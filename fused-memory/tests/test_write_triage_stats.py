@@ -80,6 +80,11 @@ class TestWilsonBounds:
         with pytest.raises(ValueError, match=f'n={n}'):
             _mod().wilson_bounds(share, n)
 
+    @pytest.mark.parametrize('share', [-0.1, 1.5])
+    def test_a_share_outside_the_unit_interval_is_refused(self, share: float) -> None:
+        with pytest.raises(ValueError, match=f'share={share}, n=10'):
+            _mod().wilson_bounds(share, 10)
+
 
 class TestNearestRank95:
     def test_is_the_2_5th_and_97_5th_nearest_rank_to_four_places(self) -> None:

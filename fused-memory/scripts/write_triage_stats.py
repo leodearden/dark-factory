@@ -35,8 +35,8 @@ def rate(hits: int, total: int) -> float | None:
 
 def wilson_bounds(share: float, n: float, z: float = _WILSON_Z) -> tuple[float, float]:
     """Unrounded Wilson score bounds for an observed *share* over *n* trials, *n* possibly a non-integer effective n."""
-    if n <= 0:
-        raise ValueError(f'wilson_bounds needs a positive n; got n={n}')
+    if n <= 0 or not 0.0 <= share <= 1.0:
+        raise ValueError(f'wilson_bounds needs 0 <= share <= 1 and n > 0; got share={share}, n={n}')
     z2 = z * z
     denominator = 1 + z2 / n
     centre = (share + z2 / (2 * n)) / denominator
