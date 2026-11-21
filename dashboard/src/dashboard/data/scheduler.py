@@ -755,8 +755,8 @@ async def collect_scheduler_state(
     For each project root:
       - Calls ``get_scheduler_state`` and ``get_scheduler_events`` via
         ``mcp_tool_call``.
-      - Joins with ``collect_tasks_with_counts`` output for task metadata and
-        lock sets.
+      - Joins with the shaped rows its ``collect_tasks_with_counts`` unit
+        carries, for task metadata and lock sets.
       - Composes rows, module contention list, and per-task event sparklines.
 
     *now* is resolved ONCE (via :func:`dashboard.data.utils.resolve_now`) at
@@ -798,8 +798,9 @@ async def collect_scheduler_state(
     since = effective_now - timedelta(hours=1)
 
     # Fetch active tasks (for lock sets and titles).
-    all_active, snapshots = await collect_tasks_with_counts(client, config, now=effective_now)
+    _, snapshots = await collect_tasks_with_counts(client, config, now=effective_now)
     health = {label: classify(snapshot) for label, snapshot in snapshots.items()}
+    rows_by_label = {label: snapshot.rows.value or [] for label, snapshot in snapshots.items()}
     offline_projects: list[str] = [
         label for label, h in health.items() if h is SnapshotHealth.OFFLINE
     ]
@@ -945,8 +946,8 @@ async def collect_scheduler_state(
                 'reason': snapshot.pause_reason,
             })
 
-        # Build task lookup from active_tasks for this project
-        project_active = [t for t in all_active if t.get('project') == label]
+        # This root's shaped rows come from its own unit.
+        project_active = rows_by_label.get(label, [])
 
         # Enrich active tasks with raw task_id, project label, and project_root
         # for snapshot lookups and downstream override POSTs.
