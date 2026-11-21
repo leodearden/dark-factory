@@ -517,20 +517,20 @@ class TestReadingAndResolvingUnderAnAnchor:
         assert records[other_role]['status'] == 'pending'
         assert _pending(str(tmp_path)) == []
 
-    def test_one_failed_resolve_does_not_stop_the_next(self, tmp_path, monkeypatch):
+    def test_one_failed_resolve_does_not_stop_the_next(self, tmp_path):
         first = _emit(tmp_path)
         second = _emit(tmp_path, dedupe=False)
         assert first is not None and second is not None
-        class _FirstResolveFails(_folded_escalation.EscalationQueue):
-            def resolve(self, escalation_id, *args, **kwargs):
-                if escalation_id == first:
-                    raise OSError('cannot rewrite the record')
-                return super().resolve(escalation_id, *args, **kwargs)
-
-        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _FirstResolveFails)
+        # A directory where the first record's lock file goes: resolving it
+        # cannot take its lock.
+        lock_path = escalation_queue_dir(tmp_path) / f'{first}.json.lock'
+        lock_path.unlink(missing_ok=True)
+        lock_path.mkdir()
 
         assert _resolve(str(tmp_path)) == [second]
-        assert _every_record_by_id(tmp_path)[second]['status'] == 'resolved'
+        records = _every_record_by_id(tmp_path)
+        assert records[first]['status'] == 'pending'
+        assert records[second]['status'] == 'resolved'
 
     @pytest.mark.parametrize('call', [_pending, _resolve], ids=['pending', 'resolve'])
     def test_a_none_root_returns_empty_and_writes_nothing(self, tmp_path, call):

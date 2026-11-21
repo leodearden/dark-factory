@@ -244,6 +244,21 @@ def pending_folded_escalations(
     )
     if queue is None:
         return []
+    return _pending_in(
+        queue, project_root, anchor_task_id=anchor_task_id, agent_role=agent_role,
+        logger=logger, log_label=log_label,
+    )
+
+
+def _pending_in(
+    queue: EscalationQueue,
+    project_root: str | None,
+    *,
+    anchor_task_id: str,
+    agent_role: str,
+    logger: logging.Logger,
+    log_label: str,
+) -> list[Escalation]:
     try:
         return queue.get_by_task(anchor_task_id, status='pending', agent_role=agent_role)
     except Exception:
@@ -269,17 +284,15 @@ def resolve_folded_escalations(
     failure on one record is logged and the next is still tried.  Returns the
     resolved ids. NEVER raises.
     """
-    pending = pending_folded_escalations(
-        project_root, anchor_task_id=anchor_task_id, agent_role=agent_role,
-        logger=logger, log_label=log_label,
-    )
-    if not pending:
-        return []
     queue = _open_queue(
         project_root, logger=logger, log_label=log_label, outcome='nothing resolved',
     )
     if queue is None:
         return []
+    pending = _pending_in(
+        queue, project_root, anchor_task_id=anchor_task_id, agent_role=agent_role,
+        logger=logger, log_label=log_label,
+    )
     resolved: list[str] = []
     for esc in pending:
         try:
