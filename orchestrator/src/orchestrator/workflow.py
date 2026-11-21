@@ -3523,7 +3523,7 @@ class TaskWorkflow:
             disp = classify_failure(e)
             block_reason = disp.reason_prefix
             logger.info(
-                'Task %s: warm-lane requeue (%s, counts_against_requeue_cap=%s): %s',
+                'Task %s: requeue (%s, counts_against_requeue_cap=%s): %s',
                 self.task_id, block_reason, disp.counts_against_requeue_cap, e,
             )
             # γ3/D6: make the REQUEUED exit TRUTHFUL — re-pend the row BEFORE
