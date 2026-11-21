@@ -1,0 +1,19 @@
+from common import *
+EV=events()
+MAINRED={'LOOP':('2026-11-15T10:09','2026-11-15T22:55'),'RETIRED':('2026-11-17T14:07','2026-11-17T18:50')}
+def mainred_groups(v):
+    s=dt.datetime.fromtimestamp(v['start'],dt.timezone.utc).isoformat()[:16]
+    return {g for g,(a,b) in MAINRED.items() if a<=s and v['ts'][:16]<=b}
+def nxt(task,ts):
+    out=[]
+    for e in EV:
+        if e['task']==task and e['ts']>ts and e['et'] in('merge_finalized','merge_attempt','verdict_voided'):
+            d=e['d']; out.append('%s %s:%s'%(e['ts'][5:16],e['et'][6:] if e['et'].startswith('merge_') else e['et'],(d.get('state') or d.get('outcome') or d.get('reason') or '')+('/'+d.get('disposition') if d.get('disposition') else '')+(' '+(d.get('reason') or '')[:38] if e['et']=='merge_finalized' and d.get('reason') else '')))
+            if len(out)>=2: break
+    return ' | '.join(out)
+for v in V:
+    if v['ts']<'2026-11-15T11:19' or v['passed'] or v['k']!=1: continue
+    fs=fset(v) or set(); mr=mainred_groups(v)
+    pred=v['layers'][1:]; unl=[l.get('task') for l in pred if not l.get('on_main_now')]
+    if fs and fs<=mr and not unl: continue
+    print(v['vid'],v['ts'][5:16],v['task'],v['runner'][:3],v['base_relation'][:5],'tip',(v['layers'][0].get('tip') or '?')[:8],'fails',sorted(fs) or 'NOLOG','| unlanded-base:',unl or '-','| next:',nxt(v['task'],v['ts']))

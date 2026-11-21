@@ -21,6 +21,7 @@ everything else is loaded from the actual source files.
 
 from __future__ import annotations
 
+import ast
 import collections
 import sys
 import types
@@ -31,6 +32,24 @@ import pytest
 
 if TYPE_CHECKING:
     import socket
+
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd escalation && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
+# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
+# at sys.path[0] it would make the subproject directories resolve as namespace
+# packages pointing at the project folder instead of src/<pkg>/, beating the
+# inserts below.  df_pytest_isolation is stdlib + pytest only, so it imports
+# cleanly ahead of the stubbing block in this venv, which deliberately excludes
+# aiosqlite.
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from df_pytest_isolation import (
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    reject_unsafe_basetemp,
+)
 
 _SRC = Path(__file__).parent.parent / 'src'
 if str(_SRC) not in sys.path:
@@ -48,7 +67,7 @@ if str(_SRC) not in sys.path:
 # (`_SUBPROJECTS_WITH_CONFTEST`), which also fixes the spelling.
 #
 # Note this is `insert(0, ...)`, deliberately unlike the `REPO_ROOT` *append*
-# lower in this file: a tests dir contributes no package-shadowing directories,
+# higher in this file: a tests dir contributes no package-shadowing directories,
 # and `insert(0, ...)` is the spelling the enforcing test requires.
 _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
@@ -61,6 +80,31 @@ if str(_TESTS_DIR) not in sys.path:
 _REPO_ROOT = Path(__file__).parent.parent.parent
 _SHARED_SRC = _REPO_ROOT / 'shared' / 'src'
 _ORCH_SRC = _REPO_ROOT / 'orchestrator' / 'src'
+
+def _checkpoint_result_stub(async_base_source: Path) -> type:
+    """A namedtuple mirroring the real ``CheckpointResult`` NamedTuple, read from source.
+
+    The real module imports aiosqlite, so it cannot be imported here; parsing
+    its source keeps the stub's fields and defaults single-sourced instead of
+    hand-mirrored.  Every annotated name counts as a field, ``ClassVar``
+    included: ``NamedTuple`` never exempts one (it rejects a live ``ClassVar``
+    and, under the module's string annotations, makes it a field).
+    """
+    tree = ast.parse(async_base_source.read_text())
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == 'CheckpointResult':
+            fields = [
+                (stmt.target.id, stmt.value)
+                for stmt in node.body
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+            ]
+            return collections.namedtuple(
+                'CheckpointResult',
+                [name for name, _ in fields],
+                defaults=[ast.literal_eval(value) for _, value in fields if value is not None],
+            )
+    raise RuntimeError(f'CheckpointResult not found in {async_base_source}')
+
 
 if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
     # Stub ``shared`` package before adding shared/src to sys.path so that
@@ -77,7 +121,7 @@ if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
     # Provide minimal stubs so orchestrator modules that import these can load.
     if 'shared.async_sqlite_base' not in sys.modules:
         _async_base_stub = types.ModuleType('shared.async_sqlite_base')
-        _CheckpointResult = collections.namedtuple('CheckpointResult', ['log', 'checkpointed'])
+        _CheckpointResult = _checkpoint_result_stub(_SHARED_SRC / 'shared' / 'async_sqlite_base.py')
         # Populate via __dict__.update: pyright rejects attribute assignment on a
         # bare ModuleType instance (reportAttributeAccessIssue), but a module
         # namespace is a plain dict[str, Any], so this is runtime-equivalent and
@@ -95,43 +139,22 @@ if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
         if _p not in sys.path:
             sys.path.insert(0, _p)
 
-# NOTE (task 3644, review finding #6): the `scripts/` + `scripts/legibility/`
-# path injection the census<->escalation E2E contract test needs is NOT done
-# here.  It lives in that one test module
-# (`test_legibility_census_escalation_e2e.py`), scoped to its only consumer and
-# APPENDING rather than inserting.  `scripts/legibility/` contributes very
-# generic flat top-level module names — `config.py`, `inventory.py`,
-# `sampling.py`, `digest.py`, `coder.py`, `codebook.py` — and putting those at
-# `sys.path[0]` for all ~1080 tests in this directory would shadow any
-# same-named module for every one of them, with a wrong-module import (not an
-# ImportError) as the failure mode.  The two-entry idiom in
-# `scripts/tests/conftest.py` is fine THERE because every test in that
+# NOTE (task 3644, review finding #6): the `scripts/` path injection the
+# census<->escalation E2E contract test needs is NOT done here.  It lives in
+# that one test module (`test_legibility_census_escalation_e2e.py`), scoped to
+# its only consumer and APPENDING rather than inserting.  `scripts/` contributes
+# ~130 flat top-level module names, and putting those at `sys.path[0]` for all
+# ~1080 tests in this directory would shadow any same-named module for every
+# one of them, with a wrong-module import (not an ImportError) as the failure
+# mode.  `scripts/tests/conftest.py` inserts it because every test in that
 # directory needs those modules; here exactly one does.
-
-# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
-# runs `cd escalation && uv run pytest tests/`, which makes rootdir the
-# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
-# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
-# at sys.path[0] it would make the subproject directories resolve as namespace
-# packages pointing at the project folder instead of src/<pkg>/, beating the
-# inserts above.  Placed after the stubbing block to keep that contiguous;
-# df_pytest_isolation is stdlib + pytest only, so it imports cleanly in this
-# venv, which deliberately excludes aiosqlite.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from df_pytest_isolation import (  # noqa: E402
-    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
-    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
-    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
-    reject_unsafe_basetemp,
-)
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the suite-wide defences."""
     reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
+    arm_leaked_drain_process_guard(config)
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +206,8 @@ def pytest_configure(config):
 # Both are pinned by tests in `test_serve_escalation_mcp_fixture.py`.
 
 # Read by `_start` as a global at call time, so tests may shorten it.
-_READY_TIMEOUT_S = 10.0
+# Derived from measurement: test_serve_escalation_mcp_fixture.py::test_the_readiness_bound_clears_the_measured_first_start_with_headroom.
+_READY_TIMEOUT_S = 60.0
 
 
 class EscalationServerNotReady(RuntimeError):
@@ -311,7 +335,7 @@ async def _mcp_handshake_ready(
         async with asyncio.timeout(timeout_s):
             async with Client(transport) as client:
                 await client.ping()
-    except Exception as exc:  # noqa: BLE001 - any failure just means "not ready yet"
+    except Exception as exc:  # any failure just means "not ready yet"
         if error_box is not None:
             error_box[:] = [exc]
         return False
@@ -331,14 +355,18 @@ def _serve_escalation_mcp_impl():
 
     Call as ``serve_escalation_mcp(queue_dir)`` -> ``(base_url, port, queue)``.
     Builds ``EscalationQueue(queue_dir)`` + ``create_server(queue,
-    startup_sweep=False, dedupe_config=...)`` and serves its ``http_app()``
+    startup_sweep=False, dedupe_config=...)``, passing an optional
+    ``store_identity=`` through (``None``, the default, keeps today's
+    identity-less server), as it does ``prefix_resolver=`` and
+    ``per_call_projects=``, and serves its ``http_app()``
     through ``uvicorn.Server`` -- production's shape -- on a localhost listener
     the fixture binds and holds from allocation onward
     (``_bind_escalation_listener``), inside a daemon thread running its own
     event loop; teardown closes that listener.  Readiness is polled by a real
     MCP handshake (``_mcp_handshake_ready``) -- not a bare TCP connect, and no
-    fixed sleep -- until it succeeds, the serving thread exits, or ~10s pass;
-    each attempt is bounded by the time remaining.  Failure raises
+    fixed sleep -- until it succeeds, the serving thread exits, or
+    ``_READY_TIMEOUT_S`` passes; each attempt is bounded by the time
+    remaining.  Failure raises
     ``EscalationServerNotReady``.  Every server started through the factory is
     torn down when the test finishes.
 
@@ -382,15 +410,22 @@ def _serve_escalation_mcp_impl():
     from escalation.dedupe import DedupeConfig
     from escalation.queue import EscalationQueue
     from escalation.server import create_server
+    from escalation.store_identity import StoreIdentity
 
     started: list[tuple] = []
 
-    def _start(queue_dir, *, dedupe_config=None, startup_sweep=False):
+    def _start(
+        queue_dir, *, dedupe_config=None, startup_sweep=False,
+        store_identity: StoreIdentity | None = None,
+        prefix_resolver=None, per_call_projects=(),
+    ):
         queue = EscalationQueue(queue_dir)
         if dedupe_config is None:
             dedupe_config = DedupeConfig(infra_dedupe_enabled=False)
         mcp = create_server(
             queue, startup_sweep=startup_sweep, dedupe_config=dedupe_config,
+            store_identity=store_identity, prefix_resolver=prefix_resolver,
+            per_call_projects=per_call_projects,
         )
         listener = _bind_escalation_listener()
         port = listener.getsockname()[1]
@@ -407,7 +442,7 @@ def _serve_escalation_mcp_impl():
                     mcp.http_app(), log_level='error', ws='none',
                 ))
                 loop.run_until_complete(server.serve(sockets=[listener]))
-            except BaseException as exc:  # noqa: BLE001 - surfaced on timeout below
+            except BaseException as exc:  # surfaced on timeout below
                 # Two distinct cases, told apart by the `stopping` flag:
                 #
                 # * Teardown stopped the loop mid-serve -- a deliberate,
@@ -441,9 +476,9 @@ def _serve_escalation_mcp_impl():
         # up, not that the FastMCP ASGI app has finished mounting /mcp/. Every
         # poll implicitly re-probes the TCP layer too (a refused/reset connect
         # just fails the handshake and retries), so no separate TCP wait is
-        # needed. Bounded ~10s instead of a fixed sleep, and ended early by the
-        # serving thread's death: past that point nothing of ours is listening
-        # on the port. Thread death is checked BEFORE the deadline so a thread
+        # needed. Bounded by `_READY_TIMEOUT_S` instead of a fixed sleep, and
+        # ended early by the serving thread's death: past that point nothing of
+        # ours is listening on the port. Thread death is checked BEFORE the deadline so a thread
         # that died during the final poll interval is still reported as exited.
         base_url = f'http://127.0.0.1:{port}'
         deadline = time.monotonic() + _READY_TIMEOUT_S

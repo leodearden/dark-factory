@@ -51,14 +51,15 @@ class DbPool:
     Both sets are fixed once at startup (``DashboardConfig.from_env`` reads
     ``DASHBOARD_KNOWN_PROJECT_ROOTS``; ``__post_init__`` resolves them; they
     are never mutated at runtime).  The ``rel-path`` values are fixed literals
-    (``data/orchestrator/runs.db``, ``data/burndown/burndown.db``) plus the
-    six fixed ``@property`` paths on ``DashboardConfig``.  The ``@property``
+    (``data/orchestrator/runs.db``, ``data/burndown/burndown.db``,
+    ``.taskmaster/tasks/tasks.db`` — ``project_dbs.py::TASKS_DB_REL_PATH``)
+    plus the six fixed ``@property`` paths on ``DashboardConfig``.  The ``@property``
     paths (``reconciliation_db``, ``tickets_db``, ``metrics_db``,
     ``write_journal_db``, etc.) are called only with ``config.project_root``,
     never with each root in ``known_project_roots``, so they contribute a
     flat ``+6`` rather than a per-root multiplier.  Therefore::
 
-        |_open_locks| ≤ (1 + len(known_project_roots)) × 2 + 6
+        |_open_locks| ≤ (1 + len(known_project_roots)) × 3 + 6
 
     Per-path lock entries are retained for the process lifetime (cleared only
     in :meth:`close_all`) — this is *intentional*: evicting an entry while
@@ -117,7 +118,8 @@ class DbPool:
         self._closing: dict[aiosqlite.Connection, asyncio.Future[None]] = {}
         # Per-path open locks — prevents duplicate opens for the same path while
         # allowing disjoint paths to open concurrently (no serialisation between
-        # unrelated paths).  Mirrors SqliteTaskBackend._get_connection convention.
+        # unrelated paths).  Mirrors the per-project connect-lock convention of
+        # fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend._get_write_access.
         # Growth is bounded; see class docstring for the structural argument.
         self._open_locks: dict[Path, asyncio.Lock] = {}
         self._open_locks_lock: asyncio.Lock = asyncio.Lock()
@@ -157,7 +159,7 @@ class DbPool:
             #     resumed get() would install a fresh connection into an already-
             #     drained pool, leaking the aiosqlite worker thread indefinitely.
             #     DbPool closes that window here; note the mirrored
-            #     SqliteTaskBackend._get_connection convention has the same window
+            #     SqliteTaskBackend._get_write_access convention has the same window
             #     (not closed there — callers must not race close and get).
             if self._closed:
                 return None

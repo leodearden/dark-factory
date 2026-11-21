@@ -25,6 +25,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _seed_script_stubs import seed_default_warm_base
 
 # ---------------------------------------------------------------------------
 # step-03: GitConfig.warm_lane_structural_exhaustion_l2_threshold knob
@@ -213,17 +214,11 @@ async def _init_repo(repo: Path) -> None:
 
 @pytest.fixture
 def wl_git_repo(tmp_path: Path) -> Path:
-    """A git repo whose default warm-lane base + pool-storage sentinel exist so
-    ``acquire_warm_lane``'s pre-acquire base-health gate sees
-    ``WarmBaseHealth.OK`` and the mount-presence guard does not false-trip
-    (mirrors test_warm_lane_pool.py::wl_git_repo)."""
+    """A git repo with the default warm-lane base and pool-storage sentinel."""
     repo = tmp_path / 'repo'
     repo.mkdir()
     asyncio.run(_init_repo(repo))
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    seed_default_warm_base(repo)
     return repo
 
 

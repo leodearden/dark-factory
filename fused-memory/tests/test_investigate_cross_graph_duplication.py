@@ -6,7 +6,9 @@ test_purge_knowlive_namespace.py.
 """
 from __future__ import annotations
 
+import errno
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -14,6 +16,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
+from _graph_access_fake import FakeGraphAccess
+
+from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.config.schema import QueueConfig
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'investigate_cross_graph_duplication.py'
 
@@ -167,27 +173,26 @@ class TestProbeNodeAcrossGraphs:
     """Tests for async probe_node_across_graphs(graphiti, uuid, graph_names) -> list[dict]."""
 
     @pytest.mark.asyncio
-    async def test_calls_graph_for_once_per_graph_name(self):
-        """graphiti._graph_for is called exactly once for each graph name."""
-        graphiti = MagicMock()
-        graph = _make_graph_mock([])
-        graphiti._graph_for = MagicMock(return_value=graph)
+    async def test_reads_each_named_graph_once(self, make_backend, mock_config):
+        """Each graph name's own graph is read exactly once."""
+        graphs = {name: _make_graph_mock([]) for name in ('reify', 'dark_factory', 'know_live')}
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess(graphs))
 
         await _mod.probe_node_across_graphs(
             graphiti, 'uuid-1', ['reify', 'dark_factory', 'know_live'],
         )
 
-        assert graphiti._graph_for.call_count == 3
-        called_names = {c.args[0] for c in graphiti._graph_for.call_args_list}
-        assert called_names == {'reify', 'dark_factory', 'know_live'}
+        for graph in graphs.values():
+            graph.ro_query.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_uses_ro_query_not_query(self):
+    async def test_uses_ro_query_not_query(self, make_backend, mock_config):
         """The probe is read-only: ro_query is used once per graph, and
         query is NEVER called."""
-        graphiti = MagicMock()
         graph = _make_graph_mock([])
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess(
+            {'reify': graph, 'dark_factory': graph, 'know_live': graph},
+        ))
 
         await _mod.probe_node_across_graphs(
             graphiti, 'uuid-1', ['reify', 'dark_factory', 'know_live'],
@@ -197,12 +202,11 @@ class TestProbeNodeAcrossGraphs:
         graph.query.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_uuid_passed_as_cypher_parameter(self):
+    async def test_uuid_passed_as_cypher_parameter(self, make_backend, mock_config):
         """The target uuid is passed as a Cypher query parameter, not
         string-interpolated into the query text."""
-        graphiti = MagicMock()
         graph = _make_graph_mock([])
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'reify': graph}))
 
         await _mod.probe_node_across_graphs(graphiti, 'target-uuid', ['reify'])
 
@@ -211,17 +215,16 @@ class TestProbeNodeAcrossGraphs:
         assert params == {'uuid': 'target-uuid'}
 
     @pytest.mark.asyncio
-    async def test_returns_one_entry_per_graph_with_nonempty_result(self):
+    async def test_returns_one_entry_per_graph_with_nonempty_result(
+        self, make_backend, mock_config,
+    ):
         """Graphs with a matching row contribute one normalized entry each;
         a graph with an empty result_set contributes none."""
-        graphiti = MagicMock()
-
-        def _graph_for(name):
-            if name in ('reify', 'dark_factory'):
-                return _make_graph_mock([['target-uuid', 'orchestrator', 'reify']])
-            return _make_graph_mock([])  # know_live: not present
-
-        graphiti._graph_for = MagicMock(side_effect=_graph_for)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({
+            'reify': _make_graph_mock([['target-uuid', 'orchestrator', 'reify']]),
+            'dark_factory': _make_graph_mock([['target-uuid', 'orchestrator', 'reify']]),
+            'know_live': _make_graph_mock([]),  # not present
+        }))
 
         result = await _mod.probe_node_across_graphs(
             graphiti, 'target-uuid', ['reify', 'dark_factory', 'know_live'],
@@ -233,43 +236,37 @@ class TestProbeNodeAcrossGraphs:
         ]
 
     @pytest.mark.asyncio
-    async def test_empty_result_set_is_omitted(self):
+    async def test_empty_result_set_is_omitted(self, make_backend, mock_config):
         """A graph with no matching node is omitted from the result entirely."""
-        graphiti = MagicMock()
         graph = _make_graph_mock([])
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'reify': graph}))
 
         result = await _mod.probe_node_across_graphs(graphiti, 'uuid-1', ['reify'])
 
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_empty_graph_names_returns_empty_list_without_calls(self):
-        """No graph names -> no _graph_for calls, empty result."""
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock()
+    async def test_empty_graph_names_returns_empty_list(self, make_backend, mock_config):
+        """No graph names -> nothing to read (no graph is wired), empty result."""
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({}))
 
         result = await _mod.probe_node_across_graphs(graphiti, 'uuid-1', [])
 
         assert result == []
-        graphiti._graph_for.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_continues_past_raising_graph_and_records_error(self):
+    async def test_continues_past_raising_graph_and_records_error(self, make_backend, mock_config):
         """A graph whose ro_query raises (e.g. a malformed/inaccessible
         path-leak graph) is skipped and recorded into *errors* -- it does
         not abort the probe of the remaining graphs."""
-        graphiti = MagicMock()
-
-        def _graph_for(name):
-            if name == '-home-leo-src-dark-factory':
-                graph = MagicMock()
-                graph.ro_query = AsyncMock(side_effect=RuntimeError('graph key not found'))
-                graph.query = AsyncMock()
-                return graph
-            return _make_graph_mock([['target-uuid', 'orchestrator', 'reify']])
-
-        graphiti._graph_for = MagicMock(side_effect=_graph_for)
+        broken = MagicMock()
+        broken.ro_query = AsyncMock(side_effect=RuntimeError('graph key not found'))
+        broken.query = AsyncMock()
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({
+            'reify': _make_graph_mock([['target-uuid', 'orchestrator', 'reify']]),
+            '-home-leo-src-dark-factory': broken,
+            'dark_factory': _make_graph_mock([['target-uuid', 'orchestrator', 'reify']]),
+        }))
         errors: list = []
 
         result = await _mod.probe_node_across_graphs(
@@ -285,20 +282,18 @@ class TestProbeNodeAcrossGraphs:
         assert errors == [{'graph': '-home-leo-src-dark-factory', 'error': 'graph key not found'}]
 
     @pytest.mark.asyncio
-    async def test_raising_graph_is_swallowed_when_errors_not_supplied(self):
+    async def test_raising_graph_is_swallowed_when_errors_not_supplied(
+        self, make_backend, mock_config,
+    ):
         """If the caller doesn't pass an *errors* accumulator, a raising
         graph is still skipped rather than propagating -- the *errors*
         param is optional, not required for the read-only guarantee."""
-        graphiti = MagicMock()
-
-        def _graph_for(name):
-            if name == 'bad-graph':
-                graph = MagicMock()
-                graph.ro_query = AsyncMock(side_effect=RuntimeError('boom'))
-                return graph
-            return _make_graph_mock([])
-
-        graphiti._graph_for = MagicMock(side_effect=_graph_for)
+        broken = MagicMock()
+        broken.ro_query = AsyncMock(side_effect=RuntimeError('boom'))
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({
+            'bad-graph': broken,
+            'reify': _make_graph_mock([]),
+        }))
 
         result = await _mod.probe_node_across_graphs(graphiti, 'uuid-1', ['bad-graph', 'reify'])
 
@@ -511,35 +506,43 @@ class TestRun:
         import types as _types
         return _types.SimpleNamespace(uuid=uuid)
 
-    def _make_memory_service(self, graphs, presence_rows_by_graph=None):
-        """AsyncMock memory_service with .graphiti wired for list_graphs
-        (GRAPH.LIST) + _graph_for (one stable mock per graph name), and
-        delete_memory/update_edge as AsyncMocks for the read-only guarantee.
-        Returns (memory_service, graph_mocks) so tests can inspect the
-        per-graph mocks directly."""
-        rows_by_graph = presence_rows_by_graph or {}
-        graph_mocks = {name: _make_graph_mock(rows_by_graph.get(name, [])) for name in graphs}
+    @pytest.fixture
+    def make_memory_service(self, make_backend, mock_config):
+        """Factory fixture: (graphs, presence_rows_by_graph) -> (memory_service, graph_mocks).
 
-        memory_service = AsyncMock()
-        graphiti = MagicMock()
-        graphiti.list_graphs = AsyncMock(return_value=graphs)
-        graphiti._graph_for = MagicMock(side_effect=lambda name: graph_mocks[name])
-        memory_service.graphiti = graphiti
-        memory_service.delete_memory = AsyncMock(return_value=None)
-        memory_service.update_edge = AsyncMock(return_value=None)
-        return memory_service, graph_mocks
+        memory_service.graphiti is a real backend over one stable raw graph
+        per name, so the backend's own list_graphs enumerates exactly those
+        names; delete_memory/update_edge are AsyncMocks for the read-only
+        guarantee. graph_mocks lets tests inspect the per-graph mocks.
+        """
+        def _factory(graphs, presence_rows_by_graph=None):
+            rows_by_graph = presence_rows_by_graph or {}
+            graph_mocks = {name: _make_graph_mock(rows_by_graph.get(name, [])) for name in graphs}
 
-    @pytest.mark.asyncio
-    async def test_calls_list_graphs_for_graph_list(self):
-        """memory_service.graphiti.list_graphs() enumerates GRAPH.LIST."""
-        memory_service, _ = self._make_memory_service(['reify', 'dark_factory'])
+            memory_service = AsyncMock()
+            memory_service.graphiti = make_backend(
+                mock_config, graph_access=FakeGraphAccess(graph_mocks),
+            )
+            memory_service.delete_memory = AsyncMock(return_value=None)
+            memory_service.update_edge = AsyncMock(return_value=None)
+            return memory_service, graph_mocks
 
-        await _mod.run(self._args(uuid='some-uuid'), memory_service)
-
-        memory_service.graphiti.list_graphs.assert_called_once_with()
+        return _factory
 
     @pytest.mark.asyncio
-    async def test_report_built_end_to_end(self):
+    async def test_enumerates_every_listed_graph(self, make_memory_service):
+        """The backend's graph listing is what run() enumerates and probes."""
+        graphs = ['-home-leo-src-dark-factory', 'dark-factory', 'reify']
+        memory_service, graph_mocks = make_memory_service(graphs)
+
+        report = await _mod.run(self._args(uuid='some-uuid'), memory_service)
+
+        assert report['all_graphs'] == graphs
+        for graph in graph_mocks.values():
+            graph.ro_query.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_report_built_end_to_end(self, make_memory_service):
         """The returned report has present_in, collision_groups, verdict,
         and scope -- the full pipeline ran, not a partial stub."""
         graphs = ['reify', 'dark_factory', 'know_live']
@@ -548,12 +551,12 @@ class TestRun:
             'dark_factory': [['target-uuid', 'orchestrator', 'reify']],
             'know_live': [['target-uuid', 'orchestrator', 'reify']],
         }
-        memory_service, _ = self._make_memory_service(graphs, rows_by_graph)
+        memory_service, _ = make_memory_service(graphs, rows_by_graph)
 
         report = await _mod.run(self._args(uuid='target-uuid'), memory_service)
 
         assert report['target_uuid'] == 'target-uuid'
-        assert report['all_graphs'] == graphs
+        assert report['all_graphs'] == sorted(graphs)
         assert len(report['present_in']) == 3
         assert report['collision_groups'] == []
         assert report['verdict']['confirmed'] is True
@@ -561,20 +564,20 @@ class TestRun:
         assert report['scope'] == 'single_node'
 
     @pytest.mark.asyncio
-    async def test_uuid_none_falls_back_to_target_node_uuid(self):
+    async def test_uuid_none_falls_back_to_target_node_uuid(self, make_memory_service):
         """args.uuid=None uses the module's default TARGET_NODE_UUID."""
-        memory_service, _ = self._make_memory_service(['reify'])
+        memory_service, _ = make_memory_service(['reify'])
 
         report = await _mod.run(self._args(uuid=None), memory_service)
 
         assert report['target_uuid'] == _mod.TARGET_NODE_UUID
 
     @pytest.mark.asyncio
-    async def test_strictly_read_only(self):
+    async def test_strictly_read_only(self, make_memory_service):
         """run() never issues a mutating graph query, memory delete, or
         edge update."""
         graphs = ['reify', 'dark_factory']
-        memory_service, graph_mocks = self._make_memory_service(graphs)
+        memory_service, graph_mocks = make_memory_service(graphs)
 
         await _mod.run(self._args(uuid='some-uuid'), memory_service)
 
@@ -584,13 +587,13 @@ class TestRun:
         memory_service.update_edge.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_probe_failure_surfaced_in_report_without_aborting_run(self):
+    async def test_probe_failure_surfaced_in_report_without_aborting_run(self, make_memory_service):
         """A single graph raising on probe does not abort run(): the
         failure is surfaced under report['errors'] and the report is still
         built from the remaining, healthy graphs."""
         graphs = ['reify', 'bad-graph']
         rows_by_graph = {'reify': [['target-uuid', 'orchestrator', 'reify']]}
-        memory_service, graph_mocks = self._make_memory_service(graphs, rows_by_graph)
+        memory_service, graph_mocks = make_memory_service(graphs, rows_by_graph)
         graph_mocks['bad-graph'].ro_query = AsyncMock(side_effect=RuntimeError('no such graph'))
 
         report = await _mod.run(self._args(uuid='target-uuid'), memory_service)
@@ -606,22 +609,24 @@ class TestRun:
 
 class _StubConfig:
     """Lightweight stand-in for FusedMemoryConfig -- main() only needs to
-    be able to construct one and hand it to MemoryService."""
+    be able to construct one and hand it to MemoryService, whose backend
+    reads only its queue budgets."""
 
     def __init__(self, *args, **kwargs):
-        pass
+        self.queue = QueueConfig()
 
 
 class _StubMemoryService:
-    """Lightweight stand-in for MemoryService -- wires a .graphiti mock
-    sufficient for run() to complete end-to-end without a live FalkorDB."""
+    """Lightweight stand-in for MemoryService -- a real .graphiti backend over
+    one empty 'reify' graph, sufficient for run() to complete end-to-end
+    without a live FalkorDB."""
 
     def __init__(self, config):
         self.config = config
-        graphiti = MagicMock()
-        graphiti.list_graphs = AsyncMock(return_value=['reify'])
-        graphiti._graph_for = MagicMock(return_value=_make_graph_mock([]))
-        self.graphiti = graphiti
+        self.graphiti = GraphitiBackend.with_driver(
+            config, MagicMock(), registered_graph_ids=(),
+            graph_access=FakeGraphAccess({'reify': _make_graph_mock([])}),
+        )
 
     async def initialize(self):
         return None
@@ -685,3 +690,51 @@ class TestMainCliWiring:
             assert os.environ['CONFIG_PATH'] == '/tmp/some-config.yaml'
         finally:
             os.environ.pop('CONFIG_PATH', None)
+
+
+class _UnopenableMemoryService:
+    """A store whose open fails the way ``MemoryService.initialize`` measurably
+    does when it cannot create ``config.queue.data_dir``."""
+
+    instances: list[_UnopenableMemoryService] = []
+
+    def __init__(self, config):
+        self.closed = False
+        type(self).instances.append(self)
+
+    async def initialize(self):
+        raise PermissionError(errno.EACCES, 'Permission denied', '/unwritable/queue-data')
+
+    async def close(self):
+        self.closed = True
+
+
+class TestAStoreThatCannotBeOpened:
+    """An OSError from opening the store is a run failure named at its seam.
+
+    Left to escape ``main()``, it would reach ``run_cli``'s stdout arm and be
+    reported as "cannot write to stdout".
+    """
+
+    def test_is_a_run_failure_naming_the_store_not_stdout(self, monkeypatch, capsys, caplog):
+        monkeypatch.setattr(_UnopenableMemoryService, 'instances', [])
+        monkeypatch.setattr('fused_memory.config.schema.FusedMemoryConfig', _StubConfig)
+        monkeypatch.setattr(
+            'fused_memory.services.memory_service.MemoryService', _UnopenableMemoryService,
+        )
+        monkeypatch.setattr(sys, 'argv', ['investigate_cross_graph_duplication.py'])
+
+        with caplog.at_level(logging.ERROR, logger='investigate_cross_graph_duplication'):
+            code = _mod.main()
+
+        assert code == _mod.EXIT_RUN_FAILED == 1
+        errors = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'investigate_cross_graph_duplication' and r.levelno >= logging.ERROR
+        ]
+        assert len(errors) == 1
+        assert 'store' in errors[0]
+        assert '/unwritable/queue-data' in errors[0]
+        assert 'stdout' not in errors[0]
+        assert _UnopenableMemoryService.instances[-1].closed
+        assert capsys.readouterr().out == ''

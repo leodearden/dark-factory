@@ -3,15 +3,29 @@
 import asyncio
 import contextlib
 import logging
+import uuid
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
+from _fm_qdrant_live import (
+    EPHEMERAL_COLLECTION_PREFIX,
+    QDRANT_URL,
+    assert_reapable,
+    collection_vector_size,
+    qdrant_skipif,
+)
+from _qdrant_responses import missing_collection_404
+from _stub_qdrant_server import StubQdrantServer, stub_qdrant_server
+from mem0 import AsyncMemory
+from mem0.configs.base import MemoryConfig
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
+from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
 
 from fused_memory.backends.mem0_client import Mem0Backend, is_missing_collection_error
+from fused_memory.config.schema import FusedMemoryConfig, Mem0BackendConfig
 from fused_memory.models.scope import Scope
 
 # Sentinel distinguishing "caller passed vector=None" (model a Qdrant point
@@ -196,8 +210,8 @@ class TestMem0BackendScrollByMetadata:
         Mirrors count_by_metadata's propagate-by-default contract: a timed-out
         scroll must never be indistinguishable from a genuinely-empty result
         (no-silent-fail invariant).  Since task 5265 the read is bounded by
-        Mem0Backend._timed, whose only handling of a TimeoutError is to re-raise
-        it naming the operation and the budget.
+        backends/timeout_budget.py::await_within, whose only handling of a
+        TimeoutError is to re-raise it naming the operation and the budget.
         """
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
@@ -701,6 +715,35 @@ class TestMem0BackendScrollCollectionPages:
         assert kwargs['scroll_filter'] == given_filter
 
     @pytest.mark.asyncio
+    async def test_payload_is_read_by_default(self, backend):
+        """Every existing caller reads payloads; the default must keep that."""
+        client = _paging_client([([], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_collection_pages('c', page_size=10))
+
+        assert client.scroll.await_args_list[0].kwargs['with_payload'] is True
+
+    @pytest.mark.asyncio
+    async def test_ids_only_walk_skips_payload_on_every_page(self, backend):
+        """with_payload=False reaches EVERY page request, and points still stream in order.
+
+        The uuid-prefix resolver enumerates ids only; a payload read on any
+        page would widen its data access for nothing.
+        """
+        p1, p2, p3 = (self._make_mock_point(f'id-{i}') for i in range(1, 4))
+        client = _paging_client([([p1, p2], 'off-1'), ([p3], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(
+                backend.scroll_collection_pages('fused_reify', with_payload=False, page_size=2)
+            )
+
+        assert got == [p1, p2, p3]
+        assert client.scroll.await_count == 2
+        assert [c.kwargs['with_payload'] for c in client.scroll.await_args_list] == [False, False]
+
+    @pytest.mark.asyncio
     async def test_empty_collection_yields_nothing(self, backend):
         client = _paging_client([([], None)])
 
@@ -1067,7 +1110,7 @@ class TestMem0BackendScrollCollectionPages:
 
         with (
             patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
-            patch('fused_memory.backends.mem0_client.asyncio.wait_for', _spy),
+            patch('fused_memory.backends.timeout_budget.asyncio.wait_for', _spy),
         ):
             got = await _drain(backend.scroll_collection_pages('c', page_size=1))
 
@@ -1350,9 +1393,10 @@ class TestMem0BackendSemanticReadTimeouts:
     """One contract, one test: every mem0-instance read propagates and NAMES itself.
 
     ``search`` / ``get_all`` / ``get`` share a single implementation of this —
-    ``Mem0Backend._timed``, the sole ``asyncio.wait_for`` call site on the
-    class — so they are asserted together.  Three near-identical copies of
-    this test could drift apart without noticing; one parametrized copy cannot,
+    ``Mem0Backend._timed_read`` over ``backends/timeout_budget.py::await_within``,
+    the sole ``asyncio.wait_for`` call site — so they are asserted together.
+    Three near-identical copies of this test could drift apart without
+    noticing; one parametrized copy cannot,
     which matters because the MESSAGE is a contract and not decoration: it is
     what reaches ``MemoryService._store_failure_diagnostics['error']``, and
     ``asyncio.wait_for``'s own ``TimeoutError`` stringifies EMPTY, so a bare
@@ -1510,6 +1554,65 @@ class TestMem0BackendGetPointById:
             'retrieved 2 points for a single id' in rec.getMessage()
             for rec in caplog.records
         ), f'expected a >1-point WARNING, got {[r.getMessage() for r in caplog.records]!r}'
+
+
+class TestMem0BackendGetPointsByIds:
+    """get_points_by_ids reads several points' raw payloads in ONE retrieve (task 5323)."""
+
+    @staticmethod
+    def _point(point_id: str, payload: dict | None):
+        point = MagicMock()
+        point.id = point_id
+        point.payload = payload
+        return point
+
+    @pytest.mark.asyncio
+    async def test_one_retrieve_maps_each_present_id_to_its_raw_payload(self, backend):
+        first, second, absent = (
+            '77a3f6bc-0000-4000-8000-000000000001',
+            '77a3f6bc-0000-4000-8000-000000000002',
+            '77a3f6bc-0000-4000-8000-000000000003',
+        )
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(return_value=[
+            self._point(first, {'data': 'one', 'agent_id': 'a'}),
+            self._point(second, None),
+        ])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.get_points_by_ids(
+                [first, second, absent], Scope(project_id='dark_factory'),
+            )
+
+        assert result == {first: {'data': 'one', 'agent_id': 'a'}, second: {}}
+        assert mock_client.retrieve.await_count == 1
+        call_kwargs = mock_client.retrieve.call_args.kwargs
+        assert call_kwargs['collection_name'] == f'{backend.config.mem0.collection_prefix}_dark_factory'
+        assert call_kwargs['ids'] == [first, second, absent]
+        assert call_kwargs['with_payload'] is True
+        assert call_kwargs['with_vectors'] is False
+
+    @pytest.mark.asyncio
+    async def test_no_ids_is_no_read(self, backend):
+        get_client = AsyncMock()
+
+        with patch.object(backend, '_get_async_qdrant', get_client):
+            assert await backend.get_points_by_ids([], Scope(project_id='dark_factory')) == {}
+
+        get_client.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_propagates_not_swallowed(self, backend):
+        mock_client = AsyncMock()
+        mock_client.retrieve = AsyncMock(side_effect=TimeoutError('too slow'))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(TimeoutError),
+        ):
+            await backend.get_points_by_ids(
+                ['00000000-0000-4000-8000-000000000000'], Scope(project_id='dark_factory'),
+            )
 
 
 class TestMem0BackendAddSystemRecord:
@@ -1865,30 +1968,107 @@ class TestIsMissingCollectionError:
         assert is_missing_collection_error(TimeoutError()) is False
 
 
-# ---------------------------------------------------------------------------
-# Integration: add_system_record fresh-point-per-call (task 2222 / W5-δ, P4)
-# ---------------------------------------------------------------------------
-#
-# Mirrors tests/test_recon_dedup_premise.py's real-Qdrant harness (task 2221 /
-# W5-γ, which already empirically proved the underlying infer=False primitive
-# never dedup-drops), adapted to probe add_system_record instead of add().
-# This pins the SAME fresh-point-every-call guarantee for the new dedicated,
-# dedup-exempt method.
+_ABSENT_SCOPE = Scope(project_id='solar_challenge')
+_ABSENT_FILTERS = {'kind': 'project_status_correction'}
+
+_SCOPED_METADATA_READS = ['scroll_by_metadata', 'count_by_metadata']
+
+_EMPTY_READ_RESULTS = [
+    pytest.param('scroll_by_metadata', [], id='scroll'),
+    pytest.param('count_by_metadata', 0, id='count'),
+]
+
+_PROPAGATING_FAILURES = [
+    pytest.param(
+        lambda: UnexpectedResponse(500, 'Internal Server Error', b'boom', httpx.Headers()),
+        UnexpectedResponse,
+        id='500',
+    ),
+    pytest.param(
+        lambda: UnexpectedResponse(
+            404,
+            'Not Found',
+            b'{"status":{"error":"Not found: Point 42 does not exist"}}',
+            httpx.Headers(),
+        ),
+        UnexpectedResponse,
+        id='point-404',
+    ),
+    pytest.param(
+        lambda: UnexpectedResponse(
+            404, 'Not Found', b"Snapshot `daily` doesn't exist!", httpx.Headers(),
+        ),
+        UnexpectedResponse,
+        id='snapshot-404',
+    ),
+    pytest.param(lambda: TimeoutError('too slow'), TimeoutError, id='timeout'),
+    pytest.param(lambda: RuntimeError('qdrant down'), RuntimeError, id='generic'),
+]
+
+
+class TestMem0BackendMetadataReadsOnAbsentCollection:
+    """A never-provisioned collection holds zero memories, so both Scope-addressed
+    metadata reads answer it as empty and say so at INFO, while every other
+    failure keeps propagating (task 4858).
+    """
+
+    @staticmethod
+    async def _read_raising(backend, op: str, exc: BaseException):
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(side_effect=exc)
+        mock_client.count = AsyncMock(side_effect=exc)
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            return await getattr(backend, op)(scope=_ABSENT_SCOPE, filters=_ABSENT_FILTERS)
+
+    @staticmethod
+    def _collection(backend) -> str:
+        return _ABSENT_SCOPE.mem0_collection_name(backend.config.mem0.collection_prefix)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('op', 'empty'), _EMPTY_READ_RESULTS)
+    async def test_missing_collection_reads_as_empty(self, backend, op, empty):
+        exc = missing_collection_404(self._collection(backend))
+
+        result = await self._read_raising(backend, op, exc)
+
+        assert result == empty
+        assert type(result) is type(empty)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('op', _SCOPED_METADATA_READS)
+    async def test_missing_collection_is_disclosed_at_info(self, backend, caplog, op):
+        collection = self._collection(backend)
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.backends.mem0_client'):
+            await self._read_raising(backend, op, missing_collection_404(collection))
+
+        disclosures = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO
+            and op in r.getMessage()
+            and collection in r.getMessage()
+        ]
+        assert len(disclosures) == 1, [r.getMessage() for r in caplog.records]
+        assert getattr(disclosures[0], 'collection', None) == collection
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('op', _SCOPED_METADATA_READS)
+    @pytest.mark.parametrize(('make_failure', 'raised'), _PROPAGATING_FAILURES)
+    async def test_other_failures_still_propagate(self, backend, op, make_failure, raised):
+        with pytest.raises(raised):
+            await self._read_raising(backend, op, make_failure())
 
 
 @pytest.fixture
-def _asr_scope(worker_id) -> Scope:
-    """A recon-stage scope isolated per xdist worker for add_system_record tests."""
-    return Scope(
-        project_id=f'_test_add_system_record_{worker_id}',
-        agent_id='recon-stage-task_knowledge_sync',
-    )
+def _absent_scope(worker_id) -> Scope:
+    return Scope(project_id=f'_test_absent_collection_{worker_id}')
 
 
 @pytest.fixture
-def _asr_clean_collection(_asr_scope, mock_config):
-    """Delete the scope's Qdrant collection before AND after the test."""
-    collection = _asr_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
+def _absent_collection(_absent_scope, mock_config):
+    """Guarantee the scope's Qdrant collection is absent before AND after the test."""
+    collection = _absent_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
     client = QdrantClient(url=QDRANT_URL, timeout=10)
     with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
         client.delete_collection(collection)
@@ -1898,21 +2078,84 @@ def _asr_clean_collection(_asr_scope, mock_config):
     client.close()
 
 
-async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
+class TestMem0BackendMetadataReadsOnAbsentCollectionIntegration:
+    """The live client's absent-collection 404 matches the predicate for BOTH reads.
+
+    No mem0 instance is built: ``_get_instance`` would provision the very
+    collection this test needs absent.
+    """
+
+    pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]
+
+    @pytest.mark.asyncio
+    async def test_live_absent_collection_reads_as_empty(
+        self, mock_config, _absent_scope, _absent_collection,
+    ):
+        config = mock_config.model_copy(deep=True)
+        config.mem0.qdrant_url = QDRANT_URL
+        backend = Mem0Backend(config)
+        try:
+            assert await backend.scroll_by_metadata(_absent_scope, {'kind': 'x'}) == []
+            assert await backend.count_by_metadata(_absent_scope, {'kind': 'x'}) == 0
+        finally:
+            await backend.close()
+
+
+# ---------------------------------------------------------------------------
+# Live-Qdrant probe harness, shared by the add_system_record probe and the
+# scan_payload_text tripwire below.
+#
+# A probe's collection is shared by every xdist worker and session and reused
+# across runs; scripts/cleanup_test_collections.py reaps it, and each run is
+# isolated by its own run_id.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _reapable_config(mock_config):
+    """``mock_config`` with the collection prefix scripts/cleanup_test_collections.py reaps."""
+    config = mock_config.model_copy(deep=True)
+    config.mem0.collection_prefix = EPHEMERAL_COLLECTION_PREFIX
+    return config
+
+
+def _probe_collection(scope: Scope, config: FusedMemoryConfig) -> str:
+    return scope.mem0_collection_name(config.mem0.collection_prefix)
+
+
+def _isolated_run(scope: Scope, config: FusedMemoryConfig, label: str) -> Iterator[str]:
+    """Yield a fresh run_id, then best-effort delete that run's points; the collection stays."""
+    run_id = f'{label}-{uuid.uuid4().hex}'
+    yield run_id
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    with contextlib.suppress(Exception):
+        client.delete(
+            collection_name=_probe_collection(scope, config),
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[FieldCondition(key='run_id', match=MatchValue(value=run_id))],
+                ),
+            ),
+        )
+    client.close()
+
+
+async def _build_stub_embedder_backend(
+    scope: Scope, config: FusedMemoryConfig, monkeypatch,
+) -> Mem0Backend:
     """Construct a real Mem0Backend with a stubbed constant-vector embedder.
 
-    Mirrors test_recon_dedup_premise._build_recon_backend's hermetic
-    (non-real-embedder) path: cosine=1.0 is the strongest-possible duplicate
-    signal the infer=False path could ever see.
+    Refuses, before anything is written, a config whose collection the reaper
+    would not reclaim. Mirrors test_recon_dedup_premise._build_recon_backend's
+    hermetic (non-real-embedder) path.
     """
+    collection = _probe_collection(scope, config)
+    assert_reapable(collection)
     monkeypatch.setattr('mem0.memory.main.capture_event', lambda *a, **kw: None)
 
-    config = mock_config.model_copy(deep=True)
-    backend = Mem0Backend(config)
+    backend = Mem0Backend(config.model_copy(deep=True))
     inst = await backend._get_instance(scope)
-    inst.db.add_history = lambda *a, **kw: None
 
-    collection = scope.mem0_collection_name(config.mem0.collection_prefix)
     # Race-safe vector-dim read: under `-n auto` load the just-created
     # collection can transiently 404 before it is durably readable, so retry
     # the read via the shared bounded-poll helper rather than a single get.
@@ -1927,11 +2170,43 @@ async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
     return backend
 
 
+# ---------------------------------------------------------------------------
+# Integration: add_system_record fresh-point-per-call (task 2222 / W5-δ, P4)
+# ---------------------------------------------------------------------------
+#
+# Mirrors tests/test_recon_dedup_premise.py's real-Qdrant harness (task 2221 /
+# W5-γ, which already empirically proved the underlying infer=False primitive
+# never dedup-drops), adapted to probe add_system_record instead of add().
+# This pins the SAME fresh-point-every-call guarantee for the new dedicated,
+# dedup-exempt method.
+
+
+@pytest.fixture
+def _asr_scope() -> Scope:
+    """The recon-stage scope every add_system_record run shares."""
+    return Scope(
+        project_id='_test_add_system_record',
+        agent_id='recon-stage-task_knowledge_sync',
+    )
+
+
+@pytest.fixture
+def _asr_run_id(_asr_scope, _reapable_config):
+    yield from _isolated_run(_asr_scope, _reapable_config, 'task-2222-add-system-record-probe')
+
+
+def test_the_add_system_record_probe_collection_is_one_the_reaper_can_reclaim(
+    _reapable_config, _asr_scope,
+):
+    """The probe collection outlives a run by design, so it must be one the reaper deletes."""
+    assert_reapable(_probe_collection(_asr_scope, _reapable_config))
+
+
 class TestMem0BackendAddSystemRecordIntegration:
     """P4 boundary signal: N identical add_system_record calls -> N distinct points.
 
-    Real Qdrant, isolated collection, stubbed constant-vector embedder (the
-    worst-case cosine=1.0 duplicate signal) — mirrors
+    Real Qdrant through the live-probe harness, stubbed constant-vector
+    embedder (the worst-case cosine=1.0 duplicate signal) — mirrors
     test_recon_dedup_premise.py's harness for backend.add(), applied to the
     new dedup-exempt backend.add_system_record method.
     """
@@ -1940,10 +2215,10 @@ class TestMem0BackendAddSystemRecordIntegration:
 
     @pytest.mark.asyncio
     async def test_identical_calls_all_land_distinct(
-        self, mock_config, _asr_scope, _asr_clean_collection, monkeypatch,
+        self, _reapable_config, _asr_scope, _asr_run_id, monkeypatch,
     ):
-        backend = await _build_asr_backend(mock_config, _asr_scope, monkeypatch)
-        run_id = 'task-2222-add-system-record-probe'
+        backend = await _build_stub_embedder_backend(_asr_scope, _reapable_config, monkeypatch)
+        run_id = _asr_run_id
         metadata = {'kind': 'cycle_summary', 'run_id': run_id}
         n = 6
         try:
@@ -2829,24 +3104,27 @@ class TestMem0BackendScanPayloadTextNamesItsCollection:
 # Correctness does not depend on this test passing: the mandatory Python
 # re-verify keeps the result exact either way, because tokenized matching is
 # strictly MORE permissive for these needles. Only speed would degrade.
+#
+# Runs through the live-probe harness; every scan is filtered to its run_id.
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def _spt_scope(worker_id) -> Scope:
-    return Scope(project_id=f'_test_scan_payload_text_{worker_id}')
+def _spt_scope() -> Scope:
+    """The scope every scan_payload_text tripwire run shares."""
+    return Scope(project_id='_test_scan_payload_text')
 
 
 @pytest.fixture
-def _spt_clean_collection(_spt_scope, mock_config):
-    collection = _spt_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
-    client = QdrantClient(url=QDRANT_URL, timeout=10)
-    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
-        client.delete_collection(collection)
-    yield collection
-    with contextlib.suppress(Exception):
-        client.delete_collection(collection)
-    client.close()
+def _spt_run_id(_spt_scope, _reapable_config):
+    yield from _isolated_run(_spt_scope, _reapable_config, 'task-3083-scan-payload-text-probe')
+
+
+def test_the_scan_payload_text_probe_collection_is_one_the_reaper_can_reclaim(
+    _reapable_config, _spt_scope,
+):
+    """The tripwire's collection outlives a run by design, so it must be one the reaper deletes."""
+    assert_reapable(_probe_collection(_spt_scope, _reapable_config))
 
 
 class TestMem0BackendScanPayloadTextIntegration:
@@ -2856,19 +3134,21 @@ class TestMem0BackendScanPayloadTextIntegration:
 
     @pytest.mark.asyncio
     async def test_matchtext_prefilter_is_a_literal_substring_match(
-        self, mock_config, _spt_scope, _spt_clean_collection, monkeypatch,
+        self, _reapable_config, _spt_scope, _spt_run_id, monkeypatch,
     ):
-        backend = await _build_asr_backend(mock_config, _spt_scope, monkeypatch)
+        backend = await _build_stub_embedder_backend(_spt_scope, _reapable_config, monkeypatch)
+        run_id = _spt_run_id
         try:
             await backend.add_system_record(
                 content='The reconciliation stage two judge halts on an empty backlog.',
                 scope=_spt_scope,
-                metadata={'kind': 'scan_payload_text_probe'},
+                metadata={'kind': 'scan_payload_text_probe', 'run_id': run_id},
             )
 
             # Mid-word substring: proves `contains`, not tokenization.
             midword = await backend.scan_payload_text(
-                scope=_spt_scope, needles=['econciliatio'], exhaustive=False
+                scope=_spt_scope, needles=['econciliatio'], exhaustive=False,
+                filters={'run_id': run_id},
             )
             assert midword['scanned'] == 1, (
                 'un-indexed MatchText must substring-match mid-word; a text '
@@ -2877,7 +3157,8 @@ class TestMem0BackendScanPayloadTextIntegration:
 
             # Reversed word order must NOT match a substring engine.
             reversed_order = await backend.scan_payload_text(
-                scope=_spt_scope, needles=['judge reconciliation'], exhaustive=False
+                scope=_spt_scope, needles=['judge reconciliation'], exhaustive=False,
+                filters={'run_id': run_id},
             )
             assert reversed_order['scanned'] == 0, (
                 'reversed word order matched — MatchText is tokenized here, so '
@@ -2887,7 +3168,7 @@ class TestMem0BackendScanPayloadTextIntegration:
             # Sanity: exhaustive mode ignores the prefilter entirely, so it
             # still walks the record regardless of MatchText semantics.
             assert (await backend.scan_payload_text(
-                scope=_spt_scope, exhaustive=True
+                scope=_spt_scope, exhaustive=True, filters={'run_id': run_id},
             ))['scanned'] == 1
         finally:
             await backend.close()
@@ -2898,22 +3179,20 @@ class TestBuildConfigDictEndpointPlumbing:
     AsyncMemory, no _get_instance. Greenfield: nothing tested this dict before.
     """
 
-    # --- default (shipped-config) behaviour: must stay byte-identical ---
-
-    def test_default_omits_embedding_dims_entirely(self, backend):
-        """The load-bearing byte-identical assertion.
-
-        mem0/embeddings/openai.py sets
-        ``_pass_dimensions_to_api = self.config.embedding_dims is not None``.
-        We omit the key today, so ``dimensions`` is NEVER sent on an
-        embeddings request. Emitting the key at all — even as 1536 — would
-        start sending it on every request under the shipped config. Hence the
-        emit-only-when-non-default rule; do not "simplify" it away.
+    @pytest.mark.parametrize('dims', [768, 1024, 1536])
+    def test_no_width_ever_reaches_the_embedder_config(self, mock_config, dims):
+        """mem0/embeddings/openai.py sends ``dimensions`` exactly when
+        ``embedding_dims`` is set, and no client may send it (PRD C3), so the
+        key is absent at every width while the vector store follows the config.
         """
-        config_dict = backend._build_config_dict('some_collection')
+        mock_config.embedder.dimensions = dims
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
 
-        assert backend.config.embedder.dimensions == 1536
         assert 'embedding_dims' not in config_dict['embedder']['config']
+        assert (
+            config_dict['vector_store']['config']['embedding_model_dims']
+            == mock_config.embedder.dimensions
+        )
 
     def test_default_emits_incumbent_base_urls(self, backend):
         config_dict = backend._build_config_dict('some_collection')
@@ -2924,18 +3203,20 @@ class TestBuildConfigDictEndpointPlumbing:
             == 'https://api.openai.com/v1'
         )
 
-    def test_default_vector_store_dims_match_mem0s_own_default(self, backend):
-        """Emitting this key is a no-op at the shipped config — mem0's Qdrant
-        default is already 1536 — but it is required for a collection to be
-        CREATED at a non-default dimensionality."""
+    def test_vector_store_dims_follow_the_configured_width(self, backend):
+        """mem0's own Qdrant default is 1536, so this key is what lets a
+        collection be CREATED at any other configured width."""
         from mem0.configs.vector_stores.qdrant import QdrantConfig
 
         config_dict = backend._build_config_dict('some_collection')
 
-        assert config_dict['vector_store']['config']['embedding_model_dims'] == 1536
+        assert (
+            config_dict['vector_store']['config']['embedding_model_dims']
+            == backend.config.embedder.dimensions
+        )
         assert (
             QdrantConfig.model_fields['embedding_model_dims'].default == 1536
-        ), 'mem0 changed its Qdrant dims default — the no-op claim above no longer holds'
+        ), 'mem0 changed its Qdrant dims default — the claim above no longer holds'
 
     def test_preexisting_keys_are_unchanged(self, backend):
         config_dict = backend._build_config_dict('some_collection')
@@ -2954,7 +3235,7 @@ class TestBuildConfigDictEndpointPlumbing:
 
         embedder = config_dict['embedder']['config']
         assert config_dict['embedder']['provider'] == 'openai'
-        assert embedder['model'] == 'text-embedding-3-small'
+        assert embedder['model'] == backend.config.embedder.model
         assert embedder['api_key'] == 'test-key'
 
     # --- local-endpoint behaviour ---
@@ -2973,17 +3254,16 @@ class TestBuildConfigDictEndpointPlumbing:
             == 'http://127.0.0.1:5678/v1'
         )
 
-    def test_non_default_dims_emitted_under_both_key_names(self, mock_config):
-        """BOTH keys are required for a non-1536 arm, and they are NOT the same
-        key: the embedder key controls what dimensionality is requested from
-        the API, the vector-store key controls what Qdrant creates the
-        collection with. Setting only one silently yields a mismatch.
+    def test_a_non_default_width_sets_only_the_vector_store_dims(self, mock_config):
+        """The vector-store key sets the width Qdrant creates the collection
+        at; the embedder gets no width key, so it receives the model's native
+        width and the endpoint never sees ``dimensions``.
         """
         mock_config.embedder.dimensions = 768
         config_dict = Mem0Backend(mock_config)._build_config_dict('c')
 
-        assert config_dict['embedder']['config']['embedding_dims'] == 768
         assert config_dict['vector_store']['config']['embedding_model_dims'] == 768
+        assert 'embedding_dims' not in config_dict['embedder']['config']
 
     def test_anthropic_llm_block_carries_no_openai_base_url(self, mock_config):
         """openai_base_url is an OpenAIConfig-only parameter; passing it to the
@@ -3015,8 +3295,7 @@ class TestBuildConfigDictEndpointPlumbing:
         from mem0.configs.llms.openai import OpenAIConfig
         from mem0.configs.vector_stores.qdrant import QdrantConfig
 
-        # Non-default dims so every optional key is actually emitted.
-        mock_config.embedder.dimensions = 768
+        # Local endpoints, so the endpoint keys carry non-default values.
         mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:1234/v1'
         mock_config.embedder.providers.openai.api_url = 'http://127.0.0.1:5678/v1'
         config_dict = Mem0Backend(mock_config)._build_config_dict('c')
@@ -3043,6 +3322,86 @@ class TestBuildConfigDictEndpointPlumbing:
         assert 'embedding_model_dims' in vector_store_params
 
 
+@pytest.fixture
+def stub_qdrant(mock_config) -> Iterator[StubQdrantServer]:
+    """Point ``mock_config`` at a local stub Qdrant (tests/_stub_qdrant_server.py).
+
+    Mem0Backend provisions its collection itself before mem0 is built, so a
+    test that builds an instance needs a Qdrant to answer, and this keeps it
+    off the live one.
+    """
+    with stub_qdrant_server() as stub:
+        mock_config.mem0.qdrant_url = stub.url
+        yield stub
+
+
+@pytest.fixture
+def mem0_built_from(monkeypatch) -> list[dict]:
+    """Every config dict mem0 is built from, captured at mem0's own boundary.
+
+    The recorder hands back a double whose ``add`` answers the way mem0's does,
+    so the public ``Mem0Backend.add`` runs end to end with no OpenAI.
+    """
+    captured: list[dict] = []
+
+    class _BuiltInstance:
+        async def add(self, **kwargs):
+            return {'results': [{'id': 'm1'}]}
+
+    def _record(cls, config_dict):
+        captured.append(config_dict)
+        return _BuiltInstance()
+
+    monkeypatch.setattr(AsyncMemory, 'from_config', classmethod(_record))
+    return captured
+
+
+class TestMem0HistoryPersistence:
+    """``mem0.persist_history`` decides which SQLite DB mem0 keeps its change
+    history in.
+
+    Every assertion reads mem0's PARSED ``MemoryConfig``: it ignores unknown
+    keys, so a misspelt key would silently fall back to the shared file, and
+    only the parsed value can catch that.
+    """
+
+    @pytest.mark.asyncio
+    async def test_history_goes_to_a_private_in_memory_db_when_persistence_is_off(
+        self, mock_config, stub_qdrant, mem0_built_from,
+    ):
+        mock_config.mem0.persist_history = False
+
+        await Mem0Backend(mock_config).add('x', Scope(project_id='p'))
+
+        assert MemoryConfig(**mem0_built_from[0]).history_db_path == ':memory:'
+
+    @pytest.mark.asyncio
+    async def test_the_shipped_default_leaves_mem0_on_its_own_shared_history_db(
+        self, mock_config, stub_qdrant, mem0_built_from,
+    ):
+        assert Mem0BackendConfig().persist_history is True
+        config = mock_config.model_copy(deep=True)
+        config.mem0.persist_history = True
+
+        await Mem0Backend(config).add('x', Scope(project_id='p'))
+
+        assert 'history_db_path' not in mem0_built_from[0]
+        assert (
+            MemoryConfig(**mem0_built_from[0]).history_db_path
+            == MemoryConfig().history_db_path
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_shared_test_config_keeps_history_off_the_shared_db(
+        self, mock_config, stub_qdrant, mem0_built_from,
+    ):
+        """Every test that builds a real mem0 instance derives its config from
+        ``mock_config``, and relies on this to stay off the shared file."""
+        await Mem0Backend(mock_config).add('x', Scope(project_id='p'))
+
+        assert MemoryConfig(**mem0_built_from[0]).history_db_path == ':memory:'
+
+
 class TestNonDefaultDimsAgainstAnExistingCollection:
     """The migration hazard behind plumbing embedder.dimensions at all.
 
@@ -3052,6 +3411,10 @@ class TestNonDefaultDimsAgainstAnExistingCollection:
     Both now follow the config — but only for a collection that does not exist
     yet. Changing the knob on a live deployment therefore requires recreating
     and re-embedding the collection; it is not live-migratable.
+
+    This class pins only mem0's skip of an existing collection. The product
+    creates a new one itself, and that create is pinned at
+    tests/test_mem0_collection_provisioning.py::test_a_new_collection_is_created_at_the_configured_width_under_cosine_distance.
     """
 
     @staticmethod
@@ -3088,19 +3451,6 @@ class TestNonDefaultDimsAgainstAnExistingCollection:
         )
 
         client.create_collection.assert_not_called()
-
-    def test_a_fresh_collection_is_created_at_the_configured_dimensionality(self):
-        """Control: the plumbing does work — on a collection that does not yet
-        exist, which is the only case where changing dimensions is safe."""
-        from mem0.vector_stores.qdrant import Qdrant
-
-        client = self._fake_qdrant_client([])
-
-        Qdrant(collection_name='brand_new', embedding_model_dims=768, client=client)
-
-        client.create_collection.assert_called_once()
-        vectors_config = client.create_collection.call_args.kwargs['vectors_config']
-        assert vectors_config.size == 768
 
 
 class TestAmbientBaseUrlPrecedenceIsReported:

@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _seed_script_stubs import seed_default_warm_base
 from pydantic import ValidationError
 
 from orchestrator.config import GitConfig
@@ -37,21 +38,11 @@ async def _init_repo(repo: Path) -> None:
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    """Temporary git repository with an initial commit.
-
-    Pre-creates the default warm-lane base and pool-storage sentinel so
-    tests that go through acquire_warm_lane()/create_worktree() see a
-    healthy base and mounted pool storage — mirrors
-    test_warm_lane_disk_guard.py's git_repo fixture verbatim (this test
-    file is self-contained per the task-2443 plan).
-    """
+    """Temporary git repository with an initial commit + a resolvable warm base."""
     repo = tmp_path / 'repo'
     repo.mkdir()
     asyncio.run(_init_repo(repo))
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    seed_default_warm_base(repo)
     return repo
 
 

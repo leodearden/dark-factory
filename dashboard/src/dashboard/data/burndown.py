@@ -9,8 +9,9 @@ THE SOURCE is the task snapshot unit,
 cached unit ``/api/v2/dashboard/tasks`` serves — never a whole-tree read. The
 unit's census gives the nine ``TaskStatus`` member columns; its rows give the
 ``in_progress_live`` / ``in_progress_stranded`` split and ``in_progress_rows``
-(task 5591). ``concurrency_cap`` is ``max_concurrent_tasks`` as it stood AT
-SNAPSHOT TIME, ``NULL`` when unknown (task 3543).
+(task 5591). ``concurrency_cap`` is the run-slot capacity
+(``dashboard/src/dashboard/data/orchestrator.py::read_run_slot_capacity``) as
+it stood AT SNAPSHOT TIME, ``NULL`` when unknown (task 3543).
 
 A row is written only from a unit whose two halves are both FRESH at the
 collector's instant; see :func:`collect_snapshot`.
@@ -24,23 +25,25 @@ import enum
 import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any
 
 import aiosqlite
 import httpx
+from shared.sqlite_column_migration import add_column_if_missing
 
 from dashboard.config import DashboardConfig
 from dashboard.data.census import SERIES_KEYS, TaskCensus
 from dashboard.data.datum import DatumState
-from dashboard.data.mcp_fanout import _LOCK_ACQUIRE_TIMEOUT_SECONDS
+from dashboard.data.mcp_fanout import LOCK_ACQUIRE_TIMEOUT_SECONDS
 from dashboard.data.orchestrator import (
     _read_project_root_from_config,
     _resolve_project_root,
     find_running_orchestrators,
-    read_max_concurrent_tasks,
+    read_run_slot_capacity,
 )
+from dashboard.data.retention import SqlPredicate, apply_retention
 from dashboard.data.task_snapshot import (
     PER_CALL_TIMEOUT,
     TaskSnapshot,
@@ -56,7 +59,10 @@ logger = logging.getLogger(__name__)
 # run concurrently, each under wait_for(PER_CALL_TIMEOUT). The terminal-window
 # slot of task_snapshot.PER_PROJECT_MCP_CALLS is not counted, because
 # acquire_snapshot never spends it.
-_SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIMEOUT
+_SNAPSHOT_UNIT_WORST_CASE_SECONDS = LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIMEOUT
+
+# Wall-clock-aligned sampling tick for the burndown (and metrics) collectors.
+SAMPLE_INTERVAL_SECONDS = 600
 
 # Whole-operation backstop for ONE root's snapshot acquisition, enforced by
 # collect_snapshot's Phase-2 gather. Expiry is a GAP row naming this budget,
@@ -68,7 +74,7 @@ _SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIM
 #
 # FLOOR: _SNAPSHOT_UNIT_WORST_CASE_SECONDS, so the backstop never pre-empts a
 # unit still inside its own bounds and turns a bounded read into a gap row.
-# CEILING: half of loops._SAMPLE_INTERVAL_SECONDS, so one collector cycle is
+# CEILING: half of SAMPLE_INTERVAL_SECONDS, so one collector cycle is
 # finished before the next begins.
 #
 # 60.0 is ~3x the floor. Both bounds pinned by TestCollectSnapshotPerRootBudget
@@ -76,9 +82,8 @@ _SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIM
 _SNAPSHOT_PER_ROOT_BUDGET = 60.0
 
 # The age past which a burndown sample is no longer fresh: two sample
-# intervals of dashboard/loops.py::_SAMPLE_INTERVAL_SECONDS (not imported —
-# loops imports this module). Pinned through the wire by test_redux_api.py.
-SAMPLE_FRESHNESS_BOUND_SECONDS = 1200
+# intervals. Pinned through the wire by test_redux_api.py.
+SAMPLE_FRESHNESS_BOUND_SECONDS = 2 * SAMPLE_INTERVAL_SECONDS
 
 BURNDOWN_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -96,7 +101,10 @@ CREATE TABLE IF NOT EXISTS snapshots (
     -- before task 5591, of in_progress_rows (below) on one written since.
     in_progress_live     INTEGER NOT NULL DEFAULT 0,
     in_progress_stranded INTEGER NOT NULL DEFAULT 0,
-    -- max_concurrent_tasks in force AT SNAPSHOT TIME. Nullable on purpose:
+    -- Run-slot capacity in force AT SNAPSHOT TIME, as read by
+    -- dashboard/src/dashboard/data/orchestrator.py::read_run_slot_capacity; a
+    -- row written before task 10594 holds max_concurrent_tasks alone, without
+    -- the main-health reserve. Nullable on purpose:
     -- NULL means "cap unknown", which is not a breach. Storing 0 instead would
     -- read as a cap of zero and alarm on every snapshot. The cap is restart-
     -- only (red-tier), but a burndown window spans restarts and the cap also
@@ -156,12 +164,11 @@ class SnapshotState(enum.StrEnum):
 async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
     """Bring an existing ``snapshots`` table up to the current column set.
 
-    Additive only: probes ``PRAGMA table_info`` and issues one
-    ``ALTER TABLE ... ADD COLUMN`` per missing column.  Idempotent, never drops
-    or rewrites anything, so pre-existing rows keep their data and take the
-    column defaults: ``0`` for the split (task 3543), and ``NULL`` for the cap
-    and for every column task 5591 added — an honest "not recorded", since
-    none of them was measured when the row was written.
+    Additive only: one ``ALTER TABLE ... ADD COLUMN`` per missing column.
+    Idempotent, never drops or rewrites anything, so pre-existing rows keep
+    their data and take the column defaults: ``0`` for the split (task 3543),
+    and ``NULL`` for the cap and for every column task 5591 added — an honest
+    "not recorded", since none of them was measured when the row was written.
 
     Mandatory, not cosmetic: :data:`BURNDOWN_SCHEMA` is applied with
     ``CREATE TABLE IF NOT EXISTS``, which is a no-op against every already
@@ -169,17 +176,11 @@ async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
     every current column, would fail on the first collection cycle after
     deploy.  Call it at store open, before the collector runs.
 
-    Mirrors fused-memory's ``_migrate_v1_to_v2`` probe-then-add idiom.  The
-    caller commits.
+    The caller commits.
     """
-    cursor = await conn.execute('PRAGMA table_info(snapshots)')
-    existing = {row[1] for row in await cursor.fetchall()}
-    await cursor.close()
     for column, ddl in _ADDED_SNAPSHOT_COLUMNS:
-        if column in existing:
-            continue
-        await conn.execute(f'ALTER TABLE snapshots ADD COLUMN {column} {ddl}')
-        logger.info('burndown: added snapshots.%s (%s)', column, ddl)
+        if await add_column_if_missing(conn, 'snapshots', column, ddl):
+            logger.info('burndown: added snapshots.%s (%s)', column, ddl)
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,9 +308,9 @@ def _row_for_root(
         logger.debug('Snapshot unit for %s is not wholly fresh: %s', root, reason)
         return _gap_row(root, ts, reason)
     # One cap read per ROOT: it touches the filesystem, and the value is a
-    # per-project scalar stored on the row because max_concurrent_tasks varies
+    # per-project scalar stored on the row because the run-slot capacity varies
     # across restarts and across projects — see BURNDOWN_SCHEMA.
-    cap = read_max_concurrent_tasks(root)
+    cap = read_run_slot_capacity(root)
     # The same live-vs-cap comparison compute_parity_alarm makes (PRD decision 9).
     live = measurement.in_progress_live
     if cap is not None and live > cap:
@@ -340,10 +341,12 @@ async def collect_snapshot(
     conn: aiosqlite.Connection,
     config: DashboardConfig,
     client: httpx.AsyncClient,
+    *,
+    now: datetime | None = None,
 ) -> None:
     """Discover projects and insert exactly one snapshot row per project per cycle.
 
-    Each root is read through the task snapshot unit
+    *now* is the cycle's instant, the live clock when omitted. Each root is read through the task snapshot unit
     (``task_snapshot.acquire_snapshot``), and the unit is judged as served at
     this cycle's instant. A root whose census and rows are BOTH fresh gets a
     value row: the census gives the nine member columns, the rows give the
@@ -379,7 +382,7 @@ async def collect_snapshot(
       regressions.
     """
     try:
-        now_dt = datetime.now(UTC)  # clock-exempt: single-capture writer
+        now_dt = resolve_now(now)
         # One instant for the whole cycle: the ``ts`` written to every row, the
         # instant a unit is measured at, and the one it is served at must be
         # the SAME capture, or a row could claim a measurement its own
@@ -488,15 +491,7 @@ async def _snapshot_columns(db: aiosqlite.Connection) -> frozenset[str]:
         return frozenset(row[1] for row in await cur.fetchall())
 
 
-@dataclass(frozen=True, slots=True)
-class _Predicate:
-    """A SQL boolean expression and the parameters it binds."""
-
-    sql: str
-    params: tuple[str, ...]
-
-
-def _measured_rows(columns: frozenset[str]) -> _Predicate:
+def _measured_rows(columns: frozenset[str]) -> SqlPredicate:
     """THE predicate for "this row carries a measurement".
 
     A POSITIVE selection of ``state = 'value'`` plus a NULL state (a row from
@@ -505,44 +500,23 @@ def _measured_rows(columns: frozenset[str]) -> _Predicate:
     column is un-migrated, and every row in it is measured by construction.
     """
     if 'state' not in columns:
-        return _Predicate('TRUE', ())
-    return _Predicate('(state IS NULL OR state = ?)', (SnapshotState.VALUE.value,))
+        return SqlPredicate('TRUE', ())
+    return SqlPredicate('(state IS NULL OR state = ?)', (SnapshotState.VALUE.value,))
 
 
-async def downsample(conn: aiosqlite.Connection) -> None:
+async def downsample(
+    conn: aiosqlite.Connection, *, now: datetime | None = None,
+) -> None:
     """Compact old snapshots: hourly after 7 days, expire after 90 days.
 
     Each old (project, hour) keeps ONE row: its latest measured row when it
     has one, else its latest gap, so a gap never displaces a measurement.
+    The policy lives in dashboard/src/dashboard/data/retention.py::apply_retention.
     """
-    now = datetime.now(UTC)  # clock-exempt: single-capture writer
-    cutoff_7d = (now - timedelta(days=7)).isoformat()
-    cutoff_90d = (now - timedelta(days=90)).isoformat()
     measured = _measured_rows(await _snapshot_columns(conn))
-
-    # Phase 1: For rows older than 7 days, keep one per (project_id, hour).
-    await conn.execute(
-        f"""
-        DELETE FROM snapshots
-        WHERE ts < ?
-          AND id NOT IN (
-              SELECT id FROM (
-                  SELECT id, ROW_NUMBER() OVER (
-                      PARTITION BY project_id, strftime('%Y-%m-%dT%H', ts)
-                      ORDER BY CASE WHEN {measured.sql} THEN 0 ELSE 1 END, ts DESC
-                  ) AS rn
-                  FROM snapshots
-                  WHERE ts < ?
-              )
-              WHERE rn = 1
-          )
-        """,
-        (cutoff_7d, *measured.params, cutoff_7d),
+    await apply_retention(
+        conn, 'snapshots', now=resolve_now(now), partition_by=('project_id',), prefer=measured,
     )
-
-    # Phase 2: Delete everything older than 90 days.
-    await conn.execute('DELETE FROM snapshots WHERE ts < ?', (cutoff_90d,))
-
     await conn.commit()
 
 
@@ -802,8 +776,9 @@ def compute_parity_alarm(series: Mapping[str, Any]) -> dict[str, Any]:
     the cap was breached and every surface reported ordinary throughput.
 
     **Each snapshot is judged against the cap stored on THAT snapshot**, never
-    against one "current" cap applied across history.  ``max_concurrent_tasks``
-    is restart-only (red-tier), but a burndown window spans restarts, so it is
+    against one "current" cap applied across history.  The cap is the run-slot
+    capacity (``dashboard/src/dashboard/data/orchestrator.py::read_run_slot_capacity``),
+    which is restart-only (red-tier), but a burndown window spans restarts, so it is
     still TIME-VARYING across the window: re-deriving a single cap would forgive
     a real past breach after a cap raise, and invent a fictional one after a cut.
 

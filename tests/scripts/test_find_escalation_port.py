@@ -80,9 +80,11 @@ import socket
 import subprocess
 import sys
 import types
-from collections.abc import Iterator
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 SCRIPT_PATH = REPO_ROOT / "skills" / "factory-init" / "scripts" / "find_escalation_port.py"
@@ -1448,45 +1450,16 @@ def test_stdout_is_exactly_the_chosen_port_and_nothing_else(
 
 
 @pytest.fixture
-def nightly(monkeypatch: pytest.MonkeyPatch) -> Iterator[types.ModuleType]:
-    """``legibility.nightly``, imported with ``scripts/legibility`` on sys.path.
-
-    THE PATH MUTATION IS SCOPED TO THE TEST, deliberately. ``scripts/legibility``
-    contains generically-named top-level modules — ``config.py``, ``census.py``,
-    ``inventory.py``, ``sampling.py``, ``digest.py``, ``coder.py``, ``codebook.py`` —
-    so a bare ``sys.path.insert(0, ...)`` would leave every one of them a shadowing
-    candidate at position 0 for the REST of the pytest session. This module is
-    collected alongside ~38 others in ``tests/scripts/``, so whether a sibling saw
-    that path would depend on collection order, and any future import collision would
-    surface as an order-dependent red that reproduces under only some orders.
-    ``monkeypatch.syspath_prepend`` undoes it at teardown, and the ``sys.modules``
-    sweep below undoes the other half — the modules legibility imports under
-    ABSOLUTE top-level names (``import codebook``), which would otherwise stay
-    resolvable to a sibling long after the path entry is gone. Only names this
-    fixture itself introduced are removed.
-
-    (The other fix the review offered — a third insertion in
-    ``tests/scripts/conftest.py`` next to the two already there — is outside this
-    task's locked module set, so it is not taken here.)
-
-    MEASURED: ``from legibility import nightly`` with only ``scripts/`` on sys.path
-    raises ``ModuleNotFoundError: No module named 'codebook'`` —
-    ``scripts/legibility``'s ``coder.py`` and ``census.py`` both do a top-level
-    ``import codebook``. ``tests/scripts/conftest.py`` inserts ``scripts/`` and this
-    directory, but not ``scripts/legibility``.
+def nightly() -> types.ModuleType:
+    """``legibility.nightly``.
 
     A BARE import, never ``pytest.importorskip``: if nightly stops importing under the
     module config's own ``uv run --project shared`` env, this parity guard must fail
     loudly rather than pass vacuously.
     """
-    monkeypatch.syspath_prepend(str(REPO_ROOT / "scripts" / "legibility"))
-    before = set(sys.modules)
-    from legibility import nightly as nightly_mod  # noqa: PLC0415
+    from legibility import nightly as nightly_mod
 
-    yield nightly_mod
-
-    for name in set(sys.modules) - before:
-        del sys.modules[name]
+    return nightly_mod
 
 
 def _write_legibility_config(root: pathlib.Path, project_id: str) -> pathlib.Path:

@@ -1,14 +1,14 @@
 """Tests for the deferred main-health probe's guard/dedup semantics (task 2564).
 
-``_spawn_main_health_probe`` (added task 2564 step-4) unconditionally spawns
+``spawn_main_health_probe`` (added task 2564 step-4) unconditionally spawns
 a detached background task whenever handles are supplied — the three cheap
 guards (config flag / timed_out / skip-category) and the in-flight dedup
-that ``_classify_main_health_red`` already enforces for the SYNCHRONOUS path
-are not yet mirrored inside ``_spawn_main_health_probe`` for the DEFERRED
+that ``classify_main_health_red`` already enforces for the SYNCHRONOUS path
+are not yet mirrored inside ``spawn_main_health_probe`` for the DEFERRED
 path (added task 2564 step-6). This file pins the RED bar for that gap
 (step-5), plus a regression check that
 ``main_health_probe_handles=None`` (every existing caller) still spawns
-nothing through the full ``_run_post_merge_verify`` chokepoint.
+nothing through the full ``run_post_merge_verify`` chokepoint.
 
 Reuses test_merge_queue_main_health.py's fixtures/config-builders
 (_make_config/_make_git_ops/_make_req, COMPILE_ERROR_RESULT) per that
@@ -18,11 +18,13 @@ test_merge_queue_dry_run_unblock.py, which does the same).
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, VerifyScript
+from escalation.pins import classify_pins
 from escalation.queue import EscalationQueue
 from shared.task_metadata import RetryLedger
 from test_merge_queue_main_health import (
@@ -33,19 +35,32 @@ from test_merge_queue_main_health import (
     _make_req,
 )
 
+from orchestrator import flake_recorder
 from orchestrator.event_store import EventStore
-from orchestrator.merge_queue import (
+from orchestrator.flake_ledger import (
+    FlakeCallSite,
+    FlakeSuppression,
+    FlakeVerdict,
+    ledger_db_path,
+    read_occurrences,
+)
+from orchestrator.main_health_actions import MainHealthNextAction
+from orchestrator.merge_lane.main_health_probe import (
     MAIN_HEALTH_RED_REASON_PREFIX,
+    MainHealthProbeHandles,
+    _build_main_health_outcome,
+    _main_health_fingerprint,
+    _run_deferred_main_health_probe,
+    classify_main_health_red,
+    spawn_main_health_probe,
+)
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.worker import (
+    PRODUCTION_VERIFIER,
     OutcomeKind,
     RealMergeItem,
     SpeculativeMergeWorker,
-    _build_main_health_outcome,
     _emit_merge_attempt,
-    _main_health_fingerprint,
-    _MainHealthProbeHandles,
-    _run_deferred_main_health_probe,
-    _run_post_merge_verify,
-    _spawn_main_health_probe,
 )
 from orchestrator.verify import _PROBE_CACHE, VerifyResult
 from orchestrator.verify_runner import HostLease
@@ -104,17 +119,50 @@ TEST_FAILURE_RESULT = VerifyResult(
 )
 
 
+# (live_claimant, live_claimant_id): nobody live, live with no resolvable id,
+# and live with a composed id.
+PIN_LIVENESS_STATES: tuple[tuple[bool, str | None], ...] = (
+    (False, None),
+    (True, None),
+    (True, 'run-live/sess-live/pid=1'),
+)
+
+
+def _assert_pins_only_as_queue_handoff(
+    escalation_queue: EscalationQueue, task_id: str,
+) -> None:
+    """A worker main-health record has no filing incarnation, so its pin must
+    not depend on one. A level-0 filing would read dead_l0 with no live
+    claimant (escalation.pins Link 4), which this rejects."""
+    records = escalation_queue.get_by_task(task_id, status='pending')
+    assert records, f'Expected open escalations for task {task_id!r}; got none'
+    record_ids = tuple(r.id for r in records)
+    levels = [r.level for r in records]
+    for live_claimant, live_claimant_id in PIN_LIVENESS_STATES:
+        report = classify_pins(
+            task_id, records,
+            live_claimant=live_claimant, live_claimant_id=live_claimant_id,
+        )
+        assert report.queue_handoff == record_ids and report.dead_l0 == (), (
+            f'At live_claimant={live_claimant}, '
+            f'live_claimant_id={live_claimant_id!r}, records at levels '
+            f'{levels} must all be queue_handoff; got '
+            f'queue_handoff={report.queue_handoff}, dead_l0={report.dead_l0}, '
+            f'non_pinning={report.non_pinning}'
+        )
+
+
 # ---------------------------------------------------------------------------
-# Step-5 (RED): _spawn_main_health_probe guard parity with
-# _classify_main_health_red — none of the three cheap guards are mirrored
-# inside _spawn_main_health_probe yet, so each of these currently spawns a
+# Step-5 (RED): spawn_main_health_probe guard parity with
+# classify_main_health_red — none of the three cheap guards are mirrored
+# inside spawn_main_health_probe yet, so each of these currently spawns a
 # task (asserts fail) until step-6 adds the guards.
 # ---------------------------------------------------------------------------
 
 
 class TestSpawnGuards:
-    """_spawn_main_health_probe must apply the same three cheap guards
-    _classify_main_health_red applies before probing — none of them should
+    """spawn_main_health_probe must apply the same three cheap guards
+    classify_main_health_red applies before probing — none of them should
     ever result in a background task being registered."""
 
     @pytest.mark.parametrize('verify_result,escalate_preexisting,label', [
@@ -135,13 +183,13 @@ class TestSpawnGuards:
         (tmp_path / 'task-wt').mkdir()
 
         async def _run() -> set[asyncio.Task]:
-            handles = _MainHealthProbeHandles(background_tasks=set())
+            handles = MainHealthProbeHandles(background_tasks=set())
             # No intervening await between the spawn call and the snapshot
             # below — a newly created task cannot have started (let alone
             # finished) running yet, so this snapshot is authoritative for
             # "was a task registered", independent of the stub probe's
             # runtime.
-            _spawn_main_health_probe(handles, git_ops, req, verify_result)
+            spawn_main_health_probe(handles, git_ops, req, verify_result)
             snapshot = set(handles.background_tasks)
             for t in snapshot:
                 t.cancel()
@@ -170,13 +218,13 @@ class TestSpawnDedup:
         (tmp_path / 'task-wt').mkdir()
 
         async def _run() -> set[asyncio.Task]:
-            handles = _MainHealthProbeHandles(background_tasks=set())
-            _spawn_main_health_probe(handles, git_ops, req, COMPILE_ERROR_RESULT)
+            handles = MainHealthProbeHandles(background_tasks=set())
+            spawn_main_health_probe(handles, git_ops, req, COMPILE_ERROR_RESULT)
             # No await yet, so the first spawned task is registered but
             # definitely not-done — exactly the in-flight state the dedup
             # guard must detect before adding a second task for the same
             # task_id.
-            _spawn_main_health_probe(handles, git_ops, req, COMPILE_ERROR_RESULT)
+            spawn_main_health_probe(handles, git_ops, req, COMPILE_ERROR_RESULT)
             snapshot = set(handles.background_tasks)
             for t in snapshot:
                 t.cancel()
@@ -190,8 +238,8 @@ class TestSpawnDedup:
 
 
 # ---------------------------------------------------------------------------
-# Task 2565 step-7 (RED): _run_post_merge_verify must derive origin_is_local
-# from the `runner` it receives and forward it into _spawn_main_health_probe
+# Task 2565 step-7 (RED): run_post_merge_verify must derive origin_is_local
+# from the `runner` it receives and forward it into spawn_main_health_probe
 # on the DEFERRED path — a REMOTE runner (is_local=False) means
 # origin_is_local=False; runner=None (local) means origin_is_local=True.
 # Fails today: the call site passes no origin_is_local kwarg.
@@ -199,8 +247,8 @@ class TestSpawnDedup:
 
 
 class TestRunPostMergeVerifyDerivesOriginIsLocal:
-    """_run_post_merge_verify must derive origin_is_local from `runner` and
-    forward it into _spawn_main_health_probe on the DEFERRED path (task 2565)."""
+    """run_post_merge_verify must derive origin_is_local from `runner` and
+    forward it into spawn_main_health_probe on the DEFERRED path (task 2565)."""
 
     def test_remote_runner_derives_origin_is_local_false(
         self, tmp_path: Path,
@@ -223,9 +271,9 @@ class TestRunPostMergeVerifyDerivesOriginIsLocal:
         spy = MagicMock(return_value=False)
 
         async def _run() -> None:
-            handles = _MainHealthProbeHandles(background_tasks=set())
-            with patch('orchestrator.merge_queue._spawn_main_health_probe', new=spy):
-                await _run_post_merge_verify(
+            handles = MainHealthProbeHandles(background_tasks=set())
+            with patch('orchestrator.merge_lane.verify_failure_outcome.spawn_main_health_probe', new=spy):
+                await run_post_merge_verify(
                     git_ops, req, merge_wt,
                     timeouts={},
                     enospc_retries={},
@@ -233,6 +281,7 @@ class TestRunPostMergeVerifyDerivesOriginIsLocal:
                     max_enospc=1,
                     main_health_probe_handles=handles,
                     runner=remote_runner,
+                    verifier=PRODUCTION_VERIFIER,
                 )
 
         asyncio.run(_run())
@@ -254,11 +303,11 @@ class TestRunPostMergeVerifyDerivesOriginIsLocal:
         spy = MagicMock(return_value=False)
 
         async def _run() -> None:
-            handles = _MainHealthProbeHandles(background_tasks=set())
+            handles = MainHealthProbeHandles(background_tasks=set())
             with patch(
-                'orchestrator.merge_queue._spawn_main_health_probe', new=spy,
+                'orchestrator.merge_lane.verify_failure_outcome.spawn_main_health_probe', new=spy,
             ):
-                await _run_post_merge_verify(
+                await run_post_merge_verify(
                     git_ops, req, merge_wt,
                     timeouts={},
                     enospc_retries={},
@@ -279,7 +328,7 @@ class TestRunPostMergeVerifyDerivesOriginIsLocal:
 
 
 # ---------------------------------------------------------------------------
-# Task 2565: the spawn -> probe HOP.  _spawn_main_health_probe must forward
+# Task 2565: the spawn -> probe HOP.  spawn_main_health_probe must forward
 # its origin_is_local kwarg (and its `= True` default) into the coroutine it
 # spawns.  Observed on the emitted signal rather than on a patched
 # _run_deferred_main_health_probe, so the hop is closed without re-acquiring
@@ -291,12 +340,12 @@ class TestSpawnForwardsOriginIsLocal:
     """The spawned probe records the origin the SPAWN was told about.
 
     TestRunPostMergeVerifyDerivesOriginIsLocal pins the kwarg ARRIVING at
-    _spawn_main_health_probe (it patches the spawn out entirely), and
+    spawn_main_health_probe (it patches the spawn out entirely), and
     TestDeferredProbeOriginHostTelemetry pins what
     _run_deferred_main_health_probe does with one handed to it DIRECTLY.
     Neither crosses the spawn boundary, so without this class a regression that
     drops the kwarg from the _run_deferred_main_health_probe(...) call inside
-    _spawn_main_health_probe records origin_host='local' for every
+    spawn_main_health_probe records origin_host='local' for every
     remote-origin post-merge failure with the suite green.
     """
 
@@ -314,12 +363,12 @@ class TestSpawnForwardsOriginIsLocal:
         event_store = MagicMock(spec=EventStore)
 
         async def _run() -> None:
-            handles = _MainHealthProbeHandles(background_tasks=set())
+            handles = MainHealthProbeHandles(background_tasks=set())
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(True, MAIN_SHA)),
             ):
-                spawned = _spawn_main_health_probe(
+                spawned = spawn_main_health_probe(
                     handles, git_ops, req, COMPILE_ERROR_RESULT,
                     escalation_queue=EscalationQueue(tmp_path / 'escalations'),
                     event_store=event_store,
@@ -373,7 +422,7 @@ class TestDeferredProbeHappyPath:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(True, MAIN_SHA)),
             ):
                 await _run_deferred_main_health_probe(
@@ -406,6 +455,15 @@ class TestDeferredProbeHappyPath:
             f'Expected detail derived from the main-red reason; '
             f'got {esc.detail!r}'
         )
+        _assert_pins_only_as_queue_handoff(escalation_queue, req.task_id)
+        assert esc.level == 1, (
+            f'A main-health escalation is for the auto-watcher, never a '
+            f'steward: expected level 1; got {esc.level}'
+        )
+        assert esc.suggested_action == MainHealthNextAction.NO_FIX_OWNER, (
+            f'The escalation-only fallback has no fix owner; got '
+            f'{esc.suggested_action!r}'
+        )
 
         calls = event_store.emit.call_args_list
         main_health_calls = [
@@ -426,7 +484,7 @@ class TestDeferredProbeHappyPath:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(False, '')),
             ):
                 await _run_deferred_main_health_probe(
@@ -448,7 +506,7 @@ class TestDeferredProbeHappyPath:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(side_effect=RuntimeError('boom')),
             ):
                 await _run_deferred_main_health_probe(
@@ -486,7 +544,7 @@ class TestDeferredProbeStaleCheck:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(True, STALE_PROBE_SHA)),
             ):
                 await _run_deferred_main_health_probe(
@@ -510,7 +568,7 @@ class TestDeferredProbeStaleCheck:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(True, MAIN_SHA)),
             ):
                 await _run_deferred_main_health_probe(
@@ -534,7 +592,7 @@ class TestDeferredProbeStaleCheck:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(True, MAIN_SHA)),
             ):
                 await _run_deferred_main_health_probe(
@@ -553,7 +611,7 @@ class TestDeferredProbeStaleCheck:
 # Step-13 (RED): dedup-fold — a probe outcome whose fingerprint matches an
 # ALREADY-PENDING preexisting_main_break escalation must fold into that
 # parent (submit_or_dedupe's real attach_dedupe_child path) rather than
-# create a second top-level parent. Pins that _file_main_health_escalation
+# create a second top-level parent. Pins that file_main_health_escalation
 # routes through submit_or_dedupe (not a plain queue.submit).
 # ---------------------------------------------------------------------------
 
@@ -584,12 +642,13 @@ class TestDeferredProbeDedupeFold:
             category='preexisting_main_break',
             summary='Pre-existing main-red (sibling probe)',
             dedupe_fingerprint=fp,
+            level=1,
         )
         escalation_queue.submit(parent)
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(True, MAIN_SHA)),
             ):
                 await _run_deferred_main_health_probe(
@@ -665,7 +724,7 @@ class TestShutdownDrainsMainHealthProbeTask:
 # ---------------------------------------------------------------------------
 # Step-23 (RED): production auto_heal wiring — next to step-15's wiring
 # tests above. The _run_inflight_verify call site currently builds
-# _MainHealthProbeHandles WITHOUT an auto_heal callback (it defaults to
+# MainHealthProbeHandles WITHOUT an auto_heal callback (it defaults to
 # None), so the deferred probe (test_merge_queue_main_health_deferred.py's
 # TestDeferredProbeRoutesToAutoHeal, step-21/22) has no way to reach
 # SpeculativeMergeWorker._auto_heal_main_health_deferred (step-17/18/19/20)
@@ -713,16 +772,16 @@ class TestRunInflightVerifyPassesAutoHealCallback:
         spy = AsyncMock(return_value=None)
 
         async def _run() -> None:
-            with patch('orchestrator.merge_queue._run_post_merge_verify', new=spy):
-                await worker._run_inflight_verify(item, lease)
+            with patch('orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', new=spy):
+                await worker.verify_dispatch.run_inflight_verify(item, lease)
 
         asyncio.run(_run())
 
-        assert spy.await_args is not None, '_run_post_merge_verify was not called'
+        assert spy.await_args is not None, 'run_post_merge_verify was not called'
         handles = spy.await_args.kwargs.get('main_health_probe_handles')
         assert handles is not None, (
             '_run_inflight_verify must pass a live main_health_probe_handles '
-            'into _run_post_merge_verify'
+            'into run_post_merge_verify'
         )
         assert handles.auto_heal == worker._auto_heal_main_health_deferred, (
             'Expected main_health_probe_handles.auto_heal to be '
@@ -795,6 +854,14 @@ class TestAutoHealMainHealthDeferredHappyPath:
             f'Expected the filed escalation dedupe_fingerprint to match the '
             f'outcome; got {esc.dedupe_fingerprint!r} vs '
             f'{outcome.dedupe_fingerprint!r}'
+        )
+        _assert_pins_only_as_queue_handoff(escalation_queue, req.task_id)
+        assert esc.level == 1, (
+            f'The halt-owner escalation must be L1; got {esc.level}'
+        )
+        assert esc.suggested_action == MainHealthNextAction.AUTO_HEAL_IN_FLIGHT, (
+            f'The halt owner names the in-flight auto-heal; got '
+            f'{esc.suggested_action!r}'
         )
         esc_id = esc.id
 
@@ -899,11 +966,19 @@ class TestAutoHealMainHealthDeferredGuards:
             f'Expected category=preexisting_main_break; got '
             f'{pending[0].category!r}'
         )
+        _assert_pins_only_as_queue_handoff(escalation_queue, req.task_id)
+        assert pending[0].level == 1, (
+            f'Expected level 1; got {pending[0].level}'
+        )
+        assert pending[0].suggested_action == MainHealthNextAction.NO_FIX_OWNER, (
+            f'A non-mechanical break has no fix owner; got '
+            f'{pending[0].suggested_action!r}'
+        )
 
     def test_attempt_cap_hard_escalates_without_halt_or_spawn(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
+        from orchestrator.merge_lane.worker import MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS
 
         config = _make_config(tmp_path, escalate_preexisting=True)
         req = _make_req('99', tmp_path / 'task-wt', config)
@@ -935,6 +1010,14 @@ class TestAutoHealMainHealthDeferredGuards:
             f'Expected exactly one preexisting_main_break escalation to be '
             f'filed; got {pending}'
         )
+        _assert_pins_only_as_queue_handoff(escalation_queue, req.task_id)
+        assert pending[0].level == 1, (
+            f'Expected level 1; got {pending[0].level}'
+        )
+        assert pending[0].suggested_action == MainHealthNextAction.AUTO_HEAL_EXHAUSTED, (
+            f'An attempt-capped re-break has exhausted the auto-heal; got '
+            f'{pending[0].suggested_action!r}'
+        )
 
     def test_already_halted_no_second_attempt_or_spawn(
         self, tmp_path: Path,
@@ -951,15 +1034,17 @@ class TestAutoHealMainHealthDeferredGuards:
             'compile_error', outcome.failure_cause_hint, outcome.reason,
         )
 
-        # Simulates a concurrent auto-heal already in flight — halted
-        # directly (not via a prior _auto_heal_main_health_deferred call),
-        # mirroring test_merge_queue_auto_heal.py's TestAutoHealIdempotency.
+        # Simulates THIS signature's auto-heal already in flight — its
+        # attempt recorded and the lane halted directly (not via a prior
+        # _auto_heal_main_health_deferred call).  A lane halted by anything
+        # else is task 5471's foreign-halt branch, not this one.
+        worker.auto_heal_registry.record_attempt(sig)
         worker.halt_lane('normal', 'x')
 
         asyncio.run(worker._auto_heal_main_health_deferred(outcome, req))
 
         worker._spawn_main_health_fix_task.assert_not_awaited()
-        assert worker.auto_heal_registry.attempts(sig) == 0, (
+        assert worker.auto_heal_registry.attempts(sig) == 1, (
             f'The idempotency branch must NOT record a second attempt; got '
             f'{worker.auto_heal_registry.attempts(sig)}'
         )
@@ -967,6 +1052,14 @@ class TestAutoHealMainHealthDeferredGuards:
         assert len(pending) == 1, (
             f'Expected the idempotency branch to still file/fold exactly one '
             f'pending escalation; got {pending}'
+        )
+        _assert_pins_only_as_queue_handoff(escalation_queue, req.task_id)
+        assert pending[0].level == 1, (
+            f'Expected level 1; got {pending[0].level}'
+        )
+        assert pending[0].suggested_action == MainHealthNextAction.AUTO_HEAL_IN_FLIGHT, (
+            f'The idempotency branch files the halt owner; got '
+            f'{pending[0].suggested_action!r}'
         )
 
     def test_no_escalation_queue_escalates_only_without_raising_or_halting(
@@ -994,7 +1087,7 @@ class TestAutoHealMainHealthDeferredGuards:
 #
 # _run_deferred_main_health_probe has no `auto_heal` param yet — on a
 # confirmed still-fresh break it unconditionally calls
-# _file_main_health_escalation (the steps 9-14 escalation-only behaviour).
+# file_main_health_escalation (the steps 9-14 escalation-only behaviour).
 # This pins the routing contract step-22 must add: when an `auto_heal`
 # callback is supplied, a confirmed break is routed to it
 # (``await auto_heal(outcome, req)``) INSTEAD of the escalation-only
@@ -1021,7 +1114,7 @@ class TestDeferredProbeRoutesToAutoHeal:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(True, MAIN_SHA)),
             ):
                 await _run_deferred_main_health_probe(
@@ -1083,7 +1176,7 @@ class TestDeferredProbeRoutesToAutoHeal:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(True, MAIN_SHA)),
             ):
                 await _run_deferred_main_health_probe(
@@ -1115,7 +1208,7 @@ class TestDeferredProbeRoutesToAutoHeal:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(False, '')),
             ):
                 await _run_deferred_main_health_probe(
@@ -1142,7 +1235,7 @@ class TestDeferredProbeRoutesToAutoHeal:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(side_effect=RuntimeError('boom')),
             ):
                 await _run_deferred_main_health_probe(
@@ -1169,7 +1262,7 @@ class TestDeferredProbeRoutesToAutoHeal:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(True, STALE_PROBE_SHA)),
             ):
                 await _run_deferred_main_health_probe(
@@ -1256,7 +1349,7 @@ class TestDeferredProbeOriginHostTelemetry:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(True, MAIN_SHA)),
             ):
                 await _run_deferred_main_health_probe(
@@ -1292,7 +1385,7 @@ class TestDeferredProbeOriginHostTelemetry:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(True, MAIN_SHA)),
             ):
                 await _run_deferred_main_health_probe(
@@ -1328,7 +1421,7 @@ class TestDeferredProbeOriginHostTelemetry:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(False, '')),
             ):
                 await _run_deferred_main_health_probe(
@@ -1359,7 +1452,7 @@ class TestDeferredProbeOriginHostTelemetry:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(side_effect=RuntimeError('boom')),
             ):
                 await _run_deferred_main_health_probe(
@@ -1390,7 +1483,7 @@ class TestDeferredProbeOriginHostTelemetry:
 
         async def _run() -> None:
             with patch(
-                'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
+                'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                 new=AsyncMock(return_value=(True, STALE_PROBE_SHA)),
             ):
                 await _run_deferred_main_health_probe(
@@ -1409,3 +1502,117 @@ class TestDeferredProbeOriginHostTelemetry:
             f'A stale-main probe verdict must emit no main_health_red event; '
             f'got {calls}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3788: the classifier's task-mu fork hands a flake it suppressed to a
+# sink both probe sites bind to the flake recorder.
+# ---------------------------------------------------------------------------
+
+_PROBED_MAIN_SHA = 'c3' * 20
+
+
+def _classifier_that_suppresses() -> AsyncMock:
+    """A classifier double that does what the mu fork does on an isolated pass:
+    hand the observation to the sink, then answer task-own."""
+    calls = iter(range(1_000))
+
+    async def classify(*args, flake_sink, **kwargs):
+        await flake_sink(
+            FlakeSuppression(
+                verdict=FlakeVerdict.passes_in_isolation,
+                test_ids=(f'orchestrator/tests/test_x.py::test_{next(calls)}',),
+                observed_at=datetime.now(UTC).isoformat(),
+                call_site=FlakeCallSite.main_probe,
+                runner='local',
+                psi_cpu_some10=None,
+                unconfirmable_reason=None,
+            ),
+            _PROBED_MAIN_SHA,
+        )
+        return False, ''
+
+    return AsyncMock(side_effect=classify)
+
+
+class TestTheMuForkFlakeSinkIsWired:
+    @pytest.fixture(autouse=True)
+    def _fresh_storm_streak(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(flake_recorder, '_merge_flake_suppression_streak', 0)
+
+    def test_the_deferred_probe_records_the_suppression_against_the_probed_sha(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        with patch(
+            'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
+            new=_classifier_that_suppresses(),
+        ):
+            asyncio.run(_run_deferred_main_health_probe(
+                _make_git_ops(tmp_path), req, TEST_FAILURE_RESULT,
+                escalation_queue=escalation_queue,
+            ))
+
+        [row] = read_occurrences(ledger_db_path(config.project_root))
+        assert (row.call_site, row.merge_sha, row.task_id) == ('main_probe', _PROBED_MAIN_SHA, '99')
+        assert escalation_queue.get_pending() == []
+
+    def test_the_sync_probe_reaches_the_storm_escalation_through_its_queue(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _five_suppressions() -> list[object]:
+            return [
+                await classify_main_health_red(
+                    _make_git_ops(tmp_path), req, TEST_FAILURE_RESULT, None,
+                    escalation_queue=escalation_queue,
+                )
+                for _ in range(5)
+            ]
+
+        with patch(
+            'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
+            new=_classifier_that_suppresses(),
+        ):
+            outcomes = asyncio.run(_five_suppressions())
+
+        assert outcomes == [None] * 5
+        assert len(read_occurrences(ledger_db_path(config.project_root))) == 5
+        [storm] = escalation_queue.get_pending()
+        assert storm.task_id == 'merge-flake-suppression-storm'
+
+    def test_the_post_merge_verify_threads_its_queue_to_the_sync_probe(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, escalate_preexisting=True)
+        req = _make_req('99', tmp_path / 'task-wt', config)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        escalation_queue = EscalationQueue(tmp_path / 'escalations')
+
+        async def _five_red_merges() -> None:
+            for _ in range(5):
+                await run_post_merge_verify(
+                    _make_git_ops(tmp_path), req, merge_wt,
+                    timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+                    escalation_queue=escalation_queue,
+                    verifier=FakeVerifier(default=VerifyScript(result=TEST_FAILURE_RESULT)),
+                )
+
+        with patch(
+            'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
+            new=_classifier_that_suppresses(),
+        ):
+            asyncio.run(_five_red_merges())
+
+        rows = read_occurrences(ledger_db_path(config.project_root))
+        assert sum(row.call_site == 'main_probe' for row in rows) == 5
+        assert [e.task_id for e in escalation_queue.get_pending()] == [
+            'merge-flake-suppression-storm',
+        ]

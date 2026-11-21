@@ -15,12 +15,16 @@ the module docstring and ``plans/cross-graph-entity-leak-prd.md`` decision 5.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import extract_cypher, extract_params
+from _graph_access_fake import FakeGraphAccess, HangingRawGraph, with_backend_budgets
+from _relates_to_doubles import EdgeFixture, answer_edge_read, written_edge_properties
 
+from fused_memory.backends.graph_access import GraphHandle
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.maintenance import cross_graph_move
 from fused_memory.maintenance.cross_graph_move import (
@@ -192,12 +196,15 @@ def _compact_reply(cell) -> list:
 
 
 class TestReadCompactVectorTransport:
-    """_read_compact_vector(falkor_client, *, group_id, cypher) raw-reply parsing."""
+    """_read_compact_vector(graph, *, cypher, op) raw-reply parsing."""
 
-    def _client_returning(self, reply) -> MagicMock:
-        client = MagicMock()
-        client.execute_command = AsyncMock(return_value=reply)
-        return client
+    def _raw_returning(self, reply) -> MagicMock:
+        raw = MagicMock()
+        raw.execute_command = AsyncMock(return_value=reply)
+        return raw
+
+    def _graph_over(self, raw: MagicMock, group_id: str) -> GraphHandle:
+        return FakeGraphAccess({group_id: raw}).graph(group_id)
 
     @pytest.mark.asyncio
     async def test_returns_exact_bracketed_token_string(self):
@@ -206,17 +213,17 @@ class TestReadCompactVectorTransport:
         Uses the full-precision recorded fixture tokens, so a regression that
         (say) round-tripped a token through float() would alter the returned
         string and fail here. Also asserts the raw `--compact` command is
-        issued verbatim against the given group_id/cypher.
+        issued verbatim against the given graph/cypher.
         """
         cypher = 'MATCH (n:Entity {uuid: \'x\'}) RETURN n.name_embedding'
         reply = _compact_reply([
             _VALUE_VECTORF32_TAG,
             [b'0.5', b'0.10000000149011611938', b'-0.987654321098765432'],
         ])
-        client = self._client_returning(reply)
+        raw = self._raw_returning(reply)
 
         out = await cross_graph_move._read_compact_vector(
-            client, group_id=SOURCE_GRAPH_FIXTURE, cypher=cypher,
+            self._graph_over(raw, SOURCE_GRAPH_FIXTURE), cypher=cypher, op='test',
         )
 
         # (a) exact bracketed token string, byte-for-byte the --compact fixture.
@@ -227,7 +234,7 @@ class TestReadCompactVectorTransport:
             == EXPECTED_VECF32_LITERAL_FIXTURE
         )
         # It issued the raw GRAPH.RO_QUERY ... --compact command as given.
-        client.execute_command.assert_awaited_once_with(
+        raw.execute_command.assert_awaited_once_with(
             'GRAPH.RO_QUERY', SOURCE_GRAPH_FIXTURE, cypher, '--compact',
         )
 
@@ -235,30 +242,30 @@ class TestReadCompactVectorTransport:
     async def test_str_tokens_are_materialized_without_float_coercion(self):
         """Non-bytes (str) tokens pass through via str(v), never float()-coerced."""
         reply = _compact_reply([_VALUE_VECTORF32_TAG, ['0.5', '0.10000000149011611938']])
-        client = self._client_returning(reply)
+        raw = self._raw_returning(reply)
 
         out = await cross_graph_move._read_compact_vector(
-            client, group_id=SOURCE_GRAPH_FIXTURE, cypher='RETURN n.name_embedding',
+            self._graph_over(raw, SOURCE_GRAPH_FIXTURE), cypher='RETURN n.name_embedding', op='test',
         )
 
         assert out == '[0.5, 0.10000000149011611938]'
 
     @pytest.mark.asyncio
     async def test_non_vectorf32_scalar_type_raises_naming_group_id_and_cypher(self):
-        """A non-VECTORF32 scalar-type tag raises ValueError citing group_id + cypher.
+        """A non-VECTORF32 scalar-type tag raises ValueError citing the graph + cypher.
 
         Guards the scalar-type constant (_VALUE_VECTORF32): a wrong tag, or a
         genuinely wrong-typed column, must fail loudly with a diagnostic
-        naming both the group_id and the cypher rather than mis-parsing.
+        naming both the graph and the cypher rather than mis-parsing.
         """
         cypher = 'RETURN e.fact_embedding'
         # scalar_type 10 (e.g. VALUE_ARRAY) != VECTORF32 -> type check fires.
         reply = _compact_reply([10, [b'not', b'a', b'vector']])
-        client = self._client_returning(reply)
+        raw = self._raw_returning(reply)
 
         with pytest.raises(ValueError) as excinfo:
             await cross_graph_move._read_compact_vector(
-                client, group_id='know_live', cypher=cypher,
+                self._graph_over(raw, 'know_live'), cypher=cypher, op='test',
             )
 
         msg = str(excinfo.value)
@@ -279,10 +286,10 @@ class TestReadCompactVectorTransport:
         missing vector.
         """
         reply = _compact_reply([_VALUE_NULL_TAG, None])
-        client = self._client_returning(reply)
+        raw = self._raw_returning(reply)
 
         out = await cross_graph_move._read_compact_vector(
-            client, group_id=SOURCE_GRAPH_FIXTURE, cypher='RETURN n.name_embedding',
+            self._graph_over(raw, SOURCE_GRAPH_FIXTURE), cypher='RETURN n.name_embedding', op='test',
         )
 
         assert out is None
@@ -294,17 +301,17 @@ class TestReadCompactVectorTransport:
 
         A transient race (the source row deleted between an earlier
         existence check and this read) or an unexpected reply shape must
-        surface as a hard, diagnosable failure naming group_id/cypher --
+        surface as a hard, diagnosable failure naming the graph/cypher --
         consistent with the non-VECTORF32 path just above -- rather than an
         undiagnosable IndexError from indexing an empty rows list.
         """
         cypher = 'RETURN n.name_embedding'
         reply = ['header', [], 'stats']  # zero rows
-        client = self._client_returning(reply)
+        raw = self._raw_returning(reply)
 
         with pytest.raises(ValueError) as excinfo:
             await cross_graph_move._read_compact_vector(
-                client, group_id=SOURCE_GRAPH_FIXTURE, cypher=cypher,
+                self._graph_over(raw, SOURCE_GRAPH_FIXTURE), cypher=cypher, op='test',
             )
 
         msg = str(excinfo.value)
@@ -332,6 +339,20 @@ def _route_graphs(mapping: dict) -> MagicMock:
     return MagicMock(side_effect=lambda name: mapping[name])
 
 
+def _s5_source_reads(*edges: EdgeFixture, mentions: list | None = None) -> AsyncMock:
+    """Source ``ro_query`` for move_entity_across_graphs, answering its node,
+    incident-edge and MENTIONS reads by Cypher shape (node -> NODE_ROW_FIXTURE).
+    """
+    async def _ro_query(cypher, params=None):
+        if 'RELATES_TO' in cypher:
+            return answer_edge_read(cypher, *edges)
+        if 'MENTIONS' in cypher:
+            return MagicMock(result_set=list(mentions or []))
+        return MagicMock(result_set=[NODE_ROW_FIXTURE])
+
+    return AsyncMock(side_effect=_ro_query)
+
+
 # ---------------------------------------------------------------------------
 # step-5: move_entity_across_graphs -- node core
 # ---------------------------------------------------------------------------
@@ -352,11 +373,7 @@ class TestMoveEntityAcrossGraphsNodeCore:
         # node's RELATES_TO edges (step-7/8), (3) its Episodic MENTIONS links
         # (step-9/10) -- both empty here, so no edge/mention is recreated and
         # the CREATE/embedding-read assertions below are unaffected.
-        source_mock.ro_query = AsyncMock(side_effect=[
-            MagicMock(result_set=[NODE_ROW_FIXTURE]),
-            MagicMock(result_set=[]),
-            MagicMock(result_set=[]),
-        ])
+        source_mock.ro_query = _s5_source_reads()
         target_mock = make_graph_mock()
         backend._driver._get_graph = _route_graphs({
             SOURCE_GRAPH_FIXTURE: source_mock,
@@ -376,7 +393,7 @@ class TestMoveEntityAcrossGraphsNodeCore:
         read_params = extract_params(source_mock.ro_query.call_args_list[0])
         assert read_params.get('uuid') == NODE_UUID_FIXTURE
         fake_read_compact.assert_awaited_once()
-        assert fake_read_compact.call_args.kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert fake_read_compact.call_args.args[0].name == SOURCE_GRAPH_FIXTURE
 
         # (b) issues a CREATE against target_graph carrying the byte-exact
         # vecf32 literal plus the node's uuid/name/group_id params.
@@ -411,15 +428,20 @@ class TestMoveEntityAcrossGraphsNodeCore:
 OTHER_NODE_UUID_FIXTURE = 'node-bbbb-2222'
 EDGE_UUID_FIXTURE = 'edge-cccc-3333'
 
-# (e.uuid, e.name, e.fact, e.valid_at, e.invalid_at, e.created_at, e.group_id,
-#  e.episodes, startNode(e).uuid, endNode(e).uuid) -- an outgoing edge from
-# the moved node to another (unmoved) entity.
-EDGE_ROW_FIXTURE = [
-    EDGE_UUID_FIXTURE, 'is_related_to', 'Alice is related to Bob.',
-    '2026-01-01T00:00:00+00:00', None, '2026-01-01T00:00:00+00:00',
-    SOURCE_GRAPH_FIXTURE, ['episode-uuid-1'],
-    NODE_UUID_FIXTURE, OTHER_NODE_UUID_FIXTURE,
-]
+EDGE_FIXTURE = EdgeFixture(
+    src_uuid=NODE_UUID_FIXTURE,
+    dst_uuid=OTHER_NODE_UUID_FIXTURE,
+    properties={
+        'uuid': EDGE_UUID_FIXTURE,
+        'name': 'is_related_to',
+        'fact': 'Alice is related to Bob.',
+        'valid_at': '2026-01-01T00:00:00+00:00',
+        'invalid_at': None,
+        'created_at': '2026-01-01T00:00:00+00:00',
+        'group_id': SOURCE_GRAPH_FIXTURE,
+        'episodes': ['episode-uuid-1'],
+    },
+)
 
 
 class TestMoveEntityAcrossGraphsEdges:
@@ -431,11 +453,7 @@ class TestMoveEntityAcrossGraphsEdges:
     ):
         backend = make_backend(mock_config)
         source_mock = make_graph_mock()
-        source_mock.ro_query = AsyncMock(side_effect=[
-            MagicMock(result_set=[NODE_ROW_FIXTURE]),
-            MagicMock(result_set=[EDGE_ROW_FIXTURE]),
-            MagicMock(result_set=[]),  # no MENTIONS links in this scenario (step-9/10)
-        ])
+        source_mock.ro_query = _s5_source_reads(EDGE_FIXTURE)
         target_mock = make_graph_mock()
         backend._driver._get_graph = _route_graphs({
             SOURCE_GRAPH_FIXTURE: source_mock,
@@ -458,7 +476,7 @@ class TestMoveEntityAcrossGraphsEdges:
         # fact_embedding is read via the raw transport for the node AND the edge
         assert fake_read_compact.await_count == 2
         edge_embed_call = fake_read_compact.call_args_list[1]
-        assert edge_embed_call.kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert edge_embed_call.args[0].name == SOURCE_GRAPH_FIXTURE
         assert EDGE_UUID_FIXTURE in edge_embed_call.kwargs.get('cypher', '')
 
         # target.query is called twice: (1) node CREATE, (2) edge CREATE
@@ -466,16 +484,17 @@ class TestMoveEntityAcrossGraphsEdges:
         edge_create_call = target_mock.query.call_args_list[1]
         cypher = extract_cypher(edge_create_call)
         params = extract_params(edge_create_call)
+        written = written_edge_properties(cypher, params)
         assert 'CREATE' in cypher
         assert 'RELATES_TO' in cypher
         assert EXPECTED_VECF32_LITERAL_FIXTURE in cypher
         assert params.get('src_uuid') == NODE_UUID_FIXTURE
         assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
-        assert params.get('edge_uuid') == EDGE_UUID_FIXTURE
-        assert params.get('name') == 'is_related_to'
-        assert params.get('fact') == 'Alice is related to Bob.'
-        assert params.get('group_id') == SOURCE_GRAPH_FIXTURE
-        assert params.get('episodes') == ['episode-uuid-1']
+        assert written['uuid'] == EDGE_UUID_FIXTURE
+        assert written['name'] == 'is_related_to'
+        assert written['fact'] == 'Alice is related to Bob.'
+        assert written['group_id'] == SOURCE_GRAPH_FIXTURE
+        assert written['episodes'] == ['episode-uuid-1']
 
         assert result.edges_moved == 1
 
@@ -492,11 +511,7 @@ class TestMoveEntityAcrossGraphsEdges:
         """
         backend = make_backend(mock_config)
         source_mock = make_graph_mock()
-        source_mock.ro_query = AsyncMock(side_effect=[
-            MagicMock(result_set=[NODE_ROW_FIXTURE]),
-            MagicMock(result_set=[EDGE_ROW_FIXTURE]),
-            MagicMock(result_set=[]),  # no MENTIONS links in this scenario
-        ])
+        source_mock.ro_query = _s5_source_reads(EDGE_FIXTURE)
         target_mock = make_graph_mock()
         # node CREATE succeeds (unchecked by the code -- not MATCH-gated);
         # the edge CREATE's MATCH finds no endpoint -- the documented
@@ -532,11 +547,7 @@ class TestMoveEntityAcrossGraphsEdges:
         """
         backend = make_backend(mock_config)
         source_mock = make_graph_mock()
-        source_mock.ro_query = AsyncMock(side_effect=[
-            MagicMock(result_set=[NODE_ROW_FIXTURE]),
-            MagicMock(result_set=[EDGE_ROW_FIXTURE]),
-            MagicMock(result_set=[]),  # no MENTIONS links in this scenario
-        ])
+        source_mock.ro_query = _s5_source_reads(EDGE_FIXTURE)
         target_mock = make_graph_mock()
         backend._driver._get_graph = _route_graphs({
             SOURCE_GRAPH_FIXTURE: source_mock,
@@ -560,13 +571,14 @@ class TestMoveEntityAcrossGraphsEdges:
         assert 'RELATES_TO' in cypher
         assert 'fact_embedding' not in cypher
         assert 'vecf32' not in cypher
+        written = written_edge_properties(cypher, params)
         assert params.get('src_uuid') == NODE_UUID_FIXTURE
         assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
-        assert params.get('edge_uuid') == EDGE_UUID_FIXTURE
-        assert params.get('name') == 'is_related_to'
-        assert params.get('fact') == 'Alice is related to Bob.'
-        assert params.get('group_id') == SOURCE_GRAPH_FIXTURE
-        assert params.get('episodes') == ['episode-uuid-1']
+        assert written['uuid'] == EDGE_UUID_FIXTURE
+        assert written['name'] == 'is_related_to'
+        assert written['fact'] == 'Alice is related to Bob.'
+        assert written['group_id'] == SOURCE_GRAPH_FIXTURE
+        assert written['episodes'] == ['episode-uuid-1']
 
         assert result.edges_moved == 1
         assert result.edges_skipped == 0
@@ -595,11 +607,7 @@ class TestMoveEntityAcrossGraphsMentions:
     ):
         backend = make_backend(mock_config)
         source_mock = make_graph_mock()
-        source_mock.ro_query = AsyncMock(side_effect=[
-            MagicMock(result_set=[NODE_ROW_FIXTURE]),
-            MagicMock(result_set=[]),  # no RELATES_TO edges in this scenario
-            MagicMock(result_set=[MENTION_ROW_FIXTURE]),
-        ])
+        source_mock.ro_query = _s5_source_reads(mentions=[MENTION_ROW_FIXTURE])
         target_mock = make_graph_mock()
         backend._driver._get_graph = _route_graphs({
             SOURCE_GRAPH_FIXTURE: source_mock,
@@ -645,11 +653,7 @@ class TestMoveEntityAcrossGraphsMentions:
         """
         backend = make_backend(mock_config)
         source_mock = make_graph_mock()
-        source_mock.ro_query = AsyncMock(side_effect=[
-            MagicMock(result_set=[NODE_ROW_FIXTURE]),
-            MagicMock(result_set=[]),  # no RELATES_TO edges in this scenario
-            MagicMock(result_set=[MENTION_ROW_FIXTURE]),
-        ])
+        source_mock.ro_query = _s5_source_reads(mentions=[MENTION_ROW_FIXTURE])
         target_mock = make_graph_mock()
         # node CREATE succeeds; the mention CREATE's MATCH finds no episode
         # node -- the documented silent-skip -- so relationships_created
@@ -696,11 +700,7 @@ class TestMoveEntityAcrossGraphsOrdering:
         call_order: list[tuple[str, str, dict]] = []
 
         source_mock = make_graph_mock()
-        source_mock.ro_query = AsyncMock(side_effect=[
-            MagicMock(result_set=[NODE_ROW_FIXTURE]),
-            MagicMock(result_set=[EDGE_ROW_FIXTURE]),
-            MagicMock(result_set=[MENTION_ROW_FIXTURE]),
-        ])
+        source_mock.ro_query = _s5_source_reads(EDGE_FIXTURE, mentions=[MENTION_ROW_FIXTURE])
 
         async def _record_source_query(cypher, params=None):
             call_order.append(('source', cypher, params or {}))
@@ -870,11 +870,7 @@ class TestMoveEntityAcrossGraphsForeignDuplicateGuard:
         """
         backend = make_backend(mock_config)
         source_mock = make_graph_mock()
-        source_mock.ro_query = AsyncMock(side_effect=[
-            MagicMock(result_set=[NODE_ROW_FIXTURE]),
-            MagicMock(result_set=[]),  # no RELATES_TO edges
-            MagicMock(result_set=[]),  # no MENTIONS links
-        ])
+        source_mock.ro_query = _s5_source_reads()
 
         target_mock = make_graph_mock()
         # Same uuid/name/created_at as NODE_ROW_FIXTURE -- a genuine resume.
@@ -926,11 +922,7 @@ class TestMoveEntityAcrossGraphsRewriteGroupId:
         """
         backend = make_backend(mock_config)
         source_mock = make_graph_mock()
-        source_mock.ro_query = AsyncMock(side_effect=[
-            MagicMock(result_set=[NODE_ROW_FIXTURE]),
-            MagicMock(result_set=[EDGE_ROW_FIXTURE]),
-            MagicMock(result_set=[MENTION_ROW_FIXTURE]),
-        ])
+        source_mock.ro_query = _s5_source_reads(EDGE_FIXTURE, mentions=[MENTION_ROW_FIXTURE])
         target_mock = make_graph_mock()
         backend._driver._get_graph = _route_graphs({
             SOURCE_GRAPH_FIXTURE: source_mock,
@@ -948,15 +940,16 @@ class TestMoveEntityAcrossGraphsRewriteGroupId:
 
         assert target_mock.query.await_count == 3
         node_params = extract_params(target_mock.query.call_args_list[0])
-        edge_params = extract_params(target_mock.query.call_args_list[1])
+        edge_call = target_mock.query.call_args_list[1]
+        edge_written = written_edge_properties(extract_cypher(edge_call), extract_params(edge_call))
         mention_params = extract_params(target_mock.query.call_args_list[2])
 
         assert node_params.get('group_id') == rewritten_group_id
-        assert edge_params.get('group_id') == rewritten_group_id
+        assert edge_written['group_id'] == rewritten_group_id
         assert mention_params.get('group_id') == rewritten_group_id
         # never the source's original group_id
         assert SOURCE_GRAPH_FIXTURE not in (
-            node_params.get('group_id'), edge_params.get('group_id'), mention_params.get('group_id'),
+            node_params.get('group_id'), edge_written['group_id'], mention_params.get('group_id'),
         )
 
     @pytest.mark.asyncio
@@ -969,11 +962,7 @@ class TestMoveEntityAcrossGraphsRewriteGroupId:
         """
         backend = make_backend(mock_config)
         source_mock = make_graph_mock()
-        source_mock.ro_query = AsyncMock(side_effect=[
-            MagicMock(result_set=[NODE_ROW_FIXTURE]),
-            MagicMock(result_set=[EDGE_ROW_FIXTURE]),
-            MagicMock(result_set=[MENTION_ROW_FIXTURE]),
-        ])
+        source_mock.ro_query = _s5_source_reads(EDGE_FIXTURE, mentions=[MENTION_ROW_FIXTURE])
         target_mock = make_graph_mock()
         backend._driver._get_graph = _route_graphs({
             SOURCE_GRAPH_FIXTURE: source_mock,
@@ -989,11 +978,12 @@ class TestMoveEntityAcrossGraphsRewriteGroupId:
 
         assert target_mock.query.await_count == 3
         node_params = extract_params(target_mock.query.call_args_list[0])
-        edge_params = extract_params(target_mock.query.call_args_list[1])
+        edge_call = target_mock.query.call_args_list[1]
+        edge_written = written_edge_properties(extract_cypher(edge_call), extract_params(edge_call))
         mention_params = extract_params(target_mock.query.call_args_list[2])
 
         assert node_params.get('group_id') == SOURCE_GRAPH_FIXTURE
-        assert edge_params.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert edge_written['group_id'] == SOURCE_GRAPH_FIXTURE
         assert mention_params.get('group_id') == SOURCE_GRAPH_FIXTURE
 
 
@@ -1030,22 +1020,38 @@ SHARED_EDGE_UUID_FIXTURE = 'edge-shared-9999'
 HOME_ONLY_EDGE_UUID_FIXTURE = 'edge-home-only-8888'
 UNIQUE_WRONG_EDGE_UUID_FIXTURE = 'edge-unique-wrong-7777'
 
-# Full-property row for the edge shared by both copies (already accounted
-# for on home) -- must NOT be recreated.
-SHARED_EDGE_ROW_FIXTURE = [
-    SHARED_EDGE_UUID_FIXTURE, 'is_related_to', 'Alice is related to Bob.',
-    '2026-01-01T00:00:00+00:00', None, '2026-01-01T00:00:00+00:00',
-    WRONG_GRAPH_FIXTURE, ['episode-uuid-1'],
-    NODE_UUID_FIXTURE, OTHER_NODE_UUID_FIXTURE,
-]
-# Full-property row for the wrong-copy's edge that's UNIQUE to it (absent
-# from home) -- must be recreated on home with a byte-exact fact_embedding.
-UNIQUE_WRONG_EDGE_ROW_FIXTURE = [
-    UNIQUE_WRONG_EDGE_UUID_FIXTURE, 'is_related_to', 'Alice is related to Carol.',
-    '2026-01-02T00:00:00+00:00', None, '2026-01-02T00:00:00+00:00',
-    WRONG_GRAPH_FIXTURE, ['episode-uuid-2'],
-    NODE_UUID_FIXTURE, OTHER_NODE_UUID_FIXTURE,
-]
+# The edge shared by both copies (already accounted for on home) -- must NOT
+# be recreated.
+SHARED_EDGE_FIXTURE = EdgeFixture(
+    src_uuid=NODE_UUID_FIXTURE,
+    dst_uuid=OTHER_NODE_UUID_FIXTURE,
+    properties={
+        'uuid': SHARED_EDGE_UUID_FIXTURE,
+        'name': 'is_related_to',
+        'fact': 'Alice is related to Bob.',
+        'valid_at': '2026-01-01T00:00:00+00:00',
+        'invalid_at': None,
+        'created_at': '2026-01-01T00:00:00+00:00',
+        'group_id': WRONG_GRAPH_FIXTURE,
+        'episodes': ['episode-uuid-1'],
+    },
+)
+# The wrong-copy's edge that's UNIQUE to it (absent from home) -- must be
+# recreated on home with a byte-exact fact_embedding.
+UNIQUE_WRONG_EDGE_FIXTURE = EdgeFixture(
+    src_uuid=NODE_UUID_FIXTURE,
+    dst_uuid=OTHER_NODE_UUID_FIXTURE,
+    properties={
+        'uuid': UNIQUE_WRONG_EDGE_UUID_FIXTURE,
+        'name': 'is_related_to',
+        'fact': 'Alice is related to Carol.',
+        'valid_at': '2026-01-02T00:00:00+00:00',
+        'invalid_at': None,
+        'created_at': '2026-01-02T00:00:00+00:00',
+        'group_id': WRONG_GRAPH_FIXTURE,
+        'episodes': ['episode-uuid-2'],
+    },
+)
 
 
 class TestMergeForeignDuplicate:
@@ -1068,8 +1074,8 @@ class TestMergeForeignDuplicate:
 
         wrong_mock = make_graph_mock()
         wrong_mock.ro_query = AsyncMock(
-            return_value=MagicMock(
-                result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+            side_effect=lambda cypher, params=None: answer_edge_read(
+                cypher, SHARED_EDGE_FIXTURE, UNIQUE_WRONG_EDGE_FIXTURE,
             )
         )
 
@@ -1127,13 +1133,14 @@ class TestMergeForeignDuplicate:
         assert 'CREATE' in create_cypher
         assert 'RELATES_TO' in create_cypher
         assert EXPECTED_VECF32_LITERAL_FIXTURE in create_cypher
-        assert create_params.get('edge_uuid') == UNIQUE_WRONG_EDGE_UUID_FIXTURE
+        create_written = written_edge_properties(create_cypher, create_params)
+        assert create_written['uuid'] == UNIQUE_WRONG_EDGE_UUID_FIXTURE
         assert create_params.get('src_uuid') == NODE_UUID_FIXTURE
         assert create_params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
-        assert create_params.get('fact') == 'Alice is related to Carol.'
+        assert create_written['fact'] == 'Alice is related to Carol.'
 
         fake_read_compact.assert_awaited_once()
-        assert fake_read_compact.call_args.kwargs.get('group_id') == WRONG_GRAPH_FIXTURE
+        assert fake_read_compact.call_args.args[0].name == WRONG_GRAPH_FIXTURE
         assert UNIQUE_WRONG_EDGE_UUID_FIXTURE in fake_read_compact.call_args.kwargs.get('cypher', '')
 
         # (b) the wrong-graph-copy DETACH DELETE runs strictly AFTER the
@@ -1170,8 +1177,8 @@ class TestMergeForeignDuplicate:
 
         wrong_mock = make_graph_mock()
         wrong_mock.ro_query = AsyncMock(
-            return_value=MagicMock(
-                result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+            side_effect=lambda cypher, params=None: answer_edge_read(
+                cypher, SHARED_EDGE_FIXTURE, UNIQUE_WRONG_EDGE_FIXTURE,
             )
         )
 
@@ -1223,10 +1230,11 @@ class TestMergeForeignDuplicate:
         assert 'RELATES_TO' in create_cypher
         assert 'fact_embedding' not in create_cypher
         assert 'vecf32' not in create_cypher
-        assert create_params.get('edge_uuid') == UNIQUE_WRONG_EDGE_UUID_FIXTURE
+        create_written = written_edge_properties(create_cypher, create_params)
+        assert create_written['uuid'] == UNIQUE_WRONG_EDGE_UUID_FIXTURE
         assert create_params.get('src_uuid') == NODE_UUID_FIXTURE
         assert create_params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
-        assert create_params.get('fact') == 'Alice is related to Carol.'
+        assert create_written['fact'] == 'Alice is related to Carol.'
 
         # the wrong-graph-copy DETACH DELETE still runs strictly AFTER the
         # recreate -- create-before-delete preserved for a null-embedding edge.
@@ -1260,8 +1268,8 @@ class TestMergeForeignDuplicate:
 
         wrong_mock = make_graph_mock()
         wrong_mock.ro_query = AsyncMock(
-            return_value=MagicMock(
-                result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+            side_effect=lambda cypher, params=None: answer_edge_read(
+                cypher, SHARED_EDGE_FIXTURE, UNIQUE_WRONG_EDGE_FIXTURE,
             )
         )
         wrong_mock.query = AsyncMock(return_value=MagicMock())
@@ -1363,7 +1371,7 @@ class TestCreateMovedNode:
         read_params = extract_params(source_mock.ro_query.call_args_list[0])
         assert read_params.get('uuid') == NODE_UUID_FIXTURE
         fake_read_compact.assert_awaited_once()
-        assert fake_read_compact.call_args.kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert fake_read_compact.call_args.args[0].name == SOURCE_GRAPH_FIXTURE
 
         # CREATEs the node in target with the byte-exact vecf32 literal and
         # the rewritten group_id -- never the source's original group_id.
@@ -1996,7 +2004,7 @@ class TestRecreateSubgraphRelationships:
         async def _source_ro_query(cypher, params=None):
             params = params or {}
             if 'RELATES_TO' in cypher:
-                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+                return answer_edge_read(cypher, EDGE_FIXTURE)
             if 'MENTIONS' in cypher:
                 if params.get('uuid') == NODE_UUID_FIXTURE:
                     return MagicMock(result_set=[MENTION_ROW_FIXTURE])
@@ -2037,11 +2045,12 @@ class TestRecreateSubgraphRelationships:
         params = extract_params(edge_create_calls[0])
         assert 'CREATE' in cypher
         assert EXPECTED_VECF32_LITERAL_FIXTURE in cypher
-        assert params.get('edge_uuid') == EDGE_UUID_FIXTURE
+        written = written_edge_properties(cypher, params)
+        assert written['uuid'] == EDGE_UUID_FIXTURE
         assert params.get('src_uuid') == NODE_UUID_FIXTURE
         assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
-        assert params.get('fact') == 'Alice is related to Bob.'
-        assert params.get('group_id') == TARGET_GRAPH_FIXTURE
+        assert written['fact'] == 'Alice is related to Bob.'
+        assert written['group_id'] == TARGET_GRAPH_FIXTURE
 
         # the fact_embedding is read via the raw transport, from the shared
         # SOURCE graph (never from either endpoint's target).
@@ -2050,7 +2059,7 @@ class TestRecreateSubgraphRelationships:
             if EDGE_UUID_FIXTURE in c.kwargs.get('cypher', '')
         ]
         assert len(embed_calls) == 1
-        assert embed_calls[0].kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert embed_calls[0].args[0].name == SOURCE_GRAPH_FIXTURE
 
         # the incident MENTIONS link is also recreated.
         mention_create_calls = [
@@ -2091,7 +2100,7 @@ class TestRecreateSubgraphRelationships:
 
         async def _source_ro_query(cypher, params=None):
             if 'RELATES_TO' in cypher:
-                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+                return answer_edge_read(cypher, EDGE_FIXTURE)
             return MagicMock(result_set=[])  # no MENTIONS in this scenario
 
         source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
@@ -2150,7 +2159,7 @@ class TestRecreateSubgraphRelationships:
 
         async def _source_ro_query(cypher, params=None):
             if 'RELATES_TO' in cypher:
-                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+                return answer_edge_read(cypher, EDGE_FIXTURE)
             return MagicMock(result_set=[])  # no MENTIONS in this scenario
 
         source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
@@ -2203,7 +2212,7 @@ class TestRecreateSubgraphRelationships:
 
         async def _source_ro_query(cypher, params=None):
             if 'RELATES_TO' in cypher:
-                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+                return answer_edge_read(cypher, EDGE_FIXTURE)
             return MagicMock(result_set=[])  # no MENTIONS in this scenario
 
         source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
@@ -2244,10 +2253,11 @@ class TestRecreateSubgraphRelationships:
         assert 'RELATES_TO' in cypher
         assert 'fact_embedding' not in cypher
         assert 'vecf32' not in cypher
+        written = written_edge_properties(cypher, params)
         assert params.get('src_uuid') == NODE_UUID_FIXTURE
         assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
-        assert params.get('edge_uuid') == EDGE_UUID_FIXTURE
-        assert params.get('group_id') == TARGET_GRAPH_FIXTURE
+        assert written['uuid'] == EDGE_UUID_FIXTURE
+        assert written['group_id'] == TARGET_GRAPH_FIXTURE
 
         assert result.edges_recreated == 1
         assert result.edges_skipped == 0
@@ -2262,7 +2272,7 @@ class TestRecreateSubgraphRelationships:
         wrong_graph, home copy already in target_graph=home_graph): only the
         wrong-copy's edge that is UNIQUE to it (absent from the home copy)
         is folded into the home copy -- the edge already shared with home
-        (SHARED_EDGE_ROW_FIXTURE) is left untouched, never recreated a
+        (SHARED_EDGE_FIXTURE) is left untouched, never recreated a
         second time (classify_unique_wrong_edges' dedup). No DETACH DELETE
         of the wrong copy happens in this phase -- that's delete_source_node
         (Phase C), run only after Phase B completes for the whole batch.
@@ -2277,9 +2287,7 @@ class TestRecreateSubgraphRelationships:
         # edge rows by a blanket return_value.
         async def _wrong_ro_query(cypher, params=None):
             if 'RELATES_TO' in cypher:
-                return MagicMock(
-                    result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
-                )
+                return answer_edge_read(cypher, SHARED_EDGE_FIXTURE, UNIQUE_WRONG_EDGE_FIXTURE)
             return MagicMock(result_set=[])
 
         wrong_mock.ro_query = AsyncMock(side_effect=_wrong_ro_query)
@@ -2311,16 +2319,17 @@ class TestRecreateSubgraphRelationships:
         params = extract_params(home_mock.query.call_args)
         assert 'CREATE' in cypher
         assert EXPECTED_VECF32_LITERAL_FIXTURE in cypher
-        assert params.get('edge_uuid') == UNIQUE_WRONG_EDGE_UUID_FIXTURE
+        written = written_edge_properties(cypher, params)
+        assert written['uuid'] == UNIQUE_WRONG_EDGE_UUID_FIXTURE
         assert params.get('src_uuid') == NODE_UUID_FIXTURE
         assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
-        assert params.get('fact') == 'Alice is related to Carol.'
+        assert written['fact'] == 'Alice is related to Carol.'
         # preserves the wrong-copy's OWN group_id -- MERGE has no
         # rewrite_group_id analogue (mirrors merge_foreign_duplicate).
-        assert params.get('group_id') == WRONG_GRAPH_FIXTURE
+        assert written['group_id'] == WRONG_GRAPH_FIXTURE
 
         fake_read_compact.assert_awaited_once()
-        assert fake_read_compact.call_args.kwargs.get('group_id') == WRONG_GRAPH_FIXTURE
+        assert fake_read_compact.call_args.args[0].name == WRONG_GRAPH_FIXTURE
         assert UNIQUE_WRONG_EDGE_UUID_FIXTURE in fake_read_compact.call_args.kwargs.get('cypher', '')
 
         # no DETACH DELETE of the wrong copy in this phase.
@@ -2348,9 +2357,7 @@ class TestRecreateSubgraphRelationships:
         # zero rather than mis-parsing the RELATES_TO rows.
         async def _wrong_ro_query(cypher, params=None):
             if 'RELATES_TO' in cypher:
-                return MagicMock(
-                    result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
-                )
+                return answer_edge_read(cypher, SHARED_EDGE_FIXTURE, UNIQUE_WRONG_EDGE_FIXTURE)
             return MagicMock(result_set=[])
 
         wrong_mock.ro_query = AsyncMock(side_effect=_wrong_ro_query)
@@ -2382,12 +2389,13 @@ class TestRecreateSubgraphRelationships:
         assert 'CREATE' in cypher
         assert 'fact_embedding' not in cypher
         assert 'vecf32' not in cypher
-        assert params.get('edge_uuid') == UNIQUE_WRONG_EDGE_UUID_FIXTURE
+        written = written_edge_properties(cypher, params)
+        assert written['uuid'] == UNIQUE_WRONG_EDGE_UUID_FIXTURE
         assert params.get('src_uuid') == NODE_UUID_FIXTURE
         assert params.get('dst_uuid') == OTHER_NODE_UUID_FIXTURE
         # preserves the wrong-copy's OWN group_id -- MERGE has no
         # rewrite_group_id analogue (mirrors merge_foreign_duplicate).
-        assert params.get('group_id') == WRONG_GRAPH_FIXTURE
+        assert written['group_id'] == WRONG_GRAPH_FIXTURE
 
         # no DETACH DELETE of the wrong copy in this phase.
         wrong_mock.query.assert_not_awaited()
@@ -2417,9 +2425,7 @@ class TestRecreateSubgraphRelationships:
 
         async def _wrong_ro_query(cypher, params=None):
             if 'RELATES_TO' in cypher:
-                return MagicMock(
-                    result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
-                )
+                return answer_edge_read(cypher, SHARED_EDGE_FIXTURE, UNIQUE_WRONG_EDGE_FIXTURE)
             if 'MENTIONS' in cypher:
                 # TWO incoming links, from two DISTINCT episodes.
                 return MagicMock(result_set=[
@@ -2489,9 +2495,7 @@ class TestRecreateSubgraphRelationships:
 
         async def _wrong_ro_query(cypher, params=None):
             if 'RELATES_TO' in cypher:
-                return MagicMock(
-                    result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
-                )
+                return answer_edge_read(cypher, SHARED_EDGE_FIXTURE, UNIQUE_WRONG_EDGE_FIXTURE)
             if 'MENTIONS' in cypher:
                 return MagicMock(result_set=[])
             return MagicMock(result_set=[])
@@ -2643,9 +2647,7 @@ class TestRecreateSubgraphRelationships:
 
         async def _wrong_ro_query(cypher, params=None):
             if 'RELATES_TO' in cypher:
-                return MagicMock(
-                    result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
-                )
+                return answer_edge_read(cypher, SHARED_EDGE_FIXTURE, UNIQUE_WRONG_EDGE_FIXTURE)
             if 'MENTIONS' in cypher:
                 return MagicMock(result_set=[
                     [MENTION_UUID_FIXTURE, EPISODE_UUID_FIXTURE],
@@ -2699,7 +2701,7 @@ class TestRecreateSubgraphRelationships:
 
         async def _source_ro_query(cypher, params=None):
             if 'RELATES_TO' in cypher:
-                return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+                return answer_edge_read(cypher, EDGE_FIXTURE)
             return MagicMock(result_set=[])  # no MENTIONS in this scenario
 
         source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
@@ -2826,12 +2828,20 @@ class TestRecreateSubgraphRelationships:
         second_uuid = 'node-cccc-6666'
         second_edge_uuid = 'edge-ffff-8888'
         second_edge_other_uuid = 'node-dddd-7777'
-        second_edge_row = [
-            second_edge_uuid, 'is_related_to', 'Carol is related to Dave.',
-            '2026-01-01T00:00:00+00:00', None, '2026-01-01T00:00:00+00:00',
-            SOURCE_GRAPH_FIXTURE, ['episode-uuid-2'],
-            second_uuid, second_edge_other_uuid,
-        ]
+        second_edge = EdgeFixture(
+            src_uuid=second_uuid,
+            dst_uuid=second_edge_other_uuid,
+            properties={
+                'uuid': second_edge_uuid,
+                'name': 'is_related_to',
+                'fact': 'Carol is related to Dave.',
+                'valid_at': '2026-01-01T00:00:00+00:00',
+                'invalid_at': None,
+                'created_at': '2026-01-01T00:00:00+00:00',
+                'group_id': SOURCE_GRAPH_FIXTURE,
+                'episodes': ['episode-uuid-2'],
+            },
+        )
 
         source_mock = make_graph_mock()
 
@@ -2839,9 +2849,9 @@ class TestRecreateSubgraphRelationships:
             params = params or {}
             if 'RELATES_TO' in cypher:
                 if params.get('uuid') == NODE_UUID_FIXTURE:
-                    return MagicMock(result_set=[EDGE_ROW_FIXTURE])
+                    return answer_edge_read(cypher, EDGE_FIXTURE)
                 if params.get('uuid') == second_uuid:
-                    return MagicMock(result_set=[second_edge_row])
+                    return answer_edge_read(cypher, second_edge)
             return MagicMock(result_set=[])  # no MENTIONS in this scenario
 
         source_mock.ro_query = AsyncMock(side_effect=_source_ro_query)
@@ -2862,7 +2872,9 @@ class TestRecreateSubgraphRelationships:
 
         async def _target_query(cypher, params=None):
             params = params or {}
-            if 'RELATES_TO' in cypher and params.get('edge_uuid') == EDGE_UUID_FIXTURE:
+            if 'RELATES_TO' in cypher and (
+                written_edge_properties(cypher, params).get('uuid') == EDGE_UUID_FIXTURE
+            ):
                 raise RuntimeError('simulated transient FalkorDB error')
             return MagicMock(relationships_created=1)
 
@@ -3001,3 +3013,75 @@ class TestRecreateSubgraphRelationships:
 
         target_mock.query.assert_not_awaited()
         fake_read_compact.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Every public function's raw Cypher runs under the backend's named budgets.
+# ---------------------------------------------------------------------------
+
+_READ_S = 0.05
+_WRITE_S = 0.08
+
+
+class TestCrossGraphMoveIsBudgeted:
+    """Over graphs that never answer, each public function's first call fails on its own named budget."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('call', 'op', 'budget'),
+        [
+            pytest.param(
+                lambda g: move_entity_across_graphs(
+                    g, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+                ),
+                'move_entity_across_graphs', _READ_S, id='move_entity_across_graphs',
+            ),
+            pytest.param(
+                lambda g: create_moved_node(
+                    g, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+                ),
+                'create_moved_node', _READ_S, id='create_moved_node',
+            ),
+            pytest.param(
+                lambda g: create_moved_episode(
+                    g, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+                ),
+                'create_moved_episode', _READ_S, id='create_moved_episode',
+            ),
+            pytest.param(
+                lambda g: delete_source_node(g, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE),
+                'delete_source_node', _WRITE_S, id='delete_source_node',
+            ),
+            pytest.param(
+                lambda g: delete_source_episode(
+                    g, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE,
+                ),
+                'delete_source_episode', _WRITE_S, id='delete_source_episode',
+            ),
+            pytest.param(
+                lambda g: merge_foreign_duplicate(
+                    g, NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE,
+                ),
+                'merge_foreign_duplicate', _READ_S, id='merge_foreign_duplicate',
+            ),
+            pytest.param(
+                lambda g: recreate_subgraph_relationships(
+                    g, [_move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE)],
+                ),
+                'recreate_subgraph_relationships', _READ_S, id='recreate_subgraph_relationships',
+            ),
+        ],
+    )
+    async def test_a_hanging_graph_fails_on_the_functions_budget(
+        self, mock_config, make_backend, make_graph_driver, call, op, budget,
+    ):
+        config = with_backend_budgets(mock_config, read_s=_READ_S, write_s=_WRITE_S)
+        backend = make_backend(config, driver=make_graph_driver({
+            SOURCE_GRAPH_FIXTURE: HangingRawGraph(),
+            TARGET_GRAPH_FIXTURE: HangingRawGraph(),
+        }))
+
+        with pytest.raises(TimeoutError) as raised:
+            await asyncio.wait_for(call(backend), timeout=5.0)
+
+        assert str(raised.value) == f'Graphiti {op} timed out after {budget}s'

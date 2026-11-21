@@ -102,6 +102,8 @@ from fused_memory.backends.mem0_client import (
     DEFAULT_SCROLL_MAX_PAGES,
     ScrollPageBudgetExhausted,
 )
+from fused_memory.eval.topic_registry import TopicRegistry, load_topic_registry
+from fused_memory.memory_metadata import KIND_REGISTRY
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
 # THE shared slug predicate and fold, imported and called -- never
@@ -529,7 +531,9 @@ def build_report(
         or per-category counts summing short of the collection's point total
         -- sets ``coverage.complete=false`` and appears as a NAMED entry in
         ``coverage.deltas`` (INV-11 no-silent-fail-soft). The caller exits
-        non-zero on that flag.
+        non-zero on that flag. The top-level ``kind_registry_drift`` block
+        scores the grand-total ``kind`` table against the frozen registry
+        (:func:`build_kind_registry_drift`); it reports, never fails.
     """
     projects: dict[str, Any] = {}
     grand_total = CategoryCensus()
@@ -565,11 +569,11 @@ def build_report(
         # are DISCLOSED rather than rendered as an all-zero (or perfect) score.
         registry_error = registry_error or 'no topic registry supplied'
     else:
-        # SCORING is guarded as well as LOADING. `topic_registry_loader` is
-        # lazily memoized and `load_registry_or_error` catches everything, so
-        # an unloadable probe already degrades to `registry_error` -- but the
-        # scoring below reaches `entry.project_id` / `entry.topic` by attribute
-        # on objects owned by ANOTHER script's dataclass. A `RegistryEntry`
+        # SCORING is guarded as well as LOADING. `load_registry_or_error`
+        # catches everything, so a registry that fails to load already
+        # degrades to `registry_error` -- but the scoring below reaches
+        # `entry.project_id` / `entry.topic` by attribute on objects owned by
+        # fused_memory/eval/topic_registry.py::RegistryEntry. A `RegistryEntry`
         # field rename raised straight out of build_report and took the whole
         # nightly census with it (no report, no markdown, no trend row) from a
         # block the design says is OPTIONAL. Same disclosure, same shape as
@@ -579,10 +583,11 @@ def build_report(
             registry_coverage, registry_error = _build_registry_coverage(
                 project_totals, registry,
             )
-        except Exception as exc:  # noqa: BLE001 - the gauge is never fatal
+        except Exception as exc:  # the gauge is never fatal
             registry_coverage = None
             registry_error = f'{type(exc).__name__}: {exc}'
 
+    grand_total_dict = _census_to_dict(grand_total)
     report = {
         # v2: value tables are the complete population (v1 capped them at
         # top_n, which could truncate the JSON while coverage read complete);
@@ -612,7 +617,11 @@ def build_report(
         # 'variant_spelling_records' (records under another spelling that
         # folds to the same slug); the zero-canonical rows are split into
         # 'stamping_worklist' (records present) and 'unpopulated_topics'.
-        'schema_version': 5,
+        # v6 (task 5266): new top-level 'kind_registry_drift' -- the live
+        # `kind` population scored against the frozen
+        # memory_metadata.KIND_REGISTRY baseline; reports a delta, never
+        # fails (PRD §10 OQ1 ruled option (b)).
+        'schema_version': 6,
         'params': {
             'projects': sorted(cells),
             'categories': category_order,
@@ -625,7 +634,7 @@ def build_report(
             **(extra_params or {}),
         },
         'projects': projects,
-        'grand_total': _census_to_dict(grand_total),
+        'grand_total': grand_total_dict,
         'topic_coverage': _regrade_uniqueness_at_project_grain(
             _build_topic_coverage(grand_total, canonical_uniqueness_enforced),
             projects,
@@ -634,6 +643,7 @@ def build_report(
         # at the top level rather than under any one project.
         'registry_coverage': registry_coverage,
         'registry_error': registry_error,
+        'kind_registry_drift': build_kind_registry_drift(grand_total_dict['kind']['entries']),
         # Placeholder so the key keeps its position in the artifact; filled
         # below, since the diff is computed FROM the finished report (one
         # distillation path -- see _coverage_run_row).
@@ -710,74 +720,8 @@ DEFAULT_REGISTRY_PATH = str(
     / 'memory_eval_topic_registry.json'
 )
 
-_PROBE_SCRIPT_PATH = _REPO_ROOT / 'fused-memory' / 'scripts' / 'memory_eval_retrieval_probe.py'
 
-
-def _load_probe_module() -> Any:
-    """Load ``memory_eval_retrieval_probe`` by path.
-
-    ``scripts/`` is not a package, so a plain import cannot reach it. This is
-    the same importlib idiom
-    ``fused-memory/scripts/retro_stamp_topics.py::_load_probe_module`` already
-    established for exactly this cross-script reuse, including the
-    ``sys.modules``-first lookup: that slot may already hold a module another
-    by-path loader executed, and re-executing would hand back a DIFFERENT
-    class object for ``RegistryEntry``, silently breaking identity across the
-    seam.
-    """
-    import importlib.util  # noqa: PLC0415
-
-    mod_name = 'memory_eval_retrieval_probe'
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, _PROBE_SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {_PROBE_SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-#: Memoized holder for the probe's loader. ``None`` means "not loaded yet",
-#: never "unavailable" -- an unavailable probe raises out of the accessor and
-#: is disclosed by :func:`load_registry_or_error`.
-_TOPIC_REGISTRY_LOADER: Any = None
-
-
-def topic_registry_loader() -> Any:
-    """Return the probe's ``load_topic_registry``, loading it on FIRST USE.
-
-    REUSED, never re-parsed: the registry's schema-version check, its
-    zero-entry rejection and its ``RegistryError`` type all stay single-homed
-    in the probe, exactly as
-    ``fused-memory/scripts/retro_stamp_topics.py::load_topic_registry``
-    establishes -- and the reuse stays pinnable by ``is``, through this
-    accessor.
-
-    LAZY and memoized, not an import-time module alias. As an alias the load
-    ran at ``import census_memory_metadata`` time, which made the most likely
-    registry failure -- the probe script renamed, moved, or carrying an import
-    error -- the one mode that could NOT be disclosed: it killed the whole
-    nightly census (no coverage numbers, no report, no trend row) and this
-    module's entire test suite with it, bypassing the ``registry_coverage:
-    null`` + ``registry_error`` path built for exactly that failure. The
-    registry gauge is ONE optional block of the report; it must not be able to
-    take the measurement down with it (INV-11 no-silent-fail-soft cuts both
-    ways -- disclose the shortfall, do not escalate it into a total loss).
-    """
-    global _TOPIC_REGISTRY_LOADER  # noqa: PLW0603 - one-shot memo
-    if _TOPIC_REGISTRY_LOADER is None:
-        _TOPIC_REGISTRY_LOADER = _load_probe_module().load_topic_registry
-    return _TOPIC_REGISTRY_LOADER
-
-
-def load_registry_or_error(path: str) -> tuple[Any | None, str | None]:
+def load_registry_or_error(path: str) -> tuple[TopicRegistry | None, str | None]:
     """Load the topic registry, returning ``(registry, error)``.
 
     Exactly one of the pair is ever non-``None``. Degrades LOUDLY: the caller
@@ -787,11 +731,8 @@ def load_registry_or_error(path: str) -> tuple[Any | None, str | None]:
     value of this gauge is that its zero is meaningful (INV-2).
     """
     try:
-        # The loader itself is resolved INSIDE the try: an unloadable probe
-        # module is a registry failure like any other, and is disclosed the
-        # same way rather than aborting the census.
-        registry = topic_registry_loader()(path)
-    except Exception as exc:  # noqa: BLE001 - every load failure is disclosed
+        registry = load_topic_registry(path)
+    except Exception as exc:  # every load failure is disclosed
         return None, f'{type(exc).__name__}: {exc}'
     return registry, None
 
@@ -803,7 +744,7 @@ def _build_registry_coverage(
     """Score the committed registry against measured corpus state.
 
     NOT a duplicate of E1's ``METRIC_TOPIC_CANONICAL_PRESENT`` (INV-5
-    checked). That tripwire is computed from ``_tripwire_items(observations,
+    checked). That tripwire is computed from ``tripwire_items(observations,
     TRIPWIRE_K)`` -- from SEARCH observations -- so it conflates "the
     canonical does not exist" with "it exists but ranks below K". This
     task's whole thesis is that 32/32 fails because the canonicals are
@@ -906,6 +847,44 @@ def _records_by_folded_slug(census: CategoryCensus) -> Counter[str]:
     return folded
 
 
+def build_kind_registry_drift(
+    entries: list[dict[str, Any]],
+    registry: frozenset[str] = KIND_REGISTRY,
+) -> dict[str, Any]:
+    """Score the live ``kind`` population against the frozen registry.
+
+    A DELTA on the nightly cadence, never a gate: PRD §10 open question 1
+    ruled option (b), so ``kind`` membership never rejects a write. It replaced a test
+    tripwire over the live artifact, which a nightly-regenerated artifact made
+    impossible to keep green. Why the baseline is frozen and append-only:
+    ``fused_memory.memory_metadata.KIND_REGISTRY``.
+    """
+    unregistered = [
+        {'value': entry.get('value'), 'count': entry.get('count') or 0}
+        for entry in entries
+        if not _is_registered(entry.get('value'), registry)
+    ]
+    measured_str = {
+        value for value in (entry.get('value') for entry in entries) if isinstance(value, str)
+    }
+    absent = sorted(registry - measured_str)
+    return {
+        'registry_total': len(registry),
+        'measured_distinct': len(entries),
+        'measured_records': sum(entry.get('count') or 0 for entry in entries),
+        'registered_distinct': len(entries) - len(unregistered),
+        'unregistered_distinct': len(unregistered),
+        'unregistered_records': sum(row['count'] for row in unregistered),
+        'absent_from_corpus_distinct': len(absent),
+        'unregistered': unregistered,
+        'absent_from_corpus': absent,
+    }
+
+
+def _is_registered(value: Any, registry: frozenset[str]) -> bool:
+    return isinstance(value, str) and value in registry
+
+
 def read_canonical_uniqueness_enforced(config: Any | None = None) -> bool | None:
     """Three-valued read of the live ``memory_metadata.enforce`` setting.
 
@@ -929,11 +908,11 @@ def read_canonical_uniqueness_enforced(config: Any | None = None) -> bool | None
     """
     try:
         if config is None:
-            from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+            from fused_memory.config.schema import FusedMemoryConfig
 
             config = FusedMemoryConfig()
         return bool(config.memory_metadata.enforce)
-    except Exception as exc:  # noqa: BLE001 - any load failure degrades to null
+    except Exception as exc:  # any load failure degrades to null
         logger.warning(
             'could not read memory_metadata.enforce (%s: %s) -- reporting null',
             type(exc).__name__,
@@ -1268,7 +1247,7 @@ def load_coverage_history(path: str) -> dict[str, Any]:
         return empty_coverage_history()
     try:
         raw = json.loads(history_path.read_text(encoding='utf-8'))
-    except Exception as exc:  # noqa: BLE001 - every unreadable shape is named
+    except Exception as exc:  # every unreadable shape is named
         raise CoverageHistoryError(
             f'{path}: unreadable coverage history ({type(exc).__name__}: {exc})',
         ) from exc
@@ -1851,7 +1830,7 @@ async def census_project(
         ``collection_points_before``/``collection_points`` pair, and
         per-category expected/recount/scrolled/delta/complete.
     """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     category_values = list(categories) if categories is not None else [
         c.value for c in CENSUS_CATEGORIES
@@ -1979,11 +1958,12 @@ def _regen_command(params: dict[str, Any]) -> str:
     # relative to `fused-memory/` while `--registry` / `--history-out` carry
     # `_repo_relative` values -- relative to the repo ROOT -- so a run using
     # either non-default path emitted a command whose script and whose flags
-    # could not both resolve from any single directory. `--frozen` is not
-    # decoration: regenerating a committed artifact under a resolved-fresh
-    # dependency set is not a reproduction of the run that wrote it.
+    # could not both resolve from any single directory. `--no-sync` is not
+    # decoration: with no resolve and no sync, the regen reproduces the run
+    # under the environment that run used, and never installs into the shared
+    # root .venv (measured in scripts/orchestrator-autopilot-video.service).
     parts = [
-        'uv run --frozen --project fused-memory python '
+        'uv run --no-sync --project fused-memory python '
         'fused-memory/scripts/census_memory_metadata.py',
     ]
     projects = params.get('projects') or []
@@ -2055,6 +2035,7 @@ def render_markdown(report: dict[str, Any]) -> str:
 
     lines += _render_topic_coverage(report, top_n)
     lines += _render_coverage_trend(report)
+    lines += _render_kind_registry_drift(report, top_n)
 
     lines += ['## Record counts', '']
     lines += _render_record_counts(report)
@@ -2552,6 +2533,51 @@ def _render_registry_coverage(report: dict[str, Any], top_n: int | None) -> list
     return lines
 
 
+def _render_kind_registry_drift(report: dict[str, Any], top_n: int | None) -> list[str]:
+    """The live ``kind`` population against the frozen registry -- or a stated absence."""
+    lines = [
+        '## Kind vocabulary drift',
+        '',
+        'The registry (`fused_memory.memory_metadata.KIND_REGISTRY`) is a FROZEN '
+        'baseline, deliberately not topped up from any census. `kind` is a census '
+        'axis that only warns: the registry does not reject a write carrying an '
+        'unregistered value (PRD §10 open question 1, option (b)). A registry '
+        'value listed as absent is recorded as departed, never removed from the '
+        'registry.',
+        '',
+    ]
+    drift = report.get('kind_registry_drift')
+    if not drift:
+        lines += [
+            '_The `kind_registry_drift` block is absent from this report '
+            '(pre-schema-6), so no drift was measured._',
+            '',
+        ]
+        return lines
+    lines += [
+        f'Registry values: **{_num(drift.get("registry_total"))}** · '
+        f'live distinct: **{_num(drift.get("measured_distinct"))}** · '
+        f'unregistered: **{_num(drift.get("unregistered_distinct"))}** '
+        f'({_num(drift.get("unregistered_records"))} records) · '
+        f'absent from the corpus: **{_num(drift.get("absent_from_corpus_distinct"))}**.',
+        '',
+    ]
+    lines += _render_named_rows(
+        'Unregistered — live `kind` values not in the frozen registry',
+        ['value', 'count'],
+        [[f'`{row["value"]}`', _num(row["count"])] for row in drift.get('unregistered') or []],
+        top_n,
+        aligns=['---', '---:'],
+    )
+    lines += _render_named_rows(
+        'Absent from the corpus — registry values with no live record',
+        ['value'],
+        [[f'`{value}`'] for value in drift.get('absent_from_corpus') or []],
+        top_n,
+    )
+    return lines
+
+
 def _render_coverage_trend(report: dict[str, Any]) -> list[str]:
     """This run against the most recent prior one -- or a stated null.
 
@@ -2787,7 +2813,7 @@ def _build_backend(config: Any) -> Any:
     still runs when the graph store or LLM credentials are unavailable.
     Seam kept separate so the CLI band is testable without a live Qdrant.
     """
-    from fused_memory.backends.mem0_client import Mem0Backend  # noqa: PLC0415
+    from fused_memory.backends.mem0_client import Mem0Backend
 
     return Mem0Backend(config)
 
@@ -2797,9 +2823,9 @@ async def _run(args: argparse.Namespace) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    import os  # noqa: PLC0415
+    import os
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)

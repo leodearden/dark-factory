@@ -34,8 +34,9 @@ action on it -- and on any L2 whose cascade would close it -- with
 disposition. It does NOT make this output actionable: the marker is
 opt-in, so an EMPTY `pin_declared_by` means "not declared", not "safe" --
 esc-3105-3 is exactly the shape that would be lost to that assumption,
-and it is itself still undeclared (writing the marker is operator/
-steward-only via the `declare_pin` MCP tool; no rotation holds it).
+and it is itself still undeclared (who may write the marker with the
+`declare_pin` MCP tool is stated in skills/escalation-watcher-auto/SKILL.md
+"Declared pins").
 
 Usage:
     member-chain-sweep.py                 # sweep the default fleet queues
@@ -48,6 +49,10 @@ import glob
 import json
 import os
 import sys
+from pathlib import Path
+
+import _checkout as _checkout
+from shared.project_layout import default_project_root, escalation_queue_dir
 
 DEDUP_MARKER = 'survivor, stays open'
 TERMINAL_STATUSES = ('resolved', 'dismissed')
@@ -109,11 +114,11 @@ def sweep_queue(queue_dir: str) -> int:
 
 
 def default_queues() -> list[str]:
-    src = os.path.expanduser('~/src')
-    queues = sorted(glob.glob(os.path.join(src, '*', 'data', 'escalations')))
-    recon = os.path.join(src, 'dark-factory', 'data', 'reconciliation', 'escalations')
-    if os.path.isdir(recon):
-        queues.append(recon)
+    every_project = Path(glob.escape(os.path.expanduser('~/src')), '*')
+    queues = sorted(glob.glob(str(escalation_queue_dir(every_project))))
+    recon = default_project_root() / 'data' / 'reconciliation' / 'escalations'
+    if recon.is_dir():
+        queues.append(str(recon))
     return queues
 
 

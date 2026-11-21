@@ -50,6 +50,9 @@ def make_gate_mock(**overrides) -> MagicMock:
     ``detect_cap_hit``, ``confirm``, ``settle``, ``report`` methods proxy back
     to the gate — so tests can still assert on ``gate.detect_cap_hit.call_args``,
     ``gate.confirm_account_ok.assert_called_with(...)``, etc.
+    ``confirm(...)`` mirrors production :meth:`InvokeSlot.confirm`'s
+    one-verdict rule: a no-op on a slot that ``report`` or a positive
+    ``detect_cap_hit`` already settled (task 6627).
     ``detect_cap_hit(...)`` mirrors production :meth:`InvokeSlot.detect_cap_hit`:
     it forwards ``scope=slot.scope`` (task 4969) and, on a truthy hit, calls
     ``release_probe_slot`` and then settles (task 4096).
@@ -67,6 +70,8 @@ def make_gate_mock(**overrides) -> MagicMock:
     with the sister proxy in ``tests/test_cap_retry.py::_mock_gate``.
     ``__aexit__`` calls ``gate.release_probe_slot(slot.token)`` unless the slot
     was settled, matching the real ``UsageGate.invoke_slot`` behaviour.
+    ``invoke_slot(work_class=...)`` forwards the class into ``before_invoke``
+    only when given, and mirrors it onto ``slot.work_class`` (``None`` otherwise).
     """
     gate = MagicMock(spec=UsageGate)
     gate.account_count = overrides.pop('account_count', 1)
@@ -90,15 +95,18 @@ def make_gate_mock(**overrides) -> MagicMock:
         # report()'s CapHit/NearCap arms (task 4234) and the
         # detect_cap_hit(...) proxy (task 4969).
         _scope = _kw.get('scope')
+        _work_class = _kw.get('work_class')
+        _reserve_kwargs = {} if _work_class is None else {'work_class': _work_class}
 
         async def _aenter_impl(*_args, **_akw):
-            token = await gate.before_invoke(scope=_scope)
+            token = await gate.before_invoke(scope=_scope, **_reserve_kwargs)
             slot = MagicMock(spec=InvokeSlot)
             slot.token = token
             # Mirror InvokeSlot.__init__: None → '' so tests can rely on
             # the same coercion as production code.
             slot.account_name = gate.active_account_name or ''
             slot.scope = _scope
+            slot.work_class = _work_class
             slot._settled = False
 
             def _slot_detect_cap_hit(stderr, output, backend='claude'):
@@ -119,6 +127,8 @@ def make_gate_mock(**overrides) -> MagicMock:
                 return hit
 
             def _slot_confirm(cost_usd=0.0):
+                if slot._settled:
+                    return
                 gate.confirm_account_ok(slot.token)
                 gate.on_agent_complete(cost_usd)
                 slot._settled = True

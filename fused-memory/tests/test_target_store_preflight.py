@@ -40,14 +40,14 @@ import pytest
 from _fm_helpers import make_populated_task_store, make_zero_byte_task_store
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.project_layout import tasks_db
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.utils.target_store_preflight import (
-    TargetStoreMissing,
+    TargetStoreUnpopulated,
     assert_queue_dir_populated,
     assert_task_store_populated,
-    task_store_path,
 )
 
 
@@ -80,7 +80,7 @@ class TestQueueDirArm:
         queue_dir = tmp_path / 'escalations'
         queue_dir.mkdir()
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             assert_queue_dir_populated(queue_dir, operation='dismiss_recon_integrity_noise')
 
         assert queue_dir.is_dir()
@@ -91,7 +91,7 @@ class TestQueueDirArm:
         queue_dir = tmp_path / 'data' / 'reconciliation' / 'escalations'
         assert EscalationQueue(queue_dir).get_pending() == []
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             assert_queue_dir_populated(queue_dir, operation='backfill_recon_escalations')
 
     def test_a_queue_holding_a_pending_escalation_passes(self, tmp_path: Path):
@@ -126,7 +126,7 @@ class TestQueueDirArm:
         relative = Path('escalations')
         relative.mkdir()
 
-        with pytest.raises(TargetStoreMissing) as excinfo:
+        with pytest.raises(TargetStoreUnpopulated) as excinfo:
             assert_queue_dir_populated(relative, operation='derive_orphaned_recon_escalations')
 
         message = str(excinfo.value)
@@ -151,7 +151,7 @@ class TestTaskStoreArm:
     def test_a_zero_byte_store_is_refused_and_left_untouched(self, tmp_path: Path):
         db = make_zero_byte_task_store(tmp_path)
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             assert_task_store_populated(tmp_path, operation='audit_duplicate_tasks')
 
         assert db.stat().st_size == 0
@@ -166,9 +166,9 @@ class TestTaskStoreArm:
             assert await backend.get_tasks(project_root=str(tmp_path)) == {'tasks': []}
         finally:
             await backend.close()
-        assert task_store_path(tmp_path).exists()
+        assert tasks_db(tmp_path).exists()
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             assert_task_store_populated(tmp_path, operation='audit_duplicate_tasks')
 
     @pytest.mark.asyncio
@@ -196,7 +196,7 @@ class TestTaskStoreArm:
 
     def test_a_database_with_rows_but_no_tasks_table_is_refused(self, tmp_path: Path):
         """A different database at the task-store path is not the task store."""
-        db = task_store_path(tmp_path)
+        db = tasks_db(tmp_path)
         db.parent.mkdir(parents=True)
         connection = sqlite3.connect(db)
         try:
@@ -206,28 +206,28 @@ class TestTaskStoreArm:
         finally:
             connection.close()
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             assert_task_store_populated(tmp_path, operation='op')
 
     def test_non_sqlite_bytes_fail_open(self, tmp_path: Path):
-        db = task_store_path(tmp_path)
+        db = tasks_db(tmp_path)
         db.parent.mkdir(parents=True)
         db.write_bytes(b'this is not a sqlite database\n' * 64)
 
         assert assert_task_store_populated(tmp_path, operation='op') is None
 
     def test_a_directory_at_the_store_path_fails_open(self, tmp_path: Path):
-        task_store_path(tmp_path).mkdir(parents=True)
+        tasks_db(tmp_path).mkdir(parents=True)
 
         assert assert_task_store_populated(tmp_path, operation='op') is None
 
     def test_a_missing_store_is_refused_and_nothing_is_created(self, tmp_path: Path):
-        with pytest.raises(TargetStoreMissing) as excinfo:
+        with pytest.raises(TargetStoreUnpopulated) as excinfo:
             assert_task_store_populated(tmp_path, operation='audit_duplicate_tasks')
 
         message = str(excinfo.value)
         assert 'audit_duplicate_tasks' in message
-        assert str(task_store_path(tmp_path)) in message
+        assert str(tasks_db(tmp_path)) in message
         assert '--project-root' in message
         assert not (tmp_path / '.taskmaster').exists()
 
@@ -235,12 +235,12 @@ class TestTaskStoreArm:
         """An existing store is refused as EMPTY, never misreported as absent."""
         make_zero_byte_task_store(tmp_path)
 
-        with pytest.raises(TargetStoreMissing) as excinfo:
+        with pytest.raises(TargetStoreUnpopulated) as excinfo:
             assert_task_store_populated(tmp_path, operation='correct_found_on_main_backlog')
 
         message = str(excinfo.value)
         assert 'correct_found_on_main_backlog' in message
-        assert str(task_store_path(tmp_path).resolve()) in message
+        assert str(tasks_db(tmp_path).resolve()) in message
         assert '--project-root' in message
         assert 'does not exist' not in message
 
@@ -257,7 +257,7 @@ class TestRefusesAMissingTarget:
         (tmp_path / 'data').mkdir()
         target = tmp_path / 'data' / 'reconciliation' / 'escalations'
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             assert_queue_dir_populated(target, operation='op')
 
     def test_refusal_does_not_create_the_path(self, tmp_path: Path):
@@ -268,7 +268,7 @@ class TestRefusesAMissingTarget:
         """
         target = tmp_path / 'data' / 'reconciliation' / 'escalations'
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             assert_queue_dir_populated(target, operation='op')
 
         assert not target.exists()
@@ -281,7 +281,7 @@ class TestRefusalMessage:
     def test_message_names_operation_path_what_and_remedy_flag(self, tmp_path: Path):
         target = tmp_path / 'data' / 'reconciliation' / 'escalations'
 
-        with pytest.raises(TargetStoreMissing) as excinfo:
+        with pytest.raises(TargetStoreUnpopulated) as excinfo:
             assert_queue_dir_populated(target, operation='dismiss_recon_integrity_noise')
 
         message = str(excinfo.value)
@@ -308,7 +308,7 @@ class TestRefusalMessage:
         monkeypatch.chdir(tmp_path)
         relative = Path('data') / 'reconciliation' / 'escalations-4319-absent'
 
-        with pytest.raises(TargetStoreMissing) as excinfo:
+        with pytest.raises(TargetStoreUnpopulated) as excinfo:
             assert_queue_dir_populated(relative, operation='op')
 
         assert str(tmp_path / relative) in str(excinfo.value)
@@ -317,7 +317,7 @@ class TestRefusalMessage:
 class TestExceptionType:
     def test_is_a_runtime_error_subclass(self):
         """Catchable alongside ``StoreMutationUnavailable``, which is also one."""
-        assert issubclass(TargetStoreMissing, RuntimeError)
+        assert issubclass(TargetStoreUnpopulated, RuntimeError)
 
 
 class TestFamilyWrappers:
@@ -354,9 +354,9 @@ class TestFamilyWrappers:
         opposite actions: point ``--project-root`` at the main checkout, versus
         pass an absolute ``--queue-dir``.
         """
-        with pytest.raises(TargetStoreMissing) as task_exc:
+        with pytest.raises(TargetStoreUnpopulated) as task_exc:
             assert_task_store_populated(tmp_path, operation='op')
-        with pytest.raises(TargetStoreMissing) as queue_exc:
+        with pytest.raises(TargetStoreUnpopulated) as queue_exc:
             assert_queue_dir_populated(tmp_path / 'absent', operation='op')
 
         assert '--queue-dir' not in str(task_exc.value)

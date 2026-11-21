@@ -1,5 +1,5 @@
 """Gate-level tests for a rename false-positive class of
-:func:`orchestrator.merge_gates._check_post_merge_equivalence` — SITE 1.
+:func:`orchestrator.merge_lane.gates._check_post_merge_equivalence` — SITE 1.
 
 The defect: the gate's compare set is built by a raw path-string
 subtraction, ``[p for p in branch_touched if p not in main_touched]``,
@@ -28,8 +28,8 @@ in this dedicated file rather than in the 24k-line ``test_merge_queue.py``
 — the precedent set by the sibling ``test_merge_gates_plan_files_rename.py``
 (its docstring, L29-30/36-39: real-git tests plus keeping hot
 ``merge_queue.py`` out of this task's lock scope).  They import the gate
-from ``orchestrator.merge_gates`` DIRECTLY, never through the
-``orchestrator.merge_queue`` shim.  The only deviation from pure real-git
+from ``orchestrator.merge_lane.gates`` DIRECTLY, never through the
+``orchestrator.merge_lane.worker`` shim.  The only deviation from pure real-git
 is :class:`_RunSpy`, used narrowly for the one property real git will not
 produce on demand: a non-zero rc from a specific git subcommand.
 """
@@ -45,7 +45,7 @@ import pytest
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_gates import _check_post_merge_equivalence
+from orchestrator.merge_lane.gates import _check_post_merge_equivalence
 
 # ---------------------------------------------------------------------------
 # Fixtures — the standard real-git fixture triple, copied verbatim from
@@ -321,10 +321,10 @@ class TestEquivalenceGateRenameAwareness:
             spy = _RunSpy(
                 fail_when=lambda cmd: '--name-status' in cmd and '-M' in cmd,
             )
-            monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+            monkeypatch.setattr('orchestrator.merge_lane.gates._run', spy)
 
             with caplog.at_level(
-                logging.WARNING, logger='orchestrator.merge_queue',
+                logging.WARNING, logger='orchestrator.merge_lane',
             ):
                 failed = await _check_post_merge_equivalence(
                     wt, advanced, git_ops, main_sha,
@@ -483,7 +483,7 @@ class TestEquivalenceSuppressionIsContentVerified:
         )
 
         spy = _RunSpy(fail_when=lambda cmd: 'apply' in cmd)
-        monkeypatch.setattr('orchestrator.merge_gates._run', spy)
+        monkeypatch.setattr('orchestrator.merge_lane.gates._run', spy)
 
         failed = await _check_post_merge_equivalence(
             wt, advanced, git_ops, main_sha, task_id='equiv-probe-error',

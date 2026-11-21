@@ -1,4 +1,4 @@
-"""Single-owner candidate_key computation (fm-task-dedup W8 task A1).
+"""Single owner of candidate_key and of title normalisation (fm-task-dedup W8 task A1).
 
 Deliberately dependency-free (stdlib ``hashlib`` only): the SQLite task
 backend imports this leaf directly from every INSERT chokepoint, and it
@@ -13,13 +13,10 @@ import hashlib
 from collections.abc import Iterable
 
 
-def _normalize_title(title: str | None) -> str:
+def normalize_title(title: str | None) -> str:
     """Lowercase + collapse whitespace for forgiving title comparison.
 
-    Mirror site: this is a byte-for-byte copy of
-    ``fused_memory.middleware.task_curator.normalize_title``, duplicated
-    here (rather than imported) to keep this module stdlib-only. Any
-    change to the algorithm there must be mirrored here.
+    The only title normaliser: every title comparison goes through it.
     """
     return ' '.join((title or '').strip().lower().split())
 
@@ -41,7 +38,7 @@ def compute_candidate_key(
     be the reason an insert/update fails, and ``sorted``/``join`` would
     otherwise raise ``TypeError`` on a mixed-type list.
     """
-    normalized_title = _normalize_title(title)
+    normalized_title = normalize_title(title)
     if not normalized_title:
         return None
     normalized_files = '\n'.join(sorted(f for f in (files or []) if isinstance(f, str)))
@@ -51,5 +48,6 @@ def compute_candidate_key(
     h.update(normalized_files.encode())
     # 16-char sha256-hex shape — canonical owner: orchestrator.agents.triage.sha256_16.
     # Any change to length or algorithm must be mirrored there and at the
-    # task_curator.py mirror sites (payload_hash, _intra_batch_key, _normalize_key).
+    # other mirror site, curator_types.py::CandidateTask.payload_hash.
+    # TaskCurator._normalize_key delegates here and is not a mirror.
     return h.hexdigest()[:16]

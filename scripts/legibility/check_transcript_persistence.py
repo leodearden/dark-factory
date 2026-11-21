@@ -8,8 +8,9 @@ Cross-checks fleet session-registry records
 spawn-launched interactive session — a record WITH a substantive prompt, a
 terminal status, and a ``start_ts`` inside a lookback window — produced no
 plausibly-matching transcript. This is the detector for the transcript-loss
-regression (a suppressed session-persistence path), NOT the preventer: the
-``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`` fix lands separately. Shipping
+regression (a suppressed session-persistence path), NOT the preventer: that
+is ``skills/spawn/spawn-claude.sh``'s unconditional
+``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`` export. Shipping
 the detector means any future silent transcript-loss regression is caught in
 ~a day of the nightly probe.
 
@@ -18,7 +19,7 @@ Natural home: ``scripts/legibility/`` alongside ``check_trickle_liveness.sh``
 a ``__main__`` sys.path self-bootstrap, dependency-injection seams, and a
 ``main() -> exit-code`` CLI a systemd/watcher probe can surface.
 
-Registry enumeration composes existing public ``session_registry`` helpers
+Registry enumeration composes existing public ``session_records`` helpers
 (``sessions_dir`` + ``read_record``, skipping missing/corrupt like the
 reapers) rather than adding an iterator to that heavily-tested orchestrator
 contract file — see the plan's design decisions.
@@ -48,9 +49,9 @@ if __name__ == '__main__':
     sys.path.insert(0, str(_HERE.parent.parent))  # scripts/
     sys.path.insert(0, str(_HERE.parents[2] / 'orchestrator' / 'src'))  # <repo>/orchestrator/src
 
-from legibility import census_trigger, config, inventory, sampling  # noqa: E402
+from legibility import alarm, config, detectors, inventory  # noqa: E402  # debt: task 6760
 
-from orchestrator import session_registry  # noqa: E402
+from orchestrator import session_records
 
 logger = logging.getLogger('legibility.check_transcript_persistence')
 
@@ -66,10 +67,9 @@ DEFAULT_PROJECTS_ROOT = Path.home() / '.claude' / 'projects'
 Injected in tests so the real ``~/.claude`` tree is never touched."""
 
 DEFAULT_SPAWN_SCRIPT = Path(__file__).resolve().parents[2] / 'skills' / 'spawn' / 'spawn-claude.sh'
-"""Default spawn script the ``--check-preventer`` guard reads. Tests always
-pass an explicit ``spawn_script_path`` fixture — never the real committed file
-(which does not carry the ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` token on
-this branch; the preventer lands separately)."""
+"""Spawn script the ``--check-preventer`` guard reads: the dark-factory
+checkout's ``skills/spawn/spawn-claude.sh``, whatever project ``--project-id``
+names."""
 
 PREFIX_LEN = 200
 """Number of leading prompt characters used as the strong-match needle. A
@@ -88,10 +88,10 @@ matching falls back to the WEAK file-mtime time window instead."""
 
 def iter_registry_records(
     fleet_root: Path | str | None = None,
-) -> Iterator[session_registry.SessionRecord]:
+) -> Iterator[session_records.SessionRecord]:
     """Yield every readable ``SessionRecord`` under the fleet registry.
 
-    Composes ``session_registry.sessions_dir(fleet_root).iterdir()`` +
+    Composes ``session_records.sessions_dir(fleet_root).iterdir()`` +
     ``read_record`` in sorted (directory-name) order, skipping a slug dir
     whose ``record.json`` is missing (``FileNotFoundError``) or unparseable
     (``CorruptSessionRecord``) — the same tolerate-missing/corrupt idiom
@@ -99,15 +99,15 @@ def iter_registry_records(
     (default ``None`` -> real ``~/.claude/fleet``), so tests never touch the
     real tree. Yields nothing when the sessions dir does not exist.
     """
-    base = session_registry.sessions_dir(fleet_root)
+    base = session_records.sessions_dir(fleet_root)
     if not base.is_dir():
         return
     for slug_dir in sorted(base.iterdir()):
         if not slug_dir.is_dir():
             continue
         try:
-            record = session_registry.read_record(slug_dir.name, root=fleet_root)
-        except (FileNotFoundError, session_registry.CorruptSessionRecord):
+            record = session_records.read_record(slug_dir.name, root=fleet_root)
+        except (FileNotFoundError, session_records.CorruptSessionRecord):
             continue
         yield record
 
@@ -131,11 +131,11 @@ def _parse_start_ts(value: str | None) -> datetime | None:
 
 
 def find_completed_spawn_records(
-    records: Iterable[session_registry.SessionRecord],
+    records: Iterable[session_records.SessionRecord],
     *,
     now: datetime,
     lookback: timedelta,
-) -> list[session_registry.SessionRecord]:
+) -> list[session_records.SessionRecord]:
     """Filter *records* to COMPLETED spawn sessions worth checking.
 
     Keeps a record iff ALL hold:
@@ -151,11 +151,11 @@ def find_completed_spawn_records(
     unparseable ``start_ts``) are skipped defensively.
     """
     window_start = now - lookback
-    kept: list[session_registry.SessionRecord] = []
+    kept: list[session_records.SessionRecord] = []
     for record in records:
         if not record.prompt or not record.prompt.strip():
             continue
-        if record.status not in session_registry.TERMINAL_STATUSES:
+        if record.status not in session_records.TERMINAL_STATUSES:
             continue
         start = _parse_start_ts(record.start_ts)
         if start is None:
@@ -188,26 +188,16 @@ def _usable_prompt_prefix(prompt: str | None) -> str | None:
 def _first_user_turn(path: Path) -> dict[str, Any] | None:
     """Return *path*'s first non-sidechain/non-meta user-turn record, or None.
 
-    A LIGHT alternative to ``sampling.scan_transcript`` for the
-    STRONG match: that helper must read the WHOLE file to also compute the
-    5-class confusion score (tool_error/not_found/self_correct/df_guard/
-    interrupt) — all of which the strong match discards. This loop instead
-    early-returns on the first matching user record, so matching a record
-    against a busy encoded-cwd dir full of large sibling transcripts costs
-    O(bytes-until-first-user-turn) per candidate rather than O(filesize)
-    (reviewer_comprehensive/efficiency, task 2893 amendment). The
-    first-turn selection predicate is identical to the scorer's, so
-    ``sampling._first_user_turn_text`` flattens the result the same way.
-    Degrades to ``None`` on an unreadable file, mirroring the scorer's
-    ``except OSError`` contract.
+    It early-returns on the first such record, so matching against a busy
+    encoded-cwd dir full of large sibling transcripts costs
+    O(bytes-until-first-user-turn) per candidate rather than a whole-file
+    scan (task 2893 amendment). The predicate is
+    :func:`detectors.is_primary_user_turn`, the one the sampler's first turn
+    uses. Degrades to ``None`` on an unreadable file.
     """
     try:
         for record in inventory.iter_json_lines(path):
-            if (
-                record.get('type') == 'user'
-                and not record.get('isSidechain')
-                and not record.get('isMeta')
-            ):
+            if detectors.is_primary_user_turn(record):
                 return record
     except OSError:
         return None
@@ -258,7 +248,7 @@ def _typed_slash_command(text: str) -> str | None:
 
 
 def find_matching_transcript(
-    record: session_registry.SessionRecord,
+    record: session_records.SessionRecord,
     projects_root: Path | str,
     *,
     now: datetime,
@@ -287,21 +277,22 @@ def find_matching_transcript(
     Matching is PER-SESSION to defeat the same-cwd confound (sibling
     headless-agent transcripts share the encoded-cwd dir), in one of three
     tiers:
-      - EXACT (bound id, per :func:`_bound_session_id`):
-        ``<expected_dir>/<id>.jsonl`` is the transcript, or there is none.
-        Authoritative, with NO fallback — a same-prompt re-spawn, an in-window
-        sibling, or a later session that quotes the prompt would otherwise mask
-        a genuine loss. The accepted cost: ``/clear`` re-mints the id and the
-        registry re-binds to it, so a session that exits before writing under
-        the new id is reported missing although its launch transcript survives.
+      - EXACT (bound ids, per :func:`_bound_session_ids`): the first
+        ``<expected_dir>/<id>.jsonl`` that exists for the current or the launch
+        id is the transcript, or there is none. Authoritative, with NO
+        fallback — a same-prompt re-spawn, an in-window sibling, or a later
+        session that quotes the prompt would otherwise mask a genuine loss. A
+        ``/clear`` or compaction re-mint moves ``claude_session_id``, but
+        ``claude_launch_session_id`` still names the launch file; a record
+        bound before that field existed is matched on its current id alone.
       - STRONG (unbound, usable prompt): :func:`_match_prompt_prefix`.
       - WEAK (unbound, prompt too short/empty): :func:`_match_mtime_window`,
         never reached for a usable prompt.
     """
     session_dir = Path(projects_root) / inventory.encode_cwd(record.cwd)
-    bound_id = _bound_session_id(record)
-    if bound_id is not None:
-        return _bound_transcript(session_dir, bound_id)
+    bound_ids = _bound_session_ids(record)
+    if bound_ids:
+        return _bound_transcript(session_dir, bound_ids)
     if not session_dir.is_dir():
         return None
     candidates = sorted(session_dir.glob('*.jsonl'))
@@ -311,31 +302,38 @@ def find_matching_transcript(
     return _match_mtime_window(record.start_ts, candidates, now=now, skew=skew)
 
 
-def _bound_session_id(record: session_registry.SessionRecord) -> str | None:
-    """Return *record*'s bound Claude Code session id, or None to match it as unbound.
+def _bound_session_ids(record: session_records.SessionRecord) -> tuple[str, ...]:
+    """Return *record*'s usable bound Claude Code session ids, current then launch; empty means unbound.
 
-    The id becomes a filename inside the expected dir, so one that is not a
+    Each id becomes a filename inside the expected dir, so one that is not a
     single path component (a hand-edited ``../x`` or an absolute path) could
     resolve to an unrelated file elsewhere and hide a real loss. Such an id
-    is rejected loudly rather than trusted.
+    is rejected loudly and ignored; the record's other id still counts.
     """
-    session_id = record.claude_session_id
-    if not session_id:
-        return None
-    if Path(session_id).name != session_id:
-        logger.warning(
-            '%s: claude_session_id %r is not a single path component; '
-            'matching the record as unbound',
-            record.session_slug, session_id,
-        )
-        return None
-    return session_id
+    usable: list[str] = []
+    for field_name, session_id in (
+        ('claude_session_id', record.claude_session_id),
+        ('claude_launch_session_id', record.claude_launch_session_id),
+    ):
+        if not session_id:
+            continue
+        if Path(session_id).name != session_id:
+            logger.warning(
+                '%s: %s %r is not a single path component; ignoring it',
+                record.session_slug, field_name, session_id,
+            )
+            continue
+        usable.append(session_id)
+    return tuple(dict.fromkeys(usable))
 
 
-def _bound_transcript(session_dir: Path, claude_session_id: str) -> Path | None:
-    """Return ``session_dir/<claude_session_id>.jsonl`` if that file exists, else None."""
-    path = session_dir / f'{claude_session_id}.jsonl'
-    return path if path.is_file() else None
+def _bound_transcript(session_dir: Path, session_ids: Sequence[str]) -> Path | None:
+    """Return the first ``session_dir/<id>.jsonl`` among *session_ids* that is a file, else None."""
+    for session_id in session_ids:
+        path = session_dir / f'{session_id}.jsonl'
+        if path.is_file():
+            return path
+    return None
 
 
 def _match_prompt_prefix(prefix: str, candidates: Sequence[Path]) -> Path | None:
@@ -354,7 +352,8 @@ def _match_prompt_prefix(prefix: str, candidates: Sequence[Path]) -> Path | None
     # are whitespace-normalized so a reflowed transcript still matches.
     needle = _normalize_ws(prefix)
     for path in candidates:
-        text = sampling._first_user_turn_text(_first_user_turn(path))
+        turn = _first_user_turn(path)
+        text = (detectors.user_turn_text(turn) if turn is not None else None) or ''
         typed = _typed_slash_command(text)
         matched = needle in _normalize_ws(text) or (
             typed is not None and needle in _normalize_ws(typed)
@@ -403,8 +402,8 @@ class MissingTranscript:
     a follow-up probe) can locate the lost session: its registry slug, real
     ``cwd``, prompt prefix, ``start_ts``, exit code, and the encoded
     ``~/.claude/projects/<enc>`` dir the transcript should have lived in. The
-    bound Claude Code session id, when present, names the exact file that was
-    expected: ``<expected_dir>/<id>.jsonl``.
+    bound Claude Code session ids (current and launch), when present, name the
+    exact files that were expected: ``<expected_dir>/<id>.jsonl``.
     """
 
     session_slug: str
@@ -414,10 +413,11 @@ class MissingTranscript:
     exit_code: int | None
     expected_dir: Path
     claude_session_id: str | None = None
+    claude_launch_session_id: str | None = None
 
 
 def find_missing_transcripts(
-    records: Iterable[session_registry.SessionRecord],
+    records: Iterable[session_records.SessionRecord],
     projects_root: Path | str,
     cwd_prefixes: Sequence[str],
     *,
@@ -453,6 +453,7 @@ def find_missing_transcripts(
                 exit_code=record.exit_code,
                 expected_dir=projects_root / inventory.encode_cwd(record.cwd),
                 claude_session_id=record.claude_session_id,
+                claude_launch_session_id=record.claude_launch_session_id,
             )
         )
     return findings
@@ -503,40 +504,29 @@ def payload_exports_force_persistence(script_text: str) -> bool:
     """Return True iff *script_text* sets ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1``.
 
     A PURE function over the script text — the detector's opt-in
-    (``--check-preventer``) guard that the separately-landing preventer is in
-    place. False when the token is absent or explicitly set to ``0``. Never
+    (``--check-preventer``) guard that spawn-claude.sh's preventer export is
+    in place. False when the token is absent or explicitly set to ``0``. Never
     reads the real committed ``spawn-claude.sh``; callers pass its text in.
     """
     return bool(_FORCE_PERSISTENCE_RE.search(script_text))
 
 
 # ---------------------------------------------------------------------------
-# escalation — self-contained best-effort escalate_info mirror
+# escalation — the transcript-loss alarm
 # ---------------------------------------------------------------------------
-# Mirrors nightly.py's escalate_info shape by CONVENTION, not import: importing
-# nightly pulls the whole trickle pipeline at module load. Same JSON-RPC
-# tools/call envelope, escalate_info tool, infra_issue/info classification,
-# http://localhost:<port>/mcp URL, and best-effort never-raises contract.
 
-_ESCALATION_TOOL_NAME = 'escalate_info'
-_ESCALATION_AGENT_ROLE = 'legibility-transcript-check'
-_ESCALATION_CATEGORY = 'infra_issue'
-_ESCALATION_SEVERITY = 'info'
-
-
-def _build_escalation_arguments(
+def _findings_message(
     findings: Sequence[MissingTranscript],
-    cfg: config.LegibilityConfig,
+    project_id: str,
     *,
     force_persistence_ok: bool | None = None,
-) -> dict:
-    """Build the ``escalate_info`` MCP tool arguments for a transcript-loss alarm.
+) -> tuple[str, str]:
+    """The ``(summary, detail)`` of a transcript-loss alarm.
 
-    A synthetic ``task_id`` (``legibility-transcript-check-<project_id>``)
-    labels the detector as the source since it is a timer-driven probe, not a
-    Taskmaster task. The ``summary`` names the count of lost sessions; the
+    The ``summary`` names the count of lost sessions; the
     ``detail`` names each finding's slug and real ``cwd`` (plus expected dir,
-    ``start_ts``, exit code, ``claude_session_id``, and prompt prefix) so a
+    ``start_ts``, exit code, ``claude_session_id``,
+    ``claude_launch_session_id``, and prompt prefix) so a
     human can locate every lost session. When *force_persistence_ok* is not
     ``None`` (the preventer guard was evaluated), its verdict is appended — a
     MISSING preventer strengthens the diagnosis (the known regression cause is
@@ -545,14 +535,14 @@ def _build_escalation_arguments(
     count = len(findings)
     summary = (
         f'legibility transcript-loss: {count} completed spawn session(s) ran '
-        f'with NO matching transcript (project {cfg.project_id})'
+        f'with NO matching transcript (project {project_id})'
     )
     detail_lines = [
         f'{count} completed spawn-launched interactive session(s) in project '
-        f'{cfg.project_id!r} produced no plausibly-matching transcript under '
+        f'{project_id!r} produced no plausibly-matching transcript under '
         f'~/.claude/projects — the "session ran, no transcript" regression. '
         f'Per-session (slug / cwd / start_ts / exit_code / expected_dir / '
-        f'claude_session_id / prompt):',
+        f'claude_session_id / claude_launch_session_id / prompt):',
     ]
     for finding in findings:
         detail_lines.append(
@@ -560,19 +550,17 @@ def _build_escalation_arguments(
             f'start_ts={finding.start_ts}  exit_code={finding.exit_code}  '
             f'expected_dir={finding.expected_dir}  '
             f'claude_session_id={finding.claude_session_id}  '
+            f'claude_launch_session_id={finding.claude_launch_session_id}  '
             f'prompt={finding.prompt_prefix!r}'
         )
     detail_lines.append(
-        'NOTE: a record with a bound claude_session_id is matched exactly — '
-        '<expected_dir>/<claude_session_id>.jsonl must exist. An unbound record '
-        'falls back to prompt-prefix containment (whitespace-normalized) in a '
-        'transcript first user turn under expected_dir, with a slash-command '
-        'expansion de-expanded to its typed form, or to a file-mtime window when '
-        'the prompt is too short to match. Known false-positive class: /clear '
-        're-mints the session id and the registry re-binds to it, so a session '
-        'that exited before writing under the new id is listed here although '
-        'its launch transcript (first user turn = the prompt) may still be in '
-        'expected_dir. Inspect expected_dir before acting.'
+        'NOTE: a record with a bound claude_session_id and/or '
+        'claude_launch_session_id is matched exactly — <expected_dir>/<id>.jsonl '
+        'must exist for at least one of them. An unbound record falls back to '
+        'prompt-prefix containment (whitespace-normalized) in a transcript first '
+        'user turn under expected_dir, with a slash-command expansion '
+        'de-expanded to its typed form, or to a file-mtime window when the '
+        'prompt is too short to match. Inspect expected_dir before acting.'
     )
     if force_persistence_ok is not None:
         verdict = 'present' if force_persistence_ok else 'MISSING'
@@ -580,39 +568,7 @@ def _build_escalation_arguments(
             f'preventer guard (CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 in '
             f'spawn-claude.sh): {verdict}'
         )
-    return {
-        'task_id': f'legibility-transcript-check-{cfg.project_id}',
-        'agent_role': _ESCALATION_AGENT_ROLE,
-        'category': _ESCALATION_CATEGORY,
-        'severity': _ESCALATION_SEVERITY,
-        'summary': summary,
-        'detail': '\n'.join(detail_lines),
-    }
-
-
-def _default_poster(url: str, envelope: dict) -> None:
-    """Post *envelope* to *url* over the MCP streamable-HTTP transport.
-
-    Delegates to ``census_trigger.post_mcp_envelope``, which single-sources
-    the whole transport contract for this subsystem: the required
-    Accept/Content-Type pair, the session handshake, and response-body
-    decoding. Raises on any network/HTTP failure; :func:`post_findings`
-    wraps this best-effort.
-
-    Why this is not a bare POST any more (task 3644): the escalation server
-    is a STATEFUL streamable-HTTP server. A session-less ``tools/call`` is
-    rejected at the transport layer, before the tool ever runs, with
-    ``400 Bad Request`` / ``"Missing session ID"`` -- and with
-    :func:`post_findings` swallowing that best-effort, the transcript-loss
-    alarm never reached anyone. ``post_mcp_envelope`` performs the
-    ``initialize`` -> ``notifications/initialized`` handshake on that 400 and
-    retries once, and decodes the SSE-framed reply that server then sends.
-
-    Keeps returning None and discarding the decoded body: the caller only
-    needs "did it land", and preserving the ``(url, envelope) -> None`` seam
-    signature keeps every injected ``poster=`` in the test suite working.
-    """
-    census_trigger.post_mcp_envelope(url, envelope, timeout=10.0)
+    return summary, '\n'.join(detail_lines)
 
 
 def post_findings(
@@ -620,39 +576,20 @@ def post_findings(
     findings: Sequence[MissingTranscript],
     *,
     force_persistence_ok: bool | None = None,
-    poster=None,
+    poster: alarm.Poster | None = None,
 ) -> bool:
-    """Best-effort ``escalate_info`` POST for the transcript-loss alarm.
-
-    Posts an MCP ``tools/call`` JSON-RPC envelope for tool ``escalate_info``
-    to ``http://localhost:<cfg.escalation_port>/mcp`` (via *poster*, default
-    :func:`_default_poster`). NEVER raises: any failure (poster exception,
-    network error) is logged as a warning and swallowed, returning ``False``
-    — a down escalation server must not mask the finding, since
-    :func:`run_check`'s non-zero exit code is the authoritative loud signal
-    regardless of whether this POST succeeded. Returns ``True`` on a
-    successful post.
-    """
-    poster_fn = poster if poster is not None else _default_poster
-    url = f'http://localhost:{cfg.escalation_port}/mcp'
-    arguments = _build_escalation_arguments(
-        findings, cfg, force_persistence_ok=force_persistence_ok,
+    """Raise the transcript-loss alarm at ERROR; True iff it landed. Never raises."""
+    summary, detail = _findings_message(
+        findings, cfg.project_id, force_persistence_ok=force_persistence_ok,
     )
-    envelope = {
-        'jsonrpc': '2.0',
-        'id': 1,
-        'method': 'tools/call',
-        'params': {'name': _ESCALATION_TOOL_NAME, 'arguments': arguments},
-    }
-    try:
-        poster_fn(url, envelope)
-        return True
-    except Exception as exc:  # noqa: BLE001 - best-effort, never propagate
-        logger.warning(
-            'legibility transcript-check: escalation post failed '
-            '(best-effort, run still exits non-zero): %s', exc,
-        )
-        return False
+    return alarm.raise_alarm(
+        alarm.AlarmProject.of(cfg),
+        alarm.AlarmSource.TRANSCRIPT_CHECK,
+        summary,
+        detail,
+        level=logging.ERROR,
+        poster=poster,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -802,9 +739,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     Mirrors ``nightly.py``'s ``run`` subcommand flags. Exactly one of
     ``--config`` or ``--project-id`` identifies the project. Prints the
     one-line reason (to stderr on a non-zero exit, stdout otherwise) and
-    returns :attr:`CheckResult.exit_code`. Uses the default (real httpx)
-    poster — a down escalation server is swallowed best-effort, the non-zero
-    exit remains the authoritative loud signal.
+    returns :attr:`CheckResult.exit_code`. Uses the alarm's default poster —
+    a down escalation server is swallowed best-effort, the non-zero exit
+    remains the authoritative loud signal.
     """
     parser = argparse.ArgumentParser(
         prog='check_transcript_persistence.py',

@@ -32,13 +32,13 @@ from fused_memory.services.write_journal import WriteJournal
 # ---------------------------------------------------------------------------
 
 
-async def _std_lifecycle(store, tmp_path: Path) -> None:  # noqa: ARG001
+async def _std_lifecycle(store, tmp_path: Path) -> None:
     """Standard initialize() lifecycle used by all stores except SqliteTaskBackend."""
     await store.initialize()
 
 
 async def _backend_lifecycle(store: SqliteTaskBackend, tmp_path: Path) -> None:
-    """SqliteTaskBackend lifecycle: start() then trigger _get_connection via get_tasks()."""
+    """SqliteTaskBackend lifecycle: start() then trigger _get_write_access via get_tasks()."""
     await store.start()
     await store.get_tasks(project_root=str(tmp_path))
 
@@ -74,7 +74,7 @@ _DELEGATION_CASES = [
     ),
     pytest.param(
         'fused_memory.backends.sqlite_task_backend.apply_full_durability_pragmas',
-        lambda tmp: SqliteTaskBackend(),  # noqa: ARG005
+        lambda tmp: SqliteTaskBackend(),
         _backend_lifecycle,
         id='SqliteTaskBackend',
     ),
@@ -116,7 +116,7 @@ async def test_pragma_delegation(
 
 
 class TestSqliteTaskBackendForeignKeysOff:
-    """_get_connection() must explicitly set PRAGMA foreign_keys=OFF after the helper.
+    """_get_write_access() must explicitly set PRAGMA foreign_keys=OFF after the helper.
 
     The assertion is meaningful because we pre-enable foreign_keys=ON via a
     patched ``aiosqlite.connect`` wrapper.  Reading 0 afterwards proves the
@@ -143,8 +143,7 @@ class TestSqliteTaskBackendForeignKeysOff:
             await backend.start()
             project_root = str(tmp_path)
             await backend.get_tasks(project_root=project_root)
-            conn = backend._connections.get(project_root)
-            assert conn is not None
+            conn = backend._write_accesses[project_root].connection
             cursor = await conn.execute('PRAGMA foreign_keys')
             row = await cursor.fetchone()
             assert row is not None

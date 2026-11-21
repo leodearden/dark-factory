@@ -20,17 +20,16 @@ import contextlib
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import (
+from _falkor_index_live import live_backends
+from _fm_falkor_live import (
     FALKOR_HOST,
     FALKOR_PORT,
     await_index_operational,
     falkor_skipif,
-    poll_until,
     unique_graph_name,
 )
+from _fm_polling import poll_until
 from falkordb.asyncio import FalkorDB
-
-from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
 
 TEST_GRAPH: str = unique_graph_name('530_list_indices_integration')
 
@@ -113,7 +112,7 @@ class TestCallDbIndexesOverRoQuery:
         bulk data to widen the window, producing a slow and inherently flaky
         test that blows the module's 15s timeout budget.
 
-        Its durable job is different: ``_fm_helpers.await_index_operational``
+        Its durable job is different: ``_fm_falkor_live.await_index_operational``
         resolves the readiness column BY NAME (``status``) from
         ``result.header`` and matches its value EXACTLY against
         ``'OPERATIONAL'``. If a FalkorDB upgrade renames or reorders that
@@ -159,7 +158,7 @@ class TestCallDbIndexesOverRoQuery:
             assert all(len(col) == 2 for col in result.header), (
                 f'CALL db.indexes() header rows are no longer (type, name) '
                 f'2-tuples (header={result.header!r}); '
-                f'_fm_helpers.await_index_operational reads the column name as '
+                f'_fm_falkor_live.await_index_operational reads the column name as '
                 f'col[1] and can no longer be trusted.'
             )
 
@@ -168,7 +167,7 @@ class TestCallDbIndexesOverRoQuery:
             header_names = [col[1] for col in result.header]
             assert 'status' in header_names, (
                 f'CALL db.indexes() has no "status" column (header={header_names}). '
-                f'_fm_helpers.await_index_operational resolves readiness from this '
+                f'_fm_falkor_live.await_index_operational resolves readiness from this '
                 f'column by name; without it the barrier cannot be trusted.'
             )
             status_idx = header_names.index('status')
@@ -201,7 +200,7 @@ class TestCallDbIndexesOverRoQuery:
             assert observed >= {'OPERATIONAL'}, (
                 f'the index build settled but never reported the exact ready '
                 f'sentinel "OPERATIONAL" (statuses seen={sorted(observed)!r}). '
-                f'_fm_helpers.await_index_operational matches that string exactly '
+                f'_fm_falkor_live.await_index_operational matches that string exactly '
                 f'and fail-closed, so a renamed sentinel turns the barrier into a '
                 f'permanent timeout. Re-verify the barrier against this FalkorDB '
                 f'version and update its predicate.'
@@ -239,13 +238,9 @@ class TestBackendListIndicesLive:
     @pytest.mark.asyncio
     async def test_list_indices_returns_records_live(self, mock_config, live_test_graph):
         """GraphitiBackend.list_indices() parses live FalkorDB index records correctly."""
-        backend = GraphitiBackend(mock_config)
-        # Inject a real driver directly — list_indices only needs _driver, not a full
-        # Graphiti client stack (see _require_driver vs _require_client in graphiti_client.py).
-        # Skip initialize() so the enumeration-based _ensure_indices pass in
-        # GraphitiBackend.initialize() does not build Graphiti indices on the fixture graph.
-        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
-        try:
+        async with live_backends(mock_config) as make:
+            # list_indices never provisions, so no graph needs registering.
+            backend = make(set())
             records = await backend.list_indices(group_id=TEST_GRAPH)
             assert len(records) >= 1
             for rec in records:
@@ -266,5 +261,3 @@ class TestBackendListIndicesLive:
             # is also True, so this works uniformly whether field_val is a list or str).
             field_val = entity_records[0]['field']
             assert 'name' in field_val
-        finally:
-            await backend.close()

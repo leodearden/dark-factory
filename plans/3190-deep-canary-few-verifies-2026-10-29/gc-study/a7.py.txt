@@ -1,0 +1,80 @@
+import re,json,datetime as dt,collections,statistics as st,bisect
+U=dt.timezone.utc
+def T(s): return dt.datetime.fromisoformat(s).astimezone(U)
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+A=json.load(open('a1.json'))
+resets=sorted((T(s),T(e),l) for s,e,l,_ in A['resets'])
+gens=collections.defaultdict(list)
+for t,g,l in A['gens']: gens[l].append((T(t),g))
+EV=collections.defaultdict(list);ROUTE=collections.Counter();RD=[]
+BUILD=('Invoking claude agent','cli_invoke] Command','verify start','Verification failed','acquire_spec_lane: reset','route=recycle','route=reset_in_place_reattach','acquire_warm_lane: route=reuse','_reuse_warm_lane: reused','stole lane','acquire_warm_lane: acquired','release_lane_for_terminal_task')
+for l in open('lane_any.log',errors='replace'):
+    m=re.match(r'^(\S+) ',l);la=re.search(r'_(lane|spec)-\d+',l)
+    if not m or not la or 'Recovery:' in l or 'reconciler' in l: continue
+    if any(b in l for b in BUILD): EV[la.group(0)].append(T(m.group(1)))
+    r=re.search(r'route=(\w+) edge=(\S+)',l)
+    if r: ROUTE[r.group(1)+' '+r.group(2)]+=1
+print(ROUTE.most_common())
+per=collections.defaultdict(list)
+for s,e,l in resets: per[l].append((s,e))
+c=collections.Counter();byl=collections.Counter();tot=collections.Counter()
+for l,v in per.items():
+    ev=sorted(EV[l]);v.sort();gs=sorted(gens[l])
+    def g_at(t):
+        i=bisect.bisect_right([x[0] for x in gs],t);return gs[i-1][1] if i else None
+    for i in range(1,len(v)):
+        a=v[i-1][1];s,e=v[i]
+        h=bisect.bisect_right(ev,s)-bisect.bisect_left(ev,a)
+        c[(bool(h),g_at(a)==g_at(e))]+=1
+        tot[l]+=1
+        byl[l]+= (not h)
+print('(activity, same_gen)',c)
+# SE of Δ
+free=[(T(t),f) for t,f in A['free']];ts=[x[0] for x in free]
+def at(t):
+    i=bisect.bisect_left(ts,t);return free[min(i,len(free)-1)][1]
+noop=[];act=[]
+for l,v in per.items():
+    ev=sorted(EV[l]);v.sort()
+    for i in range(1,len(v)):
+        a=v[i-1][1];s,e=v[i]
+        h=bisect.bisect_right(ev,s)-bisect.bisect_left(ev,a)
+        d=at(e+dt.timedelta(minutes=6))-at(s-dt.timedelta(minutes=1));(act if h else noop).append(d)
+for n,x in (('noop',noop),('active',act)):
+    print(n,'n',len(x),'mean',round(st.mean(x),2),'se',round(st.stdev(x)/len(x)**.5,2),'sum GiB/day',round(sum(x)/5.64))
+# baseline: Δ over a same-size window at arbitrary times
+import random
+random.seed(1);base=[]
+for _ in range(3000):
+    t=free[random.randrange(len(free))][0]
+    base.append(at(t+dt.timedelta(minutes=9))-at(t))
+print('baseline 10-min Δfree mean',round(st.mean(base),2),'p10/p90',round(pct(base,.1)),round(pct(base,.9)))
+# long series worst declines
+rows=[]
+for l in open('samples.log',errors='replace'):
+    m=re.match(r'(\S+) .*pool_free_gib=(\d+)',l)
+    if m: rows.append((T(m.group(1).replace('Z','+00:00')),int(m.group(2))))
+for H in (6,24,48,72):
+    w=dt.timedelta(hours=H);best=(0,None,None);j=0;
+    from collections import deque
+    dq=deque()
+    for i,(t,f) in enumerate(rows):
+        while dq and rows[dq[-1]][1]<=f: dq.pop()
+        dq.append(i)
+        while rows[dq[0]][0]<t-w: dq.popleft()
+        dd=rows[dq[0]][1]-f
+        if dd>best[0]: best=(dd,rows[dq[0]][0],t)
+    print(H,'h worst',best[0],'GiB',best[1].strftime('%m-%d %H:%M'),'->',best[2].strftime('%m-%d %H:%M'))
+print('all-time min',min(rows,key=lambda r:r[1]))
+gn=[];sm=[]
+for l,v in per.items():
+    ev=sorted(EV[l]);v.sort();gs=sorted(gens[l])
+    def g_at(t):
+        i=bisect.bisect_right([x[0] for x in gs],t);return gs[i-1][1] if i else None
+    for i in range(1,len(v)):
+        a=v[i-1][1];s,e=v[i]
+        if bisect.bisect_right(ev,s)-bisect.bisect_left(ev,a): continue
+        d=at(e+dt.timedelta(minutes=6))-at(s-dt.timedelta(minutes=1))
+        (sm if g_at(a)==g_at(e) else gn).append(d)
+print('noop same-gen mean',round(st.mean(sm),2),'se',round(st.stdev(sm)/len(sm)**.5,2),'n',len(sm));print('noop gen-moved mean',round(st.mean(gn),2),'se',round(st.stdev(gn)/len(gn)**.5,2),'n',len(gn))

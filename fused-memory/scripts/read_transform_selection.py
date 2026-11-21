@@ -57,47 +57,14 @@ from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any
 
+from fused_memory.utils.script_loader import load_script
+
 _SCRIPTS_DIR = Path(__file__).resolve().parent
-
-
-def _load_script(name: str) -> Any:
-    """Load a sibling script in ``scripts/`` by path.
-
-    The same mechanism as ``bake_off_storage_shape._load_sibling_script``
-    (:1513), and registered in ``sys.modules`` for the same reason:
-    ``@dataclass`` and other reflection-based decorators look the defining
-    module up there, so a module loaded without registering breaks on the
-    way in.
-
-    It is spelled out here rather than imported from the bake-off only
-    because of the chicken-and-egg — this is the helper that loads the
-    bake-off in the first place.  Once :func:`bake_off` has returned, any
-    FURTHER sibling (``memory_eval_transcript_corpus``, the calibration
-    fixture loader) is loaded through the bake-off's own helper, so the
-    duplication stops at this one bootstrap.
-    """
-    import importlib.util  # noqa: PLC0415
-    import sys  # noqa: PLC0415
-
-    if name in sys.modules:
-        return sys.modules[name]
-    path = _SCRIPTS_DIR / f'{name}.py'
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'cannot load sibling script {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(name, None)
-        raise
-    return module
 
 
 def bake_off() -> Any:
     """``scripts/bake_off_storage_shape.py`` — the measurement library."""
-    return _load_script('bake_off_storage_shape')
+    return load_script(_SCRIPTS_DIR / 'bake_off_storage_shape.py', 'bake_off_storage_shape')
 
 
 # ---------------------------------------------------------------------------
@@ -948,7 +915,7 @@ def load_production_queries(path: str | Path) -> list[ProductionQuery]:
     this is the symmetric half, so the two corpora cannot silently merge in
     either direction.
     """
-    import json  # noqa: PLC0415
+    import json
 
     target = Path(path)
     if not target.exists():
@@ -1452,8 +1419,9 @@ def run_selection(
 # of it was paid for: render BEFORE writing (:2316) so a render failure
 # leaves both files untouched rather than a stale .md beside a fresh .json;
 # `_atomic_write_text` (:2322); `_cell`/`_NO_MEASUREMENT` (:1955/:1824) so a
-# None cannot print as 0.00; `fixture_provenance` (:1844) for the commit
-# stamps.
+# None cannot print as 0.00;
+# `fused-memory/scripts/bake_off_storage_shape.py::fixture_provenance` for the
+# fixture stamps (commit + blob).
 
 from fused_memory.memory_metadata import (  # noqa: E402
     RESERVED_VOCABULARY_KEYS as _LIVE_RESERVED_KEYS,
@@ -1620,7 +1588,7 @@ def build_selection_report(scored: dict[str, Any]) -> dict[str, Any]:
     the live vocabulary set rather than restated as prose constants, so the
     document cannot drift from the code it describes.
     """
-    from dataclasses import asdict  # noqa: PLC0415
+    from dataclasses import asdict
 
     _check_selection_arms(scored)
     arms = {
@@ -2014,7 +1982,7 @@ def write_artifacts(
     if fixture_paths:
         stamped['fixture_provenance'] = bake.fixture_provenance(list(fixture_paths))
     markdown = render_selection_markdown(stamped)
-    import json  # noqa: PLC0415
+    import json
 
     body = json.dumps(stamped, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
     json_target, md_target = Path(json_path), Path(md_path)
@@ -2089,7 +2057,7 @@ def production_query_provenance(
     report is not regenerated, the committed-artifact test says so instead of
     the table quietly describing a corpus that is no longer in the tree.
     """
-    import json  # noqa: PLC0415
+    import json
 
     templates = [
         {
@@ -2215,7 +2183,7 @@ def load_production_fetches(
     and the recorded ``'k'`` is the REQUESTED k, so a 3-deep window scored at
     ``k=5`` is indistinguishable from a full one downstream.
     """
-    import json  # noqa: PLC0415
+    import json
 
     bake = bake_off()
     target = Path(path)
@@ -2309,11 +2277,11 @@ async def fetch_production_rankings(
     * teardown runs in a ``finally``, because the leak that matters is the
       mid-run one.
     """
-    import shutil  # noqa: PLC0415
-    import tempfile  # noqa: PLC0415
+    import shutil
+    import tempfile
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.maintenance._utils import maintenance_service
 
     bake = bake_off()
     search_limit: int = int(bake.DEFAULT_SEARCH_LIMIT if limit is None else limit)
@@ -2333,18 +2301,16 @@ async def fetch_production_rankings(
         openai_provider.api_key = None
     qdrant_url = config.mem0.qdrant_url
     # Resolved HERE, before the first acquisition below — never in the `with`
-    # header further down, where it would sit after `mkdtemp` and after
-    # `MemoryService(...)` but before the `try` that releases them.
-    # `load_cleanup_script()` can raise (`_load_sibling_script` raises
-    # `FixtureError` when the spec cannot be built), and a raise in that one
-    # window leaks the queue directory and skips `close()`.  `run_bake_off`
-    # carries the same hoist for the same reason.
+    # header further down, where it would sit after `mkdtemp` but before the
+    # `try` that releases it.  `load_cleanup_script()` can raise (a sibling
+    # whose body raises on first load propagates out of `load_script`), and a
+    # raise in that one window leaks the queue directory.
+    # `run_bake_off` carries the same hoist for the same reason.
     reaper = bake.load_cleanup_script()
 
     queue_dir = tempfile.mkdtemp(prefix='read-transform-queue-')
     config.queue.data_dir = queue_dir
 
-    memory = MemoryService(config)
     # The in-use lease that stops `scripts/cleanup_test_collections.py` — a
     # 6-hourly cron job — deleting this pass's collection between the seed
     # above and the fetch below.  `collection` sits under
@@ -2363,13 +2329,12 @@ async def fetch_production_rankings(
     with reaper.hold_lease(owner=f'read_transform_selection {bake.worker_suffix()}'):
         try:
             bake.drop_collections([collection], qdrant_url=qdrant_url)
-            await memory.initialize()
-            await bake.seed_arm(memory.mem0, seeded, concurrency=seed_concurrency)
-            fetched = await bake.fetch_arm(
-                memory.mem0, seeded, list(production_queries), [], limit=search_limit,
-            )
+            async with maintenance_service(config=config) as (_, memory):
+                await bake.seed_arm(memory.mem0, seeded, concurrency=seed_concurrency)
+                fetched = await bake.fetch_arm(
+                    memory.mem0, seeded, list(production_queries), [], limit=search_limit,
+                )
         finally:
-            await memory.close()
             bake.drop_collections([collection], qdrant_url=qdrant_url)
             shutil.rmtree(queue_dir, ignore_errors=True)
 
@@ -2394,7 +2359,7 @@ def extend_fetch_cache(path: str | Path, fetched: dict[str, Any]) -> Path:
     for the wrong reason — and would put label-free rows into the block the
     E2 replay treats as its labeled query set.
     """
-    import json  # noqa: PLC0415
+    import json
 
     bake = bake_off()
     target = Path(path)
@@ -2431,19 +2396,13 @@ def score_from_cache(
         expect_limit=e2_k,
         # Sound ONLY because `materialize_selection_arm` is invoked with all
         # defaults just above and hardcodes `DEFAULT_QUERY_SET_PATH`; if that
-        # ever takes an override, this list must follow it.
+        # ever takes an override, these defaults must follow it.
         #
         # The guard covers the E2 half alone.  The production block stores no
         # fixture digests at all (`extend_fetch_cache` writes only the corpus
         # fingerprint, limit, embedder and rankings), so adding them there is
         # a separate change — this is not coverage of that half.
-        expect_fixtures=[
-            bake.DEFAULT_ALPHA_FIXTURE_PATH,
-            bake.DEFAULT_REGISTRY_PATH,
-            bake.DEFAULT_ARM_CLAIMS_PATH,
-            bake.DEFAULT_QUERY_SET_PATH,
-            bake.DEFAULT_DISTRACTOR_SLAB_PATH,
-        ],
+        expect_fixtures=bake.digest_pinned_fixtures(),
     )
     prod_queries = load_production_queries(production_queries)
     prod_hits = load_production_fetches(
@@ -2472,7 +2431,7 @@ def score_from_cache(
 
 
 def build_parser() -> Any:
-    import argparse  # noqa: PLC0415
+    import argparse
 
     parser = argparse.ArgumentParser(
         description=(
@@ -2508,8 +2467,8 @@ def build_parser() -> Any:
 
 
 def main(argv: list[str] | None = None) -> int:
-    import asyncio  # noqa: PLC0415
-    import sys  # noqa: PLC0415
+    import asyncio
+    import sys
 
     args = build_parser().parse_args(argv)
 

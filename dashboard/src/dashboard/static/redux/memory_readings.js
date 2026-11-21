@@ -4,7 +4,8 @@
 //     (dashboard/src/dashboard/data/memory.py::write_queue_datum);
 //   - the window's memory operations, served by /memory-graphs as MEMORY_OPS
 //     (data/write_journal.py::get_memory_ops via redux_api.shape_memory_graphs),
-//     whose totals the server derives so the client never re-counts them.
+//     whose totals and newest_hour_total are served Datums the server derives,
+//     so the client never re-counts them and a dead journal reads as a hole.
 //
 // A PLAIN-JS CLASSIC SCRIPT, NOT A .jsx MODULE, so its decisions are
 // EXECUTABLE: dashboard/tests/js/memory_readings.test.mjs runs them.
@@ -19,8 +20,6 @@
 // header.
 const {
   servedDatum: servedMemoryDatum,
-  plainDatum: plainMemoryDatum,
-  derivedDatum: derivedMemoryDatum,
   datumView: viewOfMemoryDatum,
 } = window.DF_DATUM;
 
@@ -71,9 +70,10 @@ function formatOpsCount(n) {
 }
 
 function opsTotals(data) {
-  return plainMemoryDatum(
+  return servedMemoryDatum(
     (data.MEMORY_OPS || {}).totals,
     MEMORY_GRAPHS_ENDPOINT,
+    'the /memory-graphs payload has no totals Datum',
     memoryReceipts(data),
   );
 }
@@ -91,11 +91,10 @@ function opsTotalText(data) {
 }
 
 function newestHourOps(data) {
-  const hourly = (data.MEMORY_OPS || {}).total || [];
-  return derivedMemoryDatum(
-    hourly.length ? hourly[hourly.length - 1] : null,
+  return servedMemoryDatum(
+    (data.MEMORY_OPS || {}).newest_hour_total,
     MEMORY_GRAPHS_ENDPOINT,
-    'no ops recorded in this window',
+    'the /memory-graphs payload has no newest_hour_total Datum',
     memoryReceipts(data),
   );
 }

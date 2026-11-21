@@ -35,8 +35,8 @@ so a diff touching only THIS file produces a FILE_SCOPED run of exactly this
 file; ``session.items`` would then hold only this module's own items, and the
 guard would pass while checking nothing else — the exact silent-vacuity trap
 this repo refuses (cf. ``test_warm_lane_bash_bucket_placement.py``). A disk
-sweep of ``tests_dir.rglob('*.py')`` reads every file regardless of what a
-given invocation happened to collect.
+sweep of every ``*.py`` under the tests tree reads every file regardless of
+what a given invocation happened to collect.
 
 RESIDUAL GAPS, deliberately out of scope and recorded rather than silently
 omitted:
@@ -61,81 +61,31 @@ the REAL pytest config (``TestMarkerRegistrationDrift``).
 from __future__ import annotations
 
 import ast
+import dataclasses
+import functools
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _orch_helpers import ORCH_PYPROJECT
+from _tree_scan import (
+    ORCHESTRATOR_TESTS,
+    TESTS_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
+from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# This guard sweeps every *.py under orchestrator/tests/ -- 535 files at
-# authorship time -- and ast.parse()s each one; its module-scoped
-# `_real_tree_sweep` fixture measured ~5.6s for ~494 files.
-# This module-level mark is the SINGLE budget for every test here, as
-# test_whole_tree_scan_timeout_guard.py demands of every whole-tree scanner: a
-# MODULE-LEVEL pytestmark is a sound LOWER bound on every collected item, where
-# "some timeout mark somewhere in the file" is only an UPPER bound -- which is
-# why this file is the 12th member of that family rather than an exception to
-# it.  A per-test decorator here would REPLACE the mark, not add to it.
-# WHY that budget, the thread-mode os._exit() cost model it clears, and the
-# guard that ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-
-def _marker_name(element: ast.expr) -> str | None:
-    """The marker name in a ``pytest.mark.NAME`` / ``pytest.mark.NAME(...)`` element.
-
-    Mirrors ``orchestrator.pytest_markers._marker_name`` BY CONSTRUCTION, not
-    by import — see the module docstring's note on the two modules'
-    deliberately opposite fail-safe polarities. Anything else — a bare
-    constant, a local name, an unrelated attribute chain — yields None and is
-    skipped silently, without suppressing its siblings.
-    """
-    if isinstance(element, ast.Call):
-        element = element.func
-    if not isinstance(element, ast.Attribute):
-        return None
-    owner = element.value
-    if (
-        isinstance(owner, ast.Attribute)
-        and owner.attr == 'mark'
-        and isinstance(owner.value, ast.Name)
-        and owner.value.id == 'pytest'
-    ):
-        return element.attr
-    return None
-
-
-def _is_pytestmark_target(node: ast.expr) -> bool:
-    """True iff *node* is the bare name ``pytestmark``."""
-    return isinstance(node, ast.Name) and node.id == 'pytestmark'
-
-
-def _pytestmark_value(statement: ast.stmt) -> ast.expr | None:
-    """The value *statement* binds to ``pytestmark``, else None.
-
-    Covers both the plain ``pytestmark = ...`` and the annotated
-    ``pytestmark: list = ...`` spellings; an annotation with no value binds
-    nothing. Anything other than an ``Assign``/``AnnAssign`` — including
-    every ``ast.expr`` node ``ast.walk`` also yields — falls through to None.
-    """
-    if isinstance(statement, ast.Assign):
-        if any(_is_pytestmark_target(target) for target in statement.targets):
-            return statement.value
-        return None
-    if isinstance(statement, ast.AnnAssign) and _is_pytestmark_target(statement.target):
-        return statement.value
-    return None
-
-
-def _names_from_marker_value(value: ast.expr) -> frozenset[str]:
-    """Accepted value shapes: a bare element, or a list/tuple of elements."""
-    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
-    return frozenset(
-        name for name in (_marker_name(element) for element in elements) if name is not None
-    )
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 
 def _applied_marker_names(source: str) -> frozenset[str]:
@@ -165,19 +115,20 @@ def _applied_marker_names(source: str) -> frozenset[str]:
     being swallowed into an empty set, because a silent empty set here would
     make a drift guard built on top of this silently vacuous.
     """
-    tree = ast.parse(source)
-    names: set[str] = set()
+    return _applied_marker_names_in(ast.parse(source))
+
+
+def _applied_marker_names_in(tree: ast.Module) -> frozenset[str]:
+    """:func:`_applied_marker_names` over an already-parsed module."""
+    elements: list[ast.expr] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            for decorator in node.decorator_list:
-                name = _marker_name(decorator)
-                if name is not None:
-                    names.add(name)
+            elements.extend(node.decorator_list)
         elif isinstance(node, ast.Assign | ast.AnnAssign):
-            value = _pytestmark_value(node)
+            value = pytestmark_value(node)
             if value is not None:
-                names |= _names_from_marker_value(value)
-    return frozenset(names)
+                elements.extend(mark_elements(value))
+    return frozenset(name for name in map(marker_name, elements) if name is not None)
 
 
 def _registered_marker_names(ini_lines: Sequence[str]) -> frozenset[str]:
@@ -192,42 +143,40 @@ def _registered_marker_names(ini_lines: Sequence[str]) -> frozenset[str]:
     return frozenset(line.split(':', 1)[0].split('(', 1)[0].strip() for line in ini_lines)
 
 
+def _module_applied_markers(module: ParsedModule) -> frozenset[str]:
+    return _applied_marker_names_in(module.tree)
+
+
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem, files=ORCHESTRATOR_TESTS, extract=_module_applied_markers,
+)
+TREE_ANALYSES = (ANALYSIS,)
+
+
+def _markers_by_file(facts: Mapping[Path, frozenset[str]], root: Path) -> dict[str, set[str]]:
+    """``{marker_name: {paths relative to *root*}}`` folded from per-file facts."""
+    applied: dict[str, set[str]] = {}
+    for path, names in facts.items():
+        relative = str(path.relative_to(root))
+        for name in names:
+            applied.setdefault(name, set()).add(relative)
+    return applied
+
+
 def _sweep_applied_markers(tests_dir: Path) -> dict[str, set[str]]:
     """``{marker_name: {relative file paths}}`` for EVERY marker applied
     anywhere under *tests_dir* — unfiltered by any notion of "registered".
 
-    Sweeps every ``*.py`` file from DISK (``sorted(tests_dir.rglob('*.py'))``
-    — sorted for deterministic failure messages under xdist), never pytest's
-    own collection, so the result does not depend on what any one invocation
-    happened to collect (see the module docstring's rejected-alternative
-    note). Reported paths are relative to *tests_dir*.
-
-    A file that fails to parse or read (``SyntaxError``/``OSError``) is
-    re-raised as an ``AssertionError`` naming the offending file — never
-    swallowed, never silently skipped, the same loud-on-failure polarity as
-    ``_applied_marker_names`` itself.
-
-    Factored out of ``_unregistered_markers`` (task 3532 amendment pass,
-    reviewer finding: sweeping the real ~494-file tree measured at ~5.6s, and
-    ``TestMarkerRegistrationDrift`` was paying that cost independently in two
-    tests) so callers that need the full applied-marker map — the drift diff
-    and the real-tree non-vacuity check alike — can share ONE pass.
+    Runs this module's own :data:`ANALYSIS` over every ``*.py`` under
+    *tests_dir* from DISK, never pytest's own collection, so the result does
+    not depend on what any one invocation happened to collect (see the module
+    docstring's rejected-alternative note). Reported paths are relative to
+    *tests_dir*. A file that fails to read or parse fails the pass loudly,
+    naming it — never swallowed, never silently skipped, the same
+    loud-on-failure polarity as ``_applied_marker_names`` itself.
     """
-    applied: dict[str, set[str]] = {}
-    for path in sorted(tests_dir.rglob('*.py')):
-        relative = str(path.relative_to(tests_dir))
-        try:
-            names = _applied_marker_names(path.read_text())
-        except (SyntaxError, OSError) as exc:
-            raise AssertionError(
-                f'{relative} could not be read/parsed while sweeping '
-                f'{tests_dir} for applied pytest markers: {exc!r}. Fix the '
-                f'file — a silently-skipped file would make this guard '
-                f'vacuous for it.'
-            ) from exc
-        for name in names:
-            applied.setdefault(name, set()).add(relative)
-    return applied
+    analysis = dataclasses.replace(ANALYSIS, files=functools.partial(python_files, tests_dir))
+    return _markers_by_file(TreePass.run((analysis,)).facts(analysis), tests_dir.resolve())
 
 
 def _unregistered_markers(tests_dir: Path, registered: frozenset[str]) -> dict[str, set[str]]:
@@ -318,15 +267,15 @@ class TestAppliedMarkerNames:
 
     def test_module_level_pytestmark_annotated_assignment(self):
         """``pytestmark: list = [...]`` — the ``AnnAssign``-with-value
-        spelling ``_pytestmark_value``'s own docstring documents but which no
-        prior case here exercised (reviewer finding, task 3532 amendment
-        pass)."""
+        spelling ``shared.pytest_mark_grammar.pytestmark_value``'s docstring
+        documents but which no prior case here exercised (reviewer finding,
+        task 3532 amendment pass)."""
         source = 'import pytest\n\npytestmark: list = [pytest.mark.slow]\n'
         assert _applied_marker_names(source) == frozenset({'slow'})
 
     def test_module_level_pytestmark_bare_annotation_binds_nothing(self):
         """``pytestmark: list`` with NO value binds nothing — the other
-        ``_pytestmark_value``-documented ``AnnAssign`` case with no prior
+        ``pytestmark_value``-documented ``AnnAssign`` case with no prior
         coverage (reviewer finding, task 3532 amendment pass). This is the
         branch that would silently under-sweep if it ever regressed to
         treating a bare annotation as an applied marker.
@@ -416,85 +365,6 @@ class TestAppliedMarkerNames:
             _applied_marker_names('def f(:\n    pass\n')
 
 
-class TestMirrorsPytestMarkersByConstruction:
-    """Cross-checks that ``_marker_name``, ``_is_pytestmark_target`` and
-    ``_pytestmark_value`` above have not silently DRIFTED from
-    ``orchestrator.pytest_markers``' same-named originals they were mirrored
-    from BY CONSTRUCTION rather than by import (module docstring; reviewer
-    finding, task 3532 amendment pass).
-
-    WHY NOT JUST IMPORT THEM, addressing the finding directly: the three
-    functions here ARE pure, polarity-neutral AST-shape predicates — nothing
-    about them raises or swallows — so the module docstring's "opposite
-    fail-safe polarity" rationale genuinely does not cover them; that
-    rationale is about ``_applied_marker_names``/``_unregistered_markers``
-    (loud) versus ``module_level_marker_names`` (swallows ``SyntaxError``
-    into ``frozenset()``) — the SWEEP layer, not this shape-recognition
-    layer. But ``orchestrator.pytest_markers``'s module docstring separately
-    declares "This module's sole consumer is
-    ``verify_plan._derive_module_runs``" (a design decision this task's plan
-    weighed and kept), and even that module's own dedicated test,
-    test_pytest_marker_deselection.py, only ever imports its PUBLIC names
-    (``deselecting_expression_for_targets``, ``module_level_marker_names``,
-    etc.) — never these underscore-prefixed helpers. Importing the private
-    names here for production use would make this file the source module's
-    second real consumer while its docstring still claims one, and updating
-    that claim is outside this task's locked scope (pytest_markers.py is not
-    a file this task holds a lock on). A plain import was therefore not the
-    right fix to land unilaterally in this pass.
-
-    So instead: this class imports the source module's private predicates
-    LOCALLY, inside each test, for comparison ONLY — never for the guard's
-    own operation, which keeps mirroring them by construction as designed —
-    and asserts the two implementations agree on every shape below. This
-    converts the exact risk the finding named (a future fix to the source,
-    e.g. recognising an aliased ``import pytest as _pytest`` — a gap both
-    modules' docstrings already flag — landing there without a matching
-    update here) from a SILENT divergence into a LOUD, immediate test
-    failure, which is the same guarantee an import would have bought,
-    without relocating the "sole consumer" question to a file this task
-    cannot edit.
-    """
-
-    @pytest.mark.parametrize('source_expr', [
-        'pytest.mark.slow',
-        'pytest.mark.timeout(120)',
-        'pytest.mark',
-        'other.mark.thing',
-        'functools.wraps(f)',
-        'pytest.raises',
-    ])
-    def test_marker_name_matches_the_source_module(self, source_expr):
-        from orchestrator.pytest_markers import _marker_name as upstream_marker_name
-
-        element = ast.parse(source_expr, mode='eval').body
-        assert _marker_name(element) == upstream_marker_name(element)
-
-    @pytest.mark.parametrize('name_expr', ['pytestmark', 'not_pytestmark', 'x'])
-    def test_is_pytestmark_target_matches_the_source_module(self, name_expr):
-        from orchestrator.pytest_markers import _is_pytestmark_target as upstream
-
-        node = ast.parse(name_expr, mode='eval').body
-        assert _is_pytestmark_target(node) == upstream(node)
-
-    @pytest.mark.parametrize('source', [
-        'pytestmark = pytest.mark.slow\n',
-        'pytestmark: list = [pytest.mark.slow]\n',
-        'pytestmark: list\n',
-        'x = 1\n',
-        'x: int = 1\n',
-    ])
-    def test_pytestmark_value_matches_the_source_module(self, source):
-        from orchestrator.pytest_markers import _pytestmark_value as upstream
-
-        statement = ast.parse(source).body[0]
-        # Both implementations, given the SAME statement object, either
-        # return None or hand back the identical `statement.value` child —
-        # `is`, not `==`, is the precise check (ast nodes have no structural
-        # equality).
-        assert _pytestmark_value(statement) is upstream(statement)
-
-
 class TestUnregisteredMarkers:
     """``_registered_marker_names`` and ``_unregistered_markers`` — the
     drift-diff half, unit-tested against synthetic ini lines and synthetic
@@ -579,11 +449,10 @@ class TestUnregisteredMarkers:
             _unregistered_markers(tmp_path, frozenset({'slow'}))
 
     def test_an_unreadable_file_fails_loudly_naming_the_file(self, tmp_path: Path):
-        """The ``OSError`` half of the ``except (SyntaxError, OSError)``
-        branch — only the ``SyntaxError`` half had a case before (reviewer
-        finding, task 3532 amendment pass). A dangling symlink triggers
-        ``FileNotFoundError`` (an ``OSError`` subclass) on
-        ``Path.read_text()`` without being root-UID-dependent the way
+        """The ``OSError`` half of loud failure; the ``SyntaxError`` half is
+        the case above (reviewer finding, task 3532 amendment pass). A
+        dangling symlink triggers ``FileNotFoundError`` (an ``OSError``
+        subclass) on read without being root-UID-dependent the way
         ``chmod(0o000)`` would be (a root process can still read a 0o000
         file, so that path wouldn't reliably raise here) — same technique as
         test_merge_liveness.py's
@@ -591,7 +460,7 @@ class TestUnregisteredMarkers:
         """
         broken = tmp_path / 'test_dangling.py'
         broken.symlink_to(tmp_path / 'does-not-exist-target.py')
-        with pytest.raises(AssertionError, match='test_dangling.py'):
+        with pytest.raises(AssertionError, match='test_dangling.py: FileNotFoundError'):
             _unregistered_markers(tmp_path, frozenset({'slow'}))
 
     def test_recurses_into_nested_subdirs_and_ignores_non_py_siblings(self, tmp_path: Path):
@@ -609,13 +478,6 @@ class TestUnregisteredMarkers:
 # ---------------------------------------------------------------------------
 # The wired guard — REAL tests/ tree vs REAL pytest config
 # ---------------------------------------------------------------------------
-
-# Resolved from THIS FILE, never the process CWD: merge-verify runs pytest
-# from the orchestrator/ cwd (orchestrator/orchestrator.yaml) while a plain
-# `pytest orchestrator/tests` runs from the repo root, and this must resolve
-# identically under both. Same idiom as test_warm_lane_bash_bucket_placement.py.
-TESTS_DIR = Path(__file__).resolve().parent
-ORCH_PYPROJECT = Path(__file__).resolve().parents[1] / 'pyproject.toml'
 
 #: A floor, not an equality — 494 measured at authorship time — so adding
 #: test files over time never breaks this guard.
@@ -656,18 +518,9 @@ _PLUGIN_PROVIDED_MARKERS = {
 
 
 @pytest.fixture(scope='module')
-def _real_tree_sweep() -> dict[str, set[str]]:
-    """The one on-disk applied-marker sweep of ``TESTS_DIR``, shared by every
-    test below that needs it.
-
-    Measured at ~5.6s for the ~494 files under orchestrator/tests/;
-    ``test_every_marker_applied_under_tests_is_registered`` and
-    ``test_the_sweep_is_not_vacuous`` used to each perform this independently
-    (~11s combined — uncomfortably close to this suite's 60s per-test
-    timeout under load, per the addopts loadavg note above) (reviewer
-    finding, task 3532 amendment pass).
-    """
-    return _sweep_applied_markers(TESTS_DIR)
+def _real_tree_sweep(tree_pass: TreePass) -> dict[str, set[str]]:
+    """The applied-marker map of ``TESTS_DIR``, projected from the shared tree pass."""
+    return _markers_by_file(tree_pass.facts(ANALYSIS), TESTS_DIR)
 
 
 class TestMarkerRegistrationDrift:
@@ -726,14 +579,16 @@ class TestMarkerRegistrationDrift:
             f'in tests/conftest.py.' + note
         )
 
-    def test_the_sweep_is_not_vacuous(self, _real_tree_sweep: dict[str, set[str]]):
+    def test_the_sweep_is_not_vacuous(
+        self, tree_pass: TreePass, _real_tree_sweep: dict[str, set[str]]
+    ):
         """A broken extractor returning ``frozenset()`` would make the guard
         above pass forever. In the spirit of
         test_warm_lane_bash_bucket_placement.py's live ``--collect-only``
         probe, pin that the sweep actually visits the real tree and actually
         finds markers spanning every extraction path this module supports.
         """
-        files = sorted(TESTS_DIR.rglob('*.py'))
+        files = tree_pass.facts(ANALYSIS)
         assert len(files) >= _MIN_EXPECTED_TEST_FILES, (
             f'only found {len(files)} .py files under {TESTS_DIR}, expected '
             f'at least {_MIN_EXPECTED_TEST_FILES}. The sweep may be looking '

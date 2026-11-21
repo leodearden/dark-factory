@@ -11,6 +11,11 @@ Not a ``conftest.py`` fixture: the interposition takes arguments (which file
 is doomed, and where it goes), so a plain factory is the honest shape;
 ``escalation/tests`` is on ``sys.path`` under pytest's default prepend import
 mode, so a flat import works from both suites.
+
+:func:`concurrently_pruned_rmtree` covers the sibling prune-side race (task
+6662): a dated subdir vanishing between ``archive.prune_archive``'s scan and
+its own rmtree.  ``test_archive.py`` uses it directly, ``test_sweep.py``
+through ``run_startup_sweep``.
 """
 
 from __future__ import annotations
@@ -47,6 +52,26 @@ def relocating_read_text(doomed: Path, dest_dir: Path) -> Callable[..., str]:
         if self == doomed and doomed.exists():
             dest_dir.mkdir(parents=True, exist_ok=True)
             os.replace(str(doomed), str(dest_dir / doomed.name))
+        return original(self, *args, **kwargs)
+
+    return flaky
+
+
+def deleting_read_text(doomed: Path) -> Callable[..., str]:
+    """Interpose ``Path.read_text`` to really delete *doomed* mid-read.
+
+    The deletion counterpart to :func:`relocating_read_text`: the record is
+    genuinely gone rather than moved, so the re-locate/retry in
+    ``queue.py::EscalationQueue.get`` and ``queue.py::EscalationQueue.get_by_task``
+    has nothing to find and must give up cleanly.  The ``doomed.exists()``
+    guard makes it fire exactly once, so the retry's re-read reaches the real
+    ``FileNotFoundError`` rather than a second unlink.
+    """
+    original = Path.read_text
+
+    def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == doomed and doomed.exists():
+            doomed.unlink()
         return original(self, *args, **kwargs)
 
     return flaky
@@ -92,3 +117,28 @@ def pruning_read_text(doomed: Path) -> Callable[..., str]:
         return original(self, *args, **kwargs)
 
     return flaky
+
+
+def concurrently_pruned_rmtree(doomed: Path) -> Callable[..., None]:
+    """Interpose ``shutil.rmtree`` so a concurrent prune removes *doomed* first.
+
+    Models a second startup sweep's pass 3, or a manual
+    ``python -m escalation.archive``, removing the same dated subdir between
+    ``archive.prune_archive``'s scan and its rmtree.  The subdir is really
+    removed with the original rmtree, which is then called through, so the
+    caller's own ``FileNotFoundError`` comes from the filesystem.  The
+    ``doomed.exists()`` guard makes the concurrent removal fire once.
+
+    Usage::
+
+        with patch.object(shutil, 'rmtree', concurrently_pruned_rmtree(doomed)):
+            ...
+    """
+    original = shutil.rmtree
+
+    def racing(path: Any, *args: Any, **kwargs: Any) -> None:
+        if Path(path) == doomed and doomed.exists():
+            original(doomed)
+        return original(path, *args, **kwargs)
+
+    return racing

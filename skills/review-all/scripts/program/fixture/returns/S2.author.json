@@ -1,0 +1,34 @@
+{
+  "schema": "review-all-prd-return/1",
+  "run_id": "review-all-fixture-20261019",
+  "stream": "S2",
+  "pass": "author",
+  "session": {
+    "kind": "agent",
+    "title": "prd:fixture S2"
+  },
+  "prd_path": "plans/review-all-fixture-s2-prd.md",
+  "manifest_path": "plans/review-all-fixture-s2-prd.capability-manifest.md",
+  "sidecar_path": "plans/review-all-fixture-s2-prd.capability-manifest.yaml",
+  "commits": [],
+  "open_questions": [],
+  "rulings_in_session": [],
+  "seam_dependencies": [
+    {
+      "stream": "S1",
+      "contract": "C2"
+    }
+  ],
+  "xrefs": [
+    {
+      "to": "S1",
+      "text": "C2 is delivered by S2 α and releases S1 ζ."
+    }
+  ],
+  "lead_actions": [],
+  "notes": "No open design questions.",
+  "touches": [
+    "src/fixture/beta.py",
+    "src/fixture/seam.py"
+  ]
+}

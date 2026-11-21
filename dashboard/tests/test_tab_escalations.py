@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     assert_script_loads_before,
     extract_df_data_block,
     extract_function_body,
@@ -207,7 +207,7 @@ def test_app_jsx_wires_escalations_tab(app_jsx_body: str) -> None:
         esc_in_toolbar = "esc:" in parts[1] or "'esc'" in parts[1]
     assert esc_in_toolbar, (
         "app.jsx toolbarConfig does not have an 'esc:' entry — add "
-        "`esc: { showWindow: false, showAgents: false, search: false }` to toolbarConfig."
+        "`esc: { showAgents: false, search: false }` to toolbarConfig."
     )
 
 
@@ -432,7 +432,9 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
     (b) sidebar rendered with role="dialog" and an onClose handler / close button.
     (c) sidebar references escalation record fields: detail, suggested_action,
         level, category, severity, agent_role, workflow_state, worktree, resolution.
-    (d) sidebar references linked task card fields: task.title, task.status, task.description.
+    (d) sidebar references linked task card fields task.title and task.status,
+        and does not read task.description: rows carry no prose, so the
+        description comes from the taskProse on-demand read.
     (e) renders the resolved project label.
     (f) the linked task is the row's served task Datum, read through
         escalation_views.js::taskCard, and a card with no measurement renders
@@ -470,11 +472,15 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
         )
 
     # (d) Linked task card fields
-    for field in ('task.title', 'task.status', 'task.description'):
+    for field in ('task.title', 'task.status'):
         assert field in body, (
             f'tab_escalations.jsx detail sidebar does not reference linked task field '
             f'`{field}` — add it to the sidebar linked-task section.'
         )
+    assert 'task.description' not in strip_js_comments(extract_function_body(body, 'EscalationSidebar')), (
+        'EscalationSidebar reads `task.description` off the card, but task rows carry '
+        'no prose — read it through the taskProse on-demand read instead.'
+    )
 
     # (e) Resolved project label
     assert 'row.project' in body, (
@@ -638,14 +644,14 @@ def test_tab_escalations_renders_skipped_queue_files(tab_escalations_jsx_body: s
         'tab_escalations.jsx never reads `skipped_count` — add a global pill beside the '
         'existing `N pending · N L1 · N L2` summary pills.'
     )
-    # Anchored on the `byLevel[2]` identifier (the global pills; the subsection
-    # pips read `secByLevel[2]`, which does not match) and bounded at the next
-    # structural landmark — the subsection map — rather than by a character
-    # count.  The stated contract is "in the controls header, after the
-    # pending/L1/L2 pills and before the subsection groups", which survives a
-    # reformat or a label change; `'L1 · {byLevel[2]'` pinned exact whitespace
-    # and an interpunct.
-    pills_at = body.find('byLevel[2]')
+    # Anchored on the `levelCount(DF, 2)` call (the global L2 pill; the
+    # subsection pips read `secByLevel[2]`, which does not match) and bounded at
+    # the next structural landmark — the subsection map — rather than by a
+    # character count.  The stated contract is "in the controls header, after
+    # the pending/L1/L2 pills and before the subsection groups", which survives
+    # a reformat or a label change; pinning the pill's surrounding text would
+    # pin exact whitespace and an interpunct.
+    pills_at = body.find('levelCount(DF, 2)')
     assert pills_at != -1, 'could not locate the global summary-pill span'
     pills_end = body.find('subsections.map(', pills_at)
     pills_window = body[pills_at:pills_end if pills_end != -1 else len(body)]

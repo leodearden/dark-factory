@@ -16,8 +16,8 @@ Covers:
   step-12 GREEN — built-depth introspection implementation
   step-13 RED   — SpeculativeMergeWorker._probe_verify_placement(item)
   step-14 GREEN — worker placement implementation
-  step-15 RED   — _dispatch_item integration: byte-identical default + probe label
-  step-16 GREEN — _dispatch_item integration + _record_verify_outcome wiring
+  step-15 RED   — VerifyDispatcher.dispatch integration: byte-identical default + probe label
+  step-16 GREEN — VerifyDispatcher.dispatch integration + _record_verify_outcome wiring
 
 GOAL (PHASE-1, sibling of 2340 calibration): let the EXISTING second verify
 slot occasionally target a DEEPER already-built speculative stack (cumulative
@@ -58,7 +58,8 @@ from orchestrator.config import (
     OrchestratorConfig,
     SpeculationProbeConfig,
 )
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     InflightVerifyResult,
@@ -66,7 +67,6 @@ from orchestrator.merge_queue import (
     RealMergeItem,
     SpeculativeMergeWorker,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify_runner import HostLease
 
 # ---------------------------------------------------------------------------
@@ -82,9 +82,8 @@ class TestSpeculationProbeConfigDefaults:
     OrchestratorConfig.speculation_probe field.
     """
 
-    def test_defaults_attached_on_orchestrator_config(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_defaults_attached_on_orchestrator_config(self):
         cfg = OrchestratorConfig()
         assert isinstance(cfg.speculation_probe, SpeculationProbeConfig)
         assert cfg.speculation_probe.probe_fraction == 0.0
@@ -131,13 +130,12 @@ class TestSpeculationProbeConfigValidation:
         cfg = SpeculationProbeConfig(probe_depths=[1, 4, 9])
         assert cfg.probe_depths == [1, 4, 9]
 
-    def test_rejected_at_load_via_orchestrator_config(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_rejected_at_load_via_orchestrator_config(self):
         """Mirrors TestMinInflightFloorValidation.test_rejected_at_load_via_orchestrator_config
         (test_config_psi_admission_reload.py): a nested-dict construction (as
         YAML would deserialize into) must also raise.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError):
             OrchestratorConfig(speculation_probe={'probe_fraction': 1.5})  # type: ignore[arg-type]
 
@@ -180,7 +178,7 @@ class TestSelectProbeDepthByteIdenticalAtZero:
 
     @pytest.mark.parametrize('round_index', list(range(21)))
     def test_zero_fraction_always_none(self, round_index):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=0.0,
@@ -205,7 +203,7 @@ class TestSelectProbeDepthFrequencyAndCycling:
     """
 
     def test_frequency_bounded_and_depths_cycle_in_order(self):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         probe_depths = [2, 3, 5, 8]
         n_rounds = 100
@@ -255,7 +253,7 @@ class TestSelectProbeDepthFrequencyBoundMidRange:
 
     @pytest.mark.parametrize('probe_fraction', [0.3, 0.4, 0.5, 0.7])
     def test_observed_firing_rate_never_exceeds_fraction(self, probe_fraction):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         n_rounds = 1000
         fired = [
@@ -299,7 +297,7 @@ class TestSelectProbeDepthAvailabilityFallback:
     """
 
     def test_insufficient_built_depth_falls_back_to_none(self):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -312,7 +310,7 @@ class TestSelectProbeDepthAvailabilityFallback:
         assert result is None
 
     def test_exactly_sufficient_built_depth_returns_sampled_depth(self):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -325,7 +323,7 @@ class TestSelectProbeDepthAvailabilityFallback:
         assert result == 8
 
     def test_more_than_sufficient_built_depth_returns_sampled_depth(self):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -339,7 +337,7 @@ class TestSelectProbeDepthAvailabilityFallback:
 
     @pytest.mark.parametrize('available_built_depth', [0, 1, 2, 7])
     def test_various_insufficient_depths_fall_back_to_none(self, available_built_depth):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -374,7 +372,7 @@ class TestSelectProbeDepthFlakeSuppression:
     """
 
     def test_high_fail_rate_suppresses_probe(self):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -388,7 +386,7 @@ class TestSelectProbeDepthFlakeSuppression:
 
     def test_fail_rate_exactly_at_threshold_suppresses_probe(self):
         """>= is inclusive of the threshold itself."""
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -401,7 +399,7 @@ class TestSelectProbeDepthFlakeSuppression:
         assert result is None
 
     def test_low_fail_rate_allows_probe(self):
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -417,7 +415,7 @@ class TestSelectProbeDepthFlakeSuppression:
         """No rolling-window data yet (e.g. a freshly started worker) must
         not suppress -- only an observed high fail rate suppresses.
         """
-        from orchestrator.merge_queue import select_probe_depth
+        from orchestrator.merge_lane.worker import select_probe_depth
 
         result = select_probe_depth(
             probe_fraction=1.0,
@@ -806,7 +804,7 @@ class TestProbeVerifyPlacement:
 
     def test_default_config_byte_identical(self):
         """probe_fraction=0.0 (the default) -> None, unconditionally --
-        _dispatch_item's caller falls through to the unchanged
+        VerifyDispatcher.dispatch's caller falls through to the unchanged
         _verify_frontier_depth() path.
         """
         worker = _make_bare_worker()
@@ -915,7 +913,7 @@ class TestProbeVerifyPlacement:
 
 
 # ---------------------------------------------------------------------------
-# step-15 RED / step-16 GREEN: _dispatch_item integration
+# step-15 RED / step-16 GREEN: VerifyDispatcher.dispatch integration
 # ---------------------------------------------------------------------------
 
 
@@ -946,7 +944,7 @@ def _make_dispatch_ready_item(
     """Build a dispatch-ready RealMergeItem with a REAL result Future.
 
     Unlike ``_make_probe_item``'s bare ``MagicMock`` result,
-    ``_dispatch_item``'s ``_request_abandoned()`` guard calls
+    ``VerifyDispatcher.dispatch``'s ``_request_abandoned()`` guard calls
     ``req.result.cancelled()`` -- a MagicMock call is always truthy, which
     would incorrectly short-circuit dispatch down the pre-dispatch-abandon
     path -- so this needs a genuine (never-cancelled) asyncio.Future.
@@ -967,18 +965,18 @@ def _make_dispatch_ready_item(
 
 @pytest.mark.asyncio
 class TestDispatchItemProbeWiring:
-    """_dispatch_item's depth/probe_base computation (task 2359 step-16) --
+    """VerifyDispatcher.dispatch's depth/probe_base computation (task 2359 step-16) --
     proof via a stand-in ``_run_inflight_verify`` capturing its kwargs
     (mirrors test_merge_queue_verify_base_invariant.py's
     TestDispatchRefreshesLastKnownMainSha harness style: a fake local
     HostAllocator + a fully-replaced ``_run_inflight_verify`` -- no real
     verify/runner/event-store machinery needed since this proves ONLY the
-    ``_dispatch_item`` -> ``_run_inflight_verify`` call-site wiring; task
+    ``VerifyDispatcher.dispatch`` -> ``_run_inflight_verify`` call-site wiring; task
     2340's own tests already exhaustively cover depth's forwarding from
     ``_run_inflight_verify`` through to the emitted ``merge_verify`` event).
 
     RED until step-16 GREEN wires ``_probe_verify_placement()`` into
-    ``_dispatch_item`` and adds the ``probe_base`` param to
+    ``VerifyDispatcher.dispatch`` and adds the ``probe_base`` param to
     ``_run_inflight_verify``.
     """
 
@@ -991,7 +989,7 @@ class TestDispatchItemProbeWiring:
 
         captured: dict = {}
 
-        # **_kw absorbs telemetry kwargs _dispatch_item forwards but this
+        # **_kw absorbs telemetry kwargs VerifyDispatcher.dispatch forwards but this
         # test does not assert on (task 3185 added chain_items), so a
         # future additive kwarg cannot break these probe assertions.
         async def _fake_run_inflight_verify(item, lease, depth=None, probe_base=None, **_kw):
@@ -999,15 +997,15 @@ class TestDispatchItemProbeWiring:
             captured['probe_base'] = probe_base
             return InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
 
-        worker._run_inflight_verify = _fake_run_inflight_verify
+        worker.verify_dispatch.run_inflight_verify = _fake_run_inflight_verify
         config = _make_probe_config(probe_fraction=0.0)
         item = _make_dispatch_ready_item(
             config=config, merge_wt=tmp_path, merge_commit='c-dispatch',
         )
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
-        assert entry is not None, 'dispatch should succeed with a free local slot'
+        assert isinstance(entry, InflightEntry), 'dispatch should succeed with a free local slot'
         assert entry.verify_task is not None
         await entry.verify_task
         assert captured['depth'] == 1
@@ -1032,7 +1030,7 @@ class TestDispatchItemProbeWiring:
 
         captured: dict = {}
 
-        # **_kw absorbs telemetry kwargs _dispatch_item forwards but this
+        # **_kw absorbs telemetry kwargs VerifyDispatcher.dispatch forwards but this
         # test does not assert on (task 3185 added chain_items), so a
         # future additive kwarg cannot break these probe assertions.
         async def _fake_run_inflight_verify(item, lease, depth=None, probe_base=None, **_kw):
@@ -1040,15 +1038,15 @@ class TestDispatchItemProbeWiring:
             captured['probe_base'] = probe_base
             return InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
 
-        worker._run_inflight_verify = _fake_run_inflight_verify
+        worker.verify_dispatch.run_inflight_verify = _fake_run_inflight_verify
         config = _make_probe_config(probe_fraction=1.0, probe_depths=[2])
         item = _make_dispatch_ready_item(
             config=config, merge_wt=tmp_path, merge_commit='c-dispatch',
         )
 
-        entry = await worker._dispatch_item(item)
+        entry = await worker.verify_dispatch.dispatch(item)
 
-        assert entry is not None, 'dispatch should succeed with a free local slot'
+        assert isinstance(entry, InflightEntry), 'dispatch should succeed with a free local slot'
         assert entry.verify_task is not None
         await entry.verify_task
         assert captured['depth'] == 2
@@ -1062,13 +1060,13 @@ class TestDispatchItemProbeWiring:
 @pytest.mark.asyncio
 class TestRunInflightVerifyProbeBaseWiring:
     """_run_inflight_verify's new ``probe_base`` parameter (task 2359
-    step-16) overrides the ``main_sha`` fed to ``_run_post_merge_verify``'s
+    step-16) overrides the ``main_sha`` fed to ``run_post_merge_verify``'s
     merge-skew classification metadata -- WITHOUT touching ``item`` itself
     (item.base_sha, hence the frozen-prefix chain, is never mutated).
 
     Mirrors test_merge_queue_depth_telemetry.py's
     TestRunInflightVerifyDepthWiring exactly (same MagicMock git_ops +
-    HostLease(is_local=False) + patched ``_run_post_merge_verify``
+    HostLease(is_local=False) + patched ``run_post_merge_verify``
     capturing kwargs), scoped to the NEW ``probe_base`` -> ``main_sha``
     channel rather than the already-covered ``depth`` channel.
 
@@ -1105,10 +1103,10 @@ class TestRunInflightVerifyProbeBaseWiring:
         worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
 
         with patch(
-            'orchestrator.merge_queue._run_post_merge_verify',
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify',
             _fake_run_post_merge_verify,
         ):
-            await worker._run_inflight_verify(
+            await worker.verify_dispatch.run_inflight_verify(
                 item, lease, depth=2, probe_base='deep-tip-commit',  # RED: no probe_base kwarg yet
             )
 
@@ -1156,9 +1154,9 @@ class TestRunInflightVerifyProbeBaseWiring:
         worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())
 
         with patch(
-            'orchestrator.merge_queue._run_post_merge_verify',
+            'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify',
             _fake_run_post_merge_verify,
         ):
-            await worker._run_inflight_verify(item, lease, depth=1)
+            await worker.verify_dispatch.run_inflight_verify(item, lease, depth=1)
 
         assert captured.get('main_sha') == 'items-own-base-sha'

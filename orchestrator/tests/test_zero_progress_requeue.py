@@ -14,6 +14,8 @@ unresolved incident and auto-resolving when the loop breaks.
 from __future__ import annotations
 
 import pytest
+from _null_task_escalation import submit_null_task_escalation
+from _packaged_defaults import load_packaged_defaults
 
 from orchestrator.workflow import WorkflowOutcome
 
@@ -565,8 +567,7 @@ class TestResolveZeroProgressRequeueAlert:
             escalation_queue=queue, event_store=None, task_id='3068',
             recovered_streak=1, threshold=5, filed_at={},
         ) is False
-        queue.get_by_task.assert_not_called()
-        queue.resolve.assert_not_called()
+        assert queue.method_calls == []
 
     def test_long_streak_checks_disk_even_without_a_memo_entry(self, tmp_path):
         """A PRIOR process may have filed before a restart wiped the memo."""
@@ -608,7 +609,7 @@ class TestResolveZeroProgressRequeueAlert:
             agent_role='someone-else',
             severity='blocking',
             level=1,
-            category='merge_conflict',
+            category='merge_error',
             summary='not ours',
             detail='not ours',
         )
@@ -633,6 +634,7 @@ class TestResolveZeroProgressRequeueAlert:
 
         queue = MagicMock()
         queue.get_by_task.side_effect = RuntimeError('queue wedged')
+        queue.get_pending.side_effect = RuntimeError('queue wedged')
 
         assert _resolve(
             escalation_queue=queue, event_store=None, task_id='3068',
@@ -640,24 +642,359 @@ class TestResolveZeroProgressRequeueAlert:
         ) is False
 
 
+def _role() -> str:
+    from orchestrator.zero_progress_requeue import ZERO_PROGRESS_REQUEUE_ROLE
+
+    return ZERO_PROGRESS_REQUEUE_ROLE
+
+
+def _file_alarm(queue, task_id: str = '3068'):
+    """File the real zero-progress alarm for *task_id* and return the pending record."""
+    assert _emit(**_default_kwargs(queue, None, task_id=task_id)) is True
+    (alarm,) = queue.get_by_task(_sentinel(task_id), status='pending')
+    return alarm
+
+
+def _submit(queue, esc_id: str, *, task_id: str, level: int, members=(),
+            agent_role='escalation-watcher-auto', category='risk_identified',
+            pin_declared_by=()):
+    """Submit a real record — an L2 wrapper when *members* is given."""
+    from escalation.models import Escalation
+
+    esc = Escalation(
+        id=esc_id, task_id=task_id, agent_role=agent_role, severity='blocking',
+        category=category, summary=f'{esc_id} summary', level=level,
+        members=list(members), pin_declared_by=list(pin_declared_by),
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _status(queue, esc_id: str) -> str:
+    record = queue.get(esc_id)
+    assert record is not None, f'{esc_id} vanished'
+    return record.status
+
+
+def _recover(queue, task_id: str = '3068', event_store=None) -> bool:
+    return _resolve(
+        escalation_queue=queue, event_store=event_store, task_id=task_id,
+        recovered_streak=7, threshold=5,
+    )
+
+
+class TestResolveZeroProgressWrappers:
+    """The recovery also discharges L2 wrappers of the alarm, under ANY task id.
+
+    A wrapper is an L2 whose members are zero-progress alarms.  It is
+    discharged by MEMBERSHIP — never by its category or task_id, both chosen by
+    an LLM — and only when none of its members is still pending, so the LAST
+    recovering member-task closes a shared wrapper and none closes another
+    task's live alarm through the cascade.
+    """
+
+    def test_a_sentinel_id_wrapper_is_discharged_whatever_its_category(self, tmp_path):
+        """(a) The server-enforced sentinel shape, under a category an LLM chose."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(
+            queue, 'esc-wrap-1', task_id=_sentinel('3068'), level=2,
+            members=[alarm.id], category='design_concern',
+        )
+
+        assert _recover(queue) is True
+
+        assert _status(queue, alarm.id) == 'resolved'
+        assert _status(queue, wrapper.id) == 'resolved'
+
+    def test_a_real_id_wrapper_is_discharged_with_its_alarm(self, tmp_path):
+        """(b) The pre-guard esc-5469-11 shape: the L2 minted under the REAL task id."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id])
+
+        assert _recover(queue) is True
+
+        assert _status(queue, alarm.id) == 'resolved'
+        assert _status(queue, wrapper.id) == 'resolved'
+
+    def test_the_own_alarm_is_resolved_before_its_wrapper(self, tmp_path):
+        """(c) Attribution stays the detector's, not ``l2-cascade:<id>``."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id])
+
+        _recover(queue)
+
+        for record_id in (alarm.id, wrapper.id):
+            record = queue.get(record_id)
+            assert record is not None
+            assert record.status == 'resolved'
+            assert record.resolved_by == _role(), f'{record_id} lost the detector attribution'
+
+    def test_a_wrapper_outliving_its_operator_resolved_member_is_discharged(
+        self, tmp_path,
+    ):
+        """(d) Nothing pending under the sentinel, yet the wrapper still closes."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id])
+        queue.resolve(alarm.id, 'looked at it', resolved_by='interactive')
+        assert queue.get_by_task(_sentinel('3068'), status='pending') == []
+
+        assert _recover(queue) is True
+
+        assert _status(queue, wrapper.id) == 'resolved'
+
+    def test_a_cross_task_wrapper_waits_for_its_last_member_task(self, tmp_path):
+        """(e) NEGATIVE then POSITIVE: never close a wrapper holding a live alarm."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        mine = _file_alarm(queue, '3068')
+        theirs = _file_alarm(queue, '7000')
+        wrapper = _submit(
+            queue, 'esc-wrap-1', task_id=_sentinel('3068'), level=2,
+            members=[mine.id, theirs.id],
+        )
+
+        _recover(queue, '3068')
+
+        assert _status(queue, wrapper.id) == 'pending'
+        assert queue.get(theirs.id) == theirs, "task 7000's live alarm must be untouched"
+
+        assert _recover(queue, '7000') is True
+
+        assert _status(queue, wrapper.id) == 'resolved'
+
+    def test_a_wrapper_mixing_in_ordinary_work_stays_pending(self, tmp_path):
+        """(f) NEGATIVE: an ordinary member means a human is still deciding something."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        work = _submit(
+            queue, 'esc-3068-2', task_id='3068', level=1, agent_role='implementer',
+        )
+        wrapper = _submit(
+            queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id, work.id],
+        )
+
+        _recover(queue)
+
+        assert _status(queue, wrapper.id) == 'pending'
+        assert _status(queue, work.id) == 'pending'
+
+    def test_a_wrapper_with_no_readable_alarm_member_stays_pending(self, tmp_path):
+        """(g) NEGATIVE: empty members, or a member that resolves to nothing."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _file_alarm(queue)
+        empty = _submit(queue, 'esc-wrap-empty', task_id=_sentinel('3068'), level=2)
+        ghost = _submit(
+            queue, 'esc-3068-11', task_id='3068', level=2, members=['esc-ghost-1'],
+        )
+
+        _recover(queue)
+
+        assert _status(queue, empty.id) == 'pending'
+        assert _status(queue, ghost.id) == 'pending'
+
+    def test_a_wrapper_carrying_a_declared_pin_stays_pending(self, tmp_path):
+        """(h) NEGATIVE: an auto-close never spends a pin someone declared."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(
+            queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id],
+            pin_declared_by=['operator-gate'],
+        )
+
+        _recover(queue)
+
+        assert _status(queue, wrapper.id) == 'pending'
+
+    def test_a_failing_wrapper_pass_keeps_the_own_alarm_resolve(self, tmp_path):
+        """(i) ISOLATION: a member-read fault must not report real work as nothing."""
+        from escalation.queue import EscalationQueue
+
+        class _MemberReadsFail:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def get(self, esc_id):
+                raise RuntimeError('member read failed')
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id])
+
+        assert _recover(_MemberReadsFail(queue)) is True
+
+        assert _status(queue, alarm.id) == 'resolved'
+        assert _status(queue, wrapper.id) == 'pending'
+
+    def test_a_wrapper_mixing_sentinel_classes_stays_pending(self, tmp_path):
+        """(j) NEGATIVE: membership is matched per alarm role, never across classes."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        streak = _submit(
+            queue, 'esc-streak-3068-1', task_id='__recovery_veto_streak__3068',
+            level=1, agent_role='orchestrator-recovery-veto-streak',
+        )
+        queue.resolve(streak.id, 'streak broke', resolved_by='orchestrator-recovery-veto-streak')
+        wrapper = _submit(
+            queue, 'esc-wrap-1', task_id=_sentinel('3068'), level=2,
+            members=[alarm.id, streak.id],
+        )
+
+        _recover(queue)
+
+        assert _status(queue, wrapper.id) == 'pending'
+
+    def test_the_recovery_event_counts_discharged_wrappers(self, tmp_path):
+        """(k) The recovered event reports wrappers beside the own-alarm count."""
+        from _recording_event_store import _RecordingEventStore
+        from escalation.queue import EscalationQueue
+
+        from orchestrator.event_store import EventType
+
+        queue = EscalationQueue(tmp_path)
+        rec = _RecordingEventStore()
+        alarm = _file_alarm(queue)
+        _submit(queue, 'esc-3068-11', task_id='3068', level=2, members=[alarm.id])
+
+        assert _recover(queue, event_store=rec) is True
+
+        (recovered,) = [
+            entry for (etype, entry) in rec.events
+            if etype == EventType.zero_progress_requeue_recovered
+        ]
+        assert recovered['data'] == {'streak': 7, 'resolved': 1, 'wrappers': 1}
+
+
+def _inherit(pending, *, filed_at):
+    from orchestrator.zero_progress_requeue import inherit_zero_progress_alarms
+
+    return inherit_zero_progress_alarms(pending, filed_at=filed_at)
+
+
+class TestInheritZeroProgressAlarms:
+    """A restarted process inherits the alarms its predecessor left pending.
+
+    The tracker and the filed-at memo die with the process; the pending queue
+    does not.  Seeding the memo from it is what lets the resolver's cheap gate
+    open on the inherited task's next progress outcome.
+    """
+
+    def test_a_prior_process_alarm_seeds_the_memo_at_zero(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _file_alarm(queue, '3068')
+        memo: dict[str, int] = {}
+
+        assert _inherit(queue.get_pending(), filed_at=memo) == frozenset({'3068'})
+        assert memo == {'3068': 0}
+
+    def test_the_inherited_alarm_resolves_on_the_first_progress_outcome(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue, '3068')
+        memo: dict[str, int] = {}
+        _inherit(queue.get_pending(), filed_at=memo)
+
+        assert _resolve(
+            escalation_queue=queue, event_store=None, task_id='3068',
+            recovered_streak=0, threshold=5, filed_at=memo,
+        ) is True
+        assert _status(queue, alarm.id) == 'resolved'
+        assert '3068' not in memo
+
+    def test_without_inheritance_the_same_progress_strands_the_alarm(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue, '3068')
+
+        assert _resolve(
+            escalation_queue=queue, event_store=None, task_id='3068',
+            recovered_streak=0, threshold=5, filed_at={},
+        ) is False
+        assert _status(queue, alarm.id) == 'pending'
+
+    def test_a_sentinel_bound_wrapper_is_inherited(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue, '4000')
+        _submit(queue, 'esc-w', task_id=_sentinel('4000'), level=2, members=[alarm.id])
+        queue.resolve(alarm.id, 'looked at it', resolved_by='interactive')
+
+        assert '4000' in _inherit(queue.get_pending(), filed_at={})
+
+    def test_records_of_other_classes_are_ignored(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _submit(queue, 'esc-4001-1', task_id='4001', level=1, agent_role='implementer')
+        _submit(
+            queue, 'esc-streak-4001-1', task_id='__recovery_veto_streak__4001',
+            level=1, agent_role='orchestrator-recovery-veto-streak',
+        )
+        memo: dict[str, int] = {}
+
+        assert _inherit(queue.get_pending(), filed_at=memo) == frozenset()
+        assert memo == {}
+
+    def test_a_null_task_id_record_beside_a_real_alarm_is_skipped(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        submit_null_task_escalation(queue)
+        _file_alarm(queue, '3068')
+        memo: dict[str, int] = {}
+
+        assert _inherit(queue.get_pending(), filed_at=memo) == frozenset({'3068'})
+        assert memo == {'3068': 0}
+
+    def test_a_live_memo_entry_keeps_its_value(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _file_alarm(queue, '3068')
+        memo = {'3068': 7}
+
+        _inherit(queue.get_pending(), filed_at=memo)
+
+        assert memo == {'3068': 7}
+
+
 # ---------------------------------------------------------------------------
 # Part C.3 — the config section
 # ---------------------------------------------------------------------------
 
 
-def _load_package_defaults() -> dict:
-    """Read the shipped defaults.yaml (test_config_merge_deep.py:63-69 idiom)."""
-    import importlib.resources as pkg_resources
-
-    import yaml
-
-    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
-    return yaml.safe_load(defaults_file.read_text())
-
-
 class TestZeroProgressRequeueConfig:
     """The detector must be operator-visible, tunable, and hot-reloadable."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_section_is_registered_on_orchestrator_config(self):
         """OrchestratorConfig exposes zero_progress_requeue with the defaults.
 
@@ -709,7 +1046,7 @@ class TestZeroProgressRequeueConfig:
         STANZA — not the Field(default=...) — is what actually applies.  A
         drifted stanza would silently win.
         """
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'zero_progress_requeue' in defaults, (
             'the shipped defaults.yaml must declare the zero_progress_requeue: '
             'block so the knob is discoverable without reading pydantic source'
@@ -994,8 +1331,7 @@ class TestHarnessZeroProgressWiring:
                 str(i), _report(WorkflowOutcome.DONE, task_id=str(i)), False,
             )
 
-        queue.get_by_task.assert_not_called()
-        queue.has_open_l1.assert_not_called()
+        assert queue.method_calls == []
 
     async def test_run_id_guard_still_short_circuits(self, wired_harness):
         """The _run_id=None no-op hook (relied on by other suites) is preserved."""
@@ -1040,3 +1376,68 @@ class TestHarnessZeroProgressWiring:
 
         assert await wired_harness._apply_retry_cap('3068', _report(), True) is True
         wired_harness.scheduler.record_requeue.assert_called_once()
+
+
+def _recovered_events(harness):
+    from orchestrator.event_store import EventType
+
+    return [
+        entry for (etype, entry) in harness.event_store.events
+        if etype == EventType.zero_progress_requeue_recovered
+    ]
+
+
+@pytest.mark.asyncio
+class TestHarnessZeroProgressAlarmSurvivesRestart:
+    """The fixture harness is the RESTARTED process: its tracker and memo are
+    empty, and the prior process's alarm exists only on the queue."""
+
+    @pytest.fixture
+    def restarted(self, wired_harness):
+        _file_alarm(wired_harness._escalation_queue, '3068')
+        wired_harness._inherit_pending_streak_alarms()
+        return wired_harness
+
+    async def test_the_first_done_resolves_the_inherited_alarm(self, restarted):
+        await restarted._apply_retry_cap('3068', _report(WorkflowOutcome.DONE), False)
+
+        assert _alerts(restarted) == []
+        assert len(_recovered_events(restarted)) == 1
+
+        for _ in range(3):
+            await restarted._apply_retry_cap('3068', _report(), True)
+        assert len(_alerts(restarted)) == 1, 'the detector must re-arm'
+
+    async def test_a_requeue_that_invoked_an_agent_resolves_it(self, restarted):
+        await restarted._apply_retry_cap('3068', _report(agent_invocations=1), True)
+
+        assert _alerts(restarted) == []
+
+    async def test_a_task_still_looping_keeps_exactly_one_alarm(self, restarted):
+        for _ in range(5):
+            await restarted._apply_retry_cap('3068', _report(), True)
+
+        assert len(_alerts(restarted)) == 1
+
+    async def test_progress_after_a_below_threshold_loop_resolves_it(self, restarted):
+        """Two requeues are below the threshold of 3, so this process's own
+        streak cannot open the resolver's gate; only the inherited memo can."""
+        for _ in range(2):
+            await restarted._apply_retry_cap('3068', _report(), True)
+
+        await restarted._apply_retry_cap('3068', _report(WorkflowOutcome.DONE), False)
+
+        assert _alerts(restarted) == []
+
+    async def test_a_null_task_id_record_does_not_stop_the_inheritance(
+        self, wired_harness,
+    ):
+        queue = wired_harness._escalation_queue
+        null_record = submit_null_task_escalation(queue)
+        _file_alarm(queue, '3068')
+        wired_harness._inherit_pending_streak_alarms()
+
+        await wired_harness._apply_retry_cap('3068', _report(WorkflowOutcome.DONE), False)
+
+        assert _alerts(wired_harness) == []
+        assert _status(queue, null_record.id) == 'pending'

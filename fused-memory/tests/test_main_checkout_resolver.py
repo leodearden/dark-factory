@@ -7,9 +7,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.models import scope
 from fused_memory.models.scope import resolve_main_checkout
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest.fixture(autouse=True)

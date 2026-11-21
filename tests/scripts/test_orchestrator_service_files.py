@@ -9,7 +9,8 @@ required.  Every suite here takes a .service / .timer template as its SUBJECT:
      - scripts/orchestrator-watchdog.service
      - scripts/orchestrator-watchdog.timer
      - every scripts/orchestrator-*.service, via ALL_ORCHESTRATOR_SERVICE_FILES
-       (ORCH_UNIT self-identification; canonical --config filename)
+       (ORCH_UNIT self-identification; canonical --config filename; the
+       StartLimit cap, which also covers the factory-init reference unit)
 
 WHAT LEFT, AND WHY (task 3746).  Two further suites lived here until this
 module reached ~1300 lines: scripts/setup-host.sh installer coverage and
@@ -25,15 +26,16 @@ That split was gated on a helper extraction this docstring previously called
 tests/scripts/systemd_unit_invariants.py, because the split leaves a consumer
 on both sides of each.  They are imported back below under their public names.
 
-Extraction state of the rest is unchanged.  CANONICAL_CONFIG_BASENAME,
-MalformedExecStart and the ``--config`` token scan live in
-systemd_unit_invariants.py (task 3773), a second consumer having hand-copied
-them (tests/scripts/test_know_live_installed_unit_parity.py) and drifted.
-``_exec_start_line`` did NOT move — it still has exactly one consumer, and
-this directory's lift trigger is a second consumer, not proximity.
+Extraction state of the rest.  CANONICAL_CONFIG_BASENAME, MalformedExecStart
+and the ``--config`` token scan live in systemd_unit_invariants.py (task
+3773), a second consumer having hand-copied them
+(tests/scripts/test_know_live_installed_unit_parity.py) and drifted.  So does
+``logical_exec_start``, which locates the effective ExecStart= command; this
+module's fixture-string section owns its negative cases.
 ``shell_statements`` had already moved to the sibling setup_host_parsing.py
-for the same reason; it is no longer imported here at all, having left with
-the installer suite that was its only consumer in this module.
+for the same second-consumer reason; it is no longer imported here at all,
+having left with the installer suite that was its only consumer in this
+module.
 
 tests/scripts/test_orchestrator_watchdog.py's ``_unit_sections`` was the
 third hand-copy of the section parse; task 3913 retired it, and that module
@@ -48,8 +50,13 @@ See also:
 """
 
 import pathlib
+import re
 
 import pytest
+from orchestrator_projects import scan_units
+from shared.cgroup_slice import DAEMON_SUBGROUP, project_slice_name
+from shared.project_id import project_id_for_root
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Shared with tests/scripts/test_know_live_installed_unit_parity.py, which had
 # hand-copied the ExecStart parsers from this module and drifted; task 3773
@@ -58,19 +65,24 @@ import pytest
 # ALL_ORCHESTRATOR_SERVICE_FILES joined them under task 3746, when the
 # installer and operator-doc suites moved to
 # tests/scripts/test_setup_host_unit_installation.py and left a consumer on
-# BOTH sides of them.  Importable by name only because
-# tests/scripts/conftest.py puts this directory on sys.path, which pytest's
-# --import-mode=importlib deliberately does not.
+# BOTH sides of them.  logical_exec_start joined them when this module's
+# ExecStart= locator and two sibling copies became one.  Importable by name
+# only because tests/scripts/conftest.py puts this directory on sys.path,
+# which pytest's --import-mode=importlib deliberately does not.
 # Imported UNALIASED: the sibling modules import these under exactly these
 # public names, and a private alias here would obscure that they are one
 # definition rather than several.
 from systemd_unit_invariants import (
     ALL_ORCHESTRATOR_SERVICE_FILES,
     CANONICAL_CONFIG_BASENAME,
+    FACTORY_INIT_REFERENCE,
     MalformedExecStart,
     config_arg_from_exec_start,
+    logical_exec_start,
     parse_sections,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_SERVICE = REPO_ROOT / "scripts" / "orchestrator-dark-factory.service"
@@ -78,6 +90,9 @@ REIFY_SERVICE = REPO_ROOT / "scripts" / "orchestrator-reify.service"
 AUTOPILOT_SERVICE = REPO_ROOT / "scripts" / "orchestrator-autopilot-video.service"
 WATCHDOG_SERVICE = REPO_ROOT / "scripts" / "orchestrator-watchdog.service"
 WATCHDOG_TIMER = REPO_ROOT / "scripts" / "orchestrator-watchdog.timer"
+
+# The restart-rate cap every supervised orchestrator unit declares under [Unit].
+EXPECTED_START_LIMIT = ("StartLimitIntervalSec=1800", "StartLimitBurst=10")
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +160,6 @@ def test_dark_factory_orchestrator_service_structure() -> None:
     # VALUE; the relational cap-implies-steps invariant is enforced fleet-wide
     # in tests/scripts/test_systemd_restart_backoff.py.
     assert "RestartSteps=4" in content
-    assert "StartLimitIntervalSec=600" in content
-    assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content
     # TimeoutStartSec must exceed the ExecStartPre poll budget (280s) so a slow
     # fused-memory cold-start is covered by ONE start attempt rather than
@@ -224,8 +237,6 @@ def test_reify_orchestrator_service_structure() -> None:
     # VALUE; the relational cap-implies-steps invariant is enforced fleet-wide
     # in tests/scripts/test_systemd_restart_backoff.py.
     assert "RestartSteps=4" in content
-    assert "StartLimitIntervalSec=600" in content
-    assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content
     assert "TimeoutStartSec=300" in content
     assert "StandardOutput=journal" in content
@@ -316,6 +327,9 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     # After=/Requires= referencing the unit), masking real structural drift.
     expected_df_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-dark-factory.service"
     expected_reify_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-reify.service"
+    # Each unit also runs under its OWN project slice, matched exactly the same way.
+    expected_df_slice_line = f"Slice={project_slice_name('dark_factory')}"
+    expected_reify_slice_line = f"Slice={project_slice_name('reify')}"
 
     # Each unit also Wants=/After= and (in [Install]) Also= its OWN
     # `orchestrator-<project>.socket` (escalation socket activation), so every
@@ -336,6 +350,8 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
             and rl.strip() == expected_reify_orch_unit_line
         ):
             continue
+        if dl.strip() == expected_df_slice_line and rl.strip() == expected_reify_slice_line:
+            continue
         if df_socket in dl and dl.replace(df_socket, reify_socket) == rl:
             continue
         df_ok = any(frag in dl for frag in allowed_df_fragments)
@@ -345,7 +361,7 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
 
     assert not unexpected, (
         "Unexpected differences between df and reify service files "
-        "(only Description, --config path, and ORCH_UNIT should differ):\n"
+        "(only Description, --config path, ORCH_UNIT and Slice should differ):\n"
         + "\n".join(f"  line {n}:\n    df:    {d!r}\n    reify: {r!r}" for n, d, r in unexpected)
     )
 
@@ -400,8 +416,6 @@ def test_autopilot_video_service_exists_and_structure() -> None:
         in content
     ), "ExecStart must invoke the orchestrator with the autopilot-video config, no-sync"
     assert "Restart=on-failure" in content
-    assert "StartLimitIntervalSec=600" in content
-    assert "StartLimitBurst=10" in content
     assert "TimeoutStopSec=90" in content
     assert "TimeoutStartSec=300" in content
     assert "StandardOutput=journal" in content
@@ -409,17 +423,6 @@ def test_autopilot_video_service_exists_and_structure() -> None:
 
     # --- [Install] ---
     assert "WantedBy=default.target" in content
-
-
-def test_autopilot_video_start_limit_directives_under_unit_section() -> None:
-    """StartLimit directives must be under [Unit], not [Service] (systemd >=230)."""
-    sections = parse_sections(AUTOPILOT_SERVICE.read_text(encoding="utf-8"))
-    unit_text = "\n".join(sections.get("Unit", []))
-    service_text = "\n".join(sections.get("Service", []))
-    assert "StartLimitIntervalSec=600" in unit_text
-    assert "StartLimitBurst=10" in unit_text
-    assert "StartLimitIntervalSec" not in service_text
-    assert "StartLimitBurst" not in service_text
 
 
 # ---------------------------------------------------------------------------
@@ -506,24 +509,58 @@ def test_watchdog_service_structure() -> None:
 # StartLimit directives must live in [Unit], not [Service]
 # ---------------------------------------------------------------------------
 
+# Every supervised orchestrator unit, plus the factory-init reference new ones
+# are copied from.  orchestrator-watchdog.service is a oneshot probe with no
+# restart loop for a StartLimit cap to bound.
+_START_LIMITED_UNITS = [
+    *(path for path in ALL_ORCHESTRATOR_SERVICE_FILES if path != WATCHDOG_SERVICE),
+    REPO_ROOT / FACTORY_INIT_REFERENCE,
+]
 
-@pytest.mark.parametrize(
-    "service_path",
-    [
-        pytest.param(
-            REPO_ROOT / "scripts" / "orchestrator-dark-factory.service",
-            id="orchestrator-dark-factory",
-        ),
-        pytest.param(
-            REPO_ROOT / "scripts" / "orchestrator-reify.service",
-            id="orchestrator-reify",
-        ),
-    ],
-)
-def test_start_limit_directives_under_unit_section(
-    service_path: pathlib.Path,
-) -> None:
-    """StartLimitIntervalSec and StartLimitBurst must be in [Unit], NOT [Service].
+_INI_FENCE = re.compile(r"^```ini\n(.*?)^```", re.DOTALL | re.MULTILINE)
+
+
+def _service_unit_text(path: pathlib.Path) -> str:
+    """The service unit *path* declares: the file itself, or a reference doc's service block.
+
+    The factory-init reference fences two units, the service and then its
+    socket.  Parsing the whole document would let the socket's [Unit] header
+    replace the service's, so only the one ``ini`` block with a [Service]
+    section is returned.
+    """
+    content = path.read_text(encoding="utf-8")
+    if path.suffix != ".md":
+        return content
+    service_blocks = [
+        block for block in _INI_FENCE.findall(content) if "[Service]" in block.splitlines()
+    ]
+    assert len(service_blocks) == 1, (
+        f"{path.name} must fence exactly one ```ini service unit, found {len(service_blocks)}"
+    )
+    return service_blocks[0]
+
+
+def _directives(section_lines: list[str]) -> list[str]:
+    return [
+        line.strip()
+        for line in section_lines
+        if line.strip() and not line.lstrip().startswith(("#", ";"))
+    ]
+
+
+def _unit_fixture(*service_lines: str) -> str:
+    """A minimal [Service]-shaped unit carrying *service_lines*.
+
+    Shared by the ExecStart parser tests and the cgroup-placement predicate
+    tests below; each asserts only on the lines it passes in.
+    """
+    body = "\n".join(service_lines)
+    return f"[Unit]\nDescription=Fixture\n\n[Service]\nType=simple\n{body}\n"
+
+
+@pytest.mark.parametrize("unit_path", _START_LIMITED_UNITS, ids=lambda p: p.name)
+def test_start_limit_directives_under_unit_section(unit_path: pathlib.Path) -> None:
+    """EXPECTED_START_LIMIT must be declared in [Unit], and no StartLimit key in [Service].
 
     Since systemd v230 these directives are only honoured under [Unit].
     Under [Service] systemd 255 (the target host) treats them as unknown keys
@@ -531,28 +568,17 @@ def test_start_limit_directives_under_unit_section(
     allow an unbounded 10s restart loop — especially dangerous when combined
     with the watchdog.
     """
-    content = service_path.read_text(encoding="utf-8")
-    sections = parse_sections(content)
+    sections = parse_sections(_service_unit_text(unit_path))
+    unit_directives = _directives(sections.get("Unit", []))
+    service_directives = _directives(sections.get("Service", []))
 
-    unit_text = "\n".join(sections.get("Unit", []))
-    service_text = "\n".join(sections.get("Service", []))
+    missing = [d for d in EXPECTED_START_LIMIT if d not in unit_directives]
+    assert not missing, f"{unit_path.name} must declare {missing} under [Unit]"
 
-    # Must be present in [Unit]
-    assert "StartLimitIntervalSec=600" in unit_text, (
-        f"StartLimitIntervalSec=600 must be under [Unit] in {service_path.name}"
-    )
-    assert "StartLimitBurst=10" in unit_text, (
-        f"StartLimitBurst=10 must be under [Unit] in {service_path.name}"
-    )
-
-    # Must NOT appear in [Service] (where systemd 255 ignores them)
-    assert "StartLimitIntervalSec" not in service_text, (
-        f"StartLimitIntervalSec must NOT be under [Service] in {service_path.name} "
-        "(systemd >=230 only honours it under [Unit])"
-    )
-    assert "StartLimitBurst" not in service_text, (
-        f"StartLimitBurst must NOT be under [Service] in {service_path.name} "
-        "(systemd >=230 only honours it under [Unit])"
+    misplaced = [d for d in service_directives if d.startswith("StartLimit")]
+    assert not misplaced, (
+        f"{unit_path.name} declares {misplaced} under [Service], where systemd "
+        ">=230 silently ignores them; they belong under [Unit]"
     )
 
 
@@ -577,12 +603,13 @@ _EXPECTED_ORCHESTRATOR_SERVICE_BASENAMES = {
     "orchestrator-autopilot-video.service",
     "orchestrator-know-live.service",
     "orchestrator-pump-web-ui.service",
+    "orchestrator-stream-touch.service",
     "orchestrator-watchdog.service",
 }
 
 
 def test_orchestrator_service_glob_covers_all_known_units() -> None:
-    """Coverage guard: the glob must be non-empty and include all eight known units.
+    """Coverage guard: the glob must be non-empty and include all nine known units.
 
     A wrong CWD or other glob mishap would silently shrink the parametrized
     ORCH_UNIT lint below to zero cases — a zero-case parametrize collects no
@@ -623,102 +650,186 @@ def test_orchestrator_service_sets_own_orch_unit(
 
 
 # ---------------------------------------------------------------------------
-# Canonical orchestrator-config filename (task 3641; completes task 3512's sweep)
+# Per-project cgroup slice (task 3394; contract docs/cgroup-slice-topology.md)
 #
-# CANONICAL_CONFIG_BASENAME, MalformedExecStart and the token scan itself are
-# imported from tests/scripts/systemd_unit_invariants.py, where the parse
-# contract is stated once (config_arg_from_exec_start). What stays here is the
-# FILE-CONTENT half: finding the effective ExecStart= line, which has exactly
-# one consumer and so did not meet this directory's lift trigger.
+# Each project unit runs under the slice the shared name rule gives the project
+# its --config names. The project roots come from scan_units, the same
+# ExecStart --config reader the restart tooling uses.
 # ---------------------------------------------------------------------------
 
+_PROJECT_UNIT_SCAN = scan_units(REPO_ROOT / "scripts")
+_PROJECT_UNIT_ROOTS = {
+    unit: root for root, units in _PROJECT_UNIT_SCAN.roots.items() for unit in units
+}
 
-def _exec_start_line(content: str, unit_name: str = "<unit>") -> str:
-    """The unit's EFFECTIVE ExecStart= line, stripped.  Raises if it has none.
 
-    LAST occurrence wins, matching systemd itself and
-    systemd_unit_invariants.restart_directive — which is what the sibling
-    parity module feeds the shared scan from, so a first-match read here would
-    have the two layers disagreeing about the same unit.  A drop-in override
-    lands as an empty ``ExecStart=`` list RESET followed by the real command;
-    reading the reset line would find no ``--config`` token and answer None,
-    i.e. silently skip a unit whose real command may well be wrong — the exact
-    direction the shared parser's contract refuses (see
-    systemd_unit_invariants.config_arg_from_exec_start).  An effective
-    ExecStart= with no command after the ``=`` raises for that same reason
-    instead of degrading to that None.
+def test_slice_scan_covers_every_project_unit() -> None:
+    """Every non-watchdog unit has a scanned project root, so none passes vacuously."""
+    assert _PROJECT_UNIT_SCAN.problems == ()
+    project_units = {
+        p.name for p in ALL_ORCHESTRATOR_SERVICE_FILES if p != WATCHDOG_SERVICE
+    }
+    assert set(_PROJECT_UNIT_ROOTS) == project_units
 
-    Lines are stripped before matching because systemd permits leading
-    whitespace on a directive; the trailing ``=`` in the prefix is what keeps
-    ExecStartPre= out of the match.
-    """
-    exec_lines = [
-        stripped
-        for ln in content.splitlines()
-        if (stripped := ln.strip()).startswith("ExecStart=")
-    ]
-    if not exec_lines:
-        raise MalformedExecStart(
-            f"{unit_name} declares no ExecStart= line. Every orchestrator unit "
-            "must have one — systemd refuses to start a Type=simple service "
-            "without it. Treating this as 'takes no --config' would silently "
-            "skip the unit out of the canonical-config-filename guard below."
+
+@pytest.mark.parametrize("unit_name", sorted(_PROJECT_UNIT_ROOTS))
+def test_project_unit_runs_under_its_project_slice(unit_name: str) -> None:
+    service = parse_sections(
+        (REPO_ROOT / "scripts" / unit_name).read_text(encoding="utf-8")
+    )["Service"]
+    slices = [line.removeprefix("Slice=") for line in service if line.startswith("Slice=")]
+    expected = project_slice_name(project_id_for_root(_PROJECT_UNIT_ROOTS[unit_name]))
+    assert slices == [expected]
+
+
+# ---------------------------------------------------------------------------
+# Memory-only delegation, started in the daemon subgroup (task 10460; contract
+# docs/cgroup-slice-topology.md, plans/per-consumer-resource-recording-prd.md
+# D9/D10)
+#
+# A unit under its project slice also delegates the memory controller and
+# starts its process tree in the daemon subgroup; a unit outside any slice
+# carries none of the three. No unit delegates cpu.
+# ---------------------------------------------------------------------------
+
+_DELEGATE_MEMORY = "Delegate=memory"
+_DELEGATE_SUBGROUP = f"DelegateSubgroup={DAEMON_SUBGROUP}"
+_SYSTEMD_BOOLEAN_TRUE = frozenset({"1", "yes", "y", "true", "t", "on"})
+
+
+def _delegates_cpu(value: str) -> bool:
+    """Whether a Delegate= value hands the cpu controller over; boolean true hands over all."""
+    return value.strip().lower() in _SYSTEMD_BOOLEAN_TRUE or "cpu" in value.split()
+
+
+def _cgroup_placement_problems(service_directives: list[str]) -> list[str]:
+    found = {
+        "Slice=": any(d.startswith("Slice=") for d in service_directives),
+        _DELEGATE_MEMORY: _DELEGATE_MEMORY in service_directives,
+        _DELEGATE_SUBGROUP: _DELEGATE_SUBGROUP in service_directives,
+    }
+    problems = []
+    if len(set(found.values())) > 1:
+        present = ", ".join(name for name, is_present in found.items() if is_present)
+        problems.append(
+            f"Slice=, {_DELEGATE_MEMORY} and {_DELEGATE_SUBGROUP} must appear all three "
+            f"or none; present: {present}"
         )
-    exec_line = exec_lines[-1]
-    if not exec_line.partition("=")[2].strip():
-        raise MalformedExecStart(
-            f"{unit_name}'s effective ExecStart= carries no command "
-            f"({exec_line!r}): the last assignment is a list RESET with nothing "
-            "appended after it, so systemd has no command to run at all. "
-            "Treating this as 'takes no --config' would silently skip a unit "
-            "that cannot start."
-        )
-    return exec_line
+    problems.extend(
+        f"{d} delegates the cpu controller, which no orchestrator unit may"
+        for d in service_directives
+        if d.startswith("Delegate=") and _delegates_cpu(d.removeprefix("Delegate="))
+    )
+    return problems
+
+
+_ALL_THREE = ("Slice=df-x.slice", _DELEGATE_MEMORY, _DELEGATE_SUBGROUP)
+
+
+@pytest.mark.parametrize(
+    "service_lines",
+    [pytest.param((), id="none-of-the-three"), pytest.param(_ALL_THREE, id="all-three")],
+)
+def test_cgroup_placement_accepts_all_three_or_none(service_lines: tuple[str, ...]) -> None:
+    service = _directives(parse_sections(_unit_fixture(*service_lines))["Service"])
+    assert _cgroup_placement_problems(service) == []
+
+
+@pytest.mark.parametrize(
+    ("service_lines", "named"),
+    [
+        pytest.param(("Slice=df-x.slice",), "present: Slice=", id="slice-alone"),
+        pytest.param(
+            ("Slice=df-x.slice", _DELEGATE_MEMORY),
+            f"present: Slice=, {_DELEGATE_MEMORY}",
+            id="slice-and-delegation-without-subgroup",
+        ),
+        pytest.param(
+            (_DELEGATE_MEMORY, _DELEGATE_SUBGROUP),
+            f"present: {_DELEGATE_MEMORY}, {_DELEGATE_SUBGROUP}",
+            id="delegation-without-slice",
+        ),
+        pytest.param(
+            ("Slice=df-x.slice", "Delegate=yes", _DELEGATE_SUBGROUP),
+            "Delegate=yes delegates the cpu controller",
+            id="boolean-true-delegates-cpu",
+        ),
+        pytest.param(
+            ("Slice=df-x.slice", "Delegate=memory cpu", _DELEGATE_SUBGROUP),
+            "Delegate=memory cpu delegates the cpu controller",
+            id="controller-list-names-cpu",
+        ),
+    ],
+)
+def test_cgroup_placement_problems_name_what_is_wrong(
+    service_lines: tuple[str, ...], named: str
+) -> None:
+    service = _directives(parse_sections(_unit_fixture(*service_lines))["Service"])
+    problems = _cgroup_placement_problems(service)
+    assert any(named in problem for problem in problems), problems
+
+
+@pytest.mark.parametrize(
+    "unit_path",
+    [*ALL_ORCHESTRATOR_SERVICE_FILES, REPO_ROOT / FACTORY_INIT_REFERENCE],
+    ids=lambda p: p.name,
+)
+def test_unit_carries_slice_and_memory_delegation_together_or_not_at_all(
+    unit_path: pathlib.Path,
+) -> None:
+    service = _directives(parse_sections(_service_unit_text(unit_path))["Service"])
+    assert _cgroup_placement_problems(service) == []
+
+
+# ---------------------------------------------------------------------------
+# Canonical orchestrator-config filename (task 3641; completes task 3512's sweep)
+#
+# CANONICAL_CONFIG_BASENAME, MalformedExecStart, the token scan and the
+# FILE-CONTENT half — locating the effective ExecStart= command
+# (logical_exec_start) — are all imported from
+# tests/scripts/systemd_unit_invariants.py, where the parse contract is stated
+# once (config_arg_from_exec_start).
+# ---------------------------------------------------------------------------
 
 
 def _exec_start_config_arg(content: str, unit_name: str = "<unit>") -> str | None:
     """Return the `--config` argument of the unit's ExecStart=, or None if absent.
 
-    This wrapper owns only the locating half — the effective ExecStart= line
-    inside unit FILE CONTENT (``_exec_start_line`` above).  When None comes
-    back and when MalformedExecStart is raised is the contract of
-    systemd_unit_invariants.config_arg_from_exec_start, stated there once.
+    Composes the two shared halves: logical_exec_start locates the effective
+    command inside unit FILE CONTENT, and config_arg_from_exec_start scans it.
+    When None comes back and when MalformedExecStart is raised is the latter's
+    contract, stated there once.
 
     The sibling parity module hands that same scan an already-extracted value
     instead (a ``restart_directive`` result, or a ``systemctl show`` ``argv[]``
-    segment); the scan is prefix-agnostic, so both shapes reach it without
-    either side normalising first.
+    segment); the scan is prefix-agnostic, so every shape reaches it without
+    normalising first.
     """
-    return config_arg_from_exec_start(_exec_start_line(content, unit_name), unit_name)
+    return config_arg_from_exec_start(logical_exec_start(content, unit_name), unit_name)
 
 
 # ---------------------------------------------------------------------------
 # Fixture-string coverage for the FILE-CONTENT half of the --config parse
 #
-# The token scan itself is shared (systemd_unit_invariants.config_arg_from_
-# exec_start) and its negative cases are owned ONCE, by the PARSER-layer
-# section of tests/scripts/test_know_live_installed_unit_parity.py — this
-# directory's one-owner convention — so they are deliberately NOT re-pinned
-# here.  What these fixtures own is the OTHER half: locating the effective
-# ExecStart= line inside unit FILE CONTENT (_exec_start_line), which had no
-# fixture-string coverage at all.  Its only exercise was the parametrized
-# sweep over real committed templates, every one of which is well-formed and
-# carries exactly one ExecStart=, so its raise branches, its
-# last-occurrence rule and the None branch reached through file content were
-# asserted nowhere.  One positive case is kept, to pin that file content
-# reaches the shared scan at all.
+# These fixtures are systemd_unit_invariants.logical_exec_start's
+# negative-case guard: locating the effective ExecStart= command inside unit
+# FILE CONTENT.  The committed orchestrator templates cannot stand in for it —
+# each is well-formed with exactly one single-line ExecStart=, so the raise
+# branches, the last-occurrence rule, the continuation join and the None
+# branch reached through file content would be asserted nowhere.
+#
+# The token scan's own negative cases (config_arg_from_exec_start) are owned
+# ONCE, by the PARSER-layer section of
+# tests/scripts/test_know_live_installed_unit_parity.py — this directory's
+# one-owner convention — so they are deliberately NOT re-pinned here.  One
+# positive case is kept, to pin that file content reaches the shared scan at
+# all.
 #
 # Inline fixtures rather than tmp_path files, matching how sibling guards in
 # this directory build unit text (cf. test_check_dashboard_unit_parity.py's
 # _SAMPLE_UNIT): both helpers take a string, so a file would add I/O without
 # adding coverage.
 # ---------------------------------------------------------------------------
-
-
-def _unit_fixture(*service_lines: str) -> str:
-    """A minimal [Service]-shaped unit carrying *service_lines*, for the parsers."""
-    body = "\n".join(service_lines)
-    return f"[Unit]\nDescription=Fixture\n\n[Service]\nType=simple\n{body}\n"
 
 
 @pytest.mark.parametrize(
@@ -769,13 +880,12 @@ def test_exec_start_config_arg_answers_from_unit_content(exec_start: str, expect
         ),
     ],
 )
-def test_exec_start_line_raises_on_unit_with_no_usable_command(content: str) -> None:
+def test_unit_content_with_no_usable_exec_start_raises(content: str) -> None:
     """A unit with no usable ExecStart= FAILS, naming itself — it does not skip.
 
-    _exec_start_line's own negative cases, owned here because that helper
-    stayed local when the token scan was lifted (the scan's negative cases
-    stayed with THEIR owner, the parity module, and are not duplicated here).
-    Neither may be answered with None: the canonical-filename guard SKIPs on
+    logical_exec_start's own negative cases (the token scan's stay with THEIR
+    owner, the parity module, and are not duplicated here).  Neither may be
+    answered with None: the canonical-filename guard SKIPs on
     None, so a unit systemd could not even start would be waved straight
     through it.  Both must raise the SHARED MalformedExecStart that the
     parser's callers already catch, not a locally redefined look-alike.
@@ -815,8 +925,8 @@ def test_exec_start_config_arg_reads_the_last_execstart_assignment() -> None:
 def test_exec_start_config_arg_ignores_exec_start_pre() -> None:
     """ExecStartPre= must not be mistaken for ExecStart=, --config and all.
 
-    Pins the trailing-``=`` discrimination _exec_start_line's docstring calls
-    out.  A prefix match on "ExecStart" alone reads the FIRST ExecStartPre=
+    Pins systemd_unit_invariants.EXEC_START_PREFIX's trailing-``=``
+    discrimination.  A prefix match on "ExecStart" alone reads the FIRST ExecStartPre=
     line as the unit's command, so a pre-command that happens to carry its own
     --config (a config-rendering or validation step, exactly the shape a
     preparatory ExecStartPre= takes) silently answers for the real one — and
@@ -828,6 +938,41 @@ def test_exec_start_config_arg_ignores_exec_start_pre() -> None:
         "--config /home/leo/src/x/dark-factory-orchestrator.yaml",
     )
     assert _exec_start_config_arg(content, "fixture.service") == (
+        "/home/leo/src/x/dark-factory-orchestrator.yaml"
+    )
+
+
+_CONTINUED_ORCHESTRATOR_RUN = (
+    "ExecStart=/usr/bin/uv run --no-sync --project orchestrator \\",
+    "  orchestrator run \\",
+    "  --config /home/leo/src/x/dark-factory-orchestrator.yaml",
+)
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        pytest.param(_CONTINUED_ORCHESTRATOR_RUN, id="config-on-a-continuation-line"),
+        pytest.param(
+            (
+                "ExecStart = /usr/bin/uv run orchestrator run "
+                "--config /home/leo/src/x/dark-factory-orchestrator.yaml",
+            ),
+            id="whitespace-around-separator",
+        ),
+        pytest.param(
+            ("ExecStart=", *_CONTINUED_ORCHESTRATOR_RUN),
+            id="reset-then-continued-command",
+        ),
+    ],
+)
+def test_exec_start_config_arg_reads_the_logical_command(lines: tuple[str, ...]) -> None:
+    """The --config parse reads the whole LOGICAL command systemd runs.
+
+    These are the continuation-line variants the coverage guard below names,
+    plus the whitespace around ``=`` that systemd.syntax accepts.
+    """
+    assert _exec_start_config_arg(_unit_fixture(*lines), "fixture.service") == (
         "/home/leo/src/x/dark-factory-orchestrator.yaml"
     )
 
@@ -867,7 +1012,7 @@ def test_exec_start_config_parser_answers_for_every_orchestrator_run_unit() -> N
         # A malformed ExecStart= raises out of here — deliberately, so it is a
         # hard failure of this guard rather than a skipped parametrized case.
         parsed[path.name] = _exec_start_config_arg(content, path.name)
-        if _ORCHESTRATOR_RUN_MARKER in _exec_start_line(content, path.name):
+        if _ORCHESTRATOR_RUN_MARKER in logical_exec_start(content, path.name):
             runs_orchestrator.add(path.name)
 
     assert runs_orchestrator, (

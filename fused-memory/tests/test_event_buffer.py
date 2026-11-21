@@ -1,11 +1,15 @@
 """Tests for SQLite-backed reconciliation event buffer."""
 
+import inspect
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import get_type_hints
 
 import aiosqlite
 import pytest
 import pytest_asyncio
+from reconciliation.legacy_drains import drain_unattributed
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -33,10 +37,15 @@ def _make_event(
     )
 
 
+@pytest.fixture
+def buf_db_path(tmp_path) -> Path:
+    return tmp_path / 'test.db'
+
+
 @pytest_asyncio.fixture
-async def buf(tmp_path):
+async def buf(buf_db_path):
     b = EventBuffer(
-        db_path=tmp_path / 'test.db',
+        db_path=buf_db_path,
         buffer_size_threshold=5,
         max_staleness_seconds=300,
     )
@@ -128,11 +137,11 @@ async def test_drain_returns_events_and_clears(buf):
     await buf.push(_make_event())
     await buf.push(_make_event())
 
-    events = await buf.drain('test-project')
+    events = await buf.drain('test-project', run_id='R1')
     assert len(events) == 2
 
     # Buffer is now empty (drained events don't count)
-    events2 = await buf.drain('test-project')
+    events2 = await buf.drain('test-project', run_id='R1')
     assert len(events2) == 0
 
 
@@ -542,10 +551,10 @@ async def test_restore_drained_moves_events_back_to_buffered(buf):
     for _ in range(3):
         await buf.push(_make_event())
 
-    await buf.drain('test-project')
+    await buf.drain('test-project', run_id='R1')
     assert (await buf.get_buffer_stats('test-project'))['size'] == 0
 
-    restored = await buf.restore_drained('test-project')
+    restored = await buf.restore_drained('test-project', run_id='R1')
     assert restored == 3
     assert (await buf.get_buffer_stats('test-project'))['size'] == 3
 
@@ -553,7 +562,7 @@ async def test_restore_drained_moves_events_back_to_buffered(buf):
 @pytest.mark.asyncio
 async def test_restore_drained_returns_zero_when_empty(buf):
     """Restore on empty buffer returns 0."""
-    restored = await buf.restore_drained('test-project')
+    restored = await buf.restore_drained('test-project', run_id='R1')
     assert restored == 0
 
 
@@ -566,10 +575,10 @@ async def test_restore_drained_only_affects_target_project(tmp_path):
         await buf.push(_make_event(project_id='project-a'))
         await buf.push(_make_event(project_id='project-b'))
 
-        await buf.drain('project-a')
-        await buf.drain('project-b')
+        await buf.drain('project-a', run_id='R1')
+        await buf.drain('project-b', run_id='R1')
 
-        restored = await buf.restore_drained('project-a')
+        restored = await buf.restore_drained('project-a', run_id='R1')
         assert restored == 1
         assert (await buf.get_buffer_stats('project-a'))['size'] == 1
         assert (await buf.get_buffer_stats('project-b'))['size'] == 0
@@ -678,7 +687,7 @@ async def test_cleanup_drained(tmp_path):
         await buf.push(_make_event())  # recent
 
         # Drain all
-        await buf.drain('test-project')
+        await buf.drain('test-project', run_id='R1')
 
         # Cleanup with 1h cutoff
         deleted = await buf.cleanup_drained(max_age_seconds=3600)
@@ -735,7 +744,7 @@ async def test_cleanup_drained_rolls_arrivals_up_per_hour_and_event_type(tmp_pat
             await buf.push(_make_event(
                 timestamp=hour_b, event_type=EventType.task_status_changed))
 
-        await buf.drain('test-project')
+        await buf.drain('test-project', run_id='R1')
         deleted = await buf.cleanup_drained(max_age_seconds=0)
         assert deleted == 6
 
@@ -759,7 +768,7 @@ async def test_cleanup_drained_rollup_accumulates_across_sweeps(tmp_path):
         for _ in range(2):
             await buf.push(_make_event(
                 timestamp=hour, event_type=EventType.task_modified))
-        await buf.drain('test-project')
+        await buf.drain('test-project', run_id='R1')
         await buf.cleanup_drained(max_age_seconds=0)
         assert await _arrival_rollup(buf) == {
             ('test-project', '2026-07-25T13', 'task_modified'): 2,
@@ -769,7 +778,7 @@ async def test_cleanup_drained_rollup_accumulates_across_sweeps(tmp_path):
         for _ in range(5):
             await buf.push(_make_event(
                 timestamp=hour, event_type=EventType.task_modified))
-        await buf.drain('test-project')
+        await buf.drain('test-project', run_id='R1')
         await buf.cleanup_drained(max_age_seconds=0)
 
         assert await _arrival_rollup(buf) == {
@@ -796,7 +805,7 @@ async def test_cleanup_drained_rollup_skips_locked_projects(tmp_path):
             await buf.push(_make_event(
                 project_id='locked-project', timestamp=hour,
                 event_type=EventType.memory_added))
-        await buf.drain('locked-project')
+        await buf.drain('locked-project', run_id='R1')
 
         assert await buf.mark_run_active('locked-project') is True
         assert await buf.cleanup_drained(max_age_seconds=0) == 0
@@ -825,7 +834,7 @@ async def test_cleanup_drained_rollup_ignores_still_buffered_rows(tmp_path):
         hour = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
         await buf.push(_make_event(
             timestamp=hour, event_type=EventType.memory_added))
-        await buf.drain('test-project')
+        await buf.drain('test-project', run_id='R1')
         # This one arrives after the drain and stays buffered.
         await buf.push(_make_event(
             timestamp=hour, event_type=EventType.memory_added))
@@ -864,7 +873,7 @@ async def test_cleanup_drained_is_not_blockable_by_an_unparseable_timestamp(tmp_
         hour = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
         await buf.push(_make_event(timestamp=hour, event_type=EventType.memory_added))
         await buf.push(_make_event(timestamp=hour, event_type=EventType.memory_added))
-        await buf.drain('test-project')
+        await buf.drain('test-project', run_id='R1')
 
         # Corrupt one drained row's timestamp behind the buffer's back — a
         # legacy/hand-edited row is the only way this can arise, since push()
@@ -956,7 +965,7 @@ async def test_cleanup_drained_consumes_the_returning_cursor_in_bounded_chunks(
         for _ in range(3):
             await buf.push(_make_event(
                 timestamp=hour_b, event_type=EventType.memory_added))
-        await buf.drain('test-project')
+        await buf.drain('test-project', run_id='R1')
 
         calls.clear()
         deleted = await buf.cleanup_drained(max_age_seconds=0)
@@ -1024,7 +1033,7 @@ async def test_cleanup_drained_poison_timestamp_does_not_truncate_a_multi_chunk_
         hour = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
         for _ in range(7):
             await buf.push(_make_event(timestamp=hour, event_type=EventType.memory_added))
-        await buf.drain('test-project')
+        await buf.drain('test-project', run_id='R1')
 
         # Corrupt one drained row's timestamp behind the buffer's back — same
         # recipe as test_cleanup_drained_is_not_blockable_by_an_unparseable_timestamp:
@@ -1080,7 +1089,7 @@ async def test_cleanup_drained_mid_stream_fault_rolls_the_whole_sweep_back(
         hour = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
         for _ in range(7):
             await buf.push(_make_event(timestamp=hour, event_type=EventType.memory_added))
-        await buf.drain('test-project')
+        await buf.drain('test-project', run_id='R1')
 
         # event_buffer.py does `from ...throughput import utc_hour_bucket`,
         # rebinding the name into event_buffer's own module namespace — so
@@ -1509,7 +1518,7 @@ async def test_drain_by_ids_marks_specific_events(buf):
     await buf.push(e2)
     await buf.push(e3)
 
-    count = await buf.drain_by_ids('test-project', [e1.id, e3.id])
+    count = await buf.drain_by_ids('test-project', [e1.id, e3.id], run_id='R1')
     assert count == 2
 
     # e2 should still be buffered
@@ -1517,7 +1526,7 @@ async def test_drain_by_ids_marks_specific_events(buf):
     assert stats['size'] == 1
 
     # Drain the remaining one
-    remaining = await buf.drain('test-project')
+    remaining = await buf.drain('test-project', run_id='R2')
     assert len(remaining) == 1
     assert remaining[0].id == e2.id
 
@@ -1526,7 +1535,7 @@ async def test_drain_by_ids_marks_specific_events(buf):
 async def test_drain_by_ids_empty_list(buf):
     """drain_by_ids with empty list is a no-op."""
     await buf.push(_make_event())
-    count = await buf.drain_by_ids('test-project', [])
+    count = await buf.drain_by_ids('test-project', [], run_id='R1')
     assert count == 0
     assert (await buf.get_buffer_stats('test-project'))['size'] == 1
 
@@ -1539,7 +1548,7 @@ async def test_drain_by_ids_ignores_wrong_project(buf):
     await buf.push(e1)
     await buf.push(e2)
 
-    count = await buf.drain_by_ids('project-a', [e1.id, e2.id])
+    count = await buf.drain_by_ids('project-a', [e1.id, e2.id], run_id='R1')
     # e2 belongs to project-b, so only e1 should be drained
     assert count == 1
     assert (await buf.get_buffer_stats('project-a'))['size'] == 0
@@ -1557,9 +1566,38 @@ async def test_peek_then_drain_by_ids_workflow(buf):
 
     # "Assemble" selects first 3
     selected_ids = [e.id for e in peeked[:3]]
-    count = await buf.drain_by_ids('test-project', selected_ids)
+    count = await buf.drain_by_ids('test-project', selected_ids, run_id='R1')
     assert count == 3
     assert (await buf.get_buffer_stats('test-project'))['size'] == 2
+
+
+@pytest.mark.asyncio
+async def test_drain_by_ids_stamps_run_id_for_run_scoped_restore(buf):
+    """drain_by_ids(run_id=) attributes the chunk so a run-scoped restore targets exactly it."""
+    e1, e2, e3 = _make_event(), _make_event(), _make_event()
+    for event in (e1, e2, e3):
+        await buf.push(event)
+
+    assert await buf.drain_by_ids('test-project', [e1.id, e2.id], run_id='R1') == 2
+    assert [e.id for e in await buf.drain('test-project', run_id='R2')] == [e3.id]
+
+    assert {e.id for e in await buf.get_drained_events('test-project', 'R1')} == {e1.id, e2.id}
+    assert await buf.restore_drained('test-project', run_id='R1') == 2
+    assert await buf.count_buffered('test-project') == 2
+    assert [e.id for e in await buf.get_drained_events('test-project', 'R2')] == [e3.id]
+
+
+@pytest.mark.parametrize(
+    'drain_path',
+    [EventBuffer.drain, EventBuffer.drain_oldest_chunk, EventBuffer.drain_by_ids],
+)
+def test_every_drain_method_requires_a_str_run_id(drain_path):
+    """An unattributed drained row is what restore_drained(include_unattributed=True)
+    folds into another run's recovery, so no drain path may produce one (task 6784).
+    A new drain method belongs both here and in restore_drained's list of drain paths."""
+    run_id = inspect.signature(drain_path).parameters['run_id']
+    assert run_id.default is inspect.Parameter.empty
+    assert get_type_hints(drain_path)['run_id'] is str
 
 
 # ── _debug_get_deferred_row tests ─────────────────────────────────────
@@ -1633,8 +1671,7 @@ async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
     """Regression: _migrate() drops the legacy idx_dw_project single-column index.
 
     Seeds an intermediate-migration schema — deferred_writes already has
-    claimed_at and attempt_count (so executescript's CREATE INDEX IF NOT EXISTS
-    idx_dw_project_claimed can succeed), but the old single-column
+    claimed_at and attempt_count, but the old single-column
     idx_dw_project index has not yet been removed.  This represents a DB
     created by a code version that added claimed_at without also dropping the
     now-redundant index.
@@ -1648,9 +1685,8 @@ async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
     db_path = tmp_path / 'legacy.db'
 
     # Seed an intermediate-migration state: the full current column set is
-    # present (claimed_at, attempt_count) so executescript won't fail when it
-    # tries to CREATE INDEX IF NOT EXISTS idx_dw_project_claimed, but the old
-    # single-column index idx_dw_project has NOT been dropped yet.
+    # present (claimed_at, attempt_count), but the old single-column index
+    # idx_dw_project has NOT been dropped yet.
     intermediate_schema = """
     CREATE TABLE deferred_writes (
         id TEXT PRIMARY KEY,
@@ -1682,7 +1718,7 @@ async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
         row = await cursor.fetchone()
     assert row is None, 'idx_dw_project should have been dropped by _migrate()'
 
-    # Replacement covering index must exist (created by executescript or _migrate).
+    # Replacement covering index must exist.
     async with db_inner.execute(
         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dw_project_claimed'"
     ) as cursor:
@@ -1690,6 +1726,44 @@ async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
     assert row is not None, 'idx_dw_project_claimed should be present after migration'
 
     await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_a_deferred_writes_table_older_than_claimed_at(tmp_path):
+    """A database predating claimed_at opens, keeps its rows, and can claim them.
+
+    The shape is leo-laptop's real reconciliation.db (2026-10-30), whose
+    fused-memory.service crash-looped on ``no such column: claimed_at``.
+    """
+    db_path = tmp_path / 'pre_claimed_at.db'
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.executescript("""
+        CREATE TABLE deferred_writes (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            category TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            agent_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_dw_project ON deferred_writes(project_id);
+        INSERT INTO deferred_writes (id, project_id, content, category, created_at)
+            VALUES ('old-row', 'p', 'kept', 'procedural_knowledge', '2026-01-01T00:00:00+00:00');
+        """)
+        await db.commit()
+
+    buf = EventBuffer(db_path=db_path)
+    await buf.initialize()
+    try:
+        assert [row['id'] for row in await buf.claim_deferred_writes('p')] == ['old-row']
+        async with buf._require_access().connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='deferred_writes'"
+            " AND name LIKE 'idx_%'"
+        ) as cursor:
+            assert [row[0] for row in await cursor.fetchall()] == ['idx_dw_project_claimed']
+    finally:
+        await buf.close()
 
 
 @pytest.mark.asyncio
@@ -1708,7 +1782,7 @@ async def test_mark_project_dead_letter_transitions_buffered_only(buf):
 
     await buf.push(_make_event(project_id='dark_factory'))
     # Drain that one 'dark_factory' event so we have a 'drained' row.
-    dark_events = await buf.drain('dark_factory')
+    dark_events = await buf.drain('dark_factory', run_id='R1')
     assert len(dark_events) == 1, 'Expected 1 drained dark_factory event'
 
     # Push one more 'dark_factory' buffered event (stays buffered).
@@ -1879,17 +1953,15 @@ async def test_get_drained_events_reads_run_scoped_without_restoring(buf):
 
 @pytest.mark.asyncio
 async def test_mark_drained_run_id_attributes_pre_drained_events_to_a_run(buf):
-    """mark_drained_run_id lets an already-drained (NULL-attributed) row be
-    retroactively attributed to the run about to process it — used by the
-    BacklogIterator path, which drains events via drain_by_ids() before
-    run_full_cycle mints a run_id."""
+    """mark_drained_run_id attributes already-drained rows to the run about to
+    process them — run_full_cycle's attribution of caller-supplied events. A
+    real drain always stamps a run, so the rows start out as R0's."""
     events = [_make_event() for _ in range(4)]
     for e in events:
         await buf.push(e)
 
-    # drain() with no run_id — rows land 'drained' with NULL drained_by_run_id,
-    # mirroring drain_by_ids()'s pre-existing (unattributed) behaviour.
-    drained = await buf.drain('test-project')
+    # Drained under R0, as every drain path stamps its run.
+    drained = await buf.drain('test-project', run_id='R0')
     assert len(drained) == 4
     id1, id2, id3, id4 = (e.id for e in events)
 
@@ -1901,7 +1973,7 @@ async def test_mark_drained_run_id_attributes_pre_drained_events_to_a_run(buf):
     restored_rx = await buf.restore_drained('test-project', run_id='RX')
     assert restored_rx == 2
 
-    # ...and id3/id4 (never attributed) remain 'drained'.
+    # ...and id3/id4 (still R0's) stay 'drained'.
     async def _status(event_id: str) -> str:
         async with buf._require_access().connection.execute(
             'SELECT status, drained_by_run_id FROM event_buffer WHERE id = ?',
@@ -1953,27 +2025,9 @@ async def test_mark_drained_run_id_attributes_pre_drained_events_to_a_run(buf):
 
 
 @pytest.mark.asyncio
-async def test_restore_drained_without_run_id_restores_all_project_wide(buf):
-    """(c) Legacy backward-compat: restore_drained(project) with no run_id still
-    restores ALL remaining drained rows project-wide (guards existing callers)."""
-    events_r1 = [_make_event() for _ in range(2)]
-    events_r2 = [_make_event() for _ in range(3)]
-    for e in events_r1:
-        await buf.push(e)
-    await buf.drain('test-project', run_id='R1')
-    for e in events_r2:
-        await buf.push(e)
-    await buf.drain('test-project', run_id='R2')
-
-    assert (await buf.get_buffer_stats('test-project'))['size'] == 0
-
-    restored = await buf.restore_drained('test-project')
-    assert restored == 5
-    assert (await buf.get_buffer_stats('test-project'))['size'] == 5
-
-
-@pytest.mark.asyncio
-async def test_restore_drained_include_unattributed_sweeps_null_rows_for_recovered_run(buf):
+async def test_restore_drained_include_unattributed_sweeps_null_rows_for_recovered_run(
+    buf, buf_db_path,
+):
     """include_unattributed=True additionally restores drained_by_run_id IS
     NULL rows (pre-task-2711 leftovers, drained before drains stamped run
     attribution) when recovering a specific run — closing the upgrade-
@@ -1988,13 +2042,12 @@ async def test_restore_drained_include_unattributed_sweeps_null_rows_for_recover
         await buf.push(e)
     await buf.drain('test-project', run_id='orphan-run')
 
-    # Pre-task-2711 leftovers: drained with NO run_id, so drained_by_run_id
-    # is NULL — simulates events drained by the old code before this
-    # upgrade, which an exact-match run-scoped restore alone would never
-    # restore.
+    # Pre-task-2711 leftovers, seeded as a pre-task-2711 process left them:
+    # drained with drained_by_run_id NULL, which an exact-match run-scoped
+    # restore alone would never restore.
     for e in events_legacy_null:
         await buf.push(e)
-    await buf.drain('test-project')
+    assert drain_unattributed(buf_db_path, 'test-project') == 2
 
     # A different, concurrent run's drained events must survive.
     for e in events_concurrent:
@@ -2025,7 +2078,7 @@ async def test_restore_drained_include_unattributed_sweeps_null_rows_for_recover
 
 
 @pytest.mark.asyncio
-async def test_restore_drained_default_excludes_unattributed_rows(buf):
+async def test_restore_drained_default_excludes_unattributed_rows(buf, buf_db_path):
     """Without include_unattributed (the default), a run-scoped restore must
     NOT touch NULL-attributed rows — locks in the exact-match contract relied
     on by test_mark_drained_run_id_attributes_pre_drained_events_to_a_run."""
@@ -2034,9 +2087,10 @@ async def test_restore_drained_default_excludes_unattributed_rows(buf):
     for e in events_run:
         await buf.push(e)
     await buf.drain('test-project', run_id='R1')
+    # Seeded as a pre-task-2711 process left it: drained with no run stamp.
     for e in events_null:
         await buf.push(e)
-    await buf.drain('test-project')
+    assert drain_unattributed(buf_db_path, 'test-project') == 1
 
     restored = await buf.restore_drained('test-project', run_id='R1')
     assert restored == 1

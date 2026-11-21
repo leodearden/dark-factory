@@ -7,13 +7,16 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import time
 from pathlib import Path
 
 import pytest
 from _merge_lane_fakes import (
+    FakeClock,
     FakeVerifier,
     ScopedVerifyCall,
     VerifyScript,
+    delegates_to,
     fails,
     hangs_until,
     passes,
@@ -166,6 +169,141 @@ class TestVerifyScriptEntered:
             await asyncio.gather(first, return_exceptions=True)
 
 
+class TestVerifyScriptDelegate:
+    @pytest.mark.asyncio
+    async def test_a_delegated_call_gets_run_scoped_own_arguments_and_returns_the_delegate_result(
+        self,
+    ):
+        cfg, m = object(), object()
+        seen: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        delegated = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='from delegate',
+        )
+
+        async def delegate(*args: object, **kwargs: object) -> VerifyResult:
+            seen.append((args, kwargs))
+            return delegated
+
+        verifier = FakeVerifier(delegates_to(delegate))
+
+        result = await verifier.run_scoped(
+            Path('wt'), cfg, [m], ['f.py'], task_id='t', role='merge',
+        )
+
+        assert seen == [((Path('wt'), cfg, [m], ['f.py']), {'task_id': 't', 'role': 'merge'})]
+        assert result is delegated
+
+    @pytest.mark.asyncio
+    async def test_a_delegated_call_is_recorded_while_the_delegate_is_still_running(self):
+        release = asyncio.Event()
+
+        async def delegate(*args: object, **kwargs: object) -> VerifyResult:
+            await release.wait()
+            return passes().result
+
+        verifier = FakeVerifier(delegates_to(delegate))
+        parked = asyncio.create_task(_verify(verifier, 't'))
+        try:
+            await wait_responsive(
+                verifier.await_entry(1), label='delegated verify entered',
+            )
+            assert not parked.done()
+            assert verifier.verify_calls == [
+                ScopedVerifyCall(task_id='t', worktree=Path('wt-t'), module_configs=()),
+            ]
+            assert verifier.verified == ['t']
+
+            release.set()
+            result = await wait_responsive(parked, label='delegated verify returned')
+            assert result.passed
+        finally:
+            parked.cancel()
+            await asyncio.gather(parked, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_a_delegate_in_the_sequence_governs_only_its_own_call(self):
+        delegated_calls: list[object] = []
+
+        async def delegate(*args: object, **kwargs: object) -> VerifyResult:
+            delegated_calls.append(kwargs.get('task_id'))
+            return passes('delegated').result
+
+        verifier = FakeVerifier(sequence=[delegates_to(delegate)])
+
+        summaries = [(await _verify(verifier, 't')).summary for _ in range(2)]
+
+        assert summaries == ['delegated', 'fake verify passed']
+        assert delegated_calls == ['t']
+
+    @pytest.mark.asyncio
+    async def test_entered_is_set_before_the_delegate_runs(self):
+        entered = asyncio.Event()
+        entered_when_delegated: list[bool] = []
+
+        async def delegate(*args: object, **kwargs: object) -> VerifyResult:
+            entered_when_delegated.append(entered.is_set())
+            return passes().result
+
+        verifier = FakeVerifier(dataclasses.replace(delegates_to(delegate), entered=entered))
+
+        await _verify(verifier, 't')
+
+        assert entered_when_delegated == [True]
+
+    @pytest.mark.asyncio
+    async def test_a_delegate_with_a_release_runs_only_once_released(self):
+        release = asyncio.Event()
+        delegated = passes('from delegate').result
+        delegated_calls: list[object] = []
+
+        async def delegate(*args: object, **kwargs: object) -> VerifyResult:
+            delegated_calls.append(kwargs.get('task_id'))
+            return delegated
+
+        verifier = FakeVerifier(dataclasses.replace(delegates_to(delegate), release=release))
+        parked = asyncio.create_task(_verify(verifier, 't'))
+        try:
+            await wait_responsive(
+                verifier.await_entry(1), label='released-delegate verify entered',
+            )
+            assert not parked.done()
+            assert delegated_calls == []
+
+            release.set()
+            result = await wait_responsive(parked, label='released delegate returned')
+            assert delegated_calls == ['t']
+            assert result is delegated
+        finally:
+            parked.cancel()
+            await asyncio.gather(parked, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_an_error_the_delegate_raises_propagates_after_the_call_is_recorded(self):
+        async def delegate(*args: object, **kwargs: object) -> VerifyResult:
+            raise RuntimeError('delegate boom')
+
+        verifier = FakeVerifier(delegates_to(delegate))
+
+        with pytest.raises(RuntimeError, match='delegate boom'):
+            await _verify(verifier, 't')
+        assert verifier.verify_calls == [
+            ScopedVerifyCall(task_id='t', worktree=Path('wt-t'), module_configs=()),
+        ]
+        assert verifier.verified == ['t']
+
+    def test_a_script_that_both_raises_and_delegates_is_rejected_at_construction(self):
+        async def delegate(*args: object, **kwargs: object) -> VerifyResult:
+            return passes().result
+
+        error = RuntimeError('scripted boom')
+
+        with pytest.raises(ValueError, match=r"raise RuntimeError\('scripted boom'\).*delegate"):
+            dataclasses.replace(delegates_to(delegate), error=error)
+        with pytest.raises(ValueError, match='delegate'):
+            dataclasses.replace(raises(error), delegate=delegate)
+
+
 class TestNextScriptSeam:
     @pytest.mark.asyncio
     async def test_a_subclass_overriding_next_script_keeps_the_base_recording(self):
@@ -181,3 +319,65 @@ class TestNextScriptSeam:
         assert (await _verify(verifier, 'q')).summary == 'fake verify passed'
         assert [call.task_id for call in verifier.verify_calls] == ['p', 'q']
         assert verifier.verified == ['p', 'q']
+
+
+class TestFakeClockSleeps:
+    """``sleep`` on the fake every merge-lane test injects.
+
+    A started lane's ``_heartbeat_loop`` and ``_reprobe_loop`` sleep on this
+    clock, so a bare-yield sleep would spin them at event-loop speed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_one_sleep_really_waits_so_a_periodic_loop_cannot_spin(self) -> None:
+        clock = FakeClock()
+        started = time.monotonic()
+        await clock.sleep(30.0)
+        # A floor well under the fake's own cap, not the cap itself: what is
+        # being pinned is that a sleep costs REAL time at all. A bare yield
+        # takes about 0.00002s.
+        assert time.monotonic() - started >= 0.01
+
+    @pytest.mark.asyncio
+    async def test_a_sleep_waits_no_longer_than_the_cap_not_the_requested_period(self) -> None:
+        await asyncio.wait_for(FakeClock().sleep(3600.0), timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_a_sleep_shorter_than_the_cap_waits_only_the_requested_period(self) -> None:
+        await asyncio.wait_for(FakeClock(sleep_cap=60.0).sleep(0.01), timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_a_sleep_advances_both_readings_by_the_full_request_and_records_it(self) -> None:
+        clock = FakeClock()
+        before_now, before_mono = clock.now(), clock.monotonic()
+
+        await clock.sleep(30.0)
+        await clock.sleep(120.0)
+
+        assert clock.now() - before_now == 150.0
+        assert clock.monotonic() - before_mono == 150.0
+        assert clock.sleeps == [30.0, 120.0]
+
+    @pytest.mark.asyncio
+    async def test_sleep_cap_zero_is_a_bare_yield_for_a_production_sized_poll_count(self) -> None:
+        clock = FakeClock(sleep_cap=0.0)
+
+        async def _poll_a_thousand_times() -> None:
+            for _ in range(1000):
+                await clock.sleep(0.05)
+
+        # At the default cap each of these polls would be a real wait.
+        await asyncio.wait_for(_poll_a_thousand_times(), timeout=10.0)
+        assert len(clock.sleeps) == 1000
+
+    @pytest.mark.asyncio
+    async def test_sleep_cap_leaves_wait_for_any_on_wait_cap(self) -> None:
+        clock = FakeClock(sleep_cap=0.0)
+        forever = asyncio.create_task(asyncio.Event().wait())
+        try:
+            started = time.monotonic()
+            assert await clock.wait_for_any({forever}, timeout=600.0) == set()
+            assert time.monotonic() - started >= 0.01
+        finally:
+            forever.cancel()
+            await asyncio.gather(forever, return_exceptions=True)

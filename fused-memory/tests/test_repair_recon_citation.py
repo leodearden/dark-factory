@@ -23,6 +23,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _cli_boundary_assertions import closed_pipe_error_line
 from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'repair_recon_citation.py'
@@ -394,7 +395,7 @@ class TestMainStartupFailures:
             async def initialize(self):
                 raise RuntimeError('qdrant connect refused')
 
-            async def close(self):  # pragma: no cover - must never be reached
+            async def close(self):
                 wiring['closed'].append('memory')
 
         # A later setattr wins over the fixture's.
@@ -414,9 +415,10 @@ class TestMainStartupFailures:
         assert outcome['hint']
 
         # The leak the finding names: the already-initialized journal WAS
-        # closed. ``memory`` is absent because it never finished initializing —
-        # a half-constructed backend is what close() would have to guess about.
-        assert wiring['closed'] == ['journal']
+        # closed. The half-opened memory is closed first, by the shared close
+        # in maintenance_service, before the script's own finally closes the
+        # journal.
+        assert wiring['closed'] == ['memory', 'journal']
 
     def test_journal_initialize_failure_reports_json_and_never_constructs_the_memory_service(
         self, monkeypatch, wiring, capsys
@@ -535,3 +537,26 @@ class TestMainStartupFailures:
         outcome = json.loads(capsys.readouterr().out)
         assert 'status' not in outcome
         assert _mod.exit_code_for(outcome) == 1
+
+
+@pytest.mark.parametrize('buffering', [None, 1], ids=['deferred', 'in-band'])
+class TestALateStdoutFailureNamesTheCommittedRepair:
+    """The outcome is printed AFTER --apply committed the repair it reports.
+    A stdout failure there must say the repair landed: the exit status alone
+    says only that the run could not complete."""
+
+    def test_an_applied_repair_is_named(self, monkeypatch, wiring, capsys, buffering):
+        TestMain._patch_repair(monkeypatch, return_value={'status': 'repaired'})
+        monkeypatch.setattr(sys, 'argv', ['repair_recon_citation', *_REQUIRED, '--apply'])
+
+        line = closed_pipe_error_line(monkeypatch, capsys, _mod.main, buffering=buffering)
+
+        assert line.endswith('(--apply already committed the repair)')
+
+    def test_a_dry_run_claims_no_repair(self, monkeypatch, wiring, capsys, buffering):
+        TestMain._patch_repair(monkeypatch, return_value={'status': 'dry_run'})
+        monkeypatch.setattr(sys, 'argv', ['repair_recon_citation', *_REQUIRED])
+
+        line = closed_pipe_error_line(monkeypatch, capsys, _mod.main, buffering=buffering)
+
+        assert '(' not in line

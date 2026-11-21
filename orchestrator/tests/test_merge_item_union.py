@@ -28,11 +28,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 from _merge_queue_harness import drive_verify_and_advance
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import InflightEntry, QueuedBranch
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     GroupMergeRequest,
     MergeOutcome,
@@ -40,7 +42,6 @@ from orchestrator.merge_queue import (
     RealMergeItem,
     SpeculativeMergeWorker,
 )
-from orchestrator.merge_types import QueuedBranch
 
 pytestmark = pytest.mark.asyncio
 
@@ -83,7 +84,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 def _make_req(
@@ -169,8 +170,8 @@ async def test_decided_item_dispatches_as_passthrough(
         request=req, immediate_outcome=outcome, base_sha='deadbeef', speculative=False,
     )
 
-    entry = await worker._dispatch_item(item)
-    assert entry is not None
+    entry = await worker.verify_dispatch.dispatch(item)
+    assert isinstance(entry, InflightEntry)
     assert entry.verify_task is None, 'DecidedItem must dispatch with no real verify task'
     assert entry.lease is None, 'DecidedItem passthrough must not hold a host lease'
     assert entry.passthrough_outcome is outcome, (
@@ -201,8 +202,8 @@ async def test_decided_item_already_delivered_skips_double_set_result(
         request=req, immediate_outcome=conflict_outcome, base_sha='deadbeef',
         speculative=False, already_delivered=True,
     )
-    entry = await worker._dispatch_item(item)
-    assert entry is not None
+    entry = await worker.verify_dispatch.dispatch(item)
+    assert isinstance(entry, InflightEntry)
     assert entry.passthrough_outcome is conflict_outcome
 
     # Must not raise InvalidStateError (double set_result on an already-done Future).
@@ -260,8 +261,8 @@ async def test_train_handoff_decided_item_passthrough_no_drift(
     main_before = await git_ops.get_main_sha()
     slots_available_before = worker.snapshot()['speculation']['slot_available']
 
-    entry = await worker._dispatch_item(item)
-    assert entry is not None
+    entry = await worker.verify_dispatch.dispatch(item)
+    assert isinstance(entry, InflightEntry)
     assert entry.verify_task is None
     assert entry.was_speculative is False
     assert entry.passthrough_outcome is done_outcome

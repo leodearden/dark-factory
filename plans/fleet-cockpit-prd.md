@@ -285,7 +285,7 @@ watcher SKILL.mds + session_registry.py lease additions → 2289; hooks → 2288
 
 - **C5b — Decision queue + keybindings + spawn bar + focus wiring** *(deps: C5a, C2, C3, C4).*
   **Decision queue** (score-ordered via C3; rows `[score][age][project#task][question]`); keys/mouse:
-  Enter/click = `backend.focus` + mark handling; `b`/`B` boost, `d` defer, `x` drop, digits = manual
+  Enter/click = `backend.focus`; `b`/`B` boost, `d` defer, `x` drop, digits = manual
   priority; **spawn bar** (`n` → project/role/prompt picker → spawn-claude.sh); refresh path calls only
   `set_urgency`/`reorder`. *Modules:* `cockpit/src/cockpit/app.py`, `.../panes/`.
   **Signal (leaf-ish):** Textual pilot — a synthetic record flips to `awaiting-input`; the cockpit

@@ -1,0 +1,18 @@
+{
+  "task_id": "6278",
+  "reason": "Net-additive (task 6278): the single-branch gate re-verify runs on the head's own leased host, with local fallback on RunnerUnavailable, a local-only history leg and a reaped remote attempt on cancel; one worker binder (_lane_post_merge_verify) serves the in-flight verify and the gate (folds 6344); the train's run-and-reap recipe is shared.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2267,
+      "current": 2271
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5003,
+      "current": 5007
+    }
+  ]
+}

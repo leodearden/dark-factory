@@ -1,0 +1,54 @@
+"""Item 6 (b): eventual attribution of each red-chain member, following it through later verifies.
+
+A member is GOOD once it is in a passing verify (solo or chain) or lands done without a later failing solo;
+BAD once a solo verify of it fails; still UNKNOWN otherwise. Red chains in membership era only."""
+import sys
+sys.path.insert(0, '/tmp/gate-10069/measure')
+from collections import Counter, defaultdict
+from common import verifies, by_type, T10617, T8528
+
+V = sorted([v for v in verifies('2026-11-05')], key=lambda r: r['id'])
+MEMB_LO = '2026-11-15T11:19:00+00:00'
+done_ids = defaultdict(list)
+for f in by_type('merge_finalized', '2026-11-05'):
+    if f['d'].get('state') == 'done':
+        done_ids[f['d'].get('branch') or f['task']].append(f['id'])
+
+
+def era(t):
+    if t < T10617: return 'a2'
+    if t < T8528: return 'a3'
+    return 'b'
+
+
+res = defaultdict(Counter)
+per_chain = defaultdict(list)
+for rc in [v for v in V if v['k'] >= 2 and not v['passed'] and v['members']]:
+    later = [v for v in V if v['id'] > rc['id']]
+    verdicts = Counter()
+    for m in rc['members']:
+        verdict = 'unknown'
+        for v in later:
+            in_it = (v['k'] == 1 and v['task'] == m) or (v['k'] >= 2 and v['members'] and m in v['members'])
+            if not in_it:
+                continue
+            if v['passed']:
+                verdict = 'good'; break
+            if v['k'] == 1:
+                verdict = 'bad'; break
+        if verdict == 'unknown' and any(i > rc['id'] for i in done_ids.get(m, [])):
+            verdict = 'good(landed)'
+        verdicts[verdict] += 1
+    e = era(rc['ts'])
+    res[e]['red_chains'] += 1
+    res[e]['members'] += len(rc['members'])
+    res[e].update(verdicts)
+    nbad = verdicts['bad']
+    resolved = verdicts['unknown'] == 0
+    res[e]['fully_resolved'] += resolved
+    if resolved:
+        per_chain[e].append(nbad)
+        if nbad == 0:
+            res[e]['fully_resolved_zero_bad'] += 1
+for e in sorted(res):
+    print(e, dict(res[e]), 'bad per fully-resolved chain', sorted(Counter(per_chain[e]).items()))

@@ -29,11 +29,6 @@ expectation is derived rather than remembered.
 :data:`RECIPE_DOCS`: it is the generic multi-repo template and names no
 dark-factory command to execute.
 
-THE EXTRACTOR IS RE-IMPLEMENTED RATHER THAN IMPORTED from its two siblings in
-this directory, per the no-cross-import-between-guards convention recorded in
-``tests/scripts/conftest.py`` — task 3959 copied it from task 3558 for the
-same reason.
-
 PLACEMENT IS LOAD-BEARING. ``tests/scripts/`` carries its own module config, so
 this guard runs under FULL_SUITE and merge-role ``merge_verify_breadth: full``.
 """
@@ -46,6 +41,10 @@ import subprocess
 import sys
 
 import pytest
+import verify_command_invariants as vci
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -73,60 +72,6 @@ _FIXTURE_COLUMNS = ("id", "status")
 _FIXTURE_DDL = "CREATE TABLE tasks (id INTEGER NOT NULL PRIMARY KEY, status TEXT NOT NULL)"
 
 
-def _marked_command(markdown_text, marker, bullet_label, doc_name):
-    """The inline-code command on the *bullet_label* bullet delimited by *marker*.
-
-    Every failure is a loud ``AssertionError`` naming the marker literal and
-    *doc_name*, never a ``''``/``None`` return: an extractor that silently
-    yields nothing turns the execution assertion vacuously green while
-    certifying nothing, which is strictly worse than no guard because the
-    check still reports success. The span regex is anchored on the LABEL
-    rather than on backticks, because keying on backticks alone would extract
-    the begin comment's own explanatory inline code — a plausible-looking
-    string, so the mistake would not announce itself.
-    """
-    begin = f"{marker}:begin"
-    end = f"{marker}:end"
-
-    begin_count = markdown_text.count(begin)
-    assert begin_count == 1, (
-        f"expected exactly one {begin!r} marker, found {begin_count} (task 5330). "
-        f"It delimits the copy-pasteable store-shape command in {doc_name}. "
-        f"If it was deleted, restore it around that "
-        f"bullet; if it was duplicated, one of the two copies is unpinned and "
-        f"free to rot into a command that no longer runs."
-    )
-    end_count = markdown_text.count(end)
-    assert end_count == 1, (
-        f"expected exactly one {end!r} marker to close {begin!r} in {doc_name}, "
-        f"found {end_count} (task 5330) — restore the closing marker below the "
-        f"bullet it wraps"
-    )
-
-    # Inverted markers yield an empty slice, so the next assertion catches that
-    # too, loudly and with the same remedy.
-    marked = markdown_text[markdown_text.index(begin):markdown_text.index(end)]
-    prefix = f"- **{bullet_label}**: `"
-    spans = [
-        segment.split("`", 1)[0]
-        for segment in marked.split(prefix)[1:]
-        if "`" in segment
-    ]
-    assert len(spans) == 1, (
-        f"expected exactly one ``{prefix}<command>``` bullet between {begin!r} "
-        f"and {end!r} in {doc_name}, found {len(spans)}: {spans!r} (task 5330). "
-        f"The marker must wrap that bullet and nothing else; if the bullet was "
-        f"relabelled or the markers were inverted, move the marker back around "
-        f"the copy-pasteable command."
-    )
-
-    command = spans[0].strip()
-    assert command, (
-        f"the command between {begin!r} and {end!r} in {doc_name} is empty (task 5330)"
-    )
-    return command
-
-
 _HAPPY_DOC = """\
 Ask the store what shape it is; never guess a column name or a value type.
 
@@ -144,24 +89,6 @@ _HAPPY_COMMAND = "python scripts/tasks_db_schema.py"
 
 _SELF_TEST_DOC_NAME = "self-test-doc.md"
 
-_NO_MARKER_DOC = """\
-- **Task store shape**: `python scripts/tasks_db_schema.py`
-
-Somewhere else entirely, an unmarked mention of `.taskmaster/tasks/tasks.db`.
-"""
-
-_DUPLICATE_MARKER_DOC = """\
-<!-- tasks-db-schema-lookup:begin -->
-- **Task store shape**: `python scripts/tasks_db_schema.py`
-<!-- tasks-db-schema-lookup:end -->
-
-## Some later section
-
-<!-- tasks-db-schema-lookup:begin -->
-- **Task store shape**: `python scripts/tasks_db_schema.py --db /elsewhere.db`
-<!-- tasks-db-schema-lookup:end -->
-"""
-
 _DECOY_DOC = """\
 The store is at `.taskmaster/tasks/tasks.db`, never inside your worktree.
 
@@ -177,42 +104,21 @@ Afterwards, `SELECT` against the columns it printed.
 """
 
 
-def test_marked_command_extracts_the_marked_span():
+def test_tasks_db_schema_bullet_extracts_the_marked_span():
     """Only the marked bullet's command is returned, backticks stripped."""
     assert (
-        _marked_command(
-            _HAPPY_DOC, SHAPE_LOOKUP_MARKER, SHAPE_LOOKUP_LABEL, _SELF_TEST_DOC_NAME
+        vci.marked_bullet_command(
+            _HAPPY_DOC,
+            slug=SHAPE_LOOKUP_MARKER,
+            bullet_label=SHAPE_LOOKUP_LABEL,
+            source=_SELF_TEST_DOC_NAME,
+            task="5330",
         )
         == _HAPPY_COMMAND
     )
 
 
-@pytest.mark.parametrize(
-    ("markdown_text", "case"),
-    [
-        (_NO_MARKER_DOC, "missing"),
-        (_DUPLICATE_MARKER_DOC, "duplicated"),
-    ],
-)
-def test_marked_command_fails_loudly_on_a_broken_marker(markdown_text, case):
-    """A missing or duplicated marker RAISES — never '' or None.
-
-    Missing is the vacuity hazard: an extractor that silently returns nothing
-    turns every downstream assertion green while executing nothing at all.
-    Duplicated is the same failure one level down — silently taking the first
-    leaves the second copy unexecuted and free to rot.
-    """
-    with pytest.raises(AssertionError) as excinfo:
-        _marked_command(
-            markdown_text, SHAPE_LOOKUP_MARKER, SHAPE_LOOKUP_LABEL, _SELF_TEST_DOC_NAME
-        )
-
-    message = str(excinfo.value)
-    assert SHAPE_LOOKUP_MARKER in message, case
-    assert _SELF_TEST_DOC_NAME in message, case
-
-
-def test_marked_command_is_immune_to_inline_code_in_the_begin_comment():
+def test_tasks_db_schema_bullet_is_immune_to_inline_code_in_the_begin_comment():
     """Prose inline code inside the marked slice is never extracted.
 
     An extractor keyed on "the first backtick span after the begin marker"
@@ -220,8 +126,12 @@ def test_marked_command_is_immune_to_inline_code_in_the_begin_comment():
     so the mistake would survive review and then be executed as a command.
     """
     assert (
-        _marked_command(
-            _DECOY_DOC, SHAPE_LOOKUP_MARKER, SHAPE_LOOKUP_LABEL, _SELF_TEST_DOC_NAME
+        vci.marked_bullet_command(
+            _DECOY_DOC,
+            slug=SHAPE_LOOKUP_MARKER,
+            bullet_label=SHAPE_LOOKUP_LABEL,
+            source=_SELF_TEST_DOC_NAME,
+            task="5330",
         )
         == _HAPPY_COMMAND
     )
@@ -295,11 +205,12 @@ def test_documented_store_shape_lookup_reports_the_stores_real_shape(doc_path, t
     the claim the doc is making to every agent that reads it.
     """
     doc_name = doc_path.relative_to(REPO_ROOT).as_posix()
-    command = _marked_command(
+    command = vci.marked_bullet_command(
         doc_path.read_text(encoding="utf-8"),
-        SHAPE_LOOKUP_MARKER,
-        SHAPE_LOOKUP_LABEL,
-        doc_name,
+        slug=SHAPE_LOOKUP_MARKER,
+        bullet_label=SHAPE_LOOKUP_LABEL,
+        source=doc_name,
+        task="5330",
     )
     argv = _documented_tool_argv(command, doc_name)
     root = _seeded_project_root(tmp_path)

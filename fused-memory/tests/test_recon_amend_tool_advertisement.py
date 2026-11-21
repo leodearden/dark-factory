@@ -141,6 +141,11 @@ class TestDisallowListForAmendAndEpisodeTools:
     `config/config.yaml` leaves that list commented out (only the metadata-patch
     list is active there), so that default applies — Stage 3 both passed the
     authz gate and held the tool.
+
+    This class is a PER-TOOL contract for these three advertised tools. The
+    COMPLETENESS contract — no fused-memory tool registers without a stage
+    classification — is
+    tests/test_recon_stage_fused_memory_tool_classification.py::test_every_fused_memory_server_tool_is_classified.
     """
 
     # -- PART A: set membership (cheap structural guard) --------------------
@@ -191,8 +196,8 @@ class TestDisallowListForAmendAndEpisodeTools:
         recon call site and exercise (not dodge) `build_claude_argv`'s
         schema-wildcard branch (the `'*'` -> `--tools ''` substitution, which
         removes built-in and deferred tools but not MCP). That branch only
-        rewrites disallowed_tools when '*' is present; DISALLOW_BUILTIN (['Bash', 'Edit', 'Write',
-        'NotebookEdit']) carries no '*', so STAGE3_DISALLOWED renders as a
+        rewrites disallowed_tools when '*' is present; DISALLOW_BUILTIN carries
+        no '*', so STAGE3_DISALLOWED renders as a
         straight passthrough here — confirmed against today's code.
         """
         from shared.cli_invoke import build_claude_argv

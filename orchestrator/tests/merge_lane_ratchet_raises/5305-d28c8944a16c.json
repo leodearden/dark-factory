@@ -1,0 +1,30 @@
+{
+  "task_id": "5305",
+  "reason": "Move, not growth (PRD plans/merge-lane-quality-prd.md task iota, part 2; module split per esc-5305-1): MergeIntake, the sole writer of the lane buffers, the redispatch park and the suffix-conflict tracker, leaves worker.py for the new merge_lane/intake_buffers.py together with its IntakeLifecycle port. worker.py lines 20748 -> 20188 (-560), prose_lines 11761 -> 11454 (-307), cognitive 1969 -> 1906 (-63). intake_buffers.py adds 714 lines, 337 prose_lines, cognitive 63: 492 lines moved verbatim from worker.py (buffer_owned_request, _coalesce_reentrant_drain, drain_into_lanes, pop_next_pickable, take_buffered, restore_buffered, the two suffix delegators and _alarm_coalesce_live_original), the 56-line constructor that replaces the worker's buffer/park/tracker attribute block, a 41-line module header, the 27-line IntakeLifecycle port with its LifecycleHop protocol, 51 lines of read properties and request methods that replace direct container access, and the class docstring and section separators. intake.py 1154 -> 1151 and tip_relation.py 346 -> 342 (redundant TYPE_CHECKING guards dropped; cognitive 117 -> 116 and 25 -> 24). __init__.py 94 -> 95 lines (the _INTAKE_BUFFERS submodule constant that routes MERGE_WORKER_SHUTDOWN_REASON). Net total:lines 57384 -> 57532 (+148) and total:prose_lines 31628 -> 31658 (+30). Every other total holds or falls: total:cognitive 4790 -> 4788 (4836 -> 4788 across iota), total:private_reads 6547 -> 6492, total:patch_targets 55 -> 55. new_function_over_ceiling intake_buffers.py::MergeIntake::buffer_owned_request 24 is the rename artifact of a verbatim move: worker.py::SpeculativeMergeWorker::_buffer_owned_request scored 24 on base.",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/__init__.py",
+      "baseline": 94,
+      "current": 95
+    },
+    {
+      "measure": "new_function_over_ceiling",
+      "key": "orchestrator/src/orchestrator/merge_lane/intake_buffers.py::MergeIntake::buffer_owned_request",
+      "baseline": 15,
+      "current": 24
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57384,
+      "current": 57532
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31628,
+      "current": 31658
+    }
+  ]
+}

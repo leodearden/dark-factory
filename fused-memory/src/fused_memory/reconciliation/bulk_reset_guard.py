@@ -62,6 +62,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from shared.project_layout import escalation_queue_dir
+
 logger = logging.getLogger(__name__)
 
 
@@ -483,9 +485,9 @@ class BulkResetGuard:
         # Use project_root when available; fall back to the constructor-supplied dir.
         _esc_base: Path | None = None
         if project_root:
-            _esc_base = Path(project_root) / 'data' / 'escalations'
+            _esc_base = escalation_queue_dir(project_root)
         elif self._fallback_dir is not None:
-            _esc_base = self._fallback_dir / 'data' / 'escalations'
+            _esc_base = escalation_queue_dir(self._fallback_dir)
 
         if _esc_base is None:
             logger.error('bulk_reset_guard: no escalation directory available for %s', project_id)

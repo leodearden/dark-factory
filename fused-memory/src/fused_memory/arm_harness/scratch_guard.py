@@ -25,6 +25,11 @@ class GuardCheckpoint(StrEnum):
     TOPOLOGY_READ = 'topology-read'
     TEARDOWN_GRAPH = 'teardown-graph'
     TEARDOWN_COLLECTION = 'teardown-collection'
+    GRAPH_COPY = 'graph-copy'
+    REEMBED = 'reembed'
+    INDEX_DROP = 'index-drop'
+    REPLICA_BUILD = 'replica-build'
+    SEARCH = 'search'
 
 
 class ScratchGuardError(Exception):

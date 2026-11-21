@@ -15,11 +15,11 @@ Scope, deliberately narrow. This is option (a) of task 5264's three: REPORT the
 residue. Wiring the census into ``GraphitiBackend._scan_duplicate_entity_names``
 (option b) and running an unattended collapse sweep (option c) are NOT
 authorized by that task and are not implemented here. Nothing in this module
-mutates anything: it calls ``enumerate_entity_nodes`` and
-``find_entity_nodes_by_name_substring``, both ``ro_query``-backed, and nothing
-else. That read-only guarantee is structural rather than a promise in prose —
-tests/test_task_family_census.py asserts it against the backend's mutating
-methods and against the driver's writable query channel.
+mutates anything: it calls ``enumerate_ranked_entity_nodes``, which is
+``ro_query``-backed, and ``list_graphs``, a read-only graph listing, and
+nothing else. That read-only guarantee is structural rather than a promise in
+prose — tests/test_task_family_census.py asserts it against the backend's
+mutating methods and against the driver's writable query channel.
 
 Family membership is decided by ``utils.task_naming.group_task_node_families``,
 the same function the write-path normalizer uses, which is what keeps the two
@@ -32,10 +32,10 @@ import asyncio
 import json
 import logging
 import sys
-import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
-from fused_memory.maintenance._utils import maintenance_service
+from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
+from fused_memory.maintenance.graph_sweep import GraphFailure, read_each_graph, sweep_complete
 from fused_memory.utils.task_naming import group_task_node_families
 
 logger = logging.getLogger(__name__)
@@ -45,29 +45,25 @@ logger = logging.getLogger(__name__)
 class VariantSpelling:
     """One node in a fragmented family: how it is spelled, and what it holds.
 
-    ``edge_count`` is the number of still-VALID RELATES_TO edges hanging off the
-    node, and ONLY those. It says how many edges a collapse would have to move.
-    It no longer says which node a collapse would KEEP: since task 4986 the
-    backend ranks survivors by ``provenance_rank`` (``edge_count`` plus the
-    node's Episodic MENTIONS), so an edge-poorer node can legitimately outrank
-    an edge-richer one. Read ``variants[0]`` for the would-be survivor, not the
-    largest ``edge_count``.
+    ``edge_count`` counts still-VALID RELATES_TO edges ONLY — what a collapse
+    would have to move. ``mentions_count`` counts the Episodic MENTIONS
+    pointing at the node. ``provenance_rank`` is the backend's survivor key,
+    copied from the enumerated row and never recomputed here.
     """
 
     name: str
     uuid: str
     edge_count: int
+    mentions_count: int
+    provenance_rank: int
 
 
 @dataclass(frozen=True)
 class FragmentedFamily:
     """One task whose nodes are still split across more than one node.
 
-    ``variants`` holds at least TWO spellings, always: it is what the family
-    was measured to be, so a family the probe fails to confirm is recorded as
-    an :class:`UnconfirmedFamily` instead of as a one- or zero-variant instance
-    of this type. :meth:`TaskFamilyCensus.run` is the only constructor, which
-    is what lets that be an invariant rather than a hope.
+    ``variants`` holds at least TWO spellings, always; ``__post_init__``
+    enforces it.
 
     It is ordered survivor-first — highest provenance_rank (valid RELATES_TO
     plus Episodic MENTIONS), then oldest, then uuid — which is the order the
@@ -80,33 +76,12 @@ class FragmentedFamily:
     canonical_name: str
     variants: tuple[VariantSpelling, ...]
 
-
-@dataclass(frozen=True)
-class UnconfirmedFamily:
-    """A family the enumeration flagged and the per-family probe did not confirm.
-
-    The census makes two reads, and they are neither identically scoped nor a
-    single snapshot. ``enumerate_entity_nodes`` matches every ``:Entity`` node
-    under a graph KEY, while ``find_entity_nodes_by_name_substring`` also
-    requires ``n.group_id = $group_id`` — the predicate that keeps task-2115's
-    cross-graph leak (a node whose group_id names ANOTHER project while sitting
-    physically inside this key) out of any collapse. A leaked node therefore
-    counts toward the enumeration's >1 threshold and then vanishes from the
-    probe. The same shortfall arises with no leak at all: the store is live, so
-    the write-path normalizer can collapse the family between the two reads.
-
-    Either way the family is not residue by the time it was measured, and
-    reporting it as a :class:`FragmentedFamily` of fewer than two variants
-    would contradict that type's meaning and inflate the very number this
-    module exists to produce. Recording it here keeps the count honest without
-    discarding the signal: an occasional one is a race, while a persistent
-    non-zero count is a leak worth chasing, and the two fields are what tell
-    them apart.
-    """
-
-    canonical_name: str
-    enumerated_members: int
-    probed_members: int
+    def __post_init__(self) -> None:
+        if len(self.variants) < 2:
+            raise ValueError(
+                'a fragmented family holds at least two variants; '
+                f'{self.canonical_name!r} has {len(self.variants)}'
+            )
 
 
 @dataclass(frozen=True)
@@ -116,18 +91,14 @@ class GraphCensus:
     The completeness fields are not decoration. This module's entire output is
     a number a human will act on, and a number derived from a silently
     truncated enumeration is worse than no number at all — so the
-    ``PagedRead`` that ``enumerate_entity_nodes`` already returns is carried
+    ``PagedRead`` that ``enumerate_ranked_entity_nodes`` returns is carried
     here verbatim rather than being collapsed into a bare count.
 
-    ``complete`` answers only "was the whole graph read", which is why
-    ``unconfirmed`` sits beside it rather than flipping it: a family the probe
-    did not confirm is a fully-read graph reporting a divergence between its
-    two reads, not a coverage shortfall (see :class:`UnconfirmedFamily`).
+    ``nodes_scanned`` counts the graph's same-group Entity nodes.
     """
 
     group_id: str
     families: tuple[FragmentedFamily, ...]
-    unconfirmed: tuple[UnconfirmedFamily, ...]
     nodes_scanned: int
     complete: bool
     incomplete_kind: str | None
@@ -136,43 +107,43 @@ class GraphCensus:
 
 
 @dataclass(frozen=True)
-class GraphFailure:
-    """A graph the sweep tried to census and could not read.
-
-    Recorded as structure rather than folded into a log line, because the two
-    fields answer different operator questions: ``group_id`` is what a re-run
-    is scoped to, and ``error`` names the exception TYPE as well as its message,
-    which is what says whether to retry or to go and fix something.
-    """
-
-    group_id: str
-    error: str
-
-
-@dataclass(frozen=True)
 class CensusSweep:
     """What a sweep over one or more graphs found.
 
-    ``total_families`` and ``complete`` are summaries of ``graphs`` and
-    ``failures`` rather than independent facts. They are stored rather than
-    derived on access so that ``--json`` emits them (``dataclasses.asdict``
-    sees fields, not properties) — and they cannot drift from what they
-    summarise because :meth:`TaskFamilyCensus.sweep` is this type's only
-    constructor. ``GraphCensus.nodes_scanned`` is stored for the same reason.
+    ``total_families`` and ``complete`` are derived from ``graphs`` and
+    ``failures`` at construction and cannot be passed in, so no sweep can
+    contradict what it summarises. They are fields rather than properties so
+    that ``--json`` emits them (``dataclasses.asdict`` sees fields, not
+    properties). ``GraphCensus.nodes_scanned`` is stored for the same reason.
 
-    ``complete`` is the flag to read before acting on ``total_families``: it is
-    False if ANY graph was truncated OR failed outright. A failed graph is an
-    unknown, not a zero, and the per-graph flags cannot say that on their own —
-    every graph the sweep DID read can be complete while a graph it never read
-    holds the residue that matters.
+    ``complete`` is the flag to read before acting on ``total_families``. It is
+    ``graph_sweep.sweep_complete``'s answer: False if ANY graph was truncated,
+    failed outright, or no graph was read. A failed graph is an unknown, not a
+    zero, and the per-graph flags cannot say that on their own — every graph
+    the sweep DID read can be complete while a graph it never read holds the
+    residue that matters.
     """
 
     graphs: tuple[GraphCensus, ...]
     failures: tuple[GraphFailure, ...]
-    total_families: int
-    total_unconfirmed: int
-    complete: bool
+    total_families: int = field(init=False)
+    complete: bool = field(init=False)
     elapsed_ms: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'total_families', sum(len(graph.families) for graph in self.graphs),
+        )
+        object.__setattr__(self, 'complete', sweep_complete(self.graphs, self.failures))
+
+
+def _describe_variants(variants: tuple[VariantSpelling, ...]) -> str:
+    """Each variant's survivor key and the two counts beneath it, in the order given."""
+    return '; '.join(
+        f'{v.name!r} provenance_rank={v.provenance_rank} '
+        f'({v.edge_count} edge(s), {v.mentions_count} mention(s))'
+        for v in variants
+    )
 
 
 class TaskFamilyCensus:
@@ -188,31 +159,19 @@ class TaskFamilyCensus:
     async def run(self, group_id: str) -> GraphCensus:
         """Census one graph.
 
-        Enumerates every Entity node, partitions them into task families, keeps
-        only the families holding MORE THAN ONE node, and asks the backend for
-        each survivor family's per-spelling edge counts.
+        Reads every same-group Entity node, partitions them into task families,
+        and keeps only the families holding MORE THAN ONE node. The >1
+        threshold is the honest one: a single node whose NAME is non-canonical
+        ('task 800' alone) is not a fragmented family — it splits nothing, and
+        the write-path normalizer renames it the next time an episode touches
+        that task.
 
-        The >1 threshold is the honest one: a single node whose NAME is
-        non-canonical ('task 800' alone) is not a fragmented family — it splits
-        nothing, and the write-path normalizer renames it the next time an
-        episode touches that task.
-
-        The threshold is applied TWICE, because the enumeration decides
-        membership and the probe supplies the edge counts, and the two are
-        neither identically scoped nor a single snapshot. A family that thins
-        below two spellings by the time it is probed is recorded as an
-        :class:`UnconfirmedFamily` rather than reported as residue — see that
-        class for the two ways it happens.
-
-        The per-family probe is a second read per fragmented family rather than
-        one widened enumeration. ``enumerate_entity_nodes`` returns
-        uuid/name/summary and is also consumed by ``list_entity_nodes``,
-        ``detect_stale_with_edges`` and ``rebuild_entity_summaries``; adding an
-        edge count to serve this one new reader would change a hot, shared row
-        shape for every one of them. The probe instead reuses the query the
-        write-path normalizer already depends on, so a regression in it shows up
-        in both, and its cost scales with the residue rather than with the
-        graph.
+        Membership and per-node provenance (edge count, mention count, rank)
+        come from ONE group-scoped read, so they cannot disagree. A node whose
+        group_id property names another project (task 2115's leak) is not a
+        member, matching every group-scoped collapse path; such nodes are
+        counted by ``fused_memory/maintenance/cross_graph_leak_census.py``. Why that read is a dedicated method rather than a
+        widened ``enumerate_entity_nodes``: task 5264, decision 7.
 
         Args:
             group_id: Project graph to census.
@@ -221,45 +180,32 @@ class TaskFamilyCensus:
             A :class:`GraphCensus`, including the completeness of the
             underlying enumeration.
         """
-        nodes, paged = await self.backend.enumerate_entity_nodes(group_id=group_id)
+        rows, paged = await self.backend.enumerate_ranked_entity_nodes(group_id=group_id)
 
         families = []
-        unconfirmed = []
-        for referent, members in group_task_node_families(nodes).items():
-            if len(members) <= 1:
+        for referent, members in group_task_node_families(rows).items():
+            if len(members) < 2:
                 continue
-            candidates = await self.backend.find_entity_nodes_by_name_substring(
-                referent.number, group_id=group_id,
-            )
             variants = tuple(
                 VariantSpelling(
-                    name=row['name'], uuid=row['uuid'], edge_count=row['edge_count'],
+                    name=row['name'],
+                    uuid=row['uuid'],
+                    edge_count=row['edge_count'],
+                    mentions_count=row['mentions_count'],
+                    provenance_rank=row['provenance_rank'],
                 )
-                for row in group_task_node_families(candidates).get(referent, [])
+                for row in members
             )
-            if len(variants) < 2:
-                unconfirmed.append(UnconfirmedFamily(
-                    canonical_name=referent.node_name,
-                    enumerated_members=len(members),
-                    probed_members=len(variants),
-                ))
-                logger.warning(
-                    'unconfirmed task family %s in graph %r: enumerated %d node(s), '
-                    'probe returned %d — a group_id-leaked node (task 2115) or a '
-                    'concurrent collapse; NOT counted as residue',
-                    referent.node_name, group_id, len(members), len(variants),
-                )
-                continue
             family = FragmentedFamily(
                 canonical_name=referent.node_name, variants=variants,
             )
             families.append(family)
             logger.warning(
-                'fragmented task family %s in graph %r: %d node(s) — %s',
+                'fragmented task family %s in graph %r: %d node(s), survivor first — %s',
                 family.canonical_name,
                 group_id,
                 len(variants),
-                ', '.join(f'{v.name!r}={v.edge_count} edge(s)' for v in variants),
+                _describe_variants(variants),
             )
 
         if not paged.complete:
@@ -274,8 +220,7 @@ class TaskFamilyCensus:
         return GraphCensus(
             group_id=group_id,
             families=tuple(families),
-            unconfirmed=tuple(unconfirmed),
-            nodes_scanned=len(nodes),
+            nodes_scanned=len(rows),
             complete=paged.complete,
             incomplete_kind=paged.incomplete_kind,
             rows_seen=paged.rows_seen,
@@ -285,17 +230,11 @@ class TaskFamilyCensus:
     async def sweep(self, group_id: str | None = None) -> CensusSweep:
         """Census every project graph, or just one.
 
-        Each graph is censused inside its own ``try/except Exception``, copying
-        ``GraphitiBackend._run_startup_identity_scan``'s shape: one unreachable
+        Graphs are read through ``graph_sweep.read_each_graph``: one unreachable
         graph costs the sweep that graph and nothing else. The failure is
         recorded in the result, not merely logged — a count that quietly omits
         an unreachable graph reads as "this graph has no residue" when the truth
         is "this graph was never looked at".
-
-        ``except Exception`` deliberately does not catch ``CancelledError``,
-        ``KeyboardInterrupt`` or ``SystemExit``: all three are ``BaseException``,
-        so an operator's Ctrl-C aborts the sweep instead of being recorded as
-        one graph's data problem.
 
         Args:
             group_id: A single graph to census. When None, every graph
@@ -308,50 +247,30 @@ class TaskFamilyCensus:
             ``total_families``.
         """
         graphs = [group_id] if group_id is not None else await self.backend.list_graphs()
-        start = time.monotonic()
-
-        censused: list[GraphCensus] = []
-        failures: list[GraphFailure] = []
-        for graph_name in graphs:
-            try:
-                censused.append(await self.run(graph_name))
-            except Exception as exc:
-                logger.error(
-                    'task-family census failed for graph %r', graph_name, exc_info=True,
-                )
-                failures.append(
-                    GraphFailure(group_id=graph_name, error=f'{type(exc).__name__}: {exc}')
-                )
-
-        elapsed_ms = (time.monotonic() - start) * 1000
-        total_families = sum(len(graph.families) for graph in censused)
-        total_unconfirmed = sum(len(graph.unconfirmed) for graph in censused)
-        complete = not failures and all(graph.complete for graph in censused)
+        reads = await read_each_graph(graphs, self.run, what='task-family census')
+        sweep = CensusSweep(
+            graphs=reads.results, failures=reads.failures, elapsed_ms=reads.elapsed_ms,
+        )
         logger.info(
             'task-family census complete: graphs_censused=%d graphs_failed=%d '
-            'fragmented_families=%d unconfirmed=%d complete=%s elapsed_ms=%.1f',
-            len(censused), len(failures), total_families, total_unconfirmed,
-            complete, elapsed_ms,
+            'fragmented_families=%d complete=%s elapsed_ms=%.1f',
+            len(sweep.graphs), len(sweep.failures), sweep.total_families, sweep.complete,
+            sweep.elapsed_ms,
         )
-        return CensusSweep(
-            graphs=tuple(censused),
-            failures=tuple(failures),
-            total_families=total_families,
-            total_unconfirmed=total_unconfirmed,
-            complete=complete,
-            elapsed_ms=elapsed_ms,
-        )
+        return sweep
 
 
 async def run_task_family_census(
     config_path: str | None = None,
     group_id: str | None = None,
 ) -> CensusSweep:
-    """Load config, initialize the service, sweep, close resources.
+    """Load config, open the store for reads only, sweep, close resources.
 
     The CLI-callable entrypoint. Lifecycle is delegated entirely to
     ``maintenance_service``, exactly as ``verify_zombie_edges.py`` does, so this
-    module owns no setup or teardown of its own.
+    module owns no setup or teardown of its own. The store is opened with
+    ``ServiceOpen.READS``: a census counts, so it runs no Graphiti startup
+    maintenance and opens no durable queue (task 6835).
 
     Args:
         config_path: Optional path to the YAML config file. When given it is
@@ -361,7 +280,7 @@ async def run_task_family_census(
     Returns:
         A :class:`CensusSweep`.
     """
-    async with maintenance_service(config_path) as (_config, service):
+    async with maintenance_service(config_path, open_as=ServiceOpen.READS) as (_config, service):
         census = TaskFamilyCensus(backend=service.graphiti)
         return await census.sweep(group_id=group_id)
 
@@ -407,7 +326,6 @@ def _format_summary(sweep: CensusSweep) -> str:
     line = (
         f'task-family census: {sweep.total_families} fragmented family/families '
         f'across {len(sweep.graphs)} graph(s) [{breakdown}] '
-        f'unconfirmed={sweep.total_unconfirmed} '
         f'complete={sweep.complete} elapsed_ms={sweep.elapsed_ms:.1f}'
     )
     if sweep.failures:
@@ -429,15 +347,11 @@ def main(argv: list[str] | None = None) -> int:
 
     Returns:
         0 only when every graph was read in full; 1 when any graph was
-        truncated or could not be read at all. A truncated census must never
+        truncated or could not be read at all, or when no graph was read (an
+        empty listing proves nothing). A truncated census must never
         pass for a clean one to a script reading the exit status — the number it
         reports is then a lower bound, and acting on it as a total would
         under-count the residue.
-
-        An unconfirmed family deliberately does NOT move the exit code: the
-        graph was read in full, and the count it produced is honest precisely
-        because that family was excluded. It is reported in the summary and in
-        the JSON, where a persistent non-zero value is the thing to chase.
     """
     args = _build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO)

@@ -10,147 +10,44 @@ from __future__ import annotations
 import ast
 import inspect
 import json
-import types
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# Shared note fixtures, owned by the pure-matcher suite. Imported rather than
-# copied so the two suites cannot drift: an edit to the straddling note (e.g.
-# adding or removing a phrase hit) must move BOTH the matcher assertions there
-# and the whole-tool assertions here, instead of leaving one silently
-# exercising a different scenario (task 3054, reviewer: duplication).
-#
-# The bare import resolves because fused-memory/tests/conftest.py inserts the
-# tests dir onto sys.path (the same mechanism that makes `from _fm_helpers
-# import X` work), and pytest loads a conftest by PATH regardless of import
-# mode. Do NOT reason about this from pytest's rootdir/prepend behaviour: the
-# repo-root pyproject.toml sets `--import-mode=importlib`, under which a test
-# file's own directory is NOT put on sys.path, so a root-bound run would fail
-# at collection without that insert. Verified green under -n0, under xdist,
-# standalone, and root-bound via `pytest -c pyproject.toml` from the repo root.
-from test_config_schema import (
-    MERGE_BASE_NEGATIVE_CONTROL_NOTE,
-    STRADDLING_WRITE_FIXTURE,
-)
+# One shared note drives both this whole-tool suite and the pure-matcher suite
+# in test_config_schema.py, so an edit to it moves both and neither can drift
+# (task 3054). The bare import resolves because fused-memory/tests/conftest.py
+# inserts the tests dir onto sys.path, which the repo-root
+# `--import-mode=importlib` run needs.
+from _fm_helpers import MERGE_BASE_NEGATIVE_CONTROL_NOTE, STRADDLING_WRITE_FIXTURE
 
 from fused_memory.config.schema import (
     Mem0UpdateConfig,
-    ProceduralTopicCluster,
     ReconciliationConfig,
 )
-from fused_memory.models.enums import MemoryCategory, SourceStore
-from fused_memory.models.memory import AddMemoryResponse, MemoryResult
+from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.models.scope import Scope
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.topic_cluster_store import TopicClusterStore, derive_topic_cluster
-from fused_memory.services.memory_service import RRF_K
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY
+from server.write_triage_harness import (
+    TOPIC_MATCH_CONTENT,
+    configure_pass_through_add_memory,
+    configure_reject_guard_config,
+    configure_triage_config,
+    search_candidate,
+    topic_cluster,
+)
 
 _PROJECT_ID = 'dark_factory'
 _CONTENT = 'canonical .task gitignore gotcha'
-
-# Content matching the injected test cluster's phrases ('plan-tools' + 'create_plan').
-_TOPIC_MATCH_CONTENT = 'run create_plan against the missing plan-tools MCP server'
+_EXISTING_DUPLICATE = f'{_CONTENT} (existing entry)'
 
 # A peer for `consolidate_memories`' `retain` arm (task 3134). Full 36-char
 # UUID: the op refuses anything shorter by name, per slot.
 _RETAINED_PEER = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
-
-
-def _topic_cluster(
-    topic_id: str = 'test-topic',
-    phrases: tuple[str, ...] = ('plan-tools', 'create_plan'),
-    min_phrase_hits: int = 2,
-    hint: str = '',
-) -> ProceduralTopicCluster:
-    return ProceduralTopicCluster(
-        topic_id=topic_id,
-        phrases=list(phrases),
-        min_phrase_hits=min_phrase_hits,
-        hint=hint,
-    )
-
-
-def _near_duplicate_result(
-    id_: str = 'm1',
-    score: float = 0.97,
-    content: str = 'canonical .task gitignore gotcha (existing entry)',
-    category: MemoryCategory = MemoryCategory.procedural_knowledge,
-    store_rank: int = 1,
-) -> MemoryResult:
-    """Build the POST-RRF result shape the tool really receives from search().
-
-    *score* is the Mem0 COSINE and lands in ``metadata['store_score']``;
-    ``relevance_score`` carries the ordinal RRF value, deliberately unrelated
-    to it.  Every gate test in this module therefore exercises the real
-    post-task-3658 shape, with its threshold expectations unchanged.
-
-    ``RRF_K`` is imported from production rather than restated as the literal
-    60, so a retune of the constant carries this fixture with it instead of
-    leaving it silently modelling a shape ``search()`` no longer emits.
-    """
-    return MemoryResult(
-        id=id_,
-        content=content,
-        category=category,
-        source_store=SourceStore.mem0,
-        relevance_score=1.0 / (RRF_K + store_rank),
-        metadata={'store_rank': store_rank, 'store_score': score},
-    )
-
-
-def _configure_reconciliation(mock_service: AsyncMock, **fields) -> None:
-    """Stand in for memory_service.config.reconciliation with a plain namespace.
-
-    A plain types.SimpleNamespace (rather than more AsyncMock/MagicMock
-    attribute chaining) means the resolver sees real bool/float values for
-    exactly the fields under test.
-    """
-    mock_service.config = types.SimpleNamespace(
-        reconciliation=types.SimpleNamespace(**fields)
-    )
-
-
-def _configure_pass_through_add_memory(mock_service: AsyncMock) -> None:
-    """Configure mock_service.add_memory to return a dict-dumpable result.
-
-    Mirrors test_add_memory_snapshot_gate.py: an unspecced AsyncMock's default
-    return value chains AsyncMock all the way down, so ``result.model_dump()``
-    would itself be an unawaited coroutine unless the return value is an
-    explicit MagicMock with model_dump configured.
-    """
-    mem_result = MagicMock()
-    mem_result.model_dump.return_value = {'id': 'ok'}
-    mock_service.add_memory.return_value = mem_result
-
-
-def _configure_triage_and_reconciliation(mock_service: AsyncMock, **reconciliation_fields) -> None:
-    """Stand in for memory_service.config with BOTH write_triage (enabled)
-    and reconciliation namespaces, for exercising the triage-supersedes-gate
-    path (task 3127 PRD D2: redirect supersedes reject).
-
-    ``_configure_reconciliation`` alone cannot express this: it builds only
-    the ``reconciliation`` section, which is exactly why ``write_triage.enabled``
-    reads False (attribute absent -> resolver default) in every other test in
-    this module. ``judge_enabled=False`` here is REQUIRED, not cosmetic:
-    omitting the attribute makes the resolver default it True, and
-    OPENAI_API_KEY is set in this environment, so a middle-band write would
-    place a real billed LLM call. Mirrors — without importing, since that
-    file sits outside this task's declared 2-file set —
-    test_add_memory_write_triage_gate.py's ``_configure_config`` helper shape.
-    """
-    mock_service.config = types.SimpleNamespace(
-        write_triage=types.SimpleNamespace(
-            enabled=True,
-            candidate_k=20,
-            t_high=0.90,
-            t_low=0.70,
-            judge_enabled=False,
-        ),
-        reconciliation=types.SimpleNamespace(**reconciliation_fields),
-    )
 
 
 class TestAddMemoryNearDuplicateGate:
@@ -164,7 +61,7 @@ class TestAddMemoryNearDuplicateGate:
         call memory_service.add_memory.
         """
         mock_service = AsyncMock()
-        matched = _near_duplicate_result(id_='m1', score=0.97)
+        matched = search_candidate(id_='m1', score=0.97, content=_EXISTING_DUPLICATE)
         mock_service.search.return_value = [matched]
         server = create_mcp_server(mock_service)
 
@@ -221,8 +118,8 @@ class TestAddMemoryNearDuplicateGate:
     async def test_allows_write_when_top_match_below_threshold(self):
         """A search match scoring well below the threshold does not block the write."""
         mock_service = AsyncMock()
-        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.50)]
-        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [search_candidate(id_='m1', score=0.50)]
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -248,8 +145,8 @@ class TestAddMemoryNearDuplicateGate:
         when the write's own category is something else.
         """
         mock_service = AsyncMock()
-        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -276,8 +173,8 @@ class TestAddMemoryNearDuplicateGate:
         has explicitly opted in to writing a near-duplicate.
         """
         mock_service = AsyncMock()
-        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -301,7 +198,7 @@ class TestAddMemoryNearDuplicateGate:
         """A search error must never block the write — fail-open, not fail-closed."""
         mock_service = AsyncMock()
         mock_service.search.side_effect = TimeoutError('search backend unavailable')
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -336,7 +233,7 @@ class TestAddMemoryNearDuplicateGate:
         mock_service.search.side_effect = TypeError(
             "search() got an unexpected keyword argument 'stores'"
         )
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -360,7 +257,7 @@ class TestAddMemoryNearDuplicateGate:
         """No candidate results at all → no match → write proceeds."""
         mock_service = AsyncMock()
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -387,8 +284,8 @@ class TestAddMemoryNearDuplicateGate:
         memory forever and shows up in future search results' metadata.
         """
         mock_service = AsyncMock()
-        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         await server._tool_manager.call_tool(
@@ -420,8 +317,8 @@ class TestAddMemoryNearDuplicateGate:
         / conflicting_task_status) already use.
         """
         mock_service = AsyncMock()
-        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -459,8 +356,8 @@ class TestAddMemoryNearDuplicateGate:
         short-circuited above it.
         """
         mock_service = AsyncMock()
-        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -494,7 +391,7 @@ class TestAddMemoryNearDuplicateGate:
         """
         mock_service = AsyncMock()
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
         content = (
             'Before writing to write_queue.db verify the path; the merge '
@@ -587,13 +484,13 @@ class TestAddMemoryNearDuplicateGateConfig:
     async def test_guard_disabled_via_config_allows_write(self):
         """procedural_knowledge_near_dup_guard_enabled=False skips the guard entirely."""
         mock_service = AsyncMock()
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=False,
-            procedural_knowledge_near_dup_threshold=0.92,
+            near_dup_guard_enabled=False,
+            near_dup_threshold=0.92,
         )
-        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -620,13 +517,13 @@ class TestAddMemoryNearDuplicateGateConfig:
         passes if the configured 0.99 threshold is actually being read.
         """
         mock_service = AsyncMock()
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=True,
-            procedural_knowledge_near_dup_threshold=0.99,
+            near_dup_guard_enabled=True,
+            near_dup_threshold=0.99,
         )
-        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
-        _configure_pass_through_add_memory(mock_service)
+        mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -648,12 +545,12 @@ class TestAddMemoryNearDuplicateGateConfig:
     async def test_configured_threshold_below_match_score_blocks_write(self):
         """Guard enabled with an explicit threshold still blocks a qualifying match."""
         mock_service = AsyncMock()
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=True,
-            procedural_knowledge_near_dup_threshold=0.90,
+            near_dup_guard_enabled=True,
+            near_dup_threshold=0.90,
         )
-        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.95)]
+        mock_service.search.return_value = [search_candidate(id_='m1', score=0.95)]
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -699,20 +596,20 @@ class TestAddMemoryTopicClusterGate:
         gated categories.
         """
         mock_service = AsyncMock()
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=True,
-            procedural_knowledge_near_dup_threshold=0.92,
-            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+            near_dup_guard_enabled=True,
+            near_dup_threshold=0.92,
+            topic_clusters=[topic_cluster()],
         )
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
             'add_memory',
             {
-                'content': _TOPIC_MATCH_CONTENT,
+                'content': TOPIC_MATCH_CONTENT,
                 'category': category,
                 'agent_id': 'claude-interactive',
                 'project_id': _PROJECT_ID,
@@ -732,7 +629,7 @@ class TestAddMemoryTopicClusterGate:
             f'category={category}: expected matched_phrases, got: {result!r}'
         )
         assert result.get('agent_id') == 'claude-interactive'
-        assert result.get('content_excerpt') == _TOPIC_MATCH_CONTENT[:200]
+        assert result.get('content_excerpt') == TOPIC_MATCH_CONTENT[:200]
         assert result.get('hint'), f'category={category}: expected a non-empty hint, got: {result!r}'
         assert result.get('category') == category, (
             f'category={category}: expected the category echo on the block dict, got: {result!r}'
@@ -747,20 +644,20 @@ class TestAddMemoryTopicClusterGate:
         for either gated category — the override is evaluated before the
         category branch and works for any agent/category."""
         mock_service = AsyncMock()
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=True,
-            procedural_knowledge_near_dup_threshold=0.92,
-            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+            near_dup_guard_enabled=True,
+            near_dup_threshold=0.92,
+            topic_clusters=[topic_cluster()],
         )
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
             'add_memory',
             {
-                'content': _TOPIC_MATCH_CONTENT,
+                'content': TOPIC_MATCH_CONTENT,
                 'category': category,
                 'agent_id': 'claude-interactive',
                 'project_id': _PROJECT_ID,
@@ -795,19 +692,19 @@ class TestAddMemoryTopicClusterGate:
         the exemption that short-circuited.
         """
         mock_service = AsyncMock()
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=True,
-            procedural_knowledge_near_dup_threshold=0.92,
-            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+            near_dup_guard_enabled=True,
+            near_dup_threshold=0.92,
+            topic_clusters=[topic_cluster()],
         )
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
             'add_memory',
             {
-                'content': _TOPIC_MATCH_CONTENT,
+                'content': TOPIC_MATCH_CONTENT,
                 'category': category,
                 'agent_id': 'recon-stage-memory_consolidator',
                 'project_id': _PROJECT_ID,
@@ -829,14 +726,14 @@ class TestAddMemoryTopicClusterGate:
         counterpart — see test_non_matching_content_does_not_trigger_cosine_search.
         """
         mock_service = AsyncMock()
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=True,
-            procedural_knowledge_near_dup_threshold=0.92,
-            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+            near_dup_guard_enabled=True,
+            near_dup_threshold=0.92,
+            topic_clusters=[topic_cluster()],
         )
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -869,13 +766,13 @@ class TestAddMemoryTopicClusterGate:
         through with no `search` call at all.
         """
         mock_service = AsyncMock()
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=True,
-            procedural_knowledge_near_dup_threshold=0.92,
-            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+            near_dup_guard_enabled=True,
+            near_dup_threshold=0.92,
+            topic_clusters=[topic_cluster()],
         )
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -903,19 +800,19 @@ class TestAddMemoryTopicClusterGate:
         call, with its own false-positive analysis this task has not done.
         """
         mock_service = AsyncMock()
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=True,
-            procedural_knowledge_near_dup_threshold=0.92,
-            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+            near_dup_guard_enabled=True,
+            near_dup_threshold=0.92,
+            topic_clusters=[topic_cluster()],
         )
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
             'add_memory',
             {
-                'content': _TOPIC_MATCH_CONTENT,
+                'content': TOPIC_MATCH_CONTENT,
                 'category': 'observations_and_summaries',
                 'agent_id': 'claude-interactive',
                 'project_id': _PROJECT_ID,
@@ -948,20 +845,20 @@ class TestAddMemoryTopicClusterGate:
         this case parametrizes the expectation rather than just the category.
         """
         mock_service = AsyncMock()
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=True,
-            procedural_knowledge_near_dup_threshold=0.92,
-            procedural_knowledge_topic_guard_clusters=[],
+            near_dup_guard_enabled=True,
+            near_dup_threshold=0.92,
+            topic_clusters=[],
         )
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
             'add_memory',
             {
-                'content': _TOPIC_MATCH_CONTENT,
+                'content': TOPIC_MATCH_CONTENT,
                 'category': category,
                 'agent_id': 'claude-interactive',
                 'project_id': _PROJECT_ID,
@@ -984,19 +881,19 @@ class TestAddMemoryTopicClusterGate:
         """procedural_knowledge_near_dup_guard_enabled=False disables BOTH
         guards, for either gated category."""
         mock_service = AsyncMock()
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=False,
-            procedural_knowledge_near_dup_threshold=0.92,
-            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+            near_dup_guard_enabled=False,
+            near_dup_threshold=0.92,
+            topic_clusters=[topic_cluster()],
         )
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
             'add_memory',
             {
-                'content': _TOPIC_MATCH_CONTENT,
+                'content': TOPIC_MATCH_CONTENT,
                 'category': category,
                 'agent_id': 'claude-interactive',
                 'project_id': _PROJECT_ID,
@@ -1025,20 +922,17 @@ class TestAddMemoryTopicClusterGate:
         mock/server rather than sharing state across loop iterations.
         """
         mock_service = AsyncMock()
-        _configure_triage_and_reconciliation(
-            mock_service,
-            procedural_knowledge_near_dup_guard_enabled=True,
-            procedural_knowledge_near_dup_threshold=0.92,
-            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+        configure_triage_config(
+            mock_service, near_dup_threshold=0.92, topic_clusters=[topic_cluster()],
         )
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
             'add_memory',
             {
-                'content': _TOPIC_MATCH_CONTENT,
+                'content': TOPIC_MATCH_CONTENT,
                 'category': category,
                 'agent_id': 'claude-interactive',
                 'project_id': _PROJECT_ID,
@@ -1056,7 +950,7 @@ class TestAddMemorySufficientPhraseGate:
 
     Unlike every class above, this wires the REAL shipped cluster seed
     (``ReconciliationConfig().procedural_knowledge_topic_guard_clusters``)
-    rather than the synthetic ``_topic_cluster()``, so the clusters agents
+    rather than the synthetic ``topic_cluster()``, so the clusters agents
     actually hit in production are exercised through the whole tool path.
 
     The content is the reconstructed straddling-write fixture IMPORTED from
@@ -1070,11 +964,11 @@ class TestAddMemorySufficientPhraseGate:
 
     @staticmethod
     def _configure_real_clusters(mock_service: AsyncMock) -> None:
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=True,
-            procedural_knowledge_near_dup_threshold=0.92,
-            procedural_knowledge_topic_guard_clusters=(
+            near_dup_guard_enabled=True,
+            near_dup_threshold=0.92,
+            topic_clusters=(
                 ReconciliationConfig().procedural_knowledge_topic_guard_clusters
             ),
         )
@@ -1085,7 +979,7 @@ class TestAddMemorySufficientPhraseGate:
         mock_service = AsyncMock()
         self._configure_real_clusters(mock_service)
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -1122,7 +1016,7 @@ class TestAddMemorySufficientPhraseGate:
         mock_service = AsyncMock()
         self._configure_real_clusters(mock_service)
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -1158,7 +1052,7 @@ class TestAddMemorySufficientPhraseGate:
         """
         mock_service = AsyncMock()
         self._configure_real_clusters(mock_service)
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -1183,7 +1077,7 @@ class TestAddMemorySufficientPhraseGate:
         mock_service = AsyncMock()
         self._configure_real_clusters(mock_service)
         mock_service.search.return_value = []
-        _configure_pass_through_add_memory(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await server._tool_manager.call_tool(
@@ -1262,11 +1156,11 @@ class TestConsolidateMemoriesIsNotCaughtByThisGuard:
         # The guards are ARMED -- same config the inverted exemption tests
         # above use -- so a pass here means the path misses them, not that
         # they were switched off.
-        _configure_reconciliation(
+        configure_reject_guard_config(
             mock_service,
-            procedural_knowledge_near_dup_guard_enabled=True,
-            procedural_knowledge_near_dup_threshold=0.92,
-            procedural_knowledge_topic_guard_clusters=[_topic_cluster()],
+            near_dup_guard_enabled=True,
+            near_dup_threshold=0.92,
+            topic_clusters=[topic_cluster()],
         )
         # `consolidate_memories` authorizes through resolve_mem0_update_authorization,
         # whose fail-closed resolver rejects bare Mock leaves; a REAL config
@@ -1276,7 +1170,7 @@ class TestConsolidateMemoriesIsNotCaughtByThisGuard:
         # Content that WOULD trip both deterministic guards at the tool layer:
         # it carries the injected cluster's phrases, and search is primed with
         # a 0.97 cosine near-duplicate.
-        mock_service.search.return_value = [_near_duplicate_result(id_='m1', score=0.97)]
+        mock_service.search.return_value = [search_candidate(id_='m1', score=0.97)]
         mock_service.add_memory.return_value = AddMemoryResponse(
             memory_ids=['canonical-1'], message='ok'
         )
@@ -1297,7 +1191,7 @@ class TestConsolidateMemoriesIsNotCaughtByThisGuard:
         result = await server._tool_manager.call_tool(
             'consolidate_memories',
             {
-                'canonical_content': _TOPIC_MATCH_CONTENT,
+                'canonical_content': TOPIC_MATCH_CONTENT,
                 'topic': 'test-topic',
                 'project_id': _PROJECT_ID,
                 'category': 'procedural_knowledge',
@@ -1361,14 +1255,14 @@ def derived_cluster_store(tmp_path: Path) -> Iterator[TopicClusterStore]:
 
 def _derived_guard_service() -> AsyncMock:
     mock_service = AsyncMock()
-    _configure_reconciliation(
+    configure_reject_guard_config(
         mock_service,
-        procedural_knowledge_near_dup_guard_enabled=True,
-        procedural_knowledge_near_dup_threshold=0.92,
-        procedural_knowledge_topic_guard_clusters=[],
+        near_dup_guard_enabled=True,
+        near_dup_threshold=0.92,
+        topic_clusters=[],
     )
     mock_service.search.return_value = []
-    _configure_pass_through_add_memory(mock_service)
+    configure_pass_through_add_memory(mock_service)
     return mock_service
 
 
@@ -1465,3 +1359,73 @@ class TestRuntimeSeededClusterBlocksAProbeWrite:
 
         assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', result
         mock_service.add_memory.assert_awaited_once()
+
+
+_LONG_PADDING = ' The surrounding narrative restates the cycle context at length.' * 6
+_LONG_SNAPSHOT_CONTENT = (
+    'As of 2026-05-28, project reify has 2 pending / 2 in-progress / '
+    '0 blocked / 1 deferred / 1505 done / 148 cancelled tasks.' + _LONG_PADDING
+)
+
+
+class TestAddMemoryGuardBlocksDiscloseTheirExcerptClip:
+    """Every add_memory soft-block discloses a cut excerpt the same way (task 5365).
+
+    ``near_duplicate_guard`` owns the excerpt shape every pre-service guard
+    spreads, so this pins it at the tool boundary for the near-duplicate gate
+    and for one recon-stage gate in ``server/tools.py``: the excerpt stays
+    ``content[:200]``, and a ``truncation_facts`` list says what was cut.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_near_duplicate_rejection_reports_both_cut_excerpts(self):
+        content = _CONTENT + _LONG_PADDING
+        matched = search_candidate(content='existing entry.' + _LONG_PADDING)
+        mock_service = AsyncMock()
+        mock_service.search.return_value = [matched]
+        server = create_mcp_server(mock_service)
+
+        result = await _add(server, content)
+
+        assert result.get('error_type') == 'ProceduralKnowledgeNearDuplicateWriteRejected', result
+        assert result['content_excerpt'] == content[:200], result
+        assert result['matched_excerpt'] == matched.content[:200], result
+        assert result[TRUNCATION_FACTS_KEY] == [
+            {'field': 'content_excerpt', 'cap': 200, 'elided': len(content) - 200},
+            {'field': 'matched_excerpt', 'cap': 200, 'elided': len(matched.content) - 200},
+        ], result
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_recon_stage_rejection_reports_its_cut_excerpt(self):
+        mock_service = AsyncMock()
+        server = create_mcp_server(mock_service)
+
+        result = await _add(
+            server,
+            _LONG_SNAPSHOT_CONTENT,
+            category='temporal_facts',
+            agent_id='recon-stage-task_knowledge_sync',
+        )
+
+        assert result.get('error') == 'count_snapshot_write_blocked', result
+        assert result['content_excerpt'] == _LONG_SNAPSHOT_CONTENT[:200], result
+        assert result[TRUNCATION_FACTS_KEY] == [
+            {
+                'field': 'content_excerpt',
+                'cap': 200,
+                'elided': len(_LONG_SNAPSHOT_CONTENT) - 200,
+            },
+        ], result
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_uncut_rejection_carries_no_truncation_facts(self):
+        mock_service = AsyncMock()
+        mock_service.search.return_value = [search_candidate(content=_EXISTING_DUPLICATE)]
+        server = create_mcp_server(mock_service)
+
+        result = await _add(server, _CONTENT)
+
+        assert result.get('error_type') == 'ProceduralKnowledgeNearDuplicateWriteRejected', result
+        assert TRUNCATION_FACTS_KEY not in result, result

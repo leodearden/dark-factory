@@ -6,8 +6,8 @@ Task 3583. The FIRE half of the signal whose seam is
 
 WHAT THIS CLOSES. A durably-queued write is ACCEPTED synchronously and executed
 later: ``add_episode`` returns ``status='queued'``, and ``add_memory``'s
-Graphiti leg appends ``SourceStore.graphiti`` to ``stores_written`` the moment
-the item is enqueued. Both are true statements about durable acceptance. But
+Graphiti leg is reported in ``stores_queued`` the moment the item is enqueued.
+Both are true statements about durable acceptance. But
 when the item later exhausts its attempts, the caller who acted on that success
 is told nothing, ever — the whole premise of the queue is that an accepted
 enqueue eventually lands, and a dead-letter is that premise being broken.
@@ -50,7 +50,7 @@ WHAT THE CALLER WAS TOLD is carried explicitly, via ``_REPORTED_TO_CALLER``,
 keyed on the durable-queue OPERATION name and gated on the evidence that
 operation's claim rests on. The two enqueue sites that report a synchronous
 success make DIFFERENT claims — ``add_episode`` returns ``status='queued'``,
-``add_memory`` returns ``stores_written`` containing graphiti — and an alarm
+``add_memory`` returns ``stores_queued`` containing graphiti — and an alarm
 that misreported which one was made would not be triageable. Neither is the
 operation name alone always evidence that a claim was made at all: see
 ``_Claim.requires_write_op_id`` for the operation with a second, caller-less
@@ -68,9 +68,14 @@ log line plus ``None``.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
+
+from shared.project_layout import escalation_queue_dir
+
+from fused_memory.services.durable_queue import POST_EXECUTE_DEAD_PREFIX
+from fused_memory.services.queued_writes import QueueOperation
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
@@ -89,8 +94,6 @@ except ImportError:
     HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
-
-_QUEUE_DIRNAME = 'data/escalations'
 
 _ANCHOR_TASK_ID = 'durable-write-dead-letter'
 
@@ -112,7 +115,7 @@ class _Claim:
     ONE producer and only some of them face a caller, so the operation NAME
     alone is not always evidence that anybody was told anything.
     ``add_memory_graphiti`` is the case that forces it: ``add_memory`` mints a
-    ``_write_op_id`` for every item it enqueues and returns ``stores_written``
+    ``_write_op_id`` for every item it enqueues and returns ``stores_queued``
     to a live caller, while ``MemoryService.replay_from_store`` enqueues the
     same operation from a background loop with no caller, no synchronous claim
     and deliberately no ``_write_op_id``. Ungated, a replayed death would name
@@ -124,22 +127,24 @@ class _Claim:
     requires_write_op_id: bool = False
 
 
-# What the CALLER was synchronously told, keyed on the durable-queue OPERATION
-# name. This is what makes the record say not merely "a write died" but "a
-# caller acted on a success that will never be true" — the difference between
-# an alarm an operator can triage and one they cannot.
+# What the CALLER was synchronously told, keyed on the durable-queue OPERATION.
+# This is what makes the record say not merely "a write died" but "a caller
+# acted on a success that will never be true" — the difference between an alarm
+# an operator can triage and one they cannot. Looked up by the row's raw
+# operation string, which for an undecodable row is outside the vocabulary and
+# falls to the default.
 #
 # A new enqueue site that reports success synchronously must add an entry here,
 # and must set `requires_write_op_id` when it is not that operation's only
 # producer.
-_REPORTED_TO_CALLER = {
-    'add_episode': _Claim(
+_REPORTED_TO_CALLER: Mapping[str, _Claim] = {
+    QueueOperation.ADD_EPISODE: _Claim(
         "add_episode returned status='queued' and an episode_id, so the caller "
         'was told the write had been durably accepted and would land'
     ),
-    'add_memory_graphiti': _Claim(
-        'add_memory returned stores_written containing graphiti at enqueue '
-        'time — the caller was told this write LANDED, not that it was queued',
+    QueueOperation.ADD_MEMORY_GRAPHITI: _Claim(
+        'add_memory returned stores_queued containing graphiti, so the caller '
+        'was told the write had been durably queued and would land',
         requires_write_op_id=True,
     ),
 }
@@ -176,21 +181,11 @@ def _error_class(error: str | None) -> str:
     with one owner, and a local copy would silently stop stripping the day the
     wording changed.
 
-    The import is DEFERRED into this function to break an import cycle, not as
-    a style choice. At module scope it reaches ``services/__init__``, which
-    eagerly imports ``MemoryService``, which imports this module back — so
-    whenever this module is imported FIRST (collecting
-    ``tests/middleware/`` alone does exactly that) the service layer finds it
-    half-initialized and ``emit_dead_letter_escalation`` undefined. By call
-    time both modules are fully loaded.
-
     Falls back to ``'unknown'`` for ``None`` or an unparseable message, which
     folds those deaths together rather than dropping them.
     """
     if not error:
         return 'unknown'
-    from fused_memory.services.durable_queue import POST_EXECUTE_DEAD_PREFIX
-
     text = error
     if text.startswith(POST_EXECUTE_DEAD_PREFIX):
         text = text[len(POST_EXECUTE_DEAD_PREFIX):]
@@ -227,9 +222,9 @@ def emit_dead_letter_escalation(
             from ``MemoryService._known_projects`` and never defaulted to the
             server cwd, where no operator watches.
         project_id: The project whose write was lost.
-        operation: The durable-queue operation that died (``add_episode``,
-            ``add_memory_graphiti``, ``mem0_classify_and_add``, ...). The
-            operator's first question, and part of the dedupe fold.
+        operation: The dead row's raw operation string: a ``QueueOperation``
+            value, or whatever an undecodable row held. The operator's first
+            question, and part of the dedupe fold.
         group_id: The queue group the item sat in — the graphiti group for a
             Graphiti write, ``mem0_{project_id}`` for a Mem0 one.
         item_id: The ``write_queue`` row id, for as long as the row survives.
@@ -262,7 +257,7 @@ def emit_dead_letter_escalation(
         return None
 
     try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+        queue = EscalationQueue(escalation_queue_dir(project_root))
     except Exception:
         # Constructing the queue creates its directory; a read-only or missing
         # project_root must not turn a lost alarm into a crash in the worker.

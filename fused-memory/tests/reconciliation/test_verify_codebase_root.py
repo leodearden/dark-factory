@@ -17,15 +17,20 @@ Kept separate from ``test_verify_agent_failure.py`` — that file is task 4343's
 failure-token census guard, and each file here pins ONE contract.
 """
 
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from _git_root_helper import make_git_root
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationVerdict
 from fused_memory.reconciliation.verify import CodebaseVerifier
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY, elision_marker
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -52,15 +57,12 @@ def _mock_agent_loop():
     patcher = patch('fused_memory.reconciliation.verify.AgentLoop')
     mock_cls = patcher.start()
     instance = AsyncMock()
-    instance.run = AsyncMock(return_value=(
-        {
-            'verdict': 'inconclusive',
-            'confidence': 0.5,
-            'evidence': [],
-            'summary': 'nothing conclusive',
-        },
-        [],
-    ))
+    instance.run = AsyncMock(return_value={
+        'verdict': 'inconclusive',
+        'confidence': 0.5,
+        'evidence': [],
+        'summary': 'nothing conclusive',
+    })
     mock_cls.return_value = instance
     return patcher, mock_cls, instance
 
@@ -149,8 +151,8 @@ async def test_prompt_names_the_per_call_root(tmp_path):
 async def test_agent_cwd_is_the_per_call_root(tmp_path):
     """The agent runs IN the caller's root, not the global explore root.
 
-    Task 1989's rationale, re-pointed: the cwd's auto-loaded CLAUDE.md is the
-    agent's main passive codebase signal, so it must be the TARGET project's.
+    The cwd is the root the CLI confines its read tools to, so it must be the
+    TARGET project's.
     """
     root_a = make_git_root(tmp_path, 'root_a')
     config = _config()
@@ -241,6 +243,68 @@ async def test_subprocess_tools_run_in_the_per_call_root(tmp_path):
         search_path = Path(mock_exec.call_args.args[-1])
         assert search_path.is_relative_to(root_a.resolve()), search_path
         assert not search_path.is_relative_to(decoy.resolve()), search_path
+
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false',
+         '-c', 'core.hooksPath=/dev/null', *args],
+        cwd=root, check=True, capture_output=True, text=True,
+    ).stdout
+
+
+def _commit(root: Path, filename: str, message: str) -> str:
+    (root / filename).write_text(f'{filename}\n')
+    _git(root, 'add', filename)
+    _git(root, 'commit', '-q', '-m', message)
+    return _git(root, 'rev-parse', 'HEAD').strip()
+
+
+async def _git_show_tool(root: Path):
+    patcher, mock_cls, _instance = _mock_agent_loop()
+    try:
+        await CodebaseVerifier(_config()).verify(claim='Task X completed', codebase_root=root)
+    finally:
+        patcher.stop()
+    return mock_cls.call_args.kwargs['tools']['git_show'].function
+
+
+def _repo(tmp_path: Path) -> Path:
+    root = tmp_path / 'repo'
+    root.mkdir()
+    _git(root, 'init', '-q')
+    return root
+
+
+@pytest.mark.asyncio
+async def test_git_show_discloses_a_clipped_stat_view(tmp_path):
+    """A clipped ``git show`` says so, and by how much, like read_file and glob_search do."""
+    root = _repo(tmp_path)
+    big_sha = _commit(root, 'big.txt', 'big commit\n\n' + 'word ' * 20_000)
+    git_show = await _git_show_tool(root)
+
+    big = await git_show(commit=big_sha)
+
+    full_big = _git(root, 'show', '--stat', big_sha)
+    [fact] = big[TRUNCATION_FACTS_KEY]
+    cap = fact['cap']
+    assert fact == {'field': 'output', 'cap': cap, 'elided': len(full_big) - cap}
+    assert big['output'] == full_big[:cap] + elision_marker(len(full_big) - cap)
+
+
+@pytest.mark.asyncio
+async def test_git_show_returns_the_measured_ordinary_worst_case_commit_whole(tmp_path):
+    """10789 chars was the largest ordinary ``git show --stat`` measured on 2026-09-14."""
+    root = _repo(tmp_path)
+    sha = _commit(root, 'ordinary.txt', 'ordinary commit\n\n' + 'word ' * 2_200)
+    git_show = await _git_show_tool(root)
+    full = _git(root, 'show', '--stat', sha)
+    assert len(full) > 11_000
+
+    shown = await git_show(commit=sha)
+
+    assert shown['output'] == full
+    assert TRUNCATION_FACTS_KEY not in shown
 
 
 @pytest.mark.asyncio

@@ -62,8 +62,12 @@ from __future__ import annotations
 import pathlib
 import tomllib
 
+import pytest
 import yaml
 from orchestrator.config import _discover_module_configs
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

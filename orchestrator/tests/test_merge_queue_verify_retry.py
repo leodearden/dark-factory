@@ -9,10 +9,10 @@ reify's verify.sh (α/β/γ) is the CONSUMER — out of scope here.
 Covers:
   * ``_build_retry_verify_env`` — writes the debug/release nextest filter files
     and returns the REIFY_* env dict.
-  * ``_assemble_retry_verify_env`` — INV-3 tree-OID corroboration gate.
+  * ``assemble_retry_verify_env`` — INV-3 tree-OID corroboration gate.
   * ``_load_reify_attempt_sidecar`` — the drift tripwire pinned to the REAL
     bytes reify writes (task 3059).
-  * ``_run_post_merge_verify`` wiring under ``req.retry_failed_only``.
+  * ``run_post_merge_verify`` wiring under ``req.retry_failed_only``.
 """
 from __future__ import annotations
 
@@ -28,18 +28,18 @@ import pytest
 from _merge_lane_fakes import FakeVerifier
 
 if TYPE_CHECKING:
-    from orchestrator.merge_queue import MergeRequest
+    from orchestrator.merge_lane.worker import MergeRequest
 
 
 def _attempt0(tree_oid: str):
-    """An attempt-0 payload shaped exactly as _build_attempt0_payload builds one.
+    """An attempt-0 payload shaped exactly as build_attempt0_payload builds one.
 
     Ids are in ``parse_per_test_results``' key space (``"<binary-id> <test-name>"``)
     so the filter-file assertions below exercise the real ``nextest_filter_ids``
     mapping.  Only the FIRST profile (debug) is populated; release carries the
     empty subset a later profile always gets.
     """
-    from orchestrator.merge_queue import _Attempt0Payload
+    from orchestrator.merge_lane.retry_verify_env import _Attempt0Payload
 
     return _Attempt0Payload(
         tree_oid=tree_oid,
@@ -80,11 +80,11 @@ async def test_assemble_retry_verify_env_subset_is_failed_union_not_started(
     tests, so they are absent from the verdicts.  A failed-only filter would
     silently never re-run them.
     """
-    from orchestrator.merge_queue import _assemble_retry_verify_env
+    from orchestrator.merge_lane.retry_verify_env import assemble_retry_verify_env
 
     git_ops = _git_ops_returning('abc123')
     req = cast('MergeRequest', SimpleNamespace(task_id='t-1', retry_failed_only=True))
-    env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
+    env = await assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
 
     assert env is not None
     debug_path = Path(env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG'])
@@ -113,11 +113,11 @@ async def test_assemble_retry_verify_env_filter_lines_are_bare_test_names(
     and matches ZERO tests: a narrowed retry that runs nothing and reports PASS.
     A FALSE GREEN, strictly worse than not narrowing at all.
     """
-    from orchestrator.merge_queue import _assemble_retry_verify_env
+    from orchestrator.merge_lane.retry_verify_env import assemble_retry_verify_env
 
     git_ops = _git_ops_returning('abc123')
     req = cast('MergeRequest', SimpleNamespace(task_id='t-b', retry_failed_only=True))
-    env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
+    env = await assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
 
     assert env is not None
     debug_path = Path(env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG'])
@@ -139,11 +139,11 @@ async def test_assemble_retry_verify_env_later_profile_file_is_empty(
     "retry refused: no subset" FULL-fallback trigger, so a profile whose
     attempt-0 pass never ran degrades loudly rather than being skipped.
     """
-    from orchestrator.merge_queue import _assemble_retry_verify_env
+    from orchestrator.merge_lane.retry_verify_env import assemble_retry_verify_env
 
     git_ops = _git_ops_returning('abc123')
     req = cast('MergeRequest', SimpleNamespace(task_id='t-c', retry_failed_only=True))
-    env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
+    env = await assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
 
     assert env is not None
     release_path = Path(env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE'])
@@ -160,11 +160,11 @@ async def test_assemble_retry_verify_env_tree_oid_is_the_corroborated_oid(
     Both arms agree here: DF's own `git_ops.get_head_tree_hash` read and
     reify's independent `git rev-parse HEAD:` stamp from the sidecar.
     """
-    from orchestrator.merge_queue import _assemble_retry_verify_env
+    from orchestrator.merge_lane.retry_verify_env import assemble_retry_verify_env
 
     git_ops = _git_ops_returning('abc123')
     req = cast('MergeRequest', SimpleNamespace(task_id='t-e', retry_failed_only=True))
-    env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
+    env = await assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
 
     assert env is not None
     assert env['REIFY_VERIFY_RETRY_TREE_OID'] == 'abc123'
@@ -181,12 +181,12 @@ async def test_assemble_retry_verify_env_rebased_returns_none(
     disagreement means the tree moved under the retry.  Falls back to the
     existing M4 _reverify_rebased_tree FULL re-verify route.
     """
-    from orchestrator.merge_queue import _assemble_retry_verify_env
+    from orchestrator.merge_lane.retry_verify_env import assemble_retry_verify_env
 
     git_ops = _git_ops_returning('different-oid')
     req = cast('MergeRequest', SimpleNamespace(task_id='t-2', retry_failed_only=True))
-    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-        env = await _assemble_retry_verify_env(
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+        env = await assemble_retry_verify_env(
             git_ops, req, tmp_path, _attempt0('abc123')
         )
 
@@ -205,12 +205,12 @@ async def test_assemble_retry_verify_env_unknown_tree_returns_none(
     An unreadable OID is not a match — it is an absence of corroboration, and
     the retry must not proceed on one arm alone.
     """
-    from orchestrator.merge_queue import _assemble_retry_verify_env
+    from orchestrator.merge_lane.retry_verify_env import assemble_retry_verify_env
 
     git_ops = _git_ops_returning(None)
     req = cast('MergeRequest', SimpleNamespace(task_id='t-3', retry_failed_only=True))
-    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-        env = await _assemble_retry_verify_env(
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+        env = await assemble_retry_verify_env(
             git_ops, req, tmp_path, _attempt0('abc123')
         )
 
@@ -234,7 +234,7 @@ async def test_assemble_retry_verify_env_unknown_tree_returns_none(
 def _payload(
     *, debug_planned: list[str], debug_verdicts: dict[str, str], tree_oid: str = 'abc123',
 ):
-    from orchestrator.merge_queue import _Attempt0Payload
+    from orchestrator.merge_lane.retry_verify_env import _Attempt0Payload
 
     return _Attempt0Payload(
         tree_oid=tree_oid,
@@ -275,12 +275,12 @@ async def test_assemble_refuses_a_subset_that_narrows_nothing(
     verdicts: dict[str, str],
 ) -> None:
     """A retry that narrows NOTHING must not be reported as narrowed."""
-    from orchestrator.merge_queue import _assemble_retry_verify_env
+    from orchestrator.merge_lane.retry_verify_env import assemble_retry_verify_env
 
     git_ops = _git_ops_returning('abc123')
     req = cast('MergeRequest', SimpleNamespace(task_id='t-mn', retry_failed_only=True))
-    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-        env = await _assemble_retry_verify_env(
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
+        env = await assemble_retry_verify_env(
             git_ops, req, tmp_path,
             _payload(debug_planned=planned, debug_verdicts=verdicts),
         )
@@ -302,9 +302,9 @@ async def test_assemble_refuses_a_subset_at_the_reify_ceiling(
     and runs the profile FULL, so DF must mirror the ceiling rather than charge
     a full re-verify to the narrowed budget.
     """
-    from orchestrator.merge_queue import (
+    from orchestrator.merge_lane.retry_verify_env import (
         _REIFY_VERIFY_RETRY_MAX_SUBSET,
-        _assemble_retry_verify_env,
+        assemble_retry_verify_env,
     )
 
     n = _REIFY_VERIFY_RETRY_MAX_SUBSET
@@ -314,7 +314,7 @@ async def test_assemble_refuses_a_subset_at_the_reify_ceiling(
 
     git_ops = _git_ops_returning('abc123')
     req = cast('MergeRequest', SimpleNamespace(task_id='t-mn2', retry_failed_only=True))
-    env = await _assemble_retry_verify_env(
+    env = await assemble_retry_verify_env(
         git_ops, req, tmp_path,
         _payload(debug_planned=planned, debug_verdicts=verdicts),
     )
@@ -324,7 +324,7 @@ async def test_assemble_refuses_a_subset_at_the_reify_ceiling(
     # assertion above is about the ceiling and not about the plan being large.
     verdicts_small = {f'c t{i}': 'pass' for i in range(2)}
     planned_small = [f'c t{i}' for i in range(n)]
-    env_ok = await _assemble_retry_verify_env(
+    env_ok = await assemble_retry_verify_env(
         git_ops, req, tmp_path,
         _payload(debug_planned=planned_small, debug_verdicts=verdicts_small),
     )
@@ -336,19 +336,19 @@ async def test_assemble_logs_per_suite_subset_sizes_when_it_narrows(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The narrowing site logs the sizes behind the larger-budget decision."""
-    from orchestrator.merge_queue import _assemble_retry_verify_env
+    from orchestrator.merge_lane.retry_verify_env import assemble_retry_verify_env
 
     git_ops = _git_ops_returning('abc123')
     req = cast('MergeRequest', SimpleNamespace(task_id='t-mn3', retry_failed_only=True))
-    with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
-        env = await _assemble_retry_verify_env(
+    with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
+        env = await assemble_retry_verify_env(
             git_ops, req, tmp_path, _attempt0('abc123')
         )
 
     assert env is not None
     msgs = [
         r.getMessage() for r in caplog.records
-        if r.name == 'orchestrator.merge_queue'
+        if r.name == 'orchestrator.merge_lane'
     ]
     # _attempt0(): 4 planned debug tests, 1 passed -> a 3/4 subset.
     assert any('debug 3/4' in m for m in msgs), msgs
@@ -369,7 +369,7 @@ def test_build_retry_verify_env_writes_filter_files_and_env(tmp_path: Path) -> N
     fallback, :2156), and a comma-joined multi-member run_all value collapses
     into one unmatchable token.
     """
-    from orchestrator.merge_queue import _build_retry_verify_env
+    from orchestrator.merge_lane.retry_verify_env import _build_retry_verify_env
 
     debug = ['beta::test_three', 'alpha::test_two']
     release = ['gamma::test_one']
@@ -421,7 +421,7 @@ def test_build_retry_verify_env_empty_subsets_still_write_files(tmp_path: Path) 
     ``[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]`` and :2127 does the same for
     the gui specs.
     """
-    from orchestrator.merge_queue import _build_retry_verify_env
+    from orchestrator.merge_lane.retry_verify_env import _build_retry_verify_env
 
     env = _build_retry_verify_env(
         nextest_subset_debug=[],
@@ -445,7 +445,7 @@ def test_build_retry_verify_env_empty_subsets_still_write_files(tmp_path: Path) 
 
 
 # ---------------------------------------------------------------------------
-# _run_post_merge_verify wiring.  Guarded by req.retry_failed_only; the retry env
+# run_post_merge_verify wiring.  Guarded by req.retry_failed_only; the retry env
 # is merged into MergeVerifySpec.verify_env inside the classified-infra-transient
 # RETRY branch (task 3059) — never before the first dispatch, which would narrow
 # attempt-0 itself.  Driven on the LOCAL path (runner=None) so task 2822's
@@ -459,7 +459,7 @@ def _make_git_ops_mock() -> MagicMock:
     m.get_main_sha = AsyncMock(return_value='main-sha')
     m.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
     m.cleanup_merge_worktree = AsyncMock()
-    m.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+    m.create_ephemeral_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
     m.get_head_tree_hash = AsyncMock(return_value='deadbeef')
     return m
 
@@ -486,7 +486,7 @@ _REIFY_SIDECAR_FIXTURE = _REIFY_FIXTURE_DIR / 'reify-verify-attempt.json'
 
 def _place_real_sidecar(merge_wt: Path, text: str | None = None) -> Path:
     """Copy the fixture bytes VERBATIM to the path reify writes under merge_wt."""
-    from orchestrator.merge_queue import _REIFY_ATTEMPT_SIDECAR_RELPATH
+    from orchestrator.merge_lane.retry_verify_env import _REIFY_ATTEMPT_SIDECAR_RELPATH
 
     path = merge_wt / _REIFY_ATTEMPT_SIDECAR_RELPATH
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -504,7 +504,7 @@ def test_reify_attempt_sidecar_relpath_is_reifys_default() -> None:
     so if that default moves this fails LOUDLY at the constant rather than
     silently degrading every retry to a full verify.
     """
-    from orchestrator.merge_queue import _REIFY_ATTEMPT_SIDECAR_RELPATH
+    from orchestrator.merge_lane.retry_verify_env import _REIFY_ATTEMPT_SIDECAR_RELPATH
 
     assert _REIFY_ATTEMPT_SIDECAR_RELPATH == 'target/reify-verify-attempt.json'
 
@@ -529,7 +529,7 @@ def test_load_reify_attempt_sidecar_parses_real_bytes(tmp_path: Path) -> None:
     Not a JSON list — a reader who assumed a list would get a per-character
     iteration and silently build a nonsense profile set.
     """
-    from orchestrator.merge_queue import _load_reify_attempt_sidecar
+    from orchestrator.merge_lane.retry_verify_env import _load_reify_attempt_sidecar
 
     _place_real_sidecar(tmp_path)
     sidecar = _load_reify_attempt_sidecar(tmp_path)
@@ -542,7 +542,7 @@ def test_load_reify_attempt_sidecar_parses_real_bytes(tmp_path: Path) -> None:
 
 def test_load_reify_attempt_sidecar_absent_file_returns_none(tmp_path: Path) -> None:
     """No sidecar (reify never stamped one) -> None -> full verify."""
-    from orchestrator.merge_queue import _load_reify_attempt_sidecar
+    from orchestrator.merge_lane.retry_verify_env import _load_reify_attempt_sidecar
 
     assert _load_reify_attempt_sidecar(tmp_path) is None
 
@@ -575,7 +575,7 @@ def test_load_reify_attempt_sidecar_malformed_returns_none(
     `profiles`, or fall back to a full verify" obligation (verify.sh:219-230).
     Silently ignoring the unknown profile would narrow a profile that never ran.
     """
-    from orchestrator.merge_queue import _load_reify_attempt_sidecar
+    from orchestrator.merge_lane.retry_verify_env import _load_reify_attempt_sidecar
 
     _place_real_sidecar(tmp_path, text=text)
     assert _load_reify_attempt_sidecar(tmp_path) is None, label
@@ -597,7 +597,7 @@ def _mq_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
         r.getMessage()
         for r in caplog.records
-        if r.name == 'orchestrator.merge_queue' and r.levelno >= logging.WARNING
+        if r.name == 'orchestrator.merge_lane' and r.levelno >= logging.WARNING
     ]
 
 
@@ -614,7 +614,7 @@ async def test_probe_nextest_planned_argv(
     `--release` is the ONLY difference between the two profiles: nextest's
     profile selection is a cargo flag, and the JSON message format is identical.
     """
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     seen: dict[str, object] = {}
 
@@ -625,8 +625,8 @@ async def test_probe_nextest_planned_argv(
         seen['env'] = env
         return 0, _NEXTEST_LIST_FIXTURE.read_text(), ''
 
-    with patch.object(mq, '_run_probe_cmd', _fake):
-        planned = await mq._probe_nextest_planned(
+    with patch.object(rve, '_run_probe_cmd', _fake):
+        planned = await rve._probe_nextest_planned(
             tmp_path, profile, timeout_secs=123.0
         )
 
@@ -651,16 +651,16 @@ async def test_probe_nextest_planned_parses_real_bytes(tmp_path: Path) -> None:
     Delegates to parse_nextest_list_planned, so the ids land in
     parse_per_test_results' key space with no translation.
     """
-    from orchestrator import merge_queue as mq
-    from orchestrator.merge_shadow import parse_nextest_list_planned
+    from orchestrator.merge_lane import retry_verify_env as rve
+    from orchestrator.merge_lane.shadow import parse_nextest_list_planned
 
     raw = _NEXTEST_LIST_FIXTURE.read_text()
 
     async def _fake(argv, *, cwd, timeout_secs, env=None):
         return 0, raw, ''
 
-    with patch.object(mq, '_run_probe_cmd', _fake):
-        planned = await mq._probe_nextest_planned(tmp_path, 'debug', timeout_secs=5.0)
+    with patch.object(rve, '_run_probe_cmd', _fake):
+        planned = await rve._probe_nextest_planned(tmp_path, 'debug', timeout_secs=5.0)
 
     assert planned == parse_nextest_list_planned(raw)
     assert planned  # the fixture is non-empty, so this is a real assertion
@@ -691,7 +691,7 @@ async def test_probe_nextest_planned_failure_modes_return_none(
     None is NEVER an empty plan — it routes the caller to a FULL verify.  A
     silent empty plan would narrow the retry to nothing: a FALSE GREEN.
     """
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     async def _fake(argv, *, cwd, timeout_secs, env=None):
         if exc is not None:
@@ -700,10 +700,10 @@ async def test_probe_nextest_planned_failure_modes_return_none(
         return result
 
     with (
-        caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
-        patch.object(mq, '_run_probe_cmd', _fake),
+        caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
+        patch.object(rve, '_run_probe_cmd', _fake),
     ):
-        planned = await mq._probe_nextest_planned(tmp_path, 'release', timeout_secs=5.0)
+        planned = await rve._probe_nextest_planned(tmp_path, 'release', timeout_secs=5.0)
 
     assert planned is None, label
     warnings = _mq_warnings(caplog)
@@ -722,7 +722,7 @@ async def test_probe_nextest_planned_nonzero_exit_warning_carries_stderr(
     are otherwise indistinguishable in the log.  The tail is BOUNDED so a
     runaway build log cannot flood the orchestrator log.
     """
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     noise = 'x' * 5000
     stderr = f'{noise}\nerror: no such command: `nextest`\n'
@@ -731,10 +731,10 @@ async def test_probe_nextest_planned_nonzero_exit_warning_carries_stderr(
         return 101, '', stderr
 
     with (
-        caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
-        patch.object(mq, '_run_probe_cmd', _fake),
+        caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
+        patch.object(rve, '_run_probe_cmd', _fake),
     ):
-        planned = await mq._probe_nextest_planned(
+        planned = await rve._probe_nextest_planned(
             Path('/nonexistent'), 'debug', timeout_secs=5.0
         )
 
@@ -760,7 +760,7 @@ async def test_probe_threads_the_verify_env_into_the_subprocess() -> None:
     minutes and times out — silently degrading every narrowed retry to a full
     verify while still paying the probe cost.
     """
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     seen: dict[str, object] = {}
 
@@ -769,8 +769,8 @@ async def test_probe_threads_the_verify_env_into_the_subprocess() -> None:
         return 0, _NEXTEST_LIST_FIXTURE.read_text(), ''
 
     verify_env = {'RUSTC_WRAPPER': '/usr/bin/sccache', 'SCCACHE_DIR': '/tmp/sccache'}
-    with patch.object(mq, '_run_probe_cmd', _fake):
-        planned = await mq._probe_nextest_planned(
+    with patch.object(rve, '_run_probe_cmd', _fake):
+        planned = await rve._probe_nextest_planned(
             Path('/nonexistent'), 'debug', timeout_secs=5.0, verify_env=verify_env,
         )
 
@@ -781,7 +781,7 @@ async def test_probe_threads_the_verify_env_into_the_subprocess() -> None:
 @pytest.mark.asyncio
 async def test_probe_nextest_planned_timeout_is_bounded_by_a_named_constant() -> None:
     """A module constant bounds the probe so it can never wedge the merge lane."""
-    from orchestrator.merge_queue import _NEXTEST_LIST_PROBE_TIMEOUT_SECS
+    from orchestrator.merge_lane.retry_verify_env import _NEXTEST_LIST_PROBE_TIMEOUT_SECS
 
     assert isinstance(_NEXTEST_LIST_PROBE_TIMEOUT_SECS, (int, float))
     assert 0 < _NEXTEST_LIST_PROBE_TIMEOUT_SECS <= 900
@@ -803,9 +803,9 @@ async def test_probe_nextest_planned_timeout_is_bounded_by_a_named_constant() ->
 @pytest.mark.asyncio
 async def test_run_probe_cmd_success_returns_rc_stdout_stderr(tmp_path: Path) -> None:
     """rc, stdout and stderr all come back, decoded, from a real subprocess."""
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
-    rc, stdout, stderr = await mq._run_probe_cmd(
+    rc, stdout, stderr = await rve._run_probe_cmd(
         ['sh', '-c', 'printf hi; printf oops >&2'], cwd=tmp_path, timeout_secs=30.0,
     )
 
@@ -815,11 +815,11 @@ async def test_run_probe_cmd_success_returns_rc_stdout_stderr(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_run_probe_cmd_runs_in_cwd_with_the_layered_env(tmp_path: Path) -> None:
     """`cwd` is honoured and `env` layers OVER os.environ (not replacing it)."""
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     (tmp_path / 'marker.txt').write_text('x')
 
-    rc, stdout, _ = await mq._run_probe_cmd(
+    rc, stdout, _ = await rve._run_probe_cmd(
         ['sh', '-c', 'ls marker.txt; printf "|%s|%s" "$DF_PROBE_MARKER" "${PATH:+haspath}"'],
         cwd=tmp_path,
         timeout_secs=30.0,
@@ -837,9 +837,9 @@ async def test_run_probe_cmd_runs_in_cwd_with_the_layered_env(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_run_probe_cmd_nonzero_exit_is_returned_not_raised(tmp_path: Path) -> None:
     """A non-zero exit is DATA (the caller warns + falls back), not an exception."""
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
-    rc, stdout, _ = await mq._run_probe_cmd(
+    rc, stdout, _ = await rve._run_probe_cmd(
         ['sh', '-c', 'exit 3'], cwd=tmp_path, timeout_secs=30.0,
     )
 
@@ -860,7 +860,7 @@ async def test_run_probe_cmd_timeout_raises_promptly_and_reaps_the_child(
     """
     import time as _time
 
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     spawned: list = []
     real_exec = asyncio.create_subprocess_exec
@@ -875,7 +875,7 @@ async def test_run_probe_cmd_timeout_raises_promptly_and_reaps_the_child(
         patch.object(asyncio, 'create_subprocess_exec', _spy_exec),
         pytest.raises(TimeoutError),
     ):
-        await mq._run_probe_cmd(
+        await rve._run_probe_cmd(
             ['sh', '-c', 'sleep 120'], cwd=tmp_path, timeout_secs=0.5,
         )
     elapsed = _time.monotonic() - started
@@ -901,7 +901,7 @@ def test_run_probe_cmd_spawns_its_own_session(tmp_path: Path) -> None:
     happens to die with its parent is OS/environment-dependent — the flag is
     the thing this module actually controls.
     """
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     seen: dict[str, object] = {}
 
@@ -914,7 +914,7 @@ def test_run_probe_cmd_spawns_its_own_session(tmp_path: Path) -> None:
             patch.object(asyncio, 'create_subprocess_exec', _fake_exec),
             pytest.raises(OSError),
         ):
-            await mq._run_probe_cmd(
+            await rve._run_probe_cmd(
                 ['cargo', 'nextest', 'list'], cwd=tmp_path, timeout_secs=1.0,
             )
 
@@ -937,7 +937,7 @@ async def test_kill_probe_process_tree_delegates_to_the_shared_group_kill() -> N
     have been reaped and its pid recycled onto an unrelated group, which a
     hand-rolled killpg would then signal.
     """
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     proc = cast('asyncio.subprocess.Process', SimpleNamespace(pid=4242))
     seen: dict[str, object] = {}
@@ -946,11 +946,11 @@ async def test_kill_probe_process_tree_delegates_to_the_shared_group_kill() -> N
         seen.update(proc=p, pgid=pgid, grace_secs=grace_secs)
 
     with patch('shared.proc_group.terminate_process_group', _fake_terminate):
-        await mq._kill_probe_process_tree(proc, 4242)
+        await rve._kill_probe_process_tree(proc, 4242)
 
     assert seen['proc'] is proc
     assert seen['pgid'] == 4242
-    assert seen['grace_secs'] == mq._PROBE_KILL_GRACE_SECS
+    assert seen['grace_secs'] == rve._PROBE_KILL_GRACE_SECS
 
 
 @pytest.mark.asyncio
@@ -958,7 +958,7 @@ async def test_run_probe_cmd_kills_with_the_pgid_captured_at_spawn(
     tmp_path: Path,
 ) -> None:
     """The pgid handed to the kill is proc.pid, read while the child is alive."""
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     seen: dict[str, object] = {}
 
@@ -969,10 +969,10 @@ async def test_run_probe_cmd_kills_with_the_pgid_captured_at_spawn(
         await proc.wait()
 
     with (
-        patch.object(mq, '_kill_probe_process_tree', _spy_kill),
+        patch.object(rve, '_kill_probe_process_tree', _spy_kill),
         pytest.raises(TimeoutError),
     ):
-        await mq._run_probe_cmd(
+        await rve._run_probe_cmd(
             ['sh', '-c', 'sleep 120'], cwd=tmp_path, timeout_secs=0.5,
         )
 
@@ -981,7 +981,7 @@ async def test_run_probe_cmd_kills_with_the_pgid_captured_at_spawn(
 
 
 # ---------------------------------------------------------------------------
-# _build_attempt0_payload — the payload is built from DF-OWNED attempt-0 data
+# build_attempt0_payload — the payload is built from DF-OWNED attempt-0 data
 # (task 3059, WORK item 1), not from a phantom reify sidecar.
 #
 # PROFILE ATTRIBUTION is the subtle part.  VerifyResult.test_output is ONE
@@ -1019,7 +1019,7 @@ _PROBED_PLANNED = [
 ]
 
 
-def _verify_result(test_output: str):
+def _verify_result(test_output: str, **overrides):
     from orchestrator.verify import VerifyResult
 
     return VerifyResult(
@@ -1029,6 +1029,7 @@ def _verify_result(test_output: str):
         type_output='',
         summary='attempt-0 red',
         category='disk_pressure',
+        **overrides,
     )
 
 
@@ -1041,8 +1042,8 @@ async def test_build_attempt0_payload_narrows_only_the_first_profile(
     A `pass` seen in the debug pass is NOT evidence the same test ran in the
     release pass, so release must not be narrowed on debug-profile evidence.
     """
-    from orchestrator import merge_queue as mq
-    from orchestrator.merge_shadow import parse_per_test_results
+    from orchestrator.merge_lane import retry_verify_env as rve
+    from orchestrator.merge_lane.shadow import parse_per_test_results
 
     _place_real_sidecar(tmp_path)
     calls: list[str] = []
@@ -1051,8 +1052,8 @@ async def test_build_attempt0_payload_narrows_only_the_first_profile(
         calls.append(profile)
         return list(_PROBED_PLANNED)
 
-    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
-        payload = await mq._build_attempt0_payload(
+    with patch.object(rve, '_probe_nextest_planned', _fake_probe):
+        payload = await rve.build_attempt0_payload(
             tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
         )
 
@@ -1075,26 +1076,37 @@ async def test_build_attempt0_payload_narrows_only_the_first_profile(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('run_all_failed_members', 'expected_members'),
+    [
+        pytest.param(None, ['test_skip_ledger.sh'], id='channel-absent-text-parse'),
+        pytest.param(['test_from_channel.sh'], ['test_from_channel.sh'], id='channel-present'),
+    ],
+)
 async def test_build_attempt0_payload_fields_come_from_df_owned_sources(
     tmp_path: Path,
+    run_all_failed_members: list[str] | None,
+    expected_members: list[str],
 ) -> None:
-    """tree_oid from reify's sidecar; run_all members parsed; gui_specs empty."""
-    from orchestrator import merge_queue as mq
+    """tree_oid from reify's sidecar; run_all members from the channel, else
+    parsed (C3 rule 3); gui_specs empty."""
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     _place_real_sidecar(tmp_path)
 
     async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
         return list(_PROBED_PLANNED)
 
-    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
-        payload = await mq._build_attempt0_payload(
-            tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
+    with patch.object(rve, '_probe_nextest_planned', _fake_probe):
+        payload = await rve.build_attempt0_payload(
+            tmp_path,
+            _verify_result(_FAIL_FAST_OUTPUT, run_all_failed_members=run_all_failed_members),
         )
 
     assert payload is not None
     expected_oid = json.loads(_REIFY_SIDECAR_FIXTURE.read_text())['tree_oid']
     assert payload.tree_oid == expected_oid
-    assert payload.run_all_members == ['test_skip_ledger.sh']
+    assert payload.run_all_members == expected_members
     # Deliberately empty: no real reify gui failure log was available to pin a
     # fixture to, and an empty value makes verify.sh run the FULL gui suite.
     assert payload.gui_specs == []
@@ -1111,15 +1123,15 @@ async def test_build_attempt0_payload_empty_verdicts_still_yields_a_payload(
     plan — wide, but never skipping.  reify's REIFY_VERIFY_RETRY_MAX_SUBSET
     ceiling is what rejects a runaway subset, not a silent DF narrowing.
     """
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     _place_real_sidecar(tmp_path)
 
     async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
         return list(_PROBED_PLANNED)
 
-    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
-        payload = await mq._build_attempt0_payload(
+    with patch.object(rve, '_probe_nextest_planned', _fake_probe):
+        payload = await rve.build_attempt0_payload(
             tmp_path, _verify_result('error: could not compile `crate-a`\n')
         )
 
@@ -1131,7 +1143,7 @@ async def test_build_attempt0_payload_empty_verdicts_still_yields_a_payload(
 @pytest.mark.asyncio
 async def test_build_attempt0_payload_none_when_sidecar_absent(tmp_path: Path) -> None:
     """No sidecar -> None -> full verify. The probe is never even run."""
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     called = False
 
@@ -1140,8 +1152,8 @@ async def test_build_attempt0_payload_none_when_sidecar_absent(tmp_path: Path) -
         called = True
         return list(_PROBED_PLANNED)
 
-    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
-        payload = await mq._build_attempt0_payload(
+    with patch.object(rve, '_probe_nextest_planned', _fake_probe):
+        payload = await rve.build_attempt0_payload(
             tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
         )
 
@@ -1154,15 +1166,15 @@ async def test_build_attempt0_payload_none_when_sidecar_malformed(
     tmp_path: Path,
 ) -> None:
     """A malformed sidecar (loader returned None) -> None -> full verify."""
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     _place_real_sidecar(tmp_path, text='{"tree_oid": "abc", "profiles": "bench"}')
 
     async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
         return list(_PROBED_PLANNED)
 
-    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
-        payload = await mq._build_attempt0_payload(
+    with patch.object(rve, '_probe_nextest_planned', _fake_probe):
+        payload = await rve.build_attempt0_payload(
             tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
         )
 
@@ -1188,7 +1200,7 @@ async def test_build_attempt0_payload_none_when_the_plan_misses_a_real_failure(
     module's standing rule — never narrow on an incomplete plan — is ENFORCED
     rather than assumed.
     """
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     _place_real_sidecar(tmp_path)
 
@@ -1199,10 +1211,10 @@ async def test_build_attempt0_payload_none_when_the_plan_misses_a_real_failure(
         return list(partial_plan)
 
     with (
-        caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
-        patch.object(mq, '_probe_nextest_planned', _fake_probe),
+        caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
+        patch.object(rve, '_probe_nextest_planned', _fake_probe),
     ):
-        payload = await mq._build_attempt0_payload(
+        payload = await rve.build_attempt0_payload(
             tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
         )
 
@@ -1226,7 +1238,7 @@ async def test_build_attempt0_payload_coverage_gate_ignores_passes_and_libtest_i
     Without both carve-outs the gate would refuse to narrow on every mixed
     nextest/libtest workspace — a silent, permanent loss of the capability.
     """
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     _place_real_sidecar(tmp_path)
 
@@ -1242,8 +1254,8 @@ async def test_build_attempt0_payload_coverage_gate_ignores_passes_and_libtest_i
     async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
         return list(plan)
 
-    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
-        payload = await mq._build_attempt0_payload(tmp_path, _verify_result(output))
+    with patch.object(rve, '_probe_nextest_planned', _fake_probe):
+        payload = await rve.build_attempt0_payload(tmp_path, _verify_result(output))
 
     assert payload is not None, (
         'a passed-but-unplanned id and a bare libtest id must not trip the gate'
@@ -1256,7 +1268,7 @@ async def test_build_attempt0_payload_threads_verify_env_into_the_probe(
     tmp_path: Path,
 ) -> None:
     """attempt-0's own verify_env reaches the probe, so it models the same build."""
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     _place_real_sidecar(tmp_path)
     seen: dict[str, object] = {}
@@ -1266,8 +1278,8 @@ async def test_build_attempt0_payload_threads_verify_env_into_the_probe(
         return list(_PROBED_PLANNED)
 
     env = {'RUSTC_WRAPPER': '/usr/bin/sccache'}
-    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
-        payload = await mq._build_attempt0_payload(
+    with patch.object(rve, '_probe_nextest_planned', _fake_probe):
+        payload = await rve.build_attempt0_payload(
             tmp_path, _verify_result(_FAIL_FAST_OUTPUT), verify_env=env,
         )
 
@@ -1282,15 +1294,15 @@ async def test_build_attempt0_payload_none_when_probe_fails(tmp_path: Path) -> N
     Never narrow on a partial plan: an unknown plan cannot distinguish
     'this test passed' from 'this test was never listed'.
     """
-    from orchestrator import merge_queue as mq
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     _place_real_sidecar(tmp_path)
 
     async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
         return None
 
-    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
-        payload = await mq._build_attempt0_payload(
+    with patch.object(rve, '_probe_nextest_planned', _fake_probe):
+        payload = await rve.build_attempt0_payload(
             tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
         )
 
@@ -1298,7 +1310,7 @@ async def test_build_attempt0_payload_none_when_probe_fails(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
-# _run_post_merge_verify wiring — the task's HEADLINE user-observable signal
+# run_post_merge_verify wiring — the task's HEADLINE user-observable signal
 # (task 3059, step 19).
 #
 # The shipped D2 built the retry env BEFORE the first dispatch, from a
@@ -1410,9 +1422,11 @@ async def _run_wiring(
     max_narrowed: int = 2,
     narrowed_retries: dict[str, int] | None = None,
     enospc_retries: dict[str, int] | None = None,
+    runner: MagicMock | None = None,
 ):
-    """Drive _run_post_merge_verify on the LOCAL path with a recording pool."""
-    from orchestrator import merge_queue as mq
+    """Drive run_post_merge_verify with a recording pool; LOCAL unless *runner* is given."""
+    from orchestrator.merge_lane import post_merge_verify as pmv
+    from orchestrator.merge_lane import retry_verify_env as rve
 
     pool_cls, specs = _recording_pool(results)
     git_ops = git_ops if git_ops is not None else _make_git_ops_mock()
@@ -1421,18 +1435,19 @@ async def _run_wiring(
         return list(_PROBED_PLANNED)
 
     with (
-        patch.object(mq, 'VerifyRunnerPool', pool_cls),
+        patch.object(pmv, 'VerifyRunnerPool', pool_cls),
         patch.object(
-            mq, '_probe_nextest_planned', probe if probe is not None else _default_probe
+            rve, '_probe_nextest_planned', probe if probe is not None else _default_probe
         ),
     ):
-        outcome = await mq._run_post_merge_verify(
+        outcome = await pmv.run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries if enospc_retries is not None else {},
             max_timeouts=2, max_enospc=max_enospc,
             max_narrowed=max_narrowed,
             narrowed_retries=narrowed_retries if narrowed_retries is not None else {},
             shadow_baseline_sink=sink,
+            runner=runner,
             verifier=FakeVerifier(),
         )
     return outcome, specs
@@ -1625,6 +1640,82 @@ async def test_a_non_narrowing_payload_keeps_the_legacy_budget(tmp_path: Path) -
     )
     assert nr == {}, f'the narrowed counter must stay untouched: {nr}'
     assert sink == {}, 'a refused narrowing must not seed the shadow baseline'
+
+
+def _remote_runner_double() -> MagicMock:
+    """A remote VerifyRunner stand-in; it flips run_post_merge_verify onto its remote fork."""
+    runner = MagicMock()
+    runner.name = 'laptop'
+    runner.is_local = False
+    return runner
+
+
+def _remote_wiring_req(task_id: str) -> MagicMock:
+    """`_wiring_req` with the task-2822 remote-green local cross-check switched off."""
+    req = _wiring_req(task_id)
+    req.config.verify_cross_check_remote_green = False
+    return req
+
+
+@pytest.mark.asyncio
+async def test_remote_dispatch_retry_runs_full_and_writes_nothing_on_the_dispatcher(
+    tmp_path: Path,
+) -> None:
+    """A remote host cannot see the dispatcher's untracked filter files.
+
+    So a REMOTE dispatch's retry ships attempt-0's own env, runs FULL, and the
+    dispatcher's merge_wt gains no filter file.  See verify_runner.py::MergeVerifySpec.
+    """
+    _place_real_sidecar(tmp_path)
+    before = {p.relative_to(tmp_path) for p in tmp_path.rglob('*')}
+
+    outcome, specs = await _run_wiring(
+        tmp_path,
+        req=_remote_wiring_req('t-remote-a'),
+        runner=_remote_runner_double(),
+        git_ops=_corroborating_git_ops(),
+        results=[_infra_transient_attempt0(_FAIL_FAST_OUTPUT), _passing_result()],
+    )
+
+    assert outcome is None
+    assert len(specs) == 2, f'expected attempt-0 + one full retry, got {len(specs)}'
+    retry_env = specs[1].verify_env
+    for key in _RETRY_ENV_KEYS:
+        assert key not in retry_env, f'{key} shipped on a remote retry: {retry_env!r}'
+    assert retry_env == specs[0].verify_env
+    after = {p.relative_to(tmp_path) for p in tmp_path.rglob('*')}
+    assert after == before, f'dispatcher merge_wt gained {sorted(map(str, after - before))}'
+
+
+@pytest.mark.asyncio
+async def test_remote_dispatch_retry_is_charged_to_the_legacy_budget(
+    tmp_path: Path,
+) -> None:
+    """A remote retry runs FULL, so it is accounted as FULL.
+
+    It spends the legacy ENOSPC budget, leaves the narrowed one untouched, and
+    seeds no D4 warm-shadow baseline from a narrowing that never happened.
+    """
+    _place_real_sidecar(tmp_path)
+    req = _remote_wiring_req('t-remote-b')
+
+    outcome, _specs = await _run_wiring(
+        tmp_path,
+        req=req,
+        runner=_remote_runner_double(),
+        git_ops=_corroborating_git_ops(),
+        results=[_infra_transient_attempt0(_FAIL_FAST_OUTPUT), _passing_result()],
+        max_enospc=1,
+        max_narrowed=2,
+        narrowed_retries=(nr := {}),
+        enospc_retries=(er := {}),
+        sink=(sink := {}),
+    )
+
+    assert outcome is None
+    assert er == {req.task_id: 1}, f'the full retry must spend the legacy budget: {er}'
+    assert nr == {}, f'the narrowed counter must stay untouched: {nr}'
+    assert sink == {}, f'a remote retry must not seed the shadow baseline: {sink}'
 
 
 @pytest.mark.asyncio

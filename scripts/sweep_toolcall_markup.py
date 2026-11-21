@@ -76,12 +76,8 @@ Dry run is the DEFAULT; ``--apply`` is required to write anything::
     uv run --project shared python scripts/sweep_toolcall_markup.py
     uv run --project shared python scripts/sweep_toolcall_markup.py --apply
 
-The ``uv run --project shared`` prefix is not optional. ``shared/__init__.py``
-imports the whole package eagerly, so ``import shared.toolcall_markup`` drags
-in shared's third-party dependencies even though ``toolcall_markup`` is itself
-pure and stdlib-only — a dependency-free system python cannot run this script.
-The same cost is recorded at ``scripts/scan_task_toolcall_leaks.py:102-112``,
-which carries this identical bootstrap.
+``_checkout`` binds this checkout's ``shared``, and ``shared`` serves its
+names lazily, so a plain ``python3`` runs this script too.
 
 ## AUTHORING HAZARD — this file spells NO envelope literal, ever
 
@@ -108,20 +104,9 @@ import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple
 
-# shared/src bootstrap. Same idiom and same precedence argument as
-# scripts/scan_task_toolcall_leaks.py:113-115 and
-# scripts/repair_wiped_metadata_files.py:67-73: resolve it from __file__ and
-# insert at sys.path[0], so a run inside a task worktree resolves `shared` to
-# THIS checkout's copy of the envelope-literal enumeration rather than to
-# whatever editable install happens to be on the path. The fused-memory/shared
-# editable installs are ordinary .pth entries, so sys.path ORDER decides the
-# winner and a hardcoded or install-provided path would silently test the main
-# checkout's literals.
-_SHARED_SRC = Path(__file__).resolve().parent.parent / 'shared' / 'src'
-if str(_SHARED_SRC) not in sys.path:
-    sys.path.insert(0, str(_SHARED_SRC))
-
-from shared.toolcall_markup import (  # noqa: E402
+import _checkout as _checkout
+from shared.project_layout import escalation_queue_dir
+from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     INVOKE_CLOSER,
     PREFILTER_NEEDLES,
@@ -201,9 +186,6 @@ LANE_ESCALATIONS = 'escalations'
 #: ``.worktrees/<id>`` check instead.
 LANE_PLANS = 'plans'
 
-#: Where the escalations lane is rooted, relative to the repo root.
-_ESCALATIONS_DIR = ('data', 'escalations')
-
 #: Plan artifacts in the DURABLE per-lane store at
 #: ``.worktrees/.task-meta/*/plan.json``. Same rules as :data:`LANE_PLANS` and
 #: gated by the same live-lane check — the difference is REACH, not policy.
@@ -275,7 +257,7 @@ def discover_targets(root: Path | str) -> list[Target]:
     root_path = Path(root)
     targets: list[Target] = []
 
-    escalations_dir = root_path.joinpath(*_ESCALATIONS_DIR)
+    escalations_dir = escalation_queue_dir(root_path)
     if escalations_dir.is_dir():
         for path in escalations_dir.rglob('*.json'):
             if not path.is_file():
@@ -395,7 +377,7 @@ class Refusal(NamedTuple):
     """A target this sweep declines to write, and why.
 
     Returned as a VALUE, never raised-and-swallowed. ``scripts`` is inside
-    ``shared/tests/silent_fallthrough_scan.py``'s ``SCOPE_ROOTS``, so a broad
+    ``tests/repo_guards/silent_fallthrough_scan.py``'s ``SCOPE_ROOTS``, so a broad
     ``except Exception`` funnelling into a default would trip the ratchet — and
     would also discard the reason a human needs in order to adjudicate the
     refusal. Every refusal reaches the report.
@@ -467,7 +449,7 @@ def resolve_write_target(target: Target, root: Path | str) -> ResolvedTarget | R
         return Refusal(path=target.path, lane=target.lane, reason=REASON_NEVER_TOUCH)
 
     if target.lane == LANE_ESCALATIONS:
-        lane_root = Path(os.path.realpath(root_real.joinpath(*_ESCALATIONS_DIR)))
+        lane_root = Path(os.path.realpath(escalation_queue_dir(root_real)))
         if not resolved.is_relative_to(lane_root):
             return Refusal(
                 path=target.path,
@@ -615,7 +597,9 @@ ACTION_DID_NOT_CONVERGE = 'did-not-converge'
 #: recovered value now blocks — WITHOUT restoring the old premise: a quoted
 #: closer still repairs, which is 4502's whole carve-out. So a second round is
 #: reachable in principle, and :func:`repair_document`'s loop is load-bearing
-#: rather than merely structural.
+#: rather than merely structural. Task **5639** made the opener refusal uniform,
+#: closer or no closer, and still did not restore the premise: a quoted closer
+#: still repairs, so a second round stays reachable.
 #:
 #: WHAT JUSTIFIES THE SMALL CEILING is the round count actually recorded for
 #: both live corpora: every document converges in one round, a second yielding
@@ -899,17 +883,12 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
 
     The walk repeats until a pass changes nothing, bounded by
     :data:`_MAX_REPAIR_ROUNDS`. The loop exists because a recovered value is a
-    verbatim substring of the corrupted tail and can therefore itself carry
-    markup — the nested double-leak class cancelled task 3654 identified.
-    Landing such a value in a hole and stopping would leave a repairable string
-    behind and break the binding "a second run reports 0" invariant.
-
-    A SECOND ROUND IS REACHABLE IN PRINCIPLE, which is what makes this loop
-    LOAD-BEARING rather than merely structural: two widenings of ``repair()``
-    have landed (tasks **4502** and **5620**) and neither restored the premise
-    this paragraph used to rest on. No document in either live corpus has been
-    OBSERVED to need a second round — a different claim, and a weaker one. See
-    :data:`_MAX_REPAIR_ROUNDS`, where both are stated once.
+    verbatim substring of the corrupted tail and may itself QUOTE a closing tag
+    (task 4502's carve-out). Round one lands such a value in its hole still
+    tripping detect(), and only a later round can refuse it, so stopping after
+    one pass would leave that residue unreported. Why a second round is
+    reachable, and what the live corpora have actually been observed to need,
+    are stated once at :data:`_MAX_REPAIR_ROUNDS`.
 
     Exceeding the bound is reported LOUDLY as a
     :data:`ACTION_DID_NOT_CONVERGE` outcome naming the path that was still
@@ -927,7 +906,7 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
     tripwire connected to nothing is not a tripwire. Never observed is all it
     is: unreachability was never a guarantee from B5, and that correction is
     written once, at :data:`_MAX_REPAIR_ROUNDS`.
-    """  # noqa: D205
+    """
     # The two outcome classes accumulate DIFFERENTLY across rounds, because
     # they mean different things:
     #
@@ -952,8 +931,8 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
     # DISTINCT refusals that happen to collide on a path across rounds —
     # whereas replacement is exact. Replacement also preserves the case that
     # motivates the loop existing at all: a refusal that only becomes VISIBLE
-    # in a later round (the nested double-leak residue, refusable only once
-    # round 1 has landed it in its hole) is reported, where a naive "keep only
+    # in a later round (a recovered value that quotes a closer, refusable only
+    # once round 1 has landed it in its hole) is reported, where a naive "keep only
     # round 1" correction would drop it.
     #
     # The partition is exhaustive: the walk emits ONLY ACTION_REPAIRED and
@@ -1044,7 +1023,7 @@ def load_target(target: Target) -> LoadedDocument | Refusal:
     Error handling is NARROW by construction — only ``OSError``,
     ``UnicodeDecodeError`` and ``json.JSONDecodeError`` are caught, each
     recorded with a reason and returned as a value. ``scripts`` is inside
-    ``shared/tests/silent_fallthrough_scan.py``'s ``SCOPE_ROOTS``, so a broad
+    ``tests/repo_guards/silent_fallthrough_scan.py``'s ``SCOPE_ROOTS``, so a broad
     ``except Exception`` funnelling into a default would trip the ratchet; more
     to the point, it would swallow a genuine bug in the repairer as though it
     were a malformed file.

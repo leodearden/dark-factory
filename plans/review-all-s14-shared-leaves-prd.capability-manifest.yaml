@@ -1,0 +1,306 @@
+# Machine-readable twin of review-all-s14-shared-leaves-prd.capability-manifest.md
+# Evidence verified against main ae3047ec3a (2026-10-10); task_id values are stamped by commit_planning.
+prd: plans/review-all-s14-shared-leaves-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: 6710
+    title: "Shared layout, project-id and merge-subject leaves"
+    capabilities:
+      - name: "project-layout-leaf"
+        binding: "capability→producer — built by α; values taken from today's harness/sqlite_task_backend/config spellings"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def runs_db\\("
+          paths: ["shared/src/shared/project_layout.py"]
+          expect: present
+      - name: "project-id-leaf"
+        binding: "capability→producer — rule from fused_memory.utils.validation::_to_underscore_canonical, fold from session_registry::normalize_project_token"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def normalize_project_id\\("
+          paths: ["shared/src/shared/project_id.py"]
+          expect: present
+      - name: "merge-subject-leaf"
+        binding: "capability→producer — writer git_ops::_merge_subject; parse precedent _merge_marker_pattern"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def parse_merge_subject\\("
+          paths: ["shared/src/shared/merge_subject.py"]
+          expect: present
+  - label: "β"
+    task_id: 6714
+    title: "Orchestrator adopts shared layout and project id"
+    capabilities:
+      - name: "orchestrator-paths-from-layout"
+        binding: "DAG-direction — α upstream"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from shared\\.project_layout import"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+      - name: "cockpit-fold-from-shared"
+        binding: "DAG-direction — α upstream"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "fold_project_token"
+          paths: ["orchestrator/src/orchestrator/session_registry.py"]
+          expect: present
+      - name: "non-layout-queue-dir-refused"
+        binding: "rejection-mechanism — built by β (config validator); 10/10 live yamls already set the layout value"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "refusal behaviour is asserted by β's config-load test (B3), not greppable"
+  - label: "γ"
+    task_id: 6715
+    title: "fused-memory adopts shared layout and project id"
+    capabilities:
+      - name: "fm-escalators-use-layout"
+        binding: "DAG-direction — α upstream"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "shared\\.project_layout"
+          paths: ["fused-memory/src/fused_memory/middleware/curator_escalator.py"]
+          expect: present
+  - label: "δ"
+    task_id: 6716
+    title: "Merge-subject readers derive from shared.merge_subject"
+    capabilities:
+      - name: "landed-on-main-mirror-retired"
+        binding: "DAG-direction — α upstream"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from shared\\.merge_subject import"
+          paths: ["fused-memory/src/fused_memory/services/landed_on_main.py"]
+          expect: present
+      - name: "git-ops-writer-from-shared"
+        binding: "DAG-direction — α upstream"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from shared\\.merge_subject import"
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          expect: present
+  - label: "ε"
+    task_id: 6713
+    title: "Scripts adopt the shared store locators"
+    note: "depends on S25's scripts/_checkout.py bootstrap leaf (cross-stream), wired at decompose"
+    capabilities:
+      - name: "scripts-locators-from-layout"
+        binding: "DAG-direction — α upstream"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "shared\\.project_layout"
+          paths: ["scripts/_task_db_scan.py"]
+          expect: present
+      - name: "scripts-checkout-bootstrap"
+        binding: "capability→producer — S25 scripts/_checkout.py bootstrap leaf (fk-638eb09e52b1); id from the FILED table"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "cross-stream producer; dependency edge wired at decompose"
+  - label: "ζ"
+    task_id: 6711
+    title: "One MCP session client and write-success predicate in shared"
+    capabilities:
+      - name: "shared-mcp-session"
+        binding: "capability→producer — moved from orchestrator.mcp_lifecycle::McpSession"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class McpSession"
+          paths: ["shared/src/shared/mcp_session.py"]
+          expect: present
+      - name: "sync-mcp-session-for-scripts"
+        binding: "capability→producer — lead ruling 2026-10-10 (S21 extent): synchronous client, initialize handshake capturing the server-minted mcp-session-id (stateful escalation servers) or none (stateless fused-memory), POST /mcp without trailing slash, SSE decode, session release, isError surfaced, neutral error type"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class SyncMcpSession"
+          paths: ["shared/src/shared/mcp_session.py"]
+          expect: present
+      - name: "orchestrator-uses-shared-session"
+        binding: "capability→producer (wired) — mcp_lifecycle::mcp_call"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from shared\\.mcp_session import"
+          paths: ["orchestrator/src/orchestrator/mcp_lifecycle.py"]
+          expect: present
+  - label: "η"
+    task_id: 6717
+    title: "Typed SchedulerStateSnapshot shared by producer and readers"
+    capabilities:
+      - name: "snapshot-model"
+        binding: "field-population — Scheduler.get_state_snapshot emits the 13 keys"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class SchedulerStateSnapshot"
+          paths: ["shared/src/shared/scheduler_state.py"]
+          expect: present
+      - name: "fm-reader-parses-model"
+        binding: "capability→producer (wired) — tools.py get_scheduler_state → read_scheduler_state"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "SchedulerStateSnapshot"
+          paths: ["fused-memory/src/fused_memory/mcp_tools/scheduler_state.py"]
+          expect: present
+  - label: "θ"
+    task_id: 6718
+    title: "One scheduler-override store in shared"
+    capabilities:
+      - name: "shared-override-store"
+        binding: "capability→producer — moved from orchestrator.overrides::OverrideStore"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class OverrideStore"
+          paths: ["shared/src/shared/scheduler_overrides.py"]
+          expect: present
+      - name: "fm-duplicate-schema-gone"
+        binding: "rejection of the second writer — tools.py holds no override SQL"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^_OVERRIDE_SCHEMA = "
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: absent
+  - label: "ξ"
+    task_id: 6719
+    title: "Declared MCP error codes"
+    capabilities:
+      - name: "error-code-vocabulary"
+        binding: "capability→producer — backends/task_backend_errors classes declare their code"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class McpErrorType"
+          paths: ["shared/src/shared/mcp_envelope.py"]
+          expect: present
+  - label: "ν"
+    task_id: 6720
+    title: "The memory child rule in one home"
+    capabilities:
+      - name: "child-rule-in-memory-metadata"
+        binding: "capability→producer — memory_metadata importable from services without a cycle"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def child_parent_id\\("
+          paths: ["fused-memory/src/fused_memory/memory_metadata.py"]
+          expect: present
+      - name: "topic-anchor-restatement-gone"
+        binding: "rejection of the third kind-set copy"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^_CHILD_KINDS = "
+          paths: ["fused-memory/src/fused_memory/services/topic_anchor.py"]
+          expect: absent
+  - label: "μ"
+    task_id: 6721
+    title: "Parsed caller identity replaces agent_id prefix checks"
+    capabilities:
+      - name: "agent-identity-parse"
+        binding: "capability→producer — table from shared.task_transitions::derive_actor_class"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def parse_agent_identity\\("
+          paths: ["shared/src/shared/agent_identity.py"]
+          expect: present
+      - name: "fm-tools-read-identity"
+        binding: "capability→producer (wired) — server/tools.py::_resolve_identity"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "parse_agent_identity"
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: present
+  - label: "κ"
+    task_id: 6722
+    title: "Dashboard adopts shared layout, MCP session and error codes"
+    capabilities:
+      - name: "dashboard-private-session-gone"
+        binding: "DAG-direction — ζ, ξ upstream"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class McpSession"
+          paths: ["dashboard/src/dashboard/data/memory.py"]
+          expect: absent
+  - label: "ι"
+    task_id: 6723
+    title: "Scripts adopt the shared MCP client"
+    capabilities:
+      - name: "migration-script-client-gone"
+        binding: "DAG-direction — ζ, ξ upstream"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class FusedMemoryClient"
+          paths: ["scripts/migrate_metadata_modules_to_files.py"]
+          expect: absent
+  - label: "λ"
+    task_id: 6712
+    title: "Shared consecutive-streak primitive"
+    capabilities:
+      - name: "streak-primitive"
+        binding: "capability→producer — generalises orchestrator.streaks::StreakCounter"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class KeyedStreaks"
+          paths: ["shared/src/shared/streak.py"]
+          expect: present
+  - label: "ο"
+    task_id: 6724
+    title: "Orchestrator streaks on the shared primitive"
+    capabilities:
+      - name: "private-streak-classes-gone"
+        binding: "DAG-direction — λ upstream"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class _Streak:"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: absent
+  - label: "π"
+    task_id: 6725
+    title: "fused-memory and dashboard streaks on the shared primitive"
+    capabilities:
+      - name: "fm-private-streak-classes-gone"
+        binding: "DAG-direction — λ upstream"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class (_DegradedStreak|_ShardFailureStreak|ConsecutiveFailureBreaker)"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: absent
+  - label: "ρ"
+    task_id: 6726
+    title: "Integration gate: shared-leaf spelling guard"
+    capabilities:
+      - name: "guard-red-on-seeded-literal"
+        binding: "rejection-mechanism — built by ρ; B11 seeded fixtures"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the guard's home module is a tactical choice (open question 4); its behaviour is its own fixture test"
+      - name: "census-trigger-debt-owner"
+        binding: "INV-12 Debt(owner) — S21's census_trigger transport leaf; id from the FILED table"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "cross-stream owner id wired at decompose"

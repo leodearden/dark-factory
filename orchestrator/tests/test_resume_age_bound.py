@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from shared.project_layout import CheckoutRootError
 
 from orchestrator import resume_age_bound as rab
 from orchestrator.config import SessionResumeConfig
@@ -307,9 +308,9 @@ def test_default_runs_db_path_is_env_overridable(tmp_path, monkeypatch):
     """The live guard must be able to reach runs.db from a task worktree.
 
     ``data/`` is gitignored and absent from a worktree, so the default is an
-    ABSOLUTE main-checkout path with an env override — the idiom
-    ``evals/prompt_opt/__main__.py`` and ``evals/reviewer_trial/__main__.py``
-    already use for exactly this class of offline data.
+    ABSOLUTE main-checkout path with an env override, resolved by
+    ``orchestrator/src/orchestrator/main_checkout_defaults.py::env_or_main_checkout``
+    like every other default for this class of offline data.
     """
     monkeypatch.delenv(rab.RUNS_DB_ENV_VAR, raising=False)
     default = rab.default_runs_db_path()
@@ -481,7 +482,10 @@ def test_absolute_resume_age_is_derived_from_live_runs_db():
     guard re-measures every run, so a fleet that gets slower or suffers longer
     outages trips the test instead of quietly losing resumable sessions.
     """
-    db = rab.default_runs_db_path()
+    try:
+        db = rab.default_runs_db_path()
+    except CheckoutRootError as exc:
+        pytest.skip(f'no live runs.db reachable from this host: {exc}')
     if not db.is_file():
         pytest.skip(
             f'no live runs.db at {db} — nothing to derive the bound from '

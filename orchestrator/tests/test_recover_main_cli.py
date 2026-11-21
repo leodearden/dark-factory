@@ -1,6 +1,6 @@
 """Tests for orchestrator.recover_main CLI — step-7 RED.
 
-Mirrors test_b3_gate.py's CLI-invocation + JSON-parse pattern:
+Mirrors test_b3_gate_cli.py's CLI-invocation + JSON-parse pattern:
 monkeypatch recover_red_main to return a known result, capture stdout,
 json.loads it, assert required keys.
 """
@@ -44,7 +44,7 @@ class TestRecoverMainCLI:
 
     def _run_cli(self, argv, capsys):
         """Import and invoke main; return (rc, parsed_json)."""
-        from orchestrator.recover_main import main  # noqa: PLC0415
+        from orchestrator.recover_main import main
         rc = main(argv)
         out = capsys.readouterr().out.strip()
         return rc, json.loads(out)
@@ -124,7 +124,7 @@ class TestRecoverMainCLI:
         not receive a raw traceback — it must receive a parseable JSON object so
         it can route the failure to a human rather than failing opaquely.
         """
-        from orchestrator.recover_main import main  # noqa: PLC0415
+        from orchestrator.recover_main import main
 
         with patch(
             'orchestrator.recover_main.load_config',
@@ -214,7 +214,7 @@ class TestRecoverMainCLI:
             f'  main_gate_bypass_clear_command: "rm -f {flag_file}"\n',
         )
 
-        from orchestrator.recover_main import main  # noqa: PLC0415
+        from orchestrator.recover_main import main
         rc = main([
             '--project-root', str(repo),
             '--config', str(cfg),

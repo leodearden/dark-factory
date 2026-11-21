@@ -104,7 +104,7 @@ async def test_verify_boundary_s1_computed_stats_override_llm_report(journal):
 def test_stats_verifier_has_no_alias_map():
     """_STAT_ALIASES is retired — memories_written no longer mirrors a
     canonical key; it's either dropped (S1) or absent entirely."""
-    import fused_memory.reconciliation.stats_verifier as sv  # noqa: PLC0415
+    import fused_memory.reconciliation.stats_verifier as sv
 
     assert not hasattr(sv, '_STAT_ALIASES')
 

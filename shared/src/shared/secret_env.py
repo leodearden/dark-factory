@@ -1,0 +1,83 @@
+"""Which environment variables carry secrets, and which of them an agent subprocess may inherit.
+
+A variable is secret-bearing when its name starts with the OAuth pool prefix or
+ends in ``_API_KEY`` or ``_TOKEN``; the rule reads names only, never values. An
+agent child inherits no secret-bearing variable except the credentials its
+spawner names. The default is its own session credential,
+``CLAUDE_CODE_OAUTH_TOKEN``; each non-Claude backend names its provider keys
+(``orchestrator/src/orchestrator/agents/invoke.py``). A ``CLAUDE_OAUTH_TOKEN_*``
+pool name is refused as a credential. An agent child also inherits no
+endpoint-selection variable (``AGENT_ENDPOINT_VARS``: the endpoint and its
+client key) and no Python-environment selection (``shared.python_env``); an
+endpoint reaches a child only through its caller's overrides. A target
+project's verify or offline-lane child inherits every credential except the
+``CLAUDE_OAUTH_TOKEN_*`` account pool (``without_account_pool``). Operator
+view: ``OPERATIONS.md``.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
+
+from shared.python_env import without_python_env_selection
+
+__all__ = [
+    'AGENT_CREDENTIAL_VAR',
+    'AGENT_ENDPOINT_VARS',
+    'ENDPOINT_AUTH_TOKEN_VAR',
+    'ENDPOINT_BASE_URL_VAR',
+    'POOL_TOKEN_PREFIX',
+    'agent_subprocess_env',
+    'is_secret_env_name',
+    'secret_env_values',
+    'without_account_pool',
+]
+
+POOL_TOKEN_PREFIX = 'CLAUDE_OAUTH_TOKEN_'
+AGENT_CREDENTIAL_VAR = 'CLAUDE_CODE_OAUTH_TOKEN'
+ENDPOINT_BASE_URL_VAR = 'ANTHROPIC_BASE_URL'
+ENDPOINT_AUTH_TOKEN_VAR = 'ANTHROPIC_AUTH_TOKEN'
+AGENT_ENDPOINT_VARS = frozenset({ENDPOINT_BASE_URL_VAR, ENDPOINT_AUTH_TOKEN_VAR})
+
+_SECRET_SUFFIXES = ('_API_KEY', '_TOKEN')
+_SESSION_CREDENTIALS = frozenset({AGENT_CREDENTIAL_VAR})
+
+
+def _is_pool_token_name(name: str) -> bool:
+    return name.startswith(POOL_TOKEN_PREFIX)
+
+
+def is_secret_env_name(name: str) -> bool:
+    return _is_pool_token_name(name) or name.endswith(_SECRET_SUFFIXES)
+
+
+def without_account_pool(environ: Mapping[str, str]) -> dict[str, str]:
+    return {name: value for name, value in environ.items() if not _is_pool_token_name(name)}
+
+
+def _without_agent_endpoint_vars(environ: Mapping[str, str]) -> dict[str, str]:
+    return {
+        name: value
+        for name, value in without_python_env_selection(environ).items()
+        if name not in AGENT_ENDPOINT_VARS
+    }
+
+
+def agent_subprocess_env(
+    environ: Mapping[str, str], *, credentials: AbstractSet[str] = _SESSION_CREDENTIALS
+) -> dict[str, str]:
+    pool_names = sorted(name for name in credentials if _is_pool_token_name(name))
+    if pool_names:
+        raise ValueError(
+            f'agent credentials may not name the {POOL_TOKEN_PREFIX}* account pool: {pool_names}'
+        )
+    return {
+        name: value
+        for name, value in _without_agent_endpoint_vars(environ).items()
+        if name in credentials or not is_secret_env_name(name)
+    }
+
+
+def secret_env_values(environ: Mapping[str, str]) -> dict[str, str]:
+    return {name: value for name, value in environ.items() if value and is_secret_env_name(name)}

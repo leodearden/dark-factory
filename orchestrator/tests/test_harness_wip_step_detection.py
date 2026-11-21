@@ -252,7 +252,7 @@ class TestDetectTipWipCommits:
         wip_sha = await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
         assert wip_sha, 'Setup: expected a real commit to be made'
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == [
             {'sha': wip_sha, 'subject': 'chore: save WIP before requeue rebase'},
@@ -268,7 +268,7 @@ class TestDetectTipWipCommits:
         (wt / 'real.txt').write_text('real work\n')
         await git_ops.commit(wt, 'feat: GREEN — real implementation')
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == []
 
@@ -285,13 +285,13 @@ class TestDetectTipWipCommits:
         wip_sha = await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
         assert wip_sha
 
-        workflow.plan = {
+        plan = {
             'task_id': '42',
             'prerequisites': [],
             'steps': [{'id': 'step-1', 'status': 'done', 'commit': wip_sha}],
         }
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(plan)
 
         assert result == []
 
@@ -316,13 +316,13 @@ class TestDetectTipWipCommits:
         wip_sha = await git_ops.commit(wt, 'chore: save WIP before requeue rebase')
         assert wip_sha
 
-        workflow.plan = {
+        plan = {
             'task_id': '42',
             'prerequisites': [],
             'steps': [{'id': 'step-1', 'status': 'done', 'commit': wip_sha[:12]}],
         }
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(plan)
 
         assert result == []
 
@@ -338,7 +338,7 @@ class TestDetectTipWipCommits:
         (wt / 'real.txt').write_text('real work\n')
         await git_ops.commit(wt, 'feat: GREEN — real implementation')
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == []
 
@@ -367,7 +367,7 @@ class TestDetectTipWipCommits:
         )
         assert wip1_sha and wip2_sha
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == [
             {'sha': wip2_sha, 'subject': 'chore: save WIP before inter-iteration rebase'},
@@ -394,7 +394,7 @@ class TestDetectTipWipCommits:
             side_effect=RuntimeError('boom'),
         )
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == []
 
@@ -404,7 +404,7 @@ class TestDetectTipWipCommits:
         artifacts.update_base_commit(wt_info.base_commit)
         workflow.worktree = None
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == []
 
@@ -414,7 +414,7 @@ class TestDetectTipWipCommits:
         artifacts.update_base_commit(wt_info.base_commit)
         workflow.git_ops = None  # type: ignore[assignment]
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == []
 
@@ -436,7 +436,7 @@ class TestDetectTipWipCommits:
         workflow.artifacts = artifacts
         workflow.plan = {'task_id': '42', 'steps': [], 'prerequisites': []}
 
-        result = await workflow._detect_tip_wip_commits()
+        result = await workflow._detect_tip_wip_commits(workflow.plan)
 
         assert result == []
 
@@ -682,7 +682,8 @@ class TestExecuteIterationsForwardsWipNotice:
         artifacts.stamp_plan_provenance(workflow.session_id)
         workflow.plan = artifacts.read_plan()
 
-        def _mark_step_done_side_effect(*args, **kwargs):
+        async def _mark_step_done_side_effect(_role, build_prompt, *args, **kwargs):
+            await build_prompt()
             artifacts.update_step_status('step-1', 'done', 'impl-commit-sha')
             return AgentResult(success=True, output='')
 

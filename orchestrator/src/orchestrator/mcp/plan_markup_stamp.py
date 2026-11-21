@@ -22,6 +22,13 @@ to :data:`MARKUP_STAMP_MAX_EVENTS` individual events, and one static ``note``
 naming what the block means — so a reader who has never seen the key does not
 have to infer it.
 
+WRITTEN EAGERLY, at refusal time, rather than buffered until the next accepted
+write, which would have left a refused call's ``plan.json`` byte-identical.
+Buffering's one hole is the worst case: an architect whose LAST plan-tools call
+is a refusal, and which then stops, would have its losses silently dropped —
+the situation most in need of explanation. (The pending buffer below holds only
+refusals that arrive before any plan exists.)
+
 WHAT AN EVENT HOLDS: ``ts``, ``tool``, ``param``, ``outcome``, and nothing
 else. :data:`STAMP_EVENT_KEYS` is the DECLARED allowlist, and
 :func:`build_event` copies FROM it rather than filtering the record — so a fact
@@ -73,7 +80,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import Plan, TaskArtifacts
 
 logger = logging.getLogger(__name__)
 
@@ -438,46 +445,21 @@ def summary(plan: object) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
-# Concurrency — the one writer pair this module owns.
+# Concurrency — the pending buffer's lock.
 # ---------------------------------------------------------------------------
 
 
-#: Serialises this module's bookkeeping AGAINST ITSELF: the sink's
-#: read-merge-write of ``plan.json``, and every mutation of the process-global
-#: pending buffer below.
+#: Guards the process-global pending buffer below, and nothing else.
 #:
-#: WHY THERE IS A RACE AT ALL. plan-tools registers its tools as sync ``def``,
-#: so FastMCP dispatches them on a thread pool, and the emitter adds a hop of
-#: its own (``asyncio.to_thread``). A client that batches parallel calls can
-#: have two refusals in flight at the same instant, on two different threads,
-#: both reading ``plan.json`` before either writes — and the second write would
-#: land a block that never saw the first refusal, undercounting the very leak
-#: the block exists to describe. The buffer has the matching shape: a refused
-#: ``create_plan`` buffering while an accepted one drains could have its event
-#: cleared without ever being folded in. Both pairs are fully closable here,
-#: because this module owns both sides of each, so both are closed.
+#: The sink's read-merge-write of ``plan.json`` is serialised against EVERY
+#: plan writer — concurrent stamps, the plan-tools mutators on FastMCP's thread
+#: pool, and the orchestrator's TaskArtifacts calls — by
+#: ``TaskArtifacts.plan_mutex`` (task 5745).
 #:
-#: REENTRANT, because :func:`make_plan_stamp`'s body calls :func:`note_pending`
-#: while already holding it — a plain ``Lock`` would self-deadlock on the very
-#: pre-plan refusal path the buffer exists for.
-#:
-#: WHAT THIS LOCK DOES NOT CLOSE, stated plainly so the residue is a decision
-#: rather than an oversight: ``plan.json`` has NO cross-writer lock anywhere.
-#: The ten plan-tools mutators already race each other and
-#: ``artifacts.update_step_status`` the same way, and the sink is a third writer
-#: joining that existing race — an accepted ``add_plan_step`` whose write lands
-#: between the sink's read and its write is lost, and vice versa. Closing THAT
-#: needs the lock to live with ``artifacts.write_plan``, the single owner of the
-#: file, and to be taken by every mutator; that is a change to
-#: ``orchestrator/artifacts.py``, outside this task's scope, and it is filed as
-#: follow-up work rather than half-done here. The window is pinned by
-#: ``test_plan_markup_stamp.TestTheCrossWriterWindowIsKnown``, so the day it is
-#: closed the test that has to change says so.
-#:
-#: The critical section is deliberately as short as the work allows: one read,
-#: one PURE merge, one write. There is nothing between the two I/O calls to
-#: hoist out.
-_STAMP_LOCK = threading.RLock()
+#: LOCK ORDER: the plan mutex first, then this lock, everywhere — the stamp,
+#: ``_create_plan`` -> :func:`drain_pending`, and ``_confirm_plan`` ->
+#: :func:`session_summary`. Never take the plan mutex while holding this lock.
+_PENDING_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +478,7 @@ _STAMP_LOCK = threading.RLock()
 # So it is held here and adopted by the plan ``_create_plan`` is about to write.
 #
 # PROCESS-GLOBAL STATE IS THE ESTABLISHED SHAPE HERE, not an invention:
-# ``plan_tools._REPORTED_REFUSALS`` is exactly this, with an autouse fixture
+# ``plan_markup_repair._REPORTED_REFUSALS`` is exactly this, with an autouse fixture
 # clearing it per test — which a consumer of THIS buffer must do too, or one
 # test's buffered refusal inflates the next one's count.
 #
@@ -514,7 +496,7 @@ _PENDING_BLOCK: dict[str, Any] | None = None
 def note_pending(event: dict[str, Any]) -> None:
     """Hold *event* until there is a plan to fold it into."""
     global _PENDING_BLOCK
-    with _STAMP_LOCK:
+    with _PENDING_LOCK:
         _PENDING_BLOCK = (
             block_of(event) if _PENDING_BLOCK is None
             else merge_block(_PENDING_BLOCK, block_of(event))
@@ -523,14 +505,14 @@ def note_pending(event: dict[str, Any]) -> None:
 
 def pending_block() -> dict[str, Any] | None:
     """The buffered block, or ``None`` when nothing is waiting."""
-    with _STAMP_LOCK:
+    with _PENDING_LOCK:
         return _PENDING_BLOCK
 
 
 def clear_pending() -> None:
     """Drop the buffer. For the autouse fixture that guards it per test."""
     global _PENDING_BLOCK
-    with _STAMP_LOCK:
+    with _PENDING_LOCK:
         _PENDING_BLOCK = None
 
 
@@ -551,8 +533,8 @@ def drain_pending(plan: dict[str, Any]) -> dict[str, Any]:
     global _PENDING_BLOCK
     # READ, MERGE AND CLEAR AS ONE. A refusal buffering concurrently would
     # otherwise be cleared without ever being folded in — the buffer's own
-    # version of the lost update the sink's critical section closes.
-    with _STAMP_LOCK:
+    # version of the lost update the plan mutex closes for plan.json.
+    with _PENDING_LOCK:
         if _PENDING_BLOCK is None:
             return plan
         plan[PLAN_MARKUP_REJECTIONS_KEY] = merge_block(
@@ -577,7 +559,7 @@ def session_summary(plan: object) -> dict[str, Any] | None:
     still yields ``None`` through exactly one code path (SPOT).
 
     Reads the buffer through :func:`pending_block` — which takes
-    :data:`_STAMP_LOCK`, so the read is consistent against a concurrent
+    :data:`_PENDING_LOCK`, so the read is consistent against a concurrent
     refusal — and does NOT clear it. Clearing belongs to :func:`drain_pending`;
     a reporting read that consumed the buffer would destroy the record before
     ``_create_plan`` could adopt it, which is the same silent loss the whole
@@ -617,9 +599,9 @@ def make_plan_stamp(
              registration and schema, ``outcome`` from the guard's closed
              vocabulary, ``ts`` from the clock.
 
-    What the byte pin was a PROXY for is preserved in full. ``create_server``'s
-    comment justifies the reject policy because "forwarding a repair would
-    write a guessed-at document that every later reader inherits", and the
+    What the byte pin was a PROXY for is preserved in full. This module's
+    docstring justifies the reject policy because "forwarding a repair would
+    write a guessed-at document every later reader inherits", and the
     middleware header says "no middleware-repaired value can ever reach
     plan.json". Both are about VALUES. Nothing guessed, repaired or
     caller-authored reaches the document through here.
@@ -631,28 +613,29 @@ def make_plan_stamp(
     This is a bookkeeping read of one machine-written key and touches no prose
     field.
 
-    WRITTEN THROUGH ``artifacts.write_plan``, the single owner of
+    WRITTEN THROUGH ``artifacts.write_plan_model``, the single owner of
     ``plan.json``'s byte format and of its atomic/durable write — never an
     open-and-dump here, which would drop ``_schema_version`` and the atomicity
-    every other writer on this file depends on.
+    every other writer on this file depends on. The block is no step-set
+    edit, so the plan's confirmation is kept.
 
     ASYNC, with the blocking work on a worker thread: the middleware calls this
     from inside the server's event loop, and one record costs a read and a
     write.
 
-    SERIALISED under :data:`_STAMP_LOCK`, which also covers the pending buffer
-    — two concurrent pre-plan refusals mutate the same process-global block.
-    See that constant for what the lock does and does not close.
+    SERIALISED under ``artifacts.plan_mutex()`` against every other plan.json
+    writer, so neither a concurrent stamp nor an accepted tool write is lost
+    inside the read-merge-write. The pending buffer has its own lock, taken
+    inside it: see :data:`_PENDING_LOCK`.
     """
-    plan_path = artifacts.root / 'plan.json'
+    plan_path = artifacts.artifact_path('plan.json')
 
     def stamp(record: dict[str, Any]) -> str | None:
         """The blocking body, run on a worker thread."""
         event = build_event(record, now=now)
-        # BUILT OUTSIDE THE LOCK, held across the read/merge/write: the event is
-        # pure and needs no shared state, and the critical section stays the
-        # three lines that touch ``plan.json`` and ``_PENDING_BLOCK``.
-        with _STAMP_LOCK:
+        # BUILT OUTSIDE THE MUTEX, which is held across the read/merge/write:
+        # the event is pure and needs no shared state.
+        with artifacts.plan_mutex():
             plan = artifacts.read_plan()
             if isinstance(plan, dict) and not plan:
                 # NO PLAN YET — ``read_plan`` returns an empty dict for a
@@ -673,7 +656,7 @@ def make_plan_stamp(
             plan[PLAN_MARKUP_REJECTIONS_KEY] = merge_block(
                 plan.get(PLAN_MARKUP_REJECTIONS_KEY), block_of(event)
             )
-            artifacts.write_plan(plan)
+            artifacts.write_plan_model(Plan.from_json(plan), mutex_held=True)
         return str(plan_path)
 
     async def plan_stamp(record: dict[str, Any]) -> str | None:

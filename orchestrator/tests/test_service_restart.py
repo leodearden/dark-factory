@@ -10,7 +10,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from df_pytest_isolation import wait_pid_gone
+from df_pytest_isolation import read_proc_state
 
 from orchestrator.service_restart import (
     DEFAULT_FLEET_LEASE_MAX_AGE_SECS,
@@ -1232,14 +1232,9 @@ async def test_schedule_detached_systemd_restart_builds_correct_argv() -> None:
         '--collect',
         '--working-directory=/fake/project',
     )
-    # Index-derived, not a re-hardcoded length: `--setenv=` options (task 3453,
-    # the submit child's explicit PYTHONPATH) are spliced between
-    # --working-directory and /bin/sh, so pin the COMMAND's shape relative to
-    # /bin/sh rather than at fixed offsets.
-    sh_at = argv.index('/bin/sh')
-    assert argv[sh_at + 1] == '-c'
-    assert len(argv) == sh_at + 3, 'the /bin/sh -c payload must be the final token'
-    wrapped = argv[sh_at + 2]
+    assert argv[6:8] == ('/bin/sh', '-c')
+    assert len(argv) == 9, 'the /bin/sh -c payload must be the final token'
+    wrapped = argv[8]
     expected_script = str(Path('/fake/project') / 'scripts/restart-orchestrator.sh')
     assert wrapped.startswith(expected_script)
     assert '__rc=$?;' in wrapped
@@ -2268,7 +2263,11 @@ def _reliably_dead_pid() -> int:
     """A pid that is definitively not running, for the crash-safety tests."""
     proc = subprocess.Popen(['true'])
     proc.wait()
-    assert wait_pid_gone(proc.pid), 'the probe child must be reaped before use'
+    state = read_proc_state(proc.pid)
+    assert state is None, (
+        f'pid {proc.pid} still has a /proc entry {state} after proc.wait() reaped it; '
+        'os.kill(pid, 0), which the lease liveness check uses, would read it as alive'
+    )
     return proc.pid
 
 

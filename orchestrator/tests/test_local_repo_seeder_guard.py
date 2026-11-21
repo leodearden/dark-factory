@@ -9,24 +9,37 @@ too.  Migrating a module means deleting its entry.
 from __future__ import annotations
 
 import ast
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _tree_scan import (
+    TESTS_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# Whole-tree scanner: see WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-_TESTS_DIR = Path(__file__).parent
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 _NOT_YET_MIGRATED = frozenset({
     '_merge_deep_scene.py',
+    '_verify_merge_cli_fixtures.py',  # debt: task 11025
     'test_agent_capability_wiring.py',
     'test_architect_all_committed_plan.py',
     'test_atomic_train_merge.py',
     'test_convert_to_blocked.py',
     'test_create_merge_worktree_retry.py',
+    'test_deterministic_provenance_wire_e2e.py',  # debt: task 11025
+    'test_dry_run_unblock.py',  # debt: task 11026
     'test_git_repo_isolation_guard.py',
     'test_harness_infra_resume_truthful.py',
     'test_harness_interactive_reaper.py',
@@ -36,7 +49,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_interactive_warm_worktree_integration_gate.py',
     'test_interactive_worktree.py',
     'test_interactive_worktree_reaper.py',
-    'test_invoke_role_config_resolution.py',
     'test_lane_lifecycle_gitops.py',
     'test_lane_lifecycle_integration.py',
     'test_merge_drift.py',
@@ -47,13 +59,10 @@ _NOT_YET_MIGRATED = frozenset({
     'test_merge_item_union.py',
     'test_merge_lane_package.py',
     'test_merge_queue_bounce.py',
-    'test_merge_queue_build_chain.py',
     'test_merge_queue_c3_submit_identity.py',
     'test_merge_queue_chain_intact.py',
-    'test_merge_queue_coalesce.py',
     'test_merge_queue_concurrent_verify.py',
     'test_merge_queue_conflict_graph.py',
-    'test_merge_queue_deep_dispatch.py',
     'test_merge_queue_depth_telemetry.py',
     'test_merge_queue_dry_run_unblock.py',
     'test_merge_queue_duplicate_submission.py',
@@ -62,7 +71,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_merge_queue_frozen_prefix.py',
     'test_merge_queue_host_observability.py',
     'test_merge_queue_invariant_integration_gate.py',
-    'test_merge_queue_lifecycle_registry.py',
     'test_merge_queue_metrics.py',
     'test_merge_queue_multihost_wiring.py',
     'test_merge_queue_orphan_reaper.py',
@@ -86,8 +94,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_merge_verify_survivor_barrier.py',
     'test_merge_worktree_lifecycle_integration_gate.py',
     'test_multihost_verify_integration.py',
-    'test_offline_lane_infra_integration.py',
-    'test_offline_lane_integration.py',
     'test_pool_storage_guard.py',
     'test_protected_prefixes.py',
     'test_provenance_gate_integration.py',
@@ -95,13 +101,17 @@ _NOT_YET_MIGRATED = frozenset({
     'test_rebase_verify_cost.py',
     'test_reconcile_done_step_commits.py',
     'test_remove_merge_worktree_guarded.py',
-    'test_seed_lane_lock_reentrancy.py',
-    'test_session_hooks.py',
+    'test_reopen_sticks_e2e.py',  # debt: task 11025
+    'test_roles_ancestry_check.py',  # debt: task 11025
+    'test_roles_staging_command.py',  # debt: task 11026
+    'test_scheduler_park_owner_state.py',  # debt: task 11026
+    'test_session_hooks_install.py',
     'test_session_resume_integration_gate.py',
     'test_substrate_gate.py',
     'test_suffix_conflict_tracker.py',
     'test_task_runtime.py',
     'test_train_integration.py',
+    'test_verify_events_units.py',  # debt: task 11025
     'test_verify_phase_rebase.py',
     'test_verify_plan_integration.py',
     'test_verify_scope_inversion_boundary.py',
@@ -117,7 +127,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_workflow.py',
     'test_workflow_agent_session_preserve.py',
     'test_workflow_escalated_steward_stall.py',
-    'test_workflow_merge_gating_strand.py',
     'test_workflow_signature_loop_guard.py',
     'test_workflow_status_on_resume.py',
     'test_workflow_truthful_commit_stamp.py',
@@ -125,17 +134,41 @@ _NOT_YET_MIGRATED = frozenset({
 })
 
 
-def _git_argvs(func: ast.AST) -> list[list[object]]:
-    """Every ``['git', <verb>, ...]`` list literal under *func*; non-constant elements are None."""
-    argvs: list[list[object]] = []
+_GLOBAL_OPTIONS_WITH_A_VALUE = frozenset({'-C', '-c', '--git-dir', '--work-tree', '--namespace'})
+
+
+def _verb(argv: Sequence[object]) -> str | None:
+    """The git subcommand after git's global options; None if there is none or a non-constant element precedes it."""
+    elements = iter(argv[1:])
+    for element in elements:
+        if not isinstance(element, str):
+            return None
+        if element in _GLOBAL_OPTIONS_WITH_A_VALUE:
+            next(elements, None)
+        elif not element.startswith('-'):
+            return element
+    return None
+
+
+@dataclass(frozen=True)
+class _GitArgv:
+    """One ``['git', ...]`` list literal: its subcommand and every element, non-constant ones as None."""
+
+    verb: str
+    argv: tuple[object, ...]
+
+
+def _git_argvs(func: ast.AST) -> list[_GitArgv]:
+    """Every ``['git', ...]`` list literal under *func* whose verb, read after git's global options, is known."""
+    calls: list[_GitArgv] = []
     for node in ast.walk(func):
         if isinstance(node, ast.List):
-            argv: list[object] = [
+            argv = tuple(
                 elt.value if isinstance(elt, ast.Constant) else None for elt in node.elts
-            ]
-            if len(argv) >= 2 and argv[0] == 'git' and isinstance(argv[1], str):
-                argvs.append(argv)
-    return argvs
+            )
+            if argv and argv[0] == 'git' and (verb := _verb(argv)) is not None:
+                calls.append(_GitArgv(verb, argv))
+    return calls
 
 
 def _local_repo_seeders(tree: ast.Module) -> list[str]:
@@ -143,23 +176,34 @@ def _local_repo_seeders(tree: ast.Module) -> list[str]:
     seeders: list[str] = []
     for func in tree.body:
         if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            argvs = _git_argvs(func)
+            calls = _git_argvs(func)
             if (
-                any(argv[1] == 'init' and '--bare' not in argv for argv in argvs)
-                and any(argv[1] == 'commit' for argv in argvs)
+                any(call.verb == 'init' and '--bare' not in call.argv for call in calls)
+                and any(call.verb == 'commit' for call in calls)
             ):
                 seeders.append(func.name)
     return seeders
 
 
+def _top_level_test_modules() -> tuple[Path, ...]:
+    return tuple(path for path in python_files(TESTS_DIR) if path.parent == TESTS_DIR)
+
+
+def _module_seeders(module: ParsedModule) -> tuple[str, ...]:
+    return tuple(_local_repo_seeders(module.tree))
+
+
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=_top_level_test_modules, extract=_module_seeders)
+TREE_ANALYSES = (ANALYSIS,)
+
+
 @pytest.fixture(scope='module')
-def seeders_by_module() -> dict[str, list[str]]:
-    found: dict[str, list[str]] = {}
-    for module in sorted(_TESTS_DIR.glob('*.py')):
-        seeders = _local_repo_seeders(ast.parse(module.read_text(encoding='utf-8')))
-        if seeders:
-            found[module.name] = seeders
-    return found
+def seeders_by_module(tree_pass: TreePass) -> dict[str, list[str]]:
+    return {
+        path.name: list(seeders)
+        for path, seeders in tree_pass.facts(ANALYSIS).items()
+        if seeders
+    }
 
 
 def test_no_module_grows_its_own_repo_seeder(seeders_by_module: dict[str, list[str]]) -> None:
@@ -194,6 +238,75 @@ def test_the_legacy_seeder_is_flagged() -> None:
     )
 
     assert _local_repo_seeders(tree) == ['_setup_repo']
+
+
+def test_a_seeder_that_commits_through_a_dash_upper_c_path_is_flagged() -> None:
+    tree = ast.parse(
+        'def _init_git_repo(path):\n'
+        '    p = str(path)\n'
+        "    subprocess.run(['git', 'init', '-b', 'main', p])\n"
+        "    subprocess.run(['git', '-C', p, 'commit', '-m', 'initial commit'])\n"
+    )
+
+    assert _local_repo_seeders(tree) == ['_init_git_repo']
+
+
+def test_a_seeder_that_commits_through_dash_c_config_options_is_flagged() -> None:
+    tree = ast.parse(
+        'def _commit_main(root):\n'
+        "    subprocess.run(['git', 'init', '-q', '-b', 'main'], cwd=root)\n"
+        '    subprocess.run(\n'
+        "        ['git', '-c', 'user.name=t', '-c', 'user.email=t@example.com',\n"
+        "         'commit', '-q', '--allow-empty', '-m', 'main'],\n"
+        '        cwd=root,\n'
+        '    )\n'
+    )
+
+    assert _local_repo_seeders(tree) == ['_commit_main']
+
+
+def test_a_seeder_that_commits_through_git_dir_and_work_tree_is_flagged() -> None:
+    tree = ast.parse(
+        'def _seed(repo, git_dir):\n'
+        "    subprocess.run(['git', 'init', str(repo)])\n"
+        "    subprocess.run(['git', '--git-dir', git_dir, '--work-tree=/w', 'commit', '-m', 'x'])\n"
+    )
+
+    assert _local_repo_seeders(tree) == ['_seed']
+
+
+@pytest.mark.parametrize('option', ['-C', '-c', '--git-dir', '--work-tree', '--namespace'])
+def test_a_seeder_that_commits_through_any_global_option_with_a_value_is_flagged(
+    option: str,
+) -> None:
+    tree = ast.parse(
+        'def _seed(repo, value):\n'
+        "    subprocess.run(['git', 'init', str(repo)])\n"
+        f"    subprocess.run(['git', {option!r}, value, 'commit', '-m', 'x'])\n"
+    )
+
+    assert _local_repo_seeders(tree) == ['_seed']
+
+
+def test_a_git_literal_with_no_subcommand_is_skipped() -> None:
+    tree = ast.parse(
+        'def _probe(repo):\n'
+        "    subprocess.run(['git', '--version'])\n"
+        "    subprocess.run(['git', 'init', str(repo)])\n"
+        "    subprocess.run(['git', '-C'])\n"
+    )
+
+    assert _local_repo_seeders(tree) == []
+
+
+def test_a_global_bare_init_is_not_flagged() -> None:
+    tree = ast.parse(
+        'def _make_origin(origin, p):\n'
+        "    subprocess.run(['git', '--bare', 'init'], cwd=origin)\n"
+        "    subprocess.run(['git', '-C', p, 'commit', '--allow-empty', '-m', 'x'])\n"
+    )
+
+    assert _local_repo_seeders(tree) == []
 
 
 def test_a_bare_origin_helper_is_not_flagged() -> None:

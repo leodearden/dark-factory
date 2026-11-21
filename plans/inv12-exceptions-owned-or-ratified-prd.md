@@ -280,6 +280,19 @@ successor, and re-reads status immediately before acting (INV-3).
   excludes only `cancelled`, so it can fold a finding onto the very `done` owner
   it reports (`fused_memory/middleware/task_curator.py`), and the store's
   `ux_tasks_candidate_key` index keys on title **and** files.
+  *Amended (task 9468, 2026-11-15):* every sweep escalation is an
+  info-severity L0, which the info-L0 router dismisses and converts into a task
+  carrying `metadata.escalation_id` within minutes. So a live task whose
+  `escalation_id` names any escalation ever filed in the key's `task_id` slot
+  (archive-inclusive `get_task_escalations`, exact id) also counts as carrying
+  the key, and one no longer open (closed or deferred) is a terminal finding
+  whose escalation names that task and its status in its summary. The store's
+  `ux_tasks_candidate_key` index covers `done` rows and the router titles a
+  conversion by its summary, so without a distinct summary each re-raise would
+  fold onto that task and the finding would recur nightly. The curator's
+  semantic drop excludes only `cancelled` too, so a re-raise it drops onto the
+  home it names still recurs nightly until the entry is re-owned. Named lists
+  still escalate: the decision-not-edit reading of this decision stands.
 - *A terminal finding with the condition unchanged escalates; it is never
   re-filed.* That ends the loop where a finding task re-owns to itself.
 - *Output by scope.* Inline → a task through
@@ -290,7 +303,8 @@ successor, and re-reads status immediately before acting (INV-3).
   `x_inv12_owns` note into that task's metadata, so the record an operator or a
   later agent reads says what cites it.
 - *Storm bound.* At most 10 outputs per run; the overflow is one roll-up with a
-  constant key whose body says "run `--report`" (INV-4).
+  constant key whose body says "run `--dry-run`" (INV-4). *Amended (task 9468):*
+  it said "run `--report`", which lists no findings.
 - *Slack.* Non-zero baseline slack files one constant-key `tighten` task.
 - *Fail loud.* Store or MCP unreachable → zero outputs and an `escalate_info`;
   the unit wrapper itself exits 0, as
@@ -649,7 +663,9 @@ Grants (propose: design, not governed):
 `orchestrator/src/orchestrator/config.py::RELOADABLE_FIELDS`; the entity-mint and
 mem0-update prefix configs;
 `fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::_BRIEFING_REFRESH_PROJECT_ALLOWLIST`;
-`scripts/render_systemd_unit.py::HOST_LOCAL_ENVIRONMENT`.
+`scripts/systemd_unit_parity.py::ENV_POLICY` (the single declaration the renderer's preserve sets, the dashboard divergence allowlist and the fused-memory required `Environment=` lines project from).
+This entry first named `scripts/render_systemd_unit.py::HOST_LOCAL_ENVIRONMENT`,
+which task 6757 folded into that table.
 
 ### Part 3 — questions
 
@@ -661,3 +677,16 @@ mem0-update prefix configs;
    rewrites ≥144 marker-bearing lines.
 3. **Burn-down.** Confirm none is scheduled (D10), or name the owner.
 4. **Dead markers.** Run the `RUF100` autofix, or leave 1,499 grandfathered?
+
+## Appendix B — inline scanner design notes
+
+Rationale behind the inline scanner that no caller relies on and no test pins.
+A note lands here when it is moved out of the code; the scanner's docstrings
+still carry rationale that has not been moved, so a note's absence from this
+list says nothing about whether one exists. One bullet per note, each citing
+the symbol it explains.
+
+- `scripts/inline_suppression_refusal.py::InstrumentFailure` is one exception type for
+  every exit-2 cause, not one per cause. Splitting by cause would hand `main`
+  five `except` clauses that all do the same thing, and would let the stderr
+  prefix a log reader greps for differ between causes.

@@ -60,6 +60,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_checkouts import git, main_checkout_with_lane
+from _markup_corpus import corpus_specimen
 from _markup_helpers import (
     INVOKE_CLOSER,
     LT,
@@ -70,11 +72,22 @@ from _markup_helpers import (
 from escalation.models import Escalation
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.mcp_markup_middleware import (
+    MARKUP_BOUNDARY_STORM_CATEGORY,
+    MARKUP_RECURRENCE_ROUTING,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
 from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY, detect, repair
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp, plan_tools
+from orchestrator.mcp import (
+    markup_journal,
+    markup_sink,
+    plan_markup_repair,
+    plan_markup_stamp,
+    plan_tools,
+)
 from orchestrator.workflow import _is_gating_escalation
 
 # ---------------------------------------------------------------------------
@@ -131,14 +144,14 @@ QUOTED_DECISION = (
 
 @pytest.fixture(autouse=True)
 def _clear_reported_refusals():
-    """Clear ``_REPORTED_REFUSALS`` around every test in this module.
+    """Forget every reported refusal around each test in this module.
 
     It is PROCESS-global memo state owned by the read-time path, so a refusal
     reported by one test would otherwise be suppressed in the next.
     """
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair.forget_reported_refusals()
     yield
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair.forget_reported_refusals()
 
 
 @pytest.fixture(autouse=True)
@@ -183,7 +196,7 @@ class Harness:
 
     @property
     def plan_path(self) -> Path:
-        return self.artifacts.root / 'plan.json'
+        return self.artifacts.artifact_path('plan.json')
 
     def plan_bytes(self) -> bytes:
         return self.plan_path.read_bytes()
@@ -942,36 +955,12 @@ class TestEveryToolDeclaresTheOverrideParameter:
 # preserved verbatim in the escalation named above".
 
 #: The committed corpus of REAL leaked calls (task 3688, boundary row B13).
-CORPUS_PATH = (
-    Path(__file__).resolve().parents[2]
-    / 'shared' / 'tests' / 'fixtures' / 'toolcall_markup_corpus.jsonl'
-)
-
-
-def _specimen(tool_use_id: str) -> dict[str, Any]:
-    """The committed corpus record with this ``tool_use_id``.
-
-    Keyed by id rather than by index or by "the shortest one", so a corpus
-    refresh that adds records cannot silently repoint a test at a different
-    payload. Read as JSON, which is also how the raw envelope literals reach
-    this module WITHOUT appearing in its own source text — the corpus escapes
-    every one of them as ``\\u003c``.
-    """
-    for line in CORPUS_PATH.read_text(encoding='utf-8').splitlines():
-        if not line.strip():
-            continue
-        record = json.loads(line)
-        if record.get('tool_use_id') == tool_use_id:
-            return record
-    raise AssertionError(f'specimen {tool_use_id!r} is missing from {CORPUS_PATH}')
-
-
 #: A REAL ``add_design_decision.decision`` payload whose own boundary cannot be
 #: determined. A refusal is the one outcome an invented specimen can trivially
 #: fake — anything sufficiently mangled refuses — so the assertion that this
 #: guard never guesses is only worth something against input the harness really
 #: produced.
-UNREPAIRABLE_SPECIMEN = _specimen('toolu_01CX8okLpKgz5auenVYQzY23')
+UNREPAIRABLE_SPECIMEN = corpus_specimen('toolu_01CX8okLpKgz5auenVYQzY23')
 UNREPAIRABLE_DECISION: str = UNREPAIRABLE_SPECIMEN['value']
 
 #: What ``add_design_decision`` declares, as the middleware resolves it LIVE
@@ -1080,8 +1069,8 @@ def build_residue_rig(
 
     real_factory = plan_tools._markup_escalation_sink
 
-    def recording_factory(sink_artifacts: TaskArtifacts):
-        sink = real_factory(sink_artifacts)
+    def recording_factory(sink_artifacts: TaskArtifacts, loss_sink):
+        sink = real_factory(sink_artifacts, loss_sink)
 
         # ASYNC, because the real sink is: it does its blocking work on a
         # worker thread so a git subprocess and two fsync'd queue writes never
@@ -1160,7 +1149,7 @@ class TestUnrepairableResidueIsPreserved:
         ``detect_for(value, param, schema_params)`` triple the scan asks, so
         the three sites agree BY CONSTRUCTION rather than coinciding. Here
         ``repair`` returned ``None``, so there is no ``Repair`` to read one off
-        at all and the guard publishes what ``_first_markup_argument``
+        at all and the guard publishes what ``_markup_arguments``
         actually matched on. Asserting
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
@@ -1169,7 +1158,7 @@ class TestUnrepairableResidueIsPreserved:
         The expectation is SPELLED, not computed by calling ``detect_for``
         here. An expectation derived from the predicate under test moves with
         it, so it can only ever catch a disagreement between
-        ``_first_markup_argument`` and ``detect_for`` — never a change to what
+        ``_markup_arguments`` and ``detect_for`` — never a change to what
         ``detect_for`` MEANS. Measured on this corpus specimen: the self-name
         closer sits at offset 459 and the blanket ``detect``'s answer at 471,
         so the widened value is the HEAD of the leak and the blanket one
@@ -1223,16 +1212,33 @@ class TestUnrepairableResidueIsPreserved:
         )
 
     @pytest.mark.asyncio
+    async def test_the_residue_record_routes_a_recurrence_through_the_shared_sentence(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The queued record is where an operator reads the route (task 5698)."""
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': UNREPAIRABLE_DECISION})
+
+        assert len(rig.queue.submitted) == 1
+        detail = rig.queue.submitted[0].detail
+        assert 'plans/toolcall-markup-containment-prd.md' in detail
+        assert MARKUP_RECURRENCE_ROUTING in detail, (
+            f'must carry the ONE shared routing sentence, not a local copy: {detail!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_the_residue_never_gates_the_leaking_task(
         self, monkeypatch, artifacts: TaskArtifacts
     ):
         """The record is filed under a NON-TASK anchor, and that is deliberate.
 
-        The middleware declares residue at ``level=2``, and a PENDING level>=2
-        escalation carrying a live task id is a stop-the-line event in this
-        repo: ``workflow._is_gating_escalation`` gates on ``level >= 2``,
+        The middleware declares residue at ``level=2``, and a PENDING non-info
+        level>=2 escalation carrying a live task id is a stop-the-line event in this
+        repo: ``workflow._is_gating_escalation`` gates on a non-info ``level >= 2``,
         ``_check_escalations`` looks records up by task id alone, and
-        ``_wait_for_resolution`` raises ``_StewardReescalated`` — which
+        ``_wait_for_resolution`` raises ``_NoStewardApplicable`` — which
         ``run()`` turns into ``_mark_blocked``.
 
         So filing under the leaking task's own id would turn ONE leaked tool
@@ -1350,7 +1356,7 @@ class TestUnrepairableResidueIsPreserved:
         ``detect_for(value, param, schema_params)`` triple the scan asks, so
         the three sites agree BY CONSTRUCTION rather than coinciding. Here
         ``repair`` returned ``None``, so there is no ``Repair`` to read one off
-        at all and the guard publishes what ``_first_markup_argument``
+        at all and the guard publishes what ``_markup_arguments``
         actually matched on. Asserting
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
@@ -1359,7 +1365,7 @@ class TestUnrepairableResidueIsPreserved:
         The expectation is SPELLED, not computed by calling ``detect_for``
         here. An expectation derived from the predicate under test moves with
         it, so it can only ever catch a disagreement between
-        ``_first_markup_argument`` and ``detect_for`` — never a change to what
+        ``_markup_arguments`` and ``detect_for`` — never a change to what
         ``detect_for`` MEANS. Measured on this corpus specimen: the self-name
         closer sits at offset 459 and the blanket ``detect``'s answer at 471,
         so the widened value is the HEAD of the leak and the blanket one
@@ -1400,7 +1406,7 @@ class TestUnrepairableResidueIsPreserved:
 # ---------------------------------------------------------------------------
 #
 # The middleware routes storm records through the SAME injected sink as residue
-# records (``_file_storm_escalation`` hands it ``{'error_type':
+# records (its ``BoundaryStormEscape`` hands it ``{'error_type':
 # 'mcp_markup_storm', ...}``), so without a branch the sink would file a
 # residue-shaped record — one claiming to hold a caller payload it does not
 # have — for a burst.
@@ -1408,7 +1414,7 @@ class TestUnrepairableResidueIsPreserved:
 #: A SECOND real unrepairable ``add_design_decision.decision`` payload, so
 #: "residue records never dedup" is asserted across two DISTINCT caller
 #: payloads rather than the same one twice.
-SECOND_UNREPAIRABLE_SPECIMEN = _specimen('toolu_0183rUJqrD3dMjmWAx71mKmP')
+SECOND_UNREPAIRABLE_SPECIMEN = corpus_specimen('toolu_0183rUJqrD3dMjmWAx71mKmP')
 SECOND_UNREPAIRABLE_DECISION: str = SECOND_UNREPAIRABLE_SPECIMEN['value']
 
 
@@ -1428,18 +1434,17 @@ class _Clock:
 def tune_storm(rig: ResidueRig, *, threshold: int, clock: _Clock) -> MarkupGuardMiddleware:
     """Point the REGISTERED guard's burst detector at a fake clock.
 
-    Not a reach-around: ``StormCounter``'s reload-safety contract has the
-    middleware pass ``threshold`` and ``window_seconds`` PER record() call
-    precisely so a consumer can read them live, and the counters themselves are
-    created lazily on the first event — so tuning them on the constructed guard
-    before any call is exactly as supported as reading them from a config leaf.
-    The alternative is sleeping through the real 3600s window.
+    Through the guard's public ``storm_escape``, whose ``threshold`` and
+    ``time_provider`` are documented live-read tuning: both are read at every
+    record, so setting them before the first call is exactly as supported as
+    reading them from a config leaf. The alternative is sleeping through the
+    real 3600s window.
     """
     guard = next(
         m for m in rig.harness.server.middleware if isinstance(m, MarkupGuardMiddleware)
     )
-    guard._storm_threshold = threshold
-    guard._storm_time_provider = clock
+    guard.storm_escape.threshold = threshold
+    guard.storm_escape.time_provider = clock
     return guard
 
 
@@ -1468,12 +1473,16 @@ class TestTheStormEscape:
 
         assert len(rig.queue.submitted) == 1
         filed = rig.queue.submitted[0]
-        assert filed.category == plan_tools._MARKUP_STORM_CATEGORY
+        assert filed.category == MARKUP_BOUNDARY_STORM_CATEGORY
         assert filed.task_id == plan_tools._MARKUP_STORM_ANCHOR_TASK_ID, (
             'the burst is a property of the SERVER window, not of one task '
             "payload — pinning the anchor is what makes the dedup lookup stable"
         )
         assert 'plans/toolcall-markup-containment-prd.md' in filed.detail
+        assert MARKUP_RECURRENCE_ROUTING in filed.detail, (
+            f'must carry the ONE shared routing sentence, not a local copy: '
+            f'{filed.detail!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_a_second_burst_folds_into_the_still_open_record(
@@ -1524,7 +1533,7 @@ class TestTheStormEscape:
                 'crossing_subject_agent_role': None,
                 'callers': [],
             },
-            plan_tools._MARKUP_SINK_SPEC,
+            plan_tools.MARKUP_SINK_SPEC,
         )
 
     def test_the_open_records_subject_reads_back_through_one_spelling(self):
@@ -1545,7 +1554,7 @@ class TestTheStormEscape:
         assert markup_sink._recorded_subject(
             Escalation(
                 id='esc-x', task_id='t', agent_role='r', severity='blocking',
-                category=markup_sink.MARKUP_STORM_CATEGORY,
+                category=MARKUP_BOUNDARY_STORM_CATEGORY,
                 summary='s', detail='some other producer squatted the anchor',
                 worktree='/tmp/wt', level=1,
             )
@@ -1640,7 +1649,7 @@ class TestTheStormEscape:
             await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
 
         assert len(rig.queue.submitted) == 1
-        assert rig.queue.submitted[0].category == plan_tools._MARKUP_STORM_CATEGORY
+        assert rig.queue.submitted[0].category == MARKUP_BOUNDARY_STORM_CATEGORY
 
     @pytest.mark.asyncio
     async def test_a_storm_filing_failure_never_changes_the_refusal(
@@ -1778,7 +1787,7 @@ class TestTheStormEscape:
                 'callers': [spoof],
             },
             'test-1',
-            plan_tools._MARKUP_SINK_SPEC,
+            plan_tools.MARKUP_SINK_SPEC,
         )
 
         assert spoof not in detail, 'the raw newline reached the body verbatim'
@@ -1818,7 +1827,9 @@ class TestTheStormEscape:
             assert "the guard's own log lines" not in body
         # The routing survives — the grep is demoted, not the destination.
         assert 'plans/toolcall-markup-containment-prd.md' in filed.suggested_action
-        assert '3083' in filed.suggested_action
+        assert MARKUP_RECURRENCE_ROUTING in filed.suggested_action, (
+            filed.suggested_action
+        )
 
     @pytest.mark.asyncio
     async def test_the_dedup_anchor_and_routing_are_untouched(
@@ -1840,7 +1851,7 @@ class TestTheStormEscape:
 
         filed = rig.queue.submitted[0]
         assert filed.task_id == plan_tools._MARKUP_STORM_ANCHOR_TASK_ID
-        assert filed.level == plan_tools._MARKUP_STORM_LEVEL
+        assert filed.level == markup_sink.MARKUP_STORM_LEVEL
         assert rig.queue.reads == [
             (plan_tools._MARKUP_STORM_ANCHOR_TASK_ID, 'pending')
         ]
@@ -1871,7 +1882,7 @@ class TestTheStormEscape:
 
         assert len(rig.queue.submitted) == 1
         filed = rig.queue.submitted[0]
-        assert filed.category == plan_tools._MARKUP_STORM_CATEGORY
+        assert filed.category == MARKUP_BOUNDARY_STORM_CATEGORY
         assert filed.summary.startswith(f'[{artifacts.worktree.name}] ')
 
 
@@ -1888,13 +1899,6 @@ class TestTheStormEscape:
 # data exactly where this leaf promises none is lost.
 
 
-def _git(*args: str, cwd: Path) -> None:
-    """Run one git command in *cwd*, failing loudly."""
-    subprocess.run(
-        ['git', *args], cwd=str(cwd), check=True, capture_output=True, text=True,
-    )
-
-
 class TestWhereTheRecordLands:
     """``_markup_project_root`` decides which queue every record reaches."""
 
@@ -1906,7 +1910,7 @@ class TestWhereTheRecordLands:
         """
         checkout = tmp_path / 'repo'
         checkout.mkdir()
-        _git('init', cwd=checkout)
+        git('init', cwd=checkout)
 
         assert plan_tools._markup_project_root(checkout) == checkout.resolve()
 
@@ -1918,13 +1922,7 @@ class TestWhereTheRecordLands:
         would answer with the lane itself, filing each record into a directory
         that is deleted when the lane is reset.
         """
-        checkout = tmp_path / 'repo'
-        checkout.mkdir()
-        _git('init', cwd=checkout)
-        _git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit',
-             '--allow-empty', '-m', 'root', cwd=checkout)
-        lane = tmp_path / 'lane'
-        _git('worktree', 'add', str(lane), '-b', 'task/1', cwd=checkout)
+        checkout, lane = main_checkout_with_lane(tmp_path)
 
         assert plan_tools._markup_project_root(lane) == checkout.resolve()
         assert plan_tools._markup_project_root(lane) != lane.resolve()
@@ -1940,7 +1938,7 @@ class TestWhereTheRecordLands:
         this branch would silently file every record under the CWD.
         """
         monkeypatch.setattr(
-            plan_tools.subprocess, 'run',
+            subprocess, 'run',
             lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout='  \n', stderr=''),
         )
 
@@ -2065,7 +2063,7 @@ class TestAnUnrecognisedRecordKindIsStillFiled:
         monkeypatch.setattr(
             plan_tools, '_escalation_channel', lambda root: (Escalation, queue)
         )
-        sink = plan_tools._markup_escalation_sink(artifacts)
+        sink = plan_tools._markup_escalation_sink(artifacts, _RecordingArm())
 
         esc_id = await sink({
             'error_type': 'mcp_markup_something_new',
@@ -2077,8 +2075,8 @@ class TestAnUnrecognisedRecordKindIsStillFiled:
         assert len(queue.submitted) == 1
         esc = queue.submitted[0]
         assert esc.id == esc_id
-        assert esc.category == plan_tools._ESCALATION_FALLBACK_CATEGORY
-        assert plan_tools._ESCALATION_FALLBACK_SUMMARY in esc.summary
+        assert esc.category == markup_sink.ESCALATION_FALLBACK_CATEGORY
+        assert plan_tools.MARKUP_SINK_SPEC.fallback_summary in esc.summary
         assert UNREPAIRABLE_DECISION in esc.detail, (
             'an unfamiliar record still carries a payload — filing it without '
             'that payload would discard the very thing worth keeping'
@@ -2379,13 +2377,11 @@ class _RecordingArm:
 def _compose(monkeypatch, artifacts, journal: _RecordingArm, stamp: _RecordingArm):
     """Build ``_markup_fact_sink`` over two fake arms.
 
-    Substitutes the module-level SEAMS rather than reaching into the built
-    sink, which is the convention ``_markup_escalation_sink`` and
-    ``_markup_fact_journal`` already keep on this module.
+    The journal is handed in, as ``create_server`` hands in the one it shares
+    with the escalation sink; the stamp is substituted at its module-level seam.
     """
-    monkeypatch.setattr(plan_tools, '_markup_fact_journal', lambda _a: journal)
     monkeypatch.setattr(plan_tools, '_markup_plan_stamp', lambda _a: stamp)
-    return plan_tools._markup_fact_sink(artifacts)
+    return plan_tools._markup_fact_sink(artifacts, journal)
 
 
 class TestTheFactSinkFansOutToBothChannels:
@@ -2490,10 +2486,9 @@ class TestTheTwoArmsAreIsolatedFromEachOther:
             order.append('stamp')
             return 'plan.json'
 
-        monkeypatch.setattr(plan_tools, '_markup_fact_journal', lambda _a: journal)
         monkeypatch.setattr(plan_tools, '_markup_plan_stamp', lambda _a: stamp)
 
-        await plan_tools._markup_fact_sink(artifacts)({'tool': 'add_design_decision'})
+        await plan_tools._markup_fact_sink(artifacts, journal)({'tool': 'add_design_decision'})
 
         assert order == ['journal', 'stamp']
 

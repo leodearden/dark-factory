@@ -26,6 +26,7 @@ import pytest
 
 from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
+from orchestrator.verify_admission_gate import AdmissionPlan
 
 # Post-fix the merge acquire enters in ~0.000s with the pool saturated, so this
 # is three orders of magnitude of headroom, not a tuned threshold.
@@ -93,9 +94,12 @@ class TestAdmissionSlotBypassesExecutorForUngatedRoles:
     async def test_merge_role_enters_immediately_when_executor_saturated(self, tmp_path, monkeypatch):
         slots_dir = tmp_path / 'slots'
         slots_dir.mkdir()
+        # Two slots, both held externally below: the admission gate (task
+        # 5628) sends only as many waiters to the executor as there are slots,
+        # so two admitted task-role waiters are what saturate the pool.
         config = OrchestratorConfig(
             verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
+            verify_admission_task_slots=2,
         )
 
         # A tiny pool so two blocked task-role acquisitions fully saturate it
@@ -103,13 +107,19 @@ class TestAdmissionSlotBypassesExecutorForUngatedRoles:
         monkeypatch.setattr(verify, '_ADMISSION_EXECUTOR_MAX_WORKERS', 2)
         monkeypatch.setattr(verify, '_admission_executor_singleton', None)
 
-        # Hold the sole slot externally so every task-role acquisition below
-        # blocks forever in T1's flock poll loop until this fd is closed.
-        holder_fd = os.open(str(slots_dir / 'slot-1'), os.O_RDWR | os.O_CREAT, 0o644)
-        fcntl.flock(holder_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Hold both slots externally so every task-role acquisition below
+        # blocks forever in T1's flock poll loop until these fds are closed.
+        holder_fds = []
+        for slot in ('slot-1', 'slot-2'):
+            fd = os.open(str(slots_dir / slot), os.O_RDWR | os.O_CREAT, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            holder_fds.append(fd)
 
         async def _saturate():
-            async with verify._admission_slot('task', config):
+            request = AdmissionPlan.begin(role='task', task_id=None).request(
+                module=None, scope_kind=None,
+            )
+            async with verify._admission_slot('task', config, request):
                 pass  # pragma: no cover - never reached while the slot is held
 
         saturating_tasks = [asyncio.create_task(_saturate()) for _ in range(2)]
@@ -117,7 +127,7 @@ class TestAdmissionSlotBypassesExecutorForUngatedRoles:
             await _await_executor_saturation()
 
             try:
-                async with asyncio.timeout(_ENTER_BUDGET_SECS), verify._admission_slot('merge', config):
+                async with asyncio.timeout(_ENTER_BUDGET_SECS), verify._admission_slot('merge', config, None):
                     pass
             except TimeoutError:
                 pytest.fail(
@@ -128,7 +138,8 @@ class TestAdmissionSlotBypassesExecutorForUngatedRoles:
                     f'shared executor'
                 )
         finally:
-            os.close(holder_fd)
+            for fd in holder_fds:
+                os.close(fd)
             await asyncio.wait_for(asyncio.gather(*saturating_tasks), timeout=5.0)
             executor = verify._admission_executor_singleton
             if executor is not None:

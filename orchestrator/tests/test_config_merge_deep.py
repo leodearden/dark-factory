@@ -19,16 +19,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from importlib import resources as pkg_resources
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
+from _packaged_defaults import load_packaged_defaults
 from pydantic import ValidationError
 
 from orchestrator.config import (
     RELOADABLE_FIELDS,
+    DepthRow,
     MergeDeepConfig,
     OrchestratorConfig,
     apply_reload,
@@ -39,6 +40,8 @@ from orchestrator.config import (
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.run_store import RunStore
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # ---------------------------------------------------------------------------
 # Harness helpers replicated (not imported) from test_harness_config_reload.py:37-71
@@ -60,15 +63,6 @@ def _make_harness(tmp_path: Path) -> tuple[Harness, EventStore]:
     return harness, event_store
 
 
-def _load_package_defaults() -> dict:
-    """Read the shipped defaults.yaml so tests stay in sync automatically.
-
-    Copied from test_chronic_flake.py:35-38.
-    """
-    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
-    return yaml.safe_load(defaults_file.read_text())
-
-
 def _query_events(event_store: EventStore, event_type_str: str) -> list[dict]:
     """Query all rows matching event_type_str from the EventStore's DB."""
     conn = sqlite3.connect(str(event_store.db_path))
@@ -86,15 +80,14 @@ class TestMergeDeepKnobInProjectYaml:
     on main) writes: ``merge_deep:\\n  chain_cap: <cap>`` in the project YAML.
     """
 
-    def test_project_yaml_override_loads_through(self, monkeypatch, tmp_path):
+    def test_project_yaml_override_loads_through(self, tmp_path):
         """Project layer beats package defaults (test_config.py:982 precedent)."""
         project_cfg = tmp_path / 'orchestrator.yaml'
         project_cfg.write_text(yaml.dump({'merge_deep': {'chain_cap': 6}}))
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         cfg = load_config(project_cfg)
         assert cfg.merge_deep.chain_cap == 6
 
-    def test_knob_is_a_known_census_key(self, monkeypatch, tmp_path):
+    def test_knob_is_a_known_census_key(self, tmp_path):
         """Registering the submodel makes ``merge_deep.chain_cap`` a KNOWN key,
         so the deploy script's edit is neither silently dropped by pydantic
         ``extra='ignore'`` nor censused as a phantom key (which would file a
@@ -102,16 +95,14 @@ class TestMergeDeepKnobInProjectYaml:
         """
         project_cfg = tmp_path / 'orchestrator.yaml'
         project_cfg.write_text(yaml.dump({'merge_deep': {'chain_cap': 6}}))
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         assert census_config_keys(project_cfg).unknown == []
 
-    def test_typo_under_the_knob_still_censuses(self, monkeypatch, tmp_path):
+    def test_typo_under_the_knob_still_censuses(self, tmp_path):
         """Negative control: the census must still descend INTO merge_deep, so a
         typo'd leaf is reported rather than swallowed by the new known parent.
         """
         project_cfg = tmp_path / 'orchestrator.yaml'
         project_cfg.write_text(yaml.dump({'merge_deep': {'chain_capp': 6}}))
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
         paths = [uk.path for uk in census_config_keys(project_cfg).unknown]
         assert 'merge_deep.chain_capp' in paths, (
             f'expected the typo to be censused under the known merge_deep parent; got {paths!r}'
@@ -123,31 +114,182 @@ class TestChainCapBoundValidation:
 
     @pytest.mark.parametrize('bad_value', [-1, -6, -32])
     def test_negative_cap_rejected(self, bad_value):
-        """A negative cap is meaningless in
-        ``target_depth = min(len(queue), cap, halving_state)`` — it would silently
-        win that min() and disable or underflow the gate, so it must fail loudly
-        at construction (loud over silent degradation).
+        """A negative cap is neither "off" nor "on", so it must fail loudly at
+        construction (loud over silent degradation).
         """
         with pytest.raises(ValidationError):
             MergeDeepConfig(chain_cap=bad_value)
 
-    def test_negative_cap_rejected_at_load(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_negative_cap_rejected_at_load(self):
         """Covers the 'rejected at load' signal: OrchestratorConfig builds the
         merge_deep submodel from the nested dict shape YAML deserializes into, so
         a bad project YAML fails at load rather than reaching dispatch.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         with pytest.raises(ValidationError):
             OrchestratorConfig(merge_deep={'chain_cap': -1})  # type: ignore[arg-type]
 
     @pytest.mark.parametrize('good_value', [0, 1, 6, 32])
-    def test_whole_staging_ladder_is_representable(self, good_value):
-        """0 = kill switch, 1 = the halving floor (d=1, byte-identical to today's
-        adjacent verify), 6 = the ζ canary depth, 32 = η2's "uncapped in
-        practice". No upper bound is imposed — θ owns the ceiling question.
+    def test_any_non_negative_cap_is_representable(self, good_value):
+        """0 is the kill switch; every positive value simply means "on" (task
+        8528). Depth comes from ``depth_table``, so the cap bounds nothing and
+        no upper bound is imposed.
         """
         assert MergeDeepConfig(chain_cap=good_value).chain_cap == good_value
+
+
+def _from_yaml_rows(rows: object) -> MergeDeepConfig:
+    """Validate *rows* in the shape a project yaml's ``depth_table`` parses to."""
+    return MergeDeepConfig.model_validate({'depth_table': rows})
+
+
+class TestDepthTable:
+    """``depth_table``: the rolling pass-estimate rows that set chain depth
+    (task 8528, plans/merge-lane-policy-prd.md D7).
+    """
+
+    def test_default_rows_are_typed(self):
+        table = MergeDeepConfig().depth_table
+        assert all(isinstance(row, DepthRow) for row in table)
+        assert [row.depth for row in table] == list(range(12, 2, -1))
+        assert (table[0], table[-1]) == ((0.992, 12), (0.75, 3))
+
+    def test_each_default_row_starts_where_its_depth_gets_cheaper(self):
+        """plans/merge-lane-policy-prd.md D7: a chain of k costs 1/k + (1 - p^k)
+        verifies per item when every member of a red chain verifies alone."""
+        def verifies_per_item(p: float, k: int) -> float:
+            return 1 / k + (1 - p**k)
+
+        *rows, shallowest = MergeDeepConfig().depth_table
+        for threshold, depth in rows:
+            just_below, just_above = threshold - 0.002, threshold + 0.002
+            assert verifies_per_item(just_above, depth) < verifies_per_item(just_above, depth - 1), depth
+            assert verifies_per_item(just_below, depth) > verifies_per_item(just_below, depth - 1), depth
+        assert verifies_per_item(shallowest.min_pass_estimate, shallowest.depth) < 1, (
+            'the shallowest row must still beat verifying each item alone'
+        )
+        assert all(
+            verifies_per_item(p / 100, 3) < verifies_per_item(p / 100, 2) for p in range(50, 100)
+        ), 'depth 2 is never cheaper than depth 3, so it has no row'
+
+    def test_project_yaml_table_loads_as_rows(self, tmp_path):
+        project_cfg = tmp_path / 'orchestrator.yaml'
+        project_cfg.write_text(
+            yaml.dump({'merge_deep': {'chain_cap': 6, 'depth_table': [[0.9, 16], [0.5, 2]]}})
+        )
+        cfg = load_config(project_cfg)
+        assert cfg.merge_deep.depth_table == [DepthRow(0.9, 16), DepthRow(0.5, 2)]
+        assert all(isinstance(row, DepthRow) for row in cfg.merge_deep.depth_table)
+
+    def test_empty_table_rejected(self):
+        with pytest.raises(ValidationError, match='must not be empty'):
+            _from_yaml_rows([])
+
+    @pytest.mark.parametrize('bad_threshold', [-0.1, 1.5])
+    def test_threshold_outside_unit_interval_rejected(self, bad_threshold):
+        with pytest.raises(ValidationError) as excinfo:
+            _from_yaml_rows([[0.95, 8], [bad_threshold, 2]])
+        message = str(excinfo.value)
+        assert '[0, 1]' in message
+        assert repr(DepthRow(bad_threshold, 2)) in message
+
+    @pytest.mark.parametrize('bad_depth', [1, 0, -2])
+    def test_depth_below_two_rejected(self, bad_depth):
+        with pytest.raises(ValidationError) as excinfo:
+            _from_yaml_rows([[0.95, 8], [0.8, bad_depth]])
+        message = str(excinfo.value)
+        assert '>= 2' in message
+        assert repr(DepthRow(0.8, bad_depth)) in message
+
+    @pytest.mark.parametrize(
+        'table', [[[0.8, 8], [0.9, 4]], [[0.9, 8], [0.9, 4]]], ids=['ascending', 'equal']
+    )
+    def test_thresholds_not_strictly_descending_rejected(self, table):
+        with pytest.raises(ValidationError) as excinfo:
+            _from_yaml_rows(table)
+        message = str(excinfo.value)
+        assert 'thresholds' in message and 'strictly descending' in message
+        assert repr(DepthRow(*table[1])) in message
+
+    @pytest.mark.parametrize(
+        'table', [[[0.9, 4], [0.8, 8]], [[0.9, 4], [0.8, 4]]], ids=['ascending', 'equal']
+    )
+    def test_depths_not_strictly_descending_rejected(self, table):
+        with pytest.raises(ValidationError) as excinfo:
+            _from_yaml_rows(table)
+        message = str(excinfo.value)
+        assert 'depths' in message and 'strictly descending' in message
+        assert repr(DepthRow(*table[1])) in message
+
+    @pytest.mark.parametrize('bad_row', [[0.9], [0.9, 8, 1], 0.9, 'eight'])
+    def test_row_that_is_not_a_pair_rejected(self, bad_row):
+        with pytest.raises(ValidationError) as excinfo:
+            _from_yaml_rows([[0.95, 16], bad_row])
+        assert 'depth_table.1' in str(excinfo.value)
+
+    def test_zero_threshold_row_pins_a_fixed_depth(self):
+        assert MergeDeepConfig(depth_table=[DepthRow(0.0, 3)]).depth_table == [(0.0, 3)]
+
+    def test_is_green_tier(self):
+        assert 'merge_deep.depth_table' in RELOADABLE_FIELDS
+
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_retunes_the_held_submodel_in_place(self):
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(
+            merge_deep=MergeDeepConfig(depth_table=[DepthRow(0.9, 16), DepthRow(0.5, 2)])
+        )
+        submodel = live.merge_deep
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert 'merge_deep.depth_table' in report['applied']
+        assert 'merge_deep.depth_table' not in report['restart_required']
+        assert live.merge_deep is submodel
+        assert submodel.depth_table == [DepthRow(0.9, 16), DepthRow(0.5, 2)]
+
+    def test_operational_yaml_keeps_the_cap_and_leaves_the_table_at_its_default(self):
+        cfg = load_config(_REPO_ROOT / 'dark-factory-orchestrator.yaml')
+        assert cfg.merge_deep.chain_cap == 6
+        assert cfg.merge_deep.depth_table == MergeDeepConfig().depth_table
+
+
+class TestChainBuildTimeout:
+    """``chain_build_timeout_secs``: shipped default 1800, strictly positive."""
+
+    def test_default_is_1800(self):
+        assert MergeDeepConfig().chain_build_timeout_secs == 1800.0
+
+    @pytest.mark.parametrize('bad_value', [0, -1, -1800.0])
+    def test_non_positive_rejected(self, bad_value):
+        with pytest.raises(ValidationError):
+            MergeDeepConfig(chain_build_timeout_secs=bad_value)
+
+
+class TestChainReservationTimeout:
+    """``chain_reservation_timeout_secs``: shipped default 7200, strictly positive,
+    green-tier, and declared in the shipped defaults.yaml (task 7720).
+    """
+
+    def test_default_is_7200(self):
+        assert MergeDeepConfig().chain_reservation_timeout_secs == 7200.0
+
+    @pytest.mark.parametrize('bad_value', [0, -1])
+    def test_non_positive_rejected(self, bad_value):
+        with pytest.raises(ValidationError):
+            MergeDeepConfig(chain_reservation_timeout_secs=bad_value)
+
+    def test_is_green_tier(self):
+        assert 'merge_deep.chain_reservation_timeout_secs' in RELOADABLE_FIELDS
+
+    @pytest.mark.usefixtures("code_default_config")
+    def test_defaults_yaml_ships_7200(self):
+        defaults = load_packaged_defaults()
+        assert (
+            OrchestratorConfig().merge_deep.chain_reservation_timeout_secs
+            == defaults['merge_deep']['chain_reservation_timeout_secs']
+            == MergeDeepConfig.model_fields['chain_reservation_timeout_secs'].default
+            == 7200
+        )
 
 
 class TestMergeDeepReloadDisposition:
@@ -166,20 +308,16 @@ class TestMergeDeepReloadDisposition:
             f'but is missing from RELOADABLE_FIELDS'
         )
 
-    def test_cap_edit_lands_in_applied_candidates_not_restart_required(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_cap_edit_lands_in_applied_candidates_not_restart_required(self):
         live = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
         fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=6))
         diff = diff_config(live, fresh)
         assert 'merge_deep.chain_cap' in diff.applied_candidates
         assert 'merge_deep.chain_cap' not in diff.restart_required
 
-    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_applies_in_place(self):
         live = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
         fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=6))
         report = apply_reload(live, fresh)
@@ -188,14 +326,13 @@ class TestMergeDeepReloadDisposition:
         assert 'merge_deep.chain_cap' not in report['restart_required']
         assert live.merge_deep.chain_cap == 6
 
-    def test_reload_preserves_submodel_identity(self, monkeypatch, tmp_path):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_reload_preserves_submodel_identity(self):
         """Invariant I3: β's chain builder and γ's dispatch gate may hold a
         reference to the submodel, so a hot-reload must MUTATE it in place rather
         than rebind the field — otherwise a held reference keeps reading a stale
         cap and an operator's kill (cap -> 0) would not take effect.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
         fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=6))
         submodel = live.merge_deep
@@ -206,6 +343,7 @@ class TestMergeDeepReloadDisposition:
         assert submodel.chain_cap == 6
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestHarnessReloadAppliesChainCap:
     """The user-observable signal named in the task description: an operator
     hot-reload reports the knob under the ``applied`` disposition.
@@ -219,7 +357,6 @@ class TestHarnessReloadAppliesChainCap:
     async def test_reload_config_reports_chain_cap_as_applied(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         harness, event_store = _make_harness(tmp_path)
         assert harness.config.merge_deep.chain_cap == 0
 
@@ -243,6 +380,7 @@ class TestHarnessReloadAppliesChainCap:
         assert data['applied']['merge_deep.chain_cap'] == {'old': 0, 'new': 6}
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestDefaultsYamlMergeDeepBlock:
     """The shipped defaults.yaml declares the ``merge_deep:`` block explicitly so
     the knob is discoverable and retunable in a project's
@@ -250,7 +388,7 @@ class TestDefaultsYamlMergeDeepBlock:
     (the git:/chronic_flake:/psi_admission: precedent).
     """
 
-    def test_defaults_yaml_does_not_drift_from_the_field_default(self, monkeypatch, tmp_path):
+    def test_defaults_yaml_does_not_drift_from_the_field_default(self):
         """The single canonical pin for "the shipped default is the kill switch".
 
         Drift guard, and deliberately the ONLY place the value 0 is asserted:
@@ -263,9 +401,7 @@ class TestDefaultsYamlMergeDeepBlock:
         it fails loudly if the stanza is dropped or retuned, if the Field default
         changes, or if the knob stops being reachable through a loaded config.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'merge_deep' in defaults, (
             'the shipped defaults.yaml must declare the merge_deep: block so the '
             'knob is discoverable by an operator reading it'
@@ -277,7 +413,15 @@ class TestDefaultsYamlMergeDeepBlock:
             == 0
         )
 
+    def test_defaults_yaml_ships_the_field_default_depth_table(self):
+        """Same drift guard for ``depth_table``: the stanza is what applies."""
+        defaults = load_packaged_defaults()
+        field_default = MergeDeepConfig().depth_table
+        assert [tuple(row) for row in defaults['merge_deep']['depth_table']] == field_default
+        assert OrchestratorConfig().merge_deep.depth_table == field_default
 
+
+@pytest.mark.usefixtures("code_default_config")
 class TestChainCapZeroIsANoOp:
     """The α-scoped byte-identity leg of the PRD's kill-switch contract.
 
@@ -313,12 +457,10 @@ class TestChainCapZeroIsANoOp:
         )
         assert dumped['merge_deep']['chain_cap'] == 0
 
-    def test_explicit_zero_stanza_moves_no_leaf(self, monkeypatch, tmp_path):
+    def test_explicit_zero_stanza_moves_no_leaf(self):
         """An explicit kill-switch stanza must be indistinguishable from an absent
         one, so shipping the defaults.yaml block cannot move any config leaf.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig()
         self._assert_kill_switch_is_live(live)
         fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
@@ -326,12 +468,10 @@ class TestChainCapZeroIsANoOp:
         assert diff.applied_candidates == {}
         assert diff.restart_required == {}
 
-    def test_whole_config_surface_is_unperturbed(self, monkeypatch, tmp_path):
+    def test_whole_config_surface_is_unperturbed(self):
         """Whole-config equality: adding the stanza at 0 perturbs nothing else in
         the config surface — the only way α could have changed merge behaviour.
         """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig()
         self._assert_kill_switch_is_live(live)
         fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))

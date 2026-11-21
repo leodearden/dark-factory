@@ -33,17 +33,17 @@ the upstream format changes, this module must be updated by hand.
    Anyone renaming the ``run`` command or its ``--prd``/``--config`` flags
    must update ``find_running_orchestrators`` to match.
 
-2. Config DEFAULTS layering (:func:`read_max_concurrent_tasks`) — the
-   orchestrator's effective config is ``_deep_merge(_load_defaults(),
-   project_config)`` (``orchestrator/src/orchestrator/config.py``), so a key
-   a project's YAML omits is still in force from
-   ``orchestrator/src/orchestrator/defaults.yaml``. Reading a project YAML
-   alone therefore under-reports, and for a parity DENOMINATOR that silently
-   disables the alarm rather than loosening it. The one default this module
-   needs is restated as
-   :data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`; anyone changing
-   ``max_concurrent_tasks`` in ``defaults.yaml`` must update it (a test
-   asserts the two agree whenever the orchestrator source is present).
+2. Config DEFAULTS layering (:func:`read_run_slot_capacity`) — the
+   orchestrator's effective config is ``_deep_merge(_load_defaults(), project_config)``
+   (``orchestrator/src/orchestrator/config.py``), so a key a project's YAML
+   omits is still in force from ``orchestrator/src/orchestrator/defaults.yaml``.
+   Reading a project YAML alone therefore misreports the parity DENOMINATOR.
+   The two defaults this module needs are restated as
+   :data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS` and
+   :data:`_ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS`; anyone
+   changing ``max_concurrent_tasks`` or ``main_health_fix_reserved_slots`` in
+   ``defaults.yaml`` must update its constant (a test asserts each pair agrees
+   whenever the orchestrator source is present).
 
 RETIRED: this module used to re-derive a second format — the ``.task/``
 artifact layout (``metadata.json``, ``plan.json``, ``iterations.jsonl``,
@@ -62,7 +62,9 @@ import asyncio
 import logging
 import re
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 from dashboard.config import DashboardConfig
 
@@ -115,13 +117,8 @@ def _read_project_root_from_config(config_path: str) -> Path | None:
     Handles ``${VAR:default}`` env-var expansion for the project_root value.
     Returns ``None`` if the file can't be read or doesn't contain project_root.
     """
-    import yaml
-
-    try:
-        raw = yaml.safe_load(Path(config_path).read_text())
-    except (FileNotFoundError, yaml.YAMLError, OSError):
-        return None
-    if not isinstance(raw, dict):
+    raw = _load_config_mapping(Path(config_path))
+    if raw is None:
         return None
     value = raw.get('project_root')
     if not isinstance(value, str):
@@ -130,8 +127,25 @@ def _read_project_root_from_config(config_path: str) -> Path | None:
     return p.resolve() if p.is_absolute() else None
 
 
-def _load_config_mapping(path: Path) -> dict | None:
-    """``yaml.safe_load`` *path* and return it if it is a mapping, else ``None``.
+_config_mapping_cache: dict[Path, tuple[tuple[int, int], Mapping[str, object] | None]] = {}
+"""Parsed config per path, valid while the file's ``(st_mtime_ns, st_size)`` holds.
+
+One entry per path (a changed file replaces its entry), so the cache is bounded
+by the number of distinct config paths ever seen. A parse failure is cached
+under the same key as a success: fixing the file changes the key.
+"""
+
+
+def _load_config_mapping(path: Path) -> Mapping[str, object] | None:
+    """Parse *path* as YAML and return it if it is a mapping, else ``None``.
+
+    The parse is cached on the file's ``(st_mtime_ns, st_size)``: this is
+    reached from every ``/orchestrators`` request (via
+    :func:`_read_project_root_from_config`) as well as the burndown collector,
+    and the pure-Python YAML parse is measurable on the event loop. An edited
+    file is re-parsed on the next call. A file that cannot be stat-ed is never
+    cached. Every caller shares the cached mapping, so it is returned as a
+    read-only view.
 
     Never raises: this runs inside the burndown collector loop, where an
     exception would take down a whole collection cycle — strictly worse than
@@ -141,125 +155,128 @@ def _load_config_mapping(path: Path) -> dict | None:
     import yaml
 
     try:
-        raw = yaml.safe_load(path.read_text())
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+        st = path.stat()
+    except OSError as exc:
         logger.debug('Unreadable orchestrator config %s: %s', path, exc)
         return None
-    return raw if isinstance(raw, dict) else None
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _config_mapping_cache.get(path)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+
+    try:
+        text = path.read_text()
+    except (OSError, ValueError) as exc:
+        logger.debug('Unreadable orchestrator config %s: %s', path, exc)
+        return None
+    try:
+        raw = yaml.safe_load(text)
+    except (ValueError, yaml.YAMLError) as exc:
+        logger.debug('Unparseable orchestrator config %s: %s', path, exc)
+        raw = None
+    mapping = MappingProxyType(raw) if isinstance(raw, dict) else None
+    _config_mapping_cache[path] = (key, mapping)
+    return mapping
 
 
-# FORMAT COUPLING item 2 (see the module docstring). Restates
-# ``orchestrator/src/orchestrator/defaults.yaml``'s ``max_concurrent_tasks``,
-# which ``orchestrator.config`` deep-merges UNDER every project config. A
-# project that omits the key therefore runs with this cap, not with no cap —
-# so the reader must layer it the same way or the parity alarm silently never
-# fires for those projects (the exact E12 miss it exists to catch).
-# ``dashboard/tests/test_orchestrator.py`` asserts this constant against that
-# file whenever the orchestrator source is present, so drift fails a test
-# rather than degrading an alarm.
+# FORMAT COUPLING item 2 (see the module docstring). Restate
+# ``orchestrator/src/orchestrator/defaults.yaml``'s ``max_concurrent_tasks``
+# and ``main_health_fix_reserved_slots``, which ``orchestrator.config``
+# deep-merges UNDER every project config. A project that omits either key
+# therefore runs with these values, not with none — so the reader must layer
+# them the same way or the parity alarm misjudges those projects (the exact
+# E12 miss it exists to catch). ``dashboard/tests/test_orchestrator.py``
+# asserts both constants against that file whenever the orchestrator source is
+# present, so drift fails a test rather than degrading an alarm.
 _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS = 24
-
-_CAP_KEY_ABSENT = object()
-"""Sentinel: the config mapping has no ``max_concurrent_tasks`` key at all.
-
-Distinct from an explicit ``max_concurrent_tasks:`` (YAML null). Absent means
-"the orchestrator's own default applies"; an explicit null is a config defect —
-``OrchestratorConfig`` types the field ``int``, so such a config fails
-validation and no orchestrator runs from it at all.
-"""
+_ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS = 1
 
 
-def _coerce_concurrency_cap(value: object, path: Path) -> int | None:
-    """Coerce a raw ``max_concurrent_tasks`` value to a usable cap, or ``None``.
+def _coerce_slot_count(
+    data: Mapping[str, object], key: str, default: int, path: Path
+) -> int | None:
+    """Read slot-count *key* from *data* (parsed from *path*) as a usable count, or ``None``.
 
     ``None`` means UNKNOWN, which the parity alarm must never conflate with
-    "not breaching", and is now reserved STRICTLY for "the file is unreadable
-    or the value is malformed". A malformed value logs a WARNING naming the
-    file and the value, because that is a config defect an operator needs
-    to see.
+    "not breaching", and is reserved STRICTLY for "the value is malformed". A
+    malformed value logs a WARNING naming the key, the value and the file,
+    because that is a config defect an operator needs to see.
 
-    An ABSENT key (*value* is :data:`_CAP_KEY_ABSENT`) is not unknown: the
-    orchestrator deep-merges ``defaults.yaml`` under the project config, so
-    the project runs with :data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`.
-    Returning ``None`` here would exclude the whole project from the parity
-    alarm — of the live configs under ``/home/leo/src``, two omit the key.
+    An ABSENT key is not unknown: the orchestrator deep-merges
+    ``defaults.yaml`` under the project config, so the project runs with
+    *default*. Returning ``None`` here would exclude the whole project from
+    the parity alarm — of the live configs under ``/home/leo/src``, two omit
+    ``max_concurrent_tasks``.
 
     Boundaries:
 
+    * An explicit YAML null (``key:`` with no value) is MALFORMED, not absent:
+      ``OrchestratorConfig`` types both slot counts ``int``, so such a config
+      fails validation and no orchestrator runs from it at all.
     * ``bool`` is rejected explicitly — it is an ``int`` subclass, so a bare
-      ``isinstance(value, int)`` would silently read ``true`` as a cap of 1.
-    * ``0`` is KEPT as a real cap ("dispatch nothing"). Tasks still
-      in-progress against a 0 cap are a genuine breach; reporting that as
-      unknown would hide it.
-    * Negative caps are nonsense and rejected.
-    * An explicit YAML null is MALFORMED, not absent — see
-      :data:`_CAP_KEY_ABSENT`.
+      ``isinstance(value, int)`` would silently read ``true`` as 1.
+    * ``0`` is KEPT as a real count ("dispatch nothing" / "no reserve").
+      Tasks still in-progress against a 0 cap are a genuine breach; reporting
+      that as unknown would hide it.
+    * Negative counts are nonsense and rejected.
     * A numeric *string* is accepted after ``${VAR:default}`` expansion —
       that is how a config spells an env-driven int.
     """
-    if value is _CAP_KEY_ABSENT:
+    if key not in data:
         logger.debug(
-            'No max_concurrent_tasks in %s — applying the orchestrator default '
-            'of %d (defaults.yaml is merged under every project config)',
+            'No %s in %s — applying the orchestrator default of %d '
+            '(defaults.yaml is merged under every project config)',
+            key,
             path,
-            _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS,
+            default,
         )
-        return _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS
+        return default
 
-    raw = value
+    value = data[key]
     if isinstance(value, bool):
-        cap = None
+        count = None
     elif isinstance(value, int):
-        cap = value
+        count = value
     elif isinstance(value, str):
         expanded = _expand_env_placeholders(value).strip()
         try:
-            cap = int(expanded)
+            count = int(expanded)
         except ValueError:
-            cap = None
+            count = None
     else:
-        cap = None
+        count = None
 
-    if cap is None or cap < 0:
+    if count is None or count < 0:
         logger.warning(
-            'Ignoring unusable max_concurrent_tasks %r in %s — treating the '
-            'concurrency cap as unknown',
-            raw,
+            'Ignoring unusable %s %r in %s — treating the run-slot capacity as unknown',
+            key,
+            value,
             path,
         )
         return None
-    return cap
+    return count
 
 
-def read_max_concurrent_tasks(project_root: Path | str) -> int | None:
-    """Read *project_root*'s orchestrator concurrency cap, or ``None`` if unknown.
+def _resolve_orchestrator_config(
+    project_root: Path | str,
+) -> tuple[Path, Mapping[str, object]] | None:
+    """Find *project_root*'s orchestrator config: its path and parsed mapping.
 
-    This is the burndown parity alarm's denominator. ``max_concurrent_tasks``
-    is restart-only (red-tier: it is absent from ``config.py``'s hot-reload
-    allowlist, and the scheduler semaphore is sized once at startup), but a
-    burndown window spans restarts and the cap varies between projects, so it
-    is TIME-VARYING across the window regardless. The collector therefore calls
-    this once per snapshot and stores the answer ON the snapshot row: comparing
-    a historical in-progress census against today's cap would forgive a past
-    breach after a cap raise and invent one after a cut. Callers must treat
-    ``None`` as UNKNOWN, never as "not breaching".
+    ``None`` means no config file exists, or the authoritative one cannot be
+    read as a mapping.
 
-    ``None`` is reserved for a config that is ABSENT, unreadable, or carries a
-    malformed value. A readable config that simply OMITS the key yields the
-    orchestrator's own default
-    (:data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`), because
-    ``orchestrator.config`` deep-merges ``defaults.yaml`` under every project
-    config — every running orchestrator has a cap, whether or not its YAML
-    spells one. Reading such a project as capless would drop it out of the
-    parity alarm entirely.
+    The resolved file is authoritative for EVERY key read from it: a key it
+    omits takes the orchestrator default and a key it spells badly is
+    unknown, but neither is ever supplied by another file. Mixing two files
+    would describe an orchestrator that runs from neither.
 
-    Resolution mirrors ``dashboard.config._discover_root_escalation_url`` and
+    Resolution mirrors ``dashboard.config.discover_root_escalation_url`` and
     reuses its filename constants so the two cannot fork: the canonical
     ``dark-factory-orchestrator.yaml`` is authoritative once it exists on
-    disk (a live config must not be masked by a stale legacy file — including
-    when it omits the key, where the default applies rather than the legacy
-    file's value), and only its outright absence falls through to
-    ``_LEGACY_CONFIG_NAMES`` in order, taking the first readable one.
+    disk (a live config must not be masked by a stale legacy file), and only
+    its outright absence falls through to ``_LEGACY_CONFIG_NAMES`` in order,
+    where the first one that parses to a mapping is authoritative the same
+    way.
 
     Unlike that startup-time discovery helper, the legacy-spelling nudge here
     is logged at DEBUG, not WARNING: this runs every collection cycle
@@ -275,32 +292,66 @@ def read_max_concurrent_tasks(project_root: Path | str) -> int | None:
     canonical = root / _CANONICAL_CONFIG_NAME
     if canonical.is_file():
         data = _load_config_mapping(canonical)
-        if data is None:
-            return None
-        return _coerce_concurrency_cap(
-            data.get('max_concurrent_tasks', _CAP_KEY_ABSENT), canonical
-        )
+        return None if data is None else (canonical, data)
 
     for legacy_name in _LEGACY_CONFIG_NAMES:
         legacy_path = root / legacy_name
         if not legacy_path.is_file():
             continue
         data = _load_config_mapping(legacy_path)
-        if data is None:
-            continue
-        cap = _coerce_concurrency_cap(
-            data.get('max_concurrent_tasks', _CAP_KEY_ABSENT), legacy_path
-        )
-        if cap is not None:
+        if data is not None:
             logger.debug(
-                'Project %s: read max_concurrent_tasks from legacy config path %s '
-                '(expected %s)',
+                'Project %s: using legacy config path %s (expected %s)',
                 root.name,
                 legacy_path,
                 _CANONICAL_CONFIG_NAME,
             )
-            return cap
+            return legacy_path, data
     return None
+
+
+def read_run_slot_capacity(project_root: Path | str) -> int | None:
+    """Read *project_root*'s run-slot capacity, or ``None`` if unknown.
+
+    The capacity is ``max_concurrent_tasks + main_health_fix_reserved_slots``:
+    the orchestrator holds reserved slots beyond the general pool that only a
+    main-health fix may take, so a fix running on the reserve is legitimate
+    occupancy, not a breach (``docs/main-health-fix-run-slot-reserve.md``).
+
+    This is the burndown parity alarm's denominator. Both keys are
+    restart-only (red-tier: absent from ``config.py``'s hot-reload allowlist,
+    and the scheduler is sized once at startup), but a burndown window spans
+    restarts and the capacity varies between projects, so it is TIME-VARYING
+    across the window regardless. The collector therefore calls this once per
+    snapshot and stores the answer ON the snapshot row: comparing a historical
+    in-progress census against today's capacity would forgive a past breach
+    after a raise and invent one after a cut. Callers must treat ``None`` as
+    UNKNOWN, never as "not breaching".
+
+    Both keys come from the one file :func:`_resolve_orchestrator_config`
+    picks. One it OMITS gets the orchestrator's own default
+    (:data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`,
+    :data:`_ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS`), because
+    ``orchestrator.config`` deep-merges ``defaults.yaml`` under every project
+    config. Either key being malformed makes the whole capacity unknown:
+    dropping only a bad reserve would understate capacity and false-alarm.
+    """
+    resolved = _resolve_orchestrator_config(project_root)
+    if resolved is None:
+        return None
+    path, data = resolved
+    general = _coerce_slot_count(
+        data, 'max_concurrent_tasks', _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS, path
+    )
+    reserved = _coerce_slot_count(
+        data,
+        'main_health_fix_reserved_slots',
+        _ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS,
+        path,
+    )
+    if general is None or reserved is None:
+        return None
+    return general + reserved
 
 
 def find_running_orchestrators() -> list[dict]:

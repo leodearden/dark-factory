@@ -19,11 +19,9 @@ import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 
-from orchestrator.session_registry import (
-    DecisionRecord,
-    SessionRecord,
-    normalize_project_token,
-)
+from orchestrator.decision_registry import DecisionRecord
+from orchestrator.session_records import SessionRecord
+from shared.project_id import fold_project_token
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -101,7 +99,7 @@ def known_projects(
     Fail-soft (PRD §2): an empty/falsy project name is simply excluded,
     never raises.
 
-    Every candidate is folded through ``normalize_project_token`` FIRST, so
+    Every candidate is folded through ``fold_project_token`` FIRST, so
     the picker offers CANONICAL names only -- one name per project, never a
     project listed twice under two spellings (task 3812). Folding before the
     falsy filter is deliberate: a whitespace-only name is truthy as a raw
@@ -139,7 +137,7 @@ def known_projects(
     raw = {record.project for record in records}
     raw.update(decision.project for decision in decisions)
     raw.update(existing)
-    projects = {normalize_project_token(name) for name in raw}
+    projects = {fold_project_token(name) for name in raw}
     return sorted(name for name in projects if name)
 
 
@@ -273,8 +271,8 @@ class WeightEditorScreen(ModalScreen[None]):
         than on the Input itself -- a new Textual pattern with no existing
         precedent in this codebase. Reviewed and intentionally deferred as
         a UX nicety, not a correctness gap: see
-        test_submit_keeps_prior_value_for_a_rejected_category_edit in
-        test_app.py for the pinned current behavior.
+        test_app_weight_editor.py::TestWeightEditor::test_submit_keeps_prior_value_for_a_rejected_category_edit
+        for the pinned current behavior.
         """
         category_edits: dict[str, str] = {}
         for index, name in enumerate(self._priorities.category_weights):

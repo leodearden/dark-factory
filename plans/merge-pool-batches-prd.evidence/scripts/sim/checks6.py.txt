@@ -1,0 +1,77 @@
+"""Checks of the unscannable-fallback run: (1) m = 0 reproduces default U+S run for run; (2) e = 0 and no main-red:
+no sound request blocked, no defective one landed, under every fallback."""
+import os, sys
+from multiprocessing import Pool
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import lane as L, fbcfg as F
+
+KEYS = ('landings', 'verifies', 'block_bad', 'busy', 'n_scan')
+
+
+def work(a):
+    tag, cfg, spec, s = a
+    m, eng = L.run_one(cfg, (tag, spec), s, log=True)
+    R = eng.reqs
+    assert eng.n_live == len(R) - sum(1 for r in R if r.state == 'done')
+    return tag, s, tuple(m[k] for k in KEYS), m['block_good'], m['conv_good'], m['nb_good'], m['bad_landed'], m['landings'], m['n_unscan'], m['conv_bad']
+
+
+if __name__ == '__main__':
+    FBS = ('alone', 'halve', 'infer', 'bisect', 'halve2')
+    tasks = []
+    for q in (0.08, 0.14):
+        b = F.base_cfg(q)
+        ex, sp = F.DEFAULT_S
+        for s in range(20):
+            tasks.append(('1|q=%.2f|default' % q, dict(b, **ex), sp, s))
+            for fb in FBS:
+                ex2, sp2 = F.scan_pair(0.0, 'sticky', fb, mode='lin', t1=False, t2=False, t3=0, t4=False)
+                tasks.append(('1|q=%.2f|plain|%s' % (q, fb), dict(b, **ex2), sp2, s))
+                ex3, sp3 = F.scan_pair(0.0, 'sticky', fb)
+                tasks.append(('1|q=%.2f|corrected|%s' % (q, fb), dict(b, **ex3), sp3, s))
+    var = []
+    for model in ('coin', 'sticky'):
+        for m in (0.16, 0.25):
+            for fb in FBS:
+                var.append(('%s m=%.2f %s' % (model, m, fb), F.scan_pair(m, model, fb)))
+            var.append(('%s m=%.2f F3b' % (model, m), F.scan_pair(m, model, 'infer', pol_extra=F.F3B)))
+        var.append(('%s m=0.16 alone, T2 on' % model, F.scan_pair(0.16, model, 'alone', t2=True)))
+        var.append(('%s m=0.16 alone, prefix-binary scan' % model, F.scan_pair(0.16, model, 'alone', mode='pbin')))
+        var.append(('%s m=0.16 alone, on-host scan' % model, F.scan_pair(0.16, model, 'alone', t3=0)))
+        var.append(('%s m=0.16 alone, scan concurrency 4, 2 resources' % model, F.scan_pair(0.16, model, 'alone', t3=2, conc=4)))
+        for fb in ('alone', 'halve'):
+            for pr in ('cost', 'queue'):
+                var.append(('%s m=0.16 %s, predicate %s, ct=0.3' % (model, fb, pr), F.scan_pair(0.16, model, fb, ct=0.3, pol_extra=dict(scan_pred=pr))))
+        var.append(('%s m=0.16 F3b, predicate cost, ct=0.3' % model, F.scan_pair(0.16, model, 'infer', ct=0.3, pol_extra=dict(F.F3B, scan_pred='cost'))))
+    for fb in ('alone', 'halve', 'halve2', 'bisect'):
+        var.append(('scan off %s' % fb, F.scanoff_pair(fb)))
+        var.append(('never scan %s' % fb, F.never_pair(fb)))
+    for tag, (ex, sp) in var:
+        for q in (0.05, 0.14, 0.20):
+            for s in range(8):
+                cfg = F.base_cfg(q, **ex)
+                cfg.update(e=0.0, mainred=False, restarts=bool(s % 2))
+                tasks.append(('2|' + tag, cfg, sp, s * 100 + int(q * 100)))
+    with Pool(4) as pool:
+        res = pool.map(work, tasks, chunksize=8)
+    by = {}
+    for r in res:
+        by.setdefault(r[0], []).append(r)
+    print('== (1) m = 0: run-for-run identity with default U+S (20 seeds per q) ==')
+    for q in (0.08, 0.14):
+        d0 = {r[1]: r[2] for r in by['1|q=%.2f|default' % q]}
+        for fb in FBS:
+            dp = {r[1]: r[2] for r in by['1|q=%.2f|plain|%s' % (q, fb)]}
+            print('q=%.2f %-7s corrections off: %d of 20 runs identical to default U+S' % (q, fb, sum(1 for s in d0 if d0[s] == dp[s])))
+        dc = {fb: {r[1]: r[2] for r in by['1|q=%.2f|corrected|%s' % (q, fb)]} for fb in FBS}
+        print('q=%.2f corrections on: runs identical across the five fallbacks: %d of 20' % (q, sum(1 for s in range(20) if len({dc[fb][s] for fb in FBS}) == 1)))
+    print('== (2) e = 0, no main-red; 24 runs per row (3 q x 8 seeds, restarts on in half) ==')
+    print('variant | runs | landings | unscannable reds | sound blocked by own verify | sound convicted | sound blocked by name | defective landed | right convictions')
+    tot = [0, 0, 0, 0]
+    for tag in sorted(k for k in by if k.startswith('2|')):
+        rows = by[tag]
+        v = [sum(r[i] for r in rows) for i in (3, 4, 5, 6)]
+        tot = [a + b for a, b in zip(tot, v)]
+        print('%-58s | %d | %d | %d | %d | %d | %d | %d | %d' % (tag[2:], len(rows), sum(r[7] for r in rows), sum(r[8] for r in rows), v[0], v[1], v[2], v[3], sum(r[9] for r in rows)))
+    print('TOTAL sound blocked / convicted / named / defective landed: %s over %d runs' % (tot, sum(len(v) for k, v in by.items() if k.startswith('2|'))))

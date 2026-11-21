@@ -1,18 +1,16 @@
-"""Stdin-delivery test stubs, shared by BOTH spawn runners (task 3147).
+"""Stdin-delivery test stubs for the spawn runner (task 3147).
 
-There are two independent implementations of the spawn path that carry an
-agent payload on stdin, and both had the same starvation defect:
+There is one spawn runner that carries an agent payload on stdin,
+``shared.cli_invoke.run_cli_subprocess``, used by every backend (claude,
+sandboxed and direct, and the codex and mimo payloads).  It once had a
+starvation defect that these stubs reproduce.
 
-  * ``shared.cli_invoke._run_subprocess``            (claude, sandboxed + direct)
-  * ``orchestrator.agents.invoke._run_subprocess_local``  (codex)
-
-Their regression suites live in different packages
-(``shared/tests/test_cli_invoke.py`` and ``orchestrator/tests/test_invoke.py``)
-and ``shared.tests`` is not an importable package from the orchestrator pytest
-rootdir, so the stubs live HERE — in the shipped ``shared`` package, the same
-convention as :mod:`shared.testing` — rather than being copy-pasted into each
-suite.  One definition, so an edit to the rejection signature cannot land in
-one suite and silently miss the other.
+Its regression suites live in both packages (``shared/tests`` and
+``orchestrator/tests``), and ``shared.tests`` is not an importable package
+from the orchestrator pytest rootdir, so the stubs live HERE — in the shipped
+``shared`` package, the same convention as :mod:`shared.testing` — rather
+than being copy-pasted into each suite.  One definition, so an edit to the
+rejection signature cannot land in one suite and silently miss the other.
 
 **The stubs' stderr must stay verbatim-equal to the production rejection
 signature.**  The second line reproduces

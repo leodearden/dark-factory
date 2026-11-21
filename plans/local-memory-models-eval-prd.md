@@ -7,6 +7,16 @@ records. Production cutover (LLM) and the embedding backfill/migration are **fol
 authored only after — and gated on — the verdicts.** They are deliberately unfiled today and are
 not counted as G1 consumers of anything here.
 
+> **Amendment 2026-10-11 (task 6799)** — **the embedding follow-up PRD named in §"Out of scope" is
+> `plans/local-embedder-cutover-prd.md`.** That PRD is the "embedding backfill/migration" follow-up
+> this file and `plans/local-memory-models-eval-decision-embedding.md` §6 defer to, and it carries
+> the `calibrate_write_triage` re-run listed there. It records Leo's rulings of 2026-10-10 on the two
+> axes this PRD evaluated:
+> - **LLM axis:** the LLM stays on `gpt-4o-mini`. No local-LLM production cutover follows.
+> - **Embedding axis:** the embedder moves to `granite-embedding-english-r2` (768 dims).
+>
+> The out-of-scope list, the decision records and every figure in this PRD are unchanged.
+
 > **Amendment 2026-08-06 (task 3748)** — the operating VRAM budget is the MEASURED ~16.4 GiB, not
 > the nominal 19–20GB this PRD was authored against. See D10.
 >
@@ -251,6 +261,15 @@ today's production, where the BM25 leg silently returns nothing). Probes use rep
 known-item queries plus real queries from the transcript corpus. All embedding arms run in full —
 re-embedding ~28k short texts is minutes, not hours.
 
+> **Erratum (2026-10-08, esc-3722-3) — framing only.** "Today's production, where the BM25 leg
+> silently returns nothing" no longer holds for `dark_factory`. Index provisioning task 3708
+> (`docs/prds/falkordb-index-provisioning.md`) landed on 2026-10-02. A read-only
+> `GRAPH.RO_QUERY dark_factory "CALL db.indexes()"` shows range and fulltext indexes on `Entity`
+> name/summary, `RELATES_TO` fact and `Episodic` content. On that graph with-indices is today's
+> production, and embedding-only is not. Only `dark_factory` was measured. The text above is
+> kept as written. This note changes no configuration, metric, margin, rule or result:
+> with-indices is still primary and decides, and embedding-only is still reported.
+
 **Pre-registration before candidate arms.** Incumbent-vs-incumbent control runs measure run-to-run
 variance; the non-inferiority margins are **derived from that measured variance by a committed
 formula**, never hand-picked. The decision rule (Leo, 2026-08-05: non-inferiority — quality within
@@ -360,6 +379,10 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
    LLM involved.
 5. **Two retrieval configurations** on the embedding axis; *with-indices is primary* (future prod);
    the current-prod embedding-only configuration is reported alongside, with the confound stated.
+   - **Erratum (2026-10-08, esc-3722-3) — framing only.** "Current-prod embedding-only" is
+     stale for `dark_factory`, which has been indexed since 2026-10-02. The measured state is in
+     the erratum under §"Sketch of approach". The same correction covers "the current-prod
+     confound" in the ι row of §"Decomposition plan". The decision is unchanged.
 6. **Funnel**: LLM axis screens all 3 (was 4 — Mistral-Small-3.2-24B dropped 2026-08-06), replays
    ≤3; for what the narrowed slate does to the cap's selectivity see the consequence note at the
    candidate slate (canonical — not restated here). Embedding axis runs all arms in full.

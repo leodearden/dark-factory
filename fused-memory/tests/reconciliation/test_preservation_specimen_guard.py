@@ -25,26 +25,50 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
+from fused_memory.models.reconciliation import (
+    ReconciliationRun,
+    RunType,
+    StageId,
+    StageReport,
+)
 from fused_memory.reconciliation import preservation_specimen_guard
+from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.preservation_specimen_guard import (
+    CANDIDATE_TASK_IDS_STAT,
     CATEGORY_PRESERVATION_SPECIMEN_STORM,
     MEM0_KIND_INVESTIGATION_OUTCOME,
     PRESERVATION_CORROBORATION_BUDGET_SECONDS,
     PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
     PRESERVATION_TOKEN_FAMILY,
+    PRESERVED_SPECIMEN_COMPONENTS_KEY,
     STRANDED_FLAG_TOKEN_FAMILY,
+    UNRESOLVED_CORROBORATION_STREAK_THRESHOLD,
     UNRESOLVED_CORROBORATION_SUBJECT,
+    UNRESOLVED_TASK_IDS_STAT,
     PreservationSuppressionResult,
     cites_preservation,
     filter_preservation_specimen_flags,
     flag_asserts_stranded,
     maybe_escalate_preservation_suppression_storm,
+    maybe_escalate_unresolved_corroboration,
+    preservation_mem0_filters,
+)
+from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
+from fused_memory.services.write_journal import WriteJournal
+from reconciliation._preservation_specimen_history import (
+    STAGE1_KEY,
+    observation_report,
+    stage1_pass,
+    unresolved_passes,
 )
 
 # ── Live corroboration strings, copied verbatim from the base branch ─────────
@@ -250,6 +274,75 @@ class TestFlagAssertsStranded:
         }
         assert flag_asserts_stranded(flag) is False
 
+    @pytest.mark.parametrize('shape', ['realistic', 'reverse_split'])
+    def test_verb_and_target_split_across_fields_matches(self, shape):
+        """The action channel reads description and suggested_action TOGETHER.
+
+        Real findings state the status in description and ask for the reset in
+        suggested_action, so a novel naming must still match on that shape.
+        """
+        flag_type = 'liveness_anomaly_unattended_workflow'
+        flag = {
+            'realistic': _stranded_flag(flag_type=flag_type),
+            'reverse_split': {
+                'task_id': '3105',
+                'flag_type': flag_type,
+                'description': 'Nothing has driven task 3105 for nine days; redispatch the task.',
+                'suggested_action': 'Move task 3105 out of in-progress.',
+            },
+        }[shape]
+        assert flag_asserts_stranded(flag) is True
+
+    @pytest.mark.parametrize(
+        'suggested_action',
+        [
+            'Reset the priority override back to its default.',
+            "Reset the task's priority override back to its default.",
+            "Reset task 3105's priority override to its default.",
+            'Reset the task priority override.',
+            'Redispatch the task dependency 4223 first.',
+            'Reset task 3105 to its default priority.',
+        ],
+    )
+    def test_a_reset_aimed_elsewhere_does_not_pair_with_a_status_mention(self, suggested_action):
+        """Across fields, the verb pairs with the status only when the task is its object.
+
+        Nothing may follow the task but the clause's end or a destination
+        status.  A preserved specimen is permanently in-progress, so its
+        unrelated findings state that status routinely.
+        """
+        flag = {
+            'task_id': '3105',
+            'flag_type': 'stale_priority_override',
+            'description': 'Task 3105 is in-progress and carries a 30-day-old priority override.',
+            'suggested_action': suggested_action,
+        }
+        assert flag_asserts_stranded(flag) is False
+
+    @pytest.mark.parametrize(
+        'suggested_action',
+        ['Reset task 3105.', 'Reset task #3105 back to pending.', 'Un-stick the task; nothing is driving it.'],
+    )
+    def test_a_reset_of_the_task_itself_pairs_with_a_status_mention(self, suggested_action):
+        """The anchored form still accepts a reset of the task, ended by punctuation or a destination status."""
+        flag = {
+            'task_id': '3105',
+            'flag_type': 'liveness_anomaly_unattended_workflow',
+            'description': 'Task 3105 is in-progress with no claimant and no heartbeat.',
+            'suggested_action': suggested_action,
+        }
+        assert flag_asserts_stranded(flag) is True
+
+    def test_a_status_mention_without_a_reset_verb_does_not_match(self):
+        """The verb half stays required when the match spans both fields."""
+        flag = {
+            'task_id': '3105',
+            'flag_type': 'missing_deliverable',
+            'description': 'Task 3105 is in-progress; its acceptance criteria lack a deliverable.',
+            'suggested_action': 'Add the missing deliverable to task 3105.',
+        }
+        assert flag_asserts_stranded(flag) is False
+
     @pytest.mark.parametrize('flag_type', UNRELATED_LIVE_FLAG_TYPES)
     def test_unrelated_live_flag_types_do_not_match(self, flag_type):
         """Behavioural distinctiveness guard, run against the live vocabulary.
@@ -323,6 +416,13 @@ LIVE_MEM0_ROW = {
     },
 }
 
+#: A second specimen's row, for a composite whose every component corroborates.
+SECOND_SPECIMEN_MEM0_ROW = {
+    **LIVE_MEM0_ROW,
+    'id': '6f0c2b9e-41d7-4a3e-9b58-0c7e2d1a93f4',
+    'metadata': {**LIVE_MEM0_ROW['metadata'], 'task_id': '4223'},
+}
+
 #: The live Graphiti shape for ``get_entity('Task 3105', ...)``.
 LIVE_GRAPHITI_ENTITY = {
     'nodes': [
@@ -361,8 +461,8 @@ GUARD_LOGGER = 'fused_memory.reconciliation.preservation_specimen_guard'
 
 
 @contextlib.contextmanager
-def caplog_at_warning():
-    """Yield a growing list of the guard's WARNING+ messages.
+def caplog_at(level):
+    """Yield a growing list of the guard's messages at *level* and above.
 
     A local handler rather than pytest's ``caplog`` fixture: these tests run
     under xdist and assert on one named logger, so attaching to that logger
@@ -375,16 +475,19 @@ def caplog_at_warning():
             # getMessage() already interpolates record.args.
             records.append(record.getMessage())
 
-    handler = _Collect(level=logging.WARNING)
+    handler = _Collect(level=level)
     log = logging.getLogger(GUARD_LOGGER)
     log.addHandler(handler)
     previous = log.level
-    log.setLevel(logging.WARNING)
+    log.setLevel(level)
     try:
         yield records
     finally:
         log.removeHandler(handler)
         log.setLevel(previous)
+
+
+caplog_at_warning = functools.partial(caplog_at, logging.WARNING)
 
 
 def _stranded_flag(
@@ -487,6 +590,19 @@ class TestFilterPreservationSpecimenFlagsMem0Channel:
                 'actionable': False,
             },
         )
+
+    @pytest.mark.asyncio
+    async def test_the_query_is_the_filter_the_stage1_prompt_renders(self):
+        """The code path and Stage 1's directive ask for one filter, from one source."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+
+        await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+        )
+
+        assert memory_service.get_memories_by_metadata.await_args.kwargs[
+            'filters'
+        ] == preservation_mem0_filters('3105')
 
     @pytest.mark.asyncio
     async def test_row_without_preservation_prose_does_not_suppress(self):
@@ -949,7 +1065,8 @@ class TestBoundedScopeAndReadEconomy:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        'task_id', [None, '', 0, -5, '0', '-5', [], {'nested': 'dict'}],
+        'task_id',
+        [None, '', 0, -5, '0', '-5', [], {'nested': 'dict'}, True, False, 3105.0],
     )
     async def test_unusable_task_id_is_kept_without_reads(self, task_id):
         """(f) A flag with no resolvable task is kept, never a junk backend query.
@@ -1300,6 +1417,103 @@ class TestDegradedCorroborationReads:
         assert preservation_specimen_guard._is_degraded_entity_result(entity) is False
 
 
+def _memory_corroborating_3105_failing_for(task_id):
+    """Task 3105 corroborates through Mem0; *task_id*'s Mem0 read times out."""
+    def _scroll(project_id, filters):
+        if filters['task_id'] == task_id:
+            raise TimeoutError('down')
+        return {'3105': [LIVE_MEM0_ROW]}.get(filters['task_id'], [])
+
+    memory_service = MagicMock()
+    memory_service.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
+    memory_service.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
+    return memory_service
+
+
+class TestCandidateTaskIds:
+    """The result records which tasks the pass has an observation of.
+
+    A later pass reads this to tell "this task was flagged and resolved" apart
+    from "this pass says nothing about this task", which
+    ``unresolved_task_ids`` alone cannot.
+    """
+
+    @pytest.mark.asyncio
+    async def test_candidates_are_the_decomposed_stranded_task_ids(self):
+        memory_service = _make_memory_service()
+        flags = [
+            _stranded_flag(task_id='3105,4223'),
+            _stranded_flag(task_id='9999'),
+            {'task_id': '4102', 'flag_type': 'oversized_entity'},
+        ]
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.candidate_task_ids == ('3105', '4223', '9999')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'flags', [[], None, [{'task_id': '4102', 'flag_type': 'oversized_entity'}]],
+    )
+    async def test_no_stranded_flag_means_no_candidates_and_no_reads(self, flags):
+        memory_service = _make_memory_service()
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.candidate_task_ids == ()
+        assert memory_service.get_memories_by_metadata.await_count == 0
+        assert memory_service.get_entity.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_beside_a_corroborated_sibling_is_an_unresolved_candidate(self):
+        """5080's read failed, so the composite naming it was kept: 5080 is observed unresolved.
+
+        A composite drops only when every component corroborates, so 3105's
+        citation cannot hide 5080's failure from the streak walk.
+        """
+        result = await filter_preservation_specimen_flags(
+            memory_service=_memory_corroborating_3105_failing_for('5080'),
+            project_id=PROJECT,
+            flags=[_stranded_flag(task_id='3105,5080')],
+        )
+
+        assert result.candidate_task_ids == ('3105', '5080')
+        assert result.unresolved_task_ids == ('5080',)
+
+    @pytest.mark.asyncio
+    async def test_unresolved_ids_are_always_candidates_on_a_degraded_pass(self):
+        memory_service = _make_memory_service(
+            mem0_error=TimeoutError('down'), entity_error=RuntimeError('also down'),
+        )
+        flags = [_stranded_flag(task_id='3105,4223'), _stranded_flag(task_id='9999')]
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=flags,
+        )
+
+        assert result.unresolved_task_ids
+        assert set(result.unresolved_task_ids) <= set(result.candidate_task_ids)
+
+    def test_an_unresolved_id_outside_the_candidates_is_refused(self):
+        with pytest.raises(ValueError) as excinfo:
+            PreservationSuppressionResult(
+                kept_flags=[],
+                suppressed_by_task={},
+                citations_by_task={},
+                unresolved_task_ids=('3105',),
+                candidate_task_ids=(),
+            )
+
+        message = str(excinfo.value)
+        assert 'unresolved_task_ids' in message
+        assert 'candidate_task_ids' in message
+        assert '3105' in message
+
+
 def _suppression_result(count=None, *, extra=None, unresolved=()):
     """A PreservationSuppressionResult with task 3105 suppressed *count* times."""
     if count is None:
@@ -1311,7 +1525,58 @@ def _suppression_result(count=None, *, extra=None, unresolved=()):
         suppressed_by_task=by_task,
         citations_by_task={t: 'a8fd36a8-46db-4ca8-a21c-554c38a918ee' for t in by_task},
         unresolved_task_ids=tuple(unresolved),
+        candidate_task_ids=tuple(sorted(set(by_task) | set(unresolved))),
     )
+
+
+def _unresolved_result(*unresolved, candidates=()):
+    """A pass that suppressed nothing and left *unresolved* uncorroborated."""
+    return PreservationSuppressionResult(
+        kept_flags=[],
+        suppressed_by_task={},
+        citations_by_task={},
+        unresolved_task_ids=tuple(unresolved),
+        candidate_task_ids=tuple(sorted(set(candidates) | set(unresolved))),
+    )
+
+
+class _StubJournal:
+    """The one journal read the guard makes, answered from a fixed list.
+
+    *runs* is most-recent-first, as ``get_recent_runs``'s ``ORDER BY
+    started_at DESC`` returns them; *error* makes the read raise instead.
+    """
+
+    def __init__(self, runs=(), *, error=None):
+        self._runs = list(runs)
+        self._error = error
+        self.calls: list[tuple[str, int]] = []
+
+    async def get_recent_runs(self, project_id, limit=10):
+        self.calls.append((project_id, limit))
+        if self._error is not None:
+            raise self._error
+        return self._runs[:limit]
+
+
+_prior_run = functools.partial(stage1_pass, project_id=PROJECT)
+_unresolved_passes = functools.partial(unresolved_passes, project_id=PROJECT)
+
+
+def _targeted_runs(count, *, prefix, minutes_ago):
+    """*count* targeted runs, which carry no Stage-1 report, as the live journal holds them."""
+    return [
+        _prior_run(
+            f'{prefix}-targeted-{n}', minutes_ago=minutes_ago, stage_reports={},
+            run_type=RunType.targeted,
+        )
+        for n in range(count)
+    ]
+
+
+def _history_reaching_threshold(*task_ids):
+    """The prior passes that, with the current one, bring *task_ids* to the threshold."""
+    return _unresolved_passes(*task_ids, count=UNRESOLVED_CORROBORATION_STREAK_THRESHOLD - 1)
 
 
 class TestCorroborationBudget:
@@ -1545,9 +1810,11 @@ class TestMaybeEscalatePreservationSuppressionStorm:
         recommendation flows on, the stat reads 0 suppressed, and nothing
         distinguishes that from a healthy quiet cycle.
         """
-        escalated = await maybe_escalate_preservation_suppression_storm(
+        escalated = await maybe_escalate_unresolved_corroboration(
             queue, PROJECT, self._RUN,
             _suppression_result(1, unresolved=('3105', '4102')),
+            journal=_StubJournal(_history_reaching_threshold('3105', '4102')),
+            stage_key=STAGE1_KEY,
         )
 
         assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
@@ -1564,11 +1831,19 @@ class TestMaybeEscalatePreservationSuppressionStorm:
     @pytest.mark.asyncio
     async def test_unresolved_report_is_distinct_from_a_storm(self, queue):
         """Both can fire in one cycle, and they must not fold into each other."""
-        escalated = await maybe_escalate_preservation_suppression_storm(
-            queue, PROJECT, self._RUN, _suppression_result(unresolved=('4102',)),
+        result = _suppression_result(unresolved=('4102',))
+
+        storms = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, result,
+        )
+        unresolved_reports = await maybe_escalate_unresolved_corroboration(
+            queue, PROJECT, self._RUN, result,
+            journal=_StubJournal(_history_reaching_threshold('4102')),
+            stage_key=STAGE1_KEY,
         )
 
-        assert sorted(escalated) == sorted(['3105', UNRESOLVED_CORROBORATION_SUBJECT])
+        assert storms == ['3105']
+        assert unresolved_reports == [UNRESOLVED_CORROBORATION_SUBJECT]
         storm = self._pending(queue, '3105')[0]
         unresolved = self._pending(queue, UNRESOLVED_CORROBORATION_SUBJECT)[0]
         assert storm.dedupe_fingerprint != unresolved.dedupe_fingerprint
@@ -1576,23 +1851,35 @@ class TestMaybeEscalatePreservationSuppressionStorm:
     @pytest.mark.asyncio
     async def test_clean_cycle_files_nothing(self, queue):
         """No storm, no unresolved reads — no record."""
-        escalated = await maybe_escalate_preservation_suppression_storm(
-            queue, PROJECT, self._RUN,
-            PreservationSuppressionResult([], {}, {}, ()),
+        clean = PreservationSuppressionResult([], {}, {}, (), ())
+
+        storms = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, clean,
         )
-        assert escalated == []
+        unresolved_reports = await maybe_escalate_unresolved_corroboration(
+            queue, PROJECT, self._RUN, clean, journal=_StubJournal(), stage_key=STAGE1_KEY,
+        )
+
+        assert storms == [] and unresolved_reports == []
+        assert queue.get_pending() == []
 
     @pytest.mark.asyncio
     async def test_escalation_package_unavailable_returns_empty(self, queue, monkeypatch):
         """The reconciliation package must import where escalation is not installed."""
-        monkeypatch.setattr(
-            preservation_specimen_guard, 'Escalation', None, raising=False,
+        monkeypatch.setattr(preservation_specimen_guard, 'file_or_fold_l1', None)
+        result = _suppression_result(unresolved=('4102',))
+        journal = _StubJournal(_history_reaching_threshold('4102'))
+
+        storms = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, result,
         )
-        escalated = await maybe_escalate_preservation_suppression_storm(
-            queue, PROJECT, self._RUN, _suppression_result(),
+        unresolved_reports = await maybe_escalate_unresolved_corroboration(
+            queue, PROJECT, self._RUN, result, journal=journal, stage_key=STAGE1_KEY,
         )
-        assert escalated == []
-        assert self._pending(queue, '3105') == []
+
+        assert storms == [] and unresolved_reports == []
+        assert queue.get_pending() == []
+        assert journal.calls == []
 
     @pytest.mark.asyncio
     async def test_submit_failure_costs_one_subject_not_the_cycle(self, tmp_path):
@@ -1612,6 +1899,419 @@ class TestMaybeEscalatePreservationSuppressionStorm:
         assert escalated == []
         assert any('3105' in message for message in records)
 
+    @staticmethod
+    def _seed_legacy_parent(queue, subject, finding_category):
+        """Submit a pending parent built exactly as the pre-5466 filer built it.
+
+        *finding_category* is the persisted LITERAL, never the module's private
+        constant: the string on disk is the fold contract, so renaming the
+        constant must break this test rather than un-fold every live parent.
+        """
+        from escalation.dedupe import compute_content_fingerprint
+        from escalation.models import Escalation
+
+        return queue.submit(Escalation(
+            id=queue.make_id(subject),
+            task_id=subject,
+            agent_role='reconciliation-stage1',
+            severity='blocking',
+            category=CATEGORY_PRESERVATION_SPECIMEN_STORM,
+            summary='legacy parent',
+            detail='legacy parent',
+            level=1,
+            dedupe_fingerprint=compute_content_fingerprint(
+                CATEGORY_PRESERVATION_SPECIMEN_STORM,
+                finding_category,
+                [f'{PROJECT}:{subject}'],
+            ),
+        ))
+
+    @pytest.mark.asyncio
+    async def test_storm_folds_into_a_parent_already_on_disk(self, queue):
+        """A pending storm parent filed before the helper moved still receives the fold."""
+        parent_id = self._seed_legacy_parent(
+            queue, '3105', 'preservation_specimen_suppression_storm',
+        )
+
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, _suppression_result(),
+        )
+
+        assert escalated == []
+        parent = queue.get(parent_id)
+        assert parent is not None
+        assert parent.dedupe_count == 1
+
+    @pytest.mark.asyncio
+    async def test_unresolved_folds_into_a_parent_already_on_disk(self, queue):
+        """A pending unresolved-corroboration parent filed before the move still folds."""
+        parent_id = self._seed_legacy_parent(
+            queue,
+            UNRESOLVED_CORROBORATION_SUBJECT,
+            'preservation_specimen_corroboration_unreadable',
+        )
+
+        escalated = await maybe_escalate_unresolved_corroboration(
+            queue, PROJECT, self._RUN, _suppression_result(1, unresolved=('3105',)),
+            journal=_StubJournal(_history_reaching_threshold('3105')),
+            stage_key=STAGE1_KEY,
+        )
+
+        assert escalated == []
+        parent = queue.get(parent_id)
+        assert parent is not None
+        assert parent.dedupe_count == 1
+
+
+class TestUnresolvedCorroborationPersistence:
+    """The unresolved disclosure files on per-TASK persistence, never on one pass.
+
+    It reports sustained blindness, and sustained is a property across passes:
+    one slow pass that runs out of budget must not leave a pending L1 behind,
+    while a task left unprotected pass after pass must.  History comes from the
+    reconciliation journal, most-recent-first, as real ``ReconciliationRun``s.
+    """
+
+    _RUN = 'run-5464-current'
+    _K = UNRESOLVED_CORROBORATION_STREAK_THRESHOLD
+
+    @pytest.fixture
+    def queue(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        return EscalationQueue(tmp_path / 'escalations')
+
+    @staticmethod
+    def _pending(queue):
+        return queue.get_by_task(UNRESOLVED_CORROBORATION_SUBJECT, status='pending', level=1)
+
+    async def _escalate(self, queue, result, journal, *, run_id=None, **kwargs):
+        return await maybe_escalate_unresolved_corroboration(
+            queue, PROJECT, run_id or self._RUN, result,
+            journal=journal, stage_key=STAGE1_KEY, **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_single_unresolved_pass_files_nothing(self, queue):
+        """The regression: one blip used to leave a pending L1 nobody resolved."""
+        with caplog_at(logging.INFO) as records:
+            escalated = await self._escalate(
+                queue, _unresolved_result('3105'), _StubJournal(),
+            )
+
+        assert escalated == []
+        assert self._pending(queue) == []
+        # Below the threshold is quiet in the queue, never in the log.
+        assert any('3105' in message and 'not escalated' in message for message in records)
+
+    @pytest.mark.asyncio
+    async def test_a_task_unresolved_on_k_consecutive_passes_files(self, queue):
+        journal = _StubJournal(_history_reaching_threshold('3105'))
+
+        escalated = await self._escalate(queue, _unresolved_result('3105'), journal)
+
+        assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
+        pending = self._pending(queue)
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert esc.category == CATEGORY_PRESERVATION_SPECIMEN_STORM
+        blob = f'{esc.summary}\n{esc.detail}'
+        assert f'3105 ({self._K} passes)' in blob
+        assert f'streak_threshold: {self._K}' in blob
+        assert journal.calls and journal.calls[0][0] == PROJECT
+
+    @pytest.mark.asyncio
+    async def test_a_pass_that_resolved_the_task_resets_its_streak(self, queue):
+        history = [
+            *_unresolved_passes('3105', count=self._K - 2, start=1),
+            _prior_run('resolved', candidates=['3105'], minutes_ago=10 * (self._K - 1)),
+            *_unresolved_passes('3105', count=self._K, start=self._K),
+        ]
+
+        escalated = await self._escalate(
+            queue, _unresolved_result('3105'), _StubJournal(history),
+        )
+
+        assert escalated == []
+        assert self._pending(queue) == []
+
+    @pytest.mark.asyncio
+    async def test_passes_that_say_nothing_about_the_task_are_skipped(self, queue):
+        """Interleaved passes need not re-flag the task, so they must not reset it."""
+        integrity_only: dict[str, StageReport | dict] = {
+            StageId.integrity_check.value: StageReport(
+                stage=StageId.integrity_check,
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+            ),
+        }
+        history = [
+            _prior_run('not-a-candidate', candidates=['4102'], minutes_ago=10),
+            *_unresolved_passes('3105', count=1, start=2),
+            _prior_run('no-stage1-report', stage_reports=integrity_only, minutes_ago=30),
+            _prior_run(
+                'pre-change-row', stats={'preservation_specimen_unresolved': 1},
+                minutes_ago=40,
+            ),
+            _prior_run(
+                'malformed-report', stage_reports={STAGE1_KEY: {'error': 'cli crashed'}},
+                minutes_ago=50,
+            ),
+            *_unresolved_passes('3105', count=self._K - 2, start=6),
+        ]
+
+        escalated = await self._escalate(
+            queue, _unresolved_result('3105'), _StubJournal(history),
+        )
+
+        assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_beside_a_corroborated_sibling_extends_the_streak(self, queue):
+        """A sibling's citation leaves the composite kept, so that pass counts against 5080."""
+        beside = await filter_preservation_specimen_flags(
+            memory_service=_memory_corroborating_3105_failing_for('5080'),
+            project_id=PROJECT,
+            flags=[_stranded_flag(task_id='3105,5080')],
+        )
+        history = [
+            _prior_run(
+                'beside-a-sibling', minutes_ago=10,
+                candidates=beside.candidate_task_ids, unresolved=beside.unresolved_task_ids,
+            ),
+            *_unresolved_passes('5080', count=self._K - 2, start=2),
+        ]
+
+        escalated = await self._escalate(
+            queue, _unresolved_result('5080'), _StubJournal(history),
+        )
+
+        assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
+
+    @pytest.mark.asyncio
+    async def test_a_streak_survives_bursts_of_targeted_runs_between_its_passes(self, queue):
+        """The history window counts runs of every type, and most are targeted."""
+        history: list[ReconciliationRun] = []
+        for n in range(1, self._K):
+            history += _targeted_runs(13, prefix=f'gap-{n}', minutes_ago=10 * n - 5)
+            history.append(_prior_run(f'prior-{n}', unresolved=['3105'], minutes_ago=10 * n))
+
+        escalated = await self._escalate(
+            queue, _unresolved_result('3105'), _StubJournal(history),
+        )
+
+        assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
+
+    @pytest.mark.asyncio
+    async def test_a_window_crowded_out_by_targeted_runs_is_reported(self, queue):
+        """Too few Stage-1 passes to measure a streak must not pass for a clean answer."""
+        history = [
+            *_targeted_runs(1000, prefix='flood', minutes_ago=1),
+            *_history_reaching_threshold('3105'),
+        ]
+
+        with caplog_at_warning() as records:
+            escalated = await self._escalate(
+                queue, _unresolved_result('3105'), _StubJournal(history),
+            )
+
+        assert escalated == []
+        assert any(
+            PROJECT in message and 'not measurable' in message for message in records
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('history', [
+        pytest.param([], id='journal-shorter-than-the-window'),
+        pytest.param(
+            [*_history_reaching_threshold('4102'), *_targeted_runs(1000, prefix='old', minutes_ago=60)],
+            id='window-holds-enough-stage1-passes',
+        ),
+    ])
+    async def test_a_measurable_window_is_not_reported(self, queue, history):
+        with caplog_at_warning() as records:
+            await self._escalate(queue, _unresolved_result('3105'), _StubJournal(history))
+
+        assert not any('not measurable' in message for message in records)
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_observation_never_counts_toward_the_streak(self, queue):
+        """A missing or garbled observation can delay a filing, never cause one."""
+        history = [
+            *_unresolved_passes('3105', count=self._K - 2, start=1),
+            _prior_run(
+                'unresolved-outside-candidates',
+                stats={CANDIDATE_TASK_IDS_STAT: [], UNRESOLVED_TASK_IDS_STAT: ['3105']},
+                minutes_ago=10 * (self._K - 1),
+            ),
+            _prior_run(
+                'not-lists',
+                stats={CANDIDATE_TASK_IDS_STAT: '3105', UNRESOLVED_TASK_IDS_STAT: '3105'},
+                minutes_ago=10 * self._K,
+            ),
+        ]
+
+        escalated = await self._escalate(
+            queue, _unresolved_result('3105'), _StubJournal(history),
+        )
+
+        assert escalated == []
+        assert self._pending(queue) == []
+
+    @pytest.mark.asyncio
+    async def test_independent_blips_on_alternating_tasks_never_file(self, queue):
+        """Some task is unresolved on every pass, but no ONE task stays unresolved."""
+        history: list[ReconciliationRun] = []
+        for position in range(2 * self._K):
+            stranded = '3105' if position % 2 == 0 else '4102'
+            run_id = f'pass-{position}'
+
+            escalated = await self._escalate(
+                queue,
+                _unresolved_result(stranded, candidates=('3105', '4102')),
+                _StubJournal(history),
+                run_id=run_id,
+            )
+
+            assert escalated == []
+            history.insert(0, _prior_run(
+                run_id, candidates=['3105', '4102'], unresolved=[stranded],
+                minutes_ago=2 * self._K - position,
+            ))
+
+        assert self._pending(queue) == []
+
+    @pytest.mark.asyncio
+    async def test_the_current_runs_own_row_is_not_history(self, queue):
+        history = [
+            _prior_run(self._RUN, unresolved=['3105'], minutes_ago=0),
+            *_unresolved_passes('3105', count=self._K - 2),
+        ]
+
+        escalated = await self._escalate(
+            queue, _unresolved_result('3105'), _StubJournal(history),
+        )
+
+        assert escalated == []
+        assert self._pending(queue) == []
+
+    @pytest.mark.asyncio
+    async def test_a_journal_failure_files_nothing_and_warns(self, queue):
+        """Missing history can only under-count a streak, never fabricate one."""
+        journal = _StubJournal(error=RuntimeError('journal locked'))
+
+        with caplog_at_warning() as records:
+            escalated = await self._escalate(queue, _unresolved_result('4102'), journal)
+
+        assert escalated == []
+        assert queue.get_pending() == []
+        assert any(PROJECT in message for message in records)
+
+    @pytest.mark.asyncio
+    async def test_no_unresolved_task_means_no_journal_read(self, queue):
+        journal = _StubJournal(_history_reaching_threshold('3105'))
+
+        escalated = await self._escalate(queue, _suppression_result(), journal)
+
+        assert escalated == []
+        assert journal.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_recurrence_folds_into_one_pending_record(self, queue):
+        history = _history_reaching_threshold('3105')
+
+        first = await self._escalate(
+            queue, _unresolved_result('3105'), _StubJournal(history), run_id='run-a',
+        )
+        second = await self._escalate(
+            queue, _unresolved_result('3105'), _StubJournal(history), run_id='run-b',
+        )
+
+        assert first == [UNRESOLVED_CORROBORATION_SUBJECT]
+        assert second == []
+        pending = self._pending(queue)
+        assert len(pending) == 1
+        assert pending[0].dedupe_count == 1
+
+    @pytest.mark.asyncio
+    async def test_the_streak_threshold_is_a_knob(self, queue):
+        escalated = await self._escalate(
+            queue, _unresolved_result('3105'), _StubJournal(), streak_threshold=1,
+        )
+
+        assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
+
+
+class TestObservationSurvivesTheRealJournal:
+    """The observation stats survive the path a past pass's report actually takes.
+
+    Every other persistence test hands the guard ready-made runs.  This one
+    writes them the way the harness does — ``verify_and_rewrite_stats`` then
+    ``update_run_stage_reports`` — and lets the guard read them back through
+    ``get_recent_runs``, so a serializer or verifier change that drops the two
+    list stats breaks here rather than silently disabling the disclosure.
+    """
+
+    @pytest_asyncio.fixture
+    async def journal(self, tmp_path):
+        journal = ReconciliationJournal(tmp_path / 'recon')
+        await journal.initialize()
+        yield journal
+        await journal.close()
+
+    @pytest_asyncio.fixture
+    async def write_journal(self, tmp_path):
+        write_journal = WriteJournal(tmp_path / 'wj')
+        await write_journal.initialize()
+        yield write_journal
+        await write_journal.close()
+
+    @staticmethod
+    async def _persist_pass(journal, write_journal, run_id, result, *, minutes_ago):
+        at = datetime.now(UTC) - timedelta(minutes=minutes_ago)
+        await journal.start_run(ReconciliationRun(
+            id=run_id, project_id=PROJECT, run_type=RunType.full,
+            trigger_reason='test', started_at=at,
+        ))
+        stage_reports: dict[str, StageReport | dict] = {
+            STAGE1_KEY: observation_report(
+                at=at,
+                candidates=result.candidate_task_ids,
+                unresolved=result.unresolved_task_ids,
+            ),
+        }
+        await verify_and_rewrite_stats(run_id, stage_reports, write_journal)
+        await journal.update_run_stage_reports(run_id, stage_reports)
+
+    @pytest.mark.asyncio
+    async def test_persisted_passes_bring_a_task_to_the_threshold(
+        self, journal, write_journal, tmp_path,
+    ):
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'escalations')
+        stranded = _unresolved_result('3105', candidates=('4102',))
+        for n in range(1, UNRESOLVED_CORROBORATION_STREAK_THRESHOLD):
+            await self._persist_pass(
+                journal, write_journal, f'prior-{n}', stranded, minutes_ago=10 * n,
+            )
+        await journal.start_run(ReconciliationRun(
+            id='current', project_id=PROJECT, run_type=RunType.full,
+            trigger_reason='test', started_at=datetime.now(UTC),
+        ))
+
+        escalated = await maybe_escalate_unresolved_corroboration(
+            queue, PROJECT, 'current', stranded, journal=journal, stage_key=STAGE1_KEY,
+        )
+
+        assert escalated == [UNRESOLVED_CORROBORATION_SUBJECT]
+        (pending,) = queue.get_by_task(
+            UNRESOLVED_CORROBORATION_SUBJECT, status='pending', level=1,
+        )
+        assert f'3105 ({UNRESOLVED_CORROBORATION_STREAK_THRESHOLD} passes)' in pending.detail
+
 
 class TestCompositeFlagTaskIds:
     """A flag's OWN task_id is routinely comma-joined, and must be decomposed.
@@ -1625,13 +2325,21 @@ class TestCompositeFlagTaskIds:
 
     ``filter_suppressed._keep`` has precisely this gap — it looks the flag
     task_id up verbatim while only the suppression ROW side is decomposed. This
-    guard must not inherit it. ``_flag_candidate_task_ids`` (task
-    3476) is the existing flag-side splitter and the precedent followed here.
+    guard must not inherit it. ``flag_task_ids.task_id_components`` is the
+    shared flag-side splitter it decomposes through.
+
+    A composite is dropped only when EVERY component corroborates; a mixed one
+    is kept on a copy annotated with each corroborated component's citation.
     """
 
     @pytest.mark.asyncio
-    async def test_composite_with_a_corroborated_component_is_suppressed(self):
-        """The live shape: '3105,4223' where only 3105 is a preserved specimen."""
+    async def test_a_mixed_composite_is_kept_and_annotated(self):
+        """The live shape: '3105,4223' where only 3105 is a preserved specimen.
+
+        The finding claims both tasks are stranded, so 3105's citation alone
+        must not hide the claim about 4223 — and the specimen evidence travels
+        with the kept finding so Stage 2 sees it beside the reset request.
+        """
         memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
         flag = _stranded_flag(task_id='3105,4223')
 
@@ -1639,8 +2347,32 @@ class TestCompositeFlagTaskIds:
             memory_service=memory_service, project_id=PROJECT, flags=[flag],
         )
 
+        assert result.kept_flags == [
+            {**flag, PRESERVED_SPECIMEN_COMPONENTS_KEY: {'3105': LIVE_MEM0_ROW['id']}},
+        ]
+        assert PRESERVED_SPECIMEN_COMPONENTS_KEY not in flag
+        assert result.suppressed_by_task == {}
+        assert result.citations_by_task == {}
+        assert result.unresolved_task_ids == ()
+
+    @pytest.mark.asyncio
+    async def test_a_composite_whose_every_component_is_corroborated_is_suppressed(self):
+        """Dropped, counted once, every component's citation kept."""
+        memory_service = _make_memory_service(
+            rows={'3105': [LIVE_MEM0_ROW], '4223': [SECOND_SPECIMEN_MEM0_ROW]},
+        )
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service,
+            project_id=PROJECT,
+            flags=[_stranded_flag(task_id='3105,4223')],
+        )
+
         assert result.kept_flags == []
         assert result.suppressed_by_task == {'3105': 1}
+        assert result.citations_by_task == {
+            '3105': LIVE_MEM0_ROW['id'], '4223': SECOND_SPECIMEN_MEM0_ROW['id'],
+        }
 
     @pytest.mark.asyncio
     async def test_a_junk_component_costs_only_itself(self):
@@ -1686,18 +2418,18 @@ class TestCompositeFlagTaskIds:
 
     @pytest.mark.asyncio
     async def test_counters_key_on_the_component_not_the_composite(self):
-        """Aggregation must be per REAL task, not per string permutation.
+        """Aggregation must be per REAL task, not per raw spelling.
 
-        Task 3105 is flagged as '3105,5080', '3105,5080,5104' and '3105,4223'.
-        Keying on the raw composite would scatter one task's suppressions across
-        three counters, so the storm threshold would never trip and the citation
-        audit trail would fragment.
+        One task arrives under several raw task_id strings that all decompose to
+        it. Keying on the raw string would scatter its suppressions across a
+        counter per spelling, so the storm threshold would never trip and the
+        citation audit trail would fragment.
         """
         memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
         flags = [
-            _stranded_flag(task_id='3105,5080'),
-            _stranded_flag(task_id='3105,5080,5104'),
-            _stranded_flag(task_id='3105,4223'),
+            _stranded_flag(task_id='3105'),
+            _stranded_flag(task_id=' 3105 , '),
+            _stranded_flag(task_id='0,3105'),
         ]
 
         result = await filter_preservation_specimen_flags(
@@ -1711,17 +2443,39 @@ class TestCompositeFlagTaskIds:
         }
 
     @pytest.mark.asyncio
-    async def test_each_component_is_corroborated_independently(self):
-        """Every component is looked up — the citation may be on any of them."""
-        memory_service = _make_memory_service(rows={'4223': [LIVE_MEM0_ROW]})
-        flag = _stranded_flag(task_id='3105,4223')
+    async def test_a_dropped_composite_counts_on_one_counter_whatever_its_order(self):
+        """The order the ids were joined in must not choose the storm counter.
+
+        Otherwise '3105,4223' and '4223,3105' would scatter one pair's drops
+        across two counters, the fragmentation the test above guards against.
+        """
+        memory_service = _make_memory_service(
+            rows={'3105': [LIVE_MEM0_ROW], '4223': [SECOND_SPECIMEN_MEM0_ROW]},
+        )
 
         result = await filter_preservation_specimen_flags(
-            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+            memory_service=memory_service,
+            project_id=PROJECT,
+            flags=[_stranded_flag(task_id='3105,4223'), _stranded_flag(task_id='4223,3105')],
         )
 
         assert result.kept_flags == []
-        assert result.suppressed_by_task == {'4223': 1}
+        assert list(result.suppressed_by_task.values()) == [2]
+
+    @pytest.mark.asyncio
+    async def test_each_component_is_corroborated_independently(self):
+        """Every component is looked up — the citation may be on any of them."""
+        memory_service = _make_memory_service(rows={'4223': [LIVE_MEM0_ROW]})
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service,
+            project_id=PROJECT,
+            flags=[_stranded_flag(task_id='3105,4223')],
+        )
+
+        assert result.kept_flags[0][PRESERVED_SPECIMEN_COMPONENTS_KEY] == {
+            '4223': LIVE_MEM0_ROW['id'],
+        }
 
     @pytest.mark.asyncio
     async def test_composite_of_uncorroborated_ids_is_kept(self):
@@ -1739,7 +2493,10 @@ class TestCompositeFlagTaskIds:
 
     @pytest.mark.asyncio
     async def test_whitespace_padded_components_resolve(self):
-        """LLM-authored joins carry spaces; '3105, 4223' must still resolve."""
+        """LLM-authored joins carry spaces; '3105, 4223' must still resolve.
+
+        The annotation's stripped key is what proves the padded component did.
+        """
         memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
 
         result = await filter_preservation_specimen_flags(
@@ -1748,8 +2505,9 @@ class TestCompositeFlagTaskIds:
             flags=[_stranded_flag(task_id='3105, 4223')],
         )
 
-        assert result.kept_flags == []
-        assert result.suppressed_by_task == {'3105': 1}
+        assert result.kept_flags[0][PRESERVED_SPECIMEN_COMPONENTS_KEY] == {
+            '3105': LIVE_MEM0_ROW['id'],
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('task_id', [',', ',,', ' , ', ''])
@@ -1785,33 +2543,23 @@ class TestCompositeFlagTaskIds:
         assert queried == ['3105', '5080', '5104']
 
     @pytest.mark.asyncio
-    async def test_one_unreadable_component_does_not_hide_a_citation(self):
-        """A corroborated component still suppresses when a sibling read fails.
+    async def test_an_unreadable_component_blocks_the_drop_and_is_disclosed(self):
+        """A sibling whose read failed keeps the flag, and that is disclosed.
 
-        The citation WAS resolved, so the task is not unresolved — degradation
-        is only disclosed when it actually changed the verdict.
+        No verdict on 5080 means not every component corroborated, so the
+        unreadable component is exactly what kept the flag.
         """
-        def _scroll(project_id, filters):
-            if filters['task_id'] == '5080':
-                raise TimeoutError('down')
-            return {'3105': [LIVE_MEM0_ROW]}.get(filters['task_id'], [])
-
-        memory_service = MagicMock()
-        memory_service.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
-        memory_service.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
-
         result = await filter_preservation_specimen_flags(
-            memory_service=memory_service,
+            memory_service=_memory_corroborating_3105_failing_for('5080'),
             project_id=PROJECT,
             flags=[_stranded_flag(task_id='3105,5080')],
         )
 
-        assert result.kept_flags == []
-        assert result.suppressed_by_task == {'3105': 1}
-        # 5080's read failed, but nothing was left unprotected by it, so the
-        # cycle is NOT reported degraded — this is the assertion that covers
-        # the `if t in kept_task_ids` filter.
-        assert result.unresolved_task_ids == ()
+        assert [flag[PRESERVED_SPECIMEN_COMPONENTS_KEY] for flag in result.kept_flags] == [
+            {'3105': LIVE_MEM0_ROW['id']},
+        ]
+        assert result.suppressed_by_task == {}
+        assert result.unresolved_task_ids == ('5080',)
 
     @pytest.mark.asyncio
     async def test_unreadable_component_of_an_uncorroborated_flag_is_disclosed(self):
@@ -1827,3 +2575,26 @@ class TestCompositeFlagTaskIds:
 
         assert result.kept_flags == [flag]
         assert result.unresolved_task_ids == ('4102', '4103')
+
+    @pytest.mark.asyncio
+    async def test_a_cited_task_is_not_the_task_the_flag_claims_is_stranded(self):
+        """Only the flag's OWN task_id is corroborated, never its cited_tasks.
+
+        A cited task is evidence the flag mentions; corroborating it would drop
+        a genuine stranded finding about a different task — the over-suppression
+        this guard is biased against.
+        """
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        flag = _stranded_flag(task_id='4102', cited_tasks=[{'task_id': '3105'}])
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_task == {}
+        queried = [
+            call.kwargs['filters']['task_id']
+            for call in memory_service.get_memories_by_metadata.await_args_list
+        ]
+        assert queried == ['4102']

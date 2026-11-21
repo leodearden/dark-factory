@@ -25,6 +25,10 @@ middleware itself already do. The rule is enforced mechanically, not by
 convention alone, repo-wide by
 ``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``,
 which covers this file and ``markup_guard.py``.
+
+Where a refused payload is preserved (queue, floor, log; task 4809) is pinned
+in ``tests/test_markup_residue_tiers.py``. Both files build their servers with
+``tests/_markup_guard_harness.py``.
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -44,34 +48,37 @@ import pytest
 # MODULE-QUALIFIED so each borrowed constant names its origin at the use site
 # and cannot be confused with this file's own specimen constants.
 import test_consolidate_memories_tool as _consolidate
+from _markup_guard_harness import (
+    _AGENT_ID,
+    _CLEAN_CONTENT,
+    _KNOWN_PROJECTS,
+    _PROJECT_ID,
+    _build_guarded_server,
+    _escalations,
+    _pass_through,
+    _payload,
+)
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import RepairPolicy
+from mcp.shared.memory import create_connected_server_and_client_session
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
 from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     closer_for,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.server.boundary_guards import boundary_guard_chain, install_boundary_guards
 from fused_memory.server.main import _install_safe_tool_wrapper
-from fused_memory.server.markup_guard import (
-    _resolve_project_root,
-    install_markup_guard,
-)
+from fused_memory.server.markup_guard import _resolve_project_root, build_markup_guard
+from fused_memory.server.markup_residue_spool import MarkupResidueSpool
+from fused_memory.server.tool_middleware_bridge import install_tool_middleware
 from fused_memory.server.tools import create_mcp_server
 
-_PROJECT_ID = 'dark_factory'
-_PROJECT_ROOT = '/project'
-
-#: The guard's project-attribution map (bare id -> root), mirroring the
-#: ``_known_projects_map`` main.py passes at the real registration site.
-_KNOWN_PROJECTS = {_PROJECT_ID: _PROJECT_ROOT}
-
-#: add_system_record is recon-stage-only by agent_id convention (its
-#: authorization gate runs FIRST in the tool body), so the specimen's swallowed
-#: agent_id is a recon-stage one. That keeps the negative control meaningful:
-#: a clean call with this identity actually reaches the service instead of
-#: bouncing off the authorization gate before the write.
-_AGENT_ID = 'recon-stage-9'
-_CLEAN_CONTENT = 'a deterministic cycle summary for the merge lane'
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _leaked(clean: str, param: str, value: str) -> str:
@@ -93,51 +100,6 @@ def _leaked(clean: str, param: str, value: str) -> str:
         + value
         + closer_for('parameter')
     )
-
-
-def _pass_through(mock_service: AsyncMock, method: str) -> None:
-    """Give *method*'s return value a real ``model_dump``.
-
-    An unspecced AsyncMock chains AsyncMock all the way down, so
-    ``result.model_dump()`` would be an unawaited coroutine unless the return
-    value is an explicit MagicMock (mirrors
-    tests/server/test_markup_tripwire_gate.py::_pass_through).
-    """
-    result = MagicMock()
-    result.model_dump.return_value = {'id': 'ok'}
-    getattr(mock_service, method).return_value = result
-
-
-def _build_guarded_server(
-    *methods: str, known_projects: dict[str, str] | None = None
-) -> tuple[Any, AsyncMock]:
-    """A real bundled-FastMCP server with the boundary guard installed.
-
-    Shape copied from tests/test_tool_safe_wrapper.py::_build_server_with_tool:
-    the guard is installed by ``main.py``, NOT by ``create_mcp_server``, so a
-    test must install it explicitly — the same shape
-    ``_install_safe_tool_wrapper`` already has.
-    """
-    mock_service = AsyncMock()
-    for method in methods:
-        _pass_through(mock_service, method)
-    server = create_mcp_server(mock_service)
-    install_markup_guard(
-        server,
-        policy=RepairPolicy.REJECT_WITH_REPAIR,
-        known_projects=_KNOWN_PROJECTS if known_projects is None else known_projects,
-    )
-    return server, mock_service
-
-
-def _payload(exc_info) -> dict:
-    """The guard's structured rejection, parsed out of the raised ToolError.
-
-    The guard RAISES rather than returning a dict (prototype P4: a returned
-    dict is destroyed by the output schema of any tool annotated ``-> str``),
-    so the payload travels as the exception's ``json.dumps`` message.
-    """
-    return json.loads(str(exc_info.value))
 
 
 class TestAddSystemRecordBoundary:
@@ -497,10 +459,8 @@ class TestOverrideFlagNeverReachesPersistence:
         """
         svc = _consolidate.make_service()
         server = create_mcp_server(svc)
-        install_markup_guard(
-            server,
-            policy=RepairPolicy.REJECT_WITH_REPAIR,
-            known_projects=_KNOWN_PROJECTS,
+        install_boundary_guards(
+            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=None
         )
 
         await server._tool_manager.call_tool(
@@ -543,14 +503,6 @@ class TestOverrideFlagNeverReachesPersistence:
 #: would test StormCounter (already covered by its own suite) rather than the
 #: sink wiring this class is about.
 _BURST = 3
-
-
-def _escalations(root) -> list[dict]:
-    """Every escalation record filed under *root*, parsed."""
-    return [
-        json.loads(path.read_text())
-        for path in sorted((root / 'data' / 'escalations').glob('esc-*.json'))
-    ]
 
 
 class TestStormEscape:
@@ -736,11 +688,8 @@ class TestStormEscape:
         assert 'toolcall-markup-containment-prd.md' in routing, (
             f'must name the live owner: {routing!r}'
         )
-        # 3083 may be NAMED as the closed predecessor — what must not happen is
-        # the reader being DIRECTED to report a recurrence against it. That
-        # correction is stated explicitly, so assert it explicitly.
-        assert 'not against 3083' in routing, (
-            f'must send recurrences to the PRD, not the closed predecessor: {routing!r}'
+        assert MARKUP_RECURRENCE_ROUTING in routing, (
+            f'must carry the ONE shared routing sentence, not a local copy: {routing!r}'
         )
 
     @pytest.mark.asyncio
@@ -760,8 +709,8 @@ class TestStormEscape:
         assert mine, f'expected one greppable ERROR line; got {caplog.records!r}'
         text = '\n'.join(r.getMessage() for r in mine)
         assert 'toolcall-markup-containment-prd.md' in text
-        assert 'see DF 3083' not in text, (
-            f'must not direct the reader at the closed predecessor: {text!r}'
+        assert MARKUP_RECURRENCE_ROUTING in text, (
+            f'must carry the ONE shared routing sentence, not a local copy: {text!r}'
         )
         # The visible-counter half of the task's remedy, without a schema
         # change. Asserted IN CONTEXT: a bare `str(_BURST) in text` is vacuous
@@ -824,10 +773,8 @@ def _build_server_installed(*, guard_first: bool) -> tuple[Any, AsyncMock]:
     server = create_mcp_server(mock_service)
 
     def _guard() -> None:
-        install_markup_guard(
-            server,
-            policy=RepairPolicy.REJECT_WITH_REPAIR,
-            known_projects=_KNOWN_PROJECTS,
+        install_boundary_guards(
+            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=None
         )
 
     if guard_first:
@@ -859,7 +806,7 @@ class TestInstalledOnTheRealServer:
     by review, not by a test. No assertion here reads source text.
     """
 
-    def test_the_installer_helper_declares_the_reject_with_repair_tier(self):
+    def test_the_boundary_chain_declares_the_reject_with_repair_tier(self):
         """INV-1: the tier is declared at the interception point, not inferred.
 
         REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory
@@ -867,6 +814,54 @@ class TestInstalledOnTheRealServer:
         add_system_record and update_memory take this SERVER default rather than
         a per-tool tier, because a per-tool tier would be exactly the tool-name
         inference INV-1 forbids.
+        """
+        markup_member = boundary_guard_chain(
+            known_projects=_KNOWN_PROJECTS, prefix_resolver=None
+        )[0]
+
+        assert isinstance(markup_member, MarkupGuardMiddleware)
+        assert markup_member.policy is RepairPolicy.REJECT_WITH_REPAIR
+
+    @pytest.mark.asyncio
+    async def test_forward_repair_is_consumable_on_the_bundled_server(self):
+        """FORWARD_REPAIR's ``ToolResult`` now reaches the client as ``_meta``.
+
+        The bridge converts a member-authored ``ToolResult`` into the
+        ``CallToolResult`` the bundled low-level handler passes straight
+        through, so the tier installs without error, the repaired write LANDS
+        with the absorbed parameter recovered, and the caller is told so.
+        """
+        mock_service = AsyncMock()
+        _pass_through(mock_service, 'add_system_record')
+        server = create_mcp_server(mock_service)
+        _install_safe_tool_wrapper(server)
+        install_tool_middleware(
+            server,
+            (build_markup_guard(policy=RepairPolicy.FORWARD_REPAIR, known_projects=None),),
+            sentinel='_forward_repair_markup_guarded',
+            label='forward-repair markup guard',
+        )
+
+        async with create_connected_server_and_client_session(server._mcp_server) as session:
+            result = await session.call_tool(
+                'add_system_record', _leaked_add_system_record_arguments()
+            )
+
+        assert result.isError is False
+        mock_service.add_system_record.assert_awaited_once()
+        assert mock_service.add_system_record.await_args.kwargs['content'] == _CLEAN_CONTENT
+        assert mock_service.add_system_record.await_args.kwargs['agent_id'] == _AGENT_ID
+        assert result.meta is not None
+        repair = result.meta['markup_repair']
+        assert repair['field'] == 'content'
+        assert repair['recovered_params'] == ['agent_id']
+
+    def test_the_installer_helper_wires_the_spool_as_the_residue_floor(self, tmp_path):
+        """Task 4809: the floor reaches the chain from the one interception point.
+
+        Patching ``install_boundary_guards`` where ``main`` looks it up records
+        the keyword arguments the helper hands it, so this pins the wiring, not
+        the chain's behaviour (``tests/test_markup_residue_tiers.py`` pins that).
         """
         from fused_memory.server import main as main_module
 
@@ -877,46 +872,21 @@ class TestInstalledOnTheRealServer:
             recorded.update(kwargs)
 
         known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        spool = MarkupResidueSpool(tmp_path / 'spool')
         server = create_mcp_server(AsyncMock())
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(main_module, 'install_markup_guard', _record)
+            patch.setattr(main_module, 'install_boundary_guards', _record)
             main_module._install_tool_dispatch_guards(
-                server, known_projects=known_projects
+                server, known_projects=known_projects, prefix_resolver=None, residue_spool=spool
             )
 
         assert recorded['mcp'] is server
-        assert recorded['policy'] is RepairPolicy.REJECT_WITH_REPAIR
         assert recorded['known_projects'] is known_projects
-
-    def test_an_undeliverable_policy_is_refused_at_WIRING_time(self):
-        """The declared ValueError, which is a fail-LOUD wiring guard.
-
-        ``MarkupGuardMiddleware._forward`` returns a fastmcp ``ToolResult`` that
-        the bundled dispatcher cannot consume, so FORWARD_REPAIR does not merely
-        behave differently here — it breaks at the FIRST repair, arbitrarily far
-        from the line that declared it. A tier that cannot work has to fail at
-        the wiring, and the tool manager must be left unwrapped so the failure
-        cannot be half-applied.
-        """
-        server = create_mcp_server(AsyncMock())
-        before = server._tool_manager.call_tool
-
-        with pytest.raises(ValueError) as exc_info:
-            install_markup_guard(server, policy=RepairPolicy.FORWARD_REPAIR)
-
-        assert 'FORWARD_REPAIR' in str(exc_info.value) or 'REJECT_WITH_REPAIR' in str(
-            exc_info.value
-        )
-        # ``==`` not ``is``: an UNWRAPPED call_tool is a bound method, and every
-        # attribute access mints a fresh bound-method object, so identity would
-        # fail here even with nothing installed. Equality compares (func, self),
-        # which is exactly the question — and once wrapped the attribute holds a
-        # plain closure, which no bound method equals.
-        assert server._tool_manager.call_tool == before
-        assert getattr(server._tool_manager, '_fused_memory_markup_guarded', False) is False
+        # ``==`` compares a bound method's (func, self): this spool's preserve.
+        assert recorded['residue_floor'] == spool.preserve
 
     def test_installing_twice_does_not_double_wrap(self):
-        """The ``_fused_memory_markup_guarded`` sentinel's whole job.
+        """The ``_fused_memory_boundary_guarded`` sentinel's whole job.
 
         Without it a second install would chain a second guard around the first:
         every call scanned twice, and a rejection counted twice into the storm
@@ -925,29 +895,34 @@ class TestInstalledOnTheRealServer:
         guarded, mirroring ``_install_safe_tool_wrapper``'s own sentinel.
         """
         server = create_mcp_server(AsyncMock())
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=_KNOWN_PROJECTS
+        install_boundary_guards(
+            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=None
         )
         wrapped = server._tool_manager.call_tool
 
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=_KNOWN_PROJECTS
+        install_boundary_guards(
+            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=None
         )
 
         assert server._tool_manager.call_tool is wrapped
 
-    def test_the_installer_helper_installs_both_wrappers(self):
+    def test_the_installer_helper_installs_both_wrappers(self, tmp_path):
         """Unpatched, the helper leaves both sentinels set on the one tool
         manager — the guard is added to the defence-in-depth wrapper, never
         substituted for it."""
         from fused_memory.server.main import _install_tool_dispatch_guards
 
         server = create_mcp_server(AsyncMock())
-        _install_tool_dispatch_guards(server, known_projects=_KNOWN_PROJECTS)
+        _install_tool_dispatch_guards(
+            server,
+            known_projects=_KNOWN_PROJECTS,
+            prefix_resolver=None,
+            residue_spool=MarkupResidueSpool(tmp_path / 'spool'),
+        )
 
         manager = server._tool_manager
         assert getattr(manager, '_fused_memory_safe_wrapped', False) is True
-        assert getattr(manager, '_fused_memory_markup_guarded', False) is True
+        assert getattr(manager, '_fused_memory_boundary_guarded', False) is True
 
 
 class TestInstallationOrder:
@@ -1004,11 +979,12 @@ class TestInstallationOrder:
 
 
 class TestReconReportServerIsNotGuarded:
-    """(c) The second ``_install_safe_tool_wrapper`` call site stays bare.
+    """(c) The recon-report server gets no MARKUP guard.
 
-    The recon-report server hosts the cite_* / report tools and no write tools,
-    so it has no write boundary to guard. Asserting that keeps it from being
-    wired by accident when the two call sites are next edited together.
+    It hosts the cite_* / report tools and no write tools, so it has no write
+    boundary to guard. Asserting that keeps it from being wired by accident
+    when the two call sites are next edited together. (It does get the
+    unknown-argument guard: tests/test_unknown_argument_guard_fused_memory.py.)
     """
 
     def _make_config(self) -> Any:
@@ -1030,7 +1006,7 @@ class TestReconReportServerIsNotGuarded:
 
         manager = mcp._tool_manager
         assert getattr(manager, '_fused_memory_safe_wrapped', False) is True
-        assert getattr(manager, '_fused_memory_markup_guarded', False) is False
+        assert getattr(manager, '_fused_memory_boundary_guarded', False) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1185,10 +1161,8 @@ class TestTheFiledProjectRootIsRegistryVouched:
         interceptor = AsyncMock()
         interceptor.submit_task.return_value = {'ticket': 'tkt_x'}
         server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
-        install_markup_guard(
-            server,
-            policy=RepairPolicy.REJECT_WITH_REPAIR,
-            known_projects={_PROJECT_ID: str(tmp_path / 'registered')},
+        install_boundary_guards(
+            server, known_projects={_PROJECT_ID: str(tmp_path / 'registered')}, prefix_resolver=None
         )
         chosen = tmp_path / 'chosen-by-the-caller'
 
@@ -1212,148 +1186,54 @@ class TestTheFiledProjectRootIsRegistryVouched:
         interceptor.submit_task.assert_not_called()
 
 
-class TestUnrepairableResidueIsPreserved:
-    """A refusal must not destroy the payload it refuses.
+#: A collapsible HTML block as memory prose quotes it (task 10396). ``details``
+#: is an envelope closer name, but no fused-memory write tool declares a
+#: ``details`` parameter, so its closer terminates no envelope boundary.
+_HTML_DETAILS_BLOCK = (
+    '\x3cdetails>\x3csummary>Measured' + closer_for('summary')
+    + '\x3cpre>rc=0' + closer_for('pre') + closer_for('details')
+)
+_HTML_QUOTING_CONTENT = 'The census page renders\n' + _HTML_DETAILS_BLOCK + '\nper finding.'
 
-    ``\x3c/invoke>`` closes the ENVELOPE rather than a parameter, so
-    ``shared.toolcall_markup.repair`` can attribute the residue to nothing and
-    refuses under its NO SILENT PARTIAL REPAIR contract. Per the boundary
-    specimen table that is the COMMON outcome for the real corpus shapes, not an
-    edge case — and the caller is told, in the shared hint, that its full payload
-    is "preserved verbatim in the escalation named above". These pin that the
-    escalation named there EXISTS.
-    """
 
-    @staticmethod
-    def _unrepairable(marker: str) -> str:
-        """A specimen the repairer cannot attribute — built from the constants."""
-        return f'{_CLEAN_CONTENT} {marker}' + closer_for('invoke')
+class TestAQuotedHtmlBlockIsNotALeak:
+    """Task 10396: the boundary passes a quoted HTML closer and still refuses a leak."""
 
-    @classmethod
-    async def _refuse(cls, server, marker='one'):
+    @pytest.mark.asyncio
+    async def test_add_memory_content_reaches_the_service_unchanged(self):
+        server, mock_service = _build_guarded_server('add_memory')
+
+        await server._tool_manager.call_tool(
+            'add_memory',
+            {
+                'content': _HTML_QUOTING_CONTENT,
+                'category': 'observations_and_summaries',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        mock_service.add_memory.assert_awaited_once()
+        assert mock_service.add_memory.await_args.kwargs['content'] == _HTML_QUOTING_CONTENT
+
+    @pytest.mark.asyncio
+    async def test_a_leak_behind_the_quoted_block_is_still_refused(self, tmp_path):
+        """The clean prefix itself carries the quoted closer, so repair() declines;
+        the canonical opener and parameter closers keep the value from being inert."""
+        server, mock_service = _build_guarded_server(
+            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
+        )
+
         with pytest.raises(ToolError) as exc_info:
             await server._tool_manager.call_tool(
                 'add_system_record',
                 {
-                    'content': cls._unrepairable(marker),
+                    'content': _leaked(_HTML_QUOTING_CONTENT, 'agent_id', _AGENT_ID),
                     'project_id': _PROJECT_ID,
                     'category': 'observations_and_summaries',
-                    'agent_id': _AGENT_ID,
                 },
             )
-        return _payload(exc_info)
 
-    @pytest.mark.asyncio
-    async def test_the_refusal_names_a_record_that_actually_exists(self, tmp_path):
-        """The defect: escalation_id was null while the hint pointed at it."""
-        server, mock_service = _build_guarded_server(
-            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
-        )
-
-        payload = await self._refuse(server)
-
+        payload = _payload(exc_info)
         assert payload['error_type'] == 'mcp_markup_unrepairable'
-        assert payload['escalation_id'] is not None, (
-            f'the hint promises a record; it must exist: {payload!r}'
-        )
-        records = _escalations(tmp_path)
-        assert [r['id'] for r in records] == [payload['escalation_id']]
-        mock_service.add_system_record.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_the_record_holds_the_payload_verbatim(self, tmp_path):
-        """"Preserved VERBATIM" is the promise, so assert the caller's own bytes."""
-        server, _ = _build_guarded_server(
-            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
-        )
-
-        await self._refuse(server)
-
-        record = _escalations(tmp_path)[0]
-        assert self._unrepairable('one') in record['detail']
-        assert record['task_id'] == 'markup-residue'
-        # A residue record is NOT a burst summary: it must not land on either
-        # storm anchor, whose records are deduped into one.
-        assert record['task_id'] not in {'markup-guard', 'markup-tripwire'}
-
-    @pytest.mark.asyncio
-    async def test_two_refusals_are_never_folded_into_one_record(self, tmp_path):
-        """The one place this filer must NOT dedupe like its storm sibling.
-
-        Each record is the only surviving copy of a DIFFERENT payload, so
-        collapsing them destroys data — the exact loss the record exists to
-        prevent.
-        """
-        server, _ = _build_guarded_server(
-            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
-        )
-
-        await self._refuse(server, marker='first')
-        await self._refuse(server, marker='second')
-
-        details = '\n'.join(r['detail'] for r in _escalations(tmp_path))
-        assert len(_escalations(tmp_path)) == 2
-        assert self._unrepairable('first') in details
-        assert self._unrepairable('second') in details
-
-    @pytest.mark.asyncio
-    async def test_an_unfilable_residue_falls_back_to_the_log(self, tmp_path, caplog):
-        """When there is genuinely no queue, the log line IS the only copy — so
-        that is when the full record is dumped, and only then."""
-        server, _ = _build_guarded_server(
-            'add_system_record', known_projects={'some_other_project': str(tmp_path)}
-        )
-
-        with caplog.at_level('ERROR', logger='fused_memory.server.markup_guard'):
-            payload = await self._refuse(server)
-
-        assert payload['escalation_id'] is None
-        assert not (tmp_path / 'data' / 'escalations').exists()
-        text = '\n'.join(r.getMessage() for r in caplog.records)
-        assert 'only copy' in text
-        assert self._unrepairable('one') in text, (
-            f'the payload has to survive somewhere: {text!r}'
-        )
-
-    @pytest.mark.asyncio
-    async def test_a_filed_residue_does_not_dump_the_payload_into_the_log(
-        self, tmp_path, caplog
-    ):
-        """The log-volume half. Once the payload is queued, repeating it on every
-        refusal is maximum log volume exactly when a leak is bursting."""
-        server, _ = _build_guarded_server(
-            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
-        )
-
-        with caplog.at_level('ERROR', logger='fused_memory.server.markup_guard'):
-            payload = await self._refuse(server)
-
-        text = '\n'.join(
-            r.getMessage() for r in caplog.records
-            if r.name == 'fused_memory.server.markup_guard'
-        )
-        assert payload['escalation_id'] in text, (
-            f'the operator still needs the pointer: {text!r}'
-        )
-        assert self._unrepairable('one') not in text
-
-    @pytest.mark.asyncio
-    async def test_a_residue_filer_that_raises_never_changes_the_refusal(
-        self, tmp_path, monkeypatch
-    ):
-        """Escalation is purely additive: the refusal is already decided."""
-        import fused_memory.server.markup_guard as guard_module
-
-        def _boom(*args, **kwargs):
-            raise RuntimeError('queue on fire')
-
-        monkeypatch.setattr(guard_module, 'emit_markup_residue_escalation', _boom)
-        server, mock_service = _build_guarded_server(
-            'add_system_record', known_projects={_PROJECT_ID: str(tmp_path)}
-        )
-
-        payload = await self._refuse(server)
-
-        assert payload['error_type'] == 'mcp_markup_unrepairable'
-        assert payload['escalation_id'] is None
+        assert payload['field'] == 'content'
         mock_service.add_system_record.assert_not_awaited()

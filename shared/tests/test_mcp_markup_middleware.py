@@ -59,18 +59,23 @@ from __future__ import annotations
 import contextlib
 import enum
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
 import toolcall_markup_corpus_extract as extract
+from _schema_outage import assert_reported_once_by_shared_reader, install_schema_outage
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
+from shared.boundary_storm_escape import BoundaryStormEscape
 from shared.mcp_markup_middleware import (
     _ATTRIBUTION_AXIS_MAXLEN,
+    MARKUP_RECURRENCE_ROUTING,
     MarkupGuardMiddleware,
     RepairPolicy,
+    SpooledResidue,
     _bounded_axis,
 )
 from shared.toolcall_markup import MARKUP_OVERRIDE_KEY, detect
@@ -536,7 +541,7 @@ class TestB7ExemptTool:
     async def test_an_exempt_tool_emits_no_fact(self, policy):
         h = build_harness(policy, exempt_tools=frozenset({'scan_memory_content'}))
 
-        await h.call('scan_memory_content', {'needle': _closer('content')})
+        await h.call('scan_memory_content', {'needle': _closer('content') + INVOKE_CLOSER})
 
         assert h.facts == [], (
             'an exemption is a declaration that this is not a leak, so it must '
@@ -617,7 +622,7 @@ class TestB6DeliberateQuotingOverride:
             'submit_task',
             {
                 'title': 't',
-                'description': 'quoting ' + _closer('content'),
+                'description': 'quoting ' + _closer('content') + INVOKE_CLOSER,
                 'metadata': {'allow_mcp_markup': True, 'keep': 'this'},
             },
         )
@@ -638,7 +643,7 @@ class TestB6DeliberateQuotingOverride:
             'escalate_info',
             {
                 'summary': 's',
-                'detail': 'quoting ' + _closer('content'),
+                'detail': 'quoting ' + _closer('content') + INVOKE_CLOSER,
                 'metadata': {'allow_mcp_markup': True},
             },
         )
@@ -653,7 +658,7 @@ class TestB6DeliberateQuotingOverride:
             'submit_task',
             {
                 'title': 't',
-                'description': 'quoting ' + _closer('content'),
+                'description': 'quoting ' + _closer('content') + INVOKE_CLOSER,
                 'metadata': {'allow_mcp_markup': True},
             },
         )
@@ -682,7 +687,7 @@ class TestB6DeliberateQuotingOverride:
     @BOTH_POLICIES
     async def test_the_override_is_accepted_as_a_json_string(self, policy):
         """submit_task/update_task accept metadata as an object OR a JSON string."""
-        quoted = 'quoting ' + _closer('content')
+        quoted = 'quoting ' + _closer('content') + INVOKE_CLOSER
         h = build_harness(policy)
 
         await h.call(
@@ -766,7 +771,7 @@ class TestB6DeliberateQuotingOverride:
                 'escalate_info',
                 {
                     'summary': 's',
-                    'detail': 'quoting ' + _closer('content'),
+                    'detail': 'quoting ' + _closer('content') + INVOKE_CLOSER,
                     'metadata': {'allow_mcp_markup': True, 'keep': 'this'},
                 },
             )
@@ -877,6 +882,48 @@ class TestB1PartialDrift:
 
         assert payload['matched_pattern'] == _closer('description')
         assert payload['misclose'] == _closer('description')
+
+
+class TestAnUnresolvableSchemaFailsSafe:
+    """The tool catalogue cannot be read: the guard falls back, never guesses."""
+
+    OVERRIDE_CALL = {
+        'title': 'A task',
+        'description': 'A wholly ordinary description.',
+        'metadata': {MARKUP_OVERRIDE_KEY: True},
+    }
+
+    async def test_the_override_takes_the_drop_branch(self):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        install_schema_outage(h.mcp)
+
+        await h.call('submit_task', self.OVERRIDE_CALL)
+
+        assert h.recorder.args['metadata'] is None
+
+    @BOTH_POLICIES
+    async def test_a_repairable_leak_is_refused_rather_than_repaired(self, policy):
+        h = build_harness(policy)
+        install_schema_outage(h.mcp)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'submit_task',
+                {'title': 'A task', 'description': TestB1PartialDrift.DESCRIPTION},
+            )
+
+        assert _reject_payload(excinfo)['outcome'] == 'unrepairable'
+        assert h.recorder.calls == []
+        assert [f['outcome'] for f in h.facts] == ['unrepairable']
+
+    async def test_the_failure_is_reported_once_by_the_shared_reader(self, caplog):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        install_schema_outage(h.mcp)
+
+        with caplog.at_level(logging.WARNING):
+            await h.call('submit_task', self.OVERRIDE_CALL)
+
+        assert_reported_once_by_shared_reader(caplog.records)
 
 
 class TestB2TotalDrift:
@@ -1221,6 +1268,28 @@ class TestRejectRepairedCallValidates:
         assert retry.facts == [], 'the resubmission re-entered the guard'
 
 
+#: What ``escalate_info_typed`` requires besides ``detail``, in the coercion rows.
+_COERCION_REQUIRED_ARGS = {
+    'task_id': '3690',
+    'agent_role': 'implementer',
+    'category': 'risk_identified',
+    'summary': 'A coercion that guesses is worse than one that refuses.',
+}
+
+
+def _detail_that_swallowed(absorbed: str, recovered_param: str, recovered_value: str) -> str:
+    """A ``detail`` that mis-closed and swallowed exactly one parameter."""
+    return (
+        absorbed
+        + _closer('detail')
+        + '\n'
+        + _opener(recovered_param)
+        + recovered_value
+        + _closer(recovered_param)
+        + INVOKE_CLOSER
+    )
+
+
 class TestCoercionNeverGuesses:
     """The three ways a NAIVE decode of a recovered value is wrong.
 
@@ -1233,29 +1302,10 @@ class TestCoercionNeverGuesses:
     declared-type error, never a fabricated one.
     """
 
-    REQUIRED = {
-        'task_id': '3690',
-        'agent_role': 'implementer',
-        'category': 'risk_identified',
-        'summary': 'A coercion that guesses is worse than one that refuses.',
-    }
-
-    def _payload(self, absorbed: str, recovered_param: str, recovered_value: str) -> str:
-        """A ``detail`` that mis-closed and swallowed exactly one parameter."""
-        return (
-            absorbed
-            + _closer('detail')
-            + '\n'
-            + _opener(recovered_param)
-            + recovered_value
-            + _closer(recovered_param)
-            + INVOKE_CLOSER
-        )
-
     async def _call(self, detail: str):
         h = build_harness(RepairPolicy.FORWARD_REPAIR)
         result = await h.call(
-            'escalate_info_typed', {**self.REQUIRED, 'detail': detail}
+            'escalate_info_typed', {**_COERCION_REQUIRED_ARGS, 'detail': detail}
         )
         return h, result
 
@@ -1282,7 +1332,7 @@ class TestCoercionNeverGuesses:
 
     async def test_a_union_typed_recovery_still_lands_as_a_list(self):
         h, _ = await self._call(
-            self._payload('A union.', 'evidence', '[{"observation": "measured"}]')
+            _detail_that_swallowed('A union.', 'evidence', '[{"observation": "measured"}]')
         )
 
         evidence = h.recorder.args['evidence']
@@ -1300,7 +1350,7 @@ class TestCoercionNeverGuesses:
         """
         looks_like_json = '[consolidate, then re-measure]'
         h, _ = await self._call(
-            self._payload('A list-ish string.', 'suggested_action', looks_like_json)
+            _detail_that_swallowed('A list-ish string.', 'suggested_action', looks_like_json)
         )
 
         landed = h.recorder.args['suggested_action']
@@ -1311,7 +1361,7 @@ class TestCoercionNeverGuesses:
         """The same defect in its most decodable form: ``json.loads('3690')``
         succeeds and yields an ``int``."""
         h, _ = await self._call(
-            self._payload('A numeric string.', 'suggested_action', '3690')
+            _detail_that_swallowed('A numeric string.', 'suggested_action', '3690')
         )
 
         landed = h.recorder.args['suggested_action']
@@ -1335,8 +1385,8 @@ class TestCoercionNeverGuesses:
         await h.call(
             'escalate_info_typed',
             {
-                **self.REQUIRED,
-                'detail': self._payload('Ill-formed.', 'evidence', truncated),
+                **_COERCION_REQUIRED_ARGS,
+                'detail': _detail_that_swallowed('Ill-formed.', 'evidence', truncated),
             },
         )
 
@@ -1363,8 +1413,8 @@ class TestCoercionNeverGuesses:
         result = await h.call(
             'escalate_info_typed',
             {
-                **self.REQUIRED,
-                'detail': self._payload('Ill-formed.', 'evidence', truncated),
+                **_COERCION_REQUIRED_ARGS,
+                'detail': _detail_that_swallowed('Ill-formed.', 'evidence', truncated),
             },
         )
 
@@ -1398,8 +1448,8 @@ class TestCoercionNeverGuesses:
         result = await h.call(
             'escalate_info_typed',
             {
-                **self.REQUIRED,
-                'detail': self._payload('Ill-formed.', 'evidence', truncated),
+                **_COERCION_REQUIRED_ARGS,
+                'detail': _detail_that_swallowed('Ill-formed.', 'evidence', truncated),
             },
         )
 
@@ -1434,8 +1484,8 @@ class TestCoercionNeverGuesses:
             await h.call(
                 'escalate_info_typed',
                 {
-                    **self.REQUIRED,
-                    'detail': self._payload('Ill-formed.', 'evidence', truncated),
+                    **_COERCION_REQUIRED_ARGS,
+                    'detail': _detail_that_swallowed('Ill-formed.', 'evidence', truncated),
                 },
             )
 
@@ -1460,13 +1510,13 @@ class TestCoercionNeverGuesses:
         h = build_harness(RepairPolicy.FORWARD_REPAIR)
         tool = await h.mcp.get_tool('escalate_info_typed')
         assert tool is not None
-        detail = self._payload('A union.', 'evidence', '[{"observation": "measured"}]')
+        detail = _detail_that_swallowed('A union.', 'evidence', '[{"observation": "measured"}]')
 
         fix = repair(
             detail,
             'detail',
             tuple(tool.parameters['properties']),
-            tuple({**self.REQUIRED, 'detail': detail}),
+            tuple({**_COERCION_REQUIRED_ARGS, 'detail': detail}),
         )
 
         assert fix is not None
@@ -1686,10 +1736,27 @@ class TestB5UnrepairableIsNeverGuessed:
         assert h.recorder.calls == []
 
 
+async def _refuse_unrepairable_reuse_item(policy, **guard_kwargs) -> tuple[Any, dict[str, Any]]:
+    """The harness and refusal payload of an ``add_reuse_item`` whose ``how`` is
+    B5's unrepairable specimen. *guard_kwargs* reach :func:`build_harness`, so
+    a row picks the escalation sink it is about."""
+    h = build_harness(policy, **guard_kwargs)
+    with pytest.raises(ToolError) as excinfo:
+        await h.call(
+            'add_reuse_item',
+            {
+                'what': 'the sampler',
+                'how': TestB5UnrepairableIsNeverGuessed._value(),
+                'where': 'shared/',
+            },
+        )
+    return h, _reject_payload(excinfo)
+
+
 class TestTheHintNeverOverclaimsPreservation:
     """The refusal's PROSE must agree with its own ``escalation_id`` field.
 
-    ``_file_residue_escalation`` returns ``None`` on THREE distinct paths — no
+    ``_preserve_residue`` returns ``None`` on THREE distinct paths — no
     sink wired, a sink that RAISED (``_call_sink``'s never-raises contract), and
     a sink that returned a non-str. On every one of them the payload carries
     ``escalation_id: null``, so a hint that unconditionally asserts "your full
@@ -1716,25 +1783,12 @@ class TestTheHintNeverOverclaimsPreservation:
     #: surrounding prose is reworded.
     PRESERVED_CLAIM = 'preserved verbatim'
 
-    @staticmethod
-    def _value() -> str:
-        return TestB5UnrepairableIsNeverGuessed._value()
-
-    async def _refuse(self, policy, **guard_kwargs):
-        h = build_harness(policy, **guard_kwargs)
-        with pytest.raises(ToolError) as excinfo:
-            await h.call(
-                'add_reuse_item',
-                {'what': 'the sampler', 'how': self._value(), 'where': 'shared/'},
-            )
-        return h, _reject_payload(excinfo)
-
     # -- (a) preserved --------------------------------------------------
 
     @BOTH_POLICIES
     async def test_a_preserved_payload_is_told_it_is_preserved(self, policy):
         """The harness sink returns a real id, so the claim is TRUE here."""
-        _, payload = await self._refuse(policy)
+        _, payload = await _refuse_unrepairable_reuse_item(policy)
 
         assert payload['escalation_id'] == ESCALATION_ID
         assert self.PRESERVED_CLAIM in payload['hint'], (
@@ -1747,7 +1801,7 @@ class TestTheHintNeverOverclaimsPreservation:
     @BOTH_POLICIES
     async def test_no_sink_wired_does_not_claim_preservation(self, policy):
         """Nothing was written anywhere, so nothing may be promised."""
-        _, payload = await self._refuse(policy, escalation_sink=None)
+        _, payload = await _refuse_unrepairable_reuse_item(policy, escalation_sink=None)
 
         assert payload['escalation_id'] is None
         assert self.PRESERVED_CLAIM not in payload['hint'], (
@@ -1767,7 +1821,7 @@ class TestTheHintNeverOverclaimsPreservation:
         def boom(record):
             raise RuntimeError('queue unavailable')
 
-        _, payload = await self._refuse(policy, escalation_sink=boom)
+        _, payload = await _refuse_unrepairable_reuse_item(policy, escalation_sink=boom)
 
         assert payload['escalation_id'] is None
         assert self.PRESERVED_CLAIM not in payload['hint']
@@ -1783,7 +1837,7 @@ class TestTheHintNeverOverclaimsPreservation:
         intent — keying off ``self._escalation_sink is not None`` would get
         this row exactly backwards.
         """
-        _, payload = await self._refuse(policy, escalation_sink=lambda record: 12)
+        _, payload = await _refuse_unrepairable_reuse_item(policy, escalation_sink=lambda record: 12)
 
         assert payload['escalation_id'] is None
         assert self.PRESERVED_CLAIM not in payload['hint']
@@ -1803,7 +1857,7 @@ class TestTheHintNeverOverclaimsPreservation:
             {'escalation_sink': lambda record: 12},
         ]
         for kwargs in sinks:
-            _, payload = await self._refuse(policy, **kwargs)
+            _, payload = await _refuse_unrepairable_reuse_item(policy, **kwargs)
             assert MARKUP_OVERRIDE_KEY in payload['hint'], (
                 f'the override escape vanished for {kwargs!r}'
             )
@@ -1812,7 +1866,7 @@ class TestTheHintNeverOverclaimsPreservation:
     async def test_every_variant_still_says_unrepairable_and_no_repair(self, policy):
         """The split changes ONLY the preservation clause."""
         for kwargs in ({}, {'escalation_sink': None}):
-            _, payload = await self._refuse(policy, **kwargs)
+            _, payload = await _refuse_unrepairable_reuse_item(policy, **kwargs)
             hint = payload['hint']
             assert 'UNREPAIRABLE' in hint
             assert 'no repair was attempted' in hint
@@ -1822,8 +1876,8 @@ class TestTheHintNeverOverclaimsPreservation:
     async def test_the_two_variants_are_genuinely_different(self):
         """A copy-paste that left both branches identical would otherwise pass
         every substring check above."""
-        _, preserved = await self._refuse(RepairPolicy.FORWARD_REPAIR)
-        _, unpreserved = await self._refuse(
+        _, preserved = await _refuse_unrepairable_reuse_item(RepairPolicy.FORWARD_REPAIR)
+        _, unpreserved = await _refuse_unrepairable_reuse_item(
             RepairPolicy.FORWARD_REPAIR, escalation_sink=None
         )
 
@@ -1833,6 +1887,73 @@ class TestTheHintNeverOverclaimsPreservation:
 def _raises_for_test(record: dict[str, Any]) -> str:
     """A sink that fails, as a module-level name so it is reusable in a table."""
     raise RuntimeError('queue unavailable')
+
+
+#: What a spooling sink hands back: an absolute file path, typed apart from an
+#: escalation id.
+SPOOL_PATH = '/var/lib/fused-memory/markup_residue/20261022T000000.000000Z-abcd1234.json'
+
+
+def _spooling_sink(record: dict[str, Any]) -> SpooledResidue:
+    """A sink whose last tier is a FILE, as fused-memory's floor is."""
+    return SpooledResidue(SPOOL_PATH)
+
+
+class TestASpooledResidueIsNotAnEscalation:
+    """A sink answers a residue with a ``str`` escalation id or a
+    :class:`SpooledResidue` (task 4809).
+
+    ``get_escalation`` cannot find a file, so a spooled residue is named under
+    ``residue_spool_path`` and ``escalation_id`` stays null. The hint is chosen
+    by which of the two held the payload, or neither.
+    """
+
+    @BOTH_POLICIES
+    async def test_the_refusal_names_the_file_apart_from_any_escalation(self, policy):
+        _, payload = await _refuse_unrepairable_reuse_item(
+            policy, escalation_sink=_spooling_sink
+        )
+
+        assert payload['escalation_id'] is None
+        assert payload['residue_spool_path'] == SPOOL_PATH
+
+    @BOTH_POLICIES
+    async def test_an_escalation_id_carries_no_spool_field(self, policy):
+        _, payload = await _refuse_unrepairable_reuse_item(policy)
+
+        assert payload['escalation_id'] == ESCALATION_ID
+        assert 'residue_spool_path' not in payload
+
+    @BOTH_POLICIES
+    async def test_each_holder_selects_its_own_hint(self, policy):
+        _, escalated = await _refuse_unrepairable_reuse_item(policy)
+        _, spooled = await _refuse_unrepairable_reuse_item(
+            policy, escalation_sink=_spooling_sink
+        )
+        _, unpreserved = await _refuse_unrepairable_reuse_item(policy, escalation_sink=None)
+
+        hints = {escalated['hint'], spooled['hint'], unpreserved['hint']}
+        assert len(hints) == 3
+        assert 'residue_spool_path' in spooled['hint']
+        assert 'residue_spool_path' not in escalated['hint']
+
+    async def test_a_dropped_slice_the_sink_spooled_is_named_by_its_path(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR, escalation_sink=_spooling_sink)
+
+        result = await h.call(
+            'escalate_info_typed',
+            {
+                **_COERCION_REQUIRED_ARGS,
+                'detail': _detail_that_swallowed(
+                    'Ill-formed.', 'evidence', '[{"observation": "the tail was cut off'
+                ),
+            },
+        )
+
+        markup_repair = meta_of(result)['markup_repair']
+        assert markup_repair['unrecovered_residue_id'] is None
+        assert markup_repair['unrecovered_residue_spool_path'] == SPOOL_PATH
+
 
 class TestB8RecoveredNameOutsideTheToolSchema:
     """A tail that parses CLEANLY but names a parameter the tool does not have.
@@ -2688,15 +2809,15 @@ class TestB10StormEscape:
         clock = _Clock()
         h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
 
-        with caplog.at_level('ERROR', logger='shared.mcp_markup_middleware'):
+        # Logger-agnostic: the line is the contract, not which module emits it.
+        with caplog.at_level('ERROR'):
             for _ in range(3):
                 await self._repair(h)
                 clock.advance(60)
 
         storm_lines = [
             r.getMessage() for r in caplog.records
-            if r.name == 'shared.mcp_markup_middleware'
-            and r.levelname == 'ERROR'
+            if r.levelname == 'ERROR'
             and r.getMessage().startswith('markup_guard_storm')
         ]
         assert storm_lines, (
@@ -2710,6 +2831,10 @@ class TestB10StormEscape:
         for line in storm_lines:
             assert 'toolcall-markup-containment-prd.md' in line, (
                 f'must name the live owner, not the closed predecessor: {line!r}'
+            )
+            assert MARKUP_RECURRENCE_ROUTING in line, (
+                f'the storm line must carry the ONE shared routing sentence, '
+                f'not a local copy: {line!r}'
             )
 
     # -- the rate limit, and the window ------------------------------------
@@ -2913,12 +3038,14 @@ class TestB10StormEscape:
         )
 
         for _ in range(6):
-            await h.call('scan_memory_content', {'needle': _closer('content')})
+            await h.call(
+                'scan_memory_content', {'needle': _closer('content') + INVOKE_CLOSER}
+            )
             await h.call(
                 'submit_task',
                 {
                     'title': 't',
-                    'description': 'quoting ' + _closer('content'),
+                    'description': 'quoting ' + _closer('content') + INVOKE_CLOSER,
                     'metadata': {'allow_mcp_markup': True},
                 },
             )
@@ -3026,6 +3153,26 @@ class TestTheStormNamesItsCrossingCaller:
         assert storm['crossing_subject_agent_role'] == 'implementer-4805'
 
     # -- (b) the identity axis, and the old keys are UNCHANGED --------------
+
+    async def test_the_error_line_names_the_crossing_call_in_the_record_vocabulary(
+        self, caplog
+    ):
+        """One vocabulary for the line and the record: an operator holding an
+        escalation record greps a key name off it and finds the line."""
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        with caplog.at_level('ERROR'):
+            for _ in range(3):
+                await self._typed_repair(h)
+                clock.advance(60)
+
+        [line] = [
+            r.getMessage() for r in caplog.records
+            if r.levelname == 'ERROR' and r.getMessage().startswith('markup_guard_storm')
+        ]
+        assert "crossing_subject_task_id='4805'" in line
+        assert "crossing_subject_agent_role='implementer-4805'" in line
 
     async def test_the_storm_names_the_crossing_call_agent_id(self):
         clock = _Clock()
@@ -3271,6 +3418,51 @@ class TestTheStormNamesItsCrossingCaller:
         assert storm['callers'] and all(blob not in c for c in storm['callers'])
         # The unbounded value reaches NOTHING on the record.
         assert blob not in repr(storm)
+
+
+class TestTheStormEscapeIsTheSharedCollaborator:
+    """INV-5: the guard counts bursts through the ONE shared storm escape.
+
+    ``storm_escape`` is also the supported seam for tuning a REGISTERED guard,
+    which its own registration site constructs out of a test's reach.
+    """
+
+    @staticmethod
+    def _guard(h) -> MarkupGuardMiddleware:
+        return next(m for m in h.mcp.middleware if isinstance(m, MarkupGuardMiddleware))
+
+    def test_the_guard_composes_the_shared_boundary_storm_escape(self):
+        guard = self._guard(build_harness(RepairPolicy.FORWARD_REPAIR))
+
+        assert isinstance(guard.storm_escape, BoundaryStormEscape)
+        assert guard.storm_escape.names_callers is True
+
+    def test_the_collaborator_cannot_be_rebound(self):
+        guard = self._guard(build_harness(RepairPolicy.FORWARD_REPAIR))
+
+        replacement = BoundaryStormEscape(owner='other', error_type='e', log_event='l')
+
+        with pytest.raises(AttributeError):
+            guard.storm_escape = replacement  # pyright: ignore[reportAttributeAccessIssue]
+
+    async def test_a_registered_guard_is_tuned_live_through_the_escape(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        clock = _Clock()
+        guard = self._guard(h)
+        guard.storm_escape.threshold = 2
+        guard.storm_escape.time_provider = clock
+
+        for _ in range(2):
+            await TestB10StormEscape()._repair(h)
+        storms = TestB10StormEscape._storms(h)
+        assert [storm['count'] for storm in storms] == [2]
+
+        clock.advance(7200)
+        for _ in range(2):
+            await TestB10StormEscape()._repair(h)
+        assert len(TestB10StormEscape._storms(h)) == 2, (
+            'the swapped clock drained the window and the rate limit'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3656,7 +3848,7 @@ class TestB14OrderingDependsOnStrictInputValidationBeingOff:
 class TestSelfNameCloserIsSeenAtTheBoundary:
     """The dominant real leak dialect, pinned at the LIVE WRITE BOUNDARY.
 
-    ``_first_markup_argument`` asked the param-free ``detect``, whose fixed
+    The boundary scan (``_markup_arguments`` today) asked the param-free ``detect``, whose fixed
     six-literal union echoes NONE of the invoked tool's own parameter names.
     So a value mis-closed with its OWN name-echoing tag — and carrying no
     invoke closer and no parameter-open token to give it away — matched

@@ -1,0 +1,30 @@
+{
+  "task_id": "6273",
+  "reason": "Net-additive bug fix: worker.py::SpeculativeMergeWorker._finalize_inflight records a rebase-landed head's pre-rebase merge commit as a dead base via _record_dead_base (one call plus its comment/docstring site-list edit), cutting the dead-base gate re-verify cascade (task 6279: DF 14 d before 6647 deployed, 93 gate re-verifies, 30 dead-base cascades ~15.7 h, 11 ~5.5 h remaining after 7248). Not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22530,
+      "current": 22532
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12582,
+      "current": 12583
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58037,
+      "current": 58039
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31782,
+      "current": 31783
+    }
+  ]
+}

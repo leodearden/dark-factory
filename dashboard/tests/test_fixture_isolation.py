@@ -26,7 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from _dashboard_helpers import apply_isolated_env
+from _dashboard_helpers import apply_isolated_env, enable_samplers
 from starlette.testclient import TestClient
 
 # tests/ -> dashboard/ -> repo root
@@ -101,6 +101,13 @@ def _assert_lifespan_config_is_isolated(basetemp: Path) -> None:
     assert all(r.is_relative_to(basetemp.resolve()) for r in cfg.known_project_roots), (
         f'known_project_roots escapes pytest basetemp {basetemp}: '
         f'{cfg.known_project_roots}'
+    )
+
+    assert cfg.samplers_enabled is False, (
+        'this lifespan starts _burndown_loop/_metrics_loop, whose root discovery '
+        '(dashboard/src/dashboard/data/orchestrator.py::find_running_orchestrators) '
+        'ps-scans the real host. The suite default lives in '
+        'dashboard/tests/_dashboard_helpers.py::apply_isolated_env'
     )
 
 
@@ -377,3 +384,48 @@ class TestApplyIsolatedEnvNeutralizesAmbientFusedMemoryUrls:
             f'{client.app.state.config.fused_memory_urls} — the suite is fanning '
             f'out somewhere other than the measured-dead endpoint'
         )
+
+
+class TestEveryLifespanRunsWithoutSamplers:
+    """The burndown/metrics samplers discover roots by a ``ps aux`` scan.
+
+    That scan (dashboard/src/dashboard/data/orchestrator.py::find_running_orchestrators)
+    reaches the operator's real roots and no env var can isolate it, so
+    ``apply_isolated_env`` turns the samplers off for every lifespan in the
+    suite.  ``enable_samplers`` opts a test back in; test_lifespan_samplers.py
+    states ``DASHBOARD_SAMPLERS`` itself, because the switch is its subject.
+    """
+
+    def test_client_fixture_lifespan_has_samplers_off(self, client):
+        assert client.app.state.config.samplers_enabled is False
+
+    def test_two_url_client_fixture_lifespan_has_samplers_off(self, two_url_client):
+        assert two_url_client.app.state.config.samplers_enabled is False
+
+    def test_neither_an_ambient_on_nor_an_absent_value_survives(self, tmp_path):
+        from dashboard.config import DashboardConfig
+
+        ambient_states = {
+            'on': lambda mp: mp.setenv('DASHBOARD_SAMPLERS', 'on'),
+            'absent': lambda mp: mp.delenv('DASHBOARD_SAMPLERS', raising=False),
+        }
+
+        for label, make_ambient in ambient_states.items():
+            with pytest.MonkeyPatch.context() as mp:
+                make_ambient(mp)
+
+                apply_isolated_env(mp, tmp_path / 'isolated')
+
+                assert DashboardConfig.from_env().samplers_enabled is False, (
+                    f'[{label}] apply_isolated_env must SET DASHBOARD_SAMPLERS '
+                    f'off: unset means the product default, on'
+                )
+
+    def test_enable_samplers_opts_one_test_back_in(self, tmp_path):
+        from dashboard.config import DashboardConfig
+
+        with pytest.MonkeyPatch.context() as mp:
+            apply_isolated_env(mp, tmp_path / 'isolated')
+            enable_samplers(mp)
+
+            assert DashboardConfig.from_env().samplers_enabled is True

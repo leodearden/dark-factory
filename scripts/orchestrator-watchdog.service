@@ -6,6 +6,9 @@ Type=oneshot
 # Own-unit self-identification: harmless here (this oneshot never runs a
 # DeterministicRunner), kept for uniformity with the other orchestrator units.
 Environment=ORCH_UNIT=orchestrator-watchdog.service
+# Staleness-redeploy throttle: 24h, not the script's 8h default (Leo, ruling R9,
+# 2026-09-11; task 5020): runs of 10h or more deliver 1.7-2.2x more done per hour.
+Environment=ORCH_RESTART_MIN_INTERVAL_SECS=86400
 # Promoted from /home/leo/bin/orchestrator-watchdog.sh to the repo-tracked
 # Python implementation 2026-05-28: ss-based probe, startup-grace window,
 # is_unit_enabled skip, tested in tests/scripts/test_orchestrator_watchdog.py.

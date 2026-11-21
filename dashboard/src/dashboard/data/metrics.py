@@ -5,11 +5,11 @@ store sizes, write queue depth, reconciliation state, live merge-queue
 depth) into a dedicated SQLite database so they can be rendered as time
 series even though the underlying sources are point-in-time only.
 
-Sampling cadence and downsampling rules match
-``dashboard/data/burndown.py`` so both files retain at most 90 days of
-history (10-minute raw, hourly after 7 days). The collector runs on a
-sibling lifespan task in ``app.py``; route handlers read via the shared
-``DbPool`` (read-only).
+Sampling cadence matches ``dashboard/data/burndown.py`` (10-minute raw
+rows); both databases share one retention policy,
+dashboard/src/dashboard/data/retention.py::apply_retention (hourly after 7
+days, nothing after 90). The collector runs on a sibling lifespan task in
+``app.py``; route handlers read via the shared ``DbPool`` (read-only).
 """
 
 from __future__ import annotations
@@ -34,9 +34,9 @@ from dashboard.data.mcp_fanout import (
     describe_exc,
     fanout_label,
     first_success,
-    project_label,
 )
 from dashboard.data.memory import (
+    enclosing_deadline,
     get_curator_state,
     get_memory_status,
     get_queue_stats,
@@ -49,6 +49,7 @@ from dashboard.data.orchestrator import (
     find_running_orchestrators,
 )
 from dashboard.data.reconciliation import get_buffer_stats, get_burst_state, partition_burst_state
+from dashboard.data.retention import apply_retention
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now, safe_gather_result
 
@@ -57,7 +58,8 @@ logger = logging.getLogger(__name__)
 # 5s ceiling on any individual fused-memory HTTP call so a hung MCP cannot
 # extend the 10-minute sampling cycle.  Note: this is per-(root, url) call,
 # not per-loop — worst-case latency for the pending-count accumulation loop
-# scales as N_roots × M_urls × 5s if all URLs hang for every root.
+# scales as N_roots × M_urls × enclosing_deadline(5s) if all URLs hang for
+# every root.
 _HTTP_SAMPLER_TIMEOUT_SECONDS = 5.0
 # Default per-(root, url) page size for list_tickets; saturation triggers a WARNING.
 _LIST_TICKETS_LIMIT = 2000
@@ -98,13 +100,9 @@ async def fan_out_list_tickets(
     # Resolve limit at call time so monkeypatching _LIST_TICKETS_LIMIT in tests
     # takes effect without needing to pass an explicit kwarg.
     effective_limit = limit if limit is not None else _LIST_TICKETS_LIMIT
-    seen_roots: set[str] = set()
-    all_roots: list[str] = []
-    for root in [config.project_root, *config.known_project_roots]:
-        key = str(root)
-        if key not in seen_roots:
-            seen_roots.add(key)
-            all_roots.append(key)
+    per_url_deadline = enclosing_deadline(timeout)
+    all_roots = [str(root) for root in config.all_project_roots]
+    labels = config.project_labels
 
     async def _fan_out_one_root(root_str: str) -> tuple[int, list[dict]]:
         """Query list_tickets for *root_str* across all configured URLs.
@@ -127,12 +125,11 @@ async def fan_out_list_tickets(
                         # Per-HTTP-request budget: bounds connect/read/write AND
                         # pool acquisition on the shared client, which otherwise
                         # ran to mcp_tool_call's 10s default regardless of the
-                        # sampler's own deadline. The enclosing wait_for stays —
-                        # a cold session is three posts, so this layer alone
-                        # would permit roughly 3x timeout.
+                        # sampler's own deadline. The enclosing wait_for stays,
+                        # at a larger bound — see memory.py::enclosing_deadline.
                         timeout=timeout,
                     ),
-                    timeout=timeout,
+                    timeout=per_url_deadline,
                 )
                 count = result.get('count', 0) or 0
                 if count >= effective_limit:
@@ -162,7 +159,7 @@ async def fan_out_list_tickets(
                 # prefix is correct rather than doubled. The two branches
                 # below DO pre-render, hence PreformattedFanoutError there.
                 raise ValueError(
-                    f'timed out after {timeout:.1f}s (project_root={root_str})'
+                    f'timed out after {per_url_deadline:.1f}s (project_root={root_str})'
                 ) from None
             except (httpx.HTTPError, ValueError) as exc:
                 # DEBUG (not WARNING) and exc_info: this is the traceback
@@ -200,7 +197,7 @@ async def fan_out_list_tickets(
         return await first_success(
             config.fused_memory_urls,
             _call,
-            log_label=fanout_label('list_tickets', root_str),
+            log_label=fanout_label('list_tickets', root_str, labels),
             offline_result=lambda errs: (0, []),
         )
 
@@ -238,6 +235,7 @@ CREATE TABLE IF NOT EXISTS memory_snapshots (
     mem0_memories   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_mem_snap_pid_ts ON memory_snapshots(project_id, ts);
+CREATE INDEX IF NOT EXISTS idx_mem_snap_ts ON memory_snapshots(ts);
 
 CREATE TABLE IF NOT EXISTS queue_snapshots (
     ts      TEXT PRIMARY KEY,
@@ -379,7 +377,7 @@ async def _sample_curator(
 
     Args:
         http_client: Shared AsyncClient for MCP HTTP calls.
-        config: Dashboard configuration (fused_memory_urls, known_project_roots).
+        config: Dashboard configuration (fused_memory_urls, all_project_roots).
         tickets_db: Read-only aiosqlite connection to tickets.db. If None,
             ticket latency fields are all None and only pending/capped are set.
         runs_dbs: Per-project runs.db connections for cap-event lookup.
@@ -580,7 +578,7 @@ async def collect_metrics_snapshot(
             get_memory_status(
                 http_client, config, timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
             ),
-            timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+            timeout=enclosing_deadline(_HTTP_SAMPLER_TIMEOUT_SECONDS),
         )
         pairs, _queue_inline = _split_status(status)
         for pid, payload in pairs:
@@ -605,7 +603,7 @@ async def collect_metrics_snapshot(
             get_queue_stats(
                 http_client, config, timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
             ),
-            timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+            timeout=enclosing_deadline(_HTTP_SAMPLER_TIMEOUT_SECONDS),
         )
         pending, retry, dead = _split_queue_stats(qstats)
         await conn.execute(
@@ -640,8 +638,9 @@ async def collect_metrics_snapshot(
     # dashboard-one-datum-one-path, decisions 5 and 11).
     try:
         live_map = await fetch_live_merge_queues(http_client, config.escalation_urls)
+        labels = config.project_labels
         for pid, _db in merge_dbs:
-            live = live_map.get(project_label(pid))
+            live = live_map.get(labels.of(pid))
             if live is None or not live.get('reachable'):
                 logger.debug(
                     'merge sampler: no live queue reading for %s: %s',
@@ -697,57 +696,34 @@ async def collect_metrics_snapshot(
 
 
 # ---------------------------------------------------------------------------
-# Downsampling — same policy as burndown (raw 10min, hourly after 7d, drop 90d).
+# Downsampling — dashboard/src/dashboard/data/retention.py::apply_retention.
 # ---------------------------------------------------------------------------
 
 
-_DOWNSAMPLE_TABLES = (
-    ('orchestrator_snapshots', 'project_id'),
-    ('memory_snapshots', 'project_id'),
-    ('queue_snapshots', None),
-    ('recon_snapshots', None),
-    ('merge_snapshots', 'project_id'),
-    ('curator_snapshots', None),
-    ('curator_refusal_snapshots', None),
+_DOWNSAMPLE_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ('orchestrator_snapshots', ('project_id',)),
+    ('memory_snapshots', ('project_id',)),
+    ('queue_snapshots', ()),
+    ('recon_snapshots', ()),
+    ('merge_snapshots', ('project_id',)),
+    ('curator_snapshots', ()),
+    ('curator_refusal_snapshots', ()),
 )
 
 
-async def downsample_metrics(conn: aiosqlite.Connection) -> None:
-    """Compact old metrics rows: hourly after 7 days, drop after 90 days.
+async def downsample_metrics(
+    conn: aiosqlite.Connection, *, now: datetime | None = None,
+) -> None:
+    """Compact old metrics rows in one transaction.
 
-    For per-project tables, partition key is (project_id, hour); for
-    system-wide tables, partition key is just hour.
+    Rows older than 7 days keep one row per (project_id, hour) in per-project
+    tables and one per hour in system-wide ones; rows older than 90 days are
+    dropped. The policy lives in
+    dashboard/src/dashboard/data/retention.py::apply_retention.
     """
-    now = datetime.now(UTC)  # clock-exempt: single-capture retention cutoff
-    cutoff_7d = (now - timedelta(days=7)).isoformat()
-    cutoff_90d = (now - timedelta(days=90)).isoformat()
-
-    for table, pid_col in _DOWNSAMPLE_TABLES:
-        rowid_col = 'id' if pid_col is not None else 'rowid'
-        partition = (
-            f"{pid_col}, strftime('%%Y-%%m-%%dT%%H', ts)"
-            if pid_col is not None
-            else "strftime('%%Y-%%m-%%dT%%H', ts)"
-        )
-        await conn.execute(
-            f"""
-            DELETE FROM {table}
-            WHERE ts < ?
-              AND {rowid_col} NOT IN (
-                  SELECT {rowid_col} FROM (
-                      SELECT {rowid_col}, ROW_NUMBER() OVER (
-                          PARTITION BY {partition}
-                          ORDER BY ts DESC
-                      ) AS rn
-                      FROM {table}
-                      WHERE ts < ?
-                  )
-                  WHERE rn = 1
-              )
-            """,
-            (cutoff_7d, cutoff_7d),
-        )
-        await conn.execute(f'DELETE FROM {table} WHERE ts < ?', (cutoff_90d,))
+    now = resolve_now(now)
+    for table, partition_by in _DOWNSAMPLE_TABLES:
+        await apply_retention(conn, table, now=now, partition_by=partition_by)
     await conn.commit()
 
 
@@ -847,10 +823,13 @@ async def get_memory_24h_ago(
     but only if it falls within ±2 hours of the target. Projects whose
     only available rows are far from the 24h mark are absent from the
     result so the UI renders ``—`` rather than a misleading zero delta.
+    The read is bounded to that tolerance window, so its cost does not
+    grow with table history.
     """
     if db is None:
         return {}
-    target = (resolve_now(now) - timedelta(hours=24)).isoformat()
+    target = (resolve_now(now) - timedelta(hours=24)).astimezone(UTC)
+    margin = timedelta(seconds=_24H_TOLERANCE_SECONDS + 1)
     try:
         async with db.execute(
             """
@@ -862,9 +841,16 @@ async def get_memory_24h_ago(
                            ORDER BY ABS(strftime('%s', ts) - strftime('%s', ?)) ASC
                        ) AS rn
                 FROM memory_snapshots
+                WHERE ts >= ? AND ts <= ?
             ) WHERE rn = 1 AND d <= ?
             """,
-            (target, target, _24H_TOLERANCE_SECONDS),
+            (
+                target.isoformat(),
+                target.isoformat(),
+                (target - margin).isoformat(),
+                (target + margin).isoformat(),
+                _24H_TOLERANCE_SECONDS,
+            ),
         ) as cur:
             rows = await cur.fetchall()
     except Exception:

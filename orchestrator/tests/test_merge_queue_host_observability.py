@@ -27,29 +27,41 @@ Steps covered:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json as _json
 import logging
 import sqlite3
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _gate_fixtures import TEST_DEPLOYED_SHA
+from _merge_lane_fakes import lane_scene_config
+from escalation.queue import EscalationQueue
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventStore
-from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.merge_lane.types import (
+    InflightStatus,
+    LandingCandidate,
+    PendingGate,
+    QueuedBranch,
+    RealMergeItem,
+    RecoveryEvidence,
+)
+from orchestrator.merge_lane.worker import (
     DecidedItem,
     InflightEntry,
     ItemLifecycleState,
     MergeOutcome,
     MergeRequest,
     SpeculativeMergeWorker,
-    _HostUnavailability,
 )
-from orchestrator.merge_types import QueuedBranch
-from orchestrator.verify_runner import HostAllocator, HostLease
+from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
 # ── fixtures (ported verbatim from test_merge_queue_finalize_head_visibility) ──
 
@@ -89,7 +101,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── shared helpers ────────────────────────────────────────────────────────────
@@ -128,11 +140,13 @@ def _make_entry(
     req: MergeRequest,
     lease: HostLease | None,
     started_at: float | None = None,
+    *,
+    verify_task: asyncio.Task[Any] | None = None,
 ) -> InflightEntry:
     return InflightEntry(
         item=_make_item(req),
         lease=lease,
-        verify_task=None,
+        verify_task=verify_task,
         merge_wt=None,
         was_speculative=False,
         started_at=started_at,
@@ -159,6 +173,7 @@ def _make_mock_allocator(host_names: list[str]) -> MagicMock:
 _HOST_KEYS = {
     'name', 'is_local', 'slot_state', 'quarantined', 'quarantine_class',
     'unavailable_since', 'unavailable_secs', 'streak', 'reason',
+    'kind', 'sticky', 'identity', 'task_held_by',
 }
 
 
@@ -170,6 +185,7 @@ class _FakeRemoteRunner:
     def __init__(self, name: str, *, healthy: bool = True) -> None:
         self.name = name
         self.health = AsyncMock(return_value=healthy)
+        self.reap_idle_gates = AsyncMock()
 
 
 class _FakeRemoteRunnerCancelFails(_FakeRemoteRunner):
@@ -195,13 +211,13 @@ class _FakeEscalationQueue:
         self.submitted: list = []
         self._seq = 0
 
-    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
+    def has_open_l1(self, task_id: str) -> bool:
         return False
 
-    def get_by_task(self, task_id: str, status: str | None = None, level: int | None = None) -> list:  # noqa: ARG002
+    def get_by_task(self, task_id: str, status: str | None = None, level: int | None = None) -> list:
         return []
 
-    def make_id(self, task_id: str) -> str:  # noqa: ARG002
+    def make_id(self, task_id: str) -> str:
         self._seq += 1
         return f'esc-{self._seq}'
 
@@ -213,9 +229,9 @@ def _real_worker(
     git_ops: GitOps,
     *,
     remotes: list[str] | None = None,
-    escalation_queue: _FakeEscalationQueue | None = None,
+    escalation_queue: _FakeEscalationQueue | EscalationQueue | None = None,
 ):
-    """Bare worker + a REAL HostAllocator sharing worker._runner_quarantine.
+    """Bare worker + a REAL HostAllocator sharing its HostQuarantine's set.
 
     Deliberately NOT a MagicMock: slot state and quarantine membership must be
     genuine for these tests to mean anything.
@@ -223,7 +239,7 @@ def _real_worker(
     q: asyncio.Queue[MergeRequest] = asyncio.Queue()
     worker = SpeculativeMergeWorker(git_ops, q, escalation_queue=escalation_queue)
     runners = [_FakeRemoteRunner(n) for n in (remotes if remotes is not None else ['laptop'])]
-    alloc = HostAllocator(runners, quarantine=worker._runner_quarantine)
+    alloc = worker._host_quarantine.allocator_over(runners)
     worker._host_allocator = alloc
     return worker, alloc, {r.name: r for r in runners}
 
@@ -248,12 +264,19 @@ def _seed_ru(
     first_unavailable_at: float = 1000.0,
     reason: str = 'ssh: connect timed out',
 ) -> None:
-    """Seed the RunnerUnavailable streak tracker directly."""
-    worker._runner_unavailable[host] = _HostUnavailability(
-        streak=streak,
-        first_unavailable_at=first_unavailable_at,
-        reason=reason,
-    )
+    """Bench *host* *streak* times at *first_unavailable_at*: one episode of that streak."""
+    quarantine = worker._host_quarantine
+    for _ in range(streak):
+        quarantine.quarantine_unreachable(host, reason, first_unavailable_at)
+
+
+def _adopt_alarm_thresholds(worker, git_ops: GitOps, *, after_n: int, after_secs: float) -> None:
+    """Hand *worker* the bench-alarm thresholds an operator config would."""
+    worker._host_quarantine.adopt_config(OrchestratorConfig(
+        project_root=Path(git_ops.project_root),
+        verify_host_unreachable_escalate_after_n=after_n,
+        verify_host_unreachable_escalate_after_secs=after_secs,
+    ))
 
 
 def _by_name(snap: dict) -> dict:
@@ -267,11 +290,12 @@ def _by_name(snap: dict) -> dict:
 class TestSnapshotHostsBlock:
     """snapshot()['hosts']: per-host slot state + quarantine class.
 
-    Resolves the four-way ambiguity behind a `verifying 1/2 hosts` line:
+    Resolves the five-way ambiguity behind a `verifying 1/2 hosts` line:
       (a) RU-quarantined            → quarantine_class == 'ru'
       (b) divergence-quarantined    → quarantine_class == 'divergence'
       (c) leaked slot               → slot_state busy/parked, no occupant
       (d) free and never asked for  → slot_state == 'free', quarantined False
+      (e) skew-quarantined          → quarantine_class == 'skew' (task 6565)
 
     RED until 3275/step-4 adds the key (KeyError before that).
     """
@@ -322,6 +346,27 @@ class TestSnapshotHostsBlock:
         assert laptop['streak'] == 4
         assert laptop['reason'] == 'ssh: connect timed out'
 
+    async def test_case_e_skew_quarantined_shows_kind_and_both_identities(
+        self, git_ops: GitOps,
+    ) -> None:
+        """(e) A gate-skew bench → class 'skew' with its kind, sticky flag and identity pair."""
+        from orchestrator.remote_gate import GateIdentity, GateIdentityPair
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        worker, _alloc, _ = _real_worker(git_ops)
+        pair = GateIdentityPair(GateIdentity('1' * 40, 'a' * 64), GateIdentity('2' * 40, 'a' * 64))
+        worker.bench_unavailable_runner(
+            'laptop', RunnerUnavailable('handshake mismatch', kind='wire_shape', identity=pair),
+        )
+
+        laptop = _by_name(worker.snapshot())['laptop']
+
+        assert laptop['quarantined'] is True
+        assert laptop['quarantine_class'] == 'skew'
+        assert (laptop['kind'], laptop['sticky']) == ('wire_shape', False)
+        assert laptop['identity'] == pair.to_wire()
+        assert laptop['reason'] == 'handshake mismatch'
+
     async def test_case_b_divergence_quarantined(self, git_ops: GitOps) -> None:
         """(b) Quarantined but NOT RU-tracked → class 'divergence', RU fields None.
 
@@ -346,6 +391,7 @@ class TestSnapshotHostsBlock:
         worker, alloc, _ = _real_worker(git_ops)
         _seed_ru(worker, 'laptop', streak=2, first_unavailable_at=555.0,
                  reason='ssh: connection reset')
+        alloc.clear_quarantine('laptop')  # lifted from the set, the episode still open
         assert not any(alloc.is_quarantined(h) for h in alloc.host_names), (
             'nothing quarantined yet, on ANY managed host'
         )
@@ -426,8 +472,7 @@ class TestSnapshotHostsBlock:
         worker, alloc, runners = _real_worker(
             git_ops, escalation_queue=_FakeEscalationQueue(),
         )
-        worker._unreachable_escalate_after_secs = 5.0
-        worker._unreachable_escalate_after_n = 3
+        _adopt_alarm_thresholds(worker, git_ops, after_n=3, after_secs=5.0)
 
         now = 2000.0
         lease = alloc.acquire_remote()
@@ -444,7 +489,7 @@ class TestSnapshotHostsBlock:
 
         # Host comes back: health() → True.
         runners['laptop'].health = AsyncMock(return_value=True)
-        await worker._reprobe_quarantined_hosts(now)
+        await worker._host_quarantine.sweep(now)
 
         after = _by_name(worker.snapshot())['laptop']
         assert after['quarantined'] is False
@@ -486,7 +531,7 @@ class TestSnapshotHostsBlock:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
         runner = _FakeRemoteRunnerCancelFails('laptop')
-        alloc = HostAllocator([runner], quarantine=worker._runner_quarantine)
+        alloc = worker._host_quarantine.allocator_over([runner])
         worker._host_allocator = alloc
 
         lease = alloc.acquire_remote()
@@ -566,6 +611,7 @@ class TestSnapshotHostsBlock:
         assert _by_name(worker.snapshot())['local']['unavailable_secs'] is None
 
         # Clock stepped backwards (or a future-stamped entry): clamped, never negative.
+        worker._host_quarantine.readmit_host('laptop', now=time.time(), evidence=RecoveryEvidence.SSH_HEALTH_PROBE)
         _seed_ru(worker, 'laptop', streak=2, first_unavailable_at=time.time() + 3600.0)
         assert _by_name(worker.snapshot())['laptop']['unavailable_secs'] == 0.0
 
@@ -705,23 +751,71 @@ class TestSnapshotOccupancyLossless:
 _HEARTBEAT_INTERVAL_S = 1.0
 
 
-def _read_heartbeat_hosts(db_path: Path):
-    """Read the persisted merge_heartbeat event's `hosts` key back out of sqlite."""
+def _read_heartbeat_key(db_path: Path, key: str):
+    """Read the persisted merge_heartbeat events' *key* back out of sqlite."""
     conn = sqlite3.connect(str(db_path))
     try:
         rows = conn.execute(
-            "SELECT json_extract(data, '$.hosts') "
-            "FROM events WHERE event_type = 'merge_heartbeat' ORDER BY rowid"
+            "SELECT json_extract(data, ?) "
+            "FROM events WHERE event_type = 'merge_heartbeat' ORDER BY rowid",
+            (f'$.{key}',),
         ).fetchall()
     finally:
         conn.close()
     return rows
 
 
+def _read_heartbeat_hosts(db_path: Path):
+    """Read the persisted merge_heartbeat event's `hosts` key back out of sqlite."""
+    return _read_heartbeat_key(db_path, 'hosts')
+
+
 def _hb_message(caplog) -> str:
     records = [r for r in caplog.records if 'heartbeat' in r.message.lower()]
     assert records, f'Expected a heartbeat log; got: {[r.message for r in caplog.records]}'
     return records[-1].message
+
+
+# The task-5290 tests reach the worker's in-flight deque, heartbeat and reprobe
+# sweep only through these three.
+
+
+def _seat(worker: SpeculativeMergeWorker, *entries: InflightEntry) -> None:
+    """Put *entries* in flight on *worker*, head first."""
+    worker._inflight.extend(entries)
+
+
+def _logged_heartbeat(worker: SpeculativeMergeWorker, caplog) -> str:
+    """Fire *worker*'s heartbeat now and return the line it logged."""
+    with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
+        assert worker._maybe_log_queue_heartbeat(time.time()) is True
+    return _hb_message(caplog)
+
+
+async def _reprobe(worker: SpeculativeMergeWorker) -> None:
+    """Run one reprobe sweep of *worker*'s benched hosts now."""
+    await worker._host_quarantine.sweep(time.time())
+
+
+def _worker_with_events(
+    git_ops: GitOps,
+    tmp_path: Path,
+    name: str = 'deg',
+    *,
+    queue: asyncio.Queue[MergeRequest] | None = None,
+    escalation_queue: _FakeEscalationQueue | None = None,
+):
+    """A worker persisting events to sqlite, managing local + a fake 'laptop'."""
+    event_store = EventStore(db_path=tmp_path / f'{name}.db', run_id=f'{name}-test')
+    q = queue if queue is not None else asyncio.Queue()
+    worker = SpeculativeMergeWorker(
+        git_ops, q, event_store=event_store, escalation_queue=escalation_queue,
+    )
+    worker._heartbeat_interval_s = _HEARTBEAT_INTERVAL_S
+    runners = [_FakeRemoteRunner('laptop')]
+    alloc = worker._host_quarantine.allocator_over(runners)
+    worker._host_allocator = alloc
+    return worker, alloc, runners[0], tmp_path / f'{name}.db'
 
 
 @pytest.mark.asyncio
@@ -736,26 +830,6 @@ class TestHeartbeatDegradation:
     RED until 3275/step-8 adds the segment.
     """
 
-    def _worker_with_events(
-        self,
-        git_ops: GitOps,
-        tmp_path: Path,
-        name: str = 'deg',
-        *,
-        queue: asyncio.Queue[MergeRequest] | None = None,
-        escalation_queue: _FakeEscalationQueue | None = None,
-    ):
-        event_store = EventStore(db_path=tmp_path / f'{name}.db', run_id=f'{name}-test')
-        q = queue if queue is not None else asyncio.Queue()
-        worker = SpeculativeMergeWorker(
-            git_ops, q, event_store=event_store, escalation_queue=escalation_queue,
-        )
-        worker._heartbeat_interval_s = _HEARTBEAT_INTERVAL_S
-        runners = [_FakeRemoteRunner('laptop')]
-        alloc = HostAllocator(runners, quarantine=worker._runner_quarantine)
-        worker._host_allocator = alloc
-        return worker, alloc, runners[0], tmp_path / f'{name}.db'
-
     def _add_local_inflight(
         self, worker, config: OrchestratorConfig, git_repo: Path, task_id: str = 'hb-local',
     ) -> None:
@@ -767,12 +841,12 @@ class TestHeartbeatDegradation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
     ) -> None:
         """A DEGRADED segment names the host and its quarantine class."""
-        worker, alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path)
+        worker, alloc, _runner, _db = _worker_with_events(git_ops, tmp_path)
         self._add_local_inflight(worker, config, git_repo)
         await _quarantine_remote(alloc, 'laptop')
         _seed_ru(worker, 'laptop')
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -785,12 +859,12 @@ class TestHeartbeatDegradation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
     ) -> None:
         """The degradation segment is APPENDED, not a replacement."""
-        worker, alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg2')
+        worker, alloc, _runner, _db = _worker_with_events(git_ops, tmp_path, 'deg2')
         self._add_local_inflight(worker, config, git_repo)
         await _quarantine_remote(alloc, 'laptop')
         _seed_ru(worker, 'laptop')
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -805,11 +879,11 @@ class TestHeartbeatDegradation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
     ) -> None:
         """No RU tracker entry → the line says 'divergence', not 'ru'."""
-        worker, alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg3')
+        worker, alloc, _runner, _db = _worker_with_events(git_ops, tmp_path, 'deg3')
         self._add_local_inflight(worker, config, git_repo)
         await _quarantine_remote(alloc, 'laptop')
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -820,13 +894,13 @@ class TestHeartbeatDegradation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
     ) -> None:
         """Regression guard: nothing quarantined → no DEGRADED substring at all."""
-        worker, alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg4')
+        worker, alloc, _runner, _db = _worker_with_events(git_ops, tmp_path, 'deg4')
         self._add_local_inflight(worker, config, git_repo)
         assert not any(alloc.is_quarantined(h) for h in alloc.host_names), (
             'nothing quarantined yet, on ANY managed host'
         )
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -845,7 +919,7 @@ class TestHeartbeatDegradation:
         degradation segment must be built independently of that gate.
         """
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker, alloc, _runner, _db = self._worker_with_events(
+        worker, alloc, _runner, _db = _worker_with_events(
             git_ops, tmp_path, 'deg5', queue=queue,
         )
         queue.put_nowait(_make_req('hb-queued', 'task/hb-queued', config, git_repo))
@@ -856,7 +930,7 @@ class TestHeartbeatDegradation:
         assert snap['depth'] > 0
         assert snap['occupancy']['by_host'] == {}, 'precondition: occupancy is silent here'
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
 
         msg = _hb_message(caplog)
@@ -868,7 +942,7 @@ class TestHeartbeatDegradation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
     ) -> None:
         """The log line must not be the only carrier (structured-facts-at-failure)."""
-        worker, alloc, _runner, db_path = self._worker_with_events(git_ops, tmp_path, 'deg6')
+        worker, alloc, _runner, db_path = _worker_with_events(git_ops, tmp_path, 'deg6')
         self._add_local_inflight(worker, config, git_repo)
         await _quarantine_remote(alloc, 'laptop')
         _seed_ru(worker, 'laptop')
@@ -888,11 +962,10 @@ class TestHeartbeatDegradation:
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
     ) -> None:
         """After the host recovers, the next heartbeat is clean again."""
-        worker, alloc, runner, db_path = self._worker_with_events(
+        worker, alloc, runner, db_path = _worker_with_events(
             git_ops, tmp_path, 'deg7', escalation_queue=_FakeEscalationQueue(),
         )
-        worker._unreachable_escalate_after_secs = 5.0
-        worker._unreachable_escalate_after_n = 3
+        _adopt_alarm_thresholds(worker, git_ops, after_n=3, after_secs=5.0)
         self._add_local_inflight(worker, config, git_repo)
 
         now = 3000.0
@@ -901,17 +974,17 @@ class TestHeartbeatDegradation:
         await alloc.quarantine_and_release(lease)
         _seed_ru(worker, 'laptop', first_unavailable_at=now - 60.0)
 
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             assert worker._maybe_log_queue_heartbeat(time.time()) is True
         assert 'DEGRADED' in _hb_message(caplog)
 
         runner.health = AsyncMock(return_value=True)
-        await worker._reprobe_quarantined_hosts(now)
+        await worker._host_quarantine.sweep(now)
 
         caplog.clear()
         # The rate limit is `now - _last_heartbeat_at < _heartbeat_interval_s`,
         # so a `now` past the interval reopens the gate.
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
             later = time.time() + 2 * _HEARTBEAT_INTERVAL_S
             assert worker._maybe_log_queue_heartbeat(later) is True
 
@@ -921,3 +994,372 @@ class TestHeartbeatDegradation:
         hosts = {h['name']: h for h in _json.loads(rows[-1][0])}
         assert hosts['laptop']['quarantined'] is False
         assert hosts['laptop']['quarantine_class'] is None
+
+
+# ── 5290: recovery is a measurement, never an occupancy read ──────────────────
+
+
+@pytest.mark.asyncio
+class TestRecoveryIgnoresOccupancy:
+    """A lease on a benched host is not evidence that it recovered (the 07-24 signal).
+
+    occupancy.by_host reports LEASES; a verify task leased to a host that has
+    since been benched still shows there.  Only the host's probe answer
+    resolves its alarm.
+    """
+
+    async def test_a_lease_on_a_benched_host_leaves_its_alarm_open(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+        worker, _alloc, runners = _real_worker(git_ops, escalation_queue=queue)
+        for _ in range(3):
+            worker.bench_unavailable_runner('laptop', RunnerUnavailable('ssh: connect timed out'))
+        [l1] = [esc for esc in queue.get_pending() if esc.level == 1]
+
+        verify_task = asyncio.create_task(asyncio.Event().wait())
+        lease = HostLease(name='laptop', runner=MagicMock(), is_local=False)
+        req = _make_req('occ-phantom', 'task/occ-phantom', config, git_repo)
+        _seat(worker, _make_entry(req, lease, verify_task=verify_task))
+        try:
+            assert worker.snapshot()['occupancy']['by_host'] == {'laptop': 'occ-phantom'}
+
+            runners['laptop'].health.return_value = False
+            await _reprobe(worker)
+
+            assert [esc.id for esc in queue.get_pending()] == [l1.id]
+            assert queue.get_by_task(l1.task_id, status='resolved') == []
+            assert _by_name(worker.snapshot())['laptop']['quarantined'] is True
+
+            runners['laptop'].health.return_value = True
+            await _reprobe(worker)
+
+            assert queue.get_pending() == []
+            [resolved] = queue.get_by_task(l1.task_id, status='resolved')
+            assert 'ssh_health_probe' in (resolved.resolution or '')
+        finally:
+            verify_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await verify_task
+
+
+class TestUnreachableAlarmNamesTheProbeTarget:
+    """The unreachability L1 names the ssh target the runner dials, not only its name."""
+
+    def test_the_configured_ssh_host_reaches_the_alarm(
+        self, git_ops: GitOps, git_repo: Path, git_config: GitConfig,
+    ) -> None:
+        escalations = _FakeEscalationQueue()
+        worker = SpeculativeMergeWorker(
+            git_ops, asyncio.Queue(), escalation_queue=escalations, deployed_sha=TEST_DEPLOYED_SHA,
+        )
+        worker._ensure_host_allocator(lane_scene_config(
+            git_repo, git_config,
+            verify_runners=[VerifyRunnerConfig(
+                name='laptop', ssh_host='leo-laptop', git_remote='laptop',
+                df_checkout_path='/remote/dark-factory',
+            )],
+        ))
+        for _ in range(3):
+            worker.bench_unavailable_runner('laptop', RunnerUnavailable('ssh: connect timed out'))
+
+        [l1] = escalations.submitted
+        assert l1.category == 'verify_host_unreachable'
+        assert 'Host: laptop\nSSH target: leo-laptop\nHealth probe: ssh ' in l1.detail
+        assert l1.detail.splitlines()[2].endswith(' leo-laptop true')
+
+
+# ── 5290: occupancy says what each lease is doing, not only that it is held ───
+
+
+class _VerifyTasks:
+    """Stand-in verify tasks: a running one is pending, a finished one is done.
+
+    Running tasks are cancelled and awaited on exit, so none outlives its test.
+    """
+
+    def __init__(self) -> None:
+        self._running: list[asyncio.Task[Any]] = []
+
+    def running(self) -> asyncio.Task[Any]:
+        task: asyncio.Task[Any] = asyncio.create_task(asyncio.Event().wait())
+        self._running.append(task)
+        return task
+
+    async def finished(self) -> asyncio.Task[Any]:
+        task: asyncio.Task[Any] = asyncio.create_task(asyncio.sleep(0))
+        await task
+        return task
+
+    async def __aenter__(self) -> _VerifyTasks:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        for task in self._running:
+            task.cancel()
+        await asyncio.gather(*self._running, return_exceptions=True)
+
+
+def _local_lease() -> HostLease:
+    return HostLease(name='local', runner=MagicMock(), is_local=True)
+
+
+def _remote_lease(*, dispatch_in_flight: bool = True) -> HostLease:
+    return HostLease(
+        name='laptop',
+        runner=SimpleNamespace(dispatch_in_flight=dispatch_in_flight),
+        is_local=False,
+    )
+
+
+def _parked_gate(req: MergeRequest, task: asyncio.Task[Any], git_repo: Path) -> PendingGate:
+    """A task-6155 gate re-verify parked on *req*'s head, running as *task*."""
+    item = RealMergeItem(
+        request=req,
+        merge_result=MergeResult(success=True, merge_commit='c0ffee', merge_worktree=git_repo),
+        merge_wt=git_repo,
+        base_sha='abc123',
+        speculative=False,
+    )
+    return PendingGate(
+        task=task,
+        candidate=LandingCandidate(
+            item=item, sha='c0ffee', merge_wt=git_repo, spec_warm=False,
+            warm_results={}, verified_commit='c0ffee',
+        ),
+        rebased_sha='beef',
+        rebased_onto='abc124',
+    )
+
+
+def _released_at_verdict(
+    req: MergeRequest, verdict_host: str, verify_task: asyncio.Task[Any],
+) -> InflightEntry:
+    """An entry whose verify returned its verdict and released its lease."""
+    entry = _make_entry(req, None, verify_task=verify_task)
+    entry.status = InflightStatus.VERIFIED_PENDING_LANDING
+    entry.verdict_host = verdict_host
+    return entry
+
+
+def _lease_wire(
+    req: MergeRequest, host: str, activity: str, *, host_quarantined: bool = False,
+) -> dict:
+    return {
+        'host': host,
+        'task_id': req.task_id,
+        'request_id': req.request_id,
+        'activity': activity,
+        'host_quarantined': host_quarantined,
+    }
+
+
+
+@pytest.mark.asyncio
+class TestOccupancyLeaseFidelity:
+    """occupancy.leases / verifying_by_host: what each held lease is doing.
+
+    by_host and inflight_by_host report LEASES, and a lease can outlive its
+    verify: a verdict reached at the front of _inflight (the head, or the next
+    entry behind a popped head still finalizing) or kept on the persistent
+    merge lane holds it until its own finalize (a verdict behind another entry
+    releases it, task 8526), a remote whose dispatch returned runs its tail on
+    THIS host, and a lease can sit on a host benched since.  The heartbeat's
+    'verifying N/M' counts none of the three.
+    """
+
+    async def test_finished_lease_is_not_reported_verifying(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+    ) -> None:
+        """Live repro #2 (2026-07-25): a done verify still holding its lease."""
+        worker, _alloc, _runner, _db = _worker_with_events(git_ops, tmp_path, 'fin')
+        req_local = _make_req('occ-run', 'task/occ-run', config, git_repo)
+        req_laptop = _make_req('occ-done', 'task/occ-done', config, git_repo)
+        async with _VerifyTasks() as tasks:
+            _seat(
+                worker,
+                _make_entry(req_local, _local_lease(), verify_task=tasks.running()),
+                _make_entry(req_laptop, _remote_lease(), verify_task=await tasks.finished()),
+            )
+            occ = worker.snapshot()['occupancy']
+            msg = _logged_heartbeat(worker, caplog)
+
+        assert occ['leases'] == [
+            _lease_wire(req_local, 'local', 'verifying'),
+            _lease_wire(req_laptop, 'laptop', 'finished'),
+        ]
+        assert occ['verifying_by_host'] == {'local': ['occ-run']}
+        assert occ['by_host'] == {'local': 'occ-run', 'laptop': 'occ-done'}
+        assert occ['inflight_by_host'] == {'local': ['occ-run'], 'laptop': ['occ-done']}
+        assert occ['hosts_busy'] == 2
+        assert occ['inflight_total'] == 2
+        assert msg.endswith(' | verifying 1/2 hosts: local=occ-run laptop=occ-done(finished)'), msg
+
+    async def test_entry_released_at_verdict_reads_verified_pending_landing(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+    ) -> None:
+        """Task 8526: a verdict releases its lease; the entry awaits landing.
+
+        It is still a frontier member, so it is a lease row and counts in
+        inflight_total, but its host is free: lease occupancy leaves it out.
+        """
+        worker, _alloc, _runner, _db = _worker_with_events(git_ops, tmp_path, 'vpl')
+        req_local = _make_req('occ-run', 'task/occ-run', config, git_repo)
+        req_done = _make_req('occ-done', 'task/occ-done', config, git_repo)
+        async with _VerifyTasks() as tasks:
+            released = _released_at_verdict(req_done, 'laptop', await tasks.finished())
+            _seat(
+                worker,
+                _make_entry(req_local, _local_lease(), verify_task=tasks.running()),
+                released,
+            )
+            occ = worker.snapshot()['occupancy']
+            msg = _logged_heartbeat(worker, caplog)
+
+        assert occ['leases'] == [
+            _lease_wire(req_local, 'local', 'verifying'),
+            _lease_wire(req_done, 'laptop', 'verified_pending_landing'),
+        ]
+        assert occ['inflight_total'] == 2
+        assert occ['by_host'] == {'local': 'occ-run'}
+        assert occ['inflight_by_host'] == {'local': ['occ-run']}
+        assert occ['hosts_busy'] == 1
+        assert occ['verifying_by_host'] == {'local': ['occ-run']}
+        assert msg.endswith(
+            ' | verifying 1/2 hosts: local=occ-run laptop=occ-done(verified_pending_landing)'
+        ), msg
+
+    @pytest.mark.parametrize('benched', [False, True], ids=['host-up', 'host-benched'])
+    async def test_released_entry_flags_a_benched_verdict_host(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
+        benched: bool,
+    ) -> None:
+        """The released row names its verdict host, so a bench since then shows."""
+        worker, alloc, _runner, _db = _worker_with_events(git_ops, tmp_path, 'vplq')
+        if benched:
+            await _quarantine_remote(alloc, 'laptop')
+        req = _make_req('occ-vq', 'task/occ-vq', config, git_repo)
+        async with _VerifyTasks() as tasks:
+            _seat(worker, _released_at_verdict(req, 'laptop', await tasks.finished()))
+            occ = worker.snapshot()['occupancy']
+
+        assert occ['leases'] == [
+            _lease_wire(req, 'laptop', 'verified_pending_landing', host_quarantined=benched),
+        ]
+        assert occ['hosts_busy'] == 0
+
+    @pytest.mark.parametrize(
+        ('dispatch_in_flight', 'activity', 'verifying_by_host', 'segment'),
+        [
+            (False, 'no_live_dispatch', {}, ' | verifying 0/2 hosts: laptop=occ-tail(no_live_dispatch)'),
+            (True, 'verifying', {'laptop': ['occ-tail']}, ' | verifying 1/2 hosts: laptop=occ-tail'),
+        ],
+        ids=['dispatch-returned', 'dispatch-live'],
+    )
+    async def test_remote_lease_after_dispatch_returned_has_no_live_dispatch(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+        dispatch_in_flight: bool, activity: str, verifying_by_host: dict, segment: str,
+    ) -> None:
+        """The wrong-host shape: the ssh dispatch returned and the verify runs on.
+
+        What remains is local work (task 2822's cross-check, or a task-6155
+        gate re-verify), so the leased remote is not the host doing it.
+        """
+        worker, _alloc, _runner, _db = _worker_with_events(git_ops, tmp_path, 'tail')
+        req = _make_req('occ-tail', 'task/occ-tail', config, git_repo)
+        async with _VerifyTasks() as tasks:
+            lease = _remote_lease(dispatch_in_flight=dispatch_in_flight)
+            _seat(worker, _make_entry(req, lease, verify_task=tasks.running()))
+            occ = worker.snapshot()['occupancy']
+            msg = _logged_heartbeat(worker, caplog)
+
+        assert occ['leases'] == [_lease_wire(req, 'laptop', activity)]
+        assert occ['verifying_by_host'] == verifying_by_host
+        assert occ['by_host'] == {'laptop': 'occ-tail'}
+        assert msg.endswith(segment), msg
+
+    @pytest.mark.parametrize(
+        ('is_local', 'activity'),
+        [(True, 'verifying'), (False, 'no_live_dispatch')],
+        ids=['local', 'remote-dispatch-returned'],
+    )
+    async def test_parked_gate_reverify_counts_as_running(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        is_local: bool, activity: str,
+    ) -> None:
+        """A head parked on its gate: the verify is done, the gate re-verify runs.
+
+        The gate re-verify runs on this host, so a remote lease whose dispatch
+        returned reads no_live_dispatch rather than finished.
+        """
+        worker, _alloc, _ = _real_worker(git_ops)
+        req = _make_req('occ-gate', 'task/occ-gate', config, git_repo)
+        lease = _local_lease() if is_local else _remote_lease(dispatch_in_flight=False)
+        async with _VerifyTasks() as tasks:
+            entry = _make_entry(req, lease, verify_task=await tasks.finished())
+            entry.gate = _parked_gate(req, tasks.running(), git_repo)
+            _seat(worker, entry)
+            occ = worker.snapshot()['occupancy']
+
+        assert occ['leases'] == [_lease_wire(req, lease.name, activity)]
+        assert occ['verifying_by_host'] == ({'local': ['occ-gate']} if is_local else {})
+
+    async def test_lease_on_quarantined_host_is_flagged(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+    ) -> None:
+        """The 07-24 shape: a lease on a host benched since the lease was taken."""
+        worker, alloc, _runner, _db = _worker_with_events(git_ops, tmp_path, 'quar')
+        await _quarantine_remote(alloc, 'laptop')
+        _seed_ru(worker, 'laptop')
+        req_local = _make_req('occ-ql', 'task/occ-ql', config, git_repo)
+        req_laptop = _make_req('occ-q', 'task/occ-q', config, git_repo)
+        async with _VerifyTasks() as tasks:
+            _seat(
+                worker,
+                _make_entry(req_local, _local_lease(), verify_task=tasks.running()),
+                _make_entry(req_laptop, _remote_lease(), verify_task=tasks.running()),
+            )
+            occ = worker.snapshot()['occupancy']
+            msg = _logged_heartbeat(worker, caplog)
+
+        assert occ['leases'] == [
+            _lease_wire(req_local, 'local', 'verifying'),
+            _lease_wire(req_laptop, 'laptop', 'verifying', host_quarantined=True),
+        ]
+        assert occ['verifying_by_host'] == {'local': ['occ-ql']}
+        assert (
+            ' | verifying 1/2 hosts: local=occ-ql laptop=occ-q(verifying,quarantined) | DEGRADED'
+        ) in msg, msg
+
+    async def test_leased_entry_without_verify_task_counts_as_dispatching(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+    ) -> None:
+        """Lease held, nothing pending yet: dispatching, and counted as live.
+
+        This is why test_no_degraded_noise_when_healthy's byte-identical
+        heartbeat holds unedited: its hand-built entry has no verify task.
+        """
+        worker, _alloc, _runner, _db = _worker_with_events(git_ops, tmp_path, 'disp')
+        req = _make_req('occ-disp', 'task/occ-disp', config, git_repo)
+        _seat(worker, _make_entry(req, _remote_lease()))
+        occ = worker.snapshot()['occupancy']
+        msg = _logged_heartbeat(worker, caplog)
+
+        assert occ['leases'] == [_lease_wire(req, 'laptop', 'dispatching')]
+        assert occ['verifying_by_host'] == {'laptop': ['occ-disp']}
+        assert msg.endswith(' | verifying 1/2 hosts: laptop=occ-disp'), msg
+
+    async def test_heartbeat_event_carries_leases(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+    ) -> None:
+        """The persisted merge_heartbeat event carries the activity view too."""
+        worker, _alloc, _runner, db_path = _worker_with_events(git_ops, tmp_path, 'evt')
+        req = _make_req('occ-evt', 'task/occ-evt', config, git_repo)
+        async with _VerifyTasks() as tasks:
+            _seat(worker, _make_entry(req, _local_lease(), verify_task=tasks.running()))
+            _logged_heartbeat(worker, caplog)
+
+        [(raw,)] = _read_heartbeat_key(db_path, 'occupancy')
+        occ = _json.loads(raw)
+        assert occ['leases'] == [_lease_wire(req, 'local', 'verifying')]
+        assert occ['verifying_by_host'] == {'local': ['occ-evt']}

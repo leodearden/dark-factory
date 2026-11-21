@@ -182,7 +182,7 @@ from typing import Any
 # closing line) and ships inside the very package this script lives in. The
 # sibling audit script (audit_found_on_main_provenance.py) imports both at
 # module level from this same directory, as do the other two task-store
-# scripts for the guard. `TargetStoreMissing` comes along with the guard
+# scripts for the guard. `TargetStoreUnpopulated` comes along with the guard
 # because main() needs it in scope to map the refusal onto exit 3, and one
 # import beats a second one at a different altitude for a single name. The
 # deferred imports exist for a DIFFERENT reason: they are either
@@ -191,7 +191,7 @@ from typing import Any
 from shared.task_metadata import parse_metadata
 
 from fused_memory.utils.target_store_preflight import (
-    TargetStoreMissing,
+    TargetStoreUnpopulated,
     assert_task_store_populated,
 )
 
@@ -269,7 +269,7 @@ def _stamped_at_of(task: dict[str, Any]) -> str | None:
     """
     try:
         meta, _warnings = parse_metadata(task.get('metadata'), direction='read')
-    except Exception:  # noqa: BLE001 - never-raises contract; any parse
+    except Exception:  # never-raises contract; any parse
         return None      # failure just means "no usable stamp".
     provenance = meta.done_provenance
     if provenance is None:
@@ -511,7 +511,7 @@ async def _run(args: argparse.Namespace, since: datetime) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    import os  # noqa: PLC0415
+    import os
 
     # Sibling import: audit_found_on_main_provenance.py lives alongside this
     # script in fused-memory/scripts/, which is sys.path[0] when this file
@@ -519,10 +519,10 @@ async def _run(args: argparse.Namespace, since: datetime) -> int:
     # so the test suite can importlib-load this module in isolation without
     # the scripts/ directory on sys.path — mirrors
     # correct_found_on_main_backlog.py's identical deferred-import pattern.
-    from audit_found_on_main_provenance import GitFacts, build_audit_report  # noqa: PLC0415
+    from audit_found_on_main_provenance import GitFacts, build_audit_report
 
-    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import FusedMemoryConfig
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
@@ -651,7 +651,7 @@ def main() -> int:
     # stdout means it can never be mistaken for a verdict payload.
     try:
         return asyncio.run(_run(args, since))
-    except TargetStoreMissing as exc:
+    except TargetStoreUnpopulated as exc:
         print(f'error: {exc}', file=sys.stderr)
         return 3
 

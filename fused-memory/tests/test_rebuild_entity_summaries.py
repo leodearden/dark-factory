@@ -8,7 +8,7 @@ Covers:
 - MCP tool rebuild_entity_summaries             (step 5)
 - DISALLOW_MEMORY_WRITES list                   (step 6)
 - RebuildSummariesManager / run_rebuild_summaries (step 7)
-- GraphitiBackend.get_all_valid_edges()           (unit tests in test_refresh_entity_summary.py; used here as a mocked dependency)
+- GraphitiBackend.enumerate_entity_nodes() / enumerate_all_valid_edges()  (used here as mocked dependencies)
 """
 from __future__ import annotations
 
@@ -20,10 +20,33 @@ from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _fm_helpers import make_rebuild_detail, pydantic_spec
+from _fm_helpers import (
+    COMPLETE_READ,
+    complete_paged_read,
+    incomplete_paged_read,
+    make_rebuild_detail,
+    pydantic_spec,
+)
+from _read_policy_logs import node_read_warnings
+from _rebuild_service_results import rebuild_service_result
 
-from fused_memory.backends.graphiti_client import EdgeDict, GraphitiBackend, StaleSummaryResult
+from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_SHORT_READ,
+    INCOMPLETE_STRUCTURAL_KINDS,
+    EdgeDict,
+    GraphitiBackend,
+    IncompleteEnumerationError,
+    ReadCompleteness,
+    StaleProbeResult,
+    StaleSummaryResult,
+)
+from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE
 from fused_memory.config.schema import FusedMemoryConfig
+
+#: The logger the service hands both stale probes, detect_stale_with_edges and
+#: detect_stale_dry_run, for the policy warning.
+_SERVICE_LOG = logging.getLogger('fused_memory.services.memory_service')
 
 
 def _make_svc(mock_config):
@@ -358,8 +381,8 @@ class TestDetectStaleSummaries:
         ], edges={})
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
-        # get_all_valid_edges still called once (before the loop), even if no edges
-        backend.get_all_valid_edges.assert_awaited_once()
+        # the edge read is still issued once (before the loop), even if no edges
+        backend.enumerate_all_valid_edges.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_no_entities_returns_empty(self, mock_config, make_backend, make_edge_backend):
@@ -412,7 +435,7 @@ class TestDetectStaleSummaries:
     async def test_entity_with_zero_valid_edges_flagged_stale(self, mock_config, make_backend, make_edge_backend):
         """Entity with non-empty summary but zero valid edges is flagged stale.
 
-        When get_all_valid_edges returns no edges for the entity, the canonical
+        When the edge read returns no edges for the entity, the canonical
         summary is '' (empty). Since summary != canonical, the entity is stale.
         All summary lines are counted as stale_line_count because none appear
         in the empty valid_fact_set. valid_fact_count=0, duplicate_count=0.
@@ -428,447 +451,6 @@ class TestDetectStaleSummaries:
         assert entity['valid_fact_count'] == 0
         assert entity['duplicate_count'] == 0
         assert entity['summary_line_count'] == 2
-
-
-# ---------------------------------------------------------------------------
-# task-526: GraphitiBackend.detect_stale_dry_run (cheap probe)
-# ---------------------------------------------------------------------------
-
-class TestDetectStaleSummariesDryRun:
-    """Unit tests for GraphitiBackend.detect_stale_dry_run.
-
-    This method is the memory-cheaper alternative to
-    ``detect_stale_with_edges`` used by the force=False, dry_run=True
-    code path in ``rebuild_entity_summaries``.
-
-    Unlike the bulk variant, this probe issues up-to-N targeted
-    ``get_valid_edges_for_node`` calls (one per non-empty-summary entity)
-    and never materialises the O(E) all-edges dict.  The stale dict schema
-    it produces is identical to ``detect_stale_with_edges`` so
-    that downstream consumers (e.g. the result['details'] field) see no
-    surface-level change.
-
-    These tests live in test_rebuild_entity_summaries.py (the canonical file
-    for rebuild_entity_summaries coverage) rather than in
-    test_graphiti_rebuild_pipeline.py (rebuild/refresh pipeline quality improvements) per the
-    established layout where each backend method gets a dedicated test class.
-    See task 526 for the full design rationale.
-    """
-
-    @pytest.mark.asyncio
-    async def test_returns_stale_list_and_total_count(self, mock_config, make_backend):
-        """Returns a (list, int) tuple where int is the total entity count.
-
-        Three entities:
-        - Alice: stale (summary != canonical)
-        - Bob: clean (summary matches canonical)
-        - Charlie: empty summary (cheap-skipped)
-
-        Expected: stale_list has 1 entry (Alice), total_count == 3.
-        """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-alice', 'name': 'Alice', 'summary': 'old fact'},
-            {'uuid': 'uuid-bob', 'name': 'Bob', 'summary': 'current fact'},
-            {'uuid': 'uuid-charlie', 'name': 'Charlie', 'summary': ''},
-        ])
-
-        def edges_for_node(node_uuid, *, group_id):
-            if node_uuid == 'uuid-alice':
-                return [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]
-            if node_uuid == 'uuid-bob':
-                return [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}]
-            return []
-
-        backend.get_valid_edges_for_node = AsyncMock(side_effect=edges_for_node)
-
-        result = await backend.detect_stale_dry_run(group_id='test')
-
-        assert isinstance(result, tuple)
-        stale_list, total_count = result
-        assert isinstance(stale_list, list)
-        assert isinstance(total_count, int)
-        assert total_count == 3
-        assert len(stale_list) == 1
-        assert stale_list[0]['uuid'] == 'uuid-alice'
-        # Charlie's empty summary is cheap-skipped: only Alice and Bob trigger edge queries.
-        assert backend.get_valid_edges_for_node.await_count == 2
-
-    @pytest.mark.asyncio
-    async def test_flags_stale_entity_with_diagnostic_counts(self, mock_config, make_backend):
-        """Stale entity dict has the same schema as detect_stale_with_edges.
-
-        Keys: uuid, name, summary, duplicate_count, stale_line_count,
-              valid_fact_count, summary_line_count.
-        """
-        backend = make_backend(mock_config)
-        # Summary has 'factA' duplicated and 'old' which is not a valid edge fact.
-        # valid edges: factA only.
-        # duplicate_count=1 ('factA' appears twice → 2-1=1 extra)
-        # stale_line_count=1 ('old' is not in valid_fact_set, 'factA' appears twice
-        #   but the duplicate is also 'factA' which IS in valid_fact_set, so only 'old' is stale)
-        # valid_fact_count=1 ('factA')
-        # summary_line_count=3 ('factA', 'factA', 'old')
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA\nfactA\nold'},
-        ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'factA', 'name': 'edge1'},
-        ])
-
-        stale_list, total_count = await backend.detect_stale_dry_run(group_id='test')
-
-        assert total_count == 1
-        assert len(stale_list) == 1
-        entity = stale_list[0]
-
-        # Schema keys must exactly match detect_stale_with_edges output
-        expected_keys = {
-            'uuid', 'name', 'summary',
-            'duplicate_count', 'stale_line_count', 'valid_fact_count', 'summary_line_count',
-        }
-        assert set(entity.keys()) == expected_keys
-
-        assert entity['uuid'] == 'uuid-1'
-        assert entity['name'] == 'Alice'
-        assert entity['summary'] == 'factA\nfactA\nold'
-        assert entity['duplicate_count'] == 1   # 'factA' appears twice → 1 extra
-        assert entity['stale_line_count'] == 1  # 'old' not in valid_fact_set
-        assert entity['valid_fact_count'] == 1  # deduped: only 'factA'
-        assert entity['summary_line_count'] == 3
-
-    @pytest.mark.asyncio
-    async def test_skips_clean_entity(self, mock_config, make_backend):
-        """Entity whose summary exactly matches canonical facts is not flagged as stale.
-
-        Summary 'current fact' matches the single valid edge fact → clean.
-        stale_list should be empty, but total_count is still 1.
-        """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'current fact'},
-        ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'},
-        ])
-
-        stale_list, total_count = await backend.detect_stale_dry_run(group_id='test')
-
-        assert stale_list == []
-        assert total_count == 1
-
-    @pytest.mark.asyncio
-    async def test_does_not_call_get_all_valid_edges(self, mock_config, make_backend):
-        """The dry_run probe never awaits get_all_valid_edges.
-
-        This is the defining property of the cheap probe: it fetches edges
-        per-entity via get_valid_edges_for_node rather than materialising the
-        O(E) bulk all-edges dict.  The assertion style follows the project's
-        AsyncMock convention (assert_not_awaited, not assert_not_called) as
-        enforced in test_graphiti_rebuild_pipeline.py.
-        """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale fact'},
-        ])
-        backend.get_all_valid_edges = AsyncMock()
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'},
-        ])
-
-        await backend.detect_stale_dry_run(group_id='test')
-
-        backend.get_all_valid_edges.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_skips_empty_summary_entity_without_edge_query(self, mock_config, make_backend):
-        """Empty-summary entities are cheap-skipped: no get_valid_edges_for_node call.
-
-        Empty summaries are 'not stale by definition' (matches the semantics
-        of detect_stale_with_edges at graphiti_client.py:905-907).
-        The probe additionally saves the edge query for those entities.
-        """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Charlie', 'summary': ''},
-        ])
-        backend.get_valid_edges_for_node = AsyncMock()
-
-        stale_list, total_count = await backend.detect_stale_dry_run(group_id='test')
-
-        # Empty summary is not stale
-        assert stale_list == []
-        assert total_count == 1
-        # get_valid_edges_for_node must NOT have been called for the empty-summary entity
-        backend.get_valid_edges_for_node.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_accepts_max_concurrency_kwarg(self, mock_config, make_backend):
-        """detect_stale_dry_run accepts an optional max_concurrency keyword parameter.
-
-        Calling with max_concurrency=5 must not raise TypeError.
-        Calling with the default (no kwarg) must also still work.
-        Both calls return well-formed (stale_list, total_count) tuples.
-        """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'fact'},
-        ])
-        backend.get_valid_edges_for_node = AsyncMock(return_value=[
-            {'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'},
-        ])
-
-        # Should not raise TypeError with explicit max_concurrency
-        stale_list, total_count = await backend.detect_stale_dry_run(
-            group_id='test', max_concurrency=5
-        )
-        assert total_count == 1
-
-        # Default (no kwarg) must still work
-        stale_list2, total_count2 = await backend.detect_stale_dry_run(group_id='test')
-        assert total_count2 == 1
-
-    @pytest.mark.asyncio
-    async def test_raises_when_max_concurrency_invalid(self, mock_config, make_backend):
-        """detect_stale_dry_run raises ValueError for max_concurrency < 1.
-
-        Semaphore(0) would deadlock; Semaphore(-1) raises ValueError from stdlib.
-        A clear ValueError with a descriptive message is better than either.
-        """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[])
-
-        with pytest.raises(ValueError, match='max_concurrency must be >= 1'):
-            await backend.detect_stale_dry_run(group_id='test', max_concurrency=0)
-
-        with pytest.raises(ValueError, match='max_concurrency must be >= 1'):
-            await backend.detect_stale_dry_run(group_id='test', max_concurrency=-5)
-
-    @pytest.mark.asyncio
-    async def test_edge_fetches_run_concurrently(self, mock_config, make_backend):
-        """Edge fetches overlap rather than running sequentially (peak_concurrent == 5).
-
-        Uses asyncio.Barrier(5) so all 5 coroutines must be in-flight simultaneously
-        before any of them can complete — this provides a deterministic proof of
-        concurrency (not just a scheduler hint via sleep(0)).
-        """
-        n = 5
-        backend = make_backend(mock_config)
-        entities = [
-            {'uuid': f'uuid-{i}', 'name': f'Entity{i}', 'summary': 'fact'}
-            for i in range(n)
-        ]
-        backend.list_entity_nodes = AsyncMock(return_value=entities)
-
-        in_flight = 0
-        peak_concurrent = 0
-        barrier = asyncio.Barrier(n)
-
-        async def tracking_edges(node_uuid, *, group_id):
-            nonlocal in_flight, peak_concurrent
-            in_flight += 1
-            peak_concurrent = max(peak_concurrent, in_flight)
-            await barrier.wait()  # all n must arrive before any can continue
-            in_flight -= 1
-            return [{'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'}]
-
-        backend.get_valid_edges_for_node = AsyncMock(side_effect=tracking_edges)
-
-        await backend.detect_stale_dry_run(group_id='test', max_concurrency=n)
-
-        assert peak_concurrent == n, (
-            f"Expected all {n} fetches in-flight simultaneously, got peak={peak_concurrent}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_concurrency_bounded_by_max_concurrency(self, mock_config, make_backend):
-        """Peak concurrent calls never exceeds max_concurrency.
-
-        With 6 entities and max_concurrency=2, the semaphore must hold all but
-        2 calls back — peak_concurrent must be <= 2.
-        """
-        backend = make_backend(mock_config)
-        entities = [
-            {'uuid': f'uuid-{i}', 'name': f'Entity{i}', 'summary': 'fact'}
-            for i in range(6)
-        ]
-        backend.list_entity_nodes = AsyncMock(return_value=entities)
-
-        in_flight = 0
-        peak_concurrent = 0
-
-        async def tracking_edges(node_uuid, *, group_id):
-            nonlocal in_flight, peak_concurrent
-            in_flight += 1
-            peak_concurrent = max(peak_concurrent, in_flight)
-            await asyncio.sleep(0)  # yield to event loop so others can contend
-            in_flight -= 1
-            return [{'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'}]
-
-        backend.get_valid_edges_for_node = AsyncMock(side_effect=tracking_edges)
-
-        await backend.detect_stale_dry_run(group_id='test', max_concurrency=2)
-
-        assert peak_concurrent <= 2, (
-            f"Expected peak concurrent calls <= 2 (bounded), got {peak_concurrent}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_exception_propagates_from_gather(self, mock_config, make_backend):
-        """RuntimeError raised by one entity's edge fetch propagates out of detect_stale_dry_run.
-
-        Other entities succeed; the first Exception found in the gather results
-        must be re-raised (not swallowed or returned).
-        """
-        backend = make_backend(mock_config)
-        entities = [
-            {'uuid': 'uuid-ok', 'name': 'OK', 'summary': 'fact'},
-            {'uuid': 'uuid-bad', 'name': 'Bad', 'summary': 'fact'},
-            {'uuid': 'uuid-ok2', 'name': 'OK2', 'summary': 'fact'},
-        ]
-        backend.list_entity_nodes = AsyncMock(return_value=entities)
-
-        async def edges_with_error(node_uuid, *, group_id):
-            if node_uuid == 'uuid-bad':
-                raise RuntimeError('db timeout')
-            return [{'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'}]
-
-        backend.get_valid_edges_for_node = AsyncMock(side_effect=edges_with_error)
-
-        with pytest.raises(RuntimeError, match='db timeout'):
-            await backend.detect_stale_dry_run(group_id='test')
-
-    @pytest.mark.asyncio
-    async def test_cancelled_error_propagates_from_gather(self, mock_config, make_backend):
-        """asyncio.CancelledError raised during an edge fetch propagates out immediately.
-
-        CancelledError is a BaseException (not Exception), so Pass 1
-        (propagate_cancellations) must re-raise it before Pass 2 even runs.
-        """
-        backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(return_value=[
-            {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'fact'},
-        ])
-
-        async def cancel_on_fetch(node_uuid, *, group_id):
-            raise asyncio.CancelledError()
-
-        backend.get_valid_edges_for_node = AsyncMock(side_effect=cancel_on_fetch)
-
-        with pytest.raises(asyncio.CancelledError):
-            await backend.detect_stale_dry_run(group_id='test')
-
-    @pytest.mark.asyncio
-    async def test_exception_logs_warning_for_each_failure_before_raising_first(
-        self, mock_config, make_backend, caplog
-    ):
-        """Each captured Exception is logged at WARNING before the first is raised.
-
-        Task β (fm-cancellederror-convention-prd.md): detect_stale_dry_run routes
-        through gather_or_raise (fused_memory.utils.async_utils), which adds
-        observability the hand-rolled Pass 2 never had — every captured Exception
-        is logged at WARNING (not just the one that gets raised) before the
-        positionally-first is re-raised. Raise-first semantics are unchanged (see
-        test_exception_propagates_from_gather above); this test pins the *added*
-        logging side-effect.
-
-        Three entities: 'uuid-bad-one' and 'uuid-bad-two' both raise distinct
-        RuntimeErrors; 'uuid-ok' succeeds. asyncio.gather preserves input order in
-        its results list regardless of completion order, so the positionally-first
-        Exception (uuid-bad-one's) is the one raised, and both failures are logged.
-
-        The CancelledError-propagates-with-zero-warnings guarantee is not
-        re-asserted here: Pass 1 (inside gather_or_raise) re-raises a captured
-        BaseException before Pass 2's logging loop even runs (see
-        fused_memory/utils/async_utils.py), and test_cancelled_error_propagates_from_gather
-        above already pins CancelledError propagation for this call site.
-        """
-        backend = make_backend(mock_config)
-        entities = [
-            {'uuid': 'uuid-bad-one', 'name': 'BadOne', 'summary': 'fact'},
-            {'uuid': 'uuid-ok', 'name': 'OK', 'summary': 'fact'},
-            {'uuid': 'uuid-bad-two', 'name': 'BadTwo', 'summary': 'fact'},
-        ]
-        backend.list_entity_nodes = AsyncMock(return_value=entities)
-
-        async def edges_with_errors(node_uuid, *, group_id):
-            if node_uuid == 'uuid-bad-one':
-                raise RuntimeError('first failure')
-            if node_uuid == 'uuid-bad-two':
-                raise RuntimeError('second failure')
-            return [{'uuid': 'e1', 'fact': 'fact', 'name': 'edge1'}]
-
-        backend.get_valid_edges_for_node = AsyncMock(side_effect=edges_with_errors)
-
-        with (
-            caplog.at_level(logging.WARNING, logger='fused_memory.backends.graphiti_client'),
-            pytest.raises(RuntimeError, match='first failure'),
-        ):
-            await backend.detect_stale_dry_run(group_id='test')
-
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == 2, (
-            f'expected one WARNING per captured Exception (2), got {len(warnings)}: '
-            f'{[r.message for r in warnings]}'
-        )
-        assert any('first failure' in r.message for r in warnings)
-        assert any('second failure' in r.message for r in warnings)
-        assert all('RuntimeError' in r.message for r in warnings)
-
-    @pytest.mark.asyncio
-    async def test_result_correctness_under_parallel_execution(self, mock_config, make_backend):
-        """Stale/clean/empty distribution is preserved correctly under parallel execution.
-
-        10 entities with deterministic distribution:
-        - 4 stale (summary differs from canonical edge facts)
-        - 3 clean (summary matches)
-        - 3 empty-summary (cheap-skipped, not stale)
-
-        Assert:
-        - total_count == 10
-        - stale_list contains exactly the 4 stale entity UUIDs (order-independent)
-        - stale_list does NOT contain any clean or empty-summary UUIDs
-        """
-        backend = make_backend(mock_config)
-
-        stale_uuids = {f'uuid-stale-{i}' for i in range(4)}
-        clean_uuids = {f'uuid-clean-{i}' for i in range(3)}
-        empty_uuids = {f'uuid-empty-{i}' for i in range(3)}
-
-        entities = (
-            [{'uuid': u, 'name': u, 'summary': 'old fact'} for u in sorted(stale_uuids)]
-            + [{'uuid': u, 'name': u, 'summary': 'current fact'} for u in sorted(clean_uuids)]
-            + [{'uuid': u, 'name': u, 'summary': ''} for u in sorted(empty_uuids)]
-        )
-        backend.list_entity_nodes = AsyncMock(return_value=entities)
-
-        async def edges_by_uuid(node_uuid, *, group_id):
-            # stale entities: edge fact differs from their summary ('old fact')
-            if node_uuid in stale_uuids:
-                return [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]
-            # clean entities: edge fact matches their summary
-            if node_uuid in clean_uuids:
-                return [{'uuid': 'e2', 'fact': 'current fact', 'name': 'edge2'}]
-            return []
-
-        backend.get_valid_edges_for_node = AsyncMock(side_effect=edges_by_uuid)
-
-        # max_concurrency=2 with 10 entities exercises bounding alongside correctness
-        stale_list, total_count = await backend.detect_stale_dry_run(group_id='test', max_concurrency=2)
-
-        assert total_count == 10
-        returned_uuids = {e['uuid'] for e in stale_list}
-        assert returned_uuids == stale_uuids
-        # No clean or empty entities in the stale list
-        assert returned_uuids.isdisjoint(clean_uuids)
-        assert returned_uuids.isdisjoint(empty_uuids)
-        # Empty-summary entities never trigger edge queries
-        for empty_uuid in empty_uuids:
-            # Verify no call was made for empty-summary entities
-            for call in backend.get_valid_edges_for_node.call_args_list:
-                assert call.args[0] != empty_uuid, (
-                    f"Expected no edge fetch for empty-summary entity {empty_uuid}"
-                )
 
 
 # ---------------------------------------------------------------------------
@@ -970,6 +552,8 @@ class TestRebuildEntitySummaries:
                 stale=[{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale fact'}],
                 all_edges={'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
                 total_count=2,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(return_value={
@@ -980,21 +564,23 @@ class TestRebuildEntitySummaries:
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 1
         assert result['rebuilt'] == 1
-        svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(group_id='test')
+        svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(
+            group_id='test', log=_SERVICE_LOG
+        )
         assert result['details'][0]['old_summary'] == 'stale fact'
 
     @pytest.mark.asyncio
     async def test_force_rebuilds_all(self, mock_config):
-        """With force=True, rebuilds all entities using list_entity_nodes + get_all_valid_edges."""
+        """With force=True, rebuilds all entities using enumerate_entity_nodes + enumerate_all_valid_edges."""
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=([
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'ok'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'also ok'},
-        ])
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={
+        ], complete_paged_read()))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
-        })
+        }, complete_paged_read()))
         dispatch = _uuid_dispatch({
             'uuid-1': {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok', 'new_summary': 'fact1', 'edge_count': 1},
             'uuid-2': {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'also ok', 'new_summary': 'fact2', 'edge_count': 1},
@@ -1009,13 +595,20 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_returns_aggregate_result(self, mock_config):
-        """Returns dict with total_entities, stale_entities, rebuilt, skipped, errors, details."""
+        """Returns the six count/detail keys plus the four read-completeness keys."""
         svc = _make_svc(mock_config)
         svc.graphiti.detect_stale_with_edges = AsyncMock(
-            return_value=StaleSummaryResult(stale=[], all_edges={}, total_count=0)
+            return_value=StaleSummaryResult(
+                stale=[], all_edges={}, total_count=0,
+                entities_completeness=COMPLETE_READ, edges_completeness=COMPLETE_READ,
+            )
         )
         result = await svc.rebuild_entity_summaries(project_id='test')
-        assert set(result.keys()) == {'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors', 'details'}
+        assert set(result.keys()) == {
+            'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors', 'details',
+            'entities_complete', 'entities_incomplete_kind',
+            'edges_complete', 'edges_incomplete_kind',
+        }
 
     @pytest.mark.asyncio
     async def test_partial_failure_continues(self, mock_config):
@@ -1032,6 +625,8 @@ class TestRebuildEntitySummaries:
                     'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
                 },
                 total_count=2,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
 
@@ -1047,7 +642,9 @@ class TestRebuildEntitySummaries:
         error_detail = next(d for d in result['details'] if d['status'] == 'error')
         assert 'FalkorDB timeout' in error_detail['error']
         assert error_detail['uuid'] == 'uuid-1'
-        svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(group_id='test')
+        svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(
+            group_id='test', log=_SERVICE_LOG
+        )
         dispatch.assert_all_dispatched()
 
     @pytest.mark.asyncio
@@ -1055,7 +652,10 @@ class TestRebuildEntitySummaries:
         """No entities means all counts are 0."""
         svc = _make_svc(mock_config)
         svc.graphiti.detect_stale_with_edges = AsyncMock(
-            return_value=StaleSummaryResult(stale=[], all_edges={}, total_count=0)
+            return_value=StaleSummaryResult(
+                stale=[], all_edges={}, total_count=0,
+                entities_completeness=COMPLETE_READ, edges_completeness=COMPLETE_READ,
+            )
         )
         result = await svc.rebuild_entity_summaries(project_id='test')
         assert result['total_entities'] == 0
@@ -1075,7 +675,9 @@ class TestRebuildEntitySummaries:
         stale_list = [{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale',
                        'duplicate_count': 0, 'stale_line_count': 1, 'valid_fact_count': 0,
                        'summary_line_count': 1}]
-        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=(stale_list, 1))
+        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=StaleProbeResult(
+            stale=stale_list, total_count=1, entities_completeness=COMPLETE_READ,
+        ))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock()
         result = await svc.rebuild_entity_summaries(project_id='test', dry_run=True)
         assert result['stale_entities'] == 1
@@ -1083,7 +685,9 @@ class TestRebuildEntitySummaries:
         assert result['skipped'] == 1
         svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()
         assert result['details'][0]['status'] == 'skipped_dry_run'
-        svc.graphiti.detect_stale_dry_run.assert_awaited_once_with(group_id='test')
+        svc.graphiti.detect_stale_dry_run.assert_awaited_once_with(
+            group_id='test', log=_SERVICE_LOG
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +718,8 @@ class TestMemoryServiceRebuildEntitySummaries:
                     'u2': [{'uuid': 'e2', 'fact': 'new B', 'name': 'rel2'}],
                 },
                 total_count=5,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         dispatch = _uuid_dispatch({
@@ -1135,7 +741,7 @@ class TestMemoryServiceRebuildEntitySummaries:
             dry_run=False,
         )
         service.graphiti.detect_stale_with_edges.assert_awaited_once_with(
-            group_id='dark_factory'
+            group_id='dark_factory', log=_SERVICE_LOG
         )
         assert result['total_entities'] == 5
         service.graphiti.rebuild_entity_from_edges.side_effect.assert_all_dispatched()
@@ -1184,10 +790,11 @@ class TestMemoryServiceRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_journal_result_summary_is_condensed(self, mock_config):
-        """Journal result_summary must contain only aggregate fields, not 'details'.
+        """Journal result_summary holds the aggregate counts and the two completeness booleans.
 
         The service builds the result internally. This test verifies the journal
-        only receives the condensed aggregate fields (not the full details list).
+        only receives the condensed aggregate counts plus entities_complete and
+        edges_complete, without the details list or the incomplete kinds.
         """
         svc = _make_svc(mock_config)
         # 4 stale entities out of 10 total: 3 rebuilt, 1 skipped_dry_run (force=False)
@@ -1206,6 +813,8 @@ class TestMemoryServiceRebuildEntitySummaries:
                     'u4': [{'uuid': 'e4', 'fact': 'new D', 'name': 'r4'}],
                 },
                 total_count=10,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
@@ -1222,7 +831,7 @@ class TestMemoryServiceRebuildEntitySummaries:
         call_kwargs = mock_journal.log_write_op.call_args[1]
         result_summary = call_kwargs.get('result_summary')
         assert result_summary is not None, 'result_summary must be set on success'
-        # Must contain the five aggregate fields
+        # Must contain the aggregate counts
         assert 'total_entities' in result_summary
         assert 'stale_entities' in result_summary
         assert 'rebuilt' in result_summary
@@ -1240,9 +849,14 @@ class TestMemoryServiceRebuildEntitySummaries:
         # Must contain 'skipped' aggregate field
         assert 'skipped' in result_summary
         assert result_summary['skipped'] == 0
-        # Key set must be exactly these five aggregate fields — no more, no less
+        # Both reads were COMPLETE_READ, so both verdicts are recorded as True
+        assert result_summary['entities_complete'] is True
+        assert result_summary['edges_complete'] is True
+        # Key set must be exactly the aggregate counts plus the two completeness
+        # booleans, without the incomplete kinds — no more, no less
         assert set(result_summary.keys()) == {
-            'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors'
+            'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors',
+            'entities_complete', 'edges_complete',
         }
 
 
@@ -1265,14 +879,14 @@ class TestRebuildEntitySummariesEntityUuids:
         (the _uuid_dispatch mapping below omits u2, so any u2 call would raise).
         """
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=([
             {'uuid': 'u1', 'name': 'Alice', 'summary': 'baked stale line\nvalid fact'},
             {'uuid': 'u2', 'name': 'Bob', 'summary': 'ok'},
-        ])
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={
+        ], complete_paged_read()))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({
             'u1': [{'uuid': 'e1', 'fact': 'valid fact', 'name': 'r'}],
             'u2': [{'uuid': 'e2', 'fact': 'ok', 'name': 'r'}],
-        })
+        }, complete_paged_read()))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
             'u1': {'uuid': 'u1', 'name': 'Alice', 'old_summary': 'baked stale line\nvalid fact',
                    'new_summary': 'valid fact', 'edge_count': 1},
@@ -1283,8 +897,8 @@ class TestRebuildEntitySummariesEntityUuids:
         assert result['total_entities'] == 1
         assert result['stale_entities'] == 1
         assert result['rebuilt'] == 1
-        # force-style target selection: list_entity_nodes is consulted (not detect_stale_*)
-        svc.graphiti.list_entity_nodes.assert_awaited_once()
+        # force-style target selection: enumerate_entity_nodes is consulted (not detect_stale_*)
+        svc.graphiti.enumerate_entity_nodes.assert_awaited_once()
         # Baked stale line is dropped — the rebuilt summary reflects only the valid edge.
         assert result['details'][0]['new_summary'] == 'valid fact'
 
@@ -1295,12 +909,12 @@ class TestRebuildEntitySummariesEntityUuids:
         while a matched UUID in the same request still rebuilds normally.
         """
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=([
             {'uuid': 'u1', 'name': 'Alice', 'summary': 's'},
-        ])
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={
+        ], complete_paged_read()))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({
             'u1': [{'uuid': 'e1', 'fact': 's', 'name': 'r'}],
-        })
+        }, complete_paged_read()))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=_uuid_dispatch({
             'u1': {'uuid': 'u1', 'name': 'Alice', 'old_summary': 's', 'new_summary': 's', 'edge_count': 1},
         }))
@@ -1320,11 +934,11 @@ class TestRebuildEntitySummariesEntityUuids:
         never fetches edges or rebuilds — detection is bypassed but nothing is written.
         """
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=([
             {'uuid': 'u1', 'name': 'Alice', 'summary': 's'},
-        ])
+        ], complete_paged_read()))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock()
-        svc.graphiti.get_all_valid_edges = AsyncMock()
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock()
 
         result = await svc.rebuild_entity_summaries(project_id='test', entity_uuids=['u1'], dry_run=True)
 
@@ -1333,7 +947,7 @@ class TestRebuildEntitySummariesEntityUuids:
         assert result['rebuilt'] == 0
         assert result['details'][0]['status'] == 'skipped_dry_run'
         # No edge fetch needed for dry_run — the targeted path must not pay for it.
-        svc.graphiti.get_all_valid_edges.assert_not_awaited()
+        svc.graphiti.enumerate_all_valid_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_empty_entity_uuids_is_zero_count_noop(self, mock_config):
@@ -1343,7 +957,7 @@ class TestRebuildEntitySummariesEntityUuids:
         force/dry_run behavior unchanged).
         """
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock()
+        svc.graphiti.enumerate_entity_nodes = AsyncMock()
         svc.graphiti.rebuild_entity_from_edges = AsyncMock()
 
         result = await svc.rebuild_entity_summaries(project_id='test', entity_uuids=[])
@@ -1355,8 +969,12 @@ class TestRebuildEntitySummariesEntityUuids:
             'skipped': 0,
             'errors': 0,
             'details': [],
+            'entities_complete': None,
+            'entities_incomplete_kind': None,
+            'edges_complete': None,
+            'edges_incomplete_kind': None,
         }
-        svc.graphiti.list_entity_nodes.assert_not_awaited()
+        svc.graphiti.enumerate_entity_nodes.assert_not_awaited()
         svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()
 
 
@@ -1489,14 +1107,11 @@ class TestRebuildSummariesManager:
         """RebuildSummariesManager.run() calls service.rebuild_entity_summaries."""
         from fused_memory.maintenance.rebuild_summaries import RebuildSummariesManager
         mock_service = MagicMock()
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 4,
-            'stale_entities': 2,
-            'rebuilt': 2,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=4,
+            stale_entities=2,
+            rebuilt=2,
+        ))
         manager = RebuildSummariesManager(service=mock_service, group_id='test_project')
         result = await manager.run()
         mock_service.rebuild_entity_summaries.assert_awaited_once_with(
@@ -1510,14 +1125,12 @@ class TestRebuildSummariesManager:
         """force and dry_run params are forwarded correctly to the service."""
         from fused_memory.maintenance.rebuild_summaries import RebuildSummariesManager
         mock_service = MagicMock()
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 2,
-            'stale_entities': 2,
-            'rebuilt': 0,
-            'skipped': 2,
-            'errors': 0,
-            'details': [],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=2,
+            stale_entities=2,
+            rebuilt=0,
+            skipped=2,
+        ))
         manager = RebuildSummariesManager(service=mock_service, group_id='test_project')
         result = await manager.run(force=True, dry_run=True)
         mock_service.rebuild_entity_summaries.assert_awaited_once_with(
@@ -1531,14 +1144,11 @@ class TestRebuildSummariesManager:
         from fused_memory.maintenance.rebuild_summaries import run_rebuild_summaries
         mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 0,
-            'stale_entities': 0,
-            'rebuilt': 0,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=0,
+            stale_entities=0,
+            rebuilt=0,
+        ))
         fake_ctx = make_fake_maintenance_service(mock_cfg, mock_service)
         with patch(
             'fused_memory.maintenance.rebuild_summaries.maintenance_service',
@@ -1553,14 +1163,12 @@ class TestRebuildSummariesManager:
         from fused_memory.maintenance.rebuild_summaries import RebuildResult, run_rebuild_summaries
         mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 7,
-            'stale_entities': 3,
-            'rebuilt': 3,
-            'skipped': 0,
-            'errors': 0,
-            'details': [make_rebuild_detail('u1', 'Alice', old_summary='old', new_summary='new', edge_count=2)],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=7,
+            stale_entities=3,
+            rebuilt=3,
+            details=[make_rebuild_detail('u1', 'Alice', old_summary='old', new_summary='new', edge_count=2)],
+        ))
         fake_ctx = make_fake_maintenance_service(mock_cfg, mock_service)
         with patch(
             'fused_memory.maintenance.rebuild_summaries.maintenance_service',
@@ -1590,14 +1198,11 @@ class TestRebuildSummariesManager:
 
         mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = AsyncMock()
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 5,
-            'stale_entities': 3,
-            'rebuilt': 3,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=5,
+            stale_entities=3,
+            rebuilt=3,
+        ))
         fake_ctx = make_fake_maintenance_service(mock_cfg, mock_service)
         with caplog.at_level(logging.INFO, logger='fused_memory.maintenance.rebuild_summaries'), patch(
             'fused_memory.maintenance.rebuild_summaries.maintenance_service',
@@ -1623,14 +1228,11 @@ class TestRebuildSummariesManager:
 
         from fused_memory.maintenance.rebuild_summaries import RebuildSummariesManager
         mock_service = MagicMock()
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 3,
-            'stale_entities': 1,
-            'rebuilt': 1,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=3,
+            stale_entities=1,
+            rebuilt=1,
+        ))
         manager = RebuildSummariesManager(service=mock_service, group_id='test')
         with caplog.at_level(logging.INFO, logger='fused_memory.maintenance.rebuild_summaries'):
             await manager.run()
@@ -1643,15 +1245,15 @@ class TestRebuildSummariesManager:
 
 
 # ---------------------------------------------------------------------------
-# N+1 fix step-7: detect_stale_summaries uses bulk get_all_valid_edges
+# N+1 fix step-7: detect_stale_summaries uses the bulk enumerate_all_valid_edges
 # ---------------------------------------------------------------------------
 
 class TestDetectStaleSummariesBulk:
-    """detect_stale_summaries uses get_all_valid_edges (one query) not N per-entity queries."""
+    """detect_stale_summaries uses enumerate_all_valid_edges (one read) not N per-entity queries."""
 
     @pytest.mark.asyncio
-    async def test_calls_get_all_valid_edges_once_not_per_entity(self, mock_config, make_backend, make_edge_backend):
-        """detect_stale_summaries calls get_all_valid_edges exactly once (not N times)."""
+    async def test_calls_enumerate_all_valid_edges_once_not_per_entity(self, mock_config, make_backend, make_edge_backend):
+        """detect_stale_summaries reads the bulk edge corpus exactly once (not N times)."""
         backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'factB'},
@@ -1661,7 +1263,7 @@ class TestDetectStaleSummariesBulk:
         })
         backend.get_valid_edges_for_node = AsyncMock()
         await backend.detect_stale_summaries(group_id='test')
-        backend.get_all_valid_edges.assert_awaited_once()
+        backend.enumerate_all_valid_edges.assert_awaited_once()
         backend.get_valid_edges_for_node.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1701,14 +1303,14 @@ def two_entity_backend(mock_config, make_backend, make_edge_backend):
 
     Provides:
       - make_backend(mock_config) instantiation (GraphitiBackend with mocked client)
-      - list_entity_nodes returning Alice (uuid-1/stale1) and Bob (uuid-2/stale2)
-      - get_all_valid_edges returning current1/current2 edges for each entity
+      - enumerate_entity_nodes returning Alice (uuid-1/stale1) and Bob (uuid-2/stale2)
+      - enumerate_all_valid_edges returning current1/current2 edges for each entity
 
     Function-scoped (pytest default) so each test gets a fresh backend with fresh
     AsyncMock.await_count counters — important for await_count assertions in both
     TestRebuildEntitySummariesParallel and TestRebuildEntitySummariesCancellation.
 
-    The list_entity_nodes and get_all_valid_edges mocks are exercised by force=True
+    The enumerate_entity_nodes and enumerate_all_valid_edges mocks are exercised by force=True
     consumers (TestRebuildEntitySummariesParallel.test_partial_failure_in_update_does_not_cancel_others
     and all TestRebuildEntitySummariesCancellation tests except test_cancelled_error_propagates_force_false).
     force=False consumers may intentionally supersede those lower-level mocks by stubbing
@@ -1734,8 +1336,8 @@ def two_entity_service(mock_config):
 
     Provides:
       - MemoryService with mocked graphiti backend (no real DB needed)
-      - list_entity_nodes returning Alice (uuid-1/stale1) and Bob (uuid-2/stale2)
-      - get_all_valid_edges returning current1/current2 edges for each entity
+      - enumerate_entity_nodes returning Alice (uuid-1/stale1) and Bob (uuid-2/stale2)
+      - enumerate_all_valid_edges returning current1/current2 edges for each entity
 
     Function-scoped (pytest default) so each test gets a fresh service with fresh
     AsyncMock.await_count counters.
@@ -1744,14 +1346,14 @@ def two_entity_service(mock_config):
     the specific scenario under test.
     """
     svc = _make_svc(mock_config)
-    svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+    svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=([
         {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale1'},
         {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'stale2'},
-    ])
-    svc.graphiti.get_all_valid_edges = AsyncMock(return_value={
+    ], complete_paged_read()))
+    svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({
         'uuid-1': [{'uuid': 'e1', 'fact': 'current1', 'name': 'edge1'}],
         'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
-    })
+    }, complete_paged_read()))
     return svc
 
 
@@ -1772,6 +1374,8 @@ class TestRebuildEntitySummariesParallel:
                 'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
             },
             total_count=2,
+            entities_completeness=COMPLETE_READ,
+            edges_completeness=COMPLETE_READ,
         ))
         svc.graphiti.get_valid_edges_for_node = AsyncMock()
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
@@ -1785,19 +1389,19 @@ class TestRebuildEntitySummariesParallel:
         assert result['rebuilt'] == 2
 
     @pytest.mark.asyncio
-    async def test_force_calls_get_all_valid_edges_once_not_refresh_entity_summary(
+    async def test_force_calls_enumerate_all_valid_edges_once_not_refresh_entity_summary(
         self, mock_config
     ):
-        """Force path: get_all_valid_edges called once; refresh_entity_summary never called."""
+        """Force path: enumerate_all_valid_edges called once; refresh_entity_summary never called."""
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=([
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'ok'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'also ok'},
-        ])
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={
+        ], complete_paged_read()))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
-        })
+        }, complete_paged_read()))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'ok', 'new_summary': 'fact1', 'edge_count': 1},
             {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'also ok', 'new_summary': 'fact2', 'edge_count': 1},
@@ -1806,7 +1410,7 @@ class TestRebuildEntitySummariesParallel:
 
         result = await svc.rebuild_entity_summaries(project_id='test', force=True)
 
-        svc.graphiti.get_all_valid_edges.assert_awaited_once_with(group_id='test')
+        svc.graphiti.enumerate_all_valid_edges.assert_awaited_once_with(group_id='test')
         svc.graphiti.refresh_entity_summary.assert_not_awaited()
         assert result['total_entities'] == 2
         assert result['rebuilt'] == 2
@@ -1818,8 +1422,8 @@ class TestRebuildEntitySummariesParallel:
         """Force path: bulk fetches run exactly once and every entity is updated.
 
         Guards three independent invariants under the force path:
-        1. list_entity_nodes is awaited exactly once (single bulk node fetch).
-        2. get_all_valid_edges is awaited exactly once with the forwarded project_id
+        1. enumerate_entity_nodes is awaited exactly once (single bulk node fetch).
+        2. enumerate_all_valid_edges is awaited exactly once with the forwarded project_id
            (single bulk edge fetch, correctly scoped).
         3. rebuild_entity_from_edges is awaited once per entity and each entity receives
            its own edge data — uses three distinct entities with distinct facts so
@@ -1827,16 +1431,16 @@ class TestRebuildEntitySummariesParallel:
            per-uuid new_summary assertions below.
         """
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=([
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'summary-1'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'summary-2'},
             {'uuid': 'uuid-3', 'name': 'Carol', 'summary': 'summary-3'},
-        ])
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={
+        ], complete_paged_read()))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact-1', 'name': 'rel-1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact-2', 'name': 'rel-2'}],
             'uuid-3': [{'uuid': 'e3', 'fact': 'fact-3', 'name': 'rel-3'}],
-        })
+        }, complete_paged_read()))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'summary-1', 'new_summary': 'fact-1', 'edge_count': 1},
             {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'summary-2', 'new_summary': 'fact-2', 'edge_count': 1},
@@ -1845,9 +1449,9 @@ class TestRebuildEntitySummariesParallel:
 
         result = await svc.rebuild_entity_summaries(project_id='test', force=True)
 
-        # list_entity_nodes must be called exactly once — no per-entity re-fetch
-        svc.graphiti.list_entity_nodes.assert_awaited_once()
-        svc.graphiti.get_all_valid_edges.assert_awaited_once_with(group_id='test')
+        # enumerate_entity_nodes must be called exactly once — no per-entity re-fetch
+        svc.graphiti.enumerate_entity_nodes.assert_awaited_once()
+        svc.graphiti.enumerate_all_valid_edges.assert_awaited_once_with(group_id='test')
         assert result['total_entities'] == 3
         assert result['rebuilt'] == 3
         assert svc.graphiti.rebuild_entity_from_edges.await_count == 3
@@ -1871,8 +1475,8 @@ class TestRebuildEntitySummariesParallel:
             for i in range(n)
         }
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=entities)
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value=edges)
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=(entities, complete_paged_read()))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=(edges, complete_paged_read()))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
             {'uuid': f'uuid-{i}', 'name': f'Entity{i}',
              'old_summary': f'stale{i}', 'new_summary': f'current{i}', 'edge_count': 1}
@@ -1889,17 +1493,17 @@ class TestRebuildEntitySummariesParallel:
     async def test_force_path_passes_old_summary_no_get_node_text(
         self, mock_config
     ):
-        """Force path: old_summary from list_entity_nodes is passed to
+        """Force path: old_summary from enumerate_entity_nodes is passed to
         rebuild_entity_from_edges and get_node_text is never called."""
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=([
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'alice summary'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'bob summary'},
-        ])
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={
+        ], complete_paged_read()))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact1', 'name': 'edge1'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact2', 'name': 'edge2'}],
-        })
+        }, complete_paged_read()))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'alice summary', 'new_summary': 'fact1', 'edge_count': 1},
             {'uuid': 'uuid-2', 'name': 'Bob', 'old_summary': 'bob summary', 'new_summary': 'fact2', 'edge_count': 1},
@@ -1909,7 +1513,7 @@ class TestRebuildEntitySummariesParallel:
         result = await svc.rebuild_entity_summaries(project_id='test', force=True)
 
         assert result['rebuilt'] == 2
-        # old_summary must be threaded from list_entity_nodes summary field
+        # old_summary must be threaded from enumerate_entity_nodes summary field
         calls = svc.graphiti.rebuild_entity_from_edges.call_args_list
         by_uuid = {c.args[0]: c for c in calls}
         assert by_uuid['uuid-1'].kwargs['old_summary'] == 'alice summary'
@@ -1930,12 +1534,12 @@ class TestRebuildEntitySummariesParallel:
         """Force path: old_summary='' (FalkorDB NULL→'' normalisation) is passed
         as empty string — NOT None — to rebuild_entity_from_edges."""
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=[
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=([
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': ''},
-        ])
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={
+        ], complete_paged_read()))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({
             'uuid-1': [{'uuid': 'e1', 'fact': 'new fact', 'name': 'edge1'}],
-        })
+        }, complete_paged_read()))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(return_value={
             'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': '', 'new_summary': 'new fact', 'edge_count': 1,
         })
@@ -1969,6 +1573,8 @@ class TestRebuildEntitySummariesParallel:
                 'uuid-2': [{'uuid': 'e2', 'fact': 'bob current', 'name': 'edge2'}],
             },
             total_count=2,
+            entities_completeness=COMPLETE_READ,
+            edges_completeness=COMPLETE_READ,
         ))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'alice stale', 'new_summary': 'alice current', 'edge_count': 1},
@@ -2126,7 +1732,7 @@ class TestRebuildEntitySummariesCancellation:
         dict and pytest.raises will report DID NOT RAISE — confirming the test fails before
         the fix and passes after.
 
-        Uses force=True (simpler mock surface: list_entity_nodes + get_all_valid_edges)
+        Uses force=True (simpler mock surface: enumerate_entity_nodes + enumerate_all_valid_edges)
         matching the pattern from TestRebuildEntitySummariesParallel.
         """
         svc = two_entity_service
@@ -2260,7 +1866,7 @@ class TestRebuildEntitySummariesCancellation:
 
         The two existing cancellation tests (test_cancelled_error_propagates and
         test_cancelled_error_propagates_alongside_other_errors) both use force=True
-        (simpler mock surface: list_entity_nodes + get_all_valid_edges).  This test
+        (simpler mock surface: enumerate_entity_nodes + enumerate_all_valid_edges).  This test
         exercises the force=False branch, which routes through
         detect_stale_with_edges instead, to confirm that both code paths
         share the same gather + two-tier propagation guarantee.
@@ -2289,6 +1895,8 @@ class TestRebuildEntitySummariesCancellation:
                     'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
                 },
                 total_count=2,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         # First entity's rebuild raises CancelledError; second would succeed
@@ -2491,6 +2099,8 @@ class TestServiceRebuildOrchestration:
                 stale=stale_entities,
                 all_edges=all_edges,
                 total_count=3,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
@@ -2506,7 +2116,7 @@ class TestServiceRebuildOrchestration:
         """Service calls graphiti.detect_stale_with_edges with the correct group_id."""
         await service.rebuild_entity_summaries(project_id='myproject')
         service.graphiti.detect_stale_with_edges.assert_awaited_once_with(
-            group_id='myproject'
+            group_id='myproject', log=_SERVICE_LOG
         )
 
     @pytest.mark.asyncio
@@ -2564,8 +2174,8 @@ class TestServiceRebuildOrchestrationForce:
             'uuid-1': [{'uuid': 'e1', 'fact': 'fact A'}],
             'uuid-2': [{'uuid': 'e2', 'fact': 'fact B'}],
         }
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=all_entities)
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value=all_edges)
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=(all_entities, complete_paged_read()))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=(all_edges, complete_paged_read()))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'old summary A',
              'new_summary': 'new summary A', 'edge_count': 1},
@@ -2575,20 +2185,20 @@ class TestServiceRebuildOrchestrationForce:
         return svc
 
     @pytest.mark.asyncio
-    async def test_calls_list_entity_nodes_not_detect(self, service_force):
-        """force=True calls list_entity_nodes, not detect_stale_with_edges."""
+    async def test_calls_enumerate_entity_nodes_not_detect(self, service_force):
+        """force=True calls enumerate_entity_nodes, not detect_stale_with_edges."""
         await service_force.rebuild_entity_summaries(project_id='proj', force=True)
-        service_force.graphiti.list_entity_nodes.assert_awaited_once_with(group_id='proj')
+        service_force.graphiti.enumerate_entity_nodes.assert_awaited_once_with(group_id='proj')
         # detect methods must NOT be called
         service_force.graphiti.detect_stale_with_edges = AsyncMock()
         await service_force.rebuild_entity_summaries(project_id='proj', force=True)
         service_force.graphiti.detect_stale_with_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_calls_get_all_valid_edges_when_not_dry_run(self, service_force):
-        """force=True, dry_run=False calls get_all_valid_edges."""
+    async def test_calls_enumerate_all_valid_edges_when_not_dry_run(self, service_force):
+        """force=True, dry_run=False calls enumerate_all_valid_edges."""
         await service_force.rebuild_entity_summaries(project_id='proj', force=True)
-        service_force.graphiti.get_all_valid_edges.assert_awaited_once_with(group_id='proj')
+        service_force.graphiti.enumerate_all_valid_edges.assert_awaited_once_with(group_id='proj')
 
     @pytest.mark.asyncio
     async def test_rebuilds_all_entities_not_just_stale(self, service_force):
@@ -2630,14 +2240,16 @@ class TestServiceRebuildOrchestrationDryRun:
         stale = [
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old summary A'},
         ]
-        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=(stale, 3))
+        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=StaleProbeResult(
+            stale=stale, total_count=3, entities_completeness=COMPLETE_READ,
+        ))
         svc.graphiti.detect_stale_with_edges = AsyncMock()
         svc.graphiti.rebuild_entity_from_edges = AsyncMock()
         return svc
 
     @pytest.fixture
     def service_force_dry_run(self, mock_config):
-        """Service with list_entity_nodes mocked (force=True, dry_run=True)."""
+        """Service with enumerate_entity_nodes mocked (force=True, dry_run=True)."""
         from fused_memory.services.memory_service import MemoryService
         svc = MemoryService(mock_config)
         svc.graphiti = MagicMock()
@@ -2649,8 +2261,8 @@ class TestServiceRebuildOrchestrationDryRun:
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'old summary A'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'old summary B'},
         ]
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=all_entities)
-        svc.graphiti.get_all_valid_edges = AsyncMock()
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=(all_entities, complete_paged_read()))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock()
         svc.graphiti.rebuild_entity_from_edges = AsyncMock()
         return svc
 
@@ -2658,7 +2270,9 @@ class TestServiceRebuildOrchestrationDryRun:
     async def test_false_dry_run_calls_detect_stale_dry_run(self, service_dry_run):
         """force=False+dry_run=True calls detect_stale_dry_run, NOT detect_stale_with_edges."""
         await service_dry_run.rebuild_entity_summaries(project_id='proj', dry_run=True)
-        service_dry_run.graphiti.detect_stale_dry_run.assert_awaited_once_with(group_id='proj')
+        service_dry_run.graphiti.detect_stale_dry_run.assert_awaited_once_with(
+            group_id='proj', log=_SERVICE_LOG
+        )
         service_dry_run.graphiti.detect_stale_with_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -2675,13 +2289,13 @@ class TestServiceRebuildOrchestrationDryRun:
         service_dry_run.graphiti.rebuild_entity_from_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_force_dry_run_calls_list_nodes_not_get_edges(self, service_force_dry_run):
-        """force=True+dry_run=True calls list_entity_nodes but NOT get_all_valid_edges."""
+    async def test_force_dry_run_reads_nodes_not_edges(self, service_force_dry_run):
+        """force=True+dry_run=True calls enumerate_entity_nodes but NOT enumerate_all_valid_edges."""
         await service_force_dry_run.rebuild_entity_summaries(
             project_id='proj', force=True, dry_run=True
         )
-        service_force_dry_run.graphiti.list_entity_nodes.assert_awaited_once_with(group_id='proj')
-        service_force_dry_run.graphiti.get_all_valid_edges.assert_not_awaited()
+        service_force_dry_run.graphiti.enumerate_entity_nodes.assert_awaited_once_with(group_id='proj')
+        service_force_dry_run.graphiti.enumerate_all_valid_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_force_dry_run_returns_all_entities_as_skipped(self, service_force_dry_run):
@@ -2720,6 +2334,8 @@ class TestServiceRebuildOrchestrationErrors:
                 stale=stale_entities,
                 all_edges={},
                 total_count=2,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         return svc
@@ -2821,14 +2437,11 @@ class TestRebuildSummariesManagerWithService:
         """Return a MagicMock representing MemoryService with a mocked rebuild method."""
         from fused_memory.services.memory_service import MemoryService
         mock_svc = MagicMock(spec=MemoryService)
-        mock_svc.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 5,
-            'stale_entities': 2,
-            'rebuilt': 2,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-        })
+        mock_svc.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=5,
+            stale_entities=2,
+            rebuilt=2,
+        ))
         return mock_svc
 
     def test_manager_accepts_service_argument(self):
@@ -2859,14 +2472,13 @@ class TestRebuildSummariesManagerWithService:
             RebuildSummariesManager,
         )
         mock_svc = self._make_mock_service()
-        mock_svc.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 10,
-            'stale_entities': 4,
-            'rebuilt': 3,
-            'skipped': 1,
-            'errors': 0,
-            'details': [{'uuid': 'u1', 'name': 'Alice', 'status': 'rebuilt'}],
-        })
+        mock_svc.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=10,
+            stale_entities=4,
+            rebuilt=3,
+            skipped=1,
+            details=[{'uuid': 'u1', 'name': 'Alice', 'status': 'rebuilt'}],
+        ))
         manager = RebuildSummariesManager(service=mock_svc, group_id='proj')
         result = await manager.run()
         assert isinstance(result, RebuildResult)
@@ -2885,14 +2497,11 @@ class TestRebuildSummariesManagerWithService:
 
         mock_cfg = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         mock_service = MagicMock(spec=MemoryService)
-        mock_service.rebuild_entity_summaries = AsyncMock(return_value={
-            'total_entities': 3,
-            'stale_entities': 1,
-            'rebuilt': 1,
-            'skipped': 0,
-            'errors': 0,
-            'details': [],
-        })
+        mock_service.rebuild_entity_summaries = AsyncMock(return_value=rebuild_service_result(
+            total_entities=3,
+            stale_entities=1,
+            rebuilt=1,
+        ))
         # Ensure service.graphiti.rebuild_entity_summaries does NOT exist
         # so if manager wrongly calls service.graphiti.rebuild_entity_summaries it'll error
         mock_service.graphiti = MagicMock()
@@ -2916,13 +2525,13 @@ class TestRebuildSummariesManagerWithService:
 #
 # The sharpest vector, and the one that does NOT go through
 # detect_stale_with_edges at all: the force=True path takes `targets` = every
-# entity from list_entity_nodes, then _rebuild_one does
+# entity from enumerate_entity_nodes, then _rebuild_one does
 # all_edges.get(uuid, []) -> rebuild_entity_from_edges ->
 # '\n'.join([]) == '' -> update_node_summary. It never consults staleness, so
 # a fabricated-empty edge read blanks EVERY entity in the graph.
 #
 # The node read is deliberately kept HEALTHY while only the edge read is made
-# structurally incomplete. Both shims default to the same page size, so a
+# structurally incomplete. Both reads default to the same page size, so a
 # refusal would otherwise fire on both reads in lockstep, leaving `targets`
 # empty and the rebuild loop unentered — a test written that way would pass
 # without the fix and prove nothing. That lockstep is an accident of two
@@ -2962,10 +2571,10 @@ class _DualCorpusGraph:
 
 
 def _force_edge_read_structural(monkeypatch, **forced):
-    """Force _paged_ro_query kwargs for the EDGE read only (dispatch on the template)."""
+    """Force paged_ro_query kwargs for the EDGE read only (dispatch on the template)."""
     from fused_memory.backends import graphiti_client
 
-    real = graphiti_client._paged_ro_query
+    real = graphiti_client.paged_ro_query
 
     async def dispatching(*args, **kwargs):
         page_template = args[1] if len(args) > 1 else kwargs.get('page_template', '')
@@ -2973,7 +2582,7 @@ def _force_edge_read_structural(monkeypatch, **forced):
             kwargs = {**kwargs, **forced}
         return await real(*args, **kwargs)
 
-    monkeypatch.setattr(graphiti_client, '_paged_ro_query', dispatching)
+    monkeypatch.setattr(graphiti_client, 'paged_ro_query', dispatching)
 
 
 _STRUCTURAL_CASES = [
@@ -3053,3 +2662,303 @@ class TestStructuralRefusalNeverBlanksSummaries:
 
         backend.update_node_summary.assert_not_awaited()
         assert backend.update_node_summary.await_count == 0
+
+
+# ---------------------------------------------------------------------------
+# task 4714: the bulk rebuild and the single-entity refresh read the SAME
+# population — otherwise the two summary generators diverge for one entity
+# ---------------------------------------------------------------------------
+
+class TestBulkAndSingleRefreshShareTheEdgePopulation:
+    """Both summary generators must select edges by the same predicate.
+
+    ``rebuild_entity_summaries`` (bulk, via ``get_all_valid_edges``) and
+    ``refresh_entity_summary`` (single, via ``get_valid_edges_for_node``) write
+    to the SAME ``summary`` property.  If their predicates drift apart, which
+    facts an entity's summary contains depends on which code path last touched
+    it — the bulk pass and a targeted refresh would disagree about the same
+    entity, and each would silently overwrite the other.  The population both
+    reads return on a real server is pinned by
+    tests/test_refresh_entity_summary.py::TestActiveEdgePopulationLiveFalkorDB.
+    """
+
+    @pytest.mark.asyncio
+    async def test_both_reads_use_the_shared_active_edge_predicate(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        graph = _DualCorpusGraph(
+            node_rows=[['u1', 'Task 99', 'stale']],
+            edge_rows=[['u1', 'e1', 'Task 99 depends on Task 98', 'DEPENDS_ON']],
+        )
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.update_node_summary = AsyncMock()
+
+        # The bulk path's whole-graph edge read...
+        await backend.get_all_valid_edges(group_id='test')
+        bulk = [q for q in graph.queries if 'RELATES_TO' in q]
+
+        graph.queries.clear()
+        # ...and the single-entity refresh, whose read has its own row shape:
+        # uuid, fact, name, valid_at, invalid_at.
+        graph.edge_rows = [['e1', 'Task 99 depends on Task 98', 'DEPENDS_ON', None, None]]
+        await backend.refresh_entity_summary(
+            'u1', group_id='test', name='Task 99', old_summary='stale'
+        )
+        single = [q for q in graph.queries if 'RELATES_TO' in q]
+
+        assert bulk, 'no RELATES_TO read recorded for the bulk path'
+        assert single, 'no RELATES_TO read recorded for the refresh path'
+        for query in bulk + single:
+            assert ACTIVE_EDGE_PREDICATE in query, query
+            assert 'expired_at' not in query, query  # restored edges stay (esc-4714-9)
+
+
+# ---------------------------------------------------------------------------
+# task 4914: the service reads through the checked reads, so the policy holds
+# ---------------------------------------------------------------------------
+
+
+_REBUILD_READ_PATHS = [
+    pytest.param({'force': True}, id='force'),
+    pytest.param({'entity_uuids': ['u1']}, id='targeted'),
+]
+
+
+class TestRebuildReadsApplyThePolicy:
+    """A structural read verdict raises at the service and nothing is written.
+
+    ``enumerate_*`` never raises, so a service that read through it directly
+    instead of through ``read_entity_nodes_checked`` /
+    ``read_all_valid_edges_checked`` would hand a fabricated corpus to the
+    write path.  The collections here are NON-EMPTY so the write path
+    WOULD be reached without the policy, and the absence of the write is
+    pinned, not just the exception.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('path_kwargs', _REBUILD_READ_PATHS)
+    @pytest.mark.parametrize('read', ['nodes', 'edges'])
+    @pytest.mark.parametrize('kind', sorted(INCOMPLETE_STRUCTURAL_KINDS))
+    async def test_structural_read_raises_and_writes_nothing(
+        self, path_kwargs, read, kind, mock_config
+    ):
+        svc = _make_svc(mock_config)
+        nodes_read = incomplete_paged_read(kind) if read == 'nodes' else complete_paged_read()
+        edges_read = incomplete_paged_read(kind) if read == 'edges' else complete_paged_read()
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=(
+            [{'uuid': 'u1', 'name': 'Alice', 'summary': 'a real summary'}], nodes_read,
+        ))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=(
+            {'u1': [{'uuid': 'e1', 'fact': 'a real summary', 'name': 'knows'}]}, edges_read,
+        ))
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(
+            return_value=make_rebuild_detail('u1', 'Alice')
+        )
+
+        with pytest.raises(IncompleteEnumerationError):
+            await svc.rebuild_entity_summaries(
+                project_id='test', dry_run=False, **path_kwargs
+            )
+
+        svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()
+
+
+class TestRebuildReportsReadCompleteness:
+    """The result carries the tri-state completeness of each read on every path.
+
+    True is proven complete, False is observed incomplete, and None is no
+    verdict for that read on this path.  Every assertion is an explicit
+    ``is``, never truthiness, because only ``is True`` is a safe gate.
+    """
+
+    _NODES = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'a real summary'}]
+    _EDGES = {'u1': [{'uuid': 'e1', 'fact': 'a real summary', 'name': 'knows'}]}
+
+    def _svc(self, mock_config, *, nodes_read, edges_read):
+        """The service, and the MagicMock backend it reads through."""
+        svc = _make_svc(mock_config)
+        graphiti = MagicMock()
+        graphiti.enumerate_entity_nodes = AsyncMock(return_value=(self._NODES, nodes_read))
+        graphiti.enumerate_all_valid_edges = AsyncMock(return_value=(self._EDGES, edges_read))
+        graphiti.rebuild_entity_from_edges = AsyncMock(
+            return_value=make_rebuild_detail('u1', 'Alice')
+        )
+        svc.graphiti = graphiti
+        return svc, graphiti
+
+    @pytest.mark.asyncio
+    async def test_force_write_reports_a_short_node_read_and_still_rebuilds(self, mock_config):
+        """Empirical incompleteness is reported, never escalated into a refusal."""
+        svc, graphiti = self._svc(
+            mock_config,
+            nodes_read=incomplete_paged_read(INCOMPLETE_SHORT_READ),
+            edges_read=complete_paged_read(),
+        )
+        result = await svc.rebuild_entity_summaries(project_id='test', force=True)
+
+        assert result['entities_complete'] is False
+        assert result['entities_incomplete_kind'] == INCOMPLETE_SHORT_READ
+        assert result['edges_complete'] is True
+        assert result['edges_incomplete_kind'] is None
+        assert result['rebuilt'] == len(self._NODES)
+        graphiti.rebuild_entity_from_edges.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_force_dry_run_has_no_edge_verdict(self, mock_config):
+        svc, graphiti = self._svc(
+            mock_config,
+            nodes_read=incomplete_paged_read(INCOMPLETE_CENSUS_UNAVAILABLE),
+            edges_read=complete_paged_read(),
+        )
+        result = await svc.rebuild_entity_summaries(project_id='test', force=True, dry_run=True)
+
+        assert result['entities_complete'] is False
+        assert result['entities_incomplete_kind'] == INCOMPLETE_CENSUS_UNAVAILABLE
+        assert result['edges_complete'] is None
+        assert result['edges_incomplete_kind'] is None
+        graphiti.enumerate_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_targeted_write_reports_an_unproven_edge_read(self, mock_config):
+        svc, _ = self._svc(
+            mock_config,
+            nodes_read=complete_paged_read(),
+            edges_read=incomplete_paged_read(INCOMPLETE_CENSUS_UNAVAILABLE),
+        )
+        result = await svc.rebuild_entity_summaries(project_id='test', entity_uuids=['u1'])
+
+        assert result['entities_complete'] is True
+        assert result['entities_incomplete_kind'] is None
+        assert result['edges_complete'] is False
+        assert result['edges_incomplete_kind'] == INCOMPLETE_CENSUS_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_targeted_dry_run_has_no_edge_verdict(self, mock_config):
+        svc, _ = self._svc(
+            mock_config, nodes_read=complete_paged_read(), edges_read=complete_paged_read(),
+        )
+        result = await svc.rebuild_entity_summaries(
+            project_id='test', entity_uuids=['u1'], dry_run=True
+        )
+
+        assert result['entities_complete'] is True
+        assert result['entities_incomplete_kind'] is None
+        assert result['edges_complete'] is None
+        assert result['edges_incomplete_kind'] is None
+
+    @pytest.mark.asyncio
+    async def test_stale_write_mirrors_both_detection_verdicts(self, mock_config):
+        svc = _make_svc(mock_config)
+        svc.graphiti.detect_stale_with_edges = AsyncMock(return_value=StaleSummaryResult(
+            stale=[], all_edges={}, total_count=0,
+            entities_completeness=COMPLETE_READ,
+            edges_completeness=ReadCompleteness(
+                complete=False, incomplete_kind=INCOMPLETE_SHORT_READ
+            ),
+        ))
+        result = await svc.rebuild_entity_summaries(project_id='test')
+
+        assert result['entities_complete'] is True
+        assert result['entities_incomplete_kind'] is None
+        assert result['edges_complete'] is False
+        assert result['edges_incomplete_kind'] == INCOMPLETE_SHORT_READ
+
+    @pytest.mark.asyncio
+    async def test_journal_records_both_read_verdicts(self, mock_config):
+        svc = _make_svc(mock_config)
+        svc.graphiti.detect_stale_with_edges = AsyncMock(return_value=StaleSummaryResult(
+            stale=[], all_edges={}, total_count=0,
+            entities_completeness=COMPLETE_READ,
+            edges_completeness=ReadCompleteness(
+                complete=False, incomplete_kind=INCOMPLETE_SHORT_READ
+            ),
+        ))
+        journal = MagicMock()
+        journal.log_write_op = AsyncMock()
+        svc.set_write_journal(journal)
+
+        await svc.rebuild_entity_summaries(project_id='test')
+
+        result_summary = journal.log_write_op.call_args.kwargs['result_summary']
+        assert result_summary['entities_complete'] is True
+        assert result_summary['edges_complete'] is False
+        assert 'entities_incomplete_kind' not in result_summary
+        assert 'edges_incomplete_kind' not in result_summary
+
+    @pytest.mark.asyncio
+    async def test_stale_dry_run_reports_the_node_verdict_only(self, mock_config):
+        """The force=False dry_run probe reports its node read's verdict.
+
+        There is no edge verdict, because the probe issues only per-node edge
+        reads, never a whole-graph one.
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=StaleProbeResult(
+            stale=[], total_count=0,
+            entities_completeness=ReadCompleteness(
+                complete=False, incomplete_kind=INCOMPLETE_SHORT_READ
+            ),
+        ))
+        result = await svc.rebuild_entity_summaries(project_id='test', dry_run=True)
+
+        assert result['entities_complete'] is False
+        assert result['entities_incomplete_kind'] == INCOMPLETE_SHORT_READ
+        assert result['edges_complete'] is None
+        assert result['edges_incomplete_kind'] is None
+
+    @pytest.mark.asyncio
+    async def test_stale_dry_run_reports_the_real_probes_short_node_read(
+        self, mock_config, make_backend, make_edge_backend
+    ):
+        """A real backend, so the probe runs the real checked node read."""
+        svc = _make_svc(mock_config)
+        svc.graphiti = make_edge_backend(
+            make_backend(mock_config),
+            nodes=self._NODES,
+            edges=self._EDGES,
+            nodes_read=incomplete_paged_read(INCOMPLETE_SHORT_READ),
+        )
+        svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=self._EDGES['u1'])
+
+        result = await svc.rebuild_entity_summaries(project_id='test', dry_run=True)
+
+        assert result['entities_complete'] is False
+        assert result['entities_incomplete_kind'] == INCOMPLETE_SHORT_READ
+        assert result['edges_complete'] is None
+        svc.graphiti.enumerate_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'path_kwargs',
+        [
+            pytest.param({'force': True}, id='force'),
+            pytest.param({'entity_uuids': ['u1']}, id='targeted'),
+            pytest.param({}, id='stale'),
+            pytest.param({'dry_run': True}, id='stale_dry_run'),
+        ],
+    )
+    async def test_empirical_warning_is_logged_under_the_service(
+        self, path_kwargs, mock_config, make_backend, make_edge_backend, caplog
+    ):
+        """On every path the policy warning surfaces beside the rebuild's own lines.
+
+        A real backend, so the stale paths run the real detect_stale_with_edges
+        and detect_stale_dry_run.
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti = make_edge_backend(
+            make_backend(mock_config),
+            nodes=self._NODES,
+            edges=self._EDGES,
+            nodes_read=incomplete_paged_read(INCOMPLETE_SHORT_READ),
+        )
+        svc.graphiti.get_valid_edges_for_node = AsyncMock(return_value=self._EDGES['u1'])
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(
+            return_value=make_rebuild_detail('u1', 'Alice')
+        )
+        with caplog.at_level(logging.WARNING):
+            await svc.rebuild_entity_summaries(project_id='test', **path_kwargs)
+
+        assert node_read_warnings(caplog, 'fused_memory.services.memory_service')
+        assert not node_read_warnings(caplog, 'fused_memory.backends.graphiti_client')

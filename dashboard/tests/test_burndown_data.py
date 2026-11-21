@@ -24,6 +24,7 @@ from dashboard.data.burndown import (
     aggregate_burndown_projects,
     aggregate_burndown_series,
     collect_snapshot,
+    compute_parity_alarm,
     compute_window_completion,
     downsample,
     ensure_snapshot_columns,
@@ -173,9 +174,9 @@ def _isolate_caches():
     """The snapshot unit cache may not cross a test."""
     import dashboard.data.task_snapshot as snapshot_mod
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     yield
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -652,7 +653,9 @@ class TestEnsureSnapshotColumns:
         db = tmp_path / 'pre_delta1.db'
         _pre_delta1_burndown_db(db)
         project_root = tmp_path / 'project'
-        _write_orch_config(project_root, 'max_concurrent_tasks: 24\n')
+        _write_orch_config(
+            project_root, 'max_concurrent_tasks: 24\nmain_health_fix_reserved_slots: 0\n'
+        )
         config = DashboardConfig(project_root=project_root)
         store = _CannedStore({project_root: [_live_now(id=1), _stranded(id=2)]})
 
@@ -1356,11 +1359,49 @@ class TestCollectSnapshotTaskSourceAndCap:
     """The collector persists the rows' live/stranded split and stamps the cap.
 
     The split needs the claimant columns only ``get_tasks`` rows carry; the
-    concurrency cap is read once per root and stored ON the row because
-    ``max_concurrent_tasks`` varies across restarts and projects: resolving it
-    at render time would compare a historical in-progress census against
-    today's cap and mislabel both directions.
+    concurrency cap — the run-slot capacity, ``read_run_slot_capacity`` — is
+    read once per root and stored ON the row because it varies across restarts
+    and projects: resolving it at render time would compare a historical
+    in-progress census against today's cap and mislabel both directions.
     """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('live_count', 'alarms'), [(37, False), (38, True)])
+    async def test_a_fix_on_the_reserve_slot_is_not_a_breach(
+        self, burndown_env, caplog, dummy_client, live_count, alarms,
+    ):
+        """36 general slots + the default reserve of 1: 37 live is full, 38 breaches."""
+        db_path, config, conn = burndown_env
+        _write_orch_config(Path(str(config.project_root)), 'max_concurrent_tasks: 36\n')
+        tasks = [_live_now(id=i) for i in range(1, live_count + 1)]
+
+        with (
+            _serve(_CannedStore({config.project_root: tasks})),
+            patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
+            caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
+        ):
+            await collect_snapshot(conn, config, client=dummy_client)
+
+        async with conn.execute(
+            'SELECT in_progress_live, concurrency_cap FROM snapshots'
+        ) as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row['concurrency_cap'] == 37
+
+        breach = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and 'cap' in r.getMessage().lower()
+        ]
+        assert bool(breach) is alarms, breach
+        if alarms:
+            assert '38 live in-progress vs cap 37' in breach[0], breach[0]
+
+        parity = compute_parity_alarm({
+            'in_progress_live': [row['in_progress_live']],
+            'concurrency_cap': [row['concurrency_cap']],
+        })
+        assert parity['parity_alarm'] is alarms
 
     @pytest.mark.asyncio
     async def test_persists_the_live_stranded_split(self, burndown_env, dummy_client):
@@ -1404,8 +1445,12 @@ class TestCollectSnapshotTaskSourceAndCap:
     async def test_persists_the_cap_in_force_at_snapshot_time(
         self, burndown_env, dummy_client,
     ):
+        """The stored cap is the full run-slot capacity, reserve included."""
         db_path, config, conn = burndown_env
-        _write_orch_config(Path(str(config.project_root)), 'max_concurrent_tasks: 24\n')
+        _write_orch_config(
+            Path(str(config.project_root)),
+            'max_concurrent_tasks: 24\nmain_health_fix_reserved_slots: 2\n',
+        )
 
         with (
             _serve(_CannedStore({config.project_root: [_live_now(id=1)]})),
@@ -1416,7 +1461,7 @@ class TestCollectSnapshotTaskSourceAndCap:
         async with conn.execute('SELECT concurrency_cap FROM snapshots') as cur:
             row = await cur.fetchone()
         assert row is not None
-        assert row['concurrency_cap'] == 24
+        assert row['concurrency_cap'] == 26
 
     @pytest.mark.asyncio
     async def test_unknown_cap_persists_null_without_a_breach_warning(
@@ -1458,7 +1503,10 @@ class TestCollectSnapshotTaskSourceAndCap:
         live in-progress, and against what cap — so the log line stands alone.
         """
         db_path, config, conn = burndown_env
-        _write_orch_config(Path(str(config.project_root)), 'max_concurrent_tasks: 2\n')
+        _write_orch_config(
+            Path(str(config.project_root)),
+            'max_concurrent_tasks: 2\nmain_health_fix_reserved_slots: 0\n',
+        )
 
         tasks = [_live_now(id=1), _live_now(id=2), _live_now(id=3), _stranded(id=4)]
 
@@ -1490,7 +1538,10 @@ class TestCollectSnapshotTaskSourceAndCap:
     ):
         """The cap is INCLUSIVE — running exactly at capacity is healthy."""
         db_path, config, conn = burndown_env
-        _write_orch_config(Path(str(config.project_root)), 'max_concurrent_tasks: 2\n')
+        _write_orch_config(
+            Path(str(config.project_root)),
+            'max_concurrent_tasks: 2\nmain_health_fix_reserved_slots: 0\n',
+        )
 
         with (
             _serve(_CannedStore({config.project_root: [_live_now(id=1), _live_now(id=2)]})),
@@ -1511,7 +1562,10 @@ class TestCollectSnapshotTaskSourceAndCap:
     ):
         """Stranded rows hold no slot, so only the live count breaches (PRD decision 9)."""
         db_path, config, conn = burndown_env
-        _write_orch_config(Path(str(config.project_root)), 'max_concurrent_tasks: 2\n')
+        _write_orch_config(
+            Path(str(config.project_root)),
+            'max_concurrent_tasks: 2\nmain_health_fix_reserved_slots: 0\n',
+        )
 
         tasks = [
             _live_now(id=1), _live_now(id=2),
@@ -1562,7 +1616,7 @@ class TestCollectSnapshotTaskSourceAndCap:
 
             with (
                 _serve(_CannedStore({config.project_root: many, root_a: many, root_b: many})),
-                patch('dashboard.data.burndown.read_max_concurrent_tasks', side_effect=fake_cap),
+                patch('dashboard.data.burndown.read_run_slot_capacity', side_effect=fake_cap),
                 patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
@@ -2011,6 +2065,46 @@ class TestDownsample:
                 assert row is not None
                 assert row[0] == 1  # only the recent one
 
+    async def test_retains_relative_to_an_explicit_now(self, tmp_path):
+        """Both cutoffs are measured from *now*; against today's wall clock the
+        recent hour would collapse to one row and the 89-day row would expire."""
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+        now = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+        old_hour = (now - timedelta(days=10)).replace(minute=0, second=0, microsecond=0)
+        gap_only_hour = old_hour - timedelta(hours=1)
+        recent_hour = (now - timedelta(days=1)).replace(minute=0, second=0, microsecond=0)
+
+        def at(hour: datetime, minute: int) -> str:
+            return (hour + timedelta(minutes=minute)).isoformat()
+
+        kept_89d = (now - timedelta(days=89)).isoformat()
+        sync_conn = sqlite3.connect(str(db_path))
+        _insert_value(sync_conn, 'proj', at(old_hour, 10))
+        _insert_gap(sync_conn, 'proj', at(old_hour, 50))
+        _insert_gap(sync_conn, 'proj', at(gap_only_hour, 10))
+        _insert_gap(sync_conn, 'proj', at(gap_only_hour, 50))
+        _insert_value(sync_conn, 'proj', at(recent_hour, 10))
+        _insert_value(sync_conn, 'proj', at(recent_hour, 50))
+        _insert_value(sync_conn, 'proj', kept_89d)
+        _insert_value(sync_conn, 'proj', (now - timedelta(days=100)).isoformat())
+        sync_conn.commit()
+        sync_conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await downsample(conn, now=now)
+            async with conn.execute('SELECT ts, state FROM snapshots ORDER BY ts') as cur:
+                got = [tuple(row) for row in await cur.fetchall()]
+
+        expected = [
+            (kept_89d, 'value'),
+            (at(gap_only_hour, 50), 'gap'),
+            (at(old_hour, 10), 'value'),
+            (at(recent_hour, 10), 'value'),
+            (at(recent_hour, 50), 'value'),
+        ]
+        assert got == expected, f'expected {expected}, got {got}'
+
 
 # ---------------------------------------------------------------------------
 # get_burndown_projects
@@ -2362,7 +2456,9 @@ class TestReadSideSeesMeasuredRowsOnly:
         """Wire compatibility with ``redux_api.shape_burndown`` (task 5592 owns it):
         a gap row contributes nothing — not zeros — to either block."""
         from dashboard.data.redux_api import shape_burndown
+        from dashboard.project_labels import ProjectLabels
 
+        no_configured_roots = ProjectLabels.of_roots(())
         with_gap, without_gap = tmp_path / 'with_gap.db', tmp_path / 'without_gap.db'
         for path in (with_gap, without_gap):
             _migrated_pre_delta1_db(path)
@@ -2375,8 +2471,8 @@ class TestReadSideSeesMeasuredRowsOnly:
             conn.commit()
             conn.close()
 
-        shaped = shape_burndown({'/p/proj': await _series_of(with_gap)})
-        expected = shape_burndown({'/p/proj': await _series_of(without_gap)})
+        shaped = shape_burndown({'/p/proj': await _series_of(with_gap)}, labels=no_configured_roots)
+        expected = shape_burndown({'/p/proj': await _series_of(without_gap)}, labels=no_configured_roots)
 
         assert shaped['BURNDOWN_BY_PROJECT'] == expected['BURNDOWN_BY_PROJECT']
         assert shaped['BURNDOWN'] == expected['BURNDOWN']
@@ -2937,8 +3033,8 @@ class TestCollectSnapshotExplicitRollback:
         """An unexpected exception inside collect_snapshot must trigger conn.rollback()
         and re-raise the original exception.
 
-        Injection point: patch `dashboard.data.burndown.datetime` so that
-        `datetime.now(UTC).isoformat()` raises RuntimeError('clock failure').
+        Injection point: patch `dashboard.data.burndown.resolve_now` so that
+        the cycle's clock read raises RuntimeError('clock failure').
         This fires before any per-project try/except, so the outer except
         must catch it, call rollback, then re-raise.
 
@@ -2960,16 +3056,13 @@ class TestCollectSnapshotExplicitRollback:
 
         conn.rollback = rollback_spy
 
-        # Patch datetime.now to raise RuntimeError — fires before any per-project try/except
-        class _FakeDatetime:
-            @staticmethod
-            def now(tz=None):
-                raise RuntimeError('clock failure')
-
         try:
             with (
                 _patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-                _patch('dashboard.data.burndown.datetime', _FakeDatetime),
+                _patch(
+                    'dashboard.data.burndown.resolve_now',
+                    side_effect=RuntimeError('clock failure'),
+                ),
                 pytest.raises(RuntimeError, match='clock failure'),
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
@@ -3002,11 +3095,9 @@ class TestCollectSnapshotPerRootBudget:
         pre-empts a unit still inside its own bounds. Ceiling: half one
         collector cycle, so cycle N is done before cycle N+1 starts even when a
         root spends its whole budget."""
-        import dashboard.loops as loops_module
-
         budget = burndown_module._SNAPSHOT_PER_ROOT_BUDGET
         floor = burndown_module._SNAPSHOT_UNIT_WORST_CASE_SECONDS
-        ceiling = loops_module._SAMPLE_INTERVAL_SECONDS / 2
+        ceiling = burndown_module.SAMPLE_INTERVAL_SECONDS / 2
 
         assert budget >= floor, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the snapshot unit\'s own '
@@ -3015,8 +3106,8 @@ class TestCollectSnapshotPerRootBudget:
         )
         assert budget <= ceiling, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is above HALF one collector '
-            f'cycle ({ceiling} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
-            f'{loops_module._SAMPLE_INTERVAL_SECONDS} / 2).'
+            f'cycle ({ceiling} s = SAMPLE_INTERVAL_SECONDS / 2 = '
+            f'{burndown_module.SAMPLE_INTERVAL_SECONDS} / 2).'
         )
 
 

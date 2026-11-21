@@ -164,6 +164,17 @@ control runs.
 - **with-indices decides.** embedding-only is reported with its confound stated: it is
   today's production retrieval path on the unindexed live graphs, not the configuration a
   cutover would ship.
+  - **Erratum (2026-10-08, esc-3722-3) — framing only.** The premise "today's production
+    retrieval path on the unindexed live graphs" was already stale when this doc was committed
+    on 2026-10-07. Index provisioning task 3708 landed on 2026-10-02. A read-only
+    `CALL db.indexes()` on the live `dark_factory` graph shows range and fulltext indexes on
+    `Entity` name/summary, `RELATES_TO` fact and `Episodic` content. So on `dark_factory`
+    with-indices is today's production, and embedding-only is not. Only `dark_factory` was
+    measured. The sentence above is left as committed. This note changes no rule, margin,
+    envelope, floor, metric or arm, and no result: with-indices still decides, embedding-only
+    is still reported, and ι had produced no numbers when this note was written. A candidate
+    artifact that carries this note's commit as its `preregistration_sha` is bound by the
+    same rules as one that carries η's `865a017d79`.
 - **query-embed-latency-p95 envelope:** `queue.search_timeout_seconds` 30 s / 2.0 =
   15000 ms, on the same warm-under-load definition.
 - **Reported:** reembed-throughput, projected to full-backfill wall-clock.

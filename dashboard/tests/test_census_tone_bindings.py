@@ -13,7 +13,7 @@ is the live hazard — a recent, singly-used addition.
 WHY A PYTHON SOURCE READ. charts.jsx is a Babel file node cannot load, so the
 shipped artifact cannot be asked what its palette contains. This is the route
 ``test_charts_consumer_bindings.py`` already takes to the adjacent DF_CHARTS
-bindings, over the same shared parser in ``_dashboard_helpers``.
+bindings, over the same shared parser in ``_jsx_source_helpers``.
 
 AND WHY THAT IS NOT THE UNTESTED MATCHER PRD DECISION 17 REJECTS. That
 decision rejects a SUBSTRING GUARD whose matcher is untested — a token grep
@@ -29,7 +29,7 @@ from __future__ import annotations
 import pathlib
 import re
 
-from _dashboard_helpers import strip_js_comments, walk_balanced
+from _jsx_source_helpers import strip_js_comments, walk_balanced
 
 from dashboard.data.census import TONES
 

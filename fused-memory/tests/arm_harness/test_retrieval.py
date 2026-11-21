@@ -7,6 +7,7 @@ import pytest
 
 from arm_harness._fakes import FakeArmGraph, llm_spec
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
+from fused_memory.arm_harness.metrics_record import EmbeddingMetricId
 from fused_memory.arm_harness.replay_types import EpisodeOutcome, ReplayItem
 from fused_memory.arm_harness.retrieval import (
     RETRIEVAL_UTILITY_K,
@@ -118,6 +119,16 @@ def test_mrr_is_absent_without_ranks():
     assert mrr_metric([]) is None
 
 
+def test_mrr_emits_the_metric_id_it_is_given():
+    default = mrr_metric(RANKS)
+    mem0 = mrr_metric(RANKS, metric_id=EmbeddingMetricId.MEM0_MRR)
+
+    assert mem0 is not None
+    assert default is not None
+    assert mem0.metric_id == 'mem0-mrr'
+    assert (mem0.value, mem0.n, mem0.kind) == (default.value, default.n, default.kind)
+
+
 def test_provenance_matcher_matches_results_citing_the_replayed_episode():
     matches = provenance_matcher('replay-ep-1')
 
@@ -185,3 +196,20 @@ async def test_probe_refuses_an_ok_outcome_without_a_replay_uuid_rather_than_mat
         await probe_retrieval_utility(graph, llm_spec(), [no_uuid], items=[_item('ep-0')])
 
     assert graph.search_calls == []
+
+
+@pytest.mark.asyncio
+async def test_probe_propagates_a_search_timeout_rather_than_ranking_a_miss():
+    def search_results(query: str) -> list:
+        if query == 'body of ep-1':
+            raise TimeoutError('graphiti search timed out after 30.0s')
+        return [_edge('replay-ep-0')]
+
+    graph = FakeArmGraph(search_results=search_results)
+    outcomes = [_outcome(f'ep-{i}') for i in range(3)]
+    items = [_item(f'ep-{i}') for i in range(3)]
+
+    with pytest.raises(TimeoutError, match='timed out after'):
+        await probe_retrieval_utility(graph, llm_spec(), outcomes, items=items)
+
+    assert [call['query'] for call in graph.search_calls] == ['body of ep-0', 'body of ep-1']

@@ -12,10 +12,10 @@ error-dict assertion with `assert_not_called()`.
 Harness copied from `test_add_memory_snapshot_gate.py` / its siblings: an
 `AsyncMock` memory service wired through `create_mcp_server`, invoked via
 `server._tool_manager.call_tool(...)`. Two inherited shapes that bite if copied
-carelessly — `mock_service.add_memory` must return an explicit `MagicMock` with
-`model_dump` configured (otherwise `result.model_dump()` is an unawaited
-coroutine), and an unspecced `AsyncMock`'s attribute chain auto-generates a
-truthy `Mock` for every config hop.
+carelessly — `mock_service.add_memory`'s result must dump to a plain dict (see
+`tests/server/write_triage_harness.py::configure_pass_through_add_memory`), and
+an unspecced `AsyncMock`'s attribute chain auto-generates a truthy `Mock` for
+every config hop.
 
 (The MCP-markup boundary guard task 4458 added is installed in `server/main.py`,
 NOT in `create_mcp_server`, so this harness does not run through it and the
@@ -30,8 +30,9 @@ import pytest
 
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.utils.referent_resolution import _DECLARED_REFERENT_HINT
+from server.entities_declaration_shapes import MALFORMED_SHAPES
 
-# The C1 fallback harness, imported rather than re-derived: reaching
+# The shared write-triage harness, imported rather than re-derived: reaching
 # `add_memory`'s SECOND service call site needs write triage enabled with a
 # calibrated high-cosine candidate, and a private copy would drift the moment
 # those bands are retuned. The bare `server.` import resolves because
@@ -39,15 +40,11 @@ from fused_memory.utils.referent_resolution import _DECLARED_REFERENT_HINT
 # tests/server/ is a package (see the same note in
 # test_add_memory_near_duplicate_gate.py, which imports test_config_schema the
 # same way).
-from server.test_add_memory_write_triage_gate import _candidate, _configure_config
-
-# The malformed-shape corpus, IMPORTED rather than re-spelled. The unit tests
-# pin what the pure gate answers for each shape; this module pins what an agent
-# actually receives for the same shape. Two copies of the list would let those
-# two claims drift — a shape added to one and not the other is silently
-# unchecked at the seam that matters — which is the whole point of the
-# single-list amendment (see `_MALFORMED_SHAPES`' own comment).
-from server.test_entities_gate import _MALFORMED_SHAPES
+from server.write_triage_harness import (
+    configure_pass_through_add_memory,
+    configure_triage_config,
+    search_candidate,
+)
 
 _PROJECT_ID = 'dark_factory'
 
@@ -60,14 +57,6 @@ _CONFLICTING = [{'kind': 'task', 'id': 3129}]
 _CORROBORATING = [{'kind': 'task', 'id': 3127}]
 #: Structurally invalid — gamma raises InputValidationError on a non-digit id.
 _MALFORMED = [{'id': 'abc'}]
-
-
-def _pass_through(mock_service: AsyncMock, dump: dict | None = None) -> MagicMock:
-    """Configure ``mock_service.add_memory`` to return a dict-dumpable result."""
-    mem_result = MagicMock()
-    mem_result.model_dump.return_value = dump if dump is not None else {'id': 'ok'}
-    mock_service.add_memory.return_value = mem_result
-    return mem_result
 
 
 async def _call(server, **overrides) -> dict:
@@ -88,7 +77,7 @@ class TestAddMemoryEntitiesGate:
     async def test_a_conflicting_declaration_rejects_and_does_not_write(self):
         """The PRD's user-observable signal, end to end at the boundary."""
         mock_service = AsyncMock()
-        _pass_through(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await _call(server, entities=_CONFLICTING)
@@ -108,7 +97,7 @@ class TestAddMemoryEntitiesGate:
         """The control. Absence is never a rejection, so the ONLY difference
         between this and the case above is the declaration."""
         mock_service = AsyncMock()
-        _pass_through(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await _call(server)
@@ -119,7 +108,7 @@ class TestAddMemoryEntitiesGate:
     @pytest.mark.asyncio
     async def test_a_corroborating_declaration_writes(self):
         mock_service = AsyncMock()
-        _pass_through(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await _call(server, entities=_CORROBORATING)
@@ -132,7 +121,7 @@ class TestAddMemoryEntitiesGate:
         """Tri-state arm 2 — "considered, none apply" — is not a rejection,
         even though the scan DID find a referent the declaration omits."""
         mock_service = AsyncMock()
-        _pass_through(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await _call(server, entities=[])
@@ -143,7 +132,7 @@ class TestAddMemoryEntitiesGate:
     @pytest.mark.asyncio
     async def test_a_malformed_declaration_rejects_and_does_not_write(self):
         mock_service = AsyncMock()
-        _pass_through(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await _call(server, entities=_MALFORMED)
@@ -153,52 +142,93 @@ class TestAddMemoryEntitiesGate:
         mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_the_gate_is_category_independent(self):
-        """A Mem0-primary category that never routes to Graphiti STILL rejects.
+    @pytest.mark.parametrize(
+        'category',
+        ['observations_and_summaries', 'preferences_and_norms', 'procedural_knowledge'],
+    )
+    async def test_a_mem0_primary_write_is_never_conflict_rejected(self, category):
+        """The declaration on this write is discarded, so a conflict verdict
+        could only cost a false rejection (task 6059).
 
-        Scoping the gate to `write_graphiti` is the tempting optimization and
-        it is unimplementable at this seam: `category=None` auto-classifies
-        BELOW the tool boundary, so the tool structurally cannot know the
-        destination store without running the classifier a second time (INV-5).
-        It is also wrong on the merits — a declaration contradicting its own
-        prose is a defective assertion whichever store it lands in, and
-        accepting it for Mem0 writes would teach agents that `entities` is
-        advisory.
+        `search` answers no hits, so the procedural near-duplicate guard finds
+        nothing to block on and every category must reach the write.
         """
-        for category in ('observations_and_summaries', 'preferences_and_norms', None):
-            mock_service = AsyncMock()
-            _pass_through(mock_service)
-            server = create_mcp_server(mock_service)
+        mock_service = AsyncMock()
+        mock_service.search.return_value = []
+        configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
 
-            result = await _call(server, category=category, entities=_CONFLICTING)
+        result = await _call(server, category=category, dual_write=False, entities=_CONFLICTING)
 
-            assert result.get('error_type') == 'DeclaredReferentConflictRejected', (
-                f'category={category!r} escaped the gate: {result!r}'
-            )
-            mock_service.add_memory.assert_not_called()
+        assert 'error' not in result, f'{result!r}'
+        mock_service.add_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dual_write_still_rejects(self):
+        mock_service = AsyncMock()
+        configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call(
+            server, category='observations_and_summaries', dual_write=True, entities=_CONFLICTING,
+        )
+
+        assert result.get('error_type') == 'DeclaredReferentConflictRejected', f'{result!r}'
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unclassified_write_still_rejects(self):
+        """`category=None` is classified BELOW the tool boundary, so the tool
+        cannot know the destination without running the classifier twice
+        (INV-5)."""
+        mock_service = AsyncMock()
+        configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, category=None, entities=_CONFLICTING)
+
+        assert result.get('error_type') == 'DeclaredReferentConflictRejected', f'{result!r}'
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_mem0_primary_write_still_rejects_a_malformed_declaration(self):
+        mock_service = AsyncMock()
+        configure_pass_through_add_memory(mock_service)
+        server = create_mcp_server(mock_service)
+
+        result = await _call(server, category='observations_and_summaries', entities=_MALFORMED)
+
+        assert result.get('error_type') == 'ValidationError', f'{result!r}'
+        mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_the_rejection_is_cheap_no_embedding_round_trip(self):
         """Gate ORDERING: a self-contradictory declaration must not pay for the
         near-duplicate guard's embedding search or write triage's judge call.
 
+        dual_write=True keeps the declaration recorded, so it is conflict-
+        checked; the near-duplicate guard ignores dual_write, so the control
+        still reaches `search`.
+
         The control below is load-bearing — without it this assertion would
         also pass if `search` were simply never reachable for this input, and
         the ordering claim would be vacuous.
         """
         mock_service = AsyncMock()
-        _pass_through(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
-        await _call(server, category='procedural_knowledge', entities=_CONFLICTING)
+        await _call(
+            server, category='procedural_knowledge', dual_write=True, entities=_CONFLICTING,
+        )
 
         mock_service.search.assert_not_called()
 
         control = AsyncMock()
-        _pass_through(control)
+        configure_pass_through_add_memory(control)
         control_server = create_mcp_server(control)
 
-        await _call(control_server, category='procedural_knowledge')
+        await _call(control_server, category='procedural_knowledge', dual_write=True)
 
         assert control.search.call_count, (
             'the control never reached the near-duplicate search, so the '
@@ -218,7 +248,7 @@ class TestAddMemoryForwardsTheDeclaration:
     @pytest.mark.asyncio
     async def test_the_caller_list_is_forwarded_verbatim(self):
         mock_service = AsyncMock()
-        _pass_through(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         await _call(server, entities=_CORROBORATING)
@@ -239,7 +269,7 @@ class TestAddMemoryForwardsTheDeclaration:
         source='declared' to 'derived'/'none' and corrupt the very counter
         leaf iota reads."""
         mock_service = AsyncMock()
-        _pass_through(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         kwargs = {} if entities is None else {'entities': entities}
@@ -262,19 +292,19 @@ class TestAddMemoryForwardsTheDeclaration:
         so. The fallback deliberately drops the failed parent link; it must
         NOT drop this, for the same reason it keeps the full content.
 
-        Harness reused from `test_add_memory_write_triage_gate.py`'s C1 suite
-        rather than re-derived, so a retune of its bands or its candidate shape
-        carries this test with it.
+        Harness reused from `tests/server/write_triage_harness.py` rather than
+        re-derived, so a retune of its bands or its candidate shape carries
+        this test with it.
         """
         mock_service = AsyncMock()
-        _configure_config(mock_service, enabled=True)
+        configure_triage_config(mock_service, enabled=True)
         mem_result = MagicMock()
         mem_result.model_dump.return_value = {'id': 'fallback-id'}
         mock_service.add_memory.side_effect = [
             RuntimeError('parent_id rejected by the write seam'),
             mem_result,
         ]
-        mock_service.search.return_value = [_candidate('m1', 0.97, content=_CONTENT)]
+        mock_service.search.return_value = [search_candidate('m1', 0.97, content=_CONTENT)]
         server = create_mcp_server(mock_service)
 
         result = await _call(
@@ -315,9 +345,11 @@ _KNOWN_PROJECTS = {'dark_factory': '/root'}
 def _pass_through_episode(mock_service: AsyncMock, dump: dict | None = None) -> MagicMock:
     """Configure ``mock_service.add_episode`` to return a dict-dumpable result.
 
-    Same shape trap as `_pass_through`: `add_episode` ends in
-    `result.model_dump()`, so a bare AsyncMock return would make the tool's
-    final expression an unawaited coroutine rather than a dict.
+    Same shape trap as
+    `tests/server/write_triage_harness.py::configure_pass_through_add_memory`:
+    `add_episode` ends in `result.model_dump()`, so a bare AsyncMock return
+    would make the tool's final expression an unawaited coroutine rather than
+    a dict.
     """
     ep_result = MagicMock()
     ep_result.model_dump.return_value = dump if dump is not None else {'id': 'ep'}
@@ -420,7 +452,7 @@ class TestAddEpisodeEntitiesGate:
             server,
             content=_COMPLETION_CONTENT,
             agent_id='recon-stage-task_knowledge_sync',
-            entities=_CONFLICTING,
+            entities=[{'kind': 'task', 'id': 5253}],
         )
 
         assert result.get('error_type') == 'DeclaredReferentConflictRejected', f'{result!r}'
@@ -536,10 +568,10 @@ class TestEveryMalformedShapeReachesTheGate:
     """
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
+    @pytest.mark.parametrize('declared', MALFORMED_SHAPES)
     async def test_add_memory_answers_with_the_hinted_block(self, declared):
         mock_service = AsyncMock()
-        _pass_through(mock_service)
+        configure_pass_through_add_memory(mock_service)
         server = create_mcp_server(mock_service)
 
         result = await _call(server, entities=declared)
@@ -551,7 +583,7 @@ class TestEveryMalformedShapeReachesTheGate:
         mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
+    @pytest.mark.parametrize('declared', MALFORMED_SHAPES)
     async def test_add_episode_answers_with_the_hinted_block(self, declared):
         mock_service = AsyncMock()
         _pass_through_episode(mock_service)

@@ -41,11 +41,18 @@ inject their own fakes and must not accidentally exercise a live LLM.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard, get_args
+from urllib.parse import urlsplit
 
-from fused_memory.config.schema import JudgeReasoningEffort, WriteTriageConfig
+from fused_memory.config.schema import (
+    JudgeReasoningEffort,
+    WriteTriageConfig,
+    blank_means_inherit,
+)
 from fused_memory.routing.json_extract import extract_json
 from fused_memory.server.grouped_read import PARENT_ID_KEY
 
@@ -65,9 +72,10 @@ from fused_memory.server.write_triage import (
     JudgeUsage,
     TriageJudgeVerdict,
 )
+from fused_memory.utils.clip_disclosure import TruncationFact, elide_text
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     from fused_memory.models.memory import MemoryResult
 
@@ -305,11 +313,6 @@ _DEFAULT_JUDGE_CANDIDATE_COUNT = 5
 #: multiply the cost of every call.
 _DEFAULT_JUDGE_FIELD_CHARS: int = WriteTriageConfig.model_fields['judge_field_chars'].default
 
-#: Appended to any field this module cut. The marker is not decoration: a
-#: silent truncation hands the model a severed sentence to read as the whole
-#: record, and "this text continues" is information the verdict depends on.
-_ELIDED_MARKER = '…[elided]'
-
 #: The ceiling on the whole judge call at the shipped defaults, in the unit
 #: this module can actually count: characters. It is not a token cap — what a
 #: call costs in tokens per slate width is PRD C1's measured ESTIMATE
@@ -340,19 +343,52 @@ _ELIDED_MARKER = '…[elided]'
 #: fused-memory/tests/server/test_write_triage_judge.py::TestJudgeExemplars::test_the_budget_admits_no_further_worked_example
 #: holds it there, measuring both sides afresh on every run.
 #:
-#: Note "over" the cap, not "at": `_elide` returns a field of exactly the cap
-#: unchanged and cuts a longer one to the cap plus `_ELIDED_MARKER`, so the
-#: widest render is 9 chars per field — 54 across the six — wider than a slate
-#: built at the cap.
-JUDGE_PROMPT_CHAR_BUDGET = 27_000
+#: WHY A CUT FIELD IS WIDER THAN THE CAP. :func:`_elide` renders a field at the
+#: cap untouched, and a longer one as the cap plus a marker that counts the
+#: cut, so the widest render grows by one char per field for each digit of
+#: that count. The measured worst case cuts every field by a six-digit count;
+#: each further digit adds 6 chars across the call, and the slack absorbs
+#: those up to a count no process could hold. That worst case is measured
+#: afresh on every run by
+#: fused-memory/tests/server/test_write_triage_judge.py::_worst_case_call_chars.
+JUDGE_PROMPT_CHAR_BUDGET = 27_318
 
 
 def _elide(text: object, field_chars: int) -> str:
-    """*text* as a string, bounded by *field_chars* and marked if cut."""
-    body = text if isinstance(text, str) else str(text or '')
-    if len(body) <= field_chars:
-        return body
-    return body[:field_chars] + _ELIDED_MARKER
+    """*text* cut to *field_chars* by elide_text, which marks how many characters it dropped.
+
+    The marker is not decoration: a silent truncation hands the model a
+    severed sentence to read as the whole record. It carries the count
+    because the size of the loss decides whether it mattered. Input that is
+    not a string is coerced to its text first.
+    """
+    return elide_text(text, field_chars, field='judge_field').text
+
+
+class JudgePromptElisions(NamedTuple):
+    """Which fields build_judge_prompt cuts at one width: the entry, and each candidate by id."""
+
+    entry: bool
+    candidates: Mapping[str, bool]
+
+
+def judge_prompt_elisions(
+    content: str,
+    candidates: Sequence[MemoryResult],
+    *,
+    field_chars: int = _DEFAULT_JUDGE_FIELD_CHARS,
+) -> JudgePromptElisions:
+    """Which fields :func:`build_judge_prompt` would cut, for every candidate given.
+
+    Answered by the same :func:`_elide` the render calls, so it cannot disagree
+    with the prompt. It selects nothing: the whole slate it is handed is reported.
+    """
+    return JudgePromptElisions(
+        entry=_elide(content, field_chars) != content,
+        candidates=MappingProxyType(
+            {c.id: _elide(c.content, field_chars) != c.content for c in candidates},
+        ),
+    )
 
 
 def select_judge_candidates(
@@ -480,8 +516,11 @@ Answer with exactly one of these four words:
 
 - "distinct" — no candidate makes the same core claim as the new entry. \
 Shared wording alone neither makes a match nor rules one out.
-- "restates" — the new entry asserts what a candidate already asserts, adding \
-nothing new. A paraphrase restates.
+- "restates" — the new entry asserts what a candidate already asserts and \
+adds nothing a reader of that candidate would need: no new number, condition, \
+cause, fix, caveat or newer state. A paraphrase that adds nothing restates; \
+anything new makes it "amends", or "contests" if it says the candidate is \
+wrong, outdated or different.
 - "amends" — the new entry asserts what a candidate asserts AND adds \
 something the candidate does not have: a detail, a scope, a later \
 observation — without saying the candidate is wrong.
@@ -526,9 +565,9 @@ def build_judge_prompt(
     No candidate is marked or singled out. The verdict carries its own id, so
     neither slate position nor the band's winner steers the answer.
 
-    Every field is bounded by *field_chars* and marked with
-    :data:`_ELIDED_MARKER` when cut, so a pathological canonical cannot blow
-    up the call. :func:`judge_write` passes ``write_triage.judge_field_chars``,
+    Every field is bounded by *field_chars* and cut by :func:`_elide`, which
+    marks how many characters it dropped, so a pathological canonical cannot
+    blow up the call. :func:`judge_write` passes ``write_triage.judge_field_chars``,
     resolved per call; what that costs in tokens per slate width is PRD C1's
     measured estimate.
 
@@ -768,6 +807,38 @@ def resolve_judge_reasoning_effort(memory_service: Any) -> str | None:
     return None
 
 
+def _judge_override(memory_service: Any, attr: str) -> str | None:
+    """A judge-only override leaf, or None meaning INHERIT the provider's value.
+
+    The ``isinstance`` gate stays here because this runs on the write path,
+    where C1 forbids raising, and :func:`blank_means_inherit` takes only str.
+    """
+    value = _judge_attr(memory_service, attr)
+    if isinstance(value, str):
+        return blank_means_inherit(value)
+    return None
+
+
+def resolve_judge_api_url(memory_service: Any) -> str | None:
+    """The judge's own endpoint, or None meaning INHERIT the provider's api_url.
+
+    A blank or non-string value inherits, for the same reason
+    :func:`_provider_credentials` refuses to forward a blank credential: an
+    empty ``base_url`` fails every call and reads as a judge outage rather
+    than as the cleared leaf it is.
+    """
+    return _judge_override(memory_service, 'judge_api_url')
+
+
+def resolve_judge_api_key(memory_service: Any) -> str | None:
+    """The judge's own API key, or None meaning INHERIT the provider's api_key.
+
+    A blank key is never forwarded: ``AsyncOpenAI(api_key='')`` 401s every
+    call instead of falling back to the environment.
+    """
+    return _judge_override(memory_service, 'judge_api_key')
+
+
 # --- the LLM call ------------------------------------------------------------
 
 #: Output cap for the two answer-only arms (anthropic, and a chat-only compat
@@ -786,6 +857,22 @@ _JUDGE_MAX_TOKENS = 128
 #: plans/write-triage-flip-readiness-prd.md §11.
 _JUDGE_MAX_OUTPUT_TOKENS = 2_048
 
+#: Every arm's SDK client makes ONE attempt, so nothing retries inside
+#: ``write_triage.judge_timeout_seconds``; the SDK's per-attempt timeouts still
+#: apply within it. Why: that field's description in
+#: ``config/schema.py::WriteTriageConfig``.
+_JUDGE_SDK_MAX_RETRIES = 0
+
+
+class _JudgeRoute(NamedTuple):
+    """Where a judge call goes and which leaf supplied each credential; never the key itself."""
+
+    provider: str
+    #: ``host[:port]`` of the ``base_url``, or None for the SDK's default endpoint.
+    host: str | None
+    url_from: str
+    key_from: str
+
 
 class _ProviderCredentials(NamedTuple):
     """How to reach *provider*'s endpoint, and what that endpoint speaks."""
@@ -794,6 +881,47 @@ class _ProviderCredentials(NamedTuple):
     client_kwargs: dict[str, Any]
     #: Whether the endpoint serves the OpenAI Responses API.
     serves_responses_api: bool
+    route: _JudgeRoute
+
+
+def _judge_route(
+    provider: str,
+    client_kwargs: Mapping[str, Any],
+    *,
+    judge_url_set: bool,
+    judge_key_set: bool,
+) -> _JudgeRoute:
+    def source(judge_set: bool, kwarg: str, leaf: str) -> str:
+        if judge_set:
+            return f'write_triage.judge_{leaf}'
+        if kwarg in client_kwargs:
+            return f'llm.providers.{provider}.{leaf}'
+        return 'the SDK environment'
+
+    base_url = client_kwargs.get('base_url')
+    return _JudgeRoute(
+        provider=provider,
+        host=urlsplit(base_url).netloc.rpartition('@')[2] if base_url else None,
+        url_from=source(judge_url_set, 'base_url', 'api_url'),
+        key_from=source(judge_key_set, 'api_key', 'api_key'),
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _announce_judge_route(route: _JudgeRoute) -> None:
+    """Log *route* at INFO whenever it differs from the previous judge call's.
+
+    The endpoint leaves are read live and inherit independently, so a reload,
+    a half-set plan-proxy pair or an unset variable changes where the judge
+    goes with nothing else to show for it. One line per change, not per call.
+    """
+    logger.info(
+        'write_triage judge route: %s at %s (base_url from %s), api_key from %s',
+        route.provider,
+        route.host or 'the SDK default endpoint',
+        route.url_from,
+        route.key_from,
+    )
 
 
 def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCredentials:
@@ -804,6 +932,12 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     deployment is actually configured (``OPENAI_API_KEY`` in the shell, nothing
     in config.yaml). Reading the config section is for a deployment that pins a
     key or points at an OpenAI-compatible local endpoint.
+
+    ``base_url`` is ``write_triage.judge_api_url`` when set and ``api_key`` is
+    ``write_triage.judge_api_key`` when set; each otherwise comes from
+    ``llm.providers.<provider>``. Both overrides are judge-only, so the main
+    LLM arm is unaffected. ``serves_responses_api`` below still comes from
+    ``llm.client_class``.
 
     ``serves_responses_api`` is the deployment's existing declaration of what
     the configured OpenAI endpoint speaks — ``llm.client_class``, the same
@@ -819,16 +953,22 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     providers = getattr(llm, 'providers', None)
     section = getattr(providers, provider, None)
     client_kwargs: dict[str, Any] = {}
-    api_key = getattr(section, 'api_key', None)
+    judge_key = resolve_judge_api_key(memory_service)
+    api_key = judge_key or getattr(section, 'api_key', None)
     if isinstance(api_key, str) and api_key:
         client_kwargs['api_key'] = api_key
-    api_url = getattr(section, 'api_url', None)
+    judge_url = resolve_judge_api_url(memory_service)
+    api_url = judge_url or getattr(section, 'api_url', None)
     if isinstance(api_url, str) and api_url:
         client_kwargs['base_url'] = api_url
     serves_responses_api = (
         provider == 'openai' and _llm_attr(memory_service, 'client_class') != 'openai_generic'
     )
-    return _ProviderCredentials(client_kwargs, serves_responses_api)
+    route = _judge_route(
+        provider, client_kwargs,
+        judge_url_set=judge_url is not None, judge_key_set=judge_key is not None,
+    )
+    return _ProviderCredentials(client_kwargs, serves_responses_api, route)
 
 
 class _JudgeReply(NamedTuple):
@@ -892,9 +1032,10 @@ async def _call_llm(
     Each arm builds and closes its client PER CALL. A cached client would pin
     a stale ``api_key``/``api_url`` past a hot reload, turning a green-tier
     knob into a restart-only one. ``async with`` around ``asyncio.wait_for``
-    closes the connection pool even when a timeout cancels the request, which
-    matters because neither SDK client defines ``__del__``. The lost
-    connection reuse is a deliberate trade.
+    closes the connection pool even when a timeout cancels the request. The
+    SDK's own ``httpx`` wrapper finaliser (``AsyncHttpxClientWrapper.__del__``)
+    is no substitute: it closes the pool only if an event loop is running when
+    the client is collected. The lost connection reuse is a deliberate trade.
 
     NO ``try``/``except`` anywhere, and ``async with`` swallows nothing: every
     failure propagates to ``write_triage.py::triage_write``'s ``except`` arm,
@@ -907,6 +1048,7 @@ async def _call_llm(
             f'{list(_KNOWN_PROVIDERS)}',
         )
     creds = _provider_credentials(memory_service, provider)
+    _announce_judge_route(creds.route)
     if reasoning_effort is not None and not creds.serves_responses_api:
         why = (
             'the anthropic arm has no reasoning-effort parameter'
@@ -944,14 +1086,16 @@ async def _call_openai_responses(
     Unset means a non-reasoning model, pinned to ``temperature=0.0`` as on the
     other two arms.
     """
-    import openai  # noqa: PLC0415 — per-call import, matching judge.py
+    import openai  # per-call import, matching judge.py
 
     sampling: dict[str, Any] = (
         {'temperature': 0.0}
         if reasoning_effort is None
         else {'reasoning': {'effort': reasoning_effort}}
     )
-    async with openai.AsyncOpenAI(**creds.client_kwargs) as client:
+    async with openai.AsyncOpenAI(
+        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
+    ) as client:
         response = await asyncio.wait_for(
             client.responses.create(
                 model=model,
@@ -989,9 +1133,11 @@ async def _call_openai_chat(
     ``llm.client_class: openai_generic`` (llama.cpp, vLLM, LM Studio). Its
     compat 400s are task 5277 C's.
     """
-    import openai  # noqa: PLC0415 — per-call import, matching judge.py
+    import openai  # per-call import, matching judge.py
 
-    async with openai.AsyncOpenAI(**creds.client_kwargs) as client:
+    async with openai.AsyncOpenAI(
+        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
+    ) as client:
         response = await asyncio.wait_for(
             client.chat.completions.create(
                 model=model,
@@ -1024,9 +1170,11 @@ async def _call_anthropic(
     ``temperature=0.0`` because Anthropic's default is 1.0, and the system
     prompt via ``system=`` because Anthropic has no system role.
     """
-    import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
+    import anthropic  # per-call import, matching judge.py
 
-    async with anthropic.AsyncAnthropic(**creds.client_kwargs) as client:
+    async with anthropic.AsyncAnthropic(
+        **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
+    ) as client:
         response = await asyncio.wait_for(
             client.messages.create(
                 model=model,
@@ -1059,7 +1207,7 @@ async def judge_write(
     decision: Any,
     candidates: Any = (),
 ) -> TriageJudgeVerdict:
-    """Adjudicate one middle-band write, naming the candidate the verdict is about.
+    """Adjudicate one judged write, naming the candidate the verdict is about.
 
     This is what ``tools.py`` passes as ``triage_write(..., judge=...)``,
     replacing leaf beta's ``_stub_judge``. The signature is beta's, plus the
@@ -1126,15 +1274,16 @@ async def judge_write(
         # decision, not a failure.
         logger.info(
             'write_triage judge disabled by config '
-            '(write_triage.judge_enabled=false); middle-band write acked as '
+            '(write_triage.judge_enabled=false); judged write acked as '
             '%r without an LLM call',
             OUTCOME_STORED,
         )
         return TriageJudgeVerdict(OUTCOME_STORED)
 
+    candidate_count = resolve_judge_candidate_count(memory_service)
     selected = select_judge_candidates(
         candidates,
-        resolve_judge_candidate_count(memory_service),
+        candidate_count,
         canonical_id=getattr(decision, 'canonical_id', None),
     )
     if not selected:
@@ -1151,4 +1300,18 @@ async def judge_write(
         reasoning_effort=resolve_judge_reasoning_effort(memory_service),
     )
     verdict = parse_judge_verdict(reply.text, [candidate.id for candidate in selected])
-    return verdict._replace(usage=reply.usage)
+    return verdict._replace(
+        usage=reply.usage,
+        truncation_facts=_slate_trim_facts(candidates, selected, candidate_count),
+    )
+
+
+def _slate_trim_facts(
+    candidates: Any, selected: Sequence[MemoryResult], candidate_count: int,
+) -> tuple[TruncationFact, ...]:
+    """How many COMPARABLE candidates the judge was not shown, counted with ``cosine_of``."""
+    comparable = sum(1 for result in candidates or () if cosine_of(result) is not None)
+    elided = comparable - len(selected)
+    if elided <= 0:
+        return ()
+    return (TruncationFact(field='judge_candidates', cap=candidate_count, elided=elided),)

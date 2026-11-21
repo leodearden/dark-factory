@@ -28,9 +28,10 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from audit_model_admission import (
-    DEFAULT_RUNS_DB,
     MERGER_ROLE,
     InvocationRecord,
+    OrchestratorStartup,
+    RestartRequiredReload,
     RoleContainment,
     RoutingRejection,
     RoutingScan,
@@ -38,10 +39,12 @@ from audit_model_admission import (
     ServiceRestart,
     SpendInWindow,
     connect_ro,
+    default_runs_db,
     iso,
     load_events,
     markdown_table,
     parse_moment,
+    restart_witness_tables,
     roles_on_model,
     scan_invocations,
     scan_routing_decisions,
@@ -49,21 +52,21 @@ from audit_model_admission import (
     spend_in_window,
 )
 from escalation_ladder import (
-    DEFAULT_ESCALATIONS_DIR,
     STEWARD_ROLE,
     EscalationCorpus,
     L2TierMetrics,
     StewardDisposition,
     StewardDispositionSummary,
+    default_escalations_dir,
     l2_tier_metrics,
     load_escalation_corpus,
     summarize_steward_dispositions,
 )
+from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE
 
-# The CLI's result subtypes for a run killed at its dispatch caps. The _usd
-# spelling is orchestrator/src/orchestrator/routing.py::PROBE_BUDGET_EXHAUSTED_SUBTYPE.
+# The CLI's result subtype for a run killed at its turn cap; the budget one is
+# imported from shared.cli_invoke.
 TURN_CAP_SUBTYPE = 'error_max_turns'
-BUDGET_CAP_SUBTYPE = 'error_max_budget_usd'
 
 MERGE_DONE_STATE = 'done'
 MERGE_CONFLICT_STATE = 'conflict'
@@ -150,7 +153,7 @@ def summarize_outcomes(records: Sequence[InvocationRecord]) -> OutcomeSummary:
         runs=len(records),
         succeeded=sum(1 for r in records if r.succeeded is True),
         turn_cap_kills=sum(1 for r in records if r.subtype == TURN_CAP_SUBTYPE),
-        budget_kills=sum(1 for r in records if r.subtype == BUDGET_CAP_SUBTYPE),
+        budget_kills=sum(1 for r in records if r.subtype == BUDGET_EXHAUSTED_SUBTYPE),
         timed_out=sum(1 for r in records if r.timed_out is True),
         no_end_event=sum(1 for r in records if r.succeeded is None and r.subtype is None),
         over_flat_ceiling=sum(1 for r in records if r.at_or_over_flat_role_ceiling is True),
@@ -461,6 +464,8 @@ class ReviewResult:
     scoped_hits: tuple[tuple[str, int, str], ...]
     unscoped_cap_hits: int
     restarts: tuple[ServiceRestart, ...]
+    orchestrator_startups: tuple[OrchestratorStartup, ...]
+    restart_required_reloads: tuple[RestartRequiredReload, ...]
     containment: RoleContainment
 
 
@@ -534,6 +539,8 @@ def review(
         scoped_hits=scoped_hits_by_account(scoped),
         unscoped_cap_hits=scoped.unscoped_cap_hit_count,
         restarts=scoped.restarts,
+        orchestrator_startups=scoped.orchestrator_startups,
+        restart_required_reloads=scoped.restart_required_reloads,
         containment=roles_on_model(conn, model=model, since=apply, until=end,
                                    expected_roles=expected_roles),
     )
@@ -744,12 +751,11 @@ def _cost_section(result: ReviewResult) -> list[str]:
     out += [f'Cap hits scoped to `{result.model}`, by account:', '']
     out += [*markdown_table(['account', 'scoped hits', 'first hit'],
                             result.scoped_hits), '']
-    out += [f'Account-level (unscoped) cap hits: {result.unscoped_cap_hits}', '',
-            'Service restarts:', '']
-    out += [*markdown_table(
-        ['timestamp', 'service', 'reason'],
-        [(r.timestamp, r.service, r.reason or '-') for r in result.restarts],
-    ), '']
+    out += [f'Account-level (unscoped) cap hits: {result.unscoped_cap_hits}', '']
+    out += restart_witness_tables(
+        span=f'in {window}', startups=result.orchestrator_startups,
+        reloads=result.restart_required_reloads, restarts=result.restarts,
+    )
     return out
 
 
@@ -809,12 +815,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                              'means unknown, rendered as "-"')
     parser.add_argument('--steward-min-tier', default=1, type=int,
                         help='dispatch tier the steward arms split at (default: 1)')
-    parser.add_argument('--runs-db', default=DEFAULT_RUNS_DB, type=Path)
-    parser.add_argument('--escalations-dir', default=DEFAULT_ESCALATIONS_DIR, type=Path)
+    parser.add_argument('--runs-db', default=None, type=Path,
+                        help="(default: the main checkout's runs.db)")
+    parser.add_argument('--escalations-dir', default=None, type=Path,
+                        help="(default: the main checkout's escalation queue)")
     args = parser.parse_args(argv)
 
-    corpus = load_escalation_corpus(args.escalations_dir)
-    conn = connect_ro(args.runs_db)
+    corpus = load_escalation_corpus(
+        args.escalations_dir if args.escalations_dir is not None else default_escalations_dir()
+    )
+    conn = connect_ro(args.runs_db if args.runs_db is not None else default_runs_db())
     try:
         result = review(
             conn, corpus,

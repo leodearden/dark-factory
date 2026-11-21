@@ -42,7 +42,7 @@ from orchestrator.config import TranscriptArchiveConfig
 def git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_transcript_repo(repo))
+    _init_transcript_repo(repo)
     return repo
 
 

@@ -17,7 +17,7 @@ cockpit.ui_config) -- and even that write is DEBOUNCED for the app's whole
 life: the session table's two selection seams (CockpitApp._sync_detail_pane
 on a cursor move, CockpitApp._resync_session_detail on a rebuild) only
 RECORD the live selection in _selected_slug, and CockpitApp._flush_ui_config
-writes from the poll timer (CockpitApp._poll_registry) only when that
+writes from the poll timer (CockpitApp.start_poll_tick) only when that
 differs from what was last persisted, leaving CockpitApp.on_unmount as the
 single unconditional final write. So neither a keypress nor a table rebuild
 ever WRITES cockpit-ui.json -- a narrower claim than it may look: the
@@ -35,14 +35,15 @@ test_app.py's TestWriteDiscipline (the C5a session/detail path) and
 TestRefreshWriteDiscipline (the C5b queue/attention path) for the
 end-to-end proof of the refresh-path half of this contract.
 
-Every decision READ goes through cockpit.registry_reader.scan_decisions --
-registry_reader's folding wrapper over C1's list_decisions, which
-canonicalizes DecisionRecord.project (task 3812) -- at both of this
-module's read sites: _scan_registry, and _reread_decisions (the post-write
-re-read _apply_boost and action_drop share). That does not weaken the
-discipline above: scan_decisions is itself read-only, so the canonicalized
-record exists in memory only and can never be written back (this module
-still never calls write_decision).
+Every decision READ goes through the app's one decisions reader, the
+`decisions_reader` constructor kwarg, which defaults to
+cockpit.registry_reader.scan_decisions -- registry_reader's folding wrapper
+over C1's list_decisions, which canonicalizes DecisionRecord.project (task
+3812) -- at both of this module's read sites: _scan_registry, and
+_reread_decisions (the post-write re-read _apply_boost and action_drop
+share). That does not weaken the discipline above: scan_decisions is itself
+read-only, so the canonicalized record exists in memory only and can never
+be written back (this module still never calls write_decision).
 """
 
 from __future__ import annotations
@@ -54,18 +55,18 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     DecisionRecord,
     DecisionState,
-    SessionRecord,
-    Status,
     set_manual_boost,
     update_decision_state,
 )
-from orchestrator.session_registry import (
+from orchestrator.fleet_files import (
     fleet_root as resolve_fleet_root,
 )
+from orchestrator.session_records import SessionRecord, Status
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -141,7 +142,7 @@ def _default_spawn_runner(argv: list[str]) -> None:
     of whether a spawn attempt succeeded.
     """
     try:
-        subprocess.Popen(argv)  # noqa: S603 -- argv is built by build_spawn_argv, not shell text
+        subprocess.Popen(argv)  # argv is built by build_spawn_argv, not shell text
     except OSError:
         _log.exception('spawn_session: failed to launch %r', argv)
 
@@ -176,6 +177,18 @@ def _decisions_snapshot(decisions: list[DecisionRecord]) -> dict[str, tuple]:
         decision.id: tuple(getattr(decision, field) for field in _DECISION_SNAPSHOT_FIELDS)
         for decision in decisions
     }
+
+
+class DecisionsReader(Protocol):
+    """CockpitApp's `decisions_reader` seam, the decision-side twin of SessionScannerProtocol.
+
+    Contract, as registry_reader.scan_decisions (the default) keeps it: read-only,
+    and every returned DecisionRecord.project is already canonicalized.
+    """
+
+    def __call__(self, root: Path | str | None) -> list[DecisionRecord]:
+        """Return every readable DecisionRecord under the fleet *root*."""
+        ...
 
 
 class DetailOwner(StrEnum):
@@ -236,6 +249,7 @@ class CockpitApp(App):
         fleet_root: Path | str | None = None,
         poll_interval: float = 1.5,
         scanner: SessionScannerProtocol | None = None,
+        decisions_reader: DecisionsReader | None = None,
         now_fn: Callable[[], datetime] | None = None,
         backend: FocusArrangeBackend | None = None,
         spawn_runner: Callable[[list[str]], None] | None = None,
@@ -248,6 +262,7 @@ class CockpitApp(App):
         self.fleet_root = fleet_root
         self.poll_interval = poll_interval
         self._scanner = scanner if scanner is not None else SessionScanner(self.fleet_root)
+        self._decisions_reader = decisions_reader if decisions_reader is not None else scan_decisions
         self._now_fn = now_fn if now_fn is not None else lambda: datetime.now(UTC)
         self._backend = backend
         self._default_backends: dict[str, FocusArrangeBackend] = {
@@ -275,7 +290,7 @@ class CockpitApp(App):
         self._has_scanned = False
         # Monotonic scan-sequence guard (esc-2517-1, task 2606): _scan_seq is
         # the next-to-issue sequence number (see _next_scan_seq), bumped once
-        # per scan INITIATED -- by refresh_registry, _poll_registry or
+        # per scan INITIATED -- by refresh_registry, start_poll_tick or
         # _reread_decisions, all always on the main thread. Each of the two
         # registries has its own high-water mark of the newest sequence
         # actually applied: _applied_scan_seq for sessions, which only a full
@@ -289,11 +304,11 @@ class CockpitApp(App):
         self._applied_scan_seq = 0
         self._applied_decisions_seq = 0
         # Drop-tick backpressure for the threaded poll path (see
-        # _poll_registry/_scan_registry_worker): True while a scan launched
-        # by _poll_registry is still running. Only ever read/written on the
-        # main thread (set in _poll_registry, cleared by
+        # start_poll_tick/_scan_registry_worker): True while a scan launched
+        # by start_poll_tick is still running. Only ever read/written on the
+        # main thread (set in start_poll_tick, cleared by
         # _clear_scan_in_flight via call_from_thread), so the check-then-set
-        # in _poll_registry is race-free without needing a lock.
+        # in start_poll_tick is race-free without needing a lock.
         self._scan_in_flight = False
         self._selected_slug: str | None = None
         # The pane starts on the session-flavoured placeholder (and, when
@@ -321,17 +336,12 @@ class CockpitApp(App):
         # of any one item's key.
         self._attention_targets: set[DisplayTarget] = set()
         self._queue_items_by_key: dict[str, QueueItem] = {}
-        # In-memory "already acted on" marker, set by action_focus_selected.
-        # Expires with the ASK it was set against, under the same shared
-        # predicate as the overlays below (_prune_overlays). The
-        # queue-membership line at the tail of _rebuild_queue is only a guard.
-        self._handling: set[str] = set()
-        # Ephemeral in-memory overlays, keyed the same way (a session key is
-        # stable for the session's whole lifetime). Pruned on every rebuild
-        # by that same ASK LIVENESS rule (_prune_overlays) and NOT by queue
+        # Ephemeral in-memory overlays, keyed by QueueItem.key (a session key
+        # is stable for the session's whole lifetime). Pruned on every
+        # rebuild by ASK LIVENESS (_prune_overlays) and NOT by queue
         # membership: a dropped item is by construction absent from the
-        # rebuilt queue, so _rebuild_queue's `&= queue keys` line would clear
-        # every drop on the very rebuild action_drop itself triggers.
+        # rebuilt queue, so a queue-membership prune would clear every drop
+        # on the very rebuild action_drop itself triggers.
         self._boosts: dict[str, int] = {}
         self._dropped: set[str] = set()
         self._deferred: dict[str, datetime] = {}
@@ -371,7 +381,7 @@ class CockpitApp(App):
         self.refresh_registry()
         if ui_config.selected_slug is not None:
             self.query_one('#session-table', SessionTable).select_slug(ui_config.selected_slug)
-        self.set_interval(self.poll_interval, self._poll_registry)
+        self.set_interval(self.poll_interval, self.start_poll_tick)
 
     def on_unmount(self) -> None:
         # Unconditional, not _flush_ui_config: an app mounted over an empty
@@ -383,7 +393,7 @@ class CockpitApp(App):
         """Issue the next monotonic scan sequence number. MAIN-THREAD-ONLY.
 
         self._scan_seq += 1 is a non-atomic read-modify-write; only
-        refresh_registry, _poll_registry and _reread_decisions call this,
+        refresh_registry, start_poll_tick and _reread_decisions call this,
         and all three always run on the main thread (mirrors the
         _scan_in_flight discipline -- see __init__), so no lock is needed.
         The returned value must travel WITH its scan as an explicit value --
@@ -401,7 +411,7 @@ class CockpitApp(App):
         A thin synchronous wrapper around _scan_registry (the I/O half) and
         _apply_scan (the UI half) -- used for on_mount's initial paint and
         by every test that calls it directly, so a same-tick rebuild stays
-        deterministic. The recurring poll timer goes through _poll_registry
+        deterministic. The recurring poll timer goes through start_poll_tick
         instead, which runs the scan on a background thread (see
         _scan_registry_worker) so a slow scan never blocks the event loop
         (C10 tour F1, esc-2303-1).
@@ -417,19 +427,20 @@ class CockpitApp(App):
     def _scan_registry(self) -> tuple[list[SessionRecord], list[DecisionRecord]]:
         """I/O half of a refresh: scan disk for the current records/decisions.
 
-        Touches only self._scanner/self.fleet_root -- no widget access -- so
-        this is safe to call off the main/UI thread (see
-        _scan_registry_worker, which does exactly that).
+        Touches only self._scanner/self._decisions_reader/self.fleet_root --
+        no widget access -- so this is safe to call off the main/UI thread
+        (see _scan_registry_worker, which does exactly that).
 
-        Decisions are read via registry_reader.scan_decisions, the folding
-        wrapper over C1's list_decisions, so DecisionRecord.project arrives
+        Decisions are read via self._decisions_reader
+        (registry_reader.scan_decisions by default), the folding wrapper
+        over C1's list_decisions, so DecisionRecord.project arrives
         already canonicalized -- the same rule the scanner applies to
         SessionRecord.project (task 3812). Why both row kinds must fold
         together is argued in registry_reader's module docstring, the one
         home for that rationale.
         """
         records = self._scanner.scan()
-        decisions = scan_decisions(self.fleet_root)
+        decisions = self._decisions_reader(self.fleet_root)
         return records, decisions
 
     def _apply_scan(
@@ -457,7 +468,7 @@ class CockpitApp(App):
         Also guards against a stale threaded-poll result landing after a
         fresher read already applied (esc-2517-1, task 2606): *seq* is the
         monotonic sequence number the caller obtained from _next_scan_seq()
-        at scan-initiation time (see refresh_registry/_poll_registry). Each
+        at scan-initiation time (see refresh_registry/start_poll_tick). Each
         half of the result is checked against its own high-water mark. A
         seq strictly older than self._applied_scan_seq (the newest scan
         already applied) is dropped whole before the snapshot diff even
@@ -473,7 +484,7 @@ class CockpitApp(App):
         Note: seq order tracks scan-*initiation* order, not measured
         read-completion order -- it is a proxy for freshness, not a direct
         stamp of it. Scans never race each other: _scan_in_flight (see
-        _poll_registry) admits only one in-flight poll worker at a time,
+        start_poll_tick) admits only one in-flight poll worker at a time,
         and refresh_registry only ever runs synchronously at on_mount,
         before the poll timer is registered. A keypress's _reread_decisions
         can take a seq while a poll scan is in flight, though, so that
@@ -568,37 +579,35 @@ class CockpitApp(App):
         if self._detail_owner is DetailOwner.SESSION_TABLE:
             self._show_session_detail(slug)
 
-    def _poll_registry(self) -> None:
-        """on_mount's set_interval callback: launch the threaded scan worker.
+    def start_poll_tick(self) -> None:
+        """Run one tick of the background poll: the same call the poll timer makes.
 
-        Never scans synchronously itself -- see _scan_registry_worker, which
-        runs the actual I/O off the UI thread so a slow scan (10k+ sessions,
-        ~4.5s) never freezes input (C10 tour F1, esc-2303-1).
+        Returns BEFORE the scan lands: the scan runs on a Textual worker
+        thread (_scan_registry_worker) so a slow one (10k+ sessions, ~4.5s)
+        never freezes input (C10 tour F1, esc-2303-1), and a caller that
+        needs its result awaits ``app.workers.wait_for_complete()``. A tick
+        that arrives while a scan is still in flight is dropped, but the
+        cockpit-ui.json flush runs even on a dropped tick. refresh_registry,
+        by contrast, scans and applies synchronously on the calling (main)
+        thread, with no flush and no backpressure. Main-thread-only, like
+        the _scan_in_flight flag it checks.
 
-        Drops an overlapping tick instead of piling up worker threads: in
-        production poll_interval (1.5s) is routinely shorter than a full
-        scan over 10k+ sessions (~4.5s), so an unguarded launch here would
-        start one thread per tick for the scan's entire duration. Checking
-        and setting _scan_in_flight here (both on the main thread, same as
-        the timer callback that invokes this method) makes the
-        check-then-set race-free without needing a lock or introspecting
-        Textual's worker registry. _scan_registry_worker's own try/finally
-        clears the flag -- via call_from_thread, also on the main thread --
-        even when the scan raises, so one bad tick never wedges every
-        later poll.
+        Why the drop: in production poll_interval (1.5s) is routinely
+        shorter than a full scan over 10k+ sessions (~4.5s), so an
+        unguarded launch here would start one thread per tick for the
+        scan's entire duration. Checking and setting _scan_in_flight here,
+        on the main thread, makes the check-then-set race-free without
+        needing a lock or introspecting Textual's worker registry.
+        _scan_registry_worker's own try/finally clears the flag -- via
+        call_from_thread, also on the main thread -- even when the scan
+        raises, so one bad tick never wedges every later poll.
 
-        Also issues this poll's scan sequence number via _next_scan_seq()
-        (main-thread-only, like the flag check above) and hands it to the
-        worker, so a stale hand-off can be dropped once it lands -- see
-        _apply_scan's stale-scan guard (esc-2517-1).
+        Also issues this tick's scan sequence number via _next_scan_seq()
+        and hands it to the worker, so a stale hand-off can be dropped once
+        it lands -- see _apply_scan's stale-scan guard (esc-2517-1).
 
-        Doubles as the flush point for the cockpit-ui.json write debounce
-        (see _flush_ui_config), reusing this timer rather than adding a
-        second recurring wake-up. The flush must run BEFORE the
-        _scan_in_flight early return: a 10k+-session scan routinely outlasts
-        the poll interval, so a flush placed after it would be starved for
-        as long as scans keep overlapping -- the busy-fleet case where the
-        operator is most likely to be moving the cursor.
+        A flush (see _flush_ui_config) placed after the _scan_in_flight
+        early return would be starved for as long as scans keep overlapping.
         test_app.py::TestUIConfigWriteDebounce::
         test_flush_is_not_starved_by_the_scan_backpressure_drop pins the
         placement.
@@ -622,7 +631,7 @@ class CockpitApp(App):
         fully shut down by the time this (possibly slow) scan finishes --
         see its docstring.
 
-        *seq* is the scan sequence number _poll_registry obtained from
+        *seq* is the scan sequence number start_poll_tick obtained from
         _next_scan_seq() (main-thread-only) before launching this worker --
         carried through unchanged on the background thread and forwarded to
         _apply_scan via the call_from_thread hand-off, so _apply_scan can
@@ -633,7 +642,7 @@ class CockpitApp(App):
         error) must only fail this one tick, never take down the whole app
         -- Textual's default would treat an unhandled worker exception as
         fatal and close the app. The finally clause below still clears
-        _scan_in_flight when the scan raises, so _poll_registry's very next
+        _scan_in_flight when the scan raises, so start_poll_tick's very next
         tick starts a fresh scan instead of being dropped forever.
         """
         try:
@@ -672,8 +681,8 @@ class CockpitApp(App):
         """Main-thread-only: clear the drop-tick backpressure flag.
 
         Only ever invoked via call_from_thread from _scan_registry_worker
-        (see _poll_registry's docstring), so this always runs on the main
-        thread, same as the _poll_registry read/set.
+        (see start_poll_tick's docstring), so this always runs on the main
+        thread, same as the start_poll_tick read/set.
         """
         self._scan_in_flight = False
 
@@ -799,30 +808,25 @@ class CockpitApp(App):
     def _prune_overlays(self) -> None:
         """Expire every overlay entry whose ask is gone or has been replaced.
 
-        Covers all four ephemeral collections -- self._dropped,
-        self._boosts, self._deferred and self._handling -- under one shared
-        predicate (_live_overlay_keys): an entry survives only while the ask
-        it was recorded against is still the same live ask, i.e. the
-        identity stored in self._overlay_asks still equals the CURRENT
+        Covers all three ephemeral collections -- self._dropped,
+        self._boosts and self._deferred -- under one shared predicate
+        (_live_overlay_keys): an entry survives only while the ask it was
+        recorded against is still the same live ask, i.e. the identity
+        stored in self._overlay_asks still equals the CURRENT
         _ask_identity(key). This is the single statement of that rule --
         the collections' own declarations and their action handlers point
-        here rather than restating it. self._handling alone also meets a
-        queue-membership guard at the tail of _rebuild_queue, which is not
-        a second rule; see there.
+        here rather than restating it.
 
         Then garbage-collects self._overlay_asks down to the keys still
         referenced by SOME overlay, so the bookkeeping side-table cannot
         become the next leak. `live` IS that set: it is by construction the
-        subset of the pre-prune union that survives, so the four
+        subset of the pre-prune union that survives, so the three
         collections below sum to exactly it afterwards.
         """
-        live = self._live_overlay_keys(
-            self._dropped | self._boosts.keys() | self._deferred.keys() | self._handling
-        )
+        live = self._live_overlay_keys(self._dropped | self._boosts.keys() | self._deferred.keys())
         self._dropped = {key for key in self._dropped if key in live}
         self._boosts = {key: boost for key, boost in self._boosts.items() if key in live}
         self._deferred = {key: stamp for key, stamp in self._deferred.items() if key in live}
-        self._handling = {key for key in self._handling if key in live}
         self._overlay_asks = {
             key: identity for key, identity in self._overlay_asks.items() if key in live
         }
@@ -839,8 +843,8 @@ class CockpitApp(App):
         calling _ask_identity per key per overlay. This runs at the head of
         every _rebuild_queue -- i.e. on every poll tick that diffs as
         changed -- and _ask_identity's index-less fallback scans
-        self._records linearly, so a key overlaid in all four collections
-        would cost four full scans of a registry the cockpit explicitly
+        self._records linearly, so a key overlaid in all three collections
+        would cost three full scans of a registry the cockpit explicitly
         sizes for 10k+ sessions (see _scan_registry_worker). order_queue
         builds the same slug index immediately afterwards for exactly this
         reason.
@@ -884,22 +888,10 @@ class CockpitApp(App):
         _resync_queue_detail below is what refreshes the highlighted row in
         those suppressed reposts' place.
 
-        Every ephemeral collection -- self._handling included -- expires
-        with the ASK it was recorded against. _prune_overlays states that
-        rule and runs as the first statement below, so the queue is always
-        built from already-pruned state.
-
-        The tail `self._handling &= self._queue_items_by_key.keys()` line
-        has no visible effect today. It is kept only as a guard, so that a
-        row restored by an un-drop action, should one ever be added, comes
-        back unmarked. The one mark it clears that _prune_overlays keeps
-        sits on a still-live ask self._dropped holds out of the queue:
-        order_queue builds no item for a dropped key, and the drop ends
-        only when its ask does, in the same _prune_overlays pass that
-        clears the mark. The line cannot move up into _prune_overlays:
-        self._queue_items_by_key is not rebuilt until order_queue returns,
-        so at the head it would read the PREVIOUS rebuild's queue and clear
-        the mark for a row about to reappear.
+        Every ephemeral overlay expires with the ASK it was recorded
+        against. _prune_overlays states that rule and runs as the first
+        statement below, so the queue is always built from already-pruned
+        state.
         """
         self._prune_overlays()
         now = self._now_fn()
@@ -909,7 +901,6 @@ class CockpitApp(App):
             self._priorities,
             now,
             boosts=self._boosts,
-            handling=self._handling,
             dropped=self._dropped,
             deferred=self._deferred,
         )
@@ -917,7 +908,6 @@ class CockpitApp(App):
         with self.prevent(DataTable.RowHighlighted):
             queue.replace_rows(queue_items, now)
         self._queue_items_by_key = {item.key: item for item in queue_items}
-        self._handling &= self._queue_items_by_key.keys()
         self._update_attention(queue_items)
         self._resync_queue_detail(queue.highlighted_key())
 
@@ -1028,25 +1018,15 @@ class CockpitApp(App):
 
         Resolves the DecisionQueue's currently-highlighted row to its
         QueueItem and, when a target is resolvable, calls
-        backend.focus(target) exactly once. Always marks the row's key
-        "handling" (an in-memory, best-effort "already acted on" marker,
-        fed back into the next order_queue call) -- even when no target
-        resolved, since the operator's acknowledgement is real regardless
-        of whether a live window was found. This mark is not permanent: it
-        expires with the ask it was set against, under the same rule as the
-        _dropped/_boosts/_deferred overlays (see _prune_overlays), which is
-        why _record_overlay is called here -- ahead of the mark, the same
-        order every other overlay-writing handler uses. Fail-soft: an empty
-        queue (no highlighted key) or a key not present in the last-built
-        queue no-ops without raising -- a gone/unlinked lead is simply not
+        backend.focus(target) exactly once. Fail-soft: an empty queue (no
+        highlighted key) or a key not present in the last-built queue
+        no-ops without raising -- a gone/unlinked lead is simply not
         focusable, never a crash.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         key = queue.highlighted_key()
         if key is None:
             return
-        self._record_overlay(key)
-        self._handling.add(key)
         item = self._queue_items_by_key.get(key)
         if item is None or item.target is None:
             return
@@ -1057,8 +1037,9 @@ class CockpitApp(App):
 
         Lets the queue re-score without waiting for a poll tick, and updates
         the snapshot too, so that tick does not re-detect the write as an
-        external change. Reads through registry_reader.scan_decisions, so
-        the task-3812 project fold holds here as well.
+        external change. Reads through self._decisions_reader, the same
+        reader _scan_registry uses, so the task-3812 project fold holds here
+        as well.
 
         A SEQUENCED read: it takes a seq from _next_scan_seq() and advances
         _applied_decisions_seq, so a poll scan issued before the write,
@@ -1071,7 +1052,7 @@ class CockpitApp(App):
         froze the session table for as long as they kept coming.
         """
         seq = self._next_scan_seq()
-        self._decisions = scan_decisions(self.fleet_root)
+        self._decisions = self._decisions_reader(self.fleet_root)
         self._decisions_snapshot = _decisions_snapshot(self._decisions)
         self._applied_decisions_seq = seq
 
@@ -1566,7 +1547,7 @@ class CockpitApp(App):
                 self._focus_slug(slug, self._records)
 
     def _flush_ui_config(self) -> None:
-        """Debounced half of the cockpit-ui.json write path; called from _poll_registry.
+        """Debounced half of the cockpit-ui.json write path; called from start_poll_tick.
 
         Writes only when the live selection differs from what was last
         persisted, so an idle cockpit does ZERO writes per tick rather than

@@ -1,0 +1,42 @@
+{
+  "task_id": "4953",
+  "reason": "amendment (review of task 4953): restore_pre_stack_tip now refuses a branch carrying commits its train did not stack (records each member's stacked tip), rolls the ref back when the worktree reset fails (RESET_FAILED), and ejects a member whose stacked tip cannot be read; net-additive guards, not a failed refactor",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1435,
+      "current": 1444
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 15957,
+      "current": 16003
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 9313,
+      "current": 9322
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4857,
+      "current": 4866
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57793,
+      "current": 57839
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 32091,
+      "current": 32100
+    }
+  ]
+}

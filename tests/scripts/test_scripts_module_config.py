@@ -70,8 +70,11 @@ import verify_command_invariants as vci
 from module_budget_family import min_budget
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.module_charter import derive_modules
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator import verify, verify_cmd, verify_plan
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -122,16 +125,11 @@ _VACUOUS_PASS = (
 )
 
 
-# The two extraPaths entries the declared type gate depends on, and the flat
-# modules that stop resolving without them. Measured, not assumed: at the
-# commit before task 3456 added these entries, the then-declared
-# `npx pyright scripts/` reported exactly 9 reportMissingImports naming these
-# five modules. That npx spelling is kept because it names the command that was
-# ACTUALLY RUN for this measurement; task 4358 later switched the declaration to
-# `uv run --project shared pyright scripts/`, which resolves the same root
-# [tool.pyright] table, so the measurement carries over unchanged.
-_REQUIRED_EXTRA_PATHS = ('scripts', 'scripts/legibility')
-_UNRESOLVED_WITHOUT = ('census', 'codebook', 'coder', 'digest', 'inventory')
+# The extraPaths entry the root-run type gates depend on, and flat names that
+# stop resolving without it: measured at task 6645 (pyright 1.1.408) by deleting
+# the entry, when `pyright tests/scripts/` reported both as reportMissingImports.
+_REQUIRED_EXTRA_PATHS = ('scripts',)
+_UNRESOLVED_WITHOUT = ('legibility', 'source_measures')
 
 
 def _load_root_pyright_config() -> dict[str, Any]:
@@ -232,10 +230,11 @@ _PYTEST = vci.PYTEST
 # compares by SET EQUALITY, not membership — fails naming two flag values as
 # missing directories.
 #
-# The worked precedent is test_skills_module_config_decision.py::
-# _PYTEST_VALUE_FLAGS, which already contains both and is why that guard's
-# target-EXISTS check never went red on the same change. Deliberately NOT
-# widened to that guard's full table: a flag listed here that no command this
+# The worked precedent is verify_command_invariants.py::PYTEST_VALUE_FLAGS,
+# which already contains both and is why
+# test_skills_module_config_decision.py's target-EXISTS check, which passes
+# it, never went red on the same change. Deliberately NOT widened to that
+# full table: a flag listed here that no command this
 # file parses actually uses would read as coverage of a command shape this file
 # never sees, which is the same objection the _NARROWING_FLAGS comment below
 # records against copying ruff's spellings to pyright. This file's ruff and
@@ -305,7 +304,7 @@ def _segment(cmd: str, keyword: str) -> str:
     quote-aware) rather than a naive ``str.split('&&')``.
 
     Chaining is an ESTABLISHED pattern here, not a hypothetical:
-    ``verify_plan._scope_prefix_to_keyword``'s own docstring records that
+    ``verify_plan.scope_prefix_to_keyword``'s own docstring records that
     "every subproject's lint_command chains a ``python3 .../check_*.py <dir>``
     gate after ``ruff check``". Extracting the checker's own segment first is
     what lets the target assertions below stay true if this module later adopts
@@ -394,8 +393,8 @@ def _targets(cmd: str, keyword: str, *, value_flags: frozenset[str] = frozenset(
     side only and that guard went red reporting two flag values as scripts
     suites. Supplying the set is the repair ``vci.positional_targets``' own
     docstring names ("Widening the set is the caller's call"), and the precedent
-    is already in this directory as ``test_skills_module_config_decision.py::
-    _PYTEST_VALUE_FLAGS``.
+    is already in this directory as ``verify_command_invariants.py::
+    PYTEST_VALUE_FLAGS``.
 
     THE TWO ALTERNATIVES WERE REJECTED. Loosening that assertion to membership
     would discard the BIDIRECTIONAL claim it exists to hold — widening either
@@ -787,7 +786,7 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     # bridge: `pytest|ruff check|pyright scripts/tests/test_census_trigger.py`).
     #
     # What this does NOT buy is copy-paste detection, and it does not claim to:
-    # under a FILE_SCOPED render _scope_prefix_to_keyword REPLACES the declared
+    # under a FILE_SCOPED render scope_prefix_to_keyword REPLACES the declared
     # targets with the touched-file list, so a config carrying the copy-pasted
     # tests/scripts/ targets renders byte-identically — the reason assertion (4)
     # of test_scripts_diff_is_lint_gated records at length, and why that claim
@@ -965,7 +964,7 @@ def test_scripts_diff_is_lint_gated(
     #
     # This assertion deliberately does NOT claim to catch the tests/scripts/
     # copy-paste, and an earlier draft that did was WRONG. Measured against the
-    # production bridge: _scope_prefix_to_keyword REPLACES the declared targets
+    # production bridge: scope_prefix_to_keyword REPLACES the declared targets
     # with the touched-file list, so a config carrying the copy-pasted
     # `ruff check tests/scripts/` renders to
     # 'uv run --project shared ruff check scripts/tests/test_census_trigger.py'
@@ -977,7 +976,7 @@ def test_scripts_diff_is_lint_gated(
     assert SAMPLE_TOUCHED_FILE in executed.lint_command, (
         f'executed lint_command {executed.lint_command!r} does not target the '
         f'touched file {SAMPLE_TOUCHED_FILE!r} (task 3445) — '
-        'verify_plan._scope_prefix_to_keyword rewrites the declared directory '
+        'verify_plan.scope_prefix_to_keyword rewrites the declared directory '
         'target to the touched file list, so a command that does not mention it '
         'is linting some other tree than the one that changed'
     )
@@ -996,7 +995,7 @@ def test_scripts_diff_is_lint_gated(
 
     # Membership, not list equality: equality would also reject a LEGITIMATE
     # strengthening — `ruff check scripts/ && python3 scripts/check_x.py
-    # scripts`, the chained-sibling-gate shape _scope_prefix_to_keyword's
+    # scripts`, the chained-sibling-gate shape scope_prefix_to_keyword's
     # docstring says every subproject's lint_command already uses — and would
     # do so with a message accusing the author of narrowing the gate. What must
     # hold is narrower and exact: the directory itself is a ruff target
@@ -1046,57 +1045,30 @@ def test_scripts_diff_is_lint_gated(
 
 
 def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
-    """The ROOT ``[tool.pyright] extraPaths`` must carry scripts/ and scripts/legibility.
+    """The ROOT ``[tool.pyright] extraPaths`` must carry scripts/.
 
-    A PRECONDITION for the type gate, not a general pyright-config preference,
-    which is why it lives beside the gate it protects rather than in its own
-    file. The declared ``type_check_command`` is
-    ``uv run --project shared pyright scripts/`` (task 4358; it was
-    ``npx pyright scripts/`` when this test was written): it carries no
-    ``--directory``, so it runs from the repo root either way and resolves
-    against the ROOT ``[tool.pyright]`` table — NOT against any per-package
-    pyproject.toml, and NOT against ``shared/``'s, since ``--project shared``
-    selects only the environment pyright is resolved from.
+    The declared ``type_check_command`` of this module
+    (``uv run --project shared pyright scripts/``, task 4358) and of the
+    ``tests/scripts`` module next door
+    (``uv run --project shared pyright tests/scripts/``, task 3842) carry no
+    ``--directory``, so both run from the repo root and resolve against the ROOT
+    ``[tool.pyright]`` table — not a per-package pyproject.toml, and not
+    ``shared/``'s, since ``--project shared`` selects only the environment
+    pyright is resolved from.
 
-    ``scripts/tests/conftest.py`` inserts BOTH ``scripts/`` and
-    ``scripts/legibility/`` onto sys.path at runtime, so the test modules
-    import flat names (``import census``, ``import digest``) that only resolve
-    for pyright if the same two directories are on extraPaths. Measured at the
-    commit before these entries were added, with the command declared AT THAT
-    TIME (``npx pyright scripts/`` — named as run, not retro-fitted to the
-    current uv spelling): exactly 9 reportMissingImports naming
-    census/codebook/coder/digest/inventory. The gate would then be RED for
-    reasons unrelated to any diff —
-    an unresolved import is not a finding about the change under review, and a
-    permanently-red gate gets suppressed or ignored, which is how a gate dies.
-
-    Both entries are needed and neither implies the other: ``scripts`` alone
-    makes ``scripts/legibility/`` importable only as a namespace package
-    (``import legibility``), not its contents as bare top-level names — a
-    distinction ``scripts/tests/conftest.py`` records about itself, and the
-    reason it performs two separate sys.path insertions.
-
-    TWO module gates depend on these entries, not one. The ``tests/scripts``
-    module config next door declares its own
-    ``uv run --project shared pyright tests/scripts/`` (task 3842), which also
-    runs from the repo root against this same root table, and five
-    of its modules import flat ``scripts/`` names. Those imports used to carry
-    ``# pyright: ignore[reportMissingImports]``; task 3456 dropped the pragmas
-    precisely BECAUSE the extraPaths entries made them resolve, so the masking
-    is gone and the dependency is now live. RE-MEASURED at the branch tip by
-    deleting both entries and re-running each command — under the npx-fronted
-    declarations both configs carried at that time, which changes which pyright
-    BINARY ran but not which config table it read: ``pyright scripts/`` ->
-    23 errors, 9 of them reportMissingImports; ``pyright tests/scripts/`` -> 8
-    errors, ALL reportMissingImports, naming migrate_metadata_modules_to_files,
-    drain_check, audit_wiped_metadata_files, repair_wiped_metadata_files,
-    reviewer_redundancy_diagnostic and trial_module_tagger_haiku. Removing an
-    entry is therefore a two-gate outage; this test failing alone would
-    under-report it.
+    The ``scripts`` entry resolves the flat names the conftests put on sys.path
+    at runtime (``import source_measures``, ``from legibility import census``).
+    Measured at task 6645 (pyright 1.1.408) by deleting it:
+    ``pyright tests/scripts/`` reported those names as reportMissingImports,
+    while ``pyright scripts/`` stayed clean. Task 3456 dropped the
+    ``# pyright: ignore[reportMissingImports]`` pragmas in ``tests/scripts``
+    because this entry made them resolve, so restoring the entry, not the
+    pragmas, is the fix. ``scripts/legibility/`` stays absent so a bare sibling
+    name is reportMissingImports (scripts/tests/test_legibility_import_spelling.py).
 
     MEMBERSHIP, never list equality or a length pin: adding a future entry is
     a legitimate change, not a regression, and an equality assertion would
-    reject it with a message accusing the author of removing these two.
+    reject it with a message accusing the author of removing this one.
     """
     pyright_config = _load_root_pyright_config()
     extra_paths = pyright_config.get('extraPaths', [])
@@ -1105,30 +1077,15 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
         assert required in extra_paths, (
             f'{required!r} missing from ROOT [tool.pyright] extraPaths = '
             f'{extra_paths!r} in {REPO_ROOT / "pyproject.toml"} (task 3456). '
-            f'The declared type gate for the {MODULE_PREFIX} module runs '
-            f'`uv run --project shared pyright {MODULE_PREFIX}/` FROM THE REPO '
-            f'ROOT (no --directory), so it resolves '
-            f'against this root table. Without both '
-            f'{list(_REQUIRED_EXTRA_PATHS)!r} entries, pyright cannot resolve '
-            f'the flat modules {list(_UNRESOLVED_WITHOUT)!r} that '
-            f'{MODULE_PREFIX}/tests/conftest.py puts on sys.path at runtime — '
-            f'measured as exactly 9 reportMissingImports before task 3456 added '
-            f'them. The gate then reports RED for reasons unrelated to any '
-            f'diff, which is how a gate gets suppressed and dies. Note '
-            f'{_REQUIRED_EXTRA_PATHS[0]!r} alone is NOT sufficient: it makes '
-            f'{_REQUIRED_EXTRA_PATHS[1]!r} importable only as a namespace '
-            f'package, not its contents as bare top-level names. '
-            f'BLAST RADIUS IS TWO GATES, NOT ONE: the {SIBLING_PREFIX} module '
-            f'config declares its own '
-            f'`uv run --project shared pyright {SIBLING_PREFIX}/`, which '
-            f'also runs from the repo root against this same table, and task '
-            f'3456 dropped the `# pyright: ignore[reportMissingImports]` '
-            f'pragmas that were masking its five modules\' flat '
-            f'{MODULE_PREFIX}/ imports. Re-measured at the branch tip with '
-            f'both entries deleted: `pyright {MODULE_PREFIX}/` -> 23 errors '
-            f'(9 reportMissingImports), `pyright {SIBLING_PREFIX}/` -> 8 '
-            f'errors, ALL reportMissingImports. Restoring these entries is the '
-            f'fix for BOTH; re-adding pragmas to {SIBLING_PREFIX} is not'
+            f'The declared type gates of the {MODULE_PREFIX} and {SIBLING_PREFIX} '
+            f'modules run `uv run --project shared pyright <dir>/` FROM THE REPO '
+            f'ROOT (no --directory), so they resolve against this root table. '
+            f'Without the entry, `pyright {SIBLING_PREFIX}/` cannot resolve flat '
+            f'{MODULE_PREFIX}/ names such as {list(_UNRESOLVED_WITHOUT)!r} '
+            f'(measured at task 6645) and reports RED for reasons unrelated to any '
+            f'diff, which is how a gate gets suppressed and dies. Restoring the '
+            f'entry is the fix; re-adding `# pyright: ignore[reportMissingImports]` '
+            f'pragmas to {SIBLING_PREFIX} is not'
         )
 
 
@@ -1168,7 +1125,7 @@ def test_scripts_diff_is_type_gated(
 
     (c) is the anti-copy-paste half. It cannot live on the executed value for
     the same reason the lint test's assertion (4) records:
-    ``_scope_prefix_to_keyword`` REPLACES the declared targets with the touched
+    ``scope_prefix_to_keyword`` REPLACES the declared targets with the touched
     file list, so a config carrying the sibling's ``pyright tests/scripts/``
     renders byte-identically to the correct one for a scripts/ diff. Only the
     DECLARED value can carry it, and only as exact-element membership —

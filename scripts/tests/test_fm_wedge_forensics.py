@@ -26,6 +26,20 @@ LOGGING_CHILD_JOURNAL (a spawned child that wrote a line of its own). Both
 cover branches that a real capture in this retention window cannot reach, and
 both use real line texts with only the separation or the pid attribution
 changed.
+
+The two APPLICATION_SAYS_CONSUMED_* inputs are assembled too, and carry one
+INVENTED application line: an application log line containing the word that
+begins systemd's stop-time accounting, which none of the captures above holds.
+
+Three inputs come from after socket activation, from a later restart job on
+2026-11-08 (task 6568), and are assembled too.
+SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL changes only the separation.
+DELIBERATE_STOP_WITH_SOCKET_JOURNAL and REOPENED_SOCKET_THEN_RESTART_JOURNAL
+also carry INVENTED fused-memory.socket lines, because the retained journal
+holds no entry for that unit.
+
+OFFSETLESS_UNIT_LEFT_DOWN_JOURNAL is UNIT_LEFT_DOWN_JOURNAL with its UTC
+offsets stripped, a form no `-o short-iso` capture prints.
 """
 from __future__ import annotations
 
@@ -34,11 +48,15 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 from fm_wedge_forensics import (
     DEFAULT_STALL_THRESHOLD_SECONDS,
     analyze,
     parse_consumed,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Episode 2 — 2026-09-16 12:04. The decisive one: fm did not service SIGTERM
@@ -164,6 +182,37 @@ SELF_RECOVERED_THEN_UNRELATED_RESTART_JOURNAL = """\
 2026-09-16T15:07:47+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
 """
 
+# A real watchdog-caught stall, 2026-09-19 19:24:35 -> 19:26:54 = 139s (task
+# 5688), reduced from the 15450-line `journalctl --user -u fused-memory.service
+# --since "2026-09-19 19:20:00" --until "2026-09-19 19:32:00"` window. What
+# makes it a fixture of its own: systemd went straight from `Consumed` to
+# `Starting` and logged NO `Stopped` line and no SIGKILL, so its stop-time
+# accounting is the only line witnessing the end of the 62s teardown.
+#
+# Real gaps preserved: 139s (the stall), 47s (19:26:54 -> 19:27:41, SIGTERM
+# latency) and 31s (19:28:04 -> 19:28:35, the startup write_ops prune).
+NO_STOPPED_LINE_JOURNAL = """\
+2026-09-19T19:24:33+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:33 - httpx - INFO - HTTP Request: PUT http://localhost:6333/collections/fused_dark_factory/points?wait=true "HTTP/1.1 200 OK"
+2026-09-19T19:24:33+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:33 - fused_memory.reconciliation.event_buffer - INFO - reconciliation.event_buffered
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/fused_dark_factory/points/scroll "HTTP/1.1 200 OK"
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/fused_dark_factory/points/count "HTTP/1.1 200 OK"
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/fused_dark_factory/points/count "HTTP/1.1 200 OK"
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/fused_dark_factory/points "HTTP/1.1 200 OK"
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - mem0.memory.main - INFO - Deleting memory with memory_id='9f93b1c9-3947-4566-bdb1-b8981b047e86'
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - httpx - INFO - HTTP Request: POST http://localhost:6333/collections/fused_dark_factory/points/delete?wait=true "HTTP/1.1 200 OK"
+2026-09-19T19:24:34+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:34 - fused_memory.reconciliation.event_buffer - INFO - reconciliation.event_buffered
+2026-09-19T19:24:35+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:35 - fused_memory.reconciliation.stages.task_knowledge_sync - WARNING - reconciliation.done_provenance_section_truncated
+2026-09-19T19:26:54+01:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-19T19:27:41+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:27:41 - __main__ - INFO - Received SIGTERM — initiating operator shutdown
+2026-09-19T19:27:55+01:00 leo-MS-7C35 uv[1601425]: asyncio.exceptions.CancelledError
+2026-09-19T19:27:56+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 8min 16.382s CPU time, 2.2G memory peak, 477.3M memory swap peak.
+2026-09-19T19:27:56+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-19T19:27:56+01:00 leo-MS-7C35 docker[54757]:  Container docker-falkordb-1 Running
+2026-09-19T19:28:04+01:00 leo-MS-7C35 uv[54920]: 2026-09-19 19:28:04 - __main__ - INFO - idempotent_ops retention prune at startup: 31 rows
+2026-09-19T19:28:35+01:00 leo-MS-7C35 uv[54920]: 2026-09-19 19:28:35 - fused_memory.services.write_journal - INFO - Pruned 155000 write_ops rows (read>30.0d: 155000, search>365.0d: 0, write>730.0d: 0); frees pages for reuse, does not shrink the file
+2026-09-19T19:28:36+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
 # ASSEMBLED, not captured: the real 15:07 stop sequence above with the restart
 # pushed out, so the silence begins with the unit already DOWN rather than
 # wedged. Only the separation is synthetic; every line text is real.
@@ -182,6 +231,64 @@ UNIT_LEFT_DOWN_JOURNAL = """\
 2026-09-16T15:07:06+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 29min 6.600s CPU time, 2.7G memory peak, 628.5M memory swap peak.
 2026-09-16T15:11:06+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
 2026-09-16T15:11:47+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
+# A hand-edited capture: nothing orders these timestamps against the
+# socket-activation cutover or against an offset-bearing line.
+OFFSETLESS_UNIT_LEFT_DOWN_JOURNAL = UNIT_LEFT_DOWN_JOURNAL.replace("+01:00 ", " ")
+
+# ASSEMBLED, not captured: the real 2026-11-08 restart job, with its Starting
+# and Started pushed out 4 minutes so the silence registers; only the
+# separation is synthetic. It is a post-deploy `restart`, which keeps
+# fused-memory.socket bound and logs nothing on it. Its service lines have the
+# same shape as UNIT_LEFT_DOWN_JOURNAL's; only the date differs. Nor can the
+# socket's own journal witness the port here: measured 2026-11-10,
+# `journalctl --user -u fused-memory.socket` = "-- No entries --".
+SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL = """\
+2026-11-08T00:33:33+00:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: Stopped fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 1h 45min 46.785s CPU time, 6.3G memory peak, 1.1G memory swap peak.
+2026-11-08T00:37:41+00:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:38:18+00:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
+# ASSEMBLED, not captured: the service lines are the real 2026-11-08 lines
+# above; the fused-memory.socket lines are INVENTED. They are written in
+# systemd's `<verb> <unit> - <Description>.` form, the same form as this host's
+# real `Stopped fused-memory.service - ...` lines, with the Description from
+# scripts/fused-memory.socket.template. They have to be invented because the
+# retained journal holds no fused-memory.socket entry at all (measured
+# 2026-11-10). The `Closed` line comes after the service's `Consumed` because
+# the service is After=fused-memory.socket: on a deliberate stop the socket's
+# stop job (queued by scripts/stop-socket-unless-restarting.sh) runs after the
+# service's.
+DELIBERATE_STOP_WITH_SOCKET_JOURNAL = """\
+2026-11-08T00:33:33+00:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: Stopped fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 1h 45min 46.785s CPU time, 6.3G memory peak, 1.1G memory swap peak.
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: Closed fused-memory.socket - Fused Memory MCP listening socket (held across service restarts).
+2026-11-08T00:37:41+00:00 leo-MS-7C35 systemd[2626]: Listening on fused-memory.socket - Fused Memory MCP listening socket (held across service restarts).
+2026-11-08T00:37:41+00:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:38:18+00:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
+# ASSEMBLED the same way, from the same real service lines and invented socket
+# lines. A deliberate stop whose socket reopens 10s later is followed by a
+# `restart` job, which logs no socket line, and the unit is then left down for
+# 4 minutes. Every gap except that last silence is under the 90s default.
+REOPENED_SOCKET_THEN_RESTART_JOURNAL = """\
+2026-11-08T00:33:33+00:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: Stopped fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 1h 45min 46.785s CPU time, 6.3G memory peak, 1.1G memory swap peak.
+2026-11-08T00:33:41+00:00 leo-MS-7C35 systemd[2626]: Closed fused-memory.socket - Fused Memory MCP listening socket (held across service restarts).
+2026-11-08T00:33:51+00:00 leo-MS-7C35 systemd[2626]: Listening on fused-memory.socket - Fused Memory MCP listening socket (held across service restarts).
+2026-11-08T00:33:51+00:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:34:28+00:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-11-08T00:35:00+00:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:35:08+00:00 leo-MS-7C35 systemd[2626]: Stopped fused-memory.service - Fused Memory MCP Server (dark-factory).
+2026-11-08T00:35:08+00:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 1h 45min 46.785s CPU time, 6.3G memory peak, 1.1G memory swap peak.
+2026-11-08T00:39:08+00:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-11-08T00:39:45+00:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
 """
 
 # ASSEMBLED, not captured: episode 2 reduced to its teardown, plus ONE added
@@ -204,6 +311,31 @@ LOGGING_CHILD_JOURNAL = """\
 2026-09-16T12:08:22+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Killing process 1289425 (git) with signal SIGKILL.
 2026-09-16T12:08:22+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
 2026-09-16T12:09:03+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
+# ASSEMBLED, not captured: NO_STOPPED_LINE_JOURNAL reduced to its restart, plus
+# ONE invented application line mid-teardown that carries the word systemd's
+# stop-time accounting begins with. Only systemd's own `Consumed <n>s CPU time`
+# line witnesses the end of a teardown; an application line that happens to say
+# "Consumed" must not cut the 62s short.
+APPLICATION_SAYS_CONSUMED_MID_TEARDOWN_JOURNAL = """\
+2026-09-19T19:24:35+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:35 - fused_memory.reconciliation.stages.task_knowledge_sync - WARNING - reconciliation.done_provenance_section_truncated
+2026-09-19T19:26:54+01:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-19T19:27:41+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:27:41 - __main__ - INFO - Received SIGTERM — initiating operator shutdown
+2026-09-19T19:27:45+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:27:45 - fused_memory.reconciliation.event_buffer - INFO - Consumed 3 buffered events before shutdown
+2026-09-19T19:27:55+01:00 leo-MS-7C35 uv[1601425]: asyncio.exceptions.CancelledError
+2026-09-19T19:27:56+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 8min 16.382s CPU time, 2.2G memory peak, 477.3M memory swap peak.
+2026-09-19T19:27:56+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-19T19:28:36+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
+# ASSEMBLED, not captured: SELF_RECOVERED_STALL_JOURNAL with its last line
+# before the silence replaced by the same invented application line. The unit
+# was running throughout, so the silence must not read as a down window.
+APPLICATION_SAYS_CONSUMED_BEFORE_SILENCE_JOURNAL = """\
+2026-09-16T12:16:06+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:16:06 - fused_memory.reconciliation.event_buffer - INFO - reconciliation.event_buffered
+2026-09-16T12:16:07+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:16:07 - fused_memory.reconciliation.event_buffer - INFO - Consumed 3 buffered events before shutdown
+2026-09-16T12:18:47+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:18:47 - __main__ - INFO - thread_monitor: threads=33 delta=-1
 """
 
 # A healthy busy window: real consecutive lines from 2026-09-16 12:03, where fm
@@ -345,6 +477,46 @@ def test_a_silence_that_begins_with_the_unit_already_down_reports_port_down():
     assert episodes[0].stall_seconds == 240.0
     assert episodes[0].watchdog_verdict == "port-down"
     assert episodes[0].outcome == "unit-down"
+
+
+def test_a_unit_down_silence_under_socket_activation_reports_no_watchdog_verdict():
+    """fused-memory.socket keeps 8002 bound through a restart or crash and logs
+    nothing, so this capture cannot say whether the watchdog saw 'port-down'
+    or 'wedged' (OPERATIONS.md §"fused-memory liveness revive")."""
+    episodes = analyze(SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL)
+
+    assert len(episodes) == 1
+    assert episodes[0].stall_seconds == 240.0
+    assert episodes[0].outcome == "unit-down"
+    assert episodes[0].watchdog_verdict is None
+
+
+def test_a_socket_closed_before_the_silence_witnesses_port_down():
+    episodes = analyze(DELIBERATE_STOP_WITH_SOCKET_JOURNAL)
+
+    assert len(episodes) == 1
+    assert episodes[0].stall_seconds == 240.0
+    assert episodes[0].outcome == "unit-down"
+    assert episodes[0].watchdog_verdict == "port-down"
+
+
+def test_a_reopened_socket_supersedes_an_earlier_close():
+    """The witness is the socket's LATEST state, not any `Closed` line in the
+    capture. Reading an earlier close would bring back the false 'port-down'
+    this guard exists to keep out."""
+    episodes = analyze(REOPENED_SOCKET_THEN_RESTART_JOURNAL)
+
+    assert len(episodes) == 1
+    assert episodes[0].stall_seconds == 240.0
+    assert episodes[0].outcome == "unit-down"
+    assert episodes[0].watchdog_verdict is None
+
+
+def test_a_timestamp_without_a_utc_offset_is_rejected_where_it_is_parsed():
+    """Rejected by analyze() itself, rather than surfacing later as a TypeError
+    from whichever property first compares it with an offset-bearing time."""
+    with pytest.raises(ValueError, match="UTC offset"):
+        analyze(OFFSETLESS_UNIT_LEFT_DOWN_JOURNAL)
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +676,36 @@ def test_episode_1_cost_decomposes_from_its_own_clean_stop():
     assert costs.startup_seconds == 39.0
 
 
+def test_a_stop_with_no_stopped_line_is_still_one_episode_stopped_on_signal():
+    episodes = analyze(NO_STOPPED_LINE_JOURNAL)
+
+    assert len(episodes) == 1
+    assert episodes[0].stall_seconds == 139.0
+    assert episodes[0].outcome == "stopped-on-signal"
+
+
+def test_a_teardown_with_no_stopped_line_ends_at_systemd_s_stop_accounting():
+    """`Stopping` at 19:26:54 to `Consumed` at 19:27:56. An absent teardown
+    means the unit was never torn down, which this capture refutes."""
+    assert analyze(NO_STOPPED_LINE_JOURNAL)[0].costs.teardown_seconds == 62.0
+
+
+def test_a_teardown_with_no_stopped_line_is_still_weighed_against_startup():
+    """62s of teardown against a 40s start."""
+    assert analyze(NO_STOPPED_LINE_JOURNAL)[0].costs.dominant_recovery_term == "teardown"
+
+
+def test_an_application_line_saying_consumed_does_not_end_a_teardown():
+    costs = analyze(APPLICATION_SAYS_CONSUMED_MID_TEARDOWN_JOURNAL)[0].costs
+
+    assert costs.teardown_seconds == 62.0
+    assert costs.dominant_recovery_term == "teardown"
+
+
+def test_an_application_line_saying_consumed_does_not_mark_the_unit_down():
+    assert analyze(APPLICATION_SAYS_CONSUMED_BEFORE_SILENCE_JOURNAL)[0].outcome == "self-recovered"
+
+
 def test_detection_interval_is_reported_unavailable_not_fabricated():
     """The watchdog's consecutive-failure streak is logged in the WATCHDOG's
     journal, not fused-memory's, so no fm-only capture can witness it. Absent
@@ -636,6 +838,44 @@ def test_cli_human_report_marks_absent_terms_as_not_measured():
     assert "self-recovered" in result.stdout
 
 
+def test_cli_reports_an_unwitnessed_watchdog_verdict_as_such():
+    """An operator mid-incident reads this line, and "None" or a guessed
+    verdict would both mislead. The remedy is the socket unit's own journal,
+    so the line names the capture that would witness the port."""
+    result = _run_cli(SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL)
+
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    assert "unit-down" in result.stdout
+    assert "port-down" not in result.stdout
+    assert "would report None" not in result.stdout
+    assert "-u fused-memory.socket" in result.stdout
+
+    json_result = _run_cli(SOCKET_ACTIVATED_UNIT_LEFT_DOWN_JOURNAL, "--json")
+
+    assert json_result.returncode == 0, f"stderr={json_result.stderr!r}"
+    episode = json.loads(json_result.stdout)["episodes"][0]
+    assert episode["watchdog_verdict"] is None
+    assert episode["socket_state_before_stall"] is None
+
+
+def test_cli_does_not_ask_for_a_socket_unit_the_capture_already_carries():
+    """A capture that saw the socket listening is not missing the socket unit,
+    so advising `add -u fused-memory.socket` would send the operator to re-run
+    a capture they already have."""
+    result = _run_cli(REOPENED_SOCKET_THEN_RESTART_JOURNAL)
+
+    assert result.returncode == 0, f"stderr={result.stderr!r}"
+    assert "fused-memory.socket was last seen listening" in result.stdout
+    assert "add -u fused-memory.socket" not in result.stdout
+
+    json_result = _run_cli(REOPENED_SOCKET_THEN_RESTART_JOURNAL, "--json")
+
+    assert json_result.returncode == 0, f"stderr={json_result.stderr!r}"
+    episode = json.loads(json_result.stdout)["episodes"][0]
+    assert episode["watchdog_verdict"] is None
+    assert episode["socket_state_before_stall"] == "listening"
+
+
 def test_cli_fails_loudly_when_nothing_in_the_input_parses():
     """The trap this exists to catch: system-scope `journalctl -u
     fused-memory.service` prints "-- No entries --" because the unit is a
@@ -645,9 +885,20 @@ def test_cli_fails_loudly_when_nothing_in_the_input_parses():
 
     assert result.returncode != 0
     assert "--user" in result.stdout + result.stderr
+    # The capture it recommends must be one that can witness the port.
+    assert "-u fused-memory.socket" in result.stderr
 
 
 def test_cli_empty_stdin_also_fails_loudly():
     result = _run_cli("")
 
     assert result.returncode != 0
+
+
+def test_cli_rejects_timestamps_without_a_utc_offset_with_the_capture_to_take():
+    result = _run_cli(OFFSETLESS_UNIT_LEFT_DOWN_JOURNAL)
+
+    assert result.returncode == 2, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "UTC offset" in result.stderr
+    assert "-o short-iso" in result.stderr
+    assert "Traceback" not in result.stderr

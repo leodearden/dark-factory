@@ -30,21 +30,20 @@ from _orch_helpers import make_placeholder_future
 from test_verify_merge_flake_suppression import _module_config
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
-from orchestrator.merge_lane.worker import enqueue_merge_request, select_recovery_winner
-from orchestrator.merge_queue import (
-    GroupMergeRequest,
-    MergeRequest,
-    patch_content_contained,
-)
+from orchestrator.event_store import EventStore
+from orchestrator.merge_lane import MergeOutcome
+from orchestrator.merge_lane.intake import enqueue_merge_request
 
 # Import the module under test — will fail (ImportError) until step-2 creates it.
-from orchestrator.merge_queue_store import (
+from orchestrator.merge_lane.queue_store import (
     MergeQueueStore,
     PersistedMergeRequest,
     reconstruct_merge_request,
     recover_pending_merges,
 )
-from orchestrator.merge_types import InFlightMergeRegistry, QueuedBranch
+from orchestrator.merge_lane.tip_relation import select_recovery_winner
+from orchestrator.merge_lane.types import InFlightMergeRegistry, QueuedBranch
+from orchestrator.merge_lane.worker import GroupMergeRequest, MergeRequest, patch_content_contained
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -611,6 +610,43 @@ class TestRecoverPendingMergesRegistryDedup:
         remaining_ids = {r.request_id for r in store.load()}
         assert req2.request_id not in remaining_ids, 'loser must be store.remove()d'
         assert req1.request_id in remaining_ids, 'winner stays journaled'
+
+    async def test_attached_loser_resolves_to_the_winner_after_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """The recovery loser never gets a merge_finalized row of its own, so the
+        winner's row lists it and a fresh run still resolves it (task 4830,
+        PRD plans/merge-status-durable-non-landed-prd.md boundary row B7)."""
+        config = _real_config(tmp_path)
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        store = MergeQueueStore(tmp_path / 'merge_queue.json')
+
+        req1 = _make_req('5326', '5326', wt, config, snapshot_tip='sha-same')
+        req2 = _make_req('5326', '5326', wt, config, snapshot_tip='sha-same')
+        store.record(req1)
+        store.record(req2)
+
+        report = await recover_pending_merges(
+            store, asyncio.Queue(), self._make_git_ops(full_branch='task/5326'),
+            config, event_store=EventStore(tmp_path / 'runs.db', 'run-1'),
+            main_branch='main', branch_prefix='task/',
+            registry=InFlightMergeRegistry(),
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
+        )
+        assert report['coalesced'] == 1
+
+        report['requests'][0].result.set_result(MergeOutcome('blocked', reason='r'))
+        await asyncio.sleep(0)
+
+        row = EventStore(tmp_path / 'runs.db', 'run-2').merge_finalized_absorbing(
+            req2.request_id, cross_run=True,
+        )
+        assert row is not None
+        assert (row['request_id'], row['state'], row['is_current_run']) == (
+            req1.request_id, 'blocked', False,
+        )
 
     async def test_descendant_wins_ancestor_first(self, tmp_path: Path) -> None:
         """Journal order [ancestor, descendant] → the DESCENDANT is enqueued (REPLACE)."""
@@ -1906,7 +1942,7 @@ class TestUnrecoverableModuleSetStaysLoudAcrossRestarts:
     THE FAILURE THIS PINS.  A legacy record with nothing to re-derive from
     reconstructs to ``[]`` with the loud "unrecoverable" WARNING.  The
     recovered request is then re-journaled by
-    ``SpeculativeMergeWorker._buffer_owned_request``.  If that write persisted
+    ``MergeIntake.buffer_owned_request``.  If that write persisted
     a plain ``[]``, the NEXT crash+recovery would take the "task genuinely had
     no assigned modules" early-return and say NOTHING — so a request still
     verifying narrower than its original goes silent from the second restart
@@ -1919,7 +1955,7 @@ class TestUnrecoverableModuleSetStaysLoudAcrossRestarts:
     ) -> tuple[MergeRequest, MergeQueueStore]:
         """One full crash-recovery cycle: read the journal, reconstruct, and
         re-journal the recovered request exactly as the worker's
-        ``_buffer_owned_request`` does."""
+        ``buffer_owned_request`` does."""
         store = MergeQueueStore(store_path)
         [record] = store.load()
         req = reconstruct_merge_request(record, config)

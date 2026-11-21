@@ -7,14 +7,18 @@ from datetime import UTC, datetime
 
 import pytest
 from _fm_helpers import assert_id_title_pairing, make_8df8_scenario
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.reconciliation.task_filter import (
     _STATUS_PRIORITY,
+    ACTIVE_TASK_TREE_HEADER,
     MAX_ACTIVE_TASKS_RENDERED,
     MAX_CANCELLED_TASKS_RETAINED,
     MAX_DONE_TASKS_RETAINED,
     FilteredTaskTree,
+    TaskTreeUnavailableReason,
     _render_task_line,
+    available_tree,
     cross_verify_task_counts,
     detect_census_inconsistency,
     diff_status_correction,
@@ -23,10 +27,14 @@ from fused_memory.reconciliation.task_filter import (
     format_task_list,
     id_key,
     render_active_section,
+    render_retained_done_tasks,
     select_done_since_boundary,
     select_visible_active,
     summarize_statuses,
+    tree_unavailable_notice,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _make_task(tid: int, status: str, title: str | None = None, deps: list | None = None) -> dict:
@@ -898,7 +906,7 @@ class TestFormatFilteredTaskTree:
         # ignoring budget args.  The four extra fields (header, cancelled_section,
         # summary_line) are empty strings — the test only checks task-line presence,
         # not the surrounding strings.
-        def _stub_with_body(t, max_tasks=50, max_chars=50_000):  # noqa: ARG001
+        def _stub_with_body(t, max_tasks=50, max_chars=50_000):
             first_three = t.active_tasks[:3]
             body = '\n'.join(_render_task_line(task) for task in first_three) + '\n'
             return first_three, body, '', '', ''
@@ -1113,6 +1121,82 @@ class TestFormatFilteredTaskTree:
         )
 
 
+def _cancelled_section_lines(output: str) -> list[str]:
+    after_header = output.split('### Recently Cancelled Tasks\n', 1)[1]
+    return [line for line in after_header.splitlines() if line][:-1]  # drop the summary line
+
+
+class TestRetainedCapDisclosure:
+    """The done/cancelled retained caps name the window they show, in the payload text."""
+
+    def _tree(self, *, cancelled: int = 0, done: int = 0) -> FilteredTaskTree:
+        tasks = [_make_task(1, 'pending')]
+        tasks += [_make_task(100 + i, 'cancelled') for i in range(cancelled)]
+        tasks += [_make_task(1000 + i, 'done') for i in range(done)]
+        return filter_task_tree({'tasks': tasks})
+
+    def test_cancelled_section_ends_with_a_window_note_over_the_cap(self):
+        total = MAX_CANCELLED_TASKS_RETAINED + 3
+        output = format_filtered_task_tree(self._tree(cancelled=total))
+
+        lines = _cancelled_section_lines(output)
+        assert len([line for line in lines if line.startswith('- [')]) == MAX_CANCELLED_TASKS_RETAINED
+        note = lines[-1]
+        assert note.startswith(
+            f'_NOTE: showing the {MAX_CANCELLED_TASKS_RETAINED} highest-id (most recent) '
+            f'of {total} cancelled task(s)'
+        )
+        assert f'MAX_CANCELLED_TASKS_RETAINED={MAX_CANCELLED_TASKS_RETAINED}' in note
+        assert 'window by design' in note
+        assert 'this cycle' not in note
+
+    @pytest.mark.parametrize('cancelled', [1, MAX_CANCELLED_TASKS_RETAINED])
+    def test_cancelled_section_at_or_under_the_cap_carries_no_note(self, cancelled):
+        output = format_filtered_task_tree(self._tree(cancelled=cancelled))
+
+        assert '### Recently Cancelled Tasks' in output
+        assert '_NOTE:' not in output
+
+    def test_no_cancelled_tasks_renders_no_cancelled_section_even_with_a_count(self):
+        tree = FilteredTaskTree(active_tasks=[_make_task(1, 'pending')], cancelled_count=4, total_count=5)
+
+        output = format_filtered_task_tree(tree)
+
+        assert '### Recently Cancelled Tasks' not in output
+        assert '_NOTE:' not in output
+
+    def test_retained_done_tasks_over_the_cap_end_with_a_window_note(self):
+        total = MAX_DONE_TASKS_RETAINED + 4
+        tree = self._tree(done=total)
+
+        rendered = render_retained_done_tasks(tree)
+
+        list_part, note = rendered.rsplit('\n\n', 1)
+        assert list_part == format_task_list(tree.done_tasks)
+        assert note.startswith(
+            f'_NOTE: showing the {MAX_DONE_TASKS_RETAINED} highest-id (most recent) of {total} done task(s)'
+        )
+        assert f'MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED}' in note
+        assert 'window by design' in note
+        assert 'this cycle' not in note
+
+    @pytest.mark.parametrize('done', [0, 3, MAX_DONE_TASKS_RETAINED])
+    def test_retained_done_tasks_at_or_under_the_cap_is_the_plain_list(self, done):
+        tree = self._tree(done=done)
+
+        assert render_retained_done_tasks(tree) == format_task_list(tree.done_tasks)
+
+    def test_existing_active_cap_strings_are_unchanged(self):
+        tasks = [_make_task(i, 'pending', title='t' * 200) for i in range(1, 80)]
+        tasks += [_make_task(100 + i, 'cancelled') for i in range(MAX_CANCELLED_TASKS_RETAINED + 2)]
+        tree = filter_task_tree({'tasks': tasks})
+
+        capped = format_filtered_task_tree(tree, max_tasks=50)
+        assert '29 more active omitted by max_tasks cap' in capped
+        clamped = format_filtered_task_tree(tree, max_tasks=50, max_chars=4_000)
+        assert re.search(r'\n\.\.\. and \d+ more active \(truncated for budget\)\n', clamped)
+
+
 class TestRenderActiveSection:
     """Tests for the render_active_section(tree) -> (list[dict], str) public helper.
 
@@ -1220,6 +1304,88 @@ class TestRenderActiveSection:
             f'({len(candidate_active)} candidate active + {len(tree.cancelled_tasks)} cancelled). '
             f'Each candidate task must be rendered at most once per render_active_section call.'
         )
+
+
+class TestUnavailableTaskTree:
+    """A tree whose fetch failed renders as 'unavailable', never as a project with zero tasks."""
+
+    def test_reasons_are_the_closed_set_of_fetch_failure_branches(self):
+        assert {r.value for r in TaskTreeUnavailableReason} == {
+            'taskmaster_disabled',
+            'empty_project_root',
+            'non_absolute_project_root',
+            'fetch_error',
+        }
+
+    def test_a_fetched_tree_is_not_unavailable(self):
+        assert FilteredTaskTree().unavailable_reason is None
+        fetched_empty = filter_task_tree({'tasks': []})
+        assert fetched_empty.unavailable_reason is None
+        assert tree_unavailable_notice(fetched_empty) is None
+
+    @pytest.mark.parametrize('reason', list(TaskTreeUnavailableReason))
+    def test_an_unavailable_tree_renders_the_notice_instead_of_counts(self, reason):
+        tree = FilteredTaskTree(unavailable_reason=reason)
+        notice = f'Task tree unavailable: {reason.value}'
+
+        visible, active_section = render_active_section(tree)
+        formatted = format_filtered_task_tree(tree)
+
+        assert (visible, active_section) == ([], f'{ACTIVE_TASK_TREE_HEADER}\n{notice}\n')
+        assert formatted == active_section
+        for rendered in (active_section, formatted):
+            assert 'active shown' not in rendered
+            assert 'total' not in rendered
+        assert tree_unavailable_notice(tree) == notice
+        assert render_retained_done_tasks(tree) == notice
+
+    def test_a_fetched_empty_tree_still_renders_zero_counts(self):
+        fetched_empty = filter_task_tree({'tasks': []})
+
+        assert format_filtered_task_tree(fetched_empty) == (
+            '### Active Task Tree\n'
+            '(0 active shown, 0 done, 0 cancelled, 0 other, 0 total, highest task id: 0)\n'
+            'No active tasks.\n'
+            '0 done, 0 cancelled — omitted'
+        )
+        assert render_retained_done_tasks(fetched_empty) == 'No tasks.'
+
+    @pytest.mark.parametrize(
+        'override',
+        [
+            {'total_count': 3},
+            {'done_count': 1},
+            {'max_task_id': 7},
+            {'active_tasks': [{'id': 1, 'status': 'pending'}]},
+        ],
+    )
+    def test_an_unavailable_tree_cannot_carry_tasks_or_counts(self, override):
+        (field_name,) = override
+
+        with pytest.raises(ValueError) as excinfo:
+            FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.fetch_error, **override)
+
+        message = str(excinfo.value)
+        assert 'unavailable_reason' in message
+        assert 'fetch_error' in message
+        assert field_name in message
+
+    def test_available_tree_of_an_unset_tree_is_none(self):
+        assert available_tree(None) is None
+
+    @pytest.mark.parametrize('reason', list(TaskTreeUnavailableReason))
+    def test_available_tree_of_an_unavailable_tree_is_none(self, reason):
+        assert available_tree(FilteredTaskTree(unavailable_reason=reason)) is None
+
+    @pytest.mark.parametrize(
+        'tasks',
+        [[], [{'id': 1, 'status': 'pending'}]],
+        ids=['empty', 'one-active'],
+    )
+    def test_available_tree_returns_a_fetched_tree_itself(self, tasks):
+        fetched = filter_task_tree({'tasks': tasks})
+
+        assert available_tree(fetched) is fetched
 
 
 class TestFilterTaskTreeDoneAndCancelledLists:
@@ -3020,6 +3186,41 @@ class TestCrossVerifyTaskCounts:
         assert result['available'] is False
         assert result['consistent'] is True
 
+    def test_an_unavailable_tree_is_never_a_divergence_against_a_live_census(self):
+        tree = FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.fetch_error)
+        statuses = {str(i): 'done' for i in range(5)}
+        statuses.update({str(i): 'pending' for i in range(5, 10)})
+
+        result = cross_verify_task_counts(tree, statuses)
+
+        assert result['available'] is True
+        assert result['consistent'] is True
+        assert result['total_mismatch'] is False
+        assert result['done_mismatch'] is False
+        assert result['authoritative']['total'] == 10
+        assert result['authoritative']['done'] == 5
+        assert result['tree'] is None
+        assert result['tree_unavailable_reason'] == 'fetch_error'
+
+    def test_an_unavailable_tree_without_a_census_reports_the_reason(self):
+        tree = FilteredTaskTree(unavailable_reason=TaskTreeUnavailableReason.fetch_error)
+
+        result = cross_verify_task_counts(tree, None)
+
+        assert result['available'] is False
+        assert result['consistent'] is True
+        assert result['tree'] is None
+        assert result['tree_unavailable_reason'] == 'fetch_error'
+
+    def test_a_fetched_tree_reports_its_counts_and_no_unavailable_reason(self):
+        tree = FilteredTaskTree(total_count=10, done_count=5)
+        statuses = {str(i): 'done' for i in range(5)}
+        statuses.update({str(i): 'pending' for i in range(5, 10)})
+
+        for result in (cross_verify_task_counts(tree, statuses), cross_verify_task_counts(tree, {})):
+            assert result['tree_unavailable_reason'] is None
+            assert result['tree'] == {'total': 10, 'done': 5}
+
 
 # ---------------------------------------------------------------------------
 # diff_status_correction — step-1 (RED) / step-2 (GREEN); step-3 (RED) / step-4 (GREEN)
@@ -3335,9 +3536,7 @@ class TestClauseSplitRe:
 
     def test_clause_split_re_has_no_out_of_module_consumers(self):
         """WIDE_CLAUSE_BOUNDARY_RE is for ALLOWLISTED consumers only — scanned,
-        not asserted in prose. The scan also covers its old private spelling,
-        _CLAUSE_SPLIT_RE, which task_filter keeps as an alias until
-        tkt_0RVBV2PMGFWETFNDCRYB4TRFW1 migrates its last importer.
+        not asserted in prose.
 
         Widening the splitter is only defensible because of who reads it: both
         consumers (find_conflicting_task_status_ids,
@@ -3401,7 +3600,7 @@ class TestClauseSplitRe:
 
         package_root = Path(__file__).resolve().parents[1]
         # Every file allowed to reference the widened constant in CODE.
-        names = {'WIDE_CLAUSE_BOUNDARY_RE', '_CLAUSE_SPLIT_RE'}
+        name = 'WIDE_CLAUSE_BOUNDARY_RE'
         allowlist = {
             'src/fused_memory/reconciliation/task_filter.py',
             'scripts/audit_duplicate_memories.py',
@@ -3419,11 +3618,11 @@ class TestClauseSplitRe:
                 tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
                 for node in ast.walk(tree):
                     if (
-                        (isinstance(node, ast.Name) and node.id in names)
-                        or (isinstance(node, ast.Attribute) and node.attr in names)
+                        (isinstance(node, ast.Name) and node.id == name)
+                        or (isinstance(node, ast.Attribute) and node.attr == name)
                         or (
                             isinstance(node, ast.ImportFrom)
-                            and any(alias.name in names for alias in node.names)
+                            and any(alias.name == name for alias in node.names)
                         )
                     ):
                         consumers.add(path.relative_to(package_root).as_posix())

@@ -14,7 +14,7 @@ Widths throughout are CELLS, not characters -- Textual crops a column by
 rich's cell measurement, so a bound counted in characters would let
 double-width text overrun its column (and lose its ellipsis with it).
 
-Consumers import orchestrator.session_registry directly (mirrors
+Consumers import orchestrator.session_records directly (mirrors
 registry_reader.py/session_table.py -- PRD §6 G5: consumers import the
 frozen C1 record shape, never re-derive it).
 """
@@ -26,13 +26,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
 
-from orchestrator.session_registry import (
-    DecisionRecord,
-    DecisionState,
-    Display,
-    SessionRecord,
-    Status,
-)
+from orchestrator.decision_registry import DecisionRecord, DecisionState
+from orchestrator.session_records import Display, SessionRecord, Status
 from rich.cells import cell_len, set_cell_size
 from textual.events import Resize
 from textual.widgets import DataTable
@@ -279,15 +274,13 @@ class QueueItem:
 
     key: a stable, kind-prefixed identity ('decision:<id>' / 'session:<slug>')
         used both as the DataTable row key and as the lookup key into the
-        app's in-memory boosts/deferred/handling overlays.
+        app's in-memory boosts/deferred/dropped overlays.
     kind: 'decision' | 'session'.
     decision_id: the backing DecisionRecord's id, or None for a session item
         (sessions aren't cockpit-writable -- see set_manual_boost/
         update_decision_state's callers).
     target: this item's resolved focus target, or None when unresolvable
         (a gone/unlinked session) -- see resolve_target.
-    handling: whether this item's key is in the app's in-memory "already
-        acted on" set (stamped by order_queue's *handling* param).
     escalation_id: the backing record's escalation_id, or None -- not
         rendered by format_queue_row, but consumed by format_copy_payload
         (the copy affordance, task 2517).
@@ -309,7 +302,6 @@ class QueueItem:
     filed_at: datetime
     score: float
     target: DisplayTarget | None
-    handling: bool
     escalation_id: str | None
     session_slug: str | None
 
@@ -448,7 +440,6 @@ def order_queue(
     *,
     boosts: Mapping[str, int] | None = None,
     deferred: Mapping[str, datetime] | None = None,
-    handling: Iterable[str] | None = None,
     dropped: Iterable[str] | None = None,
 ) -> list[QueueItem]:
     """Build the score-ordered decision queue: every open decision + awaiting-input session.
@@ -468,7 +459,6 @@ def order_queue(
     """
     boosts = boosts or {}
     deferred = deferred or {}
-    handling_set = set(handling) if handling is not None else set()
     dropped_set = set(dropped) if dropped is not None else set()
     sessions_by_slug = {session.session_slug: session for session in sessions}
 
@@ -494,7 +484,6 @@ def order_queue(
                 filed_at=scoring_item.filed_at,
                 score=score(scoring_item, priorities, now),
                 target=resolve_target(decision, sessions_by_slug),
-                handling=key in handling_set,
                 escalation_id=decision.escalation_id,
                 session_slug=None,
             )
@@ -521,7 +510,6 @@ def order_queue(
                 filed_at=scoring_item.filed_at,
                 score=score(scoring_item, priorities, now),
                 target=resolve_target(session, sessions_by_slug),
-                handling=key in handling_set,
                 escalation_id=session.escalation_id,
                 session_slug=session.session_slug,
             )

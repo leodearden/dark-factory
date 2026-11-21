@@ -45,9 +45,13 @@ from typing import Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _verify_config_corpus import ROOT_LINT_COMMAND, ROOT_TYPE_CHECK_COMMAND
+from _verify_config_corpus import (
+    ROOT_LINT_CHECKER_CLAUSE,
+    ROOT_LINT_COMMAND,
+    ROOT_TYPE_CHECK_COMMAND,
+)
 from test_verify import _canned_passing_result, _real_worktree_reader, _write_guard_script
-from test_verify_plan import (  # noqa: F401 — reused by this module's byte-identical goldens (steps 3/7/9)
+from test_verify_plan import (  # reused by this module's byte-identical goldens (steps 3/7/9)
     DATA_MODULE_DIFF,
     ROOT_CONFTEST_DIFF,
 )
@@ -56,6 +60,7 @@ from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import run_scoped_verification
 from orchestrator.verify_cmd import ToolKind, VerifyCmd, render
+from orchestrator.verify_fallback_floor import NO_TESTS_RAN_CATEGORY
 
 # ---------------------------------------------------------------------------
 # GOLDEN diff shapes (task κ corpus) — see module docstring for provenance.
@@ -220,13 +225,13 @@ class TestModuleConfigPlanAuthority:
     async def test_executed_commands_are_driven_by_the_plan(self, tmp_path: Path):
         """A touched test file + a plain source file under one registered module.
 
-        Since task 3294 this MIXED shape full-suites pytest at the default
-        role='task' (any touched SOURCE/STRUCTURAL file under the prefix runs
-        the owning module's whole test_command), so this pins the FULL_SUITE
-        arm of the plan→ModuleConfig mapping alongside lint/pyright's
-        FILE_SCOPED arms. The class's contract — executed == planned, with no
-        hand-mirrored decision tree in between — is unchanged; only which arm
-        the pytest slot exercises moved.
+        At the default role='task' this MIXED shape fires the task-role floor,
+        and mymod has no whole-tree guard family, so the floor takes its
+        full-suite fallback leg (gate 5702, task 7253): this pins the
+        FULL_SUITE arm of the plan→ModuleConfig mapping alongside
+        lint/pyright's FILE_SCOPED arms. The class's contract — executed ==
+        planned, with no hand-mirrored decision tree in between — is
+        unchanged; only which arm the pytest slot exercises moved.
         """
         (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
         (tmp_path / 'mymod' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
@@ -255,8 +260,11 @@ class TestModuleConfigPlanAuthority:
         # (scope_module_config) is deleted entirely (step-6); see
         # TestDeleteTheTwinInvariant for that invariant directly.
 
+        # The expected plan enumerates mymod's tests exactly as verify.py
+        # does, so the family really is found empty rather than unlisted.
         expected_plan = verify_plan.derive_verify_plan(
             existing_files, module_configs, config, _real_worktree_reader(tmp_path),
+            list_pkg_tests=lambda pkg: ['mymod/tests/test_thing.py'] if pkg == 'mymod' else [],
         )
 
         executed = _executed_module_configs(mock_run_verification)
@@ -270,9 +278,9 @@ class TestModuleConfigPlanAuthority:
         by_tool = {run.cmd.tool: run for run in expected_plan.runs if run.cmd is not None}
 
         pytest_run = by_tool[ToolKind.PYTEST]
-        # Task 3294: this MIXED shape (production file + co-committed test)
-        # full-suites pytest at role='task', so this now pins the FULL_SUITE
-        # arm of the plan→ModuleConfig mapping. The expectation is the
+        # This MIXED shape (production file + co-committed test) takes the
+        # task-role floor's no-guard-family fallback, so this pins the
+        # FULL_SUITE arm of the plan→ModuleConfig mapping. The expectation is the
         # VERBATIM configured command, not render(cmd): a FULL_SUITE slot is
         # rendered by _executed_module_configs_from_plan as `getattr(mc, attr)`,
         # while render() normalises `--directory` into a leading `cd` — so the
@@ -410,8 +418,10 @@ class TestModuleConfigScopeGoldens:
     ):
         """(d) SOURCE_ONLY_ZERO_PYTEST_DIFF at role='task' -> test_command == the
         owning module's verbatim full suite (λ, task 2589 R3: the task-role pytest
-        floor). Pre-λ this fabricated ZERO pytest signal (test_command was None);
-        see test_source_only_diff_skips_pytest_entirely_at_merge_role below for the
+        floor). mymod carries no whole-tree guard family, so this is the floor's
+        no-family fallback leg (gate 5702, task 7253). Pre-λ this fabricated ZERO
+        pytest signal (test_command was None); see
+        test_source_only_diff_skips_pytest_entirely_at_merge_role below for the
         preserved legacy SKIPPED shape (R4)."""
         source_path = SOURCE_ONLY_ZERO_PYTEST_DIFF[0]
         full = tmp_path / source_path
@@ -657,7 +667,8 @@ class TestDeleteTheTwinInvariant:
                 tmp_path, config, module_configs, task_files=task_files,
             )
 
-        assert len(calls) == len(set(calls)) == len(task_files), (
+        diff_calls = [path for path in calls if path in task_files]
+        assert len(diff_calls) == len(set(diff_calls)) == len(task_files), (
             f'classify_file must run exactly once per distinct touched .py file '
             f'on the module-config path — no independent re-classification by a '
             f'second (hand-mirrored) decision tree: calls={calls!r}'
@@ -816,6 +827,7 @@ class TestFallbackPlanAuthorityGoldens:
         """(b) DATA_MODULE_DIFF on bare pytest -> test_command is None + task-1852 WARNING.
 
         Already GREEN today (see class docstring).
+        Under task 7041 the skipped slot's verdict is no_tests_ran.
         """
         data_path = DATA_MODULE_DIFF[0]
         full = tmp_path / data_path
@@ -833,7 +845,8 @@ class TestFallbackPlanAuthorityGoldens:
                 tmp_path, config, [], task_files=[data_path],
             )
 
-        assert result.passed
+        assert not result.passed
+        assert result.category == NO_TESTS_RAN_CATEGORY
         executed = _executed_module_configs(mock_run_verification)
         assert len(executed) == 1
         assert executed[0].test_command is None
@@ -854,6 +867,7 @@ class TestFallbackPlanAuthorityGoldens:
         (test_verify.py), which this golden must not regress.
 
         Already GREEN today (see class docstring).
+        The verify_allow_no_tests_ran opt-in keeps the pyright subject under test.
         """
         struct_path = STRUCTURAL_FILE_DIFF[0]
         full = tmp_path / struct_path
@@ -863,6 +877,7 @@ class TestFallbackPlanAuthorityGoldens:
         config = OrchestratorConfig(
             project_root=tmp_path,
             test_command='pytest', lint_command='ruff check', type_check_command='pyright',
+            verify_allow_no_tests_ran=True,
         )
 
         mock_run_verification = _run_verification_spy()
@@ -1034,10 +1049,7 @@ class TestFallbackPlanAuthorityGoldens:
         # LINT: ruff is file-scoped AND reprojected into the fallback uv
         # project, while the trailing sibling-checker clause survives verbatim.
         assert executed[0].lint_command == (
-            f'uv run --project shared ruff check {test_path}'
-            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py '
-            'shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-            ' sampler/tests cockpit/tests'
+            f'uv run --project shared ruff check {test_path} && {ROOT_LINT_CHECKER_CLAUSE}'
         )
         assert 'check_bare_magicmock_config' in (executed[0].lint_command or '')
         # TYPE: a cd-sequenced same-tool fan-out still truncates at the keyword.
@@ -1387,6 +1399,47 @@ class TestExecutedPlanRecordsModuleSkips:
             else:
                 assert run['scope_kind'] == 'file_scoped'
                 assert executed_mc.test_command == _render_plan_cmd(run['cmd'])
+
+
+class TestExecutedModulesMatchExecutedModulePrefixes:
+    """The modules ``run_scoped_verification`` executes are exactly
+    ``verify_plan.executed_module_prefixes`` of its plan, the predicate the
+    task-verify dispatcher keys remote eligibility on."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('task_files', 'expected'), [
+        pytest.param(['mymod/tests/test_thing.py'], {'mymod'}, id='one-module-touched'),
+        pytest.param(
+            ['mymod/tests/test_thing.py', 'othermod/tests/test_other.py'], {'mymod', 'othermod'},
+            id='both-modules-touched',
+        ),
+        pytest.param(['README.md'], set(), id='docs-only-trivial'),
+    ])
+    async def test_executed_modules_are_the_plans_executed_module_prefixes(
+        self, tmp_path: Path, task_files: list[str], expected: set[str],
+    ):
+        (tmp_path / 'mymod' / 'tests').mkdir(parents=True)
+        (tmp_path / 'mymod' / 'tests' / 'test_thing.py').write_text('def test_thing(): pass\n')
+        (tmp_path / 'othermod' / 'tests').mkdir(parents=True)
+        (tmp_path / 'othermod' / 'tests' / 'test_other.py').write_text('def test_other(): pass\n')
+        (tmp_path / 'README.md').write_text('# docs\n')
+        config = OrchestratorConfig(project_root=tmp_path)
+        module_configs = [
+            ModuleConfig(prefix='mymod', test_command='uv run --directory mymod pytest tests/'),
+            ModuleConfig(prefix='othermod', test_command='uv run --directory othermod pytest tests/'),
+        ]
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            await run_scoped_verification(
+                tmp_path, config, module_configs, task_files=task_files, role='task',
+            )
+
+        plan = verify_plan.derive_verify_plan(
+            task_files, module_configs, config, _real_worktree_reader(tmp_path), role='task',
+        )
+        executed = {mc.prefix for mc in _executed_module_configs(mock_run_verification)}
+        assert executed == verify_plan.executed_module_prefixes(plan) == expected
 
 
 # ---------------------------------------------------------------------------

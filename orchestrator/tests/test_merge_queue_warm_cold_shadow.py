@@ -12,7 +12,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript
+from _harness_store_paths import point_harness_stores_at
+from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     make_placeholder_future,
@@ -29,6 +30,7 @@ from orchestrator.merge_lane.shadow import (
     _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL,
     ShadowCompareDiff,
     ShadowCompareState,
+    _alarm_warm_shadow_unparseable,
     _load_shadow_compare_state,
     _nextest_reported_test_count,
     _run_shadow_compare,
@@ -36,12 +38,15 @@ from orchestrator.merge_lane.shadow import (
     _shadow_compare_due,
     _submit_shadow_divergence_escalation,
     diff_per_test_results,
-)
-from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
-from orchestrator.merge_queue import (
-    _alarm_warm_shadow_unparseable,
-    _maybe_schedule_shadow_compare,
     parse_per_test_results,
+)
+from orchestrator.merge_lane.worker import (
+    PRODUCTION_VERIFIER,
+    MergeOutcome,
+    MergeRequest,
+    QueuedBranch,
+    SpeculativeMergeWorker,
+    _maybe_schedule_shadow_compare,
 )
 from orchestrator.verify import VerifyResult
 
@@ -832,10 +837,10 @@ class TestSubmitShadowDivergenceEscalation:
 
 
 # ---------------------------------------------------------------------------
-# Step-11: create_throwaway_verify_worktree (real-git) + _run_shadow_compare
+# Step-11: create_ephemeral_verify_worktree (real-git) + _run_shadow_compare
 # ---------------------------------------------------------------------------
 
-# --- Real-git fixtures for create_throwaway_verify_worktree ---
+# --- Real-git fixtures for create_ephemeral_verify_worktree ---
 
 
 async def _setup_repo(repo: Path) -> None:
@@ -871,71 +876,70 @@ def git_ops_wcs(git_repo_wcs: Path) -> GitOps:
     return GitOps(git, git_repo_wcs)
 
 
-class TestCreateThrowawayVerifyWorktree:
-    """Tests for git_ops.create_throwaway_verify_worktree (step-11 real-git).
+class TestCreateEphemeralVerifyWorktree:
+    """Behavioural pin of the public GitOps.create_ephemeral_verify_worktree.
 
-    (1) Verifies create_throwaway_verify_worktree creates an EPHEMERAL
-    _merge-<uuid> worktree (not the warm _merge-verify path) checked out at
-    merge_commit, and that cleanup_merge_worktree removes it.
+    It creates a ``_merge-<uuid>`` worktree directly under worktree_base,
+    detached at the given sha, never the fixed warm ``_merge-verify`` path;
+    cleanup_merge_worktree removes it.
     """
 
     @pytest.mark.asyncio
-    async def test_creates_ephemeral_worktree_at_merge_commit(
+    async def test_create_ephemeral_verify_worktree_is_detached_merge_uuid_at_sha(
         self, git_ops_wcs: GitOps, git_repo_wcs: Path
     ) -> None:
-        # Resolve the current HEAD SHA (a real commit in the repo)
         _, sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo_wcs)
-        merge_commit = sha_out.strip()
+        sha = sha_out.strip()
 
-        wt = await git_ops_wcs.create_throwaway_verify_worktree(merge_commit)
+        wt = await git_ops_wcs.create_ephemeral_verify_worktree(sha)
 
         try:
-            assert wt.exists(), f'Throwaway worktree dir must exist: {wt}'
-            # Name must start with _merge- (ephemeral UUID)
+            assert wt.exists(), f'Ephemeral worktree dir must exist: {wt}'
             assert wt.name.startswith('_merge-'), (
                 f'Expected _merge-<uuid>, got {wt.name!r}'
             )
-            # Must be checked out at the requested commit
+            assert wt.resolve().parent == git_ops_wcs.worktree_base.resolve()
             _, head_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
-            assert head_out.strip() == merge_commit, (
-                f'Worktree HEAD {head_out.strip()!r} != merge_commit {merge_commit!r}'
+            assert head_out.strip() == sha, (
+                f'Worktree HEAD {head_out.strip()!r} != sha {sha!r}'
             )
+            symref_rc, _, _ = await _run(['git', 'symbolic-ref', '-q', 'HEAD'], cwd=wt)
+            assert symref_rc != 0, 'Ephemeral worktree HEAD must be detached'
         finally:
             await git_ops_wcs.cleanup_merge_worktree(wt)
 
     @pytest.mark.asyncio
-    async def test_path_is_not_persistent_merge_verify(
+    async def test_create_ephemeral_verify_worktree_is_never_persistent_merge_verify(
         self, git_ops_wcs: GitOps, git_repo_wcs: Path
     ) -> None:
         _, sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo_wcs)
-        merge_commit = sha_out.strip()
+        sha = sha_out.strip()
 
-        wt = await git_ops_wcs.create_throwaway_verify_worktree(merge_commit)
+        wt = await git_ops_wcs.create_ephemeral_verify_worktree(sha)
 
         try:
-            # Path must NOT be the persistent warm worktree
             persistent = git_ops_wcs.persistent_merge_worktree_path
             assert wt.resolve() != persistent.resolve(), (
-                f'Throwaway path must not be {persistent}'
+                f'Ephemeral path must not be {persistent}'
             )
             assert wt.name != '_merge-verify', (
-                f'Throwaway name must not be _merge-verify; got {wt.name!r}'
+                f'Ephemeral name must not be _merge-verify; got {wt.name!r}'
             )
         finally:
             await git_ops_wcs.cleanup_merge_worktree(wt)
 
     @pytest.mark.asyncio
-    async def test_cleanup_removes_throwaway_worktree(
+    async def test_create_ephemeral_verify_worktree_is_removed_by_cleanup(
         self, git_ops_wcs: GitOps, git_repo_wcs: Path
     ) -> None:
         _, sha_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo_wcs)
-        merge_commit = sha_out.strip()
+        sha = sha_out.strip()
 
-        wt = await git_ops_wcs.create_throwaway_verify_worktree(merge_commit)
+        wt = await git_ops_wcs.create_ephemeral_verify_worktree(sha)
         assert wt.exists()
 
         await git_ops_wcs.cleanup_merge_worktree(wt)
-        assert not wt.exists(), 'cleanup_merge_worktree must remove the throwaway worktree'
+        assert not wt.exists(), 'cleanup_merge_worktree must remove the ephemeral worktree'
 
 
 # --- _run_shadow_compare async tests (cold leg stubbed) ---
@@ -945,10 +949,7 @@ def _make_mock_req(tmp_path: Path) -> MagicMock:
     """Build a minimal MergeRequest stub."""
     req = MagicMock()
     req.task_id = 'task-1710'
-    req.config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(warm_verify_shadow_compare=True),
-    )
+    req.config = lane_scene_config(tmp_path, GitConfig(warm_verify_shadow_compare=True))
     return req
 
 
@@ -1442,7 +1443,7 @@ def _make_shadow_config(
         warm_verify_shadow_compare_every_n_merges=every_n,
         warm_verify_shadow_compare_nightly_interval_secs=nightly_interval,
     )
-    return OrchestratorConfig(project_root=tmp_path, git=git)
+    return lane_scene_config(tmp_path, git)
 
 
 class TestMaybeScheduleShadowCompare:
@@ -1667,13 +1668,6 @@ class TestMaybeScheduleShadowCompare:
 # Step-15: Integration — warm capture + worker/harness wiring
 # ---------------------------------------------------------------------------
 
-from orchestrator.merge_queue import (  # noqa: E402
-    MergeOutcome,
-    MergeRequest,
-    QueuedBranch,
-    SpeculativeMergeWorker,
-)
-
 
 def _make_warm_cold_config(
     project_root: Path,
@@ -1692,7 +1686,7 @@ def _make_warm_cold_config(
         warm_verify_shadow_compare=shadow_compare,
         warm_verify_shadow_compare_every_n_merges=1,  # always due in tests
     )
-    return OrchestratorConfig(project_root=project_root, git=git)
+    return lane_scene_config(project_root, git)
 
 
 #: A warm verify output that PARSES into a per-test map.  The map is what
@@ -1737,20 +1731,20 @@ class TestSMWShadowStateInit:
 
 
 class TestRunPostMergeVerifyOnResultCallback:
-    """(2) _run_post_merge_verify invokes an optional on_result callback with the VerifyResult."""
+    """(2) run_post_merge_verify invokes an optional on_result callback with the VerifyResult."""
 
     @pytest.mark.asyncio
     async def test_on_result_kwarg_accepted_without_type_error(
         self, tmp_path: Path
     ) -> None:
         """Passing on_result= must not raise TypeError (kwarg must exist)."""
-        from orchestrator.merge_queue import _run_post_merge_verify  # noqa: PLC0415
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         received: list[VerifyResult] = []
         merge_wt = tmp_path / 'wt'
         merge_wt.mkdir()
         req = MagicMock()
-        req.config = OrchestratorConfig(project_root=tmp_path, git=GitConfig())
+        req.config = lane_scene_config(tmp_path, GitConfig())
         req.task_files = None
         req.module_configs = []
         req.task_id = 'task-15'
@@ -1762,11 +1756,11 @@ class TestRunPostMergeVerifyOnResultCallback:
         )
 
         # The verify port is INJECTED, not patched: `verifier=` already exists
-        # on _run_post_merge_verify, and FakeVerifier.ensure_disk_space returns
+        # on run_post_merge_verify, and FakeVerifier.ensure_disk_space returns
         # DiskGuardOutcome(reason=None) — identical to the
         # AsyncMock(return_value=None) this used to patch over
         # _ensure_verify_disk_space.
-        result = await _run_post_merge_verify(
+        result = await run_post_merge_verify(
             MagicMock(), req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -1778,7 +1772,7 @@ class TestRunPostMergeVerifyOnResultCallback:
         assert len(received) == 1
         assert isinstance(received[0], VerifyResult)
         assert received[0].passed is True
-        # _run_post_merge_verify returns None on PASS
+        # run_post_merge_verify returns None on PASS
         assert result is None
 
 
@@ -1787,7 +1781,7 @@ class TestRunPostMergeVerifyOnResultCallback:
 
 async def _setup_wcs_repo(repo: Path) -> None:
     """Set up a minimal git repo for integration tests (step-15)."""
-    from orchestrator.git_ops import _run  # noqa: PLC0415
+    from orchestrator.git_ops import _run
 
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
     await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
@@ -1878,7 +1872,7 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
         escalations = _make_escalation_queue()
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         # A passing verify port, INJECTED (model: test_merge_lane_package.py),
-        # replaces the _run_post_merge_verify patch this used to need.
+        # replaces the run_post_merge_verify patch this used to need.
         worker = SpeculativeMergeWorker(
             wcs_git_ops, queue, event_store=None,
             escalation_queue=escalations, verifier=_warm_verifier(),
@@ -1964,11 +1958,12 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         self, tmp_path: Path
     ) -> None:
         """SMW must be constructed with the harness's live escalation_queue."""
-        from orchestrator.harness import Harness  # noqa: PLC0415
+        from orchestrator.harness import Harness
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.max_concurrent_tasks = 2
         config.project_root = tmp_path
+        point_harness_stores_at(config, tmp_path)
         config.git = GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
             worktree_dir='.worktrees',
@@ -1999,12 +1994,11 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         fake_eq = MagicMock()
         h._escalation_queue = fake_eq
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()):
             mock_smw = MagicMock()
-            mock_smw.run = AsyncMock(return_value=None)
             mock_smw_cls.return_value = mock_smw
 
             await h._start_merge_worker()
@@ -2023,11 +2017,12 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         self, tmp_path: Path
     ) -> None:
         """When _escalation_queue is None (bare harness), SMW receives None — no crash."""
-        from orchestrator.harness import Harness  # noqa: PLC0415
+        from orchestrator.harness import Harness
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.max_concurrent_tasks = 2
         config.project_root = tmp_path
+        point_harness_stores_at(config, tmp_path)
         config.git = GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
             worktree_dir='.worktrees',
@@ -2057,12 +2052,11 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         # _escalation_queue is None by default (set in Harness.__init__)
         assert h._escalation_queue is None
 
-        with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw_cls, \
+        with patch('orchestrator.merge_lane.worker.SpeculativeMergeWorker') as mock_smw_cls, \
              patch.object(h, '_build_service_restart_coordinator',
                           return_value=MagicMock()), \
              patch('asyncio.create_task', return_value=MagicMock()):
             mock_smw = MagicMock()
-            mock_smw.run = AsyncMock(return_value=None)
             mock_smw_cls.return_value = mock_smw
 
             await h._start_merge_worker()

@@ -12,11 +12,17 @@ import dataclasses
 import os
 import subprocess
 import sys
+import tomllib
+from collections.abc import Callable
 from pathlib import Path
 
+import _checkout
 import pytest
 import source_measures
 from git_listing import git
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 
@@ -182,6 +188,44 @@ class TestFunctionLocalImports:
         with pytest.raises(source_measures.MetricsError) as excinfo:
             source_measures.function_local_imports('def (:\n', path='broken.py')
         assert 'broken.py' in str(excinfo.value)
+
+
+class TestImportStatements:
+    def test_each_statement_carries_whether_it_runs_and_whether_it_is_deferred(self) -> None:
+        source = (
+            'import a\n'
+            'from typing import TYPE_CHECKING\n'
+            'if TYPE_CHECKING:\n'
+            '    import b\n'
+            'else:\n'
+            '    import c\n'
+            'class C:\n'
+            '    import d\n'
+            'def f():\n'
+            '    import e\n'
+            '    if typing.TYPE_CHECKING:\n'
+            '        import g\n'
+            '    class Local:\n'
+            '        import h\n'
+        )
+        statements = source_measures.import_statements_in_tree(ast.parse(source))
+        assert [(s.line, s.runtime, s.deferred) for s in statements] == [
+            (1, True, False),
+            (2, True, False),
+            (4, False, False),
+            (6, True, False),
+            (8, True, False),
+            (10, True, True),
+            (12, False, True),
+            (14, True, True),
+        ]
+
+    def test_the_function_local_count_is_the_deferred_statements(self) -> None:
+        source = 'import a\n\ndef f():\n    import b\n    def g():\n        from c import d\n'
+        tree = ast.parse(source)
+        deferred = [s for s in source_measures.import_statements_in_tree(tree) if s.deferred]
+        assert [s.line for s in deferred] == [4, 6]
+        assert source_measures.function_local_imports_in_tree(tree) == len(deferred)
 
 
 class TestReexportNames:
@@ -505,6 +549,74 @@ class TestPatchCalls:
             (None, 'mod', '_two'),
         ]
 
+    def test_a_name_argument_resolves_through_the_given_constants(self) -> None:
+        tree = ast.parse('patch(_T)\nmonkeypatch.setattr(_T, v)\npatch.object(mod, _A)\n')
+        calls = source_measures.patch_calls_in_tree(
+            tree, constants={'_T': 'a.b._c', '_A': '_x'}
+        )
+        assert [_shape(call) for call in calls] == [
+            ('a.b._c', None, None),
+            ('a.b._c', None, None),
+            (None, 'mod', '_x'),
+        ]
+
+    def test_without_constants_a_name_argument_is_not_found(self) -> None:
+        assert _patch_calls('patch(_T)\n') == ()
+
+
+class TestStringConstants:
+    @pytest.mark.parametrize(
+        ('source', 'name', 'value'),
+        [
+            pytest.param("_T = 'a.b'\n", '_T', 'a.b', id='module-literal'),
+            pytest.param("_T: str = 'a.b'\n", '_T', 'a.b', id='annotated'),
+            pytest.param("_A = _B = 'x'\n", '_A', 'x', id='chained-first'),
+            pytest.param("_A = _B = 'x'\n", '_B', 'x', id='chained-second'),
+            pytest.param("_M = 'pkg'\n_T = f'{_M}.x'\n", '_T', 'pkg.x', id='f-string'),
+            pytest.param("_M = 'pkg'\n_T = _M + '.x'\n", '_T', 'pkg.x', id='concatenation'),
+            pytest.param(
+                "def f():\n    t = f'{_M}.x'\n_M = 'pkg'\n", 't', 'pkg.x', id='defined-later'
+            ),
+        ],
+    )
+    def test_a_name_bound_once_to_a_static_string_resolves(
+        self, source: str, name: str, value: str
+    ) -> None:
+        assert source_measures.string_constants_in_tree(ast.parse(source))[name] == value
+
+    @pytest.mark.parametrize(
+        ('source', 'name'),
+        [
+            pytest.param("_T = 'a'\n_T = 'b'\n", '_T', id='bound-twice'),
+            pytest.param("_T = 'a'\n_T += '.b'\n", '_T', id='aug-assign'),
+            pytest.param("_T = 'a'\ndef f(_T): pass\n", '_T', id='also-a-parameter'),
+            pytest.param("_T = 'a'\ndef _T(): pass\n", '_T', id='also-a-def'),
+            pytest.param("_T = 'a'\nasync def _T(): pass\n", '_T', id='also-an-async-def'),
+            pytest.param("_T = 'a'\nclass _T: pass\n", '_T', id='also-a-class'),
+            pytest.param("_T = 'a'\ntry: pass\nexcept E as _T: pass\n", '_T', id='also-except-as'),
+            pytest.param("_T = 'a'\nfor _T in x: pass\n", '_T', id='also-a-for-target'),
+            pytest.param("_T = 'a'\n[_T for _T in x]\n", '_T', id='also-a-comprehension-var'),
+            pytest.param("_T = 'a'\nwith x as _T: pass\n", '_T', id='also-with-as'),
+            pytest.param("_T = 'a'\n(_T := 'b')\n", '_T', id='also-a-walrus-target'),
+            pytest.param(
+                "_T = 'a'\ndef f():\n    global _T\n    _T = 'b'\n", '_T', id='global-reassigned'
+            ),
+            pytest.param("_T = 'a'\nmatch x:\n    case _T: pass\n", '_T', id='also-a-match-capture'),
+            pytest.param("_T = 'a'\nmatch x:\n    case [*_T]: pass\n", '_T', id='also-a-match-star'),
+            pytest.param("_T = 'a'\nimport h as _T\n", '_T', id='also-an-import-alias'),
+            pytest.param('from h import _T\n', '_T', id='imported'),
+            pytest.param('_N = 1\n', '_N', id='non-string'),
+            pytest.param("_A, _B = 'x', 'y'\n", '_A', id='tuple-unpacking'),
+            pytest.param("_M = 'pkg'\n_T = f'{_M!r}'\n", '_T', id='f-string-conversion'),
+            pytest.param("_M = 'pkg'\n_T = f'{_M:>5}'\n", '_T', id='f-string-format-spec'),
+            pytest.param("_T = f'{__name__}._run'\n", '_T', id='unresolvable-placeholder'),
+        ],
+    )
+    def test_an_ambiguous_or_non_static_binding_does_not_resolve(
+        self, source: str, name: str
+    ) -> None:
+        assert name not in source_measures.string_constants_in_tree(ast.parse(source))
+
 
 # ---------------------------------------------------------------------------
 # Patch targets: (module, leaf) pairs patched through a module in a given set.
@@ -596,6 +708,22 @@ class TestPatchTargets:
             '\n'
             'p = patch.object(mod, NAME, 1)\n'
         )
+        assert source_measures.patch_targets(source, MODULES) == set()
+
+    def test_a_string_path_parked_in_a_module_constant_is_detected(self) -> None:
+        source = "_T = 'pkg.mod.foo'\npatch(_T, x)\n"
+        assert source_measures.patch_targets(source, MODULES) == {('pkg.mod', 'foo')}
+
+    def test_an_f_string_over_a_module_constant_is_detected(self) -> None:
+        source = "_M = 'pkg.mod'\npatch(f'{_M}.foo', x)\n"
+        assert source_measures.patch_targets(source, MODULES) == {('pkg.mod', 'foo')}
+
+    def test_a_constant_attribute_name_for_patch_object_is_detected(self) -> None:
+        source = "from pkg import mod\n_A = 'x'\npatch.object(mod, _A, 1)\n"
+        assert source_measures.patch_targets(source, MODULES) == {('pkg.mod', 'x')}
+
+    def test_an_ambiguously_bound_name_is_not_resolved(self) -> None:
+        source = "_T = 'pkg.mod.foo'\n_T = 'pkg.mod.bar'\npatch(_T, x)\n"
         assert source_measures.patch_targets(source, MODULES) == set()
 
     def test_unparseable_source_raises_naming_the_path(self) -> None:
@@ -774,6 +902,34 @@ class TestTrackedFiles:
         assert source_measures.tracked_files(root, '*.rs') == ('sub/b.rs', 'z.rs')
 
 
+class TestBlobSha:
+    """Git's blob id of the content on disk, which is the index entry only while they agree."""
+
+    def test_a_committed_file_is_its_index_blob(self, tmp_path: Path) -> None:
+        root = _indexed_repo(tmp_path / 'repo', {'a.py': 'a = 1\n'})
+        _commit(root, 'base')
+        indexed = git(root, 'ls-files', '-s', 'a.py').split()[1]
+        assert source_measures.blob_sha(root / 'a.py') == indexed
+
+    def test_an_unstaged_edit_is_read_from_the_content_not_the_index(
+        self, tmp_path: Path
+    ) -> None:
+        root = _indexed_repo(tmp_path / 'repo', {'a.py': 'a = 1\n'})
+        _commit(root, 'base')
+        indexed = git(root, 'ls-files', '-s', 'a.py').split()[1]
+        (root / 'a.py').write_text('a = 2\n', encoding='utf-8')
+        found = source_measures.blob_sha(root / 'a.py')
+        assert found == git(root, 'hash-object', '--', 'a.py').strip()
+        assert found != indexed
+
+    def test_a_missing_file_is_refused_naming_it(self, tmp_path: Path) -> None:
+        root = _indexed_repo(tmp_path / 'repo', {'a.py': 'a = 1\n'})
+        missing = root / 'gone.py'
+        with pytest.raises(source_measures.MetricsError) as refused:
+            source_measures.blob_sha(missing)
+        assert str(missing) in str(refused.value)
+
+
 class TestTrackedPythonFilesFailsHard:
     """A listing that failed would read as an empty tree, so it raises instead."""
 
@@ -839,6 +995,7 @@ _DOMAIN_TRACKED = (
     'alpha/scripts/tool.py',
     'scripts/x.py',
     'scripts/legibility/y.py',
+    'scripts/local-model-serving/lms_z.py',
     'scripts/tests/test_x.py',
     'tests/test_y.py',
     'hooks/h.py',
@@ -898,12 +1055,32 @@ class TestWorkspaceDomain:
             ],
             'scripts': [
                 ('scripts/legibility/y.py', src, 'legibility.y'),
+                ('scripts/local-model-serving/lms_z.py', src, 'local-model-serving.lms_z'),
                 # The tests root wins over the scripts src root that contains it.
                 ('scripts/tests/test_x.py', tests, None),
                 ('scripts/x.py', src, 'x'),
             ],
             'tests': [('tests/test_y.py', tests, None)],
         }
+
+    def test_extra_import_roots_give_their_files_a_second_name(self, root: Path) -> None:
+        members = {member.name: member for member in source_measures.workspace_domain(root)}
+        scripts = {f.path: f for f in members.pop('scripts').files}
+        assert {path: f.extra_import_names for path, f in scripts.items()} == {
+            'scripts/legibility/y.py': (),
+            'scripts/local-model-serving/lms_z.py': ('lms_z',),
+            'scripts/tests/test_x.py': (),
+            'scripts/x.py': (),
+        }
+        assert {path: f.import_names for path, f in scripts.items()} == {
+            'scripts/legibility/y.py': ('legibility.y',),
+            'scripts/local-model-serving/lms_z.py': ('local-model-serving.lms_z', 'lms_z'),
+            'scripts/tests/test_x.py': (),
+            'scripts/x.py': ('x',),
+        }
+        others = [f for member in members.values() for f in member.files]
+        assert others
+        assert all(f.extra_import_names == () for f in others)
 
     def test_files_outside_every_member_root_are_not_in_the_domain(
         self, root: Path
@@ -949,6 +1126,13 @@ class TestWorkspaceDomain:
         assert (layer.kind, layer.import_name) == (source_measures.FileKind.SRC, 'source_measures')
         package = by_name['orchestrator']['orchestrator/src/orchestrator/__init__.py']
         assert package.import_name == 'orchestrator'
+        census = by_name['scripts']['scripts/legibility/census.py']
+        assert census.import_names == ('legibility.census',)
+        serving = by_name['scripts']['scripts/local-model-serving/lms_ctl.py']
+        assert (serving.import_name, serving.extra_import_names) == (
+            'local-model-serving.lms_ctl',
+            ('lms_ctl',),
+        )
         script_kinds = [f.kind for f in by_name['scripts'].values()]
         assert script_kinds.count(source_measures.FileKind.SRC) >= 50
         assert script_kinds.count(source_measures.FileKind.TESTS) >= 50
@@ -985,6 +1169,111 @@ class TestSrcModuleName:
         ]
 
 
+class TestExtraImportNames:
+    """A source file below an extra import root also imports by its path below that root."""
+
+    @pytest.fixture
+    def roots(self) -> source_measures.MemberRoots:
+        return source_measures.MemberRoots(
+            name='scripts',
+            pseudo=True,
+            src_root='scripts',
+            tests_root='scripts/tests',
+            extra_import_roots=('scripts/legibility', 'scripts/local-model-serving'),
+        )
+
+    @pytest.mark.parametrize(
+        ('path', 'names'),
+        [
+            ('scripts/legibility/census.py', ('census',)),
+            ('scripts/legibility/sub/mod.py', ('sub.mod',)),
+            ('scripts/legibility/sub/__init__.py', ('sub',)),
+            # An extra root's own __init__ has no name below that root.
+            ('scripts/legibility/__init__.py', ()),
+            ('scripts/local-model-serving/lms_ctl.py', ('lms_ctl',)),
+            ('scripts/tool.py', ()),
+            # A sibling that only shares the root's prefix is not below it.
+            ('scripts/legibility.py', ()),
+            ('scripts/tests/test_x.py', ()),
+            ('scripts/legibility/data.json', ()),
+        ],
+    )
+    def test_the_names_a_path_also_imports_as(
+        self, roots: source_measures.MemberRoots, path: str, names: tuple[str, ...]
+    ) -> None:
+        assert roots.extra_import_names(path) == names
+
+    def test_the_primary_name_stays_the_dotted_path_below_the_src_root(
+        self, roots: source_measures.MemberRoots
+    ) -> None:
+        # The S2 snapshot's node id, unchanged by the extra roots.
+        assert roots.import_name('scripts/local-model-serving/lms_ctl.py') == (
+            'local-model-serving.lms_ctl'
+        )
+
+    @pytest.mark.parametrize(
+        ('src_root', 'extra_import_roots'),
+        [
+            pytest.param('scripts', ('tools/x',), id='outside-the-src-root'),
+            pytest.param('scripts', ('scripts',), id='equal-to-the-src-root'),
+            pytest.param(None, ('scripts/legibility',), id='no-src-root'),
+        ],
+    )
+    def test_an_extra_import_root_not_strictly_below_the_src_root_is_refused(
+        self, src_root: str | None, extra_import_roots: tuple[str, ...]
+    ) -> None:
+        with pytest.raises(ValueError) as refused:
+            source_measures.MemberRoots(
+                name='scripts',
+                pseudo=True,
+                src_root=src_root,
+                tests_root='scripts/tests',
+                extra_import_roots=extra_import_roots,
+            )
+        assert extra_import_roots[0] in str(refused.value)
+        assert repr(src_root) in str(refused.value)
+
+    def test_the_scripts_extra_import_roots_are_the_root_pyright_extra_paths_below_scripts(
+        self,
+    ) -> None:
+        # scripts/tests/conftest.py puts these on sys.path at runtime; the root
+        # pyright table is that fact's structured mirror.
+        with (REPO_ROOT / 'pyproject.toml').open('rb') as fh:
+            extra_paths = tomllib.load(fh)['tool']['pyright']['extraPaths']
+        scripts = next(m for m in source_measures.PSEUDO_MEMBERS if m.name == 'scripts')
+        assert {path for path in extra_paths if path.startswith('scripts/')} == set(
+            scripts.extra_import_roots
+        )
+
+
+def _primary_name(domain_file: source_measures.DomainFile) -> tuple[str, ...]:
+    return () if domain_file.import_name is None else (domain_file.import_name,)
+
+
+class TestUniqueImportPaths:
+    def test_each_name_maps_to_the_one_file_it_names(self, tmp_path: Path) -> None:
+        domain = source_measures.workspace_domain(_domain_repo(tmp_path / 'repo'))
+        paths = source_measures.unique_import_paths(domain, lambda f: f.import_names)
+        assert paths['legibility.y'] == 'scripts/legibility/y.py'
+        assert 'y' not in paths
+        assert paths['lms_z'] == 'scripts/local-model-serving/lms_z.py'
+        assert paths['alpha.sub.deep'] == 'alpha/src/alpha/sub/deep.py'
+        assert 'test_x' not in paths
+
+    def test_a_name_two_files_share_is_refused_naming_it_and_its_sorted_paths(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _domain_repo(tmp_path / 'repo', tracked=(*_DOMAIN_TRACKED, 'scripts/lms_z.py'))
+        domain = source_measures.workspace_domain(repo)
+        with pytest.raises(source_measures.MetricsError) as refused:
+            source_measures.unique_import_paths(domain, lambda f: f.import_names)
+        assert (
+            "'lms_z' names ['scripts/lms_z.py', 'scripts/local-model-serving/lms_z.py']"
+            in str(refused.value)
+        )
+        assert source_measures.unique_import_paths(domain, _primary_name)['lms_z'] == 'scripts/lms_z.py'
+
+
 def _workspace(*members: str) -> str:
     return '[tool.uv.workspace]\nmembers = [{}]\n'.format(
         ', '.join(f'"{member}"' for member in members)
@@ -1015,6 +1304,20 @@ def _stage_conflict(root: Path, relpath: str) -> None:
     assert proc.returncode == 0, proc.stderr
 
 
+#: A tree that is neither layout is refused naming both keys that would make it one.
+_NEITHER_LAYOUT = r'tool\.uv\.workspace.*\[project\]\.name'
+
+#: Workspace-table member lists the checkout reader refuses.
+_READER_REFUSED_MEMBER_LISTS = {
+    'no-members-key': '[tool.uv.workspace]\n',
+    'empty-members': _workspace(),
+    'members-not-a-list': '[tool.uv.workspace]\nmembers = "alpha"\n',
+    'non-string-member': '[tool.uv.workspace]\nmembers = ["alpha", 3]\n',
+    'empty-string-member': _workspace('alpha', ''),
+    'glob-member': _workspace('alpha', 'packages/*'),
+}
+
+
 class TestWorkspaceDomainFailsHard:
     """A domain that cannot be enumerated whole raises, never reads as partial."""
 
@@ -1028,14 +1331,12 @@ class TestWorkspaceDomainFailsHard:
         [
             pytest.param('[tool.uv.workspace\n', 'pyproject.toml', id='invalid-toml'),
             pytest.param(
-                '[project]\nname = "x"\n', r'tool\.uv\.workspace', id='no-workspace-table'
+                '[project]\nversion = "1"\n',
+                _NEITHER_LAYOUT,
+                id='neither-a-workspace-nor-a-project-name',
             ),
-            pytest.param(_workspace(), r'tool\.uv\.workspace', id='no-members'),
-            pytest.param(
-                '[tool.uv.workspace]\nmembers = ["alpha", 3]\n',
-                r'tool\.uv\.workspace',
-                id='non-string-member',
-            ),
+            pytest.param('[project]\nname = ""\n', _NEITHER_LAYOUT, id='empty-project-name'),
+            pytest.param('[project]\nname = 3\n', _NEITHER_LAYOUT, id='non-string-project-name'),
             pytest.param(
                 _workspace('alpha', 'packages/*'), r"glob.*'packages/\*'", id='glob-member'
             ),
@@ -1061,6 +1362,21 @@ class TestWorkspaceDomainFailsHard:
         with pytest.raises(source_measures.MetricsError, match=pattern):
             source_measures.workspace_domain(root)
 
+    @pytest.mark.parametrize(
+        'pyproject',
+        _READER_REFUSED_MEMBER_LISTS.values(),
+        ids=_READER_REFUSED_MEMBER_LISTS.keys(),
+    )
+    def test_a_refused_member_list_carries_the_checkout_readers_reason(
+        self, tmp_path: Path, pyproject: str
+    ) -> None:
+        root = _domain_repo(tmp_path / 'repo', pyproject=pyproject)
+        with pytest.raises(_checkout.CheckoutBindingError) as read:
+            _checkout.workspace_members(root)
+        with pytest.raises(source_measures.MetricsError) as measured:
+            source_measures.workspace_domain(root)
+        assert str(read.value) in str(measured.value)
+
     def test_a_declared_member_with_no_tracked_python_is_refused(
         self, tmp_path: Path
     ) -> None:
@@ -1071,6 +1387,46 @@ class TestWorkspaceDomainFailsHard:
         )
         with pytest.raises(source_measures.MetricsError, match='gamma'):
             source_measures.workspace_domain(root)
+
+    def test_a_declared_members_refusal_names_its_own_roots(self, tmp_path: Path) -> None:
+        root = _domain_repo(
+            tmp_path / 'repo',
+            pyproject=_workspace('alpha', 'gamma'),
+            tracked=('alpha/src/alpha/a.py', 'gamma/pyproject.toml'),
+        )
+        with pytest.raises(source_measures.MetricsError, match='gamma/src') as refused:
+            source_measures.workspace_domain(root)
+        assert 'gamma/tests' in str(refused.value)
+
+    def test_a_single_package_named_like_a_pseudo_member_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # Two members named 'scripts' would merge in evidence and in --summary,
+        # which are keyed by member name.
+        root = _domain_repo(
+            tmp_path / 'repo',
+            pyproject='[project]\nname = "scripts"\n',
+            tracked=('src/scripts/a.py', 'scripts/tool.py'),
+        )
+        with pytest.raises(source_measures.MetricsError, match=r"'scripts'.*pseudo-member"):
+            source_measures.workspace_domain(root)
+
+    def test_a_path_under_two_members_roots_is_refused_naming_both(
+        self, tmp_path: Path
+    ) -> None:
+        # 'scripts/tool' passes every member-list check, but its src root lies
+        # inside the scripts pseudo-member's, so b.py would be measured twice.
+        root = _domain_repo(
+            tmp_path / 'repo',
+            pyproject=_workspace('alpha', 'scripts/tool'),
+            tracked=('alpha/src/alpha/a.py', 'scripts/tool/src/tool/b.py'),
+        )
+        with pytest.raises(
+            source_measures.MetricsError, match='scripts/tool/src/tool/b.py'
+        ) as refused:
+            source_measures.workspace_domain(root)
+        assert "'scripts/tool'" in str(refused.value)
+        assert "'scripts'" in str(refused.value)
 
     def test_an_empty_pseudo_member_is_returned_empty(self, tmp_path: Path) -> None:
         # Pseudo-members are conventions, not declarations: a tree without
@@ -1112,6 +1468,183 @@ class TestWorkspaceDomainFailsHard:
             source_measures.workspace_domain(root / 'alpha')
 
 
+def _commit(root: Path, message: str) -> None:
+    """Commit the index with a fixture identity: the suite guarantees none."""
+    git(
+        root,
+        '-c', 'user.name=fixture',
+        '-c', 'user.email=fixture@example.invalid',
+        'commit', '--no-verify', '-q', '-m', message,
+    )
+
+
+class TestHeadCommit:
+    def test_it_is_the_sha_head_names(self, tmp_path: Path) -> None:
+        root = _domain_repo(tmp_path / 'repo')
+        _commit(root, 'base')
+        assert source_measures.head_commit(root) == git(root, 'rev-parse', 'HEAD').strip()
+
+    def test_a_repo_with_no_commit_is_refused_naming_head(self, tmp_path: Path) -> None:
+        root = _domain_repo(tmp_path / 'repo')
+        with pytest.raises(source_measures.MetricsError, match='HEAD'):
+            source_measures.head_commit(root)
+
+    def test_a_subdirectory_of_the_work_tree_is_refused(self, tmp_path: Path) -> None:
+        root = _domain_repo(tmp_path / 'repo')
+        _commit(root, 'base')
+        with pytest.raises(
+            source_measures.MetricsError, match='not the top of a git work tree'
+        ):
+            source_measures.head_commit(root / 'alpha')
+
+
+class TestUncommittedDomainPaths:
+    @pytest.fixture
+    def root(self, tmp_path: Path) -> Path:
+        root = _domain_repo(
+            tmp_path / 'repo', tracked=(*_DOMAIN_TRACKED, 'alpha/src/alpha/data.txt')
+        )
+        _commit(root, 'base')
+        return root
+
+    def test_a_clean_tree_has_none(self, root: Path) -> None:
+        assert source_measures.uncommitted_domain_paths(root) == ()
+
+    def test_every_uncommitted_domain_python_path_is_listed_and_nothing_else(
+        self, root: Path
+    ) -> None:
+        (root / 'alpha/src/alpha/mod.py').write_text('# changed, unstaged\n', encoding='utf-8')
+        # A staged deletion is gone from the index, so the domain's own file set
+        # would never see it.
+        git(root, 'rm', '-q', 'beta/src/beta/b.py')
+        (root / 'scripts/x.py').write_text('# changed, staged\n', encoding='utf-8')
+        git(root, 'add', 'scripts/x.py')
+        (root / 'hooks/h.py').write_text('# outside every member root\n', encoding='utf-8')
+        (root / 'alpha/src/alpha/new.py').write_text('# untracked\n', encoding='utf-8')
+        (root / 'alpha/src/alpha/data.txt').write_text('not python\n', encoding='utf-8')
+        assert source_measures.uncommitted_domain_paths(root) == (
+            'alpha/src/alpha/mod.py',
+            'beta/src/beta/b.py',
+            'scripts/x.py',
+        )
+
+    def test_a_staged_change_whose_work_tree_copy_was_reverted_is_listed(
+        self, root: Path
+    ) -> None:
+        target = root / 'alpha/tests/test_a.py'
+        committed = target.read_text(encoding='utf-8')
+        target.write_text('# staged\n', encoding='utf-8')
+        git(root, 'add', 'alpha/tests/test_a.py')
+        target.write_text(committed, encoding='utf-8')
+        assert source_measures.uncommitted_domain_paths(root) == ('alpha/tests/test_a.py',)
+
+    def test_a_subdirectory_of_the_work_tree_is_refused(self, root: Path) -> None:
+        with pytest.raises(
+            source_measures.MetricsError, match='not the top of a git work tree'
+        ):
+            source_measures.uncommitted_domain_paths(root / 'alpha')
+
+    @pytest.mark.parametrize('pyproject', [pytest.param(_workspace(), id='no-members')])
+    def test_a_member_list_that_cannot_be_read_is_refused(
+        self, tmp_path: Path, pyproject: str
+    ) -> None:
+        root = _domain_repo(tmp_path / 'repo', pyproject=pyproject)
+        with pytest.raises(source_measures.MetricsError, match=r'tool\.uv\.workspace'):
+            source_measures.uncommitted_domain_paths(root)
+
+
+# ---------------------------------------------------------------------------
+# A single-package project: no [tool.uv.workspace], one package in the src layout.
+
+_SINGLE_PACKAGE_PYPROJECT = '[project]\nname = "solo"\n'
+
+_SINGLE_PACKAGE_TRACKED = (
+    'src/solo/__init__.py',
+    'src/solo/mod.py',
+    'src/solo/sub/deep.py',
+    'tests/test_mod.py',
+    'tests/unit/test_deep.py',
+    'scripts/tool.py',
+    'scripts/tests/test_tool.py',
+    'hooks/h.py',
+    'docs/conf.py',
+)
+
+
+class TestSinglePackageDomain:
+    @pytest.fixture
+    def root(self, tmp_path: Path) -> Path:
+        return _domain_repo(
+            tmp_path / 'repo', pyproject=_SINGLE_PACKAGE_PYPROJECT, tracked=_SINGLE_PACKAGE_TRACKED
+        )
+
+    def test_the_package_then_only_the_scripts_pseudo_member(self, root: Path) -> None:
+        # No `tests` pseudo-member: top-level tests/ is the package's own.
+        members = source_measures.workspace_domain(root)
+        assert tuple(member.name for member in members) == ('solo', 'scripts')
+        assert tuple(member.pseudo for member in members) == (False, True)
+
+    def test_files_are_classified_by_the_src_layout(self, root: Path) -> None:
+        src, tests = source_measures.FileKind.SRC, source_measures.FileKind.TESTS
+        members = source_measures.workspace_domain(root)
+        assert {
+            member.name: [(f.path, f.kind, f.import_name) for f in member.files]
+            for member in members
+        } == {
+            'solo': [
+                ('src/solo/__init__.py', src, 'solo'),
+                ('src/solo/mod.py', src, 'solo.mod'),
+                ('src/solo/sub/deep.py', src, 'solo.sub.deep'),
+                ('tests/test_mod.py', tests, None),
+                ('tests/unit/test_deep.py', tests, None),
+            ],
+            'scripts': [
+                ('scripts/tests/test_tool.py', tests, None),
+                ('scripts/tool.py', src, 'tool'),
+            ],
+        }
+
+    def test_a_workspace_table_still_wins_over_a_project_table(self, tmp_path: Path) -> None:
+        # A workspace root that is also a project, like this repo's own.
+        root = _domain_repo(
+            tmp_path / 'repo', pyproject='[project]\nname = "root"\n' + _DOMAIN_PYPROJECT
+        )
+        members = source_measures.workspace_domain(root)
+        assert tuple(member.name for member in members) == ('beta', 'alpha', 'scripts', 'tests')
+
+    def test_the_uncommitted_paths_follow_the_same_layout(self, root: Path) -> None:
+        _commit(root, 'base')
+        (root / 'src/solo/mod.py').write_text('# changed\n', encoding='utf-8')
+        (root / 'tests/unit/test_deep.py').write_text('# changed\n', encoding='utf-8')
+        (root / 'hooks/h.py').write_text('# outside the domain\n', encoding='utf-8')
+        assert source_measures.uncommitted_domain_paths(root) == (
+            'src/solo/mod.py',
+            'tests/unit/test_deep.py',
+        )
+
+    @pytest.mark.parametrize(
+        'enumerate_domain',
+        [
+            pytest.param(source_measures.workspace_domain, id='workspace_domain'),
+            pytest.param(source_measures.uncommitted_domain_paths, id='uncommitted_domain_paths'),
+        ],
+    )
+    def test_a_flat_layout_is_refused_naming_src(
+        self, tmp_path: Path, enumerate_domain: Callable[[Path], object]
+    ) -> None:
+        # INV-11: a flat layout would otherwise measure its tests only and read
+        # complete.
+        root = _domain_repo(
+            tmp_path / 'repo',
+            pyproject=_SINGLE_PACKAGE_PYPROJECT,
+            tracked=('solo/__init__.py', 'tests/test_a.py'),
+        )
+        with pytest.raises(source_measures.MetricsError, match='src/') as refused:
+            enumerate_domain(root)
+        assert "'solo'" in str(refused.value)
+        assert '[tool.uv.workspace].members' in str(refused.value)
+
+
 # ---------------------------------------------------------------------------
 # Layering: the measures import nothing from a consumer, and stay lazy about
 # the third-party tools.
@@ -1123,7 +1656,8 @@ def test_importing_the_layer_loads_no_consumer_and_no_tool() -> None:
     code = (
         'import sys\n'
         'import source_measures\n'
-        "print(sorted({'merge_lane_metrics', 'complexipy', 'radon'} & set(sys.modules)))\n"
+        "consumers = {'merge_lane_metrics', 'merge_lane_cluster', 'merge_lane_ratchet'}\n"
+        "print(sorted((consumers | {'complexipy', 'radon'}) & set(sys.modules)))\n"
     )
     proc = subprocess.run(
         [sys.executable, '-c', code],

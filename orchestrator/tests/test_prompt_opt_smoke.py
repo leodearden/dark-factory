@@ -26,9 +26,10 @@ from shared.prompt_artifact import (
 )
 
 from orchestrator.agents.roles import _REVIEWER_PROMPT_HARNESS_VERSION, REVIEWER_COMPREHENSIVE
-from orchestrator.evals.prompt_opt import measure_repeatability_band, smoke, split_corpus
 from orchestrator.evals.prompt_opt.__main__ import _SMOKE_DEFAULT_SPLIT_SEED, cli
 from orchestrator.evals.prompt_opt.smoke import (
+    _CONTRACT_SEPARATOR,
+    _DEFAULT_SPLIT_SEED,
     _SMOKE_EXECUTOR_MODEL,
     _SMOKE_OPTIMIZER_MODEL,
     AcceptanceReport,
@@ -37,6 +38,8 @@ from orchestrator.evals.prompt_opt.smoke import (
     build_fixture_corpus,
     run_acceptance_smoke,
 )
+from orchestrator.evals.prompt_opt.splits import split_corpus
+from orchestrator.evals.prompt_opt.variance import measure_repeatability_band
 
 
 class TestFixtureCorpus:
@@ -217,7 +220,7 @@ class TestRunAcceptanceSmoke:
         assert spec is not None
         assert report.contract_prefix_intact is True
         assert report.resolved_source == 'artifact'
-        assert report.resolved_text.startswith(spec.contract + smoke._CONTRACT_SEPARATOR)
+        assert report.resolved_text.startswith(spec.contract + _CONTRACT_SEPARATOR)
 
 
 class TestLoaderRoundTripAndRollback:
@@ -266,7 +269,7 @@ class TestContractImmutabilityEndToEnd:
         assert spec is not None
         # Reference smoke's separator constant (the single source of truth
         # within this package) rather than re-hardcoding the literal.
-        separator = smoke._CONTRACT_SEPARATOR
+        separator = _CONTRACT_SEPARATOR
         # the separator does not occur inside the contract, so split() cleanly
         # isolates the contract prefix from the heuristics region
         assert separator not in spec.contract
@@ -367,7 +370,7 @@ class TestSmokeCli:
         # equal, so a future edit to only one would silently diverge the CLI
         # default from the library default with no failing test — this is that
         # guard.
-        assert _SMOKE_DEFAULT_SPLIT_SEED == smoke._DEFAULT_SPLIT_SEED
+        assert _SMOKE_DEFAULT_SPLIT_SEED == _DEFAULT_SPLIT_SEED
 
     def test_smoke_command_uses_default_split_seed_when_omitted(self, tmp_path: Path) -> None:
         # Invoking `smoke` WITHOUT --split-seed must exercise the CLI's DEFAULT

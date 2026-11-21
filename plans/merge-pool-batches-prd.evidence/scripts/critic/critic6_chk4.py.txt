@@ -1,0 +1,40 @@
+import sys
+sys.path.insert(0,'/tmp/gate-10069/critic6')
+from rule7 import fallback_cost, batch_cost, going_costs, plan_batch
+R,U=0.01,0.15
+print('plan size for a new front (30 new waiting), scanning on, by q used:')
+print({q: plan_batch('new',['new']*30,q,R,U,True)[0] for q in (0.05,0.14,0.2,0.3,0.4,0.46,0.5,0.6,0.7,0.8)})
+print('A_new by q:', {q: round(going_costs(q,R,U,True)[0],3) for q in (0.14,0.3,0.46,0.6)})
+def qhat(q,f,u=U):
+    # per exposure of a new request in a batch of f new: convicted q (scannable share), landed-as-new (1-q)^f
+    # unscannable red (share u of reds): fallback alone -> blocked q / landed-as-new: sound ones ahead of first culprit; rest re-exposed
+    pass_ = (1-q)**f
+    ev = q*(1-u) + 0   # convictions
+    land_new = pass_
+    # fallback part: members verified alone in order until first blocked: blocked=1 event; B sound landed as new
+    Pred=1-pass_
+    p=q; rn=Pred
+    B=sum((j-1)*(1-p)**(j-1)*p for j in range(1,f+1))/rn
+    ev_fb = Pred*u*1.0/f ; land_fb = Pred*u*B/f
+    return (ev+ev_fb)/(ev+ev_fb+land_new+land_fb)
+for q in (0.05,0.08,0.14,0.20):
+    f=12; qh=q
+    for i in range(50):
+        qh=qhat(q,f); f2=plan_batch('new',['new']*30,min(qh,0.999),R,U,True)[0]
+        if f2==f: break
+        f=f2
+    a_true=going_costs(q,R,U,True); a_hat=going_costs(qh,R,U,True)
+    cf=plan_batch('cleared',['cleared']*5+['new']*20,q,R,U,True); cfh=plan_batch('cleared',['cleared']*5+['new']*20,qh,R,U,True)
+    nf=plan_batch('new',['new']*20+['cleared']*10,q,R,U,True); nfh=plan_batch('new',['new']*20+['cleared']*10,qh,R,U,True)
+    print(f'true q={q}: fitted q_hat={qh:.2f} at batch size {f}; pass_estimate reported {1-qh:.2f} (true {1-q:.2f}); '
+          f'cleared front(6 cleared,20 new): true-q plan {cf} -> fitted plan {cfh}; new front: {nf} -> {nfh}')
+# cost of the fitted plan evaluated at the TRUE q for the mixed case
+print()
+for q in (0.05,0.08):
+    qh=qhat(q,12)
+    a_new,a_cl,_=going_costs(q,R,U,True)
+    C=lambda f,c: batch_cost(f,c,q,R,U,True,a_new,a_cl)
+    for k in (3,6,11):
+        p1=plan_batch('cleared',['cleared']*(k-1)+['new']*20,q,R,U,True); p2=plan_batch('cleared',['cleared']*(k-1)+['new']*20,qh,R,U,True)
+        tot=lambda pl: C(*pl)+(12-pl[0])*a_new   # value the 12 new either inside or at going cost
+        print(f'true q={q} (q_hat {qh:.2f}), {k} cleared: plan at true q {p1} total {tot(p1):.3f}; plan at q_hat {p2} total {tot(p2):.3f}; +{100*(tot(p2)/tot(p1)-1):.1f}%')

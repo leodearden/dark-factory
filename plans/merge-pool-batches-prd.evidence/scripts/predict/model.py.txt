@@ -1,0 +1,128 @@
+import json,collections,datetime as dt,math,itertools
+P='/tmp/gate-10069/predict/'
+rows=json.load(open(P+'rows_window.json'))
+rows.sort(key=lambda r:r['verdict_t'])
+def day(t): return dt.datetime.fromtimestamp(t,dt.timezone.utc).strftime('%m-%dT%H:%M')
+# derived features
+def lane_b(r):
+    v=r['table_est']
+    if v is None: return 'na'
+    return 'L<.75' if v<0.75 else ('L<.85' if v<0.85 else ('L<.93' if v<0.93 else 'L>=.93'))
+F={
+ 'prior_fail':lambda r:'pf1+' if r['prior_fail']>0 else 'pf0',
+ 'resub':lambda r:'resub_vblock' if r['resub']=='after_verify_block' else ('resub_derail' if r['resub']=='after_train_derail' else ('first' if r['resub']=='first' else 'resub_other')),
+ 'first':lambda r:'first' if r['resub']=='first' else 'resub',
+ 'decl12':lambda r:'decl>=12' if (r['n_decl_files'] or 0)>=12 else 'decl<12',
+ 'files12':lambda r:'na' if r['n_task_files'] is None else ('tf>=12' if r['n_task_files']>=12 else 'tf<12'),
+ 'mods':lambda r:'na' if r['n_modules'] is None else ('m>=3' if r['n_modules']>=3 else 'm<3'),
+ 'age':lambda r:'na' if r['task_verify_age_h'] is None else ('age<2' if r['task_verify_age_h']<2 else ('age<24' if r['task_verify_age_h']<24 else 'age>=24')),
+ 'bigjump':lambda r:'bigjump' if r['rb_cohort']=='big-jump' else 'other',
+ 'prio':lambda r:'high' if r['priority'] in('high','critical') else 'not_high',
+ 'simple':lambda r:'simple' if r['complexity']=='simple' else 'std',
+ 'redbatch':lambda r:'redbatch' if r['prev_red_batch'] else 'no',
+ 'lane':lane_b,
+ 'hum':lambda r:str(r['human_decomposed']),
+ 'nverif':lambda r:'v>=3' if r['n_task_verifies']>=3 else 'v<3',
+}
+n=len(rows); cut=rows[int(n*2/3)]['verdict_t']
+train=[r for r in rows if r['verdict_t']<cut]; test=[r for r in rows if r['verdict_t']>=cut]
+print('split at',day(cut),'train n=%d fail=%d (%.3f)  test n=%d fail=%d (%.3f)'%(len(train),sum(r['y'] for r in train),sum(r['y'] for r in train)/len(train),len(test),sum(r['y'] for r in test),sum(r['y'] for r in test)/len(test)))
+print('test src',collections.Counter(r['src'] for r in test))
+# ---- stratified (by lane bucket) rate ratio for each per-request binary feature (Mantel-Haenszel RR)
+def mh(pop,f,pos,strat):
+    num=den=0; a_=b_=n1_=n0_=0
+    for s in set(strat(r) for r in pop):
+        g=[r for r in pop if strat(r)==s]
+        g1=[r for r in g if f(r)==pos]; g0=[r for r in g if f(r)!=pos]
+        if not g1 or not g0: continue
+        a=sum(r['y'] for r in g1); b=sum(r['y'] for r in g0); N=len(g)
+        num+=a*len(g0)/N; den+=b*len(g1)/N
+        a_+=a; b_+=b; n1_+=len(g1); n0_+=len(g0)
+    return (num/den if den else float('nan')),a_,n1_,b_,n0_
+print('\nStratified risk ratio (Mantel-Haenszel over lane-state bucket), ALL labelled rows and SOLO-only rows')
+solo=[r for r in rows if r['src'] in('solo_pass','solo_fail')]
+for name,pos in [('prior_fail','pf1+'),('resub','resub_vblock'),('first','resub'),('decl12','decl>=12'),('files12','tf>=12'),('mods','m>=3'),('age','age>=24'),('age','age<2'),('bigjump','bigjump'),('prio','high'),('simple','simple'),('redbatch','redbatch'),('hum','True'),('nverif','v>=3')]:
+    out=[]
+    for lab,pop in(('all',rows),('solo',solo)):
+        crude1=[r for r in pop if F[name](r)==pos]; crude0=[r for r in pop if F[name](r)!=pos]
+        cr=(sum(r['y'] for r in crude1)/len(crude1))/(sum(r['y'] for r in crude0)/len(crude0))
+        rr,a,n1,b,n0=mh(pop,F[name],pos,lane_b)
+        out.append(f'{lab}: {a}/{n1} vs {b}/{n0} crudeRR={cr:.2f} MH-RR={rr:.2f}')
+    print(f'  {name}={pos:14s} | '+' | '.join(out))
+# ---- within-era stability
+def era(r):
+    t=r['verdict_t']
+    return 'E1' if t<1793520000+0 else None
+E1=dt.datetime(2026,11,1,8,tzinfo=dt.timezone.utc).timestamp(); E2=dt.datetime(2026,11,11,tzinfo=dt.timezone.utc).timestamp()
+def era(r): return 'E1' if r['verdict_t']<E1 else ('E2' if r['verdict_t']<E2 else 'E3+4')
+print('\nPer-era rates (all labelled rows) pos vs neg')
+for name,pos in [('prior_fail','pf1+'),('resub','resub_vblock'),('decl12','decl>=12'),('files12','tf>=12'),('age','age>=24'),('redbatch','redbatch'),('prio','high')]:
+    s=[]
+    for e in('E1','E2','E3+4'):
+        g1=[r for r in rows if era(r)==e and F[name](r)==pos]; g0=[r for r in rows if era(r)==e and F[name](r)!=pos]
+        s.append(f'{e}: {sum(r["y"] for r in g1)}/{len(g1)}={sum(r["y"] for r in g1)/max(1,len(g1)):.2f} vs {sum(r["y"] for r in g0)}/{len(g0)}={sum(r["y"] for r in g0)/max(1,len(g0)):.2f}')
+    print(f'  {name}={pos:13s} '+' | '.join(s))
+
+# ---- table models
+def fit(train,feats,m=8):
+    base=sum(r['y'] for r in train)/len(train)
+    cell=collections.defaultdict(lambda:[0,0])
+    for r in train:
+        k=tuple(F[f](r) for f in feats); cell[k][0]+=1; cell[k][1]+=r['y']
+    def pred(r):
+        k=tuple(F[f](r) for f in feats); n_,y_=cell.get(k,(0,0))
+        return (y_+m*base)/(n_+m)
+    return pred,cell,base
+def auc(ps,ys):
+    pos=[p for p,y in zip(ps,ys) if y]; neg=[p for p,y in zip(ps,ys) if not y]
+    if not pos or not neg: return float('nan')
+    s=0
+    for p in pos:
+        for q in neg: s+= 1 if p>q else (0.5 if p==q else 0)
+    return s/(len(pos)*len(neg))
+def evaluate(name,feats,train,test,show=False):
+    pred,cell,base=fit(train,feats)
+    ps=[pred(r) for r in test]; ys=[r['y'] for r in test]
+    order=sorted(range(len(test)),key=lambda i:(ps[i],test[i]['rid']))
+    q=len(order)//5
+    lo=order[:q]; hi=order[-q:]
+    brier=sum((p-y)**2 for p,y in zip(ps,ys))/len(ys)
+    b0=sum((sum(r['y'] for r in train)/len(train)-y)**2 for y in ys)/len(ys)
+    tb=sum(ys)/len(ys); bopt=sum((tb-y)**2 for y in ys)/len(ys)
+    print(f'{name:38s} AUC={auc(ps,ys):.3f} Brier={brier:.4f} (const-train {b0:.4f}, const-test {bopt:.4f}) safest20% {sum(ys[i] for i in lo)}/{q}={sum(ys[i] for i in lo)/q:.3f} riskiest20% {sum(ys[i] for i in hi)}/{q}={sum(ys[i] for i in hi)/q:.3f} meanpred={sum(ps)/len(ps):.3f} obs={tb:.3f}')
+    if show:
+        grp=collections.defaultdict(lambda:[0,0])
+        for p,y in zip(ps,ys): grp[round(p,3)][0]+=1; grp[round(p,3)][1]+=y
+        print('      test outcome by predicted value (ties kept whole):',[(p,g[0],g[1],round(g[1]/g[0],2)) for p,g in sorted(grp.items())])
+        # calibration by predicted bins
+        bins=collections.defaultdict(lambda:[0,0,0.0])
+        for p,y in zip(ps,ys):
+            k=min(int(p*10),5); bins[k][0]+=1; bins[k][1]+=y; bins[k][2]+=p
+        for k in sorted(bins): print(f'      calib pred[{k/10:.1f},{(k+1)/10 if k<5 else 1:.1f}) n={bins[k][0]} meanpred={bins[k][2]/bins[k][0]:.3f} obs={bins[k][1]/bins[k][0]:.3f}')
+        print('      cells (train):',{k:(v[0],round(v[1]/v[0],2)) for k,v in sorted(cell.items())})
+    return pred
+print('\n=== time holdout (last third) — ALL labelled requests')
+for name,feats in [('M0 constant',[]),('M1 lane bucket only',['lane']),('M2a prior_fail+decl12',['prior_fail','decl12']),('M2b resub+decl12+files12',['resub','decl12','files12']),('M2c prior_fail+files12',['prior_fail','files12']),('M2d resub+decl12',['resub','decl12']),
+    ('M3a lane+prior_fail',['lane','prior_fail']),('M3b lane+resub+decl12',['lane','resub','decl12']),('M3c lane+decl12',['lane','decl12']),('M2e redbatch+resub+decl12',['redbatch','resub','decl12'])]:
+    evaluate(name,feats,train,test,show=name[:3] in('M1 ','M2d','M3b'))
+print('\n=== time holdout — SOLO-verdict requests only (train and test)')
+trs=[r for r in train if r['src'] in('solo_pass','solo_fail')]; tes=[r for r in test if r['src'] in('solo_pass','solo_fail')]
+print('train n=%d rate %.3f test n=%d rate %.3f'%(len(trs),sum(r['y'] for r in trs)/len(trs),len(tes),sum(r['y'] for r in tes)/len(tes)))
+for name,feats in [('M0 constant',[]),('M1 lane bucket only',['lane']),('M2a prior_fail+decl12',['prior_fail','decl12']),('M2d resub+decl12',['resub','decl12']),('M2b resub+decl12+age',['resub','decl12','age']),('M3b lane+resub+decl12',['lane','resub','decl12'])]:
+    evaluate(name,feats,trs,tes)
+# exhaustive search over 2-feature per-request tables on TRAIN via inner time split (to avoid picking on test)
+inner_cut=train[int(len(train)*2/3)]['verdict_t']; tr1=[r for r in train if r['verdict_t']<inner_cut]; va=[r for r in train if r['verdict_t']>=inner_cut]
+cands=['prior_fail','resub','first','decl12','files12','mods','bigjump','prio','simple','redbatch','hum','nverif']
+res=[]
+for k in(1,2,3):
+    for fs in itertools.combinations(cands,k):
+        pred,_,_=fit(tr1,list(fs)); ps=[pred(r) for r in va]; ys=[r['y'] for r in va]
+        res.append((auc(ps,ys),fs))
+res.sort(reverse=True)
+print('\ninner-validation (train-only) top per-request feature sets by AUC:')
+for a,fs in res[:8]: print('  %.3f'%a,fs)
+best=list(res[0][1])
+print('best on inner validation ->',best,'; evaluated on the held-out last third:')
+evaluate('BEST per-request (inner-selected)',best,train,test,show=True)
+evaluate('lane + BEST',['lane']+best,train,test)
+json.dump({'cut':cut,'best':best},open(P+'model_choice.json','w'))

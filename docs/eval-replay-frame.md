@@ -5,7 +5,7 @@ This is the normative home of the decision to brief an eval architect with an
 `orchestrator/src/orchestrator/evals/replay_frame.py`,
 `orchestrator/src/orchestrator/evals/metrics.py::EvalMetrics.replay_frame`,
 `orchestrator/src/orchestrator/evals/runner.py` and
-`orchestrator/src/orchestrator/cli.py::_run_plan_only`.
+`orchestrator/src/orchestrator/evals/cli.py::_run_plan_only`.
 
 ## 1. Problem
 
@@ -79,8 +79,9 @@ One mechanism frames every eval architect:
 plus the block, and it overrides nothing else.
 
 - `runner.py::run_architect_eval` builds one per cell.
-- `orchestrator eval --plan-only` (`cli.py::_run_plan_only`) builds one per
-  fixture, since each fixture has its own base.
+- `orchestrator eval --plan-only`
+  (`orchestrator/src/orchestrator/evals/cli.py::_run_plan_only`) builds one
+  per fixture, since each fixture has its own base.
 - `runner.py::run_end_to_end` (the both-live matrix/confirm path) passes one
   through `build_workflow`'s `briefing` parameter, so TaskWorkflow's PLAN phase
   briefs its live architect with it.
@@ -99,7 +100,7 @@ Production dispatch never constructs the subclass, so it can never be framed.
 The stamp names the REGIME the harness ran the cell under. It is written on
 every `run_architect_eval` and `run_end_to_end` cell, including harness-error,
 cap-tainted and collect-metrics-failed cells; whether the prompt was delivered
-is what `cap_tainted` and `invocation_error` say.
+is what `cap_tainted` and `invocation_errors` say.
 
 A readout that mixes framed and unframed cells must split on this field. Bump
 `REPLAY_FRAME_ID` whenever the block text changes materially, so one id always
@@ -128,16 +129,29 @@ justified it.
 
 ## 6. Demonstration
 
-No live framed cell has been recorded yet. A live cell must run from an
-unsandboxed session, because `create_eval_worktree` registers a worktree in the
-shared `.git` directory. Until one runs, these hermetic tests show that the
-architect's briefing carries the frame and that every cell is stamped:
+One live framed cell is recorded. It ran from an unsandboxed session, because
+`create_eval_worktree` registers a worktree in the shared `.git` directory
+(task 6361; Leo approved it at milestone gate esc-6361-1).
+
+- date: 2026-10-07
+- commit: 465d8723fc (main when the run started)
+- fixture: `df_task_2260`, config `architect-sonnet-replay-demo`
+  (claude / sonnet / high, role architect, `max_budget_usd=3.0`, `timeout_override=30`)
+- run_id: `05e2ecb7`
+- `replay_frame`: `'honest-frame-v1'`
+- `terminal_kind`: `'planned'`
+- `plan_steps`: 7
+- `plan_quality`: 0.82
+- `cost_usd`: 2.5042058 (architect only; the judge's 1.2203746 is reported separately)
+- `invocation_errors`: `None`
+
+The architect planned against a base that is the first parent of the task's
+own landing merge, `97059b1dd8`. §1 names this fixture as tranche 1's decline
+case. This run used 39 turns, `cap_tainted` was False, and the runner removed
+the eval worktree afterwards. It is one cell, not a rate.
+
+The hermetic tests remain the deterministic coverage:
 
 - `orchestrator/tests/test_eval_architect.py::TestArchitectCellCarriesReplayFrame`
 - `orchestrator/tests/test_eval_driver.py::TestEndToEndCarriesReplayFrame`
 - `orchestrator/tests/test_eval_replay_frame.py::TestPlanOnlyCliBriefsInReplayFrame`
-
-When a live cell runs, record here: date, commit, fixture, run id, and the
-`replay_frame`, `terminal_kind`, `plan_steps`, `plan_quality`, `cost_usd` and
-`invocation_error` values, verbatim. A decline is an acceptable result if it is
-grounded in in-frame evidence.

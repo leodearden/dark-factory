@@ -24,7 +24,9 @@ import json
 import pytest
 
 from fused_memory.server.entities_gate import entities_gate
+from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY
 from fused_memory.utils.referent_resolution import _DECLARED_REFERENT_HINT
+from server.entities_declaration_shapes import FALSY_NON_LIST_SHAPES, MALFORMED_SHAPES
 
 GROUP = 'dark_factory'
 
@@ -33,33 +35,9 @@ _CITES_3127 = 'the fix for Task 3127 landed'
 #: Content naming no referent of any kind — the scan comes back empty, which
 #: gamma treats as UNINFORMATIVE rather than contradictory.
 _CITES_NOTHING = 'the merge-lane hardening work'
-
-#: The falsy NON-list shapes, as ``(id, value)`` pairs.  Their own arm below
-#: pins the property that singles them out — that the gate short-circuits on
-#: ``entities is None`` and never on ``not entities`` — and they are spliced
-#: into ``_MALFORMED_SHAPES`` so the shared coverage sees them too, from ONE
-#: spelling of the triple.
-_FALSY_NON_LIST_SHAPES = (('empty-str', ''), ('empty-dict', {}), ('zero', 0))
-
-#: Every shape gamma's TOTAL ``InputValidationError`` contract must reject,
-#: hoisted to one list because THREE tests consume it: the two arms below, and
-#: the tool-boundary arm in ``tests/server/test_entities_gate_ingestion.py``,
-#: which imports it from here.  Kept as one list on purpose — a shape added to
-#: a second copy and not the first would be silently unchecked for the property
-#: the first pins, which is the lockstep duplication this batch keeps guarding
-#: against.  The boundary import is what stops the pure-function claim and the
-#: agent-visible behaviour from drifting apart: every shape here is reachable
-#: through FastMCP only because both tools annotate ``entities`` as ``Any``.
-_MALFORMED_SHAPES = [
-    pytest.param('task 3127', id='a-str-not-a-list'),
-    pytest.param([{'id': 'abc'}], id='non-digit-id'),
-    pytest.param([{'id': 3127, 'projectId': 'reify'}], id='unrecognized-key'),
-    pytest.param([{'id': True}], id='bool-id'),
-    pytest.param([{'id': 3127, 'project_id': 'task'}], id='task-vocabulary-qualifier'),
-    pytest.param([[1]], id='a-list-of-non-dicts'),
-    pytest.param({'kind': 'task', 'id': 3127}, id='an-unwrapped-single-dict'),
-    *(pytest.param(value, id=f'falsy-{label}') for label, value in _FALSY_NON_LIST_SHAPES),
-]
+#: ``_CITES_3127`` padded past the 200-char excerpt with prose naming nothing
+#: else, so the scan still sees exactly Task 3127.
+_LONG_CITES_3127 = _CITES_3127 + ', and the merge lane settled the cycle afterwards' * 6
 
 
 class TestAbsenceIsNeverRejected:
@@ -118,7 +96,7 @@ class TestMalformedDeclarationsAreRejected:
     ``server/tools.py`` already return.
     """
 
-    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
+    @pytest.mark.parametrize('declared', MALFORMED_SHAPES)
     def test_each_malformed_shape_blocks_the_write(self, declared):
         block = entities_gate(
             declared, content=_CITES_3127, group_id=GROUP, agent_id='claude-interactive',
@@ -130,7 +108,7 @@ class TestMalformedDeclarationsAreRejected:
         assert block['agent_id'] == 'claude-interactive', f'{block!r}'
         assert block['content_excerpt'] == _CITES_3127[:200], f'{block!r}'
 
-    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
+    @pytest.mark.parametrize('declared', MALFORMED_SHAPES)
     def test_the_remediation_reaches_the_agent_inside_the_message(self, declared):
         """Gamma single-sources the accepted shape into the exception message.
 
@@ -160,14 +138,14 @@ class TestMalformedDeclarationsAreRejected:
         lose the caller's intent invisibly — the silent degradation this
         repo's loud-over-silent norm forbids.
 
-        These three are also spliced into ``_MALFORMED_SHAPES``, so the arms
+        These three are also spliced into ``MALFORMED_SHAPES``, so the arms
         above and the tool boundary check them too.  This arm is kept separate
         anyway because it pins a DIFFERENT property — not "the gate rejects
         this shape" but "the gate did not read this shape as an absence" — and
         that is the claim whose failure message a reader needs when a future
         ``not entities`` shortcut appears.
         """
-        for _label, falsy in _FALSY_NON_LIST_SHAPES:
+        for _label, falsy in FALSY_NON_LIST_SHAPES:
             block = entities_gate(falsy, content=_CITES_3127, group_id=GROUP)
             assert isinstance(block, dict), f'{falsy!r} was read as absence: {block!r}'
             assert block['error_type'] == 'ValidationError', f'{falsy!r}: {block!r}'
@@ -181,7 +159,7 @@ class TestMalformedDeclarationsAreRejected:
 class TestConflictingDeclarationsAreRejected:
     """The leaf's user-observable signal: a declaration its own prose refutes.
 
-    Every case here reaches ``_conflicting_referents``, whose four documented
+    Every case here reaches ``_conflicting_referents``, whose five documented
     choices this class pins from the OUTSIDE — the scoping rules are gamma's,
     and what delta adds is that a non-empty ``.conflicts`` blocks the write and
     names BOTH sides of the disagreement (INV-2, structured-facts-at-failure).
@@ -232,12 +210,12 @@ class TestConflictingDeclarationsAreRejected:
         """
         content = 'dark_factory:2500 blocks task 2500 here'
         block = entities_gate(
-            [{'kind': 'task', 'id': 3129}], content=content, group_id='reify',
+            [{'kind': 'task', 'id': 2501}], content=content, group_id='reify',
         )
 
         assert isinstance(block, dict), f'the ambiguous scan did not reject: {block!r}'
         assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
-        assert block['conflicts'] == ['Task 3129'], f'{block!r}'
+        assert block['conflicts'] == ['Task 2501'], f'{block!r}'
         assert block['content_referents'], (
             f'the content side must never be empty beside a conflict: {block!r}'
         )
@@ -294,21 +272,21 @@ class TestConflictingDeclarationsAreRejected:
     def test_a_foreign_declaration_the_prose_contradicts_is_spelled_foreign(self):
         """The declared side spelled foreign, and choice 2's other half.
 
-        The prose DOES name that project ('reify:3129'), so the foreign
-        declaration's narrowed bucket is non-empty and its silence argument no
-        longer applies — 'reify:132' is contradicted.  Pins that a foreign
-        referent reaches the agent as 'reify:132' and never as 'Task 132',
-        which is the spelling the graph uses and the one leaf zeta emits.
+        The prose DOES name that project ('reify:3129'), and names a near-miss
+        of the declared number inside it — 'reify:3128' is contradicted.  Pins
+        that a foreign referent reaches the agent as 'reify:3128' and never as
+        'Task 3128', which is the spelling the graph uses and the one leaf zeta
+        emits.
         """
         block = entities_gate(
-            [{'kind': 'task', 'id': 132, 'project_id': 'reify'}],
+            [{'kind': 'task', 'id': 3128, 'project_id': 'reify'}],
             content='mirrors reify:3129',
             group_id=GROUP,
         )
 
         assert isinstance(block, dict), f'the foreign conflict did not reject: {block!r}'
-        assert block['declared'] == ['reify:132'], f'{block!r}'
-        assert block['conflicts'] == ['reify:132'], f'{block!r}'
+        assert block['declared'] == ['reify:3128'], f'{block!r}'
+        assert block['conflicts'] == ['reify:3128'], f'{block!r}'
         assert block['content_referents'] == ['reify:3129'], f'{block!r}'
 
     def test_a_foreign_declaration_the_prose_never_mentions_does_not_conflict(self):
@@ -350,6 +328,112 @@ class TestConflictingDeclarationsAreRejected:
         ) is None
 
 
+class TestHonestMixedDeclarationsAreAccepted:
+    """Task 6059's repro table: a declared task the scanner cannot see, beside
+    a task it can.  Every row was rejected before the conflict rule judged the
+    scanner's silence per REFERENT; only a genuine near-miss typo still is."""
+
+    @pytest.mark.parametrize(
+        'content,declared,group_id',
+        [
+            ('Merged task-173-fillet-fix; closes the loop.', [173], 'reify'),
+            ('Merged task-173-fillet-fix after task 170 landed.', [173], 'reify'),
+            ('gate 184 passed; task 190 unblocked.', [184, 190], 'reify'),
+            ('branch task/173 merged; task 5 noted', [173], 'reify'),
+            ('Tasks 5949/5849 both landed.', [5849], GROUP),
+            ('tasks 3659 and 3500 overlap', [3659, 3500], GROUP),
+            ('Tasks 4754 and 4755 closed the lease gap', [4754, 4755], GROUP),
+            ('via carrier 6033, task 6035 landed', [6033, 6035], GROUP),
+            ('task 6181 executor and the 6182 β sitting', [6181, 6182], GROUP),
+            ('(task 6182) renamed 3626 → 6326 (6188)', [6182, 6326, 6188], GROUP),
+            ('matched the live plan exactly: 15+4 detaches', [6182], GROUP),
+        ],
+        ids=[
+            'slug-alone',
+            'slug-beside-task-170',
+            'gate-184',
+            'branch-name',
+            'slash-list',
+            'and-list',
+            'consecutive-siblings',
+            'carrier',
+            'sighting-a',
+            'sighting-b',
+            'sighting-c',
+        ],
+    )
+    def test_the_row_is_accepted(self, content, declared, group_id):
+        assert entities_gate(
+            [{'kind': 'task', 'id': number} for number in declared],
+            content=content,
+            group_id=group_id,
+        ) is None
+
+    def test_a_near_miss_typo_beside_an_unscannable_slug_still_blocks(self):
+        block = entities_gate(
+            [{'kind': 'task', 'id': 3129}],
+            content='Merged task-173-fillet-fix after task 3127 landed.',
+            group_id=GROUP,
+        )
+
+        assert isinstance(block, dict), f'the near-miss typo was not caught: {block!r}'
+        assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
+        assert block['conflicts'] == ['Task 3129'], f'{block!r}'
+
+
+class TestProseColonNumberIsNotAForeignRef:
+    """Prose 'word: N' names no project, so declaring N beside it is honest
+    (task 6826); a tight 'project:N' still contests the declared number."""
+
+    @pytest.mark.parametrize(
+        'content,declared',
+        [
+            pytest.param('Follow-ups: 6035', 6035, id='sighting-follow-ups'),
+            pytest.param('Related owners: 5308', 5308, id='sighting-owners'),
+            pytest.param('Task 6183 at the time: 394 linked records', 394, id='sighting-time'),
+            pytest.param('matched the live plan exactly: 15+4 detaches', 15, id='sighting-exactly'),
+        ],
+    )
+    def test_the_live_sighting_is_accepted(self, content, declared):
+        assert entities_gate(
+            [{'kind': 'task', 'id': declared}], content=content, group_id=GROUP,
+        ) is None
+
+    def test_a_tight_foreign_ref_still_conflicts(self):
+        block = entities_gate(
+            [{'kind': 'task', 'id': 2500}], content='blocked on reify:2500', group_id=GROUP,
+        )
+
+        assert isinstance(block, dict), f'the tight foreign ref was not caught: {block!r}'
+        assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
+        assert block['conflicts'] == ['Task 2500'], f'{block!r}'
+
+
+class TestADiscardedDeclarationIsShapeCheckedOnly:
+    """A declaration the write will not record can buy no attribution, so it
+    is never conflict-rejected; a malformed one is still a wiring bug."""
+
+    def test_a_conflicting_declaration_is_accepted(self):
+        assert entities_gate(
+            [{'id': 3129}], content=_CITES_3127, group_id=GROUP, declaration_recorded=False,
+        ) is None
+
+    @pytest.mark.parametrize('declared', MALFORMED_SHAPES)
+    def test_a_malformed_declaration_still_blocks(self, declared):
+        block = entities_gate(
+            declared, content=_CITES_3127, group_id=GROUP, declaration_recorded=False,
+        )
+
+        assert isinstance(block, dict), f'expected a block, got {block!r}'
+        assert block['error_type'] == 'ValidationError', f'{block!r}'
+
+    def test_the_default_is_the_strict_direction(self):
+        block = entities_gate([{'id': 3129}], content=_CITES_3127, group_id=GROUP)
+
+        assert isinstance(block, dict), f'expected a block, got {block!r}'
+        assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
+
+
 class TestTheGateStaysPermissiveWhileTheProducerNarrows:
     """The gate acquires no project registry (task 5262 workstream B).
 
@@ -371,7 +455,7 @@ class TestTheGateStaysPermissiveWhileTheProducerNarrows:
         would drop it, empty the content side, and let a contradicted
         declaration through."""
         block = entities_gate(
-            [{'kind': 'task', 'id': 3129}],
+            [{'kind': 'task', 'id': 132}],
             content='mirrors evil_proj:132',
             group_id=GROUP,
             agent_id='claude-interactive',
@@ -379,5 +463,47 @@ class TestTheGateStaysPermissiveWhileTheProducerNarrows:
 
         assert isinstance(block, dict), f'the junk-qualified conflict was not caught: {block!r}'
         assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
-        assert block['conflicts'] == ['Task 3129'], f'{block!r}'
+        assert block['conflicts'] == ['Task 132'], f'{block!r}'
         assert block['content_referents'] == ['evil_proj:132'], f'{block!r}'
+
+
+class TestBlocksDiscloseTheirExcerptClip:
+    """A block whose 200-char excerpt cut the content says so (task 5365).
+
+    The excerpt itself stays ``content[:200]``; the cut rides beside it as the
+    same ``truncation_facts`` every sibling pre-service guard carries.
+    """
+
+    def test_a_conflict_block_reports_its_cut_excerpt(self):
+        block = entities_gate(
+            [{'kind': 'task', 'id': 3129}], content=_LONG_CITES_3127, group_id=GROUP,
+        )
+
+        assert isinstance(block, dict), f'expected a block, got {block!r}'
+        assert block['content_excerpt'] == _LONG_CITES_3127[:200], f'{block!r}'
+        assert block[TRUNCATION_FACTS_KEY] == [
+            {'field': 'content_excerpt', 'cap': 200, 'elided': len(_LONG_CITES_3127) - 200},
+        ], f'{block!r}'
+
+    def test_a_malformed_block_reports_its_cut_excerpt(self):
+        block = entities_gate([{'id': 'abc'}], content=_LONG_CITES_3127, group_id=GROUP)
+
+        assert isinstance(block, dict), f'expected a block, got {block!r}'
+        assert block['content_excerpt'] == _LONG_CITES_3127[:200], f'{block!r}'
+        assert block[TRUNCATION_FACTS_KEY] == [
+            {'field': 'content_excerpt', 'cap': 200, 'elided': len(_LONG_CITES_3127) - 200},
+        ], f'{block!r}'
+
+    def test_an_uncut_block_carries_no_truncation_facts(self):
+        conflict = entities_gate([{'kind': 'task', 'id': 3129}], content=_CITES_3127, group_id=GROUP)
+        malformed = entities_gate([{'id': 'abc'}], content=_CITES_3127, group_id=GROUP)
+
+        assert isinstance(conflict, dict) and TRUNCATION_FACTS_KEY not in conflict, f'{conflict!r}'
+        assert isinstance(malformed, dict) and TRUNCATION_FACTS_KEY not in malformed, f'{malformed!r}'
+
+    def test_a_cut_block_stays_json_safe(self):
+        block = entities_gate(
+            [{'kind': 'task', 'id': 3129}], content=_LONG_CITES_3127, group_id=GROUP,
+        )
+
+        assert json.loads(json.dumps(block)) == block

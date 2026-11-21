@@ -2,30 +2,61 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sqlite3
+from collections.abc import Collection, Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
+
+from sampler.metrics import (
+    METRIC_GROUPS,
+    Collected,
+    GroupName,
+    MetricGroup,
+    MetricSpec,
+    SampleKey,
+    Samples,
+    every_tick,
+)
 
 # ---------------------------------------------------------------------------
 # Fake data
 # ---------------------------------------------------------------------------
 
 FAKE_PSI = {
-    'psi_cpu_some_avg10': 2.50,
-    'psi_cpu_full_avg10': 0.30,
-    'psi_mem_some_avg10': 1.23,
-    'psi_mem_full_avg10': 0.00,
-    'psi_io_some_avg10': 0.75,
-    'psi_io_full_avg10': 0.45,
+    SampleKey('psi_cpu_some_avg10'): 2.50,
+    SampleKey('psi_cpu_full_avg10'): 0.30,
+    SampleKey('psi_mem_some_avg10'): 1.23,
+    SampleKey('psi_mem_full_avg10'): 0.00,
+    SampleKey('psi_io_some_avg10'): 0.75,
+    SampleKey('psi_io_full_avg10'): 0.45,
 }
 
-FAKE_PROCESS_METRICS = {
-    'occt_queue_depth': 3.0,
-    'verify_concurrency': 2.0,
-    'verify_rss_total_bytes': 1048576.0,
-}
+OCCT_QUEUE_DEPTH = SampleKey('occt_queue_depth')
+RUNQUEUE_RATIO = SampleKey('runqueue_ratio')
+REIFY = 'orchestrator-reify.service'
+
+FAKE_PROCESS_METRICS = {OCCT_QUEUE_DEPTH: 3.0}
+
+# Rows of one complete tick of the PSI and process groups.
+PSI_AND_PROCESS_ROWS = len(FAKE_PSI) + len(FAKE_PROCESS_METRICS)
+
+_GROUPS = {group.name: group for group in METRIC_GROUPS}
+_NOTHING: Samples = MappingProxyType({})
+
+
+def _collected(
+    *, psi: Samples = _NOTHING, process: Samples = _NOTHING, load: Samples = _NOTHING
+) -> dict[MetricGroup, Collected]:
+    """One tick's collection over the live table's every-tick groups, an empty one being ``{}``."""
+    return {
+        _GROUPS[GroupName.PSI]: Collected(psi),
+        _GROUPS[GroupName.PROCESS]: Collected(process),
+        _GROUPS[GroupName.LOAD]: Collected(load),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -34,42 +65,35 @@ FAKE_PROCESS_METRICS = {
 
 
 class TestRunTick:
-    def test_writes_exactly_9_rows_for_tick(self, tmp_path: Path):
+    def test_writes_one_row_per_sample(self, tmp_path: Path):
         from sampler.sampler import run_tick
         from sampler.store import LoadSampleStore
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        run_tick(
-            store, now,
-            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
-        )
+        run_tick(store, now, _collected(psi=FAKE_PSI, process=FAKE_PROCESS_METRICS))
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         count = conn.execute('SELECT COUNT(*) FROM samples').fetchone()[0]
         conn.close()
-        assert count == 9
+        assert count == PSI_AND_PROCESS_ROWS
 
-    def test_nine_distinct_metrics_in_tick(self, tmp_path: Path):
+    def test_one_distinct_metric_per_sample(self, tmp_path: Path):
         from sampler.sampler import run_tick
         from sampler.store import LoadSampleStore
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        run_tick(
-            store, now,
-            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
-        )
+        run_tick(store, now, _collected(psi=FAKE_PSI, process=FAKE_PROCESS_METRICS))
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         distinct = conn.execute(
             'SELECT COUNT(DISTINCT metric) FROM samples WHERE ts = ?', (now,)
         ).fetchone()[0]
         conn.close()
-        # >= 7 satisfies the task's live integration signal
-        assert distinct == 9
+        assert distinct == PSI_AND_PROCESS_ROWS
 
     def test_psi_rows_have_null_windows(self, tmp_path: Path):
         from sampler.sampler import run_tick
@@ -78,10 +102,7 @@ class TestRunTick:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        run_tick(
-            store, now,
-            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
-        )
+        run_tick(store, now, _collected(psi=FAKE_PSI, process=FAKE_PROCESS_METRICS))
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         psi_rows = conn.execute(
@@ -102,10 +123,7 @@ class TestRunTick:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        run_tick(
-            store, now,
-            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
-        )
+        run_tick(store, now, _collected(psi=FAKE_PSI, process=FAKE_PROCESS_METRICS))
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         proc_rows = conn.execute(
@@ -114,7 +132,7 @@ class TestRunTick:
         ).fetchall()
         conn.close()
 
-        assert len(proc_rows) == 3
+        assert len(proc_rows) == len(FAKE_PROCESS_METRICS)
         for metric, window_mean, window_max in proc_rows:
             assert window_mean is not None, f'{metric}: window_mean should not be NULL'
             assert window_max is not None, f'{metric}: window_max should not be NULL'
@@ -127,10 +145,7 @@ class TestRunTick:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         now = 1_000_000
 
-        run_tick(
-            store, now,
-            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
-        )
+        run_tick(store, now, _collected(psi=FAKE_PSI, process=FAKE_PROCESS_METRICS))
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         row = conn.execute(
@@ -153,21 +168,11 @@ class TestRunTick:
         store = LoadSampleStore(tmp_path / 'db.sqlite')
 
         # First tick
-        run_tick(
-            store, 1_000_000,
-            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
-        )
+        run_tick(store, 1_000_000, _collected(psi=FAKE_PSI, process=FAKE_PROCESS_METRICS))
 
         # Second tick with different process metrics
-        second_metrics = {
-            'occt_queue_depth': 5.0,
-            'verify_concurrency': 4.0,
-            'verify_rss_total_bytes': 2_097_152.0,
-        }
-        run_tick(
-            store, 1_000_005,
-            psi=FAKE_PSI, process_metrics=second_metrics, load_metrics={},
-        )
+        second_metrics = {OCCT_QUEUE_DEPTH: 5.0}
+        run_tick(store, 1_000_005, _collected(psi=FAKE_PSI, process=second_metrics))
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         row = conn.execute(
@@ -192,13 +197,10 @@ class TestRunTick:
         # Pre-insert a very old row (older than the 30-day retention window,
         # widened from 24h by task 3592 step-14).
         very_old_ts = 1_000_000 - 2_592_001
-        store.insert_sample(very_old_ts, 'psi_cpu_some_avg10', 0.0)
+        store.insert_sample(very_old_ts, SampleKey('psi_cpu_some_avg10'), 0.0)
 
         now = 1_000_000
-        run_tick(
-            store, now,
-            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
-        )
+        run_tick(store, now, _collected(psi=FAKE_PSI, process=FAKE_PROCESS_METRICS))
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         old_row = conn.execute(
@@ -209,101 +211,24 @@ class TestRunTick:
 
 
 # ---------------------------------------------------------------------------
-# Task 3592 step-9: the exact-or-stem metric-name guard (detail B)
-# ---------------------------------------------------------------------------
-
-
-class TestUnexpectedMetricNames:
-    """The guard's purpose is unchanged: a typo must still fail.
-
-    What changed is that it must now also admit names with a DYNAMIC tail —
-    ``own_cpu_some10:<cgroup-leaf>`` is generated per discovered cgroup, so no
-    fixed frozenset can ever list them. A stem set is the smallest extension
-    that admits the tail while keeping a misspelling rejected.
-    """
-
-    EXACT = frozenset({'runqueue_ratio', 'runqueue_read_ok'})
-    STEMS = frozenset({'own_cpu_some10', 'own_read_ok'})
-
-    def _unexpected(self, *names):
-        from sampler.sampler import unexpected_metric_names
-
-        return unexpected_metric_names(set(names), exact=self.EXACT, stems=self.STEMS)
-
-    def test_exact_name_accepted(self):
-        assert self._unexpected('runqueue_ratio', 'runqueue_read_ok') == set()
-
-    @pytest.mark.parametrize(
-        'name',
-        [
-            'own_cpu_some10:orchestrator-dark-factory.service',
-            'own_read_ok:df-dark_factory.slice',
-            'own_cpu_some10:df-reify.slice',
-        ],
-    )
-    def test_stem_with_a_tail_accepted(self, name):
-        assert self._unexpected(name) == set()
-
-    def test_bare_stem_without_a_tail_rejected(self):
-        """A stem is not itself a metric — nothing ever emits a bare one."""
-        assert self._unexpected('own_cpu_some10') == {'own_cpu_some10'}
-
-    def test_misspelled_stem_rejected(self):
-        assert self._unexpected('own_cpu_some_10:leaf') == {'own_cpu_some_10:leaf'}
-
-    def test_stem_with_an_empty_tail_rejected(self):
-        """``own_read_ok:`` names no cgroup, so it is evidence about nothing."""
-        assert self._unexpected('own_read_ok:') == {'own_read_ok:'}
-
-    def test_only_the_first_colon_splits_the_stem(self):
-        """A leaf name may itself contain ':' — the tail is everything after."""
-        assert self._unexpected('own_read_ok:weird:leaf.slice') == set()
-
-    def test_empty_stem_set_degenerates_to_exact_membership(self):
-        """PSI keeps its current strictness: no dynamic tail is possible there."""
-        from sampler.sampler import unexpected_metric_names
-
-        psi_exact = frozenset({'psi_cpu_some_avg10'})
-        assert unexpected_metric_names(
-            {'psi_cpu_some_avg10'}, exact=psi_exact, stems=frozenset()
-        ) == set()
-        assert unexpected_metric_names(
-            {'psi_cpu_some_avg10x'}, exact=psi_exact, stems=frozenset()
-        ) == {'psi_cpu_some_avg10x'}
-        # A colon name cannot sneak past an empty stem set either.
-        assert unexpected_metric_names(
-            {'psi_cpu_some_avg10:leaf'}, exact=psi_exact, stems=frozenset()
-        ) == {'psi_cpu_some_avg10:leaf'}
-
-    def test_every_offender_is_reported_not_just_the_first(self):
-        assert self._unexpected(
-            'runqueue_ratio', 'runqueu_ratio', 'own_read_ok:', 'own_read_ok:leaf'
-        ) == {'runqueu_ratio', 'own_read_ok:'}
-
-    def test_empty_input_is_accepted(self):
-        """A degraded collection group hands run_tick {} — never an error."""
-        assert self._unexpected() == set()
-
-
-# ---------------------------------------------------------------------------
 # Task 3592 step-11: run_tick's third collection group
 # ---------------------------------------------------------------------------
 
 FAKE_LOAD_METRICS = {
-    'runqueue_ratio': 4.0625,
-    'runqueue_read_ok': 1.0,
-    'own_cpu_some10:orchestrator-reify.service': 1.77,
-    'own_read_ok:orchestrator-reify.service': 1.0,
+    RUNQUEUE_RATIO: 4.0625,
+    SampleKey('runqueue_read_ok'): 1.0,
+    SampleKey('own_cpu_some10', REIFY): 1.77,
+    SampleKey('own_read_ok', REIFY): 1.0,
 }
 
 
-def _rows(db_path: Path, metric: str) -> list[tuple]:
+def _rows(db_path: Path, key: SampleKey) -> list[tuple]:
     conn = sqlite3.connect(str(db_path))
     try:
         return conn.execute(
             'SELECT ts, value, window_mean, window_max FROM samples'
-            ' WHERE metric = ? ORDER BY ts',
-            (metric,),
+            ' WHERE metric = ? AND leaf IS ? ORDER BY ts',
+            (key.metric, key.leaf),
         ).fetchall()
     finally:
         conn.close()
@@ -324,16 +249,14 @@ class TestRunTickLoadGroup:
         run_tick(
             store,
             1_000_000,
-            psi=FAKE_PSI,
-            process_metrics=FAKE_PROCESS_METRICS,
-            load_metrics=FAKE_LOAD_METRICS,
+            _collected(psi=FAKE_PSI, process=FAKE_PROCESS_METRICS, load=FAKE_LOAD_METRICS),
         )
 
-        for metric in FAKE_LOAD_METRICS:
-            (_ts, _value, window_mean, window_max), = _rows(db_path, metric)
-            assert window_mean is not None, f'{metric} window_mean is NULL'
-            assert window_max is not None, f'{metric} window_max is NULL'
-        (_ts, _v, psi_mean, psi_max), = _rows(db_path, 'psi_cpu_some_avg10')
+        for key in FAKE_LOAD_METRICS:
+            (_ts, _value, window_mean, window_max), = _rows(db_path, key)
+            assert window_mean is not None, f'{key} window_mean is NULL'
+            assert window_max is not None, f'{key} window_max is NULL'
+        (_ts, _v, psi_mean, psi_max), = _rows(db_path, SampleKey('psi_cpu_some_avg10'))
         assert psi_mean is None and psi_max is None
 
     def test_second_tick_window_reflects_both_samples(self, tmp_path: Path):
@@ -344,49 +267,29 @@ class TestRunTickLoadGroup:
         db_path = tmp_path / 'db.sqlite'
         store = LoadSampleStore(db_path)
 
-        run_tick(
-            store, 1_000_000, psi={}, process_metrics={},
-            load_metrics={'runqueue_ratio': 2.0},
-        )
-        run_tick(
-            store, 1_000_005, psi={}, process_metrics={},
-            load_metrics={'runqueue_ratio': 6.0},
-        )
+        run_tick(store, 1_000_000, _collected(load={RUNQUEUE_RATIO: 2.0}))
+        run_tick(store, 1_000_005, _collected(load={RUNQUEUE_RATIO: 6.0}))
 
-        _first, (_ts, value, window_mean, window_max) = _rows(db_path, 'runqueue_ratio')
+        _first, (_ts, value, window_mean, window_max) = _rows(db_path, RUNQUEUE_RATIO)
         assert value == pytest.approx(6.0)
         assert window_mean == pytest.approx(4.0)
         assert window_max == pytest.approx(6.0)
 
-    def test_dynamic_keys_round_trip_into_the_metric_column_verbatim(
-        self, tmp_path: Path
-    ):
+    def test_a_per_leaf_key_lands_in_the_metric_and_leaf_columns(self, tmp_path: Path):
         from sampler.sampler import run_tick
         from sampler.store import LoadSampleStore
 
         db_path = tmp_path / 'db.sqlite'
         store = LoadSampleStore(db_path)
-        metric = 'own_cpu_some10:orchestrator-reify.service'
 
-        run_tick(
-            store, 1_000_000, psi={}, process_metrics={},
-            load_metrics={metric: 1.77},
-        )
+        run_tick(store, 1_000_000, _collected(load={SampleKey('own_cpu_some10', REIFY): 1.77}))
 
-        (_ts, value, _mean, _max), = _rows(db_path, metric)
-        assert value == pytest.approx(1.77)
-
-    def test_unexpected_load_key_raises_naming_it(self, tmp_path: Path):
-        from sampler.sampler import run_tick
-        from sampler.store import LoadSampleStore
-
-        store = LoadSampleStore(tmp_path / 'db.sqlite')
-
-        with pytest.raises(AssertionError, match='runqueu_ratio'):
-            run_tick(
-                store, 1_000_000, psi={}, process_metrics={},
-                load_metrics={'runqueu_ratio': 1.0},
-            )
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute('SELECT metric, leaf, value FROM samples').fetchall()
+        finally:
+            conn.close()
+        assert rows == [('own_cpu_some10', REIFY, pytest.approx(1.77))]
 
     def test_degraded_load_group_writes_zero_load_rows(self, tmp_path: Path):
         """{} is the degraded group's value — zero rows, not a fabricated 0.0."""
@@ -396,10 +299,7 @@ class TestRunTickLoadGroup:
         db_path = tmp_path / 'db.sqlite'
         store = LoadSampleStore(db_path)
 
-        run_tick(
-            store, 1_000_000,
-            psi=FAKE_PSI, process_metrics=FAKE_PROCESS_METRICS, load_metrics={},
-        )
+        run_tick(store, 1_000_000, _collected(psi=FAKE_PSI, process=FAKE_PROCESS_METRICS))
 
         conn = sqlite3.connect(str(db_path))
         try:
@@ -411,142 +311,332 @@ class TestRunTickLoadGroup:
         finally:
             conn.close()
         assert loadish == 0
-        assert total == 9, 'the other two groups must still write their rows'
+        assert total == PSI_AND_PROCESS_ROWS, 'the other two groups must still write their rows'
+
+
+class TestRunTickAdmitsEachGroupAgainstItself:
+    """An unadmitted key drops its own group for the tick, never the whole tick."""
+
+    def test_an_unadmitted_key_drops_only_its_own_group(self, tmp_path: Path, caplog):
+        from sampler.sampler import run_tick
+        from sampler.store import LoadSampleStore
+
+        db_path = tmp_path / 'db.sqlite'
+        load = {SampleKey('runqueu_ratio'): 1.0, RUNQUEUE_RATIO: 2.0}
+
+        with caplog.at_level(logging.ERROR):
+            run_tick(
+                LoadSampleStore(db_path),
+                1_000_000,
+                _collected(psi=FAKE_PSI, process=FAKE_PROCESS_METRICS, load=load),
+            )
+
+        written = _metrics_written(db_path)
+        assert written == set(FAKE_PSI) | set(FAKE_PROCESS_METRICS)
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1, errors
+        assert 'load' in errors[0]
+        assert 'runqueu_ratio' in errors[0]
+
+    def test_every_offender_is_named(self, tmp_path: Path, caplog):
+        from sampler.sampler import run_tick
+        from sampler.store import LoadSampleStore
+
+        process = {
+            SampleKey('occt_queue_dept'): 1.0,
+            SampleKey('occt_queue_depth', 'leaf.service'): 1.0,
+            OCCT_QUEUE_DEPTH: 1.0,
+        }
+
+        with caplog.at_level(logging.ERROR):
+            run_tick(LoadSampleStore(tmp_path / 'db.sqlite'), 1_000_000, _collected(process=process))
+
+        (error,) = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert 'process' in error
+        assert 'occt_queue_dept' in error
+        assert 'occt_queue_depth:leaf.service' in error
+
+    @pytest.mark.parametrize('windowed', [False, True])
+    def test_window_mode_comes_from_the_group(self, tmp_path: Path, windowed: bool):
+        from sampler.sampler import run_tick
+        from sampler.store import LoadSampleStore
+
+        spec = MetricSpec('fixture_metric')
+        group = MetricGroup(
+            GroupName.LOAD, collect=every_tick(dict), metrics=(spec,), windowed=windowed
+        )
+        db_path = tmp_path / 'db.sqlite'
+
+        run_tick(LoadSampleStore(db_path), 1_000_000, {group: Collected({spec.key(): 3.5})})
+
+        ((_ts, value, window_mean, window_max),) = _rows(db_path, spec.key())
+        assert value == pytest.approx(3.5)
+        if windowed:
+            assert (window_mean, window_max) == (pytest.approx(3.5), pytest.approx(3.5))
+        else:
+            assert (window_mean, window_max) == (None, None)
+
+    def test_it_returns_each_groups_disposition(self, tmp_path: Path):
+        from sampler.sampler import Skipped, run_tick
+        from sampler.store import LoadSampleStore
+
+        collected = _collected(psi=FAKE_PSI, load={SampleKey('runqueu_ratio'): 1.0})
+
+        dispositions = run_tick(LoadSampleStore(tmp_path / 'db.sqlite'), 1_000_000, collected)
+
+        assert dispositions == {
+            _GROUPS[GroupName.PSI]: Collected(FAKE_PSI),
+            _GROUPS[GroupName.PROCESS]: Collected({}),
+            _GROUPS[GroupName.LOAD]: Skipped.DROPPED,
+        }
+
+    def test_every_admitted_group_lands_in_one_write(self, tmp_path: Path):
+        from sampler.sampler import run_tick
+        from sampler.store import LoadSampleStore, connect_durably
+
+        opened: list[int] = []
+
+        def counting_connect(db_path: Path, *, autocommit: bool = False):
+            opened.append(1)
+            return connect_durably(db_path, autocommit=autocommit)
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite', connect=counting_connect)
+        three_groups = _collected(
+            psi=FAKE_PSI, process=FAKE_PROCESS_METRICS, load=FAKE_LOAD_METRICS
+        )
+        one_group = {_GROUPS[GroupName.LOAD]: Collected(FAKE_LOAD_METRICS)}
+        run_tick(store, 999_995, three_groups)
+
+        opened.clear()
+        run_tick(store, 1_000_000, one_group)
+        one = len(opened)
+        opened.clear()
+        run_tick(store, 1_000_005, three_groups)
+        three = len(opened)
+
+        assert one >= 1, 'the connect spy never fired — the seam has detached'
+        assert three == one, f'a 1-group tick opened {one} connections, a 3-group tick {three}'
 
 
 # ---------------------------------------------------------------------------
-# Task 3592 step-17: __main__'s third independent degrade point
+# __main__.main: one degrade handler per group of an injected table
 # ---------------------------------------------------------------------------
 
+SERVICE = 'service@orchestrator-reify.service'
 
-def _metrics_written(db_path: Path) -> set[str]:
+FAKE_CONSUMERS = {
+    SampleKey('consumer_memory_bytes', SERVICE): 1_048_576.0,
+    SampleKey('consumer_members', SERVICE): 1.0,
+    SampleKey('consumer_read_ok', SERVICE): 1.0,
+    SampleKey('host_used_bytes'): 4_194_304.0,
+}
+
+FAKE_VERIFY_SCOPES = {
+    SampleKey('verify_scopes_live'): 2.0,
+    SampleKey('verify_scope_memory_bytes'): 5_000.0,
+}
+
+FAKE_SAMPLES: dict[GroupName, Samples] = {
+    GroupName.PSI: FAKE_PSI,
+    GroupName.PROCESS: FAKE_PROCESS_METRICS,
+    GroupName.LOAD: FAKE_LOAD_METRICS,
+    GroupName.CONSUMERS: FAKE_CONSUMERS,
+    GroupName.VERIFY_SCOPES: FAKE_VERIFY_SCOPES,
+}
+
+
+def _all_but(name: GroupName) -> set[SampleKey]:
+    return {key for group, samples in FAKE_SAMPLES.items() if group is not name for key in samples}
+
+
+def _metrics_written(db_path: Path) -> set[SampleKey]:
     conn = sqlite3.connect(str(db_path))
     try:
-        return {row[0] for row in conn.execute('SELECT DISTINCT metric FROM samples')}
+        return {
+            SampleKey(*row) for row in conn.execute('SELECT DISTINCT metric, leaf FROM samples')
+        }
     finally:
         conn.close()
 
 
-def _run_main(monkeypatch, tmp_path: Path, **raising: bool):
-    """Drive sampler.__main__.main with each collector optionally raising."""
+def _table(
+    *,
+    samples: Mapping[GroupName, Samples] = FAKE_SAMPLES,
+    raising: Collection[GroupName] = (),
+) -> tuple[MetricGroup, ...]:
+    """METRIC_GROUPS with each collector replaced by a fake returning *samples* or raising."""
+
+    def collector(name: GroupName):
+        def collect() -> Samples:
+            if name in raising:
+                raise RuntimeError(f'{name} is down')
+            return samples[name]
+        return collect
+
+    return tuple(
+        dataclasses.replace(group, collect=every_tick(collector(group.name)))
+        for group in METRIC_GROUPS
+    )
+
+
+def _run_main(monkeypatch, tmp_path: Path, table: tuple[MetricGroup, ...]) -> Path:
+    """Drive sampler.__main__.main over *table*, rooted at *tmp_path*."""
     import sampler.__main__ as entry
 
     monkeypatch.setenv('DARK_FACTORY_ROOT', str(tmp_path))
-
-    def collector(name: str, value: dict[str, float]):
-        def collect(**_kwargs):
-            if raising.get(name):
-                raise RuntimeError(f'{name} is down')
-            return value
-        return collect
-
-    monkeypatch.setattr(entry, 'collect_psi', collector('psi', FAKE_PSI))
-    monkeypatch.setattr(
-        entry, 'collect_process_metrics', collector('process', FAKE_PROCESS_METRICS)
-    )
-    monkeypatch.setattr(
-        entry, 'collect_load_metrics', collector('load', FAKE_LOAD_METRICS)
-    )
-    entry.main()
+    entry.main(groups=table)
     return tmp_path / 'data/load-samples.db'
 
 
-class TestMainDegradesEachGroupIndependently:
-    """Three collection groups, three loud degrade points, no shared fate.
+def _tick_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith('tick ')]
 
-    The groups read unrelated kernel surfaces — /proc/pressure, the psutil
-    process scan, and /proc/stat + cgroupfs — so one failing must not discard
-    another's rows. Each falls back to {} so run_tick writes ZERO rows for it,
-    which is the shape that makes a fabricated healthy 0.0 impossible.
+
+def _errors(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+class TestMainDegradesEachGroupIndependently:
+    """One loud degrade point per group, no shared fate.
+
+    The groups read unrelated kernel surfaces, so one failing must not discard
+    another's rows. A failing group falls back to {} so run_tick writes ZERO
+    rows for it, which is the shape that makes a fabricated healthy 0.0
+    impossible.
     """
 
-    def test_all_three_groups_written_when_healthy(self, monkeypatch, tmp_path: Path):
-        db_path = _run_main(monkeypatch, tmp_path)
+    def test_every_group_is_written_when_healthy(self, monkeypatch, tmp_path: Path):
+        written = _metrics_written(_run_main(monkeypatch, tmp_path, _table()))
 
-        written = _metrics_written(db_path)
-        assert set(FAKE_PSI) <= written
-        assert set(FAKE_PROCESS_METRICS) <= written
-        assert set(FAKE_LOAD_METRICS) <= written
+        for samples in FAKE_SAMPLES.values():
+            assert set(samples) <= written
 
-    def test_load_failure_keeps_psi_and_process_rows(self, monkeypatch, tmp_path: Path, caplog):
+    @pytest.mark.parametrize('down', list(GroupName))
+    def test_a_failing_group_keeps_the_other_groups_rows(
+        self, monkeypatch, tmp_path: Path, caplog, down: GroupName
+    ):
         with caplog.at_level(logging.ERROR):
-            db_path = _run_main(monkeypatch, tmp_path, load=True)
+            db_path = _run_main(monkeypatch, tmp_path, _table(raising={down}))
 
         written = _metrics_written(db_path)
-        assert set(FAKE_PSI) <= written
-        assert set(FAKE_PROCESS_METRICS) <= written
-        assert not [m for m in written if m.startswith(('runqueue', 'own_'))], (
-            'a failed load group must write zero rows, not a 0.0-valued one'
+        for name, samples in FAKE_SAMPLES.items():
+            if name is not down:
+                assert set(samples) <= written, name
+        assert not [key for key in written if _GROUPS[down].admits(key)], (
+            f'a failed {down} group must write zero rows, not a 0.0-valued one'
         )
-        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
-        assert any('load' in m.lower() for m in messages), messages
+        assert any(str(down) in message for message in _errors(caplog)), _errors(caplog)
 
-    def test_process_failure_keeps_load_rows(self, monkeypatch, tmp_path: Path, caplog):
-        with caplog.at_level(logging.ERROR):
-            db_path = _run_main(monkeypatch, tmp_path, process=True)
-
-        written = _metrics_written(db_path)
-        assert set(FAKE_LOAD_METRICS) <= written
-        assert set(FAKE_PSI) <= written
-        assert not set(FAKE_PROCESS_METRICS) & written
-
-    def test_psi_failure_keeps_load_rows(self, monkeypatch, tmp_path: Path, caplog):
-        with caplog.at_level(logging.ERROR):
-            db_path = _run_main(monkeypatch, tmp_path, psi=True)
-
-        written = _metrics_written(db_path)
-        assert set(FAKE_LOAD_METRICS) <= written
-        assert set(FAKE_PROCESS_METRICS) <= written
-        assert not set(FAKE_PSI) & written
-
-    def test_a_failing_group_does_not_abort_the_tick(self, monkeypatch, tmp_path: Path):
+    def test_two_failing_groups_still_write_the_third(self, monkeypatch, tmp_path: Path):
         """Only store-construction failure justifies a non-zero exit."""
-        db_path = _run_main(monkeypatch, tmp_path, load=True, process=True)
+        table = _table(raising={GroupName.LOAD, GroupName.PROCESS})
 
-        assert set(FAKE_PSI) <= _metrics_written(db_path)
+        assert set(FAKE_PSI) <= _metrics_written(_run_main(monkeypatch, tmp_path, table))
+
+    def test_an_unadmitted_key_drops_only_its_group(self, monkeypatch, tmp_path: Path, caplog):
+        bad = {**FAKE_SAMPLES, GroupName.LOAD: {**FAKE_LOAD_METRICS, SampleKey('runqueu_ratio'): 1.0}}
+
+        with caplog.at_level(logging.ERROR):
+            db_path = _run_main(monkeypatch, tmp_path, _table(samples=bad))
+
+        assert _metrics_written(db_path) == _all_but(GroupName.LOAD)
+        (error,) = _errors(caplog)
+        assert 'load' in error
+        assert 'runqueu_ratio' in error
 
     def test_a_healthy_tick_also_drives_the_vacuum_gate(
         self, monkeypatch, tmp_path: Path
     ):
         """``main()`` is the SOLE caller of maybe_vacuum, so it is the only guard.
 
-        ``sampler.sampler``'s module docstring records the split deliberately:
         run_tick enforces retention, and the compaction is wired one level up
-        in ``__main__.main`` — which means deleting the call here leaves
-        nothing red and a 30-day corpus that is never compacted again.
+        in ``__main__.main``, so deleting the call there would leave nothing
+        red and a 30-day corpus that is never compacted again.
 
         The stamp is read back against the TICK's own ts rather than merely
         asserted present: ``__main__`` reads the clock once and hands the same
         ``now`` to run_tick and maybe_vacuum, so the two agreeing is what says
         the vacuum gate ran as part of THIS tick.
         """
-        db_path = _run_main(monkeypatch, tmp_path)
+        db_path = _run_main(monkeypatch, tmp_path, _table())
 
         from sampler.store import LoadSampleStore
-
-        store = LoadSampleStore(db_path)
-        stamped = store._get_meta('last_vacuum_ts')
-        assert stamped is not None, (
-            'main() left the vacuum clock unset, so maybe_vacuum was never called'
-        )
 
         conn = sqlite3.connect(str(db_path))
         try:
             tick_ts = conn.execute('SELECT MAX(ts) FROM samples').fetchone()[0]
         finally:
             conn.close()
-        assert int(stamped) == tick_ts
 
-    def test_the_tick_log_line_reports_the_load_group(self, monkeypatch, tmp_path: Path, caplog):
-        """An operator watching journalctl must be able to see the new group."""
+        # _is_due reads "due" as elapsed outside [0, interval), so this boundary
+        # pair holds only for a stamp of exactly tick_ts.
+        store = LoadSampleStore(db_path)
+        assert store.should_vacuum(tick_ts + 86399) is False, (
+            'main() left the vacuum clock unset, so maybe_vacuum was never called'
+        )
+        assert store.should_vacuum(tick_ts + 86400) is True
+
+    def test_a_bare_main_call_ticks_every_live_group(
+        self, monkeypatch, tmp_path: Path, caplog
+    ):
+        """The systemd ExecStart path calls main() with no argument.
+
+        The live collectors degrade to {} rather than raising, so this runs on
+        any host: what it pins is that the bare call collects the live table
+        and writes a tick to the store under DARK_FACTORY_ROOT.
+        """
+        import sampler.__main__ as entry
+
+        monkeypatch.setenv('DARK_FACTORY_ROOT', str(tmp_path))
         with caplog.at_level(logging.INFO):
-            _run_main(monkeypatch, tmp_path)
+            entry.main()
 
-        tick_lines = [
-            r.getMessage() for r in caplog.records if r.getMessage().startswith('tick ')
-        ]
-        assert tick_lines, [r.getMessage() for r in caplog.records]
-        assert any('runqueue_ratio' in line for line in tick_lines), tick_lines
+        assert (tmp_path / 'data/load-samples.db').exists()
+        (line,) = _tick_lines(caplog)
+        for group in METRIC_GROUPS:
+            assert f'{group.name}=' in line, line
+
+
+class TestTheTickLogLine:
+    """An operator watching journalctl sees every group the table names."""
+
+    def test_it_names_exactly_the_tables_groups(self, monkeypatch, tmp_path: Path, caplog):
+        table = _table()[:2]
+
+        with caplog.at_level(logging.INFO):
+            _run_main(monkeypatch, tmp_path, table)
+
+        (line,) = _tick_lines(caplog)
+        for group in table:
+            assert f'{group.name}=' in line, line
+        assert f'{GroupName.LOAD}=' not in line, line
+
+    def test_it_renders_key_labels(self, monkeypatch, tmp_path: Path, caplog):
+        with caplog.at_level(logging.INFO):
+            _run_main(monkeypatch, tmp_path, _table())
+
+        (line,) = _tick_lines(caplog)
+        assert 'runqueue_ratio' in line
+        assert f'own_cpu_some10:{REIFY}' in line
+        assert 'SampleKey(' not in line
+
+    def test_it_summarises_the_consumer_group(self, monkeypatch, tmp_path: Path, caplog):
+        with caplog.at_level(logging.INFO):
+            _run_main(monkeypatch, tmp_path, _table())
+
+        (line,) = _tick_lines(caplog)
+        assert f'{GroupName.CONSUMERS}=rows:{len(FAKE_CONSUMERS)} leaves:1' in line, line
+        assert SERVICE not in line, line
+        assert f'{GroupName.VERIFY_SCOPES}=' in line and 'verify_scopes_live' in line, line
+
+    def test_a_dropped_group_shows_as_dropped(self, monkeypatch, tmp_path: Path, caplog):
+        bad = {**FAKE_SAMPLES, GroupName.LOAD: {SampleKey('runqueu_ratio'): 1.0}}
+
+        with caplog.at_level(logging.INFO):
+            _run_main(monkeypatch, tmp_path, _table(samples=bad))
+
+        (line,) = _tick_lines(caplog)
+        assert f'{GroupName.LOAD}=dropped' in line, line
 
 
 # ---------------------------------------------------------------------------
@@ -570,21 +660,26 @@ class TestTickCostIsFlatInTheMetricCount:
         run_tick(
             store,
             now,
-            psi={'psi_cpu_some_avg10': 1.0},
-            process_metrics={'verify_concurrency': 2.0},
-            load_metrics={
-                'runqueue_ratio': 0.5,
-                **{f'own_cpu_some10:leaf{i}': float(i) for i in range(leaves)},
-            },
+            _collected(
+                psi={SampleKey('psi_cpu_some_avg10'): 1.0},
+                process={OCCT_QUEUE_DEPTH: 2.0},
+                load={
+                    RUNQUEUE_RATIO: 0.5,
+                    **{SampleKey('own_cpu_some10', f'leaf{i}'): float(i) for i in range(leaves)},
+                },
+            ),
         )
 
-    def test_one_leaf_and_a_hundred_leaves_cost_the_same_connections(
-        self, tmp_path: Path, monkeypatch
-    ):
-        import sampler.store as store_module
-        from sampler.store import LoadSampleStore
+    def test_one_leaf_and_a_hundred_leaves_cost_the_same_connections(self, tmp_path: Path):
+        from sampler.store import LoadSampleStore, connect_durably
 
-        store = LoadSampleStore(tmp_path / 'db.sqlite')
+        opened: list[int] = []
+
+        def counting_connect(db_path: Path, *, autocommit: bool = False):
+            opened.append(1)
+            return connect_durably(db_path, autocommit=autocommit)
+
+        store = LoadSampleStore(tmp_path / 'db.sqlite', connect=counting_connect)
         # Prime the retention clock first. On a VIRGIN store the first tick
         # also runs the interval-gated cleanup, which opens its own
         # connections — comparing a cleanup tick against a steady-state one
@@ -592,14 +687,7 @@ class TestTickCostIsFlatInTheMetricCount:
         # this test went red on exactly that before the priming tick existed.
         self._tick(store, 999_995, leaves=1)
 
-        real_connect = store_module.sqlite3.connect
-        opened: list[int] = []
-        monkeypatch.setattr(
-            store_module.sqlite3,
-            'connect',
-            lambda *a, **kw: (opened.append(1), real_connect(*a, **kw))[1],
-        )
-
+        opened.clear()
         self._tick(store, 1_000_000, leaves=1)
         few = len(opened)
         opened.clear()
@@ -607,9 +695,9 @@ class TestTickCostIsFlatInTheMetricCount:
         many = len(opened)
 
         # A FLOOR before the equality, because both sides are spy counts: if the
-        # monkeypatched seam ever stops being the one write_tick uses — a
-        # connection helper, a pool, a module-level alias — both stay 0 and
-        # `0 == many` holds while measuring nothing.
+        # injected connect ever stops being the one write_tick uses — a cached
+        # connection, a pool — both stay 0 and `0 == many` holds while
+        # measuring nothing.
         assert few >= 1, 'the connect spy never fired — the seam has detached'
         assert few == many, (
             f'a 4-metric tick opened {few} connections and a 103-metric tick '

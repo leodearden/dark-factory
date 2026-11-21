@@ -20,14 +20,16 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-# data/ is gitignored, so a task worktree has no store of its own: the live
-# store exists only in the main checkout (as audit_model_admission.DEFAULT_RUNS_DB).
-DEFAULT_ESCALATIONS_DIR = Path('/home/leo/src/dark-factory/data/escalations')
+import _checkout as _checkout
+from shared.project_layout import default_project_root, escalation_queue_dir
 
-# escalation/src/escalation/archive.py::ARCHIVE_SUBDIR. Restated, not imported:
-# scripts/ imports no first-party package (the comment on
-# dark-factory-orchestrator.yaml::test_command).
+# Mirrors escalation/src/escalation/archive.py::ARCHIVE_SUBDIR.
 ARCHIVE_SUBDIR = 'archive'
+
+
+def default_escalations_dir() -> Path:
+    """The main checkout's escalation queue: data/ is gitignored, so no task worktree has one."""
+    return escalation_queue_dir(default_project_root())
 
 
 def _parse_instant(raw: Any) -> datetime | None:

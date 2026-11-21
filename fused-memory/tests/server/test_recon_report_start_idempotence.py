@@ -53,7 +53,7 @@ class TestStartReportPreservesExistingEntry:
         real_id = real['finding_id']
 
         null = state.add_finding(
-            run_id='r1', severity='low', category='other',
+            run_id='r1', severity='minor', category='other',
             description='null null observation', suggested_action='note',
             actionable=False,
         )
@@ -105,7 +105,7 @@ class TestStartReportPreservesExistingEntry:
         assert any(item['finding_id'] == real_id for item in report['flagged_items'])
 
         dup_null = state.add_finding(
-            run_id='r1', severity='low', category='other',
+            run_id='r1', severity='minor', category='other',
             description='null null observation', suggested_action='note',
             actionable=False,
         )
@@ -121,7 +121,7 @@ class TestStartReportPreservesExistingEntry:
         state, _t = self._make_state()
         state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
         state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d',
+            run_id='r1', severity='minor', category='cat', description='d',
             suggested_action='a', task_id='1', flag_type='f',
         )
         state.complete('r1', 'summary text')
@@ -138,7 +138,7 @@ class TestStartReportPreservesExistingEntry:
         assert entry_after.summary == summary_before
 
         result = state.add_finding(
-            run_id='r1', severity='high', category='cat', description='late finding',
+            run_id='r1', severity='serious', category='cat', description='late finding',
             suggested_action='a',
         )
         assert result['error'] == 'report_already_completed'
@@ -174,7 +174,7 @@ class TestStartReportPreservesExistingEntryDurable:
             real_id = real['finding_id']
 
             null = state.add_finding(
-                run_id='r1', severity='low', category='other',
+                run_id='r1', severity='minor', category='other',
                 description='null null observation', suggested_action='note',
                 actionable=False,
             )
@@ -238,7 +238,7 @@ class TestStartReportResultIsUnambiguous:
         state, _t = self._make_state()
         state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
         state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d',
+            run_id='r1', severity='minor', category='cat', description='d',
             suggested_action='a', task_id='1', flag_type='f',
         )
 
@@ -339,7 +339,7 @@ class TestStartReportResultIsUnambiguous:
         assert first['already_started'] is False
 
         add_result = await tm.call_tool('add_finding', {
-            'run_id': 'r1', 'severity': 'low', 'category': 'cat',
+            'run_id': 'r1', 'severity': 'minor', 'category': 'cat',
             'description': 'd', 'suggested_action': 'a', 'task_id': '1', 'flag_type': 'f',
         })
         assert 'finding_id' in add_result
@@ -357,7 +357,7 @@ class TestStartReportResultIsUnambiguous:
 
 
 # ---------------------------------------------------------------------------
-# step-5: the _active pointer must never be stolen by a stray repeat call
+# step-5: the active-stage pointer must never be stolen by a stray repeat call
 # naming an earlier stage, but MUST be repaired when the run has no active
 # stage at all — RED (repair half) until step-6.
 # ---------------------------------------------------------------------------
@@ -370,7 +370,7 @@ class _CountingStore:
     behaves exactly like the real thing (readback via load_all reflects
     every write) — only upsert_many is instrumented, since that is the
     write call under test: a pure no-op repeat start_report must trigger
-    ZERO of them, while the _active-repair repeat path must trigger
+    ZERO of them, while the active-stage repair repeat path must trigger
     exactly one. Mirrors the _TripwireStore shape at
     test_recon_report_store.py:896-931, counting instead of raising.
     """
@@ -399,8 +399,13 @@ class _CountingStore:
         return self._inner.load_all()
 
 
+def _active_stage(state, run_id):
+    run_index = state.run_index(run_id)
+    return None if run_index is None else run_index.active_stage
+
+
 class TestStartReportActivePointerAndPersistence:
-    """_active pointer semantics and store side-effects of a repeat call."""
+    """Active-stage pointer semantics and store side-effects of a repeat call."""
 
     def _make_state(self):
         from fused_memory.server.recon_report import ReconReportState
@@ -412,24 +417,24 @@ class TestStartReportActivePointerAndPersistence:
         state, _t = self._make_state()
         state.start_report(run_id='r1', stage='stage_one', project_id='dark_factory')
         finding_one = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d1',
+            run_id='r1', severity='minor', category='cat', description='d1',
             suggested_action='a', task_id='1', flag_type='f',
         )
         assert 'finding_id' in finding_one, finding_one
         state.complete('r1', 'stage one summary')
 
         state.start_report(run_id='r1', stage='stage_two', project_id='dark_factory')
-        assert state._active['r1'] == 'stage_two'
+        assert _active_stage(state, 'r1') == 'stage_two'
 
         before = state.get_assembled_report('r1', 'stage_one')
 
         # Stray repeat call naming the EARLIER, now-inactive stage.
         result = state.start_report(run_id='r1', stage='stage_one', project_id='dark_factory')
         assert result['already_started'] is True
-        assert state._active['r1'] == 'stage_two'  # pointer not stolen
+        assert _active_stage(state, 'r1') == 'stage_two'  # pointer not stolen
 
         finding_two = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d2',
+            run_id='r1', severity='minor', category='cat', description='d2',
             suggested_action='a', task_id='2', flag_type='f',
         )
         assert 'finding_id' in finding_two, finding_two
@@ -442,38 +447,7 @@ class TestStartReportActivePointerAndPersistence:
 
         after = state.get_assembled_report('r1', 'stage_one')
         assert after == before  # untouched by the stray call
-
-    def test_repeat_call_repairs_missing_active_pointer(self):
-        state, _t = self._make_state()
-        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
-        finding = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d',
-            suggested_action='a', task_id='1', flag_type='f',
-        )
-        assert 'finding_id' in finding, finding
-        finding_id = finding['finding_id']
-
-        # Simulates tick() evicting the active stage, or a hydrate whose
-        # persisted rows carried no is_active=True row for this run.
-        del state._active['r1']
-        blocked = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d2',
-            suggested_action='a', task_id='2', flag_type='f',
-        )
-        assert blocked == {'error': 'run_id_unknown', 'error_type': 'ReconReportRunUnknown'}
-
-        result = state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
-        assert result['already_started'] is True
-        assert state._active['r1'] == 's1'  # pointer restored
-
-        resumed = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d3',
-            suggested_action='a', task_id='3', flag_type='f',
-        )
-        assert 'finding_id' in resumed, resumed
-        # Lands in the SAME preserved entry — earlier finding still present.
-        entry = state._state[('r1', 's1')]
-        assert {f.finding_id for f in entry.findings} == {finding_id, resumed['finding_id']}
+        assert state.violations() == []
 
     def test_pure_noop_repeat_triggers_zero_store_writes(self, tmp_path):
         from fused_memory.server.recon_report import ReconReportState
@@ -487,7 +461,7 @@ class TestStartReportActivePointerAndPersistence:
             state = ReconReportState(ttl_seconds=300, clock=lambda: t[0], store=store)
             state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
             state.add_finding(
-                run_id='r1', severity='low', category='cat', description='d',
+                run_id='r1', severity='minor', category='cat', description='d',
                 suggested_action='a', task_id='1', flag_type='f',
             )
             calls_before = store.upsert_many_calls
@@ -513,10 +487,15 @@ class TestStartReportActivePointerAndPersistence:
             state = ReconReportState(ttl_seconds=300, clock=lambda: t[0], store=store)
             state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
             state.add_finding(
-                run_id='r1', severity='low', category='cat', description='d',
+                run_id='r1', severity='minor', category='cat', description='d',
                 suggested_action='a', task_id='1', flag_type='f',
             )
-            del state._active['r1']
+            # Complete and evict the ACTIVE stage while in-progress s1 stays.
+            state.start_report(run_id='r1', stage='s2', project_id='dark_factory')
+            state.complete('r1', 's2 summary')
+            t[0] = 301.0
+            assert state.tick() == 1
+            assert _active_stage(state, 'r1') is None
             calls_before = store.upsert_many_calls
 
             result = state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
@@ -529,12 +508,12 @@ class TestStartReportActivePointerAndPersistence:
             ]
             assert len(rows) == 1
             assert rows[0]['is_active'] is True
+            assert state.violations() == []
         finally:
             real_store.close()
 
     def test_repeat_call_repairs_pointer_dropped_by_tick_eviction(self):
-        """Organic producer #1 of the missing-pointer state (the tests above
-        manufacture it via `del state._active[...]`): `tick()` itself drops
+        """Organic producer #1 of the missing-pointer state: `tick()` drops
         the pointer when the run's ACTIVE stage is the one that evicts,
         while an in-progress SIBLING entry of the same run survives — the
         scenario the docstring's repair-rationale paragraph cites.
@@ -542,7 +521,7 @@ class TestStartReportActivePointerAndPersistence:
         state, t = self._make_state()
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         finding = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d',
+            run_id='r1', severity='minor', category='cat', description='d',
             suggested_action='a', task_id='1', flag_type='f',
         )
         assert 'finding_id' in finding, finding
@@ -550,45 +529,46 @@ class TestStartReportActivePointerAndPersistence:
 
         # s2 becomes active; s1 stays resident and in-progress (immortal).
         state.start_report(run_id='r1', stage='s2', project_id='dark_factory')
-        assert state._active['r1'] == 's2'
+        assert _active_stage(state, 'r1') == 's2'
 
-        # complete() resolves via _active — completes s2, not s1.
+        # complete() resolves via the active stage — completes s2, not s1.
         state.complete('r1', 's2 summary')
-        assert state._active['r1'] == 's2'
+        assert _active_stage(state, 'r1') == 's2'
 
         t[0] = 301.0  # past TTL for s2's completed_at (0.0)
         evicted = state.tick()
         assert evicted == 1  # only s2 (completed); s1 is immortal in-progress
         assert ('r1', 's2') not in state._state
         assert ('r1', 's1') in state._state  # sibling survives
-        assert 'r1' not in state._active  # tick() cleared the pointer it owned
+        assert _active_stage(state, 'r1') is None  # tick() cleared the pointer it owned
 
         blocked = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d2',
+            run_id='r1', severity='minor', category='cat', description='d2',
             suggested_action='a', task_id='2', flag_type='f',
         )
         assert blocked == {'error': 'run_id_unknown', 'error_type': 'ReconReportRunUnknown'}
 
         result = state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         assert result['already_started'] is True
-        assert state._active['r1'] == 's1'  # pointer restored onto the surviving sibling
+        assert _active_stage(state, 'r1') == 's1'  # pointer restored onto the surviving sibling
 
         resumed = state.add_finding(
-            run_id='r1', severity='low', category='cat', description='d3',
+            run_id='r1', severity='minor', category='cat', description='d3',
             suggested_action='a', task_id='3', flag_type='f',
         )
         assert 'finding_id' in resumed, resumed
         entry = state._state[('r1', 's1')]
         assert {f.finding_id for f in entry.findings} == {finding_id, resumed['finding_id']}
+        assert state.violations() == []
 
     def test_repeat_call_repairs_pointer_missing_after_hydrate_with_no_active_row(self, tmp_path):
-        """Organic producer #2: `hydrate_from_store()` only sets `_active`
+        """Organic producer #2: `hydrate_from_store()` only activates a stage
         for a row persisted with `is_active=True`. A run whose persisted
         rows carry no such row (e.g. because the pointer was already
-        missing at the last `_persist_run` for that run) hydrates with
-        `_state` populated but `_active` unset for that run_id — a second,
-        independent real-world path into the same repair branch as the
-        tick()-eviction producer above.
+        missing at the last `_persist_run` for that run) hydrates with its
+        entries resident but no active stage — a second, independent
+        real-world path into the same repair branch as the tick()-eviction
+        producer above.
         """
         from fused_memory.server.recon_report import ReconReportState
         from fused_memory.server.recon_report_store import ReconReportStore
@@ -600,44 +580,54 @@ class TestStartReportActivePointerAndPersistence:
             state = ReconReportState(ttl_seconds=300, clock=lambda: t[0], store=store)
             state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
             finding = state.add_finding(
-                run_id='r1', severity='low', category='cat', description='d',
+                run_id='r1', severity='minor', category='cat', description='d',
                 suggested_action='a', task_id='1', flag_type='f',
             )
             assert 'finding_id' in finding, finding
             finding_id = finding['finding_id']
 
-            # Drop the pointer and persist through it, so the STORE row
-            # itself carries is_active=False for every (r1, *) row.
-            del state._active['r1']
-            state._persist_run('r1')
+            # Re-upsert every persisted row with is_active=False, so the
+            # STORE carries no active row for r1.
+            for row in store.load_all():
+                if row['run_id'] == 'r1':
+                    store.upsert_entry(
+                        run_id=row['run_id'],
+                        stage=row['stage'],
+                        project_id=row['project_id'],
+                        is_active=False,
+                        entry_json=row['entry_json'],
+                        updated_at=row['updated_at'],
+                    )
 
             rows = [r for r in store.load_all() if r['run_id'] == 'r1']
             assert rows and all(not r['is_active'] for r in rows)
 
-            # A FRESH state hydrating from that store never sets _active['r1'].
+            # A FRESH state hydrating from that store activates no stage of r1.
             t2 = [0.0]
             fresh_state = ReconReportState(ttl_seconds=300, clock=lambda: t2[0], store=store)
             fresh_state.hydrate_from_store()
             assert ('r1', 's1') in fresh_state._state
-            assert 'r1' not in fresh_state._active
+            assert _active_stage(fresh_state, 'r1') is None
+            assert fresh_state.violations() == []
 
             blocked = fresh_state.add_finding(
-                run_id='r1', severity='low', category='cat', description='d2',
+                run_id='r1', severity='minor', category='cat', description='d2',
                 suggested_action='a', task_id='2', flag_type='f',
             )
             assert blocked == {'error': 'run_id_unknown', 'error_type': 'ReconReportRunUnknown'}
 
             result = fresh_state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
             assert result['already_started'] is True
-            assert fresh_state._active['r1'] == 's1'
+            assert _active_stage(fresh_state, 'r1') == 's1'
 
             resumed = fresh_state.add_finding(
-                run_id='r1', severity='low', category='cat', description='d3',
+                run_id='r1', severity='minor', category='cat', description='d3',
                 suggested_action='a', task_id='3', flag_type='f',
             )
             assert 'finding_id' in resumed, resumed
             entry = fresh_state._state[('r1', 's1')]
             assert {f.finding_id for f in entry.findings} == {finding_id, resumed['finding_id']}
+            assert fresh_state.violations() == []
         finally:
             store.close()
 
@@ -650,7 +640,7 @@ class TestStartReportActivePointerAndPersistence:
         start_report's docstring), not a regression: closing it needs a
         known-stage vocabulary the guard deliberately does not have, and is
         also where a stray call naming an evicted-but-still-active-pointer
-        stage could steal `_active` from a live sibling stage (out of scope
+        stage could steal the active stage from a live sibling stage (out of scope
         here; tracked in the docstring).
         """
         state, t = self._make_state()
@@ -660,10 +650,11 @@ class TestStartReportActivePointerAndPersistence:
         evicted = state.tick()
         assert evicted == 1
         assert ('r1', 's1') not in state._state
-        assert 'r1' not in state._active
+        assert _active_stage(state, 'r1') is None
 
         result = state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         assert result['already_started'] is False
+        assert state.violations() == []
 
 
 # ---------------------------------------------------------------------------
@@ -676,7 +667,7 @@ _KNOWN_STAGES = frozenset({'memory_consolidator', 'task_knowledge_sync', 'integr
 
 def _file_finding(state, run_id, description):
     result = state.add_finding(
-        run_id=run_id, severity='low', category='cat', description=description,
+        run_id=run_id, severity='minor', category='cat', description=description,
         suggested_action='a', task_id=description, flag_type='f',
     )
     assert 'finding_id' in result, result

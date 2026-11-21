@@ -31,7 +31,7 @@ import re
 import time
 from collections.abc import Callable, Iterable, Sequence
 
-from shared.storm_counter import StormCounter
+from shared.storm_counter import KeyedStormCounters
 
 from fused_memory.memory_metadata import MetadataViolation
 from fused_memory.middleware._folded_escalation import file_folded_escalation
@@ -104,10 +104,10 @@ def emit_schema_warnings(
 # The storm detector
 # ---------------------------------------------------------------------------
 
-#: Records between stale-writer sweeps (see
-#: :meth:`UnknownKeyStormDetector._evict_silent_writers`).  Sized so the
+#: Recorded events between stale-writer sweeps (the sweep itself is
+#: ``shared/src/shared/storm_counter.py::KeyedStormCounters``).  Sized so the
 #: O(writers) sweep is negligible against the write path while still bounding
-#: the dict long before it is large enough to matter.
+#: the registry long before it is large enough to matter.
 DEFAULT_SWEEP_EVERY = 256
 
 
@@ -126,19 +126,16 @@ class UnknownKeyStormDetector:
 
     Instance state is process-lifetime: ``MemoryService`` constructs one in
     ``__init__`` so counts survive across writes but never leak between
-    processes.  Because it IS process-lifetime, the per-writer state is
-    swept — see :meth:`_evict_silent_writers`; without that, a long-running
-    MCP server accumulates one entry per distinct writer forever.
+    processes.  Because it IS process-lifetime, silent writers are swept
+    (:attr:`tracked_writers`); without that, a long-running MCP server
+    accumulates one entry per distinct writer forever.
 
-    Each writer's window IS a
-    :class:`shared.storm_counter.StormCounter` in ``fire_mode='latched'``
-    (task 4519, INV-5).  The rolling-window body this class used to hand-roll
-    — append, half-open prune, count, compare to the threshold, latch — has
-    one home, and this is one of its consumers rather than a copy of it.  The
-    per-writer KEYING stays here because it is this class's own contract, and
-    is the established one-counter-per-key shape
-    (``shared/mcp_markup_middleware.py::MarkupGuardMiddleware._record_storm``,
-    ``services/memory_service.py``'s ``_mem0_update_storm_counters``).
+    The per-writer keying and sweep ARE
+    :class:`shared.storm_counter.KeyedStormCounters` in ``fire_mode='latched'``
+    (tasks 4519 and 5102, INV-5).  This class owns only the writer key, the
+    multi-key call, and the crossing-is-the-event contract.  Evicting a
+    drained writer clears its latch by deleting the counter that holds it,
+    which ``StormCounter.prune``'s licence makes behaviour-preserving.
     """
 
     def __init__(
@@ -152,17 +149,21 @@ class UnknownKeyStormDetector:
         self._threshold = threshold
         self._window_seconds = window_seconds
         self._time_fn = time_fn
-        #: One latched ``StormCounter`` per writer, built lazily on that
-        #: writer's first warn.  The latch — "fire on the crossing, re-arm
-        #: when the window drains" — lives INSIDE each counter, so evicting a
-        #: dormant writer clears it structurally rather than by remembering to
-        #: reset a parallel set (see :meth:`_evict_silent_writers`).
-        self._warns: dict[tuple[str, str], StormCounter] = {}
-        #: Amortization counter for the stale-writer sweep.  Injectable for
-        #: the same reason ``time_fn`` is: so the eviction contract is
-        #: testable without issuing ``DEFAULT_SWEEP_EVERY`` records.
-        self._sweep_every = sweep_every
-        self._records_since_sweep = 0
+        # ``sweep_every`` is injectable for the reason ``time_fn`` is: so the
+        # eviction contract is testable without DEFAULT_SWEEP_EVERY records.
+        self._warns: KeyedStormCounters[tuple[str, str]] = KeyedStormCounters(
+            fire_mode='latched', sweep_every=sweep_every
+        )
+
+    @property
+    def tracked_writers(self) -> frozenset[tuple[str, str]]:
+        """The ``(project_id, agent_id)`` writers currently holding a window.
+
+        ``agent_id`` is free-form per-task text, so evicting silent writers is
+        a real memory bound and belongs in the interface, as
+        ``BoundaryStormEscape.tracked_keys`` argues.
+        """
+        return self._warns.tracked_keys
 
     def record(
         self, project_id: str, agent_id: str | None, keys: Iterable[str]
@@ -185,12 +186,13 @@ class UnknownKeyStormDetector:
 
         The call's instant is resolved ONCE from ``time_fn`` and threaded
         through every per-key
-        :meth:`~shared.storm_counter.StormCounter.record` as its ``now=``,
-        because the body this replaced computed a single ``cutoff`` for the
-        whole call: a shared instant keeps every key in a call landing in the
-        same window.  (It is a local, not a parameter of this method — the
-        ``*name*`` emphasis in this file is reserved for real arguments, as it
-        is on :meth:`~shared.storm_counter.StormCounter.record` itself.)
+        :meth:`~shared.storm_counter.KeyedStormCounters.record` as its
+        ``now=``, because the body this replaced computed a single ``cutoff``
+        for the whole call: a shared instant keeps every key in a call landing
+        in the same window, and ages the sweep against that same instant.
+        (It is a local, not a parameter of this method — the ``*name*``
+        emphasis in this file is reserved for real arguments, as it is on
+        :meth:`~shared.storm_counter.StormCounter.record` itself.)
         """
         new_keys = list(keys)
         if not new_keys:
@@ -198,67 +200,20 @@ class UnknownKeyStormDetector:
 
         writer = (project_id, agent_id if agent_id else UNSET_AGENT_ID)
         now = self._time_fn()
-        counter = self._warns.get(writer)
-        if counter is None:
-            counter = StormCounter(time_provider=self._time_fn, fire_mode='latched')
-            self._warns[writer] = counter
 
-        # An explicit loop, never ``any(counter.record(...) for ...)``: a
+        # An explicit loop, never ``any(self._warns.record(...) for ...)``: a
         # generator short-circuits on the first fire and would skip the
         # remaining keys, silently under-counting a multi-key burst.
         crossed = False
         for _ in new_keys:
-            summary = counter.record(
+            summary = self._warns.record(
+                writer,
                 threshold=self._threshold,
                 window_seconds=self._window_seconds,
                 now=now,
             )
             crossed = crossed or summary is not None
-
-        self._records_since_sweep += 1
-        if self._records_since_sweep >= self._sweep_every:
-            self._records_since_sweep = 0
-            self._evict_silent_writers(now)
-
         return crossed
-
-    def _evict_silent_writers(self, now: float) -> None:
-        """Drop every writer whose entire window has aged out, as of *now*.
-
-        Stale events inside a writer's counter are pruned only when that SAME
-        writer records again, so a writer that falls silent otherwise leaves
-        its dict entry — plus a window's worth of state — behind for the life
-        of the process.  ``agent_id`` is free-form per-task text in this fleet
-        (``claude-task-3195``, ``recon-stage-2``, ``claude-interactive``,
-        ...), so that key space is effectively unbounded and the residue grows
-        without limit in a long-lived MCP server.  This sweep is what bounds
-        it.
-
-        Amortized over ``sweep_every`` records rather than run per record:
-        the sweep is O(writers) while the leak is slow, so paying it on every
-        write would tax the hot path to fix a problem that only exists in
-        aggregate.  Note the writer that triggered the sweep can never be
-        evicted by it — its counter was recorded at ``now`` immediately above,
-        so :meth:`~shared.storm_counter.StormCounter.prune` cannot report it
-        empty.
-
-        Dropping the counter OBJECT is what now clears that writer's latch,
-        and the documented re-arm semantics are structural rather than a
-        separate ``discard`` a future edit could forget: a writer whose window
-        has fully drained is no longer over the line, so a later recurrence is
-        heard again.  ``StormCounter.prune``'s docstring carries the licence —
-        an empty window is below any threshold ``>= 1``, so a reconstructed
-        counter cannot decide differently from the one it replaced (pinned by
-        ``shared/tests/test_storm_counter.py::TestLatchedState::
-        test_a_latched_drained_counter_decides_like_a_fresh_one``).
-        """
-        stale = [
-            writer
-            for writer, counter in self._warns.items()
-            if counter.prune(self._window_seconds, now=now) == 0
-        ]
-        for writer in stale:
-            del self._warns[writer]
 
 
 # ---------------------------------------------------------------------------

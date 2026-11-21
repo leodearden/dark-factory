@@ -35,7 +35,7 @@ TEMPLATES_DIR="$REPO_ROOT/scripts"                             # legibility-tran
 
 # Interpreter prefix: INSTALL_TRANSCRIPT_CHECK_TIMER_PYTHON overrides the
 # default `uv run` invocation (tests inject sys.executable to drive
-# nightly.py's resolve-config directly, without uv/--frozen). Built as an
+# nightly.py's resolve-config directly, without uv). Built as an
 # array so the default branch keeps "$REPO_ROOT/shared" as a single argv
 # token -- space-safe -- mirrors install-trickle-timer.sh's
 # INSTALL_TRICKLE_TIMER_PYTHON override.
@@ -43,7 +43,7 @@ if [ -n "${INSTALL_TRANSCRIPT_CHECK_TIMER_PYTHON:-}" ]; then
     # shellcheck disable=SC2206
     PYTHON_CMD=($INSTALL_TRANSCRIPT_CHECK_TIMER_PYTHON)
 else
-    PYTHON_CMD=(uv run --frozen --project "$REPO_ROOT/shared" python3)
+    PYTHON_CMD=(uv run --no-sync --project "$REPO_ROOT/shared" python3)
 fi
 
 echo "install-transcript-check-timer.sh: resolving legibility.yaml for project_id=${PROJECT_ID}..."
