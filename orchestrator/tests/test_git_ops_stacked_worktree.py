@@ -44,9 +44,14 @@ from orchestrator.branch_stack import (
     StackRecordState,
     StackTarget,
 )
-from orchestrator.git_ops import GitOps, StackRecordUnconfirmed, _run
+from orchestrator.git_ops import (
+    GitOps,
+    StackRecordUnconfirmed,
+    TrainMembership,
+    _run,
+)
 
-_TRAIN_SUCCESSOR = {'id': 'T', 'order': 1, 'members': ['P', 'M']}
+_TRAIN_SUCCESSOR: TrainMembership = {'id': 'T', 'order': 1, 'members': ['P', 'M']}
 
 
 @dataclass(frozen=True)
