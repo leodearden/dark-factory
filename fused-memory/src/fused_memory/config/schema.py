@@ -706,6 +706,20 @@ class TaskMetadataConfig(BaseModel):
     )
 
 
+class FollowupHoldConfig(BaseModel):
+    """The follow-up hold (plans/follow-up-filing-shape-prd.md §3 decision 12)."""
+
+    backfill_enabled: bool = Field(
+        default=True,
+        description=(
+            'RESTART-ONLY: when True, each fused-memory start holds every pending '
+            'follow-up the hold rule matches behind its project\'s holder, once per '
+            'known project, before the server serves (server/main.py::'
+            'backfill_followup_holds_at_startup). A second start adds nothing.'
+        ),
+    )
+
+
 # --- Mem0 metadata write-boundary validation (task 3195, leaf β) ---
 
 _RETIRED_MEMORY_METADATA_KEYS: frozenset[str] = frozenset({'enforce_kind_registry'})
@@ -3878,6 +3892,7 @@ class FusedMemoryConfig(BaseSettings):
     )
     taskmaster: TaskmasterConfig | None = Field(default=None)
     task_metadata: TaskMetadataConfig = Field(default_factory=TaskMetadataConfig)
+    followup_hold: FollowupHoldConfig = Field(default_factory=FollowupHoldConfig)
     memory_metadata: MemoryMetadataConfig = Field(default_factory=MemoryMetadataConfig)
     task_status: TaskStatusConfig = Field(default_factory=TaskStatusConfig)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)

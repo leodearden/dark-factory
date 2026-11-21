@@ -954,6 +954,7 @@ async def test_set_task_status_accepts_merge_deferred(
         deferral=None,
         expected_stamped_at=None,
         restamp_only=False,
+        release_holder=False,
     )
 
 
