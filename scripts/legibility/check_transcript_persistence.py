@@ -8,8 +8,9 @@ Cross-checks fleet session-registry records
 spawn-launched interactive session — a record WITH a substantive prompt, a
 terminal status, and a ``start_ts`` inside a lookback window — produced no
 plausibly-matching transcript. This is the detector for the transcript-loss
-regression (a suppressed session-persistence path), NOT the preventer: the
-``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`` fix lands separately. Shipping
+regression (a suppressed session-persistence path), NOT the preventer: that
+is ``skills/spawn/spawn-claude.sh``'s unconditional
+``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`` export. Shipping
 the detector means any future silent transcript-loss regression is caught in
 ~a day of the nightly probe.
 
@@ -18,7 +19,7 @@ Natural home: ``scripts/legibility/`` alongside ``check_trickle_liveness.sh``
 a ``__main__`` sys.path self-bootstrap, dependency-injection seams, and a
 ``main() -> exit-code`` CLI a systemd/watcher probe can surface.
 
-Registry enumeration composes existing public ``session_registry`` helpers
+Registry enumeration composes existing public ``session_records`` helpers
 (``sessions_dir`` + ``read_record``, skipping missing/corrupt like the
 reapers) rather than adding an iterator to that heavily-tested orchestrator
 contract file — see the plan's design decisions.
@@ -50,7 +51,7 @@ if __name__ == '__main__':
 
 from legibility import alarm, config, detectors, inventory  # noqa: E402  # debt: task 6760
 
-from orchestrator import session_registry  # noqa: E402
+from orchestrator import session_records
 
 logger = logging.getLogger('legibility.check_transcript_persistence')
 
@@ -66,10 +67,9 @@ DEFAULT_PROJECTS_ROOT = Path.home() / '.claude' / 'projects'
 Injected in tests so the real ``~/.claude`` tree is never touched."""
 
 DEFAULT_SPAWN_SCRIPT = Path(__file__).resolve().parents[2] / 'skills' / 'spawn' / 'spawn-claude.sh'
-"""Default spawn script the ``--check-preventer`` guard reads. Tests always
-pass an explicit ``spawn_script_path`` fixture — never the real committed file
-(which does not carry the ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` token on
-this branch; the preventer lands separately)."""
+"""Spawn script the ``--check-preventer`` guard reads: the dark-factory
+checkout's ``skills/spawn/spawn-claude.sh``, whatever project ``--project-id``
+names."""
 
 PREFIX_LEN = 200
 """Number of leading prompt characters used as the strong-match needle. A
@@ -88,10 +88,10 @@ matching falls back to the WEAK file-mtime time window instead."""
 
 def iter_registry_records(
     fleet_root: Path | str | None = None,
-) -> Iterator[session_registry.SessionRecord]:
+) -> Iterator[session_records.SessionRecord]:
     """Yield every readable ``SessionRecord`` under the fleet registry.
 
-    Composes ``session_registry.sessions_dir(fleet_root).iterdir()`` +
+    Composes ``session_records.sessions_dir(fleet_root).iterdir()`` +
     ``read_record`` in sorted (directory-name) order, skipping a slug dir
     whose ``record.json`` is missing (``FileNotFoundError``) or unparseable
     (``CorruptSessionRecord``) — the same tolerate-missing/corrupt idiom
@@ -99,15 +99,15 @@ def iter_registry_records(
     (default ``None`` -> real ``~/.claude/fleet``), so tests never touch the
     real tree. Yields nothing when the sessions dir does not exist.
     """
-    base = session_registry.sessions_dir(fleet_root)
+    base = session_records.sessions_dir(fleet_root)
     if not base.is_dir():
         return
     for slug_dir in sorted(base.iterdir()):
         if not slug_dir.is_dir():
             continue
         try:
-            record = session_registry.read_record(slug_dir.name, root=fleet_root)
-        except (FileNotFoundError, session_registry.CorruptSessionRecord):
+            record = session_records.read_record(slug_dir.name, root=fleet_root)
+        except (FileNotFoundError, session_records.CorruptSessionRecord):
             continue
         yield record
 
@@ -131,11 +131,11 @@ def _parse_start_ts(value: str | None) -> datetime | None:
 
 
 def find_completed_spawn_records(
-    records: Iterable[session_registry.SessionRecord],
+    records: Iterable[session_records.SessionRecord],
     *,
     now: datetime,
     lookback: timedelta,
-) -> list[session_registry.SessionRecord]:
+) -> list[session_records.SessionRecord]:
     """Filter *records* to COMPLETED spawn sessions worth checking.
 
     Keeps a record iff ALL hold:
@@ -151,11 +151,11 @@ def find_completed_spawn_records(
     unparseable ``start_ts``) are skipped defensively.
     """
     window_start = now - lookback
-    kept: list[session_registry.SessionRecord] = []
+    kept: list[session_records.SessionRecord] = []
     for record in records:
         if not record.prompt or not record.prompt.strip():
             continue
-        if record.status not in session_registry.TERMINAL_STATUSES:
+        if record.status not in session_records.TERMINAL_STATUSES:
             continue
         start = _parse_start_ts(record.start_ts)
         if start is None:
@@ -248,7 +248,7 @@ def _typed_slash_command(text: str) -> str | None:
 
 
 def find_matching_transcript(
-    record: session_registry.SessionRecord,
+    record: session_records.SessionRecord,
     projects_root: Path | str,
     *,
     now: datetime,
@@ -302,7 +302,7 @@ def find_matching_transcript(
     return _match_mtime_window(record.start_ts, candidates, now=now, skew=skew)
 
 
-def _bound_session_ids(record: session_registry.SessionRecord) -> tuple[str, ...]:
+def _bound_session_ids(record: session_records.SessionRecord) -> tuple[str, ...]:
     """Return *record*'s usable bound Claude Code session ids, current then launch; empty means unbound.
 
     Each id becomes a filename inside the expected dir, so one that is not a
@@ -417,7 +417,7 @@ class MissingTranscript:
 
 
 def find_missing_transcripts(
-    records: Iterable[session_registry.SessionRecord],
+    records: Iterable[session_records.SessionRecord],
     projects_root: Path | str,
     cwd_prefixes: Sequence[str],
     *,
@@ -504,8 +504,8 @@ def payload_exports_force_persistence(script_text: str) -> bool:
     """Return True iff *script_text* sets ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1``.
 
     A PURE function over the script text — the detector's opt-in
-    (``--check-preventer``) guard that the separately-landing preventer is in
-    place. False when the token is absent or explicitly set to ``0``. Never
+    (``--check-preventer``) guard that spawn-claude.sh's preventer export is
+    in place. False when the token is absent or explicitly set to ``0``. Never
     reads the real committed ``spawn-claude.sh``; callers pass its text in.
     """
     return bool(_FORCE_PERSISTENCE_RE.search(script_text))

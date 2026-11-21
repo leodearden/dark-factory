@@ -19,6 +19,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 SCRIPT = SCRIPTS_DIR / 'install-transcript-secret-sweep-timer.sh'
 WRAPPER = SCRIPTS_DIR / 'transcript-secret-sweep.sh'
@@ -275,36 +280,59 @@ sys.exit(int(os.environ.get("FAKE_SWEEP_RC", "0")))
 '''
 
 
-def _run_wrapper(tmp_path: Path, **env: str) -> tuple[subprocess.CompletedProcess[str], dict]:
-    repo = tmp_path / 'repo'
-    repo.mkdir(exist_ok=True)
-    (repo / '.env').write_text(f'{_FAKE_POOL_VAR}=fake-wrapper-token-' + 'w' * 30 + '\n')
+def _recorder(tmp_path: Path) -> Path:
     recorder = tmp_path / 'fake-sweep'
     recorder.write_text(_RECORDER_SRC)
     recorder.chmod(0o755)
+    return recorder
+
+
+def _run_wrapper(
+    tmp_path: Path, *args: str, **env: str | None
+) -> tuple[subprocess.CompletedProcess[str], dict | None]:
+    """Run the wrapper over a tmp repo, forwarding *args*; an *env* value of None removes that key. The record is
+    None if never written."""
+    repo = tmp_path / 'repo'
+    repo.mkdir(exist_ok=True)
+    (repo / '.env').write_text(f'{_FAKE_POOL_VAR}=fake-wrapper-token-' + 'w' * 30 + '\n')
     record = tmp_path / 'sweep-record.json'
-    full_env = {
+    merged = {
         **{k: v for k, v in os.environ.items() if k != _FAKE_POOL_VAR},
         'REPO': str(repo),
-        'TRANSCRIPT_SECRET_SWEEP_CMD': str(recorder),
+        'TRANSCRIPT_SECRET_SWEEP_CMD': str(_recorder(tmp_path)),
         'FAKE_SWEEP_RECORD': str(record),
         **env,
     }
-    completed = subprocess.run(['bash', str(WRAPPER)], env=full_env, capture_output=True, text=True, timeout=60)
-    return completed, json.loads(record.read_text())
+    full_env = {k: v for k, v in merged.items() if v is not None}
+    completed = subprocess.run(
+        ['bash', str(WRAPPER), *args], env=full_env, capture_output=True, text=True, timeout=60,
+    )
+    return completed, json.loads(record.read_text()) if record.exists() else None
 
 
 def test_the_wrapper_runs_the_sweep_from_its_repo(tmp_path):
     completed, recorded = _run_wrapper(tmp_path)
 
     assert completed.returncode == 0, completed.stderr
+    assert recorded is not None, completed.stderr
     assert recorded['argv'] == [f'{tmp_path / "repo"}/scripts/transcript_secret_sweep.py']
+
+
+def test_the_wrapper_forwards_its_arguments(tmp_path):
+    completed, recorded = _run_wrapper(tmp_path, '--dry-run', '--host-configs-dir', '/x')
+
+    assert completed.returncode == 0, completed.stderr
+    assert recorded is not None, completed.stderr
+    assert recorded['argv'] == [
+        f'{tmp_path / "repo"}/scripts/transcript_secret_sweep.py', '--dry-run', '--host-configs-dir', '/x',
+    ]
 
 
 def test_the_wrapper_sources_the_repo_env_so_the_sweep_sees_live_values(tmp_path):
     completed, recorded = _run_wrapper(tmp_path)
 
     assert completed.returncode == 0, completed.stderr
+    assert recorded is not None, completed.stderr
     assert recorded['saw_pool_var'] is True
     assert 'fake-wrapper-token' not in completed.stdout + completed.stderr
 
@@ -314,3 +342,29 @@ def test_a_failed_sweep_is_narrated_and_still_exits_zero(tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     assert 'sweep=2' in completed.stdout + completed.stderr
+
+
+def test_the_default_prefix_runs_the_resolved_uv(tmp_path):
+    repo = tmp_path / 'repo'
+
+    completed, recorded = _run_wrapper(
+        tmp_path, TRANSCRIPT_SECRET_SWEEP_CMD=None, UV_BIN=str(_recorder(tmp_path)), PATH='/usr/bin:/bin',
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert recorded is not None, completed.stderr
+    assert recorded['argv'] == [
+        'run', '--no-sync', '--project', f'{repo}/shared', 'python', f'{repo}/scripts/transcript_secret_sweep.py',
+    ]
+
+
+def test_an_unexecutable_uv_pin_is_narrated_and_still_exits_zero(tmp_path):
+    completed, recorded = _run_wrapper(
+        tmp_path, TRANSCRIPT_SECRET_SWEEP_CMD=None, UV_BIN=str(tmp_path / 'no-such-uv'), PATH='/usr/bin:/bin',
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert recorded is None
+    assert 'UV_BIN' in completed.stderr
+    assert 'ERROR' in completed.stderr
+    assert 'sweep=127' in completed.stdout + completed.stderr

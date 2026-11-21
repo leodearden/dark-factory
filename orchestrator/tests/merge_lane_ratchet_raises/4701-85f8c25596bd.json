@@ -1,0 +1,18 @@
+{
+  "task_id": "4701",
+  "reason": "Net-additive work, not a refactor that failed to lower anything: orchestrator/tests/conftest.py gains the autouse _forbid_agent_cli_spawn guard, which fails any orchestrator test that starts an agent-CLI process (claude/codex/gemini/pi) at subprocess.Popen.__init__ and again at teardown, so a stale invoke_agent patch target (the task-882 incident) fails loudly instead of silently calling the real CLI. The +2 cognitive is the spawns_agent_cli marker opt-out and the teardown verdict; the guard logic itself lives in tests/_agent_cli_guard.py, outside the cluster.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/tests/conftest.py",
+      "baseline": 50,
+      "current": 52
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5003,
+      "current": 5005
+    }
+  ]
+}

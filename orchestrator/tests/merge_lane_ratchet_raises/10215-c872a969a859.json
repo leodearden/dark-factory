@@ -1,0 +1,18 @@
+{
+  "task_id": "10215",
+  "reason": "net-additive (review amendment, PRD one-merge-request-per-task leaf A): classify_content now refuses a tip that is not a full 40-hex sha, because SAME is string equality and a ref name or abbreviated sha naming the old tip would read OLDER; the moved git-read helpers (landing_evidence.py -> merge_lane/git_read.py) are measure-neutral",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/content_relation.py",
+      "baseline": 6,
+      "current": 7
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5314,
+      "current": 5315
+    }
+  ]
+}

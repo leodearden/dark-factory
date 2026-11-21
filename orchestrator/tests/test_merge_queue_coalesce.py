@@ -27,13 +27,14 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _live_merge_worker import (
     REAL_GIT_MERGE_RESULT_TIMEOUT,
     REAL_GIT_TRAIN_MAX_WALL_S,
     REAL_GIT_TRAIN_TIMEOUT,
     running_merge_worker,
 )
-from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until
+from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until, lane_scene_config
 from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.merge_lane.landing_evidence import LandingEvidenceVerdict
@@ -66,17 +67,9 @@ class TestConfigAndEventType:
         """
         import tempfile
 
-        from orchestrator.config import GitConfig, OrchestratorConfig
+        from orchestrator.config import OrchestratorConfig
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = OrchestratorConfig(
-                project_root=Path(tmp),
-                git=GitConfig(
-                    main_branch='main',
-                    branch_prefix='task/',
-                    remote='origin',
-                    worktree_dir='.worktrees',
-                ),
-            )
+            cfg = OrchestratorConfig(project_root=Path(tmp))
             assert cfg.merge_train_coalesce_enabled is False
 
     def test_event_type_train_coalesced(self):
@@ -88,10 +81,10 @@ class TestConfigAndEventType:
 # ─── helpers shared across steps ────────────────────────────────────────────
 
 def _make_config(tmp_path: Path, *, coalesce_enabled: bool = False) -> OrchestratorConfig:
-    from orchestrator.config import GitConfig, OrchestratorConfig
-    return OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
+    from orchestrator.config import GitConfig
+    return lane_scene_config(
+        tmp_path,
+        GitConfig(
             main_branch='main',
             branch_prefix='task/',
             remote='origin',
@@ -248,22 +241,9 @@ class TestNoOpGuards:
 
 # ─── git repo fixtures ───────────────────────────────────────────────────────
 
-async def _setup_repo(repo: Path) -> None:
-    from orchestrator.git_ops import _run
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -286,8 +266,7 @@ def git_ops(git_config, git_repo: Path):
 
 @pytest.fixture
 def config(git_repo: Path, git_config) -> OrchestratorConfig:
-    from orchestrator.config import OrchestratorConfig
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 @pytest.fixture
@@ -299,10 +278,10 @@ def coalesce_config(git_repo: Path, git_config) -> OrchestratorConfig:
     these scenes would otherwise assert trains under whatever cap the
     operational yaml (loaded via conftest's ``ORCH_CONFIG_PATH``) ships.
     """
-    from orchestrator.config import MergeDeepConfig, OrchestratorConfig
-    return OrchestratorConfig(
-        project_root=git_repo,
-        git=git_config,
+    from orchestrator.config import MergeDeepConfig
+    return lane_scene_config(
+        git_repo,
+        git_config,
         merge_train_coalesce_enabled=True,
         merge_deep=MergeDeepConfig(chain_cap=0),
     )
@@ -2956,11 +2935,11 @@ class TestCoalesceAfterHealthyMerge:
         two candidates.  That is a healthy outcome, not a lost train: every
         item lands, through the chain, and no train forms.
         """
-        from orchestrator.config import MergeDeepConfig
+        from orchestrator.config import DepthRow, MergeDeepConfig
         from orchestrator.git_ops import _run
 
         deep_config = coalesce_config.model_copy(
-            update={'merge_deep': MergeDeepConfig(chain_cap=6)},
+            update={'merge_deep': MergeDeepConfig(chain_cap=6, depth_table=[DepthRow(0.0, 6)])},
         )
         async with _healthy_burst(git_ops, deep_config, tmp_path) as burst:
             all_reqs = {'hm0': burst.warm_req, **burst.follower_reqs}

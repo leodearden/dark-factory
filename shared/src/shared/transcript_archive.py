@@ -681,7 +681,7 @@ def durable_archive_path(
       assumed, so a session archived from one worktree lane is still found
       after re-dispatch into a different lane.
     * **I-C format-agnostic** — matches both the gzipped ``.jsonl.gz`` shape
-      and the plain ``.jsonl`` shape task 3618 moves to, so the cutover needs
+      and the plain ``.jsonl`` shape task 3618 moved to, so the cutover needs
       no flag day and this locator carries no dependency on it.
     * **I-D read-only** — glob and ``stat`` only. Nothing is created, moved,
       deleted or decompressed here; *restoration* is task 3578's, under task
@@ -703,17 +703,19 @@ def durable_archive_path(
         archive_root = Path(archive_root)
         task_id = str(task_id)
         session_id = str(session_id)
-        # Two load-bearing details in this one line:
+        # Three load-bearing details in this one line:
+        #   * the task_id is joined, not globbed, so it matches literally and
+        #     only that key's own subtree is walked;
         #   * the trailing `*` on `.jsonl*` spans task 3618's gzip drop — it
-        #     matches today's `.jsonl.gz` AND tomorrow's plain `.jsonl`, so the
-        #     cutover needs no flag day and this locator no dependency on it;
+        #     matches the historical `.jsonl.gz` AND the current plain `.jsonl`,
+        #     so the cutover needed no flag day and this locator no dependency on it;
         #   * `is_file()` excludes the SUBAGENT directory, which _archive_one
-        #     names for the session itself (`<enc>/<sid>/subagents/agent-*.gz`).
+        #     names for the session itself (`<enc>/<sid>/subagents/agent-*.jsonl`).
         #     That dir carries no `.jsonl` suffix so the pattern misses it by
         #     luck today; the filter makes returning a directory as "the
         #     transcript" structurally impossible, not incidentally avoided.
         matches = [
-            p for p in archive_root.glob(f'{task_id}/*/{session_id}.jsonl*') if p.is_file()
+            p for p in (archive_root / task_id).glob(f'*/{session_id}.jsonl*') if p.is_file()
         ]
         if not matches:
             return None
@@ -747,7 +749,7 @@ def durable_archive_path(
         # GC unlinking mid-lookup), or a non-coercible id from a caller bug.
         # Each of those is a real breakage an operator should see, so silence or
         # DEBUG here would be exactly the silent degradation design-invariants
-        # INV-2/INV-4 forbid — and shared/tests/test_silent_fallthrough_gate.py
+        # INV-2/INV-4 forbid — and tests/repo_guards/test_silent_fallthrough_gate.py
         # enforces that for new code (its baseline allowlist is a burn-down
         # ratchet for pre-existing sites like _resolve_transcript_path, not a
         # hatch new code may add to). Structured extra=, matching the shape

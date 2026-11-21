@@ -1,0 +1,18 @@
+{
+  "task_id": "7836",
+  "reason": "call-site pin: harness DISCOVERY arms forward branch_base_sha; the dispatch gate has no public seam",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_already_landed_gate_wiring.py",
+      "baseline": 285,
+      "current": 286
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6439,
+      "current": 6440
+    }
+  ]
+}

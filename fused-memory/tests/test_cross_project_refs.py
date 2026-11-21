@@ -68,8 +68,6 @@ class TestFindCrossProjectTaskRefsMatches:
             # Qualifier canonicalization: hyphens -> underscores, lowercased.
             ('see Dark-Factory:2500 for context', 'dark_factory', '2500'),
             ('see DARK_FACTORY:2500 for context', 'dark_factory', '2500'),
-            # Tolerant of whitespace around the separator.
-            ('see dark_factory : 2500 for context', 'dark_factory', '2500'),
             # Start of content, and end of content with no trailing punctuation.
             ('dark_factory:2500 is the upstream', 'dark_factory', '2500'),
             ('the upstream is dark_factory:2500', 'dark_factory', '2500'),
@@ -240,7 +238,7 @@ class TestNoFalsePositives:
 
 
 class TestTaskVocabularyQualifiersAreNotProjectIds:
-    """'Task: 2500' must never be read as project 'task', task 2500.
+    """'Task:2500' must never be read as project 'task', task 2500.
 
     This is the ONE qualifier class every other narrowing provably misses, and
     the only one the consumer's decisive guard cannot make for us:
@@ -252,7 +250,7 @@ class TestTaskVocabularyQualifiersAreNotProjectIds:
     3. The allowlist is permissive by default, since no caller wires a registry.
     4. Decisively, the module docstring delegates final precision to the
        consumer, which "splits only when the episode actually touched a node
-       literally named ``Task N``". For the literal string 'Task: 2500' that
+       literally named ``Task N``". For the literal string 'Task:2500' that
        node is PRECISELY what graphiti-core's extraction produces, so the guard
        is guaranteed to CO-OCCUR rather than to filter.
 
@@ -265,15 +263,15 @@ class TestTaskVocabularyQualifiersAreNotProjectIds:
     @pytest.mark.parametrize(
         'content',
         [
-            'Task: 2500 is now done',
-            'task: 2500',
-            'task : 2500',
+            'Task:2500 is now done',
+            'task:2500',
             'TASK:2500',
-            'tasks: 2500 and 2501',
-            'Tasks : 2500',
-            'subtask: 2500',
-            'subtasks: 2500',
-            'sub-task: 2500',
+            'tasks:2500 and 2501',
+            'Tasks:2500',
+            'subtask:2500',
+            'subtasks:2500',
+            'sub-task:2500',
+            'sub-tasks:2500',
         ],
     )
     def test_task_vocabulary_qualifier_yields_nothing(self, content):
@@ -304,7 +302,8 @@ class TestTaskColonMentionsCreateAmbiguity:
     def test_word_glued_colon_lookalikes_are_not_bare_mentions(self):
         """'subtask: 2500' is NOT a bare mention of task 2500, mirroring
         TestAmbiguousRefs::test_word_glued_task_lookalikes_are_not_bare_mentions
-        and _TASK_NODE_NAME_PATTERN's documented refusal to match 'subtask 5'.
+        and parse_node_name's refusal of 'subtask 5', whose anchored rule
+        needs the task word to open the name.
 
         This is the regression guard for the new colon pattern's lookbehind:
         without it, 'tasks?\\s*:\\s*\\d+' would match the 'task: 2500' substring
@@ -316,40 +315,27 @@ class TestTaskColonMentionsCreateAmbiguity:
         assert scan.ambiguous == ()
 
 
-class TestShapeValidProseMatchesRelyOnDownstreamGuards:
-    """Prose that happens to have the '<word>: <number>' shape DOES match — the
-    scanner is deliberately whitespace-tolerant, because that is how humans
-    write a qualified reference. Precision for these comes from the consumer's
-    decisive guard: it splits only when the episode ALSO touched a node named
-    'Task N', which a stray 'Total: 42' essentially never coincides with (and,
-    when a known-projects registry is wired, from the allowlist as well)."""
+class TestProseColonNumberIsNotARef:
+    """Prose with the '<word>: <number>' shape is not a ref: a qualified ref is
+    written tight, 'proj:N', so a blank beside the colon refuses the match
+    without help from any registry (task 6826)."""
 
-    def test_prose_colon_number_matches_shape_only(self):
+    def test_prose_colon_number_is_not_a_ref(self):
         scan = find_cross_project_task_refs('Total: 42 items', group_id='reify')
-        assert [r.entity_name for r in scan.refs] == ['total:42']
-
-    def test_allowlist_removes_the_prose_match(self):
-        scan = find_cross_project_task_refs(
-            'Total: 42 items', group_id='reify', known_project_ids={'dark_factory'}
-        )
         assert scan.refs == ()
 
 
 class TestQualifiedRefNeverSpansALineBreak:
-    """Whitespace-tolerant does NOT extend across a line break. The class above
-    accepts the '<word>: <number>' shape on ONE line because that is how humans
-    write a qualified reference; a qualifier and a number separated by a
-    newline is not that shape at all — it is a YAML/'key: value' block or
-    hard-wrapped prose, both routine in episode bodies."""
+    """A qualifier and a number separated by a newline is not a qualified ref
+    either: it is a YAML/'key: value' block or hard-wrapped prose, both routine
+    in episode bodies. A qualified ref is the tight 'proj:N' on one line."""
 
     def test_colon_followed_by_newline_is_not_a_ref(self):
         scan = find_cross_project_task_refs('Notes:\n2500 items', group_id='reify')
         assert scan.refs == ()
 
-    def test_the_same_line_spelling_is_unaffected(self):
-        """Guard: the narrowing is across newlines ONLY, not a tightening of the
-        spacing humans write."""
-        scan = find_cross_project_task_refs('Notes: 2500 items', group_id='reify')
+    def test_the_tight_same_line_spelling_is_unaffected(self):
+        scan = find_cross_project_task_refs('notes:2500 items', group_id='reify')
         assert [r.entity_name for r in scan.refs] == ['notes:2500']
 
 
@@ -407,10 +393,10 @@ class TestKnownProjectIdsAllowlist:
         disable cross-project detection entirely on a registry misconfigured
         with project ROOTS where project IDs were expected.
 
-        Enforces ``canonical_labels._canonical_allowlist``'s stated contract
-        ("one bad entry never disables the whole allowlist") at the public API,
-        and mirrors ``validate_known_project_id``'s permissive falsy-registry
-        mode.
+        Enforces at the public API that scan_content skips a path-shaped entry
+        rather than disabling the whole allowlist, and narrows only when a
+        usable entry is left. Mirrors ``validate_known_project_id``'s
+        permissive falsy-registry mode.
         """
         scan = find_cross_project_task_refs(
             'see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'}

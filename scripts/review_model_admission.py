@@ -30,6 +30,8 @@ from typing import Any, TypeVar
 from audit_model_admission import (
     MERGER_ROLE,
     InvocationRecord,
+    OrchestratorStartup,
+    RestartRequiredReload,
     RoleContainment,
     RoutingRejection,
     RoutingScan,
@@ -42,6 +44,7 @@ from audit_model_admission import (
     load_events,
     markdown_table,
     parse_moment,
+    restart_witness_tables,
     roles_on_model,
     scan_invocations,
     scan_routing_decisions,
@@ -461,6 +464,8 @@ class ReviewResult:
     scoped_hits: tuple[tuple[str, int, str], ...]
     unscoped_cap_hits: int
     restarts: tuple[ServiceRestart, ...]
+    orchestrator_startups: tuple[OrchestratorStartup, ...]
+    restart_required_reloads: tuple[RestartRequiredReload, ...]
     containment: RoleContainment
 
 
@@ -534,6 +539,8 @@ def review(
         scoped_hits=scoped_hits_by_account(scoped),
         unscoped_cap_hits=scoped.unscoped_cap_hit_count,
         restarts=scoped.restarts,
+        orchestrator_startups=scoped.orchestrator_startups,
+        restart_required_reloads=scoped.restart_required_reloads,
         containment=roles_on_model(conn, model=model, since=apply, until=end,
                                    expected_roles=expected_roles),
     )
@@ -744,12 +751,11 @@ def _cost_section(result: ReviewResult) -> list[str]:
     out += [f'Cap hits scoped to `{result.model}`, by account:', '']
     out += [*markdown_table(['account', 'scoped hits', 'first hit'],
                             result.scoped_hits), '']
-    out += [f'Account-level (unscoped) cap hits: {result.unscoped_cap_hits}', '',
-            'Service restarts:', '']
-    out += [*markdown_table(
-        ['timestamp', 'service', 'reason'],
-        [(r.timestamp, r.service, r.reason or '-') for r in result.restarts],
-    ), '']
+    out += [f'Account-level (unscoped) cap hits: {result.unscoped_cap_hits}', '']
+    out += restart_witness_tables(
+        span=f'in {window}', startups=result.orchestrator_startups,
+        reloads=result.restart_required_reloads, restarts=result.restarts,
+    )
     return out
 
 

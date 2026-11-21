@@ -7,12 +7,15 @@ import re
 import sys
 import unittest.mock
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
+from _fm_helpers import MERGE_BASE_NEGATIVE_CONTROL_NOTE, STRADDLING_WRITE_FIXTURE
 from pydantic import ValidationError
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import (
     ConsolidationAutoConfig,
@@ -33,6 +36,10 @@ from fused_memory.config.schema import (
     TaskStatusConfig,
     YamlSettingsSource,
 )
+from fused_memory.server.mem0_update_authz import (
+    resolve_mem0_update_allowed_prefixes,
+    resolve_mem0_update_sanctioned_uses,
+)
 from fused_memory.server.near_duplicate_guard import (
     _TOPIC_CLUSTER_DEFAULT_HINT,
     build_topic_cluster_block,
@@ -49,6 +56,8 @@ from fused_memory.topic_slug import (
     TOPIC_SLUG_RE,
     is_valid_topic_slug,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 class _DummySettings(BaseSettings):
@@ -278,15 +287,14 @@ class TestLLMConfigClientClass:
         )
 
     @pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
-    def test_shipped_config_yaml_shares_one_openai_api_url_default(
+    def test_shipped_config_yaml_llm_api_url_follows_openai_api_url(
         self, monkeypatch, yaml_name,
     ):
-        """llm and embedder provider blocks must resolve to the SAME api_url.
+        """The llm api_url defaults to OpenAI and follows OPENAI_API_URL.
 
-        Both are ``${OPENAI_API_URL:https://api.openai.com/v1}`` today. Independent
-        LLM/embedder endpoints come from setting the two blocks to different
-        literals — but the shipped DEFAULT must stay shared, so a deployment that
-        sets only OPENAI_API_URL keeps pointing both at one endpoint.
+        The embedder endpoint is deliberately independent of the llm's
+        (plans/local-embedder-cutover-prd.md §6 C3), so its block is only
+        required to exist with a non-empty api_url.
         """
         yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
         assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
@@ -297,19 +305,17 @@ class TestLLMConfigClientClass:
         monkeypatch.delenv('OPENAI_API_URL', raising=False)
         cfg = FusedMemoryConfig()
         assert cfg.llm.providers.openai is not None
-        assert cfg.embedder.providers.openai is not None
         assert cfg.llm.providers.openai.api_url == 'https://api.openai.com/v1'
-        assert (
-            cfg.llm.providers.openai.api_url == cfg.embedder.providers.openai.api_url
-        ), f'llm and embedder api_url defaults must stay identical in {yaml_name}'
+        assert cfg.embedder.providers.openai is not None
+        assert isinstance(cfg.embedder.providers.openai.api_url, str)
+        assert cfg.embedder.providers.openai.api_url, (
+            f'embedder.providers.openai.api_url must be non-empty in {yaml_name}'
+        )
 
-        # And when it IS set, both blocks follow it together.
         monkeypatch.setenv('OPENAI_API_URL', 'http://127.0.0.1:1234/v1')
         cfg2 = FusedMemoryConfig()
         assert cfg2.llm.providers.openai is not None
-        assert cfg2.embedder.providers.openai is not None
         assert cfg2.llm.providers.openai.api_url == 'http://127.0.0.1:1234/v1'
-        assert cfg2.embedder.providers.openai.api_url == 'http://127.0.0.1:1234/v1'
 
 
 class TestEmbedderConfigProvider:
@@ -391,7 +397,7 @@ class TestFusedMemoryConfigDefaults:
         # Verify unmentioned config sections retain their defaults (not clobbered to null/empty)
         assert config.embedder.provider == 'openai'
         assert config.embedder.model == 'text-embedding-3-small'
-        assert config.server.host == '0.0.0.0'
+        assert config.server.host == '127.0.0.1'
         assert config.graphiti.provider == 'falkordb'
         assert config.mem0.qdrant_url == 'http://localhost:6333'
         assert config.routing.confidence_threshold == 0.7
@@ -882,6 +888,18 @@ class TestReconciliationConfigBulkResetGuardFields:
         assert cfg.bulk_reset_guard_write_failure_backoff_seconds == 120.5
 
 
+def _undocumented_prefixes(section: Mem0UpdateConfig) -> list[str]:
+    """Allowlisted prefixes the Mem0UpdateNotAuthorized refusal would render
+    as undocumented, read through the renderer's own resolvers."""
+    svc = SimpleNamespace(config=SimpleNamespace(mem0_update=section))
+    uses = resolve_mem0_update_sanctioned_uses(svc)
+    bar = {
+        *resolve_mem0_update_allowed_prefixes(svc, 'content_amend'),
+        *resolve_mem0_update_allowed_prefixes(svc, 'metadata_patch'),
+    }
+    return sorted(p for p in bar if p not in uses)
+
+
 class TestMem0UpdateConfig:
     """Authorization + storm knobs for the in-place update_memory tool (task 3088).
 
@@ -1010,6 +1028,94 @@ class TestMem0UpdateConfig:
     def test_two_configs_do_not_share_the_submodel(self):
         a, b = FusedMemoryConfig(), FusedMemoryConfig()
         assert a.mem0_update is not b.mem0_update
+
+    # --- agent_prefix_sanctioned_use: the role each allowlisted prefix declares ---
+
+    def test_default_sanctioned_use_documents_every_default_bar_prefix(self):
+        undocumented = _undocumented_prefixes(Mem0UpdateConfig())
+        assert not undocumented, (
+            f'default-allowlisted prefixes with no sanctioned use: {undocumented!r}'
+        )
+
+    def test_default_sanctioned_use_documents_link_heal(self):
+        """config.yaml grants link-heal- on the metadata arm without overriding
+        the map, so its role text has to ship in the schema default."""
+        uses = Mem0UpdateConfig().agent_prefix_sanctioned_use
+        assert isinstance(uses.get('link-heal-'), str)
+        assert uses['link-heal-'].strip()
+
+    def test_sanctioned_use_maps_are_separate_objects(self):
+        a = Mem0UpdateConfig()
+        a.agent_prefix_sanctioned_use['curator-'] = 'MUTATED'
+        a.agent_prefix_sanctioned_use['x-'] = 'ADDED'
+        b = Mem0UpdateConfig()
+        assert b.agent_prefix_sanctioned_use['curator-'] != 'MUTATED'
+        assert 'x-' not in b.agent_prefix_sanctioned_use
+
+    def test_sanctioned_use_override_accepted(self):
+        cfg = Mem0UpdateConfig(
+            agent_prefix_sanctioned_use={'auditor-': 'an audit sitting'},
+        )
+        assert cfg.agent_prefix_sanctioned_use == {'auditor-': 'an audit sitting'}
+
+    @pytest.mark.parametrize('blank', ['', '   '])
+    def test_blank_sanctioned_use_value_rejected_naming_the_prefix(self, blank):
+        with pytest.raises(ValidationError) as exc:
+            Mem0UpdateConfig(
+                agent_prefix_sanctioned_use={
+                    'recon-stage-': 'the reconciliation stages',
+                    'curator-': blank,
+                },
+            )
+        message = str(exc.value)
+        assert 'curator-' in message, message
+        assert 'agent_prefix_sanctioned_use' in message, message
+
+    @pytest.mark.parametrize('blank_key', ['', '  '])
+    def test_blank_sanctioned_use_key_rejected(self, blank_key):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(agent_prefix_sanctioned_use={blank_key: 'x'})
+
+    def test_non_str_sanctioned_use_value_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig.model_validate({'agent_prefix_sanctioned_use': {'curator-': 42}})
+
+    def test_every_skill_a_default_sanctioned_use_names_exists(self):
+        """A refusal must never point a caller at a skill that is not there."""
+        repo_root = Path(__file__).resolve().parents[2]
+        uses = Mem0UpdateConfig().agent_prefix_sanctioned_use
+        missing = sorted(
+            (prefix, token)
+            for prefix, use in uses.items()
+            for token in re.findall(r'skills/[a-z0-9-]+', use)
+            if not (repo_root / token / 'SKILL.md').is_file()
+        )
+        assert not missing, f'sanctioned uses naming a missing skill: {missing!r}'
+        assert re.search(r'skills/[a-z0-9-]+', uses['curator-']), (
+            'the curator- entry must name the curation skill it executes, '
+            f'got {uses["curator-"]!r}'
+        )
+
+
+@pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
+class TestShippedConfigDocumentsEveryAllowlistedPrefix:
+    """Documenting a prefix is part of widening either allowlist.
+
+    The shipped configs are where a grant is widened, so each must leave every
+    granted prefix with a sanctioned use the refusal can render.
+    """
+
+    def test_every_allowlisted_prefix_has_a_sanctioned_use(
+        self, monkeypatch, yaml_name,
+    ):
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
+        assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        undocumented = _undocumented_prefixes(FusedMemoryConfig().mem0_update)
+        assert not undocumented, (
+            f'fused-memory/config/{yaml_name} allowlists {undocumented!r} with no '
+            'entry in mem0_update.agent_prefix_sanctioned_use'
+        )
 
 
 class TestEntityMintConfig:
@@ -1443,84 +1549,6 @@ class TestReconciliationDeterministicProvenancePrefixes:
         assert b.deterministic_provenance_allowed_agent_prefixes == ['orchestrator']
 
 
-class TestReconciliationConfigResumeKnobs:
-    """Tests for the interrupted-run resume knobs (task 2717 / PRD σ, rec 13).
-
-    Five new fields on ReconciliationConfig gate the startup adopt-and-resume
-    pass:
-      - resume_after_restart (bool, default True)
-      - resume_freshness_window_seconds (int, gt=0, default 3600)
-      - resume_max_attempts_per_run (int, gt=0, default 2)
-      - resume_failure_storm_threshold (int, gt=0, default 6)
-      - resume_failure_storm_window_seconds (float, gt=0, default 3600.0)
-    """
-
-    # --- defaults ---
-
-    def test_default_resume_after_restart_is_true(self):
-        assert ReconciliationConfig().resume_after_restart is True
-
-    def test_default_resume_freshness_window_is_3600(self):
-        assert ReconciliationConfig().resume_freshness_window_seconds == 3600
-
-    def test_default_resume_max_attempts_is_2(self):
-        assert ReconciliationConfig().resume_max_attempts_per_run == 2
-
-    def test_default_resume_failure_storm_threshold_is_positive(self):
-        cfg = ReconciliationConfig()
-        assert cfg.resume_failure_storm_threshold == 6
-        assert cfg.resume_failure_storm_threshold > 0
-
-    def test_default_resume_failure_storm_window_is_positive(self):
-        cfg = ReconciliationConfig()
-        assert cfg.resume_failure_storm_window_seconds == 3600.0
-        assert cfg.resume_failure_storm_window_seconds > 0
-
-    # --- override accepted ---
-
-    def test_resume_after_restart_override_accepted(self):
-        cfg = ReconciliationConfig(resume_after_restart=False)
-        assert cfg.resume_after_restart is False
-
-    def test_resume_freshness_window_override_accepted(self):
-        cfg = ReconciliationConfig(resume_freshness_window_seconds=7200)
-        assert cfg.resume_freshness_window_seconds == 7200
-
-    def test_resume_max_attempts_override_accepted(self):
-        cfg = ReconciliationConfig(resume_max_attempts_per_run=1)
-        assert cfg.resume_max_attempts_per_run == 1
-
-    # --- gt=0 bound: resume_freshness_window_seconds ---
-
-    def test_resume_freshness_window_zero_rejected(self):
-        with pytest.raises(ValidationError):
-            ReconciliationConfig(resume_freshness_window_seconds=0)
-
-    def test_resume_freshness_window_negative_rejected(self):
-        with pytest.raises(ValidationError):
-            ReconciliationConfig(resume_freshness_window_seconds=-1)
-
-    # --- gt=0 bound: resume_max_attempts_per_run ---
-
-    def test_resume_max_attempts_zero_rejected(self):
-        with pytest.raises(ValidationError):
-            ReconciliationConfig(resume_max_attempts_per_run=0)
-
-    def test_resume_max_attempts_negative_rejected(self):
-        with pytest.raises(ValidationError):
-            ReconciliationConfig(resume_max_attempts_per_run=-1)
-
-    # --- gt=0 bounds: storm knobs ---
-
-    def test_resume_failure_storm_threshold_zero_rejected(self):
-        with pytest.raises(ValidationError):
-            ReconciliationConfig(resume_failure_storm_threshold=0)
-
-    def test_resume_failure_storm_window_zero_rejected(self):
-        with pytest.raises(ValidationError):
-            ReconciliationConfig(resume_failure_storm_window_seconds=0)
-
-
 class TestConfigYamlBacklogHardLimitOverrides:
     """Deployment test: config.yaml must carry the reify override (task 1764).
 
@@ -1735,17 +1763,43 @@ class TestCuratorEntryCharCaps:
             f'field (measured p50 1813 vs 0).'
         )
 
-    def test_the_total_cap_is_unreachable_at_stock_stream_caps(self):
-        """FINDING 1, as an executable invariant rather than a comment.
+    @pytest.mark.parametrize('value', [0, -1])
+    @pytest.mark.parametrize('field', ['entry_description_chars', 'entry_details_chars'])
+    def test_a_non_positive_entry_cap_is_refused_at_load(self, field, value):
+        """A cap of 0 or less would make every curator prompt build raise in utils/clip_disclosure.py::TruncationFact, so it is refused when the config loads."""
+        with pytest.raises(ValidationError, match=field):
+            CuratorConfig(**{field: value})
 
-        A maximal pool without siblings is anchor(<=1) + module + embedding +
-        dependency. With stock values that is 29 against a total cap of 30, so
-        ``_trim_pool`` short-circuits on every call for such a pool and the
-        STREAM caps are the binding constraints. This is pinned so a future cap edit that silently
-        re-strands or un-strands the final trim is caught here, at the config
-        layer, rather than being discovered as a permanently-silent
-        ``pool_truncated`` census.
-        """
+
+class TestCuratorPoolCaps:
+    """The stock pool caps and the relationships the task-5397 census derivation set.
+
+    The measured figures live once, in the pool-cap comment block of
+    ``config/schema.py::CuratorConfig``; these tests pin what follows from
+    them and point there rather than restating them.
+    """
+
+    EMBEDDING_FLOOR = 5
+    SIBLINGS_PER_PARENT_P90 = 3
+
+    def test_stock_pool_caps(self):
+        cfg = CuratorConfig()
+        caps = (
+            cfg.pool_module_cap,
+            cfg.pool_embedding_cap,
+            cfg.pool_dependency_cap,
+            cfg.pool_total_cap,
+        )
+        assert caps == (20, 10, 3, 29), (
+            f'module/embedding/dependency/total pool caps are {caps}; the '
+            f'derivation for 20/10/3/29 is the pool-cap block in '
+            f'config/schema.py::CuratorConfig. Move a value only with a new '
+            f'derivation there. pool_total_cap 29 is the pre-5397 reachable '
+            f'maximum: raising it spends prompt tokens and batch fan-in under '
+            f'batch_token_threshold, so restate that trade in the block first.'
+        )
+
+    def test_the_total_cap_binds_when_every_stream_is_full(self):
         cfg = CuratorConfig()
         maximal_pool = (
             1
@@ -1753,19 +1807,38 @@ class TestCuratorEntryCharCaps:
             + cfg.pool_embedding_cap
             + cfg.pool_dependency_cap
         )
-        assert maximal_pool <= cfg.pool_total_cap, (
+        assert maximal_pool > cfg.pool_total_cap, (
             f'A maximal pool is {maximal_pool} entries against pool_total_cap '
-            f'{cfg.pool_total_cap}. If this ever flips, _trim_pool becomes '
-            f'reachable and the total_cap arm of the PoolWithheld census stops '
-            f'being dead weight — update the schema comment recording the '
-            f'arithmetic, and re-read whether the stream caps are still the '
-            f'binding constraints.'
+            f'{cfg.pool_total_cap}. _trim_pool is the live budget control; if '
+            f'it becomes unreachable again, the total_cap arm of the '
+            f'PoolWithheld census goes permanently silent.'
         )
 
-    @pytest.mark.parametrize('value', [0, -1])
-    @pytest.mark.parametrize('field', ['entry_description_chars', 'entry_details_chars'])
-    def test_a_non_positive_entry_cap_is_refused_at_load(self, field, value):
-        """A cap of 0 or less would make every curator prompt build raise in utils/clip_disclosure.py::TruncationFact, so it is refused when the config loads."""
+    def test_a_full_module_stream_with_p90_siblings_keeps_the_embedding_floor(self):
+        """_trim_pool cuts siblings only after the module stream, so each sibling of a full pool costs one embedding slot."""
+        cfg = CuratorConfig()
+        siblings = self.SIBLINGS_PER_PARENT_P90
+        embedding_left = cfg.pool_total_cap - 1 - siblings - cfg.pool_module_cap
+        assert embedding_left >= self.EMBEDDING_FLOOR, (
+            f'A full module stream plus the anchor and {siblings} siblings (the '
+            f'per-parent p90 measured for pool_sibling_cap) leaves '
+            f'{embedding_left} embedding slots, below the floor of '
+            f'{self.EMBEDDING_FLOOR}. The embedding stream is the only '
+            f'relevance-ordered stream; see the pool-cap block in '
+            f'config/schema.py::CuratorConfig for why its head must survive.'
+        )
+
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [
+            ('pool_module_cap', -1),
+            ('pool_embedding_cap', -1),
+            ('pool_dependency_cap', -1),
+            ('pool_total_cap', 0),
+        ],
+    )
+    def test_a_cap_below_its_floor_is_refused_at_load(self, field, value):
+        """A stream cap of 0 disables that stream; a total cap of 0 would cut the anchor _trim_pool always keeps."""
         with pytest.raises(ValidationError, match=field):
             CuratorConfig(**{field: value})
 
@@ -2446,28 +2519,6 @@ def _seeded_cluster(topic_id: str) -> ProceduralTopicCluster:
     """
     clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
     return next(c for c in clusters if c.topic_id == topic_id)
-
-
-# --- Topic-guard note fixtures shared with tests/server/test_add_memory_near_duplicate_gate.py
-#
-# These are module-level (not class attributes) because the end-to-end gate
-# suite imports them: the same note must drive both the pure-matcher assertions
-# here and the whole-tool assertions there, or an edit to one copy would leave
-# the other silently exercising a different scenario (task 3054, reviewer:
-# duplication).
-
-STRADDLING_WRITE_FIXTURE = (
-    'Warm-lane reseed gotcha: when a task is dispatched into a recycled warm '
-    'lane, the in-worktree .task/plan.json can be a DANGLING absolute symlink '
-    'whose target worktrees/.task-meta/<lane>/plan.json was never written or '
-    'was scrubbed. The architect then sees no plan and may wrongly call '
-    'report_task_already_done instead of replanning.'
-)
-
-MERGE_BASE_NEGATIVE_CONTROL_NOTE = (
-    'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
-    'commit is an ancestor of a branch tip before cherry-picking.'
-)
 
 
 class TestProceduralTopicGuardClustersDefault:
@@ -3638,7 +3689,7 @@ class TestWriteTriageConfig:
         # code. The invariant that actually matters is that the schema ships
         # no a-priori number, so any value the server reads had to come from
         # a calibration run.
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         value = getattr(WriteTriageConfig(), field)
         assert value is None, (
@@ -3662,14 +3713,14 @@ class TestWriteTriageConfig:
     @pytest.mark.parametrize('field', ['t_high', 't_low'])
     @pytest.mark.parametrize('value', [0.0, 0.5, 1.0])
     def test_thresholds_accept_the_cosine_unit_range(self, field, value):
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         assert getattr(WriteTriageConfig(**{field: value}), field) == value
 
     @pytest.mark.parametrize('field', ['t_high', 't_low'])
     @pytest.mark.parametrize('value', [-0.1, 1.1, 42.0])
     def test_thresholds_reject_out_of_range_values(self, field, value):
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         with pytest.raises(ValidationError):
             WriteTriageConfig(**{field: value})
@@ -3683,7 +3734,7 @@ class TestWriteTriageConfig:
         calibration script's config write need a server restart instead of
         a hot reload.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         annotation = FusedMemoryConfig.model_fields['write_triage'].annotation
         assert isinstance(annotation, type) and issubclass(annotation, WriteTriageConfig), (
@@ -3699,7 +3750,7 @@ class TestWriteTriageConfig:
         fields above: FusedMemoryConfig() loads config.yaml, which by design
         carries a calibration run's output.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         assert WriteTriageConfig().t_high_by_category is None
 
@@ -3709,7 +3760,7 @@ class TestWriteTriageConfig:
         assert factory().t_high_by_category is None  # type: ignore[call-arg]
 
     def test_accepts_a_measured_mapping(self):
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         # Synthetic, full-precision: pins that a derived cutoff's precision
         # survives the field without being mistakable for a measured value.
@@ -3725,7 +3776,7 @@ class TestWriteTriageConfig:
         to a strict inequality would reject a real calibration output while
         passing every other test in this class.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         assert WriteTriageConfig(
             t_high_by_category={'procedural_knowledge': value},
@@ -3738,7 +3789,7 @@ class TestWriteTriageConfig:
         rejecting it would force the writer to choose between two spellings
         of the same measured outcome.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         assert WriteTriageConfig(t_high_by_category={}).t_high_by_category == {}
 
@@ -3751,7 +3802,7 @@ class TestWriteTriageConfig:
         either way the failure would surface as deleted (or undeleted)
         memories rather than as a config error.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         with pytest.raises(ValidationError):
             WriteTriageConfig(t_high_by_category={'procedural_knowledge': value})
@@ -3763,7 +3814,7 @@ class TestWriteTriageConfig:
         that only said "a cutoff is out of range" would leave an operator
         diffing three numbers to find the one that failed.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         with pytest.raises(ValidationError) as excinfo:
             WriteTriageConfig(t_high_by_category={
@@ -3784,7 +3835,7 @@ class TestWriteTriageConfig:
         and for the pooled t_high beside it. Demanding stricter parsing for
         one than the other would be an inconsistency invented here.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         coerced = WriteTriageConfig(
             t_high_by_category={'procedural_knowledge': value},
@@ -3798,7 +3849,7 @@ class TestWriteTriageConfig:
 
     @pytest.mark.parametrize('value', [None, [0.9], 'abc', {'x': 1}])
     def test_rejects_a_non_numeric_per_category_cutoff(self, value):
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         with pytest.raises(ValidationError):
             WriteTriageConfig(t_high_by_category={'procedural_knowledge': value})
@@ -3811,7 +3862,7 @@ class TestWriteTriageConfig:
         pooled t_high beside it would be an inconsistency invented here
         rather than one the config actually has.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         # The numeric strings are deliberately off-type: the declared fields are
         # float / dict[str, float], and what this asserts is precisely that
@@ -3823,7 +3874,7 @@ class TestWriteTriageConfig:
 
     def test_one_bad_entry_rejects_the_whole_map(self):
         """No partial acceptance: a half-applied set of cutoffs must not gate a sweep."""
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         with pytest.raises(ValidationError):
             WriteTriageConfig(t_high_by_category={
@@ -3848,7 +3899,7 @@ class TestWriteTriageConfig:
         merge that lands the skeleton, ahead of the judge (leaf gamma) and
         ahead of the 3169 flip gate.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         value = WriteTriageConfig().enabled
         assert value is False, (
@@ -3868,7 +3919,7 @@ class TestWriteTriageConfig:
         analogy: at 5 the deterministic band would miss ~three quarters of the
         duplicates it exists to catch, and the miss would be invisible.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         value = WriteTriageConfig().candidate_k
         assert isinstance(value, int) and not isinstance(value, bool), (
@@ -3891,7 +3942,7 @@ class TestWriteTriageConfig:
         with no error, no log line, and nothing to grep — the exact silent
         degradation INV-4 exists to prevent. Fail at LOAD instead.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         with pytest.raises(ValidationError):
             WriteTriageConfig(candidate_k=value)
@@ -3950,14 +4001,14 @@ class TestWriteTriageConfig:
         Why: task 6076's decision record,
         calibration/write_triage_judge_field_chars_report.md.
         """
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         assert WriteTriageConfig().judge_field_chars == 4000
 
     @pytest.mark.parametrize('value', [0, -1])
     def test_judge_field_chars_rejects_a_cap_that_would_empty_every_field(self, value):
         """A non-positive cap is refused at load and reload, never at write time."""
-        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+        from fused_memory.config.schema import WriteTriageConfig
 
         with pytest.raises(ValidationError):
             WriteTriageConfig(judge_field_chars=value)
@@ -3969,12 +4020,12 @@ class TestMemoryMetadataConfig:
 
     A direct sibling of ``TaskMetadataConfig``: same top-level placement, same
     warn-by-default posture, same RED-TIER/restart-only wording on the enforce
-    flags. PRD D3 names that precedent explicitly ("census first, tiers later"),
+    flag. PRD D3 names that precedent explicitly ("census first, tiers later"),
     so this section follows it rather than inventing a second shape.
     """
 
     def _cls(self):
-        from fused_memory.config.schema import MemoryMetadataConfig  # noqa: PLC0415
+        from fused_memory.config.schema import MemoryMetadataConfig
 
         return MemoryMetadataConfig
 
@@ -3986,7 +4037,7 @@ class TestMemoryMetadataConfig:
         import it), exactly the rationale ``TaskMetadataConfig`` records for
         its own placement.
         """
-        from fused_memory.config.schema import (  # noqa: PLC0415
+        from fused_memory.config.schema import (
             MemoryMetadataConfig,
             ReconciliationConfig,
             TaskmasterConfig,
@@ -3999,23 +4050,17 @@ class TestMemoryMetadataConfig:
         assert 'memory_metadata' not in ReconciliationConfig.model_fields
 
     def test_defaults_are_warn_mode(self):
-        """Both enforce flags default OFF.
-
-        This is the census-refuted-premise safety default, not timidity: leaf
-        α measured 242 of 329 live `kind` values as singletons, so a day-one
-        strict reject would turn every newly invented kind into a hard
-        memory-write failure on the live fleet.
-        """
+        """The ``enforce`` flag defaults OFF: a fatal shape violation censuses
+        and the write proceeds until the corpus is normalized (PRD §9 ε)."""
         cfg = FusedMemoryConfig().memory_metadata
         assert cfg.enforce is False
-        assert cfg.enforce_kind_registry is False
         assert cfg.unknown_key_storm_threshold == 50
         assert cfg.unknown_key_storm_window_seconds == 300
 
     def test_extra_keys_are_forbidden(self):
         """A mistyped leaf must fail LOUD at config load/reload.
 
-        With ``extra='ignore'`` an operator who typed ``enforce_kind_regsitry``
+        With ``extra='ignore'`` an operator who typed ``enfroce``
         would get a silently-ignored key and believe enforcement was on — the
         no-silent-fail-soft invariant applied to the config surface.
         """
@@ -4042,14 +4087,10 @@ class TestMemoryMetadataConfig:
         # loaded config.yaml actually reaches the model, and a splat makes
         # pyright widen every sibling field's type to the dict's value type,
         # producing a type error per section of FusedMemoryConfig.
-        cfg = FusedMemoryConfig.model_validate(
-            {'memory_metadata': {'enforce': True, 'enforce_kind_registry': True}}
-        )
+        cfg = FusedMemoryConfig.model_validate({'memory_metadata': {'enforce': True}})
         assert cfg.memory_metadata.enforce is True
-        assert cfg.memory_metadata.enforce_kind_registry is True
 
-    @pytest.mark.parametrize('field', ['enforce', 'enforce_kind_registry'])
-    def test_enforce_flags_are_restart_only(self, field):
+    def test_enforce_flag_is_restart_only(self):
         """RED TIER, asserted behaviourally rather than as a doc blurb.
 
         The operator-facing promise is not that some `description=` string
@@ -4065,7 +4106,7 @@ class TestMemoryMetadataConfig:
         substring check over it fails open anyway (``'restarting is not
         required'`` would have passed the check this replaces).
         """
-        from fused_memory.config.reload import (  # noqa: PLC0415
+        from fused_memory.config.reload import (
             RELOADABLE_FIELDS,
             diff_config,
         )
@@ -4079,16 +4120,16 @@ class TestMemoryMetadataConfig:
         #    test_non_allowlisted_leaf_lands_in_restart_required`.
         live = FusedMemoryConfig()
         fresh = FusedMemoryConfig()
-        old = getattr(live.memory_metadata, field)
+        old = live.memory_metadata.enforce
         # `object.__setattr__` is the established idiom in test_config_reload:
         # it bypasses the validation/assignment wrapper so the diff sees a raw
         # differing leaf.
-        object.__setattr__(fresh.memory_metadata, field, not old)
+        object.__setattr__(fresh.memory_metadata, 'enforce', not old)
 
         d = diff_config(live, fresh)
 
-        assert d.restart_required[f'memory_metadata.{field}'] == {'old': old, 'new': not old}
-        assert f'memory_metadata.{field}' not in d.applied_candidates
+        assert d.restart_required['memory_metadata.enforce'] == {'old': old, 'new': not old}
+        assert 'memory_metadata.enforce' not in d.applied_candidates
 
 
 # ── max_backlog_remediation_deferrals (task 3049) ────────────────────
@@ -4316,6 +4357,42 @@ class TestWriteJournalConfig:
         assert section.prune_max_seconds == 30.0
         assert section.prune_interval_seconds == 1800.0
         assert section.referent_findings_retention_days == 365.0
+        assert section.mem0_intents_retention_days == 30.0
+        assert section.idempotent_ops_retention_days == 7.0
+
+    @pytest.mark.parametrize(
+        ('field', 'env_name', 'days'),
+        [
+            ('mem0_intents_retention_days', 'WRITE_JOURNAL_MEM0_INTENTS_RETENTION_DAYS', 30.0),
+            ('idempotent_ops_retention_days', 'WRITE_JOURNAL_IDEMPOTENT_OPS_RETENTION_DAYS', 7.0),
+        ],
+    )
+    def test_small_table_horizon_has_a_schema_default_and_is_env_tunable(
+        self, monkeypatch, field, env_name, days,
+    ):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        assert getattr(WriteJournalConfig(), field) == days
+
+        monkeypatch.setenv(env_name, '3')
+        assert getattr(FusedMemoryConfig().write_journal, field) == 3.0, (
+            f'RED: {env_name} must reach write_journal.{field} through config.yaml; '
+            'WriteJournalConfig ignores unknown keys, so a misspelled leaf reads '
+            'silently as the schema default'
+        )
+
+    @pytest.mark.parametrize(
+        'field', ['mem0_intents_retention_days', 'idempotent_ops_retention_days'],
+    )
+    def test_a_non_positive_small_table_horizon_is_rejected(self, field):
+        from fused_memory.config.schema import WriteJournalConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalConfig.model_validate({field: 0})
+        assert field in str(excinfo.value), (
+            'RED: a 0-day horizon deletes every row of its table at each startup; '
+            'the rejection must name the field'
+        )
 
     def test_search_rows_outlive_task_read_rows(self):
         section = FusedMemoryConfig().write_journal

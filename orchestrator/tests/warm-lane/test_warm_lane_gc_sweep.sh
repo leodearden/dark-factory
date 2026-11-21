@@ -86,7 +86,9 @@ source "$SCRIPT_DIR/test_helpers.sh"
 # (see the BRIDGE-COST SEAM comment above run_sweep). Read from the lib rather
 # than written here as a literal for the same reason as in the sibling gc suite:
 # a literal would be a hand-maintained mirror of PROTECTED_PREFIXES sitting
-# outside TestProtectGlobFallbackDrift's gate.
+# outside TestProtectGlobFallbackDrift's gate and the byte-equality gate this
+# pin relies on, TestProtectGlobFallbackIsAVerbatimRender (both in
+# orchestrator/tests/test_lane_state_lib.py).
 # shellcheck source=orchestrator/scripts/warm-lane/lib_lane_state.sh
 source "$WARM_LANE_SCRIPTS_DIR/lib_lane_state.sh"
 
@@ -110,8 +112,9 @@ _TMPDIRS+=("$ERR_FILE")
 
 # ── run_sweep: invoke the sweep script, capture OUT/ERR_OUT/RC ────────────────
 #
-# BRIDGE-COST SEAM (task 3292) — the same seam as the sibling gc suite's
-# run_helper; see the long rationale there (tests/warm-lane/test_warm_lane_gc.sh).
+# BRIDGE-COST SEAM (task 3292) — the same seam as the gc suites' shared
+# run_helper; see the long rationale there
+# (tests/warm-lane/lib_warm_lane_gc_harness.sh).
 # Kept as one idiom on purpose so the two files do not drift into two unrelated
 # ones.
 #

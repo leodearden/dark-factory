@@ -34,8 +34,11 @@ from _write_triage_calibration_fixtures import (
     PACKAGE_ROOT,
     LiveStoreFixture,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import FusedMemoryConfig, WriteTriageProjectCalibration
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = PACKAGE_ROOT / 'scripts' / 'calibrate_write_triage.py'
 LIVE_STORE_SOURCE = 'live_store_topic_scroll'

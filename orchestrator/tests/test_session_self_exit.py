@@ -16,16 +16,18 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _process_identity_variants import own_identity
 from _process_tree_fakes import claude_process_tree, counting_walks
+from shared.process_identity import ProcessIdentity
 
 from orchestrator import session_hooks as sh
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 from orchestrator.session_ownership_probes import ProcessTree
 from orchestrator.session_self_exit import SelfExit, SelfExitRefusal
 
@@ -35,6 +37,7 @@ LAUNCHER = 7_193_050
 _SLUG = 'prd-df-7193-7193050'
 _TITLE = 'prd:df#7193 self-exit'
 _TERMINAL_RESULT = 'outcome: done\nchanged: x\naction_needed: none\n'
+_OWNER_ON_ANOTHER_HOST = ProcessIdentity(OWNER, 1, 'boot-x', 'other-host.invalid')
 
 
 @pytest.fixture(autouse=True)
@@ -43,11 +46,11 @@ def _isolate_fleet_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
 
 
 def _record_dir(root: Path, slug: str = _SLUG) -> Path:
-    return sr.record_path_for_slug(slug, root=root).parent
+    return session_records.record_path_for_slug(slug, root=root).parent
 
 
 def _marker(root: Path, slug: str = _SLUG) -> Path:
-    return _record_dir(root, slug) / sr.EXIT_REQUESTED_FILENAME
+    return _record_dir(root, slug) / session_records.EXIT_REQUESTED_FILENAME
 
 
 @dataclass
@@ -57,11 +60,11 @@ class _KillRecorder:
     root: Path
     slug: str = _SLUG
     calls: list[tuple[int, int]] = field(default_factory=list)
-    seen: list[tuple[sr.SessionRecord, bool]] = field(default_factory=list)
+    seen: list[tuple[session_records.SessionRecord, bool]] = field(default_factory=list)
 
     def __call__(self, pid: int, sig: int) -> None:
         self.calls.append((pid, sig))
-        self.seen.append((sr.read_record(self.slug, root=self.root), _marker(self.root, self.slug).exists()))
+        self.seen.append((session_records.read_record(self.slug, root=self.root), _marker(self.root, self.slug).exists()))
 
 
 @dataclass(frozen=True)
@@ -77,18 +80,18 @@ def _armed(
     """A self-exit session whose every precondition holds; *record_fields* break one on the record."""
     record_dir = _record_dir(root)
     fields: dict = {
-        'status': sr.Status.RUNNING,
+        'status': session_records.Status.RUNNING,
         'title': _TITLE,
         'self_exit': True,
         'claude_session_id': 'uuid-owner',
         'claude_owner_pid': OWNER,
         'launcher_pid': LAUNCHER,
-        'result_file': str(record_dir / sr.RESULT_FILENAME),
+        'result_file': str(record_dir / session_records.RESULT_FILENAME),
     }
     fields.update(record_fields)
-    sr.write_record(sr.SessionRecord(session_slug=_SLUG, **fields), root=root)
+    session_records.write_record(session_records.SessionRecord(session_slug=_SLUG, **fields), root=root)
     if result is not None:
-        (record_dir / sr.RESULT_FILENAME).write_text(result, encoding='utf-8')
+        (record_dir / session_records.RESULT_FILENAME).write_text(result, encoding='utf-8')
     if marker is not None:
         _marker(root).write_text(marker, encoding='utf-8')
     return _Armed(
@@ -116,8 +119,8 @@ def _stop(
     )
 
 
-def _read(root: Path, slug: str = _SLUG) -> sr.SessionRecord:
-    return sr.read_record(slug, root=root)
+def _read(root: Path, slug: str = _SLUG) -> session_records.SessionRecord:
+    return session_records.read_record(slug, root=root)
 
 
 class TestArmedOwnerStop:
@@ -136,9 +139,9 @@ class TestArmedOwnerStop:
 
         record = _read(tmp_path)
         request = record.exit_request
-        assert record.status is sr.Status.IDLE
+        assert record.status is session_records.Status.IDLE
         assert request is not None
-        assert request.state is sr.ExitRequestState.ATTEMPTED
+        assert request.state is session_records.ExitRequestState.ATTEMPTED
         assert request.reason is None
         assert request.pid == OWNER
         assert request.marker_session_id == 'uuid-owner'
@@ -161,9 +164,9 @@ class TestArmedOwnerStop:
         _stop(tmp_path, armed, kill)
 
         [(at_kill, marker_present)] = kill.seen
-        assert at_kill.status is sr.Status.IDLE
+        assert at_kill.status is session_records.Status.IDLE
         assert at_kill.exit_request is not None
-        assert at_kill.exit_request.state is sr.ExitRequestState.ATTEMPTED
+        assert at_kill.exit_request.state is session_records.ExitRequestState.ATTEMPTED
         assert at_kill.exit_requested_at == at_kill.exit_request.at
         assert marker_present
         assert not _marker(tmp_path).exists()
@@ -199,6 +202,14 @@ _BREAKS = {
     'no-claude-ancestor': _Break(SelfExitRefusal.OWNER_PID_UNRESOLVED, claude=None),
     'no-bound-pid': _Break(SelfExitRefusal.OWNER_PID_UNRESOLVED, armed={'claude_owner_pid': None}),
     'other-claude': _Break(SelfExitRefusal.OWNER_PID_MISMATCH, claude=7_193_009),
+    'other-host': _Break(
+        SelfExitRefusal.OTHER_HOST, armed={'claude_owner_identity': _OWNER_ON_ANOTHER_HOST}
+    ),
+    'other-host-before-pid': _Break(
+        SelfExitRefusal.OTHER_HOST,
+        armed={'claude_owner_identity': _OWNER_ON_ANOTHER_HOST},
+        claude=7_193_009,
+    ),
     'background-absent': _Break(SelfExitRefusal.BACKGROUND_TASKS_UNREPORTED, drop=('background_tasks',)),
     'background-null': _Break(SelfExitRefusal.BACKGROUND_TASKS_UNREPORTED, hook={'background_tasks': None}),
     'background-running': _Break(SelfExitRefusal.BACKGROUND_TASKS_RUNNING, hook={'background_tasks': [{'id': 'b1'}]}),
@@ -223,12 +234,25 @@ class TestRefusals:
         request = record.exit_request
         assert kill.calls == []
         assert request is not None
-        assert request.state is sr.ExitRequestState.REFUSED
+        assert request.state is session_records.ExitRequestState.REFUSED
         assert request.reason == broken.reason
         assert request.pid == broken.claude
         assert record.exit_requested_at is None
-        assert record.status is sr.Status.IDLE
+        assert record.status is session_records.Status.IDLE
         assert _marker(tmp_path).exists()
+
+    def test_an_owner_identity_on_this_host_passes_the_host_check(self, tmp_path):
+        on_this_host = replace(own_identity(), pid=OWNER)
+        armed = _armed(tmp_path, claude_owner_identity=on_this_host)
+        kill = _KillRecorder(tmp_path)
+
+        _stop(tmp_path, armed, kill)
+
+        record = _read(tmp_path)
+        assert kill.calls == [(OWNER, signal.SIGINT)]
+        assert record.exit_request is not None
+        assert record.exit_request.state is session_records.ExitRequestState.ATTEMPTED
+        assert record.claude_owner_identity == on_this_host
 
     def test_a_refusal_is_not_a_deadlock(self, tmp_path):
         armed = _armed(tmp_path)
@@ -239,11 +263,11 @@ class TestRefusals:
         _stop(tmp_path, armed, kill)
 
         assert refused is not None
-        assert refused.state is sr.ExitRequestState.REFUSED
+        assert refused.state is session_records.ExitRequestState.REFUSED
         assert kill.calls == [(OWNER, signal.SIGINT)]
         request = _read(tmp_path).exit_request
         assert request is not None
-        assert request.state is sr.ExitRequestState.ATTEMPTED
+        assert request.state is session_records.ExitRequestState.ATTEMPTED
         assert not _marker(tmp_path).exists()
 
     def test_a_later_refusal_keeps_the_last_attempt_time(self, tmp_path):
@@ -257,7 +281,7 @@ class TestRefusals:
         record = _read(tmp_path)
         assert attempted_at is not None
         assert record.exit_request is not None
-        assert record.exit_request.state is sr.ExitRequestState.REFUSED
+        assert record.exit_request.state is session_records.ExitRequestState.REFUSED
         assert record.exit_requested_at == attempted_at
 
 
@@ -297,7 +321,7 @@ def test_a_shared_session_host_is_never_signalled(tmp_path, shared_host_pid):
     request = _read(tmp_path).exit_request
     assert kill.calls == []
     assert request is not None
-    assert request.state is sr.ExitRequestState.REFUSED
+    assert request.state is session_records.ExitRequestState.REFUSED
     assert request.reason == SelfExitRefusal.SHARED_SESSION_HOST
     assert request.pid == shared_host_pid
 
@@ -306,7 +330,7 @@ class TestNoOwnerNoStamp:
     def test_a_withheld_launch_window_event_stamps_nothing(self, tmp_path):
         armed = _armed(
             tmp_path,
-            status=sr.Status.LAUNCHING,
+            status=session_records.Status.LAUNCHING,
             claude_session_id=None,
             claude_owner_pid=None,
             start_ts=datetime.now(UTC).isoformat(),
@@ -317,7 +341,7 @@ class TestNoOwnerNoStamp:
 
         record = _read(tmp_path)
         assert record.exit_request is None
-        assert record.status is sr.Status.LAUNCHING
+        assert record.status is session_records.Status.LAUNCHING
         assert kill.calls == []
         assert _marker(tmp_path).exists()
 
@@ -375,16 +399,16 @@ class TestKillFailure:
 
         osc = _stop(tmp_path, armed, _raising(exc))
 
-        assert osc == sh.osc_retitle_sequence(sr.Status.IDLE, _TITLE)
+        assert osc == sh.osc_retitle_sequence(session_records.Status.IDLE, _TITLE)
         record = _read(tmp_path)
         request = record.exit_request
         assert request is not None
-        assert request.state is sr.ExitRequestState.KILL_FAILED
+        assert request.state is session_records.ExitRequestState.KILL_FAILED
         assert request.reason == reason
         assert request.pid == OWNER
         assert request.marker_session_id == 'uuid-owner'
         assert record.exit_requested_at == request.at
-        assert record.status is sr.Status.IDLE
+        assert record.status is session_records.Status.IDLE
         assert _marker(tmp_path).exists()
 
     def test_the_next_stop_retries(self, tmp_path):
@@ -397,7 +421,7 @@ class TestKillFailure:
         assert kill.calls == [(OWNER, signal.SIGINT)]
         request = _read(tmp_path).exit_request
         assert request is not None
-        assert request.state is sr.ExitRequestState.ATTEMPTED
+        assert request.state is session_records.ExitRequestState.ATTEMPTED
         assert not _marker(tmp_path).exists()
 
 
@@ -441,11 +465,11 @@ class TestFailSoft:
         with caplog.at_level(logging.WARNING, logger=_SELF_EXIT_LOGGER):
             osc = _stop(tmp_path, armed, kill)
 
-        assert osc == sh.osc_retitle_sequence(sr.Status.IDLE, _TITLE)
+        assert osc == sh.osc_retitle_sequence(session_records.Status.IDLE, _TITLE)
         assert len(_self_exit_warnings(caplog)) == 1
         request = _read(tmp_path).exit_request
         assert request is not None
-        assert request.state is sr.ExitRequestState.ATTEMPTED
+        assert request.state is session_records.ExitRequestState.ATTEMPTED
         assert _marker(tmp_path).exists()
 
     def test_an_undeletable_marker_is_logged_not_raised(self, tmp_path, record_dir, caplog):
@@ -455,12 +479,12 @@ class TestFailSoft:
         with caplog.at_level(logging.WARNING, logger=_SELF_EXIT_LOGGER):
             osc = _stop(tmp_path, armed, kill)
 
-        assert osc == sh.osc_retitle_sequence(sr.Status.IDLE, _TITLE)
+        assert osc == sh.osc_retitle_sequence(session_records.Status.IDLE, _TITLE)
         assert kill.calls == [(OWNER, signal.SIGINT)]
         assert len(_self_exit_warnings(caplog)) == 1
         request = _read(tmp_path).exit_request
         assert request is not None
-        assert request.state is sr.ExitRequestState.ATTEMPTED
+        assert request.state is session_records.ExitRequestState.ATTEMPTED
         assert _marker(tmp_path).exists()
 
     def test_an_unreadable_marker_is_present_but_unattributed(self, tmp_path):
@@ -473,5 +497,5 @@ class TestFailSoft:
         assert kill.calls == [(OWNER, signal.SIGINT)]
         request = _read(tmp_path).exit_request
         assert request is not None
-        assert request.state is sr.ExitRequestState.ATTEMPTED
+        assert request.state is session_records.ExitRequestState.ATTEMPTED
         assert request.marker_session_id is None

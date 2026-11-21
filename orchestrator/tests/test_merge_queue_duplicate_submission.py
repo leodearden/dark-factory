@@ -56,6 +56,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from _merge_lane_census import census_for
+from _merge_lane_fakes import lane_scene_config
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -105,7 +106,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 class _FakeEscalationQueue:
@@ -119,7 +120,7 @@ class _FakeEscalationQueue:
         self._seq = 0
         self.submitted: list = []
 
-    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
+    def has_open_l1(self, task_id: str) -> bool:
         return self._open_l1
 
     def make_id(self, task_id: str) -> str:
@@ -497,7 +498,7 @@ class _FakeEventStore:
     def __init__(self) -> None:
         self.emitted: list = []
 
-    def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):  # noqa: ARG002
+    def emit(self, event_type, *, task_id=None, phase=None, data=None, **kw):
         self.emitted.append({'event_type': event_type, 'task_id': task_id, 'data': data or {}})
 
 

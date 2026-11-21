@@ -64,6 +64,9 @@ from orchestrator.offline_lane_escalations import (
 from orchestrator.offline_lane_filing import LANE_METADATA_KEY
 from orchestrator.offline_lane_records import LanePass, Phase, ProbeKind, ProbeResult, records_root
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = T0 + timedelta(days=7)
 OUTAGE_PROBE = ProbeResult(ProbeKind.OUTAGE, 75, 'qdrant', 'qdrant: get collections: ConnectError', 1.5)

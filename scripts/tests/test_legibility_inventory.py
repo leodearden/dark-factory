@@ -1,6 +1,6 @@
 """Tests for scripts/legibility/inventory.py — session enumeration (PRD §5.2 point 2).
 
-``inventory.encode_cwd`` mirrors ``orchestrator.session_registry.encode_cwd``,
+``inventory.encode_cwd`` mirrors ``orchestrator.session_records.encode_cwd``,
 the canonical cwd encoding (``/``, ``.`` and ``_`` all map to ``-``, and case
 is preserved); ``TestEncoderLockstep`` below holds every in-repo copy of that
 rule to the canonical AND to real on-disk dir names. A project's agents span many encoded
@@ -28,10 +28,12 @@ from functools import lru_cache
 from pathlib import Path
 
 import pytest
-from legibility import digest
 from legibility import inventory as mod
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-from orchestrator import session_registry
+from orchestrator import session_records
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Repo root from scripts/tests/ — the same parents[2] derivation
 # scripts/tests/conftest.py already uses.
@@ -148,11 +150,10 @@ class TestEncodeCwd:
 def _load_sibling_test_module(name: str):
     """Import a sibling scripts/tests module by file path.
 
-    ``scripts/tests`` is not on ``sys.path`` (its conftest inserts
-    ``scripts/`` and ``scripts/legibility``, not itself), so a bare
-    ``import test_legibility_nightly`` would not resolve under the suite's
-    ``--import-mode=importlib`` collection. Loading by path is the sanctioned
-    equivalent and avoids restructuring the nightly fixture.
+    ``scripts/tests`` is on ``sys.path``, but ``--import-mode=importlib`` has
+    already collected the module as ``scripts.tests.<name>``, so a bare
+    ``import <name>`` would build a second copy of it. Loading by path under a
+    distinct ``_lockstep_`` name makes that second copy explicit and intentional.
     """
     spec = importlib.util.spec_from_file_location(
         f'_lockstep_{name}', Path(__file__).parent / f'{name}.py'
@@ -269,7 +270,6 @@ def _mirrors() -> tuple[tuple[str, Callable[[str], str]], ...]:
     nightly_tests = _load_sibling_test_module('test_legibility_nightly')
     return (
         ('legibility.inventory.encode_cwd', mod.encode_cwd),
-        ('legibility.digest._encode_cwd', digest._encode_cwd),
         ('test_legibility_nightly._encode_cwd', nightly_tests._encode_cwd),
         ('skills/spawn/spawn-claude.sh:_encode_cwd', _bash_encode_cwd),
     )
@@ -278,8 +278,9 @@ def _mirrors() -> tuple[tuple[str, Callable[[str], str]], ...]:
 class TestEncoderLockstep:
     """Every in-repo copy of the cwd encoding must agree with the canonical (task 3272).
 
-    The rule is duplicated five times across the repo (four Python, one bash),
-    and EVERY ONE was found to be missing the same character (``_`` -> ``-``)
+    The rule was once duplicated five times across the repo (four Python, one
+    bash; :func:`_mirrors` lists the copies that remain), and EVERY ONE was
+    found to be missing the same character (``_`` -> ``-``)
     at once — the four Python copies in task 3272, the bash copy in task 3464.
     The old ``inventory.encode_cwd`` docstring asserted the mirrors were "kept
     in lockstep with the canonical implementation" — a claim nothing checked,
@@ -288,7 +289,7 @@ class TestEncoderLockstep:
     This class replaces that aspiration with an enforced invariant. Each
     mirror is asserted equal to BOTH:
 
-      - ``session_registry.encode_cwd``, the canonical — so a mirror that
+      - ``session_records.encode_cwd``, the canonical — so a mirror that
         drifts from it fails loudly; and
       - the hard-coded ``REAL_ENCODED_DIR_PAIRS`` dir names — so the
         canonical drifting from REALITY fails too.
@@ -315,7 +316,7 @@ class TestEncoderLockstep:
         :func:`_bash_encode_cwd_source` for precisely what that extraction does
         and does not anchor on.
       - ``tests/scripts/test_spawn_claude.py``'s fixture is no longer a copy
-        of the rule at all: it now CALLS ``session_registry.encode_cwd``, so
+        of the rule at all: it now CALLS ``session_records.encode_cwd``, so
         it is pinned to the canonical by construction and needs no entry
         here. (It could never have been listed as a mirror anyway — it names
         the dir a fake ``claude`` creates for spawn-claude.sh's own probe to
@@ -330,10 +331,10 @@ class TestEncoderLockstep:
     ``test_spawn_claude.py``'s ``test_transcript_appearance_suppresses_flag``
     is what exercises that end to end. Nor does it extend the rule's
     validated domain: the pairs below are complete only over the punctuation
-    actually observed (``- . / _``), per ``session_registry.encode_cwd``.
+    actually observed (``- . / _``), per ``session_records.encode_cwd``.
 
     Best of all is not to add a copy: prefer CALLING
-    ``session_registry.encode_cwd``, as the spawn test's fixture now does.
+    ``session_records.encode_cwd``, as the spawn test's fixture now does.
     Where a copy is genuinely unavoidable, add it to :func:`_mirrors` — being
     in another language is no longer an exemption, since a bridge can present
     it as a plain callable. Only if a copy truly cannot be pinned to the
@@ -342,7 +343,7 @@ class TestEncoderLockstep:
     """
 
     def test_every_mirror_agrees_with_canonical_and_with_reality(self):
-        canonical = session_registry.encode_cwd
+        canonical = session_records.encode_cwd
         mirrors = _mirrors()
         for cwd, expected_dir in REAL_ENCODED_DIR_PAIRS:
             # The canonical itself must match the real on-disk dir name.

@@ -12,13 +12,21 @@ import ast
 from pathlib import Path
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _tree_scan import (
+    TESTS_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# Whole-tree scanner: see WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-_TESTS_DIR = Path(__file__).parent
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 _NOT_YET_MIGRATED = frozenset({
     '_merge_deep_scene.py',
@@ -36,7 +44,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_interactive_warm_worktree_integration_gate.py',
     'test_interactive_worktree.py',
     'test_interactive_worktree_reaper.py',
-    'test_invoke_role_config_resolution.py',
     'test_lane_lifecycle_gitops.py',
     'test_lane_lifecycle_integration.py',
     'test_merge_drift.py',
@@ -49,7 +56,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_merge_queue_bounce.py',
     'test_merge_queue_c3_submit_identity.py',
     'test_merge_queue_chain_intact.py',
-    'test_merge_queue_coalesce.py',
     'test_merge_queue_concurrent_verify.py',
     'test_merge_queue_conflict_graph.py',
     'test_merge_queue_depth_telemetry.py',
@@ -60,7 +66,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_merge_queue_frozen_prefix.py',
     'test_merge_queue_host_observability.py',
     'test_merge_queue_invariant_integration_gate.py',
-    'test_merge_queue_lifecycle_registry.py',
     'test_merge_queue_metrics.py',
     'test_merge_queue_multihost_wiring.py',
     'test_merge_queue_orphan_reaper.py',
@@ -84,8 +89,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_merge_verify_survivor_barrier.py',
     'test_merge_worktree_lifecycle_integration_gate.py',
     'test_multihost_verify_integration.py',
-    'test_offline_lane_infra_integration.py',
-    'test_offline_lane_integration.py',
     'test_pool_storage_guard.py',
     'test_protected_prefixes.py',
     'test_provenance_gate_integration.py',
@@ -114,7 +117,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_workflow.py',
     'test_workflow_agent_session_preserve.py',
     'test_workflow_escalated_steward_stall.py',
-    'test_workflow_merge_gating_strand.py',
     'test_workflow_signature_loop_guard.py',
     'test_workflow_status_on_resume.py',
     'test_workflow_truthful_commit_stamp.py',
@@ -149,14 +151,25 @@ def _local_repo_seeders(tree: ast.Module) -> list[str]:
     return seeders
 
 
+def _top_level_test_modules() -> tuple[Path, ...]:
+    return tuple(path for path in python_files(TESTS_DIR) if path.parent == TESTS_DIR)
+
+
+def _module_seeders(module: ParsedModule) -> tuple[str, ...]:
+    return tuple(_local_repo_seeders(module.tree))
+
+
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=_top_level_test_modules, extract=_module_seeders)
+TREE_ANALYSES = (ANALYSIS,)
+
+
 @pytest.fixture(scope='module')
-def seeders_by_module() -> dict[str, list[str]]:
-    found: dict[str, list[str]] = {}
-    for module in sorted(_TESTS_DIR.glob('*.py')):
-        seeders = _local_repo_seeders(ast.parse(module.read_text(encoding='utf-8')))
-        if seeders:
-            found[module.name] = seeders
-    return found
+def seeders_by_module(tree_pass: TreePass) -> dict[str, list[str]]:
+    return {
+        path.name: list(seeders)
+        for path, seeders in tree_pass.facts(ANALYSIS).items()
+        if seeders
+    }
 
 
 def test_no_module_grows_its_own_repo_seeder(seeders_by_module: dict[str, list[str]]) -> None:

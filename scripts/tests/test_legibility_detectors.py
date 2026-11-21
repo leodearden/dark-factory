@@ -18,14 +18,20 @@ from legibility_carrier_fixtures import (
     TRICKLE_CODER_PREAMBLE,
     assistant_record,
     briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
     coder_judgment,
     json_fenced,
+    sdk_prompt,
     text_block,
     tool_result_record,
     tool_use_block,
     user_record,
     with_origin,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _CEILING_DECLARATION = 'WATCHER_REARM_OUTCOME: CEILING exit=124'
 """The sighted line verbatim (plans/confusion-census-2026-07-31.md:97)."""
@@ -301,10 +307,11 @@ class TestNonDialogueCarrierPredicate:
             ),
             (user_record(briefing_text()), briefing_text()),
             (user_record(TRICKLE_CODER_PREAMBLE), TRICKLE_CODER_PREAMBLE),
+            (sdk_prompt(_ORDINARY_DIALOGUE), _ORDINARY_DIALOGUE),
         ],
         ids=[
             'non_human_origin_alone_decides', 'coder_judgment', 'json_fenced_coder_judgment',
-            'briefing', 'trickle_coder_prompt',
+            'briefing', 'trickle_coder_prompt', 'headless_sdk_prompt_alone_decides',
         ],
     )
     def test_a_non_dialogue_carrier_is_rejected(self, record, text):
@@ -316,11 +323,31 @@ class TestNonDialogueCarrierPredicate:
             (with_origin(user_record(_ORDINARY_DIALOGUE), 'human'), _ORDINARY_DIALOGUE),
             (assistant_record(text_block(_PROSE_SELF_CORRECTION)), _PROSE_SELF_CORRECTION),
             (assistant_record(text_block(PROSE_QUOTING_THE_SCHEMA)), PROSE_QUOTING_THE_SCHEMA),
+            (sdk_prompt(_ORDINARY_DIALOGUE, entrypoint='t3-code'), _ORDINARY_DIALOGUE),
         ],
-        ids=['human_origin', 'genuine_self_correction', 'prose_quoting_the_schema_inline'],
+        ids=[
+            'human_origin', 'genuine_self_correction', 'prose_quoting_the_schema_inline',
+            'sdk_gui_client_turn',
+        ],
     )
     def test_this_sessions_own_dialogue_is_kept(self, record, text):
         assert detectors.is_non_dialogue_carrier(record, text) is False
+
+    def test_a_headless_sdk_prompt_counts_no_text_signal_but_its_sessions_tool_results_do(self):
+        text = 'BLOCKED: merge gate refused the branch\n[Request interrupted by user for tool use]'
+        headless = detectors.record_hits(sdk_prompt(text))
+        gui_client = detectors.record_hits(sdk_prompt(text, entrypoint='t3-code'))
+        tool_result = detectors.record_hits({
+            **tool_result_record('tool-1', 'BLOCKED: gate refused\nls: cannot access x: No such file or directory'),
+            'entrypoint': 'sdk-cli',
+        })
+
+        assert headless.count(SignalClass.DF_GUARD) == 0
+        assert headless.count(SignalClass.INTERRUPT) == 0
+        assert gui_client.count(SignalClass.DF_GUARD) == 1
+        assert gui_client.count(SignalClass.INTERRUPT) == 1
+        assert tool_result.count(SignalClass.DF_GUARD) == 1
+        assert tool_result.count(SignalClass.NOT_FOUND) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -761,22 +788,27 @@ class TestAgentClassEvidence:
 
 _ORCHESTRATED_TASK_PREAMBLE = 'Task ID: 6925\nWorktree: /home/leo/src/dark-factory/.worktrees/6925'
 
+_FOREIGN_MARKER_LINES = [
+    pytest.param(_ORCHESTRATED_TASK_PREAMBLE, id='orchestrated_task'),
+    pytest.param('<command-message>recon-escalation-watcher</command-message>', id='watcher'),
+    pytest.param('You are a Memory Consolidator agent operating in sleep mode.', id='recon'),
+    pytest.param('You are the task curator for the dark-factory orchestrator.', id='curator_classifier'),
+]
+
+_INSTRUMENT_PROMPT_BUILDERS = [
+    pytest.param(_coder_prompt, id='trickle_coder'),
+    pytest.param(census_verifier_prompt, id='census_verifier'),
+    pytest.param(census_synthesis_prompt, id='census_synthesis'),
+]
+
 
 class TestLegibilityInstrumentSessions:
-    @pytest.mark.parametrize(
-        'digest_line',
-        [
-            _ORCHESTRATED_TASK_PREAMBLE,
-            '<command-message>recon-escalation-watcher</command-message>',
-            'You are a Memory Consolidator agent operating in sleep mode.',
-            'You are the task curator for the dark-factory orchestrator.',
-        ],
-        ids=['orchestrated_task', 'watcher', 'recon', 'curator_classifier'],
-    )
-    def test_a_trickle_coder_prompt_is_classified_by_its_opener_not_its_embedded_digest(
-        self, digest_line,
+    @pytest.mark.parametrize('build_prompt', _INSTRUMENT_PROMPT_BUILDERS)
+    @pytest.mark.parametrize('foreign_line', _FOREIGN_MARKER_LINES)
+    def test_an_instrument_prompt_is_classified_by_its_opener_not_the_text_it_embeds(
+        self, foreign_line, build_prompt,
     ):
-        assert _classify(user_record(_coder_prompt(digest_line))) is AgentClass.LEGIBILITY_INSTRUMENT
+        assert _classify(user_record(build_prompt(foreign_line))) is AgentClass.LEGIBILITY_INSTRUMENT
 
     def test_later_carriers_do_not_reclassify_an_instrument_session(self):
         records = [
@@ -860,6 +892,22 @@ _SHAPES = [
             assistant_record(text_block(coder_judgment())),
         ],
         'legibility-instrument', id='trickle_coder_session',
+    ),
+    pytest.param(
+        '-home-leo-src-dark-factory',
+        [
+            user_record(census_verifier_prompt(_ORCHESTRATED_TASK_PREAMBLE)),
+            assistant_record(text_block('{"verified": true}')),
+        ],
+        'legibility-instrument', id='census_verifier_session',
+    ),
+    pytest.param(
+        '-home-leo-src-dark-factory',
+        [
+            user_record(census_synthesis_prompt(_ORCHESTRATED_TASK_PREAMBLE)),
+            assistant_record(text_block('{"new": [], "re_observed": []}')),
+        ],
+        'legibility-instrument', id='census_synthesis_session',
     ),
 ]
 

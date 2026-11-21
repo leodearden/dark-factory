@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, call
 
 import pytest
@@ -26,6 +27,11 @@ from test_git_ops_unstack import (
 )
 
 from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane.landing_evidence import (
+    LandingMethod,
+    LandingVerdict,
+    validate_landing_evidence,
+)
 from orchestrator.merge_lane.member_redrive import MemberRedriveOutcome, MemberRedriver
 from orchestrator.scheduler import StaleEvidenceRejection
 
@@ -170,6 +176,40 @@ class TestOutcomes:
         assert [(esc.category, esc.agent_role) for esc in pending] == [
             ('provenance_unattributed', _ROLE),
         ]
+
+    async def test_the_redrive_keeps_the_citation_policy(
+        self, repo: _Repo, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The re-drive stays on ``validate_landing_evidence`` DISCOVERY (task 4648).
+
+        Task 4648 moved the dispatch gate's live-branch arms to
+        ``branch_work_landed``; this site deliberately keeps the legacy
+        citation-plus-effect-present policy, so its verdict's method is
+        ``citation``, never ``patch_id``.  The ruling is recorded in
+        ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7.
+        """
+        verdicts: list[LandingVerdict] = []
+
+        async def _recording(*args: Any, **kwargs: Any) -> LandingVerdict:
+            verdict = await validate_landing_evidence(*args, **kwargs)
+            verdicts.append(verdict)
+            return verdict
+
+        monkeypatch.setattr(
+            'orchestrator.merge_lane.member_redrive.validate_landing_evidence', _recording,
+        )
+        await repo.land_unattributed('ptr')
+
+        outcomes = await repo.redriver().redrive(
+            'train-x', ['ptr'],
+            status_check=_parked('ptr'),
+            redrive_member=AsyncMock(),
+            strip_unlanded_base=True,
+        )
+
+        assert outcomes == {'ptr': MemberRedriveOutcome.ON_MAIN_UNATTRIBUTED}
+        [verdict] = verdicts
+        assert verdict.method is LandingMethod.citation
 
     async def test_memoized_provenance_conflict_skips_the_write(self, repo: _Repo) -> None:
         await repo.land_attributed('memo')

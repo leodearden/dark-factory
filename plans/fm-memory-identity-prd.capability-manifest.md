@@ -62,9 +62,21 @@ bound as β's upstream producers below. Substrate it builds on:
 | Exact-name duplicate detection | grep:graphiti_client.py:1209 (`find_duplicate_entity_nodes`), :1175 (`get_nodes_by_exact_name`) | PASS |
 | WARN/alarm log emission (B5 observable) | grep:graphiti_client.py:944 (`logger.info` pattern in redirect) → module `logger` available for `logger.warning` | PASS |
 | Dup-uuid-edge repair convention (fresh uuid + `superseded_edge_uuid`) | producer:task-δ (upstream) | PASS (producer upstream) |
-| Backend-init hook to run the pass | grep:graphiti_client.py:261 (`initialize`), :252 (`_ensure_indices` per-graph hook precedent) | PASS (wired) |
+| Backend-init hook to run the pass | grep:graphiti_client.py:261 (`initialize`); ~~:252 (`_ensure_indices` per-graph hook precedent)~~ withdrawn, see correction below | PASS (`initialize` only); `_ensure_indices` precedent withdrawn 2026-11-14: never wired, see note |
 | Read-back to assert edge-set preserved (B6) | grep:graphiti_client.py:760 (`get_all_valid_edges`) | PASS (wired) |
 | DAG-direction | δ upstream of ε | PASS |
+
+**Correction (2026-11-14, task 3712).** The "Backend-init hook to run the pass"
+row above previously certified `_ensure_indices` as a wired per-graph hook
+precedent for a backend-init hook. That was false.
+`_MultiTenantFalkorDriver.build_indices_and_constraints` was a `pass` stub, so
+`_ensure_indices` called a no-op and no index was ever built by that path, from
+`723ec915c3` (2026-04-02) until FalkorDB index provisioning landed (wiring task
+3708, merged 2026-10-02). The `initialize` evidence stands:
+`GraphitiBackend.initialize` was, and is, the backend-init hook ε's startup
+identity scan runs from. The lesson: a call site that exists is not a hook that
+works. See `docs/prds/falkordb-index-provisioning.md` (task η). The
+pre-correction wording is in git history.
 
 ## ζ — simplify edge-read queries to uuid-keyed dedup *(leaf)*
 

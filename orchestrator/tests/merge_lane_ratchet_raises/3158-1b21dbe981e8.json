@@ -1,0 +1,18 @@
+{
+  "task_id": "3158",
+  "reason": "Net-additive regression test (task 3158): TestWarmLaneHandoffReviewFreshness's same-task re-dispatch case drives the real dispatch-boundary guard, TaskWorkflow._execute_verify_review_loop via _review_loop_harness, over a reacquired warm lane's TaskArtifacts.for_task view, so it goes red if the guard is removed (+1 private read). The method has no public entry short of run(), and the reviewer asked for this test.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_lane_lifecycle_gitops.py",
+      "baseline": 16,
+      "current": 17
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6382,
+      "current": 6383
+    }
+  ]
+}

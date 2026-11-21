@@ -407,7 +407,7 @@ def _escalate_regressed_after_resolution(
         )
         return
 
-    from escalation.models import Escalation  # noqa: PLC0415 — local, escalation optional dep
+    from escalation.models import Escalation  # local, escalation optional dep
 
     sentinel = _regression_sentinel(row)
     if escalation_queue.get_by_task(sentinel, status='pending', level=2):

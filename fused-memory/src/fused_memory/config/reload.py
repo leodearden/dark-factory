@@ -23,6 +23,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from fused_memory.config.overlay import EMBEDDER_SPACE_UNITS, PROVENANCE_FIELD
 from fused_memory.config.schema import FusedMemoryConfig
 
 # Code-owned allowlist of dotted leaf paths safe to hot-apply in place. Seeded
@@ -111,6 +112,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # and restart_required would be a false alarm. Yielded whole by
     # _iter_leaves, so it reloads all-or-nothing like the map above.
     'write_triage_project_calibrations',
+    # Config overlay provenance (task 6798). Read live off
+    # memory_service.config by get_status (embedder/status.py), and it travels
+    # with the overlay values it vouches for, so it reloads exactly when they do.
+    'config_overlay',
     # The two write-triage OPERATOR KNOBS (task 3127), green-tier for a
     # different reason than the calibrated thresholds above: they are hand-set,
     # not derived, and both are read LIVE off the shared
@@ -181,6 +186,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # flow on a running server WITHOUT granting content-amend authority.
     'mem0_update.content_amend_allowed_agent_prefixes',
     'mem0_update.metadata_patch_allowed_agent_prefixes',
+    # Read live per refusal by resolve_mem0_update_sanctioned_uses
+    # (server/mem0_update_authz.py) off the shared memory_service.config.mem0_update
+    # object. Rendering-only: it never changes an allow/deny decision. A dict,
+    # so _iter_leaves yields it whole and it reloads all-or-nothing, like
+    # write_triage.t_high_by_category.
+    'mem0_update.agent_prefix_sanctioned_use',
     # Read live per shadow job by services/overreach_shadow.py::OverreachShadow,
     # whose settings() re-reads memory_service.config.overreach_guard on every
     # submit and judge call. shadow_enabled is the shadow's kill switch.
@@ -189,11 +200,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Storm-alarm knobs, read live off the shared config by
     # MemoryService.update_memory and passed INTO StormCounter.record() on every
     # call. That per-call argument is the non-obvious part: the shared
-    # StormCounter (server/storm_counter.py) deliberately does NOT capture
-    # threshold/window in __init__, because a value captured at construction
-    # cannot observe an in-place mutation (see this module's reload-safety
-    # rule) -- which would make these two leaves restart-only while sitting in
-    # this allowlist as if they were green-tier.
+    # StormCounter (shared/src/shared/storm_counter.py) deliberately does NOT
+    # capture threshold/window in __init__, because a value captured at
+    # construction cannot observe an in-place mutation (see this module's
+    # reload-safety rule) -- which would make these two leaves restart-only
+    # while sitting in this allowlist as if they were green-tier.
     'mem0_update.storm_threshold',
     'mem0_update.storm_window_seconds',
     # ensure_entity_node authorization (task 4932). Read live per tool call by
@@ -220,8 +231,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Mint-path storm-alarm knobs, read live off the shared config by
     # MemoryService.ensure_entity_node and passed INTO StormCounter.record() on
     # every call, for exactly the reason spelled out for the mem0_update storm
-    # leaves above: the shared StormCounter (server/storm_counter.py)
-    # deliberately does NOT capture threshold/window in __init__.
+    # leaves above: the shared StormCounter
+    # (shared/src/shared/storm_counter.py) deliberately does NOT capture
+    # threshold/window in __init__.
     'entity_mint.storm_threshold',
     'entity_mint.storm_window_seconds',
     # ---- Deterministic auto-consolidation (task 5237, PRD Section 7/11) ----
@@ -287,6 +299,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'link_heal.misfile_share_ceiling',
     'link_heal.corrects_share_ceiling',
     'link_heal.shard_failure_streak',
+    # The scheduled sweep and its calibration gate (task 7159): same consumers.
+    'link_heal.projects',
+    'link_heal.writes',
+    'link_heal.sweep_actions',
+    'link_heal.sweep_window_hours',
+    'link_heal.calibration_kappa_margin',
+    'link_heal.calibration_min_project_items',
 })
 
 
@@ -301,6 +320,50 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
 # so the report stays machine-checkable — rather than raising the KeyError of
 # task 2718 review esc-2718-1.
 _ABSENT = '<absent>'
+
+
+# Any embedder leaf, not only model and dimensions: the overlay provenance
+# vouches for every key the overlay merged, endpoint included, so it must
+# never report a merge the live embedder is still waiting on a restart for.
+_EMBEDDER_SECTION_PREFIX = 'embedder.'
+
+# The leaves that wait with the embedder section: the overlay's embedder-space
+# units and the provenance that vouches for them.
+_EMBEDDER_SPACE_LEAVES: frozenset[str] = frozenset(
+    {PROVENANCE_FIELD}
+    | {
+        f'{unit.section}.{key}'
+        for unit in EMBEDDER_SPACE_UNITS if unit.keys is not None
+        for key in unit.keys
+    }
+)
+_EMBEDDER_SPACE_SECTIONS: frozenset[str] = frozenset(
+    unit.section for unit in EMBEDDER_SPACE_UNITS if unit.keys is None
+)
+
+
+def _waits_with_the_embedder(path: str) -> bool:
+    return (
+        path in _EMBEDDER_SPACE_LEAVES
+        or path.split('.', 1)[0] in _EMBEDDER_SPACE_SECTIONS
+    )
+
+
+def _hold_embedder_space_while_the_embedder_waits(
+    applied_candidates: dict[str, dict[str, Any]],
+    restart_required: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Move every embedder-space candidate to restart_required when an embedder leaf is there."""
+    if not any(path.startswith(_EMBEDDER_SECTION_PREFIX) for path in restart_required):
+        return applied_candidates, restart_required
+    held = {
+        path: entry for path, entry in applied_candidates.items()
+        if _waits_with_the_embedder(path)
+    }
+    still_applied = {
+        path: entry for path, entry in applied_candidates.items() if path not in held
+    }
+    return still_applied, restart_required | held
 
 
 @dataclass
@@ -373,6 +436,11 @@ def diff_config(
     allowlisted). The union + ``_ABSENT`` fallback merely guarantees any residual
     one-sided leaf is still bucketed (never a ``KeyError``) if that symmetry were
     ever broken — see task 2718 review esc-2718-1.
+
+    Embedder-space values (bands, calibrations) mean nothing outside the
+    embedder's space, and the overlay provenance vouches for the embedder
+    keys it merged, so when an ``embedder.*`` leaf waits for a restart, so
+    do they.
     """
     live_leaves = dict(_iter_leaves(live))
     fresh_leaves = dict(_iter_leaves(fresh))
@@ -390,6 +458,9 @@ def diff_config(
                 restart_required[path] = entry
         else:
             unchanged += 1
+    applied_candidates, restart_required = _hold_embedder_space_while_the_embedder_waits(
+        applied_candidates, restart_required,
+    )
     return ConfigDiff(
         applied_candidates=applied_candidates,
         restart_required=restart_required,

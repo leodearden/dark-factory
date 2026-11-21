@@ -3,8 +3,9 @@
 ``test_mismatch_streak.py`` drives ``MismatchStreak`` directly and
 ``test_project_root_assertion.py`` drives it through ``create_server``, as does
 ``test_store_identity_boundary.py`` over a real MCP session. All three
-must agree on what counts as the storm escape's output and on how a project
-store and a reconciliation store are laid out, so that lives here once.
+must agree on which tools the guard covers, on what counts as the storm
+escape's output and on how a project store and a reconciliation store are laid
+out, so that lives here once.
 
 Plain factories rather than ``conftest.py`` fixtures, like
 ``_pending_tool_fixtures.py``: each suite keeps its own thin fixtures over
@@ -20,6 +21,16 @@ from escalation.queue import EscalationQueue
 from escalation.store_identity import StoreIdentity
 
 PROJECT_ID = 'proj'
+
+# The reads plans/escalation-store-ambiguity-prd.md §6.3 guards.
+GUARDED_READS = (
+    'get_pending_escalations',
+    'get_escalation',
+    'get_task_escalation_history',
+    'get_task_escalations',
+)
+# The writes the same §6.3 guards.
+GUARDED_WRITES = ('escalate_info', 'escalate_blocker')
 
 
 def storm_records(queue: EscalationQueue) -> list[Escalation]:

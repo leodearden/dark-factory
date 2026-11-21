@@ -511,7 +511,7 @@ class TestTheWordingCli:
     def test_a_pre_psi_run_sends_the_pre_psi_prompt_and_restores_the_shipped_one(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+        from fused_memory.server import write_triage_judge
 
         sent = self._instructions(tmp_path, monkeypatch, '--wording', 'pre-psi')
         assert set(sent) == {_wording().PRE_PSI_JUDGE_SYSTEM_PROMPT}

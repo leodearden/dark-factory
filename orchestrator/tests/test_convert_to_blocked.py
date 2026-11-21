@@ -1241,7 +1241,7 @@ async def _land_via_merge(
     """Commit *paths_content* on *branch*, then no-ff merge it into *main*.
 
     The merge subject defaults to the canonical ``Merge <branch> into <main>``
-    that ``git_ops._merge_subject`` derives and ``find_merge_marker`` greps
+    that ``shared.merge_subject.format_merge_subject`` derives (git_ops' writer) and ``find_merge_marker`` greps
     for — writer and reader share one derivation in production, and this
     helper reproduces that exact string so the probe under test is exercised
     against the real format rather than a paraphrase.  Returns the merge SHA.
@@ -1591,7 +1591,7 @@ class TestResolveAlreadyLandedBranch:
         parked = await _head_of(git_repo)
         await _reseed(git_repo, 'task/908', parked)
 
-        async def boom(*a, **k):  # noqa: ARG001
+        async def boom(*a, **k):
             raise RuntimeError('probe exploded')
         monkeypatch.setattr('orchestrator.merge_lane.gates._run', boom)
 
@@ -1617,7 +1617,7 @@ class TestResolveAlreadyLandedBranch:
     ) -> None:
         """Cancellation is not a git error.  Swallowing it would strand the
         awaiting task in a state the caller believes it left."""
-        async def cancel(*a, **k):  # noqa: ARG001
+        async def cancel(*a, **k):
             raise asyncio.CancelledError
         monkeypatch.setattr('orchestrator.merge_lane.gates._run', cancel)
 
@@ -1901,7 +1901,7 @@ class TestResolveAlreadyLandedBranch:
 
         assert await widened.get_files_touched_in_branch(
             f'{revert_sha}^1', revert_sha,
-        ) == plan_files
+        ) == (plan_files, None)
         assert await widened.commit_effect_present_in_main(revert_sha)
 
         assert await _resolve(
@@ -1990,11 +1990,11 @@ class TestSubmitToMergeQueueAlreadyLanded:
         escalation — a clean assertion failure rather than an
         ``await MagicMock`` crash.
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        async def fake_check(*a, **k):  # noqa: ARG001
+        async def fake_check(*a, **k):
             return PlanFilesTouchedResult(not_touched=['a.py'])
         monkeypatch.setattr(
             'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
@@ -2002,7 +2002,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
 
         emits: list = []
 
-        def fake_emit(event_store, task_id, outcome, **kwargs):  # noqa: ARG001
+        def fake_emit(event_store, task_id, outcome, **kwargs):
             emits.append(outcome)
         monkeypatch.setattr(
             'orchestrator.merge_lane.worker._emit_merge_attempt', fake_emit,
@@ -2108,13 +2108,15 @@ class TestSubmitToMergeQueueAlreadyLanded:
         assert 'task_citation' in reason
         assert kwargs.get('escalate_to_human') is not True
 
-    async def test_the_predicate_is_given_the_branch_and_the_recorded_base(
+    async def test_the_predicate_is_given_the_branch_and_the_own_work_base(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
         """The predicate cannot measure the range or find the marker without
         both, and a plausible-looking wiring that passes neither would make
         every case fail closed — i.e. silently restore the bug."""
         wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
+        wf.artifacts.init(wf.task_id, 'T', 'd', base_commit='stored_sha')
         seen: list = []
         self._stub_predicate(monkeypatch, self._landed(), seen=seen)
         self._wire(wf, monkeypatch)
@@ -2124,7 +2126,10 @@ class TestSubmitToMergeQueueAlreadyLanded:
         assert len(seen) == 1
         plan_files, base_sha, branch_head, kw = seen[0]
         assert plan_files == ['a.py', 'b.py', 'c.py']
-        assert base_sha == 'base_sha', 'the branch\'s RECORDED base, not HEAD'
+        assert base_sha == 'stored_sha', (
+            'the own-work base (here the stored base: the fixture worktree is '
+            'not a checkout), not wf._base_commit and not HEAD'
+        )
         assert branch_head == 'fake_head_sha'
         assert kw.get('task_id') == wf.task_id
         # EXACT, not a substring: the merge-marker probe greps for the literal
@@ -2179,7 +2184,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         emits, narrow, mark_blocked = self._wire(wf, monkeypatch)
 
         # Re-stub the gate to PASS, overriding _wire's failing stub.
-        async def passing_check(*a, **k):  # noqa: ARG001
+        async def passing_check(*a, **k):
             return PlanFilesTouchedResult()
         monkeypatch.setattr(
             'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
@@ -2193,7 +2198,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         class _ReachedEnqueue(Exception):
             pass
 
-        async def boom(*a, **k):  # noqa: ARG001
+        async def boom(*a, **k):
             raise _ReachedEnqueue
         monkeypatch.setattr(
             'orchestrator.merge_lane.intake.register_and_enqueue_merge_request', boom,
@@ -2220,7 +2225,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         wf = _make_workflow(tmp_path=tmp_path)
         order: list[str] = []
 
-        async def fake_resolve(*a, **k):  # noqa: ARG001
+        async def fake_resolve(*a, **k):
             order.append('predicate')
             return self._landed()
         monkeypatch.setattr(
@@ -2272,11 +2277,11 @@ class TestAlreadyLandedLadderWithRealMarkBlocked:
 
         from escalation.queue import EscalationQueue
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        async def fake_check(*a, **k):  # noqa: ARG001
+        async def fake_check(*a, **k):
             return PlanFilesTouchedResult(not_touched=['a.py'])
         monkeypatch.setattr(
             'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
@@ -2441,12 +2446,19 @@ class TestLandedButPinnedZombieLoop:
 
     # --- ENTRY half ---------------------------------------------------------
 
+    @pytest.mark.parametrize('creation_base', ['re_cut', 'rebased_away'])
     async def test_entry_the_gate_no_longer_mints_the_pin(
         self, git_repo: Path, git_ops: GitOps, tmp_path: Path, monkeypatch,
+        creation_base: str,
     ) -> None:
         """Over a REAL repo in the measured parked shape, the gate must not
         produce the ``escalate_to_human=True`` block whose default
-        ``category='task_failure'`` is the loop's only fuel."""
+        ``category='task_failure'`` is the loop's only fuel.
+
+        The stored base is ``parked`` either way: from the re-cut, or from an
+        inter-iteration rebase that dropped every commit while the
+        creation-time base stayed on main before the landing (task 7668)."""
+        pre_landing = await git_ops.get_main_sha()
         merge_sha = await _land_via_merge(
             git_repo, 'task/3717',
             {f: f'# {f}\n' for f in self._PLAN_FILES},
@@ -2460,15 +2472,17 @@ class TestLandedButPinnedZombieLoop:
 
         wf = _make_workflow(tmp_path=tmp_path / 'wf', task_id='3717')
         wf.plan = {'files': list(self._PLAN_FILES)}
-        wf._base_commit = parked
+        wf._base_commit = parked if creation_base == 're_cut' else pre_landing
+        assert wf.artifacts is not None
+        wf.artifacts.init('3717', 'T', 'd', base_commit=parked)
         wf.git_ops = git_ops
         wf.config.project_root = git_repo
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, f'{parked}\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        async def fake_check(*a, **k):  # noqa: ARG001
+        async def fake_check(*a, **k):
             # The REAL gate's verdict for this shape: the empty range touches
             # none of the declared files.  Stubbed rather than run so this
             # test pins the CARVE-OUT, not a second copy of the gate (which
@@ -2481,7 +2495,7 @@ class TestLandedButPinnedZombieLoop:
         emits: list = []
         monkeypatch.setattr(
             'orchestrator.merge_lane.worker._emit_merge_attempt',
-            lambda es, tid, outcome, **k: emits.append(outcome),  # noqa: ARG005
+            lambda es, tid, outcome, **k: emits.append(outcome),
         )
         narrow = AsyncMock(return_value=False)
         wf._try_narrow_plan = narrow  # type: ignore[method-assign]

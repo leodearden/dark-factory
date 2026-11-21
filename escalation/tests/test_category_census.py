@@ -231,12 +231,13 @@ class TestWrapperDiscovery:
 
     def test_reader_seeds(self, tmp_path: Path):
         _write(tmp_path, 'pkg/src/pkg/q.py', """
-            def check(q, t, sha):
+            def check(q, t, sha, pred):
                 q.has_open_l1(t, category='lambda')
                 q.find_terminal_by_citation(t, 'mu', sha)
+                q.newest_terminal_by_task(t, 'nu', pred)
         """)
 
-        assert _values(run_census([tmp_path])) == {'lambda', 'mu'}
+        assert _values(run_census([tmp_path])) == {'lambda', 'mu', 'nu'}
 
 
 class TestWhatIsNotASite:

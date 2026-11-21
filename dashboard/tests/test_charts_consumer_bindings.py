@@ -7,13 +7,14 @@ it is exactly what made HBarChart look like it had five call sites when it had
 two (task 3681, which closed out that component's null-sample defects and found
 the stale imports while measuring its real blast radius).
 
-SCOPED TO THE DESTRUCTURE SHAPE ONLY — deliberate, not an oversight.  Nine .jsx
-files under static/redux/ touch ``window.DF_CHARTS``, but only five reach it by
-a ``const { ... } = window.DF_CHARTS`` destructure.  The others use:
+SCOPED TO THE DESTRUCTURE SHAPE ONLY — deliberate, not an oversight.  Not every
+.jsx under static/redux/ that reads ``window.DF_CHARTS`` reaches it by a
+``const { ... } = window.DF_CHARTS`` destructure (``_destructure_consumers``
+below is the live list of those that do).  The others use:
 
   - a NAMESPACE binding (``const C = window.DF_CHARTS;`` —
     esc_flow_diagram.jsx, tab_escalation_analytics.jsx, tab_escalations.jsx)
-  - a single MEMBER read (``const SP_SHELL = window.DF_CHARTS.Sparkline;`` —
+  - a single MEMBER read (``const PIP_AGE_STYLE = window.DF_CHARTS.DATUM_AGE_STYLE;`` —
     shell.jsx)
 
 Do NOT widen the regex to swallow those.  Widening is actively wrong, not just
@@ -24,7 +25,7 @@ the way a destructure list is.  The defect this file exists to catch — an
 imported-but-never-rendered component — can only exist in the destructure shape
 anyway.
 
-The parser is the shared one in ``_dashboard_helpers`` (``DF_CHARTS_DESTRUCTURE_RE``
+The parser is the shared one in ``_jsx_source_helpers`` (``DF_CHARTS_DESTRUCTURE_RE``
 and ``destructure_bindings``), so this is not a second dialect of the same line.
 That helper returns ``(canonical, local)`` PAIRS and this module projects the
 LOCAL half, because the alias is what the file renders by and therefore what
@@ -37,7 +38,7 @@ from __future__ import annotations
 import pathlib
 import re
 
-from _dashboard_helpers import DF_CHARTS_DESTRUCTURE_RE, destructure_bindings
+from _jsx_source_helpers import DF_CHARTS_DESTRUCTURE_RE, destructure_bindings
 
 _REDUX_DIR = pathlib.Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
 

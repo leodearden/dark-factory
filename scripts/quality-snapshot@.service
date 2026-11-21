@@ -1,0 +1,25 @@
+[Unit]
+Description=Quality-metrics snapshot of %i's main (no LLM, never commits)
+Documentation=file:///home/leo/src/dark-factory/scripts/quality_snapshot_cadence.py
+Documentation=file:///home/leo/src/dark-factory/OPERATIONS.md
+OnFailure=quality-snapshot-alarm@%i.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/leo/src/dark-factory
+# The instance's checkout root, written by scripts/install-quality-snapshot-timer.sh.
+# Required: an instance enabled by hand without the installer fails loudly,
+# and so alarms, instead of measuring the wrong checkout.
+EnvironmentFile=%E/dark-factory/quality-snapshot/%i.env
+Nice=19
+# The lowest weight with a precedent: the background tier of
+# orchestrator/src/orchestrator/verify.py::_resolve_scope_cpu_weight.
+CPUWeight=10
+TimeoutStartSec=2h
+# No PATH pin: git resolves from the manager's default PATH, and the interpreter is absolute.
+ExecStart=/home/leo/src/dark-factory/.venv/bin/python /home/leo/src/dark-factory/scripts/quality_snapshot_cadence.py --root ${QUALITY_SNAPSHOT_ROOT} --project-id %i
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=timers.target

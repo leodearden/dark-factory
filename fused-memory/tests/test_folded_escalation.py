@@ -25,22 +25,26 @@ import ast
 import asyncio
 import importlib
 import importlib.util
+import inspect
 import json
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
 from _ast_guard import parse_python_module
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.middleware.curation_deferral import DeferReason
 from fused_memory.middleware.ticket_store import CurationBacklog
-from fused_memory.services.write_journal import JournalGrowthSample
+from fused_memory.services.write_journal import JournalGrowthSample, Mem0RetryBacklog
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 #: Applied PER CLASS rather than as a module-level ``pytestmark``, so the
 #: pairwise anchor-collision regression at the foot of this file keeps running
@@ -163,6 +167,127 @@ class TestTheFiledEscalation:
         esc_id = _emit(tmp_path, level=2)
         assert esc_id is not None
         assert _filed(tmp_path)[0]['level'] == 2
+
+
+@_needs_escalation
+class TestTheLinkHealCalibrationAndRunReportRoutes:
+    """The link-heal sweep's two anchors (task 7159), filed through
+    ``FoldedEscapeFiler`` into a real queue.
+
+    A failed calibration is an alarm, so a second filing folds into the open
+    record. A run report is a distinct payload per run, and a fold would
+    discard every later night's report path, so it never folds.
+    """
+
+    @staticmethod
+    def _file(tmp_path, anchor: str, summary: str, report: str) -> str | None:
+        from fused_memory.maintenance.link_heal_executor import (
+            Escape,
+            FoldedEscapeFiler,
+        )
+
+        return FoldedEscapeFiler(str(tmp_path))(
+            Escape(anchor=anchor, summary=summary, detail={'report': report}),
+        )
+
+    def test_a_failed_calibration_files_a_blocking_risk_and_folds(self, tmp_path):
+        from fused_memory.maintenance.link_heal_executor import (
+            CALIBRATION_ANCHOR,
+        )
+
+        first = self._file(tmp_path, CALIBRATION_ANCHOR, 'calibration failed', 'one.md')
+        second = self._file(tmp_path, CALIBRATION_ANCHOR, 'calibration failed again', 'two.md')
+
+        assert first is not None
+        assert second == first
+        [record] = _filed(tmp_path)
+        assert record['task_id'] == CALIBRATION_ANCHOR == 'link-heal-calibration'
+        assert (record['category'], record['severity'], record['level']) == (
+            'risk_identified', 'blocking', 1,
+        )
+
+    def test_a_run_report_files_info_and_never_folds(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from fused_memory.maintenance.link_heal_executor import (
+            RUN_REPORT_ANCHOR,
+        )
+
+        first = self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: one.md', 'one.md')
+        second = self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: two.md', 'two.md')
+
+        assert first is not None
+        assert second is not None
+        assert second != first
+        records = EscalationQueue(tmp_path / 'data' / 'escalations').get_by_task(RUN_REPORT_ANCHOR)
+        assert sorted(record.summary for record in records) == [
+            'link-heal sweep: one.md', 'link-heal sweep: two.md',
+        ]
+        for record in records:
+            assert record.task_id == RUN_REPORT_ANCHOR == 'link-heal-run-report'
+            assert (record.category, record.severity, record.level) == (
+                'link_heal_run_report', 'info', 1,
+            )
+
+    def test_a_new_run_report_dismisses_the_one_still_pending_before_it(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        from fused_memory.maintenance.link_heal_executor import (
+            RUN_REPORT_ANCHOR,
+        )
+
+        first = self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: one.md', 'one.md')
+        second = self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: two.md', 'two.md')
+
+        assert first is not None and second is not None
+        queue = EscalationQueue(tmp_path / 'data' / 'escalations')
+        pending = queue.get_by_task(RUN_REPORT_ANCHOR, status='pending')
+        assert [record.id for record in pending] == [second]
+        dismissed = queue.get(first)
+        assert dismissed is not None
+        assert dismissed.status == 'dismissed'
+        assert second in (dismissed.resolution or '')
+
+    def test_a_run_report_leaves_another_filer_s_pending_record_alone(self, tmp_path):
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        from fused_memory.maintenance.link_heal_executor import (
+            RUN_REPORT_ANCHOR,
+        )
+
+        queue = EscalationQueue(tmp_path / 'data' / 'escalations')
+        foreign = queue.submit(Escalation(
+            id=queue.make_id(RUN_REPORT_ANCHOR), task_id=RUN_REPORT_ANCHOR,
+            agent_role='someone-else', severity='info', category='link_heal_run_report',
+            summary='not a link-heal filing', detail='', suggested_action='', level=1,
+        ))
+
+        self._file(tmp_path, RUN_REPORT_ANCHOR, 'link-heal sweep: one.md', 'one.md')
+
+        stored = queue.get(foreign)
+        assert stored is not None
+        assert stored.status == 'pending'
+
+    def test_a_run_report_suggests_the_undo_command_operators_are_shown(self, tmp_path):
+        from fused_memory.maintenance.link_heal_executor import (
+            FoldedEscapeFiler,
+            run_report_escape,
+            undo_command,
+        )
+
+        esc_id = FoldedEscapeFiler(str(tmp_path))(
+            run_report_escape({'plan_run_id': 'a1' * 16}, tmp_path / 'report.md'),
+        )
+
+        assert esc_id is not None
+        [record] = _filed(tmp_path)
+        assert undo_command('<undo_run_id>') in record['suggested_action']
+
+    def test_the_run_report_category_is_registered(self):
+        from escalation.categories import require_registered_category
+
+        require_registered_category('link_heal_run_report')
 
 
 @_needs_escalation
@@ -602,6 +727,19 @@ def _journal_growth(ceiling: str) -> Callable[[Any, str], object]:
     return fire
 
 
+def _mem0_retry_backlog(module: Any, project_root: str) -> object:
+    now = datetime(2026, 11, 3, 12, tzinfo=UTC)
+    return module.emit_mem0_retry_backlog_escalation(
+        project_root,
+        backlog=Mem0RetryBacklog(
+            project_id='dark_factory', count=1,
+            oldest_created_at=now - timedelta(hours=2), max_attempts=3,
+        ),
+        now=now,
+        max_age=timedelta(hours=1),
+    )
+
+
 def _unverified_claim(module: Any, project_root: str) -> object:
     return module.emit_unverified_claim_escalation(
         project_root,
@@ -691,9 +829,8 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
         'completion_claim_gate',
         'fused_memory.services.completion_claim_gate',
         _unverified_claim,
-        # L0, the Escalation model's default, which this filer has always been
-        # born at. Whether an 'info' record under a synthetic anchor should be
-        # born at L1 like its siblings is a design question, not a refactor's.
+        # L0 on purpose, for the reason pinned by
+        # fused-memory/tests/test_completion_claim_gate.py::TestEmitUnverifiedClaimEscalation::test_the_filed_record_is_one_the_info_l0_router_converts_into_a_curator_task
         0,
     ),
     _Filer(
@@ -725,6 +862,12 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
             storm={'count': 5, 'threshold': 5, 'window_seconds': 3600.0,
                    'labels': ['llm_error']},
         ),
+        1,
+    ),
+    _Filer(
+        'mem0_retry_backlog_alarm',
+        'fused_memory.services.mem0_retry_backlog_alarm',
+        _mem0_retry_backlog,
         1,
     ),
     _Filer(
@@ -779,17 +922,41 @@ def _imports_the_helper(tree: ast.AST, package: str) -> bool:
     )
 
 
+def _production_modules_where(predicate: Callable[[ast.AST, str], bool]) -> set[str]:
+    """The dotted name of every production module whose parsed source, read
+    in its own package, satisfies *predicate*."""
+    found: set[str] = set()
+    for path in sorted(_SRC_ROOT.rglob('*.py')):
+        package = path.parent.relative_to(_SRC_ROOT.parent).as_posix().replace('/', '.')
+        if predicate(parse_python_module(path), package):
+            found.add(package if path.stem == '__init__' else f'{package}.{path.stem}')
+    return found
+
+
 def _modules_that_call_the_helper() -> set[str]:
     """The dotted name of every production module that imports the helper.
 
     Over PARSED imports, so prose that merely names the helper cannot count.
     """
-    found: set[str] = set()
-    for path in sorted(_SRC_ROOT.rglob('*.py')):
-        package = path.parent.relative_to(_SRC_ROOT.parent).as_posix().replace('/', '.')
-        if _imports_the_helper(parse_python_module(path), package):
-            found.add(package if path.stem == '__init__' else f'{package}.{path.stem}')
-    return found
+    return _production_modules_where(_imports_the_helper)
+
+
+_QUEUE_DIR_HOME = escalation_queue_dir.__module__
+_QUEUE_DIR_RESOLVER = f'{_QUEUE_DIR_HOME}.{escalation_queue_dir.__name__}'
+
+
+def _reaches_the_project_queue(tree: ast.AST, package: str) -> bool:
+    """Whether *tree* imports either route to `<project_root>/data/escalations`,
+    in any spelling: the layout's queue resolver or the module that holds it,
+    or the helper that calls it."""
+    return (
+        bool(_imported_targets(tree, package) & {_QUEUE_DIR_HOME, _QUEUE_DIR_RESOLVER})
+        or _imports_the_helper(tree, package)
+    )
+
+
+def _modules_that_reach_the_project_queue() -> set[str]:
+    return _production_modules_where(_reaches_the_project_queue)
 
 
 def _forwarded_kwargs(filer: _Filer, tmp_path, monkeypatch) -> dict:
@@ -863,9 +1030,10 @@ class TestEveryFilerPinsItsLevels:
         assert forwarded == filer.escalation_level, (
             f'{filer.label} files at level={forwarded!r}, table says '
             f'{filer.escalation_level!r}. An L0 record under a synthetic anchor '
-            'has no steward and waits for the orphan-L0 reaper; an L1 record '
-            'reaches the escalation watcher at once. If the change is '
-            'deliberate, edit the table and say why in the row.'
+            'has no steward and is routed as file_folded_escalation\'s `level` '
+            'docstring describes; an L1 record reaches the escalation watcher '
+            'at once. If the change is deliberate, edit the table and say why '
+            'in the row.'
         )
 
     def test_the_table_covers_every_module_that_calls_the_helper(self):
@@ -939,11 +1107,14 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     the property that makes a colliding RENAME fail this test: a copy of the
     values in this file would keep passing while production went silent.
     """
-    from fused_memory.maintenance.link_heal_executor import (  # noqa: PLC0415
+    from fused_memory.maintenance.link_heal_executor import (
         ADJUDICATOR_ANCHOR as LINK_HEAL_ADJUDICATOR_ANCHOR,
     )
     from fused_memory.maintenance.link_heal_executor import (
         BACKLOG_ANCHOR as LINK_HEAL_BACKLOG_ANCHOR,
+    )
+    from fused_memory.maintenance.link_heal_executor import (
+        CALIBRATION_ANCHOR as LINK_HEAL_CALIBRATION_ANCHOR,
     )
     from fused_memory.maintenance.link_heal_executor import (
         CORRECTS_SHARE_ANCHOR as LINK_HEAL_CORRECTS_SHARE_ANCHOR,
@@ -952,24 +1123,30 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         MISFILE_SHARE_ANCHOR as LINK_HEAL_MISFILE_SHARE_ANCHOR,
     )
     from fused_memory.maintenance.link_heal_executor import (
+        RUN_REPORT_ANCHOR as LINK_HEAL_RUN_REPORT_ANCHOR,
+    )
+    from fused_memory.maintenance.link_heal_executor import (
         WRITE_FAILURE_ANCHOR as LINK_HEAL_WRITE_FAILURE_ANCHOR,
     )
-    from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
+    from fused_memory.middleware.candidate_key_escalation import (
         _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
     )
     from fused_memory.middleware.curator_escalator import (
         _ANCHOR_TASK_ID as CURATOR_ANCHOR,
     )
-    from fused_memory.middleware.entity_mint_storm_escalator import (  # noqa: PLC0415
+    from fused_memory.middleware.dead_letter_escalator import (
+        _ANCHOR_TASK_ID as DEAD_LETTER_ANCHOR,
+    )
+    from fused_memory.middleware.entity_mint_storm_escalator import (
         _ANCHOR_TASK_ID as ENTITY_MINT_ANCHOR,
     )
-    from fused_memory.middleware.mem0_update_storm_escalator import (  # noqa: PLC0415
+    from fused_memory.middleware.mem0_update_storm_escalator import (
         _ANCHOR_TASK_ID as MEM0_UPDATE_ANCHOR,
     )
-    from fused_memory.middleware.referent_repair_storm_escalator import (  # noqa: PLC0415
+    from fused_memory.middleware.referent_repair_storm_escalator import (
         _ANCHOR_TASK_ID as REFERENT_REPAIR_ANCHOR,
     )
-    from fused_memory.middleware.scope_violation_escalator import (  # noqa: PLC0415
+    from fused_memory.middleware.scope_violation_escalator import (
         _ANCHOR_TASK_ID as SCOPE_VIOLATION_ANCHOR,
     )
     from fused_memory.middleware.scope_violation_escalator import (
@@ -984,34 +1161,37 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.middleware.ticket_janitor import (
         curation_backlog_anchor,
     )
-    from fused_memory.server.markup_guard import (  # noqa: PLC0415
+    from fused_memory.server.markup_guard import (
         _RESIDUE_ANCHOR_TASK_ID as GUARD_RESIDUE_ANCHOR,
     )
     from fused_memory.server.markup_guard import (
         _STORM_ANCHOR_TASK_ID as GUARD_STORM_ANCHOR,
     )
-    from fused_memory.server.markup_tripwire import (  # noqa: PLC0415
+    from fused_memory.server.markup_tripwire import (
         _ANCHOR_TASK_ID as TRIPWIRE_ANCHOR,
     )
     from fused_memory.server.markup_tripwire import (
         _RESIDUE_ANCHOR_TASK_ID as TRIPWIRE_RESIDUE_ANCHOR,
     )
-    from fused_memory.server.write_triage import (  # noqa: PLC0415
+    from fused_memory.server.write_triage import (
         _ANCHOR_TASK_ID as WRITE_TRIAGE_ANCHOR,
     )
-    from fused_memory.services.classification_fallback_alarm import (  # noqa: PLC0415
+    from fused_memory.services.classification_fallback_alarm import (
         ANCHOR_TASK_ID as CLASSIFICATION_FALLBACK_ANCHOR,
     )
-    from fused_memory.services.completion_claim_gate import (  # noqa: PLC0415
+    from fused_memory.services.completion_claim_gate import (
         _ANCHOR_PREFIX as UNVERIFIED_CLAIM_PREFIX,
     )
-    from fused_memory.services.journal_growth_alarm import (  # noqa: PLC0415
+    from fused_memory.services.journal_growth_alarm import (
         _FILE_SIZE_ANCHOR_TASK_ID as JOURNAL_SIZE_ANCHOR,
     )
     from fused_memory.services.journal_growth_alarm import (
         _INSERT_RATE_ANCHOR_TASK_ID as JOURNAL_RATE_ANCHOR,
     )
-    from fused_memory.services.memory_metadata_census import (  # noqa: PLC0415
+    from fused_memory.services.mem0_retry_backlog_alarm import (
+        ANCHOR_TASK_ID as MEM0_RETRY_BACKLOG_ANCHOR,
+    )
+    from fused_memory.services.memory_metadata_census import (
         _ANCHOR_TASK_ID as CENSUS_ANCHOR_BASE,
     )
     from fused_memory.services.memory_metadata_census import (
@@ -1033,16 +1213,19 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         'journal_growth_alarm file_size': JOURNAL_SIZE_ANCHOR,
         'journal_growth_alarm insert_rate': JOURNAL_RATE_ANCHOR,
         'classification_fallback_alarm': CLASSIFICATION_FALLBACK_ANCHOR,
+        'mem0_retry_backlog_alarm': MEM0_RETRY_BACKLOG_ANCHOR,
         # -- markup_guard, which CALLS the tripwire's filers with anchors of
         #    its own rather than carrying a copy of the skeleton -------------
         'markup_guard storm': GUARD_STORM_ANCHOR,
         'markup_guard residue': GUARD_RESIDUE_ANCHOR,
-        # -- the link-heal executor's run escapes (tasks 6181, 6184) ----------
+        # -- the link-heal executor's run escapes (tasks 6181, 6184, 7159) ----
         'link_heal backlog': LINK_HEAL_BACKLOG_ANCHOR,
         'link_heal write-failure': LINK_HEAL_WRITE_FAILURE_ANCHOR,
         'link_heal misfile-share': LINK_HEAL_MISFILE_SHARE_ANCHOR,
         'link_heal corrects-share': LINK_HEAL_CORRECTS_SHARE_ANCHOR,
         'link_heal adjudicator': LINK_HEAL_ADJUDICATOR_ANCHOR,
+        'link_heal calibration': LINK_HEAL_CALIBRATION_ANCHOR,
+        'link_heal run-report': LINK_HEAL_RUN_REPORT_ANCHOR,
         # -- the ticket janitor's curation backlog, one anchor per defer reason
         **{
             f'ticket_janitor curation-backlog {reason}': curation_backlog_anchor(reason)
@@ -1054,6 +1237,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         #    squat an anchor and must be in this sweep. ---------------------
         'mem0_update_storm_escalator': MEM0_UPDATE_ANCHOR,
         'entity_mint_storm_escalator': ENTITY_MINT_ANCHOR,
+        'dead_letter_escalator': DEAD_LETTER_ANCHOR,
         'scope_violation_escalator': SCOPE_VIOLATION_ANCHOR,
         'scope_violation_escalator override': SCOPE_OVERRIDE_ANCHOR,
         'scope_violation_escalator budget-misconfig': SCOPE_BUDGET_ANCHOR,
@@ -1080,6 +1264,46 @@ _DELIBERATE_ALIASES: tuple[tuple[str, str], ...] = (
 )
 
 
+def _modules_the_sweep_reads() -> set[str]:
+    """The homes `_anchors_read_from_their_own_homes` imports its anchors from,
+    read off its own source so the sweep's membership has one copy."""
+    tree = ast.parse(inspect.getsource(_anchors_read_from_their_own_homes))
+    return {
+        node.module for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+
+
+#: The modules that reach `<project_root>/data/escalations` but file no anchor
+#: another filer could squat, each with its reason. The census finds the
+#: modules that DIRECTLY import `escalation_queue_dir` or the
+#: `_folded_escalation` helper, one verdict per module. Two filers are
+#: therefore swept by hand, not by the census: a module that forwards its own
+#: anchor through another module's emitter (`markup_guard`, through
+#: `markup_tripwire`'s), and a new anchor added to a module already swept.
+#: Filers that write only the reconciliation queue (`config.escalation_queue_dir`)
+#: are out of scope: an anchor on a different queue cannot squat one on this
+#: queue.
+_QUEUE_FILERS_OUTSIDE_THE_SWEEP: dict[str, str] = {
+    'fused_memory.middleware._folded_escalation':
+        'the helper itself; every caller passes its own anchor and is swept '
+        'by that constant',
+    'fused_memory.reconciliation.reconciler_escalation':
+        "files under the real task id its caller passes (targeted.py's "
+        'orphaned-descendant and verification-contradicted L1s)',
+    'fused_memory.reconciliation.harness':
+        'its project-queue filer, `_file_finding_task_escalation`, files under '
+        "the finding's real task id; the synthetic `recon-<run_id>` records of "
+        '`_escalate` go to the reconciliation queue, a different store',
+    'fused_memory.reconciliation.backlog_policy':
+        'files `task_id=None` and folds on a content fingerprint, so there is '
+        'no anchor to squat',
+    'fused_memory.reconciliation.bulk_reset_guard':
+        'writes `task_id=None` records under a timestamped id and rate-limits '
+        'in memory, so there is no anchor to squat',
+}
+
+
 class TestNoTwoFilersShareAnAnchor:
     """A SQUATTED anchor is suppressed indefinitely, and reads as calm.
 
@@ -1099,7 +1323,7 @@ class TestNoTwoFilersShareAnAnchor:
     """
 
     def test_every_pair_of_anchors_is_distinct(self) -> None:
-        import itertools  # noqa: PLC0415
+        import itertools
 
         anchors = _anchors_read_from_their_own_homes()
         aliased = {frozenset(pair) for pair in _DELIBERATE_ALIASES}
@@ -1145,6 +1369,8 @@ class TestNoTwoFilersShareAnAnchor:
             'journal_growth_alarm file_size',
             'journal_growth_alarm insert_rate',
             'classification_fallback_alarm',
+            'markup_guard storm',
+            'markup_guard residue',
             'mem0_update_storm_escalator',
             'entity_mint_storm_escalator',
             'scope_violation_escalator',
@@ -1153,17 +1379,71 @@ class TestNoTwoFilersShareAnAnchor:
             'link_heal misfile-share',
             'link_heal corrects-share',
             'link_heal adjudicator',
+            'link_heal calibration',
+            'link_heal run-report',
             'curator_escalator',
             'ticket_janitor curator-bucket',
+            'dead_letter_escalator',
         ):
             assert required in anchors, (
                 f'{required!r} files into the same queue but is absent from '
                 'the anchor sweep'
             )
-        assert len(anchors) >= 25, (
+        assert len(anchors) >= 35, (
             f'the sweep shrank to {len(anchors)} entries; a filer was dropped '
             'rather than renamed'
         )
+
+    def test_every_module_that_reaches_the_queue_is_swept_or_excluded(self) -> None:
+        """Anti-vacuity against the source tree, not a hand-written list: a
+        new filer on the queue fails here until it is classified."""
+        found = _modules_that_reach_the_project_queue()
+        swept = _modules_the_sweep_reads()
+        excluded = set(_QUEUE_FILERS_OUTSIDE_THE_SWEEP)
+        assert 'fused_memory.middleware.curator_escalator' in found, (
+            f'the queue census found {sorted(found)!r}; it is reading the wrong '
+            'tree or the import shape changed, and would pass vacuously'
+        )
+        assert 'fused_memory.server.write_triage' in swept, (
+            f'the sweep reads {sorted(swept)!r}; its imports could not be read, '
+            'and the census would pass vacuously'
+        )
+
+        unclassified = found - swept - excluded
+        assert not unclassified, (
+            f'{sorted(unclassified)!r} file into <project_root>/data/escalations '
+            'but are neither swept nor excluded. Add each one\'s anchor to '
+            '_anchors_read_from_their_own_homes, or give it a row with its '
+            'reason in _QUEUE_FILERS_OUTSIDE_THE_SWEEP.'
+        )
+        assert not excluded - found, (
+            f'{sorted(excluded - found)!r} no longer reach the queue; drop their '
+            'rows from _QUEUE_FILERS_OUTSIDE_THE_SWEEP'
+        )
+        assert not swept & excluded, (
+            f'{sorted(swept & excluded)!r} are both swept and excluded; one of '
+            'the two is stale'
+        )
+
+    @pytest.mark.parametrize('source', [
+        'from shared.project_layout import escalation_queue_dir',
+        'from shared.project_layout import escalation_queue_dir as queue_dir',
+        'from shared import project_layout',
+        'import shared.project_layout',
+        'import shared.project_layout as pl',
+        'from fused_memory.middleware import _folded_escalation',
+    ])
+    def test_the_queue_census_counts_every_import_spelling(self, source):
+        assert _reaches_the_project_queue(ast.parse(source), 'fused_memory.server')
+
+    @pytest.mark.parametrize('source', [
+        'from shared.project_layout import tasks_db',
+        'from shared.project_layout_neighbour import escalation_queue_dir',
+        'from shared import process_identity',
+        'from ..config import escalation_queue_dir',
+    ])
+    def test_the_queue_census_ignores_a_lookalike(self, source):
+        assert not _reaches_the_project_queue(ast.parse(source), 'fused_memory.server')
 
 
 @_needs_escalation

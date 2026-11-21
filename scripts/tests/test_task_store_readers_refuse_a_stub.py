@@ -2,9 +2,10 @@
 
 One adoption check parametrised over the readers, rather than a copy in each
 script's own suite. What a refusal looks like is
-``scripts/tests/test_task_db_scan.py``'s business; all this pins is that each
-reader routes its open through ``_task_db_scan.py::connect_ro`` rather than a
-raw ``mode=ro`` connect, which would answer a stub with ``no such table``.
+``shared/tests/test_tasks_db_readonly.py``'s business; all this pins is that
+each reader routes its open through
+``shared/src/shared/tasks_db_readonly.py::connect_ro`` rather than a raw
+``mode=ro`` connect, which would answer a stub with ``no such table``.
 
 ``audit_delivered_checks.load_open_dependents`` is pinned in its own suite,
 because there the stub proves more: its ``no such table`` swallow must not read
@@ -20,7 +21,8 @@ import census_tagger_debris
 import pytest
 import scan_provenance_note_log_leaks
 import scan_task_toolcall_leaks
-from _task_db_scan import TaskDbProblem, TaskDbUnreadable, tasks_db_path
+from _task_db_scan import tasks_db_path
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 
 def _reads_the_store_path(reader):

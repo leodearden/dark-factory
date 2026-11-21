@@ -33,7 +33,8 @@ The DAG has no inversion:
 |---|---|---|
 | Task store shape | **CONFIRMED** via `scripts/tasks_db_schema.py`: `tasks(tag, id, title, description, details, test_strategy, status, priority, metadata, updated_at, claimant_run_id, heartbeat_at, candidate_key)`, `dependencies(tag, task_id, depends_on)`; one tag (`master`) on the live store | β1 pins `tag` and projects by allowlist |
 | Event types | **CONFIRMED** members of `orchestrator/src/orchestrator/event_store.py::EventType` with live rows on 2026-10-14: merge_finalized 4,283; train_merged 58; merge_verify 3,297; workflow_verify 5,936; phase_enter 53,703; phase_exit 53,487; scheduler_paused 15; scheduler_resumed 15; escalation_created 2,675; escalation_resolved 755 | β1's readers have producers that have written in production (INV-13) |
-| `escalation_created.data.level` | **PARTIAL**: present on 452 of 2,675 rows | `waiting_on: leo` only when a recorded level is 2; otherwise `factory` (PRD §4.10 amended; β1's details amended) |
+| `escalation_created.data.level` | **SUPERSEDED** by the escalation queue row below (task 7280). Was **PARTIAL**: present on 452 of 2,675 rows | was: `waiting_on: leo` only when a recorded level is 2; otherwise `factory` (PRD §4.10 amended; β1's details amended) |
+| Escalation queue root records | **CONFIRMED**, measured read-only on 2026-11-02 over `data/escalations/` and its `archive/`: `level` an int on 4,060 of 4,060 records and `task_id` a str on 4,059, with one null (re-measured the same day: 4,062, 4,061 and one null); status only `pending`, `resolved` or `dismissed`; 24 pending at the root, 5 of them at level 2 (later 25 and 6), against 1,811 left open by replaying runs.db (later 1,841) | open escalations come from the queue root (`client-feed/src/client_feed/sources/escalations.py::read_open_escalations`); `waiting_on: leo` fires on a pending level-2 record or a pending member of one (PRD §4.10, §12 2026-11-02) |
 | `review_completed` | **ABSENT** on main (the planned θ) | β1 depends on θ; the feed says `not_recorded` until a row exists |
 | Verify archive | **CONFIRMED**: 2,294 `junit-*.xml.gz` under 1,885 task dirs; task legs archive via `TaskWorkflow._run_scoped_verification_with_infra_retry` (PRD §2 anchor corrected from `_execute_verify_review_loop`); pruning in `verify.py::_prune_archive` at 30 days / 500 MB | β2 reads the archive; copies rows into the feed |
 | junit pytest-only | **CONFIRMED** `orchestrator/src/orchestrator/verify_cmd.py::with_junitxml` is a no-op unless the tool is pytest and the command is structured (a raw-retained pytest chain also gets no junit) | the feed and docs say pytest projects only |
@@ -108,6 +109,8 @@ tasks (the dashboard PRD-lanes PRD measured 255 direct holders on 2026-10-09).
 Gate task 7062 (esc-7062-1). Six new blocks in the sidecar, σ1a, σ1b, σ2, σ3, σ4 and σ5, stamped by
 their own `commit_planning`. `signal_leaves` is now `["ζ", "σ3"]`. As of main `384a6dc454`
 (2026-10-23).
+
+Added 2026-11-03 (decision 14, Leo's ruling in scoping-intake `docs/prds/declined-defect-reports.md`): one more block, σ1c (`DefectRuled` in the inbox contract, task 8351). Evidence: σ1a (7402) done, so `client_feed/contract.py`'s union and `parse_inbox_line` exist to extend; `defect_ruled` grepped absent at `06aea7ac01`; the consumer is σ2 (7404, amended, now depending on σ1c) and the writer is the portal's δ (scoping_intake 602), whose `in-v3` fixture σ3 (7407) vendors; the duty's writes exist (`shared.defects.Withdrawal`, `WithdrawalCode.NOT_A_DEFECT`, `Rule`, `Ruling{ruled_by: operator}`; `record_defect_outcome`, `declare_defect`, defect-tests α2 7044 done). Delivered check: `class DefectRuled` present in `contract.py`.
 
 **Verdict summary: 16 bindings, all PASS.**
 

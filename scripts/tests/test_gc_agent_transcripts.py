@@ -429,18 +429,19 @@ def test_prune_best_effort_on_rmtree_oserror(tmp_path, caplog, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_default_constants_match_orchestrator_config():
-    """DRIFT GUARD: the GC is stdlib-only and mirrors α's retention config as
-    module constants instead of importing OrchestratorConfig. Those constants
-    must never silently diverge from the canonical
+    """DRIFT GUARD: the GC is stdlib-only and mirrors α's retention caps as
+    module constants instead of importing OrchestratorConfig, and takes its
+    archive root from shared.project_layout.agent_transcripts_dir. Neither may
+    silently diverge from the canonical
     orchestrator.config.{TranscriptArchiveConfig,RetentionConfig} defaults — a
     divergence here would prune against the wrong root/caps. Value equality
     (not docstring/introspection), mirroring
     test_drain_check.test_default_fleet_dir_matches_orchestrator_fleet_heartbeat.
     """
     from orchestrator.config import RetentionConfig, TranscriptArchiveConfig
+    from shared.project_layout import agent_transcripts_dir
 
-    assert TranscriptArchiveConfig().root == gct.ARCHIVE_ROOT_RELATIVE
-    assert gct.ARCHIVE_ROOT_RELATIVE == "data/orchestrator/agent-transcripts"
+    assert agent_transcripts_dir(Path('/p')) == Path('/p') / TranscriptArchiveConfig().root
     assert gct.DEFAULT_MAX_AGE_DAYS == RetentionConfig().max_age_days == 90
     # max_task_dirs is a DERIVED bound, re-derived against the live archive by
     # test_max_task_dirs_is_derived_from_live_archive_rate below. Kept as exact

@@ -1,5 +1,5 @@
 // Module-contract tests for merge_queue.js, the CLIENT reader of the served
-// /merge-queue Datums (in_queue, speculative, recent_total) whose server half is
+// /merge-queue Datums (in_queue, speculative, recent_total, depth, attempts) whose server half is
 // dashboard/src/dashboard/data/merge_queue.py, and of each queued row's enqueue
 // instant. The MergeTab tiles, its per-project pips, the live feed and the rail
 // badge all read the queue through this module, so the decisions it makes are asserted here,
@@ -37,8 +37,10 @@ const { api: mergeQueue, window: loadedWindow } = loadMergeQueue();
 const {
   projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
+  projectDepth, projectAttempts, attemptCount, attemptsOver, attemptsHistory, worstP95Over,
+  totalHint,
 } = mergeQueue;
-const { isDatum, datumView, EM_DASH } = loadedWindow.DF_DATUM;
+const { isDatum, datumView, EM_DASH, LOWER_BOUND_PREFIX, missingParts } = loadedWindow.DF_DATUM;
 const { recentMergesCaption } = loadedWindow.DF_WINDOW_CHIP;
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -111,14 +113,62 @@ function entryReading(spec, recent, served = inQueue('fresh', 0)) {
   return { ...entryWith(served), speculative: spec, recent_total: recent };
 }
 
+// A served depth series value: data/merge_queue.py::DepthSeries, its leading
+// zero buckets trimmed by the shaper.
+function depthSeries(labels, values, bucketMinutes = 15) {
+  return { labels, values, bucket_minutes: bucketMinutes };
+}
+
+const UNTIMED = Object.freeze({ p50: null, p95: null, p99: null, mean_ms: null });
+
+// A served attempts value, as redux_api.py::_shape_attempts projects one window's
+// MergeAttempts: the colored outcome chart and the latency block. With no
+// *latency* given, the window is untimed — no centile over zero samples.
+function attemptsValue(outcomeCounts, latency) {
+  const labels = Object.keys(outcomeCounts);
+  const values = labels.map(label => outcomeCounts[label]);
+  const attempts = values.reduce((sum, n) => sum + n, 0);
+  return {
+    outcomes: { labels, values, colors: labels.map(() => '#888888') },
+    latency: latency || { ...UNTIMED, with_duration: 0, without_duration: attempts },
+  };
+}
+
+// A timed latency block whose worst centile is *p95*.
+function timedLatency(p95, withDuration, withoutDuration = 0) {
+  return { p50: p95 / 2, p95, p99: p95 + 1, mean_ms: p95 / 2, with_duration: withDuration, without_duration: withoutDuration };
+}
+
+// One MERGE_QUEUE[label] entry carrying its depth and attempts readings.
+function entryWindow(depth, attempts, served = inQueue('fresh', 0)) {
+  return { ...entryWith(served), depth, attempts };
+}
+
+// A project with no runs.db file at all: data/merge_queue.py serves it
+// runs_db_present false, every runs.db reading unknown saying so.
+function noRunsDbEntry() {
+  const absent = runsDbRead('unknown', null, { reason: 'no runs.db file exists for this project' });
+  return {
+    ...entryWith(inQueue('fresh', 0)),
+    runs_db_present: false,
+    depth: absent,
+    attempts: absent,
+    speculative: absent,
+    recent_total: absent,
+  };
+}
+
 // ── The module ──────────────────────────────────────────────────────────────
 
 test('the module exposes its readers and assigns window.DF_MERGE_QUEUE', () => {
   assert.deepEqual(
     Object.keys(mergeQueue).sort(),
     [
+      'attemptCount', 'attemptsHistory', 'attemptsOver',
       'depthBucketCaption', 'hitRateText', 'inQueueHistory', 'inQueueOver', 'latencyCaption',
+      'projectAttempts', 'projectDepth',
       'projectInQueue', 'projectSpeculative', 'queuedSince', 'recentTotal', 'speculativeOver',
+      'totalHint', 'worstP95Over',
     ],
   );
   for (const name of Object.keys(mergeQueue)) {
@@ -202,18 +252,29 @@ test('inQueueOver: a project whose probe failed renders its last sample with its
   assert.match(view.title, /connect refused/);
 });
 
-test('inQueueOver: one unknown project makes the total unknown, and names it', () => {
+test('inQueueOver: a probed project with no reading makes the total a lower bound naming it', () => {
+  // A probe that fails with no sample in its history (an orchestrator that is
+  // stopped) is a hole, not a zero: the others still count, as a floor.
   const data = mqData({
     a: entryWith(inQueue('fresh', 2)),
     b: entryWith(inQueue('unknown')),
   });
 
   const total = inQueueOver(data, null);
-  const view = datumView(total, { now: NOW });
+
+  assert.equal(total.state, 'lower_bound');
+  assert.equal(datumView(total, { now: NOW }).text, `${LOWER_BOUND_PREFIX}2`);
+  assert.match(total.reason, /\bb: /);
+  assert.equal(totalHint(total), 'b unreadable');
+});
+
+test('inQueueOver: every probed project unreadable has no total', () => {
+  const data = mqData({ a: entryWith(inQueue('unknown')), b: entryWith(inQueue('unknown')) });
+
+  const total = inQueueOver(data, null);
 
   assert.equal(total.state, 'unknown');
-  assert.equal(view.text, EM_DASH);
-  assert.match(total.reason, /\bb: /);
+  assert.equal(datumView(total, { now: NOW }).text, EM_DASH);
 });
 
 test('inQueueOver: a project with no live probe configured is outside the total, not a hole in it', () => {
@@ -353,14 +414,17 @@ test('queuedSince: reads its inputs and alters neither', () => {
   assert.deepEqual([entry, row], pristine);
 });
 
-// ── projectSpeculative / recentTotal: one project's runs.db readings, stamped ─
+// ── projectSpeculative / recentTotal / projectDepth / projectAttempts: one
+// project's runs.db readings, stamped ─────────────────────────────────────
 
 for (const [field, reader, value] of [
   ['speculative', projectSpeculative, counts(5, 3)],
   ['recent_total', recentTotal, 228],
+  ['depth', projectDepth, depthSeries([T1, T2], [2, 0])],
+  ['attempts', projectAttempts, attemptsValue({ done: 3, conflict: 1 }, timedLatency(900, 4))],
 ]) {
   test(`${field}: the served Datum, stamped with the /merge-queue receipt as a copy`, () => {
-    const data = mqData({ a: entryReading(runsDbRead('fresh', counts(5, 3)), runsDbRead('fresh', 228)) });
+    const data = mqData({ a: { ...entryWith(inQueue('fresh', 0)), [field]: runsDbRead('fresh', value) } });
     const wire = data.MERGE_QUEUE.a[field];
     const pristine = structuredClone(wire);
 
@@ -403,7 +467,7 @@ for (const [field, reader, value] of [
 
   test(`${field}: an unread runs.db keeps the server's reason`, () => {
     const unread = runsDbRead('unknown');
-    const served = reader(mqData({ a: entryReading(unread, unread) }), 'a');
+    const served = reader(mqData({ a: { ...entryWith(inQueue('fresh', 0)), [field]: unread } }), 'a');
     assert.equal(served.state, 'unknown');
     assert.equal(served.reason, unread.reason);
   });
@@ -447,16 +511,17 @@ test('speculativeOver: sums the counts across every payload project, unprobed on
   assert.deepEqual(speculativeOver(data, ['a']).value, { hit_count: 3, discard_count: 1, total: 4 });
 });
 
-test('speculativeOver: a hole in any project is a hole in the total, naming that project', () => {
+test('speculativeOver: a hole in any project is a hole in the total — a rate over a subset is no bound', () => {
   const data = mqData({
     a: entryReading(runsDbRead('fresh', counts(3, 1)), runsDbRead('fresh', 4)),
-    b: entryReading(runsDbRead('unknown'), runsDbRead('unknown')),
+    b: { ...entryReading(runsDbRead('unknown'), runsDbRead('unknown')), runs_db_present: true },
   });
 
   const total = speculativeOver(data, null);
 
   assert.equal(total.state, 'unknown');
   assert.match(total.reason, /\bb: /);
+  assert.deepEqual(missingParts(total), []);
   assert.equal(speculativeOver(data, ['a', 'missing']).state, 'unknown');
   assert.match(speculativeOver(data, ['a', 'missing']).reason, /missing/);
 });
@@ -496,4 +561,247 @@ test('hitRateText: hits over attempts, as a whole percentage', () => {
 
 test('hitRateText: zero attempts have no rate', () => {
   assert.equal(hitRateText({ hit_count: 0, total: 0 }), EM_DASH);
+});
+
+// ── attemptCount: how many attempts one window's outcome chart holds ──────
+
+test('attemptCount: sums the outcome chart, every attempt counted once', () => {
+  assert.equal(attemptCount(attemptsValue({ done: 3, conflict: 2, blocked: 1 })), 6);
+});
+
+test('attemptCount: a measured window with no attempts counts 0', () => {
+  assert.equal(attemptCount(attemptsValue({})), 0);
+});
+
+// ── attemptsOver: the 'Merges (window)' tile ───────────────────────────────
+
+const freshAttempts = outcomeCounts => runsDbRead('fresh', attemptsValue(outcomeCounts));
+
+test('attemptsOver: sums every payload project\'s attempts, or only its scope\'s', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 3, conflict: 1 })),
+    b: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 2 })),
+  });
+
+  const total = attemptsOver(data, null);
+
+  assert.equal(total.state, 'fresh');
+  assert.equal(total.value, 6);
+  assert.equal(attemptsOver(data, ['b']).value, 2);
+});
+
+test('attemptsOver: a present-but-unread project makes the total a lower bound that names it', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 3 })),
+    b: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')),
+  });
+
+  const total = attemptsOver(data, null);
+
+  assert.equal(total.state, 'lower_bound');
+  assert.equal(total.value, 3);
+  assert.equal(datumView(total, { now: NOW }).text, `${LOWER_BOUND_PREFIX}3`);
+  assert.match(total.reason, /\bb: /);
+  assert.equal(totalHint(total), 'b unreadable');
+});
+
+test('attemptsOver: every in-scope project unread has no total', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')),
+    b: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')),
+  });
+
+  assert.equal(attemptsOver(data, null).state, 'unknown');
+});
+
+test('attemptsOver: a stale part makes the total stale', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 3 })),
+    b: entryWindow(runsDbRead('stale', depthSeries([], [])), runsDbRead('stale', attemptsValue({ done: 1 }))),
+  });
+
+  const total = attemptsOver(data, null);
+
+  assert.equal(total.state, 'stale');
+  assert.equal(total.value, 4);
+  assert.match(total.reason, /\bb: /);
+});
+
+test('attemptsOver: before the first payload, the total is not yet fetched', () => {
+  const total = attemptsOver(mqData({}, null), null);
+  assert.equal(total.state, 'unknown');
+  assert.equal(total.reason, 'not yet fetched');
+});
+
+test('attemptsOver: an unprobed project is still counted — its attempts come from its runs.db', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 3 })),
+    c: { ...unprobedEntry('c'), depth: runsDbRead('fresh', depthSeries([], [])), attempts: freshAttempts({ done: 2 }) },
+  });
+
+  assert.equal(attemptsOver(data, null).value, 5);
+});
+
+// ── attemptsHistory: the 'Merges (window)' spark ───────────────────────────
+
+test('attemptsHistory: one project is its own depth values', () => {
+  const data = mqData({ a: entryWindow(runsDbRead('fresh', depthSeries([T1, T2, T3], [4, 0, 2])), freshAttempts({})) });
+  assert.deepEqual(attemptsHistory(data, ['a']), [4, 0, 2]);
+});
+
+test('attemptsHistory: several projects sum per label over the union, a trimmed label counting 0', () => {
+  // b's trim dropped its leading empty T1 bucket: every project's buckets are
+  // epoch-aligned and end at the same bucket, so T1 is a 0 for b, not a miss.
+  const data = mqData({
+    b: entryWindow(runsDbRead('fresh', depthSeries([T2, T3], [1, 5])), freshAttempts({})),
+    a: entryWindow(runsDbRead('fresh', depthSeries([T1, T2, T3], [4, 3, 2])), freshAttempts({})),
+  });
+
+  assert.deepEqual(attemptsHistory(data, ['a', 'b']), [4, 4, 7]);
+  assert.deepEqual(attemptsHistory(data, null), [4, 4, 7]);
+});
+
+test('attemptsHistory: a project in scope whose depth is unread or absent draws no spark at all', () => {
+  // Summing the others alone would draw a dip that never happened.
+  const readable = entryWindow(runsDbRead('fresh', depthSeries([T1, T2], [4, 3])), freshAttempts({}));
+  const holes = [
+    ['an unread depth', { a: readable, b: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')) }],
+    ['an entry with no depth', { a: readable, b: entryWith(inQueue('fresh', 0)) }],
+    ['an absent project', { a: readable }],
+  ];
+  for (const [label, entries] of holes) {
+    assert.deepEqual(attemptsHistory(mqData(entries), ['a', 'b']), [], label);
+  }
+});
+
+// ── worstP95Over: the 'p95 latency · worst project' tile ───────────────────
+
+const timedWindow = (p95, withDuration) => entryWindow(
+  runsDbRead('fresh', depthSeries([], [])),
+  runsDbRead('fresh', attemptsValue({ done: withDuration }, timedLatency(p95, withDuration))),
+);
+
+test('worstP95Over: the worst p95 over the timed projects in scope, and how many were timed', () => {
+  const data = mqData({
+    a: timedWindow(900, 3),
+    b: timedWindow(4200, 2),
+    c: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 2 })),
+  });
+
+  const worst = worstP95Over(data, null);
+
+  assert.equal(worst.state, 'fresh');
+  assert.deepEqual(worst.value, { p95_ms: 4200, timed_projects: 2 });
+  assert.deepEqual(worstP95Over(data, ['a', 'c']).value, { p95_ms: 900, timed_projects: 1 });
+});
+
+test('worstP95Over: a hole in any project makes the worst readable p95 a lower bound naming it', () => {
+  const data = mqData({ a: timedWindow(900, 3), b: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')) });
+
+  const worst = worstP95Over(data, null);
+
+  assert.equal(worst.state, 'lower_bound');
+  assert.deepEqual(worst.value, { p95_ms: 900, timed_projects: 1 });
+  assert.equal(datumView(worst, { now: NOW, format: v => String(v.p95_ms) }).text, `${LOWER_BOUND_PREFIX}900`);
+  assert.match(worst.reason, /\bb: /);
+  assert.deepEqual(missingParts(worst), ['b']);
+});
+
+test('worstP95Over: a lower bound whose readable projects have no timed merge is unknown, still naming the hole', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 2 })),
+    b: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')),
+  });
+
+  const worst = worstP95Over(data, null);
+
+  assert.equal(worst.state, 'unknown');
+  assert.match(worst.reason, /no timed merges in this window/);
+  assert.match(worst.reason, /\bb: /);
+});
+
+test('worstP95Over: no timed project in scope has no worst centile to show', () => {
+  const data = mqData({ a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 2 })) });
+
+  const worst = worstP95Over(data, null);
+
+  assert.equal(worst.state, 'unknown');
+  assert.equal(worst.reason, 'no timed merges in this window');
+});
+
+test('worstP95Over: before the first payload, it is not yet fetched', () => {
+  const worst = worstP95Over(mqData({}, null), null);
+  assert.equal(worst.state, 'unknown');
+  assert.equal(worst.reason, 'not yet fetched');
+});
+
+// ── Rule 1: a project with no runs.db file is outside every runs.db total ──
+
+test('the runs.db totals leave out a project with no runs.db file — never a lower bound over it', () => {
+  const measured = {
+    a: { ...timedWindow(900, 3), speculative: runsDbRead('fresh', counts(3, 1)) },
+    b: { ...timedWindow(4200, 2), speculative: runsDbRead('fresh', counts(1, 1)) },
+  };
+  const without = mqData(measured);
+  const withAbsent = mqData({ ...measured, gone: noRunsDbEntry() });
+
+  for (const total of [attemptsOver, worstP95Over, speculativeOver]) {
+    const expected = total(without, null);
+    const actual = total(withAbsent, null);
+    assert.equal(actual.state, expected.state, total.name);
+    assert.deepEqual(actual.value, expected.value, total.name);
+    assert.notEqual(actual.state, 'lower_bound', total.name);
+    assert.deepEqual(missingParts(actual), [], total.name);
+    assert.deepEqual(total(withAbsent, ['a', 'gone']).value, total(without, ['a']).value, total.name);
+  }
+});
+
+test('attemptsHistory: a project with no runs.db file is outside the spark', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('fresh', depthSeries([T1, T2], [4, 3])), freshAttempts({})),
+    gone: noRunsDbEntry(),
+  });
+
+  assert.deepEqual(attemptsHistory(data, null), [4, 3]);
+  assert.deepEqual(attemptsHistory(data, ['a', 'gone']), [4, 3]);
+});
+
+test('attemptsOver: a scope of only projects with no runs.db file has no total, and says why', () => {
+  const total = attemptsOver(mqData({ gone: noRunsDbEntry(), lost: noRunsDbEntry() }), null);
+
+  assert.equal(total.state, 'unknown');
+  assert.match(total.reason, /runs\.db/);
+});
+
+// ── totalHint: the tile hint naming what a lower-bound total could not read ─
+
+test('totalHint: a lower-bound total appends the unreadable projects to what it covered', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 3 })),
+    b: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')),
+  });
+
+  assert.equal(totalHint(attemptsOver(data, null), '2 projects'), '2 projects · b unreadable');
+});
+
+test('totalHint: several unreadable projects are joined in scope order', () => {
+  const data = mqData({
+    a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 3 })),
+    b: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')),
+    c: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')),
+  });
+
+  assert.equal(totalHint(attemptsOver(data, null)), 'b, c unreadable');
+});
+
+test('totalHint: a total missing nothing hints only what it covered, or nothing', () => {
+  const fresh = attemptsOver(
+    mqData({ a: entryWindow(runsDbRead('fresh', depthSeries([], [])), freshAttempts({ done: 3 })) }),
+    null,
+  );
+  const unknown = attemptsOver(mqData({ a: entryWindow(runsDbRead('unknown'), runsDbRead('unknown')) }), null);
+
+  assert.equal(totalHint(fresh, 'x'), 'x');
+  assert.equal(totalHint(fresh), undefined);
+  assert.equal(totalHint(unknown), undefined);
 });

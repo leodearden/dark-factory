@@ -14,7 +14,7 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
-import pytest_asyncio  # noqa: F401  — strict-mode async fixtures land here in later steps
+import pytest_asyncio  # strict-mode async fixtures land here in later steps
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -220,7 +220,7 @@ async def test_inflow_hourly_total_is_unchanged_across_the_rollup_boundary(recon
     assert sum(before.values()) == 7
 
     # Drain + sweep only SOME of them, so the union spans both sources.
-    await recon_db.drain('reify')
+    await recon_db.drain('reify', run_id='r')
     # A late arrival stays live in event_buffer.
     await recon_db.push(_make_event(
         timestamp=_H14, event_type=EventType.task_modified))
@@ -260,7 +260,7 @@ async def test_inflow_hourly_scopes_to_the_requested_project(recon_db):
     """Another project's arrivals never leak into the report."""
     await _seed_inflow(recon_db)
     await recon_db.push(_make_event(project_id='other', timestamp=_H13))
-    await recon_db.drain('other')
+    await recon_db.drain('other', run_id='r')
     await recon_db.cleanup_drained(max_age_seconds=0)
 
     assert inflow_hourly(recon_db._db_path, 'reify')['2026-07-25T13'] == 4
@@ -287,7 +287,7 @@ async def test_inflow_daily_rolls_hours_into_days_with_event_type_composition(re
 async def test_inflow_daily_composition_survives_the_rollup_boundary(recon_db):
     """Composition is exact across live rows and the aggregate alike."""
     await _seed_inflow(recon_db)
-    await recon_db.drain('reify')
+    await recon_db.drain('reify', run_id='r')
     await recon_db.cleanup_drained(max_age_seconds=0)
     await recon_db.push(_make_event(
         timestamp=_H14, event_type=EventType.memory_added))
@@ -493,12 +493,12 @@ async def test_inflow_concentration_reads_live_rows_only(recon_db):
     """
     db = recon_db._db_path
     await _push_task_events(recon_db, '644', EventType.task_modified, 4)
-    await recon_db.drain('reify')
+    await recon_db.drain('reify', run_id='r')
     assert await recon_db.cleanup_drained(max_age_seconds=0) == 4
 
     await _push_task_events(
         recon_db, '636', EventType.task_status_changed, 2, timestamp=_H14)
-    await recon_db.drain('reify')  # drained, NOT swept: still a live row
+    await recon_db.drain('reify', run_id='r')  # drained, NOT swept: still a live row
     await _push_task_events(
         recon_db, '636', EventType.task_modified, 1, timestamp=_H14)
 

@@ -1,0 +1,25 @@
+window 60.7s  psi cpu some avg10=60.04  procs_running=443
+bucket                 family         nice role       procs     run    wait  stall%
+other                  other             0 -           1388    2.55    3.22     56%
+df                     xdist-worker     10 -              8    2.88    2.32     45%
+other                  xdist-worker      0 -             16    0.46    2.41     84%
+df                     pytest-master    10 -             21    0.83    1.94     70%
+verify-scope:dark-factory xdist-worker     15 task          16    0.53    1.47     73%
+verify-scope:dark-factory pytest-master    15 task          14    0.59    1.34     70%
+other                  pytest-master     0 -              5    0.45    0.51     53%
+verify-scope:dark-factory other             0 -              3    0.63    0.27     30%
+other                  claude-cli        0 -             28    0.03    0.44     95%
+df                     claude-cli       10 -              9    0.09    0.37     80%
+verify-scope:solar-challenge pytest-master    15 task           2    0.34    0.06     14%
+reify                  other            10 -              5    0.12    0.26     68%
+other                  pytest-master    19 background     6    0.23    0.14     37%
+other                  orch-main         0 -             14    0.14    0.23     63%
+verify-scope:solar-challenge-platform xdist-worker     15 task          16    0.23    0.02      6%
+df                     orch-main         0 -              2    0.08    0.14     64%
+reify                  orch-main         0 -              2    0.07    0.09     55%
+other                  other           -20 -            134    0.13    0.03     19%
+verify-scope:dark-factory pytest-master     5 merge          2    0.02    0.13     88%
+other                  other            10 -             13    0.02    0.05     73%
+other                  claude-cli        5 merge          4    0.00    0.06     98%
+df                     claude-cli        0 -              2    0.01    0.05     79%
+{"psi_cpu_some_avg10": "60.04", "procs_running": "443", "window_s": 60.7, "df_agents": {"run_cores": 0.11, "wait_cores": 0.42, "stall_pct": 80}, "df_merge_workers": {"run_cores": 0.02, "wait_cores": 0.13, "stall_pct": 88}, "df_task_workers": {"run_cores": 1.12, "wait_cores": 2.82, "stall_pct": 72}, "df_background_workers": {"run_cores": 0.0, "wait_cores": 0.03, "stall_pct": 92}, "reify_agents": {"run_cores": 0.0, "wait_cores": 0.04, "stall_pct": 94}, "reify_merge_verify": {"run_cores": 0.0, "wait_cores": 0.0, "stall_pct": null}, "reify_task_verify": {"run_cores": 0.0, "wait_cores": 0.0, "stall_pct": null}}

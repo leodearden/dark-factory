@@ -38,6 +38,9 @@ import urllib.parse
 import pytest
 import yaml
 from orchestrator.config import YamlSettingsSource, _deep_merge, _load_defaults
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 WATCHDOG_PATH = REPO_ROOT / "scripts" / "dashboard-watchdog.py"
@@ -1564,6 +1567,27 @@ def test_b4_ceiling_escalation_argv_is_the_born_at_l2_contract(
     assert _argv_value(argv, "--category") == "infra_issue"
     assert _argv_value(argv, "--agent-role") == "harness-dashboard-watchdog"
     assert _argv_value(argv, "--agent-role").startswith("harness-")
+
+
+def test_b4_ceiling_escalation_runs_uv_without_syncing_the_shared_venv(
+    monkeypatch, state_env, queue_env
+):
+    """The restart-ceiling page must not reinstall into the shared root .venv the dashboard runs from.
+
+    Rationale: tests/scripts/test_uv_run_venv_isolation.py.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(
+        monkeypatch,
+        [False] * mod.FAIL_STREAK,
+        seed_state=_at_ceiling_state(mod),
+    )
+
+    argv = rec.escalations[0]
+    assert argv[:2] == [mod.UV_BIN, "run"]
+    run_flags = argv[2:argv.index("escalation")]
+    assert "--no-sync" in run_flags, f"argv={argv}"
+    assert not {"--frozen", "--locked"} & set(run_flags), f"argv={argv}"
 
 
 def test_b4_escalation_summary_carries_the_measured_evidence(

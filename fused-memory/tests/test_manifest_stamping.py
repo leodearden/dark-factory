@@ -20,11 +20,14 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 from shared.capability_manifest import load_capability_manifest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.manifest_stamping import (
     stamp_capability_manifests,
     stamping_action_required,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Hand-written rather than built from _mechanical_sidecar_yaml below: this
 # fixture mixes grep + script + manual capabilities on a single label, and

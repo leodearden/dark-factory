@@ -11,8 +11,8 @@ a passing probe — is sticky until an operator clear or a restart.  A
 
 The worker is real and so are its HostAllocator and escalation queue; the
 remote is a fake whose health and ensure-gate answers the test sets.  The
-reprobe tick is driven through ``_reprobe_quarantined_hosts``, the one method
-``_reprobe_loop`` runs.
+reprobe tick is driven through ``HostQuarantine.sweep``, the one call
+``_reprobe_loop`` makes.
 """
 
 from __future__ import annotations
@@ -123,7 +123,7 @@ class _Scene:
 
     async def tick(self, *, advance: float = 120.0) -> None:
         self.clock.time += advance
-        await self.worker._reprobe_quarantined_hosts(self.clock.now())
+        await self.worker._host_quarantine.sweep(self.clock.now())
 
     def host(self) -> dict[str, Any]:
         [entry] = [h for h in self.worker.snapshot()['hosts'] if h['name'] == _HOST]
@@ -389,7 +389,26 @@ async def test_readmit_resolves_the_skew_l1(scene: _Scene):
     await scene.tick()
 
     assert scene.open_l1s() == []
-    assert scene.events.of(EventType.verify_host_recovered)[-1]['quarantine_class'] == 'skew'
+    recovered = scene.events.of(EventType.verify_host_recovered)[-1]
+    assert (recovered['quarantine_class'], recovered['evidence']) == ('skew', 'ensure_gate')
+
+
+@pytest.mark.asyncio
+async def test_a_sticky_skew_alarm_resolved_while_benched_reopens_on_the_next_tick(scene: _Scene):
+    """The same re-assert rule as the 'ru' class (task 5290): benched means alarmed."""
+    scene.bench('gate')
+    await scene.tick()
+    scene.bench('gate')
+    [l1] = scene.open_l1s()
+    scene.escalations.resolve(
+        l1.id, 'Self-resolved — occupancy.by_host shows laptop verifying',
+        resolved_by='escalation-watcher',
+    )
+
+    await scene.tick()
+
+    [reopened] = scene.open_l1s()
+    assert (reopened.id != l1.id, reopened.task_id) == (True, l1.task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +432,22 @@ async def test_the_operator_clear_lifts_a_sticky_bench(scene: _Scene):
     assert scene.open_l1s() == []
     scene.bench('gate')
     assert scene.host()['sticky'] is False, 'a clear resets the count, as a restart does'
+
+
+@pytest.mark.asyncio
+async def test_an_operator_clear_names_itself_as_the_recovery_evidence(scene: _Scene):
+    """Health is not probed on a clear, so the alarm must not say it was (task 5290)."""
+    for _ in range(3):
+        scene.bench('transport')
+    [l1] = scene.open_l1s()
+
+    await scene.worker.clear_host_quarantine(_HOST)
+
+    [resolved] = [esc for esc in scene.escalations.get_by_task(l1.task_id) if esc.id == l1.id]
+    assert resolved.status == 'resolved'
+    assert 'operator_clear' in (resolved.resolution or '')
+    assert 'automatically via SSH' not in (resolved.resolution or '')
+    assert scene.events.of(EventType.verify_host_recovered)[-1]['evidence'] == 'operator_clear'
 
 
 @pytest.mark.asyncio
@@ -450,8 +485,11 @@ async def test_the_parked_slot_backstop_leaves_a_skew_bench_to_the_tracker(scene
     assert scene.allocator.is_parked(_HOST)
     scene.bench('gate')
     scene.remote.clean = True
+    # The slot now probes clean but ensure-gate still fails, so only the
+    # backstop could free it — and it must not.
+    scene.remote.ensure_error = RunnerUnavailable('still skewed', kind='gate')
 
-    await scene.worker._reprobe_untracked_parked_slots()
+    await scene.tick()
 
     assert scene.allocator.is_parked(_HOST)
     assert not scene.in_pool()
@@ -459,13 +497,13 @@ async def test_the_parked_slot_backstop_leaves_a_skew_bench_to_the_tracker(scene
 
 @pytest.mark.asyncio
 async def test_the_gate_reaper_runs_at_most_hourly_and_only_on_hosts_in_the_pool(scene: _Scene):
-    now = scene.clock.now()
-    await scene.worker._reap_idle_gates(now)
-    await scene.worker._reap_idle_gates(now + 1800)
+    await scene.tick(advance=0.0)
+    await scene.tick(advance=1800.0)
     assert scene.remote.reaps == 1
 
     scene.bench('transport')
-    await scene.worker._reap_idle_gates(now + 3601)
+    scene.remote.healthy = False
+    await scene.tick(advance=1801.0)
     assert scene.remote.reaps == 1
 
 
@@ -475,6 +513,6 @@ async def test_the_gate_reaper_skips_a_divergence_quarantined_host(scene: _Scene
     assert lease is not None
     await scene.allocator.quarantine_and_release(lease)
 
-    await scene.worker._reap_idle_gates(scene.clock.now())
+    await scene.tick(advance=0.0)
 
     assert scene.remote.reaps == 0

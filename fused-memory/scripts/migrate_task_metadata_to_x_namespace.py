@@ -97,15 +97,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
-import importlib.util
 import json
 import os
 import sys
 import traceback
-import types
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+
+from fused_memory.utils.script_loader import load_script
 
 DEFAULT_SERVER = 'http://127.0.0.1:8002'
 DEFAULT_PROJECT_ROOT = '/home/leo/src/dark-factory'
@@ -517,22 +517,9 @@ def _load_sibling_client() -> type:
     imported (and unit-tested) with no heavy dependencies. Deliberately NOT a
     second protocol client — there is one JSON-RPC handshake in this repo.
     """
-    sibling = Path(__file__).parent / 'strip_leaked_control_keys.py'
-    mod_name = 'strip_leaked_control_keys'
-    existing = sys.modules.get(mod_name)
-    if existing is not None and hasattr(existing, 'FusedMemoryClient'):
-        return existing.FusedMemoryClient
-    spec = importlib.util.spec_from_file_location(mod_name, sibling)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load the JSON-RPC client from {sibling}')
-    module: types.ModuleType = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module.FusedMemoryClient
+    return load_script(
+        Path(__file__).parent / 'strip_leaked_control_keys.py', 'strip_leaked_control_keys',
+    ).FusedMemoryClient
 
 
 async def _fetch_task(client, task_id: str, project_root: str) -> dict:

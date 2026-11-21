@@ -51,6 +51,7 @@ from escalation.queue import iter_all_escalation_paths
 
 from orchestrator.chain_telemetry import ChainTelemetry, summarize_chain_telemetry
 from orchestrator.event_store import EventType
+from orchestrator.lane_record_divergence import LANE_RECORD_DIVERGENCE, LaneDivergence
 from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
 from orchestrator.workflow import WorkflowOutcome
 
@@ -867,6 +868,8 @@ class DigestInputs:
     pause_visibility: PauseVisibility = field(default_factory=PauseVisibility)
     # Task 3188 ε — the '## Deep merge-ahead chains' section; defaulted and appended last.
     chain_telemetry: ChainTelemetry = field(default_factory=ChainTelemetry)
+    # Task 2987 δ; None = durable lane records unreadable.
+    lane_record_divergence: tuple[LaneDivergence, ...] | None = ()
 
 
 def render_digest_markdown(inputs: DigestInputs) -> str:
@@ -1014,7 +1017,23 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
         lines.append('_none_')
     lines.append('')
 
+    lines.extend(_lane_record_divergence_lines(inputs.lane_record_divergence))
+
     return '\n'.join(lines)
+
+
+def _lane_record_divergence_lines(
+    divergences: tuple[LaneDivergence, ...] | None,
+) -> list[str]:
+    lines = [f'## Lane record divergence ({LANE_RECORD_DIVERGENCE})']
+    if divergences is None:
+        lines.append('_unavailable: durable lane records could not be read_')
+    elif not divergences:
+        lines.append('_none_')
+    else:
+        lines.extend(f'- {d.render()}' for d in divergences)
+    lines.append('')
+    return lines
 
 
 def _render_chain_telemetry_section(telemetry: ChainTelemetry) -> list[str]:

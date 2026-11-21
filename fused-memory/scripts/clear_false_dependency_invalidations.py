@@ -143,18 +143,16 @@ async def _run(args: argparse.Namespace) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    import os  # noqa: PLC0415
+    import os
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.maintenance._utils import maintenance_service
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
     config = FusedMemoryConfig()
-    memory = MemoryService(config)
-    await memory.initialize()
-    try:
+    async with maintenance_service(config=config) as (_, memory):
         report = await repair(memory, project_id=args.project, apply=args.apply)
         print(json.dumps(report, indent=2, default=str))
 
@@ -173,9 +171,6 @@ async def _run(args: argparse.Namespace) -> int:
                 )
                 return 1
         return 0
-    finally:
-        if hasattr(memory, 'close'):
-            await memory.close()
 
 
 def main() -> int:

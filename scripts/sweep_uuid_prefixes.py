@@ -53,7 +53,7 @@ from typing import Any, Generic, NamedTuple, Protocol, TypeVar
 import _checkout as _checkout
 import httpx
 import sweep_toolcall_markup as markup_sweep
-from _task_db_scan import UNREADABLE_STORE_ERRORS, connect_ro, decode_metadata, tasks_db_path
+from _task_db_scan import UNREADABLE_STORE_ERRORS, decode_metadata, tasks_db_path
 from fused_memory.models.scope import Scope, build_known_projects_map, resolve_project_id_for_root
 from migrate_metadata_modules_to_files import (
     DEFAULT_SERVER,
@@ -61,6 +61,7 @@ from migrate_metadata_modules_to_files import (
     write_failure_reason,
 )
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV
+from shared.tasks_db_readonly import connect_ro
 from shared.uuid_prefix import PrefixToken, find_prefix_tokens, substitute_all
 from shared.uuid_prefix_guard import PrefixResolver, Resolution, ResolverUnavailable
 
@@ -995,23 +996,19 @@ async def open_live_stores(config_path: str | None, *, mem0_apply: bool) -> Asyn
     are requested, so a process that cannot write the store never starts.
     """
     from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.maintenance._utils import maintenance_service
     from fused_memory.services.id_resolver import IdResolver
-    from fused_memory.services.memory_service import MemoryService
     from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
     if config_path is not None:
         os.environ['CONFIG_PATH'] = config_path
     if mem0_apply:
         assert_store_mutation_allowed(operation='sweep_uuid_prefixes --apply --lane mem0')
-    memory = MemoryService(FusedMemoryConfig())
-    try:
-        await memory.initialize()
+    async with maintenance_service(config=FusedMemoryConfig()) as (_, memory):
         yield LiveStores(
             resolve=IdResolver.for_memory_service(memory).resolve_prefix,
             mem0=ServiceMem0Corpus(memory, live_mem0_failures()),
         )
-    finally:
-        await memory.close()
 
 
 def _positive_rate(text: str) -> float:

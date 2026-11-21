@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'cgroup-stall-ratio.py'
@@ -79,6 +82,59 @@ def test_a_dark_factory_verify_worker_is_classed_by_nice_tier_in_unit_or_scope(
     cgroup: str, nice: int, expected_class: str,
 ) -> None:
     headline = _headline((stall_ratio.bucket(cgroup), 'xdist-worker', nice))
+
+    assert headline[expected_class] == EVEN_SPLIT
+    assert _populated(headline) == {expected_class}
+
+
+@pytest.mark.parametrize('cgroup', [DF_SCOPE, DF_UNIT], ids=['scope', 'unit'])
+@pytest.mark.parametrize('family', ['pytest-master', 'other', 'git'])
+@pytest.mark.parametrize(
+    ('nice', 'expected_class'),
+    [(5, 'df_merge_workers'), (15, 'df_task_workers'), (19, 'df_background_workers')],
+)
+def test_a_dark_factory_verify_process_with_no_xdist_worker_fills_its_nice_tier_class(
+    cgroup: str, family: str, nice: int, expected_class: str,
+) -> None:
+    """pytest-xdist retitles its workers through setproctitle to '[pytest-xdist running] <nodeid>'.
+
+    That removes the execnet bootstrap marker, so family() files them as 'pytest-master'.
+    A dark_factory verify scope therefore holds pytest-master, other and git processes,
+    and no xdist-worker ones (measured: task 5208's 2026-10-12 readings came out null).
+    """
+    headline = _headline((stall_ratio.bucket(cgroup), family, nice))
+
+    assert headline[expected_class] == EVEN_SPLIT
+    assert _populated(headline) == {expected_class}
+
+
+def test_every_verify_family_in_one_df_scope_sums_into_its_class() -> None:
+    headline = _headline(
+        *((stall_ratio.bucket(DF_SCOPE), family, 5) for family in ('xdist-worker', 'pytest-master', 'other')),
+    )
+
+    assert headline['df_merge_workers'] == {'run_cores': 3.0, 'wait_cores': 3.0, 'stall_pct': 50}
+    assert _populated(headline) == {'df_merge_workers'}
+
+
+@pytest.mark.parametrize('family', ['claude-cli', 'orch-main'])
+@pytest.mark.parametrize('nice', [5, 15, 19])
+def test_agents_and_the_orchestrator_in_the_df_unit_never_count_as_verify_work(family: str, nice: int) -> None:
+    headline = _headline((stall_ratio.bucket(DF_UNIT), family, nice))
+
+    assert _populated(headline) == ({'df_agents'} if family == 'claude-cli' else set())
+
+
+@pytest.mark.parametrize('family', ['claude-cli', 'orch-main'])
+@pytest.mark.parametrize(
+    ('nice', 'expected_class'),
+    [(5, 'df_merge_workers'), (15, 'df_task_workers'), (19, 'df_background_workers')],
+)
+def test_a_df_verify_scope_holds_no_agents_so_an_agent_family_there_is_verify_work(
+    family: str, nice: int, expected_class: str,
+) -> None:
+    """The fake `claude` binaries tests/scripts/test_spawn_claude.py spawns classify as 'claude-cli'."""
+    headline = _headline((stall_ratio.bucket(DF_SCOPE), family, nice))
 
     assert headline[expected_class] == EVEN_SPLIT
     assert _populated(headline) == {expected_class}

@@ -101,7 +101,13 @@ whenever a finding or a design decision turns on it. An unnamed appeal to
     private state fail 13 while passing 14. Layering is a downward import of
     names a lower file defines and never takes back; a satellite that imports
     from the file that imports it is stitching, regardless of what the import
-    brings across.
+    brings across. A test file is sized by its subject: it is partitioned
+    with the module it tests, so a change that moves code into a new module
+    moves that code's tests into the new module's test file, driving its
+    public seam. A test file is split on its own only when it tests several
+    subjects (heuristic 6), never for its length alone. Fixtures and builders
+    the resulting files share move down into a helper module first; a test
+    file never imports from another test file.
 
 ## Two stances
 

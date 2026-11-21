@@ -37,15 +37,16 @@ from orchestrator.main_health_fix_owner import (
     MainFixTaskFiler,
     build_main_fix_task_arguments,
     ensure_main_fix_owner,
+    is_main_health_fix,
 )
+from orchestrator.merge_lane.main_health_probe import _build_main_health_outcome
 from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS,
     SpeculativeMergeWorker,
-    _build_main_health_outcome,
 )
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow import INHERITED_BREAK_NO_FIX_OWNER_LINE, TaskWorkflow, WorkflowOutcome
 
 OTHER_MAIN_SHA = 'cafef00d0987654321'
 
@@ -189,6 +190,44 @@ class TestFixMainTaskArguments:
 
     def test_an_empty_reason_files_no_details(self) -> None:
         assert 'details' not in _fix_arguments(MainBreak('compile_error', 'hint', ''))
+
+
+STEWARD_TRIAGE_HEAL_METADATA = {
+    'spawn_context': 'steward-triage',
+    'source': 'steward-triage',
+    'escalation_id': 'esc-6484-3',
+    'files': ['orchestrator/src/orchestrator/harness.py'],
+}
+
+
+class TestIsMainHealthFix:
+    """The fix owner of a confirmed main break is recognised by the signature its filer writes."""
+
+    @pytest.mark.parametrize('spawn_context', list(FixSpawnContext))
+    def test_the_filers_own_metadata_marks_a_fix(self, spawn_context: FixSpawnContext) -> None:
+        arguments = build_main_fix_task_arguments(
+            TEST_BREAK, project_root='/p', spawn_context=spawn_context,
+        )
+
+        assert is_main_health_fix({'id': 1, 'metadata': arguments['metadata']})
+
+    def test_metadata_arriving_as_a_json_string_still_marks_a_fix(self) -> None:
+        metadata = _fix_arguments(TEST_BREAK)['metadata']
+
+        assert is_main_health_fix({'id': 1, 'metadata': json.dumps(metadata)})
+
+    def test_a_steward_triage_heal_carries_no_signature(self) -> None:
+        assert not is_main_health_fix({'id': 8468, 'metadata': STEWARD_TRIAGE_HEAL_METADATA})
+
+    @pytest.mark.parametrize('task', [
+        {'id': 1},
+        {'id': 1, 'metadata': None},
+        {'id': 1, 'metadata': {SIGNATURE_KEY: ''}},
+        {'id': 1, 'metadata': {SIGNATURE_KEY: '   '}},
+        {'id': 1, 'metadata': {SIGNATURE_KEY: 123}},
+    ], ids=['no-metadata', 'null-metadata', 'empty', 'whitespace', 'non-string'])
+    def test_no_usable_signature_is_not_a_fix(self, task: dict) -> None:
+        assert not is_main_health_fix(task)
 
 
 class TestMainFixTaskFiler:
@@ -411,8 +450,8 @@ def _inherited_info(verify: VerifyResult) -> dict:
 def _run_site(
     site: str, case: str, tmp_path: Path, store: FakeTaskStore | None,
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[MainBreak, list[str]]:
-    """Drive one classification site; return the break and every next action it filed."""
+) -> tuple[MainBreak, list[tuple[str, str]]]:
+    """Drive one classification site; return the break and the (next action, detail) of every escalation it filed."""
     queue = EscalationQueue(tmp_path / 'escalations')
     worker = _make_worker(tmp_path, queue, store, monkeypatch)
     verify = {**MERGE_LANE_CASES, **VERIFY_ARM_CASES}[case]
@@ -420,7 +459,7 @@ def _run_site(
     brk = _break_of(outcome)
     _arrange(case, worker, store, brk)
 
-    async def _drive() -> list[str]:
+    async def _drive() -> list[tuple[str, str]]:
         if site == 'deferred_worker':
             await worker._auto_heal_main_health_deferred(
                 outcome, _make_req('42', tmp_path / 'task-wt', _make_config(tmp_path)),
@@ -435,11 +474,12 @@ def _run_site(
         await workflow._block_on_inherited_break(_inherited_info(verify))
         mark_blocked = workflow._mark_blocked
         assert isinstance(mark_blocked, AsyncMock)
-        return [mark_blocked.call_args.kwargs['suggested_action']]
+        filed = mark_blocked.call_args.kwargs
+        return [(filed['suggested_action'], filed['detail'])]
 
     filed_by_mark_blocked = asyncio.run(_drive())
-    actions = [esc.suggested_action for esc in queue.get_pending()] + filed_by_mark_blocked
-    return brk, actions
+    queued = [(esc.suggested_action, esc.detail) for esc in queue.get_pending()]
+    return brk, queued + filed_by_mark_blocked
 
 
 SITE_CASES = [
@@ -447,31 +487,68 @@ SITE_CASES = [
     *(('task_verify', case) for case in VERIFY_ARM_CASES),
 ]
 
+SITE_ACTIONS = {
+    'deferred_worker': OWNED_ACTIONS,
+    'sync_workflow': OWNED_ACTIONS,
+    'task_verify': frozenset({MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION}),
+}
+
 
 class TestNoOutcomeTerminatesOwnerless:
     """Every (site, outcome) ends with an open fix-main task for its signature, and
-    every escalation it files names an owned next action."""
+    every escalation it files names that site's next action."""
 
     @pytest.mark.parametrize(('site', 'case'), SITE_CASES)
-    def test_every_outcome_has_an_open_fix_task_and_an_owned_escalation(
+    def test_every_outcome_has_an_open_fix_task_and_files_its_sites_next_action(
         self, tmp_path: Path, site: str, case: str, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         store = FakeTaskStore()
 
-        brk, actions = _run_site(site, case, tmp_path, store, monkeypatch)
+        brk, filed = _run_site(site, case, tmp_path, store, monkeypatch)
 
         assert len(store.open_owners(brk.signature)) == 1, store.tasks
-        assert actions, f'{site}/{case} filed no escalation'
-        assert set(actions) <= OWNED_ACTIONS, actions
+        assert filed, f'{site}/{case} filed no escalation'
+        assert {action for action, _ in filed} <= SITE_ACTIONS[site], filed
 
     @pytest.mark.parametrize(('site', 'case'), SITE_CASES)
     def test_without_a_task_store_every_outcome_still_files_an_escalation(
         self, tmp_path: Path, site: str, case: str, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        brk, actions = _run_site(site, case, tmp_path, None, monkeypatch)
+        brk, filed = _run_site(site, case, tmp_path, None, monkeypatch)
 
-        assert actions, f'{site}/{case} ended with neither a task nor an escalation'
-        assert all(action in set(MainHealthNextAction) for action in actions), actions
+        assert filed, f'{site}/{case} ended with neither a task nor an escalation'
+        assert all(action in set(MainHealthNextAction) for action, _ in filed), filed
+
+
+class TestTaskVerifyArmGuidesTheSteward:
+    """The task-verify L0 asks its steward to re-run the failures in isolation,
+    and its detail names the fix owner the steward defers to if they fail again,
+    or, with none, asks for a re-escalation so one is filed."""
+
+    @pytest.mark.parametrize('case', VERIFY_ARM_CASES)
+    def test_the_l0_asks_for_an_isolated_rerun_and_names_the_owner(
+        self, tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        store = FakeTaskStore()
+
+        brk, filed = _run_site('task_verify', case, tmp_path, store, monkeypatch)
+
+        [(action, detail)] = filed
+        assert action == MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION
+        [owner] = store.open_owners(brk.signature)
+        assert f'task {owner}' in detail
+        assert detail.startswith(VERIFY_ARM_CASES[case].failure_report())
+        assert INHERITED_BREAK_NO_FIX_OWNER_LINE not in detail
+
+    @pytest.mark.parametrize('case', VERIFY_ARM_CASES)
+    def test_without_a_task_store_the_l0_asks_for_an_isolated_rerun_then_a_re_escalation(
+        self, tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _brk, filed = _run_site('task_verify', case, tmp_path, None, monkeypatch)
+
+        [(action, detail)] = filed
+        assert action == MainHealthNextAction.STEWARD_RERUN_IN_ISOLATION
+        assert detail == f'{VERIFY_ARM_CASES[case].failure_report()}\n\n{INHERITED_BREAK_NO_FIX_OWNER_LINE}'
 
 
 class TestOneTaskPerSignature:

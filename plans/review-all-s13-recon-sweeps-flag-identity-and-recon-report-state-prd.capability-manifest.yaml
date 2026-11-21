@@ -1,0 +1,754 @@
+prd: plans/review-all-s13-recon-sweeps-flag-identity-and-recon-report-state-prd.md
+schema_version: 1
+signal_leaves: ["ω"]
+tasks:
+  - label: "α"
+    task_id: 9732
+    title: "Give recon flag identity one public module: fingerprint, normalizer, signatures, FlagTypeFamily, UUID extraction and the parsed flag subject"
+    note: "Closes fk-e30ecd1f36b8, fk-e64ee986eeed. High. No dependency. Persisted forms are frozen byte-for-byte (D1); the golden fixture captures today's outputs. 20 declared paths, 6 of them one-line test import repoints of the moved signature functions."
+    capabilities:
+      - name: "flag-identity-module"
+        binding: "built here — fused-memory/src/fused_memory/reconciliation/flag_identity.py::parse_flag_subject (C1)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def parse_flag_subject\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/flag_identity.py"]
+          expect: present
+      - name: "private-fingerprint-imports-gone"
+        binding: "anti-inversion — scope_freshness and task_knowledge_sync import content_fingerprint from flag_identity, never flag_dedup's private name"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "[^A-Za-z0-9]_content_fingerprint"
+          paths: ["fused-memory/src/fused_memory/reconciliation/scope_freshness.py", "fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py"]
+          expect: absent
+      - name: "recon-report-local-normalizer-gone"
+        binding: "anti-inversion — server/recon_report.py imports the identity functions from flag_identity"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def _normalize_description\\("
+          paths: ["fused-memory/src/fused_memory/server/recon_report.py"]
+          expect: absent
+      - name: "persisted-forms-golden-fixture"
+        binding: "built here — fused-memory/tests/reconciliation/test_flag_identity.py holds the B1/B2 fixture captured from today's code"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/reconciliation/test_flag_identity.py"]
+          expect: present
+      - name: "flag-dedup-identity-substrate"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/flag_dedup.py::compute_marker_signature` substrate — is on main; α moves it"
+        verdict: PASS
+  - label: "β"
+    task_id: 9733
+    title: "Make recon flag suppression match any component of a composite task id and record partial matches on the suppression row"
+    note: "Closes fk-5d00812d5256 under R13 option 1. Deps δ1 (through it α); S19 α (lead ruling OQ-4). filter_suppressed gains a run_id keyword; the 8 test calls of is_suppressed move or go."
+    capabilities:
+      - name: "partial-hits-recorded"
+        binding: "built here — flag_dedup.py::filter_suppressed records partial_hits on the matching row (D2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "partial_hits"
+          paths: ["fused-memory/src/fused_memory/reconciliation/flag_dedup.py"]
+          expect: present
+      - name: "verbatim-flag-compare-gone"
+        binding: "anti-inversion — the flag side is parsed into a FlagSubject"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "tid_str = str\\(flag_tid\\)"
+          paths: ["fused-memory/src/fused_memory/reconciliation/flag_dedup.py"]
+          expect: absent
+      - name: "ledger-is-suppressed-deleted"
+        binding: "anti-inversion — no second suppression-matching rule in the ledger"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def is_suppressed\\("
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "conditional-upsert-substrate"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/recon_ledger.py::ReconLedgerStore.upsert_if_state` substrate — exists on main; β writes partial hits through it so a lifted row is never revived"
+        verdict: PASS
+  - label: "γ"
+    task_id: 9734
+    title: "Put every recon flag_type vocabulary on FlagTypeFamily with a drift log, and guard against ad-hoc flag_type matching"
+    note: "Closes fk-65aeb80b161d. Dep β. Subsumes task 7388 (cancelled). EXACT mode for the absence filter, which gates delete_memory (D3)."
+    capabilities:
+      - name: "family-match-modes"
+        binding: "built here — flag_identity.py::FamilyMatch (C2)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class FamilyMatch\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/flag_identity.py"]
+          expect: present
+      - name: "absence-frozenset-gone"
+        binding: "anti-inversion — the absence vocabulary is a FlagTypeFamily(match=EXACT)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "ABSENCE_FLAG_TYPES"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "vocabulary-guard-test"
+        binding: "built here — the AST guard test, exercised against a seeded fixture module (INV-10)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/reconciliation/test_flag_type_vocabulary_guard.py"]
+          expect: present
+  - label: "δ1"
+    task_id: 9735
+    title: "Split task_filter.py: the recon prose grammar moves to recon_prose_grammar.py, task_filter keeps the task-tree renderer"
+    note: "Closes fk-d9bfbf342b5b. Dep α. 23 declared paths, 16 of them one-line import repoints. Placement (lead ruling OQ-4): S19 β2 moves recon_prose_grammar.py in place of task_filter.py."
+    capabilities:
+      - name: "grammar-module"
+        binding: "built here — reconciliation/recon_prose_grammar.py holds the grammar half verbatim"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^COUNT_SNAPSHOT_RE"
+          paths: ["fused-memory/src/fused_memory/reconciliation/recon_prose_grammar.py"]
+          expect: present
+      - name: "task-filter-holds-no-regex"
+        binding: "anti-inversion — the tree half compiles no regex (measured: all 17 re.compile sites are in the grammar half)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "re\\.compile\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/task_filter.py"]
+          expect: absent
+  - label: "δ2"
+    task_id: 9736
+    title: "Derive the recon status lexicon and terminal sets from shared.task_statuses; make active-tree selection a typed value"
+    note: "Closes fk-51ec1e4010af, fk-9f66b6f4420c. Dep θ2; shares only server/tools.py import lines with S12 δ (rebase-only). status_rank keeps today's ranks (infra-hold 3, cancelled 7), pinned by an order test. Task 9285 depends on δ2 (lead action); S19 β2 depends on δ2 (lead ruling OQ-4)."
+    capabilities:
+      - name: "lexicon-from-taskstatus"
+        binding: "built here — recon_prose_grammar.py::STATUS_WORD_ALTERNATION generated from TaskStatus (C3)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^STATUS_WORD_ALTERNATION"
+          paths: ["fused-memory/src/fused_memory/reconciliation/recon_prose_grammar.py"]
+          expect: present
+      - name: "status-rank-public"
+        binding: "built here — task_filter.py::status_rank, total over TaskStatus (D6)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def status_rank\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/task_filter.py"]
+          expect: present
+      - name: "terminal-literal-gone"
+        binding: "anti-inversion — terminal sets are shared.task_statuses.TERMINAL (the three named recon sets, 3 matching lines at 97be1d71fa)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^(TERMINAL_STATUSES|INACTIVE_TASK_STATUSES|TERMINAL_TASK_STATUSES)( |:|=)"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "five-tuple-gone"
+        binding: "anti-inversion — _select_visible_active_with_body returns a frozen VisibleActiveSelection"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "-> tuple\\[list\\[dict\\], str \\| None, str, str, str\\]"
+          paths: ["fused-memory/src/fused_memory/reconciliation/task_filter.py"]
+          expect: absent
+      - name: "task-statuses-substrate"
+        binding: "`grep:shared/src/shared/task_statuses.py::TaskStatus` `grep:shared/src/shared/task_statuses.py::TERMINAL` substrate — are on main"
+        verdict: PASS
+  - label: "ε"
+    task_id: 9737
+    title: "Make the recon finding category a closed enum: refuse off-list categories at add_finding, record every refusal for analysis, and generate the stage schema from it"
+    note: "Closes fk-7c13df0b988c. Deps ζ, θ3, S12 ι2 (prompts/fragments.py). OQ-2 ruled (a) by Leo, plus his additions: every refusal is recorded in the append-only rejected_findings table (server/recon_report_store.py, 180-day retention, untouched by run cleanup), a same-run accepted retry stamps retried_as, and the stage report counts findings_rejected_invalid_category (C11, D18). The five producer category constants become FindingCategory members."
+    capabilities:
+      - name: "finding-category-enum"
+        binding: "built here — models/reconciliation.py::FindingCategory (C5)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class FindingCategory\\("
+          paths: ["fused-memory/src/fused_memory/models/reconciliation.py"]
+          expect: present
+      - name: "stage-schema-enum-derived"
+        binding: "built here — cli_stage_runner.py::FINDING_ITEM_SCHEMA category enum is list(FINDING_CATEGORY_VALUES)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "list\\(FINDING_CATEGORY_VALUES\\)"
+          paths: ["fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py"]
+          expect: present
+      - name: "prefix-rule-gone"
+        binding: "anti-inversion — actionable default reads FindingCategory.informational"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "startswith\\('cross_project'\\)"
+          paths: ["fused-memory/src/fused_memory/server/recon_report.py"]
+          expect: absent
+      - name: "producer-category-literals-gone"
+        binding: "anti-inversion — the producer category constants are FindingCategory members, not string literals"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^(GATE_RESOLUTION_FLAG_CATEGORY|ORPHANED_ESCALATION_FLAG_CATEGORY|UNLANDED_PATH_FLAG_CATEGORY)(: str)? = '"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "rejected-findings-table"
+        binding: "built here — server/recon_report_store.py owns the rejected_findings table (C11)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "CREATE TABLE IF NOT EXISTS rejected_findings"
+          paths: ["fused-memory/src/fused_memory/server/recon_report_store.py"]
+          expect: present
+      - name: "refusal-recorded-by-add-finding"
+        binding: "built here — ReconReportState.add_finding records each off-list refusal through ReconReportStore.record_rejection (D18)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "record_rejection\\("
+          paths: ["fused-memory/src/fused_memory/server/recon_report.py"]
+          expect: present
+      - name: "refusal-stage-stat"
+        binding: "built here — the stage entry's findings_rejected_invalid_category stat reaches the stage report (D18)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "findings_rejected_invalid_category"
+          paths: ["fused-memory/src/fused_memory/server/recon_report.py"]
+          expect: present
+      - name: "retry-stamp"
+        binding: "built here — an accepted add_finding stamps retried_as on the same run's refusals of the same digest (C11)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "stamp_retried_as\\("
+          paths: ["fused-memory/src/fused_memory/server/recon_report.py"]
+          expect: present
+      - name: "severity-precedent-substrate"
+        binding: "`grep:fused-memory/src/fused_memory/models/reconciliation.py::FindingSeverity` `grep:fused-memory/src/fused_memory/models/reconciliation.py::FINDING_SEVERITY_VALUES` substrate — on main; the add_finding refusal mirrors ReconReportState.add_finding's invalid_severity arm"
+        verdict: PASS
+  - label: "ζ"
+    task_id: 9738
+    title: "Give recon_report one RunFindingIndex per run that owns its session and dedup maps"
+    note: "Closes fk-0791e9817b84. High. Dep α."
+    capabilities:
+      - name: "run-finding-index"
+        binding: "built here — server/recon_finding_index.py::RunFindingIndex (C4)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class RunFindingIndex"
+          paths: ["fused-memory/src/fused_memory/server/recon_finding_index.py"]
+          expect: present
+      - name: "hand-synced-run-maps-gone"
+        binding: "anti-inversion — ReconReportState holds no run-scoped dedup map of its own"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "self\\._run_sig_index"
+          paths: ["fused-memory/src/fused_memory/server/recon_report.py"]
+          expect: absent
+      - name: "install-entry-substrate"
+        binding: "`grep:fused-memory/src/fused_memory/server/recon_report.py::ReconReportState._install_entry` substrate — is the existing single installer the index absorbs"
+        verdict: PASS
+  - label: "η"
+    task_id: 9739
+    title: "Give both stale-edge sweeps one Graphiti edge-sweep primitive, take the agent id from StageId, and stop recon writing task status into memory (the sweep's replacement sentence and the Stage-1 prompt's status facts)"
+    note: "Closes fk-917fdf32a542, fk-cdb8c20a3d0f. OQ-1 (b) and OQ-8 (b′) ruled by Leo: nothing writes task status into memory; the sweep invalidates and writes nothing, and the Stage-1 prompt's two status sections tell the agent to invalidate and write nothing for a task's status (D19). The detector stays as a backstop. Deps κ2, δ2; out of batch 9203 (S26 μ, C7 read surface), 6721 (S14 μ), 6718 (S14 θ, same sweep module and test), 7941, 5272 (6598 done)."
+    capabilities:
+      - name: "edge-sweep-primitive"
+        binding: "built here — reconciliation/graph_edge_sweep.py::invalidate_edges (C6)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def invalidate_edges\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/graph_edge_sweep.py"]
+          expect: present
+      - name: "private-agent-id-gone"
+        binding: "anti-inversion — the agent id comes from recon_stage_agent_id(StageId)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_SWEEP_AGENT_ID"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "agent-id-literal-gone"
+        binding: "anti-inversion — no hand-written stage agent id assignment in reconciliation"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "= 'recon-stage-memory_consolidator'"
+          paths: ["fused-memory/src/fused_memory/reconciliation/"]
+          expect: absent
+      - name: "replacement-status-prose-gone"
+        binding: "anti-inversion (OQ-1 b) — the sweep invalidates and writes no status sentence"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_SUPERSEDE_FACT_TEMPLATE"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "sweep-writes-no-replacement-guidance"
+        binding: "built here — prompts/stage1.py tells the agent the sweep writes no replacement status fact"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "do not write a replacement status fact"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/stage1.py"]
+          expect: present
+      - name: "stage1-status-flip-two-step-gone"
+        binding: "anti-inversion (OQ-8 b′) — the Stage-1 prompt no longer scopes the invalidate-and-write two-step to status flips"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "status flips"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/stage1.py"]
+          expect: absent
+      - name: "supersede-stats-gone"
+        binding: "anti-inversion (OQ-1 b) — the consolidator reports no superseding-write stats"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "stale_blocked_edges_supersede"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "stage1-task-count-example-gone"
+        binding: "anti-inversion (OQ-8 b′) — the Stage-1 prompt's effective-date example is no longer a task-status count (the recon-stage count-snapshot gate refuses that write anyway)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "3 blocked, 18 done"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/stage1.py"]
+          expect: absent
+      - name: "checked-read-surface-upstream"
+        binding: "producer:task-9203 upstream (S26 μ, C7 MemoryService.enumerate_valid_edges); its own delivered checks gate it"
+        verdict: PASS
+      - name: "recon-stage-agent-id-upstream"
+        binding: "producer:task-6721 upstream (S14 μ, shared/agent_identity.py::recon_stage_agent_id)"
+        verdict: PASS
+      - name: "stage-id-substrate"
+        binding: "`grep:fused-memory/src/fused_memory/models/reconciliation.py::StageId` substrate — on main"
+        verdict: PASS
+  - label: "θ1"
+    task_id: 9740
+    title: "Move flag_dedup's task-state refutation and systemic-pattern filters, with their shared lookup helpers, into flag_filters modules"
+    note: "Part of fk-46514b4ef0cc. Dep γ; touches no file S12 edits. Subsumes task 5996 with θ2, θ3."
+    capabilities:
+      - name: "refutation-filters-module"
+        binding: "built here — reconciliation/flag_filters/task_state_refutations.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def filter_false_absence_flags\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/flag_filters/task_state_refutations.py"]
+          expect: present
+      - name: "absence-filter-left-flag-dedup"
+        binding: "anti-inversion — moved, not copied"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def filter_false_absence_flags\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/flag_dedup.py"]
+          expect: absent
+      - name: "chain-order-substrate"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/stage1_flag_chain.py::RESOLVING_FILTERS_BEFORE_SUPPRESSION` substrate — is the one statement of filter order; θ1 only repoints its imports"
+        verdict: PASS
+  - label: "θ2"
+    task_id: 9741
+    title: "Move flag_dedup's count-snapshot, authorship and task-text accounting filters into flag_filters modules"
+    note: "Part of fk-46514b4ef0cc. Dep θ1."
+    capabilities:
+      - name: "count-snapshot-module"
+        binding: "built here — reconciliation/flag_filters/count_snapshot.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def filter_stale_count_snapshot_corrections\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/flag_filters/count_snapshot.py"]
+          expect: present
+      - name: "authorship-filter-left-flag-dedup"
+        binding: "anti-inversion — moved, not copied"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def filter_style_only_authorship_flags\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/flag_dedup.py"]
+          expect: absent
+  - label: "θ3"
+    task_id: 9742
+    title: "Move the phantom-creation filter, Hook A and the Stage-3 finding guards out of flag_dedup, leave it the ledger lifecycle, and rehome its prose"
+    note: "Closes fk-46514b4ef0cc with θ1, θ2; carries fk-2868338d3cf3. Deps θ2, δ2, ι and S12 ι2 (lead ruling OQ-6). Repoints _select_proactive_sample onto task_filter.status_rank."
+    capabilities:
+      - name: "stage3-guards-module"
+        binding: "built here — reconciliation/flag_filters/stage3_findings.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def filter_blocked_snapshot_findings\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/flag_filters/stage3_findings.py"]
+          expect: present
+      - name: "ceiling-guard-left-flag-dedup"
+        binding: "anti-inversion — flag_dedup keeps filter_suppressed as its only filter_* function"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^def filter_contamination_ceiling_findings\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/flag_dedup.py"]
+          expect: absent
+      - name: "status-priority-private-import-gone"
+        binding: "anti-inversion — _select_proactive_sample imports task_filter.status_rank at module top"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_STATUS_PRIORITY"
+          paths: ["fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py"]
+          expect: absent
+      - name: "flag-dedup-prose-rehomed"
+        binding: "built here — docs/recon-flag-dedup.md holds the narrative the module docstring drops (D16)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["docs/recon-flag-dedup.md"]
+          expect: present
+  - label: "ι"
+    task_id: 9743
+    title: "Split task_knowledge_sync.py: IntegrityCheck, the shared report formatters, snapshot I/O, the growth sweep and the reify briefing hook move to their own modules"
+    note: "Closes fk-b1cda781c60e. Deps α, 9203; lands before S12's stage-interface, streak-alarm and task-write tasks, which depend on it (lead ruling OQ-6). Subsumes task 6846."
+    capabilities:
+      - name: "integrity-check-module"
+        binding: "built here — reconciliation/stages/integrity_check.py::IntegrityCheck, imported by the harness from its own module (the path once existed and was removed by task 157, so the check reads the importer)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "from fused_memory\\.reconciliation\\.stages\\.integrity_check import"
+          paths: ["fused-memory/src/fused_memory/reconciliation/harness.py"]
+          expect: present
+      - name: "integrity-check-left-stage2-module"
+        binding: "anti-inversion — moved, not copied"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^class IntegrityCheck\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py"]
+          expect: absent
+      - name: "growth-sweep-module"
+        binding: "built here — reconciliation/standing_decision_growth_sweep.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/reconciliation/standing_decision_growth_sweep.py"]
+          expect: present
+  - label: "κ1"
+    task_id: 9744
+    title: "Delete Stage 2's dormant flag-persistence and escalation markers and the dormant human-operator stall marker; give recon marker GC its own module"
+    note: "Carries fk-9165ae3a1e72 (high) under OQ-7 (b), ruled by Leo. Dep ε; S19 β1 (lead ruling OQ-4). Subsumes task 7807. 16 declared paths, 4 of them prose-only."
+    capabilities:
+      - name: "marker-gc-module"
+        binding: "built here — reconciliation/marker_gc.py::gc_recon_markers (C7)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def gc_recon_markers\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/marker_gc.py"]
+          expect: present
+      - name: "fix-d-persistence-tracking-gone"
+        binding: "anti-inversion (OQ-7 b) — FIX D's Mem0 persistence tracking is deleted, not migrated"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def _track_flag_persistence\\("
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "persistence-mem0-sweep-gone"
+        binding: "anti-inversion (OQ-7 b) — no Mem0 persistence-marker pool remains to sweep"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def _sweep_stale_persistence_markers\\("
+          paths: ["fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py"]
+          expect: absent
+      - name: "stall-marker-gone"
+        binding: "anti-inversion (OQ-7 b) — the dormant human-operator stall marker and its escalation are deleted"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_STAGE1_HUMAN_OPERATOR_STALL_MARKER_SOURCE"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "ledger-store-substrate"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/recon_ledger.py::ReconLedgerStore.gc` `grep:fused-memory/src/fused_memory/reconciliation/recon_ledger.py::MARKER_KINDS` substrate — on main; gc_recon_markers keeps calling the ledger's own gc"
+        verdict: PASS
+  - label: "κ2"
+    task_id: 9745
+    title: "Delete the dormant Stage-1→Stage-2 Mem0 flag relay and the Mem0 marker-pool sweeper"
+    note: "Closes fk-9165ae3a1e72 with κ1, κ3, and fk-fa1fd33c7a9e, under OQ-7 (b), ruled by Leo. High. Dep κ1. 17 declared paths, almost all deletions."
+    capabilities:
+      - name: "stage2-relay-read-gone"
+        binding: "anti-inversion (OQ-7 b) — Stage 2 reads Stage 1's findings only through the recon-report channel"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^async def _query_stage2_flags\\("
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "mem0-pool-sweeper-gone"
+        binding: "anti-inversion — no Mem0 marker pool remains to sweep"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def _sweep_stale_mem0_pool\\("
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "semantic-relay-search-gone"
+        binding: "anti-inversion — no top-N semantic search for relayed flags"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "query='stage 1 flag for stage 2'"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "terminal-task-relay-retirement-gone"
+        binding: "anti-inversion — the latency layer that retired relay markers on task done goes with the pool"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def retire_flag_markers_for_terminal_task\\("
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "recon-report-channel-substrate"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::_query_recon_report_findings` substrate — on main; the one Stage-1→Stage-2 channel that stays"
+        verdict: PASS
+  - label: "κ3"
+    task_id: 9746
+    title: "Refuse recon-stage writes to the retired Stage-1→Stage-2 Mem0 relay and retire the relay from guidance, vocabulary and operator scripts"
+    note: "Closes fk-9165ae3a1e72 with κ1, κ2, under OQ-7 (b), ruled by Leo. High. Dep κ2; S19 β2 (lead ruling OQ-4) (moves flag_record_contract.py and consolidation_gate.py, so checks scan fused-memory/src/)."
+    capabilities:
+      - name: "relay-write-refusal"
+        binding: "built here — flag_record_contract.py::FLAG_FOR_STAGE2_RELAY_RETIRED returned by recon_stage_flag_kind_refusal for recon-stage writers (C7)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "flag_for_stage2_relay_retired"
+          paths: ["fused-memory/src/"]
+          expect: present
+      - name: "relay-kind-constant-gone"
+        binding: "anti-inversion — no prompt-package constant names a kind no prompt writes"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^FLAG_FOR_STAGE2_MARKER_KIND = "
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/"]
+          expect: absent
+      - name: "gate-hint-relay-gone"
+        binding: "anti-inversion — the consolidation gate's hint names add_finding, not the retired relay"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Relay it to Stage 2 via the `flag_for_stage2`"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "flag-record-contract-substrate"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/flag_record_contract.py::recon_stage_flag_kind_refusal` substrate — is the recon-stage-only write boundary that gains the refusal"
+        verdict: PASS
+  - label: "ν"
+    task_id: 9747
+    title: "Make TaskKnowledgeSync tests drive public seams: injected collaborators, no private imports or dotted-path patches"
+    note: "Closes fk-90f374fcce21 (high). Deps κ2, S12 γ2 (S12/C2 StageCollaborators); id wired at decompose. The draft's ν → S12 θ is not wired (they share only test files; lead's test-file rule). Subsumes task 7065."
+    capabilities:
+      - name: "public-seam-guard"
+        binding: "built here — the guard test that flags a seeded private import or patch (B16)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/reconciliation/test_tks_public_seam_guard.py"]
+          expect: present
+      - name: "dotted-path-patches-gone"
+        binding: "anti-inversion — no test patches a task_knowledge_sync private by dotted path"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "stages\\.task_knowledge_sync\\._"
+          paths: ["fused-memory/tests/"]
+          expect: absent
+      - name: "stage-collaborator-injection-upstream"
+        binding: "producer: S12 γ2 (S12/C2 StageCollaborators — TaskKnowledgeSync constructed with its collaborators, R12); S12 is authored in this wave and has no ids yet"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "a reviewer confirms at decompose that ν depends on the filed S12 γ2 task and that S12/C2 names TaskKnowledgeSync's injected collaborators"
+  - label: "λ"
+    task_id: 9748
+    title: "Move per-project recon policy (snapshot-write block, contamination-ceiling retirement, briefing refresh) into config keyed by project id"
+    note: "Closes fk-fbbf580e4e1d. Dep ν (through it ι, θ3, ε, κ2). Read seam ReconciliationConfig.policy_for; reload applies at the next cycle."
+    capabilities:
+      - name: "project-policies-config"
+        binding: "built here — config/schema.py::ReconciliationConfig.project_policies (C9)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "project_policies: dict\\[str, ReconProjectPolicy\\]"
+          paths: ["fused-memory/src/fused_memory/config/schema.py"]
+          expect: present
+      - name: "per-project-modules-gone"
+        binding: "anti-inversion — per-project Python modules deleted"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/src/fused_memory/reconciliation/policies/autopilot_video.py"]
+          expect: absent
+      - name: "policy-read-seam"
+        binding: "built here — config/schema.py::ReconciliationConfig.policy_for (C9 read seam)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def policy_for\\("
+          paths: ["fused-memory/src/fused_memory/config/schema.py"]
+          expect: present
+      - name: "project-policies-reloadable"
+        binding: "built here — config/schema.py: the project_policies field carries the Reload.GREEN marker (S16 C3/D4; S16 β2 9693 deletes config/reload.py first)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "project_policies: Annotated\\[.*Reload\\.GREEN"
+          paths: ["fused-memory/src/fused_memory/config/schema.py"]
+          expect: present
+      - name: "reconciliation-config-substrate"
+        binding: "`grep:fused-memory/src/fused_memory/config/schema.py::ReconciliationConfig` substrate — on main, already keying per-project values by project_id"
+        verdict: PASS
+  - label: "μ"
+    task_id: 9749
+    title: "Run EventJournal writes on one writer thread; EventQueue.enqueue awaits the durable append off the event loop"
+    note: "Closes fk-4c8d19c64d99. No intra-batch dependency; S19 α (lead ruling OQ-4). Durability shape (lead ruling OQ-5 (a)); the dead-letter replay runs off the loop thread only."
+    capabilities:
+      - name: "journal-async-append"
+        binding: "built here — event_journal.py::EventJournal.append runs on the writer thread (C8)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^    async def append\\(self, event"
+          paths: ["fused-memory/src/"]
+          expect: present
+      - name: "enqueue-awaits-append"
+        binding: "built here (OQ-5 a) — event_queue.py::EventQueue.enqueue is async"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def enqueue\\(self, event: ReconciliationEvent"
+          paths: ["fused-memory/src/"]
+          expect: present
+      - name: "on-loop-replay-branch-gone"
+        binding: "anti-inversion — replay never enqueues inline on the loop thread; _enqueue_on_loop awaits enqueue (D15)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "return self\\.enqueue(\\(event\\))?$"
+          paths: ["fused-memory/src/"]
+          expect: absent
+      - name: "writer-thread-precedent-substrate"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/dead_letter_writer.py::DeadLetterWriter` substrate — is the single-thread writer precedent"
+        verdict: PASS
+  - label: "ξ"
+    task_id: 9750
+    title: "The recon-report server takes the run id from the stage connection, refuses a differing run_id argument, and the stage prompts stop asking for run_id"
+    note: "Unconditional (lead ruling S12/OQ-10 (a)) under Leo's S12-2 refusal rule: a run_id differing from CAUSATION_ID_HEADER is refused through S12/C3's stage_identity_refusal with StageIdentityRefusal (field='run_id'), one recon_stage_identity_refused log line, no override event; the echo-run_id prompt lines go in the same change. Consumes S12/C3; deps ζ, ε, κ3, η, λ and S12 δ. C10, D20."
+    capabilities:
+      - name: "recon-report-reads-stage-headers"
+        binding: "built here — server/recon_report.py resolves run_id from CAUSATION_ID_HEADER through _report_run_id for every tool whose signature takes run_id (C10)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "CAUSATION_ID_HEADER"
+          paths: ["fused-memory/src/fused_memory/server/recon_report.py"]
+          expect: present
+      - name: "run-id-mismatch-refused"
+        binding: "built here — _report_run_id returns S12/C3's StageIdentityRefusal with field='run_id' for a differing argument (D20)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "field=['\"]run_id['\"]"
+          paths: ["fused-memory/src/fused_memory/server/recon_report.py"]
+          expect: present
+      - name: "recon-report-run-id-echo-gone"
+        binding: "anti-inversion — no hand-written recon-report call example in the stage prompts passes the run id"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "run_id=<from Reconciliation Context>"
+          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/"]
+          expect: absent
+      - name: "stage-identity-refusal-upstream"
+        binding: "producer: S12 δ (S12/C3 stage_identity_refusal, StageIdentityRefusal, the headers on the recon-report connection); ξ → S12 δ is the gate"
+        verdict: PASS
+  - label: "π"
+    task_id: 9751
+    title: "Add the recon finding-category candidate check script and its tests"
+    note: "Leo's addition to OQ-2. Dep ε (C11's read_rejected_findings). Deterministic half of the analysis: exit 1 on a candidate label (≥ --min-refusals over ≥ --min-runs runs, mostly un-retried or retried as other, not --ruled-label) or a lost share above --max-lost-share over ≥ --min-sample refusals; exit 0 with a verdict; exit 75 when the table is not there yet. Thresholds are script arguments. Read-only."
+    capabilities:
+      - name: "candidate-check-script"
+        binding: "built here — fused-memory/scripts/check_recon_category_candidates.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/scripts/check_recon_category_candidates.py"]
+          expect: present
+      - name: "candidate-check-tests"
+        binding: "built here — the B18 tests seed rejected_findings rows and assert every exit (INV-10)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/test_check_recon_category_candidates.py"]
+          expect: present
+      - name: "candidate-check-executable"
+        binding: "built here — the script is committed with git mode 100755 and a #!/usr/bin/env python3 line: the deterministic runner execs it directly (before_done_script.py::run_script) and submit_task refuses ρ unless it passes os.X_OK"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a reviewer confirms git ls-files -s fused-memory/scripts/check_recon_category_candidates.py shows 100755 on π's merge; a path check cannot see the mode"
+      - name: "rejected-findings-reader-upstream"
+        binding: "producer: ε (C11 read_rejected_findings and RejectedFindingsTableMissing); π → ε is the gate"
+        verdict: PASS
+  - label: "ρ"
+    task_id: null
+    title: "Recon finding-category candidates: fortnightly check"
+    note: "Leo's addition to OQ-2: the seed link of a native recurrence chain (docs/task-authoring.md §6.1). Filed by the lead the day π's merge lands, not at decompose: submit_task refuses a before_done script that is not on main and executable (deterministic_task_guard.py::_validate_script_under, planning mode included); the lead stamps task_id here then. task_kind=deterministic; before_done {kind: predicate, script: fused-memory/scripts/check_recon_category_candidates.py, args: the five thresholds, timeout_secs: 120, recheck_secs: 3600 (fold addition, confirmed by the lead)}; milestone dated ~30 days after filing; recurrence {key: recon-category-candidates, interval_secs: 1209600}. Dep π. No files, no finding key. A firing link files a born-at-L2 milestone_check_failed escalation and blocks its chain until resolved; first live recurring chain in this project."
+    capabilities:
+      - name: "recurrence-substrate"
+        binding: "`grep:shared/src/shared/task_metadata.py::Recurrence` `grep:fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_recurrence` `grep:fused-memory/src/fused_memory/middleware/recurrence_mint.py::run_remint_sweep_loop` substrate — the recurrence carrier contract, mint and re-mint sweep are on main"
+        verdict: PASS
+      - name: "predicate-runner-substrate"
+        binding: "`grep:orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._run_predicate` substrate — the predicate exit-code contract (0 done, 75 re-arm with recheck_secs, other milestone_check_failed) is on main"
+        verdict: PASS
+      - name: "candidate-script-upstream"
+        binding: "producer: π (the script ρ runs); ρ → π is the gate, so no link fires before the script is on main"
+        verdict: PASS
+      - name: "seed-link-shape"
+        binding: "the seed link is filed with task_kind=deterministic, the predicate before_done, a dated milestone and the recurrence key, and is accepted by submit_task's carrier validation"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the lead, filing the link once π's script is on main, reads it back with get_task and confirms the three metadata keys and the edge onto π; a malformed carrier, or a script that is missing or not executable, is rejected at submit_task and never persisted"
+  - label: "ω"
+    task_id: 9752
+    title: "Run the recon flag and report seams' two-way boundary suite and the live-run check (integration gate)"
+    note: "Signal leaf. Depends on every other leaf except ρ (the recurring chain's seed link; its first link fires about 30 days after filing and its links recur after the program)."
+    capabilities:
+      - name: "boundary-suite"
+        binding: "built here — the two-way boundary suite rows B3, B4, B7, B10, B11b, B12, B13, B14b, B17"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["fused-memory/tests/reconciliation/test_recon_flag_identity_boundary.py"]
+          expect: present
+      - name: "live-cycle-check"
+        binding: "one live dark_factory recon cycle after the last deploy shows findings reaching Stage 2 only through the recon-report channel, no recon-stage Mem0 write carrying a retired marker key or a 'has status' sentence, no accepted off-vocabulary category and a rejected_findings row per counted refusal, EdgeSweepStats keys for both sweeps, no unexplained recon_stage_identity_refused line"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "live-run reads (the Stage-2 report stats, write_journal.db, recon_report_state.db, the Stage-1 report) after deploy; not a tree property"

@@ -344,6 +344,29 @@ class TestHints:
         hints = [hint_for(reason) for reason in MergeReason]
         assert len(set(hints)) == len(hints)
 
+    def test_prior_run_terminal_hint_leaves_a_resubmit_to_a_human(self) -> None:
+        hint = MergeStatusAnswer.epistemic(
+            MergeState.stale_record, reason=MergeReason.prior_run_terminal,
+            request_id='mr-1',
+        ).to_response()['hint']
+
+        assert 'last_outcome' in hint
+        assert 'do not resubmit' in hint.lower()
+        assert 'human' in hint.lower()
+
+    def test_never_submitted_hint_names_the_keyed_resubmit_precondition(self) -> None:
+        hint = MergeStatusAnswer.epistemic(
+            MergeState.no_record, reason=MergeReason.never_submitted,
+            request_id='mr-1',
+        ).to_response()['hint']
+
+        for token in ('task_id', 'branch', 'request_id', 'get_merge_queue'):
+            assert token in hint, f'{token!r} missing from {hint!r}'
+        assert 'Submit it with merge_request' not in hint
+        resubmit_sentences = [s for s in hint.split('. ') if 'resubmit' in s.lower()]
+        assert resubmit_sentences, hint
+        assert all('licensed only' in s for s in resubmit_sentences), hint
+
 
 class TestLastOutcome:
     def test_from_row_renders_the_labelled_projection(self) -> None:

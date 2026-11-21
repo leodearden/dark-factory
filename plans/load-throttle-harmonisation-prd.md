@@ -310,7 +310,9 @@ psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (
   admission-knob parity guard parses `verify_env` with awk and accepts the unquoted form, so it
   would read green while the config is unloadable (decompose walk, 2026-09-08).
 - `@own-slice` (reify shell + python, and `shared.psi.resolve_own_cgroup` on the dark-factory side):
-  resolve `/proc/self/cgroup` → nearest `df-*.slice` ancestor → `/sys/fs/cgroup<path>/cpu.pressure`.
+  resolve `/proc/self/cgroup` → the `df-<project_id>.slice` ancestor (rule:
+  docs/cgroup-slice-topology.md §How a child finds its project slice) →
+  `/sys/fs/cgroup<path>/cpu.pressure`.
   No ancestor ⇒ fall back to `/proc/pressure/cpu` and emit **one** WARNING per process naming the
   fallback (the balancer once at startup; `cpu-admit.sh` once per verify invocation, not per poll)
   — C-A4 fail-open preserved, INV-4 bounded.
@@ -323,6 +325,7 @@ psi_admission:            # PRD plans/load-throttle-harmonisation-prd.md §6.2 (
   | under a project slice | `/user.slice/user-1000.slice/user@1000.service/df.slice/df-x.slice/df-verify-x-0123456789ab.scope` | `df-x.slice/cpu.pressure` present | the slice file |
   | not under one | `/user.slice/user-1000.slice/user@1000.service/app.slice/orchestrator-x.service` | that unit's `cpu.pressure` present | the unit file (python); `/proc/pressure/cpu` + one WARNING (bash `@own-slice`) |
   | unreadable | as row 1 | `df-x.slice/cpu.pressure` absent | `own_read_ok=False` (python); `/proc/pressure/cpu` + one WARNING (bash) |
+  | inside a governed sub-slice | `/user.slice/user-1000.slice/user@1000.service/df.slice/df-x.slice/df-x-governed.slice/df-x-governed-agents.slice/run-u1.scope` | `df-x.slice/cpu.pressure` present | the df-x.slice file, not the nearer sub-slice (both sides) |
 
 ### 6.4 Sampler rows and parity
 

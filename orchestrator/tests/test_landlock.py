@@ -318,6 +318,75 @@ class TestLandlockRefer:
 
 
 # ---------------------------------------------------------------------------
+# Test 3c: a --writable FILE grant permits in-place writes to that file only
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(_skip_landlock(), reason=_LANDLOCK_SKIP_REASON)
+@pytest.mark.skipif(_skip_var_tmp(), reason=_VAR_TMP_SKIP_REASON)
+class TestLandlockFileGrant:
+    _INNER_EXIT = 7
+
+    @pytest.fixture
+    def scaffold(self):
+        base = Path(tempfile.mkdtemp(prefix='landlock-file-grant-', dir='/var/tmp'))
+        try:
+            (base / 'wt').mkdir()
+            docs = base / 'docs'
+            docs.mkdir()
+            (docs / 'granted.md').write_text('granted\n')
+            (docs / 'sibling.md').write_text('sibling\n')
+            yield base
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def _run(self, base: Path, script: str, extras: list[str]) -> subprocess.CompletedProcess[str]:
+        inner = ['/bin/sh', '-c', f'{script}; exit {self._INNER_EXIT}']
+        cmd = build_landlock_command(inner, base / 'wt', [], writable_extras=extras)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+
+    def test_file_grant_allows_in_place_write_and_denies_everything_beside_it(
+        self, scaffold: Path,
+    ):
+        docs = scaffold / 'docs'
+        granted = docs / 'granted.md'
+        staged = scaffold / 'wt' / '.task' / 'staged.md'
+        script = ' ; '.join([
+            f'(printf appended >> {granted} && echo granted_ok)',
+            f'(printf x >> {docs}/sibling.md 2>/dev/null || echo sibling_denied)',
+            f'(printf x > {docs}/new.md 2>/dev/null || echo create_denied)',
+            f'(printf x > {granted}.tmp 2>/dev/null || echo tmp_create_denied)',
+            f'(printf replaced > {staged} && echo staged_ok)',
+            f'(mv {staged} {granted} 2>/dev/null || echo rename_denied)',
+        ])
+
+        result = self._run(scaffold, script, [str(granted)])
+
+        assert result.returncode == self._INNER_EXIT, f'stderr={result.stderr}'
+        assert 'add_rule(' not in result.stderr
+        assert 'granted_ok' in result.stdout
+        assert granted.read_text() == 'granted\nappended'
+        assert 'sibling_denied' in result.stdout
+        assert (docs / 'sibling.md').read_text() == 'sibling\n'
+        assert 'create_denied' in result.stdout
+        assert not (docs / 'new.md').exists()
+        assert 'tmp_create_denied' in result.stdout
+        assert not (docs / 'granted.md.tmp').exists()
+        assert 'staged_ok' in result.stdout
+        assert 'rename_denied' in result.stdout
+        assert staged.exists()
+
+    def test_missing_writable_path_is_skipped_loudly(self, scaffold: Path):
+        missing = scaffold / 'docs' / 'absent.md'
+
+        result = self._run(scaffold, 'true', [str(missing)])
+
+        assert result.returncode == self._INNER_EXIT, f'stderr={result.stderr}'
+        assert str(missing) in result.stderr
+        assert 'NOT granting' in result.stderr
+        assert not missing.exists()
+
+
+# ---------------------------------------------------------------------------
 # Test 4: invoke.py dispatches to the correct backend
 # ---------------------------------------------------------------------------
 
@@ -495,6 +564,7 @@ def _scaffold_git(cwd: Path, *args: str) -> str:
 
 @pytest.mark.skipif(_skip_landlock(), reason=_LANDLOCK_SKIP_REASON)
 @pytest.mark.skipif(_skip_var_tmp(), reason=_VAR_TMP_SKIP_REASON)
+@pytest.mark.spawns_agent_cli
 class TestLandlockSandboxedConflictedMerge:
     """A sandboxed agent resolves a NEW merge conflict and commits it cleanly.
 
@@ -524,7 +594,7 @@ class TestLandlockSandboxedConflictedMerge:
             for var in ('DF_AGENT_CPU_NICE', 'DF_AGENT_CPU_GOVERN'):
                 monkeypatch.delenv(var, raising=False)
             sandbox_dispatch.set_backend('landlock')
-            write_set = compute_write_set(worktree, home=fake_home)
+            write_set = compute_write_set(worktree, task_id='1', home=fake_home)
             extras = [str(p) for p in write_set.writable_paths()]
 
             self._assert_rr_cache_denied(main, worktree, fake_home, extras)

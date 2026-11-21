@@ -184,6 +184,19 @@ class TestStackBaseLedger:
         assert await ledger.base_of('task/M') is None
         assert await ledger.base_of('task/P') == stacked.p_first
 
+    async def test_move_branch_rekeys_only_that_branchs_record(
+        self, stacked: Stacked,
+    ) -> None:
+        ledger = StackBaseLedger(stacked.repo, _run)
+        await ledger.record('task/M', stacked.p_tip)
+        await ledger.record('task/M0', stacked.p_first)
+
+        await ledger.move_branch('task/M', 'task/M-20261117T000000Z')
+
+        assert await ledger.base_of('task/M') is None
+        assert await ledger.base_of('task/M-20261117T000000Z') == stacked.p_tip
+        assert await ledger.base_of('task/M0') == stacked.p_first
+
     async def test_prune_orphans_with_no_records_drops_nothing(
         self, stacked: Stacked,
     ) -> None:

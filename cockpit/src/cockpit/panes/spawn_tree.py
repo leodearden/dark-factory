@@ -9,7 +9,7 @@ Mirrors session_table.py's/decision_queue.py's own "pure helpers + widget in
 one module" convention: build_spawn_forest is fast/deterministic to unit
 test directly (no pilot, no event loop) -- only the SpawnTree widget and
 SpawnTreeScreen require a running Textual app, and are covered by
-test_app.py's pilot tests instead.
+test_app_spawn.py's pilot tests instead.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from orchestrator.session_registry import TERMINAL_STATUSES, SessionRecord, Status
+from orchestrator.session_records import TERMINAL_STATUSES, SessionRecord, Status
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import ModalScreen

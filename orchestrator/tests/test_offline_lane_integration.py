@@ -70,6 +70,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import SEED_REPO_MAX_GIT_SPAWNS, seed_repo
 from _lane_episode_fakes import Clock, FakeLedgerClient
 from _orch_helpers import (
     MEASURED_SPAWN_LATENCY_SECS,
@@ -139,11 +140,10 @@ _MARKERLESS_CEILING_FRACTION = 0.6
 _SPAWNS_PER_LANE_PASS_WORST_CASE = 5
 
 # Task 4203 — the multiplicands `_orch_helpers.py::required_timeout_secs` prices at
-# `MEASURED_SPAWN_LATENCY_SECS` per spawn. MEASURED by
-# `test_out_of_bound_spawn_counts_are_measured_not_asserted`, not
-# hand-counted: the `repo` fixture's `_setup_repo` spawns `init`, `config`
-# x2, `add`, `commit`.
-_SPAWNS_PER_REPO_FIXTURE = 5
+# `MEASURED_SPAWN_LATENCY_SECS` per spawn. The `repo` fixture is one seed_repo
+# call, priced at its worst case (a cold template); measured where seed_repo
+# lives, as `_git_fixtures.py::SEED_REPO_MAX_GIT_SPAWNS`.
+_SPAWNS_PER_REPO_FIXTURE = SEED_REPO_MAX_GIT_SPAWNS
 
 # Task 4203 — the other multiplicand of `required_timeout_secs`. MEASURED,
 # not hand-counted (see `test_out_of_bound_spawn_counts_are_measured_not_asserted`):
@@ -188,16 +188,6 @@ _SPAWNS_PER_FIXTURE_COMMIT = 2
 # ---------------------------------------------------------------------------
 
 
-async def _setup_repo(repo: Path) -> None:
-    """Create a real git repo with an initial commit (mirrors test_git_ops.py)."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 async def _advance_main(repo: Path, message: str = 'advance') -> str:
     """Commit a trivial, targeted change on main and return the new head SHA.
 
@@ -231,10 +221,7 @@ def git_config() -> GitConfig:
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     """A real tmp git repo (initial commit only) — never a MagicMock git_ops."""
-    repo_path = tmp_path / 'repo'
-    repo_path.mkdir()
-    asyncio.run(_setup_repo(repo_path))
-    return repo_path
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
@@ -930,9 +917,8 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
         # Task 4203 (review remediation) — the ONLY row in either table that
         # pays `_SPAWNS_PER_REPO_FIXTURE` TWICE: once for the `repo` fixture
         # every test in this module transitively pulls, and once more for the
-        # fresh `_setup_repo` this test deliberately runs on a clean tmp_path
-        # in order to MEASURE that very constant (it measures
-        # `_SPAWNS_PER_FIXTURE_COMMIT` on that fresh repo too). Its
+        # fresh repo this test seeds on a clean tmp_path to measure
+        # `_SPAWNS_PER_FIXTURE_COMMIT` on, priced at the same seed maximum. Its
         # `_ControllableSuiteRunner` / `_build_worker` / `_wire_lane` setup
         # contributes nothing further — measured to be spawn-free inside
         # that test, not assumed.
@@ -1062,8 +1048,8 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     False (the default; `timeout_func_only` is not set anywhere in this
     repo), so the per-test budget covers FIXTURE SETUP AND TEARDOWN, not just the
     call phase. Every test in both offline-lane modules transitively pulls
-    the `repo` fixture, whose `_setup_repo` costs `_SPAWNS_PER_REPO_FIXTURE`
-    git spawns (`init`, `config` x2, `add`, `commit`), and each
+    the `repo` fixture, whose `seed_repo` call costs up to `_SPAWNS_PER_REPO_FIXTURE`
+    git spawns (a cold template build plus the copy's index refresh), and each
     `_drive_advance` costs `_SPAWNS_PER_DRIVE_ADVANCE` more (`get_main_sha`,
     `add`, `commit`, `rev-parse` — NOT `_note_merge_all`'s `git diff`, which
     this module's `harness` fixture stubs to an `AsyncMock` and so never
@@ -1078,7 +1064,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     holds) or skips, naming the governing inifile (an invocation artifact,
     e.g. a root-bound run).
     """
-    from test_lane_lock_leak_guard import _effective_per_test_timeout  # noqa: PLC0415
+    from test_lane_lock_leak_guard import _effective_per_test_timeout
 
     floor = _SPAWNS_PER_LANE_PASS_WORST_CASE * MEASURED_SPAWN_LATENCY_SECS
     assert floor <= _LANE_PASS_BOUND_SECS, (
@@ -1093,20 +1079,17 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'real infra run_all.sh spawns).'
     )
 
-    from test_offline_lane_infra_integration import (  # noqa: PLC0415
+    from test_offline_lane_infra_integration import (
         _LANE_PASS_BOUND_SECS as _infra_lane_pass_bound_secs,
     )
-    from test_offline_lane_infra_integration import (  # noqa: PLC0415
+    from test_offline_lane_infra_integration import (
         _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE as _infra_spawns_per_assert_never_a_gate,
     )
-    from test_offline_lane_infra_integration import (  # noqa: PLC0415
+    from test_offline_lane_infra_integration import (
         _SPAWNS_PER_DRIVE_ADVANCE as _infra_spawns_per_drive_advance,
     )
     from test_offline_lane_infra_integration import (
         _SPAWNS_PER_FIXTURE_COMMIT as _infra_spawns_per_fixture_commit,
-    )
-    from test_offline_lane_infra_integration import (  # noqa: PLC0415
-        _SPAWNS_PER_REPO_FIXTURE as _infra_spawns_per_repo_fixture,
     )
 
     assert _infra_lane_pass_bound_secs == _LANE_PASS_BOUND_SECS, (
@@ -1118,17 +1101,10 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'diverging within that shared range.'
     )
 
-    # Task 4203 — the same anti-drift rationale applies verbatim to the two
-    # new required_timeout_secs multiplicands: each module independently
-    # measures its own copy (test_out_of_bound_spawn_counts_are_measured_not_asserted),
-    # so only an explicit equality check catches the two silently diverging.
-    assert _infra_spawns_per_repo_fixture == _SPAWNS_PER_REPO_FIXTURE, (
-        f"this module's _SPAWNS_PER_REPO_FIXTURE ({_SPAWNS_PER_REPO_FIXTURE}) has "
-        f"drifted from test_offline_lane_infra_integration.py's copy "
-        f'({_infra_spawns_per_repo_fixture}) — both modules share byte-identical '
-        f'_setup_repo bodies and harness fixture stubs, so a real divergence here '
-        f"means one module's measurement (or fixture) has silently changed."
-    )
+    # Task 4203 — the same anti-drift rationale applies verbatim to the
+    # _drive_advance multiplicand: each module independently measures its own
+    # copy (test_out_of_bound_spawn_counts_are_measured_not_asserted), so only
+    # an explicit equality check catches the two silently diverging.
     assert _infra_spawns_per_drive_advance == _SPAWNS_PER_DRIVE_ADVANCE, (
         f"this module's _SPAWNS_PER_DRIVE_ADVANCE ({_SPAWNS_PER_DRIVE_ADVANCE}) has "
         f"drifted from test_offline_lane_infra_integration.py's copy "
@@ -1187,7 +1163,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'test_every_composing_caller_carries_a_timeout_override), so this bounds ONLY '
         f"the marker-less budget — a single _run_lane pass. The remaining "
         f'{(1 - _MARKERLESS_CEILING_FRACTION) * 100:.0f}% is headroom for the real-git '
-        f"fixture work (the repo fixture's _setup_repo, and each _drive_advance) that "
+        f"fixture work (the repo fixture's seed_repo, and each _drive_advance) that "
         f'shares the same per-test budget, since pytest-timeout installs its timer in '
         f'pytest_runtest_protocol (func_only=False, unset in this repo) and so times '
         f'fixture setup/teardown too, not just the call phase.'
@@ -1206,7 +1182,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     # marker-less population additively was unsatisfiable: b1/b4/b6 (this
     # module) and ib1/ib3/ib5 (the sibling infra module) each do the repo
     # fixture plus at least one _drive_advance = _SPAWNS_PER_REPO_FIXTURE +
-    # _SPAWNS_PER_DRIVE_ADVANCE = 9 spawns = 42.39s of out-of-bound work
+    # _SPAWNS_PER_DRIVE_ADVANCE = 10 spawns = 47.1s of out-of-bound work
     # against the 24s the 0.6 fraction then left — precisely task 4030's "10
     # of the 15 tests exceed the 60s global" observation. Pricing every spawn
     # at the worst-case SINGLE-spawn 4.71s is a sound upper bound for sizing a
@@ -1243,11 +1219,11 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 4203 review remediation: the ONLY
 # marker-carrying test in this module composing NO _run_lane pass -- its whole bounded term
 # is _assert_never_a_gate's _NOTE_OFFLINE_LANE_BOUND_SECS + _NOTE_MERGE_ALL_BOUND_SECS =
-# 15.5s. Out-of-bound term = 23 spawns: 2 x _SPAWNS_PER_REPO_FIXTURE (the repo fixture
-# AND the fresh _setup_repo measured against below -- the only doubled fixture term in
+# 15.5s. Out-of-bound term = 25 spawns: 2 x _SPAWNS_PER_REPO_FIXTURE (6: the repo fixture
+# AND the fresh repo measured against below -- the only doubled fixture term in
 # either module), plus _SPAWNS_PER_FIXTURE_COMMIT (2), _SPAWNS_PER_DRIVE_ADVANCE (4) and
-# _SPAWNS_PER_ASSERT_NEVER_A_GATE (7); 23 x MEASURED_SPAWN_LATENCY_SECS = 108.33s,
-# required = 123.83s. The verify budget
+# _SPAWNS_PER_ASSERT_NEVER_A_GATE (7); 25 x MEASURED_SPAWN_LATENCY_SECS = 117.75s,
+# required = 133.25s. The verify budget
 # clears that requirement, and the value is ENFORCED by this test's row in
 # test_every_composing_caller_carries_a_timeout_override, which fails if the marker ever
 # drops below required.
@@ -1255,11 +1231,14 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
 async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     harness: Harness, git_ops: GitOps, repo: Path, tmp_path: Path,
 ) -> None:
-    """`_SPAWNS_PER_DRIVE_ADVANCE` / `_SPAWNS_PER_REPO_FIXTURE` are the
+    """`_SPAWNS_PER_DRIVE_ADVANCE` / `_SPAWNS_PER_FIXTURE_COMMIT` are
     multiplicands `required_timeout_secs` (task 4203) prices at
     `MEASURED_SPAWN_LATENCY_SECS` per spawn — this test MEASURES them by
     counting real git subprocess spawns, rather than trusting a
-    hand-maintained comment. That distinction is not academic: the two
+    hand-maintained comment. (`_SPAWNS_PER_REPO_FIXTURE` is measured where
+    `seed_repo` lives, by
+    `test_git_fixtures.py::test_seed_repo_max_git_spawns_is_the_costliest_seed_path`.)
+    That distinction is not academic: the two
     landed comments this task corrects (`test_lane_bounds_...`'s and
     `_run_lane`'s) had already drifted from each other AND from the truth,
     which is exactly the failure mode a measuring test — instead of a third
@@ -1297,7 +1276,7 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     `import` statement copies a REFERENCE to the `_run` function object into
     this module's own globals — a name distinct from ``orchestrator.git_ops
     ._run``, the attribute a `unittest.mock.patch` target string resolves
-    against. `_setup_repo` / `_advance_main` (defined in THIS module) call
+    against. `_advance_main` / `_commit_files` (defined in THIS module) call
     the bare name `_run`, which Python resolves through THIS module's own
     globals at call time — so patching only ``'orchestrator.git_ops._run'``
     silently misses them (confirmed directly: doing so undercounts
@@ -1334,9 +1313,9 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     The reviewer amendment that added the `_assert_never_a_gate` measurement
     above falsified BOTH clauses: that helper composes 15.5s of bounded waits
     (`_NOTE_OFFLINE_LANE_BOUND_SECS` + `_NOTE_MERGE_ALL_BOUND_SECS`), and at
-    23 out-of-bound spawns this test does ~2.6x the real-git work of a
-    B1 test (9: the `repo` fixture plus one `_drive_advance`).
-    `required_timeout_secs` puts the requirement at 123.83s. See the marker
+    25 out-of-bound spawns this test does ~2.5x the real-git work of a
+    B1 test (10: the `repo` fixture plus one `_drive_advance`).
+    `required_timeout_secs` puts the requirement at 133.25s. See the marker
     comment above for the worked derivation; the value is enforced by
     `test_every_composing_caller_carries_a_timeout_override`'s row for this
     test, not by this prose.
@@ -1365,22 +1344,7 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
         f'that calls _drive_advance, directly or via _drive_lane_pass.'
     )
 
-    calls.clear()
-    fresh_repo = tmp_path / 'fresh_repo_for_spawn_count'
-    fresh_repo.mkdir()
-    with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
-         patch(f'{__name__}._run', side_effect=_counting_run):
-        await _setup_repo(fresh_repo)
-
-    assert len(calls) == _SPAWNS_PER_REPO_FIXTURE, (
-        f'_setup_repo spawned {len(calls)} real git subprocess(es) '
-        f'({calls}), not the pinned _SPAWNS_PER_REPO_FIXTURE = '
-        f'{_SPAWNS_PER_REPO_FIXTURE}. This count is a multiplicand of '
-        f'required_timeout_secs — every test in this module transitively '
-        f'pulls the repo fixture, so a drift here mis-prices every '
-        f'composing test, not just one.'
-    )
-
+    fresh_repo = seed_repo(tmp_path / 'fresh_repo_for_spawn_count')
     calls.clear()
     with patch('orchestrator.git_ops._run', side_effect=_counting_run), \
          patch(f'{__name__}._run', side_effect=_counting_run):
@@ -1513,11 +1477,11 @@ async def test_b2_coalesces_burst_of_advances_to_one_rerun(harness, git_ops, rep
 # which is why the task-3832 review's marker sweep missed it -- but it composes anyway: a 30s
 # _run_lane bound raced concurrently by wait_entered (max, not sum), then
 # _assert_never_a_gate's 0.5 + 15.0 SEQUENTIALLY after it = 45.5s bounded, on top of
-# unbounded real-git spawns: repo init (_SPAWNS_PER_REPO_FIXTURE=5), one _drive_advance (4),
+# unbounded real-git spawns: the repo seed (_SPAWNS_PER_REPO_FIXTURE=6), one _drive_advance (4),
 # and _assert_never_a_gate's own get_main_sha + two _advance_main rounds
 # (_SPAWNS_PER_ASSERT_NEVER_A_GATE=7, task 4203 reviewer amendment -- MEASURED, supersedes an
-# earlier "two _drive_advance/_advance_main rounds" approximation) = 16 spawns x 4.71s =
-# 75.36s, required = 120.86s, comfortably under this marker.
+# earlier "two _drive_advance/_advance_main rounds" approximation) = 17 spawns x 4.71s =
+# 80.07s, required = 125.57s, comfortably under this marker.
 @pytest.mark.asyncio
 async def test_b3_never_a_gate(harness, git_ops, repo, tmp_path):
     """B3 (PRD §8, C7) — a merge-landed notification while the lane is
@@ -1547,8 +1511,8 @@ async def test_b3_never_a_gate(harness, git_ops, repo, tmp_path):
 
 
 # Two _drive_lane_pass calls: 2 x _LANE_PASS_BOUND_SECS = 60s bounded, plus the repo fixture,
-# the fixture commit and two _drive_advance rounds out of bound (5 + 2 + 2 x 4 = 15 spawns x
-# 4.71s = 70.65s); required = 130.65s, enforced by this test's rows in
+# the fixture commit and two _drive_advance rounds out of bound (6 + 2 + 2 x 4 = 16 spawns x
+# 4.71s = 75.36s); required = 135.36s, enforced by this test's rows in
 # test_every_composing_caller_carries_a_timeout_override.
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.usefixtures('pytest_on_path')
@@ -1595,8 +1559,8 @@ async def test_b4_a_confirmed_red_is_held_then_a_spaced_reproduction_files_one_t
 # ---------------------------------------------------------------------------
 
 
-# Six _drive_lane_pass calls: 6 x _LANE_PASS_BOUND_SECS = 180s bounded, plus 5 + 2 + 6 x 4 =
-# 31 out-of-bound spawns x 4.71s = 146.01s; required = 326.01s, so 360 (the next multiple of
+# Six _drive_lane_pass calls: 6 x _LANE_PASS_BOUND_SECS = 180s bounded, plus 6 + 2 + 6 x 4 =
+# 32 out-of-bound spawns x 4.71s = 150.72s; required = 330.72s, so 360 (the next multiple of
 # the 60s grid), enforced by this test's rows in
 # test_every_composing_caller_carries_a_timeout_override.
 @pytest.mark.timeout(360)
@@ -1646,7 +1610,7 @@ async def test_b5_a_persistent_red_under_an_open_task_files_once_and_escalates_o
 # ---------------------------------------------------------------------------
 
 
-# Two _drive_lane_pass calls; the same 130.65s requirement as B4.
+# Two _drive_lane_pass calls; the same 135.36s requirement as B4.
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.usefixtures('pytest_on_path')
 @pytest.mark.asyncio
@@ -1675,7 +1639,7 @@ async def test_b6_a_red_the_narrowed_confirm_clears_ends_its_episode_and_files_n
 # ---------------------------------------------------------------------------
 
 
-# Six _drive_lane_pass calls; the same 326.01s requirement as B5.
+# Six _drive_lane_pass calls; the same 330.72s requirement as B5.
 @pytest.mark.timeout(360)
 @pytest.mark.usefixtures('pytest_on_path')
 @pytest.mark.asyncio
@@ -1787,7 +1751,7 @@ _VERIFY_USAGE_DUMP = (
 )
 
 
-# Two _drive_lane_pass calls; the same 130.65s requirement as B4 (the stub commit is the
+# Two _drive_lane_pass calls; the same 135.36s requirement as B4 (the stub commit is the
 # fixture commit).
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.asyncio

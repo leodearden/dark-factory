@@ -3,7 +3,8 @@
 WHY THIS FILE LIVES HERE AND NOT IN ``scripts/tests/``.
 ``scripts/check_consolidation_closure.py`` imports ``TaskInterceptor`` at
 MODULE scope — that is the INV-5 single-sourcing of
-``_CONSOLIDATION_SCROLL_LIMIT`` and ``_extract_metadata_dict`` which makes
+``_CONSOLIDATION_SCROLL_LIMIT`` (and, beside it, the seam's own
+``metadata_dict.py::extract_metadata_dict``) which makes
 "the same mechanical check" literally true rather than aspirational.  That
 import transitively pulls in ``services.memory_service`` and therefore
 ``graphiti_core``, which is absent from the ``shared`` venv that runs
@@ -33,6 +34,8 @@ import pytest
 from _fm_helpers import load_script_module
 from shared.project_id import project_id_for_root
 from shared.project_layout import default_project_root, tasks_db
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation.consolidation_gate import (
@@ -40,6 +43,8 @@ from fused_memory.reconciliation.consolidation_gate import (
     closure_exists_probe,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = _ROOT / 'scripts' / 'check_consolidation_closure.py'
@@ -59,8 +64,6 @@ def _load_module() -> types.ModuleType:
 
 
 mod = _load_module()
-TaskDbUnreadable = mod.TaskDbUnreadable
-TaskDbProblem = sys.modules[mod.connect_ro.__module__].TaskDbProblem
 
 _TOPIC = 'cli-demo-topic'
 _PROJECT_ID = 'dark_factory'
@@ -147,6 +150,46 @@ def _run(metadata, memory, *, as_json=False):
     return asyncio.run(mod.run(_args(metadata, as_json=as_json), memory=memory))
 
 
+
+class TestTheLiveServiceOpensNothingAndIsClosed:
+    """With no injected memory, ``run`` builds its own service and opens nothing.
+
+    The lazy Qdrant client is all the scroll needs, so no FalkorDB, embedder or
+    OPENAI_API_KEY is touched, and the shared close still releases that client.
+    """
+
+    def test_a_closed_gate_run_opens_nothing_closes_once_and_agrees_with_the_injected_run(
+        self, monkeypatch,
+    ):
+        calls: list[str] = []
+        configs: list[object] = []
+        stub_config = object()
+
+        class RecordingMemory(FakeMemory):
+            def __init__(self, config):
+                super().__init__()
+                configs.append(config)
+
+            async def initialize(self):
+                calls.append('initialize')
+
+            async def initialize_for_reads(self):
+                calls.append('initialize_for_reads')
+
+            async def close(self):
+                calls.append('close')
+
+        monkeypatch.setattr('fused_memory.config.schema.FusedMemoryConfig', lambda: stub_config)
+        monkeypatch.setattr('fused_memory.services.memory_service.MemoryService', RecordingMemory)
+        blob = _gate_blob([_uuid(1), _uuid(2)])
+
+        live_rc = asyncio.run(mod.run(_args(blob)))
+
+        assert configs == [stub_config]
+        assert calls == ['close']
+        assert live_rc == _run(blob, FakeMemory()) == mod.EXIT_CLOSED
+
+
 class TestCliUnstampedClusterMember:
     def test_a_stray_is_reported_and_named(self, capsys):
         stray = _uuid(42)
@@ -160,7 +203,7 @@ class TestCliUnstampedClusterMember:
     def test_json_mode_carries_the_reason_and_discloses_the_derivation(
         self, capsys
     ):
-        import json  # noqa: PLC0415
+        import json
 
         stray = _uuid(42)
         memory = FakeMemory(live_ids=[stray])
@@ -327,7 +370,7 @@ class TestCliAndSeamAgree:
     def test_same_inputs_same_reason_codes(
         self, observed, live_ids, members, tmp_path, capsys
     ):
-        import json  # noqa: PLC0415
+        import json
 
         metadata = _gate_blob(observed)
 

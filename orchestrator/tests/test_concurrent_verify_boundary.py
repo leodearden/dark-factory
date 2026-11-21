@@ -809,15 +809,15 @@ class TestB5OperatorHalt:
             git_ops, q, verifier=verifier,
         )
         _inject_two_host_allocator(worker, gated_remote)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-polls for determinism
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-polls for determinism
 
         # Spy on _remerge: halt MUST NOT trigger chain-invalidation re-merge
         _original_remerge = worker._remerge
         remerge_task_ids: list[str] = []
 
-        async def _spy_remerge(req: Any, started_mono: Any) -> Any:
+        async def _spy_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             remerge_task_ids.append(req.task_id)
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _spy_remerge  # type: ignore[method-assign]
 
@@ -938,7 +938,7 @@ class TestB6EnospcPrune:
 
 @pytest.mark.asyncio
 class TestB7SingleHostNewPath:
-    """B7: single-host config routes through _dispatch_item/_finalize_inflight, serial semantics."""
+    """B7: single-host config routes through VerifyDispatcher.dispatch/_finalize_inflight, serial semantics."""
 
     async def test_b7_single_host_no_runners_routes_through_new_path_serial_order(
         self,
@@ -947,7 +947,7 @@ class TestB7SingleHostNewPath:
         git_config: Any,
         config: Any,
     ) -> None:
-        """No-runner config: all items flow through _dispatch_item/_finalize_inflight, peak in-flight==1."""
+        """No-runner config: all items flow through VerifyDispatcher.dispatch/_finalize_inflight, peak in-flight==1."""
         wt_a = await _make_branch_with_file(git_ops, 'task/b7-a', 'b7_a.py', 'a = 1\n')
         wt_b = await _make_branch_with_file(git_ops, 'task/b7-b', 'b7_b.py', 'b = 2\n')
         wt_c = await _make_branch_with_file(git_ops, 'task/b7-c', 'b7_c.py', 'c = 3\n')
@@ -966,8 +966,8 @@ class TestB7SingleHostNewPath:
             git_ops, q, on_merge_landed=_on_landed, verifier=FakeVerifier(),
         )
 
-        # Spy on _dispatch_item and _finalize_inflight
-        original_dispatch = worker._dispatch_item
+        # Spy on VerifyDispatcher.dispatch and _finalize_inflight
+        original_dispatch = worker.verify_dispatch.dispatch
         original_finalize = worker._finalize_inflight
         # Record the SET of distinct task_ids that flow through each path
         # rather than a raw call count: under event-loop starvation (e.g. a
@@ -982,7 +982,7 @@ class TestB7SingleHostNewPath:
         # Ordering invariant: an item can only be finalized AFTER it has been
         # dispatched (dispatch creates the in-flight entry that finalize
         # consumes). Records any id seen at _finalize_inflight before it ever
-        # passed through _dispatch_item. Unlike the raw call count, this is
+        # passed through VerifyDispatcher.dispatch. Unlike the raw call count, this is
         # deterministic under event-loop starvation (a benign re-dispatch keeps
         # the id in dispatched_ids), so it restores the double-call/path-bug
         # detection that the set-equality relaxation alone would miss — a
@@ -1001,7 +1001,7 @@ class TestB7SingleHostNewPath:
             finalized_ids.add(tid)
             return await original_finalize(entry)
 
-        worker._dispatch_item = _spy_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _spy_dispatch
         worker._finalize_inflight = _spy_finalize  # type: ignore[method-assign]
 
         # Track peak in-flight via _TrackingDeque
@@ -1046,7 +1046,7 @@ class TestB7SingleHostNewPath:
         finally:
             await stop_merge_worker(worker, worker_task)
 
-        # (1) All three items routed through the new _dispatch_item /
+        # (1) All three items routed through the new VerifyDispatcher.dispatch /
         # _finalize_inflight path. Assert on the SET of distinct task_ids
         # (deterministic) rather than the raw call count (which a benign extra
         # re-dispatch of an already-in-flight item under event-loop starvation

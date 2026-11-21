@@ -124,12 +124,6 @@ stand-down, and once its heartbeat is past the TTL the reaper reclaims it. The p
 `lease-heartbeat` is the **only** liveness signal a hosted holder has
 (`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
 
-**One-time rollout note (task 6916).** A lease a hosted session claimed *before* this change carries
-the bare `<--name>-$CLAUDE_PID` slug, so that session's re-derived heartbeat and release get
-`result=refused` (naming the holder's pid `alive`) — nothing is damaged. The lease becomes
-reclaimable once its heartbeat is past the 2h TTL; to skip the wait, release it with its original
-`--slug` (`lease-show` prints it as `holder_slug`) and claim again.
-
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** naming both,
 rather than silently drifting to a slug your own later heartbeat would fail to match; the CLI will
 not invent one, because a synthesized token would be identical for every degraded session and let
@@ -237,7 +231,7 @@ show freshness, because the heartbeat is the file's mtime.
    orphans" below) — BEFORE every drain, so the drain never sees them
 1. Drain all pending recon escalations
 2. Start the watcher: `scripts/watcher-rearm.sh` (background task, recon queue
-   dir, NO --level, --timeout 3600)
+   dir, NO --level, --timeout 3600, with the Bash tool's `timeout` parameter set to 3660000)
 3. Wait for it to exit, then branch per "Distinguishing the exits at step 3"
    below: FIRED → 4; CEILING → 5, skipping 4; KILLED / ERROR → that table's
    row and its identical-retry cap
@@ -264,12 +258,12 @@ exists to prevent.
 |---|---|---|
 | `WATCHER_REARM_OUTCOME: FIRED` | 0 | Go to step 4 and drain. Exit 0 with EMPTY stdout is a caught SIGTERM (`escalation.watcher` converts it to a clean `sys.exit(0)`; `scripts/watcher-rearm.sh` header), a non-fire that counts against the cap: this queue's **sole closer** must not silently skip a cycle on it. |
 | `WATCHER_REARM_OUTCOME: CEILING` | 124 | The bounded slice expired. Not an error, no report: skip step 4, re-drain and re-arm. The cap exempts it. |
-| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Something reaped the background task (codebook `watcher-loop-harness-mismatch`). Re-touch the `recon-watcher-<project>` lease, then re-arm per the cap. Counts against the cap. |
+| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Something reaped the background task (codebook `watcher-loop-harness-mismatch`). If the CLI's task notification says it stopped the command at its background time limit, the Bash `timeout` was missing or shorter than the slice: re-arm with the step-2 value, a material change (the sibling skill's "Diagnostic — an arm stopped from outside"). Re-touch the `recon-watcher-<project>` lease, then re-arm per the cap. Counts against the cap. |
 | `WATCHER_REARM_OUTCOME: ERROR` | any other; exit 2 prints NO marker | Read the stderr diagnostic before any retry. Exit 2 is a usage/env guard (most often an unset `DARK_FACTORY_ROOT`, `plans/confusion-census-2026-07-24.md` §1.5): it returns *instantly*, before the watcher runs (`scripts/watcher-rearm.sh` header), and recurs until the invocation is fixed, so fix it instead of spending the retry on it. Every other rc counts against the cap. |
 
 **Identical-retry cap: 1.** After KILLED, ERROR, a missing marker or an
-empty-stdout FIRED, re-issue the identical invocation (same script, flags and
-background launch) at most once. If it fails again, change the invocation
+empty-stdout FIRED, re-issue the identical invocation (same script, flags,
+background launch and Bash `timeout`) at most once. If it fails again, change the invocation
 materially or stop the loop and report the outcome to the human; never loop on
 the identical call. Falling through to "re-drain and re-arm" on a failing
 launch turns a mis-configured launch into a hot busy-loop of failed invocations
@@ -406,14 +400,11 @@ is the only acceptable failure direction for this queue's sole closer (contrast
 `--baseline` below, which fails silent). Blank lines and `#` comments are
 skipped (`watcher.py:143-146`), so the file can be annotated.
 
-**Slice length (recon delta on the shared timeout rules).** In the background
-the wrapper is exempt from the Bash tool's foreground timeouts, so this skill
-uses the long canonical slice `--timeout 3600`: at most one heartbeat wake per
-hour (`CEILING`) while a real escalation still fires instantly via inotify. Only
-**foreground** calls (e.g. debugging) are governed by the harness timeouts —
-there, size the Bash `timeout` to at least `(--timeout + 60s) × 1000` ms, or cap
-the slice at `--timeout 540` on a machine without a raised `BASH_MAX_TIMEOUT_MS`;
-the sibling skill's §"Starting the watcher" has the full rules.
+**Slice length.** Use the long canonical slice `--timeout 3600`: at most one
+heartbeat wake per hour (`CEILING`) while a real escalation still fires at once
+via inotify. Pass the Bash `timeout` on the background call too (`3660000` for
+`--timeout 3600`); the rule and its reason are in the sibling skill's §"Starting
+the watcher" (Bash-tool timeout contract).
 
 **`--baseline` is NOT safe for this loop — do not reach for it here**,
 even though `escalation.watcher` accepts it as a flag. `_snapshot_pending_ids()`
@@ -629,6 +620,42 @@ check ran in. Single normative statement of the rule:
 - **`dependency_discovered`** — if a real prerequisite task exists, note it; else
   file-a-real-task. Then resolve.
 - **`cleanup_needed`** — file-a-real-task (two-phase), then resolve.
+- **`eval_regression`** (blocking) — filed at level 1 by the scheduled
+  memory-eval runner (`fused-memory/scripts/memory_eval_runner.py`, timer
+  `fused-memory-memory-eval.timer`, daily 03:15; OPERATIONS.md §"Scheduled
+  memory evals (03:15)"). The program never resolves its own escalations: you
+  are the sole closer. While a record is pending, the runner suppresses
+  re-filing its `dedupe_fingerprint`. Three shapes, told apart by summary:
+  - *Regression* — task id `memory-eval-<eval_id>`, summary `memory-eval
+    <eval_id>: <metric>[<item>] regressed at <stamp> ...`. **verify-fixed**
+    against `fused-memory/data/memory-evals/verdicts-current.json`: when its
+    `run_stamp` is later than the record's, and the entry whose `fingerprint`
+    equals this record's `dedupe_fingerprint` is no longer `alarm`,
+    `resolve_issue(..., action='resume', resolution="Verified fixed: <eval_id>
+    <metric> verdict=<v> at <run_stamp>")`. If it still alarms, or no newer run
+    carries the entry, file-a-real-task (for retrieval findings, link the
+    3111/3112/3200 fix lineage), `stamp_triage` the record with the filed task
+    id, and **leave it pending**. Never dismiss a still-alarming fingerprint:
+    the ratchet never grandfathers a regression, so the next run re-files it as
+    soon as the record closes.
+  - *Storm aggregate* — task id `memory-eval-program`, summary `memory-eval
+    storm at <stamp>: <n> alarms exceed K=<k>`. More alarms than K in one run
+    usually share one cause. **Infrastructure first**: check fused-memory,
+    Qdrant and FalkorDB health and read the run report the record names
+    before triaging any single metric. Tell the human, file a DecisionRecord
+    via `write-decision`, and leave it pending. Unlike the other two shapes,
+    its fingerprint is scoped to its run, so a storm that persists files one
+    new aggregate per run. Fold them: keep the oldest pending aggregate as the
+    one you triage, and dismiss each later one that has the same cause with
+    `resolve_issue(..., action='close_only', resolution="Same storm as
+    <oldest esc-id>")`. Dismissing one suppresses nothing, because no later run
+    reuses its fingerprint.
+  - *Runner failure* — task id `memory-eval-program`, summary `memory-eval
+    runner: <n> failure(s) at <stamp> (...)`. Handle it as `infra_issue`: tell
+    the human and leave it pending until a clean run. Its fingerprint carries
+    no stamp, so while it is pending a later failure files nothing: read the
+    journal (`journalctl --user -u fused-memory-memory-eval.service`) and the
+    run reports for those.
 - **`reconciliation_stale_gate_backlog`** (blocking) — a task has sat
   `blocked` on a human-gated milestone gate for 48h+ (Stage 1's aging
   detector, `fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py`).
@@ -1036,7 +1063,7 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   pipeline stall): task 4835 decided against exempting them, because the same-queue custody hold
   keys on stamp equality, so an unstamped sentinel later re-filed with a stamp would re-open a row
   an operator had dropped.
-  There is a third value the field can hold: `<unknown>` (`session_registry.UNKNOWN_QUEUE`) —
+  There is a third value the field can hold: `<unknown>` (`decision_registry.UNKNOWN_QUEUE`) —
   "this record's owning queue was investigated and could not be determined". You never write it —
   and that is now enforced, not just asked: `write-decision` **rejects**
   `--escalations-dir <unknown>` outright, because a record stamped that way is refused by *every*

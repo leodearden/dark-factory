@@ -1,7 +1,7 @@
 """xdist worker restarts stay disabled for thread-method configs and for the recorded configs.
 
 THE INVARIANT has two rules. Both read the configs that
-``test_pytest_per_test_timeout_policy.py::discovered_pytest_configs`` discovers
+``tests/scripts/pytest_config_discovery.py::discovered_pytest_configs`` discovers
 from ``[tool.uv.workspace].members``, so a new member is held to them with no
 edit here.
 
@@ -62,10 +62,10 @@ import sys
 from collections.abc import Mapping
 
 import pytest
+from pytest_config_discovery import discovered_pytest_configs
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# The one config-discovery walk, with its anti-vacuity floors. Resolves because
-# tests/scripts/conftest.py puts this directory on sys.path.
-import test_pytest_per_test_timeout_policy as per_test_timeout_policy
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # The configs that keep the flag under timeout_method = "signal". The module
 # docstring states why.
@@ -159,7 +159,7 @@ def test_the_thread_rule_holds_thread_method_configs_only() -> None:
 
 def test_thread_timeout_configs_disable_worker_restarts() -> None:
     offenders = _restart_offenders(
-        _thread_method_configs(per_test_timeout_policy.discovered_pytest_configs())
+        _thread_method_configs(discovered_pytest_configs())
     )
     assert not offenders, (
         f'these configs run timeout_method = {THREAD_TIMEOUT_METHOD!r} but do '
@@ -177,7 +177,7 @@ def test_thread_timeout_configs_disable_worker_restarts() -> None:
 
 
 def test_recorded_configs_keep_worker_restarts_disabled() -> None:
-    configs = per_test_timeout_policy.discovered_pytest_configs()
+    configs = discovered_pytest_configs()
     undiscovered = sorted(RESTART_DISABLED_CONFIGS - configs.keys())
     assert not undiscovered, (
         f'RESTART_DISABLED_CONFIGS records {undiscovered!r}, but no pytest config '

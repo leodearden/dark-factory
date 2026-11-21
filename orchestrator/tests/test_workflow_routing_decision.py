@@ -37,9 +37,10 @@ from _workflow_helpers import fixed_prompt
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
 from orchestrator.config import OrchestratorConfig, PriceEntry, RoutingRule, RuleMatch, RuleSet
-from orchestrator.event_store import EventType
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.routing import PlanShape, RoutingDecision
 from orchestrator.workflow import TaskWorkflow
+from orchestrator.workflow_types import WorkflowState
 
 # Distinct, concrete values (not the role defaults) so a GREEN pass proves the
 # routing_decision payload reflects the actually-resolved config, not a
@@ -64,7 +65,7 @@ _RUST_RULE = RoutingRule(
 
 def _make_workflow(
     *,
-    event_store: _RecordingEventStore,
+    event_store: _RecordingEventStore | EventStore,
     cost_store: MagicMock | None = None,
 ) -> TaskWorkflow:
     """Minimal TaskWorkflow instance for ``_invoke`` routing-decision tests.
@@ -542,6 +543,30 @@ class TestInvokeThreadsScopeCapacity:
         # Dispatch proceeded with the fallback model (S7: capacity never blocks).
         mock_invoke.assert_awaited_once()
         assert mock_invoke.call_args.kwargs['model'] == 'sonnet'
+
+
+@pytest.mark.asyncio
+class TestRoutingDecisionCarriesWorkflowPhase:
+    """The persisted ``routing_decision`` row carries the live workflow phase,
+    the same value as its invocation's ``invocation_end`` row, so a per-role
+    cap cohort can be split by phase from runs.db alone (task 5350)."""
+
+    @pytest.mark.parametrize('state', [WorkflowState.EXECUTE, WorkflowState.REVIEW])
+    async def test_phase_matches_live_state_and_invocation_end(
+        self, tmp_path: Path, state: WorkflowState,
+    ) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-test')
+        wf = _make_workflow(event_store=store)
+        wf.state = state
+
+        await _invoke_implementer(wf, tmp_path)
+
+        decisions = store.fetch_events_by_type(EventType.routing_decision)
+        ends = store.fetch_events_by_type(EventType.invocation_end)
+        assert len(decisions) == 1, decisions
+        assert len(ends) == 1, ends
+        assert decisions[0]['phase'] == state.value
+        assert decisions[0]['phase'] == ends[0]['phase']
 
 
 class TestSelectModelForRoleRetired:

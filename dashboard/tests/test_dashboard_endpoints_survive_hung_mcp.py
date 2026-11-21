@@ -40,6 +40,7 @@ from contextlib import closing
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from _dashboard_routes import dashboard_get_paths
 from escalation.models import Escalation
 
 # Budgets are shrunk to this so the whole sweep is fast. The stub never
@@ -48,6 +49,7 @@ _TINY_BUDGET = 0.05
 
 _TARGET_MODULES = {
     'dashboard.data.task_lookup',
+    'dashboard.data.task_lineage',
 }
 """The modules whose hang this probe must actually REACH, or it proves nothing.
 
@@ -59,6 +61,9 @@ both now wait on. The hang must be reached THERE, for EACH endpoint's root —
 the sweep test checks the escalation probe's root separately — or that
 endpoint's bound is unexercised.
 
+``dashboard.data.task_lineage`` is ``/prds``' lineage index, whose background
+refresh is the one caller of ``fetch_metadata_projection``.
+
 ``dashboard.data.orchestrator`` was the third, and is deliberately no longer
 here: task 5587 removed ``discover_orchestrators``' task fetch outright, so it
 holds no ``fetch_tasks`` binding to hang. That is the strongest available
@@ -67,36 +72,6 @@ cannot wedge — and not a shrinking of the sweep. ``/api/v2/dashboard/orchestra
 is still requested below, because the route list is derived from ``app.routes``
 and cannot be opted out of; it must still answer 200 while the seam hangs.
 """
-
-
-def _dashboard_get_paths() -> list[str]:
-    """Every LITERAL GET route under /api/v2/dashboard/, read off the live app.
-
-    Templated routes (``/api/v2/dashboard/task/{project:path}/T-{task_id}``) are excluded: this
-    sweep requests each path verbatim, so a templated one would be fetched as
-    the literal string ``.../{task_id}`` and answer 404/422 — a false failure
-    about path construction, reported under a message about hung dependencies,
-    in a probe whose whole point is to be self-maintaining. A templated route
-    needs its own probe that binds real parameter values; see the guard in
-    :func:`test_templated_dashboard_routes_are_not_silently_unswept`, which
-    fails loudly if one is ever added rather than letting it go unswept.
-    """
-    return [p for p in _all_dashboard_get_paths() if '{' not in p]
-
-
-def _all_dashboard_get_paths() -> list[str]:
-    """Every GET route under /api/v2/dashboard/, templated ones included."""
-    from dashboard.app import app
-
-    # ``app.routes`` is typed ``list[BaseRoute]``, which declares no ``path``
-    # — bind it once via getattr (as the filter already did) so the duck-typed
-    # sweep still covers every route class, Mount included.
-    return sorted({
-        path
-        for route in app.routes
-        if (path := getattr(route, 'path', '')).startswith('/api/v2/dashboard/')
-        and 'GET' in (getattr(route, 'methods', None) or set())
-    })
 
 
 @pytest.fixture()
@@ -112,6 +87,7 @@ def hung_mcp(monkeypatch, tmp_path, client):
     from dashboard.data import (
         escalation_corpus,
         orchestrator,
+        task_lineage,
         task_lookup,
         task_snapshot,
     )
@@ -152,6 +128,11 @@ def hung_mcp(monkeypatch, tmp_path, client):
         'dashboard.data.task_lookup.fetch_task',
         _make_stub('dashboard.data.task_lookup'),
     )
+    # /prds' lineage index reads one projected get_tasks per root.
+    monkeypatch.setattr(
+        'dashboard.data.task_lineage.fetch_metadata_projection',
+        _make_stub('dashboard.data.task_lineage'),
+    )
 
     # The lookup's ONE deadline encloses its snapshot read before any
     # fetch_task miss, and that read pays the shrunk PER_CALL_TIMEOUT below
@@ -164,9 +145,14 @@ def hung_mcp(monkeypatch, tmp_path, client):
     # real 5 000-task trees (task 4884), and against a stub that never
     # returns the sweep would otherwise pay it per call per root.
     monkeypatch.setattr(task_snapshot, 'PER_CALL_TIMEOUT', _TINY_BUDGET)
+    # The request waits on the lineage refresh, and the refresh on the hang,
+    # for these and no longer.
+    monkeypatch.setattr(task_lineage, 'LINEAGE_REQUEST_WAIT_SECONDS', _TINY_BUDGET)
+    monkeypatch.setattr(task_lineage, 'LINEAGE_READ_TIMEOUT', _TINY_BUDGET)
 
     def _clear_caches() -> None:
         task_snapshot.clear_snapshot_cache()
+        task_lineage.clear_lineage_state()
         task_lookup._lookup_cache_clear()
         escalation_corpus._corpus_cache_clear()
         _esc._analytics_memo_clear()
@@ -254,8 +240,17 @@ def _seed_merge_attempt(project_root):
 
 
 def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp, tmp_path):
-    """Every GET endpoint answers 200 while the fetch_tasks seam hangs."""
-    paths = _dashboard_get_paths()
+    """Every GET endpoint answers 200 while the fetch_tasks seam hangs.
+
+    Only the LITERAL routes are swept. A templated one
+    (``/api/v2/dashboard/task/{project}/T-{task_id}``) would be fetched as the
+    literal brace string and answer 404/422 — a false failure about path
+    construction, reported under a message about hung dependencies. A
+    templated route needs its own probe that binds real parameter values; see
+    :func:`test_templated_dashboard_routes_are_not_silently_unswept`, which
+    fails loudly if one is ever added rather than letting it go unswept.
+    """
+    paths = dashboard_get_paths().literal
 
     # The sweep is derived, and may not silently shrink. 14 is the count at
     # the time this probe was written; a NEW endpoint raises it, and a route
@@ -331,15 +326,15 @@ def test_task_prose_route_survives_a_hung_fetch_task_prose(client, monkeypatch):
 def test_templated_dashboard_routes_are_not_silently_unswept():
     """A templated route must be noticed, not quietly dropped from the sweep.
 
-    ``_dashboard_get_paths`` filters out ``{``-bearing paths because the sweep
-    cannot request them verbatim. That filter is the right call — but a silent
+    The sweep requests only ``dashboard_get_paths().literal``, because it
+    cannot request a templated path verbatim. That filter is the right call — but a silent
     filter is how coverage rots, so this test fails the moment one appears and
     says what to do about it. Extend the expected set below ONLY together with
     a dedicated probe that exercises the new route with real parameter values
     against a hung dependency, as
     :func:`test_task_prose_route_survives_a_hung_fetch_task_prose` does.
     """
-    templated = sorted(p for p in _all_dashboard_get_paths() if '{' in p)
+    templated = list(dashboard_get_paths().templated)
 
     assert templated == ['/api/v2/dashboard/task/{project:path}/T-{task_id}'], (
         f'templated GET route(s) {templated} exist under /api/v2/dashboard/; '

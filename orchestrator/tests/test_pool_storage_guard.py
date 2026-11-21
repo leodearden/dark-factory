@@ -33,6 +33,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from _seed_script_stubs import seed_default_warm_base
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -522,7 +523,7 @@ class TestWarmLaneGcReclaimGuard:
 
 # ---------------------------------------------------------------------------
 # Real-repo fixtures for the acquire create-once discriminator (step-7/8).
-# Mirrors test_git_ops.py's git_repo / _seed_default_warm_base / _add_warm_lane_scripts.
+# Mirrors test_git_ops.py's git_repo / _add_warm_lane_scripts.
 # ---------------------------------------------------------------------------
 
 
@@ -533,20 +534,6 @@ async def _init_acquire_repo(repo: Path) -> None:
     (repo / 'README.md').write_text('# Test\n')
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
-def _seed_default_warm_base(repo: Path) -> None:
-    """Pre-create the DEFAULT derived warm-lane base (task 2061) so the
-    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK.
-
-    These tests exercise the task-2099 create-once DISCRIMINATOR — a
-    DIFFERENT (later) gate — not the 2061 base-health gate.  Mirrors
-    test_git_ops.py's ``_seed_default_warm_base``.  Deliberately does NOT
-    mark ``.pool-root`` — that is exactly the condition under test.
-    """
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
 
 
 async def _add_warm_lane_scripts(repo: Path) -> None:
@@ -581,7 +568,7 @@ def acquire_git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
     repo.mkdir()
     asyncio.run(_init_acquire_repo(repo))
-    _seed_default_warm_base(repo)
+    seed_default_warm_base(repo, pool_root=False)
     return repo
 
 
@@ -631,7 +618,7 @@ class TestAcquireCreateOnceDiscriminatorAndMarkChokepoint:
             _acquire_config(), acquire_git_repo,
             warm_lane_pool_size=1, merge_spec_warm_lane_pool_size=1,
         )
-        # worktree_base (.worktrees) already exists via _seed_default_warm_base
+        # worktree_base (.worktrees) already exists via seed_default_warm_base
         # (it created .worktrees/_merge-verify/target) — but .pool-root was
         # never written: the fresh-host bootstrap state.
         assert git_ops.worktree_base.exists()

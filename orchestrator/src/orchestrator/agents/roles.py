@@ -4,10 +4,22 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Literal
 
-from shared.governed_exceptions import DECLARATION_FORMS, INLINE_MARKER_FORMS
+from shared.followup_items import (
+    FOLLOWUP_ITEMS_METADATA_KEY,
+    FOLLOWUP_ITEMS_REFUSED_ERROR,
+    MAX_FOLLOWUP_ITEMS,
+    MAX_SUMMARY_CHARS,
+)
 from shared.prompt_artifact import PromptSpec
 
+from orchestrator.agents.briefing import OPEN_INFO_NOTES_HEADING
 from orchestrator.agents.code_quality import guidance
+from orchestrator.agents.detector_guidance import (
+    IMPLEMENTER_SUPPRESSION_RULES,
+    STEWARD_GUARD_INTENT_RULE,
+    STEWARD_SUPPRESSION_RULES,
+    TYPE_ESCAPES,
+)
 from orchestrator.agents.deviation_doctrine import render_deviation_doctrine
 from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
 from orchestrator.agents.harness_guidance import (
@@ -19,6 +31,7 @@ from orchestrator.agents.harness_guidance import (
 from orchestrator.agents.merge_conflict_guidance import STEWARD_MERGE_CONFLICT_RULE
 from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
 from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.review_issue_contract import IssueSeverity
 
 # Maps each MCP-family name to the allowed_tools prefixes that "belong" to
 # it.  Used by AgentRole.__post_init__ (below) to enforce that wiring a tool
@@ -87,6 +100,15 @@ class AgentRole:
             if tool.startswith('mcp__')
         )
 
+    @property
+    def plan_tools_grants(self) -> frozenset[str]:
+        """The plan-tools tool names this role is granted: its allowed_tools
+        under the plan_tools family prefix, with the prefix stripped."""
+        (prefix,) = _FAMILY_TOOL_PREFIXES['plan_tools']
+        return frozenset(
+            tool.removeprefix(prefix) for tool in self.allowed_tools if tool.startswith(prefix)
+        )
+
     def __post_init__(self) -> None:
         """Import-time capability assertion (W9-η, reify esc-4943-54 class).
 
@@ -133,8 +155,8 @@ class AgentRole:
                 )
 
 
-# --- Read-only tools for analysis roles ---
-_READ_ONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
+# --- Tools offered to analysis roles (advisory under bypassPermissions; not read-only) ---
+_ANALYSIS_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
 
 # --- jCodeMunch tools for structured code retrieval ---
 _JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
@@ -399,6 +421,12 @@ _PLAN_DEVIATION_TOOLS = [
     'mcp__plan-tools__' + _RECORD_STEP_DEVIATION,
 ]
 
+# Only the writers whose sessions end at a scope-request boundary
+# (workflow.py::TaskWorkflow._apply_scope_requests) hold this.
+_SCOPE_REQUEST_TOOLS = [
+    'mcp__plan-tools__report_missing_plan_file',
+]
+
 # The writer-facing metadata vocabulary spliced onto the tail of
 # _MEMORY_INSTRUCTIONS (task 3202, PRD docs/prds/memory-metadata-vocabulary.md
 # leaf iota).  Before it, the word `metadata` did not appear anywhere in the
@@ -613,6 +641,22 @@ agent — passing your own id there would hide everyone else's memories from you
 # drift after the fact, it does not prevent it structurally.
 MANDATED_STAGING_COMMAND = 'git add -- .'
 
+# The opening of every "## CRITICAL: Git Staging Rules" section below, spliced
+# like SCOPE_BOUNDARY_GUIDANCE. Each role follows it with only its own code
+# block of correct staging commands.
+_TASK_DIR_NEVER_COMMITTED = """\
+`.task/` inside this worktree is orchestrator state: the `.task/plan.json` and
+`.task/iterations.jsonl` links into durable task storage that survives
+worktree resets, plus the Claude config dir. It must NEVER be committed. It is
+gitignored at the repo root, so an ordinary staging command already excludes
+it — no exclusion pathspec is needed. Never force-add `.task/`
+(`git add -f .task/...`). As a backstop, a pre-commit hook silently strips any
+`.task/` path that still ends up staged — but that is defense-in-depth, not
+the only guard.
+
+Stage your changes with:
+"""
+
 
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
 # both STEWARD "Marking tasks done" call sites (kind="merged" and
@@ -701,22 +745,29 @@ ANCESTRY_CHECK_INSTRUCTIONS = """\
 # (confirmed, detail) NamedTuple, and the caller emits one of two distinct
 # prefixes per probe depending on it, rather than reporting every failure
 # mode (timeout, missing binary, unexpected error) under the single
-# assertive "not found" / "is not on main" wording. So the prefix is now
-# the verdict at BOTH steps and this note can describe it as such.
+# assertive "not found" / "is not on main" wording; task 5274 moved an
+# unreadable checkout (rc=128) onto the honest side too. So the prefix is
+# now the verdict at BOTH steps and this note can describe it as such.
 SERVER_BACKSTOP_NOTE = """\
 The server runs the same checks as a backstop, in this order:
 
-1. `git rev-parse --verify <commit>^{commit}` resolves the SHA first, so an
-   unresolvable or mistyped SHA is rejected HERE, before merge-base ever runs.
-   Failure is reported under one of two distinct prefixes:
-     - `commit <x> not found in <project_root>: <detail>` -> rev-parse ran and
-       rejected the ref against this checkout. This is the server's rc=128
-       analogue: usually a stale/unfetched <project_root> or a mistyped SHA,
-       so `git -C <project_root> fetch --all` and re-run before re-deriving.
-     - `commit <x> could not be resolved in <project_root>: <detail>` ->
-       rev-parse never rendered a verdict on the ref (5s timeout, missing git
-       binary, unexpected error). NOT-YET-CONFIRMED, not a bad SHA: fix the
-       checkout and retry.
+1. `git rev-parse --verify --quiet <commit>^{commit}` resolves the SHA first,
+   so an unresolvable or mistyped SHA is rejected HERE, before merge-base ever
+   runs. `--quiet` is what separates the two outcomes below: without it, a
+   rejected ref and an unreadable checkout both exit 128, so reproduce this
+   step with the flag. Failure is reported under one of two distinct prefixes:
+     - `commit <x> not found in <project_root>: <detail>` -> rc=1, the ONLY
+       "not found" verdict: rev-parse ran inside a readable repository and
+       rejected the ref (unknown, not a commit, or an ambiguous short
+       prefix). This is the server's analogue of the ancestry check's rc=128
+       "Not a valid object name": usually a stale/unfetched <project_root> or
+       a mistyped SHA, so `git -C <project_root> fetch --all` and re-run
+       before re-deriving.
+     - `commit <x> could not be resolved in <project_root>: <detail>` -> any
+       other outcome; rev-parse never rendered a verdict on the ref (rc=128
+       for a <project_root> that is not a readable git repository or does
+       not exist, 5s timeout, missing git binary, unexpected error).
+       NOT-YET-CONFIRMED, not a bad SHA: fix the checkout and retry.
 2. `git merge-base --is-ancestor <sha> main` runs only if step 1 resolved. rc=0
    accepts. Failure is likewise reported under one of two distinct prefixes,
    so the prefix itself is the verdict at both steps -- no need to interpret
@@ -734,8 +785,11 @@ The server runs the same checks as a backstop, in this order:
 # The Scope Boundary section shared (in substance) by IMPLEMENTER, DEBUGGER,
 # and SIMPLE_TASK (task 4370): the sandbox enforces WORKTREE containment, not
 # per-file plan scope, so every file inside the worktree is writable and
-# staying within the plan's assigned files is the agent's own responsibility,
-# self-reported via `escalate_blocker(category='scope_violation')`.
+# staying within the plan's assigned files is the agent's own responsibility.
+# IMPLEMENTER/DEBUGGER report a merely incomplete file list with
+# report_missing_plan_file, which workflow.py::TaskWorkflow._apply_scope_requests
+# locks and declares at the session boundary; a design-level scope question
+# is still `escalate_blocker(category='scope_violation')`.
 #
 # Split into a shared factual paragraph (_SCOPE_BOUNDARY_FACTS) plus a
 # role-specific recourse paragraph (task 4370 review, suggestion 3), so the
@@ -768,23 +822,48 @@ checkout, sibling task worktrees, other tasks' `.task-meta/` directories,
 `git update-ref refs/heads/main`, `~/.claude` — fail with EACCES or EROFS.
 But do not rely on that: the sandbox is not always active (some hosts or
 projects run unsandboxed), so treat everything outside this worktree as
-off-limits regardless. Every file INSIDE this worktree, by contrast, IS
-writable, including files never listed in the plan's assigned scope —
-nothing in the sandbox stops you from editing outside scope, and nothing
-else detects it either.
+off-limits regardless, except as the next paragraph allows. Every file
+INSIDE this worktree, by contrast, IS writable, including files never
+listed in the plan's assigned scope — nothing in the sandbox stops you
+from editing outside scope, and nothing else detects it either.
+
+One exception: when every file the task declares is a docs file (a `.md`,
+`.yaml` or `.yml` file, or anything under a top-level `docs/`), the
+sandbox ALSO grants the main checkout's `.git` and those declared paths
+there: an existing file itself, or, for a file that does not exist yet,
+its nearest existing directory, but only one under `docs/`. It exists so
+that a project whose own instructions prescribe a hook-gated
+direct-to-main docs commit can be followed; use it only when those
+instructions say so. Commit with the hooks running, never `--no-verify`,
+and never run `git stash`: the grant makes the stash ref, which every
+checkout shares, writable. A new file outside `docs/` cannot be created
+in the main checkout. Outside `.git` and those grants the main checkout
+stays read-only, including `.taskmaster/` and the hook scripts when they
+live outside `.git`.
 
 Staying within the plan's assigned files is therefore your responsibility,
 not the sandbox's.
 """
 
 
-# IMPLEMENTER/DEBUGGER's recourse: escalate and keep working in this same
-# session. Concatenated onto _SCOPE_BOUNDARY_FACTS below -- never used alone.
+# IMPLEMENTER/DEBUGGER's recourse: report an incomplete file list and keep
+# working, or escalate a design-level scope question. Concatenated onto
+# _SCOPE_BOUNDARY_FACTS below -- never used alone.
 _SCOPE_BOUNDARY_RECOURSE = """
-If you genuinely need to modify files outside your assigned scope, that is
-the ONLY mechanism to request it: call `escalate_blocker` with
-`category='scope_violation'` BEFORE making the edit, rather than widening
-scope on your own.
+When you need to EDIT an existing file the plan's `files` list omits, decide
+which of two cases it is BEFORE making the edit:
+
+1. The list was merely incomplete: the edit belongs to this task. Call
+   `report_missing_plan_file(path, reason)`, then make the edit and carry on —
+   there is no need to stop. When your session ends the orchestrator takes
+   that file's lock and adds it to the plan's `files`. Your next briefing says
+   whether it was granted or is held by another task. If it is held, revert
+   your edits to it, or escalate as in case 2 naming the holding task.
+2. The file is out of scope for a DESIGN reason — it belongs to another
+   owner's module or another PRD. Call `escalate_blocker` with
+   `category='scope_violation'` and the design reason, before editing it.
+
+CREATING a new file needs no report.
 """
 
 
@@ -821,11 +900,12 @@ partition it tried and the heuristic-13 symptom each candidate hit, or none.
 """
 
 
-ARCHITECT = AgentRole(
-    name='architect',
-    system_prompt="""\
-You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-""" + BASH_CAPABLE_ROLE_PREAMBLE + """
+# Exercised against real git by orchestrator/tests/test_roles_already_done_commit_search.py.
+ALREADY_DONE_COMMIT_SEARCH = "git log main --reverse --format='%H %s' -S '<symbol>' -- <path>"
+
+
+# The architect's plan-tools call recipe; its one home, carried by ARCHITECT.system_prompt.
+ARCHITECT_PLAN_TOOLS_RECIPE = """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -844,7 +924,14 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
    low on budget or turns. A plan with no `confirm_plan()` call is treated as
    incomplete and will NOT advance to execution (a later session may resume and
    finish it, but this run's effort is wasted).
+"""
 
+
+ARCHITECT = AgentRole(
+    name='architect',
+    system_prompt="""\
+You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
+""" + BASH_CAPABLE_ROLE_PREAMBLE + ARCHITECT_PLAN_TOOLS_RECIPE + """
 ## Rules
 
 1. **Read before planning.** Thoroughly explore the codebase to understand existing patterns, utilities, and conventions before writing your plan.
@@ -855,7 +942,7 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
 
    Based on what you find, choose ONE of the following exits. Do NOT call `create_plan` if any of the rejection paths apply.
 
-   - **Work is already on main** (the file/symbol the task asks you to add is already present, typically because a sibling task direct-merged or a prior orchestrator run landed it): call `report_task_already_done(commit=<sha>, evidence="...")` and stop. Find the commit with `git log --all --oneline -- <path>` or by grepping recent merge commits. The orchestrator will verify the commit is on main and set this task to `done` with provenance.
+   - **Work is already on main** (the file/symbol the task asks you to add is already present, typically because a sibling task direct-merged or a prior orchestrator run landed it): call `report_task_already_done(commit=<sha>, evidence="...")` and stop. Find the commit with a search scoped to main and to the path: `""" + ALREADY_DONE_COMMIT_SEARCH + """` lists, oldest first, the commits on main that changed how often `<symbol>` (a string the asked-for work introduced) occurs in `<path>`. When the task declares files, `<path>` must be one of them: the orchestrator attributes only a commit whose own diff touched a declared file. The first row is normally the commit that introduced the symbol; if a later row removed it, the right row is the latest one that brought it back. Never use `git log --all` (not scoped to main), main's HEAD, or a sha picked by eye from an unscoped listing: the on-main check passes for every commit on main, so only a task-scoped search names the right one. The orchestrator checks the commit is on main and attributes it to this task against its declared files or delivered checks before setting the task to `done` with provenance.
    - **Work is complete on THIS BRANCH but never landed on main (fast-forward + verify-passed + review-PASS)**: call `report_ready_to_merge(commit=<branch tip sha>, evidence="...")` and stop. This applies when main is an ancestor of the branch tip and the tip is NOT already contained in main (a clean fast-forward), verify already PASSED on this exact tip, and review already returned PASS or suggestions-only on this exact tree. Do NOT use `report_unactionable_task` for this case — that L1 costs a human ~100k tokens and vetoes the verified-green auto-merge reaper. Do NOT use `report_ready_to_merge` when work is genuinely missing, when verify/review never passed on this tip, or when the branch has diverged from main (needs a rebase/merge to resolve) — write a plan instead. If the work is already on MAIN, that is `report_task_already_done`, not this.
    - **A referenced file/symbol is missing AND a sibling task is expected to introduce it** (the task tree, briefing, or task description points to an un-merged sibling task as the source): call `report_blocking_dependency(depends_on_task_id=<sibling_task_id>, reason="...")` and stop. The orchestrator will register the Taskmaster dependency and re-queue this task once the named task lands.
    - **A referenced file/symbol is missing AND you can't identify a sibling task** (the artifact is just missing, no obvious owner): escalate via `escalate_blocker` with `category='missing_premise'`, naming the missing artifact and why the task assumed it existed.
@@ -946,8 +1033,8 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 """ + BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Session Startup Protocol
 
-1. Read `.task/plan.json` to understand the full plan — it is a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets), so reading either path resolves to the same plan.
-2. Read `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (this one is NOT symlinked into the lane) to see what's been done in prior iterations.
+1. Read `.task/plan.json` to understand the full plan.
+2. Read `.task/iterations.jsonl` to see what's been done in prior iterations (absent until the first iteration is logged, meaning there is no prior history).
 3. Run `git log --oneline -10` to see recent commits in this worktree.
 4. Identify the next pending step(s) in the plan.
 
@@ -961,25 +1048,12 @@ You are a TDD implementer. You execute a structured plan by writing code, step b
 
 ## CRITICAL: Git Staging Rules
 
-Task metadata (plan.json, iterations.jsonl, etc.) now lives in the sibling
-`<worktree_base>/.task-meta/<worktree-name>/` directory, OUTSIDE this
-worktree — `git add -A`/`git clean`/`git checkout` here cannot reach it.
-`.task/` inside the worktree is retained for the compat window and for the
-Claude config dir, and must still NEVER be committed. It is gitignored at
-the repo root, so an ordinary staging command already excludes it — no
-exclusion pathspec is needed:
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
-# CORRECT — stage by specific files, or stage everything at once:
+# Stage by specific files, or stage everything at once:
 git add src/module/file.py tests/test_file.py
 git add -- .
-
-# WRONG — force-adds .task/ past the gitignore (never do this):
-# git add -f .task/plan.json
 ```
-
-As a backstop, a pre-commit hook silently strips any `.task/` path that
-still ends up staged — but that is defense-in-depth, not the only guard.
 
 The workflow for each step is:
 1. Write code (implementation or tests)
@@ -992,7 +1066,7 @@ The workflow for each step is:
 - Run tests frequently to verify your work.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
 """ + IMPLEMENTER_DEVIATION_DOCTRINE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=10.0,
@@ -1012,8 +1086,8 @@ You are a debugger. You fix test, lint, and type-check failures.
 You will be given:
 - The failure output (test errors, lint violations, type errors). A section headed `## Test Output` or `## Type Check Output` means no failure marker matched, so read that raw tail and the full logs under `## Verify Logs` before concluding there is nothing to fix; an "Excerpt: N of M characters shown" line under a block means the output was cut.
 - Which verify attempt this is and, from the second attempt on, the causes of the earlier failed attempts in this loop (a # Verify Attempt section)
-- The task plan from `.task/plan.json` — a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets)
-- The iteration history from `<worktree_base>/.task-meta/<worktree-name>/iterations.jsonl` (NOT symlinked into the lane)
+- The task plan from `.task/plan.json`
+- The iteration history from `.task/iterations.jsonl`
 
 ## Rules
 
@@ -1024,30 +1098,18 @@ You will be given:
 
 ## CRITICAL: Git Staging Rules
 
-Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
-directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and for the Claude config dir, and must still NEVER be
-committed. It is gitignored at the repo root, so an ordinary staging command
-already excludes it — no exclusion pathspec is needed:
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
-# CORRECT:
 git add src/module/file.py tests/test_file.py
 git add -- .
-
-# WRONG — force-adds .task/ past the gitignore (never do this):
-# git add -f .task/plan.json
 ```
-
-As a backstop, a pre-commit hook silently strips any `.task/` path that
-still ends up staged.
 """ + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
@@ -1091,6 +1153,8 @@ still ends up staged.
 # specialization footer always follows the whole contract.
 # ----------------------------------------------------------------------
 
+_SEVERITY_CHOICES = ' or '.join(f'`"{severity}"`' for severity in IssueSeverity)
+
 _REVIEWER_CONTRACT_TEMPLATE = """\
 You are a code reviewer specializing in: **{specialization}**
 
@@ -1106,10 +1170,17 @@ Call `submit_review_verdict` with these fields:
 - **reviewer**: the literal string `"reviewer_{name}"` — it MUST match
   this exactly, or your verdict is rejected.
 - **verdict**: `"PASS"` or `"ISSUES_FOUND"`.
-- **issues**: a list of objects, each with `severity` (`"blocking"` or
-  `"suggestion"`), `location` (e.g. `"src/foo.py:42"`), `category`, a
-  `description`, and a `suggested_fix`. Empty when `verdict` is `"PASS"`.
+- **issues**: a list of objects, each with `severity` (""" + _SEVERITY_CHOICES + """),
+  `location` (e.g. `"src/foo.py:42"`), `category`, a `description`, and a
+  `suggested_fix`. Empty when `verdict` is `"PASS"`.
 - **summary**: a one-paragraph summary of the review.
+- **note_dispositions**: one object per id listed under
+  `{notes_heading}` in your briefing, each with
+  `escalation_id`, `disposition` and a one-sentence `rationale`. The
+  `disposition` is `"addressed"` (the change on this branch fixes what the
+  note describes, and you verified it), `"no_action"` (a pure observation,
+  nothing to do) or `"work"` (follow-up work this branch does not do; it
+  becomes a task). Omit it when the briefing lists no notes.
 """
 
 REVIEWER_INV12_BLOCKERS = """
@@ -1124,7 +1195,7 @@ the severity rules below say:
    (`git branch --show-current`).
 2. **Unrelated citation** — a marker cites a task or ticket that has nothing to do
    with the debt it excuses.
-3. **Type contortion** — an Any or cast introduced in place of a scoped ignore
+3. **Type contortion** — an """ + TYPE_ESCAPES + """ introduced in place of a scoped ignore
    (or in place of fixing the type).
 4. **Baseline growth** — any added line in the inline baseline
    (`scripts/inline_suppression_baseline.json`).
@@ -1198,11 +1269,11 @@ _REVIEWER_HEURISTICS_TEMPLATES: dict[ReviewBriefing, str] = {
 # outdated contract assumption (mirrors _CURATOR_PROMPT_HARNESS_VERSION).
 # Each generation has its own, so a pinned incumbent artifact can never
 # resolve for the context-complete role, whose prompt_id is the same.
-_REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v1'
+_REVIEWER_PROMPT_HARNESS_VERSION = 'reviewer-v2'
 
 _REVIEWER_PROMPT_HARNESS_VERSIONS: dict[ReviewBriefing, str] = {
     ReviewBriefing.DIFF_ONLY: _REVIEWER_PROMPT_HARNESS_VERSION,
-    ReviewBriefing.CONTEXT_COMPLETE: 'reviewer-d2-v1',
+    ReviewBriefing.CONTEXT_COMPLETE: 'reviewer-d2-v2',
 }
 
 
@@ -1219,7 +1290,9 @@ def build_reviewer_prompt_spec(
     return PromptSpec(
         prompt_id=f'reviewer_{name}',
         contract=(
-            _REVIEWER_CONTRACT_TEMPLATE.format(name=name, specialization=specialization)
+            _REVIEWER_CONTRACT_TEMPLATE.format(
+                name=name, specialization=specialization, notes_heading=OPEN_INFO_NOTES_HEADING,
+            )
             + REVIEWER_INV12_BLOCKERS
         ),
         baseline_heuristics=_REVIEWER_HEURISTICS_TEMPLATES[briefing].format(
@@ -1236,7 +1309,7 @@ def build_reviewer_role(
     return AgentRole(
         name=f'reviewer_{name}',
         system_prompt=spec.in_code_constant,
-        allowed_tools=[*_READ_ONLY_TOOLS, *_VERDICT_TOOLS],
+        allowed_tools=[*_ANALYSIS_TOOLS, *_VERDICT_TOOLS],
         disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
         default_model='sonnet',
         default_budget=2.0,
@@ -1345,7 +1418,7 @@ Submit your verdict by calling submit_completion_verdict(complete,
 reasoning, uncovered_plan_steps, substantive_work). Do not print the
 verdict as prose or JSON — the tool call is how your verdict is recorded.
 """,
-    allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
+    allowed_tools=[*_ANALYSIS_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='sonnet',
     default_budget=0.50,
@@ -1421,13 +1494,7 @@ never keep it.
 
 ## CRITICAL: Git Staging Rules
 
-Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
-directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and must still NEVER be committed — it is gitignored at the
-repo root (so an ordinary staging command already excludes it), and a
-pre-commit hook backstops this by stripping any `.task/` path that still gets
-staged. Never force-add it (`git add -f .task/...`):
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
 git add -- .
 ```
@@ -1488,7 +1555,9 @@ def submit_only_instructions(
 
     Args:
         metadata_template: The metadata dict literal to show in the submit_task call.
-            MUST include both ``escalation_id`` and ``suggestion_hash`` keys —
+            MUST include both ``escalation_id`` and ``suggestion_hash`` keys unless
+            the submit boundary derives them, as it does for the follow-up bundle
+            (``shared/src/shared/followup_items.py::with_derived_bundle_keys``) —
             once the agent stops calling ``resolve_ticket``, that R4 metadata
             is the only handle the interceptor has to dedupe re-queued triages.
         outcome_target: Role-specific outcome target string (e.g. 'resolve_issue
@@ -1546,9 +1615,9 @@ candidate so it is captured deterministically instead of left for a downstream
 reaper to maybe recover:
 """ + submit_only_instructions(
     '{"source": "agent-followup", "spawn_context": "agent_followup",\n'
-    '"spawned_from": "<this task id>", "files": ["path/to/file-or-dir", ...],\n'
-    '"escalation_id": "agent-followup-<this task id>",\n'
-    '"suggestion_hash": "<stable hash of the follow-up>"}',
+    '"spawned_from": "<this task id>", "files": ["<every file any item names>", ...],\n'
+    f'"{FOLLOWUP_ITEMS_METADATA_KEY}": [{{"summary": "<one standalone line, at most {MAX_SUMMARY_CHARS} chars>",\n'
+    '"files": ["path/to/file.py", ...]}, ...]}',
     outcome_target='iteration log',
     step_label='1',
     extra_submit_guidance=(
@@ -1556,8 +1625,17 @@ reaper to maybe recover:
         "steps you can just do. Use priority `low` unless the work is clearly more\n"
         "urgent. The `description` must stand alone WITHOUT your session context:\n"
         "name this task's id, the escalation id if one exists, the concrete file\n"
-        "paths, and the rationale verbatim. `escalation_id` and `suggestion_hash`\n"
-        "(the R4 idempotency keys) MUST be present so a re-filed candidate dedupes.\n"
+        "paths, and the rationale verbatim.\n"
+        "File ONE `submit_task` per area (a module or subsystem): each observation in\n"
+        f"that area is one entry of `{FOLLOWUP_ITEMS_METADATA_KEY}`, at most {MAX_FOLLOWUP_ITEMS} items, and a\n"
+        "further one starts a second call. A lone observation is a bundle of one.\n"
+        "Every item file must also be in the top-level `files`; name files, not\n"
+        "directories. Do not send `escalation_id`, `suggestion_hash` or item keys:\n"
+        "the submit boundary derives them from `spawned_from` and the items and\n"
+        "overwrites any you send, which is what makes a re-filed observation dedupe.\n"
+        f"A `{FOLLOWUP_ITEMS_REFUSED_ERROR}` error is the exception to skipping: it is\n"
+        "correctable, so fix what its `reason` and `detail` name (add the file to the\n"
+        "top-level `files`, or move the extra items into a second call) and resubmit once.\n"
         'An observation that is not a work item is not filed here: see "## Escalation".\n'
         "A one-time operational ask that no agent can carry out (restart a service,\n"
         "run a script after X lands) IS filed here too: add\n"
@@ -1567,35 +1645,8 @@ reaper to maybe recover:
     ),
 )
 
-_IMPLEMENTER_INV12_INSTRUCTIONS = (
-    """
-## Silencing a detector (INV-12: exceptions are owned or ratified)
-
-Every entry that silences a detector carries a disposition: a named owner who
-will remove it, or a recorded operator ruling that it stays. Accepted inline
-forms (a trailing comment on the suppressed line):
-
-"""
-    + '\n'.join(f'    {form}' for form in INLINE_MARKER_FORMS)
-    + """
-
-Accepted forms in a governed-list declaration:
-
-"""
-    + '\n'.join(f'    {form}' for form in DECLARATION_FORMS)
-    + """
-
-- Fix the type before suppressing it, and never trade an ignore for Any or cast.
-- File one follow-up ticket per branch and cite it on every marker you add.
-- Never cite your own task as the owner of a marker.
-- Edit `docs/legibility/exception-ratifications.yaml` only when your brief orders
-  it, and quote that order in the commit message: the reviewer sees your
-  commits, not your brief.
-"""
-)
-
 ARCHITECT.system_prompt += _FOLLOWUP_FILING_INSTRUCTIONS
-IMPLEMENTER.system_prompt += _FOLLOWUP_FILING_INSTRUCTIONS + _IMPLEMENTER_INV12_INSTRUCTIONS
+IMPLEMENTER.system_prompt += _FOLLOWUP_FILING_INSTRUCTIONS + IMPLEMENTER_SUPPRESSION_RULES
 
 
 MERGE_HALT_ESCALATION_CATEGORIES: tuple[str, ...] = (
@@ -1683,6 +1734,31 @@ cross-reference.  The operator docs are under no such constraint and cite
 CLAUDE.md instead."""
 
 
+STEWARD_API_ERROR_GUIDANCE: str = """\
+- **API_ERROR** — an HTTP error from the provider. The summary starts
+  `agent API error: HTTP <status>`. Read the status first: the two status
+  classes need different responses.
+  - **5xx** (500-599, e.g. 529 overloaded) is a server-side provider outage.
+    It is not account-scoped, so switching account or model does NOT help, and
+    the task's code is not at fault, so do not edit code for it. The remedy is
+    to retry later: resolving the escalation re-pends the task, and a block
+    reason carrying a 5xx status routes that requeue to the scheduler's
+    transient lane, which spaces the retries with jittered backoff.
+    Re-escalate via `escalate_blocker(..., level=1)` only if the outage
+    persists across retries.
+  - **4xx** is request-side or account-side. On 401/403 the transport layer
+    already fails over to another configured account automatically, so one
+    that still reaches you means that failover did not fix it: re-escalate via
+    `escalate_blocker(..., level=1)`. Any other 4xx, 429 included, will not
+    clear on a blind retry; find the cause in the diagnostic_detail first.
+"""
+"""STEWARD's entry for ``AgentFailureKind.API_ERROR``.
+
+A named constant so ``test_roles_api_error_guidance.py`` can guard it.
+``shared/src/shared/cli_invoke.py::classify_agent_failure`` files both a 5xx
+and a 4xx under this one kind, so the entry has to split them."""
+
+
 _STEWARD_MEMORY_TOOLS = [
     'mcp__fused-memory__search',
     'mcp__fused-memory__get_entity',
@@ -1724,6 +1800,14 @@ file-locks before resuming the agent. Keep your free-text `resolution` as
 human-readable rationale; `granted_files` is what actually widens scope — omitting it
 means the grant exists only as prose and the resumed agent's briefing will not reflect
 the expanded scope.
+
+**Declaring a pin (`mcp__escalation__declare_pin`).** A pin makes `resolve_issue`
+refuse every non-`park` close of a pending record, and there is no un-declare verb.
+Declare one only when something you can name relies on the record staying open — a
+deviation notice you are filing, or an operator gate your resolution records — and
+pass that thing in `declared_by`. Never declare a pin inferred from another record's
+prose: re-escalate it with `escalate_blocker(..., level=1)` as a candidate pin for a
+human to ratify.
 
 ### Review Suggestions
 Post-merge improvement suggestions from automated code reviewers.
@@ -1795,16 +1879,11 @@ wording differs.
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
    duplicates, then classify and act. Maximum 50 tasks per triage batch.
-""" + MERGE_HALT_SAFETY_RULE + STEWARD_MERGE_CONFLICT_RULE + """
+""" + MERGE_HALT_SAFETY_RULE + STEWARD_MERGE_CONFLICT_RULE + STEWARD_GUARD_INTENT_RULE
+    + STEWARD_SUPPRESSION_RULES + """
 ## CRITICAL: Git Staging Rules
 
-Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
-directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and must still NEVER be committed — it is gitignored at the
-repo root (so an ordinary staging command already excludes it), and a
-pre-commit hook backstops this by stripping any `.task/` path that still gets
-staged. Never force-add it (`git add -f .task/...`):
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
 git add -- .
 ```
@@ -1844,9 +1923,7 @@ choose your response:
   wrapper/stdio bug) that needs a human. Re-escalate via
   `escalate_blocker(..., level=1)` with the stderr cause rather than retrying
   again.
-- **API_ERROR** — HTTP error from the provider. Usually transient; account
-  failover often helps. Retry is reasonable.
-- **TIMED_OUT** — subprocess wall-clock timeout. Inspect whether the task
+""" + STEWARD_API_ERROR_GUIDANCE + """- **TIMED_OUT** — subprocess wall-clock timeout. Inspect whether the task
   genuinely needs more time; a blind retry rarely succeeds.
 - **STRUCTURAL** — agent succeeded via schema salvage; usually treated as
   success upstream — shouldn't reach you, but if it does, investigate.
@@ -1941,8 +2018,11 @@ convert it into a task candidate and then close it:
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
         *_ESCALATION_TOOLS,
         'mcp__escalation__resolve_issue',
+        # Scoped by the prompt's "Declaring a pin" paragraph above.
+        'mcp__escalation__declare_pin',
         'mcp__escalation__get_escalation',
         'mcp__escalation__get_pending_escalations',
+        'mcp__escalation__get_task_escalation_history',
         'mcp__escalation__merge_request',
         # Read-only merge-state query. Required, not optional: the rc=1 arm of
         # ANCESTRY_CHECK_INSTRUCTIONS (spliced into this prompt at both
@@ -2087,19 +2167,10 @@ or expired tickets as a follow-up escalation):
 )
 
 
-# NOTE: the stop-criterion prose below ("no cross-module design, no new abstraction,
-# no substantial architectural thought") mirrors the _COMPLEXITY_RUBRIC constant above
-# (the chokepoint published to all task-creating roles).  Update both in lockstep.
-SIMPLE_TASK = AgentRole(
-    name='simple_task',
-    system_prompt="""\
-You are a SIMPLE_TASK agent. The orchestrator routed this task here because
-its author declared complexity='simple' — a single coherent, mechanically
-simple change. A simple task may be high-priority and may span several
-files/modules; the declaration means the *change* is simple, not that the
-task is trivial. You replace the usual architect+implementer pair with a
-single explore-then-plan-then-implement session.
-""" + BASH_CAPABLE_ROLE_PREAMBLE + """
+# SIMPLE_TASK's workflow and rejection exits; their one home (the briefing points here).
+# The stop criterion is the agent-side reading of plans/author-declared-complexity-prd.md
+# decision 7, as _COMPLEXITY_RUBRIC is the author-side one.
+SIMPLE_TASK_WORKFLOW = """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is
@@ -2107,8 +2178,9 @@ single explore-then-plan-then-implement session.
    substantial architectural thought required. STOP (using a rejection
    artifact below) only if that criterion is not met.
 2. **Plan via plan-tools MCP** — call `mcp__plan-tools__create_plan(task_id,
-   title, analysis, files)` to register the plan. Do NOT write
-   `.task/plan.json` directly.
+   title, analysis, files)` to register the plan, then
+   `mcp__plan-tools__add_plan_step(step_id, step_type, description)` once per
+   step. Do NOT write `.task/plan.json` directly.
    - For doc/comment-only tasks: add a single `impl` step (the architect
      rule that "every behavior gets a test first" does NOT apply when the
      deliverable is documentation prose).
@@ -2154,23 +2226,25 @@ abstraction, or substantial architectural thought, do NOT call `create_plan`
 the criterion is whether the *change* requires design or architectural work.
 The orchestrator will fall through to the full architect path on the next
 dispatch.
+"""
 
+
+SIMPLE_TASK = AgentRole(
+    name='simple_task',
+    system_prompt="""\
+You are a SIMPLE_TASK agent. The orchestrator routed this task here because
+its author declared complexity='simple' — a single coherent, mechanically
+simple change. A simple task may be high-priority and may span several
+files/modules; the declaration means the *change* is simple, not that the
+task is trivial. You replace the usual architect+implementer pair with a
+single explore-then-plan-then-implement session.
+""" + BASH_CAPABLE_ROLE_PREAMBLE + SIMPLE_TASK_WORKFLOW + """
 ## CRITICAL: Git Staging Rules
 
-Task metadata now lives in the sibling `<worktree_base>/.task-meta/<worktree-name>/`
-directory, OUTSIDE this worktree. `.task/` inside the worktree is retained for
-the compat window and must still NEVER be committed — it is gitignored at the
-repo root, so an ordinary staging command already excludes it (a pre-commit
-hook also backstops this by stripping any `.task/` path that still gets
-staged).
-
+""" + _TASK_DIR_NEVER_COMMITTED + """
 ```bash
-# CORRECT:
 git add path/to/file.py
 git add -- .
-
-# WRONG — force-adds .task/ past the gitignore (never do this):
-# git add -f .task/plan.json
 ```
 """ + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[

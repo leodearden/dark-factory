@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import enum
 import math
 import operator
 import re
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -22,7 +23,16 @@ from typing import Any
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import census_findings, codebook, config, embeddings, entry_join, report_text
+from legibility import (
+    census_findings,
+    codebook,
+    codebook_lifecycle,
+    config,
+    embeddings,
+    entry_join,
+    layout,
+    report_text,
+)
 
 Vector = tuple[float, ...]
 
@@ -43,12 +53,12 @@ class Kind(enum.StrEnum):
 
 @dataclass(frozen=True)
 class Item:
-    """One indexed record. ``record_id`` is None for this run's novel
-    clusters, which are not yet in the codebook; ``key`` is the record id
-    for every other item."""
+    """One indexed record, under its codebook id: an entry's, a pending
+    candidate's, or for a NOVEL item the candidate this run's merge resolved
+    the cluster to."""
 
     kind: Kind
-    record_id: str | None
+    record_id: str
     title: str
     text: str
     sessions: tuple[str, ...]
@@ -56,10 +66,10 @@ class Item:
 
     @property
     def key(self) -> str:
-        return self.record_id if self.record_id is not None else f"{self.kind}:{self.title}"
+        return self.record_id
 
 
-def _item(kind: Kind, record: Mapping[str, Any], cause: str | None, *, record_id: str | None) -> Item:
+def _item(kind: Kind, record: Mapping[str, Any], cause: str | None, *, record_id: str) -> Item:
     return Item(
         kind=kind,
         record_id=record_id,
@@ -70,9 +80,12 @@ def _item(kind: Kind, record: Mapping[str, Any], cause: str | None, *, record_id
     )
 
 
-def items_of(cb: Mapping[str, Any], novel_clusters: Iterable[Mapping[str, Any]] = ()) -> tuple[Item, ...]:
+_NO_NOVEL: Mapping[str, Mapping[str, Any]] = MappingProxyType({})
+
+
+def items_of(cb: Mapping[str, Any], novel: Mapping[str, Mapping[str, Any]] = _NO_NOVEL) -> tuple[Item, ...]:
     """Every entry that is not fixed or retired, every pending candidate, and
-    every one of *novel_clusters*, in that order."""
+    every *novel* cluster by its candidate id, in that order."""
     return (
         *(
             _item(Kind.ENTRY, entry, codebook.entry_field(cb, entry, "cause"), record_id=entry["id"])
@@ -84,7 +97,10 @@ def items_of(cb: Mapping[str, Any], novel_clusters: Iterable[Mapping[str, Any]] 
             for candidate in cb.get("candidates") or []
             if candidate.get("disposition") == "pending"
         ),
-        *(_item(Kind.NOVEL, cluster, cluster.get("cause"), record_id=None) for cluster in novel_clusters),
+        *(
+            _item(Kind.NOVEL, cluster, cluster.get("cause"), record_id=candidate_id)
+            for candidate_id, cluster in novel.items()
+        ),
     )
 
 
@@ -229,13 +245,26 @@ class View:
     def model(self) -> str:
         return self.settings.embedding_model
 
-    def screens(self, cluster: Mapping[str, Any]) -> bool:
-        """Whether novel *cluster* is screened onto an entry, so no verify
-        call is spent on it."""
-        return any(attach.item.title == cluster["title"] for attach in self.screened)
+    def screens(self, candidate_id: str) -> bool:
+        """Whether the novel cluster of *candidate_id* is screened onto an
+        entry, so no verify call is spent on it."""
+        return any(attach.item.key == candidate_id for attach in self.screened)
 
     def select(self, limit: int) -> tuple[QueuedCluster, ...]:
         return self.queue[:max(limit, 0)]
+
+    def without(self, candidate_ids: Collection[str]) -> View:
+        """This view less every backlog attach of one of *candidate_ids* and
+        every queue cluster with a member among them, so a candidate verified
+        as a novel cluster is not also attached or adjudicated."""
+        excluded = frozenset(candidate_ids)
+        return dataclasses.replace(
+            self,
+            attaches=tuple(found for found in self.attaches if found.item.key not in excluded),
+            queue=tuple(
+                queued for queued in self.queue if not any(member.key in excluded for member in queued.members)
+            ),
+        )
 
 
 def _attaches(index: Index, items: Iterable[Item], threshold: float) -> tuple[Attach, ...]:
@@ -248,18 +277,22 @@ def _attaches(index: Index, items: Iterable[Item], threshold: float) -> tuple[At
 
 def build_view(
     cb: Mapping[str, Any],
-    novel_clusters: Sequence[Mapping[str, Any]],
+    novel: Mapping[str, Mapping[str, Any]],
     *,
     embedder: embeddings.Embedder,
     settings: config.Adjudication,
 ) -> View:
     """Embed *cb*'s open entries and pending candidates and this run's
-    *novel_clusters*, then screen, attach and queue. Never raises for an
-    embedding or cache failure: the whole stage is skipped instead."""
-    items = items_of(cb, novel_clusters)
+    *novel* clusters by candidate id, then screen, attach and queue. A novel
+    text is never cached. Never raises for an embedding or cache failure: the
+    whole stage is skipped instead."""
+    items = items_of(cb, novel)
     try:
         embedded = embeddings.vectors_for(
-            [embeddings.Text(item.key, item.record_id, item.text) for item in items],
+            [
+                embeddings.Text(item.key, None if item.kind is Kind.NOVEL else item.record_id, item.text)
+                for item in items
+            ],
             embedder=embedder,
             model=settings.embedding_model,
         )
@@ -314,30 +347,19 @@ class AppliedAttach:
     novel: bool
 
 
-def attach(
-    cb: dict, view: View, *, run_id: str,
-) -> tuple[dict, tuple[AppliedAttach, ...], tuple[Attach, ...]]:
-    """A new codebook in which every attach of *view* joins its entry: a
-    backlog candidate by its id, a screened novel cluster by the pending
-    candidate this run's merge gave its title. A screened cluster the merge
-    gave no pending candidate is returned unattached rather than raised: it
-    was neither verified nor attached, as census.py::DroppedVerdict records
-    for a verdict with no pending candidate."""
+def attach(cb: dict, view: View, *, run_id: str) -> tuple[dict, tuple[AppliedAttach, ...]]:
+    """A new codebook in which the candidate of every attach of *view*, a
+    backlog one or a screened novel one, joins its entry by its id."""
     result = cb
     applied: list[AppliedAttach] = []
-    unattached: list[Attach] = []
     for found, novel in (*((found, False) for found in view.attaches), *((found, True) for found in view.screened)):
-        candidate_id = codebook.pending_titled(result, found.item.title) if novel else found.item.key
-        if candidate_id is None:
-            unattached.append(found)
-            continue
         attached_by = similarity_attached_by(found.score, run_id)
         result = entry_join.join_entry(
-            result, candidate_id, found.entry_id,
+            result, found.item.key, found.entry_id,
             candidate_fields={"attached_by": attached_by}, sighting_fields={"attached_by": attached_by},
         )
-        applied.append(AppliedAttach(candidate_id, found.item.title, found.entry_id, found.score, novel))
-    return result, tuple(applied), tuple(unattached)
+        applied.append(AppliedAttach(found.item.key, found.item.title, found.entry_id, found.score, novel))
+    return result, tuple(applied)
 
 
 @dataclass(frozen=True)
@@ -350,24 +372,14 @@ class Adjudicated:
     members: tuple[str, ...]
 
 
-def _candidate(cb: Mapping[str, Any], candidate_id: str) -> dict:
-    for candidate in cb.get("candidates") or []:
-        if candidate.get("id") == candidate_id:
-            return candidate
-    raise ValueError(f"similarity adjudication: no candidate {candidate_id!r}")
-
-
 def _rejected_with(cb: dict, member_id: str, representative: Mapping[str, Any]) -> dict:
     result = copy.deepcopy(cb)
-    member = _candidate(result, member_id)
-    if member.get("disposition") != "pending":
-        raise ValueError(
-            f"similarity adjudication: member {member_id!r} is {member.get('disposition')!r}, not pending",
-        )
+    member = codebook.record_by_id(result.get("candidates") or [], member_id, kind="queue member")
+    codebook_lifecycle.transit(member, codebook_lifecycle.Transition.REJECT)
     identity = census_findings.FindingIdentity.from_record(representative)
     if identity is not None:
         member.update(census_findings.stamped(member, identity))
-    member.update(disposition="rejected", adjudicated_with=representative["id"])
+    member["adjudicated_with"] = representative["id"]
     codebook.assert_no_deletion(cb, result)
     return result
 
@@ -382,7 +394,9 @@ def adjudicate_members(
     result = cb
     outcomes: list[Adjudicated] = []
     for queued in offered:
-        representative = _candidate(result, queued.representative.key)
+        representative = codebook.record_by_id(
+            result.get("candidates") or [], queued.representative.key, kind="queue representative",
+        )
         others = tuple(member.key for member in queued.others)
         if representative.get("disposition") == "promoted":
             for member_id in others:
@@ -416,7 +430,6 @@ class AdjudicationReport:
 
     view: View
     attached: tuple[AppliedAttach, ...]
-    unattached: tuple[Attach, ...]
     offered: tuple[QueuedCluster, ...]
     adjudicated: tuple[Adjudicated, ...]
     inconclusive: str | None
@@ -471,10 +484,6 @@ class AdjudicationReport:
                 }
                 for item in self.attached
             ],
-            "unattached": [
-                {"title": item.item.title, "entry_id": item.entry_id, "score": float(item.score)}
-                for item in self.unattached
-            ],
             "inconclusive": self.inconclusive,
             "mass_rejection": {"offered": len(self.offered)} if self.mass_rejected else None,
         }
@@ -485,13 +494,6 @@ def _attached_line(item: Mapping[str, Any]) -> str:
     return (
         f"- attached by similarity {item['score']:.4f}: {report_text.quoted_title(item['title'])} "
         f"({item['candidate_id']}{novel}) → {item['entry_id']}"
-    )
-
-
-def _unattached_line(item: Mapping[str, Any]) -> str:
-    return (
-        f"- not attached, no pending candidate after the merge: {report_text.quoted_title(item['title'])} "
-        f"(similarity {item['score']:.4f} → {item['entry_id']}); not verified this run"
     )
 
 
@@ -540,7 +542,6 @@ def report_lines(record: Mapping[str, Any]) -> list[str]:
         *([f"- queue inconclusive: {record['inconclusive']}"] if record["inconclusive"] else []),
         *(_processed_line(item) for item in processed),
         *(_attached_line(item) for item in record["attached"]),
-        *(_unattached_line(item) for item in record["unattached"]),
     ]
 
 
@@ -596,11 +597,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     queue; 1 when the stage is skipped. Writes only the vector cache."""
     args = build_parser().parse_args(argv)
     root = args.project_root
-    cfg = config.load_config(args.config or root / "docs" / "legibility" / "legibility.yaml")
-    cb = codebook.load(root / "docs" / "legibility" / "confusion-codebook.yaml")
+    cfg = config.load_config(args.config or layout.config_path(root))
+    cb = codebook.load(layout.codebook_path(root))
     view = build_view(
         cb,
-        (),
+        {},
         embedder=embeddings.Embedder(embeddings.openai_embed, embeddings.cache_path(cfg.project_id)),
         settings=cfg.census.adjudication,
     )

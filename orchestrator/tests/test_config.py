@@ -3,12 +3,12 @@
 import logging
 import os
 import warnings
-from importlib import resources as pkg_resources
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 import yaml
+from _packaged_defaults import load_packaged_defaults
 from pydantic import ValidationError
 from shared.project_id import project_id_for_root
 
@@ -40,13 +40,6 @@ from orchestrator.config import (
     load_config,
     project_review_config,
 )
-
-
-def _load_package_defaults() -> dict:
-    """Read the shipped defaults.yaml so tests stay in sync automatically."""
-    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
-    return yaml.safe_load(defaults_file.read_text())
-
 
 # Shared diagnostic phrase used by both lock_depth boundary tests.
 # Hoisted to module scope so both the positive and negative tests reference one
@@ -102,7 +95,7 @@ class TestDefaults:
     def test_default_values(self):
         """Package defaults.yaml is loaded via settings_customise_sources."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         # Values from package defaults.yaml (not Pydantic field defaults)
         assert config.max_concurrent_tasks == defaults['max_concurrent_tasks']
         assert config.max_per_module == defaults['max_per_module']
@@ -418,7 +411,7 @@ class TestDefaults:
     def test_verify_cold_command_timeout_secs_from_defaults_yaml(self):
         """verify_cold_command_timeout_secs is loaded from defaults.yaml (expected 5400)."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_cold_command_timeout_secs == defaults['verify_cold_command_timeout_secs']
         assert config.verify_cold_command_timeout_secs == 5400
 
@@ -445,7 +438,7 @@ class TestDefaults:
         gate makes a timeout a queue-stalling block.
         """
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.merge_verify_cold_command_timeout_secs == defaults['merge_verify_cold_command_timeout_secs']
         assert config.merge_verify_cold_command_timeout_secs == 7200
 
@@ -530,7 +523,7 @@ class TestDefaults:
         max_consecutive_merge_thrash follow the same pattern.
         """
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.max_failure_signature_repeat == defaults['max_failure_signature_repeat']
 
 
@@ -1033,7 +1026,8 @@ class TestLayeredConfig:
         assert config.max_concurrent_tasks == 8
         # Preserved from package defaults
         assert config.models.architect == 'opus'
-        assert config.effort.architect == 'max'
+        assert config.effort.architect == 'xhigh'
+        assert config.max_turns.architect == 180
 
     def test_deep_merge_preserves_sibling_keys(self, tmp_path):
         """Overriding one key in a nested dict should not clobber siblings."""
@@ -1235,7 +1229,7 @@ class TestParkStopConfig:
         field defaults — any OrchestratorConfig() instantiation will pull the
         YAML values first (via settings_customise_sources).
         """
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'park_stop_enabled' in defaults, (
             "defaults.yaml is missing 'park_stop_enabled'"
         )
@@ -1279,19 +1273,18 @@ class TestMergeVerifyStormGuardFields:
 
 @pytest.mark.usefixtures("code_default_config")
 class TestMergeVerifyBreadthConfig:
-    """merge_verify_breadth (λ): restart-only knob gating the broad merge gate.
+    """merge_verify_breadth: restart-only knob setting the merge gate's breadth.
 
-    Default 'scoped' preserves legacy per-touched-module verify behaviour
-    (byte-identical rollback path). 'full' — flipped later by the σ
-    capstone — runs every REGISTERED module's full suite at merge-role
-    verify. See config.py's merge_verify_breadth field for the restart-only
-    rationale (task point 3 / design decision: mid-process flips could split
-    behaviour across an in-flight merge on the most load-bearing lane).
+    The shipped default is 'full' (task 7008): merge-role verify runs every
+    REGISTERED module's full suite. 'scoped' is the explicit per-project
+    opt-down to the legacy per-touched-module plan. The knob is restart-only
+    because a mid-process flip could split behaviour across an in-flight
+    merge on the most load-bearing lane. The paired task/merge verify policy
+    is stated once, in defaults.yaml's merge_verify_breadth comment.
     """
 
-    def test_defaults_to_scoped(self):
-        config = OrchestratorConfig()
-        assert config.merge_verify_breadth == 'scoped'
+    def test_pydantic_field_defaults_to_full(self):
+        assert OrchestratorConfig.model_fields['merge_verify_breadth'].default == 'full'
 
     def test_full_override_accepted(self):
         config = OrchestratorConfig(merge_verify_breadth='full')
@@ -1310,27 +1303,40 @@ class TestMergeVerifyBreadthConfig:
         """
         assert 'merge_verify_breadth' not in RELOADABLE_FIELDS, (
             'merge_verify_breadth requires a process restart to take effect '
-            '(flipped by the σ capstone, activated by the τ fleet restart) '
+            '(a mid-process flip could split an in-flight merge\'s breadth) '
             'and must NOT be in RELOADABLE_FIELDS'
         )
 
-    def test_defaults_yaml_carries_scoped(self, tmp_path):
+    def test_defaults_yaml_carries_full(self, tmp_path):
         """The shipped defaults.yaml explicitly carries merge_verify_breadth:
-        scoped (same guard pattern as test_defaults_yaml_has_park_stop_block
+        full (same guard pattern as test_defaults_yaml_has_park_stop_block
         above), and that value flows through both a bare OrchestratorConfig()
         and load_config() over an otherwise-empty explicit config file.
         """
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'merge_verify_breadth' in defaults, (
             "defaults.yaml is missing 'merge_verify_breadth'"
         )
-        assert defaults['merge_verify_breadth'] == 'scoped'
+        assert defaults['merge_verify_breadth'] == 'full'
 
         config = OrchestratorConfig()
-        assert config.merge_verify_breadth == 'scoped'
+        assert config.merge_verify_breadth == 'full'
 
         config_path = tmp_path / 'config.yaml'
         config_path.write_text(yaml.dump({'project_root': str(tmp_path)}))
+        loaded = load_config(config_path)
+        assert loaded.merge_verify_breadth == 'full'
+
+    def test_project_yaml_scoped_opts_down(self, tmp_path):
+        """A project yaml declaring merge_verify_breadth: scoped beats the
+        shipped 'full' default through the real layered load path
+        (defaults.yaml under the project file).
+        """
+        config_path = tmp_path / 'config.yaml'
+        config_path.write_text(yaml.dump({
+            'project_root': str(tmp_path),
+            'merge_verify_breadth': 'scoped',
+        }))
         loaded = load_config(config_path)
         assert loaded.merge_verify_breadth == 'scoped'
 
@@ -2387,7 +2393,7 @@ class TestStarvationWatchdogConfig:
 
     def test_packaged_defaults_keep_thresholds_and_add_knobs(self):
         """The retune is the predicate, not the numbers: both age floors stay 72h."""
-        block = _load_package_defaults()['starvation_watchdog']
+        block = load_packaged_defaults()['starvation_watchdog']
         assert block['idle_secs'] == 259200.0
         assert block['idle_only_secs'] == 259200.0
         assert block['skip_threshold'] == 50
@@ -2570,6 +2576,25 @@ class TestPinReservationConfig:
         assert live.pin_reservations_enabled is False
 
 
+class TestMainHealthFixReservedSlotsConfig:
+    """Run slots outside max_concurrent_tasks that only a main-health fix may take (task 8480)."""
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_one_slot_is_reserved_by_default(self):
+        assert OrchestratorConfig().main_health_fix_reserved_slots == 1
+
+    def test_zero_disables_the_reserve(self):
+        assert OrchestratorConfig(main_health_fix_reserved_slots=0).main_health_fix_reserved_slots == 0
+
+    def test_a_negative_reserve_is_rejected(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(main_health_fix_reserved_slots=-1)
+
+    def test_the_reserve_is_restart_only(self):
+        """The run loop builds its RunSlots once, like the max_concurrent_tasks pool beside it."""
+        assert 'main_health_fix_reserved_slots' not in RELOADABLE_FIELDS
+
+
 class TestTransientRequeueBackoffConfig:
     """The two jittered-backoff knobs (task 3317 / PRD contract C3).
 
@@ -2618,7 +2643,7 @@ class TestTransientRequeueBackoffConfig:
         Field default) is not re-implemented here.
         """
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'transient_requeue_backoff_base_secs' in defaults
         assert 'transient_requeue_backoff_cap_secs' in defaults
         assert (
@@ -3000,7 +3025,7 @@ class TestSimpleTaskRoleConfigAddressability:
         bare submodel Field defaults -- keeps config.py and defaults.yaml in
         lockstep."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.models.simple_task == defaults['models']['simple_task'] == 'sonnet'
         assert config.budgets.simple_task == defaults['budgets']['simple_task'] == 2.50
         assert config.max_turns.simple_task == defaults['max_turns']['simple_task'] == 50
@@ -3507,7 +3532,7 @@ class TestProgressExtensionConfig:
         bare OrchestratorConfig() (which loads package defaults.yaml via
         settings_customise_sources) picks them up byte-for-byte."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
 
         assert defaults['timeouts']['working_idle_secs'] == 1800
         assert config.timeouts.working_idle_secs == defaults['timeouts']['working_idle_secs']
@@ -3553,7 +3578,7 @@ class TestOrchestratorConfigPrices:
     """
 
     _SEED_KEYS = {
-        'gpt-5.4', 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'o4-mini',
+        'gpt-5.4', 'gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'o4-mini',
         'gemini-3.1-pro-preview', 'gemini-3-flash',
     }
 
@@ -3565,10 +3590,10 @@ class TestOrchestratorConfigPrices:
         assert config.prices['gpt-5.4'].output_per_1m == 10.00
         assert config.prices['gpt-6-astra'].input_per_1m == 10.00
         assert config.prices['gpt-6-astra'].output_per_1m == 50.00
-        assert config.prices['gpt-5.6-sol'].input_per_1m == 4.00
-        assert config.prices['gpt-5.6-sol'].output_per_1m == 20.00
-        assert config.prices['gpt-5.6-terra'].input_per_1m == 2.00
-        assert config.prices['gpt-5.6-terra'].output_per_1m == 12.00
+        assert config.prices['gpt-6.1-sol'].input_per_1m == 2.00
+        assert config.prices['gpt-6.1-sol'].output_per_1m == 10.00
+        assert config.prices['gpt-6.1-terra'].input_per_1m == 1.00
+        assert config.prices['gpt-6.1-terra'].output_per_1m == 5.00
         assert config.prices['o4-mini'].input_per_1m == 1.10
         assert config.prices['o4-mini'].output_per_1m == 4.40
         assert config.prices['gemini-3.1-pro-preview'].input_per_1m == 1.25
@@ -3587,10 +3612,10 @@ class TestOrchestratorConfigPrices:
         assert OrchestratorConfig().prices['gpt-6-astra'].cached_input_per_1m == 1.00
 
     @pytest.mark.usefixtures("code_default_config")
-    def test_sol_and_terra_have_no_cached_input_rate(self):
+    def test_sol_and_terra_seed_their_published_cached_input_rates(self):
         prices = OrchestratorConfig().prices
-        assert prices['gpt-5.6-sol'].cached_input_per_1m is None
-        assert prices['gpt-5.6-terra'].cached_input_per_1m is None
+        assert prices['gpt-6.1-sol'].cached_input_per_1m == 0.10
+        assert prices['gpt-6.1-terra'].cached_input_per_1m == 0.05
 
     def test_default_price_table_matches_defaults_yaml(self):
         """config.py's `_DEFAULT_PRICES` constant and defaults.yaml's
@@ -3598,7 +3623,7 @@ class TestOrchestratorConfigPrices:
         table (task 2459 amendment) — nothing else enforces they agree, so
         assert equality directly to catch future drift.
         """
-        assert default_price_table() == _load_package_defaults()['prices']
+        assert default_price_table() == load_packaged_defaults()['prices']
 
 
 class TestPricesReloadDisposition:
@@ -4452,7 +4477,7 @@ class TestRecoveryEmissionConfig:
         STANZA — not the ``Field(default=...)`` — is what actually applies.  A
         drifted stanza would silently win.
         """
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'recovery_emission' in defaults, (
             'the shipped defaults.yaml must declare the recovery_emission: '
             'block so the knobs are discoverable without reading pydantic source'
@@ -4648,10 +4673,10 @@ class TestProjectReviewConfig:
         review = project_review_config(tmp_path)
 
         assert review.briefing_path == 'docs/review-conventions.yaml'
-        assert review.reports_dir == _load_package_defaults()['review']['reports_dir']
+        assert review.reports_dir == load_packaged_defaults()['review']['reports_dir']
         assert os.environ['ORCH_CONFIG_PATH'] == str(tmp_path / 'some-other-project.yaml')
 
     def test_a_project_without_a_config_file_gets_the_shipped_defaults(self, tmp_path: Path):
         review = project_review_config(tmp_path)
 
-        assert review.briefing_path == _load_package_defaults()['review']['briefing_path']
+        assert review.briefing_path == load_packaged_defaults()['review']['briefing_path']

@@ -123,29 +123,8 @@ test('staleness: an explicit deps.timeoutMs still wins over both defaults', asyn
   );
 });
 
-test('staleness: DEFAULT_TIMEOUT_MS survives untouched as a parsable literal', () => {
-  // TWO Python structural tests parse this constant out of the shipped source
-  // with exactly this regex — test_tasks_budget.py and
-  // test_fetch_tasks_whole_operation_budget.py — where it is the ONLY ceiling
-  // on the server-side budgets. A rename or a computed expression makes both
-  // fail loudly, which is why STALE_TIMEOUT_MS had to be a NEW, separately
-  // named constant rather than a redefinition of this one.
-  const match = DATA_JS_SOURCE.match(/DEFAULT_TIMEOUT_MS\s*=\s*(\d+)/);
-  assert.ok(match, 'DEFAULT_TIMEOUT_MS is no longer a literal assignment in data.js');
-  assert.equal(Number(match[1]), DEFAULT_TIMEOUT_MS);
-
-  const stale = DATA_JS_SOURCE.match(/STALE_TIMEOUT_MS\s*=\s*(\d+)/);
-  assert.ok(stale, 'STALE_TIMEOUT_MS must be its own named literal constant');
-  assert.equal(Number(stale[1]), STALE_TIMEOUT_MS);
-  assert.notEqual(
-    Number(stale[1]),
-    Number(match[1]),
-    'the reduced deadline must actually be shorter than the default one',
-  );
-});
-
 test('staleness: the reduced deadline is reached through the PRODUCTION deps merge, not only a hand-built deps', async () => {
-  // REGRESSION FENCE for a defect the sibling test above structurally could
+  // REGRESSION FENCE for a defect this file's first test structurally could
   // NOT catch, found by step-19's real-browser check (task 4884, #4791).
   //
   // WHAT WAS MEASURED. Chrome 151 headless against the worktree's dashboard,
@@ -156,7 +135,7 @@ test('staleness: the reduced deadline is reached through the PRODUCTION deps mer
   // rendered ("4 consecutive attempts failed"), so the threshold was crossed;
   // only the deadline never dropped.
   //
-  // WHY THE OTHER TEST PASSED ANYWAY. It calls refreshOne with a deps object
+  // WHY THAT TEST PASSED ANYWAY. It calls refreshOne with a deps object
   // it builds by hand, and that object has no `timeoutMs` key, so
   // `deps.timeoutMs ?? (...)` falls through to the failures-based selection.
   // Production never takes that path: refreshDFData merges DEFAULT_POLL_DEPS

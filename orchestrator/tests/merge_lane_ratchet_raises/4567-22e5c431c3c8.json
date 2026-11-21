@@ -1,0 +1,12 @@
+{
+  "task_id": "4567",
+  "reason": "net-additive regression tests pinning the off-loop escalation-scan sites (test_escalation_scan_off_loop.py drives private coroutines per task 4567's accepted plan design)",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6453,
+      "current": 6472
+    }
+  ]
+}

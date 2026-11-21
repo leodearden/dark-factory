@@ -18,11 +18,11 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from _live_merge_worker import running_merge_worker
+from _merge_lane_fakes import lane_scene_config
 from _workflow_helpers import FakeScheduler
 from test_git_ops_unstack import _commit_files, _init_repo, _make_git_ops
 from test_merge_lane_member_redrive import add_unlanded, land_attributed
 
-from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import build_train_callback_factory
 from orchestrator.merge_lane import (
@@ -51,7 +51,7 @@ def held_train_request(
         pre_rebased=False,
         task_files=None,
         module_configs=[],
-        config=OrchestratorConfig(project_root=git_ops.project_root, git=git_ops.config),
+        config=lane_scene_config(git_ops.project_root, git_ops.config),
         result=result,
         train_id=train_id,
         member_task_ids=list(member_ids),

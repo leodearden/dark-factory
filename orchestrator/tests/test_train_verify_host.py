@@ -11,12 +11,13 @@ import asyncio
 import dataclasses
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 from unittest.mock import AsyncMock, call
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _merge_lane_fakes import (
+    FakeRemoteRunner,
     FakeVerifier,
     fails,
     hangs_until,
@@ -25,6 +26,7 @@ from _merge_lane_fakes import (
     make_lane,
     merge_through_lane,
     running_lane,
+    slot_states,
 )
 from _orch_helpers import wait_responsive
 from _recording_event_store import _RecordingEventStore
@@ -38,8 +40,6 @@ from orchestrator.merge_lane import (
     MergeRequest,
     QueuedBranch,
 )
-from orchestrator.verify import VerifyResult
-from orchestrator.verify_runner import RunnerUnavailable
 
 pytestmark = pytest.mark.asyncio
 
@@ -137,75 +137,6 @@ async def _single(scene: _Scene, name: str) -> MergeRequest:
     )
 
 
-class _FakeRemote:
-    """A remote verify host, duck-typed to ``verify_runner.py::VerifyRunner``.
-
-    Not a ``RemoteRunner``, so ``VerifyRunnerPool.dispatch`` calls it with
-    ``(merge_sha, spec)`` alone and skips the INV-2 code sync. ``calls`` keeps
-    every merge SHA it was asked to verify. A verify waits for *release* when
-    one is given, setting *entered* first. An *unreachable* host raises
-    ``RunnerUnavailable`` and never probes healthy or clean, so the reprobe
-    sweep cannot re-admit it during a test. ``cancel_verify`` answers
-    *cancel_rc*. ``live`` is set while a verify runs, as ``RemoteRunner``'s
-    in-flight id is; ``cancels`` records whether each remote cancel found a
-    verify still live to abort, and ``clean_probes`` counts clean-probes.
-    """
-
-    is_local: ClassVar[bool] = False
-
-    def __init__(
-        self,
-        name: str = 'laptop',
-        *,
-        release: asyncio.Event | None = None,
-        entered: asyncio.Event | None = None,
-        unreachable: bool = False,
-        cancel_rc: int = 0,
-    ) -> None:
-        self.name = name
-        self.release = release
-        self.entered = entered
-        self.unreachable = unreachable
-        self.cancel_rc = cancel_rc
-        self.calls: list[str] = []
-        self.live = False
-        self.cancels: list[bool] = []
-        self.clean_probes = 0
-
-    async def health(self) -> bool:
-        return not self.unreachable
-
-    async def probe_clean(self) -> bool:
-        self.clean_probes += 1
-        return not self.unreachable
-
-    async def cancel_verify(self) -> int:
-        self.cancels.append(self.live)
-        return self.cancel_rc
-
-    async def run_merge_verify(self, merge_sha: str, spec: Any) -> VerifyResult:
-        self.calls.append(merge_sha)
-        if self.unreachable:
-            raise RunnerUnavailable(f'{self.name} is unreachable')
-        self.live = True
-        try:
-            if self.entered is not None:
-                self.entered.set()
-            if self.release is not None:
-                await self.release.wait()
-            return VerifyResult(
-                passed=True, test_output='', lint_output='', type_output='',
-                summary=f'green on {self.name}',
-            )
-        finally:
-            self.live = False
-
-
-def _slot_states(lane: MergeLane) -> dict[str, str]:
-    """Each verify host's slot state, as the lane's public census reports it."""
-    return {host['name']: host['slot_state'] for host in lane.snapshot()['hosts']}
-
-
 def _in_flight(lane: MergeLane, task_id: str) -> list[dict[str, Any]]:
     """The restart drain's in-flight verify records for *task_id*."""
     records = lane.snapshot()['restart_drain']['verifies_in_flight']
@@ -255,7 +186,7 @@ async def test_a_lane_given_remote_runners_verifies_a_single_on_a_free_remote_un
     remote_scene: _Scene,
 ) -> None:
     single = await _single(remote_scene, 'solo')
-    remote = _FakeRemote()
+    remote = FakeRemoteRunner()
     verifier = FakeVerifier()
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
@@ -284,10 +215,10 @@ async def test_a_train_verify_holds_the_local_host_slot_until_it_lands(scene: _S
     async with running_lane(lane) as run:
         await queue.put(train.request)
         await wait_responsive(entered.wait(), label='train verify under way')
-        while_verifying = _slot_states(lane).get('local')
+        while_verifying = slot_states(lane).get('local')
         release.set()
         outcome = await run.outcome(train.request)
-        after_landing = _slot_states(lane).get('local')
+        after_landing = slot_states(lane).get('local')
 
     assert while_verifying == 'busy'
     assert outcome.status == 'done', outcome
@@ -300,7 +231,7 @@ async def test_a_two_member_train_verifies_on_a_free_remote_under_prefer_remote(
     train = await _stacked_train(remote_scene, 2)
     entered = asyncio.Event()
     release = asyncio.Event()
-    remote = _FakeRemote(release=release, entered=entered)
+    remote = FakeRemoteRunner(release=release, entered=entered)
     verifier = FakeVerifier()
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
@@ -311,11 +242,11 @@ async def test_a_two_member_train_verifies_on_a_free_remote_under_prefer_remote(
     async with running_lane(lane) as run:
         await queue.put(train.request)
         await wait_responsive(entered.wait(), label='train verify under way on the remote')
-        while_verifying = _slot_states(lane).get('laptop')
+        while_verifying = slot_states(lane).get('laptop')
         records = _in_flight(lane, train.tip)
         release.set()
         outcome = await run.outcome(train.request)
-        after_landing = _slot_states(lane).get('laptop')
+        after_landing = slot_states(lane).get('laptop')
 
     assert while_verifying == 'busy'
     assert [(r['host'], r['kind']) for r in records] == [('laptop', 'train')]
@@ -334,7 +265,7 @@ class _Unwound:
     verify_live: bool
 
 
-async def _abort_a_train_verifying_on(scene: _Scene, remote: _FakeRemote) -> _Unwound:
+async def _abort_a_train_verifying_on(scene: _Scene, remote: FakeRemoteRunner) -> _Unwound:
     """Cancel the lane's ``run()`` while a two-member train verifies on
     *remote*, as a lane crash or a hard shutdown does."""
     assert remote.entered is not None and remote.release is not None
@@ -364,7 +295,7 @@ async def test_cancelling_a_train_mid_verify_aborts_its_remote_verify_while_it_i
     """A train's verify runs inline in the merger, so cancelling the lane must
     abort the remote verify through the worker's teardown chokepoint before
     the local verify unwinds, and then free the slot."""
-    remote = _FakeRemote(release=asyncio.Event(), entered=asyncio.Event())
+    remote = FakeRemoteRunner(release=asyncio.Event(), entered=asyncio.Event())
 
     unwound = await _abort_a_train_verifying_on(remote_scene, remote)
 
@@ -381,7 +312,7 @@ async def test_a_refused_cancel_parks_the_aborted_trains_remote_until_it_probes_
 ) -> None:
     """A remote that refuses the cancel may still be running the verify, so
     its slot is parked and freed only once the host probes clean."""
-    remote = _FakeRemote(release=asyncio.Event(), entered=asyncio.Event(), cancel_rc=1)
+    remote = FakeRemoteRunner(release=asyncio.Event(), entered=asyncio.Event(), cancel_rc=1)
 
     unwound = await _abort_a_train_verifying_on(remote_scene, remote)
 
@@ -395,7 +326,7 @@ async def test_a_train_of_more_than_two_members_verifies_on_local_until_task_610
     """Pins the member cap: until task 6106 lands, a remote MemoryMax kill
     reads as a red verdict, so a train of three stays off a free remote."""
     train = await _stacked_train(remote_scene, 3)
-    remote = _FakeRemote()
+    remote = FakeRemoteRunner()
     verifier = FakeVerifier()
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
@@ -468,7 +399,7 @@ async def test_a_remote_green_the_local_cross_check_contradicts_benches_the_remo
         ),
     )
     train = await _stacked_train(scene, 2)
-    remote = _FakeRemote()
+    remote = FakeRemoteRunner()
     verifier = FakeVerifier(default=fails(category='pytest', summary='red on local'))
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
@@ -498,7 +429,7 @@ async def test_an_unreachable_remote_moves_the_train_verify_to_local(
     """A transport fault on the remote is never a derail: the remote is benched
     for reprobe and the same verify re-runs on local."""
     train = await _stacked_train(remote_scene, 2, train_id='coalesce-6160')
-    remote = _FakeRemote(unreachable=True)
+    remote = FakeRemoteRunner(unreachable=True)
     verifier = FakeVerifier()
     store = _RecordingEventStore()
     queue: asyncio.Queue[Any] = asyncio.Queue()

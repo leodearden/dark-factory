@@ -1,34 +1,50 @@
 """The single routing point for a task-role verify: the local run or a remote host.
 
-PRD ``plans/remote-task-leg-verify-prd.md`` §4.6-4.9, §5.5.  Imports point
+PRD ``plans/remote-task-leg-verify-prd.md`` §4.6-4.9, §5.5; decision 14 (an
+eligible verify queues on every host at once, and the first turn wins) and
+decision 16 (a task slot is a gate turn on every host).  Imports point
 downward only: this module must never import ``orchestrator.merge_lane`` or
 ``orchestrator.workflow``.
 """
 
+# pyright: reportIncompatibleMethodOverride=true
+
 from __future__ import annotations
 
 import asyncio
+import enum
 import functools
 import json
 import logging
 import time
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, assert_never, get_args
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Literal,
+    Protocol,
+    assert_never,
+    get_args,
+    runtime_checkable,
+)
 
 from shared.git_async import run_git
 from shared.safe_io import atomic_write_text
 
+from orchestrator.config import VerifyTaskHostPolicy
 from orchestrator.task_verify_spec import (
     CollapsedOverride,
     build_task_verify_spec,
     collapsed_module_overrides,
 )
-from orchestrator.verify import run_scoped_verification
+from orchestrator.verify import VerifyResult, run_scoped_verification
+from orchestrator.verify_admission_gate import AdmissionPlan
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
-from orchestrator.verify_hosts import HostPool, Refusal, RefusalReason
+from orchestrator.verify_hosts import HostPool
 from orchestrator.verify_plan import derive_verify_plan, executed_module_prefixes
 from orchestrator.verify_runner import RunnerUnavailable
 
@@ -36,8 +52,6 @@ if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
     from orchestrator.event_store import EventStore
     from orchestrator.git_ops import GitOps
-    from orchestrator.verify import VerifyResult
-    from orchestrator.verify_runner import HostLease
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +78,27 @@ class TaskVerifyPort(Protocol):
     ) -> VerifyResult: ...
 
 
-HostPolicy = Literal['local', 'remote_modules', 'remote_all']
+class LocalVerifyPort(TaskVerifyPort, Protocol):
+    """``run_scoped_verification``'s shape with the plan a verify moved between hosts keeps."""
+
+    async def __call__(
+        self,
+        worktree: Path,
+        config: OrchestratorConfig,
+        module_configs: list[ModuleConfig],
+        task_files: list[str] | None = None,
+        *,
+        attempt_id: int,
+        task_id: str,
+        archive_root: Path | None,
+        force_workspace: bool = False,
+        role: Literal['task'] = 'task',
+        event_store: EventStore | None = None,
+        admission_plan: AdmissionPlan | None = None,
+    ) -> VerifyResult: ...
+
+
+HostPolicy = VerifyTaskHostPolicy
 
 
 @dataclass(frozen=True)
@@ -101,6 +135,16 @@ class TaskVerifyPolicy:
             )
 
 
+def policy_from_config(config: OrchestratorConfig) -> TaskVerifyPolicy:
+    """The policy *config*'s four ``verify_task_*`` keys declare, read afresh per call."""
+    return TaskVerifyPolicy(
+        host_policy=config.verify_task_host_policy,
+        remote_modules=tuple(config.verify_task_remote_modules),
+        cross_check_every_n=config.verify_task_remote_cross_check_every_n,
+        red_confirms_locally=config.verify_task_remote_red_confirms_locally,
+    )
+
+
 @dataclass(frozen=True)
 class CrossCheck:
     """A remote verdict re-run locally on the cross-check cadence."""
@@ -130,9 +174,13 @@ class RedConfirmation:
         return {'remote_passed': False, 'local_passed': self.local_passed}
 
 
+FallbackReason = Literal[
+    'not_eligible', 'dirty_tree', 'runner_unavailable', 'infra_transient', 'dispatcher_error',
+]
+"""Why a verify that held a remote turn ran local after all."""
+
 DispatchReason = Literal[
-    RefusalReason, 'remote', 'not_eligible', 'dirty_tree', 'runner_unavailable',
-    'infra_transient', 'cross_check', 'red_confirm', 'dispatcher_error',
+    FallbackReason, 'no_host', 'local_granted_first', 'remote', 'cross_check', 'red_confirm',
 ]
 
 
@@ -148,12 +196,16 @@ class DispatchDecision:
     lease_held_secs: float | None
     cross_check: CrossCheck | None
     red_confirmed_locally: RedConfirmation | None
+    remote_wait_secs: float | None
+    """Arrival to the remote turn, when the verify ran remote; else None."""
 
     def __post_init__(self) -> None:
         if self.reason not in get_args(DispatchReason):
             raise ValueError(
                 f'dispatch reason {self.reason!r} is not one of {get_args(DispatchReason)}'
             )
+        if self.remote_wait_secs is not None and self.remote_wait_secs < 0:
+            raise ValueError(f'remote_wait_secs must be >= 0, got {self.remote_wait_secs!r}')
 
     @property
     def decision(self) -> Literal['remote', 'local']:
@@ -173,7 +225,26 @@ class DispatchDecision:
             'red_confirmed_locally': (
                 self.red_confirmed_locally.to_dict() if self.red_confirmed_locally else None
             ),
+            'remote_wait_secs': self.remote_wait_secs,
         }
+
+
+LOCAL_RUNNER: Final = HostPool.local_name
+
+
+@runtime_checkable
+class DispatchRecords(Protocol):
+    """A task-verify port that records where each task attempt's verdict came from."""
+
+    def decision_for(self, task_id: str, attempt_id: int) -> DispatchDecision | None: ...
+
+
+def verdict_runner(port: object | None, task_id: str, attempt_id: int) -> str:
+    """The host whose verdict *port* returned for this attempt; LOCAL_RUNNER when unrecorded."""
+    if not isinstance(port, DispatchRecords):
+        return LOCAL_RUNNER
+    decision = port.decision_for(task_id, attempt_id)
+    return LOCAL_RUNNER if decision is None else decision.runner
 
 
 def eligible(
@@ -212,7 +283,11 @@ class _VerifyCall:
     role: Literal['task']
     event_store: EventStore | None
 
-    async def run(self, port: TaskVerifyPort) -> VerifyResult:
+    async def run(
+        self, port: LocalVerifyPort, *, admission_plan: AdmissionPlan | None = None,
+    ) -> VerifyResult:
+        """Call *port*; the plan keyword is passed only when a plan is carried."""
+        plan = {} if admission_plan is None else {'admission_plan': admission_plan}
         return await port(
             self.worktree, self.config, self.module_configs,
             task_files=self.task_files,
@@ -222,6 +297,7 @@ class _VerifyCall:
             force_workspace=self.force_workspace,
             role=self.role,
             event_store=self.event_store,
+            **plan,
         )
 
 
@@ -245,6 +321,7 @@ class _DecisionDraft:
     lease_held_secs: float | None = None
     cross_check: CrossCheck | None = None
     red_confirmed_locally: RedConfirmation | None = None
+    remote_wait_secs: float | None = None
 
     def freeze(self) -> DispatchDecision:
         return DispatchDecision(
@@ -256,6 +333,7 @@ class _DecisionDraft:
             lease_held_secs=self.lease_held_secs,
             cross_check=self.cross_check,
             red_confirmed_locally=self.red_confirmed_locally,
+            remote_wait_secs=self.remote_wait_secs,
         )
 
 
@@ -276,19 +354,105 @@ def _infra_transient_unavailability(host: str, result: VerifyResult) -> RunnerUn
     )
 
 
-async def _reap(task: asyncio.Future[Any]) -> None:
-    task.cancel()
-    await asyncio.wait({task})
-    if not task.cancelled() and (exc := task.exception()) is not None:
+async def _reap_remote(remote: asyncio.Future[VerifyResult]) -> None:
+    """Cancel a remote verify, which normally ends in RunnerUnavailable, and await its end."""
+    remote.cancel()
+    await asyncio.wait({remote})
+    if not remote.cancelled() and (exc := remote.exception()) is not None:
         logger.debug('A cancelled remote task verify ended with %r instead', exc)
 
 
-class TaskVerifyDispatcher:
-    """Routes each task verify to a leased remote host or to *run_local*.
+async def _withdrawn(local: asyncio.Task[VerifyResult]) -> None:
+    """Await a local run already cancelled; any end but the cancel is a failed unwind."""
+    await asyncio.wait({local})
+    if not local.cancelled() and (exc := local.exception()) is not None:
+        logger.warning('A withdrawn local task verify failed to unwind', exc_info=exc)
+
+
+class _Left(enum.Enum):
+    """An attempt that left its host's turn without running the verify."""
+
+    LEFT = 'left'
+
+
+@dataclass(frozen=True)
+class _RemoteVerdict:
+    """The claiming attempt's verdict, with the policy read at its grant, which settles it."""
+
+    result: VerifyResult
+    policy: TaskVerifyPolicy
+
+
+_AttemptOutcome = _RemoteVerdict | FallbackReason | Literal[_Left.LEFT]
+
+
+def _warn_if_failed(host: str, attempt: asyncio.Task[_AttemptOutcome]) -> None:
+    if not attempt.cancelled() and (exc := attempt.exception()) is not None:
+        logger.warning('Task verify attempt on %s failed', host, exc_info=exc)
+
+
+async def _reap_attempt(host: str, attempt: asyncio.Task[_AttemptOutcome]) -> None:
+    attempt.cancel()
+    await asyncio.wait({attempt})
+    _warn_if_failed(host, attempt)
+
+
+@dataclass(frozen=True)
+class _LocalWon:
+    """The local call finished while no remote attempt had claimed the verify."""
+
+    local: asyncio.Task[VerifyResult]
+
+
+_RaceOutcome = _LocalWon | _RemoteVerdict | FallbackReason
+
+
+@dataclass(eq=False)
+class _Race:
+    """One eligible call's race between the local queue and every remote host's gate."""
+
+    plan: AdmissionPlan
+    local: asyncio.Task[VerifyResult] | None = None
+    attempts: dict[asyncio.Task[_AttemptOutcome], str] = field(default_factory=dict)
+    claimed_by: str | None = None
+    reaping: asyncio.Future[None] | None = None
+    remote_wait_secs: float | None = None
+
+    def try_claim(self, host: str, policy: TaskVerifyPolicy) -> bool:
+        """Claim the verify for *host*'s turn, unless it is no longer the remote's to run."""
+        local_done = self.local is not None and self.local.done()
+        if self.claimed_by is not None or self.plan.has_been_granted() or local_done:
+            return False
+        if policy.host_policy == 'local':
+            return False
+        self.claimed_by = host
+        return True
+
+    def withdraw_local(self) -> asyncio.Future[None] | None:
+        """Cancel the local call once, in the caller's step, so no leg already
+        scheduled starts after a claim; every caller awaits the same reap."""
+        if self.reaping is None and self.local is not None and not self.local.done():
+            self.local.cancel()
+            self.reaping = asyncio.ensure_future(_withdrawn(self.local))
+        return self.reaping
+
+
+async def _reap_race(race: _Race) -> None:
+    reaps: list[Awaitable[None]] = [
+        _reap_attempt(host, attempt) for attempt, host in race.attempts.items()
+    ]
+    reaping = race.withdraw_local()
+    if reaping is not None:
+        reaps.append(reaping)
+    await asyncio.gather(*reaps)
+
+
+class TaskVerifyDispatcher(DispatchRecords):
+    """Routes each task verify to whichever comes first: a remote host's turn or *run_local*.
 
     Shared by every workflow of one orchestrator, so decisions are keyed by
-    ``(task_id, attempt_id)`` and the policy is read on every call.  Each
-    routed call leaves a dispatch sidecar beside its verify logs.
+    ``(task_id, attempt_id)`` and the policy is read on every call and at every
+    grant.  Each routed call leaves a dispatch sidecar beside its verify logs.
     """
 
     def __init__(
@@ -297,7 +461,7 @@ class TaskVerifyDispatcher:
         git_ops: GitOps,
         *,
         policy_of: Callable[[OrchestratorConfig], TaskVerifyPolicy],
-        run_local: TaskVerifyPort = run_scoped_verification,
+        run_local: LocalVerifyPort = run_scoped_verification,
     ) -> None:
         self._pool = pool
         self._git_ops = git_ops
@@ -327,8 +491,9 @@ class TaskVerifyDispatcher:
         )
         policy = self._policy_of(config)
         if policy.host_policy == 'local':
+            self._decisions.pop((task_id, attempt_id), None)
             return await call.run(self._run_local)
-        draft = _DecisionDraft(runner=self._pool.allocator.local_name)
+        draft = _DecisionDraft(runner=self._pool.local_name)
         try:
             result = await self._dispatch(call, policy, draft)
         except Exception:
@@ -350,14 +515,100 @@ class TaskVerifyDispatcher:
         draft.tip_sha, draft.base_sha = scope.tip_sha, scope.base_sha
         if not self._eligible(call, policy, scope):
             return await self._run_local_because(call, draft, 'not_eligible')
-        lease = self._pool.acquire_for_task(call.task_id)
-        if isinstance(lease, Refusal):
-            return await self._run_local_because(call, draft, lease.reason)
-        outcome = await self._run_remote(call, scope, lease, draft)
-        if isinstance(outcome, str):
-            return await self._run_local_because(call, draft, outcome)
-        draft.reason = 'remote'
-        return await self._settle_remote(call, policy, outcome, draft)
+        if not self._pool.hosts:
+            return await self._run_local_because(call, draft, 'no_host')
+        race = _Race(plan=AdmissionPlan.begin(role='task', task_id=call.task_id))
+        outcome = await self._race(race, call, draft)
+        return await self._after_race(call, race, outcome, draft)
+
+    async def _after_race(
+        self, call: _VerifyCall, race: _Race, outcome: _RaceOutcome, draft: _DecisionDraft,
+    ) -> VerifyResult:
+        """Settle *outcome* once the race has unwound, so no local run holds a remote turn."""
+        if isinstance(outcome, _LocalWon):
+            draft.reason = 'local_granted_first'
+            return outcome.local.result()
+        if isinstance(outcome, _RemoteVerdict):
+            draft.reason = 'remote'
+            draft.remote_wait_secs = race.remote_wait_secs
+            return await self._settle_remote(call, outcome.policy, outcome.result, draft)
+        draft.reason = outcome
+        return await call.run(self._run_local, admission_plan=race.plan)
+
+    async def _race(self, race: _Race, call: _VerifyCall, draft: _DecisionDraft) -> _RaceOutcome:
+        """Queue *call* on every remote host's gate, then locally unless a turn came at once."""
+        try:
+            for host in self._pool.hosts:
+                attempt = asyncio.ensure_future(self._attempt(race, host, call, draft))
+                race.attempts[attempt] = host
+            await asyncio.sleep(0)
+            if race.claimed_by is None:
+                race.local = asyncio.ensure_future(
+                    call.run(self._run_local, admission_plan=race.plan),
+                )
+            return await self._await_race(race)
+        finally:
+            await asyncio.shield(_reap_race(race))
+
+    async def _await_race(self, race: _Race) -> _RaceOutcome:
+        while True:
+            local = {race.local} if race.local is not None and race.claimed_by is None else set()
+            done, _ = await asyncio.wait(
+                {*race.attempts, *local}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in race.attempts.keys() & done:
+                outcome = self._attempt_outcome(race, race.attempts.pop(task), task)
+                if outcome is not _Left.LEFT:
+                    return outcome
+            if race.claimed_by is None and race.local is not None and race.local.done():
+                return _LocalWon(race.local)
+
+    def _attempt_outcome(
+        self, race: _Race, host: str, attempt: asyncio.Task[_AttemptOutcome],
+    ) -> _AttemptOutcome:
+        """The claiming attempt's outcome (its exception re-raised); any other attempt left."""
+        if race.claimed_by == host:
+            return attempt.result()
+        _warn_if_failed(host, attempt)
+        return _Left.LEFT
+
+    async def _attempt(
+        self, race: _Race, host: str, call: _VerifyCall, draft: _DecisionDraft,
+    ) -> _AttemptOutcome:
+        """Wait for *host*'s turn; the first eligible grant claims the verify and runs it there.
+
+        The claim is checked at the grant with no await in between, and every
+        return leaves the hold and the turn before the parent sees its value.
+        """
+        request = race.plan.request(module=None, scope_kind=None)
+        gate_policy = functools.partial(self._pool.policy, host, call.config)
+        async with self._pool.gate(host).admit(request, gate_policy) as grant:
+            policy = self._policy_of(call.config)
+            if not race.try_claim(host, policy):
+                return _Left.LEFT
+            race.remote_wait_secs = grant.granted - race.plan.arrival
+            with self._pool.holding(host, call.task_id):
+                return await self._claimed_turn(race, host, policy, call, draft)
+
+    async def _claimed_turn(
+        self, race: _Race, host: str, policy: TaskVerifyPolicy, call: _VerifyCall,
+        draft: _DecisionDraft,
+    ) -> _RemoteVerdict | FallbackReason:
+        """Withdraw the local call, re-derive the scope at the turn, then run on *host*
+        under *policy*, the one read at the claiming grant."""
+        reaping = race.withdraw_local()
+        if reaping is not None:
+            await asyncio.shield(reaping)
+        scope = await self._scope_or_none(call)
+        if scope is None:
+            return 'dispatcher_error'
+        draft.tip_sha, draft.base_sha = scope.tip_sha, scope.base_sha
+        if not self._eligible(call, policy, scope):
+            return 'not_eligible'
+        outcome = await self._run_remote(call, scope, host, draft)
+        if isinstance(outcome, VerifyResult):
+            return _RemoteVerdict(outcome, policy)
+        return outcome
 
     async def _settle_remote(
         self, call: _VerifyCall, policy: TaskVerifyPolicy, remote: VerifyResult,
@@ -370,7 +621,7 @@ class TaskVerifyDispatcher:
         confirm = policy.red_confirms_locally and not remote.passed
         if not (cross or confirm):
             return remote
-        draft.runner = self._pool.allocator.local_name
+        draft.runner = self._pool.local_name
         local = await self._run_local_because(call, draft, 'cross_check' if cross else 'red_confirm')
         if cross:
             draft.cross_check = CrossCheck(remote_passed=remote.passed, local_passed=local.passed)
@@ -381,14 +632,17 @@ class TaskVerifyDispatcher:
     async def _run_local_because(
         self, call: _VerifyCall, draft: _DecisionDraft, reason: DispatchReason,
     ) -> VerifyResult:
+        """Run local under a fresh plan: before any remote queueing, and for parity re-runs (row 39)."""
         draft.reason = reason
         return await call.run(self._run_local)
 
     async def _run_remote(
-        self, call: _VerifyCall, scope: _TaskScope, lease: HostLease, draft: _DecisionDraft,
-    ) -> VerifyResult | DispatchReason:
-        """Run the verify on *lease*'s host; the lease ends here on every path."""
-        acquired = time.monotonic()
+        self, call: _VerifyCall, scope: _TaskScope, host: str, draft: _DecisionDraft,
+    ) -> VerifyResult | FallbackReason:
+        """Run the verify on a fresh runner for *host*'s turn; a verify still in flight
+        (only on cancellation) is cancelled on its host while the turn is held."""
+        started = time.monotonic()
+        runner = self._pool.runner_for_turn(host)
         remote: asyncio.Future[VerifyResult] | None = None
         try:
             if await self._git_ops.has_uncommitted_work(call.worktree):
@@ -398,48 +652,37 @@ class TaskVerifyDispatcher:
                 force_workspace=False, attempt_id=call.attempt_id,
                 task_id=call.task_id, tip_sha=scope.tip_sha,
             )
-            remote = verifying = asyncio.ensure_future(lease.runner.run_task_verify(
+            remote = verifying = asyncio.ensure_future(runner.run_task_verify(
                 spec, task_id=call.task_id, archive_root=call.archive_root,
                 event_store=call.event_store,
             ))
-            return await self._remote_verdict(verifying, lease, draft)
+            return await self._remote_verdict(verifying, host, draft)
         finally:
-            await self._end_lease(lease, remote)
-            draft.lease_held_secs = time.monotonic() - acquired
+            if remote is not None and not remote.done():
+                await asyncio.shield(self._pool.cancel_in_flight(
+                    host, runner, unwind=functools.partial(_reap_remote, remote),
+                ))
+            draft.lease_held_secs = time.monotonic() - started
 
     async def _remote_verdict(
-        self, remote: asyncio.Future[VerifyResult], lease: HostLease, draft: _DecisionDraft,
-    ) -> VerifyResult | DispatchReason:
+        self, remote: asyncio.Future[VerifyResult], host: str, draft: _DecisionDraft,
+    ) -> VerifyResult | FallbackReason:
         started = time.monotonic()
         try:
             result = await asyncio.shield(remote)
         except RunnerUnavailable as exc:
-            self._pool.mark_unavailable(lease, exc)
+            self._pool.mark_unavailable(host, exc)
             return 'runner_unavailable'
         finally:
             draft.remote_wall_secs = time.monotonic() - started
         if not result.passed and result.category in INFRA_TRANSIENT_CATEGORIES:
-            self._pool.mark_unavailable(lease, _infra_transient_unavailability(lease.name, result))
+            self._pool.mark_unavailable(host, _infra_transient_unavailability(host, result))
             return 'infra_transient'
-        self._pool.mark_recovered(lease)
-        draft.runner = lease.name
+        draft.runner = host
         return result
 
-    async def _end_lease(
-        self, lease: HostLease, remote: asyncio.Future[VerifyResult] | None,
-    ) -> None:
-        """Release *lease*; a remote verify still in flight (only on cancellation) is
-        cancelled on its host while its dispatch is live, then reaped, and only then is
-        its slot freed or PARKED (PRD §4.3 exclusive use, §4.8)."""
-        if remote is None or remote.done():
-            await self._pool.release(lease)
-            return
-        await asyncio.shield(
-            self._pool.cancel_and_release(lease, unwind=functools.partial(_reap, remote)),
-        )
-
     async def _scope_or_none(self, call: _VerifyCall) -> _TaskScope | None:
-        """*call*'s scope, or None (logged) when it cannot be derived; nothing is leased yet."""
+        """*call*'s scope, or None (logged) when it cannot be derived."""
         try:
             return await self._scope_of(call)
         except Exception:

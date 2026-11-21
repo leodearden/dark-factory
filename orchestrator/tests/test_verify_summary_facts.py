@@ -25,7 +25,7 @@ _LINT_CMD = 'uv run ruff check src/'
 
 
 def _module_config(prefix='__fallback__', *, test_command=_TEST_CMD):
-    from orchestrator.config import ModuleConfig  # noqa: PLC0415
+    from orchestrator.config import ModuleConfig
 
     return ModuleConfig(
         prefix=prefix,
@@ -68,10 +68,10 @@ async def _run_task_verification(
     Only ``_run_cmd`` is stubbed. *config_overrides* are
     ``OrchestratorConfig`` fields; admission is off unless they turn it on.
     """
-    from unittest.mock import patch  # noqa: PLC0415
+    from unittest.mock import patch
 
-    from orchestrator import verify as verify_mod  # noqa: PLC0415
-    from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+    from orchestrator import verify as verify_mod
+    from orchestrator.config import OrchestratorConfig
 
     (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
     config = OrchestratorConfig(
@@ -118,14 +118,14 @@ class TestTheSummaryCarriesTheRole:
 
     @pytest.mark.parametrize('role', ['task', 'merge'])
     def test_the_payload_names_its_role(self, role):
-        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+        from orchestrator.verify import _build_summary_payload
 
         payload = _build_summary_payload([_run('test')], 'clean', '', role=role)
 
         assert payload['role'] == role
 
     def test_the_role_is_present_even_when_no_command_ran(self):
-        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+        from orchestrator.verify import _build_summary_payload
 
         payload = _build_summary_payload(
             [_run('test', cmd=None), _run('lint', cmd=None)], 'clean', '', role='task',
@@ -139,20 +139,21 @@ class TestTheSummaryCarriesTheRole:
 
         assert _read_worktree_summary(tmp_path)['role'] == 'task'
 
-    def test_the_merge_writer_stamps_merge(self, tmp_path):
-        """``_archive_merge_verify_logs`` is the merge-path writer by definition.
-
-        It serves both the local merge lane and ``verify_runner.RemoteRunner``,
-        so its role cannot be anything but 'merge'.
+    @pytest.mark.parametrize('role', ['merge', 'task'])
+    def test_the_archive_writer_stamps_the_role_it_is_given(self, tmp_path, role):
+        """``archive_verify_logs`` serves both roles: the local merge lane archives
+        as 'merge', and ``verify_runner.RemoteRunner.run_task_verify`` passes 'task'
+        through ``RemoteRunner._archive_failure_streams``.
         """
-        from orchestrator.verify import _archive_merge_verify_logs  # noqa: PLC0415
+        from orchestrator.verify import archive_verify_logs
 
         archive_root = tmp_path / 'archive'
-        _archive_merge_verify_logs(
+        archive_verify_logs(
             [_run('test', rc=1)], archive_root, '5671', 1, 'test_failure', '',
+            role=role,
         )
 
-        assert _read_archived_summary(archive_root)['role'] == 'merge'
+        assert _read_archived_summary(archive_root)['role'] == role
 
 
 class TestTheTopLevelNamesItsCommand:
@@ -166,7 +167,7 @@ class TestTheTopLevelNamesItsCommand:
 
     @staticmethod
     def _payload(runs):
-        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+        from orchestrator.verify import _build_summary_payload
 
         payload = _build_summary_payload(runs, 'lint_failure', '', role='task')
         named = [c for c in payload['commands'] if c['label'] == payload['label']]
@@ -242,9 +243,9 @@ def _another_verify_holds_the_slot(tmp_path: Path):
     ``shared.verify_admission.acquire_task_slot`` where verify imports it; the
     real function still grants the slot, on the real flock.
     """
-    from unittest.mock import patch  # noqa: PLC0415
+    from unittest.mock import patch
 
-    from shared.verify_admission import acquire_task_slot  # noqa: PLC0415
+    from shared.verify_admission import acquire_task_slot
 
     slots_dir = tmp_path / 'slots'
     slots_dir.mkdir(parents=True, exist_ok=True)
@@ -376,7 +377,7 @@ def _junit_target(cmd: str) -> Path | None:
     rendering one); the attached ``=`` form is accepted too so the fake does
     not depend on that choice.
     """
-    import shlex  # noqa: PLC0415
+    import shlex
 
     tokens = shlex.split(cmd)
     for index, token in enumerate(tokens):
@@ -464,7 +465,7 @@ class TestTaskLegsArchiveAJunitReport:
 
     @pytest.mark.asyncio
     async def test_a_green_run_archives_exactly_one_gzipped_report(self, tmp_path):
-        import gzip  # noqa: PLC0415
+        import gzip
 
         fake = _JunitWritingPytest((0, _GREEN_JUNIT, False))
         result = await self._run(tmp_path, fake)

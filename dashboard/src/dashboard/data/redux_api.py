@@ -10,7 +10,7 @@ through the matching ``shape_*`` function before serialising as JSON.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
@@ -26,15 +26,19 @@ from dashboard.data.burndown import (
     compute_parity_alarm,
     compute_window_completion,
 )
+from dashboard.data.chart_utils import ChartData, trim_leading_zero_buckets
 from dashboard.data.datum import (
     Datum,
     DatumContractError,
     DatumInvariant,
     DatumState,
     aged_at,
+    map_datum,
     validate_datum,
 )
 from dashboard.data.escalation_corpus import EscalationView
+from dashboard.data.label_spans import label_spans
+from dashboard.data.merge_queue import DepthSeries, MergeAttempts
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
@@ -469,17 +473,26 @@ def shape_recon(
 # ---------------------------------------------------------------------------
 
 
-def _wire_served(candidate: object, field: str, served_at: datetime) -> dict[str, object]:
+def _wire_served(
+    candidate: object,
+    field: str,
+    served_at: datetime,
+    *,
+    project: Callable[[Any], object] | None = None,
+) -> dict[str, object]:
     """*candidate* as served at *served_at*: aged, validated and rendered to the wire.
 
     A route fills every Datum field of its payload, so a *field* holding
     anything but a Datum is a wiring bug and raises ``DATUM_REQUIRED``, as
-    does a Datum that breaks its contract at *served_at*.
+    does a Datum that breaks its contract at *served_at*. *project*, when
+    given, reshapes a known value for the wire (:func:`map_datum`).
     """
     if not isinstance(candidate, Datum):
         raise DatumContractError(
             DatumInvariant.DATUM_REQUIRED, f'{field} must be a Datum, got {candidate!r}',
         )
+    if project is not None:
+        candidate = map_datum(candidate, project)
     aged = aged_at(candidate, served_at)
     validate_datum(aged, served_at)
     return aged.to_wire()
@@ -496,30 +509,30 @@ def _wire_views(
     }
 
 
-def _shape_outcomes(raw: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Enrich an outcomes dict with a parallel ``colors`` list.
+def _shape_outcomes(chart: ChartData) -> dict[str, Any]:
+    """An outcome chart's ``{labels, values}`` plus a parallel ``colors`` list.
 
-    Given the raw ``outcomes`` mapping (``{labels, values}`` from the
-    aggregator), returns a new dict with those keys preserved and a
-    ``colors`` key added via :func:`~dashboard.data.outcome_colors.assign_outcome_colors`.
+    The colors come from :func:`~dashboard.data.outcome_colors.assign_outcome_colors`.
     """
-    outcomes = dict(raw or {'labels': [], 'values': []})
-    labels: list[str] = outcomes.get('labels') or []
-    outcomes['colors'] = assign_outcome_colors(labels)
-    return outcomes
+    return {**chart, 'colors': assign_outcome_colors(chart['labels'])}
 
 
-def _shape_depth(raw: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Serve a depth series as ``{labels, values, bucket_minutes}``.
+def _shape_attempts(attempts: MergeAttempts) -> dict[str, Any]:
+    """One window's attempts as the donut's colored chart and the latency block."""
+    return {'outcomes': _shape_outcomes(attempts.outcome_chart()), 'latency': attempts.latency()}
+
+
+def _shape_depth(series: DepthSeries) -> dict[str, Any]:
+    """Serve a depth series as ``{labels, values, bucket_minutes}``, leading zero buckets trimmed.
 
     ``bucket_minutes`` is the width in minutes each bucket spans, None when
     the series names no width.
     """
-    depth = raw or {}
+    trimmed = trim_leading_zero_buckets(series)
     return {
-        'labels': list(depth.get('labels') or []),
-        'values': list(depth.get('values') or []),
-        'bucket_minutes': depth.get('bucket_minutes'),
+        'labels': list(trimmed['labels']),
+        'values': list(trimmed['values']),
+        'bucket_minutes': series.get('bucket_minutes'),
     }
 
 
@@ -537,21 +550,25 @@ def shape_merge_queue(
     from absolute project_root paths to each root's project label
     (``dashboard/project_labels.py::ProjectLabels``) so the React side can
     match against ``PROJECTS[].name``.  Per project: ``depth`` (renamed from
-    ``depth_timeseries``, shaped by :func:`_shape_depth`), ``outcomes``,
-    ``latency`` (whose ``with_duration`` and ``without_duration`` sum to the
-    outcomes total), ``recent``, ``recent_total`` (how many merges the window
-    holds; ``recent`` is capped), ``speculative``, ``active`` (the live
-    probe's entries), ``in_queue``, ``live_probe_configured`` (false keeps
-    the project out of the client's multi-project in-queue totals),
-    ``active_spark``, ``halt``, ``train_events``. ``in_queue``,
-    ``speculative``, ``recent_total`` and ``live_probe_configured`` are
-    required: the route resolves them for every project.
+    ``depth_timeseries``, its value shaped by :func:`_shape_depth`),
+    ``attempts`` (one value ``{outcomes, latency}``, whose latency's
+    ``with_duration`` and ``without_duration`` sum to the outcomes total),
+    ``recent``, ``recent_total`` (how many merges the window holds;
+    ``recent`` is capped), ``speculative``, ``active`` (the live probe's
+    entries), ``in_queue``, ``live_probe_configured`` (false keeps the
+    project out of the client's multi-project in-queue totals),
+    ``runs_db_present`` (false keeps the project out of the client's runs.db
+    totals), ``active_spark``, ``halt``, ``train_events``,
+    ``train_throughput``. ``depth``, ``attempts``, ``in_queue``,
+    ``speculative``, ``recent_total``, ``train_throughput``,
+    ``live_probe_configured`` and ``runs_db_present`` are required: the
+    route resolves them for every project.
 
-    ``in_queue``, ``speculative``, ``recent_total`` and every
-    ``recent``/``active`` row's ``title`` are Datums the route resolved, each
-    aged to *served_at*, validated against it and rendered to the wire. A
-    field that is not a Datum, or a Datum that breaks its contract there, is
-    a wiring or shaper bug, and the
+    ``depth``, ``attempts``, ``in_queue``, ``speculative``, ``recent_total``,
+    ``train_throughput`` and every ``recent``/``active`` row's ``title`` are
+    Datums the route resolved, each aged to *served_at*, validated against it
+    and rendered to the wire. A field that is not a Datum, or a Datum that
+    breaks its contract there, is a wiring or shaper bug, and the
     :class:`~dashboard.data.datum.DatumContractError` propagates.
 
     ``active_sparks`` (optional) is ``in_queue``'s sampled history, keyed by
@@ -562,8 +579,10 @@ def shape_merge_queue(
     projects fall back to ``{offline: True}`` so the UI can render an Offline
     pill on every panel.
     """
-    def _served(candidate: object, field: str) -> dict[str, object]:
-        return _wire_served(candidate, f'MERGE_QUEUE {field}', served_at)
+    def _served(
+        candidate: object, field: str, *, project: Callable[[Any], object] | None = None,
+    ) -> dict[str, object]:
+        return _wire_served(candidate, f'MERGE_QUEUE {field}', served_at, project=project)
 
     def _titled(rows: Iterable[Mapping[str, Any]] | None, table: str) -> list[dict[str, Any]]:
         return [
@@ -578,22 +597,24 @@ def shape_merge_queue(
         spark = sparks.get(pid) or _EMPTY_SERIES
         label = labels.of(pid)
         out[label] = {
-            'depth': _shape_depth(data.get('depth_timeseries')),
-            'outcomes': _shape_outcomes(data.get('outcomes')),
-            'latency': dict(data.get('latency') or {}),
+            'depth': _served(data.get('depth_timeseries'), f'{label}.depth', project=_shape_depth),
+            'attempts': _served(data.get('attempts'), f'{label}.attempts', project=_shape_attempts),
             'recent': _titled(data.get('recent'), f'{label}.recent'),
             'recent_total': _served(data.get('recent_total'), f'{label}.recent_total'),
             'speculative': _served(data.get('speculative'), f'{label}.speculative'),
             'active': _titled(data.get('active'), f'{label}.active'),
             'in_queue': _served(data.get('in_queue'), f'{label}.in_queue'),
             'live_probe_configured': bool(data['live_probe_configured']),
+            'runs_db_present': bool(data['runs_db_present']),
             'active_spark': {
                 'labels': list(spark.get('labels') or []),
                 'values': list(spark.get('values') or []),
             },
             'halt': dict(halts.get(label) or {'offline': True}),
             'train_events': [dict(e) for e in (data.get('train_events') or [])],
-            'train_throughput': dict(data.get('train_throughput') or {}),
+            'train_throughput': _served(
+                data.get('train_throughput'), f'{label}.train_throughput', project=dict,
+            ),
             # ι=1894: live retries-per-landing + drift-at-detection metrics
             'metrics': dict(data.get('live_metrics') or {}),
         }
@@ -816,6 +837,27 @@ def shape_costs(
 # ESCALATIONS
 # ---------------------------------------------------------------------------
 
+_ESCALATION_CARD_FIELDS: tuple[str, ...] = ('id', 'title', 'status')
+"""What ``tab_escalations.jsx::EscalationSidebar`` reads of a card; it reads the prose on demand from ``api/task_prose.py``."""
+
+
+def _wire_card(card: object, field: str, served_at: datetime) -> dict[str, object]:
+    """*card*, a ``tasks._shape_task`` row's Datum, wired at *served_at* as :data:`_ESCALATION_CARD_FIELDS`.
+
+    A known card lacking one of those fields is a wiring bug and raises
+    ``VALUE_CONTRACT``, naming *field* and the missing keys.
+    """
+    def project(row: Mapping[str, Any]) -> dict[str, Any]:
+        missing = [key for key in _ESCALATION_CARD_FIELDS if key not in row]
+        if missing:
+            raise DatumContractError(
+                DatumInvariant.VALUE_CONTRACT,
+                f'{field} lacks card field(s) {missing}; it holds {sorted(row)}',
+            )
+        return {key: row[key] for key in _ESCALATION_CARD_FIELDS}
+
+    return _wire_served(card, field, served_at, project=project)
+
 
 def shape_escalations(
     queues: Mapping[str, Any],
@@ -826,11 +868,12 @@ def shape_escalations(
     """``{ESCALATIONS: {subsections, summary, views}, served_at}`` from ``build_escalation_queues``.
 
     Each row keeps its escalation fields and ``project``, and gains ``task``:
-    its card from *cards* (keyed by ``(subsection id, escalation id)``), wired
-    at *served_at*. Each subsection, and the top level, carries ``views``,
+    its card from *cards* (keyed by ``(subsection id, escalation id)``),
+    projected to :data:`_ESCALATION_CARD_FIELDS` and wired at *served_at*.
+    Each subsection, and the top level, carries ``views``,
     every :class:`~dashboard.data.escalation_corpus.EscalationView` wired the
     same way. A row with no card or a missing view is a wiring bug and raises
-    ``DATUM_REQUIRED``.
+    ``DATUM_REQUIRED``; a card lacking a card field raises ``VALUE_CONTRACT``.
 
     ``skipped`` (the queue's unreadable files) and ``summary.skipped_count``
     sit beside the counts they qualify (INV-2), copied so the payload never
@@ -843,7 +886,7 @@ def shape_escalations(
         rows = [
             {
                 **{k: v for k, v in esc.items() if k != 'project_root'},
-                'task': _wire_served(
+                'task': _wire_card(
                     cards.get((sub_id, esc.get('id'))),
                     f"ESCALATIONS {label} {esc.get('id')} task", served_at,
                 ),
@@ -1024,7 +1067,7 @@ def shape_burndown(
     UNKNOWN.  The aggregate is as of its OLDEST contribution, STALE when any
     project is carried or the newest sample is past the bound, and a
     LOWER_BOUND when a listed project has nothing measured —
-    ``static/redux/datum.js::combinedDatum``'s rules, applied where the
+    ``static/redux/datum.js::lowerBoundCombinedDatum``'s rules, applied where the
     aggregate is built.  A forecast absent for want of 7 days of history is
     UNKNOWN.  Every reason is built from the data alone, so shaping one
     series at two instants past the bound gives one payload.
@@ -1039,18 +1082,24 @@ def shape_burndown(
       contributing row is a hole, and a hole anywhere is a hole (None) in the
       total, never a 0.  Each aggregate series is always ``len(labels)``.
     * Each ``BURNDOWN_BY_PROJECT[p]`` block carries that project's OWN
-      measured rows, generally SHORTER than the union row.  Its series are
-      copied verbatim, so they are co-length with that row exactly as far as
-      the caller made them so — :func:`~dashboard.data.burndown.get_burndown_series`
+      measured rows, generally SHORTER than the union row.  It sends that
+      row as ``label_spans`` — half-open ``[start, stop)`` index ranges into
+      ``BURNDOWN['labels']``, in the row's own order — rather than repeating
+      the timestamps.  The client recovers the row with
+      ``static/redux/burndown_bands.js::projectBurndownBlock``, Python with
+      ``data/label_spans.py::labels_from_spans``.  Its series are copied
+      verbatim, so they are co-length with that row exactly as far as the
+      caller made them so — :func:`~dashboard.data.burndown.get_burndown_series`
       appends one value per key per snapshot row, which is what establishes
       the invariant; this function preserves it but does not enforce it (a
       ragged input is passed through unnormalized, with ``completed`` /
       ``velocity`` zeroed by the length guard in ``compute_window_completion``).
 
-    So a consumer must pair per-project values with per-project ``labels``.
-    Pairing them with ``BURNDOWN['labels']`` both overruns the values and
-    index-shifts them onto the wrong timestamps — the defect fixed at the
-    per-project status-mix chart in ``static/redux/tabs.jsx``.
+    So a consumer must pair per-project values with the project's OWN decoded
+    row, never with the union.  Pairing them with ``BURNDOWN['labels']`` both
+    overruns the values and index-shifts them onto the wrong timestamps — the
+    defect fixed at the per-project status-mix chart in
+    ``static/redux/tabs.jsx``.
 
     Per-project rows are deliberately not densified onto the union row: a
     0-fill would assert a measurement that was never taken, and a carried or
@@ -1086,14 +1135,14 @@ def shape_burndown(
         {pid: _newest_label(series) for pid, series in raw.items()}, served_at,
     )
 
+    union_labels = sorted({label for series in raw.values() for label in series.get('labels') or []})
     by_project = {
         pid: _project_block(
-            raw[pid], filled[pid], completions[pid], provenance[pid], served_at,
+            raw[pid], filled[pid], completions[pid], provenance[pid], served_at, union_labels,
         )
         for pid in raw
     }
 
-    union_labels = sorted({label for series in raw.values() for label in series.get('labels') or []})
     aggregate: dict[str, Any] = {
         'labels': union_labels,
         **_carry_last_sum(filled.values(), union_labels),
@@ -1117,11 +1166,14 @@ def _project_block(
     completion: Mapping[str, Any],
     provenance: _Provenance,
     served_at: datetime,
+    union_labels: Sequence[str],
 ) -> dict[str, Any]:
     """One project's own measured rows, its two served Datums and its parity verdict.
 
-    Parity reads the RAW *series*: *filled*'s census fill of a missing split
-    is display-only and never compared against the cap.
+    The rows' labels go out as spans over *union_labels*; everything else is
+    read from the project's own row.  Parity reads the RAW *series*:
+    *filled*'s census fill of a missing split is display-only and never
+    compared against the cap.
     """
     labels = list(series.get('labels') or [])
     columns = {key: list(filled.get(key) or []) for key in _BURNDOWN_KEYS}
@@ -1130,7 +1182,7 @@ def _project_block(
         **{field: completion[field] for field in _COMPLETION_FIELDS},
     }
     return {
-        'labels': labels,
+        'label_spans': label_spans(labels, union_labels),
         **columns,
         'completed_per_day': completion['completed_per_day'],
         'latest': _served_datum(latest, provenance, served_at),
@@ -1193,7 +1245,7 @@ def _burndown_provenance(
 def _aggregate_provenance(
     as_of: datetime, carried: Mapping[str, str], unmeasured: list[str], age_reason: str | None,
 ) -> _Provenance:
-    """The total's provenance by ``static/redux/datum.js::combinedDatum``'s rules.
+    """The total's provenance by ``static/redux/datum.js::lowerBoundCombinedDatum``'s rules.
 
     As of the oldest contribution; LOWER_BOUND over STALE over FRESH; one
     reason part per carried or unmeasured project, and one for the newest

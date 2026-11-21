@@ -1,0 +1,36 @@
+{
+  "task_id": "4496",
+  "reason": "Net-additive work for task 4496: the delivered_checks rescue disclosure in merge_lane/landing_evidence.py (cognitive +3) and new test coverage asserting landing_evidence_rejected rows at the ancestry gate arm and the reconcile-stranded sweep (private_reads +17 across the two harness test files). Re-recorded after merging main, which retired merge_lane_ratchet_authorized_raises.json (task 7298).",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+      "baseline": 151,
+      "current": 154
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_already_landed_gate_wiring.py",
+      "baseline": 282,
+      "current": 291
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_reconcile_stranded.py",
+      "baseline": 185,
+      "current": 193
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4999,
+      "current": 5002
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6586,
+      "current": 6603
+    }
+  ]
+}

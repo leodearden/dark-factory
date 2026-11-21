@@ -399,7 +399,7 @@ async def _drive_verifier_loop_blocking_get(
 
 @pytest.mark.asyncio
 class TestDispatchErrorChokepoint:
-    """DISPATCH path fault injection: _dispatch_item raises.
+    """DISPATCH path fault injection: VerifyDispatcher.dispatch raises.
 
     RED until step-4 GREEN routes both dispatch except-handlers through
     _resolve_and_release. RED marker: the chokepoint spy call count is 0
@@ -425,10 +425,10 @@ class TestDispatchErrorChokepoint:
         item.permit = permit
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _raising_dispatch(_item: Any) -> Any:
+        async def _raising_dispatch(item: Any) -> Any:
             raise Exception('boom')
 
-        worker._dispatch_item = _raising_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _raising_dispatch
 
         depth0 = worker.snapshot()['speculation']['slot_available']
 
@@ -458,7 +458,7 @@ class TestDispatchErrorChokepoint:
     async def test_dispatch_cancelled_error_propagates_and_skips_chokepoint(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """CancelledError from _dispatch_item must propagate out of
+        """CancelledError from VerifyDispatcher.dispatch must propagate out of
         _verifier_loop untouched; the chokepoint must never see it.
         """
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -470,10 +470,10 @@ class TestDispatchErrorChokepoint:
         worker._register_owned_merge_worktree(item.merge_wt)
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _cancelling_dispatch(_item: Any) -> Any:
+        async def _cancelling_dispatch(item: Any) -> Any:
             raise asyncio.CancelledError()
 
-        worker._dispatch_item = _cancelling_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _cancelling_dispatch
 
         worker._verifier_queue.put_nowait(item)
         worker._verifier_queue.put_nowait(None)
@@ -504,10 +504,10 @@ class TestDispatchErrorChokepoint:
         item.permit = permit
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _raising_dispatch(_item: Any) -> Any:
+        async def _raising_dispatch(item: Any) -> Any:
             raise Exception('boom')
 
-        worker._dispatch_item = _raising_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _raising_dispatch
 
         # Simulate the waiter detaching before the dispatch error fires.
         assert req.result.cancel()
@@ -544,7 +544,7 @@ def _make_decided_item_and_entry(
 ) -> tuple[DecidedItem, InflightEntry]:
     """Build a DECIDED DecidedItem (immediate_outcome set, no real merge)
     and its passthrough InflightEntry (verify_task=None, lease=None,
-    merge_wt=None) — the shape _dispatch_item returns for conflict /
+    merge_wt=None) — the shape VerifyDispatcher.dispatch returns for conflict /
     already_merged / skip_verify items.
     """
     immediate_outcome = MergeOutcome('blocked', reason='decided-elsewhere')
@@ -592,13 +592,13 @@ class TestPassthroughFinalizeErrorChokepoint:
         item, entry = _make_decided_item_and_entry(req, was_speculative=True)
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _passthrough_dispatch(_item: Any) -> Any:
+        async def _passthrough_dispatch(item: Any) -> Any:
             return entry
 
         async def _raising_finalize(_entry: Any) -> Any:
             raise Exception('boom')
 
-        worker._dispatch_item = _passthrough_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _passthrough_dispatch
         worker._finalize_inflight = _raising_finalize  # type: ignore[method-assign]
 
         depth0 = worker.snapshot()['speculation']['slot_available']
@@ -645,13 +645,13 @@ class TestPassthroughFinalizeErrorChokepoint:
         item, entry = _make_decided_item_and_entry(req, was_speculative=True)
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _passthrough_dispatch(_item: Any) -> Any:
+        async def _passthrough_dispatch(item: Any) -> Any:
             return entry
 
         async def _cancelling_finalize(_entry: Any) -> Any:
             raise asyncio.CancelledError()
 
-        worker._dispatch_item = _passthrough_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _passthrough_dispatch
         worker._finalize_inflight = _cancelling_finalize  # type: ignore[method-assign]
 
         with pytest.raises(asyncio.CancelledError):
@@ -711,7 +711,7 @@ class TestFinalizeHeadErrorChokepoint:
             permit=permit,
         )
 
-        async def _dispatch_returns_entry(_item: Any) -> Any:
+        async def _dispatch_returns_entry(item: Any) -> Any:
             return entry
 
         async def _raising_finalize(_entry: Any) -> Any:
@@ -726,7 +726,7 @@ class TestFinalizeHeadErrorChokepoint:
             worker._speculation_ledger.release(_entry.permit)
             raise Exception('boom')
 
-        worker._dispatch_item = _dispatch_returns_entry  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _dispatch_returns_entry
         worker._finalize_inflight = _raising_finalize  # type: ignore[method-assign]
 
         class _StubAllocator:
@@ -816,13 +816,13 @@ class TestFinalizeHeadErrorChokepoint:
             was_speculative=True,
         )
 
-        async def _dispatch_returns_entry(_item: Any) -> Any:
+        async def _dispatch_returns_entry(item: Any) -> Any:
             return entry
 
         async def _cancelling_finalize(_entry: Any) -> Any:
             raise asyncio.CancelledError()
 
-        worker._dispatch_item = _dispatch_returns_entry  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _dispatch_returns_entry
         worker._finalize_inflight = _cancelling_finalize  # type: ignore[method-assign]
 
         class _StubAllocator:
@@ -942,13 +942,13 @@ class TestCascadeErrorChokepoint:
         # ── Inject killer: _remerge raises RuntimeError for req_b's task_id ─
         _original_remerge = worker._remerge
 
-        async def _killer_remerge(req: Any, started_mono: Any) -> Any:
+        async def _killer_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             if req.task_id == 'rrcas-b':
                 raise RuntimeError(
                     'Failed to create merge worktree: '
                     '/repo/.worktrees/rrcas-b No space left on device'
                 )
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _killer_remerge  # type: ignore[method-assign]
 
@@ -1151,13 +1151,13 @@ class TestCascadeErrorChokepoint:
         # ── Inject killer: _remerge raises RuntimeError for req_b's task_id ─
         _original_remerge = worker._remerge
 
-        async def _killer_remerge(req: Any, started_mono: Any) -> Any:
+        async def _killer_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             if req.task_id == 'rrcdc-b':
                 raise RuntimeError(
                     'Failed to create merge worktree: '
                     '/repo/.worktrees/rrcdc-b No space left on device'
                 )
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _killer_remerge  # type: ignore[method-assign]
 
@@ -1472,7 +1472,7 @@ class TestCascadeErrorChokepoint:
             git_ops, q, verifier=verifier,
         )
         _inject_two_host_allocator(worker, gated_remote)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
         calls = _spy_on_resolve_and_release(worker)
 
         loop = asyncio.get_running_loop()
@@ -1494,9 +1494,9 @@ class TestCascadeErrorChokepoint:
         _original_remerge = worker._remerge
         remerge_task_ids: list[str] = []
 
-        async def _spy_remerge(req: Any, started_mono: Any) -> Any:
+        async def _spy_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             remerge_task_ids.append(req.task_id)
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _spy_remerge  # type: ignore[method-assign]
 

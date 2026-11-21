@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 
 import pytest
 import pytest_asyncio
@@ -222,3 +223,48 @@ class TestSharedConnectionAtomicity:
         await reg.close()
 
         assert await reg.checkpoint() == CheckpointResult.unavailable()
+
+
+async def _seed_registry(data_dir, *planned_uuids: str) -> None:
+    writer = PlannedEpisodeRegistry(data_dir=data_dir)
+    await writer.initialize()
+    for episode_uuid in planned_uuids:
+        await writer.register(episode_uuid, 'proj')
+    await writer.close()
+
+
+class TestOpenReadOnly:
+    @pytest.mark.asyncio
+    async def test_reads_rows_a_writer_committed(self, tmp_path):
+        await _seed_registry(tmp_path / 'queue', 'ep-1')
+
+        ro = await PlannedEpisodeRegistry.open_read_only(tmp_path / 'queue')
+        try:
+            assert await ro.get_planned_uuids('proj') == {'ep-1'}
+        finally:
+            await ro.close()
+
+    @pytest.mark.asyncio
+    async def test_refuses_writes(self, tmp_path):
+        await _seed_registry(tmp_path / 'queue', 'ep-1')
+
+        ro = await PlannedEpisodeRegistry.open_read_only(tmp_path / 'queue')
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                await ro.register('ep-2', 'proj')
+        finally:
+            await ro.close()
+
+        rw = PlannedEpisodeRegistry(data_dir=tmp_path / 'queue')
+        await rw.initialize()
+        try:
+            assert await rw.get_planned_uuids('proj') == {'ep-1'}
+        finally:
+            await rw.close()
+
+    @pytest.mark.asyncio
+    async def test_a_missing_database_raises_and_creates_nothing(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            await PlannedEpisodeRegistry.open_read_only(tmp_path / 'absent')
+
+        assert not (tmp_path / 'absent').exists()

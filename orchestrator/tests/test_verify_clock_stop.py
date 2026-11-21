@@ -17,11 +17,10 @@ import asyncio
 import collections
 import re
 import types
-from importlib import resources as pkg_resources
 from pathlib import Path
 
 import pytest
-import yaml
+from _packaged_defaults import load_packaged_defaults
 from pydantic import ValidationError
 from shared.testing_timeout_markers import DELIBERATE_TIGHT_BOUND_CEILING
 from shared.testing_virtual_clock import virtual_clock_test
@@ -42,12 +41,6 @@ _TERMINATE_GRACE_SECS = 5.0
 _UNREACHED_RUN_CMD_TIMEOUT_SECS = 10.0
 _WORST_CASE_SECS = _UNREACHED_RUN_CMD_TIMEOUT_SECS + 2 * _TERMINATE_GRACE_SECS
 REAL_SUBPROCESS_TEST_TIMEOUT = int(3 * _WORST_CASE_SECS)
-
-
-def _load_package_defaults() -> dict:
-    """Read the shipped defaults.yaml so tests stay in sync automatically."""
-    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
-    return yaml.safe_load(defaults_file.read_text())
 
 
 def _make_clock_stop_cfg(
@@ -123,7 +116,7 @@ class TestClockStopConfigDefaults:
     def test_defaults_yaml_marker_stop(self):
         """defaults.yaml ships the @@REIFY_CLOCK_STOP@@ marker string."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_clock_stop_marker_stop == defaults['verify_clock_stop_marker_stop']
         assert config.verify_clock_stop_marker_stop == '@@REIFY_CLOCK_STOP@@'
 
@@ -131,7 +124,7 @@ class TestClockStopConfigDefaults:
     def test_defaults_yaml_marker_heartbeat(self):
         """defaults.yaml ships the @@REIFY_CLOCK_HEARTBEAT@@ marker string."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_clock_stop_marker_heartbeat == defaults['verify_clock_stop_marker_heartbeat']
         assert config.verify_clock_stop_marker_heartbeat == '@@REIFY_CLOCK_HEARTBEAT@@'
 
@@ -139,7 +132,7 @@ class TestClockStopConfigDefaults:
     def test_defaults_yaml_marker_start(self):
         """defaults.yaml ships the @@REIFY_CLOCK_START@@ marker string."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_clock_stop_marker_start == defaults['verify_clock_stop_marker_start']
         assert config.verify_clock_stop_marker_start == '@@REIFY_CLOCK_START@@'
 
@@ -147,7 +140,7 @@ class TestClockStopConfigDefaults:
     def test_defaults_yaml_heartbeat_idle_max(self):
         """defaults.yaml ships verify_clock_stop_heartbeat_idle_max == 180."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_clock_stop_heartbeat_idle_max == defaults['verify_clock_stop_heartbeat_idle_max']
         assert config.verify_clock_stop_heartbeat_idle_max == 180.0
 
@@ -155,7 +148,7 @@ class TestClockStopConfigDefaults:
     def test_defaults_yaml_max_total_secs(self):
         """defaults.yaml ships verify_clock_stop_max_total_secs == 0 (unlimited)."""
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_clock_stop_max_total_secs == defaults['verify_clock_stop_max_total_secs']
         assert config.verify_clock_stop_max_total_secs == 0.0
 

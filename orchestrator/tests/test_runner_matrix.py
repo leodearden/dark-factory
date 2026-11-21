@@ -53,7 +53,7 @@ def patch_load_task(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture()
 def single_task_matrix_case(
-    patch_load_task,  # noqa: ARG001 — applied for side-effect (load_task stub)
+    patch_load_task,  # applied for side-effect (load_task stub)
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):

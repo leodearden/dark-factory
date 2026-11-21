@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _git_fixtures import seed_repo
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -41,10 +42,7 @@ from orchestrator.warm_lane_pool import LaneState, WarmLanePool, WarmLanePoolShr
 def ig_git_repo(tmp_path: Path) -> Path:
     """Temporary git repo with an initial commit, a warm base and pool-root sentinel."""
     repo = seed_repo(tmp_path / 'repo')
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    seed_default_warm_base(repo)
     return repo
 
 
@@ -77,7 +75,8 @@ def _git_config() -> GitConfig:
 
 def _make_orch_config(repo: Path, *, max_concurrent_tasks: int) -> OrchestratorConfig:
     return OrchestratorConfig(
-        project_root=repo, max_concurrent_tasks=max_concurrent_tasks, git=_git_config(),
+        project_root=repo, max_concurrent_tasks=max_concurrent_tasks,
+        main_health_fix_reserved_slots=0, git=_git_config(),
     )
 
 
@@ -168,7 +167,7 @@ async def _acquire_three_live_lanes(git_ops: GitOps) -> str:
         assert isinstance(wt, WorktreeInfo), f'acquire for {task_id} failed: {wt!r}'
 
     lane2 = base / '_lane-2'
-    ta = TaskArtifacts(lane2, TaskArtifacts.meta_root_for(base, lane2.name))
+    ta = TaskArtifacts.for_task(lane2, '43')
     ta.init('43', _title('43'), 'd')
     ta.write_plan(_make_plan(3, 5, '43'))
     (lane2 / 'wip43.txt').write_text('task 43 work in progress\n')

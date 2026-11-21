@@ -35,6 +35,7 @@ import types
 from pathlib import Path
 
 import pytest
+from _seed_script_stubs import seed_default_warm_base
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
@@ -90,10 +91,7 @@ def git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
     repo.mkdir()
     asyncio.run(_init_repo(repo))
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    seed_default_warm_base(repo)
     return repo
 
 
@@ -238,7 +236,7 @@ class TestB4HonestZero:
         lifecycle = git_ops._lane_lifecycle
         lifecycle.note_assigned('_lane-7', task_id='44')
         _make_task_artifacts(worktree_base, '_lane-7', '44')
-        empty_log = TaskArtifacts.meta_root_for(worktree_base, '_lane-7') / 'iterations.jsonl'
+        empty_log = TaskArtifacts.task_root_for(worktree_base, '44') / 'iterations.jsonl'
         empty_log.write_text('')
 
         by_task, offline = _tool_runtime_tasks(git_ops, tmp_path)

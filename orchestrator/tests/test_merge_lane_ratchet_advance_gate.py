@@ -32,7 +32,7 @@ from _merge_lane_ratchet_fixtures import (
     GATE_IMPORT_CLOSURE,
     RatchetRepo,
     a_py_cognitive_raise,
-    metrics,
+    ratchet,
     record,
     synthetic_report,
 )
@@ -55,7 +55,7 @@ def _advance(repo: RatchetRepo, old: str, new: str) -> subprocess.CompletedProce
     return subprocess.run(
         [
             sys.executable,
-            str(_REPO_ROOT / metrics.ADVANCE_GATE_RELPATH),
+            str(_REPO_ROOT / ratchet.ADVANCE_GATE_RELPATH),
             '--root',
             str(repo.root),
             old,
@@ -121,7 +121,7 @@ def _land(
 
 def _how_to_lines(stderr: str, base: str) -> list[str]:
     """The advance-specific how-to lines: they restore *base*'s baseline on the branch."""
-    restore = f'git checkout {base} -- {metrics.BASELINE_RELPATH}'
+    restore = f'git checkout {base} -- {ratchet.BASELINE_RELPATH}'
     return [
         line
         for line in stderr.splitlines()
@@ -157,7 +157,7 @@ class TestTheAdvanceAuditor:
 
         assert result.returncode == 1, result.stdout + result.stderr
         assert 'cognitive rose 120 -> 125 for a.py' in result.stderr
-        assert metrics.RAISE_REMEDY in result.stderr
+        assert ratchet.RAISE_REMEDY in result.stderr
         how_to = _how_to_lines(result.stderr, old)
         assert how_to, result.stderr
         assert '--write-baseline' in how_to[0] and '--authorize-raise' in how_to[0]
@@ -274,7 +274,7 @@ class TestTheAdvanceAuditor:
     def test_an_advance_deleting_the_baseline_is_refused(self, tmp_path: Path) -> None:
         repo = RatchetRepo.seeded(tmp_path)
         _fork(repo)
-        repo.git('rm', '--quiet', '--', metrics.BASELINE_RELPATH)
+        repo.git('rm', '--quiet', '--', ratchet.BASELINE_RELPATH)
         repo.commit_all('delete the baseline')
         old, new = _land(repo, _TASK_BRANCH)
 
@@ -282,7 +282,7 @@ class TestTheAdvanceAuditor:
 
         assert result.returncode == 1, result.stdout + result.stderr
         assert 'delete' in result.stderr.lower()
-        assert metrics.BASELINE_RELPATH in result.stderr
+        assert ratchet.BASELINE_RELPATH in result.stderr
 
     @pytest.mark.parametrize('rewrite', ['modify', 'delete'])
     def test_rewriting_a_recorded_entry_is_a_policy_refusal(
@@ -290,7 +290,7 @@ class TestTheAdvanceAuditor:
     ) -> None:
         repo = RatchetRepo.seeded(tmp_path)
         history = repo.write_entry(
-            record([metrics.Violation.rose('cognitive', 'a.py', 110, 120)], '5485')
+            record([ratchet.Violation.rose('cognitive', 'a.py', 110, 120)], '5485')
         )
         repo.commit_all('record a historical raise')
         _fork(repo)
@@ -311,14 +311,14 @@ class TestTheAdvanceAuditor:
     ) -> None:
         repo = RatchetRepo.seeded(tmp_path)
         _fork(repo)
-        repo.write_file(metrics.LEGACY_LEDGER_RELPATH, '{"raises": []}\n')
+        repo.write_file(ratchet.LEGACY_LEDGER_RELPATH, '{"raises": []}\n')
         repo.commit_all('stage the retired ledger back')
         old, new = _land(repo, _TASK_BRANCH)
 
         result = _advance(repo, old, new)
 
         assert result.returncode == 1, result.stdout + result.stderr
-        assert metrics.LEGACY_LEDGER_RELPATH in result.stderr
+        assert ratchet.LEGACY_LEDGER_RELPATH in result.stderr
 
     def test_an_entry_not_named_for_its_content_is_an_instrument_failure(
         self, tmp_path: Path
@@ -326,8 +326,8 @@ class TestTheAdvanceAuditor:
         repo = RatchetRepo.seeded(tmp_path)
         _fork(repo)
         repo.write_file(
-            f'{metrics.LEDGER_DIR_RELPATH}/5722-guessed.json',
-            metrics.render_entry(record([], '5722')),
+            f'{ratchet.LEDGER_DIR_RELPATH}/5722-guessed.json',
+            ratchet.render_entry(record([], '5722')),
         )
         repo.commit_all('hand-write an entry under a guessed name')
         old, new = _land(repo, _TASK_BRANCH)
@@ -345,7 +345,7 @@ class TestTheAdvanceAuditor:
         self, tmp_path: Path
     ) -> None:
         repo = RatchetRepo.seeded(tmp_path)
-        repo.git('rm', '--quiet', '--', metrics.BASELINE_RELPATH)
+        repo.git('rm', '--quiet', '--', ratchet.BASELINE_RELPATH)
         repo.commit_all('main without a baseline')
         _fork(repo)
         _commit(repo, 'introduce the baseline', baseline=_a_py_cognitive(125))
@@ -508,7 +508,7 @@ class TestTheAdvanceHonoursTheRestoreCarveOut:
     ) -> None:
         repo, _previous = self._main_with_a_lowering(tmp_path)
         _fork(repo)
-        repo.write_baseline_text(metrics.render_baseline(_a_py_cognitive(129)) + '\n')
+        repo.write_baseline_text(ratchet.render_baseline(_a_py_cognitive(129)) + '\n')
         repo.commit_all('restore the previous measures under other bytes')
         old, new = _land(repo, _TASK_BRANCH)
 
@@ -543,7 +543,7 @@ class TestTheAdvanceHonoursTheRestoreCarveOut:
 _HOOK = 'hooks/reference-transaction'
 
 #: What the copied hook needs to run the auditor.
-_AUDITOR_FILES = (metrics.ADVANCE_GATE_RELPATH, *GATE_IMPORT_CLOSURE)
+_AUDITOR_FILES = (ratchet.ADVANCE_GATE_RELPATH, *GATE_IMPORT_CLOSURE)
 
 
 def _install_advance_hook(repo: RatchetRepo, *, with_auditor: bool = True) -> None:
@@ -628,7 +628,7 @@ class TestTheHookGatesEveryMoveOfMain:
         old = repo.git('rev-parse', 'HEAD')
         _install_advance_hook(repo)
         repo.write_baseline(_a_py_cognitive(125))
-        repo.stage(metrics.BASELINE_RELPATH)
+        repo.stage(ratchet.BASELINE_RELPATH)
 
         result = repo.attempt('commit', '--no-verify', '-m', 'raise a.py on main')
 
@@ -747,10 +747,10 @@ class TestTheHookGatesEveryMoveOfMain:
         # carries duplicates that must still name the real paths.
         source = (_REPO_ROOT / _HOOK).read_text(encoding='utf-8')
 
-        assert metrics.BASELINE_RELPATH in source
-        assert metrics.LEDGER_DIR_RELPATH in source
-        assert metrics.LEGACY_LEDGER_RELPATH in source
-        assert metrics.ADVANCE_GATE_RELPATH in source
+        assert ratchet.BASELINE_RELPATH in source
+        assert ratchet.LEDGER_DIR_RELPATH in source
+        assert ratchet.LEGACY_LEDGER_RELPATH in source
+        assert ratchet.ADVANCE_GATE_RELPATH in source
 
     def test_the_real_hook_is_executable(self) -> None:
         # git silently ignores a hook it cannot execute, and the copy-and-chmod

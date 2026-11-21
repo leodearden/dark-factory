@@ -3,7 +3,8 @@
 
 server:
   transport: "http"
-  host: "0.0.0.0"
+  # Loopback only; also the bind host of the self-bound server.recon_report_port.
+  host: "127.0.0.1"
   port: 8002
   stateless_http: true
   json_response: true
@@ -41,7 +42,8 @@ llm:
   # OPENAI_API_BASE environment variables that the openai SDK and mem0 would
   # otherwise fall back to. If you route OpenAI traffic through a gateway by
   # exporting OPENAI_BASE_URL, set OPENAI_API_URL (or edit api_url) to the same
-  # value — otherwise traffic goes to whatever is written here. A disagreement
+  # value — otherwise traffic goes to whatever is written here. The routing LLM
+  # inherits it too, unless routing.openai_api_url is set. A disagreement
   # is logged as a warning at client construction.
   providers:
     openai:
@@ -91,6 +93,11 @@ routing:
   confidence_threshold: 0.7
   use_heuristics: true
   llm_fallback: true
+  # The routing LLM's own endpoint and key (add_memory auto-classification and
+  # read routing); null inherits llm.providers.openai.api_url / api_key. See
+  # config/schema.py::RoutingConfig.
+  openai_api_url: null
+  openai_api_key: null
 
 queue:
   semaphore_limit: ${SEMAPHORE_LIMIT:3}
@@ -167,7 +174,6 @@ queue:
 # ─────────────────────────────────────────────────────────────────────────────
 taskmaster:
   project_root: "${PROJECT_ROOT:.}"
-  tool_mode: "all"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # write_journal — RED-TIER / restart-only. Every journal table with a horizon is
@@ -268,6 +274,10 @@ taskmaster:
 # referent_findings_retention_days (task 5551) ages out the referent diagnosis
 # log at startup. Measured 2026-10-31: 416 rows from 2026-09-17 to 2026-10-31,
 # ~12.6/day, so the 365-day horizon keeps ~4.6k rows.
+#
+# mem0_intents_retention_days ages out terminal mem0_intents at startup (which
+# statuses count: services/write_journal.py::WriteJournal.prune_mem0_intents).
+# idempotent_ops_retention_days ages out idempotent_ops client keys at startup.
 # ─────────────────────────────────────────────────────────────────────────────
 write_journal:
   read_retention_days: ${WRITE_JOURNAL_READ_RETENTION_DAYS:30}
@@ -278,6 +288,8 @@ write_journal:
   prune_max_seconds: ${WRITE_JOURNAL_PRUNE_MAX_SECONDS:30}
   prune_interval_seconds: ${WRITE_JOURNAL_PRUNE_INTERVAL_SECONDS:1800}
   referent_findings_retention_days: ${WRITE_JOURNAL_REFERENT_FINDINGS_RETENTION_DAYS:365}
+  mem0_intents_retention_days: ${WRITE_JOURNAL_MEM0_INTENTS_RETENTION_DAYS:30}
+  idempotent_ops_retention_days: ${WRITE_JOURNAL_IDEMPOTENT_OPS_RETENTION_DAYS:7}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # write_journal_growth_alarm — RED-TIER / restart-only (task 3311). Every
@@ -354,6 +366,7 @@ reconciliation:
       - wip-requeue-plan-step-attribution
   # Phase 2 enforcement of done_provenance: require commit|note payload on done transitions
   require_done_provenance: true
+  # A relative value is anchored at the checkout holding fused-memory/, not the process CWD (fused_memory/config/checkout_anchor.py).
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
   buffer_size_threshold: 250
   max_staleness_seconds: 14400
@@ -478,11 +491,12 @@ reconciliation:
   # DENY-ON-MISSING: a caller whose resolved identity matches no prefix here is
   # refused, and an EMPTY list denies EVERY caller — that empty value is the
   # incident knob, and it is green-tier so it lands on the next call rather than
-  # after a restart. Only 'orchestrator' by default: the orchestrator sends no
-  # agent_id, so the identity resolver falls back to the clientInfo.name its MCP
-  # session advertises, which is that literal. NOTE the identity this bar reads
-  # is SELF-REPORTED, so it deters a cooperating caller rather than enforcing a
-  # boundary. Shown at its shipped default; uncomment to change.
+  # after a restart. Only 'orchestrator' by default: Scheduler.set_task_status
+  # sends agent_id='orchestrator' explicitly, because stateless HTTP drops
+  # clientInfo so the identity resolver has nothing to fall back to. NOTE the
+  # identity this bar reads is SELF-REPORTED, so it deters a cooperating caller
+  # rather than enforcing a boundary. Shown at its shipped default; uncomment
+  # to change.
   # deterministic_provenance_allowed_agent_prefixes: ['orchestrator']
   usage_cap:
     enabled: true
@@ -549,10 +563,11 @@ summary_rebuild:
 
 # In-place Mem0 amendment (task 3088) — the update_memory MCP tool, which
 # rewrites a record's content and/or metadata while PRESERVING its Qdrant point
-# id. All five leaves are green-tier hot-reloadable (see OPERATIONS.md §6).
+# id. Every leaf is green-tier hot-reloadable (see OPERATIONS.md §6).
 # Only metadata_patch_allowed_agent_prefixes is active; every commented value
-# below is the shipped default, shown so the knobs are discoverable without
-# reading the schema. Uncomment to change one.
+# below, except the agent_prefix_sanctioned_use placeholder, is the shipped
+# default, shown so the knobs are discoverable without reading the schema.
+# Uncomment to change one.
 mem0_update:
   # Kill switch. false denies every caller on the very next call, allowlisted
   # or not — this is the knob to flip during a runaway-rewrite incident.
@@ -566,12 +581,11 @@ mem0_update:
   #
   # curator- is part of the SCHEMA DEFAULT (ruling 2026-08-12, promoting the
   # 2026-08-11 esc-3524-1 ruling (b) from a per-machine override here to an
-  # all-deployments default): it admits the interactive memory-consolidation
-  # sitting defined by skills/curate-fused-memories, which cannot work
-  # without the grant. Both arms deliberately — gate 3200's retain-and-tag
-  # stamps retained peers via metadata-only patches, so content_amend alone
-  # would be the destructive half without the preserving half. Full
-  # rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
+  # all-deployments default). Both arms deliberately — gate 3200's
+  # retain-and-tag stamps retained peers via metadata-only patches, so
+  # content_amend alone would be the destructive half without the preserving
+  # half. The role each prefix declares is agent_prefix_sanctioned_use below.
+  # Full rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
   # content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
   #
   # link-heal- is owned by plans/write-triage-link-healing-prd.md H1 and task α
@@ -581,19 +595,41 @@ mem0_update:
   # for this arm, so a future change to Mem0UpdateConfig's default
   # metadata_patch_allowed_agent_prefixes must be mirrored here by hand.
   metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-', 'link-heal-']
+  # The role each prefix above declares, rendered into the
+  # Mem0UpdateNotAuthorized refusal for the refusing arm's prefixes. The
+  # shipped default (Mem0UpdateConfig.agent_prefix_sanctioned_use) documents
+  # every prefix on either default allowlist. Setting it here REPLACES that map
+  # wholesale, so restate every entry and add one for any prefix added to
+  # either list. agent_id is self-reported: this makes the norm legible, not
+  # the gate enforceable. Unlike the values above, the placeholder below is
+  # NOT the default and cannot be uncommented as-is: a bare key is YAML null
+  # and fails validation.
+  # agent_prefix_sanctioned_use: {...}  # restate every entry of Mem0UpdateConfig's default
   # Content-amend burst alarm: escalates, never blocks (a hard block would
   # risk a legitimate large consolidation cycle failing mid-run over its own
   # success count). Metadata-only calls do not count toward it.
   # storm_threshold: 20
   # storm_window_seconds: 3600.0
 
-# Link-heal executor caps and link adjudicator knobs (tasks 6181, 6184;
-# plans/write-triage-link-healing-prd.md H1, H2). Read by
-# fused-memory/scripts/link_heal.py and scripts/eval_link_adjudicator.py at each
-# run start, so an edit takes effect on the next run with no restart. Every
-# value below is the shipped default, shown so the knobs are discoverable.
-# Uncomment to change one.
-# link_heal:
+# Link-heal executor caps, link adjudicator knobs and the scheduled sweep
+# (tasks 6181, 6184, 7159; plans/write-triage-link-healing-prd.md H1, H2). Read
+# by fused-memory/scripts/link_heal.py and scripts/eval_link_adjudicator.py at
+# each run start, so an edit takes effect on the next run with no restart. The
+# commented values are the shipped defaults, shown so the knobs are
+# discoverable. Uncomment to change one.
+link_heal:
+  # The projects with write-triage children in the 2026-10-19 soak.
+  projects: [dark_factory, reify, solar_challenge, solar_challenge_platform, scoping_intake]
+  # Writes need a passing soak calibration and an operator flip (INV-12 owned hold; runbook: OPERATIONS.md).
+  writes: false
+#   # Heal actions a sweep may stage; the rest are recorded as not_enabled.
+#   sweep_actions: [detach, relabel]
+#   # How far back the first sweep looks; later sweeps resume from the last complete one.
+#   sweep_window_hours: 24
+#   # Calibration passes at no less than the raters' own kappa minus this.
+#   calibration_kappa_margin: 0.10
+#   # Rated pairs a project needs before calibration gates on it.
+#   calibration_min_project_items: 60
 #   # Write attempts per unattended run, oldest-planned first; the rest stay
 #   # pending as skipped_cap. 0 applies nothing unattended.
 #   max_actions_per_run: 25
@@ -773,7 +809,7 @@ write_triage:
   # On replay the 0.60 floor removed 28 contested misfiles for 2 correct
   # contests.
   min_parent_cosine: 0.60
-  # hoist_max_cosine_gap: in the judge band, refuse to hoist from the matched
+  # hoist_max_cosine_gap: on a judged write, refuse to hoist from the matched
   # child to its parent when the parent's cosine is more than this below the
   # child's; store standalone. On replay the 0.05 gap removed 32 contested
   # misfiles for 1 correct contest; with F1 (task 6956) contested misfile fell
@@ -782,14 +818,16 @@ write_triage:
   # JUDGE KNOBS (leaf gamma, task 3128) — also hand-set operator knobs, and
   # deliberately ABOVE the calibration fence below so --write-config preserves
   # them. Every judge knob is green-tier hot-reloadable and read live per
-  # middle-band write.
+  # judged write: every write from t_low up except a near-verbatim restatement
+  # (task 7155), so with the judge off the high band stores rather than files
+  # `restated`.
   #
   # judge_enabled: the kill switch for the LLM arm alone. Defaults TRUE,
   # unlike `enabled` above, because the judge is inert while triage is off —
   # and because a judge that had to be switched on SEPARATELY at the 3169 flip
   # is a footgun: the operator would flip `enabled`, get stub behaviour, and
   # read the all-`stored` ack stream as "the corpus is novel". Set false to
-  # stop an in-flight judge incident without disabling the deterministic bands.
+  # stop an in-flight judge incident without disabling the deterministic paths.
   judge_enabled: true
   # judge_provider / judge_model: null INHERITS llm.provider / llm.model, so
   # the judge follows the model this deployment already trusts for add_memory

@@ -11,61 +11,14 @@ update an existing plan without recreating it from scratch, and
 go through ``TaskArtifacts`` methods, preserving ``_session_id`` and
 enforcing correct schema.
 
-plan.json is also REPAIRED LAZILY ON READ.  Live plans in the fleet carry
-MCP tool-call envelope markup that leaked into their prose fields when the
-harness mis-closed an argument — a trailing mis-close, or a whole sibling
-parameter absorbed into the value before it.  Every entry point that opens
-an existing plan goes through :func:`_read_plan_repaired`, which repairs
-what it can, writes the result back through ``TaskArtifacts.write_plan``,
-and reports every repair and every refusal on the response's
-``markup_repairs`` key.  EVERY plan.json write -- repair write-back and
-tool mutation alike -- goes through that one method, which owns the byte
-format and the atomic/durable guarantee (task 3957): a concurrent reader
-observes either the complete old plan or the complete new one, never a
-partial write.  This module deliberately keeps NO writer of its own; the
-duplicate it used to carry existed only while ``TaskArtifacts`` was
-truncate-then-write.  No fleet quiesce is needed: the next tool call an agent makes fixes
-its own plan.  ``shared.toolcall_markup`` is the SINGLE owner of the
-literal set and of every accept/refuse decision (INV-5) — this module
-enumerates only WHICH plan fields are prose (``_REPAIRABLE_PLAN_FIELDS``),
-never what corruption looks like.
+plan.json is also repaired lazily on read: every entry point that opens an
+existing plan goes through :func:`_read_plan_repaired`, whose mechanism is
+``orchestrator/mcp/plan_markup_repair.py``.  That read-time repair COMPOSES
+with the write-time ``MarkupGuardMiddleware`` ``create_server`` registers;
+the ruling and its two consequences are D8 of
+``plans/toolcall-markup-containment-prd.md``.
 
-TWO MECHANISMS, ONE BOUNDARY EACH (task 4457's ruling — do not collapse them).
-The read-time repair above is NOT the only markup guard on this file:
-``create_server`` also registers
-:class:`shared.mcp_markup_middleware.MarkupGuardMiddleware` under
-``REJECT_WITH_REPAIR``, which guards INBOUND ARGUMENTS at the FastMCP request
-layer, before pydantic validation and before any tool body runs.  The three
-options were enumerated and COMPOSE was chosen:
-
-* SKIP (leave the read-time path as the only mechanism) — rejected.  It cannot
-  reject, cannot see inbound arguments at all, and cannot recover a swallowed
-  REQUIRED parameter; ``_create_plan`` is deliberately unhooked from it and
-  would stay wholly unguarded, on the server that owns 52 of the system's 95
-  unrepairable specimens.
-* SUPERSEDE (register and retire the read-time path) — rejected.  The two have
-  DISJOINT populations: the read-time path's is damage ALREADY LANDED in stored
-  plan.json, which the middleware repairs none of because it only ever sees
-  what an agent is sending NOW.
-* COMPOSE — chosen.  Different layers over different populations: inbound
-  arguments at the request layer, versus stored state at read time inside the
-  tool body.  INV-5 forbids a second ENUMERATION of the envelope literals and
-  there is none — both delegate every accept/refuse decision to
-  ``shared.toolcall_markup``.  D1 forbids per-boundary CALL SITES in place of a
-  blanket middleware, and the read-time path is not a per-boundary call site.
-
-Two consequences of that pairing are load-bearing, and both follow from the
-DECLARED policy rather than from coincidence:
-
-1. Under ``REJECT_WITH_REPAIR`` the middleware NEVER forwards a repaired
-   argument, so no middleware-repaired value can ever reach plan.json — which
-   is why the read-time path can never re-report the same damage as a second
-   fact.
-2. A rejected call short-circuits the tool body, so pre-existing STORED damage
-   is not repaired on that call.  That is a DEFERRAL, not a loss: the next
-   accepted call repairs it.  Do NOT "fix" it by invoking the read-time repair
-   from the middleware — that is exactly how two mechanisms on one boundary
-   become one tangled one.
+Heuristic 14's measurement of this file and its split: task 7082's commit.
 
 Usage (stdio transport, spawned by orchestrator):
     # Direct-interpreter no-uv hot path (production, task 1776):
@@ -80,19 +33,17 @@ from __future__ import annotations
 
 import argparse
 import ast
-import copy
 import functools
 import inspect
 import json
 import logging
 import re
-import subprocess
 import sys
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Concatenate, NamedTuple, ParamSpec, TypeVar
+from typing import Any, Concatenate, ParamSpec, TypeVar
 
 from fastmcp import FastMCP
 from shared.mcp_markup_middleware import (
@@ -102,11 +53,20 @@ from shared.mcp_markup_middleware import (
 )
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
-from shared.toolcall_markup import detect_for, repair
 
-from orchestrator import plan_descope
-from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp
+from orchestrator import plan_descope, quarantine_provenance
+from orchestrator.artifacts import Plan, PlanConfirmation, PlanState, TaskArtifacts
+from orchestrator.mcp import (
+    branch_probes,
+    foreign_task_meta,
+    markup_journal,
+    markup_sink,
+    plan_markup_repair,
+    plan_markup_stamp,
+)
+from orchestrator.mcp.branch_probes import Reachability
+from orchestrator.mcp.plan_markup_repair import PlanField
+from orchestrator.scope_drift import InvalidScopeRequest, ScopeRequest, pending_scope_paths
 
 logger = logging.getLogger(__name__)
 
@@ -208,67 +168,6 @@ def _coerce_files(files: object) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-class _PlanField(NamedTuple):
-    """One repairable plan field, and the tool schema it must validate against.
-
-    ``collection`` is the plan key holding a LIST OF DICTS the field lives in,
-    or ``None`` for a top-level plan key.
-
-    ``schema_params`` and ``target_keys`` are DELIBERATELY ASYMMETRIC, and the
-    asymmetry is the whole point of carrying both.
-
-    ``schema_params`` is the ORIGINATING TOOL'S FULL PARAMETER LIST. ``repair()``
-    needs it complete so it can RECOGNISE a tail that names any real parameter
-    of that call — a name outside the list is not a leaked argument at all and
-    the candidate is refused.
-
-    ``target_keys`` is the strictly smaller subset of those parameters that name
-    a PROSE PLAN KEY a recovered value may legally be written to, mapped to the
-    key to write it under. The two vocabularies are NOT the same: the tool's
-    parameter names and the plan document's key names differ. A parameter absent
-    from ``target_keys`` is one of three things, and none of them is a legal
-    recovery target:
-
-    * an identifier the plan stores under a different key — ``prereq_id`` and
-      ``step_id`` are both written as ``id``;
-    * an enum the plan stores under a different key — ``step_type`` is written
-      as ``type``;
-    * a non-prose value — ``files`` is a list, ``task_id`` an identifier.
-
-    Keying a recovery on the parameter name alone would therefore write a JUNK
-    KEY onto the record (``step_type`` beside the real, still-corrupt ``type``)
-    or a bare ``str`` over the ``files`` list. Both are silent-wrong-value
-    corruption of the plan artifact, which is the damage class this surface
-    exists to end.
-
-    ``also_written_by`` names the OTHER tools that write this same field, and
-    exists so the structured fact does not overstate its own precision. The
-    ``tool`` a fact reports is the collection's SCHEMA OWNER — the call whose
-    parameter vocabulary ``repair()`` validates against — which is not always
-    the call that produced the corruption: ``replace_plan_step`` also writes
-    ``steps[].description`` AND ``prerequisites[].description`` (its lookup loop
-    spans both collections), ``update_plan_metadata`` also writes ``analysis``,
-    and ``mark_step_committed`` ALSO writes ``steps[].description`` AND
-    ``prerequisites[].description`` — but differently from the other two: it
-    takes no ``description`` parameter at all. It re-reads the plan and
-    prepends ``TaskArtifacts.mark_step_committed``'s ``[COMMITTED <sha12>]``
-    provenance tag to whatever the field already held. It can therefore never
-    be the tail that INTRODUCES envelope markup into the field — it has no
-    prose argument to leak one from — but it IS a call site a triager may need
-    to account for when a ``[COMMITTED ...]``-prefixed description turns out
-    corrupt, which is why it is listed here despite writing no prose of its
-    own. Naming only the schema owner would send whoever triages a fact to the
-    wrong call site; naming the alternates alongside it keeps the diagnosis
-    honest without pretending the fact can identify the writer it cannot see.
-    """
-
-    collection: str | None
-    field: str
-    schema_params: tuple[str, ...]
-    target_keys: Mapping[str, str]
-    also_written_by: tuple[str, ...]
-
-
 def _params_of(fn: Callable[..., Any]) -> tuple[str, ...]:
     """The originating tool's parameter names, read off its LIVE signature.
 
@@ -328,7 +227,9 @@ _DROP_PLAN_FILE_TARGETS: Mapping[str, str] = MappingProxyType({'reason': 'reason
 #: ``mark_step_committed`` rewrites ``description`` by re-reading and
 #: rewriting the plan, never taking a ``description`` argument at all, so a
 #: signature-based check would have rejected it as an alternate despite it
-#: being a real one.
+#: being a real one. It prepends a ``[COMMITTED <sha12>]`` tag, so it cannot
+#: introduce markup, but a triager of a corrupt tagged description must
+#: still account for it.
 #:
 #: That check is SOUNDNESS only — it cannot catch a writer left OUT of this
 #: mapping. COMPLETENESS is the converse check,
@@ -374,617 +275,60 @@ _UPDATE_METADATA_ALSO: tuple[str, ...] = ('update_plan_metadata',)
 #: ``schema_params`` from (``_params_of`` needs them to exist). Annotated but
 #: deliberately UNBOUND here, so a use before that point raises a loud
 #: NameError instead of silently reading an empty table and repairing nothing.
-_REPAIRABLE_PLAN_FIELDS: tuple[_PlanField, ...]
+_REPAIRABLE_PLAN_FIELDS: tuple[PlanField, ...]
 
 
-def _build_repairable_plan_fields() -> tuple[_PlanField, ...]:
+def _plan_field(
+    collection: str | None,
+    field: str,
+    writer: Callable[..., Any],
+    target_keys: Mapping[str, str],
+    also_written_by: tuple[str, ...] = (),
+) -> PlanField:
+    """A row whose ``tool`` and ``schema_params`` are both read off *writer*."""
+    return PlanField(
+        collection,
+        field,
+        writer.__name__.removeprefix('_'),
+        _params_of(writer),
+        target_keys,
+        also_written_by,
+    )
+
+
+def _build_repairable_plan_fields() -> tuple[PlanField, ...]:
     """Construct :data:`_REPAIRABLE_PLAN_FIELDS`; see its docs above."""
     return (
-        _PlanField(None, 'title', _params_of(_create_plan), _CREATE_PLAN_TARGETS, ()),
-        _PlanField(
-            None,
-            'analysis',
-            _params_of(_create_plan),
-            _CREATE_PLAN_TARGETS,
-            _UPDATE_METADATA_ALSO,
+        _plan_field(None, 'title', _create_plan, _CREATE_PLAN_TARGETS),
+        _plan_field(
+            None, 'analysis', _create_plan, _CREATE_PLAN_TARGETS, _UPDATE_METADATA_ALSO
         ),
-        _PlanField(
+        _plan_field(
             'prerequisites',
             'description',
-            _params_of(_add_prerequisite),
+            _add_prerequisite,
             _ADD_PREREQUISITE_TARGETS,
             _DESCRIPTION_ALSO,
         ),
-        _PlanField(
-            'steps',
-            'description',
-            _params_of(_add_plan_step),
-            _ADD_PLAN_STEP_TARGETS,
-            _DESCRIPTION_ALSO,
+        _plan_field(
+            'steps', 'description', _add_plan_step, _ADD_PLAN_STEP_TARGETS, _DESCRIPTION_ALSO
         ),
-        _PlanField(
-            'design_decisions',
-            'decision',
-            _params_of(_add_design_decision),
-            _ADD_DESIGN_DECISION_TARGETS,
-            (),
+        _plan_field(
+            'design_decisions', 'decision', _add_design_decision, _ADD_DESIGN_DECISION_TARGETS
         ),
-        _PlanField(
-            'design_decisions',
-            'rationale',
-            _params_of(_add_design_decision),
-            _ADD_DESIGN_DECISION_TARGETS,
-            (),
+        _plan_field(
+            'design_decisions', 'rationale', _add_design_decision, _ADD_DESIGN_DECISION_TARGETS
         ),
-        _PlanField(
-            'reuse', 'what', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS, ()
-        ),
-        _PlanField(
-            'reuse', 'where', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS, ()
-        ),
-        _PlanField(
-            'reuse', 'how', _params_of(_add_reuse_item), _ADD_REUSE_ITEM_TARGETS, ()
-        ),
-        _PlanField(
-            'dropped_files',
-            'reason',
-            _params_of(_drop_plan_file),
-            _DROP_PLAN_FILE_TARGETS,
-            (),
-        ),
+        _plan_field('reuse', 'what', _add_reuse_item, _ADD_REUSE_ITEM_TARGETS),
+        _plan_field('reuse', 'where', _add_reuse_item, _ADD_REUSE_ITEM_TARGETS),
+        _plan_field('reuse', 'how', _add_reuse_item, _ADD_REUSE_ITEM_TARGETS),
+        _plan_field('dropped_files', 'reason', _drop_plan_file, _DROP_PLAN_FILE_TARGETS),
     )
-
-#: The collection's SCHEMA OWNER — the tool whose parameter vocabulary defines
-#: the collection's fields, and which ``repair()`` validates a recovery against.
-#: Reported as the structured fact's ``tool`` (contract C2's name, verbatim).
-#:
-#: NOT "the only tool that writes this collection", which would be false of this
-#: module: ``replace_plan_step`` also writes ``description`` on both ``steps``
-#: and ``prerequisites`` items, ``update_plan_metadata`` also writes
-#: ``analysis``, and ``mark_step_committed`` also writes ``description`` on
-#: both — without taking a ``description`` parameter at all. A fact therefore
-#: carries ``also_written_by`` beside ``tool`` (see :class:`_PlanField`) so a
-#: triager is not sent to a call site the corruption may never have passed
-#: through. Asserted callable via ``getattr(plan_tools, '_' + tool)`` by the
-#: repair tests, so the label cannot drift into prose.
-_COLLECTION_SCHEMA_TOOL: dict[str | None, str] = {
-    None: 'create_plan',
-    'prerequisites': 'add_prerequisite',
-    'steps': 'add_plan_step',
-    'design_decisions': 'add_design_decision',
-    'reuse': 'add_reuse_item',
-    'dropped_files': 'drop_plan_file',
-}
-
-
-def _is_authored(value: object) -> bool:
-    """True when *value* already holds real content, i.e. is NOT a hole.
-
-    A blank/whitespace-only str, ``None``, and an empty list/dict are holes a
-    recovery may legitimately fill. Anything else is authored content that a
-    recovery must never displace — including a NON-str value such as the
-    ``files`` list, which the string-only reading would have mistaken for a
-    hole and happily overwritten with a recovered string.
-    """
-    if isinstance(value, str):
-        return bool(value.strip())
-    return bool(value)
-
-
-def _repair_one_field(
-    holder: dict[str, Any],
-    index: int | None,
-    record: _PlanField,
-) -> dict[str, Any] | None:
-    """Repair ``holder[record.field]`` IN PLACE; return a fact, or ``None``.
-
-    *holder* is the plan dict itself for a top-level record, or one item of
-    ``plan[record.collection]`` otherwise. ``None`` means nothing to report:
-    the value is absent, is not a str, or carries no envelope literal at all.
-
-    THE CONTRACT IS BINARY. ``repair()`` validates -> the field becomes
-    ``clean_value``. ``repair()`` declines -> the field is left BYTE-IDENTICAL
-    and the refusal is reported as an ``'unrepairable'`` fact so the residue
-    stays visible. There is deliberately NO fallback that strips the trailing
-    bit anyway, and that is not caution for its own sake: measured across the
-    28 corrupted live plans, the declining population is dominated by plans
-    that legitimately QUOTE the sentinels in prose — worktree 2939's plan is a
-    plan ABOUT this leak, so its decision/rationale fields discuss the closing
-    and opening tags in ordinary sentences. A trailing-only sanitize would
-    silently mutilate that authored text, which is the same class of
-    silent-wrong-value damage this whole PRD exists to end. Never partial,
-    never guessed.
-
-    THE ONE ACCEPTED TRUNCATION, AND WHY IT IS ASYMMETRIC. A value ending in
-    the field's OWN closer is cut at that tag with nothing recovered, and
-    ``_read_plan_repaired`` persists the shorter string. That is chosen, not
-    overlooked — D10a in ``plans/toolcall-markup-containment-prd.md``: 212 of
-    212 invisible specimens are this shape, and the fact's ``misclose`` names
-    the deleted span, so the cut is reversible from the record rather than
-    silent. The same empty tail under a SIBLING's closer is refused and left
-    byte-identical instead, because the discriminator is evidence rather than
-    breadth — this value arrived as a named parameter of a known tool, so its
-    own closer is evidence about that parameter, while the sweep's
-    ``scripts/sweep_toolcall_markup.py::_repair_dict`` qualifies candidates
-    against every sibling KEY of the containing object, a far wider vocabulary
-    in which the same shape is likelier quotation than leak.
-
-    A RECOVERY ONLY EVER FILLS A HOLE. ``supplied`` is computed as the sibling
-    fields of this same record that already hold authored content, so a
-    recovered parameter can land only in an EMPTY or ABSENT sibling and can
-    never overwrite real text. That rule is not fussiness: on disk the sibling
-    key normally EXISTS (the tool wrote every field), and worktree 3024's live
-    plans show the retry fingerprint — a corrupted decision still carrying the
-    absorbed rationale while the record's own rationale field holds genuine,
-    later-authored prose. At read time those two are indistinguishable, so
-    clobbering the authored one would be precisely the silent-wrong-value
-    failure this surface exists to prevent.
-
-    The collision check itself is NOT re-implemented here: ``supplied`` is
-    handed to ``repair()``, whose accept-time disjointness condition (PRD
-    boundary row B9) does the refusing. One mechanism, per INV-5.
-
-    THE ONE HOLE B9 CANNOT COVER IS THE FIELD ITSELF. ``supplied`` must exclude
-    ``record.field`` — repair() is repairing that parameter, so declaring it
-    already-supplied would refuse every candidate — which means a tail that
-    RE-DECLARES the field being repaired passes the disjointness check, and both
-    sides of the mis-close become candidates for the one field. WHICH SIDE HOLDS
-    THE AUTHORED TEXT DEPENDS ON WHERE THE MIS-CLOSE SITS, so this is decided by
-    content and never by position: the fill-a-hole rule above governs the
-    field's own key exactly as it governs its siblings, read through the same
-    ``_is_authored`` helper. The authored side wins in BOTH directions; only a
-    redeclaration that would displace authored text is declined and reported on
-    ``declined_params``.
-
-    A RECOVERY MAY ONLY LAND ON A DECLARED PROSE KEY. The repairable surface
-    distinguishes the TOOL's parameter vocabulary (``schema_params``) from the
-    PLAN's key vocabulary (``target_keys``), and for three parameters they
-    differ: ``prereq_id`` and ``step_id`` are stored as ``id``, ``step_type``
-    as ``type``. Two more name no prose key at all — ``files`` is a list and
-    ``task_id`` an identifier. Writing a recovered prose string into any of
-    them is silent-wrong-value corruption of the plan artifact that the lock
-    charter (``derive_modules`` / ``files_to_modules``) and the merge gate
-    (``plan_files_not_touched``) both consume, which is the exact damage class
-    this surface exists to end — so refusing conservatively there is the point,
-    not a limitation.
-
-    That rule is enforced through the SAME mechanism, not a second one: a
-    parameter with no prose target is placed in ``supplied`` UNCONDITIONALLY,
-    so ``repair()``'s existing B9 condition refuses any candidate whose tail
-    recovers it and the field is left byte-identical. A parameter WITH a prose
-    target has its authorship read from the key the plan actually uses
-    (``holder.get('type')``, never the always-absent ``holder.get('step_type')``)
-    — without which the fill-a-hole guard was inert for exactly those params,
-    because the lookup could never see the authored value it was meant to
-    protect.
-    """
-    value = holder.get(record.field)
-    if not isinstance(value, str):
-        return None
-    # PARAMETER-AWARE, and free here (task 4696). Unlike the middleware
-    # boundary — which holds only the argument name and will not pay an awaited
-    # get_tool to learn more — this site already has the whole schema in hand
-    # off the DECLARED table, so it scans the shared enumeration widened by
-    # this field's own closer AND every sibling parameter's. The diagnostic
-    # below therefore names the tag actually seen instead of whatever fixed
-    # literal happens to trail the leak.
-    pattern = detect_for(value, record.field, record.schema_params)
-    if pattern is None:
-        # The cheap prefilter, and the overwhelmingly common path: no literal
-        # anywhere in the value, so repair() is never called.
-        return None
-
-    supplied = frozenset(
-        name
-        for name in record.schema_params
-        if name != record.field
-        and (
-            # No prose key to land on: ALWAYS supplied, so repair() refuses.
-            name not in record.target_keys
-            # Authorship read from the key the PLAN uses, not the tool's param.
-            or _is_authored(holder.get(record.target_keys[name]))
-        )
-    )
-    result = repair(
-        value,
-        param=record.field,
-        schema_params=record.schema_params,
-        supplied=supplied,
-    )
-    if result is None:
-        return {
-            'tool': _COLLECTION_SCHEMA_TOOL[record.collection],
-            'also_written_by': list(record.also_written_by),
-            'param': record.field,
-            'pattern': pattern,
-            # No mis-close was VALIDATED — every candidate was rejected — so
-            # naming one here would be a guess dressed up as a diagnostic.
-            'misclose': None,
-            'outcome': 'unrepairable',
-            'recovered_params': [],
-            'declined_params': [],
-            'collection': record.collection,
-            'index': index,
-            'field': record.field,
-        }
-
-    holder[record.field] = result.clean_value
-    # Every recovered value is a verbatim slice of the absorbing field (D5,
-    # guaranteed by construction in ``repair``), and every SIBLING target here
-    # was proven a hole by the ``supplied`` set above. The field's own key is
-    # deliberately NOT in ``supplied``, so it carries no such proof and is
-    # decided on content just below.
-    written: list[str] = []
-    declined: list[str] = []
-    for name, recovered_value in result.recovered.items():
-        # THE TAIL RE-DECLARED THE FIELD BEING REPAIRED. ``supplied``
-        # deliberately excludes ``record.field`` (repair() is repairing it,
-        # so calling it already-supplied would refuse every candidate), and
-        # repair()'s B9 disjointness check therefore ACCEPTS a tail that
-        # recovers that same name. Both sides of the mis-close are then
-        # candidates for the one field, and WHICH SIDE IS AUTHORED DEPENDS
-        # ENTIRELY ON WHERE THE MIS-CLOSE SITS — so a fixed choice is wrong
-        # in one direction whichever way it is fixed:
-        #
-        #   Mis-close near the END — authored prose, the mis-close, then a
-        #   stub re-opener. ``clean_value`` is the prose and the recovered
-        #   self-value is the stub. Keep ``clean_value``.
-        #
-        #   Mis-close at or near the START — the mis-close, then the real
-        #   re-opener. ``clean_value`` is the HOLE (empty, or whitespace)
-        #   and the recovered self-value is the authored prose. Keep the
-        #   RECOVERED value. Declining here would blank the field, and
-        #   because the fact still reads ``outcome: 'repaired'``,
-        #   ``_read_plan_repaired`` would persist that blank through
-        #   ``TaskArtifacts.write_plan`` — authored text destroyed on
-        #   disk,
-        #   unrecoverable on the next read. That is the same
-        #   silent-authored-text-loss this whole surface exists to end,
-        #   merely pointed the other way.
-        #
-        # So the SAME rule the siblings already follow decides it, through
-        # the same ``_is_authored`` helper rather than a second policy
-        # (INV-5): A RECOVERY ONLY EVER FILLS A HOLE. Decline when
-        # ``clean_value`` is already authored, or when the recovered
-        # self-value is not authored; otherwise fall through and let the
-        # ordinary ``target_keys`` write path install it — ``record.field``
-        # maps to itself for every record, which the repair tests assert, so
-        # no separate write path is needed. When BOTH sides are holes the
-        # decline keeps ``clean_value``, which is equivalent.
-        #
-        # A recovered self-value MAY itself still trip ``detect()``: a
-        # nested opener with no closing tag parses into the recovered value,
-        # since ``_parse_tail`` only refuses on an embedded closer. That is
-        # why writing it is RIGHT and not merely tolerable — the prose
-        # survives, and the next read re-detects it, finds no mis-close to
-        # validate, and reports ``unrepairable``, leaving the residue
-        # visible and byte-identical. Declining would have thrown the prose
-        # away to reach that same visibility.
-        if name == record.field and (
-            _is_authored(result.clean_value) or not _is_authored(recovered_value)
-        ):
-            declined.append(name)
-            continue
-        key = record.target_keys.get(name)
-        if key is None:
-            # Unreachable while ``supplied`` holds every non-target: repair()
-            # would have refused. Kept as total-safety so a future change to
-            # repair() can never make this walk write a junk key — NOT as a
-            # second policy, which is why it only declines and reports.
-            logger.warning(
-                'plan_markup_repair: refusing to write recovered %r — %s.%s '
-                'declares no plan key for it',
-                name,
-                record.collection,
-                record.field,
-            )
-            declined.append(name)
-            continue
-        holder[key] = recovered_value
-        written.append(name)
-    return {
-        'tool': _COLLECTION_SCHEMA_TOOL[record.collection],
-        'also_written_by': list(record.also_written_by),
-        'param': record.field,
-        # The GATE's pattern, exactly as the unrepairable arm above publishes
-        # it, so one field cannot carry two semantics depending on whether the
-        # repair happened to succeed. ``result.pattern`` is the same expression
-        # on the same inputs since task 5283; naming the local keeps the two
-        # arms visibly identical rather than identical by coincidence.
-        'pattern': pattern,
-        'misclose': result.misclose,
-        'outcome': 'repaired',
-        # What was recovered AND WRITTEN, versus what the tail declared and this
-        # walk refused to write. Splitting them is what keeps a declined
-        # recovery visible instead of reading as a successful one.
-        'recovered_params': sorted(written),
-        'declined_params': sorted(declined),
-        'collection': record.collection,
-        'index': index,
-        'field': record.field,
-    }
-
-
-def _walk_repairable(plan: dict) -> Iterator[tuple[dict[str, Any], int | None, _PlanField]]:
-    """Every ``(holder, index, record)`` the declared table addresses in *plan*.
-
-    The surface walked is :data:`_REPAIRABLE_PLAN_FIELDS` — the DECLARED table —
-    never an inferred walk of the plan dict. Non-dict items in a collection are
-    skipped, mirroring the ``isinstance(item, dict)`` guards the mutation
-    helpers already use, so the walk stays total for adversarial plan shapes.
-
-    Shared by the prefilter scan and the repair pass so the two can never
-    disagree about WHICH fields are in scope — one enumeration, two readers.
-    """
-    for record in _REPAIRABLE_PLAN_FIELDS:
-        if record.collection is None:
-            yield plan, None, record
-            continue
-        items = plan.get(record.collection)
-        if not isinstance(items, list):
-            continue
-        for index, item in enumerate(items):
-            if isinstance(item, dict):
-                yield item, index, record
-
-
-def _carries_markup(plan: dict) -> bool:
-    """True when ANY declared field of *plan* trips :func:`detect_for`.
-
-    The cheap prefilter over the whole document, run before anything is copied.
-    Each check is ONE compiled pass over the value; a deep copy of a plan is
-    tens of KB of analysis prose plus every step description, and on the
-    overwhelmingly common clean path that copy would be pure waste.
-
-    PARAMETER-AWARE AS OF TASK 4696, and this gate is why the task exists. It
-    asked the param-free ``detect``, whose fixed literal set spells none of
-    plan-tools' own parameter names — so a plan whose only damage was a field
-    mis-closed with its OWN tag looked CLEAN, the pass never ran, and the
-    corruption survived every read. Measured on 2026-08-25: 296 ``rationale``
-    and 129 ``how`` specimens sitting unrepaired on disk for that reason.
-
-    The widening costs this site NOTHING: the walk already yields the
-    ``_PlanField`` record, so ``record.field`` and ``record.schema_params``
-    come straight off the declared table — no lookup, no second enumeration
-    (INV-5). It is deliberately WIDER than the middleware's gate, which holds
-    only the argument's own name; the asymmetry is a cost decision, recorded at
-    ``MarkupGuardMiddleware._first_markup_argument``, not a divergence.
-    """
-    for holder, _index, record in _walk_repairable(plan):
-        value = holder.get(record.field)
-        if (
-            isinstance(value, str)
-            and detect_for(value, record.field, record.schema_params) is not None
-        ):
-            return True
-    return False
-
-
-def _repair_plan_fields(plan: dict) -> tuple[dict, list[dict[str, Any]]]:
-    """Repair every declared prose field of *plan*; return ``(plan, facts)``.
-
-    NEVER MUTATES THE INPUT, and never touches the filesystem. Persisting the
-    result is :func:`_read_plan_repaired`'s decision, not this pass's.
-
-    THE COPY IS LAZY. A clean plan is returned AS-IS — the same object, not a
-    copy — because nothing was going to change in it. Only once
-    :func:`_carries_markup` finds a hit does the document get deep-copied and
-    re-walked, so the copy is paid on the rare corrupted read rather than on
-    every plan-tools call in the fleet. The no-mutation contract is unaffected:
-    on the returned-as-is path this function writes nothing at all. Callers that
-    intend to mutate what they get back must therefore own a fresh document —
-    which :func:`_read_plan_repaired`'s callers do, since ``read_plan`` parses
-    the file anew on every call.
-
-    The prefilter runs ``detect_for`` a second time on the values that DO trip
-    it (once here, once inside :func:`_repair_one_field`). That is deliberate:
-    the duplicate pass is paid only on the corrupted path, where the walk is
-    about to call ``repair()`` anyway, and it buys skipping the copy on the
-    clean one. Both passes ask the SAME parameter-aware predicate with the SAME
-    record, so the prefilter can never wave through a value the walk would then
-    decline to look at, nor the reverse.
-    """
-    if not _carries_markup(plan):
-        return plan, []
-
-    repaired = copy.deepcopy(plan)
-    facts: list[dict[str, Any]] = []
-    for holder, index, record in _walk_repairable(repaired):
-        fact = _repair_one_field(holder, index, record)
-        if fact is not None:
-            facts.append(fact)
-
-    return repaired, facts
-
-
-
-#: Stable event name for a structured markup fact (INV-2). plan-tools is a bare
-#: stdio subprocess with no event bus reachable, so the log IS the channel — and
-#: for that to be usable the WHOLE message must be the payload. One line, one
-#: fact, ``json.loads``-able; never a value a consumer has to regex out of prose.
-_MARKUP_FACT_EVENT = 'plan_markup_repaired'
-
-#: Stable event name for a repair that could not be PERSISTED. Deliberately
-#: distinct from the fact event: the repair itself succeeded and was served, so
-#: folding the two would make a delivery failure look like a detection outcome.
-_MARKUP_WRITE_FAILED_EVENT = 'plan_markup_write_back_failed'
-
-#: Refusals already reported by THIS process, keyed by locator plus a hash of
-#: the refusing value. Process-local, and that is exactly the right scope: the
-#: orchestrator spawns one plan-tools subprocess per agent invocation, so "once
-#: per process" is "once per agent session".
-#:
-#: WHY A REPAIRED FACT IS NEVER MEMOIZED AND A REFUSAL ALWAYS IS: a repair
-#: CONVERGES — the field is fixed on disk, so the next read emits nothing. A
-#: refusal never converges. A plan that legitimately QUOTES the sentinels in
-#: prose (worktree 2939, a plan about this very leak) refuses on every single
-#: call, forever. An architect making ~50 plan-tool calls against it would
-#: otherwise get 50xN identical warning lines and 50xN identical facts fed back
-#: into its context, each reading like a NEW detection and none of them
-#: actionable. The first report is what keeps the residue visible; the 50th is
-#: pure amplification of a fact already delivered.
-#:
-#: Bounded by the number of DISTINCT refusals a process sees (a handful per
-#: plan), and keyed on the value's hash so an EDITED field reports again rather
-#: than being suppressed by a stale locator. ONE refusal is never memoized at
-#: all: a locator that no longer resolves (see :data:`_UNRESOLVED_VALUE`) never
-#: gets a key built for it, so it is reported on every call instead of being
-#: suppressed under a key that means nothing.
-_REPORTED_REFUSALS: set[tuple[str, str | None, int | None, str, int]] = set()
-
-#: Sentinel returned by :func:`_fact_value` when a fact's locators no longer
-#: resolve against the plan (a collection shrank, an index moved). DISTINCT
-#: from a resolvable locator whose field is legitimately absent — both used to
-#: read back as plain ``None``, so "the locator broke" and "the field is
-#: missing" were indistinguishable and shared one memo key. Module-private;
-#: never leaves this file.
-_UNRESOLVED_VALUE = object()
-
-
-def _fact_value(plan: dict, fact: dict[str, Any]) -> object:
-    """The value a *fact* is about, re-read from *plan* through its locators.
-
-    Kept OUT of the fact itself: a fact is attached to the tool response, and
-    echoing a whole corrupted prose field back into the caller's context is the
-    amplification this memo exists to avoid. The locators are enough to find it.
-
-    Returns :data:`_UNRESOLVED_VALUE` — never plain ``None`` — when the
-    locators themselves no longer resolve, so that case can never share a memo
-    key with a locator that resolves to a field that is legitimately absent.
-    """
-    try:
-        collection = fact['collection']
-        holder = plan if collection is None else plan[collection][fact['index']]
-        return holder.get(fact['field'])
-    except (KeyError, IndexError, TypeError, AttributeError):
-        # An unresolvable locator is signalled distinctly and is NEVER
-        # memoized (see _report_markup_facts), so it is reported every time —
-        # rather than collapsing to a constant hash key under which a second,
-        # unrelated unresolvable refusal would be silently suppressed.
-        return _UNRESOLVED_VALUE
-
-
-def _report_markup_facts(
-    plan_path: Path, plan: dict, facts: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Log every fact; return the ones worth surfacing to the caller.
-
-    INV-2: the WHOLE log message is a single-line JSON payload under a stable
-    event name, so no consumer regex-scrapes a value out of prose.
-
-    A refusal already reported by this process is logged at DEBUG instead of
-    WARNING and is dropped from the returned list — see
-    :data:`_REPORTED_REFUSALS` for why a refusal is the one outcome that never
-    converges on its own. Dropping it makes a repeat call's response converge to
-    the clean shape (no ``markup_repairs`` key at all), which is the same
-    convergence a successful repair gets for free.
-    """
-    reportable: list[dict[str, Any]] = []
-    for fact in facts:
-        payload = json.dumps({
-            'event': _MARKUP_FACT_EVENT,
-            'path': str(plan_path),
-            **fact,
-        })
-        if fact['outcome'] == 'unrepairable':
-            value = _fact_value(plan, fact)
-            if value is not _UNRESOLVED_VALUE:
-                key = (
-                    str(plan_path),
-                    fact['collection'],
-                    fact['index'],
-                    fact['field'],
-                    hash(value),
-                )
-                if key in _REPORTED_REFUSALS:
-                    logger.debug(payload)
-                    continue
-                _REPORTED_REFUSALS.add(key)
-            # else: the locator no longer resolves. No key means anything for
-            # it, so nothing is built or inserted — fall through and report
-            # this call exactly like a first-time refusal, every time.
-        logger.warning(payload)
-        reportable.append(fact)
-    return reportable
 
 
 def _read_plan_repaired(artifacts: TaskArtifacts) -> tuple[dict, list[dict[str, Any]]]:
-    """Read the plan, repairing envelope-markup corruption on the way through.
-
-    THE ONE READ PATH for every plan-tools mutation helper. Returns
-    ``(plan, facts)``: the plan as the caller should see it, and the structured
-    facts describing every field this read touched or refused (empty on the
-    overwhelmingly common clean path).
-
-    LAZY, NOT SWEPT. The corruption sits in LIVE ``.task/plan.json`` files
-    belonging to running tasks, so a fleet-wide sweep would have to quiesce
-    every lane first. Repairing at read time needs no quiesce at all: the next
-    tool call any agent makes fixes its own plan, in place, atomically.
-
-    WRITTEN BACK ONLY WHEN SOMETHING ACTUALLY CHANGED. A plan whose every fact
-    is ``'unrepairable'`` is byte-identical to what is already on disk, so
-    rewriting it would churn the file — and its mtime, under every watcher —
-    to no effect. Same for a wholly clean plan, which never reaches the write
-    at all. Reads stay reads.
-
-    TOTAL BY CONSTRUCTION. Missing plan -> ``artifacts.read_plan()``'s empty
-    dict, returned untouched with no facts and no write; an unparseable plan
-    raises exactly what ``read_plan`` already raises. This surface adds no new
-    failure mode to a path every tool depends on.
-
-    A REFUSAL IS REPORTED ONCE PER PROCESS, not once per call. The returned
-    facts are the REPORTABLE ones: a refusal this process has already reported
-    for the same field and the same value is logged at DEBUG and left out, so a
-    plan that can never be repaired stops re-announcing itself on every call.
-    See :data:`_REPORTED_REFUSALS`. Repairs are never suppressed — they converge
-    on their own, because the next read finds the field already fixed.
-
-    AND A WRITE-BACK FAILURE NEVER WITHHOLDS THE REPAIR. It is logged loudly
-    and the in-memory repaired plan is still returned, because the alternative
-    — refusing to serve a plan because its repair could not be persisted —
-    hands the caller the CORRUPTED text back, which is strictly worse than
-    today's behaviour and is exactly the failure this surface exists to end.
-    """
-    plan = artifacts.read_plan()
-    if not plan:
-        return plan, []
-
-    repaired, facts = _repair_plan_fields(plan)
-    if not facts:
-        return repaired, facts
-
-    plan_path = artifacts.root / 'plan.json'
-    reportable = _report_markup_facts(plan_path, repaired, facts)
-
-    if not any(fact['outcome'] == 'repaired' for fact in facts):
-        # Every fact was a refusal: nothing in the document changed, so there
-        # is nothing to persist. This is what keeps a plan that legitimately
-        # QUOTES the sentinels in prose (worktree 2939) byte-stable forever.
-        # Decided over ALL facts, never the reported subset — a suppressed
-        # repeat must not be able to flip a write decision.
-        return repaired, reportable
-
-    try:
-        artifacts.write_plan(repaired)
-    except Exception as exc:
-        # Broad on purpose: the caller must receive the repaired plan whatever
-        # went wrong on the way to disk. TaskArtifacts.write_plan can raise an
-        # OSError family member (EACCES, ENOSPC, the ArtifactWriteError
-        # dangling-symlink refusal) or a TypeError/ValueError out of its
-        # json.dumps, so narrowing here would turn a persistence failure into
-        # a failed tool call.
-        logger.warning(
-            json.dumps({
-                'event': _MARKUP_WRITE_FAILED_EVENT,
-                'path': str(plan_path),
-                'error': repr(exc),
-                'served_from_memory': True,
-                'repaired_fields': [
-                    fact['field'] for fact in facts if fact['outcome'] == 'repaired'
-                ],
-            })
-        )
-    return repaired, reportable
+    """Read this server's plan, repaired under :data:`_REPAIRABLE_PLAN_FIELDS`."""
+    return plan_markup_repair.read_plan_repaired(artifacts, _REPAIRABLE_PLAN_FIELDS)
 
 
 _P = ParamSpec('_P')
@@ -1025,6 +369,16 @@ def _with_markup_repairs(
     if facts:
         response['markup_repairs'] = facts
     return response
+
+
+def _body_edit(plan: dict[str, Any]) -> Plan:
+    """*plan* edited outside its step set: its confirmation is kept."""
+    return Plan.from_json(plan)
+
+
+def _step_set_edit(plan: dict[str, Any]) -> Plan:
+    """*plan* after a step-set edit: its confirmation is cleared (``artifacts.py::Plan.restructured``)."""
+    return Plan.from_json(plan).restructured()
 
 
 # ---------------------------------------------------------------------------
@@ -1071,34 +425,20 @@ def _create_plan(
                 'full analysis via update_plan_metadata(analysis=...).'
             ),
         }
-    # DELIBERATELY NOT hooked to _read_plan_repaired: this overwrites plan.json
-    # wholesale, so there is no existing document to repair on the way in.
-    # Guarding these INBOUND arguments against envelope markup is the write-time
-    # middleware's job, not this read-time surface's — don't "fix" the omission.
-    # That promise is now KEPT: MarkupGuardMiddleware is LIVE on this server
-    # (see create_server), and it refuses a poisoned title or analysis before
-    # this function is ever entered. The instruction above is load-bearing in
-    # the other direction now — hooking this function into _read_plan_repaired
-    # would put the same damage through two mechanisms.
+    # DELIBERATELY NOT hooked to _read_plan_repaired: inbound arguments are the
+    # write-time middleware's (plans/toolcall-markup-containment-prd.md D8).
     #
-    # THE BOOKKEEPING READ BELOW IS NOT A BREACH OF THAT INSTRUCTION. It goes
+    # THE BOOKKEEPING READ BELOW IS NOT A BREACH OF THAT RULE. It goes
     # through a plain `artifacts.read_plan()` for the same reason, and it
-    # touches only the guard's own `_markup_rejections` block and the C4
+    # touches only the guard's own `_markup_rejections` block, the C4
     # descope record (`plan_descope.DESCOPE_PLAN_KEYS`), whose prose already
-    # passed the inbound guard on `record_descoped_step`. Do not "simplify"
+    # passed the inbound guard on `record_descoped_step`, and the quarantine
+    # back-pointer (`quarantine_provenance.QUARANTINED_FROM_KEY`), which the
+    # orchestrator writes and which carries no agent prose. Do not "simplify"
     # it onto `_read_plan_repaired`.
     files = _coerce_files(files)
-    plan = {
-        'task_id': task_id,
-        'title': title,
-        'analysis': analysis,
-        'files': files,
-        'prerequisites': [],
-        'steps': [],
-        'design_decisions': [],
-        'reuse': [],
-        'dropped_files': [],
-    }
+    carried: dict[str, Any] = {}
+    replaced = Plan.from_json({})
     try:
         # TWO BOOKKEEPING MOVES, both required and for DIFFERENT reasons
         # (task 4597).
@@ -1129,17 +469,19 @@ def _create_plan(
         # DROPPED rather than laundered into a present-and-zero key that would
         # contradict this key's contract that its PRESENCE is the signal.
         existing = artifacts.read_plan()
-        carried = plan_markup_stamp.normalize_block(
+        block = plan_markup_stamp.normalize_block(
             existing.get(plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY)
             if isinstance(existing, dict) else None
         )
-        if carried is not None:
-            plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = carried
-        plan_markup_stamp.drain_pending(plan)
+        if block is not None:
+            carried[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = block
+        plan_markup_stamp.drain_pending(carried)
         # The descope record is the one trace of a done step a revalidation
         # dropped; a wholesale overwrite must not erase it.
         if isinstance(existing, dict):
-            plan.update(plan_descope.descope_record_of(existing))
+            carried.update(plan_descope.descope_record_of(existing))
+            carried.update(quarantine_provenance.quarantined_from_of(existing))
+            replaced = Plan.from_json(existing)
     except Exception:
         # BOOKKEEPING CAN NEVER FAIL A create_plan. The counter is a legibility
         # aid; the plan is the work. Losing the count is a cost an operator
@@ -1148,7 +490,10 @@ def _create_plan(
             'markup stamp: could not carry the rejection counter into the new '
             'plan for %s; the plan itself is unaffected', task_id,
         )
-    artifacts.write_plan(plan, mutex_held=True)
+    recreated = replaced.recreated(
+        task_id=task_id, title=title, analysis=analysis, files=files, carried=carried,
+    )
+    artifacts.write_plan_model(recreated, mutex_held=True)
     return {'status': 'ok', 'task_id': task_id}
 
 
@@ -1180,16 +525,20 @@ def _add_plan_step(
             markup_facts,
         )
 
-    plan.setdefault('steps', []).append({
+    step = {
         'id': step_id,
         'type': step_type,
         'description': description,
         'status': 'pending',
         'commit': None,
-    })
-    artifacts.write_plan(plan, mutex_held=True)
+    }
+    plan.setdefault('steps', []).append(step)
+    artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
     return _with_markup_repairs(
-        {'status': 'ok', 'step_id': step_id, 'total_steps': len(plan['steps'])},
+        foreign_task_meta.annotate(
+            {'status': 'ok', 'step_id': step_id, 'total_steps': len(plan['steps'])},
+            foreign_task_meta.step_findings(artifacts, [step]),
+        ),
         markup_facts,
     )
 
@@ -1216,15 +565,22 @@ def _add_prerequisite(
             markup_facts,
         )
 
-    plan.setdefault('prerequisites', []).append({
+    prerequisite = {
         'id': prereq_id,
         'description': description,
         'status': 'pending',
         'commit': None,
         'tests': [],
-    })
-    artifacts.write_plan(plan, mutex_held=True)
-    return _with_markup_repairs({'status': 'ok', 'prereq_id': prereq_id}, markup_facts)
+    }
+    plan.setdefault('prerequisites', []).append(prerequisite)
+    artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
+    return _with_markup_repairs(
+        foreign_task_meta.annotate(
+            {'status': 'ok', 'prereq_id': prereq_id},
+            foreign_task_meta.step_findings(artifacts, [prerequisite]),
+        ),
+        markup_facts,
+    )
 
 
 @_plan_mutation
@@ -1241,7 +597,7 @@ def _add_design_decision(
         'decision': decision,
         'rationale': rationale,
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'total_decisions': len(plan['design_decisions'])},
         markup_facts,
@@ -1264,7 +620,7 @@ def _add_reuse_item(
         'where': where,
         'how': how,
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'total_reuse': len(plan['reuse'])}, markup_facts
     )
@@ -1302,7 +658,7 @@ def _drop_plan_file(
     if not plan:
         return {'status': 'error', 'message': 'No plan exists.'}
 
-    # Every refusal below returns BEFORE any artifacts.write_plan call — the
+    # Every refusal below returns BEFORE any artifacts.write_plan_model call — the
     # module-wide convention that a refusal envelope always implies no write.
     if not reason or not reason.strip():
         return _with_markup_repairs(
@@ -1357,7 +713,7 @@ def _drop_plan_file(
         'path': path,
         'reason': reason,
     })
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {
             'status': 'ok',
@@ -1404,14 +760,14 @@ def _mark_step_done(
     # written any repair back to disk, so the reject path must still report it
     # via _with_markup_repairs like every other exit.
     #
-    # Fail-OPEN on 'unknown', deliberately asymmetric to _mark_step_committed's
-    # fail-CLOSED reuse of _sha_exists_on_branch: this caller is an implementer
+    # Fail-OPEN on UNKNOWN, deliberately asymmetric to _mark_step_committed's
+    # fail-CLOSED branch_probes.sha_exists_on_branch: this caller is an implementer
     # recording work it JUST committed, so a false reject would leave the step
     # `pending` while its code sits on the branch — inviting a re-implementation
     # on top of a correct one, the exact harm the guard exists to prevent. The
     # degradation is logged at WARNING rather than passing silently.
-    reachability = _sha_branch_reachability(artifacts.worktree, commit_sha)
-    if reachability == 'unreachable':
+    reachability = branch_probes.sha_branch_reachability(artifacts.worktree, commit_sha)
+    if reachability is Reachability.UNREACHABLE:
         return _with_markup_repairs(
             {
                 'status': 'error',
@@ -1424,7 +780,7 @@ def _mark_step_done(
             },
             markup_facts,
         )
-    if reachability == 'unknown':
+    if reachability is Reachability.UNKNOWN:
         logger.warning(
             'mark_step_done(%r, %r): on-branch reachability check could not '
             'run (no usable git repo at %s); recording the sha unverified',
@@ -1557,7 +913,7 @@ def _record_descoped_step(
         _session_identity_in_hand(artifacts, plan) or plan_descope.RESCOPED_BY_UNKNOWN
     )
     plan[plan_descope.RESCOPED_NOTE_KEY] = note
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {'status': 'ok', 'step_id': step_id, 'commit': commit, 'descoped_steps': len(entries)},
         markup_facts,
@@ -1584,7 +940,7 @@ def _update_plan_metadata(
         _forget_redeclared_drops(plan)
     if analysis is not None:
         plan['analysis'] = analysis
-    artifacts.write_plan(plan, mutex_held=True)
+    artifacts.write_plan_model(_body_edit(plan), mutex_held=True)
     return _with_markup_repairs(
         {
             'status': 'ok',
@@ -1631,7 +987,7 @@ def _remove_plan_step(
                         markup_facts,
                     )
                 items.pop(i)
-                artifacts.write_plan(plan, mutex_held=True)
+                artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
                 return _with_markup_repairs(
                     {'status': 'ok', 'removed': step_id, 'collection': collection},
                     markup_facts,
@@ -1673,9 +1029,13 @@ def _replace_plan_step(
                     )
                 item['type'] = step_type
                 item['description'] = description
-                artifacts.write_plan(plan, mutex_held=True)
+                artifacts.write_plan_model(_step_set_edit(plan), mutex_held=True)
                 return _with_markup_repairs(
-                    {'status': 'ok', 'replaced': step_id}, markup_facts
+                    foreign_task_meta.annotate(
+                        {'status': 'ok', 'replaced': step_id},
+                        foreign_task_meta.step_findings(artifacts, [item]),
+                    ),
+                    markup_facts,
                 )
 
     return _with_markup_repairs(
@@ -1719,6 +1079,9 @@ def _confirm_plan(
     # what this session has REFUSED) and neither should be able to suppress
     # the other.
     rejections = plan_markup_stamp.session_summary(plan)
+    findings = foreign_task_meta.step_findings(
+        artifacts, [*(plan.get('prerequisites') or []), *(plan.get('steps') or [])],
+    ) if plan else {}
 
     def _respond(payload: dict[str, Any]) -> dict[str, Any]:
         """The ONE place that decides what a confirm_plan response carries.
@@ -1732,11 +1095,12 @@ def _confirm_plan(
         """
         if rejections is not None:
             payload['markup_rejections'] = rejections
-        return _with_markup_repairs(payload, markup_facts)
+        return _with_markup_repairs(foreign_task_meta.annotate(payload, findings), markup_facts)
 
     if not plan:
         return _respond({'status': 'error', 'message': 'No plan exists.'})
-    if not plan.get('steps'):
+    model = Plan.from_json(plan)
+    if model.state is PlanState.SHELL:
         return _respond(
             {'status': 'error', 'message': 'Plan has no steps — cannot confirm.'}
         )
@@ -1749,28 +1113,13 @@ def _confirm_plan(
             ),
         })
 
-    now = datetime.now(UTC).isoformat()
-    # ``_finalized_at`` is the durable completeness marker.  Its PRESENCE means
-    # the architect declared the plan complete; the workflow requires it before
-    # a plan may advance to execution (workflow._plan), and salvages a plan that
-    # carries it even when the CLI run failed on a budget/turn cap.  Its ABSENCE
-    # on a plan that already has steps means a prior session was interrupted
-    # mid-build — the workflow routes that partial to a completion pass instead
-    # of discarding it.  ``_revalidated_at`` is retained for revalidation-age
-    # checks (see workflow._can_skip_revalidation).
-    #
-    # ``_finalized_at`` dates the LAST confirm: every re-confirm, revalidation
-    # and amendment re-confirms included, overwrites it.  ``_created_at``,
-    # stamped by ``orchestrator/artifacts.py::TaskArtifacts.stamp_plan_provenance``,
-    # is a post-hoc provenance stamp and is always later.  Neither dates the
-    # moment the plan was first frozen.
-    plan['_finalized_at'] = now
-    plan['_revalidated_at'] = now
-    artifacts.write_plan(plan, mutex_held=True)
+    # What confirmation records, and what clears it: ``orchestrator/artifacts.py::Plan.confirmed``.
+    confirmed = model.confirmed(at=datetime.now(UTC).isoformat(), by=PlanConfirmation.ARCHITECT)
+    artifacts.write_plan_model(confirmed, mutex_held=True)
     return _respond({
         'status': 'ok',
         'finalized': True,
-        'steps': len(plan['steps']),
+        'steps': len(model.steps),
         'files': len(plan.get('files', [])),
     })
 
@@ -1875,119 +1224,35 @@ def _report_false_premise(
     return {'status': 'ok', 'classification': classification}
 
 
-def _resolve_main_sha(worktree: Path) -> str:
-    """Return the current ``main`` HEAD SHA visible from *worktree*.
+def _report_missing_plan_file(
+    artifacts: TaskArtifacts,
+    path: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Record a writer's request to add an existing file to the declared scope.
 
-    Falls back to an empty string on git failure — the workflow side
-    treats an empty ``main_sha_at_report`` as "advance check skipped".
+    The workflow applies it at the next writer boundary
+    (``workflow.py::TaskWorkflow._apply_scope_requests``). Reads the declared
+    files with ``peek_plan``, which never writes plan.json. A path naming no
+    file in the worktree is refused, so a typo never reaches plan.files.
     """
     try:
-        result = subprocess.run(
-            ['git', 'rev-parse', 'main'],
-            cwd=str(worktree),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return result.stdout.strip()
-    except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning(
-            'Failed to resolve main SHA for blocking_dependency report: %s', exc
-        )
-        return ''
-
-
-def _sha_exists_on_branch(worktree: Path, sha: str) -> bool:
-    """Return True iff *sha* is reachable from HEAD in the repo at *worktree*.
-
-    A real ``git merge-base --is-ancestor <sha> HEAD`` reachability check
-    (returncode 0 == *sha* is an ancestor of — or equal to — HEAD), run in the
-    worktree cwd. This is the machine-checked corroborate-before-acting guard
-    for ``mark_step_committed`` (INV-1/INV-3): the architect must be UNABLE to
-    pre-satisfy a plan step against a commit that does not resolve on the
-    current branch.
-
-    Note we check reachability (``--is-ancestor``), NOT mere object existence
-    (``git cat-file -e``): in this repo's shared/multi-worktree object store a
-    commit from another task's branch — or a dangling/unreachable object —
-    exists in the object DB yet is NOT on this branch. ``--is-ancestor`` returns
-    non-zero (exit 1 for a real-but-unreachable commit, 128 for a bad object)
-    for both, so the guard matches its advertised on-branch contract. It
-    deliberately does NOT prove the step's semantics — VERIFY remains the gate.
-    Mirrors :func:`_resolve_main_sha`'s subprocess shape (cwd=worktree,
-    timeout=10, OSError/SubprocessError -> safe ``False``).
-
-    Implemented as the fail-CLOSED projection of :func:`_sha_branch_reachability`
-    (task 3651): ``'reachable'`` is the only True, so both ``'unreachable'`` and
-    ``'unknown'`` collapse into this function's existing ``False``, which is
-    behaviour-preserving and keeps ONE copy of the probe — a future change to
-    the argv, the cwd or the timeout cannot now be made to one caller and
-    forgotten at the other. The fail-CLOSED reading is deliberate and stays
-    here: a pre-satisfaction guard that cannot check must refuse, the opposite
-    of :func:`_mark_step_done`'s fail-OPEN treatment of ``'unknown'``.
-    """
-    return _sha_branch_reachability(worktree, sha) == 'reachable'
-
-
-def _sha_branch_reachability(worktree: Path, sha: str) -> str:
-    """Tri-state reachability probe for *sha*: ``'reachable' | 'unreachable' | 'unknown'`` (task 3651).
-
-    THE ONE PROBE. :func:`_sha_exists_on_branch` is now a thin fail-CLOSED
-    projection of this function (``== 'reachable'``), so the argv, the cwd and
-    the ``timeout=10`` are stated once and both callers move together. What
-    this function adds over that boolean is a THIRD outcome the projection
-    folds into its bare ``False``: "the check could not run at all". That
-    distinction is what lets :func:`_mark_step_done` fail OPEN on an infra
-    fault while still rejecting a sha the branch genuinely does not carry.
-
-    Two probes, in order:
-
-    1. ``git rev-parse --git-dir`` — is there a usable repo at *worktree*? A
-       non-zero rc (or an ``OSError``/``SubprocessError``) means git or the
-       worktree is unavailable, which is an INFRA fault and says nothing about
-       the sha: return ``'unknown'``.
-    2. ``git merge-base --is-ancestor <sha> HEAD`` — rc 0 -> ``'reachable'``;
-       ANY other rc -> ``'unreachable'``. Folding rc 1 (a real commit that is
-       not an ancestor) and rc 128 (a bad/fabricated object) together is
-       correct here precisely because probe 1 already proved the repo healthy —
-       see :func:`_sha_exists_on_branch`'s docstring for those two return
-       codes. An ``OSError``/``SubprocessError`` on this call -> ``'unknown'``.
-
-    :func:`_mark_step_committed` keeps calling :func:`_sha_exists_on_branch`
-    rather than this function directly: a fail-CLOSED architect guard has no
-    use for the third state, and that function's docstring is where the
-    INV-1/INV-3 corroborate-before-acting rationale lives.
-    """
-    try:
-        health = subprocess.run(
-            ['git', 'rev-parse', '--git-dir'],
-            cwd=str(worktree),
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if health.returncode != 0:
-            return 'unknown'
-    except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning(
-            'Reachability probe: no usable git repo at %s (%s)', worktree, exc
-        )
-        return 'unknown'
-    try:
-        result = subprocess.run(
-            ['git', 'merge-base', '--is-ancestor', sha, 'HEAD'],
-            cwd=str(worktree),
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (subprocess.SubprocessError, OSError) as exc:
-        logger.warning(
-            'Reachability probe failed for sha %r: %s', sha, exc
-        )
-        return 'unknown'
-    return 'reachable' if result.returncode == 0 else 'unreachable'
+        request = ScopeRequest(path, reason)
+    except InvalidScopeRequest as exc:
+        return {'status': 'error', 'field': exc.field, 'message': str(exc)}
+    if not (artifacts.worktree / request.path).is_file():
+        return {
+            'status': 'error',
+            'field': 'path',
+            'message': (
+                f'path {request.path!r} names no file in the worktree; '
+                'a file you create needs no report'
+            ),
+        }
+    if not pending_scope_paths([request], artifacts.peek_plan().get('files', [])):
+        return {'status': 'already_in_scope', 'path': request.path}
+    pending = artifacts.write_scope_request(request)
+    return {'status': 'ok', 'path': request.path, 'pending': pending}
 
 
 def _mark_step_committed(
@@ -2015,7 +1280,7 @@ def _mark_step_committed(
     convention (so ``status=='error'``/substring assertions hold) and add
     ``ok:False`` so callers can branch uniformly on ``ok``.
     """
-    if not _sha_exists_on_branch(artifacts.worktree, sha):
+    if not branch_probes.sha_exists_on_branch(artifacts.worktree, sha):
         return {
             'ok': False,
             'status': 'error',
@@ -2074,11 +1339,6 @@ _MARKUP_RESIDUE_ANCHOR_TASK_ID = 'plan-tools-markup-residue'
 _MARKUP_STORM_ANCHOR_TASK_ID = 'plan-tools-markup-storm'
 
 _MARKUP_UNATTRIBUTED_SUBJECT = markup_sink.MARKUP_UNATTRIBUTED_SUBJECT
-_MARKUP_RESIDUE_ERROR_TYPE = markup_sink.MARKUP_RESIDUE_ERROR_TYPE
-_MARKUP_STORM_ERROR_TYPE = markup_sink.MARKUP_STORM_ERROR_TYPE
-_MARKUP_STORM_CATEGORY = markup_sink.MARKUP_STORM_CATEGORY
-_MARKUP_STORM_LEVEL = markup_sink.MARKUP_STORM_LEVEL
-_ESCALATION_FALLBACK_CATEGORY = markup_sink.ESCALATION_FALLBACK_CATEGORY
 
 #: plan-tools' declaration of its own channel. Every field is stated here
 #: rather than defaulted in ``markup_sink``: adding a server must be a decision
@@ -2103,8 +1363,6 @@ MARKUP_SINK_SPEC = markup_sink.MarkupSinkSpec(
         "the burst window's own lines (jq or grep '\"subject_task_id\"')"
     ),
 )
-
-_ESCALATION_FALLBACK_SUMMARY = MARKUP_SINK_SPEC.fallback_summary
 
 
 def _markup_project_root(worktree: Path) -> Path | None:
@@ -2136,8 +1394,8 @@ def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
         plan = artifacts.read_plan()
     except Exception:
         logger.warning(
-            'markup guard: could not read the plan for attribution under %s; '
-            'falling back to the worktree name', artifacts.root,
+            'markup guard: could not read the plan for attribution at %s; '
+            'falling back to the worktree name', artifacts.artifact_path('plan.json'),
         )
         plan = {}
     task_id = plan.get('task_id') if isinstance(plan, dict) else None
@@ -2148,16 +1406,18 @@ def _markup_subject_task_id(artifacts: TaskArtifacts) -> str:
 
 def _markup_escalation_sink(
     artifacts: TaskArtifacts,
+    loss_sink: Callable[[dict[str, Any]], Awaitable[object]],
 ) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
     """Build plan-tools' emitter — the shared channel, this server's spec.
 
     The queue-or-nothing payload floor is ``markup_sink``'s, shared with
-    verdict-tools.
+    verdict-tools. A record the queue cannot take is handed to *loss_sink*.
     """
     return markup_sink.make_escalation_sink(
         worktree=artifacts.worktree,
         spec=MARKUP_SINK_SPEC,
         subject_task_id=lambda: _markup_subject_task_id(artifacts),
+        loss_sink=loss_sink,
         # Resolved through THIS module's globals per call, so a test that
         # substitutes either seam steers an already-built sink.
         resolve_root=lambda worktree: _markup_project_root(worktree),
@@ -2214,6 +1474,7 @@ def _markup_plan_stamp(
 
 def _markup_fact_sink(
     artifacts: TaskArtifacts,
+    journal: Callable[[dict[str, Any]], Awaitable[str | None]],
 ) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
     """Fan one markup fact out to BOTH of this server's fact channels.
 
@@ -2236,10 +1497,11 @@ def _markup_fact_sink(
     composed sink returns THE JOURNAL'S locator — the existing fact-sink return
     contract is unchanged, and the stamp is purely additive.
 
-    Both emitters are built ONCE, here, rather than per record: each memoizes
-    its own resolution state, and rebuilding them per call would discard it.
+    Both emitters are built ONCE rather than per record: each memoizes its own
+    resolution state, and rebuilding them per call would discard it. The
+    journal is built by ``create_server`` and shared with the escalation sink's
+    loss channel; the stamp is built here.
     """
-    journal = _markup_fact_journal(artifacts)
     stamp = _markup_plan_stamp(artifacts)
 
     async def fact_sink(record: dict[str, Any]) -> str | None:
@@ -2272,122 +1534,64 @@ def _markup_fact_sink(
 # ---------------------------------------------------------------------------
 
 
-def create_server(artifacts: TaskArtifacts) -> FastMCP:
-    """Create the plan-tools MCP server with all tools registered."""
+def create_server(
+    artifacts: TaskArtifacts, granted_tools: frozenset[str] | None = None,
+) -> FastMCP:
+    """Create the plan-tools MCP server.
+
+    *granted_tools* ``None`` registers every tool. Otherwise only the granted
+    names stay registered, so an ungranted tool neither lists nor dispatches;
+    a granted name this server does not register raises ``ValueError``.
+    """
+    mcp, registered = _server_with_every_tool(artifacts)
+    if granted_tools is not None:
+        unknown = sorted(granted_tools - registered)
+        if unknown:
+            raise ValueError(
+                f'plan-tools grant names unregistered tool(s) {unknown}; '
+                f'registered: {sorted(registered)}'
+            )
+        _restrict_to_grant(mcp, registered, granted_tools)
+    return mcp
+
+
+def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozenset[str]]:
     mcp = FastMCP('plan-tools')
+    registered: list[str] = []
+
+    def tool(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+        registered.append(fn.__name__)
+        mcp.tool()(fn)
+        return fn
 
     # THE WRITE-TIME BOUNDARY GUARD (task 4457, PRD contract C2). Every INBOUND
     # string argument of every tool on this server is scanned for leaked
-    # tool-call envelope markup before pydantic ever validates it — which is
-    # what lets a repair recover a parameter this server declares as REQUIRED:
-    # the loudest leak shape here is add_design_decision.decision absorbing its
-    # rationale sibling, and no read-time surface can see it at all.
+    # tool-call envelope markup before pydantic validates it. Each wiring
+    # choice below is stated where it is owned:
     #
-    # BOTH ARGUMENTS ARE DECLARED EXPLICITLY (INV-1), never left to a default:
-    #
-    # * The POLICY is PRD section 4 C2's table row for plan-tools. A plan is
-    #   authored once and read for the life of the task, so bouncing the caller
-    #   costs one mechanical retry while forwarding a repair would write a
-    #   guessed-at document that every later reader inherits.
-    # * The empty EXEMPTION SET is an answer, not an omission: no plan-tools
-    #   tool has searching for envelope literals as its job, the way
-    #   fused-memory's scan_memory_content does. An architect legitimately
-    #   QUOTING the literals — planning a task about this very leak — uses the
-    #   deliberate-quoting override instead, which every tool on this server
-    #   DECLARES (task 5283): `accepts_markup_override` appends the `metadata`
-    #   parameter to each registered signature, so the remediation the
-    #   rejection hint gives is part of the advertised contract rather than a
-    #   client that happens to send an undeclared argument. The middleware
-    #   therefore takes `_apply_override`'s FORWARD branch here, and the
-    #   decorator — not the middleware — is what consumes the flag: no tool
-    #   body ever sees it, so it cannot reach plan.json.
-    #
-    # THE ESCALATION SINK IS WIRED, and that is not optional here. Contract C2
-    # is explicit that unrepairable input is refused AND its full raw payload
-    # preserved, and the middleware's refusal hint tells the caller its payload
-    # "is preserved verbatim in the escalation named above". Registering REJECT
-    # with `escalation_sink=None` would ship that promise with nothing behind
-    # it, on the largest unrepairable surface in the system — 52 of the 95
-    # measured specimens are plan-tools' — turning "corrupt but present in
-    # plan.json" into "silently absent".
-    #
-    # Residue is filed under a NON-TASK anchor, never under the leaking task's
-    # own id: the middleware declares it at level 2, and a pending level>=2
-    # record carrying a live task id halts that task. Preserving one payload
-    # must not cost the run that produced it. See
-    # `_MARKUP_RESIDUE_ANCHOR_TASK_ID` for the full reading of the gate.
-    #
-    # `fact_sink` IS WIRED, to a durable journal (task 4744). It was left
-    # unwired here on the premise that "the operator-facing half rides the
-    # storm escalation" and that a second fact channel would have no consumer.
-    # Both halves of that premise were measured false on 2026-08-25.
-    #
-    # The storm escalation carries only count / threshold / window_seconds /
-    # outcome / project — a WINDOW summary — and `project` is structurally None
-    # on this boundary, because `_identity` reads only arguments named agent_id
-    # / project_root / project_id and no plan-tools tool declares any of the
-    # three. So it can say that N calls leaked and never which. Meanwhile the
-    # per-call line that CAN say so reached only this subprocess's stderr:
-    #
-    #     journalctl --user --since 2026-08-22 | grep 'markup guard:'
-    #         ->  0 plan-tools lines
-    #
-    # against 35 real plan-tools rejections in data/orchestrator/
-    # agent-transcripts/ over the same span. A storm record therefore asked a
-    # human to identify the leaking caller from log lines nobody retains, and
-    # anyone following that instruction correctly concluded "no evidence" and
-    # was wrong.
-    #
-    # The fact channel now HAS a consumer — an operator reading
-    # `data/orchestrator/markup-guard/plan-tools.jsonl` — which is exactly the
-    # condition the old comment made the wiring conditional on.
-    #
-    # THE FACT CHANNEL NOW HAS TWO CONSUMERS (task 4597, esc-4528-1), fanned
-    # out by `_markup_fact_sink`. The journal serves an OPERATOR reading a file
-    # under the main checkout; the second stamps a `_markup_rejections` block
-    # onto plan.json itself, which is the artifact every LATER READER opens —
-    # the implementer briefing tells its agent to read `.task/plan.json`
-    # directly, and four architect-facing prompts embed the document verbatim.
-    # Neither of those audiences ever sees the journal, so without the stamp
-    # `design_decisions: []` stayed ambiguous between "the architect never
-    # called" and "the architect called six times and was refused six times".
-    #
-    # THIS NARROWS THE CONTRACT THIS SERVER'S TESTS PIN, deliberately and in
-    # exactly one place:
-    #
-    #     OLD: a refused call leaves plan.json BYTE-identical.
-    #     NEW: a refused call leaves every AUTHORED field of plan.json
-    #          identical. The only difference is the guard's own
-    #          `_markup_rejections` block.
-    #
-    # The narrowing is sound because the byte pin was a PROXY for a property
-    # about VALUES — the one stated four paragraphs above ("forwarding a repair
-    # would write a guessed-at document that every later reader inherits") and
-    # in the middleware header ("no middleware-repaired value can ever reach
-    # plan.json"). That property is preserved intact and is now asserted more
-    # directly than the byte pin ever asserted it: `tool` and `param` come from
-    # the invoked tool's own registration and schema, `outcome` from the
-    # guard's closed vocabulary, `ts` from the clock. NOTHING guessed, repaired
-    # or caller-authored reaches the document. In particular the matched
-    # pattern, the mis-close and the raw payload are all excluded — see
-    # `plan_markup_stamp`'s docstring for the three measured reasons.
-    #
-    # It is EAGER rather than buffered-until-the-next-accepted-write, which
-    # would have left the byte pins untouched. That alternative's one hole is
-    # the worst case: an architect whose LAST plan-tools call is a refusal, and
-    # which then stops, would have its losses silently dropped — and that is
-    # precisely the situation most in need of explanation.
+    # * REJECT_WITH_REPAIR, the empty exempt_tools and a real escalation_sink:
+    #   plans/toolcall-markup-containment-prd.md section 4 C2 and section 9 γ2.
+    # * The deliberate-quoting override every tool here declares: PRD D12.
+    # * Residue filed under a non-task anchor: PRD D9.
+    # * The durable fact journal and the measurement that wired it:
+    #   orchestrator/mcp/markup_journal.py's docstring.
+    # * The plan stamp, and the narrowing of "a refusal leaves plan.json
+    #   byte-identical" to "every authored field identical":
+    #   orchestrator/mcp/plan_markup_stamp.py's docstring.
+    # * The one journal both sinks share:
+    #   orchestrator/src/orchestrator/mcp/markup_sink.py::make_escalation_sink.
+    journal = _markup_fact_journal(artifacts)
     mcp.add_middleware(
         MarkupGuardMiddleware(
             RepairPolicy.REJECT_WITH_REPAIR,
             exempt_tools=frozenset(),
-            escalation_sink=_markup_escalation_sink(artifacts),
-            fact_sink=_markup_fact_sink(artifacts),
+            escalation_sink=_markup_escalation_sink(artifacts, journal),
+            fact_sink=_markup_fact_sink(artifacts, journal),
         )
     )
     mcp.add_middleware(MissingArgumentMiddleware())
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def create_plan(
         task_id: str,
@@ -2413,7 +1617,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _create_plan(artifacts, task_id, title, analysis, files)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def add_plan_step(
         step_id: str,
@@ -2421,6 +1625,9 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         description: str,
     ) -> dict[str, Any]:
         """Add a TDD step to the plan. Steps execute in the order added.
+
+        The response may carry ``foreign_task_meta``, naming
+        paths in the description that no lane of this task can write.
 
         Args:
             step_id: Unique step ID (e.g. "step-1", "step-2").
@@ -2432,7 +1639,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _add_plan_step(artifacts, step_id, step_type, description)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def add_prerequisite(
         prereq_id: str,
@@ -2441,6 +1648,8 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """Add a prerequisite to the plan. Prerequisites run before TDD steps.
 
         Use for setup work like config files, fixtures, etc.
+        The response may carry ``foreign_task_meta``, naming
+        paths in the description that no lane of this task can write.
 
         Args:
             prereq_id: Unique prerequisite ID (e.g. "pre-1").
@@ -2448,7 +1657,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _add_prerequisite(artifacts, prereq_id, description)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def add_design_decision(
         decision: str,
@@ -2462,7 +1671,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _add_design_decision(artifacts, decision, rationale)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def add_reuse_item(
         what: str,
@@ -2478,7 +1687,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _add_reuse_item(artifacts, what, where, how)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def drop_plan_file(
         path: str,
@@ -2503,15 +1712,15 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
                 legitimately needed no edit to it.
         """
         # Both parameters are flat ``str`` DELIBERATELY, not a map or a list
-        # of drops. MarkupGuardMiddleware._first_markup_argument skips
+        # of drops. MarkupGuardMiddleware._markup_arguments skips
         # non-string values (shared/src/shared/mcp_markup_middleware.py::
-        # _first_markup_argument), so ONLY flat string params get inbound
+        # MarkupGuardMiddleware._markup_arguments), so ONLY flat string params get inbound
         # envelope-markup protection — and ``reason`` is agent-authored free
         # prose, exactly the leak class that guard exists for. A later
         # refactor to a batch/map signature would silently drop the guard.
         return _drop_plan_file(artifacts, path, reason)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def mark_step_done(
         step_id: str,
@@ -2525,9 +1734,9 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
         *commit_sha* MUST be reachable from HEAD on the current branch — it is
         checked with a real ``git merge-base --is-ancestor`` before anything is
-        written (``plan_tools.py::_sha_branch_reachability``). A sha the branch
-        does not carry is REJECTED with ``{'status': 'error'}`` and the step is
-        left untouched. On rejection: COMMIT the work first, then call again
+        written (``orchestrator/mcp/branch_probes.py::sha_branch_reachability``).
+        A sha the branch does not carry is REJECTED with
+        ``{'status': 'error'}`` and the step is left untouched. On rejection: COMMIT the work first, then call again
         with the sha that commit produced — never retry with a guessed or
         invented one. An ABBREVIATED sha is fine and always has been: the
         already-committed-WIP notice in your briefing shows 12-char short
@@ -2545,7 +1754,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _mark_step_done(artifacts, step_id, commit_sha)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def record_step_deviation(
         step_id: str,
@@ -2582,7 +1791,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             prose_only, note,
         )
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def record_descoped_step(
         step_id: str,
@@ -2613,7 +1822,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         # strings get MarkupGuardMiddleware's inbound coverage.
         return _record_descoped_step(artifacts, step_id, commit, disposition, authority, note)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def mark_step_committed(
         step_id: str,
@@ -2645,7 +1854,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
     # --- Revalidation tools ---
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def update_plan_metadata(
         files: list[str] | str | None = None,
@@ -2667,7 +1876,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _update_plan_metadata(artifacts, files, analysis)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def remove_plan_step(
         step_id: str,
@@ -2682,7 +1891,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _remove_plan_step(artifacts, step_id)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def replace_plan_step(
         step_id: str,
@@ -2694,6 +1903,8 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         Preserves the step's position, status, and commit fields.
         Use during plan revalidation when a step needs revision due
         to changes on main. Cannot replace steps with status "done".
+        The response may carry ``foreign_task_meta``, naming
+        paths in the description that no lane of this task can write.
 
         Args:
             step_id: The step ID to replace (e.g. "step-2").
@@ -2703,7 +1914,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _replace_plan_step(artifacts, step_id, step_type, description)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def confirm_plan() -> dict[str, Any]:
         """Mark the plan COMPLETE. Call this as your final plan-tools action.
@@ -2723,7 +1934,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _confirm_plan(artifacts)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def report_blocking_dependency(
         depends_on_task_id: str,
@@ -2748,17 +1959,17 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             reason: One-line explanation of what's missing — file/symbol
                 names and where this task expected to find them.
         """
-        # ``artifacts.root`` is a SIBLING of the worktree once a meta_root is
-        # supplied (`.task-meta/<name>/`), so `artifacts.root.parent` is the
+        # ``artifacts.lane_root`` is a SIBLING of the worktree once a meta_root
+        # is supplied (`.task-meta/<name>/`), so its parent is the
         # `.task-meta` base, NOT the worktree. `artifacts.worktree` is always
         # correct, legacy or relocated (see TaskArtifacts.__init__).
         worktree = artifacts.worktree
-        main_sha = _resolve_main_sha(worktree)
+        main_sha = branch_probes.resolve_main_sha(worktree)
         return _report_blocking_dependency(
             artifacts, depends_on_task_id, reason, main_sha,
         )
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def report_task_already_done(
         commit: str,
@@ -2786,7 +1997,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _report_task_already_done(artifacts, commit, evidence)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def report_ready_to_merge(
         commit: str,
@@ -2830,7 +2041,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _report_ready_to_merge(artifacts, commit, evidence)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def report_unactionable_task(
         reason: str,
@@ -2857,7 +2068,7 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         """
         return _report_unactionable_task(artifacts, reason, evidence)
 
-    @mcp.tool()
+    @tool
     @accepts_markup_override
     def report_false_premise(
         classification: str,
@@ -2901,7 +2112,41 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
             artifacts, classification, premise, evidence, proposed_resolution
         )
 
-    return mcp
+    @tool
+    @accepts_markup_override
+    def report_missing_plan_file(
+        path: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Report an EXISTING file you must edit that the plan's ``files`` omits.
+
+        Use this BEFORE editing such a file when the list was merely
+        incomplete. You may then make the edit and keep working; there is no
+        need to stop. When this session ends the orchestrator tries to take
+        the file's lock and adds it to plan.json ``files``. Your next
+        briefing reports it granted, or contested with the task holding it.
+        If it is contested, revert your edits to it, or call
+        ``escalate_blocker(category='scope_violation')`` with the design
+        reason it must change.
+
+        A file you CREATE needs no report. A file that is out of scope for a
+        DESIGN reason (another owner's module, another PRD) is
+        ``escalate_blocker``, not this tool.
+
+        Args:
+            path: The repo-relative path of the existing file.
+            reason: One line: why this task must edit it.
+        """
+        return _report_missing_plan_file(artifacts, path, reason)
+
+    return mcp, frozenset(registered)
+
+
+def _restrict_to_grant(
+    mcp: FastMCP, registered: frozenset[str], granted: frozenset[str],
+) -> None:
+    for name in registered - granted:
+        mcp.local_provider.remove_tool(name)
 
 
 # ---------------------------------------------------------------------------
@@ -2910,16 +2155,49 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
 
 
 def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
-    """Parse ``--worktree``/``--meta-root`` and return the corresponding
-    ``TaskArtifacts``.
+    """Parse ``--worktree``/``--meta-root``/``--task-root`` and return the
+    corresponding ``TaskArtifacts``.
 
-    Mirrors workflow.py's orchestrator-side construction
-    (``TaskArtifacts(worktree, _meta_root_for_worktree(worktree))``) so both
-    sides resolve the IDENTICAL meta_root for a given worktree
-    (worktree-lane-lifecycle PRD task ε1). When ``--meta-root`` is omitted,
-    behaviour is byte-identical to before this argument existed: the root
-    dir checked for existence is the legacy ``<worktree>/.task``.
+    Mirrors workflow.py's orchestrator-side construction so both sides
+    resolve the IDENTICAL roots for a given dispatch (worktree-lane-lifecycle
+    PRD task ε1; the task root, task 3155). Each root must already exist;
+    omitting both flags leaves the legacy ``<worktree>/.task`` single root.
     """
+    return _artifacts_from_namespace(_cli_parser().parse_args(argv))
+
+
+def server_from_argv(argv: list[str] | None = None) -> FastMCP:
+    """The server a stdio launch with *argv* serves, over its artifacts.
+
+    A launch carrying ``--grants-enforced`` or any ``--grant`` exposes only
+    the granted tools, so a marked launch with no grant exposes none. A
+    granted name this server does not register is dropped with a WARNING,
+    where ``create_server`` raises. A launch carrying neither keeps every
+    tool and logs a WARNING. Why both cases exist:
+    plans/plan-deviation-recording-prd.md D14.
+    """
+    args = _cli_parser().parse_args(argv)
+    mcp, registered = _server_with_every_tool(_artifacts_from_namespace(args))
+    granted: frozenset[str] = frozenset(args.grant or ())
+    if not (args.grants_enforced or granted):
+        logger.warning(
+            'plan-tools launched without --grants-enforced or any --grant: exposing '
+            'every plan-tools tool, because the launcher predates task 7717. '
+            'Task 10803 removes this path.'
+        )
+        return mcp
+    unknown = sorted(granted - registered)
+    if unknown:
+        logger.warning(
+            'plan-tools launch grants tool(s) %s that this server does not register: '
+            'dropping them, because the launcher predates their rename or removal.',
+            unknown,
+        )
+    _restrict_to_grant(mcp, registered, granted)
+    return mcp
+
+
+def _cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Plan-tools MCP server (stdio)')
     parser.add_argument(
         '--worktree', type=Path, required=True,
@@ -2933,22 +2211,43 @@ def _artifacts_from_args(argv: list[str] | None = None) -> TaskArtifacts:
             '<worktree>/.task location.'
         ),
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        '--task-root', type=Path, default=None,
+        help=(
+            'Optional task-lifetime `.task-meta/task-<id>` root. When '
+            'omitted, every artifact resolves against the lane root.'
+        ),
+    )
+    parser.add_argument(
+        '--grant', action='append', metavar='NAME',
+        help='A tool this launch exposes; repeatable.',
+    )
+    parser.add_argument(
+        '--grants-enforced', action='store_true',
+        help=(
+            'Expose only the --grant tools, so none when no grant is given. '
+            'Every launcher from task 7717 on passes it.'
+        ),
+    )
+    return parser
 
-    worktree = args.worktree.resolve()
-    meta_root = args.meta_root.resolve() if args.meta_root is not None else None
-    root_to_check = meta_root if meta_root is not None else worktree / '.task'
-    if not root_to_check.is_dir():
-        print(f'Error: {root_to_check} does not exist', file=sys.stderr)
-        sys.exit(1)
 
-    return TaskArtifacts(worktree, meta_root)
+def _artifacts_from_namespace(args: argparse.Namespace) -> TaskArtifacts:
+    artifacts = TaskArtifacts(
+        args.worktree.resolve(),
+        args.meta_root.resolve() if args.meta_root is not None else None,
+        args.task_root.resolve() if args.task_root is not None else None,
+    )
+    for root in (artifacts.lane_root, artifacts.task_root):
+        if not root.is_dir():
+            print(f'Error: {root} does not exist', file=sys.stderr)
+            sys.exit(1)
+    return artifacts
 
 
 def main() -> None:
-    """Parse --worktree/--meta-root and run the stdio MCP server."""
-    artifacts = _artifacts_from_args()
-    server = create_server(artifacts)
+    """Parse the worktree, artifact roots and grants and run the stdio MCP server."""
+    server = server_from_argv()
     # show_banner=False suppresses FastMCP's decorative startup banner and its
     # synchronous PyPI update-check (check_for_newer_version -> httpx.get). That
     # check runs on the stdio startup path BEFORE the MCP initialize handshake;

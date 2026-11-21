@@ -20,11 +20,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.reconciliation.event_buffer import EventBuffer
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _TOPIC = 'seam-demo-topic'
 _PROJECT_ROOT = '/tmp/seam-demo'
@@ -729,7 +732,7 @@ class TestClosureCollaboratorWiring:
 
     @staticmethod
     def _wire(memory_service):
-        from fused_memory.server.main import (  # noqa: PLC0415
+        from fused_memory.server.main import (
             _wire_closure_collaborators,
         )
 
@@ -832,7 +835,7 @@ class TestSeamFlagsABlockLessGate:
     async def test_it_emits_exactly_one_warning_naming_the_facts(
         self, interceptor, taskmaster, caplog
     ):
-        import logging  # noqa: PLC0415
+        import logging
 
         caplog.set_level(logging.WARNING)
         taskmaster.get_task.return_value = self._blockless(
@@ -860,7 +863,7 @@ class TestSeamFlagsABlockLessGate:
         """`TestSeamDormancy::test_dormant_without_the_gate_key`\'s shape — the
         118-task majority. The existing dormancy tests must not be made
         noisy."""
-        import logging  # noqa: PLC0415
+        import logging
 
         caplog.set_level(logging.WARNING)
         taskmaster.get_task.return_value = self._blockless()

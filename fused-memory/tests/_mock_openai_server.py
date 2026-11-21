@@ -34,6 +34,8 @@ from typing import Any
 # misread as a plumbing bug.
 DEFAULT_EMBEDDING_LEN = 1536
 
+DEFAULT_SERVED_MODEL = 'mock-embedding-model'
+
 
 def chat_completion_body(content: str) -> dict[str, Any]:
     """A minimal valid chat.completions payload.
@@ -91,6 +93,16 @@ def responses_body(text: str, *, input_tokens: int = 3, output_tokens: int = 4) 
     }
 
 
+def _models_body(model_ids: Sequence[str]) -> dict[str, Any]:
+    return {
+        'object': 'list',
+        'data': [
+            {'id': m, 'object': 'model', 'created': 0, 'owned_by': 'mock'}
+            for m in model_ids
+        ],
+    }
+
+
 def _embeddings_body(count: int, length: int) -> dict[str, Any]:
     return {
         'object': 'list',
@@ -102,7 +114,7 @@ def _embeddings_body(count: int, length: int) -> dict[str, Any]:
             }
             for i in range(max(count, 1))
         ],
-        'model': 'mock-embedding-model',
+        'model': DEFAULT_SERVED_MODEL,
         'usage': {'prompt_tokens': 1, 'total_tokens': 1},
     }
 
@@ -121,6 +133,8 @@ class MockOpenAIServer:
         self.chat_responder: Callable[[Any], str] | None = None
         """When set, each chat reply's content is computed from that request's JSON body."""
         self.embedding_len = DEFAULT_EMBEDDING_LEN
+        self.served_models: list[str] = [DEFAULT_SERVED_MODEL]
+        """The ids GET /models lists."""
 
     @property
     def base_url(self) -> str:
@@ -169,7 +183,7 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
-        def log_message(self, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        def log_message(self, *args: Any) -> None:  # stdlib signature
             """Silence the default stderr access log."""
 
         def _send_json(self, status: int, body: dict[str, Any]) -> None:
@@ -180,7 +194,26 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(payload)
 
-        def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+        def do_GET(self) -> None:  # stdlib naming
+            state._record({
+                'path': self.path,
+                'method': 'GET',
+                'headers': dict(self.headers),
+                'json_body': None,
+            })
+
+            canned = state._canned(self.path)
+            if canned is not None:
+                self._send_json(*canned)
+                return
+
+            if self.path.endswith('/models'):
+                self._send_json(200, _models_body(state.served_models))
+                return
+
+            self._send_json(404, {'error': {'message': f'unhandled path {self.path}'}})
+
+        def do_POST(self) -> None:  # stdlib naming
             length = int(self.headers.get('Content-Length') or 0)
             raw = self.rfile.read(length) if length else b''
             try:

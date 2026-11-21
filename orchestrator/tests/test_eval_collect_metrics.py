@@ -11,6 +11,7 @@ from _eval_diff_repo import repo_with_commit
 
 from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
 from orchestrator.evals.runner import collect_metrics
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.verify import VerifyResult
 
 _RUNNER_LOGGER = 'orchestrator.evals.runner'
@@ -40,13 +41,14 @@ async def _collect(
     *,
     role: RoleUnderTest = RoleUnderTest.IMPLEMENTER,
     replay_frame: str | None = None,
+    workflow: MagicMock | None = None,
 ) -> EvalMetrics:
     verification = VerifyResult(
         passed=True, test_output='', lint_output='', type_output='', summary='',
     )
     with patch('orchestrator.verify.run_verification', AsyncMock(return_value=verification)):
         return await collect_metrics(
-            _workflow(), worktree, {'id': 't', 'pre_task_commit': base_commit},
+            workflow or _workflow(), worktree, {'id': 't', 'pre_task_commit': base_commit},
             role=role, replay_frame=replay_frame,
         )
 
@@ -120,3 +122,48 @@ class TestDiffStats:
 
         assert (m.lines_changed, m.files_changed) == (-1, -1)
         assert _runner_warnings(caplog)
+
+
+def _zero_work_workflow(variant: ImplementerBriefVariant, iterations: int) -> MagicMock:
+    wf = _workflow()
+    wf.config.implementer_brief_variant = variant
+    wf.config.prices = {}
+    wf.metrics.execute_iterations = iterations
+    wf.artifacts.read_plan.return_value = {
+        'prerequisites': [],
+        'steps': [{'id': f's{i}', 'status': 'pending'} for i in range(3)],
+    }
+    return wf
+
+
+@pytest.mark.asyncio
+class TestFalseGreenAtTheEnforcedCap:
+    """The false-green guard reads the cap the EXECUTE loop enforced, not max_execute_iterations.
+
+    Under one-step a 3-step plan stops at 3 + slack = 6 iterations, far short
+    of the eval default of 20, so a zero-work $0 T/T/T run must still be nulled.
+    """
+
+    async def test_one_step_run_stopped_at_its_cap_is_flagged(self, tmp_path: Path):
+        repo, base = repo_with_commit(tmp_path / 'repo', {})
+
+        m = await _collect(
+            repo, base,
+            workflow=_zero_work_workflow(ImplementerBriefVariant.ONE_STEP, 6),
+        )
+
+        assert m.tests_pass is None
+        assert m.lint_clean is None
+        assert m.typecheck_clean is None
+
+    async def test_whole_plan_run_short_of_max_execute_iterations_is_not_flagged(
+        self, tmp_path: Path,
+    ):
+        repo, base = repo_with_commit(tmp_path / 'repo', {})
+
+        m = await _collect(
+            repo, base,
+            workflow=_zero_work_workflow(ImplementerBriefVariant.WHOLE_PLAN, 6),
+        )
+
+        assert m.tests_pass is True

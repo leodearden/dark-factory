@@ -2,6 +2,10 @@
 
 **Status:** active — authored 2026-09-08 (design-first: implementation plan + adversarial
 review, four reviewers, Leo ruled every finding in-window the same day).
+**Amended 2026-11-17** by `plans/consolidation-adjudicator-prd.md`, which replaces D1, D8, D9,
+the hazard-gate half of C4 and C6, rows B4 and B8, and the §11 rollout (its §13 lists them):
+an LLM adjudicator sits between the predicate and any human, and the executor files no
+curator gate. Read that document first; the text below is unchanged and partly superseded.
 **Project:** dark_factory. **Approach:** B+H (contracts + boundary-test sketch; G5 hit:
 four packages touched, twelve mechanisms, the MCP write boundary and the task interceptor
 are load-bearing seams).

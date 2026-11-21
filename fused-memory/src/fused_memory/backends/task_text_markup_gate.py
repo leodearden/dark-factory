@@ -3,7 +3,8 @@
 ``SqliteTaskBackend.add_task`` and ``SqliteTaskBackend.update_task`` call
 :func:`refuse_leaked_task_text` inside their write transaction, so every
 writer is covered, including the ones that never cross MCP dispatch and so
-never meet ``fused_memory/server/markup_guard.py::install_markup_guard``.
+never meet the boundary chain
+``fused_memory/server/boundary_guards.py::install_boundary_guards`` installs.
 
 This gate uses the PRECISE stored-text detector,
 ``fused_memory/utils/toolcall_xml_leak.py::detect_leak``, not the recall-first

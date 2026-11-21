@@ -14,17 +14,31 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _lane_test_helpers import (
+    acquire_lane,
+    add_warm_lane_scripts,
+    build_harness,
+    get_head,
+    make_orch_config,
+    make_plan,
+    make_warm_lane_repo,
+    wire_recovery_scheduler,
+)
+from _seed_script_stubs import seed_default_warm_base
 from _workflow_helpers import _build_harness, _init_git_repo
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
+from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.quarantine_provenance import NOT_RELOCATED
 from orchestrator.warm_lane_pool import WarmLanePool
 
 # ---------------------------------------------------------------------------
@@ -38,6 +52,7 @@ def _make_config(
     warm_lane_pool: bool,
     spare_warm_lanes: int = 0,
     warm_lane_prewarm: bool = False,
+    main_health_fix_reserved_slots: int = 0,
     tmp_path: Path,
 ) -> OrchestratorConfig:
     """Build a minimal OrchestratorConfig with the given warm-lane settings."""
@@ -48,6 +63,7 @@ def _make_config(
     return OrchestratorConfig(
         project_root=repo,
         max_concurrent_tasks=max_concurrent_tasks,
+        main_health_fix_reserved_slots=main_health_fix_reserved_slots,
         git=GitConfig(
             warm_lane_pool=warm_lane_pool,
             spare_warm_lanes=spare_warm_lanes,
@@ -154,6 +170,31 @@ class TestHarnessWarmLaneWiring:
 
         assert harness.git_ops.warm_lane_pool is None
 
+    def test_main_health_fix_reserve_adds_to_pool_size(self, tmp_path: Path):
+        """Every run slot needs a lane, the main-health-fix reserve included (task 8480)."""
+        config = _make_config(
+            max_concurrent_tasks=7,
+            warm_lane_pool=True,
+            spare_warm_lanes=2,
+            main_health_fix_reserved_slots=1,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
+        assert harness.git_ops.warm_lane_pool is not None
+        assert harness.git_ops.warm_lane_pool.size == 10  # 7 + 1 + 2
+
+    def test_main_health_fix_reserve_no_effect_when_pool_off(self, tmp_path: Path):
+        config = _make_config(
+            max_concurrent_tasks=7,
+            warm_lane_pool=False,
+            main_health_fix_reserved_slots=1,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
+        assert harness.git_ops.warm_lane_pool is None
+
 
 # ---------------------------------------------------------------------------
 # Helpers for spec-pool tests
@@ -194,15 +235,14 @@ def _make_spec_config(
 
 
 class TestHarnessSpecPoolWiring:
-    """Harness passes merge_spec_warm_lane_pool_size=K to GitOps (step-5 RED, step-6 GREEN).
+    """Harness sizes GitOps' spec warm-lane pool at the lane's speculation depth.
 
-    K = 1 + len(config.enabled_verify_runners) — the SAME expression as
-    speculation_depth passed to SpeculativeMergeWorker — so the spec pool size
-    and the worker cap derive from one source and cannot drift.
+    The pool size is orchestrator/src/orchestrator/harness.py::Harness._speculation_k:
+    one warm lane per frontier entry (plans/merge-lane-policy-prd.md D4).
     """
 
     def test_spec_pool_sized_from_k_with_runners(self, tmp_path: Path):
-        """K=3 (1+2 runners) → spec pool size==3 when knob on."""
+        """Two enabled runners → spec pool size==4 when knob on."""
         runners = [_make_runner('r1'), _make_runner('r2')]
         config = _make_spec_config(
             merge_spec_warm_lane_pool=True,
@@ -215,14 +255,12 @@ class TestHarnessSpecPoolWiring:
             'spec_warm_lane_pool should be a WarmLanePool when knob on and K>0'
         )
         assert isinstance(harness.git_ops.spec_warm_lane_pool, WarmLanePool)
-        # K = 1 + len(enabled_verify_runners) = 1 + 2 = 3
-        expected_k = 1 + len(config.enabled_verify_runners)
-        assert harness.git_ops.spec_warm_lane_pool.size == expected_k, (
-            f'spec pool size must equal K={expected_k}'
+        assert harness.git_ops.spec_warm_lane_pool.size == 4, (
+            'spec pool size must be hosts (1 + 2 runners) + 1 = 4'
         )
 
-    def test_spec_pool_k1_no_runners(self, tmp_path: Path):
-        """K=1 (no remote runners) → spec pool size==1 when knob on."""
+    def test_spec_pool_no_runners_is_two(self, tmp_path: Path):
+        """No remote runners → spec pool size==2 (one host + 1) when knob on."""
         config = _make_spec_config(
             merge_spec_warm_lane_pool=True,
             verify_runners=[],
@@ -231,8 +269,9 @@ class TestHarnessSpecPoolWiring:
         harness = _build_harness(config)
 
         assert harness.git_ops.spec_warm_lane_pool is not None
-        # K = 1 + 0 = 1
-        assert harness.git_ops.spec_warm_lane_pool.size == 1
+        assert harness.git_ops.spec_warm_lane_pool.size == 2, (
+            'spec pool size must be one host + 1 = 2'
+        )
 
     def test_spec_pool_none_when_knob_off(self, tmp_path: Path):
         """spec_warm_lane_pool is None when merge_spec_warm_lane_pool=False."""
@@ -1341,7 +1380,9 @@ class TestRecoveryTerminalTaskLaneRelease:
         harness.scheduler.get_status = AsyncMock(return_value='in-progress')
 
         with patch.object(git_ops, 'cleanup_worktree', new_callable=AsyncMock) as mock_cleanup, \
-             patch.object(git_ops, 'quarantine_worktree', new_callable=AsyncMock) as mock_quarantine, \
+             patch.object(
+                 git_ops, 'quarantine_worktree', new_callable=AsyncMock, return_value=NOT_RELOCATED,
+             ) as mock_quarantine, \
              patch.object(pool, 'restore_assignment') as mock_restore:
             await harness._recover_crashed_tasks()
 
@@ -1355,7 +1396,7 @@ class TestRecoveryTerminalTaskLaneRelease:
         )
         # Quarantined (relocates the worktree), not cleaned up (a different cell)
         mock_quarantine.assert_called_once_with(
-            lane_entry, '3459', 'recovery-record-divergence',
+            lane_entry, '3459', 'recovery-record-divergence', stored_title=None,
         )
         mock_cleanup.assert_not_called()
         # Lane must remain FREE (never pinned) and its durable record QUARANTINED
@@ -1363,6 +1404,83 @@ class TestRecoveryTerminalTaskLaneRelease:
         record = git_ops._lane_lifecycle.read(lane_entry)
         assert record is not None
         assert record.state == DurableLaneState.QUARANTINED
+
+
+@pytest.mark.asyncio
+class TestRecordDrivenQuarantineProvenance:
+    """Task 4845: each record-driven quarantine in recovery parks a resolvable
+    branch, emits its payload, and stamps a back-pointer in the live task
+    plan, carrying the stored title when the quarantine was an identity
+    mismatch.
+
+    Real git, real GitOps: the writer (acquire_warm_lane) feeds the reader
+    (_recover_crashed_tasks) across a simulated restart, as
+    test_lane_lifecycle_integration.py's B2 suite does.
+    """
+
+    async def _recover_a_divergent_lane(
+        self, tmp_path: Path, *, live_title: str | None, drop_admin_entry: bool,
+    ) -> tuple[Harness, TaskArtifacts, MagicMock]:
+        repo = make_warm_lane_repo(tmp_path)
+        await add_warm_lane_scripts(repo)
+        harness = build_harness(make_orch_config(repo))
+        wire_recovery_scheduler(harness)
+        if live_title is not None:
+            harness.scheduler.get_task = AsyncMock(return_value={'title': live_title})
+        lane = await acquire_lane(harness.git_ops, '42', await get_head(repo), expected_title='Stored title')
+        artifacts = TaskArtifacts.for_task(lane, '42')
+        artifacts.init('42', 'Stored title', 'd')
+        artifacts.write_plan(make_plan(1, 2, '42'))
+        artifacts.ensure_lane_symlinks()
+        (lane / 'work.py').write_text('x = 1\n')
+        await harness.git_ops.commit(lane, 'lane work')
+        old_pool = harness.git_ops.warm_lane_pool
+        assert old_pool is not None
+        harness.git_ops.warm_lane_pool = WarmLanePool(
+            worktree_base=harness.git_ops.worktree_base, size=old_pool.size,
+        )
+        if drop_admin_entry:
+            shutil.rmtree(repo / '.git' / 'worktrees' / lane.name)
+        events = MagicMock()
+        harness.event_store = events
+
+        await harness._recover_crashed_tasks()
+
+        return harness, artifacts, events
+
+    async def _assert_parked(self, harness: Harness, events: MagicMock, reason: str) -> dict:
+        (emit,) = [
+            call.kwargs for call in events.emit.call_args_list
+            if call.args[0] == EventType.worktree_quarantined
+        ]
+        data = emit['data']
+        assert data['reason'] == reason
+        assert data['branch'] is not None
+        assert data['tip_sha'] is not None
+        assert data['unique_commit_count'] == 1
+        assert await harness.git_ops.resolve_branch_sha(data['branch']) == data['tip_sha']
+        parked_plan = Path(data['dest']) / '.task' / 'plan.json'
+        assert parked_plan.is_file()
+        assert not parked_plan.is_symlink()
+        return data
+
+    async def test_identity_mismatch_site_stamps_the_stored_title(self, tmp_path: Path):
+        harness, artifacts, events = await self._recover_a_divergent_lane(
+            tmp_path, live_title='A different live task', drop_admin_entry=False,
+        )
+
+        data = await self._assert_parked(harness, events, 'recovery-identity-mismatch')
+        entry = artifacts.read_plan()['_quarantined_from'][-1]
+        assert entry['branch'] == data['branch']
+        assert entry['stored_title'] == 'Stored title'
+
+    async def test_record_divergence_site_records_provenance(self, tmp_path: Path):
+        harness, artifacts, events = await self._recover_a_divergent_lane(
+            tmp_path, live_title=None, drop_admin_entry=True,
+        )
+
+        data = await self._assert_parked(harness, events, 'recovery-record-divergence')
+        assert artifacts.read_plan()['_quarantined_from'][-1]['branch'] == data['branch']
 
 
 # ===========================================================================
@@ -2185,16 +2303,8 @@ class TestReconcileLaneCheckouts:
         repo.mkdir()
         _init_git_repo(repo)
 
-        # Pre-create the default warm-lane CoW seed base so the pre-acquire
-        # base-health gate sees WarmBaseHealth.OK (mirrors wl_git_repo in
-        # test_warm_lane_pool.py), and a no-op seed script so a successful
-        # acquire's seed step succeeds.
-        default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-        default_base.mkdir(parents=True, exist_ok=True)
-        (default_base / '.keep').write_text('warm base sentinel\n')
-        # Task 2099: mark pool storage present so the create-once discriminator
-        # does not refuse the first lane creation below (mirrors wl_git_repo).
-        (repo / '.worktrees' / '.pool-root').touch()
+        seed_default_warm_base(repo)
+        # A no-op seed script so a successful acquire's seed step succeeds.
         scripts_dir = repo / 'scripts'
         scripts_dir.mkdir(parents=True, exist_ok=True)
         seed_script = scripts_dir / 'seed-warm-lane.sh'
@@ -2508,16 +2618,8 @@ class TestMidRunRecycleLeak:
         repo.mkdir()
         _init_git_repo(repo)
 
-        # Pre-create the default warm-lane CoW seed base so the pre-acquire
-        # base-health gate sees WarmBaseHealth.OK — it runs BEFORE the (here
-        # mocked-out) real seed step either way.
-        default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-        default_base.mkdir(parents=True, exist_ok=True)
-        (default_base / '.keep').write_text('warm base sentinel\n')
-        # Task 2099: mark pool storage present (mirrors wl_git_repo) — belt
-        # and braces even though this test's reset-in-place path does not
-        # exercise the create-once discriminator.
-        (repo / '.worktrees' / '.pool-root').touch()
+        # The base-health gate runs BEFORE the (here mocked-out) seed step.
+        seed_default_warm_base(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -2592,7 +2694,7 @@ def _neutralise_prewarm_startup(harness: Harness) -> None:
     harness._load_persisted_scheduler_pause = AsyncMock()
     harness._dismiss_stale_escalations = AsyncMock()
     harness._file_dirty_tree_escalation = AsyncMock()
-    harness._rehydrate_merge_halt = MagicMock()
+    harness._rehydrate_merge_halt = AsyncMock()
     harness._recover_pending_merges = AsyncMock(return_value={})
     harness._reap_orphaned_merge_worktrees = AsyncMock()
     harness._reconcile_landed_outbox = AsyncMock()

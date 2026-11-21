@@ -41,6 +41,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _live_merge_worker import running_merge_worker
+from _merge_lane_fakes import lane_scene_config, remerge_on_main
 from _orch_helpers import make_placeholder_future, wait_responsive
 from _resolution_merges import resolution_merge
 
@@ -106,7 +107,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ---------------------------------------------------------------------------
@@ -1065,7 +1066,7 @@ class TestPathEquivalence:
         es_remerge = _make_event_store(tmp_path / 'remerge')
         queue2: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker2 = SpeculativeMergeWorker(git_ops, queue2, event_store=es_remerge)
-        item = await worker2._remerge(remerge_req, time.monotonic())
+        item = await remerge_on_main(worker2, remerge_req, time.monotonic())
 
         # A flowing (non-decided) item means _remerge merged successfully
         # without hitting any guard.  None is a deliberately distinct

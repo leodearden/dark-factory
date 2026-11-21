@@ -3,7 +3,8 @@
 Non-fixture helpers (MockEdge, make_rebuild_detail, extract_cypher, …)
 live in `_fm_helpers.py` — a uniquely-named sibling module — so they can
 be imported from test files without conflicting with sibling subprojects'
-conftests under `sys.modules['conftest']`.
+conftests under `sys.modules['conftest']`, and in the `_fm_*.py` siblings
+that `_fm_helpers`' module docstring lists.
 
 Testing a `scripts/` script? `scripts/` is not a package and is not on
 PYTHONPATH, so import it with `from _fm_helpers import
@@ -34,6 +35,23 @@ from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.llm_client import LLMClient
 
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd fused-memory && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
+# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
+# at sys.path[0] it would make the subproject directories resolve as namespace
+# packages pointing at the project folder instead of src/<pkg>/, beating the
+# inserts below.
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from df_pytest_isolation import (
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    arm_usage_gate_sweep_confinement,
+    reject_unsafe_basetemp,
+)
+
 # Make this file's directory importable by test modules so
 # `from _fm_helpers import ...` resolves regardless of whether pytest
 # is invoked from the subproject root or the workspace root.
@@ -63,36 +81,14 @@ _escalation_src = os.path.join(
 if _escalation_src not in sys.path:
     sys.path.insert(0, _escalation_src)
 
-# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
-# runs `cd fused-memory && uv run pytest tests/`, which makes rootdir the
-# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
-# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
-# at sys.path[0] it would make the subproject directories resolve as namespace
-# packages pointing at the project folder instead of src/<pkg>/, beating the
-# inserts above.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
 from _fm_helpers import (  # noqa: E402
-    _leaked_async_httpx_clients,
-    _warn_if_drain_closed_a_foreign_client,
     complete_paged_read,
     install_identity_mocks,
     pydantic_spec,
-    reap_leaked_async_httpx_clients,
     reap_leaked_ticket_workers,
     resolve_xdist_worker_id,
-    track_async_httpx_clients,
 )
 from _graphiti_fake import FakeGraphitiClient  # noqa: E402
-from df_pytest_isolation import (  # noqa: E402
-    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
-    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
-    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
-    arm_leaked_drain_process_guard,
-    reject_unsafe_basetemp,
-)
 
 from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402
@@ -109,16 +105,45 @@ from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV  # noqa: E402
 
 
 def pytest_configure(config):
-    """Session-start hooks: basetemp safety, the drain-leak guard, async-httpx leak tracking.
+    """Session-start hooks: basetemp safety, the suite-wide defences, UsageGate sweep confinement, async-httpx leak tracking.
 
     ``track_async_httpx_clients()`` runs HERE — at session start, before
     collection — rather than lazily from a fixture, so clients constructed at
     module import time are tracked too and can be reaped like any other
     (task 4412).
+
+    ``shared.usage_gate`` here, and ``_fm_httpx_leaks`` here and in the two
+    httpx-reaping fixtures, are imported function-locally because a
+    module-level import after this file's ``sys.path`` setup would need a new
+    ``E402`` suppression, which ``scripts/inline_suppressions.py`` refuses.
+
+    ``_aim_falkordb_at_scratch`` ends the session with a usage error (exit 4)
+    when it is aimed at the production FalkorDB, or, under the offline lane,
+    when the scratch FalkorDB is unreachable (task 7792).
     """
     reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
     arm_leaked_drain_process_guard(config)
+    from _fm_httpx_leaks import track_async_httpx_clients
+    from shared import usage_gate
+
+    arm_usage_gate_sweep_confinement(config, usage_gate)
     track_async_httpx_clients()
+    _aim_falkordb_at_scratch()
+
+
+def _aim_falkordb_at_scratch() -> None:
+    """Importing ``_fm_falkor_live`` resolves the scratch endpoint, so the import is where production is refused."""
+    from fused_memory.config.falkordb_endpoints import ProductionFalkorDBTarget
+
+    try:
+        from _fm_falkor_live import ScratchFalkorDBUnreachable, prepare_scratch_falkordb_session
+    except ProductionFalkorDBTarget as error:
+        raise pytest.UsageError(str(error)) from None
+    try:
+        prepare_scratch_falkordb_session(os.environ)
+    except ScratchFalkorDBUnreachable as error:
+        raise pytest.UsageError(str(error)) from None
 
 
 @pytest.fixture(scope='session')
@@ -276,9 +301,16 @@ def _isolate_fm_config(monkeypatch, tmp_path):
     since mutating ``os.environ`` while iterating it raises.  The YAML's own
     interpolation surface, which pydantic never sees, is covered by the
     path-leaf pin above: ``setenv`` overwrites an inherited value.
+    ``OVERLAY_ENV_VAR`` is a fourth env surface the model-field-derived scrub
+    cannot see, and operators export it during the embedder soak, so it is
+    deleted by name, and imported function-locally for the reason
+    ``pytest_configure``'s docstring gives.
     """
+    from fused_memory.config.overlay import OVERLAY_ENV_VAR
+
     for inherited in [name for name in os.environ if _reads_as_a_config_override(name)]:
         monkeypatch.delenv(inherited, raising=False)
+    monkeypatch.delenv(OVERLAY_ENV_VAR, raising=False)
 
     for name, layout in _FM_CONFIG_PATH_INTERPOLATIONS.items():
         monkeypatch.setenv(name, str(tmp_path / layout))
@@ -303,6 +335,27 @@ def _no_inherited_project_registry(monkeypatch):
     never the launching checkout.
     """
     monkeypatch.delenv(KNOWN_PROJECT_ROOTS_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_fm_data_dir(monkeypatch, tmp_path):
+    """Pin ``DARK_FACTORY_DATA_DIR`` at this test's ``tmp_path / 'data'`` (task 6456).
+
+    Unpinned, ``fused_memory.middleware.task_interceptor::_combine_audit_path``
+    appends every curator combine to ``<CWD>/data/combine_audit.jsonl``; run
+    from the repo root that is the live service's own audit file, since the
+    service's ``WorkingDirectory`` is the repo root.
+
+    Separate from ``_isolate_fm_config`` because this variable is a
+    module-level ``os.getenv``, not a config leaf.  The ``tmp_path / 'data'``
+    layout mirrors a deployment rooted at ``tmp_path``, which is where
+    ``_isolate_fm_config`` puts ``PROJECT_ROOT``.  ``setenv`` overwrites an
+    inherited value; a test-body ``setenv`` still wins, as
+    ``test_task_interceptor.py::audit_dir`` relies on.  See
+    ``test_data_dir_hermeticity.py`` and
+    ``plans/fused-memory-config-cwd-leak-rca-2026-09-13.md``.
+    """
+    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
 
 
 @pytest.fixture
@@ -428,7 +481,7 @@ async def _reap_leaked_ticket_workers():
 # a real defence for a hypothetical one is the wrong way round, so the
 # constraint is enforced by DISCOVERABILITY instead: the sync arm snapshots
 # the already-leaked clients at SETUP and warns via
-# _fm_helpers._warn_if_drain_closed_a_foreign_client whenever the drain closed
+# _fm_httpx_leaks._warn_if_drain_closed_a_foreign_client whenever the drain closed
 # one that pre-dated the current test — naming the trap at the teardown that
 # sprang it, instead of leaving it to be diagnosed from the far-away symptom.
 # ---------------------------------------------------------------------------
@@ -442,7 +495,7 @@ def _reap_leaked_async_httpx_clients_sync():
     exception was never retrieved`` ERROR into some unrelated test's ``caplog``
     window, and why closing it at teardown makes that record unreachable, see
     the ONE canonical write-up of the mechanism —
-    ``_fm_helpers.reap_leaked_async_httpx_clients``. It is deliberately not
+    ``_fm_httpx_leaks.reap_leaked_async_httpx_clients``. It is deliberately not
     restated here.
 
     THIS ARM IS DEFENCE IN DEPTH, NOT COVERAGE OF A GAP THE ASYNC ARM LEAVES.
@@ -476,6 +529,12 @@ def _reap_leaked_async_httpx_clients_sync():
     innocent test's teardown. A warning keeps it loud without letting the
     BACKSTOP arm become a flake source itself.
     """
+    from _fm_httpx_leaks import (
+        _leaked_async_httpx_clients,
+        _warn_if_drain_closed_a_foreign_client,
+        reap_leaked_async_httpx_clients,
+    )
+
     # Snapshot at SETUP (this arm is set up first, before the test body runs):
     # the clients already leaked by someone else. Weak refs, so the snapshot
     # never keeps a client alive or changes its GC timing.
@@ -484,13 +543,13 @@ def _reap_leaked_async_httpx_clients_sync():
     if _leaked_async_httpx_clients():
         try:
             asyncio.run(reap_leaked_async_httpx_clients())
-        except Exception as exc:  # noqa: BLE001 — a backstop must not fail the test
+        except Exception as exc:  # a backstop must not fail the test
             warnings.warn(
                 f'async-httpx drain fallback failed: {exc!r}. The sync arm '
                 f'closes clients from a throwaway asyncio.run loop, so an '
                 f'exception type beyond the suppressed TimeoutError/'
                 f'RuntimeError reached it — widen the suppression in '
-                f'_fm_helpers.reap_leaked_async_httpx_clients or fix the '
+                f'_fm_httpx_leaks.reap_leaked_async_httpx_clients or fix the '
                 f'ordering that sent this client to the fallback (task 4412).',
                 stacklevel=2,
             )
@@ -501,7 +560,7 @@ def _reap_leaked_async_httpx_clients_sync():
 async def _reap_leaked_async_httpx_clients(_reap_leaked_async_httpx_clients_sync):
     """Close leaked openai/anthropic httpx clients before this test's loop closes.
 
-    Task 4412 — mechanism in ``_fm_helpers.reap_leaked_async_httpx_clients``,
+    Task 4412 — mechanism in ``_fm_httpx_leaks.reap_leaked_async_httpx_clients``,
     same as the sync arm above.
 
     THE ARGUMENT IS THE ORDERING, and it is the only reason it is there.
@@ -516,9 +575,11 @@ async def _reap_leaked_async_httpx_clients(_reap_leaked_async_httpx_clients_sync
     ``test_async_httpx_leak_isolation.py::test_aab_the_leak_was_closed_in_its_own_test_loop``.
 
     Best-effort and bounded — see ``reap_leaked_async_httpx_clients`` in
-    ``_fm_helpers.py``: it never fails a test, and is a cheap no-op for the
+    ``_fm_httpx_leaks.py``: it never fails a test, and is a cheap no-op for the
     vast majority of tests that leak nothing.
     """
+    from _fm_httpx_leaks import reap_leaked_async_httpx_clients
+
     yield
     await reap_leaked_async_httpx_clients()
 
@@ -557,13 +618,18 @@ def make_backend():
     make_backend_over_fake_graphiti.
 
     ``driver=`` replaces the default MagicMock driver; make_graph_driver builds one.
+    ``graph_access=`` injects the provider every raw Cypher call resolves its
+    graph through; ``_graph_access_fake.FakeGraphAccess`` is the test one.
     For a real driver and spec'd sub-clients, use make_wired_backend.
     """
-    def _factory(config, *, registered_graph_ids=(), driver=None) -> GraphitiBackend:
+    def _factory(
+        config, *, registered_graph_ids=(), driver=None, graph_access=None,
+    ) -> GraphitiBackend:
         backend = GraphitiBackend.with_driver(
             config,
             MagicMock() if driver is None else driver,
             registered_graph_ids=registered_graph_ids,
+            graph_access=graph_access,
         )
         backend.client = MagicMock()
         return backend
@@ -580,16 +646,13 @@ def make_graph_driver():
     it as ``make_backend(config, driver=...)`` instead of assigning
     ``backend._driver._get_graph``.
     """
+    from _graph_access_fake import wired_graph
+
     from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
 
     def _factory(graphs: Mapping[str, Any]) -> _MultiTenantFalkorDriver:
-        def _select(name: str) -> Any:
-            if name not in graphs:
-                raise KeyError(f'no graph wired for {name!r}; wired: {sorted(graphs)}')
-            return graphs[name]
-
         falkor = MagicMock()
-        falkor.select_graph.side_effect = _select
+        falkor.select_graph.side_effect = lambda name: wired_graph(graphs, name)
         return _MultiTenantFalkorDriver(falkor_db=falkor)
 
     return _factory
@@ -672,7 +735,7 @@ def make_graph_mock():
     defaults to ``[]`` rather than to the auto-``MagicMock`` attribute a bare
     ``MagicMock()`` would otherwise supply.  Code that resolves FalkorDB result
     columns BY NAME (``GraphitiBackend.list_indices``, and
-    ``_fm_helpers.await_index_operational`` before it) iterates
+    ``_fm_falkor_live.await_index_operational`` before it) iterates
     ``result.header``, and an auto-``MagicMock`` is not iterable — every mocked
     call would raise ``TypeError`` instead of exercising the code under test.
     The ``[]`` default is safe because no existing consumer of this fixture
@@ -767,7 +830,7 @@ def make_fake_maintenance_service():
     """Factory fixture: returns a callable(mock_cfg, mock_service) -> async context manager."""
     def _factory(mock_cfg, mock_service):
         @asynccontextmanager
-        async def fake(config_path):
+        async def fake(config_path=None, *, config=None, open_as=None):
             yield mock_cfg, mock_service
 
         return fake
@@ -822,6 +885,11 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     ``overreach_guard.shadow_enabled`` is pinned off for the same reason: with
     it on, every decision write in a unit test would reach the real overreach
     judge; a test of the shadow opts in on its own config.
+    ``mem0.persist_history`` is pinned off too: with it on, any test that
+    builds a real mem0 instance from this config would write the
+    process-shared, xdist-contended, sandbox-read-only
+    ``$MEM0_DIR/history.db`` rather than a private in-memory DB; a test of the
+    persisted default opts in on its own config.
     """
     config = FusedMemoryConfig(
         llm=LLMConfig(
@@ -854,6 +922,7 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     )
     config.write_triage.enabled = False
     config.overreach_guard.shadow_enabled = False
+    config.mem0.persist_history = False
     return config
 
 
@@ -889,17 +958,17 @@ def _integration_collection_lease(request):
     ``-m 'not integration'``) never writes into the machine-global lease
     directory the live cron reads.
 
-    The reaper is loaded LAZILY here rather than at conftest import time, for
-    the reason ``_fm_helpers.qdrant_skipif`` documents for deferring its own
-    probe: a session that never runs an integration test must not pay for
-    it.  Via ``load_script_module`` — do not add another local
+    The reaper is loaded LAZILY here rather than at conftest import time, so
+    a session that never runs an integration test does not pay for it — the
+    same deferral ``_fm_qdrant_live.qdrant_skipif`` applies to its probe.
+    Via ``load_script_module`` — do not add another local
     ``spec_from_file_location`` loader (tasks 3738/3895).
     """
     if request.node.get_closest_marker('integration') is None:
         yield
         return
 
-    from _fm_helpers import load_script_module  # noqa: PLC0415
+    from _fm_helpers import load_script_module
 
     reaper = load_script_module(
         Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py',

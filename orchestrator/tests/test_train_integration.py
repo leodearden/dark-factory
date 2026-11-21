@@ -209,6 +209,7 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
     """
     return OrchestratorConfig(
         project_root=repo,
+        escalate_preexisting_main_break=True,
         test_command="cargo test --workspace --quiet",
         lint_command="true",
         type_check_command="true",
@@ -280,7 +281,7 @@ class TestTrainIntegrationB1B7:
 
     async def test_two_member_train_lands_via_one_union_verify(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -426,7 +427,7 @@ class TestTrainIntegrationB2:
     @pytest.mark.exercise_merge_verify
     async def test_lower_member_break_blocks_train(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -681,7 +682,7 @@ class TestTrainIntegrationB8:
 
     async def test_solo_merge_no_train_events(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:

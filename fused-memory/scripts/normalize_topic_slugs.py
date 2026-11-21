@@ -23,99 +23,8 @@ The jobs differ too: that one STAMPS a topic onto records carrying none;
 this one REWRITES the value of one that already exists.
 
 What is shared is the *fold*.  :func:`fused_memory.topic_slug.derive_topic_slug`
-has one home (INV-5) and both scripts import it, so the two can never disagree
-about what a legacy value becomes.
-
-The migration spans TWO stores
-------------------------------
-Most of the work patches Mem0 record metadata.  But
-``metadata.x_recon_consolidation_gate.topic`` is a Tier-C block on **task**
-metadata — read by ``reconciliation/consolidation_gate.py`` and enforced on
-the ``done`` transition by ``middleware/task_interceptor.py`` — a genuinely
-different store, reached through the MCP server rather than a backend call.
-
-Renaming the memories without moving that block would leave a gate task's
-closure check scrolling a slug no record carries any more: the uncloseable-gate
-trap re-created at a NEW address, which is strictly worse than leaving the
-snake_case slug alone because the operator would then also have to discover
-that this migration caused it.  So the two halves are planned as a pair and
-refused as a pair.
-
-On the live path that promise rests on the GATE CENSUS, not on an operator's
-memory of which topics are gated: ``census_consolidation_gates`` reads every
-gate block out of each named task store, and ``run`` refuses ``--apply``
-unless the census covers every swept project.  A store the census could not
-read is a gap it names, never a silent "no gates here".
-
-A gated slug moves all-or-nothing; an ungated slug does not
------------------------------------------------------------
-When any member write of a GATED slug fails, ``rename_group`` undoes the
-members that moved, because a gate left on a vacated slug is uncloseable.
-
-An UNGATED slug gets no undo.  A partial failure leaves it split: the members
-that moved carry the new slug and those whose write did not land keep the
-legacy value.  The residue probe files ``legacy_slug_residue`` for it, and the
-report lists the group under ``ungated_partial_rename``.
-
-A plain re-run does NOT finish the move.  The collision guard sees the moved
-members as incumbents on the new slug and refuses the stragglers as
-``slug_collision``.  The remedy is by hand: once a straggler's failure is
-resolved, patch its ``metadata.topic`` to the new slug with a metadata-only
-``update_memory`` merge, the same patch this script issues.
-
-Dry run is the default — the operator runbook
---------------------------------------------
-1. **Dry run**, from anywhere, naming the checkout of EACH swept corpus::
-
-       uv run --project fused-memory python \
-           fused-memory/scripts/normalize_topic_slugs.py \
-           --project-root <dark-factory checkout> \
-           --project-root <reify checkout>
-
-   Writes ``plans/topic-slug-normalization-report.{json,md}`` and prints the
-   markdown.  Nothing is modified.  ``--project-root`` REPLACES the default
-   (this checkout alone), so a swept corpus whose checkout is not named is a
-   ``gate_census_incomplete`` gap: the dry run exits 1 and names it.
-   ``--topic <legacy value>`` (repeatable) narrows the write set to the named
-   legacy spellings; it is how one registry topic is normalized without
-   sweeping the whole project.
-
-2. **Read the refusal buckets and resolve them BY HAND.**  ``slug_collision``,
-   ``canonical_collision``, ``topic_unfoldable`` and ``gate_ambiguous`` are
-   the buckets this script deliberately will not decide for you: the first two
-   would merge two topic namespaces (and, in the canonical case, manufacture
-   the second canonical ``_check_canonical_uniqueness`` exists to prevent),
-   the third has no honest fold, so any value the script picked would be a
-   guess written across the whole corpus, and the fourth is a slug carrying
-   more than one consolidation gate, where moving one gate would strand the
-   others.  Also check ``under_enumerated`` / ``scroll_budget_exhausted``: a
-   run with either populated is a LOWER BOUND, and a clean residue probe over
-   it proves nothing.  After an ``--apply``, ``ungated_partial_rename`` lists
-   any slug left split across both values; it too is resolved by hand, as
-   described above.
-
-3. **Apply**, as an OPERATOR, with the same roots::
-
-       ... normalize_topic_slugs.py --apply \
-           --project-root <dark-factory checkout> \
-           --project-root <reify checkout>
-
-   ``--apply`` refuses before scrolling anything (``GateCensusIncomplete``)
-   while any swept project is uncovered or any named root failed to answer.
-   This is an operator action, not an agent one.  The store-mutation preflight
-   fails closed for any process that cannot write mem0's history directory,
-   which is the normal posture inside an agent sandbox — so a dry run is what
-   an agent can deliver, and the deliverable of task 4878 is THIS INSTRUMENT
-   PLUS A VERIFIED DRY RUN, not the live mutation.
-
-4. **Re-measure** with the standing instrument and compare against the
-   committed baseline::
-
-       ... census_memory_metadata.py   # read coverage.topic_coverage.slug_non_conforming
-
-   The report's ``baseline_delta`` block already carries the arithmetic; step 4
-   is how you confirm it against the corpus rather than against this run's own
-   enumeration.
+has one home (INV-5) and both migrations import it (this one through its
+planner), so the two can never disagree about what a legacy value becomes.
 
 Scope boundary
 --------------
@@ -126,17 +35,30 @@ task 3202.  Normalizing the existing corpus is worth doing regardless of
 whether either ever lands: it is what makes an exact-match ``{'topic': T}``
 read return the whole cluster instead of whichever spelling the caller
 guessed.
+
+Where things live
+-----------------
+* The operator runbook (dry run, refusal buckets, apply, re-measure, and the
+  hand remedy for a split slug):
+  ``fused-memory/scripts/README_normalize_topic_slugs.md``.
+* The pure planner:
+  ``fused-memory/src/fused_memory/maintenance/topic_slug_plan.py``.
+* The gate census and gate pairing:
+  ``fused-memory/src/fused_memory/maintenance/topic_slug_gates.py``.
+* The write boundary and the two-store lockstep, including why every slug
+  moves all-or-nothing:
+  ``fused-memory/src/fused_memory/maintenance/topic_slug_lockstep.py``.
+* Here: the corpus enumeration, the residue probe, the sweep (``run``), the
+  report and the CLI.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import contextlib
-import functools
 import json
 import logging
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -144,8 +66,26 @@ from fused_memory.backends.mem0_client import (
     DEFAULT_SCROLL_MAX_PAGES,
     ScrollPageBudgetExhausted,
 )
-from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
-from fused_memory.topic_slug import derive_topic_slug, is_valid_topic_slug
+from fused_memory.canonical_marker import is_canonical
+from fused_memory.maintenance.topic_slug_gates import (
+    GateCensus,
+    census_consolidation_gates,
+    gate_topic,
+    pair_gate_blocks,
+)
+from fused_memory.maintenance.topic_slug_lockstep import (
+    MOVED_OUTCOMES,
+    REHEARSED_OUTCOMES,
+    rename_group,
+)
+from fused_memory.maintenance.topic_slug_plan import (
+    Rename,
+    in_selection,
+    is_non_conforming_topic,
+    plan_renames,
+    refuse_invalid_selection,
+)
+from fused_memory.utils.script_loader import load_script
 from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 # This script reports through ``print``; stdout carries its machine-read
@@ -172,36 +112,20 @@ __all__ = [
     'DEFAULT_MAX_PAGES',
     'DEFAULT_MD_OUT',
     'DEFAULT_PROJECTS',
-    'GATE_METADATA_KEY',
-    'GateCensus',
     'GateCensusIncomplete',
-    'GateGroup',
-    'WriteRejectedError',
-    'assert_write_accepted',
-    'census_consolidation_gates',
-    'describe_partial_ungated_group',
     'load_mcp_client_class',
     'load_mcp_client_module',
     'open_live_memory_service',
     'open_mcp_client',
-    'pair_gate_blocks',
-    'rename_group',
-    'WRITE_REASON',
-    'WRITE_SOURCE',
     'DEFAULT_PAGE_SIZE',
-    'DEFAULT_SCROLL_MAX_PAGES',
     'ERROR_OUTCOMES',
-    'Rename',
     'SKIP_BUCKETS',
     'ScrollPageBudgetExhausted',
     'assert_store_mutation_allowed',
     'census_categories',
-    'derive_topic_slug',
     'enumerate_topic_bearing',
-    'is_valid_topic_slug',
     'load_census_module',
     'main',
-    'plan_renames',
     'REMEASURE_COMMAND',
     'render_json',
     'render_markdown',
@@ -211,7 +135,6 @@ __all__ = [
     'resolve_topics',
     'run',
     'run_live',
-    'rename_one',
     'verify_old_slugs_drained',
 ]
 
@@ -249,7 +172,7 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'record_without_id',
     'slug_collision',
     'canonical_collision',
-    # from rename_one
+    # from fused-memory/src/fused_memory/maintenance/topic_slug_lockstep.py::rename_one
     'memory_not_found',
     'topic_moved_since_plan',
     'update_failed',
@@ -260,20 +183,11 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'orphan_gate_topic',
     'gate_ambiguous',
     'gate_lockstep_failed',
-    # from describe_partial_ungated_group
+    # from rename_group's hold of a split ungated slug
     'ungated_partial_rename',
     # from verify_old_slugs_drained
     'legacy_slug_residue',
 )
-
-#: Written to every ``update_memory`` so the write journal attributes each
-#: rename to this sweep rather than to a generic ``mcp_tool``.  The amendment
-#: storm alarm reads this field; a bulk run under the default source would
-#: look exactly like the runaway rewrite that alarm exists to catch.
-WRITE_SOURCE = 'normalize_topic_slugs'
-
-#: Recorded on the write journal row beside the patch.
-WRITE_REASON = 'corpus-wide topic-slug normalization (task 4878)'
 
 #: Page size and page budget for each cell's scroll.  ALIASED from the
 #: backend, never restated: the budget travels with the paging loop it bounds
@@ -289,38 +203,9 @@ DEFAULT_MAX_PAGES = DEFAULT_SCROLL_MAX_PAGES
 # The corpus partition — borrowed, never restated
 # ---------------------------------------------------------------------------
 
-@functools.cache
 def load_census_module() -> Any:
-    """Load ``census_memory_metadata`` by path.
-
-    ``scripts/`` is not a package, so a plain import cannot reach it.  Same
-    importlib idiom — including the ``sys.modules``-first lookup — that
-    ``census_memory_metadata.py::_load_probe_module`` and
-    ``retro_stamp_topics.py::_load_probe_module`` already established for
-    exactly this cross-script reuse: that slot may already hold a module
-    another by-path loader executed, and re-executing would hand back
-    DIFFERENT class objects, silently breaking identity across the seam.
-
-    Memoized because the load is not free and because the identity above is
-    only stable if it happens once.
-    """
-    import importlib.util  # noqa: PLC0415
-
-    mod_name = 'census_memory_metadata'
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, _CENSUS_SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {_CENSUS_SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    """Load ``census_memory_metadata`` by path via ``load_script``, sharing its key's module."""
+    return load_script(_CENSUS_SCRIPT_PATH, 'census_memory_metadata')
 
 
 def census_categories() -> tuple[str, ...]:
@@ -346,16 +231,6 @@ def census_categories() -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 # The corpus boundary
 # ---------------------------------------------------------------------------
-
-def _is_non_conforming_topic(topic: object) -> bool:
-    """A PRESENT topic the slug rule rejects, whatever its type.
-
-    ``None`` is an absent topic (``retro_stamp_topics.py``'s job), never a
-    non-conforming one.  Both the corpus boundary and the planner ask this, so
-    the two cannot disagree about which records need attention.
-    """
-    return topic is not None and not is_valid_topic_slug(topic)
-
 
 async def enumerate_topic_bearing(
     memory_service: Any,
@@ -404,7 +279,7 @@ async def enumerate_topic_bearing(
         *coverage* maps category -> the expected/scrolled/recount/delta/
         complete cell, and *complete* is the conjunction over all cells.
     """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     backend = memory_service.mem0
     category_values = (
@@ -440,15 +315,11 @@ async def enumerate_topic_bearing(
                 topic = metadata.get('topic')
                 if isinstance(topic, str):
                     occupied_topics.add(topic)
-                    # ``is True``, not truthiness: metadata off a live store is
-                    # not schema-enforced here, and ``canonical: 'false'`` would
-                    # otherwise read as a canonical claim and escalate a mild
-                    # collision into the severe bucket.
-                    if metadata.get('canonical') is True:
+                    if is_canonical(metadata):
                         memory_id = record.get('id')
                         if isinstance(memory_id, str) and memory_id:
                             canonical_ids_by_topic.setdefault(topic, []).append(memory_id)
-                if not _is_non_conforming_topic(topic):
+                if not is_non_conforming_topic(topic):
                     continue
                 # The residue triple: the id to write to, the topic to fold,
                 # and whether this record claims canonical (which decides
@@ -460,7 +331,7 @@ async def enumerate_topic_bearing(
                         'topic': topic,
                         **(
                             {'canonical': True}
-                            if metadata.get('canonical') is True else {}
+                            if is_canonical(metadata) else {}
                         ),
                     },
                 })
@@ -534,919 +405,6 @@ async def enumerate_topic_bearing(
     }
 
 
-# ---------------------------------------------------------------------------
-# The plan row
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class Rename:
-    """One record's topic move, decided before anything is written.
-
-    Frozen because the artifact and the writes must agree: the whole reason
-    the corpus is planned before it is touched is so an operator can read the
-    rehearsal and know what ``--apply`` will do.  A mutable row lets the two
-    diverge between the report and the write loop.
-
-    Attributes:
-        project_id: The corpus this record lives in.  Carried on the row
-            rather than inferred at the write, because collisions are scoped
-            per project and the report interleaves both defaults.
-        memory_id: The Mem0 record id — how :func:`rename_one` addresses it.
-        old_topic: The raw non-conforming value, verbatim.  Needed to detect
-            a record whose topic moved between the plan and the write, and to
-            probe the legacy slug for residue afterwards.
-        new_topic: The folded, validated slug.  Always a value
-            :func:`is_valid_topic_slug` accepts — the planner never emits a
-            row it could not stand behind.
-    """
-
-    project_id: str
-    memory_id: str
-    old_topic: str
-    new_topic: str
-
-
-# ---------------------------------------------------------------------------
-# Pure core — planning
-# ---------------------------------------------------------------------------
-
-def _in_selection(legacy_topic: object, topics: frozenset[str] | None) -> bool:
-    """Whether a ``--topic`` selection covers *legacy_topic*.
-
-    ``None`` is no selection and covers every value.  A selection holds only
-    strings, so a non-string topic (a ``topic_unfoldable`` entry) is never in one.
-    """
-    return topics is None or (isinstance(legacy_topic, str) and legacy_topic in topics)
-
-
-def plan_renames(
-    records,
-    *,
-    project_id: str,
-    occupied_topics=None,
-    canonical_ids_by_topic=None,
-    topics: frozenset[str] | None = None,
-) -> tuple[list[Rename], list[dict]]:
-    """Decide what to rename in one project's records, and what to refuse.
-
-    Pure: takes scroll-shaped ``{'id', 'created_at', 'metadata'}`` dicts and no
-    service, so every verdict is reproducible from the input alone.
-
-    Takes the project's FULL record set rather than one record at a time.  It
-    has to: deciding whether ``foo_bar`` may become ``foo-bar`` requires
-    knowing whether anything already carries ``foo-bar``, which is not a
-    property of the record being examined.
-
-    Four dispositions, and the distinctions between them are load-bearing:
-
-    * **rename** — the topic fails :func:`is_valid_topic_slug` and folds
-      cleanly.  This is the work.
-    * **ignored, silently** — the topic already conforms, or there is no
-      ``topic`` key, or it is ``None``.  Deliberately NOT a skip line: most
-      of the ~49k-record corpus conforms, and filing each conforming record
-      would bury the ~141 that need attention.  A ``None`` topic is an
-      *absent* topic, not a malformed one; stamping an absent topic is
-      ``retro_stamp_topics.py``'s job, not this script's.
-    * **skipped, reported** — no honest fold exists (``topic_unfoldable``), or
-      the record has no id to write to (``record_without_id``).  The entry
-      carries the RAW value and never a guessed slug: an operator resolving
-      it by hand needs to see what is actually on the record, and the reason
-      it is here at all is that this script refused to name a replacement.
-    * **refused, per SLUG** — the fold lands on an occupied slug
-      (``slug_collision``), possibly severely (``canonical_collision``).  See
-      the guard below; the refusal covers every record carrying that legacy
-      value, and is filed once for the slug rather than once per record.
-
-    Output is sorted by ``(project_id, new_topic, memory_id)`` — and the skips
-    correspondingly — because scroll order is not stable, and two rehearsals
-    over an unchanged corpus must produce byte-comparable artifacts for a diff
-    to mean anything.
-
-    Args:
-        records: Scroll-shaped record dicts for ONE project.
-        project_id: The corpus they came from; stamped onto every row.
-        topics: The legacy values whose verdicts to return; ``None`` returns
-            every verdict.  It narrows the verdicts only: a selected value
-            that an unselected spelling contests is still refused.
-
-    Returns:
-        ``(renames, skips)`` — frozen :class:`Rename` rows, and report-ready
-        skip dicts each carrying a ``reason``.
-    """
-    renames: list[Rename] = []
-    skips: list[dict] = []
-
-    # --- pass 1: what does the corpus already look like? -------------------
-    # Built BEFORE any verdict, from the whole record set, so no decision can
-    # depend on the order the backend happened to page records back in.  It
-    # ignores *topics* for the same reason: the planner must see every legacy
-    # value to know which targets are contested.
-    #
-    #   observed_topics       every topic value present, conforming or not
-    #   canonical_ids_by_topic  which records under a topic claim canonical
-    #   sources_by_target     which legacy values want to fold onto a target
-    #
-    # *occupied_topics* / *canonical_ids_by_topic* carry the incumbents that
-    # are NOT in *records*.  ``enumerate_topic_bearing`` discards conforming
-    # records to keep a corpus sweep affordable, so on the live path the
-    # incumbent a fold would collide with has already been thrown away by the
-    # time this function runs — and a collision guard that cannot see the
-    # incumbent silently degrades into a namespace merger.  Tests that pass a
-    # complete record set (conforming rows included) need neither argument.
-    observed_topics: set[str] = set(occupied_topics or ())
-    canonical_ids_by_topic = {
-        topic: list(ids) for topic, ids in (canonical_ids_by_topic or {}).items()
-    }
-    sources_by_target: dict[str, set[str]] = {}
-    for record in records:
-        metadata = record.get('metadata') or {}
-        topic = metadata.get('topic')
-        if not isinstance(topic, str):
-            continue
-        observed_topics.add(topic)
-        # ``is True``, not truthiness: metadata comes off a live store and is
-        # not schema-enforced at this seam, so ``canonical: 'false'`` — a
-        # non-empty string — would otherwise read as a canonical claim and
-        # escalate a mild refusal into the severe bucket.
-        if metadata.get('canonical') is True:
-            memory_id = record.get('id')
-            if isinstance(memory_id, str) and memory_id and memory_id not in (
-                canonical_ids_by_topic.get(topic) or ()
-            ):
-                canonical_ids_by_topic.setdefault(topic, []).append(memory_id)
-        if not is_valid_topic_slug(topic):
-            folded = derive_topic_slug(topic)
-            if folded is not None:
-                sources_by_target.setdefault(folded, set()).add(topic)
-
-    # --- pass 2: classify, then emit --------------------------------------
-    # WHY REFUSE RATHER THAN MERGE.  Folding ``foo_bar`` onto ``foo-bar`` when
-    # something already carries ``foo-bar`` is not a normalization: it merges
-    # two topic namespaces, changing cluster membership for records this sweep
-    # never examined.  When both sides hold a ``canonical: true`` it is worse
-    # than that — ``topic`` is what SCOPES canonical uniqueness
-    # (``memory_service._check_canonical_uniqueness`` probes
-    # ``{'topic': T, 'canonical': True}``), so the merged cluster holds exactly
-    # the second canonical that invariant exists to prevent.  Under the shipped
-    # ``memory_metadata.enforce = false`` that seam WARN-fails open, so it would
-    # land silently with this script as its author.
-    #
-    # WHY THE SERVICE-SIDE PROBE CANNOT SUBSTITUTE FOR THIS ONE.  The seam
-    # adjudicates a SINGLE write against live state, one at a time.  It would
-    # let the first member of a colliding group through and refuse only the
-    # second — leaving the corpus in a state determined by iteration order, and
-    # half-merged.  Deciding here, against the whole record set, makes the
-    # verdict a property of the CORPUS instead.  Same posture, same reason, as
-    # ``retro_stamp_topics.stamp_one``'s ``stray_canonical_on_member``.
-    collisions: dict[str, dict] = {}
-    for record in records:
-        metadata = record.get('metadata') or {}
-        topic = metadata.get('topic')
-        if not _is_non_conforming_topic(topic) or not _in_selection(topic, topics):
-            continue
-
-        memory_id = record.get('id')
-        folded = derive_topic_slug(topic)
-        if not isinstance(topic, str) or folded is None:
-            skips.append({
-                'reason': 'topic_unfoldable',
-                'project_id': project_id,
-                'memory_id': memory_id,
-                'topic': topic,
-                'topic_type': type(topic).__name__,
-                'note': (
-                    'no honest fold exists for this value (it collapses to '
-                    'empty, exceeds TOPIC_SLUG_MAX_LEN once folded, or is not '
-                    'a string) — resolve it by hand rather than letting the '
-                    'sweep invent a slug no human chose'
-                ),
-            })
-            continue
-
-        # Occupied by a record that already carries the target value, or
-        # contested by a SECOND legacy value folding onto the same target.
-        # The second case is refused for BOTH sources: letting one through
-        # would make the outcome depend on scroll order, and would refuse the
-        # other for an occupancy this script had just manufactured.
-        incumbent = folded in observed_topics
-        contested = len(sources_by_target.get(folded, ())) > 1
-        if incumbent or contested:
-            entry = collisions.get(topic)
-            if entry is None:
-                old_canonicals = sorted(canonical_ids_by_topic.get(topic, ()))
-                new_canonicals = sorted(
-                    memory_id
-                    for other in (
-                        {folded} | (sources_by_target.get(folded, set()) - {topic})
-                    )
-                    for memory_id in canonical_ids_by_topic.get(other, ())
-                )
-                severe = bool(old_canonicals) and bool(new_canonicals)
-                entry = {
-                    'reason': (
-                        'canonical_collision' if severe else 'slug_collision'
-                    ),
-                    'project_id': project_id,
-                    'old_topic': topic,
-                    'new_topic': folded,
-                    'colliding_count': 0,
-                    'memory_ids': [],
-                    'old_canonical_ids': old_canonicals,
-                    'new_canonical_ids': new_canonicals,
-                    'note': (
-                        'the fold would merge two topic namespaces AND carry a '
-                        'canonical from each side into one cluster, '
-                        'manufacturing the second canonical '
-                        '_check_canonical_uniqueness exists to prevent — '
-                        'resolve by hand before re-running'
-                        if severe else
-                        'the target slug is already occupied (by conforming '
-                        'records, or by a second legacy value folding onto it), '
-                        'so the rename would MERGE two topic namespaces rather '
-                        'than normalize one — resolve by hand before re-running'
-                    ),
-                }
-                collisions[topic] = entry
-            entry['colliding_count'] += 1
-            if isinstance(memory_id, str) and memory_id:
-                entry['memory_ids'].append(memory_id)
-            continue
-
-        if not memory_id or not isinstance(memory_id, str):
-            # ``update_memory`` is addressed by memory id.  Refusing here keeps
-            # an unaddressable row out of the planned-work count instead of
-            # letting it fail one at a time at the write boundary, inside a
-            # report that already claimed it.
-            skips.append({
-                'reason': 'record_without_id',
-                'project_id': project_id,
-                'memory_id': memory_id,
-                'topic': topic,
-                'new_topic': folded,
-                'note': 'record carries no usable id, so it cannot be written to',
-            })
-            continue
-
-        renames.append(Rename(
-            project_id=project_id,
-            memory_id=memory_id,
-            old_topic=topic,
-            new_topic=folded,
-        ))
-
-    for entry in collisions.values():
-        entry['memory_ids'].sort()
-        skips.append(entry)
-
-    renames.sort(key=lambda r: (r.project_id, r.new_topic, r.memory_id))
-    skips.sort(key=lambda s: (
-        str(s.get('reason')),
-        str(s.get('project_id')),
-        str(s.get('old_topic', '')),
-        str(s.get('memory_id')),
-    ))
-    return renames, skips
-
-
-# ---------------------------------------------------------------------------
-# The single write boundary
-# ---------------------------------------------------------------------------
-
-async def rename_one(memory_service, rename: Rename, *, apply: bool) -> dict:
-    """Move one record's topic, or report precisely why it was not moved.
-
-    The only function here that writes.  Order is copied from
-    ``retro_stamp_topics.stamp_one`` and is load-bearing:
-
-    1. **live re-read** (``get_memory_by_id``).  The plan's ids come off a
-       scroll that may be minutes old on a corpus orchestrators are writing
-       to.  Reading first is what turns a record consolidated away since the
-       scroll into a report line instead of a Qdrant ``set_payload`` that
-       acknowledges a write to nothing.
-    2. **decide** against the LIVE value, not the planned one.  A topic that
-       moved since the plan makes this row stale; applying anyway would
-       overwrite a live value with a fold of a value that no longer exists —
-       a data loss the report would score as a success.  A live topic that
-       already equals the target ends the call: a no-op ``update_memory``
-       would still journal a write op, still count toward the
-       content-amendment storm alarm, and would inflate the renamed count
-       with records that gained nothing.
-    3. **write**, metadata-only, patch = exactly ``{'topic': new}`` under
-       ``metadata_mode='merge'``.  Narrow on purpose: a wider patch would let
-       a normalization silently clobber ``canonical``, ``supersedes`` or the
-       consolidation bookkeeping across the whole target population at once.
-       Never a delete-and-recreate — that would mint a new memory id,
-       orphaning every reference to the old one and destroying ``created_at``,
-       the field consolidation uses to pick a canonical.
-
-    Every await is individually guarded.  The artifact is written after the
-    loop, so an exception escaping here would discard everything the sweep had
-    already learned; one backend hiccup must cost one report row instead.
-
-    Args:
-        memory_service: The injected ``MemoryService``.
-        rename: The frozen plan row.
-        apply: ``False`` performs the read and the decision and issues no
-            write, so the rehearsal exercises the SAME path ``--apply`` runs
-            rather than predicting it.
-
-    Returns:
-        A report-ready dict always carrying ``outcome``, plus whatever that
-        outcome needs to be actionable without a follow-up query
-        (``existing_topic``, ``error``, ``error_type``, ``response``).
-    """
-    base = {
-        'project_id': rename.project_id,
-        'memory_id': rename.memory_id,
-        'old_topic': rename.old_topic,
-        'new_topic': rename.new_topic,
-    }
-
-    try:
-        record = await memory_service.get_memory_by_id(
-            project_id=rename.project_id, memory_id=rename.memory_id,
-        )
-    except Exception as exc:
-        return {
-            **base,
-            'outcome': 'rename_error',
-            'error': f'{type(exc).__name__}: {exc}',
-        }
-    if record is None:
-        return {**base, 'outcome': 'memory_not_found'}
-
-    metadata = dict(record.get('metadata') or {})
-    existing_topic = metadata.get('topic')
-
-    if existing_topic == rename.new_topic:
-        return {**base, 'outcome': 'already_normalized', 'existing_topic': existing_topic}
-    if existing_topic != rename.old_topic:
-        return {
-            **base,
-            'outcome': 'topic_moved_since_plan',
-            'existing_topic': existing_topic,
-        }
-
-    if not apply:
-        return {**base, 'outcome': 'would_rename', 'existing_topic': existing_topic}
-
-    try:
-        response = await memory_service.update_memory(
-            memory_id=rename.memory_id,
-            project_id=rename.project_id,
-            metadata_patch={'topic': rename.new_topic},
-            metadata_mode='merge',
-            reason=WRITE_REASON,
-            _source=WRITE_SOURCE,
-        )
-    except Exception as exc:
-        return {
-            **base,
-            'outcome': 'rename_error',
-            'error': f'{type(exc).__name__}: {exc}',
-        }
-    # ``update_memory`` reports a not-found (and some other rejections) by
-    # RETURNING a structured envelope rather than raising, so a caller that
-    # only guarded against exceptions would score a refused write as a rename
-    # -- and the residue probe would then find the legacy slug still populated
-    # with no explanation anywhere in the report.
-    if isinstance(response, dict) and response.get('error_type'):
-        return {
-            **base,
-            'outcome': 'update_failed',
-            'error_type': response.get('error_type'),
-            'error': response.get('error'),
-            'response': response,
-        }
-    return {**base, 'outcome': 'renamed', 'response': response}
-
-
-# ---------------------------------------------------------------------------
-# The two-store lockstep — memories and the consolidation gate move together
-# ---------------------------------------------------------------------------
-
-class WriteRejectedError(RuntimeError):
-    """An MCP tool call that returned an error envelope inside a success frame."""
-
-
-def assert_write_accepted(result: object, *, tool: str = 'update_task') -> None:
-    """Raise :class:`WriteRejectedError` on a tool-level rejection.
-
-    Restated locally from ``migrate_task_metadata_to_x_namespace.py`` for the
-    same reason it exists there: an accepted ``update_task`` returns
-    ``{'id', 'message', 'updated', 'updated_task'}`` and a REFUSED one returns
-    ``{'success': False, 'error': <code>, ...}`` — inside the SAME successful
-    JSON-RPC envelope.  Nothing raises.  A caller guarding only against
-    exceptions therefore scores a refused gate move as a completed one, which
-    is precisely the state this lockstep exists to make unreachable.
-
-    The rejection most likely to fire here is the ``done_provenance``
-    write-authority floor, which refuses any whole-blob metadata replace of a
-    done/merged task.  This writer never sends one — see :func:`rename_group`
-    — but the guard is what makes that a checked claim rather than a hope.
-    """
-    if not isinstance(result, dict):
-        return
-    if result.get('success') is False or result.get('error'):
-        raise WriteRejectedError(
-            f'{tool} was REJECTED by the server (the JSON-RPC envelope was '
-            f'still a success, so this would otherwise be invisible): '
-            f'error={result.get("error")!r} '
-            f'error_type={result.get("error_type")!r} '
-            f'hint={result.get("hint")!r}'
-        )
-
-
-@dataclass(frozen=True)
-class GateGroup:
-    """Every rename on one slug, plus the gate task that must move with them.
-
-    The unit of atomicity.  Renames are grouped by ``(project_id, old_topic)``
-    rather than handled one record at a time because the gate's closure scroll
-    addresses a TOPIC, not a record: moving four of a slug's five records
-    splits the cluster just as badly as moving none of them.
-
-    Attributes:
-        project_id: The corpus this slug lives in.
-        old_topic / new_topic: The slug's move, shared by every member.
-        renames: The frozen plan rows, in plan order.
-        gate_task_id: The consolidation gate filed against *old_topic*, or
-            ``None`` — most topics are not gates, and an ungated group needs
-            no MCP handshake at all.
-        gate_project_root: The gate task's project root (tasks are addressed
-            by root, memories by project id — a genuinely different store).
-        gate_block: The PATCHED ``x_recon_consolidation_gate`` block: the
-            live one with ``topic`` moved and every sibling key carried across
-            verbatim.  Built at plan time so the artifact shows exactly what
-            ``--apply`` will send.
-    """
-
-    project_id: str
-    old_topic: str
-    new_topic: str
-    renames: tuple[Rename, ...]
-    gate_task_id: str | None = None
-    gate_project_root: str | None = None
-    gate_block: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class GateCensus:
-    """Every consolidation gate the task stores hold, and what could not be read.
-
-    A value rather than a bare list because "no gate was found" and "no store
-    was read" must never share a representation: an empty list said both, and
-    that ambiguity is how the live path came to treat every slug as ungated.
-
-    Attributes:
-        roots: The project roots attempted, deduplicated, in the order given.
-        tasks: The gate tasks of the covered projects, in the shape
-            :func:`pair_gate_blocks` consumes, sorted by ``(project_id, id)``.
-        covered_projects: The project ids whose one task store answered.
-        failures: One ``gate_census_incomplete`` entry per root that could not
-            be read, or whose store contradicted another root's.
-    """
-
-    roots: tuple[str, ...]
-    tasks: tuple[dict, ...]
-    covered_projects: frozenset[str]
-    failures: tuple[dict, ...]
-
-
-def _census_failure(root: str, error: str, **extra) -> dict:
-    return {'reason': 'gate_census_incomplete', 'project_root': root, **extra, 'error': error}
-
-
-def _unreadable_listing(response: object) -> str | None:
-    """Why a ``get_tasks`` answer is not a task listing, or ``None`` if it is."""
-    if not isinstance(response, dict):
-        return f'get_tasks answered a {type(response).__name__}, not a task listing'
-    if (
-        isinstance(response.get('tasks'), list)
-        and isinstance(response.get('project_id'), str) and response['project_id']
-        and isinstance(response.get('project_root'), str) and response['project_root']
-    ):
-        return None
-    if response.get('error') or response.get('error_type'):
-        return f'{response.get("error_type") or "error"}: {response.get("error")}'
-    return 'get_tasks answered without a task list, project_id and project_root'
-
-
-def _gate_tasks_in(listing: dict) -> list[dict]:
-    gates: list[dict] = []
-    for task in listing['tasks']:
-        metadata = task.get('metadata') if isinstance(task, dict) else None
-        block = metadata.get(GATE_METADATA_KEY) if isinstance(metadata, dict) else None
-        if not isinstance(block, dict):
-            continue
-        gates.append({
-            'id': str(task.get('id')),
-            'project_id': listing['project_id'],
-            'project_root': listing['project_root'],
-            'metadata': {GATE_METADATA_KEY: block},
-        })
-    return gates
-
-
-async def census_consolidation_gates(client, roots) -> GateCensus:
-    """Read every consolidation gate out of each root's task store.
-
-    One ``get_tasks`` per DISTINCT root, through the same client that later
-    patches the gates, so a run cannot pair against one task store and patch
-    another.  Each root's call is individually guarded: a timed-out or refused
-    root becomes one failure entry instead of unwinding the census, because
-    the census's whole contract is to state what it could NOT see.
-
-    A refusal is detected STRUCTURALLY — a missing or non-list ``tasks``, or
-    a missing ``project_id``/``project_root`` — because
-    ``FusedMemoryClient.call_tool`` raises only on a JSON-RPC-level error; a
-    tool-level refusal arrives as an ordinary dict.
-
-    ``project_id`` and ``project_root`` are taken from the RESPONSE as-is.
-    The server derives the id with ``resolve_project_id`` over the
-    main-checkout-normalized root, which is the derivation
-    ``TaskInterceptor._consolidation_closure_error`` scrolls under, so the
-    pairing key and the closure key cannot diverge.  Two roots the server
-    normalizes to one store are one store read twice; two DIFFERENT stores
-    answering for one project id are a contradiction this census cannot
-    settle, so that project is left uncovered.
-
-    Why no paging: ``page_size`` slices a FULL server-side re-read on every
-    page, and an offset shifts when a task is removed between pages, so a gate
-    could be skipped with no error.  One call is one SQL SELECT, an atomic
-    snapshot.  Measured 2026-09-23 through ``FusedMemoryClient``: dark-factory
-    5,747 tasks, 32.3 MB, 11.4 s, 17 gates; reify 7,760 tasks, 33.1 MB, 5.8 s,
-    40 gates — both inside the client's 30 s timeout, and a timeout degrades
-    into a failure entry, never into a silent gap.
-    """
-    attempted = tuple(dict.fromkeys(roots))
-    gates: list[dict] = []
-    failures: list[dict] = []
-    # project_id -> (the store that answered for it, the root it was asked as)
-    stores: dict[str, tuple[str, str]] = {}
-    contradicted: set[str] = set()
-    for root in attempted:
-        try:
-            listing = await client.call_tool('get_tasks', {'project_root': root})
-        except Exception as exc:
-            failures.append(_census_failure(root, f'{type(exc).__name__}: {exc}'))
-            continue
-        problem = _unreadable_listing(listing)
-        if problem is not None:
-            failures.append(_census_failure(root, problem))
-            continue
-        project_id, store = listing['project_id'], listing['project_root']
-        first_store, first_root = stores.setdefault(project_id, (store, root))
-        if first_store != store:
-            contradicted.add(project_id)
-            failures.append(_census_failure(
-                root,
-                f'ambiguous task store: {root!r} answered as project '
-                f'{project_id!r} from {store!r}, but {first_root!r} answered '
-                f'as {project_id!r} from {first_store!r}',
-                project_id=project_id,
-            ))
-        elif first_root == root:
-            gates.extend(_gate_tasks_in(listing))
-
-    covered = frozenset(stores) - contradicted
-    return GateCensus(
-        roots=attempted,
-        tasks=tuple(sorted(
-            (gate for gate in gates if gate['project_id'] in covered),
-            key=lambda gate: (gate['project_id'], gate['id']),
-        )),
-        covered_projects=covered,
-        failures=tuple(failures),
-    )
-
-
-def _gate_topic(task: dict) -> object:
-    """The ``topic`` of a gate task's block, or ``None`` when it carries no block."""
-    block = (task.get('metadata') or {}).get(GATE_METADATA_KEY)
-    return block.get('topic') if isinstance(block, dict) else None
-
-
-def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
-    """Pair each slug's renames with the consolidation gate filed against it.
-
-    Pure.  Takes the plan rows and the gate tasks as plain dicts (``{'id',
-    'project_id', 'project_root', 'metadata'}`` — the shape
-    :func:`census_consolidation_gates` produces) and returns
-    ``(groups, skips)``.
-
-    ``metadata.x_recon_consolidation_gate`` is a Tier-C block on TASK
-    metadata, read by ``reconciliation/consolidation_gate.py`` and enforced on
-    the ``done`` transition by ``middleware/task_interceptor.py``.  Its
-    ``topic`` is what the closure scroll matches on, so a gate left behind on
-    a slug this sweep vacated becomes permanently uncloseable — the trap this
-    task exists to remove, re-created at a new address.
-
-    The patch moves ``topic`` and NOTHING else: ``provenance``,
-    ``considered_and_kept`` and any future sibling are copied across verbatim.
-    A block rebuilt from scratch would silently drop the provenance a curator
-    needs to adjudicate the gate.  The source task is never mutated — the
-    planner's whole job is to leave the corpus untouched.
-
-    A renamed slug carrying MORE THAN ONE gate is refused as
-    ``gate_ambiguous``: no group is built, so neither store moves.  A
-    :class:`GateGroup` moves exactly one gate, and :func:`rename_group`'s
-    commit-point argument — the single gate patch is the one atomic write of
-    the pair — depends on that.  Moving one of several gates would strand the
-    rest on the vacated slug, the same failure as moving none.  Refusing
-    leaves both stores on the legacy slug for hand resolution, the posture
-    ``slug_collision`` already takes.  It costs nothing today: no
-    non-conforming gate topic in either live store carries more than one gate
-    (measured 2026-09-23).
-
-    An unmatched gate on a NON-conforming slug is reported as
-    ``orphan_gate_topic``: this sweep found no live record carrying it, so
-    renaming would not help and staying silent would hide a gate that is
-    already uncloseable.  An unmatched gate on a CONFORMING slug is neither
-    work nor an orphan and is reported nowhere — nothing to migrate is not
-    the same fact as a dangling gate.
-    """
-    # (project_id, topic) -> the gate tasks carrying it, lowest id first so
-    # every verdict below is a property of the corpus rather than of read order.
-    gates_by_topic: dict[tuple[str, str], list[dict]] = {}
-    for task in gate_tasks or ():
-        topic = _gate_topic(task)
-        if not isinstance(topic, str) or not topic:
-            continue
-        key = (str(task.get('project_id') or ''), topic)
-        gates_by_topic.setdefault(key, []).append(task)
-    for bucket in gates_by_topic.values():
-        bucket.sort(key=lambda t: str(t.get('id')))
-
-    by_slug: dict[tuple[str, str], list[Rename]] = {}
-    for rename in renames or ():
-        by_slug.setdefault((rename.project_id, rename.old_topic), []).append(rename)
-
-    groups: list[GateGroup] = []
-    ambiguous: list[dict] = []
-    for key, members in sorted(by_slug.items(), key=lambda kv: (kv[0][0], kv[1][0].new_topic)):
-        project_id, old_topic = key
-        bucket = gates_by_topic.get(key) or []
-        if len(bucket) > 1:
-            ambiguous.append({
-                'reason': 'gate_ambiguous',
-                'project_id': project_id,
-                'old_topic': old_topic,
-                'new_topic': members[0].new_topic,
-                'gate_task_ids': [str(task.get('id')) for task in bucket],
-                'memory_ids': sorted(r.memory_id for r in members),
-                'note': (
-                    'more than one consolidation gate is filed against this '
-                    'legacy slug, and moving one would strand the others on '
-                    'the vacated slug — neither store was touched; resolve the '
-                    'duplicate gates by hand before re-running'
-                ),
-            })
-            continue
-        gate = bucket[0] if bucket else None
-        block: dict[str, Any] | None = None
-        if gate is not None:
-            live_block = gate['metadata'][GATE_METADATA_KEY]
-            # Copy, then move exactly one key: the source task stays as read.
-            block = {**live_block, 'topic': members[0].new_topic}
-        groups.append(GateGroup(
-            project_id=project_id,
-            old_topic=old_topic,
-            new_topic=members[0].new_topic,
-            renames=tuple(members),
-            gate_task_id=None if gate is None else str(gate.get('id')),
-            gate_project_root=None if gate is None else gate.get('project_root'),
-            gate_block=block,
-        ))
-    groups.sort(key=lambda g: (g.project_id, g.new_topic))
-
-    # A gate on a slug this sweep renames was paired or refused above; only a
-    # gate whose slug no rename reached can be an orphan.
-    orphans: list[dict] = []
-    for (project_id, topic), bucket in gates_by_topic.items():
-        for task in bucket:
-            if (project_id, topic) in by_slug:
-                continue
-            if is_valid_topic_slug(topic):
-                continue
-            orphans.append({
-                'reason': 'orphan_gate_topic',
-                'project_id': project_id,
-                'gate_task_id': str(task.get('id')),
-                'gate_project_root': task.get('project_root'),
-                'gate_topic': topic,
-                'note': (
-                    'a consolidation gate carries a non-conforming slug that '
-                    'THIS sweep matched to no live record, so normalizing the '
-                    'corpus will not close it — the gate needs hand work '
-                    '(check the under_enumerated bucket before concluding the '
-                    'cluster is genuinely empty)'
-                ),
-            })
-    orphans.sort(key=lambda s: (s['project_id'], s['gate_topic'], s['gate_task_id']))
-    return groups, ambiguous + orphans
-
-
-def _gate_row(group: GateGroup, outcome: str, **extra) -> dict:
-    return {
-        'project_id': group.project_id,
-        'gate_task_id': group.gate_task_id,
-        'gate_project_root': group.gate_project_root,
-        'old_topic': group.old_topic,
-        'new_topic': group.new_topic,
-        'memory_ids': [r.memory_id for r in group.renames],
-        'outcome': outcome,
-        **extra,
-    }
-
-
-async def _undo_group(memory_service, group: GateGroup, results: list[dict]) -> list[dict]:
-    """Put back exactly the writes THIS run made, and report what would not go.
-
-    An undo is just a rename in the opposite direction, so it runs through
-    :func:`rename_one` rather than a second write path — same live re-read,
-    same narrow metadata-only patch, same guard posture.
-
-    Only rows scored ``renamed`` are reversed.  A record that was
-    ``already_normalized`` arrived at the new value before this sweep touched
-    it; "undoing" it would be this script inventing a write of its own, and
-    would move a record the operator never asked it to move.
-    """
-    failures: list[dict] = []
-    for result in results:
-        if result.get('outcome') != 'renamed':
-            continue
-        undo = await rename_one(
-            memory_service,
-            Rename(
-                project_id=result['project_id'],
-                memory_id=result['memory_id'],
-                old_topic=result['new_topic'],
-                new_topic=result['old_topic'],
-            ),
-            apply=True,
-        )
-        if undo.get('outcome') != 'renamed':
-            failures.append({
-                'memory_id': result['memory_id'],
-                'outcome': undo.get('outcome'),
-                'error': undo.get('error') or undo.get('error_type'),
-            })
-        result['undone'] = undo.get('outcome') == 'renamed'
-        result['outcome'] = 'gate_lockstep_failed'
-    return failures
-
-
-async def rename_group(
-    memory_service,
-    group: GateGroup,
-    *,
-    apply: bool,
-    client: Any = None,
-) -> tuple[list[dict], dict | None]:
-    """Move one slug in both stores, or leave it exactly where it started.
-
-    Order, and why it is this way round:
-
-    1. **the memory renames**, all of them, through :func:`rename_one`;
-    2. **the gate patch**, and only once every one of them succeeded.
-
-    The gate is second because it is the single atomic write of the pair: N
-    record patches cannot be made atomic, so the one call that can be is the
-    commit point.  If it is refused, step 1 is UNDONE, so the pair's net state
-    is unchanged and the group is reported as ``gate_lockstep_failed``.  A
-    failed half never stands alone in either direction — memories on the new
-    slug with the gate on the old, or the gate on the new with the records on
-    the old, are the SAME uncloseable-gate failure, just seen from two sides.
-
-    (The undo is why "hold the whole group" is achievable at all with
-    memory-first ordering.  It is deliberately narrow: it reverses only the
-    writes this run made, and a reversal that itself fails is named on the row
-    — an operator must never have to infer that a half-applied state exists.)
-
-    An UNGATED group is the common case and short-circuits after step 1: it
-    needs no client, so a sweep that touches no gate never opens a socket.
-    It also gets no undo; see the module docstring's "A gated slug moves
-    all-or-nothing; an ungated slug does not".
-    A GATED group with no client is the same verdict as a refused gate —
-    unable to move it is not permission to leave it behind.
-
-    Returns:
-        ``(memory results, gate row or None)``.  Rows whose write was undone
-        are re-scored ``gate_lockstep_failed`` so the report never claims a
-        rename that no longer stands; rows that never wrote keep their own
-        diagnosis, which is the actionable one.
-    """
-    results = [
-        await rename_one(memory_service, rename, apply=apply)
-        for rename in group.renames
-    ]
-    if group.gate_task_id is None:
-        return results, None
-
-    failed = [r for r in results if r.get('outcome') not in _STOOD_OUTCOMES]
-    if failed:
-        undo_failures = await _undo_group(memory_service, group, results)
-        logger.warning(
-            'GATE LOCKSTEP HELD project=%s topic=%s -> %s: %d of %d memory writes '
-            'did not stand, so gate task %s was NOT patched.',
-            group.project_id, group.old_topic, group.new_topic,
-            len(failed), len(results), group.gate_task_id,
-        )
-        return results, _gate_row(
-            group, 'gate_lockstep_failed',
-            half='memory',
-            error=f'{len(failed)} of {len(results)} memory renames did not stand',
-            failed_outcomes=sorted({str(r.get('outcome')) for r in failed}),
-            undo_failures=undo_failures,
-            note=(
-                'the gate patch was withheld, so the gate still points at the '
-                'legacy slug — resolve the memory-side failures and re-run'
-            ),
-        )
-
-    if not apply:
-        return results, _gate_row(group, 'would_patch_gate', patch=group.gate_block)
-
-    error: str | None = None
-    if client is None:
-        error = (
-            'no MCP client: the gate half of this pair could not be attempted, '
-            'and an unmovable gate is refused exactly like a refused one'
-        )
-    else:
-        payload = {
-            'id': group.gate_task_id,
-            'project_root': group.gate_project_root,
-            # A NARROW merge of one Tier-C block, never a whole-blob replace:
-            # `update_task` refuses any replace carrying `done_provenance`, and
-            # a replace here would also stake the task's entire metadata on
-            # this script having read it back correctly.
-            'metadata': {GATE_METADATA_KEY: dict(group.gate_block or {})},
-            'metadata_mode': 'merge',
-        }
-        try:
-            response = await client.call_tool('update_task', payload)
-            assert_write_accepted(response, tool='update_task')
-        except Exception as exc:
-            error = f'{type(exc).__name__}: {exc}'
-        else:
-            return results, _gate_row(
-                group, 'gate_patched', patch=group.gate_block, response=response)
-
-    undo_failures = await _undo_group(memory_service, group, results)
-    logger.warning(
-        'GATE LOCKSTEP HELD project=%s topic=%s -> %s: gate task %s was not '
-        'patched (%s); %d memory write(s) undone, %d undo failure(s).',
-        group.project_id, group.old_topic, group.new_topic, group.gate_task_id,
-        error, len(group.renames), len(undo_failures),
-    )
-    return results, _gate_row(
-        group, 'gate_lockstep_failed',
-        half='gate', error=error, undo_failures=undo_failures,
-        note=(
-            'the memory half was undone so the slug is unchanged in BOTH '
-            'stores; a gate left pointing at a slug no record carries is '
-            'permanently uncloseable, which is worse than not migrating'
-        ),
-    )
-
-
-def describe_partial_ungated_group(group: GateGroup, results: list[dict]) -> dict | None:
-    """The report entry for an ungated slug that only partly moved, else ``None``.
-
-    Pure.  A gated group is never described here: its gate row already reports
-    a held pair.  ``failed_outcomes`` has the gate row's key and shape, so the
-    two read the same way.  "Failed" means a member whose rename did not land
-    and so still carries the legacy value; a vanished or concurrently moved
-    member splits nothing and is reported only in its own bucket.
-    """
-    if group.gate_task_id is not None:
-        return None
-    stood = [r for r in results if r.get('outcome') in _STOOD_OUTCOMES]
-    failed = [r for r in results if r.get('outcome') in _LEFT_ON_LEGACY_OUTCOMES]
-    if not stood or not failed:
-        return None
-    return {
-        'reason': 'ungated_partial_rename',
-        'project_id': group.project_id,
-        'old_topic': group.old_topic,
-        'new_topic': group.new_topic,
-        'stood_memory_ids': sorted(r['memory_id'] for r in stood),
-        'failed_memory_ids': sorted(r['memory_id'] for r in failed),
-        'failed_outcomes': sorted({str(r.get('outcome')) for r in failed}),
-        'note': (
-            'this slug carries no consolidation gate, so members that move are '
-            'not rolled back when another fails and the slug is split across '
-            'both values (in a dry run the split is predicted, not yet made); '
-            'a plain re-run refuses the failed members still on the legacy '
-            'value as slug_collision, because the moved members occupy the new '
-            'slug — finish them by hand once their failure is resolved (see '
-            'the module docstring)'
-        ),
-    }
-
-
 def load_mcp_client_class() -> type:
     """Reuse ``FusedMemoryClient`` from ``strip_leaked_control_keys.py``.
 
@@ -1457,8 +415,8 @@ def load_mcp_client_class() -> type:
     would be a second thing to keep in step with the server.
 
     Lazy so the pure planner, the pairing and the CLI parser stay importable
-    with no HTTP dependency, and so the tests — which inject a double — never
-    reach this function at all.
+    with no HTTP dependency, and so the behavioural tests can inject a double
+    in its place.
     """
     return load_mcp_client_module().FusedMemoryClient
 
@@ -1469,50 +427,12 @@ def load_mcp_client_module() -> Any:
     Exposed so :func:`open_mcp_client` reads that module's ``DEFAULT_SERVER``
     beside its client class, rather than restating the URL a third time.
     """
-    import importlib.util  # noqa: PLC0415
-
-    sibling = Path(__file__).parent / 'strip_leaked_control_keys.py'
-    mod_name = 'strip_leaked_control_keys'
-    existing = sys.modules.get(mod_name)
-    if existing is not None and hasattr(existing, 'FusedMemoryClient'):
-        return existing
-    spec = importlib.util.spec_from_file_location(mod_name, sibling)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load the JSON-RPC client from {sibling}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    return load_script(Path(__file__).parent / 'strip_leaked_control_keys.py', 'strip_leaked_control_keys')
 
 
 # ---------------------------------------------------------------------------
 # Scope item 3 — did the old slugs actually drain?
 # ---------------------------------------------------------------------------
-
-#: Outcomes whose rows still carry the LEGACY topic value at probe time and
-#: were put there by this run's own rehearsal.  Only these are subtracted.
-#: A failed write also still carries it — and that is genuine residue,
-#: correctly left in.
-_REHEARSED_OUTCOMES = frozenset({'would_rename'})
-
-#: Outcomes that actually moved (or intended to move) a slug.  Anything else
-#: never touched one, so there is nothing to drain and nothing to probe.
-_MOVED_OUTCOMES = frozenset({'renamed', 'would_rename', 'update_failed', 'rename_error'})
-
-#: Outcomes after which a member sits on the new slug, or would in a dry run.
-#: Every other outcome is a member that did not stand.
-_STOOD_OUTCOMES: frozenset[str] = frozenset({'renamed', 'would_rename', 'already_normalized'})
-
-#: Outcomes after which a member still carries the LEGACY value: its rename was
-#: attempted and did not land.  A record that is gone (``memory_not_found``) or
-#: that now carries a third value (``topic_moved_since_plan``) did not stand
-#: either, but it is not on the legacy slug, so it splits nothing.
-_LEFT_ON_LEGACY_OUTCOMES: frozenset[str] = _MOVED_OUTCOMES - _STOOD_OUTCOMES
-
 
 async def verify_old_slugs_drained(memory_service, results, skips) -> None:
     """Count records still carrying each legacy slug this run moved.
@@ -1549,7 +469,7 @@ async def verify_old_slugs_drained(memory_service, results, skips) -> None:
     """
     pending: dict[tuple[str, str], dict] = {}
     for result in results:
-        if result.get('outcome') not in _MOVED_OUTCOMES:
+        if result.get('outcome') not in MOVED_OUTCOMES:
             continue
         legacy = result.get('old_topic')
         if not isinstance(legacy, str) or not legacy:
@@ -1558,7 +478,7 @@ async def verify_old_slugs_drained(memory_service, results, skips) -> None:
             (result['project_id'], legacy),
             {'new_topic': result.get('new_topic'), 'rehearsed': 0},
         )
-        if result.get('outcome') in _REHEARSED_OUTCOMES:
+        if result.get('outcome') in REHEARSED_OUTCOMES:
             entry['rehearsed'] += 1
 
     bucket = skips.setdefault('legacy_slug_residue', [])
@@ -1667,42 +587,6 @@ class GateCensusIncomplete(RuntimeError):
         self.gaps = gaps
 
 
-def _selection_defect(topic: object) -> str | None:
-    """Why *topic* cannot be a selected legacy value, or ``None`` if it can."""
-    if not isinstance(topic, str):
-        return 'not a string'
-    if is_valid_topic_slug(topic):
-        return 'already conforms; name the legacy value that folds onto it'
-    if derive_topic_slug(topic) is None:
-        return 'has no fold'
-    return None
-
-
-def _refuse_invalid_selection(topics: frozenset[str] | None) -> None:
-    """Raise ``ValueError`` unless *topics* is ``None`` or names foldable legacy values.
-
-    Passing the target slug instead of its source is the likely typo.  Left
-    unrefused, it would plan nothing and exit 0, which reads as a clean run.
-    A legacy value no record carries is NOT refused: a re-run after a
-    successful ``--apply`` legitimately finds the value drained.
-    """
-    if topics is None:
-        return
-    if not topics:
-        raise ValueError(
-            'empty topic selection: name at least one legacy topic value, or '
-            'omit --topic to migrate every non-conforming value')
-    defects = sorted(
-        f'{topic!r} ({defect})'
-        for topic in topics
-        if (defect := _selection_defect(topic)) is not None
-    )
-    if defects:
-        raise ValueError(
-            'a topic selection names LEGACY source values, never target slugs; '
-            'refused: ' + ', '.join(defects))
-
-
 def _census_gaps(gates: GateCensus, projects) -> list[dict]:
     """Every reason this sweep cannot trust its gate pairing, as report entries.
 
@@ -1776,17 +660,18 @@ async def run(
         The report dict — rendered by :func:`render_json` /
         :func:`render_markdown` and graded by :func:`resolve_exit_code`.
     """
-    _refuse_invalid_selection(topics)
+    refuse_invalid_selection(topics)
     gaps = _census_gaps(gates, projects)
 
     # Fail-CLOSED capability preflight: ONE probe per run, ABOVE the scroll.
     #
-    # ``run`` is the choke point precisely because ``rename_one``'s own
-    # ``apply`` gate is PER RECORD: probing there would run the check once per
-    # target and -- since ``StoreMutationUnavailable`` subclasses
-    # ``RuntimeError`` -- be swallowed by the per-record ``except Exception``
-    # around the write, downgrading a run-wide environment denial into N error
-    # rows inside a report that otherwise reads as a completed sweep.
+    # ``run`` is the choke point precisely because the ``apply`` gate of
+    # ``fused-memory/src/fused_memory/maintenance/topic_slug_lockstep.py::rename_one``
+    # is PER RECORD: probing there would run the check once per target and -- since
+    # ``StoreMutationUnavailable`` subclasses ``RuntimeError`` -- be swallowed
+    # by the per-record ``except Exception`` around the write, downgrading a
+    # run-wide environment denial into N error rows inside a report that
+    # otherwise reads as a completed sweep.
     #
     # Emitted through the logger, never ``print``: stdout is reserved for the
     # machine-read artifact rendered at the end of ``main``.
@@ -1879,7 +764,7 @@ async def run(
         [
             task for task in gates.tasks
             if task.get('project_id') in projects
-            and _in_selection(_gate_topic(task), topics)
+            and in_selection(gate_topic(task), topics)
         ],
     )
     _record_skips(gate_skips)
@@ -1887,14 +772,12 @@ async def run(
     results: list[dict] = []
     gate_results: list[dict] = []
     for group in groups:
-        group_results, gate_row = await rename_group(
-            memory_service, group, apply=apply, client=client)
-        results.extend(group_results)
-        if gate_row is not None:
-            gate_results.append(gate_row)
-        partial = describe_partial_ungated_group(group, group_results)
-        if partial is not None:
-            _record_skips([partial])
+        group_outcome = await rename_group(memory_service, group, apply=apply, client=client)
+        results.extend(group_outcome.results)
+        if group_outcome.gate_row is not None:
+            gate_results.append(group_outcome.gate_row)
+        if group_outcome.held_entry is not None:
+            _record_skips([group_outcome.held_entry])
 
     # Scope item 3, in the same run that did the writing.
     await verify_old_slugs_drained(memory_service, results, skips)
@@ -1998,7 +881,8 @@ DEFAULT_JSON_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.j
 DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.md')
 
 #: Keys a skip line leaves out.  The bucket heading already names the reason
-#: or outcome, and ``response`` is :func:`rename_one`'s whole write envelope,
+#: or outcome, and ``response`` is the whole write envelope of
+#: ``fused-memory/src/fused_memory/maintenance/topic_slug_lockstep.py::rename_one``,
 #: which the JSON keeps.
 _SKIP_LINE_OMITTED_KEYS: frozenset[str] = frozenset({'reason', 'outcome', 'response'})
 
@@ -2287,16 +1171,11 @@ async def open_live_memory_service():
     Imports deferred so importing this module — which the tests do, by path —
     never constructs a backend.
     """
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.maintenance._utils import maintenance_service
 
-    memory = MemoryService(FusedMemoryConfig())
-    try:
-        await memory.initialize()
+    async with maintenance_service(config=FusedMemoryConfig()) as (_, memory):
         yield memory
-    finally:
-        if hasattr(memory, 'close'):
-            await memory.close()
 
 
 def open_mcp_client(server_url: str | None) -> Any:
@@ -2358,7 +1237,7 @@ def main(
     args = _build_parser().parse_args(argv)
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
 
         os.environ['CONFIG_PATH'] = str(args.config)
 

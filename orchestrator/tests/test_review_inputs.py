@@ -17,7 +17,6 @@ from orchestrator.review_inputs import (
     collect_review_change,
     gather_review_subject,
     load_review_conventions,
-    review_fork_point,
 )
 
 
@@ -66,17 +65,11 @@ class TestFreshForkPoint:
         _git(worktree, 'merge', '-q', '--no-edit', 'main')
         return worktree, creation_sha, main_tip
 
-    async def test_the_fork_point_is_the_merged_main_tip(self, repo: Path, tmp_path: Path):
-        worktree, _, main_tip = self._branch_with_main_merged_in(repo, tmp_path)
-
-        assert await review_fork_point(worktree, 'main') == main_tip
-
     async def test_the_change_from_the_fork_point_is_the_task_work_alone(
         self, repo: Path, tmp_path: Path,
     ):
         worktree, _, _ = self._branch_with_main_merged_in(repo, tmp_path)
-        fork_point = await review_fork_point(worktree, 'main')
-        assert fork_point is not None
+        fork_point = _git(worktree, 'merge-base', 'HEAD', 'main')
 
         change = await collect_review_change(worktree, fork_point)
 
@@ -93,9 +86,6 @@ class TestFreshForkPoint:
         change = await collect_review_change(worktree, creation_sha)
 
         assert {'m1.py', 'm2.py'} <= {changed.path for changed in change.files}
-
-    async def test_an_unresolvable_main_has_no_fork_point(self, repo: Path):
-        assert await review_fork_point(repo, 'no-such-branch') is None
 
 
 @pytest.mark.asyncio

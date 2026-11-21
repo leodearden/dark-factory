@@ -23,15 +23,15 @@ The **frozen prefix** = {verifying} ∪ {landed}.  The **unfrozen suffix** = eve
 
 ## 2. Key design invariants (§5.3)
 
-All four invariants must hold simultaneously.  `two_layer_invariants(main_sha)` → `[]` when healthy; a non-empty list describes specific violations.
+Three invariants and one detector.  I1, I3 and I4 are invariants and must hold simultaneously.  `two_layer_invariants(main_sha)` → `[]` when healthy; it reports the frozen-prefix half as INV-3 chain-intact (no frozen entry built on a recorded dead commit, `plans/merge-verdict-integrity-prd.md` §1), successor chain links and frozen∩suffix disjointness, plus the conflict-graph consistency checks.  I2 is a detector, judged once at dispatch, with its own surface (task 5302).
 
 ### I1. Frozen prefix immutable
 
 An item in the frozen prefix (verifying or landed) is **never reordered or re-based** out from under an in-flight verify.  Its `_inflight` position and `base_sha` are set at dispatch time and do not change.
 
-### I2. Verify base equals frozen-prefix tip
+### I2 (detector). Verify base equals frozen-prefix tip at dispatch
 
-Every real-verify dispatch uses **exactly the tip of the frozen prefix** as its base SHA (`frozen_prefix_tip(main_sha)`).  Dispatching against any other base is a violation (logged at WARNING by `_warn_if_base_not_frozen_tip`).
+Every real-verify dispatch should use **exactly the tip of the frozen prefix** as its base SHA (`frozen_prefix_tip(main_sha)`).  The rule is judged once, at dispatch, by `SpeculativeMergeWorker._verify_base_divergence_at_dispatch` against that dispatch's freshly fetched main; the policy, with the recovery re-merge carve-out, is `merge_lane/verify_base_detector.py::detect_verify_base_divergence`.  A hit is logged at WARNING, stamped on the in-flight entry as a `VerifyBaseDivergence`, surfaced in `snapshot()['verify_base_divergences']`, and filed as an L1 `merge_verify_base_divergence` unless one is already open.  It never refuses the dispatch (esc-3206-3): INV-3 voids a dead-base verdict at adoption.  It is not re-judged later, because main legitimately moves under an in-flight verify; re-judging it at snapshot time was the false positive behind the 2026-08-12 and 2026-08-28 recurrences (PRD §5.3).  The detector and `two_layer_invariants` are not disjoint.  At depth ≥ 1 (the frozen prefix already holds a real merge) the same divergent dispatch also reads in `two_layer_invariants` as a successor chain-link break ('frozen-prefix base-chain broken at <request_id>'), for as long as its predecessor stays frozen.  At depth 0 only the detector reports it: the head has no predecessor and is judged by INV-3 alone, so an off-tip base that is not a recorded dead commit raises no field string (`merge_lane/worker.py::SpeculativeMergeWorker::_chain_breaks`).
 
 ### I3. Reorder touches only the unfrozen suffix
 
@@ -101,12 +101,13 @@ The breaker itself is a pure read/decide component; the Harness pass owns all si
 | `suffix_conflict_graph` | dict | In-memory conflict-graph edges for unfrozen suffix items (δ=1889) |
 | `frozen_prefix` | dict | `{request_ids, tip_merge_commit, verify_depth}` — current frozen-prefix state (ε=1890) |
 | `metrics` | dict | `{retries_per_landing, drift_at_detection: {count, last, mean, max}, landings_total}` (ι=1894) |
-| `two_layer_invariants` | list\[str\] | `[]` when all §5.3 invariants hold; violation strings otherwise (λ=1895) |
+| `two_layer_invariants` | list\[str\] | `[]` when the §5.3 invariants hold; otherwise INV-3 dead-link, successor chain-link, disjointness or graph-consistency violation strings (λ=1895; INV-3 head arm since task 5302) |
+| `verify_base_divergences` | list\[dict\] | `[]` normally; one `{request_id, task_id, base_sha, expected_tip, verify_depth, observed_at}` record per in-flight verify dispatched off the frozen-prefix tip, judged once at dispatch (I2 detector, task 5302) |
 | `hosts` | list\[dict\] | Per-verify-host state: `{name, is_local, slot_state: free\|busy\|parked\|null, quarantined, quarantine_class: ru\|divergence\|null, unavailable_since, unavailable_secs, streak, reason}` (task 3275) |
 
 `hosts` is what makes an under-full `verifying N/M hosts` line diagnosable — it
 has five possible causes, each with its own discriminator: **RU-quarantine**
-(`quarantine_class == 'ru'` — auto-recovers via `_reprobe_quarantined_hosts`);
+(`quarantine_class == 'ru'` — auto-recovers via `merge_lane/host_quarantine.py::HostQuarantine._reprobe_quarantined_hosts`);
 **divergence-quarantine** (`quarantine_class == 'divergence'` — held for verdict
 parity, operator-cleared only); **untracked PARK** (`slot_state == 'parked'`
 with `quarantine_class == null` — a cancel failed and its probe gave up;
@@ -134,7 +135,16 @@ the number of verifies in flight — read `inflight_total` for that.
 `inflight_by_host` is the authoritative lossless `{host: [task_id, ...]}` view
 (finalize head first, then `_inflight` order); `by_host` is the
 retained-for-compatibility lossy `{host: task_id}` map, which keeps only the last
-occupant when two entries share a host.
+occupant when two entries share a host. All four are **lease** occupancy, and a
+lease is never evidence that its host is reachable: a finished verify holds its
+lease until finalize, and a lease can sit on a host benched since it was taken.
+Whether a verify really runs on a host is `leases[].activity` (`dispatching`,
+`verifying`, `no_live_dispatch`, `finished`) with `leases[].host_quarantined`, and
+`verifying_by_host`, which counts the live leases on unquarantined hosts and is
+the `N` of the heartbeat's `verifying N/M hosts` line (task 5290).
+`no_live_dispatch` is a remote lease whose verify task runs on THIS host with no
+ssh dispatch live: either before the dispatch claims (the main-mirror push, which
+can hang on an ssh connect) or after it returned (a cross-check or gate re-verify).
 
 ---
 
@@ -164,8 +174,10 @@ occupant when two entries share a host.
 | `MergeIntake.pop_next_pickable()` | merge_lane/intake_buffers.py | Select next item using clique-scoped aging (ζ=1891) |
 | `frozen_prefix()` | merge_lane/worker.py | Return ordered `request_id`s in the frozen prefix |
 | `frozen_prefix_tip()` | merge_lane/worker.py | Return the base SHA for next verify dispatch |
-| `check_frozen_prefix_invariant()` | merge_lane/worker.py | §5.3 I1+I2 violations (base-chain integrity) |
-| `two_layer_invariants()` | merge_lane/worker.py | All §5.3 violations (I1–I4 + graph consistency) |
+| `check_frozen_prefix_invariant()` | merge_lane/worker.py | Frozen-prefix violations: INV-3 dead links (via `_chain_dead_link`), successor chain links, frozen∩suffix disjointness |
+| `two_layer_invariants()` | merge_lane/worker.py | The §5.3 invariant violations: `check_frozen_prefix_invariant()` + graph consistency.  Not the I2 detector |
+| `verify_base_divergences()` | merge_lane/worker.py | The I2 detector's records stamped on the frozen prefix, in frozen order (task 5302) |
+| `detect_verify_base_divergence()` | merge_lane/verify_base_detector.py | Pure I2 policy: the `VerifyBaseDivergence` a dispatch commits, or None (task 5302) |
 | `recompute_suffix_conflict_graph()` | merge_lane/worker.py | Worker delegator → `MergeIntake.recompute_suffix_conflict_graph()` → `SuffixConflictTracker.recompute()` (suffix_graph.py); recomputes the conflict graph |
 | `MergeIntake.bounce_conflicting_suffix_items()` | merge_lane/intake_buffers.py | Delegator → `SuffixConflictTracker.bounce_conflicting_suffix_items()` (suffix_graph.py); graph-time disk-free bounce of the younger conflicting item |
 | `_run_no_landings_breaker_pass()` | harness.py | Harness pass that acts on `BreakerTrip`: calls `force_halt_scheduler` + files L2-INFO escalation |
@@ -198,7 +210,7 @@ exports the public subset.
 | `MergedOk` | merge_lane/types.py | `classify_and_merge`'s REAL-arm return value (mirrors `SpeculativeItem`'s REAL/DECIDED split): `merge_result` + `merge_wt` + `branch_tip` for a merge that actually happened (MQ-refactor task κ, task 1995) |
 | `Decided` | merge_lane/types.py | `classify_and_merge`'s DECIDED-arm return value: a terminal `MergeOutcome` (+ the failed `MergeResult`, when one was attempted) (MQ-refactor task κ, task 1995) |
 | `InflightEntry` | merge_lane/types.py | An in-flight verify entry held in `SpeculativeMergeWorker._inflight` |
-| `InflightVerifyResult` | merge_lane/types.py | Result returned by `SpeculativeMergeWorker._run_inflight_verify` |
+| `InflightVerifyResult` | merge_lane/types.py | Result returned by `merge_lane/verify_dispatch.py::VerifyDispatcher.run_inflight_verify` |
 | `SoloVerifyResult` | merge_lane/types.py | Result of verifying a single train member's delta in isolation |
 | `WaiterRecord` | merge_lane/types.py | Server-side durable-intent waiter record keyed by `request_id` |
 | `MergeDispatchResult` | merge_lane/types.py | Structured return value from `coalesce_or_enqueue_merge_request` |
@@ -222,10 +234,12 @@ Also here since task 5036 (formerly worker-resident): `AUTO_CHAIN_GENERATIONS_EN
 `_run_unscoped_typechecks` + `_POST_MERGE_PYRIGHT_MAX_DETAIL`, `_emit_merge_attempt`,
 `_elapsed_ms` and `_MAX_EVENT_EVIDENCE_ITEMS`.
 
-**Open Q1 (resolved NO):** verify *execution* — `_run_post_merge_verify`, `_ensure_verify_disk_space`,
-`_classify_main_health_red`, `_verify_hit_enospc` — stays in `merge_lane/worker.py`. This module
-owns gate *policy* only, and never imports the worker: where a gate needs a worker function the
-worker injects it — the re-verify through `_reverify_rebased_tree`'s `run_post_merge_verify`
+**Open Q1 (resolved NO):** verify *execution* stays out of this module, which owns gate *policy*
+only. Since task 5040 (§7.9) it lives in `merge_lane/post_merge_verify.py::run_post_merge_verify`,
+`merge_lane/main_health_probe.py::classify_main_health_red` and
+`merge_lane/verify_failure_outcome.py::verify_hit_enospc`; `_ensure_verify_disk_space` is still
+`merge_lane/worker.py::_ensure_verify_disk_space`, handed to the verify as its disk guard. This
+module never imports the worker: where a gate needs a worker function the worker injects it — the re-verify through `_reverify_rebased_tree`'s `run_post_merge_verify`
 parameter, the γ2 auto-chain through `_GenerationChainContext`.
 
 | Symbol | Location | Description |
@@ -235,23 +249,28 @@ parameter, the γ2 auto-chain through `_GenerationChainContext`.
 | `POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX` | merge_lane/gates.py | Reason prefix: post-merge Decision-2 content-equivalence gate failed |
 | `POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX` | merge_lane/gates.py | Reason prefix: post-merge unscoped type-check found a cross-PR union break |
 | `DropGuardResult` | merge_lane/gates.py | Structured return value from `_check_plan_targets_in_tree` |
-| `PlanFilesTouchedResult` | merge_lane/gates.py | Structured return value from `_check_plan_files_touched_in_branch` |
+| `PlanFilesTouchedResult` | merge_lane/gates.py | Structured return value from `_check_plan_files_touched_in_branch`; `touched_set_error` set means the branch history was unreadable, so every declared entry is listed unmeasured (task 3918) |
 | `PostMergePyrightResult` | merge_lane/gates.py | Structured return value from `_check_post_merge_pyright` / `_run_unscoped_typechecks` |
 | `_GenerationChainContext` | merge_lane/gates.py | Bundle passed into `_finalize_advanced_merge` for γ2 auto-chaining (queue + counters + retention) |
 | `_OVERLAP_GIT_ERROR_SENTINEL` | merge_lane/gates.py | Fail-CLOSED sentinel returned by `_rebase_delta_touched_overlap` on a git error |
 | `_check_plan_targets_in_tree()` | merge_lane/gates.py | Drop-guard: files on task HEAD but dropped from the merge commit |
 | `_normalize_plan_path()` | merge_lane/gates.py | Git-canonical form of a declared plan path (helper of the plan-files-touched gate) |
 | `_check_plan_files_touched_in_branch()` | merge_lane/gates.py | Pre-merge Decision-1: every declared plan file must be touched on the branch |
+| `PLAN_DELIVERY_UNMEASURED_REASON_PREFIX` | merge_lane/unmeasured_delivery.py | Reason prefix: the Decision-1 range never measured the task's own work, so no non-delivery is claimed (task 3918) |
+| `UnmeasuredCause` | merge_lane/unmeasured_delivery.py | Why a not-touched verdict measured nothing: unreadable history, a stopped rebase, merge, cherry-pick or revert, uncommitted declared edits, work on a sibling ref; one policy table maps each to its `suggested_action` and remedy |
+| `UnmeasuredDelivery` | merge_lane/unmeasured_delivery.py | Frozen finding: the cause, the entries it explains, the rest still not touched, `block_reason()` |
+| `diagnose_unmeasured_branch()` | merge_lane/unmeasured_delivery.py | Never-raises in-branch diagnosis (unreadable history, a stopped rebase, merge, cherry-pick or revert, uncommitted declared edits) on the gate's failing arm; runs BEFORE the already-landed carve-out, since a mid-rebase HEAD invalidates its empty-range signal, and again on the re-check after narrowing |
+| `find_work_on_sibling_ref()` | merge_lane/unmeasured_delivery.py | Never-raises probe for declared work on a `task/<id>-*` ref, offered only when the measured HEAD has no commit beyond main; runs AFTER the already-landed carve-out declines and before narrowing, and skips any ref `recut_ruling.py::RecutSupersession` says an executed re-cut ruling superseded |
 | `_check_post_merge_equivalence()` | merge_lane/gates.py | Post-merge Decision-2: branch-touched paths must match the advanced main tree |
 | `_rebase_delta_touched_overlap()` | merge_lane/gates.py | Intersection of branch-touched and intervening-rebase-delta files (fail-closed) |
-| `_reverify_rebased_tree()` | merge_lane/gates.py | Disjoint-delta re-verify gate; records each decision as a `merge_reverify_gate` event and, when it fires, delegates to `_run_post_merge_verify` (forwarding `event_store`). On a same tree that declares a history leg, it passes that leg as `history_leg_command`, so only the leg runs through `_run_post_merge_verify` |
+| `_reverify_rebased_tree()` | merge_lane/gates.py | Disjoint-delta re-verify gate; records each decision as a `merge_reverify_gate` event and, when it fires, delegates to `merge_lane/post_merge_verify.py::run_post_merge_verify` (forwarding `event_store`). On a same tree that declares a history leg, it passes that leg as `history_leg_command`, so only the leg runs through `run_post_merge_verify` |
 | `_decide_reverify_gate()` | merge_lane/gates.py | Classifies a rebased tree into a `ReverifyGateDecision` (same tree, same tree with a history leg, disjoint, untrusted disjoint, overlap, unknown overlap) without verifying |
 | `_log_reverify_gate_decision()` | merge_lane/gates.py | One log line per gate decision: INFO for a skip, WARNING for a fire |
 | `GateClearance` | merge_lane/reverify_gate_decision.py | Why a rebased tree cleared the gate: `same_tree`, `disjoint`, `reverified` (task 6647; moved from gates.py by task 5064) or `history_leg` (task 7248) |
 | `ReverifyGateReason` | merge_lane/reverify_gate_decision.py | Every way the gate decides; its `_SKIP_CLEARANCE` map is the one home of skip-vs-fire |
 | `ReverifyGateDecision` | merge_lane/reverify_gate_decision.py | The facts one gate decision was made on; `event_data()` is the `merge_reverify_gate` payload |
 | `emit_reverify_gate_decision()` | merge_lane/reverify_gate_decision.py | Writes a decision as a `merge_reverify_gate` event (no-op without a store) |
-| `HistoryLegRunner` | merge_lane/history_leg.py | A `VerifyRunner` that runs only the project's `merge_gate_history_test_command`; `_run_post_merge_verify` selects it by `history_leg_command` (task 7248) |
+| `HistoryLegRunner` | merge_lane/history_leg.py | A `VerifyRunner` that runs only the project's `merge_gate_history_test_command`; `run_post_merge_verify` selects it by `history_leg_command` (task 7248) |
 | `_check_post_merge_pyright()` | merge_lane/gates.py | Post-merge Decision-3: unscoped package-wide type-check against the advanced main SHA |
 | `_resolve_second_parent()` | merge_lane/gates.py | Second parent (`sha^2`) of a `--no-ff` merge commit, for equivalence-gate tip resolution |
 | `_commit_is_linear()` | merge_lane/gates.py | True iff a commit has ≤1 parent (task-1928 worktree-HEAD-fallback fail-safe gate) |
@@ -348,11 +367,10 @@ test or config patches later.
 | `PersistentWorktreeConfigError` | merge_lane/liveness.py | Raised by `enforce_persistent_worktree_serial_lane` when per-host in-flight count would exceed 1 |
 | `_safety_valve_due()` | merge_lane/liveness.py | Periodic cold-verify safety-valve gate (every Nth verifying attempt, PRD §10 invariant 6) |
 | `_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX` | merge_lane/liveness.py | Per-host dedup sentinel prefix for unreachability alarms (task 1795) |
-| `_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX` | merge_lane/liveness.py | Per-host sentinel prefix for recovery info escalations, distinct from the unreachable prefix |
 | `_MERGE_WORKER_LOOP_DIED_SENTINEL` | merge_lane/liveness.py | Sentinel task_id base for the merge-worker supervisor loop-death escalation |
 | `_verify_host_unreachable_sentinel()` | merge_lane/liveness.py | Per-host dedup sentinel task_id for unreachability alarms |
 | `_alarm_verify_host_unreachable()` | merge_lane/liveness.py | Dedup'd L1 escalation when a remote verify host is persistently unreachable |
-| `_clear_verify_host_unreachable()` | merge_lane/liveness.py | Resolve any open unreachability alarm and emit a recovery event on reprobe success |
+| `_clear_verify_host_unreachable()` | merge_lane/liveness.py | Resolve every pending record on the host's sentinel on named `RecoveryEvidence`, then emit `verify_host_recovered` |
 | `_acquire_warm_verify_worktree()` | merge_lane/liveness.py | Swap the ephemeral merge worktree for the persistent warm worktree (or the `_spec-` warm lane) |
 | `enforce_persistent_worktree_serial_lane()` | merge_lane/liveness.py | Fail-closed startup guard: per-host in-flight verify count must not exceed 1 |
 | `TOUCH_MISS_TOLERANCE` | merge_lane/liveness.py | Consecutive heartbeat ticks a live worker's `_merge-*` worktrees may miss before mtime ages into the reaper window (= 20); moved out of the worker, task 5036 |
@@ -415,7 +433,7 @@ production or anywhere under `orchestrator/tests`.
 
 The shared pipeline pieces the serial worker used were never worker-specific, and remain:
 `classify_and_merge()` (§7, task κ/1995), `_do_train_merge()` with its `_TrainMergeHost`
-Protocol (the narrow statement of what the train pipeline touches), `_run_post_merge_verify()`,
+Protocol (the narrow statement of what the train pipeline touches), `merge_lane/post_merge_verify.py::run_post_merge_verify` (moved by task 5040, §7.9),
 `_finalize_advanced_merge()`, `_map_advance_failure()`, `_emit_merge_queued()` (now in
 `merge_lane/intake.py`), `_HALT_ADVANCE_RESULTS` and the lane halt state, now `HaltState` in
 `merge_lane/halt.py`, which the worker composes (task 5305).
@@ -461,6 +479,36 @@ API as one-statement delegators.
 | `C3SubmitAction` / `decide_c3_submit_action()` | merge_lane/tip_relation.py | The SHA-sensitive `merge_request` submit-gate action (COALESCE / REPLACE / REJECT; PRD §4 C3) |
 | `select_recovery_winner()` | merge_lane/tip_relation.py | Pick the descendant-most snapshot tip for recovery dedup |
 
+### 7.9 The verify modules — hosts, post-merge verify, in-flight verify and the dispatcher (merge-lane-quality κ, task 5040)
+
+Task 5040 moved the lane's verify execution out of `merge_lane/worker.py` into nine modules, and
+none imports the worker. The concerns the dispatcher does not own reach it through the ports of
+`dispatch_ports.py`, one concern each, built by the worker as callables that re-read its live
+members.
+
+| Module | Purpose |
+|--------|---------|
+| `merge_lane/host_quarantine.py` | `HostQuarantine`: which remote verify hosts are benched (RunnerUnavailable or verdict divergence), the re-probe that readmits them, and the operator clear. Sole owner of `_runner_unavailable` and `_runner_quarantine` |
+| `merge_lane/main_health_probe.py` | Does a red verify fail the same way on bare main? `classify_main_health_red`, the deferred probe and its `preexisting_main_break` escalation |
+| `merge_lane/retry_verify_env.py` | The narrowed env a failed-only infra-transient retry runs under |
+| `merge_lane/post_merge_verify.py` | `run_post_merge_verify`: run one merge's verify and decide whether it may land |
+| `merge_lane/verify_cross_check.py` | The land-time cross-check of a remote green on the local trust anchor; divergence quarantines the host and escalates |
+| `merge_lane/verify_failure_outcome.py` | Turn a red post-merge verify into the blocked `MergeOutcome` it earns (`red_verify_outcome`, `verify_hit_enospc`) |
+| `merge_lane/inflight_verify.py` | `InflightVerifyRun`: one dispatched item's verify on its held lease, polled for a verdict or one of the three mid-run abandonments (the interrupts live here), then settled |
+| `merge_lane/verify_dispatch.py` | `VerifyDispatcher`: dispatch a merged item onto a free host, launch its in-flight verify, bind every post-merge verify to the lane context, run a parked gate's history leg; owns the verify tuning, attempt counts and the chain-invalidation flag |
+| `merge_lane/dispatch_ports.py` | Request and entry custody `DispatchCustody` and the verify frontier `VerifyFrontier` (toward μ); `ChainPlanning`, `SpeculationPermits`, `DispatchRemerge` and `MainTip` (λ); the INV-3 dead-base ledger `DeadBases`; the merger's held base `MergerAnchor`; `DispatchWorktrees` (ν); `LeaseContention` (ξ); `LaneVerifyContext`, `VerifyRetryBudgets` |
+
+Former worker symbols and their homes:
+
+| Was | Now |
+|-----|-----|
+| `_run_post_merge_verify` | `merge_lane/post_merge_verify.py::run_post_merge_verify` |
+| `_run_inflight_verify` | `merge_lane/verify_dispatch.py::VerifyDispatcher.run_inflight_verify`, running `merge_lane/inflight_verify.py::InflightVerifyRun` |
+| `_dispatch_item` | `merge_lane/verify_dispatch.py::VerifyDispatcher.dispatch` |
+| `_reprobe_quarantined_hosts` | `merge_lane/host_quarantine.py::HostQuarantine._reprobe_quarantined_hosts` |
+| `_classify_main_health_red` | `merge_lane/main_health_probe.py::classify_main_health_red` |
+| `_verify_hit_enospc` | `merge_lane/verify_failure_outcome.py::verify_hit_enospc` |
+
 ---
 
 ## 8. Greek→task-ID provenance table
@@ -477,6 +525,7 @@ API as one-statement delegators.
 | λ | 1895 | Integration gate + `two_layer_invariants()` — §5.3 invariant health surface |
 | μ | 1896 | This documentation task (SKILL.md + design-doc companion) |
 | ν | 1897 | Follow-on task (post-integration cleanup / companion) |
+| — | 5302 | Frozen-prefix liveness (a vacated finalize head is not frozen); the I2 verify-base rule split out of `two_layer_invariants()` into the dispatch-time detector (`verify_base_divergences()`, L1 `merge_verify_base_divergence`) |
 
 ---
 

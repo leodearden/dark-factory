@@ -25,7 +25,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from _task_db_scan import TaskDbProblem, TaskDbUnreadable
 from cli_subprocess_timeout import cli_timeout_from_env
 from scan_task_toolcall_leaks import (
     LeakMatch,
@@ -34,6 +33,7 @@ from scan_task_toolcall_leaks import (
     format_report,
     scan_db,
 )
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 # The tasks-table schema and the fake-db builder live in scripts/tests/
 # conftest.py, behind the `make_tasks_db` fixture (task

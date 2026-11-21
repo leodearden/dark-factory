@@ -29,7 +29,7 @@ from _verify_boundary_harness import (
     worktree_base_for,
     write_verify_config,
 )
-from test_cli import _setup_verify_repo
+from _verify_merge_cli_fixtures import _setup_verify_repo
 
 from orchestrator.verify_cancel import merge_verify_lock_path, write_lock_holder_pgid
 from orchestrator.verify_runner import FLOCK_CONTENTION_CATEGORY, result_from_json
@@ -689,7 +689,8 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     """ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS overrides the flock bounded wait.
 
     Holds the real flock (+ writes the holder pgid) exactly as
-    test_cli.py:1419 does, then spawns a real knob-on verify-merge with the
+    test_cli_verify_merge.py::test_verify_merge_flock_contention_emits_distinguished_result
+    does, then spawns a real knob-on verify-merge with the
     override set small.  Today (RED) verify-merge ignores the env var and
     waits the full 10.0s production window; asserting the wait came in well
     under that fails until cli.py reads the override.

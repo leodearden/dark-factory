@@ -132,13 +132,15 @@ class VerifyPort(Protocol):
 
 
 class ClockPort(Protocol):
-    """The worker's clocks, its sleep and bounded wait, and its merge-worktree progress probe."""
+    """The worker's clocks, its sleep and bounded wait, and its merge-worktree progress probes."""
 
     def now(self) -> float: ...
 
     def monotonic(self) -> float: ...
 
     def newest_content_mtime(self, root: Path) -> float | None: ...
+
+    def verify_cpu_ticks(self, root: Path) -> int | None: ...
 
     async def sleep(self, secs: float) -> None: ...
 
@@ -185,7 +187,9 @@ class ProductionVerifier:
 
     Every method resolves its function and forwards the call exactly as
     received -- positional arguments positionally, keywords by keyword -- so
-    the function sees the same call it saw before the port existed.
+    the function sees the same call it saw before the port existed. The one
+    addition is ``cold_shadow``'s ``verifier=self``: the cold leg verifies
+    through the port it was asked through, whichever instance that is.
     """
 
     scoped: Resolver[Callable[..., Awaitable[VerifyResult]]]
@@ -212,7 +216,7 @@ class ProductionVerifier:
         return DiskGuardOutcome(reason=await self.disk_guard()(*args, **options))
 
     async def cold_shadow(self, *args: Any, **options: Any) -> dict[str, str]:
-        return await self.cold_shadow_verify()(*args, **options)
+        return await self.cold_shadow_verify()(*args, verifier=self, **options)
 
     def dry_run_unblock(self, **investigation: Any) -> Coroutine[Any, Any, None]:
         return self.dry_run()(**investigation)
@@ -222,11 +226,13 @@ class ProductionVerifier:
 class ProductionClock:
     """``ClockPort`` on the real clocks.
 
-    ``content_mtime`` resolves ``merge_liveness.newest_content_mtime`` the
-    way the verify resolvers do, for the same reason.
+    ``content_mtime`` and ``cpu_ticks`` resolve ``liveness.newest_content_mtime``
+    and ``liveness.verify_tree_cpu_ticks`` the way the verify resolvers do,
+    for the same reason.
     """
 
     content_mtime: Resolver[Callable[[Path], float | None]]
+    cpu_ticks: Resolver[Callable[[Path], int | None]]
 
     def now(self) -> float:
         return time.time()
@@ -236,6 +242,9 @@ class ProductionClock:
 
     def newest_content_mtime(self, root: Path) -> float | None:
         return self.content_mtime()(root)
+
+    def verify_cpu_ticks(self, root: Path) -> int | None:
+        return self.cpu_ticks()(root)
 
     async def sleep(self, secs: float) -> None:
         await asyncio.sleep(secs)

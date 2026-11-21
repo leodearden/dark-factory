@@ -21,6 +21,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 SCRIPT = Path(__file__).parent.parent / "legibility" / "install-trickle-timer.sh"
 TEMPLATES_DIR = Path(__file__).parent.parent  # scripts/tests/../ = scripts/
 
@@ -166,7 +171,7 @@ def _run_script(tmp_path, project_id, *, env=None):
     Puts a fresh fake `systemctl` on PATH (state reset each call) and
     defaults INSTALL_TRICKLE_TIMER_PYTHON=sys.executable so the script's
     `nightly.py resolve-config` delegation runs the REAL resolver directly
-    -- no `uv run`/`--frozen` needed in-test. Callers supply
+    -- no `uv run` needed in-test. Callers supply
     XDG_CONFIG_HOME and LEGIBILITY_SEARCH_ROOTS via *env*.
     """
     bin_dir, state_path = _fake_systemctl(tmp_path)

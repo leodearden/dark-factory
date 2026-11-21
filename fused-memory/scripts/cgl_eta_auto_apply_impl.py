@@ -96,12 +96,11 @@ def backup_falkordb() -> Path:
     return dest
 
 
-async def _compact_vec(backend, gkey, edge_uuid):
+async def _compact_vec(backend, gkey, edge_uuid, *, op: str):
     """Best-effort raw --compact fact_embedding read; None if null/absent."""
     q = f"MATCH ()-[e:RELATES_TO {{uuid: '{edge_uuid}'}}]-() RETURN e.fact_embedding"
     try:
-        client = backend._require_falkor_client()
-        reply = await client.execute_command('GRAPH.RO_QUERY', gkey, q, '--compact')
+        reply = await backend.graph_access.graph(gkey).ro_query_compact(q, op=op)
         rows = reply[1]
         if not rows:
             return None
@@ -125,7 +124,9 @@ async def dump_cross_target(backend, migrate, manifest) -> Path:
     async def present(g, u):
         k = (g, u)
         if k not in present_cache:
-            r = await backend._graph_for(g).ro_query('MATCH (n:Entity {uuid: $u}) RETURN n.uuid LIMIT 1', {'u': u})
+            r = await backend.graph_access.graph(g).ro_query(
+                'MATCH (n:Entity {uuid: $u}) RETURN n.uuid LIMIT 1', {'u': u}, op='dump_cross_target',
+            )
             present_cache[k] = bool(r.result_set)
         return present_cache[k]
 
@@ -136,12 +137,14 @@ async def dump_cross_target(backend, migrate, manifest) -> Path:
     seen: set = set()
     dropped = []
     for src_graph, uuids in by_src.items():
-        graph = backend._graph_for(src_graph)
+        graph = backend.graph_access.graph(src_graph)
         for uuid in uuids:
             res = await graph.ro_query(
                 'MATCH (n:Entity {uuid: $u})-[e:RELATES_TO]-(m:Entity) '
                 'WITH DISTINCT e, startNode(e) AS s, endNode(e) AS t '
-                'RETURN e.uuid, e.name, e.fact, s.uuid, s.name, t.uuid, t.name', {'u': uuid})
+                'RETURN e.uuid, e.name, e.fact, s.uuid, s.name, t.uuid, t.name', {'u': uuid},
+                op='dump_cross_target',
+            )
             for row in (res.result_set or []):
                 e_uuid, e_name, fact, s_uuid, s_name, t_uuid, t_name = row
                 if e_uuid in seen:
@@ -158,7 +161,9 @@ async def dump_cross_target(backend, migrate, manifest) -> Path:
                     'edge_uuid': e_uuid, 'edge_name': e_name, 'fact': fact,
                     'lives_in_graph': src_graph, 'src_uuid': s_uuid, 'src_name': s_name,
                     'dst_uuid': t_uuid, 'dst_name': t_name, 'src_target': s_tgt, 'dst_target': t_tgt,
-                    'fact_embedding_compact': await _compact_vec(backend, src_graph, e_uuid),
+                    'fact_embedding_compact': await _compact_vec(
+                        backend, src_graph, e_uuid, op='dump_cross_target',
+                    ),
                 })
     dest = OUTDIR / f'cross-target-edges-recovery-{STAMP}.json'
     dest.write_text(json.dumps({'count': len(dropped), 'edges': dropped}, indent=2, default=str))

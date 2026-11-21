@@ -5,8 +5,9 @@ TABLE half of finding 1.2). This module is the pure, shared companion to
 ``shared.task_statuses`` (the vocabulary, shipped by task 2163): it adds the
 actor taxonomy (``ActorClass``, ``derive_actor_class``), the enumerated
 (from, to, actor) -> allowed legality table (``TRANSITIONS``,
-``is_legal_transition``), and the WorkflowOutcome -> TaskStatus consistency
-map (``outcome_allows_status``).
+``is_legal_transition``), the WorkflowOutcome -> TaskStatus consistency
+map (``outcome_allows_status``), and the outcome vocabulary that map is keyed
+by (``WORKFLOW_OUTCOMES``).
 
 This module is intentionally PURE: it imports only ``shared.task_statuses``
 and defines no I/O, no enforcement wiring, and no orchestrator/fused-memory
@@ -33,6 +34,7 @@ __all__ = [
     'TRANSITIONS',
     'is_legal_transition',
     'outcome_allows_status',
+    'WORKFLOW_OUTCOMES',
 ]
 
 
@@ -119,7 +121,7 @@ _UNION: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
             TaskStatus.MERGE_DEFERRED,
             TaskStatus.DONE,
         ),  # train workflow.py::TaskWorkflow._maybe_enqueue_group_merge (its _mark_member_done closure) / _attribute_train_failure, harness.py::build_train_callback_factory (mark_member_done / redrive_member)
-        (TaskStatus.BLOCKED, TaskStatus.DONE),  # train attribution workflow.py::TaskWorkflow._attribute_train_failure
+        (TaskStatus.BLOCKED, TaskStatus.DONE),  # train attribution workflow.py::TaskWorkflow._attribute_train_failure; harness.py::Harness._run_held_pure_gate_inline (DeterministicRunner pure-gate close)
         (
             TaskStatus.PENDING,
             TaskStatus.DONE,
@@ -358,6 +360,10 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
         }
     ),
 }
+
+# The WorkflowOutcome string vocabulary the exit contract is keyed by,
+# mirrored here because shared/ cannot import orchestrator.
+WORKFLOW_OUTCOMES: frozenset[str] = frozenset(_OUTCOME_ALLOWED)
 
 
 def outcome_allows_status(outcome: object, status: TaskStatus | str) -> bool:

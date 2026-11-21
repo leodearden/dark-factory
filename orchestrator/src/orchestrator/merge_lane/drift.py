@@ -21,7 +21,7 @@ import asyncio
 import dataclasses
 import json
 import logging
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -66,8 +66,8 @@ _DRIFT_HOST_POLL_SECS = 5.0
 # ``project_root/data/orchestrator/drift_check_state.json`` makes the cadence
 # survive restarts.  The runner quarantine set is deliberately NOT persisted:
 # the dedup'd open L1 verify_drift_divergence escalation is the cross-restart
-# guard (see merge_queue.py SpeculativeMergeWorker.__init__ RESTART RE-TRUST
-# WINDOW note).
+# guard (see merge_lane/host_quarantine.py::HostQuarantine.__init__ RESTART
+# RE-TRUST WINDOW note).
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -277,7 +277,7 @@ async def _run_drift_check(
     merge_commit: str,
     escalation_queue: Any,
     event_store: EventStore | None,
-    quarantine_set: set[str],
+    quarantine: Callable[[str], None],
     *,
     verifier: VerifyPort,
     allocator: HostAllocator,
@@ -293,9 +293,9 @@ async def _run_drift_check(
     Waits up to *host_settle_secs* for both host slots, then creates a
     throwaway verify worktree for the local leg, builds a 2-host pool (local
     trust-anchor + eligible remote), runs ``DriftDetector.check_env_safely`` and
-    then ``check``, and propagates any quarantined remote name into
-    *quarantine_set* (the worker-level shared set consulted by
-    ``_run_post_merge_verify``).
+    then ``check``, and hands any quarantined remote name to *quarantine*
+    (the lane's ``HostQuarantine.quarantine_divergent``, which takes it out of
+    the shared set the allocator dispatches from).
 
     Each host slot is released the moment its own leg ends; the ``finally``
     releases only what is still held, then ``cleanup_merge_worktree``.  If the
@@ -316,8 +316,8 @@ async def _run_drift_check(
         merge_commit: The just-landed merge commit SHA.
         escalation_queue: Live escalation queue (None-safe: passed to DriftDetector).
         event_store: Optional event store (None-safe: passed to DriftDetector).
-        quarantine_set: Worker-level mutable set; quarantined remote names are
-            added here so subsequent dispatches skip the diverged remote.
+        quarantine: The divergence sink; a quarantined remote name is handed
+            to it so subsequent dispatches skip the diverged remote.
         allocator: Worker-lifetime :class:`~orchestrator.verify_runner.HostAllocator`
             (β decision 5), from which both host slots are acquired.
         verifier: The worker's :class:`~orchestrator.merge_lane.ports.VerifyPort`;
@@ -405,7 +405,7 @@ async def _run_drift_check(
             # divergence class.  Forcing task_files=None runs the complete
             # workspace gate (verify.py task_files=None path) on both hosts so a
             # genuine divergence is observable.  This deliberately does NOT
-            # derive/scope task_files (unlike _run_post_merge_verify's serial-lane
+            # derive/scope task_files (unlike merge_lane/post_merge_verify.py::run_post_merge_verify's serial-lane
             # dispatching-host derivation) — the derivation gate is intentionally
             # dropped here.  task_files_tuple stays None so BOTH the spec and the
             # LocalRunner below run the whole suite.
@@ -444,7 +444,7 @@ async def _run_drift_check(
                 merge_commit, spec, on_leg_done=held.release_leg,
             )
             if result.quarantined and eligible_before is not None:
-                quarantine_set.add(eligible_before.name)
+                quarantine(eligible_before.name)
     except Exception:
         logger.warning(
             'Drift check failed for task %s / commit %s; ignoring (detective control)',
@@ -551,7 +551,7 @@ async def _maybe_run_drift_check(
     return _spawn_drift_task(worker, _run_drift_check(
         git_ops, req, merge_commit,
         worker._escalation_queue, worker._event_store,
-        worker._runner_quarantine,
+        worker._host_quarantine.quarantine_divergent,
         verifier=verifier,
         allocator=worker._ensure_host_allocator(req.config),
         on_unavailable=worker.bench_unavailable_runner,

@@ -248,10 +248,10 @@ hoist the loop-invariant probe out of the body and bound the fan-out with
 an explicit cap that logs what it dropped (no silent truncation); loop-lag
 heartbeat firing above a threshold (INV-4 applied to scheduling).
 Mechanical enforcement now stands behind this slug:
-`shared/tests/test_loop_blocking_gate.py` scans `fused-memory/src` caller-side
-(`shared/tests/loop_blocking_scan.py::find_loop_blocking_sites`) and ratchets
+`tests/repo_guards/test_loop_blocking_gate.py` scans `fused-memory/src` caller-side
+(`tests/repo_guards/loop_blocking_scan.py::find_loop_blocking_sites`) and ratchets
 every coroutine call site reaching a blocking primitive against a
-dispositioned ledger, `shared/tests/loop_blocking_allowlist.py`. A new site
+dispositioned ledger, `tests/repo_guards/loop_blocking_allowlist.py`. A new site
 must be fixed or blessed with a stated reason in the same change, and a landed
 fix must delete its blessing. This is what the Census seam section below asks
 for when a slug is violated across repeated census batches — INV-8 was missed
@@ -340,7 +340,7 @@ the documented thing — `tests/scripts/test_package_source_lookup_convention.py
 a real package. (2) MIRROR a marker-delimited span against the live
 artifact — `tests/scripts/test_contributing_lint_command_drift.py` (task
 3558) against `dark-factory-orchestrator.yaml`'s `lint_command`, and
-`scripts/tests/test_design_invariants_consistency.py` (task 3802) against
+`tests/repo_guards/test_design_invariants_consistency.py` (task 3802) against
 this doc's own headings. (3) Nothing else: a substring/regex over prose is
 a finding, not a guard, and "harden the regex" is not a remedy. The
 reviewer's standing discriminator
@@ -366,11 +366,11 @@ answer is "the log says so", the path is silent. If it is "the caller gets
 fewer items", what tells the caller that fewer is not all?
 
 **Evidence**: Already machine-enforced per occurrence, with no slug to
-name it: `shared/tests/test_silent_fallthrough_gate.py` lints all
+name it: `tests/repo_guards/test_silent_fallthrough_gate.py` lints all
 first-party source for `except (Exception|BaseException|bare):` returning
 an empty/None value with no WARN+ log and no re-raise, against the
-burn-down allowlist `shared/tests/silent_fallthrough_allowlist.py`
-(scanner `shared/tests/silent_fallthrough_scan.py`, PRD
+burn-down allowlist `tests/repo_guards/silent_fallthrough_allowlist.py`
+(scanner `tests/repo_guards/silent_fallthrough_scan.py`, PRD
 `plans/silent-fallthrough-dedup-prd.md`). The concept was ALSO minted
 independently as a bare phrase across 55 tracked files (measured on base
 eba215060c; the figure grows as citations accrue); where those citations
@@ -437,18 +437,16 @@ tasks 4354, 4920 and 5215, each owning a burn-down that nothing connects to
 the entries it retires, so nothing notices when one of those tasks completes
 and entries remain.
 
-**House pattern**: `plans/inv12-exceptions-owned-or-ratified-prd.md` — the
-disposition vocabulary, the ratification table, the inline-marker grammar,
-the multiset ratchet kernel, the exception register and the owner-liveness
-sweep. The landed mechanism is `shared/src/shared/governed_exceptions.py`
-(the disposition vocabulary and the inline-marker grammar),
-`shared/src/shared/ratchet.py` (the multiset ratchet kernel),
-`scripts/exception_register.py` (the exception register and the
-ratification-table loader), `scripts/inline_suppressions.py` (the
-inline-suppression gate and ratchet) and
-`docs/legibility/exception-ratifications.yaml` (the ratification table). The
-owner-liveness sweep (PRD step η) has not landed yet; the PRD is its only
-reference.
+**House pattern**: `shared/src/shared/governed_exceptions.py` (the
+disposition vocabulary, the `governed_exceptions(...)` declaration and the
+inline-marker grammar), `shared/src/shared/ratchet.py` (the multiset ratchet
+kernel), `scripts/inline_suppressions.py` (the inline-suppression gate and
+ratchet over its committed baseline), `scripts/exception_register.py` (the
+exception register, the ratification-table loader and `--report`),
+`scripts/exception_owner_sweep.py` (the nightly owner-liveness sweep) and
+`docs/legibility/exception-ratifications.yaml` (the ratification table).
+Rationale: `plans/inv12-exceptions-owned-or-ratified-prd.md`. Operator
+runbook: `OPERATIONS.md` §12a.
 
 **Family boundary**: INV-7 `holds-owned-and-bounded` and INV-12 are
 adjacent — both ask who owns a thing and what notices when the owner is

@@ -8,7 +8,9 @@ by ``agents/invoke.py:979-985``, which builds the backend allowlist from
 ``allowed_tools`` — an ungranted tool is unreachable regardless of prompt
 text); the dead-grant check; and bare tool-name-presence anchors for
 ``report_ready_to_merge`` / ``mark_step_committed`` on the two roles.py
-system prompts and the two ``BriefingAssembler`` dispatch prompts.
+system prompts and the plan-completion ``BriefingAssembler`` dispatch prompt.
+The SIMPLE_TASK briefing points at its system prompt for the exits instead
+(``orchestrator/tests/test_briefing_simple_task_spot.py``, task 6564).
 
 Prose-window/keyword assertions were deliberately removed in review (design
 decision 4) — do not reintroduce them.
@@ -29,7 +31,7 @@ _REPORT_READY_TO_MERGE = 'mcp__plan-tools__report_ready_to_merge'
 
 class TestArchitectCanReachReportReadyToMerge:
     def test_architect_is_granted_report_ready_to_merge(self):
-        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
+        from orchestrator.agents.roles import ARCHITECT
 
         assert _REPORT_READY_TO_MERGE in ARCHITECT.allowed_tools, (
             f'ARCHITECT.allowed_tools omits {_REPORT_READY_TO_MERGE!r} — the '
@@ -43,7 +45,7 @@ class TestArchitectCanReachReportReadyToMerge:
         SIMPLE_TASK path too (the same handler as the architect path), so a
         simple-task agent hitting a merge-landing desync needs the same
         reachable exit."""
-        from orchestrator.agents.roles import SIMPLE_TASK  # noqa: PLC0415
+        from orchestrator.agents.roles import SIMPLE_TASK
 
         assert _REPORT_READY_TO_MERGE in SIMPLE_TASK.allowed_tools, (
             f'SIMPLE_TASK.allowed_tools omits {_REPORT_READY_TO_MERGE!r} — '
@@ -55,12 +57,12 @@ class TestArchitectCanReachReportReadyToMerge:
     def test_implementer_is_not_granted_report_ready_to_merge(self):
         """Reporting merge-readiness is an AUTHORING-time authority, not an
         execution one — same reasoning as mark_step_committed's role split."""
-        from orchestrator.agents.roles import IMPLEMENTER  # noqa: PLC0415
+        from orchestrator.agents.roles import IMPLEMENTER
 
         assert _REPORT_READY_TO_MERGE not in IMPLEMENTER.allowed_tools
 
     def test_debugger_is_not_granted_report_ready_to_merge(self):
-        from orchestrator.agents.roles import DEBUGGER  # noqa: PLC0415
+        from orchestrator.agents.roles import DEBUGGER
 
         assert _REPORT_READY_TO_MERGE not in DEBUGGER.allowed_tools
 
@@ -72,12 +74,12 @@ class TestArchitectCanReachReportReadyToMerge:
         the ``plan_tools`` family; asserted here too so a grant added without
         the family declaration fails in this suite as well.
         """
-        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
+        from orchestrator.agents.roles import ARCHITECT
 
         assert 'plan_tools' in ARCHITECT.mcp_families
 
     def test_simple_task_declares_plan_tools_family(self):
-        from orchestrator.agents.roles import SIMPLE_TASK  # noqa: PLC0415
+        from orchestrator.agents.roles import SIMPLE_TASK
 
         assert 'plan_tools' in SIMPLE_TASK.mcp_families
 
@@ -90,7 +92,7 @@ class TestGrantedReadyToMergeToolExists:
         Mirrors test_architect_all_committed_plan.py::TestGrantedToolActuallyExists
         — an allowlist entry for a non-existent tool is a silent dead grant.
         """
-        from orchestrator.mcp import plan_tools  # noqa: PLC0415
+        from orchestrator.mcp import plan_tools
 
         artifacts = TaskArtifacts(tmp_path)
         artifacts.init('42', 'X', 'desc', base_commit='base')
@@ -106,12 +108,12 @@ class TestGrantedReadyToMergeToolExists:
 
 class TestArchitectPromptEnumeratesNewExits:
     def test_prompt_names_report_ready_to_merge(self):
-        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
+        from orchestrator.agents.roles import ARCHITECT
 
         assert 'report_ready_to_merge' in ARCHITECT.system_prompt
 
     def test_prompt_names_mark_step_committed(self):
-        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
+        from orchestrator.agents.roles import ARCHITECT
 
         assert 'mark_step_committed' in ARCHITECT.system_prompt
 
@@ -121,12 +123,12 @@ class TestArchitectPromptEnumeratesNewExits:
 
 class TestSimpleTaskPromptEnumeratesNewExits:
     def test_rejection_artifacts_list_names_report_ready_to_merge(self):
-        from orchestrator.agents.roles import SIMPLE_TASK  # noqa: PLC0415
+        from orchestrator.agents.roles import SIMPLE_TASK
 
         assert 'mcp__plan-tools__report_ready_to_merge' in SIMPLE_TASK.system_prompt
 
     def test_prompt_names_mark_step_committed(self):
-        from orchestrator.agents.roles import SIMPLE_TASK  # noqa: PLC0415
+        from orchestrator.agents.roles import SIMPLE_TASK
 
         assert 'mark_step_committed' in SIMPLE_TASK.system_prompt
 
@@ -136,8 +138,8 @@ class TestSimpleTaskPromptEnumeratesNewExits:
 
 @pytest.fixture
 def briefing(tmp_path: Path):
-    from orchestrator.agents.briefing import BriefingAssembler  # noqa: PLC0415
-    from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: PLC0415
+    from orchestrator.agents.briefing import BriefingAssembler
+    from orchestrator.config import GitConfig, OrchestratorConfig
 
     config = OrchestratorConfig(
         project_root=tmp_path,
@@ -190,13 +192,3 @@ class TestBriefingPromptsEnumerateNewExits:
             task, _partial_plan_with_pending_steps(), worktree=None, context='',
         )
         assert 'mark_step_committed' in prompt
-
-    async def test_simple_task_prompt_names_report_ready_to_merge(self, briefing):
-        """The SIMPLE_TASK dispatch briefing's only exit sentence currently
-        names just report_unactionable_task; it must also teach
-        report_ready_to_merge for the branch-complete-but-unmerged case."""
-        task = {'id': '77', 'title': 'Small fix', 'description': 'Demo'}
-        prompt = await briefing.build_simple_task_prompt(
-            task, worktree=None, context='',
-        )
-        assert 'report_ready_to_merge' in prompt

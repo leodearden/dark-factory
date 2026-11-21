@@ -28,7 +28,7 @@ from __future__ import annotations
 import contextlib
 from collections.abc import AsyncIterator, Callable, Iterable
 
-from _fm_helpers import FALKOR_HOST, FALKOR_PORT, unique_graph_name
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, unique_graph_name
 from falkordb.asyncio import FalkorDB
 from falkordb.asyncio.graph import AsyncGraph
 

@@ -2,7 +2,7 @@
 
 Closes the AFK coverage gap: today metadata.dry_run_proposals[] is written
 ONLY by workflow._spawn_dry_run_unblock at agent-block time — merge_queue's
-post-merge-verify block path (_run_post_merge_verify) produces a
+post-merge-verify block path (run_post_merge_verify) produces a
 MergeOutcome('blocked') but never spawned a dry-run investigation, so
 b3_gate.check_proposal returned ABORT 'no proposal to gate' for the entire
 merge-verify-RED class.
@@ -13,7 +13,7 @@ timeouts / disabled unblock_auto / duplicate in-flight investigations, and the
 exclusion of the sibling blocked classes (flock-contention, persistent
 ENOSPC, disk-guard-skip, main-health-red). Reuses the
 test_merge_queue_main_health.py driver (_make_config/_make_git_ops/_make_req,
-COMPILE_ERROR_RESULT) to reach _run_post_merge_verify's blocked outcomes.
+COMPILE_ERROR_RESULT) to reach run_post_merge_verify's blocked outcomes.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript, make_lane
+from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config, make_lane
 from _orch_helpers import wait_responsive
 from test_dry_run_unblock import _init_git_repo, _make_agent_result, _RecordingScheduler
 from test_merge_queue_main_health import (
@@ -45,16 +45,18 @@ from orchestrator.dry_run_unblock import investigation_task_name
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.git_ops import _run as _run_git
+from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.verify_failure_outcome import (
+    TRANSIENT_INFRA_REASON_PREFIX,
+    DryRunInvestigationHandles,
+)
 from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
     PRODUCTION_CLOCK,
     PRODUCTION_VERIFIER,
-    TRANSIENT_INFRA_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
     QueuedBranch,
-    _DryRunInvestigationHandles,
-    _run_post_merge_verify,
 )
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
@@ -141,13 +143,13 @@ class _SpawnIsdirVerifier(FakeVerifier):
 
 def _make_handles(
     *, scheduler: object | None = None, mcp: object | None = None,
-) -> _DryRunInvestigationHandles:
+) -> DryRunInvestigationHandles:
     """Build a handles bundle with a live (non-None) scheduler by default.
 
-    A live scheduler is required for _spawn_merge_verify_dry_run to proceed
+    A live scheduler is required for spawn_merge_verify_dry_run to proceed
     past its `handles is None or handles.scheduler is None` early return.
     """
-    return _DryRunInvestigationHandles(
+    return DryRunInvestigationHandles(
         scheduler=MagicMock() if scheduler is None else scheduler,
         mcp=MagicMock() if mcp is None else mcp,
     )
@@ -159,7 +161,7 @@ async def _drive_verify_with_handles(
     git_ops,
     *,
     verifier: FakeVerifier,
-    dry_run_handles: _DryRunInvestigationHandles | None,
+    dry_run_handles: DryRunInvestigationHandles | None,
 ) -> MergeOutcome | None:
     """test_merge_queue_main_health._drive_verify + the dry_run_handles kwarg.
 
@@ -167,7 +169,7 @@ async def _drive_verify_with_handles(
     result, answers the disk guard, and records (instead of running) the
     dry-run investigation the block path spawns.
     """
-    return await _run_post_merge_verify(
+    return await run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts={},
         enospc_retries={},
@@ -459,14 +461,14 @@ class TestUnscopedTypecheckFailedSpawns:
             # The ONE patch this file still needs (PRD γ9 residual). Every
             # sibling arm produces its condition for real -- the RED verify
             # through the injected port, "not pre-existing" through
-            # `escalate_preexisting_main_break=False`, the disk skip through
-            # the port's disk guard -- but a genuinely RED main has no such
-            # seam: `verify_failure_is_preexisting_on_main` lives in
+            # `_make_config(tmp_path, escalate_preexisting=False)`, the disk
+            # skip through the port's disk guard -- but a genuinely RED main
+            # has no such seam: `verify_failure_is_preexisting_on_main` lives in
             # `orchestrator.verify`, takes no port, and probes by running a
             # real scoped verification in a real `_mainprobe-` worktree.
             with (
                 patch(
-                    'orchestrator.merge_lane.worker.verify_failure_is_preexisting_on_main',
+                    'orchestrator.merge_lane.main_health_probe.verify_failure_is_preexisting_on_main',
                     new=AsyncMock(return_value=(True, MAIN_SHA)),
                 ),
             ):
@@ -619,14 +621,7 @@ async def _lane_repo(tmp_path: Path) -> tuple[GitOps, OrchestratorConfig]:
         worktree_dir='.worktrees', push_after_advance=False,
     )
     git_ops = GitOps(git_config, repo)
-    config = OrchestratorConfig(
-        project_root=repo,
-        git=git_config,
-        # The main-health probe is out of scope here and would run a REAL
-        # scoped verification against a probe worktree; the production guard
-        # that skips it is this flag (_classify_main_health_red).
-        escalate_preexisting_main_break=False,
-    )
+    config = lane_scene_config(repo, git_config)
     return git_ops, config
 
 
@@ -672,7 +667,7 @@ class TestLaneHandsItsHandlesToTheInvestigation:
     Replaces three construction-site tests that read
     ``worker._scheduler`` / ``._mcp`` / ``._usage_gate`` / ``._cost_store`` /
     ``._dry_run_handles`` / ``._background_tasks`` and spied on
-    ``_run_post_merge_verify`` to watch ``dry_run_handles`` being threaded:
+    ``run_post_merge_verify`` to watch ``dry_run_handles`` being threaded:
     the same contract, observed where it actually matters -- on the
     investigation the port is asked to run.
     """
@@ -813,7 +808,7 @@ class TestMergeVerifyRedProducesGateableProposal:
     with block_class='merge_verify_red' that b3_gate.check_proposal accepts
     as non-ABORT — AND the investigation must emit the same
     invocation_end/'blocked' telemetry event the agent-block path emits
-    (observability parity).  Today _spawn_merge_verify_dry_run receives
+    (observability parity).  Today spawn_merge_verify_dry_run receives
     event_store but discards it (`_ = event_store`), so the investigation's
     emit never fires through this MagicMock — RED on the event assertion.
 
@@ -835,7 +830,7 @@ class TestMergeVerifyRedProducesGateableProposal:
         head_sha = _init_git_repo(req.worktree)
 
         scheduler = _RecordingScheduler({'dry_run_proposals': []})
-        handles = _DryRunInvestigationHandles(scheduler=scheduler)
+        handles = DryRunInvestigationHandles(scheduler=scheduler)
         event_store = MagicMock()
 
         structured = {
@@ -872,7 +867,7 @@ class TestMergeVerifyRedProducesGateableProposal:
                     return_value=True,
                 ),
             ):
-                outcome = await _run_post_merge_verify(
+                outcome = await run_post_merge_verify(
                     git_ops, req, merge_wt,
                     timeouts={},
                     enospc_retries={},
@@ -961,7 +956,7 @@ class TestMergeVerifyRedClampedWithoutCompletionEvidence:
         head_sha = _init_git_repo(req.worktree)
 
         scheduler = _RecordingScheduler({'dry_run_proposals': []})
-        handles = _DryRunInvestigationHandles(scheduler=scheduler)
+        handles = DryRunInvestigationHandles(scheduler=scheduler)
         # Bare event_store: no workflow_verify(passed) and no phase_enter(merge)
         # rows -> the real merge_completion_eligible returns False -> clamp fires.
         event_store = MagicMock()
@@ -991,7 +986,7 @@ class TestMergeVerifyRedClampedWithoutCompletionEvidence:
                 # here — the real predicate runs against the evidence-free
                 # event_store and returns False, so the clamp fires.
             ):
-                outcome = await _run_post_merge_verify(
+                outcome = await run_post_merge_verify(
                     git_ops, req, merge_wt,
                     timeouts={},
                     enospc_retries={},
@@ -1051,7 +1046,7 @@ class TestInvestigationWorktreeSurvivesCleanup:
     which is exactly what hid this bug), *merge_wt* is actually removed
     before the fire-and-forget investigation task runs. The investigation
     must be pointed at the task's OWN retained worktree (``req.worktree`` —
-    which is never touched by ``_run_post_merge_verify`` and survives while
+    which is never touched by ``run_post_merge_verify`` and survives while
     the task stays blocked), not the ephemeral merge worktree that has
     already been deleted by the time the spawned task reads it.
     """

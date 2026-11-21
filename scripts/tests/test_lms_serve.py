@@ -23,6 +23,9 @@ import lms_manifest
 import lms_serve
 import lms_vram
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 MEASURED_GPU = lms_vram.GpuReading(total_mib=24576, used_mib=7362, free_mib=16761)
 

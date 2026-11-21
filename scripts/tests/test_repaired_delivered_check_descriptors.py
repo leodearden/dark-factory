@@ -33,6 +33,9 @@ from shared.delivered_check_polarity import (
     evaluate_grep_at_tree,
     evaluate_path_at_tree,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Task 6036: re-anchored on both sides.
 _REANCHORED = [
@@ -68,13 +71,13 @@ _RESYNCED_TO_TASK_RECORD = [
         "plans/flake-ledger-prd.capability-manifest.yaml",
         3787, "γ", "merge-boundary-call-sites-exist",
         {"kind": "grep", "pattern": r"effective_merge_module_configs\(", "expect": "present",
-         "paths": ["orchestrator/src/orchestrator/merge_lane/worker.py"]},
+         "paths": ["orchestrator/src/orchestrator/merge_lane/post_merge_verify.py"]},
     ),
     (
         "plans/flake-ledger-prd.capability-manifest.yaml",
         3789, "ε", "remote-path-drops-all-three-side-effects-today",
         {"kind": "grep", "pattern": "record_merge_flake_suppression", "expect": "present",
-         "paths": ["orchestrator/src/orchestrator/merge_lane/worker.py"]},
+         "paths": ["orchestrator/src/orchestrator/merge_lane/post_merge_verify.py"]},
     ),
     (
         "plans/merge-lane-throughput-prd.capability-manifest.yaml",

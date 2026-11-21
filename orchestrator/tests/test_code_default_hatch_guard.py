@@ -35,30 +35,36 @@ This module holds three things:
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 from _code_default_hatch import require_code_default_config
 from _config_default_scan import (
+    CONFIG_CLASS_NAME,
     DEFAULT_CONFIG,
     ConfigPathWrite,
+    config_path_blanking_sites_in,
+    default_asserting_tests_in,
     iter_config_path_blanking_sites,
     iter_default_asserting_tests,
 )
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _tree_scan import (
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    orchestrator_test_modules,
+)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
 
-# The ratchet below glob()s every test_*.py directly in tests/ and ast.parse()s each
-# one, which makes this module the newest member of the whole-tree-scanner
-# family.  Exceeding the 60s pyproject default does NOT merely fail the test:
-# pytest-timeout's thread method os._exit()s the whole xdist worker and
-# --max-worker-restart=0 then truncates the ENTIRE suite, reporting against
-# some innocent guard that shared the dead worker (esc-3980-1, esc-3787-1).
-# WHY 300s and the guard that ENFORCES this mark rather than trusting it to be
-# sprinkled: see WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 
 def _write(tmp_path: Path, name: str, body: str) -> Path:
@@ -1077,24 +1083,87 @@ def test_z(monkeypatch, tmp_path, env, fake_environ):
 # THE RATCHETS
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class _HatchFacts:
+    """One suite module's findings for both ratchets; each asserted value as its repr."""
+
+    default_assertions: tuple[tuple[str | None, str, int, str, str], ...]
+    blanking_sites: tuple[tuple[str, int, ConfigPathWrite], ...]
+
+
+def _default_assertion_facts(module: ParsedModule) -> tuple[tuple[str | None, str, int, str, str], ...]:
+    if not module.may_name(CONFIG_CLASS_NAME):
+        return ()
+    return tuple(
+        (cls, test, lineno, attr, repr(value))
+        for cls, test, lineno, attr, value in default_asserting_tests_in(module.tree)
+    )
+
+
+def _hatch_facts(module: ParsedModule) -> _HatchFacts:
+    return _HatchFacts(
+        default_assertions=_default_assertion_facts(module),
+        blanking_sites=tuple(config_path_blanking_sites_in(module.tree)),
+    )
+
+
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=orchestrator_test_modules, extract=_hatch_facts)
+TREE_ANALYSES = (ANALYSIS,)
+
+
+def _ratchet_facts(path: Path) -> _HatchFacts:
+    probe = TreeAnalysis('hatch_probe', files=lambda: [path], extract=_hatch_facts)
+    return TreePass.run([probe]).facts(probe)[path]
+
+
+@pytest.mark.parametrize('binding, asserted_root', [
+    ('', 'ＯrchestratorConfig()'),
+    (f'cfg = {CONFIG_CLASS_NAME}()', 'cfg'),
+], ids=['nfkc-spelled-direct-call', 'bound-name'])
+def test_the_ratchet_extract_reports_each_spelling_of_a_bare_config(tmp_path, binding, asserted_root):
+    leaf = f'{_PROBE_SECTION}.{_PROBE_LEAF}'
+    source = _write(tmp_path.resolve(), 'test_synth_ratchet_probe.py', (
+        'def test_default():\n'
+        f'    {binding}\n'
+        f'    assert {asserted_root}.{leaf} == {_probe_default()!r}\n'
+    ))
+
+    found = [(cls, test, attr) for cls, test, _lineno, attr, _value in _ratchet_facts(source).default_assertions]
+
+    assert found == [(None, 'test_default', leaf)]
+
+
+def test_the_ratchet_extract_reports_a_blanking_site_in_a_module_naming_no_config(tmp_path):
+    source = _write(tmp_path.resolve(), 'test_synth_blanking_probe.py', (
+        'def test_isolated(monkeypatch):\n'
+        "    monkeypatch.delenv('ORCH_CONFIG_PATH')\n"
+    ))
+
+    facts = _ratchet_facts(source)
+
+    assert facts.default_assertions == ()
+    assert [(qualname, kind) for qualname, _lineno, kind in facts.blanking_sites] == [
+        ('test_isolated', ConfigPathWrite.DELETE),
+    ]
+
 #: One param per FILE, not one per suite, so a regression names the offending
-#: file directly and each repair turns a specific subset green.  Collected by
-#: glob so a newly added test module is covered automatically.
-_SUITE_FILES = sorted(Path(__file__).parent.glob('test_*.py'))
+#: file directly and each repair turns a specific subset green.  Listed at
+#: collection so a newly added test module is covered automatically.
+_SUITE_FILES = orchestrator_test_modules()
 
 
 @pytest.mark.parametrize('source', _SUITE_FILES, ids=lambda p: p.name)
-def test_no_unhatched_code_default_assertions(source):
+def test_no_unhatched_code_default_assertions(source, tree_pass: TreePass):
     """No test may assert a package default off an un-isolated bare config.
 
     See this module's docstring for the incident.  The remedy is one line.
     """
-    findings = list(iter_default_asserting_tests(source))
+    findings = tree_pass.facts(ANALYSIS)[source].default_assertions
     if not findings:
         return
     lines = '\n'.join(
         f'  {cls or "<module>"}::{test}  line {lineno}  '
-        f'{attr} == {literal!r}'
+        f'{attr} == {literal}'
         for cls, test, lineno, attr, literal in findings
     )
     tests = {(cls, test) for cls, test, _, _, _ in findings}
@@ -1123,19 +1192,25 @@ _ABSENT_CONFIG_PATH_IS_THE_PRECONDITION = frozenset({
      'TestLayeredConfig.test_load_config_raises_when_no_config_and_no_env'),
     ('test_flake_report.py',
      'TestFlakeLedgerCommand.test_no_config_and_no_env_exits_one_with_an_error'),
+    ('test_verify_cache_status_cli.py',
+     'TestVerifyCacheStatus.test_no_config_and_no_env_exits_one_with_an_error'),
     ('test_eval_task_sampler.py',
      'TestEvalListFixturesCLI.test_needs_no_orchestrator_config'),
     ('test_code_default_hatch_guard.py',
      'TestRequireCodeDefaultConfig.test_fails_when_the_variable_is_unset'),
+    ('test_cli_config.py',
+     'test_missing_config_exits_1_with_the_error_and_never_runs_the_body'),
+    ('test_cli_config.py',
+     'test_every_config_loading_command_fails_the_same_way_without_a_config'),
 })
 
 
 @pytest.mark.parametrize('source', _SUITE_FILES, ids=lambda p: p.name)
-def test_no_cwd_dependent_config_isolation(source):
+def test_no_cwd_dependent_config_isolation(source, tree_pass: TreePass):
     """No test may blank or delete ``ORCH_CONFIG_PATH`` to isolate itself."""
     sites = [
         (qualname, lineno, kind)
-        for qualname, lineno, kind in iter_config_path_blanking_sites(source)
+        for qualname, lineno, kind in tree_pass.facts(ANALYSIS)[source].blanking_sites
         if (source.name, qualname) not in _ABSENT_CONFIG_PATH_IS_THE_PRECONDITION
     ]
     if not sites:
@@ -1164,11 +1239,11 @@ _EXEMPTIONS = sorted(_ABSENT_CONFIG_PATH_IS_THE_PRECONDITION)
 
 @pytest.mark.parametrize('file_name, qualname', _EXEMPTIONS,
                          ids=[f'{f}::{q}' for f, q in _EXEMPTIONS])
-def test_every_exemption_still_names_a_blanking_site(file_name, qualname):
+def test_every_exemption_still_names_a_blanking_site(file_name, qualname, tree_pass: TreePass):
     """A renamed or migrated exemption must not linger as a silent blind spot."""
-    source = Path(__file__).parent / file_name
+    source = Path(__file__).resolve().parent / file_name
     assert source.is_file(), f'exempted file {file_name} no longer exists'
-    qualnames = {site[0] for site in iter_config_path_blanking_sites(source)}
+    qualnames = {site[0] for site in tree_pass.facts(ANALYSIS)[source].blanking_sites}
     assert qualname in qualnames, (
         f'{file_name}::{qualname} is exempted from '
         f'test_no_cwd_dependent_config_isolation but no longer blanks or '

@@ -23,10 +23,24 @@ from collections import Counter
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from shared.cli_invoke import no_mcp_servers_config
+from shared.merge_subject import MergeSubject, parse_merge_subject
 
 from orchestrator.agents.invoke import invoke_agent
+from orchestrator.evals.measurement import (
+    MeasurementStage,
+    Scored,
+    Unmeasured,
+    json_answer,
+    measured_call,
+)
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest, GroundTruthIssue
+
+if TYPE_CHECKING:
+    from shared.cli_invoke import AgentResult
 
 logger = logging.getLogger(__name__)
 
@@ -251,28 +265,38 @@ def recover_diff(merge_sha: str, repo_path: Path) -> str | None:
     return fallback.stdout
 
 
-def resolve_merge_sha_by_task_id(task_id: str, repo_path: Path) -> str | None:
+def resolve_merge_sha_by_task_id(
+    task_id: str, repo_path: Path, *, branch_prefix: str, main_branch: str,
+) -> str | None:
     """Fallback merge-sha lookup for FN candidates with no ``merge_finalized`` event.
 
     Older/legacy task rows (or logging gaps) can lack the ``merge_finalized``
-    event ``mine_fn_candidates`` normally reads ``merge_sha`` from. This repo's
-    merge commits follow a fixed message convention, ``"Merge task/<id> into
-    <branch>"`` (see e.g. ``git log --oneline``), so greps ``git log --all``
-    for it as a second recovery path. Returns the most recent matching
-    commit's sha, or ``None`` (never raises) when no such commit exists, the
-    repo path is invalid, or git errors.
+    event ``mine_fn_candidates`` normally reads ``merge_sha`` from. The task's
+    landing commit carries ``shared/src/shared/merge_subject.py``'s subject for
+    ``<branch_prefix><task_id>`` into *main_branch*, so this pre-filters
+    ``git log --all`` on the bare branch name (it survives a wrapped first
+    paragraph, which ``%s`` joins) as a second recovery path, then requires each
+    candidate's SUBJECT to equal it, since the grep also matches a body line, a
+    longer id or a Revert.
+    Returns the most recent such commit's sha, or ``None`` (never raises) when
+    none exists, *task_id* is not a git ref token, the repo path is invalid, or
+    git errors.
     """
     try:
+        expected = MergeSubject(f'{branch_prefix}{task_id}', main_branch)
+    except ValueError:
+        return None
+    try:
         result = subprocess.run(
-            ['git', 'log', '--all', '--format=%H', '--grep', f'^Merge task/{task_id} ', '-E', '-n', '1'],
+            ['git', 'log', '--all', '--fixed-strings', f'--grep={expected.branch}', '--format=%H%x1f%s'],
             cwd=repo_path, capture_output=True, text=True,
         )
     except OSError:
         return None
     if result.returncode != 0:
         return None
-    sha = result.stdout.strip()
-    return sha or None
+    records = (line.partition('\x1f') for line in result.stdout.splitlines())
+    return next((sha for sha, _, subject in records if parse_merge_subject(subject) == expected), None)
 
 
 @dataclass(frozen=True)
@@ -289,6 +313,8 @@ def recover_candidates(
     *,
     existing_ids: Collection[str],
     repo_path: Path,
+    branch_prefix: str,
+    main_branch: str,
 ) -> list[RecoveredCandidate]:
     """Each candidate not already in the corpus whose diff *repo_path* can recover, smallest diff first.
 
@@ -300,7 +326,9 @@ def recover_candidates(
     for candidate in candidates:
         if candidate.diff_id in existing_ids:
             continue
-        sha = candidate.merge_sha or resolve_merge_sha_by_task_id(candidate.task_id, repo_path)
+        sha = candidate.merge_sha or resolve_merge_sha_by_task_id(
+            candidate.task_id, repo_path, branch_prefix=branch_prefix, main_branch=main_branch,
+        )
         if not sha:
             continue
         diff_text = recover_diff(sha, repo_path)
@@ -450,13 +478,13 @@ async def propose_labels_frontier(
     description: str = '',
     oauth_token: str | None = None,
     max_turns: int = 3,
-) -> tuple[list[GroundTruthIssue], float]:
+) -> Scored[list[GroundTruthIssue]] | Unmeasured:
     """Propose ground-truth issue labels for a mined diff via a frontier model.
 
-    Reuses the ``scorer.match_issues`` ``invoke_agent`` pattern (no tools,
-    structured JSON output, cost always reported) but the frontier model
-    proposes NEW issues found in *diff_text* rather than matching against
-    existing ground truth.
+    Runs through ``measured_call`` like ``scorer.match_issues`` (built-in
+    tools denied, MCP scoped to no servers, structured JSON output, spend
+    always reported) but the frontier model proposes NEW issues found in
+    *diff_text* rather than matching against existing ground truth.
 
     Each proposed issue is mapped into a ``GroundTruthIssue``. Its ``id`` is
     always synthesized as ``"frontier_<n>"`` — never taken from the model's
@@ -466,10 +494,11 @@ async def propose_labels_frontier(
     layer richer provenance (model name, diff description, timestamps) on
     top of this.
 
-    Returns ``(issues, cost_usd)``. Never raises: returns ``([], cost_usd)``
-    when the output is unparseable or carries no usable ``issues`` list —
-    the incurred cost is still reported since the tokens were billed
-    regardless (mirrors ``match_issues``' unparseable-output behaviour).
+    Returns ``Scored`` with the proposed issues; an empty list means the
+    model judged the diff clean. Returns ``Unmeasured`` with the spend when
+    the call was refused or the answer carries no usable ``issues`` list, so
+    a refusal is never read as a clean diff. Any other exception propagates
+    (``measured_call``'s contract).
 
     *oauth_token*, when set, is forwarded to ``invoke_agent`` to select a
     specific Claude account from the multi-account pool (env vars
@@ -481,8 +510,9 @@ async def propose_labels_frontier(
     *max_turns* defaults to 3 (matching ``match_issues``' turn budget), but
     empirically ``effort='high'`` needs materially more turns than a plain
     low-effort matcher call to reach a schema-conformant final answer — the
-    ``mine`` CLI passes a larger value (~15) to avoid a silent
-    ``error_max_turns`` (empty output, cost still billed).
+    ``mine`` CLI passes a larger value (~15) because a call that ends in
+    ``error_max_turns`` has empty output, is still billed, and so comes
+    back ``Unmeasured``.
     """
     diff_context = diff_text[:10_000] if len(diff_text) > 10_000 else diff_text
 
@@ -523,7 +553,12 @@ If there are no issues, return an empty issues list. Output your findings as JSO
         'report issues you are confident are real. Output ONLY valid JSON.'
     )
 
-    result = await invoke_agent(
+    return await measured_call(
+        invoke_agent,
+        _frontier_labels,
+        stage=MeasurementStage.LABEL_PROPOSER,
+        backend='claude',
+        label='frontier label proposer',
         prompt=prompt,
         system_prompt=system_prompt,
         cwd=Path('/home/leo/src/dark-factory'),
@@ -532,26 +567,25 @@ If there are no issues, return an empty issues list. Output your findings as JSO
         max_budget_usd=2.0,
         output_schema=_FRONTIER_LABEL_SCHEMA,
         effort='high',
-        allowed_tools=[],  # no tools needed — all context is in the prompt
+        # All context is in the prompt: deny the built-ins and scope MCP to an
+        # empty server set so the .mcp.json at cwd is never ambient-merged
+        # (allowed_tools=[] does not restrict under bypassPermissions).
+        disallowed_tools=['*'],
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
         oauth_token=oauth_token,
     )
 
-    cost = result.cost_usd
 
-    data = result.structured_output
-    if not data:
-        try:
-            data = json.loads(result.output)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                'Frontier label proposal produced unparseable output: %s',
-                result.output[:200],
-            )
-            return [], cost
+def _frontier_labels(result: AgentResult) -> list[GroundTruthIssue]:
+    """The proposer's answer as issues, skipping each malformed item.
 
-    raw_issues = data.get('issues') if isinstance(data, dict) else None
+    Raises ``ValueError`` when the answer has no ``issues`` list, or a
+    non-empty one in which no item is well-formed.
+    """
+    raw_issues = json_answer(result).get('issues')
     if not isinstance(raw_issues, list):
-        return [], cost
+        raise ValueError(f'issues is not a list but {type(raw_issues).__name__}')
 
     issues: list[GroundTruthIssue] = []
     for i, raw in enumerate(raw_issues, start=1):
@@ -566,9 +600,10 @@ If there are no issues, return an empty issues list. Output your findings as JSO
             ))
         except (KeyError, TypeError):
             logger.warning('Skipping malformed frontier issue at index %d: %r', i, raw)
-            continue
 
-    return issues, cost
+    if raw_issues and not issues:
+        raise ValueError(f'none of the {len(raw_issues)} proposed issues is well-formed')
+    return issues
 
 
 _LANG_EXTENSIONS = {
@@ -677,6 +712,39 @@ def admit_mined_diff(
         frontier_model=frontier_model,
         notes=f'Frontier-proposed labels for FN candidate {diff.diff_id}.',
     )
+
+
+@dataclass(frozen=True)
+class NoIssuesProposed:
+    """The proposer measured and proposed no issues, so ``admit_proposal`` admitted nothing."""
+
+
+def admit_proposal(
+    manifest: CorpusManifest,
+    log: AdjudicationLog,
+    recovered: RecoveredCandidate,
+    proposal: Scored[list[GroundTruthIssue]] | Unmeasured,
+    *,
+    description: str,
+    escalation_refs: Sequence[EscalationRef],
+    runs_db: Path,
+    frontier_model: str,
+) -> CorpusDiff | Unmeasured | NoIssuesProposed:
+    """Admit *recovered* labelled with *proposal*'s issues and return the admitted diff.
+
+    Admit nothing and return why when the proposer did not measure (its
+    ``Unmeasured``) or proposed no issues (``NoIssuesProposed``).
+    """
+    if isinstance(proposal, Unmeasured):
+        return proposal
+    if not proposal.value:
+        return NoIssuesProposed()
+    diff = mined_corpus_diff(
+        recovered, issues=proposal.value, description=description,
+        escalation_refs=escalation_refs, runs_db=runs_db,
+    )
+    admit_mined_diff(manifest, log, diff, frontier_model=frontier_model)
+    return diff
 
 
 _SPLIT_RATIO_NAMES = ('train', 'selection', 'test')

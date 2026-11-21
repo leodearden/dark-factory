@@ -49,7 +49,10 @@ rather than run unconfined, with one escalation per backend-state change (D4).
 
 - Writes only: the whole filesystem stays readable, and network is unscoped.
 - The write scope is the whole worktree (D1). Tightening it to the plan's files
-  was declined, not deferred: task 2916 (δ1) records why.
+  was declined, not deferred: task 2916 (δ1) records why. A docs-only task
+  additionally gets the main checkout's `.git` plus its declared docs paths,
+  so the hook-gated direct-main docs commit works without a steward fallback
+  (PRD §Docs-only main grant).
 - merger, steward and architect Bash are not confined.
 
 ## Census

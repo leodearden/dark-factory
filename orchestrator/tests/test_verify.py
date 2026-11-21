@@ -12,7 +12,15 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT, ROOT_SHAPED_PYPROJECT, addopts_values
 from _xdist_crash_fixtures import (
+    NESTED_RUN_FAILED_NODEID,
+    PYTEST_INTERNALERROR_QUOTES_BAILOUT_OUTPUT,
+    PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
+    PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT,
+    PYTEST_V_ASSERTION_QUOTES_BAILOUT_OUTPUT,
+    PYTEST_V_NESTED_BAILOUT_IN_CAPTURED_STDOUT_OUTPUT,
+    XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT,
     XDIST_BAILOUT_LINE,
+    XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT,
     XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT,
     XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
     XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
@@ -20,14 +28,18 @@ from _xdist_crash_fixtures import (
     XDIST_IN_FLIGHT_NODEID,
     XDIST_MAX_WORKERS_REACHED_OUTPUT,
     XDIST_PARTIAL_TALLY,
+    XDIST_Q_BAILOUT_UNDER_MAXFAIL_OUTPUT,
     XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT,
     XDIST_Q_MAXFAIL_REAL_FAILED_LINE,
     XDIST_Q_RECOVERED_OUTPUT,
+    XDIST_Q_RECOVERED_THEN_KEYBOARD_INTERRUPTED_OUTPUT,
     XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT,
     XDIST_Q_TRUNCATED_AT_LINE_EDGE_OUTPUT,
     XDIST_Q_TRUNCATED_OUTPUT,
     XDIST_RESTART_DISABLED_MESSAGE,
     XDIST_SESSION_ABORTED_OUTPUT,
+    XDIST_V_BAILOUT_COMPLETE_SESSION_OUTPUT,
+    XDIST_V_BAILOUT_TRUNCATED_OUTPUT,
     XDIST_WORKER_CRASH_OUTPUT,
     XDIST_WORKER_REPLACED_OUTPUT,
 )
@@ -53,6 +65,7 @@ from orchestrator.verify import (
     _resolve_verify_env,
     _root_plus_single_subproject_prefix,
     _run_cmd,
+    _run_segmented,
     _scope_fallback_tool_to_subproject,
     _single_subproject_prefix,
     _worker_death_leg_note,
@@ -61,7 +74,7 @@ from orchestrator.verify import (
     run_verification,
 )
 from orchestrator.verify_classify import classify_failure
-from orchestrator.verify_cmd import ToolKind, render
+from orchestrator.verify_cmd import ToolKind, render, split_and_chain_segments
 
 
 class TestKillCgroupScope:
@@ -842,6 +855,7 @@ def test_apply_cargo_scope_preserves_every_non_command_field(tmp_path: Path):
         sequential_lint_first=True,
         verify_env={'K': 'V'},
         scope_cargo=True,
+        verify_cache='never',
     )
     left_default = [f.name for f in fields(ModuleConfig) if getattr(mc, f.name) == f.default]
     assert left_default == [], (
@@ -2982,7 +2996,7 @@ class TestRunVerificationJunitxmlInjection:
         assert result.failing_test_ids is None
 
     async def test_scoped_breadth_does_not_inject_or_collect(self, tmp_path: Path):
-        """merge_verify_breadth='scoped' (the default) — merge role but no injection."""
+        """merge_verify_breadth='scoped' (the per-project opt-down) — merge role but no injection."""
         config = self._make_config(tmp_path, breadth='scoped')
         module_config = self._module_config()
         fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
@@ -3028,6 +3042,57 @@ class TestRunVerificationJunitxmlInjection:
             f'non-pytest command must never receive --junitxml; got {captured}'
         )
         assert result.failing_test_ids is None
+
+    async def test_caller_named_report_replaces_the_prefix_keyed_one(self, tmp_path: Path):
+        config = self._make_config(tmp_path, breadth='full')
+        report = tmp_path / 'custom' / 'r.xml'
+        report.parent.mkdir()
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, self._module_config(), max_retries=0, role='merge',
+                junit_report=report,
+            )
+
+        [test_cmd] = [c for c in captured if 'pytest' in c]
+        parts = test_cmd.split()
+        assert parts.count('--junitxml') == 1, test_cmd
+        assert parts[parts.index('--junitxml') + 1] == str(report), test_cmd
+        assert result.failing_test_ids == ['tests.test_sample::test_fail']
+
+    async def test_caller_named_report_is_written_whatever_the_role_and_breadth(
+        self, tmp_path: Path,
+    ):
+        config = self._make_config(tmp_path, breadth='scoped')
+        report = tmp_path / 'custom' / 'r.xml'
+        report.parent.mkdir()
+        fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, self._module_config(), max_retries=0, role='task',
+                junit_report=report,
+            )
+
+        [test_cmd] = [c for c in captured if 'pytest' in c]
+        parts = test_cmd.split()
+        assert parts.count('--junitxml') == 1, test_cmd
+        assert parts[parts.index('--junitxml') + 1] == str(report), test_cmd
+        assert result.failing_test_ids == ['tests.test_sample::test_fail']
+
+    async def test_caller_named_report_is_refused_with_a_segmented_test_leg(
+        self, tmp_path: Path,
+    ):
+        report = tmp_path / 'r.xml'
+
+        with pytest.raises(ValueError, match='segment_chained_test=True') as refused:
+            await run_verification(
+                tmp_path, self._make_config(tmp_path), self._module_config(),
+                max_retries=0, role='task', segment_chained_test=True, junit_report=report,
+            )
+
+        assert repr(report) in str(refused.value)
 
 
 # ---------------------------------------------------------------------------
@@ -3578,6 +3643,20 @@ class TestExtractCauseHint:
         hint = _extract_cause_hint(output)
         assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
 
+    def test_non_truncated_crash_hint_names_the_real_failure_first(self):
+        """Rung 1 skips the report xdist fabricated for the crashed test when
+        a genuine FAILED line follows it, so a recovered session's hint does
+        not send the debugger after a failure that never happened."""
+        real_failure = 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError'
+        output = (
+            XDIST_WORKER_CRASH_OUTPUT
+            + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+            + real_failure + '\n'
+            + '========== 2 failed, 2 passed in 5.00s ==========\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == real_failure, f'Unexpected hint: {hint!r}'
+
     @pytest.mark.parametrize(
         'surviving_line',
         [
@@ -4119,7 +4198,8 @@ class TestWorkerDeathTruncationWithoutTheBailoutLine:
     Every ``-q`` module-scoped verify leg lacks the bailout literal (xdist
     gates it on ``verbose >= 0``), so these specimens exercise the
     progress-line witness alone: a crash signature, a final progress line
-    below ``[100%]``, and pytest's own failure tally after it.
+    below ``[100%]``, pytest's own failure tally after it, and no
+    interrupted-run banner after that line.
     """
 
     HEADING = '## Session Aborted After Worker Death'
@@ -4193,21 +4273,46 @@ class TestWorkerDeathTruncationWithoutTheBailoutLine:
             f'Unexpected summary: {result.summary!r}'
         )
 
-    def test_a_maxfail_stop_after_a_recovered_crash_is_labelled_without_masking(self):
-        """ACCEPTED RESIDUAL, pinned: once xdist has replaced a crashed worker,
-        a -x/--maxfail stop satisfies all three witness facts, so the leg is
-        labelled. Its tally IS partial; only the named cause is imprecise. The
-        real failure that stopped the run must still be reported beside it."""
-        output = XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT
-        summary = _test_leg_result(output).summary
-        fragments = summary.removeprefix('Failures: ').split(', ')
-        assert fragments[0] == 'tests failed', f'Unexpected summary: {summary!r}'
-        assert WORKER_DEATH_SUMMARY_MARKER in fragments[1], f'Unexpected summary: {summary!r}'
+    @pytest.mark.parametrize(
+        ('output', 'expected_hint'),
+        [
+            (
+                XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT,
+                XDIST_Q_MAXFAIL_REAL_FAILED_LINE.strip(),
+            ),
+            (
+                XDIST_Q_RECOVERED_THEN_KEYBOARD_INTERRUPTED_OUTPUT,
+                f'FAILED {XDIST_IN_FLIGHT_NODEID}',
+            ),
+        ],
+        ids=['maxfail-stop', 'keyboard-interrupt'],
+    )
+    def test_an_interrupted_run_after_a_recovered_crash_is_not_labelled(
+        self, output, expected_hint,
+    ):
+        """task 5905: the stop came from pytest's interrupted run loop, not
+        from xdist abandoning the queue, so failure_report must not claim the
+        --max-worker-restart cap was exceeded. The hint names the real failure
+        that stopped an -x run, never the report xdist fabricated for the
+        crashed test; with no real failure, that report is all there is."""
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
         hint = _extract_cause_hint(output)
-        assert hint == (
-            f'{WORKER_DEATH_SUMMARY_MARKER}; '
-            f'first surviving failure: {XDIST_Q_MAXFAIL_REAL_FAILED_LINE.strip()}'
-        ), f'Unexpected hint: {hint!r}'
+        assert hint == expected_hint, f'Unexpected hint: {hint!r}'
+
+    def test_a_bailout_that_maxfail_also_counted_is_still_labelled(self):
+        """task 5905: a genuine bailout under -x prints pytest's 'stopping
+        after N failures' banner too, so that banner is no interruption."""
+        output = XDIST_Q_BAILOUT_UNDER_MAXFAIL_OUTPUT
+        _assert_labelled_aborted(output)
+        hint = _extract_cause_hint(output)
+        assert hint == f'{WORKER_DEATH_SUMMARY_MARKER}; run stopped at 46% of collected tests', (
+            f'Unexpected hint: {hint!r}'
+        )
 
     def test_a_run_stopped_short_without_a_worker_crash_is_not_labelled(self):
         """An -x/--maxfail stop: progress below 100% alone is never enough."""
@@ -4221,6 +4326,225 @@ class TestWorkerDeathTruncationWithoutTheBailoutLine:
         assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
         hint = _extract_cause_hint(output)
         assert hint == failed_line, f'Unexpected hint: {hint!r}'
+
+
+_SESSION_START = ' test session starts '.center(80, '=') + '\n'
+_SESSION_ABORTED_HEADING = '## Session Aborted After Worker Death'
+_PASSING_SESSION = (
+    _SESSION_START
+    + '.' * 72 + ' [100%]\n'
+    + ' 300 passed in 5.00s '.center(80, '=') + '\n'
+)
+_STOPPED_PROGRESS_ONLY_OUTPUT = ''.join(
+    line
+    for line in XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT.splitlines(keepends=True)
+    if XDIST_RESTART_DISABLED_MESSAGE not in line
+)
+
+
+def _assert_labelled_aborted(output: str) -> None:
+    hint = _extract_cause_hint(output)
+    assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+    result = _test_leg_result(output)
+    assert WORKER_DEATH_SUMMARY_MARKER in result.summary, (
+        f'Unexpected summary: {result.summary!r}'
+    )
+    report = result.failure_report()
+    assert _SESSION_ABORTED_HEADING in report, f'Unexpected report: {report!r}'
+
+
+async def _segmented_chain_output(*segments: tuple[int, str]) -> str:
+    """The aggregated output ``_run_segmented`` builds when each segment of a
+    two-subproject chain returns its ``(rc, output)`` pair, in order."""
+    chain = split_and_chain_segments(
+        'cd orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/',
+    )
+    assert chain is not None and len(chain) == len(segments), f'Unexpected split: {chain!r}'
+    results = iter(segments)
+
+    async def run_one(cmd: str, cwd: Path, timeout: float, label: str) -> tuple[int, str, bool]:
+        rc, out = next(results)
+        return rc, out, False
+
+    _, output, _, _ = await _run_segmented(
+        chain,
+        run_one=run_one,
+        worktree=Path('.'),
+        budget_secs=10_000.0,
+        now=lambda: 0.0,
+    )
+    return output
+
+
+class TestCompleteSessionIsNotLabelledAborted:
+    """task 5891: a session whose every collected test reported is complete,
+    whatever worker-death text appears in its output."""
+
+    @pytest.mark.parametrize(
+        'output',
+        [
+            XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT,
+            XDIST_BAILOUT_PEER_FINISHED_ITS_QUEUE_OUTPUT,
+            XDIST_V_BAILOUT_COMPLETE_SESSION_OUTPUT,
+        ],
+        ids=['crashed-test-was-last', 'peer-finished-its-queue', 'verbose-crashed-test-was-last'],
+    )
+    def test_a_bailout_that_still_reached_100_percent_keeps_its_verdict(self, output):
+        assert XDIST_RESTART_DISABLED_MESSAGE in output
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
+
+    def test_a_verbose_bailout_short_of_100_percent_is_still_labelled(self):
+        """GUARD: the -v outcome lines' percentage vetoes only at 100."""
+        _assert_labelled_aborted(XDIST_V_BAILOUT_TRUNCATED_OUTPUT)
+
+    def test_a_nested_runs_progress_line_in_captured_output_is_not_the_sessions(self):
+        output = PYTEST_Q_NESTED_RUN_IN_CAPTURED_STDOUT_OUTPUT
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {NESTED_RUN_FAILED_NODEID} - assert 1 == 0', (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    def test_an_earlier_sessions_recovered_crash_lends_nothing_to_a_later_session(self):
+        """The root test_command &&-chains default-verbosity sessions. A crash
+        the first session recovered from must not complete the -q witness for
+        a later session that ``-x`` stopped short."""
+        failed_line = 'FAILED orchestrator/tests/test_x.py::test_real - assert 0'
+        recovered_session = (
+            _SESSION_START
+            + '.' * 30 + '[gw0] node down: Not properly terminated\n'
+            + 'replacing crashed worker gw0\n'
+            + '.' * 41 + ' ' * 31 + '[100%]\n'
+            + ' 300 passed in 5.00s '.center(80, '=') + '\n'
+        )
+        stopped_session = (
+            _SESSION_START
+            + '....F'.ljust(73) + '[ 10%]\n'
+            + ' FAILURES '.center(80, '=') + '\n'
+            + 'E   assert 0\n'
+            + ' short test summary info '.center(80, '=') + '\n'
+            + failed_line + '\n'
+            + ' stopping after 1 failures '.center(80, '!') + '\n'
+            + ' 1 failed, 4 passed in 0.10s '.center(80, '=') + '\n'
+        )
+        output = recovered_session + stopped_session
+        summary = _test_leg_result(output).summary
+        assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == failed_line, f'Unexpected hint: {hint!r}'
+
+    @pytest.mark.parametrize(
+        'truncated_session',
+        [XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT, _STOPPED_PROGRESS_ONLY_OUTPUT],
+        ids=['with-bailout-literal', 'stopped-progress-only'],
+    )
+    def test_a_truncated_last_session_after_a_passing_one_is_still_labelled(
+        self, truncated_session,
+    ):
+        """GUARD: a session header must not hide the progress that follows it,
+        and an earlier session's [100%] must not veto the last session."""
+        output = _PASSING_SESSION + _SESSION_START + truncated_session
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        summary = _test_leg_result(output).summary
+        assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+
+    @pytest.mark.parametrize(
+        'output',
+        [
+            PYTEST_V_ASSERTION_QUOTES_BAILOUT_OUTPUT,
+            PYTEST_V_NESTED_BAILOUT_IN_CAPTURED_STDOUT_OUTPUT,
+            PYTEST_INTERNALERROR_QUOTES_BAILOUT_OUTPUT,
+        ],
+        ids=['assertion-quote', 'nested-run-in-captured-stdout', 'internalerror-mid-line'],
+    )
+    def test_a_quoted_bailout_literal_is_not_xdists(self, output):
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER not in hint, f'Unexpected hint: {hint!r}'
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
+
+
+class TestATruncatedSessionIsLabelledWhereverItSits:
+    """task 5891 review: each pytest session is judged alone, because the
+    segmented fallback runs every segment, so a truncated session need not be
+    last."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('first', 'second'),
+        [
+            ((1, _SESSION_START + XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT), (0, _PASSING_SESSION)),
+            ((1, _SESSION_START + _STOPPED_PROGRESS_ONLY_OUTPUT), (0, _PASSING_SESSION)),
+            ((1, XDIST_Q_TRUNCATED_OUTPUT), (0, '.' * 72 + ' [100%]\n300 passed in 5.00s\n')),
+        ],
+        ids=[
+            'default-verbosity-bailout',
+            'default-verbosity-stopped-progress',
+            'q-segment-without-session-header',
+        ],
+    )
+    async def test_a_truncated_segment_ahead_of_a_complete_one_is_labelled(self, first, second):
+        output = await _segmented_chain_output(first, second)
+        _assert_labelled_aborted(output)
+
+    def test_a_plain_join_of_a_truncated_session_then_a_complete_one_is_labelled(self):
+        output = _SESSION_START + XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT + _PASSING_SESSION
+        _assert_labelled_aborted(output)
+
+    def test_a_truncated_q_module_after_a_completed_failing_one_is_labelled(self):
+        """The header-less -q join ``_aggregate_results`` builds: the earlier
+        module's stats line closes its report body, so the truncated module's
+        run stream is read."""
+        aggregated = _aggregate_results([
+            _test_leg_result(PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT, module='orchestrator'),
+            _test_leg_result(XDIST_Q_TRUNCATED_OUTPUT, module='fused-memory'),
+        ])
+        report = aggregated.failure_report()
+        assert _SESSION_ABORTED_HEADING in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(aggregated.test_output)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+
+    def test_a_truncated_q_module_after_a_completed_verbose_one_is_labelled(self):
+        """The -q module joins the -v session's stream, and its later progress
+        reading, not the -v session's [100%], decides the veto."""
+        aggregated = _aggregate_results([
+            _test_leg_result(_SESSION_START + XDIST_V_BAILOUT_COMPLETE_SESSION_OUTPUT),
+            _test_leg_result(XDIST_Q_TRUNCATED_OUTPUT),
+        ])
+        report = aggregated.failure_report()
+        assert _SESSION_ABORTED_HEADING in report, f'Unexpected report: {report!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_complete_segment_ahead_of_a_passing_one_keeps_its_verdict(self):
+        """GUARD: per-session judging keeps the [100%] veto per session."""
+        output = await _segmented_chain_output(
+            (1, _SESSION_START + XDIST_BAILOUT_COMPLETE_SESSION_OUTPUT), (0, _PASSING_SESSION),
+        )
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert _SESSION_ABORTED_HEADING not in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
 
 
 class TestVerifyResultCauseHint:
@@ -4819,7 +5143,7 @@ class TestClassifyFailure:
     """
 
     def _classify(self, output: str, rc: int, timed_out: bool) -> str:
-        from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
+        from orchestrator.verify_classify import classify_failure
         return classify_failure(ToolKind.OPAQUE, rc, output, timed_out)
 
     # (a) rc == 0 → 'passed' regardless of output content
@@ -5228,7 +5552,7 @@ class TestPersistAttemptLogs:
     """
 
     def _persist(self, worktree, attempt_id, runs, category='cargo_cli_error', cause_hint='error: bad'):
-        from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
+        from orchestrator.verify import _persist_attempt_logs
         return _persist_attempt_logs(
             worktree, attempt_id, runs,
             _build_summary_payload(runs, category, cause_hint, role='task'),
@@ -5396,7 +5720,7 @@ class TestArchiveAttemptLog:
     """
 
     def _archive(self, worktree_log_paths, archive_root, task_id, attempt_id, category):
-        from orchestrator.verify import _archive_attempt_log, _archive_stamp  # noqa: PLC0415
+        from orchestrator.verify import _archive_attempt_log, _archive_stamp
         return _archive_attempt_log(
             worktree_log_paths, archive_root, task_id, attempt_id, category,
             stamp=_archive_stamp(),
@@ -5491,7 +5815,7 @@ class TestPruneArchive:
     """
 
     def _prune(self, archive_root, max_age_days=30, max_total_bytes=1_000_000_000):
-        from orchestrator.verify import _prune_archive  # noqa: PLC0415
+        from orchestrator.verify import _prune_archive
         return _prune_archive(archive_root, max_age_days=max_age_days, max_total_bytes=max_total_bytes)
 
     # (a) old files deleted, fresh files kept
@@ -6184,9 +6508,7 @@ class TestRunVerificationMergeArchival:
 
     These tests use a fake worktree with NO .task/ dir (mimicking a merge
     worktree) and verify that passing role='merge' + archive_root causes
-    _archive_merge_verify_logs to be called directly.
-
-    Tests are RED until step-4 adds the role=='merge' branch to run_verification.
+    archive_verify_logs to be called directly.
     """
 
     def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
@@ -6352,11 +6674,11 @@ class TestTaskPathSummaryArchival:
 
     @staticmethod
     def _load(path: Path) -> dict:
-        import json  # noqa: PLC0415
+        import json
         return json.loads(path.read_text())
 
     async def test_green_attempt_summary_survives_worktree_teardown(self, tmp_path: Path):
-        import shutil  # noqa: PLC0415
+        import shutil
         worktree = self._worktree(tmp_path)
         archive_root = tmp_path / 'data' / 'verify-logs'
 
@@ -6506,7 +6828,7 @@ class TestPersistAttemptLogsModulePrefix:
         cause_hint='error: bad',
         module_prefix=None,
     ):
-        from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
+        from orchestrator.verify import _persist_attempt_logs
 
         kwargs = {}
         if module_prefix is not None:
@@ -6704,7 +7026,7 @@ class TestShouldArchiveCategory:
     """
 
     def _should_archive(self, category: str) -> bool:
-        from orchestrator.verify import _should_archive_category  # noqa: PLC0415
+        from orchestrator.verify import _should_archive_category
         return _should_archive_category(category)
 
     # Categories that MUST be archived (human triage required)
@@ -8217,7 +8539,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
 
     @pytest.fixture(autouse=True)
     def _reset_prune_throttle(self, monkeypatch):
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
         monkeypatch.setattr(verify, '_LAST_PRUNE_AT', None)
 
     def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
@@ -8250,8 +8572,8 @@ class TestPruneArchiveDedupedAtAggregateSite:
         ``_prune_archive`` belongs at the aggregate site in
         ``run_scoped_verification``, not inside the per-file copy loop.
         """
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _archive_attempt_log  # noqa: PLC0415
+        from orchestrator import verify
+        from orchestrator.verify import _archive_attempt_log
 
         log_file = tmp_path / 'attempt-1.test.log'
         log_file.write_text('cratea ERR\n')
@@ -8290,7 +8612,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
                 return 1, 'error: --exclude crateb\ncrateb ERR\n', False
             return 0, 'ok', False
 
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
                 patch.object(verify, '_prune_archive') as spy:
@@ -8319,7 +8641,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
         async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 1, 'error: --exclude\n', False
 
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
                 patch.object(verify, '_prune_archive') as spy:
@@ -8348,7 +8670,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
         async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 1, 'error: --exclude\nfoo\n', False
 
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
                 patch.object(verify, '_prune_archive') as spy:
@@ -9431,7 +9753,7 @@ class TestRoleThreading:
 
 
 # ---------------------------------------------------------------------------
-# Step-1 (task 1768): _build_summary_payload + _archive_merge_verify_logs
+# Step-1 (task 1768): _build_summary_payload + archive_verify_logs
 # ---------------------------------------------------------------------------
 
 
@@ -9471,7 +9793,7 @@ class TestBuildSummaryPayload:
     """Tests for the extracted _build_summary_payload(runs, category, cause_hint) helper."""
 
     def _build(self, runs, category='test_failure', cause_hint=''):
-        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+        from orchestrator.verify import _build_summary_payload
         return _build_summary_payload(runs, category, cause_hint, role='task')
 
     def test_top_level_keys_present(self):
@@ -9530,12 +9852,8 @@ class TestBuildSummaryPayload:
         assert payload['commands'] == []
 
 
-class TestArchiveMergeVerifyLogs:
-    """Tests for the new _archive_merge_verify_logs helper (task 1768).
-
-    These tests import the symbol directly and will fail with ImportError /
-    AttributeError until step-2 implements the function — that is the RED state.
-    """
+class TestArchiveVerifyLogs:
+    """Tests for archive_verify_logs (introduced by task 1768)."""
 
     def _archive(
         self,
@@ -9548,10 +9866,10 @@ class TestArchiveMergeVerifyLogs:
         *,
         module_prefix=None,
     ):
-        from orchestrator.verify import _archive_merge_verify_logs  # noqa: PLC0415
-        return _archive_merge_verify_logs(
+        from orchestrator.verify import archive_verify_logs
+        return archive_verify_logs(
             runs, archive_root, task_id, attempt_id, category, cause_hint,
-            module_prefix=module_prefix,
+            module_prefix=module_prefix, role='merge',
         )
 
     # (a) writes per-command .log files into <archive_root>/<task_id>/
@@ -9583,7 +9901,7 @@ class TestArchiveMergeVerifyLogs:
         json_files = list(task_dir.glob('*.json'))
         assert len(json_files) == 1, f'Expected 1 summary.json, got {json_files}'
 
-        import json  # noqa: PLC0415
+        import json
         payload = json.loads(json_files[0].read_text())
         assert payload['category'] == 'test_failure'
         assert payload['cause_hint'] == 'assert x == y'
@@ -9633,7 +9951,7 @@ class TestArchiveMergeVerifyLogs:
     # (f) swallows OSError best-effort (no crash when dir unwritable)
     def test_swallows_oserror_best_effort(self, tmp_path: Path):
         """When the archive dir is unwritable, no exception is raised."""
-        import stat  # noqa: PLC0415
+        import stat
         runs = _make_runs(test_rc=1)
         archive_root = tmp_path / 'data' / 'verify-logs'
         archive_root.mkdir(parents=True)
@@ -10394,7 +10712,10 @@ class TestRunVerificationGovernRouting:
     equivalent to be covered by.
     """
 
-    def _make_govern_config(self, tmp_path, enabled=True, create_exec=True):
+    def _make_govern_config(
+        self, tmp_path, enabled=True, create_exec=True, *,
+        breadth: Literal['scoped', 'full'] = 'full',
+    ):
         """Build an OrchestratorConfig with cpu_governance wired to a tmp executable."""
         from orchestrator.config import CpuGovernConfig
         scripts = tmp_path / 'scripts'
@@ -10403,7 +10724,7 @@ class TestRunVerificationGovernRouting:
         if create_exec:
             exec_file.write_text('#!/bin/sh\nexec "$@"\n')
             exec_file.chmod(0o755)
-        config = OrchestratorConfig()
+        config = OrchestratorConfig(merge_verify_breadth=breadth)
         config.cpu_governance = CpuGovernConfig(
             enabled=enabled,
             exec_path='scripts/cpu-governed-exec.sh',
@@ -10580,7 +10901,9 @@ class TestRunVerificationGovernRouting:
         import shlex
 
         from orchestrator.config import ModuleConfig
-        config, exec_file = self._make_govern_config(tmp_path)
+        # Under 'full', role='merge' injects --junitxml into the test leg,
+        # which would change the exact inner command this test pins.
+        config, exec_file = self._make_govern_config(tmp_path, breadth='scoped')
         module_config = ModuleConfig(
             prefix='pkg',
             test_command='pytest tests/x.py -v',
@@ -10982,7 +11305,7 @@ class TestFailureAnchoredExcerpt:
 
     # (a) a buried failure marker deep inside a long PASS-wall must survive.
     def test_buried_failure_is_included_with_context(self):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         pass_lines = [f'tests/test_mod.py::test_pass_{i} PASSED' for i in range(200)]
         buried = 'FAILED tests/pkg/test_mod.py::test_buried - AssertionError'
@@ -10996,7 +11319,7 @@ class TestFailureAnchoredExcerpt:
 
     # (b) no marker anywhere -> tail fallback, byte-identical to today's slice.
     def test_no_marker_falls_back_to_tail_slice(self):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         output = '\n'.join(f'plain line {i}' for i in range(500))
 
@@ -11006,7 +11329,7 @@ class TestFailureAnchoredExcerpt:
 
     # (c) multiple markers: overlapping windows merge into one contiguous block.
     def test_overlapping_marker_windows_merge_without_elision_gap(self):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         lines = [f'noise line {i}' for i in range(200)]
         lines[50] = 'FAILED tests/test_mod.py::test_alpha - AssertionError'
@@ -11023,7 +11346,7 @@ class TestFailureAnchoredExcerpt:
 
     # (c) multiple far-apart markers: total excerpt is capped.
     def test_many_far_apart_markers_capped_to_budget(self):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         lines = []
         for i in range(40):
@@ -11045,7 +11368,7 @@ class TestFailureAnchoredExcerpt:
         ],
     )
     def test_marker_type_is_anchored(self, marker_line, needle):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         pad = [f'noise line {i}' for i in range(100)]
         lines = pad[:50] + [marker_line] + pad[50:]

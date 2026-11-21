@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -42,10 +42,10 @@ from orchestrator.workflow_types import classify_failure
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
     from shared.cost_store import CostStore
+    from shared.usage_gate import UsageGate
 
     from orchestrator.event_store import EventStore
     from orchestrator.mcp_lifecycle import McpLifecycle
-    from orchestrator.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,11 @@ NO_BRIEFING_NOTICE = (
     '`known_gaps`, `conventions` or `stability_concerns`. Judge findings from the '
     'code alone.'
 )
+
+
+def review_escalation_task_id(review_id: str) -> str:
+    """The task_id the deep reviewer files escalations under, and the one ReviewCheckpoint._promote_reviewer_escalations promotes from."""
+    return f'review-{review_id}'
 
 
 class ReviewOutcome(StrEnum):
@@ -141,10 +146,13 @@ class ReviewCheckpoint:
         config: OrchestratorConfig,
         mcp: McpLifecycle,
         usage_gate: UsageGate | None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.config = config
         self.mcp = mcp
         self.usage_gate = usage_gate
+        self._clock = clock
         self.cost_store: CostStore | None = None
         self.escalation_queue: EscalationQueue | None = None
         self.run_id: str = ''
@@ -202,7 +210,8 @@ class ReviewCheckpoint:
         ``full_review_min_interval_secs`` since the last full review (the very
         first review is unconstrained on time — ``_last_full_review_time`` is
         None) AND at least ``full_review_min_tasks`` merges since the last full
-        review.  ``now`` is a ``time.monotonic()`` reading supplied by the
+        review.  ``now`` must be a reading of this checkpoint's
+        ``clock`` (``time.monotonic`` in production), supplied by the
         caller so it shares a clock with the timestamp ``run_full()`` records.
 
         Only consulted on the run-forever idle path; the exit / --until-idle
@@ -225,7 +234,7 @@ class ReviewCheckpoint:
         if report.ran:
             self._last_review_at_merge = self._merge_count
             # Record full-review trackers so should_run_full() re-closes the gate.
-            self._last_full_review_time = time.monotonic()
+            self._last_full_review_time = self._clock()
             self._last_full_review_at_merge = self._merge_count
             self._merged_modules.clear()
         self._reports.append(report)
@@ -241,7 +250,7 @@ class ReviewCheckpoint:
             )
 
         review_id = datetime.now(UTC).strftime('%Y%m%dT%H%M%S')
-        start = time.monotonic()
+        start = self._clock()
 
         logger.info(
             'Review checkpoint [%s] starting — mode=%s, modules=%s',
@@ -342,13 +351,13 @@ class ReviewCheckpoint:
                 tasks_created=[],
                 escalated_findings=0,
                 cost_usd=0.0,
-                duration_ms=int((time.monotonic() - start) * 1000),
+                duration_ms=int((self._clock() - start) * 1000),
                 phase1_working_tree=working_tree,
                 pre_test=pre_test,
             )
         completed_at = datetime.now(UTC).isoformat()
 
-        elapsed_ms = int((time.monotonic() - start) * 1000)
+        elapsed_ms = int((self._clock() - start) * 1000)
 
         if self.cost_store:
             try:
@@ -408,11 +417,9 @@ class ReviewCheckpoint:
                 review_id, result.success, (result.output or '')[:200],
             )
 
-        # Promote any L0 escalations emitted by the reviewer to L1.  The
-        # reviewer runs outside a task workflow, so the synthetic
-        # ``review-<id>`` task_id it uses has no steward that could pick
-        # these up; left alone they sit pending until the next orchestrator
-        # restart auto-dismisses them unread.
+        # Promote any L0 escalations the reviewer filed to L1.  The reviewer
+        # runs outside a task workflow, so no steward reads what it files
+        # under review_escalation_task_id(review_id).
         self._promote_reviewer_escalations(review_id)
 
         report = ReviewReport(
@@ -472,8 +479,8 @@ class ReviewCheckpoint:
         """Promote pending L0 escalations from this review run to level 1.
 
         The deep reviewer runs outside a task workflow, so any escalations
-        it emits land against the synthetic ``review-<review_id>`` task_id
-        which has no steward.  Post-hoc, we promote them directly to L1
+        it emits land against review_escalation_task_id(review_id), which
+        has no steward.  Post-hoc, we promote them directly to L1
         (human-visible) and dismiss the L0.  Returns the number promoted.
         """
         if self.escalation_queue is None:
@@ -481,7 +488,7 @@ class ReviewCheckpoint:
 
         from escalation.models import Escalation
 
-        synthetic_task_id = f'review-{review_id}'
+        synthetic_task_id = review_escalation_task_id(review_id)
         pending = self.escalation_queue.get_by_task(
             synthetic_task_id, status='pending', level=0,
         )
@@ -551,6 +558,7 @@ class ReviewCheckpoint:
         """Assemble the user prompt for the deep review agent."""
         project_root = str(self.config.project_root)
         project_id = self.config.fused_memory.project_id
+        escalation_task_id = review_escalation_task_id(review_id)
 
         reflection_block = render_reflection_instructions(
             project_id=project_id, review_id=review_id
@@ -623,6 +631,7 @@ do NOT re-run these checks yourself.
 ## Agent Identity
 
 - **agent_id:** `claude-review-{review_id}`
+- **task_id:** `{escalation_task_id}`
 - **project_id:** `{project_id}`
 - **project_root:** `{project_root}`
 
@@ -641,7 +650,7 @@ do NOT re-run these checks yourself.
 3. **Triage each finding** and act:
    - Clear-cut issues — submit a candidate (single step, no resolve_ticket):
 {submit_resolve_block}
-   - Ambiguous/architectural → `escalate_info(category=..., summary=...)`
+   - Ambiguous/architectural → `escalate_info(task_id="{escalation_task_id}", category=..., summary=...)`
    - Known/accepted → dismiss (don't report)
 
 {reflection_block}
