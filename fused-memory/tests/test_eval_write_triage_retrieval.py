@@ -25,6 +25,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     decide_band,
     retrieve_candidates,
+    route_band,
 )
 from fused_memory.server.write_triage_judge import select_judge_candidates
 
@@ -146,6 +147,48 @@ class TestRetrievedSlates:
         [slate] = _slates([record], await _prefetch(FakeMemoryService(rows), [record]))
         assert slate.band == OUTCOME_RESTATED
         assert slate.attach_target_id == 'parent'
+
+    @pytest.mark.asyncio
+    async def test_a_restate_band_write_that_adds_to_its_winner_is_routed_to_the_judge(
+        self,
+    ) -> None:
+        record = _record('d1', 'c1')
+        rows = [_row('c1', 0.95), _row('x', 0.6)]
+        [slate] = _slates([record], await _prefetch(FakeMemoryService(rows), [record]))
+        band = decide_band(rows, t_high=T_HIGH, t_low=T_LOW)
+        routed = route_band(rows, content=record['content'], t_high=T_HIGH, t_low=T_LOW)
+        assert (band.outcome, routed.outcome) == (OUTCOME_RESTATED, OUTCOME_JUDGE)
+        assert (slate.band, slate.routed) == (band.outcome, routed.outcome)
+        assert slate.attach_target_id == band.canonical_id == routed.canonical_id
+        assert slate.similarity == band.similarity == routed.similarity
+
+    @pytest.mark.asyncio
+    async def test_a_restate_band_write_repeating_its_winner_keeps_restated(self) -> None:
+        record = {**_record('d1', 'c1'), 'content': '  THE text   of C1 '}
+        rows = [_row('c1', 0.95), _row('x', 0.6)]
+        [slate] = _slates([record], await _prefetch(FakeMemoryService(rows), [record]))
+        routed = route_band(rows, content=record['content'], t_high=T_HIGH, t_low=T_LOW)
+        assert routed.outcome == OUTCOME_RESTATED
+        assert (slate.band, slate.routed) == (OUTCOME_RESTATED, routed.outcome)
+
+    @pytest.mark.asyncio
+    async def test_a_child_winner_whose_parent_is_repeated_keeps_restated(self) -> None:
+        record = {**_record('d1', 'parent'), 'content': 'the text of parent'}
+        rows = [_child('child', 0.95, 'parent'), _row('parent', 0.7)]
+        [slate] = _slates([record], await _prefetch(FakeMemoryService(rows), [record]))
+        routed = route_band(rows, content=record['content'], t_high=T_HIGH, t_low=T_LOW)
+        assert routed.outcome == OUTCOME_RESTATED
+        assert (slate.band, slate.routed) == (OUTCOME_RESTATED, routed.outcome)
+        assert slate.attach_target_id == 'parent'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('top_cosine', [0.7, 0.3])
+    async def test_outside_the_restate_band_the_route_is_the_band(self, top_cosine: float) -> None:
+        record = _record('d1', 'c1')
+        rows = [_row('c1', top_cosine), _row('x', top_cosine - 0.1)]
+        [slate] = _slates([record], await _prefetch(FakeMemoryService(rows), [record]))
+        routed = route_band(rows, content=record['content'], t_high=T_HIGH, t_low=T_LOW)
+        assert slate.routed == slate.band == routed.outcome
 
     @pytest.mark.asyncio
     async def test_a_degraded_retrieval_is_warned_about_by_memory_id(self, caplog) -> None:
