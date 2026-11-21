@@ -207,9 +207,14 @@ def _gated_verify(
     return AsyncMock(side_effect=_side_effect)
 
 
-def _mock_verify_pass():
-    """Return a mock that makes run_scoped_verification always pass."""
-    return AsyncMock(return_value=fake_verify_result(passed=True, summary=''))
+def _mock_verify_pass(*, failing_test_ids: frozenset[str] | None = None):
+    """Return a mock that makes run_scoped_verification always pass.
+
+    Only a non-None *failing_test_ids* lets the pass seed main's baseline.
+    """
+    return AsyncMock(return_value=fake_verify_result(
+        passed=True, summary='', failing_test_ids=failing_test_ids,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -15917,6 +15922,14 @@ class TestReverifyRebasedTree:
         req = _make_request(branch_name, branch_name, wt, config)
         return result.merge_worktree, req
 
+    @staticmethod
+    async def _commit_drift(git_ops: GitOps, branch_name: str) -> str:
+        """Commit a file disjoint from *branch_name*'s onto main; return main's new sha."""
+        (git_ops.project_root / f'{branch_name}_drift.py').write_text('d = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        return await git_ops.get_main_sha()
+
     async def _rebased_onto_drift(
         self, git_ops: GitOps, config: OrchestratorConfig, branch_name: str,
     ) -> tuple[Path, MergeRequest, str, str, str]:
@@ -15924,20 +15937,10 @@ class TestReverifyRebasedTree:
         merge_wt, req = await self._make_merge_wt(git_ops, branch_name, config)
         rebased_from = await git_ops.get_main_sha()
         _, verified, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
-        (git_ops.project_root / f'{branch_name}_drift.py').write_text('d = 1\n')
-        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
-        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
-        rebased_onto = await git_ops.get_main_sha()
+        rebased_onto = await self._commit_drift(git_ops, branch_name)
         rc, _, err = await _run(['git', 'rebase', rebased_onto], cwd=merge_wt)
         assert rc == 0, err
         return merge_wt, req, verified.strip(), rebased_from, rebased_onto
-
-    @staticmethod
-    def _mock_green_verify_with_ids() -> AsyncMock:
-        """A passing verify whose failing_test_ids is a set: a None leaves the baseline unseeded."""
-        return AsyncMock(return_value=fake_verify_result(
-            passed=True, summary='', failing_test_ids=frozenset(),
-        ))
 
     async def _advance_onto_drift(
         self, git_ops: GitOps, config: OrchestratorConfig, branch_name: str,
@@ -15946,9 +15949,7 @@ class TestReverifyRebasedTree:
         merge_wt, req = await self._make_merge_wt(git_ops, branch_name, config)
         _, verified, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
         base = await git_ops.get_main_sha()
-        (git_ops.project_root / f'{branch_name}_drift.py').write_text('d = 1\n')
-        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
-        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        await self._commit_drift(git_ops, branch_name)
         outcome = await git_ops.advance_main(
             verified.strip(), merge_wt,
             branch=branch_name, expected_main=base, reverify_on_rebase=True,
@@ -15965,7 +15966,6 @@ class TestReverifyRebasedTree:
     ) -> None:
         """(s) A rebased sha whose tree IS the verified tree clears with no verify."""
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         merge_wt, req, verified, rebased_from, rebased_onto = await self._rebased_onto_drift(
             git_ops,
@@ -16011,7 +16011,6 @@ class TestReverifyRebasedTree:
     ) -> None:
         """(s) Fail closed: no tree to compare means the whole-tree gate re-verifies."""
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         merge_wt, req, _, rebased_from, rebased_onto = await self._rebased_onto_drift(
             git_ops,
@@ -16055,9 +16054,7 @@ class TestReverifyRebasedTree:
         is one this queue landed green: gate returns None and does NOT call
         run_scoped_verification.  merge_wt still exists.
         """
-        from orchestrator.merge_lane.gates import note_queue_verified_main_tip
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         # This repo's own config declares merge_verify_breadth='full' (a
         # whole-tree merge gate), which alone denies the fast path.  Exercise
@@ -16123,7 +16120,6 @@ class TestReverifyRebasedTree:
         not one this queue landed green.
         """
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         # Diff-scoped breadth, so the ONLY thing denying the fast path is the
         # drift's unknown provenance.
@@ -16183,9 +16179,7 @@ class TestReverifyRebasedTree:
         a tip this queue landed green — and the P2 kill switch does not cover
         this arm.
         """
-        from orchestrator.merge_lane.gates import note_queue_verified_main_tip
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         merge_wt, req = await self._make_merge_wt(
             git_ops, 'rvrt-whole-tree', config,
@@ -16245,7 +16239,6 @@ class TestReverifyRebasedTree:
         run_scoped_verification called exactly once, merge_wt still exists.
         """
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-overlap-green', config)
         fork_sha = await git_ops.get_main_sha()
@@ -16293,7 +16286,6 @@ class TestReverifyRebasedTree:
         merge_wt cleaned up.
         """
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-overlap-red', config)
         fork_sha = await git_ops.get_main_sha()
@@ -16340,6 +16332,9 @@ class TestReverifyRebasedTree:
     ) -> None:
         """(d) The whole-tree gate re-verifies the rebased tree green, which seeds
         main's baseline at the rebased sha before the follow-up advance lands it.
+
+        Covers the inline re-verify arm (dispatch_reverify=False), which only the
+        train path takes. The single-branch loop's dispatched arm is not pinned here.
         """
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
@@ -16349,7 +16344,7 @@ class TestReverifyRebasedTree:
                 git_ops, config.model_copy(update={'merge_verify_breadth': 'full'}), branch_name,
             )
         )
-        verify_mock = self._mock_green_verify_with_ids()
+        verify_mock = _mock_verify_pass(failing_test_ids=frozenset())
         try:
             with patch('orchestrator.merge_lane.worker.run_scoped_verification', verify_mock):
                 result = await _reverify_rebased_tree(
@@ -16385,7 +16380,7 @@ class TestReverifyRebasedTree:
             if merge_wt.exists():
                 await git_ops.cleanup_merge_worktree(merge_wt)
 
-    async def test_disjoint_skip_landing_seeds_no_baseline(
+    async def test_disjoint_skip_clearance_seeds_no_baseline(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """(e) Real git disjointness over a queue-verified drift clears with no
@@ -16398,7 +16393,7 @@ class TestReverifyRebasedTree:
             await self._advance_onto_drift(git_ops, scoped, 'rvrt-seed-disjoint')
         )
         note_queue_verified_main_tip(git_ops.project_root, rebased_onto)
-        verify_mock = self._mock_green_verify_with_ids()
+        verify_mock = _mock_verify_pass(failing_test_ids=frozenset())
         try:
             with patch('orchestrator.merge_lane.worker.run_scoped_verification', verify_mock):
                 result = await _reverify_rebased_tree(
@@ -16431,7 +16426,6 @@ class TestReverifyRebasedTree:
         RED: TypeError because the parameter doesn't exist yet.
         GREEN after step-10 adds keep_worktrees param and forwards it.
         """
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         git_ops = MagicMock()
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -16489,7 +16483,6 @@ class TestReverifyRebasedTree:
         Regression guard: after step-10 adds keep_worktrees to the signature,
         the default None must be forwarded (not omitted).
         """
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         git_ops = MagicMock()
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -16738,7 +16731,6 @@ class TestSpeculativeMergeWorkerGate:
         Fast path: the gate detects no overlap and skips re-verify.
         run_scoped_verification called exactly once (initial verify only).
         """
-        from orchestrator.merge_lane.gates import note_queue_verified_main_tip
 
         branch = 'smwg-disjoint'
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -21263,7 +21255,6 @@ class TestMergeShaThreading:
         RED: TypeError because the parameter doesn't exist yet.
         GREEN after step-14 adds merge_sha param and forwards it to run_post_merge_verify.
         """
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         git_ops = MagicMock()
         git_ops.cleanup_merge_worktree = AsyncMock()
