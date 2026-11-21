@@ -1648,22 +1648,29 @@ class UsageGate:
 
         THE HEARTBEAT (task 7243) is per waiter: *clock* is this caller's,
         handed back for its next pass, and it dies with ``before_invoke``'s
-        frame, so an abandoned park has nothing to bequeath. It is purely
-        additive: it changes neither what ``before_invoke`` returns nor when
-        it unblocks.
+        frame, so an abandoned park has nothing to bequeath. It logs at most
+        once per ``_SCOPE_PARK_LOG_INTERVAL_SECS``, however often the probe
+        re-poll wakes it. It is purely additive: it changes neither what
+        ``before_invoke`` returns nor when it unblocks.
         """
         now = time.monotonic()
         clock = clock or _ParkClock(started=now)
         soonest = self._soonest_scope_reset(scope)
-        logger.warning(
-            self._park_heartbeat(
-                'scope_exhausted_park',
-                now - clock.started,
-                scope=scope,
-                soonest_scope_reset_at=soonest.isoformat() if soonest is not None else None,
+        if (
+            clock.last_logged is None
+            or now - clock.last_logged >= _SCOPE_PARK_LOG_INTERVAL_SECS
+        ):
+            logger.warning(
+                self._park_heartbeat(
+                    'scope_exhausted_park',
+                    now - clock.started,
+                    scope=scope,
+                    soonest_scope_reset_at=(
+                        soonest.isoformat() if soonest is not None else None
+                    ),
+                )
             )
-        )
-        clock = replace(clock, last_logged=now)
+            clock = replace(clock, last_logged=now)
         sleep_for = (
             max(0.0, (soonest - datetime.now(UTC)).total_seconds())
             if soonest is not None
