@@ -3,8 +3,8 @@
 PRD task epsilon of plans/module-tagger-retirement-prd.md (decision 3). The
 census enumerates every task record carrying ``metadata.files_tagged_at`` — the
 stamp the retired module tagger left behind — across all six project corpora,
-and classifies each on three axes so the artifact's consumers can consume a
-machine-readable candidate set instead of a prose claim.
+and classifies each on three axes so a consumer can join a machine-readable
+candidate set instead of a prose claim.
 
 NO TEST HERE ASSERTS A COUNT OR TASK ID DERIVED FROM THE LIVE DATABASES.
 This norm is inherited verbatim from both sibling suites —
@@ -1144,7 +1144,8 @@ def test_census_record_carries_every_field_a_consumer_joins_on(tmp_path):
 
     The merge signature is the audit's own verdict over this task's
     merge_finalized history — a second, independently derived piece of
-    evidence, in the vocabulary the artifact's consumers already consume.
+    evidence, in the vocabulary audit_wiped_metadata_files.py and
+    repair_wiped_metadata_files.py already speak.
     """
     root = _make_project(
         tmp_path,
@@ -1662,9 +1663,7 @@ def test_the_markdown_says_which_file_is_authoritative(tmp_path):
     markdown = render_markdown(report)
 
     assert "module-tagger-debris-census.json" in markdown
-    for consumer in report["params"]["consumers"]:
-        assert "Consumers: " in markdown
-        assert consumer in markdown
+    assert f"Consumers: {', '.join(report['params']['consumers'])}." in markdown
 
 
 def test_the_markdown_names_an_unreadable_event_log_rather_than_omitting_it(tmp_path):
@@ -2090,11 +2089,15 @@ def test_the_committed_artifact_carries_the_builders_static_params(artifact):
     """A params change made without regenerating leaves consumers reading a
     stale self-description, which is why the schema-bump test exists too."""
     expected = build_report([])["params"]
-    markdown = _ARTIFACT_MD.read_text(encoding="utf-8")
 
     for key in sorted(expected.keys() - {"project_roots", "regen_command"}):
         assert artifact["params"][key] == expected[key], key
-    assert "Consumers: " + ", ".join(expected["consumers"]) + "." in markdown
+
+
+def test_the_committed_markdown_is_the_render_of_the_committed_json(artifact):
+    """A render_markdown edit made without regenerating leaves the twin
+    describing the JSON in words the renderer no longer produces."""
+    assert render_markdown(artifact) == _ARTIFACT_MD.read_text(encoding="utf-8")
 
 
 def test_all_six_corpora_are_present_in_both_halves(artifact):

@@ -33,7 +33,8 @@ re-running the command below and diffing is a meaningful reproducibility check.
   the `never_reconciled` caveat below.
 - **merge_signature** — the audit's own `merge_finalized` verdict
   (`audit_wiped_metadata_files.classify_wipe_signature`), carried as correlating
-  evidence in the vocabulary the audit and the repair already speak.
+  evidence in the vocabulary `audit_wiped_metadata_files.py` and
+  `repair_wiped_metadata_files.py` already speak.
 
 ### Why `lock_reconciled` is a weaker signal than `plan_reconciled`
 

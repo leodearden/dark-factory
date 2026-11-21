@@ -9,18 +9,18 @@ read-only SQLite URI: the task store goes through
 through :func:`_connect_readonly`
 (``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
 structurally incapable of writing to the live WAL databases the six running
-orchestrators hold open. REMEDIATION IS A SEPARATE, REVIEWED
-FOLLOW-UP — nothing here repairs, backfills or clears a stamp.
+orchestrators hold open. Nothing here repairs, backfills or clears a stamp;
+whether repair is needed is decided in the PRD's "Debris repair disposition".
 
 WHAT THIS IS FOR. PRD task epsilon of ``plans/module-tagger-retirement-prd.md``
 (decision 3). The retired module tagger stamped ``metadata.files_tagged_at``
 onto task records alongside a GUESSED file scope. This census enumerates every
 surviving stamp across all six project corpora and classifies each on three
 axes. Its consumer, DF 7271, used it to decide no dedicated tagger-debris repair
-is needed: DF 3113's plan-boundary heal
+is needed: DF 3113's heal
 (``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._heal_metadata_files_if_diverged``)
-restores metadata.files from plan.files before any live record executes. The
-measured basis is the PRD's "Debris repair disposition" section.
+restores metadata.files from plan.files at the plan boundary. The measured
+basis, and the simple-task residual, is the PRD's "Debris repair disposition".
 
 Every census row also carries the audit's ``merge_finalized`` wipe-signature
 verdict, keyed to the same task ids, so a consumer can join it to the audit's
@@ -313,9 +313,9 @@ class CensusRecord(NamedTuple):
 
     ``merge_signature`` is the audit's OWN ``classify_wipe_signature`` verdict
     over this task's ``merge_finalized`` history — a second, independently
-    derived piece of evidence in a vocabulary the audit and the repair already
-    speak, so a consumer can join this artifact to the audit's candidate sets
-    without a translation layer. When the event log could not be read it is
+    derived piece of evidence in a vocabulary audit_wiped_metadata_files.py and
+    repair_wiped_metadata_files.py already speak, so a consumer can join this
+    artifact to the audit's candidate sets without a translation layer. When the event log could not be read it is
     the audit's ``EVENT_LOG_UNREAD``, never a verdict over a log nobody read.
     It is deliberately NOT the same field as ``wipe_signature``, which is this
     census's own axis-3 label.
@@ -1134,7 +1134,8 @@ def render_markdown(report: dict) -> str:
         f"  the `{NEVER_RECONCILED}` caveat below.",
         "- **merge_signature** — the audit's own `merge_finalized` verdict",
         "  (`audit_wiped_metadata_files.classify_wipe_signature`), carried as correlating",
-        "  evidence in the vocabulary the audit and the repair already speak.",
+        "  evidence in the vocabulary `audit_wiped_metadata_files.py` and",
+        "  `repair_wiped_metadata_files.py` already speak.",
         "",
         f"### Why `{LOCK_RECONCILED}` is a weaker signal than `{RECONCILED}`",
         "",
