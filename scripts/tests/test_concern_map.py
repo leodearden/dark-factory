@@ -208,6 +208,65 @@ class TestSelfAccessAndRefs:
         assert units['Engine.by_assignment'].refs == frozenset()
         assert units['Engine.by_global'].refs == frozenset({'helper'})
 
+    def test_import_and_except_bindings_shadow_a_top_level_unit(self) -> None:
+        source = (
+            'def helper():\n'
+            '    return 1\n'
+            '\n'
+            'class Engine:\n'
+            '    def by_import(self):\n'
+            '        import helper\n'
+            '        return helper\n'
+            '\n'
+            '    def by_dotted_import(self):\n'
+            '        import helper.sub\n'
+            '        return helper\n'
+            '\n'
+            '    def by_from_import(self):\n'
+            '        from lib import helper\n'
+            '        return helper\n'
+            '\n'
+            '    def by_handler(self):\n'
+            '        try:\n'
+            '            return 1\n'
+            '        except ValueError as helper:\n'
+            '            return helper\n'
+        )
+        units = _units(source)
+        assert units['Engine.by_import'].refs == frozenset()
+        assert units['Engine.by_dotted_import'].refs == frozenset()
+        assert units['Engine.by_from_import'].refs == frozenset()
+        assert units['Engine.by_handler'].refs == frozenset()
+
+    def test_a_global_declaration_keeps_the_ref_despite_an_assignment(self) -> None:
+        source = (
+            'def helper():\n'
+            '    return 1\n'
+            '\n'
+            'class Engine:\n'
+            '    def by_global_rebinding(self):\n'
+            '        global helper\n'
+            '        helper = None\n'
+            '        return helper\n'
+        )
+        assert _units(source)['Engine.by_global_rebinding'].refs == frozenset({'helper'})
+
+    def test_a_staticmethod_first_parameter_is_not_a_receiver(self) -> None:
+        source = (
+            'class Engine:\n'
+            '    @staticmethod\n'
+            '    def unbound(other):\n'
+            '        other._pool = other._count\n'
+            '        return other.first()\n'
+            '\n'
+            '    def first(self):\n'
+            '        return 1\n'
+        )
+        unbound = _units(source)['Engine.unbound']
+        assert (unbound.writes, unbound.reads, unbound.refs) == (
+            frozenset(), frozenset(), frozenset(),
+        )
+
     def test_a_member_reached_through_the_class_name_is_a_ref(self) -> None:
         source = (
             'class Engine:\n'
