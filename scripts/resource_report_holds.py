@@ -559,6 +559,9 @@ class Aside:
     role: Role
     label: str
     grew: float
+    """The members' positive growth, on the same basis as ``total_positive_growth``."""
+    net_grew: float
+    """The members' growth net of any member that shrank."""
     reclaimed_pages: float
     growth_share: float | None
     reclaim_share: float | None
@@ -578,10 +581,14 @@ def aside(window: Window) -> tuple[Aside, ...]:
     rows = []
     for role, label in ASIDE_ROLES.items():
         members = [c for c in window.consumers.values() if c.consumer.role is role]
-        grew = sum(c.grew for c in members)
+        grew = sum(max(c.grew, 0.0) for c in members)
+        net_grew = sum(c.grew for c in members)
         reclaimed = sum(c.reclaimed_pages for c in members)
         rows.append(
-            Aside(role, label, grew, reclaimed, _share(grew, growth), _share(reclaimed, pages))
+            Aside(
+                role, label, grew, net_grew, reclaimed,
+                _share(grew, growth), _share(reclaimed, pages),
+            )
         )
     return tuple(rows)
 
@@ -897,7 +904,8 @@ def _reclaim_threads(window: Window) -> str:
 
 def _aside_line(row: Aside, window: Window) -> str:
     line = (
-        f'  {row.label}: grew {_bytes(row.grew)} ({_percent(row.growth_share)} of growth), '
+        f'  {row.label}: grew {_bytes(row.grew)} ({_percent(row.growth_share)} of growth, '
+        f'net {_bytes(row.net_grew)}), '
         f'{_pages(row.reclaimed_pages)} reclaimed ({_percent(row.reclaim_share)} of pages)'
     )
     return f'{line}; {_reclaim_threads(window)}' if row.role is Role.KERNEL else line
@@ -1052,6 +1060,7 @@ def _aside_json(row: Aside) -> dict[str, Any]:
     return {
         'label': row.label,
         'grew_bytes': row.grew,
+        'net_grew_bytes': row.net_grew,
         'reclaimed_pages': row.reclaimed_pages,
         'growth_share': row.growth_share,
         'reclaim_share': row.reclaim_share,

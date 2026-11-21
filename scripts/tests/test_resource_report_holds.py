@@ -267,6 +267,7 @@ class TestRankings:
     SCCACHE = Consumer(Role.SHARED, 'sccache.service')
     REIFY_SLICE = Consumer(Role.PROJECT, 'reify.slice')
     UNATTRIBUTED = Consumer(Role.OTHER, 'app.slice')
+    SHRINKING = Consumer(Role.OTHER, 'user.slice')
     EXITED = Consumer(Role.EXITED, 'app.slice')
     UNREADABLE = Consumer(Role.OTHER, 'system.slice')
 
@@ -307,6 +308,7 @@ class TestRankings:
                     Figure.ANON: (100 + 150 * step) * MiB,
                     Figure.RECLAIM_DIRECT_PAGES: 100 if later else 0,
                 },
+                self.SHRINKING: {Figure.ANON: (500 - 200 * step) * MiB},
                 self.EXITED: {Figure.ANON: (25 * step) * MiB},
                 KERNEL: {Figure.ANON: (200 + 10 * step) * MiB, Figure.RECLAIM_KSWAPD_PAGES: 25 if later else 0},
                 self.UNREADABLE: {Figure.ANON: 5 * MiB},
@@ -372,6 +374,14 @@ class TestRankings:
         assert aside['unattributed'].reclaim_share == pytest.approx(200 / total_reclaimed)
         assert aside['exited'].growth_share == pytest.approx(50 * MiB / total_growth)
         assert aside['exited'].reclaim_share == 0
+
+    def test_a_shrinking_member_does_not_lower_its_roles_growth_share(self, window):
+        total_growth = GiB + 10 * MiB + 300 * MiB + 50 * MiB + 20 * MiB
+
+        unattributed = {row.label: row for row in holds.aside(window)}['unattributed']
+
+        assert (unattributed.grew, unattributed.net_grew) == (300 * MiB, -100 * MiB)
+        assert unattributed.growth_share == pytest.approx(300 * MiB / total_growth)
 
     def test_a_consumer_unreadable_in_the_window_is_listed_incomplete(self, window):
         assert holds.incomplete(window) == (self.UNREADABLE,)
