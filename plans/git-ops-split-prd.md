@@ -178,9 +178,10 @@ imports any module listed below it.
 The layering orders constructor collaborators (§Contract's Takes column) as well as unit refs, so a
 module may take only collaborators listed above it here. The order is a linear extension of the concern
 map's "Cluster strata", and α re-derives it from the post-S5 map plus the Takes column rather than
-maintaining it by hand. `lane_lifecycle` (868 lines) and `warm_lane_pool` (933 lines) stay outside
-`CLUSTER_PATHS`: they are existing modules, not moved code. B1 asserts that they import no git-engine
-module.
+maintaining it by hand. `lane_lifecycle` (868 lines) and `warm_lane_pool` (933 lines) are already in
+`CLUSTER_PATHS` and the ratchet baseline at c787af9409. They are existing modules this batch does not
+move, and D4's rule holds them to the ceiling like every other cluster file. No leaf removes them from
+`CLUSTER_PATHS`. B1 asserts that they import no git-engine module.
 
 ```
 shared.git_async, git_run, git_diff, worktree_list, block_disposition     S5 (α, ζ, δ)
@@ -459,7 +460,7 @@ every seam.
 
 | # | Scenario | Preconditions | Postconditions |
 |---|---|---|---|
-| B1 | Import layering (producer side) | every git-engine module in `CLUSTER_PATHS`, plus `lane_lifecycle` and `warm_lane_pool` (bottom stratum, outside `CLUSTER_PATHS`) | AST: each imports only modules below it in §Sketch; `lane_lifecycle` and `warm_lane_pool` import no git-engine module; none imports `orchestrator.git_ops`; no function-local import of a git-engine module; no name re-exported from a module that does not define it |
+| B1 | Import layering (producer side) | every git-engine module in `CLUSTER_PATHS`, plus `lane_lifecycle` and `warm_lane_pool` (bottom stratum; existing modules already in `CLUSTER_PATHS`) | AST: each imports only modules below it in §Sketch; `lane_lifecycle` and `warm_lane_pool` import no git-engine module; none imports `orchestrator.git_ops`; no function-local import of a git-engine module; no name re-exported from a module that does not define it |
 | B2 | Importers repointed (consumer side) | all leaves landed | `git grep -nE "from orchestrator\.git_ops import" -- orchestrator/src escalation/src scripts` matches only `GitOps` (and S5's remaining names, if α records any); every moved name resolves from its new module |
 | B3 | Ceiling holds | the live tree | `scripts/merge_lane_metrics.py --report` rows for every git-engine module are ≤ 1,500 lines; the baseline records no git-engine path above 1,500 |
 | B4 | Regrowth is caught (D4) | a fixture baseline recording a path at 1,400 lines; a current report at 1,501 | `check_against_baseline` reports `new_file_over_ceiling` for it; the same path recorded at 1,600 (grandfathered) at 1,601 does not |
