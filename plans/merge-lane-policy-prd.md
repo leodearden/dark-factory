@@ -130,9 +130,9 @@ the drift on main, so it verifies its own rebased tree alone. Its task carries t
 dispatch until its request is retired, which also covers a dispatch-time re-merge onto a main that moved
 again. The successors re-parked behind it, and requests buffered in the lane, still stack speculatively behind
 it and may chain on their own dispatch. Measured: of five rebased heads re-verified as 6-chains on
-2026-11-17/18, four lost the landing (6836, 6904, 10423, 5897). The amendment does not reach task 8329, a
-chain built ON a head that the gate then rebases; that successor-side case is the next sentence's. The 8329
-class (void at adoption when the head was gate-rebased) is subsumed: the successor is re-anchored, not voided.
+2026-11-17/18, four lost the landing (6836, 6904, 10423, 5897). Task 8329, a chain built ON a head that the
+gate then rebases, is a separate successor-side case and this amendment does not change it. The 8329 class
+(void at adoption when the head was gate-rebased) is subsumed: the successor is re-anchored, not voided.
 
 **D4. K = hosts + 1 and the host lease is released at verdict.** `harness.py::Harness._speculation_k`
 returns `1 + enabled runners + 1`. `_finalize_inflight` → `_resolve_and_release` releases the host lease as

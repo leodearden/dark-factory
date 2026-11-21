@@ -4809,11 +4809,12 @@ class SpeculativeMergeWorker:
         # consecutive tip-advance equivalence failure; popped on a clean
         # 'done' landing or bound-exceeded escalation.
         self._generation_chain_counts: dict[str, int] = {}
-        # Tasks whose NEXT dispatch verifies un-chained (tasks 3185, 10617): a
-        # chain-arm error marks its owner, a red tip marks its owner and every
-        # link, because neither verdict is attributable to any one member, and
-        # a gate-rebased head marks its own task at dispatch (task 10721;
-        # plans/merge-lane-policy-prd.md D3).  A marked task is neither a chain
+        # Tasks whose NEXT dispatch verifies un-chained (tasks 3185, 10617,
+        # 10721).  A chain-arm error marks its owner, and a red tip marks its
+        # owner and every link, because neither verdict is attributable to any
+        # one member.  A gate-rebased head marks its own task at dispatch, so
+        # its re-verify covers its own rebased tree alone
+        # (plans/merge-lane-policy-prd.md D3).  A marked task is neither a chain
         # owner (`_deep_chain_placement` guard 2b) nor a link (`chain_snapshot`),
         # so its own subset tree gets a verdict that IS attributable to it.  The
         # mark lasts until a verdict for the task is applied, which is when its
@@ -7206,19 +7207,16 @@ class SpeculativeMergeWorker:
              green-tier ``reload_config`` — which mutates the held
              :class:`~orchestrator.config.MergeDeepConfig` in place — takes
              effect on the very next dispatch, in both directions.
-          2b. ``task_id in self._next_dispatch_unchained`` -> the same.  The
-             LOOP GUARD (tasks 3185, 10617).  A chain-arm error or a red tip
-             was not attributed to this item (the tree was cumulative), so the
-             request was DEFERRED rather than blocked — and a defer that
-             re-chained into the same tree would ping-pong forever.  Declining
-             sends the re-dispatch down the ordinary path, where it verifies the
-             item's OWN subset tree and gets a verdict that IS attributable to
-             it.  A gate-rebased head is marked too (task 10721): its re-verify
-             covers its own rebased tree alone.  Sits AFTER the kill switch so
-             the stock path still pays nothing, and BEFORE the queue scan so a
-             marked task pays no O(n) walk either.  The mark lasts until the
-             task's verdict is applied (see ``_next_dispatch_unchained`` in
-             ``__init__``).
+          2b. ``task_id in self._next_dispatch_unchained`` -> the same.
+             Declining sends the dispatch down the ordinary path, where it
+             verifies the item's OWN subset tree and gets a verdict that IS
+             attributable to it.  What marks a task, and until when, is
+             ``_next_dispatch_unchained`` in ``__init__``.  It is also the
+             LOOP GUARD (tasks 3185, 10617): an unattributable chain verdict
+             DEFERS its request rather than blocking it, and a defer that
+             re-chained into the same tree would ping-pong forever.  Sits
+             AFTER the kill switch so the stock path still pays nothing, and
+             BEFORE the queue scan so a marked task pays no O(n) walk either.
           3. ``(d, reason) = choose_depth(...)``
              (:mod:`~orchestrator.merge_lane.chain_policy`): the depth table
              over the rolling pass estimate, bounded by the queue.
