@@ -76,7 +76,9 @@ class TestSleepLeg:
     )
     def test_a_real_sleep_is_one_violation_at_the_call(self, statement: str):
         found = _scan(_in_test(statement))
-        call_col = 4 + _SLEEP_CALL.search(statement).start()
+        call = _SLEEP_CALL.search(statement)
+        assert call is not None, statement
+        call_col = 4 + call.start()
         assert [(v.lineno, v.col_offset) for v in found] == [(_SLEEP_LINENO, call_col)], found
 
     @pytest.mark.parametrize(
