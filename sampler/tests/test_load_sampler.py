@@ -13,11 +13,13 @@ import pytest
 
 from sampler.metrics import (
     METRIC_GROUPS,
+    Collected,
     GroupName,
     MetricGroup,
     MetricSpec,
     SampleKey,
     Samples,
+    every_tick,
 )
 
 # ---------------------------------------------------------------------------
@@ -34,16 +36,13 @@ FAKE_PSI = {
 }
 
 OCCT_QUEUE_DEPTH = SampleKey('occt_queue_depth')
-VERIFY_CONCURRENCY = SampleKey('verify_concurrency')
-VERIFY_RSS_TOTAL_BYTES = SampleKey('verify_rss_total_bytes')
 RUNQUEUE_RATIO = SampleKey('runqueue_ratio')
 REIFY = 'orchestrator-reify.service'
 
-FAKE_PROCESS_METRICS = {
-    OCCT_QUEUE_DEPTH: 3.0,
-    VERIFY_CONCURRENCY: 2.0,
-    VERIFY_RSS_TOTAL_BYTES: 1048576.0,
-}
+FAKE_PROCESS_METRICS = {OCCT_QUEUE_DEPTH: 3.0}
+
+# Rows of one complete tick of the PSI and process groups.
+PSI_AND_PROCESS_ROWS = len(FAKE_PSI) + len(FAKE_PROCESS_METRICS)
 
 _GROUPS = {group.name: group for group in METRIC_GROUPS}
 _NOTHING: Samples = MappingProxyType({})
@@ -51,12 +50,12 @@ _NOTHING: Samples = MappingProxyType({})
 
 def _collected(
     *, psi: Samples = _NOTHING, process: Samples = _NOTHING, load: Samples = _NOTHING
-) -> dict[MetricGroup, Samples]:
-    """One tick's collection over the live table, a degraded group being ``{}``."""
+) -> dict[MetricGroup, Collected]:
+    """One tick's collection over the live table's every-tick groups, an empty one being ``{}``."""
     return {
-        _GROUPS[GroupName.PSI]: psi,
-        _GROUPS[GroupName.PROCESS]: process,
-        _GROUPS[GroupName.LOAD]: load,
+        _GROUPS[GroupName.PSI]: Collected(psi),
+        _GROUPS[GroupName.PROCESS]: Collected(process),
+        _GROUPS[GroupName.LOAD]: Collected(load),
     }
 
 
@@ -66,7 +65,7 @@ def _collected(
 
 
 class TestRunTick:
-    def test_writes_exactly_9_rows_for_tick(self, tmp_path: Path):
+    def test_writes_one_row_per_sample(self, tmp_path: Path):
         from sampler.sampler import run_tick
         from sampler.store import LoadSampleStore
 
@@ -78,9 +77,9 @@ class TestRunTick:
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
         count = conn.execute('SELECT COUNT(*) FROM samples').fetchone()[0]
         conn.close()
-        assert count == 9
+        assert count == PSI_AND_PROCESS_ROWS
 
-    def test_nine_distinct_metrics_in_tick(self, tmp_path: Path):
+    def test_one_distinct_metric_per_sample(self, tmp_path: Path):
         from sampler.sampler import run_tick
         from sampler.store import LoadSampleStore
 
@@ -94,8 +93,7 @@ class TestRunTick:
             'SELECT COUNT(DISTINCT metric) FROM samples WHERE ts = ?', (now,)
         ).fetchone()[0]
         conn.close()
-        # >= 7 satisfies the task's live integration signal
-        assert distinct == 9
+        assert distinct == PSI_AND_PROCESS_ROWS
 
     def test_psi_rows_have_null_windows(self, tmp_path: Path):
         from sampler.sampler import run_tick
@@ -134,7 +132,7 @@ class TestRunTick:
         ).fetchall()
         conn.close()
 
-        assert len(proc_rows) == 3
+        assert len(proc_rows) == len(FAKE_PROCESS_METRICS)
         for metric, window_mean, window_max in proc_rows:
             assert window_mean is not None, f'{metric}: window_mean should not be NULL'
             assert window_max is not None, f'{metric}: window_max should not be NULL'
@@ -173,11 +171,7 @@ class TestRunTick:
         run_tick(store, 1_000_000, _collected(psi=FAKE_PSI, process=FAKE_PROCESS_METRICS))
 
         # Second tick with different process metrics
-        second_metrics = {
-            OCCT_QUEUE_DEPTH: 5.0,
-            VERIFY_CONCURRENCY: 4.0,
-            VERIFY_RSS_TOTAL_BYTES: 2_097_152.0,
-        }
+        second_metrics = {OCCT_QUEUE_DEPTH: 5.0}
         run_tick(store, 1_000_005, _collected(psi=FAKE_PSI, process=second_metrics))
 
         conn = sqlite3.connect(str(tmp_path / 'db.sqlite'))
@@ -317,7 +311,7 @@ class TestRunTickLoadGroup:
         finally:
             conn.close()
         assert loadish == 0
-        assert total == 9, 'the other two groups must still write their rows'
+        assert total == PSI_AND_PROCESS_ROWS, 'the other two groups must still write their rows'
 
 
 class TestRunTickAdmitsEachGroupAgainstItself:
@@ -350,8 +344,8 @@ class TestRunTickAdmitsEachGroupAgainstItself:
 
         process = {
             SampleKey('occt_queue_dept'): 1.0,
-            SampleKey('verify_concurrency', 'leaf.service'): 1.0,
-            VERIFY_RSS_TOTAL_BYTES: 1.0,
+            SampleKey('occt_queue_depth', 'leaf.service'): 1.0,
+            OCCT_QUEUE_DEPTH: 1.0,
         }
 
         with caplog.at_level(logging.ERROR):
@@ -360,7 +354,7 @@ class TestRunTickAdmitsEachGroupAgainstItself:
         (error,) = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
         assert 'process' in error
         assert 'occt_queue_dept' in error
-        assert 'verify_concurrency:leaf.service' in error
+        assert 'occt_queue_depth:leaf.service' in error
 
     @pytest.mark.parametrize('windowed', [False, True])
     def test_window_mode_comes_from_the_group(self, tmp_path: Path, windowed: bool):
@@ -368,10 +362,12 @@ class TestRunTickAdmitsEachGroupAgainstItself:
         from sampler.store import LoadSampleStore
 
         spec = MetricSpec('fixture_metric')
-        group = MetricGroup(GroupName.LOAD, collect=dict, metrics=(spec,), windowed=windowed)
+        group = MetricGroup(
+            GroupName.LOAD, collect=every_tick(dict), metrics=(spec,), windowed=windowed
+        )
         db_path = tmp_path / 'db.sqlite'
 
-        run_tick(LoadSampleStore(db_path), 1_000_000, {group: {spec.key(): 3.5}})
+        run_tick(LoadSampleStore(db_path), 1_000_000, {group: Collected({spec.key(): 3.5})})
 
         ((_ts, value, window_mean, window_max),) = _rows(db_path, spec.key())
         assert value == pytest.approx(3.5)
@@ -380,17 +376,18 @@ class TestRunTickAdmitsEachGroupAgainstItself:
         else:
             assert (window_mean, window_max) == (None, None)
 
-    def test_it_returns_the_groups_it_wrote(self, tmp_path: Path):
-        from sampler.sampler import run_tick
+    def test_it_returns_each_groups_disposition(self, tmp_path: Path):
+        from sampler.sampler import Skipped, run_tick
         from sampler.store import LoadSampleStore
 
         collected = _collected(psi=FAKE_PSI, load={SampleKey('runqueu_ratio'): 1.0})
 
-        written = run_tick(LoadSampleStore(tmp_path / 'db.sqlite'), 1_000_000, collected)
+        dispositions = run_tick(LoadSampleStore(tmp_path / 'db.sqlite'), 1_000_000, collected)
 
-        assert written == {
-            _GROUPS[GroupName.PSI]: FAKE_PSI,
-            _GROUPS[GroupName.PROCESS]: {},
+        assert dispositions == {
+            _GROUPS[GroupName.PSI]: Collected(FAKE_PSI),
+            _GROUPS[GroupName.PROCESS]: Collected({}),
+            _GROUPS[GroupName.LOAD]: Skipped.DROPPED,
         }
 
     def test_every_admitted_group_lands_in_one_write(self, tmp_path: Path):
@@ -407,7 +404,7 @@ class TestRunTickAdmitsEachGroupAgainstItself:
         three_groups = _collected(
             psi=FAKE_PSI, process=FAKE_PROCESS_METRICS, load=FAKE_LOAD_METRICS
         )
-        one_group = {_GROUPS[GroupName.LOAD]: FAKE_LOAD_METRICS}
+        one_group = {_GROUPS[GroupName.LOAD]: Collected(FAKE_LOAD_METRICS)}
         run_tick(store, 999_995, three_groups)
 
         opened.clear()
@@ -425,11 +422,31 @@ class TestRunTickAdmitsEachGroupAgainstItself:
 # __main__.main: one degrade handler per group of an injected table
 # ---------------------------------------------------------------------------
 
+SERVICE = 'service@orchestrator-reify.service'
+
+FAKE_CONSUMERS = {
+    SampleKey('consumer_memory_bytes', SERVICE): 1_048_576.0,
+    SampleKey('consumer_members', SERVICE): 1.0,
+    SampleKey('consumer_read_ok', SERVICE): 1.0,
+    SampleKey('host_used_bytes'): 4_194_304.0,
+}
+
+FAKE_VERIFY_SCOPES = {
+    SampleKey('verify_scopes_live'): 2.0,
+    SampleKey('verify_scope_memory_bytes'): 5_000.0,
+}
+
 FAKE_SAMPLES: dict[GroupName, Samples] = {
     GroupName.PSI: FAKE_PSI,
     GroupName.PROCESS: FAKE_PROCESS_METRICS,
     GroupName.LOAD: FAKE_LOAD_METRICS,
+    GroupName.CONSUMERS: FAKE_CONSUMERS,
+    GroupName.VERIFY_SCOPES: FAKE_VERIFY_SCOPES,
 }
+
+
+def _all_but(name: GroupName) -> set[SampleKey]:
+    return {key for group, samples in FAKE_SAMPLES.items() if group is not name for key in samples}
 
 
 def _metrics_written(db_path: Path) -> set[SampleKey]:
@@ -457,7 +474,8 @@ def _table(
         return collect
 
     return tuple(
-        dataclasses.replace(group, collect=collector(group.name)) for group in METRIC_GROUPS
+        dataclasses.replace(group, collect=every_tick(collector(group.name)))
+        for group in METRIC_GROUPS
     )
 
 
@@ -521,7 +539,7 @@ class TestMainDegradesEachGroupIndependently:
         with caplog.at_level(logging.ERROR):
             db_path = _run_main(monkeypatch, tmp_path, _table(samples=bad))
 
-        assert _metrics_written(db_path) == set(FAKE_PSI) | set(FAKE_PROCESS_METRICS)
+        assert _metrics_written(db_path) == _all_but(GroupName.LOAD)
         (error,) = _errors(caplog)
         assert 'load' in error
         assert 'runqueu_ratio' in error
@@ -602,6 +620,15 @@ class TestTheTickLogLine:
         assert f'own_cpu_some10:{REIFY}' in line
         assert 'SampleKey(' not in line
 
+    def test_it_summarises_the_consumer_group(self, monkeypatch, tmp_path: Path, caplog):
+        with caplog.at_level(logging.INFO):
+            _run_main(monkeypatch, tmp_path, _table())
+
+        (line,) = _tick_lines(caplog)
+        assert f'{GroupName.CONSUMERS}=rows:{len(FAKE_CONSUMERS)} leaves:1' in line, line
+        assert SERVICE not in line, line
+        assert f'{GroupName.VERIFY_SCOPES}=' in line and 'verify_scopes_live' in line, line
+
     def test_a_dropped_group_shows_as_dropped(self, monkeypatch, tmp_path: Path, caplog):
         bad = {**FAKE_SAMPLES, GroupName.LOAD: {SampleKey('runqueu_ratio'): 1.0}}
 
@@ -635,7 +662,7 @@ class TestTickCostIsFlatInTheMetricCount:
             now,
             _collected(
                 psi={SampleKey('psi_cpu_some_avg10'): 1.0},
-                process={VERIFY_CONCURRENCY: 2.0},
+                process={OCCT_QUEUE_DEPTH: 2.0},
                 load={
                     RUNQUEUE_RATIO: 0.5,
                     **{SampleKey('own_cpu_some10', f'leaf{i}'): float(i) for i in range(leaves)},
