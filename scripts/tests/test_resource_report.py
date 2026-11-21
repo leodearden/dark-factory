@@ -7,6 +7,8 @@ injected ``now``.
 from __future__ import annotations
 
 import json
+import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -39,6 +41,22 @@ def holds_argv(store: Path, *roots: Path, extra: tuple[str, ...] = ()) -> tuple[
     return ('holds', *root_args, '--samples-db', str(store), *extra)
 
 
+def not_a_database(path: Path) -> None:
+    path.write_bytes(b'this file is not an sqlite database\n' * 64)
+
+
+def a_database_of_another_schema(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute('CREATE TABLE unrelated (x INTEGER)')
+        conn.commit()
+    finally:
+        conn.close()
+
+
+BROKEN_STORES: tuple[Callable[[Path], None], ...] = (not_a_database, a_database_of_another_schema)
+
+
 class TestArguments:
     def test_holds_without_a_project_root_exits_2_naming_it(self, store, capsys):
         with pytest.raises(SystemExit) as exc:
@@ -57,6 +75,32 @@ class TestArguments:
         assert rc == 2
         assert str(absent) in err
         assert out == ''
+
+    @pytest.mark.parametrize('broken', BROKEN_STORES)
+    def test_an_unreadable_samples_db_exits_2_naming_its_path(
+        self, tmp_path, make_runs_db, capsys, broken
+    ):
+        root = project_root(tmp_path, 'dark-factory')
+        make_runs_db([], directory=runs_db(root).parent)
+        unreadable = tmp_path / 'samples' / 'load-samples.db'
+        unreadable.parent.mkdir()
+        broken(unreadable)
+
+        rc, out, err = run(capsys, *holds_argv(unreadable, root))
+
+        assert rc == 2
+        assert str(unreadable) in err
+        assert out == ''
+
+    @pytest.mark.parametrize('window', ['0', '-5'])
+    def test_a_window_of_no_seconds_exits_2_naming_it(self, tmp_path, store, capsys, window):
+        root = project_root(tmp_path, 'dark-factory')
+
+        with pytest.raises(SystemExit) as exc:
+            resource_report.main(list(holds_argv(store, root, extra=('--window', window))), now=NOW)
+
+        assert exc.value.code == 2
+        assert '--window' in capsys.readouterr().err
 
     def test_an_unparseable_since_exits_2(self, tmp_path, store, capsys):
         root = project_root(tmp_path, 'dark-factory')
@@ -89,6 +133,30 @@ class TestTheRootsHeader:
         assert 'missing' not in lines[read_at]
         assert str(missing_root) in lines[missing_at]
         assert read_at < missing_at < count_at
+
+    @pytest.mark.parametrize('broken', BROKEN_STORES)
+    def test_an_unreadable_runs_db_is_said_and_the_other_roots_are_read(
+        self, tmp_path, make_runs_db, store, capsys, broken
+    ):
+        unreadable_root = project_root(tmp_path, 'reify')
+        broken(runs_db(unreadable_root))
+        read_root = project_root(tmp_path, 'dark-factory')
+        make_runs_db([], directory=runs_db(read_root).parent)
+
+        text_rc, text, _err = run(capsys, *holds_argv(store, unreadable_root, read_root))
+        json_rc, out, _err = run(capsys, *holds_argv(store, unreadable_root, read_root, extra=('--json',)))
+
+        assert (text_rc, json_rc) == (0, 0)
+        assert any(
+            f'runs.db unreadable: {runs_db(unreadable_root)}' in line for line in text.splitlines()
+        )
+        roots = json.loads(out)['roots']
+        assert [(entry['root'], entry['status']) for entry in roots] == [
+            (str(unreadable_root), 'unreadable'),
+            (str(read_root), 'read'),
+        ]
+        assert roots[0]['detail']
+        assert roots[1]['detail'] is None
 
     def test_a_root_named_twice_is_read_once(self, tmp_path, make_runs_db, store, capsys):
         root = project_root(tmp_path, 'dark-factory')
