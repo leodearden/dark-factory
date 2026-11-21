@@ -1759,6 +1759,7 @@ def _frontmatter_meta():
         'score': 12.5,
         'n_user_turns': 3,
         'truncated_items': 0,
+        'parent_session': '',
         'signal_counts': {
             'tool_error': 1,
             'self_correct': 2,
@@ -1791,7 +1792,7 @@ class TestRenderFrontmatter:
         assert top_level_keys == [
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
             'size_bytes', 'score', 'n_user_turns', 'truncated_items',
-            'instrument_version', 'signal_counts',
+            'parent_session', 'instrument_version', 'signal_counts',
         ]
 
     def test_signal_counts_nested_in_contract_order(self):
@@ -1859,6 +1860,7 @@ class TestRenderFrontmatter:
         assert mod.FRONTMATTER_KEYS[:-1] == (
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
             'size_bytes', 'score', 'n_user_turns', 'truncated_items',
+            'parent_session',
         )
 
     def test_instrument_version_emits_as_a_bare_numeric_scalar(self):

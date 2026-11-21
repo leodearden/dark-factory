@@ -6,7 +6,7 @@ pattern of which signal class each one holds, and what every structured
 error in it means. Both readers reduce these hits, and both take a
 session's agent class from :func:`classify_agent_class`, so neither can
 disagree with the other (plans/confusion-reduction-prd.md §7.2.4). Imports
-only :mod:`legibility.reingestion`.
+only :mod:`legibility.reingestion` and :mod:`legibility.inventory`.
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from legibility.inventory import transcript_encoded_dir, transcript_identity
 from legibility.reingestion import (
     CENSUS_SYNTHESIS_PROMPT_OPENER,
     CENSUS_VERIFIER_PROMPT_OPENER,
@@ -573,12 +574,16 @@ model calls. A session whose first primary user turn opens with one is
 LEGIBILITY_INSTRUMENT; the same text anywhere else is foreign material."""
 
 
-def is_primary_user_turn(record: Mapping[str, Any]) -> bool:
-    """A user turn of the session itself: not a sidechain, not an isMeta injection."""
+def is_primary_user_turn(record: Mapping[str, Any], *, subagent_transcript: bool = False) -> bool:
+    """A user turn on the transcript's OWN chain, not an isMeta injection.
+
+    That chain is the main chain in a session transcript and the sidechain
+    in a sub-agent transcript.
+    """
     return (
         record.get('type') == 'user'
-        and not record.get('isSidechain')
         and not record.get('isMeta')
+        and bool(record.get('isSidechain')) == subagent_transcript
     )
 
 
@@ -606,21 +611,25 @@ class AgentClassEvidence:
 
     Start from :meth:`for_path`, fold each record in with :meth:`observe` as
     it is read, and read :attr:`agent_class` at the end, so no caller ever
-    holds a transcript's records together. *first_turn_text* is None until
-    the first primary user turn arrives, and '' when that turn holds no text.
+    holds a transcript's records together. *subagent_transcript* is None
+    until the first identity-bearing record says which chain is the
+    transcript's own. *first_turn_text* is None until the first primary user
+    turn on that chain arrives, and '' when that turn holds no text.
     """
 
     in_worktree: bool
     has_records: bool = False
+    subagent_transcript: bool | None = None
     first_turn_text: str | None = None
     first_turn_class: AgentClass | None = None
     carrier_literals: frozenset[str] = frozenset()
 
     @classmethod
     def for_path(cls, path: Path) -> AgentClassEvidence:
-        """No records yet, from a transcript at *path*: its encoded dir (the
-        parent of *path*) says whether it ran in an orchestrated worktree."""
-        return cls(in_worktree=any(marker in path.parent.name for marker in WORKTREE_DIR_MARKERS))
+        """No records yet, from a transcript at *path*: the encoded dir it
+        is filed under says whether it ran in an orchestrated worktree."""
+        encoded_dir = transcript_encoded_dir(path)
+        return cls(in_worktree=any(marker in encoded_dir for marker in WORKTREE_DIR_MARKERS))
 
     def observe(self, record: Mapping[str, Any]) -> AgentClassEvidence:
         """This evidence with *record*, the session's next record, folded in.
@@ -629,7 +638,15 @@ class AgentClassEvidence:
         require-all marker whose literals sit in different carriers matches.
         """
         evidence = self if self.has_records else replace(self, has_records=True)
-        if evidence.first_turn_text is None and is_primary_user_turn(record):
+        if evidence.subagent_transcript is None:
+            identity = transcript_identity(record)
+            if identity is not None:
+                evidence = replace(
+                    evidence, subagent_transcript=identity.parent_session is not None
+                )
+        if evidence.first_turn_text is None and is_primary_user_turn(
+            record, subagent_transcript=bool(evidence.subagent_transcript)
+        ):
             text = user_turn_text(record) or ''
             evidence = replace(
                 evidence,
