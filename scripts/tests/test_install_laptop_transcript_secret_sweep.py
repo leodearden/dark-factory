@@ -68,32 +68,6 @@ READ_ONLY_SYSTEMCTL = ('--user show-environment', f'--user is-enabled {UNIT}.tim
 FAKE_UV = '#!/bin/sh\nprintf \'%s\\n\' "$*" >>"$FAKE_STATE/uv.log"\nexit 0\n'
 
 
-def _directives(path: Path) -> dict[str, list[tuple[str, str]]]:
-    """Parse a unit into ``{section: [(key, value), ...]}``: full-line comments skipped, duplicate keys kept.
-
-    A copy of scripts/tests/test_install_transcript_secret_sweep_timer.py::_directives.
-    """
-    sections: dict[str, list[tuple[str, str]]] = {}
-    current = ''
-    for raw in path.read_text().splitlines():
-        line = raw.strip()
-        if not line or line[0] in '#;':
-            continue
-        if line.startswith('[') and line.endswith(']'):
-            current = line[1:-1].strip()
-            sections.setdefault(current, [])
-            continue
-        if '=' not in line:
-            continue
-        key, value = line.split('=', 1)
-        sections.setdefault(current, []).append((key.strip(), value.strip()))
-    return sections
-
-
-def _exec_starts(path: Path) -> list[str]:
-    return [value for key, value in _directives(path).get('Service', []) if key == 'ExecStart']
-
-
 def _here(production_path: str) -> Path:
     """*production_path*, a path under the production checkout, mapped onto this checkout."""
     assert production_path.startswith(f'{PRODUCTION_ROOT}/'), production_path
@@ -169,22 +143,22 @@ def assert_nothing_installed(world: dict[str, Path]) -> None:
 # ── the committed drop-in ───────────────────────────────────────────────────
 
 
-def test_the_drop_in_replaces_execstart_with_the_wrapper_and_the_laptop_flags():
-    assert _exec_starts(DROP_IN) == [
+def test_the_drop_in_replaces_execstart_with_the_wrapper_and_the_laptop_flags(unit_values):
+    assert unit_values(DROP_IN, 'Service', 'ExecStart') == [
         '',
         f'{PRODUCTION_ROOT}/scripts/transcript-secret-sweep.sh '
         '--host-configs-dir /home/leo/.config/orchestrator --no-escalation',
     ]
 
 
-def test_the_drop_in_names_the_committed_executable_wrapper():
-    wrapper = _here(_exec_starts(DROP_IN)[-1].split()[0])
+def test_the_drop_in_names_the_committed_executable_wrapper(unit_values):
+    wrapper = _here(unit_values(DROP_IN, 'Service', 'ExecStart')[-1].split()[0])
 
     assert wrapper == SCRIPTS_DIR / 'transcript-secret-sweep.sh'
     assert os.access(wrapper, os.X_OK)
 
 
-def test_the_sweep_accepts_the_drop_ins_arguments(monkeypatch, tmp_path):
+def test_the_sweep_accepts_the_drop_ins_arguments(monkeypatch, tmp_path, unit_values):
     for name in list(os.environ):
         if is_secret_env_name(name):
             monkeypatch.delenv(name)
@@ -192,7 +166,7 @@ def test_the_sweep_accepts_the_drop_ins_arguments(monkeypatch, tmp_path):
     empty_units = tmp_path / 'units'
     empty_units.mkdir()
     (tmp_path / 'laptop.yaml').write_text(f'project_root: "{tmp_path / "proj"}"\n')
-    drop_in_args = _exec_starts(DROP_IN)[-1].split()[1:]
+    drop_in_args = unit_values(DROP_IN, 'Service', 'ExecStart')[-1].split()[1:]
 
     assert sweep.main([
         *drop_in_args,
