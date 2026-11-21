@@ -21,6 +21,8 @@ import pytest
 from _tree_pass_workers import TreePassWorkerError, partition_by_size, run_across_workers
 from _tree_scan import TreeAnalysis, TreePass, python_files
 
+import orchestrator
+
 GuardFactory = Callable[[str], ModuleType]
 
 
@@ -251,6 +253,31 @@ def test_a_module_not_importable_by_its_name_is_refused_before_any_worker_starts
 
     with pytest.raises(ValueError, match="'not_in_sys_modules'.*cannot re-import"):
         run_across_workers([stray], workers=2)
+
+
+_ORCHESTRATOR_FILE_GUARD = '''
+import os
+import orchestrator
+from _tree_scan import TreeAnalysis, python_files
+
+TREE_ANALYSES = (TreeAnalysis('orchestrator-file', lambda: python_files({root!r}), lambda m: (os.getpid(), orchestrator.__file__)),)
+'''
+
+
+def test_a_worker_imports_orchestrator_from_the_file_the_parent_did(
+    tmp_path: Path, guard_module: GuardFactory, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _tree(tmp_path / 'tree', {'a.py': 'x = 1\n', 'b.py': 'x = 1\n'})
+    module = guard_module(_ORCHESTRATOR_FILE_GUARD.format(root=str(root)))
+    decoy = _tree(tmp_path / 'decoy', {'orchestrator/__init__.py': ''})
+    monkeypatch.syspath_prepend(str(decoy))
+
+    facts = run_across_workers([module], workers=2).facts(module.TREE_ANALYSES[0])
+
+    assert os.getpid() not in {pid for pid, _file in facts.values()}
+    assert {Path(file).resolve() for _pid, file in facts.values()} == {
+        Path(orchestrator.__file__).resolve(),
+    }
 
 
 _HANGING_GUARD = '''
