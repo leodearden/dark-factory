@@ -40,8 +40,8 @@ GIT_TIMEOUT_SECONDS = 120
 SCOPE_UNIT_GLOB = "df-verify-*.scope"
 SCOPE_UNIT_NAME = re.compile(r"df-verify-.+\.scope")
 SYSTEMCTL_TIMEOUT_SECONDS = 20
-UNIT_STILL_RUNNING = frozenset({"active", "activating", "deactivating"})
 SERVICE_MANAGER_COMM = "systemd"
+SHARED_DAEMON_COMMS = frozenset({"sccache"})
 EXIT_OK, EXIT_SOME_FAILED, EXIT_USAGE = 0, 1, 2
 PROG = "verify_host_hygiene"
 
@@ -71,10 +71,42 @@ class Reason(StrEnum):
     GIT_LOCKED = "git-locked"
     DIRTY = "dirty"
     UNREGISTERED = "unregistered"
+    UNREADABLE = "unreadable"
     ORPHANED = "orphaned"
+    SHARED_DAEMON = "shared-daemon"
     UNIT_FAILED = "unit-failed"
+    UNIT_INACTIVE = "unit-inactive"
+    UNIT_TRANSITIONING = "unit-transitioning"
+    UNIT_STATE_UNKNOWN = "unit-state-unknown"
     CONTROLLER_ALIVE = "controller-alive"
     CGROUP_UNREADABLE = "cgroup-unreadable"
+
+
+class UnitState(StrEnum):
+    """systemd's ActiveState vocabulary; anything else it prints reads as UNKNOWN."""
+
+    ACTIVE = "active"
+    FAILED = "failed"
+    INACTIVE = "inactive"
+    ACTIVATING = "activating"
+    DEACTIVATING = "deactivating"
+    RELOADING = "reloading"
+    REFRESHING = "refreshing"
+    MAINTENANCE = "maintenance"
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def _missing_(cls, value: object) -> UnitState:
+        return cls.UNKNOWN
+
+
+UNIT_GONE_STATES = frozenset({UnitState.INACTIVE, UnitState.FAILED})
+NOT_ACTIVE_REASONS = {
+    UnitState.FAILED: Reason.UNIT_FAILED,
+    UnitState.INACTIVE: Reason.UNIT_INACTIVE,
+    UnitState.UNKNOWN: Reason.UNIT_STATE_UNKNOWN,
+}
+SCOPE_RECLAIM_REASONS = frozenset({Reason.ORPHANED, Reason.UNIT_FAILED})
 
 
 @dataclass(frozen=True)
@@ -98,6 +130,10 @@ class Verdict:
 
 class GitFailed(Exception):
     """A git command exited non-zero, timed out or could not start."""
+
+
+class Unreadable(Exception):
+    """A liveness signal could not be read, so the candidate is kept; the message says why."""
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -196,9 +232,14 @@ def pgid_is_live(pgid: int | None) -> bool:
     return True
 
 
+def worktree_record_path(pgid_file: Path) -> Path:
+    """The record beside a pgid file naming its run's worktree (verify_cancel.py::worktree_path_file)."""
+    return pgid_file.with_name(pgid_file.name + PGID_WORKTREE_SUFFIX)
+
+
 def read_pgid_record(pgid_file: Path) -> PgidRecord:
     try:
-        recorded = pgid_file.with_name(pgid_file.name + PGID_WORKTREE_SUFFIX).read_text().strip()
+        recorded = worktree_record_path(pgid_file).read_text().strip()
     except OSError:
         recorded = ""
     return PgidRecord(live=pgid_is_live(read_int(pgid_file)),
@@ -281,8 +322,8 @@ def lock_is_held(lock: Path) -> bool:
         fd = os.open(lock, os.O_RDONLY)
     except FileNotFoundError:
         return False
-    except OSError:
-        return True
+    except OSError as exc:
+        raise Unreadable(exc) from exc
     try:
         return not try_lock_exclusive(fd)
     finally:
@@ -294,9 +335,8 @@ def held_lane_lock(lock: Path) -> Iterator[bool]:
     """Hold *lock*, created if absent, across the block; False when anyone else holds it."""
     try:
         fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
-    except OSError:
-        yield False
-        return
+    except OSError as exc:
+        raise Unreadable(exc) from exc
     try:
         yield try_lock_exclusive(fd)
     finally:
@@ -304,76 +344,69 @@ def held_lane_lock(lock: Path) -> Iterator[bool]:
 
 
 def newest_mtime(path: Path) -> float:
-    """Newest lstat mtime of *path* and its direct children; unreadable is newest."""
+    """Newest lstat mtime of *path* and its direct children."""
     try:
         newest = os.lstat(path).st_mtime
         with os.scandir(path) as entries:
             for entry in entries:
                 newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
-    except OSError:
-        return math.inf
+    except OSError as exc:
+        raise Unreadable(exc) from exc
     return newest
 
 
 def is_dirty(worktree: Path) -> bool:
-    """Any `git status` output, or any failure to get it, counts as dirty."""
+    """Whether `git status --porcelain` prints anything."""
     try:
         return bool(git(worktree, "--no-optional-locks", "status", "--porcelain").strip())
-    except GitFailed:
-        return True
+    except GitFailed as exc:
+        raise Unreadable(exc) from exc
 
 
-@dataclass(frozen=True)
-class WorktreeFacts:
-    kind: Kind
-    git_locked: bool
-    lock_held: bool
-    pgid_live: bool
-    process_cwd: bool
-    too_young: bool
-    registered: bool
-    dirty: bool
+def liveness_signals(candidate: Candidate, facts: RepoFacts, min_age_seconds: float, *,
+                     probe_lock: bool) -> Iterator[Reason]:
+    """Each signal that keeps *candidate*, read lazily in this order; Unreadable if one cannot be.
 
-
-def worktree_facts(candidate: Candidate, facts: RepoFacts, *, lock_held: bool,
-                   min_age_seconds: float) -> WorktreeFacts:
+    The lane lock is probed after git's lock, the pgid records, process cwds and the
+    age floor, so a dir any of those keeps never has its lock taken, even briefly.
+    """
     path = Path(candidate.target)
     registration = facts.registrations.get(path)
-    registered = registration is not None and not registration.prunable
-    return WorktreeFacts(
-        kind=candidate.kind,
-        git_locked=registration is not None and registration.locked,
-        lock_held=lock_held,
-        pgid_live=facts.pgid_live_for(path),
-        process_cwd=facts.cwd_inside(path),
-        too_young=time.time() - newest_mtime(path) < min_age_seconds,
-        registered=registered,
-        dirty=candidate.kind is Kind.TASK_WORKTREE and registered and is_dirty(path),
-    )
+    if registration is not None and registration.locked:
+        yield Reason.GIT_LOCKED
+    if facts.pgid_live_for(path):
+        yield Reason.PGID_LIVE
+    if facts.cwd_inside(path):
+        yield Reason.PROCESS_CWD
+    if time.time() - newest_mtime(path) < min_age_seconds:
+        yield Reason.TOO_YOUNG
+    if probe_lock and lock_is_held(lane_lock_path(path)):
+        yield Reason.LOCK_HELD
+    if candidate.kind is Kind.TASK_WORKTREE:
+        if registration is None or registration.prunable:
+            yield Reason.UNREGISTERED
+        elif is_dirty(path):
+            yield Reason.DIRTY
 
 
-def classify_worktree(facts: WorktreeFacts) -> Reason:
+def classify_worktree(candidate: Candidate, facts: RepoFacts, min_age_seconds: float, *,
+                      probe_lock: bool) -> Reason:
     """The first liveness signal that holds keeps the dir; none holding means stale."""
-    if facts.git_locked:
-        return Reason.GIT_LOCKED
-    if facts.lock_held:
-        return Reason.LOCK_HELD
-    if facts.pgid_live:
-        return Reason.PGID_LIVE
-    if facts.process_cwd:
-        return Reason.PROCESS_CWD
-    if facts.too_young:
-        return Reason.TOO_YOUNG
-    if facts.kind is Kind.TASK_WORKTREE and not facts.registered:
-        return Reason.UNREGISTERED
-    if facts.dirty:
-        return Reason.DIRTY
-    return Reason.STALE
+    return next(liveness_signals(candidate, facts, min_age_seconds, probe_lock=probe_lock),
+                Reason.STALE)
+
+
+def kept_unreadable(candidate: Candidate, exc: Unreadable) -> Verdict:
+    print(f"{PROG}: keeping {candidate.target}: could not check it: {exc}", file=sys.stderr)
+    return Verdict(candidate, Action.KEEP, Reason.UNREADABLE)
 
 
 def tree_bytes(root: Path) -> int:
-    """Allocated bytes under *root*: lstat only, never following a symlink or a mount."""
-    top = os.lstat(root)
+    """Allocated bytes under *root*: lstat only, never following a symlink or a mount; 0 once gone."""
+    try:
+        top = os.lstat(root)
+    except OSError:
+        return 0
     total, pending = top.st_blocks * 512, [root]
     while pending:
         try:
@@ -394,12 +427,12 @@ def tree_bytes(root: Path) -> int:
 
 
 def report_worktree(candidate: Candidate, facts: RepoFacts, min_age_seconds: float) -> Verdict:
-    path = Path(candidate.target)
-    reason = classify_worktree(worktree_facts(
-        candidate, facts, lock_held=lock_is_held(lane_lock_path(path)),
-        min_age_seconds=min_age_seconds))
+    try:
+        reason = classify_worktree(candidate, facts, min_age_seconds, probe_lock=True)
+    except Unreadable as exc:
+        return kept_unreadable(candidate, exc)
     if reason is Reason.STALE:
-        return Verdict(candidate, Action.RECLAIM, reason, tree_bytes(path))
+        return Verdict(candidate, Action.RECLAIM, reason, tree_bytes(Path(candidate.target)))
     return Verdict(candidate, Action.KEEP, reason)
 
 
@@ -421,14 +454,24 @@ def remove_worktree(candidate: Candidate, facts: RepoFacts) -> None:
 
 
 def reclaim_worktree(candidate: Candidate, facts: RepoFacts, min_age_seconds: float) -> Verdict:
-    """Acquire-then-remove under the lane lock, the remove_merge_worktree_guarded discipline."""
+    """Classify without creating a lock first, so only a dir that reads stale gets a `<dir>.lock`."""
+    try:
+        reason = classify_worktree(candidate, facts, min_age_seconds, probe_lock=True)
+        if reason is not Reason.STALE:
+            return Verdict(candidate, Action.KEEP, reason)
+        return reclaim_under_lock(candidate, facts, min_age_seconds)
+    except Unreadable as exc:
+        return kept_unreadable(candidate, exc)
+
+
+def reclaim_under_lock(candidate: Candidate, facts: RepoFacts, min_age_seconds: float) -> Verdict:
+    """Acquire, re-check, remove, all under the lane lock: remove_merge_worktree_guarded's discipline."""
     path = Path(candidate.target)
     lock = lane_lock_path(path)
     with held_lane_lock(lock) as held:
         if not held:
             return Verdict(candidate, Action.KEEP, Reason.LOCK_HELD)
-        reason = classify_worktree(worktree_facts(
-            candidate, facts, lock_held=False, min_age_seconds=min_age_seconds))
+        reason = classify_worktree(candidate, facts, min_age_seconds, probe_lock=False)
         if reason is not Reason.STALE:
             return Verdict(candidate, Action.KEEP, reason)
         size = tree_bytes(path)
@@ -453,6 +496,7 @@ def prune_registry(repo: Path) -> None:
 @dataclass(frozen=True)
 class ScopeMember:
     pid: int
+    comm: str
     ppid: int
     parent_comm: str | None
 
@@ -477,7 +521,7 @@ def systemctl(*args: str) -> subprocess.CompletedProcess[str] | None:
         return None
 
 
-def scope_units() -> list[tuple[str, str]] | None:
+def scope_units() -> list[tuple[str, UnitState]] | None:
     """(unit, active state) per df-verify scope, or None when the listing failed."""
     proc = systemctl("list-units", "--all", "--plain", "--no-legend", SCOPE_UNIT_GLOB)
     if proc is None or proc.returncode != 0:
@@ -486,7 +530,7 @@ def scope_units() -> list[tuple[str, str]] | None:
     for line in proc.stdout.splitlines():
         fields = line.split()
         if len(fields) >= 3 and SCOPE_UNIT_NAME.fullmatch(fields[0]):
-            units.append((fields[0], fields[2]))
+            units.append((fields[0], UnitState(fields[2])))
     return units
 
 
@@ -498,13 +542,15 @@ def read_comm(pid: int) -> str | None:
 
 
 def scope_member(pid: int) -> ScopeMember | None:
-    """*pid*'s parent facts, or None once it has exited. The comm may hold spaces or ')'."""
+    """*pid*'s facts, or None once it has exited. The comm may hold spaces or ')'."""
     try:
         stat_text = Path(f"/proc/{pid}/stat").read_text()
     except (FileNotFoundError, ProcessLookupError):
         return None
-    ppid = int(stat_text[stat_text.rindex(")") + 1:].split()[1])
-    return ScopeMember(pid=pid, ppid=ppid, parent_comm=read_comm(ppid))
+    comm_start, comm_end = stat_text.index("(") + 1, stat_text.rindex(")")
+    ppid = int(stat_text[comm_end + 1:].split()[1])
+    return ScopeMember(pid=pid, comm=stat_text[comm_start:comm_end], ppid=ppid,
+                       parent_comm=read_comm(ppid))
 
 
 def scope_members(unit: str, cgroup_root: Path) -> tuple[ScopeMember, ...] | None:
@@ -527,9 +573,9 @@ def reap_scope(unit: str) -> bool:
     systemctl("kill", "--signal=SIGKILL", unit)
     systemctl("stop", unit)
     probe = systemctl("is-active", unit)
-    state = probe.stdout.strip() if probe is not None else "unknown"
-    if probe is None or state in UNIT_STILL_RUNNING:
-        print(f"{PROG}: {unit} is still {state} after kill and stop", file=sys.stderr)
+    state = UnitState(probe.stdout.strip()) if probe is not None else UnitState.UNKNOWN
+    if state not in UNIT_GONE_STATES:
+        print(f"{PROG}: {unit} is {state} after kill and stop", file=sys.stderr)
         return False
     return True
 
@@ -543,34 +589,59 @@ def reset_failed(unit: str) -> bool:
     return True
 
 
-def judge_scope(unit: str, state: str, cgroup_root: Path, apply: bool) -> Verdict:
+def scope_reason(state: UnitState, members: tuple[ScopeMember, ...] | None) -> Reason:
+    """Only a failed unit, or an active one provably without a controller, may be reclaimed.
+
+    A controller-less scope still holding a shared build daemon is kept: other live
+    verifies use that daemon, and it exits on its own idle timeout.
+    """
+    if state is not UnitState.ACTIVE:
+        return NOT_ACTIVE_REASONS.get(state, Reason.UNIT_TRANSITIONING)
+    if members is None:
+        return Reason.CGROUP_UNREADABLE
+    if not scope_is_orphaned(members):
+        return Reason.CONTROLLER_ALIVE
+    if any(member.comm in SHARED_DAEMON_COMMS for member in members):
+        return Reason.SHARED_DAEMON
+    return Reason.ORPHANED
+
+
+def judge_scope(unit: str, state: UnitState, members: tuple[ScopeMember, ...] | None,
+                apply: bool) -> Verdict:
     candidate = Candidate(Kind.VERIFY_SCOPE, unit)
-    if state == "failed":
-        reason = Reason.UNIT_FAILED
-    elif state != "active":
-        return Verdict(candidate, Action.KEEP, Reason.CONTROLLER_ALIVE)
-    else:
-        members = scope_members(unit, cgroup_root)
-        if members is None:
-            return Verdict(candidate, Action.KEEP, Reason.CGROUP_UNREADABLE)
-        if not scope_is_orphaned(members):
-            return Verdict(candidate, Action.KEEP, Reason.CONTROLLER_ALIVE)
-        reason = Reason.ORPHANED
+    reason = scope_reason(state, members)
+    if reason not in SCOPE_RECLAIM_REASONS:
+        return Verdict(candidate, Action.KEEP, reason)
     if not apply:
         return Verdict(candidate, Action.RECLAIM, reason)
     done = reset_failed(unit) if reason is Reason.UNIT_FAILED else reap_scope(unit)
     return Verdict(candidate, Action.RECLAIMED if done else Action.FAILED, reason)
 
 
-def scope_pass(cgroup_root: Path, apply: bool) -> list[Verdict]:
+@dataclass(frozen=True)
+class ScopeReport:
+    verdicts: tuple[Verdict, ...]
+    controllerless: Mapping[str, tuple[ScopeMember, ...]]
+
+    def summary_lines(self) -> list[str]:
+        """One `scope-member` line per process a controller-less scope held when judged."""
+        return [f"scope-member\t{unit}\t{member.pid}\t{member.comm}"
+                for unit, members in sorted(self.controllerless.items()) for member in members]
+
+
+def scope_pass(cgroup_root: Path, apply: bool) -> ScopeReport:
     if shutil.which("systemctl") is None:
         print("verify-scope: systemctl not found, skipped")
-        return []
+        return ScopeReport((), {})
     units = scope_units()
     if units is None:
         print("verify-scope: systemctl list-units failed, skipped")
-        return []
-    return [judge_scope(unit, state, cgroup_root, apply) for unit, state in units]
+        return ScopeReport((), {})
+    held = {unit: scope_members(unit, cgroup_root)
+            for unit, state in units if state is UnitState.ACTIVE}
+    verdicts = tuple(judge_scope(unit, state, held.get(unit), apply) for unit, state in units)
+    return ScopeReport(verdicts, {unit: members for unit, members in held.items()
+                                  if members is not None and scope_is_orphaned(members)})
 
 
 # --- per-repo pass ----------------------------------------------------------
@@ -688,15 +759,16 @@ def run_local(ns: argparse.Namespace) -> int:
     if repos is None:
         return EXIT_USAGE
     cwds = process_cwds() if repos else frozenset()
-    reports = [repo_pass(repo, kinds, cwds, ns.min_age_hours * 3600, ns.apply)
-               for repo in repos]
-    verdicts = [verdict for report in reports for verdict in report.verdicts]
+    reports: list[RepoReport | ScopeReport] = [
+        repo_pass(repo, kinds, cwds, ns.min_age_hours * 3600, ns.apply) for repo in repos]
     if Kind.VERIFY_SCOPE in kinds:
-        verdicts += scope_pass(ns.cgroup_root, ns.apply)
+        reports.append(scope_pass(ns.cgroup_root, ns.apply))
+    verdicts = [verdict for report in reports for verdict in report.verdicts]
     for verdict in sorted(verdicts, key=lambda v: (v.candidate.kind, v.candidate.target)):
         print(verdict.line())
     for report in reports:
-        print("\n".join(report.summary_lines()))
+        for line in report.summary_lines():
+            print(line)
     failed = any(verdict.action is Action.FAILED for verdict in verdicts)
     return EXIT_SOME_FAILED if failed else EXIT_OK
 

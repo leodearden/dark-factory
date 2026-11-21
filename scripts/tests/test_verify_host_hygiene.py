@@ -9,10 +9,12 @@ default, lists no units, so no test can ever reach the real user manager.
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -20,10 +22,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+import verify_host_hygiene as hygiene
 from cli_subprocess_timeout import cli_timeout_from_env
 from committed_git_repo import committed_repo
+from dashboard.project_dbs import TASKS_DB_REL_PATH
 from git_repo_probe import git
-from verify_host_hygiene import SERVICE_MANAGER_COMM, ScopeMember, scope_is_orphaned
+from orchestrator.git_ops import PROTECTED_PREFIXES, classify_worktree_entry
+from verify_host_hygiene import SERVICE_MANAGER_COMM, Kind, ScopeMember, scope_is_orphaned
+
+from orchestrator import verify_cancel
 
 SCRIPT = Path(__file__).resolve().parent.parent / "verify_host_hygiene.py"
 CLI_TIMEOUT = cli_timeout_from_env("VERIFY_HOST_HYGIENE_CLI_TIMEOUT")
@@ -266,6 +273,7 @@ def free_lines(stdout: str) -> list[str]:
 
 def test_apply_reclaims_only_stale_worktrees(mirror):
     records_before = pgid_records(mirror)
+    locks_before = lock_files(mirror)
 
     result = run(mirror, "--repo", str(mirror.repo), "--apply", *WORKTREE_CLASSES)
 
@@ -286,10 +294,45 @@ def test_apply_reclaims_only_stale_worktrees(mirror):
     assert (mirror.base / "_merge-cccccccc.lock").exists()
     assert mirror.lock_holder.poll() is None
     assert not lock_is_free(mirror.base / "_merge-cccccccc.lock")
+    assert lock_files(mirror) == locks_before
     assert pgid_records(mirror) == records_before
     free = free_lines(result.stdout)
     assert free
     assert all("before=" in line and "after=" in line for line in free)
+
+
+def with_unreadable_signals(mirror: Mirror) -> tuple[Path, Path]:
+    """A merge dir whose `.lock` cannot be opened, and a task worktree git cannot read."""
+    looped = mirror.wt("_merge-12121212")
+    _plain_dir(looped)
+    lock = mirror.base / f"{looped.name}.lock"
+    lock.symlink_to(lock.name)
+    broken = mirror.wt("125")
+    git(mirror.repo, "worktree", "add", "--detach", str(broken))
+    (broken / ".git").write_text("not a gitfile\n")
+    _age(looped)
+    _age(broken)
+    return looped, broken
+
+
+@pytest.mark.parametrize("apply", [False, True], ids=["report", "apply"])
+def test_unreadable_signal_keeps_the_dir_and_says_why(mirror, apply):
+    looped, broken = with_unreadable_signals(mirror)
+
+    result = run(mirror, "--repo", str(mirror.repo), *WORKTREE_CLASSES,
+                 *(["--apply"] if apply else []))
+
+    assert result.returncode == 0, result.stderr
+    table = verdicts(result.stdout)
+    for path in (looped, broken):
+        assert table[path.name][1:3] == ("keep", "unreadable"), path.name
+        assert path.is_dir(), path.name
+    stderr = result.stderr.splitlines()
+    looped_line = next(line for line in stderr if str(looped) in line)
+    assert f"{looped}.lock" in looped_line
+    assert os.strerror(errno.ELOOP) in looped_line
+    assert any(str(broken) in line for line in stderr)
+    assert (mirror.base / f"{looped.name}.lock").is_symlink()
 
 
 @pytest.fixture
@@ -318,20 +361,20 @@ def test_apply_failure_exits_nonzero_and_reports_failed(mirror, unremovable):
 
 @pytest.mark.parametrize("members", [
     (),
-    (ScopeMember(pid=100, ppid=1, parent_comm=SERVICE_MANAGER_COMM),
-     ScopeMember(pid=101, ppid=0, parent_comm=None)),
-    (ScopeMember(pid=100, ppid=50, parent_comm=SERVICE_MANAGER_COMM),
-     ScopeMember(pid=101, ppid=100, parent_comm="bash")),
+    (ScopeMember(pid=100, comm="bash", ppid=1, parent_comm=SERVICE_MANAGER_COMM),
+     ScopeMember(pid=101, comm="sleep", ppid=0, parent_comm=None)),
+    (ScopeMember(pid=100, comm="bash", ppid=50, parent_comm=SERVICE_MANAGER_COMM),
+     ScopeMember(pid=101, comm="sleep", ppid=100, parent_comm="bash")),
 ], ids=["empty", "parents-are-pid-0-or-1", "parents-are-the-service-manager-or-members"])
 def test_scope_without_a_live_controller_is_orphaned(members):
     assert scope_is_orphaned(members)
 
 
 @pytest.mark.parametrize("members", [
-    (ScopeMember(pid=100, ppid=4242, parent_comm="python3"),),
-    (ScopeMember(pid=100, ppid=4242, parent_comm=None),),
-    (ScopeMember(pid=100, ppid=50, parent_comm=SERVICE_MANAGER_COMM),
-     ScopeMember(pid=101, ppid=4242, parent_comm="python3")),
+    (ScopeMember(pid=100, comm="pytest", ppid=4242, parent_comm="python3"),),
+    (ScopeMember(pid=100, comm="pytest", ppid=4242, parent_comm=None),),
+    (ScopeMember(pid=100, comm="bash", ppid=50, parent_comm=SERVICE_MANAGER_COMM),
+     ScopeMember(pid=101, comm="pytest", ppid=4242, parent_comm="python3")),
 ], ids=["python-parent", "unreadable-parent", "one-of-two-roots-has-a-controller"])
 def test_scope_with_a_live_or_unknown_controller_is_not_orphaned(members):
     assert not scope_is_orphaned(members)
@@ -348,13 +391,32 @@ SCOPE_UNITS = {
     "df-verify-x-dead.scope": "active",
     "df-verify-x-failed.scope": "failed",
     "df-verify-x-unreadable.scope": "active",
+    "df-verify-x-deactivating.scope": "deactivating",
+    "df-verify-x-inactive.scope": "inactive",
+    "df-verify-x-odd-state.scope": "no-such-state",
 }
 SCOPE_CLASS = ("--class", "verify-scope")
 
 
+def install_scope_units(mirror: Mirror, cgroup_root: Path,
+                        units: dict[str, tuple[str, list[int] | None]]) -> None:
+    """List *units* (unit -> state, cgroup pids or None for no cgroup.procs) in the fake systemctl."""
+    listing = []
+    for unit, (state, pids) in units.items():
+        sub = "running" if state == "active" else state
+        listing.append(f"{unit} loaded {state} {sub} verify scope")
+        cgroup = f"user.slice/app.slice/{unit}"
+        (mirror.state / f"cgroup.{unit}").write_text(f"/{cgroup}\n")
+        (mirror.state / f"state.{unit}").write_text(state)
+        (cgroup_root / cgroup).mkdir(parents=True)
+        if pids is not None:
+            (cgroup_root / cgroup / "cgroup.procs").write_text("".join(f"{p}\n" for p in pids))
+    (mirror.state / "units").write_text("\n".join(listing) + "\n")
+
+
 @pytest.fixture
 def scopes(mirror, tmp_path):
-    """Four df-verify units in the fake systemctl, over a fake cgroup tree."""
+    """The SCOPE_UNITS df-verify units in the fake systemctl, over a fake cgroup tree."""
     controller = _spawn([sys.executable, "-c", CONTROLLER], cwd=tmp_path,
                         stdout=subprocess.PIPE, text=True)
     mirror.children.append(controller)
@@ -362,20 +424,10 @@ def scopes(mirror, tmp_path):
     live_pid = int(controller.stdout.readline())
     reaped = _spawn(["true"], cwd=tmp_path)
     reaped.wait()
-    procs = {"df-verify-x-live.scope": f"{live_pid}\n",
-             "df-verify-x-dead.scope": f"{reaped.pid}\n"}
+    procs = {"df-verify-x-live.scope": [live_pid], "df-verify-x-dead.scope": [reaped.pid]}
     cgroup_root = tmp_path / "cgroup"
-    listing = []
-    for unit, state in SCOPE_UNITS.items():
-        sub = "running" if state == "active" else state
-        listing.append(f"{unit} loaded {state} {sub} verify scope")
-        cgroup = f"user.slice/app.slice/{unit}"
-        (mirror.state / f"cgroup.{unit}").write_text(f"/{cgroup}\n")
-        (mirror.state / f"state.{unit}").write_text(state)
-        (cgroup_root / cgroup).mkdir(parents=True)
-        if unit in procs:
-            (cgroup_root / cgroup / "cgroup.procs").write_text(procs[unit])
-    (mirror.state / "units").write_text("\n".join(listing) + "\n")
+    install_scope_units(mirror, cgroup_root, {
+        unit: (state, procs.get(unit)) for unit, state in SCOPE_UNITS.items()})
     return cgroup_root
 
 
@@ -393,7 +445,11 @@ def test_scope_class_reclaims_only_orphaned_units(mirror, scopes):
         "df-verify-x-dead.scope": ("verify-scope", "reclaim", "orphaned"),
         "df-verify-x-failed.scope": ("verify-scope", "reclaim", "unit-failed"),
         "df-verify-x-unreadable.scope": ("verify-scope", "keep", "cgroup-unreadable"),
+        "df-verify-x-deactivating.scope": ("verify-scope", "keep", "unit-transitioning"),
+        "df-verify-x-inactive.scope": ("verify-scope", "keep", "unit-inactive"),
+        "df-verify-x-odd-state.scope": ("verify-scope", "keep", "unit-state-unknown"),
     }
+    assert scope_member_lines(report.stdout) == []
     assert acting_calls(mirror) == []
 
     applied = run(mirror, *SCOPE_CLASS, "--cgroup-root", str(scopes), "--apply")
@@ -418,6 +474,101 @@ def test_scope_that_survives_the_reap_is_failed(mirror, scopes):
 
     assert result.returncode == 1
     assert verdicts(result.stdout)["df-verify-x-dead.scope"][1:3] == ("failed", "orphaned")
+
+
+def scope_member_lines(stdout: str) -> list[str]:
+    return [line for line in stdout.splitlines() if line.startswith("scope-member\t")]
+
+
+PR_SET_NAME, PR_SET_CHILD_SUBREAPER = 15, 36
+SUBREAPER = (
+    "import ctypes, os, subprocess, sys\n"
+    "libc = ctypes.CDLL(None, use_errno=True)\n"
+    f"assert libc.prctl({PR_SET_CHILD_SUBREAPER}, 1, 0, 0, 0) == 0\n"
+    f"assert libc.prctl({PR_SET_NAME}, {SERVICE_MANAGER_COMM.encode()!r}, 0, 0, 0) == 0\n"
+    "controller = subprocess.Popen([sys.executable, '-c', sys.argv[1], *sys.argv[2:]],\n"
+    "                              stdout=subprocess.PIPE, text=True)\n"
+    "print(controller.pid, controller.stdout.readline().strip(), flush=True)\n"
+    "while True:\n"
+    "    os.wait()\n"
+)
+CONTROLLER_OF = (
+    "import subprocess, sys\n"
+    "children = [subprocess.Popen([program, '600']) for program in sys.argv[1:]]\n"
+    "print(*(child.pid for child in children), flush=True)\n"
+    "for child in children:\n"
+    "    child.wait()\n"
+)
+REPARENTED_UNITS = {"df-verify-x-odd.scope": "a b) c", "df-verify-x-daemon.scope": "sccache"}
+
+
+@dataclass(frozen=True)
+class Reparenting:
+    cgroup_root: Path
+    controller: int
+    members: dict[str, int]
+
+
+@pytest.fixture
+def reparenting(mirror, tmp_path) -> Reparenting:
+    """One `sleep` copy per REPARENTED_UNITS comm, each alone in its unit's cgroup.
+
+    Their controller runs under a subreaper named like the service manager, so
+    killing the controller reparents them to it as systemd --user would.
+    """
+    sleep = shutil.which("sleep")
+    assert sleep is not None
+    programs = tmp_path / "programs"
+    programs.mkdir()
+    for comm in REPARENTED_UNITS.values():
+        shutil.copy(sleep, programs / comm)
+    helper = _spawn([sys.executable, "-c", SUBREAPER, CONTROLLER_OF,
+                     *(str(programs / comm) for comm in REPARENTED_UNITS.values())],
+                    cwd=tmp_path, stdout=subprocess.PIPE, text=True)
+    mirror.children.append(helper)
+    assert helper.stdout is not None
+    controller, *member_pids = map(int, helper.stdout.readline().split())
+    members = dict(zip(REPARENTED_UNITS, member_pids, strict=True))
+    cgroup_root = tmp_path / "cgroup"
+    install_scope_units(mirror, cgroup_root, {
+        unit: ("active", [pid]) for unit, pid in members.items()})
+    return Reparenting(cgroup_root=cgroup_root, controller=controller, members=members)
+
+
+def wait_until_gone(pid: int) -> None:
+    deadline = time.monotonic() + 10
+    while Path(f"/proc/{pid}").exists():
+        assert time.monotonic() < deadline, f"pid {pid} still present"
+        time.sleep(0.05)
+
+
+def test_reparented_scope_members_are_read_by_comm(mirror, reparenting):
+    scope_args = (*SCOPE_CLASS, "--cgroup-root", str(reparenting.cgroup_root))
+    alive = run(mirror, *scope_args)
+
+    assert alive.returncode == 0, alive.stderr
+    assert {unit: action_reason(verdicts(alive.stdout), unit) for unit in REPARENTED_UNITS} == {
+        unit: ("verify-scope", "keep", "controller-alive") for unit in REPARENTED_UNITS}
+    assert scope_member_lines(alive.stdout) == []
+
+    os.kill(reparenting.controller, signal.SIGKILL)
+    wait_until_gone(reparenting.controller)
+    orphaned = run(mirror, *scope_args)
+
+    assert orphaned.returncode == 0, orphaned.stderr
+    assert {unit: action_reason(verdicts(orphaned.stdout), unit) for unit in REPARENTED_UNITS} == {
+        "df-verify-x-odd.scope": ("verify-scope", "reclaim", "orphaned"),
+        "df-verify-x-daemon.scope": ("verify-scope", "keep", "shared-daemon"),
+    }
+    assert sorted(scope_member_lines(orphaned.stdout)) == sorted(
+        f"scope-member\t{unit}\t{reparenting.members[unit]}\t{comm}"
+        for unit, comm in REPARENTED_UNITS.items())
+
+    applied = run(mirror, *scope_args, "--apply")
+
+    assert applied.returncode == 0, applied.stderr
+    assert acting_calls(mirror) == ["--user kill --signal=SIGKILL df-verify-x-odd.scope",
+                                    "--user stop df-verify-x-odd.scope"]
 
 
 FAKE_SSH = (
@@ -448,9 +599,6 @@ def disk_state(mirror: Mirror) -> tuple:
     return (sorted(p.name for p in mirror.base.iterdir()),
             git(mirror.repo, "worktree", "list", "--porcelain"),
             lock_files(mirror), pgid_records(mirror))
-
-
-TASK_STORE = Path(".taskmaster/tasks/tasks.db")
 
 
 def with_ignored_task_state(mirror: Mirror) -> Path:
@@ -490,6 +638,20 @@ def test_host_mode_runs_the_same_report_over_ssh(mirror):
     assert disk_state(mirror) == before
 
 
+def test_host_mode_forwards_apply(mirror):
+    ssh = install_shim(mirror, "fakessh", FAKE_SSH)
+
+    remote = run(mirror, "--host", "fakehost", "--repo", str(mirror.repo), *WORKTREE_CLASSES,
+                 "--apply", SSH=str(ssh))
+
+    assert remote.returncode == 0, remote.stderr
+    assert "--apply" in (mirror.state / "ssh.argv").read_text().splitlines()[4:]
+    table = verdicts(remote.stdout)
+    for name in APPLY_RECLAIMS:
+        assert table[name][1:3] == ("reclaimed", "stale"), name
+        assert not mirror.wt(name).exists(), name
+
+
 def test_host_mode_relays_ssh_failure(mirror):
     ssh = install_shim(mirror, "refusingssh", REFUSING_SSH)
 
@@ -504,7 +666,7 @@ def test_host_mode_relays_ssh_failure(mirror):
     [], ["--class", "task-worktree"], ["--class", "merge-worktree"],
 ], ids=["default-classes", "task-worktree", "merge-worktree"])
 def test_orchestrator_project_root_refuses_the_worktree_classes(mirror, class_args, apply):
-    store = mirror.repo / TASK_STORE
+    store = mirror.repo / TASKS_DB_REL_PATH
     store.parent.mkdir(parents=True)
     store.touch()
     plan = with_ignored_task_state(mirror)
@@ -523,7 +685,7 @@ def test_orchestrator_project_root_refuses_the_worktree_classes(mirror, class_ar
 
 
 def test_verify_scope_class_alone_ignores_the_task_store(mirror):
-    store = mirror.repo / TASK_STORE
+    store = mirror.repo / TASKS_DB_REL_PATH
     store.parent.mkdir(parents=True)
     store.touch()
 
@@ -555,7 +717,7 @@ def test_task_store_appearing_mid_run_blocks_the_removal(mirror):
     assert real_git is not None
     plan = with_ignored_task_state(mirror)
     install_shim(mirror, GIT_PROGRAM, store_on_status_git(real_git))
-    store = mirror.repo / TASK_STORE
+    store = mirror.repo / TASKS_DB_REL_PATH
 
     result = run(mirror, "--repo", str(mirror.repo), "--class", "task-worktree", "--apply",
                  STORE_ON_STATUS=str(store))
@@ -566,3 +728,27 @@ def test_task_store_appearing_mid_run_blocks_the_removal(mirror):
     assert plan.exists()
     assert str(mirror.wt("123")) in result.stderr
     assert str(store) in result.stderr
+
+
+def test_mirrored_orchestrator_facts_match_their_homes(tmp_path):
+    base = tmp_path / ".worktrees"
+    pgid_file = verify_cancel.pgid_file(base, "req1")
+    lane = base / "_merge-abcdef12"
+
+    assert hygiene.TASK_STORE_REL_PATH == TASKS_DB_REL_PATH
+    assert verify_cancel.pgid_dir(base) == base / hygiene.PGID_DIR_NAME
+    assert hygiene.worktree_record_path(pgid_file) == verify_cancel.worktree_path_file(pgid_file)
+    assert hygiene.lane_lock_path(lane) == verify_cancel.lane_lock_path(lane)
+
+
+@pytest.mark.parametrize("name", [
+    "_merge-abcdef12", "_merge-verify", "123", "7269", "158",
+    *(f"{prefix}x" for prefix in PROTECTED_PREFIXES),
+])
+def test_worktree_kind_refines_the_git_ops_band(name):
+    band = classify_worktree_entry(name)
+    kind = hygiene.worktree_kind(name)
+
+    assert (kind is Kind.TASK_WORKTREE) == (band == "task")
+    if kind is Kind.MERGE_WORKTREE:
+        assert band == "merge"

@@ -1936,28 +1936,38 @@ It is report-only unless `--apply` is given. `--class merge-worktree`,
 tab-separated line, `kind action reason bytes target`. `action` is `reclaim` or
 `keep` in a report, and `reclaimed`, `failed` or `keep` under `--apply`.
 `bytes` is counted only for reclaims. Each repo then gets a `pgid-records` line
-and a `free` line (`now=`, or `before=`/`after=`). Exit codes: 0 ok, 1 some
+and a `free` line (`now=`, or `before=`/`after=`), and each controller-less
+scope gets one `scope-member pid comm` line per process it held. Exit codes: 0 ok, 1 some
 reclaim failed, 2 usage (a `--repo` that is not a checkout top level, or,
 whenever a worktree class is requested, one holding
 `.taskmaster/tasks/tasks.db`, in report mode too), otherwise ssh's own code.
 Under `--apply`, a store that appears mid-run turns the pending removals into
 `failed` (exit 1).
 
-A worktree is kept by the first of these that holds: git `locked`; a held
-`<dir>.lock` (`--apply` takes that lock and holds it across the removal); a
-live `.merge_verify_pgids` record naming it; a process cwd inside it; a touch
-within the age floor; and, for task worktrees only, being unregistered or
-dirty. Dirty means `git status --porcelain` output, so ignored files such as
+A worktree is kept by the first of these that holds: git `locked`; a live
+`.merge_verify_pgids` record naming it; a process cwd inside it; a touch within
+the age floor; a held `<dir>.lock`; and, for task worktrees only, being
+unregistered or dirty. A signal that cannot be read keeps the dir as
+`unreadable`, with one stderr line naming the path and the error. `--apply`
+takes `<dir>.lock` only for a dir that reads stale, then re-checks and removes
+it under that lock, so a kept dir never gains a `.lock` file, and a dir any
+earlier signal keeps never has its lock touched. Dirty means `git status --porcelain` output, so ignored files such as
 `.task/` do not count, and a non-force `git worktree remove` deletes them. That
 is why both worktree classes refuse a repo holding `.taskmaster/tasks/tasks.db`,
 an orchestrator's project root: there a clean, idle task worktree can still
 belong to a blocked, queued or in-review task, and a `_merge-*` dir belongs to
 that host's merge worker and its
 `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.reap_orphaned_merge_worktrees`. A scope
-is reclaimed only when no member has an out-of-scope parent other than PID 1 or
-a systemd instance. An unreadable cgroup or parent keeps the scope. A failed
-unit is `reset-failed`; an orphaned one is SIGKILLed, stopped and confirmed
-with `is-active`. Human gate task 11145 runs the first `--apply` on leo-laptop.
+is reclaimed only when it is `failed`, or `active` with no member whose
+out-of-scope parent is anything but PID 1 or a systemd instance. An unreadable
+cgroup or parent keeps the scope, and so does any other state
+(`unit-transitioning`, `unit-inactive`, `unit-state-unknown`). A controller-less
+scope still holding an `sccache` process is kept as `shared-daemon`: reify's
+`verify_env` sets `RUSTC_WRAPPER=sccache`, so a verify can leave the server it
+started in its scope, other live verifies use that server, and it exits on its
+own idle timeout. A failed unit is `reset-failed`; an orphaned one is
+SIGKILLed, stopped, and confirmed `inactive` or `failed` by `is-active`. Human
+gate task 11145 runs the first `--apply` on leo-laptop.
 
 ---
 
