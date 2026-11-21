@@ -293,9 +293,36 @@ def test_a_worker_already_holding_another_copy_of_a_parent_module_fails_the_pass
         run_across_workers([module], workers=2)
 
     message = str(raised.value)
-    assert 'orchestrator' in message
+    assert "'orchestrator' from " in message
     assert str(decoy / 'orchestrator' / '__init__.py') in message
     assert orchestrator.__file__ in message
+
+
+_HELD_FILE_GUARD = '''
+import os, sys
+from _tree_scan import TreeAnalysis, python_files
+
+TREE_ANALYSES = (TreeAnalysis('held-file', lambda: python_files({root!r}), lambda m: (os.getpid(), sys.modules[{held!r}].__file__)),)
+'''
+
+
+def test_a_worker_holding_a_parent_module_through_a_symlink_to_the_parent_file_runs(
+    tmp_path: Path, guard_module: GuardFactory, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _tree(tmp_path / 'tree', {'a.py': 'x = 1\n', 'b.py': 'x = 1\n'})
+    held = guard_module('')
+    assert held.__file__ is not None
+    held_file = Path(held.__file__)
+    module = guard_module(_HELD_FILE_GUARD.format(root=str(root), held=held.__name__))
+    link = tmp_path / 'link'
+    link.symlink_to(held_file.parent, target_is_directory=True)
+    startup = _tree(tmp_path / 'startup', {'sitecustomize.py': f'import {held.__name__}\n'})
+    monkeypatch.setenv('PYTHONPATH', os.pathsep.join([str(startup), str(link)]))
+
+    facts = run_across_workers([module], workers=2).facts(module.TREE_ANALYSES[0])
+
+    assert os.getpid() not in {pid for pid, _file in facts.values()}
+    assert {file for _pid, file in facts.values()} == {str(link / held_file.name)}
 
 
 _HANGING_GUARD = '''
