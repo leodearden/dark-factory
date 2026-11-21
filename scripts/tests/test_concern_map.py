@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import MutableMapping
 from pathlib import Path
 
 import _checkout
@@ -344,10 +345,10 @@ class TestFailures:
 
     def test_the_map_is_immutable(self) -> None:
         cmap = _measure()
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            cmap.total_lines = 0  # type: ignore[misc]
-        with pytest.raises(TypeError):
-            cmap.residual['inter_unit_gaps'] = 0  # type: ignore[index]
+        for field in dataclasses.fields(cmap):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(cmap, field.name, getattr(cmap, field.name))
+        assert not isinstance(cmap.residual, MutableMapping)
 
 
 # ---------------------------------------------------------------------------
@@ -440,10 +441,10 @@ class TestEvaluatePartition:
 
     def test_the_report_is_immutable(self) -> None:
         report = _report()
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            report.edges = {}  # type: ignore[misc]
-        with pytest.raises(TypeError):
-            report.clusters['A'] = report.clusters['B']  # type: ignore[index]
+        for field in dataclasses.fields(report):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(report, field.name, getattr(report, field.name))
+        assert not isinstance(report.clusters, MutableMapping)
 
 
 class TestPartitionCoverage:
