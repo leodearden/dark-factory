@@ -912,7 +912,7 @@ class TestRunSlotCapacityConfigRules:
 
         assert read_run_slot_capacity(tmp_path) is None
 
-    def test_canonical_beats_legacy(self, tmp_path):
+    def test_stray_legacy_file_beside_canonical_is_ignored(self, tmp_path):
         """A stray legacy file beside the canonical one is never read."""
         from dashboard.data.orchestrator import read_run_slot_capacity
 
@@ -921,11 +921,11 @@ class TestRunSlotCapacityConfigRules:
 
         assert read_run_slot_capacity(tmp_path) == 24
 
-    def test_present_canonical_is_authoritative_even_without_the_key(self, tmp_path):
+    def test_canonical_omitting_the_key_ignores_stray_legacy_value(self, tmp_path):
         """A canonical config that omits the key never takes it from a stray legacy file.
 
-        The canonical file is authoritative for every key, so a stale legacy
-        spelling beside it can never supply a cap the live config dropped.
+        Only the canonical file is read, so a stale legacy spelling beside it
+        can never supply a cap the live config dropped.
         The omitted key resolves to the orchestrator's own default of 24 —
         never to the legacy file's 99.
         """

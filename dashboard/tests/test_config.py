@@ -38,7 +38,7 @@ def _write_raw(path, text: str) -> None:
     path.write_text(text)
 
 
-class TestCanonicalConfigPreferred:
+class TestCanonicalConfigOnly:
     """Scope 1: only the canonical name is read; legacy spellings are never consulted."""
 
     def test_canonical_only_resolves_with_no_warning(self, tmp_path, caplog):
@@ -52,7 +52,7 @@ class TestCanonicalConfigPreferred:
         assert result == {'myproj': 'http://127.0.0.1:9101/mcp'}
         assert [r for r in caplog.records if r.name == _LOGGER_NAME] == []
 
-    def test_canonical_wins_over_legacy(self, tmp_path, caplog):
+    def test_stray_legacy_file_beside_canonical_is_ignored(self, tmp_path, caplog):
         """A stray legacy file beside the canonical one is never read."""
         root = tmp_path / 'myproj'
         _write_yaml(root / 'dark-factory-orchestrator.yaml', {'escalation': {'port': 9101}})
@@ -85,6 +85,7 @@ class TestCanonicalConfigPreferred:
         assert records[0].levelno == logging.WARNING
         assert 'No escalation URL discovered' in records[0].getMessage()
         assert str(root) in records[0].getMessage()
+        assert 'dark-factory-orchestrator.yaml' in records[0].getMessage()
         assert not any(str(legacy_path) in r.getMessage() for r in caplog.records)
 
 
@@ -122,7 +123,7 @@ class TestNoUrlWarnsNamingRoot:
         assert records[0].levelno == logging.WARNING
         assert str(root) in records[0].getMessage()
 
-    def test_portless_canonical_is_authoritative_over_valid_legacy(self, tmp_path, caplog):
+    def test_portless_canonical_ignores_stray_legacy_port(self, tmp_path, caplog):
         """A portless canonical config never takes a stray legacy file's port.
 
         The misconfigured canonical config is the real problem, so the no-URL
@@ -141,10 +142,10 @@ class TestNoUrlWarnsNamingRoot:
         assert records[0].levelno == logging.WARNING
         assert str(root) in records[0].getMessage()
 
-    def test_malformed_canonical_is_authoritative_over_valid_legacy(self, tmp_path, caplog):
+    def test_malformed_canonical_ignores_stray_legacy_port(self, tmp_path, caplog):
         """A malformed canonical config never takes a stray legacy file's port.
 
-        Mirrors ``test_portless_canonical_is_authoritative_over_valid_legacy``
+        Mirrors ``test_portless_canonical_ignores_stray_legacy_port``
         for the ``_read_escalation_url`` parse-failure branch. Two WARNINGs
         fire (the parse-failure naming the file, plus the no-URL one naming
         the root), and the legacy port is ignored entirely.
@@ -259,10 +260,10 @@ class TestNonMappingEscalationSection:
         ]
         assert len(mapping_msgs) == 1
 
-    def test_non_mapping_canonical_is_authoritative_over_valid_legacy(self, tmp_path, caplog):
+    def test_non_mapping_canonical_ignores_stray_legacy_port(self, tmp_path, caplog):
         """A non-mapping canonical config never takes a stray legacy file's port.
 
-        Mirrors ``test_malformed_canonical_is_authoritative_over_valid_legacy``
+        Mirrors ``test_malformed_canonical_ignores_stray_legacy_port``
         for the type-check branch: a wrong-typed ``escalation:`` yields no
         URL, and the legacy port is ignored entirely.
         """
