@@ -261,6 +261,11 @@ POST_EXECUTE_DEAD_PREFIX = (
     'post-execute failure (the backend write LANDED; do not blind-replay): '
 )
 
+#: The rows the queue still owes a write: a worker claims each once its
+#: ``next_retry_at`` is due.
+CLAIMABLE_STATUSES: tuple[str, ...] = ('pending', 'retry', 'parked')
+_CLAIMABLE_SQL = 'status IN ({})'.format(', '.join(f"'{s}'" for s in CLAIMABLE_STATUSES))
+
 
 class DurableWriteQueue:
     """SQLite WAL-backed write queue with per-group workers and global semaphore."""
@@ -486,7 +491,7 @@ class DurableWriteQueue:
             async with self._require_access().write() as db:
                 rows = list(await db.execute_fetchall(
                     "SELECT * FROM write_queue "
-                    "WHERE group_id = ? AND status IN ('pending', 'retry', 'parked') "
+                    f'WHERE group_id = ? AND {_CLAIMABLE_SQL} '
                     "  AND next_retry_at <= ? "
                     "ORDER BY id ASC LIMIT 1",
                     (group_id, now),
@@ -922,8 +927,7 @@ class DurableWriteQueue:
     async def _start_workers_for_pending_groups(self) -> None:
         """Start workers for any groups that have pending/retry/parked items."""
         rows = await self._require_access().read_all(
-            "SELECT DISTINCT group_id FROM write_queue "
-            "WHERE status IN ('pending', 'retry', 'parked')"
+            f'SELECT DISTINCT group_id FROM write_queue WHERE {_CLAIMABLE_SQL}'
         )
         for row in rows:
             group_id = row[0] if isinstance(row, tuple) else row['group_id']
@@ -1011,14 +1015,13 @@ class DurableWriteQueue:
         oldest_pending_age = None
         if group_id is not None:
             row = await access.read_one(
-                "SELECT MIN(created_at) FROM write_queue "
-                "WHERE status IN ('pending', 'retry', 'parked') AND group_id = ?",
+                'SELECT MIN(created_at) FROM write_queue '
+                f'WHERE {_CLAIMABLE_SQL} AND group_id = ?',
                 (group_id,),
             )
         else:
             row = await access.read_one(
-                "SELECT MIN(created_at) FROM write_queue "
-                "WHERE status IN ('pending', 'retry', 'parked')"
+                f'SELECT MIN(created_at) FROM write_queue WHERE {_CLAIMABLE_SQL}'
             )
         if row:
             min_created = row[0] if isinstance(row, tuple) else row[0]
