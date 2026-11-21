@@ -8,6 +8,7 @@ Why they are kept, and the retention rule: docs/falkordb-recovery-dumps.md.
 import argparse
 import hashlib
 import re
+import shutil
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -198,6 +199,44 @@ def _archive_problems(root: Path, archive: ArchiveDir) -> list[str]:
     return problems
 
 
+def copy_archives(source: Path, dest: Path, archives: Sequence[ArchiveDir]) -> list[str]:
+    refusal = _copy_refusal(source, dest, archives)
+    if refusal:
+        return _logged_failures([refusal])
+    problems: list[str] = []
+    for archive in archives:
+        problems += _logged_failures(_copy_archive(source, dest, archive))
+    dest_problems = check_root(dest, archives)
+    if dest_problems:
+        log("to tell a corrupt source from a bad copy, run: "
+            f"python3 {Path(__file__).resolve()} check {source}")
+    return problems + dest_problems
+
+
+def _copy_refusal(source: Path, dest: Path, archives: Sequence[ArchiveDir]) -> str | None:
+    resolved_dest = dest.resolve()
+    if resolved_dest == source.resolve():
+        return f"refusing to copy {source} onto itself ({dest})"
+    for archive in archives:
+        source_dir = source / archive.path
+        if resolved_dest.is_relative_to(source_dir.resolve()):
+            return f"refusing to copy into {dest}: it is inside the source archive {source_dir}"
+    return None
+
+
+def _copy_archive(source: Path, dest: Path, archive: ArchiveDir) -> list[str]:
+    source_dir, dest_dir = source / archive.path, dest / archive.path
+    if not source_dir.is_dir():
+        return [f"{source_dir}: source archive directory missing"]
+    try:
+        shutil.copytree(source_dir, dest_dir, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+    except OSError as exc:
+        return [f"{source_dir}: copy to {dest_dir} failed: {exc}"]
+    log(f"copied {archive.path}")
+    return []
+
+
 def _logged_failures(problems: list[str]) -> list[str]:
     for problem in problems:
         log(f"FAILED {problem}")
@@ -208,8 +247,9 @@ def main(argv: Sequence[str] | None = None, *,
          archives: Sequence[ArchiveDir] = RECOVERY_ARCHIVES) -> int:
     args = parse_args(argv)
     if args.command == "copy":
-        raise NotImplementedError("copy lands in task 7153 step-6")
-    problems = check_root(args.root, archives)
+        problems = copy_archives(args.source, args.dest, archives)
+    else:
+        problems = check_root(args.root, archives)
     return 1 if problems else 0
 
 
