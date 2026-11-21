@@ -115,6 +115,23 @@ CASES: dict[str, dict[str, Any]] = {
         'resume_session_id': None,
         'session_id': 'sess-1',
     },
+    # A dontAsk envelope reading no settings file: ``setting_sources=[]``
+    # must reach ``--setting-sources ''`` on BOTH paths, or an ambient
+    # settings allow rule widens the envelope on whichever path drops it.
+    'dont_ask_reading_no_settings': {
+        'model': 'opus',
+        'max_turns': 30,
+        'max_budget_usd': 4.0,
+        'allowed_tools': ['Read', 'Bash(git log:*)'],
+        'disallowed_tools': ['Edit', 'Write'],
+        'mcp_config': None,
+        'output_schema': {'type': 'object'},
+        'permission_mode': 'dontAsk',
+        'effort': None,
+        'resume_session_id': None,
+        'session_id': 'sess-2',
+        'setting_sources': [],
+    },
 }
 
 
