@@ -51,10 +51,12 @@ from orchestrator.remote_gate import (
     classify_remote_exit,
     ensure_script_text,
     local_gate_identity,
+    off_wire_field,
     parse_ensure_report,
     parse_gate_identity,
     reap_script_text,
     wire_classes,
+    wire_fields,
     wire_fingerprint,
 )
 from orchestrator.verify import VerifyResult
@@ -129,6 +131,16 @@ def test_class_order_does_not_matter():
     assert wire_fingerprint([a, b]) == wire_fingerprint([b, a])
 
 
+def test_an_off_wire_field_leaves_the_fingerprint_and_the_wire_fields():
+    on_wire = _one_class('Verdict', ('passed', bool))
+    with_off_wire = _one_class(
+        'Verdict', ('passed', bool), ('record', 'object | None', off_wire_field(default=None)),
+    )
+
+    assert wire_fingerprint([with_off_wire]) == wire_fingerprint([on_wire])
+    assert [f.name for f in wire_fields(with_off_wire)] == ['passed']
+
+
 def test_local_gate_identity_pairs_the_sha_with_this_process_fingerprint():
     identity = local_gate_identity('1' * 40)
     assert identity == GateIdentity('1' * 40, wire_fingerprint(wire_classes()))
@@ -144,7 +156,7 @@ def _component_types(tp: object) -> list[object]:
 def _nested_dataclasses(cls: type) -> dict[str, frozenset[type]]:
     hints = typing.get_type_hints(cls)
     nested: dict[str, frozenset[type]] = {}
-    for f in dataclasses.fields(cls):
+    for f in wire_fields(cls):
         found: set[type] = set()
         stack: list[object] = [hints[f.name]]
         while stack:
@@ -186,6 +198,14 @@ def test_nested_dataclass_walk_sees_a_generic_dataclass_and_a_callable_parameter
         ('hook', Callable[[inner], None]),
     )
     assert _nested_dataclasses(outer) == {'parameterised': {_Box}, 'hook': {inner}}
+
+
+def test_nested_dataclass_walk_skips_a_dataclass_behind_an_off_wire_field():
+    unlisted = _one_class('Unlisted', ('x', int))
+    outer = _one_class(
+        'Outer', ('plain', str), ('record', unlisted | None, off_wire_field(default=None)),
+    )
+    assert _nested_dataclasses(outer) == {}
 
 
 def test_every_dataclass_nested_in_a_wire_class_is_a_wire_class():
