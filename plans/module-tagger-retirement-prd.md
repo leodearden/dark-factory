@@ -79,8 +79,8 @@ Three independent leaves plus decompose-session coordination actions:
    (γ lock-charter-guard territory; `lock_charter_error` structured-error
    precedent, `routing_intent_guard` lint precedent nearby).
 3. **ε — debris census**: deterministic sweep of all six corpora emitting
-   a committed, machine-readable artifact for the repair pipeline (DF 3113
-   P4a, DF 3427) — repair itself stays with its existing owners.
+   a committed, machine-readable artifact for the repair pipeline — see
+   Debris repair disposition.
 
 No replacement predictor is built. Undeclared never-planned tasks run on
 the synthetic `task-<id>` lock until plan reconcile — accepted on the
@@ -99,9 +99,9 @@ measured basis above.
    of the historical would-reject rate, stated in its PR.
 3. **Census only for debris** (Leo, 2026-08-20). ~503 stamped records and
    the tagger-guessed wrong scopes on non-terminal tasks are enumerated
-   and classified by ε; repair/blanking stays with DF 3113 P4a and DF 3427
-   (divergence-keyed, per the wiped-field lesson: audit on divergence from
-   the authoritative source, never on emptiness).
+   and classified by ε; DF 3113 P4a's divergence-keyed plan-boundary heal
+   covers repair (per the wiped-field lesson: audit on divergence from the
+   authoritative source, never on emptiness) — see Debris repair disposition.
 4. **Land 3122 first** (Leo, 2026-08-20). Task 3122 (fileless-misfile
    soft signals) is in-progress and its branch persists
    `files_tagged_empty`, one of its three soft signals. β depends on 3122
@@ -135,6 +135,28 @@ measured basis above.
    residual idea (validating author-declared paths) goes to Open
    questions, not into any leaf.
 
+## Debris repair disposition (task 7271, measured 2026-11-21)
+
+No dedicated tagger-debris repair is needed, and none is owned. The stamp
+writer is dead (`orchestrator/src/orchestrator/harness.py::_MODULE_TAGGER_ENABLED`
+is False, and the newest `files_tagged_at` in any corpus is 2026-08-27), so the
+population measured in `plans/module-tagger-debris-census.json` is frozen.
+Every live stamped record reaches EXECUTE only through the plan boundary. There
+`orchestrator/src/orchestrator/workflow.py::TaskWorkflow._reconcile_plan_scope`
+either persists plan.files on a lock-set change, or `_heal_metadata_files_if_diverged`
+(DF 3113 P4a) restores `metadata.files` from plan.files on module-set
+divergence. Either way a tagger guess is replaced by authoritative scope before
+any edit. The one exception is `_run_simple_task`, which edits under the
+dispatch-time lock and reconciles afterwards. At measurement no live DF stamped
+record was simple, and reify had one (6735). Its worst case is a merge-lane
+conflict, an accepted residual on the Background basis that a tagger lock was
+the sole blocker 0 times. Terminal records hold no locks, and unmasking them
+stays out of scope; a reopen re-enters through the plan boundary. The 11
+records the 2026-08-27 hand restore left UNDETERMINED are covered the same way:
+9 are terminal, and reify 5470 and 6432 are pending. DF 3427 repaired only the
+emptiness-keyed DONE-path wipe sub-class (22 done tasks) and never consumed the
+census.
+
 ## Pre-conditions for activating
 
 - DF 3122 `done` (β's dependency; in-progress with a live claimant as of
@@ -147,7 +169,7 @@ measured basis above.
 |---|---|---|---|---|
 | DF 3260 (owned-field single-writer redesign) | this PRD shrinks the writer set 3260 charters | `metadata.files` writer charter | 3260 | amend 3260's record at decompose |
 | DF 3122 / 3121 (misfile soft signals) | this PRD deletes signal (c) `files_tagged_empty` after 3122 lands | tagger empty-verdict persistence in `harness.py` | this PRD (β) | β depends on 3122 |
-| DF 3113 P4a / DF 3427 (repair pipeline) | ε produces their input | census artifact (victim list keyed by project/task/classification) | this PRD (ε) produces; 3113/3427 own repair | queued |
+| DF 3113 P4a / DF 3427 (repair pipeline) | ε produces their input | census artifact (victim list keyed by project/task/classification) | 3113 P4a self-heal covers live records; no dedicated repair (7271) | resolved — see disposition |
 | DF 4504, 4191, 3380 | superseded / mooted | — | this PRD | cancel at decompose |
 | `plans/capability-delivered-checks-prd.md` | consumes | manifest YAML sidecar | that PRD's stamper | standard |
 
@@ -211,8 +233,8 @@ All three tasks are leaves (no intra-batch dependencies).
   records carrying `files_tagged_at`, classifying each: terminal vs
   non-terminal; plan-reconciled since tagging vs never-reconciled
   (tagger guess still live); known post-wipe signature. Emits a committed
-  machine-readable artifact (+ md summary) keyed for DF 3113 P4a / DF 3427
-  consumption. Read-only against task corpora (fused-memory read path,
+  machine-readable artifact (+ md summary) keyed for repair-pipeline
+  consumption (consumer: DF 7271). Read-only against task corpora (fused-memory read path,
   never raw `tasks.db`).
   **Observable signal:** the committed artifact exists with per-project
   counts; it contains the known positives (reify 6068/5602/5632, DF 3113's
@@ -228,8 +250,9 @@ status transitions that trigger reconciliation (`status-matches-liveness`
 
 ## Out of scope
 
-- **Repair of tagger-damaged records** — DF 3113 P4a (divergence-keyed
-  self-heal) and DF 3427 (second-pass sweep) own it; ε feeds them.
+- **Repair of tagger-damaged records** — covered by DF 3113 P4a's
+  plan-boundary heal; no dedicated repair (DF 7271, see Debris repair
+  disposition).
 - **Path-existence validation of author-declared `metadata.files`** — DF
   3380's residual idea; its own measurement (naive existence assertion
   ~85% FP because tasks legitimately create new files) bounds any future
