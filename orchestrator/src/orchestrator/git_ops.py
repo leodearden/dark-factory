@@ -8845,7 +8845,7 @@ class GitOps:
         """
         if keep_stack:
             return await self.rebase_preserving_task_commits(worktree)
-        held_back = await self._why_kept_on_old_base(worktree, full_branch)
+        held_back = await self._unstack_for_requeue(worktree, full_branch)
         if held_back:
             logger.warning(
                 '_rebase_requeued_onto_main: %s stays on its old base: %s',
@@ -8854,23 +8854,36 @@ class GitOps:
             return False
         return await self.rebase_preserving_task_commits(worktree)
 
-    async def _why_kept_on_old_base(self, worktree: Path, full_branch: str) -> str:
-        """Why the requeued *full_branch* must not be rebased onto main from
-        *worktree*, or '' once it carries no unlanded stack base.
+    async def _unstack_for_requeue(self, worktree: Path, full_branch: str) -> str:
+        """Un-stack the requeued *full_branch* from an unlanded base, in
+        *worktree*: rewrites the branch and drops its stack-base record.
 
-        The un-stack rewrites the branch in whichever worktree holds it, so a
-        branch *worktree* does not hold is kept.  So is one whose stack-base
-        record cannot be read, which may be stacked; the un-stack then works
-        from that same read.
+        Returns why the branch must stay on its old base, or '' once it
+        carries no unlanded stack base.  The un-stack works from the one
+        record :meth:`_reused_branch_record` read.
+        """
+        record = await self._reused_branch_record(worktree, full_branch)
+        if isinstance(record, str):
+            return record
+        unstack = await self._unstack_from(full_branch, record.base)
+        return unstack.merge_block_reason() if unstack.stops_merge else ''
+
+    async def _reused_branch_record(
+        self, worktree: Path, full_branch: str,
+    ) -> StackBaseRead | str:
+        """The readable stack-base record of the reused *full_branch*, or why
+        it must not be moved from *worktree*.  Reads only.
+
+        A reused branch is moved only from the worktree that holds it, and
+        only from a readable record: one that cannot be read may hide a stack.
         """
         holder = await self._worktree_holding_branch(full_branch)
         if holder is None or holder.resolve() != worktree.resolve():
-            return f'it is held by {holder}, not {worktree}'
+            return f'{full_branch} is held by {holder}, not by {worktree}'
         record = await self.stack_base_read(full_branch)
         if record.state is StackRecordState.UNREADABLE:
             return f'its stack-base record is unreadable: {record.detail}'
-        unstack = await self._unstack_from(full_branch, record.base)
-        return unstack.merge_block_reason() if unstack.stops_merge else ''
+        return record
 
     async def _restack_reused_branch(
         self, worktree: Path, full_branch: str, target: StackTarget,
@@ -8896,16 +8909,9 @@ class GitOps:
         "cannot read" into "no record" and replay main..HEAD instead."""
         stopped = branch_stack.RestackVerdict(full_branch, worktree, target.commit)
         old_tip = await self.resolve_branch_sha(full_branch)
-        holder = await self._worktree_holding_branch(full_branch)
-        if holder is None or holder.resolve() != worktree.resolve():
-            return stopped.refused(
-                old_tip, None, f'{full_branch} is held by {holder}, not by {worktree}',
-            )
-        record = await self.stack_base_read(full_branch)
-        if record.state is StackRecordState.UNREADABLE:
-            return stopped.refused(
-                old_tip, None, f'its stack-base record is unreadable: {record.detail}',
-            )
+        record = await self._reused_branch_record(worktree, full_branch)
+        if isinstance(record, str):
+            return stopped.refused(old_tip, None, record)
         main_sha = await self.get_main_sha()
         if not main_sha:
             return stopped.refused(
