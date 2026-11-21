@@ -414,3 +414,65 @@ def test_scope_that_survives_the_reap_is_failed(mirror, scopes):
 
     assert result.returncode == 1
     assert verdicts(result.stdout)["df-verify-x-dead.scope"][1:3] == ("failed", "orphaned")
+
+
+FAKE_SSH = (
+    '#!/usr/bin/env bash\n'
+    'printf "%s\\n" "$@" >"$FAKE_STATE/ssh.argv"\n'
+    'shift\n'
+    'exec bash -c "$*"\n'
+)
+REFUSING_SSH = (
+    '#!/usr/bin/env bash\n'
+    'echo "ssh: connect to host $1 port 22: Connection refused" >&2\n'
+    'exit 255\n'
+)
+
+
+def install_shim(mirror: Mirror, name: str, body: str) -> Path:
+    shim = mirror.bin / name
+    shim.write_text(body)
+    shim.chmod(0o755)
+    return shim
+
+
+def verdict_lines(stdout: str) -> list[str]:
+    return [line for line in stdout.splitlines() if line.split("\t")[0] in KINDS]
+
+
+def disk_state(mirror: Mirror) -> tuple:
+    return (sorted(p.name for p in mirror.base.iterdir()),
+            git(mirror.repo, "worktree", "list", "--porcelain"),
+            lock_files(mirror), pgid_records(mirror))
+
+
+def test_host_mode_runs_the_same_report_over_ssh(mirror):
+    ssh = install_shim(mirror, "fakessh", FAKE_SSH)
+    args = ("--repo", str(mirror.repo), *WORKTREE_CLASSES, "--min-age-hours", "24")
+    local = run(mirror, *args)
+    before = disk_state(mirror)
+
+    remote = run(mirror, "--host", "fakehost", *args, SSH=str(ssh))
+
+    assert remote.returncode == 0, remote.stderr
+    assert verdict_lines(remote.stdout) == verdict_lines(local.stdout)
+    assert verdict_lines(remote.stdout)
+    argv = (mirror.state / "ssh.argv").read_text().splitlines()
+    assert argv[:4] == ["fakehost", "python3", "-I", "-"]
+    forwarded = argv[4:]
+    assert "--host" not in forwarded
+    assert forwarded[forwarded.index("--repo") + 1] == str(mirror.repo)
+    classes = [forwarded[i + 1] for i, word in enumerate(forwarded) if word == "--class"]
+    assert sorted(classes) == ["merge-worktree", "task-worktree"]
+    assert float(forwarded[forwarded.index("--min-age-hours") + 1]) == 24
+    assert "--apply" not in forwarded
+    assert disk_state(mirror) == before
+
+
+def test_host_mode_relays_ssh_failure(mirror):
+    ssh = install_shim(mirror, "refusingssh", REFUSING_SSH)
+
+    result = run(mirror, "--host", "fakehost", "--repo", str(mirror.repo), SSH=str(ssh))
+
+    assert result.returncode == 255
+    assert "fakehost" in result.stderr
