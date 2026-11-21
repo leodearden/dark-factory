@@ -1322,6 +1322,52 @@ class TestLocalRunnerBundle:
         )
 
 
+@pytest.mark.asyncio
+class TestLocalRunnerHandsTheUnscopedGateWhatRan:
+    """Task 5653 (5294): the unscoped type-check gate is told what the scoped leg
+    executed, after merge-flake suppression, so it can consult that record."""
+
+    @staticmethod
+    def _recording_gate() -> tuple[list[dict[str, Any]], Any]:
+        calls: list[dict[str, Any]] = []
+
+        async def gate(*_args: Any, **options: Any) -> Any:
+            calls.append(options)
+            return MagicMock(broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[])
+
+        return calls, gate
+
+    async def test_a_passing_scoped_result_reaches_the_gate_as_executed(self):
+        scoped = _make_pass_result()
+        calls, gate = self._recording_gate()
+        runner = _make_local_runner(run_scoped=AsyncMock(return_value=scoped), run_unscoped=gate)
+
+        await runner.run_merge_verify('abc123', _make_spec())
+
+        (options,) = calls
+        assert options['executed'] is scoped
+        assert options['block_on_timeout'] is True
+
+    async def test_the_gate_sees_the_flake_suppressed_result_not_the_raw_red(self):
+        from orchestrator import verify as verify_module
+
+        red = _make_fail_result()
+        suppressed = _make_pass_result(summary='suppressed')
+
+        async def suppress(result: VerifyResult, **_kwargs: Any) -> VerifyResult:
+            assert result is red
+            return suppressed
+
+        calls, gate = self._recording_gate()
+        runner = _make_local_runner(run_scoped=AsyncMock(return_value=red), run_unscoped=gate)
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', suppress):
+            await runner.run_merge_verify('abc123', _make_spec())
+
+        (options,) = calls
+        assert options['executed'] is suppressed
+
+
 # ---------------------------------------------------------------------------
 # INV-1 (task 2883): LocalRunner threads event_store into run_scoped
 # ---------------------------------------------------------------------------
