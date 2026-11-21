@@ -116,6 +116,10 @@ from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
 from fused_memory.services.agent_project_storm_counters import AgentProjectStormCounters
+from fused_memory.services.billing_exhaustion_alarm import (
+    BillingExhaustionAlarm,
+    BillingParkPolicy,
+)
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
@@ -133,6 +137,7 @@ from fused_memory.services.mem0_write_retry import (
     Mem0RetryPassSummary,
     Mem0RetryPolicy,
     OnMem0Landed,
+    TransientProviderFailure,
     classify_transient_provider_failure,
     mem0_write_op_landed,
     retry_reason,
@@ -146,6 +151,10 @@ from fused_memory.services.overreach_shadow import (
     OverreachShadow,
     open_overreach_shadow,
     shadow_job_from_write,
+)
+from fused_memory.services.provider_billing import (
+    billing_source_of,
+    classify_billing_exhaustion,
 )
 from fused_memory.services.queued_writes import (
     DecodedReferents,
@@ -1602,30 +1611,17 @@ except Exception:
 def _is_rate_limit_or_quota_error(exc: BaseException) -> bool:
     """Return True if *exc* represents an embedding-provider rate-limit or quota error.
 
-    Matches ANY ``openai.RateLimitError`` — this covers both hard quota
-    exhaustion (``insufficient_quota``, non-retryable) and transient
-    too-many-requests rate limiting (retryable); the two are not
-    distinguished. Also matches duck-typed equivalents — a
-    ``status_code == 429`` attribute (regardless of code/message), or
-    ``'insufficient_quota'`` appearing in the error's ``code`` attribute —
-    so callers (get_entity's degraded fallback) can classify this condition
-    without a hard dependency on the openai SDK's exact exception hierarchy
-    (e.g. if Graphiti wraps/re-raises the error, or a different embedding
-    provider is configured). As a last resort, ``'insufficient_quota'``
-    appearing in the exception's string message also matches, but ONLY when
-    the exception carries neither a ``status_code`` nor a ``code`` attribute
-    — a concrete (even if non-matching, e.g. ``status_code=500``) status or
-    code classification is trusted over the fuzzy message-substring guess,
-    so a wrapped/log-echo error that merely quotes an upstream
-    'insufficient_quota' message inside an otherwise-unrelated, already-
-    classified error does not get swallowed into the degraded fallback
-    (task 2448 review).
+    Matches ANY ``openai.RateLimitError`` and any duck-typed
+    ``status_code == 429``, so a transient too-many-requests rate limit and
+    exhausted credits are deliberately ONE condition here. get_entity's
+    degraded fallback is fine with that because it has no retry loop of its
+    own: on a match it degrades immediately rather than retrying, for either
+    cause. Callers that must tell the two apart ask
+    ``provider_billing.py::classify_billing_exhaustion`` directly.
 
-    Callers that need to tell hard quota exhaustion apart from a
-    retryable transient rate limit must not rely on this predicate alone —
-    it deliberately treats both as one condition. get_entity's degraded
-    fallback is fine with that because it has no retry loop of its own: on
-    a match it degrades immediately rather than retrying, for either cause.
+    The quota half is that classifier's verdict, so the rules for reading
+    ``insufficient_quota`` (through a wrapper's ``__cause__``, structured
+    fields over a message substring, task 2448) have one home.
 
     Never matches a bare BaseException (e.g. ``asyncio.CancelledError``,
     ``KeyboardInterrupt``, ``SystemExit``) — those are structured-concurrency
@@ -1636,15 +1632,9 @@ def _is_rate_limit_or_quota_error(exc: BaseException) -> bool:
         return False
     if _OpenAIRateLimitError is not None and isinstance(exc, _OpenAIRateLimitError):
         return True
-    status_code = getattr(exc, 'status_code', None)
-    if status_code == 429:
+    if getattr(exc, 'status_code', None) == 429:
         return True
-    code = str(getattr(exc, 'code', '') or '')
-    if 'insufficient_quota' in code.lower():
-        return True
-    if status_code is None and not code:
-        return 'insufficient_quota' in str(exc).lower()
-    return False
+    return classify_billing_exhaustion(exc) is not None
 
 
 def _graphiti_degraded_entity_result() -> dict:
@@ -1754,6 +1744,7 @@ def _store_failure_diagnostics(
 
     Returns:
         dict with keys: store, reason, error_type, error, rate_limit_or_quota,
+        billing_exhausted (the exhausted ``BillingSource`` value, or None),
         query_len, project_id.
     """
     return {
@@ -1762,6 +1753,7 @@ def _store_failure_diagnostics(
         'error_type': type(exc).__name__ if exc is not None else 'TimeoutError',
         'error': (str(exc)[:500] if exc is not None else 'search_timeout'),
         'rate_limit_or_quota': _is_rate_limit_or_quota_error(exc) if exc is not None else False,
+        'billing_exhausted': billing_source_of(exc),
         'query_len': len(query),
         # Intentionally repeated per-entry (not deduped onto SearchResults) so
         # each diagnostic stays self-contained for independent log consumption —
@@ -2181,6 +2173,9 @@ class MemoryService:
         self.classifier = WriteClassifier(config)
         self.router = ReadRouter(config)
         self.durable_queue: DurableWriteQueue | None = None
+        self._billing_alarm = BillingExhaustionAlarm(
+            resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
+        )
         self._event_buffer: EventBuffer | None = None
         self._write_journal: WriteJournal | None = None
         self.taskmaster: TaskBackendProtocol | None = None
@@ -2457,6 +2452,7 @@ class MemoryService:
         except Exception:
             logger.warning('overreach shadow failed to open; running without it', exc_info=True)
 
+        await self._billing_alarm.restore()
         self.durable_queue = DurableWriteQueue(
             data_dir=qcfg.data_dir,
             execute_write=self._execute_durable_write,
@@ -2470,6 +2466,7 @@ class MemoryService:
             transient_error_names=qcfg.transient_error_names,
             on_terminal=self._record_queue_terminal_outcome,
             on_dead_letter=self._report_queue_dead_letter,
+            park_policy=BillingParkPolicy(self._billing_alarm),
         )
         self.durable_queue.register_callback(
             QueueCallback.DUAL_WRITE_EPISODE, self._dual_write_callback
@@ -6994,6 +6991,10 @@ class MemoryService:
             write_op_id,
             failure.value,
         )
+        if failure is TransientProviderFailure.BILLING_EXHAUSTED:
+            exhaustion = classify_billing_exhaustion(error)
+            if exhaustion is not None:
+                await self._billing_alarm.record_exhausted(exhaustion, site='mem0_write')
         return reason
 
     async def reissue_mem0_intent(self, intent: Mapping[str, Any]) -> Mem0AddOutcome:
@@ -7027,7 +7028,9 @@ class MemoryService:
 
         The one dispatch from method to backend call, shared by the original
         write and its re-issue so the two cannot diverge. The backend_op label
-        is ``add`` for both methods: the mem0 primitive each one calls.
+        is ``add`` for both methods: the mem0 primitive each one calls. A write
+        that lands proves OpenAI credits are back, so it resolves an open
+        billing page.
         """
         match write_method:
             case Mem0WriteMethod.ADD:
@@ -7049,9 +7052,12 @@ class MemoryService:
             payload={'content': content[:200]},
             coro=coro,
         )
-        return read_mem0_add_result(
+        outcome = read_mem0_add_result(
             raw, operation=write_method.value, zero_ids_anomalous=zero_ids_anomalous
         )
+        if outcome.landed:
+            await self._billing_alarm.record_recovered(site='mem0_write')
+        return outcome
 
     @property
     def mem0_retry_policy(self) -> Mem0RetryPolicy:
@@ -7083,6 +7089,7 @@ class MemoryService:
             now=now or datetime.now(UTC),
             max_age=timedelta(seconds=self._mem0_retry_policy.backlog_alarm_age_seconds),
             project_roots=self._known_projects,
+            billing=self._billing_alarm.state(),
         )
 
     # ------------------------------------------------------------------

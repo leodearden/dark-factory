@@ -92,6 +92,7 @@ from fused_memory.server.grouped_read import (
 # sync.)
 from fused_memory.server.near_duplicate_guard import cosine_of
 from fused_memory.server.near_verbatim import is_near_verbatim
+from fused_memory.services.provider_billing import classify_billing_exhaustion
 from fused_memory.utils.clip_disclosure import TruncationFact
 
 if TYPE_CHECKING:
@@ -889,9 +890,12 @@ class TriageFailOpenCounter:
 
     def __init__(self, time_provider: Callable[[], float] = time.time) -> None:
         self._counter = StormCounter(time_provider=time_provider)
+        self._billing_exhausted = StormCounter(time_provider=time_provider)
         self._pending_storm: dict[str, Any] | None = None
 
-    def record(self, *, project: str | None = None) -> dict[str, Any] | None:
+    def record(
+        self, *, project: str | None = None, billing_exhausted: bool = False,
+    ) -> dict[str, Any] | None:
         """Record one fail-open; return a storm summary iff a burst just fired.
 
         The summary renames ``StormCounter``'s generic ``labels`` to
@@ -900,7 +904,13 @@ class TriageFailOpenCounter:
         the reader to know the label convention. A project that could not be
         resolved still counts toward the burst — there is simply nothing to
         name it against.
+
+        *billing_exhausted* marks a fail-open caused by an exhausted provider
+        balance; the summary's ``billing_exhausted_in_window`` counts those in
+        the same window, and never changes when the burst fires.
         """
+        if billing_exhausted:
+            self._billing_exhausted.observe(window_seconds=_FAIL_OPEN_STORM_WINDOW_SECONDS)
         summary = self._counter.record(
             threshold=_FAIL_OPEN_STORM_THRESHOLD,
             window_seconds=_FAIL_OPEN_STORM_WINDOW_SECONDS,
@@ -913,6 +923,9 @@ class TriageFailOpenCounter:
             'threshold': summary['threshold'],
             'window_seconds': summary['window_seconds'],
             'projects': summary['labels'],
+            'billing_exhausted_in_window': self._billing_exhausted.prune(
+                _FAIL_OPEN_STORM_WINDOW_SECONDS,
+            ),
             'hint': _FAIL_OPEN_HINT,
         }
         # Stashed as well as returned. Most fail-opens are recorded DEEP inside
@@ -1418,14 +1431,19 @@ def _record_fail_open(
     """
     level = logging.ERROR if isinstance(exc, _WIRING_BUG_CLASSES) else logging.WARNING
     try:
+        exhaustion = classify_billing_exhaustion(exc)
+        cause = (
+            type(exc).__name__ if exhaustion is None
+            else f'billing_exhausted:{exhaustion.source.value}'
+        )
         logger.log(
             level,
-            'write_triage fail-open at stage=%s project=%s exc=%s — write stored '
-            'WITHOUT triage (contract C1: never block a write)',
-            stage, project_id, type(exc).__name__,
+            'write_triage fail-open at stage=%s project=%s exc=%s cause=%s — write '
+            'stored WITHOUT triage (contract C1: never block a write)',
+            stage, project_id, type(exc).__name__, cause,
             exc_info=exc,
         )
-        return counter.record(project=project_id)
+        return counter.record(project=project_id, billing_exhausted=exhaustion is not None)
     except Exception:  # the alarm must not break the write path.
         logger.exception('write_triage fail-open counter itself failed')
         return None
@@ -1471,6 +1489,7 @@ def emit_triage_fail_open_storm_escalation(
     """
     count = storm.get('count')
     window_seconds = storm.get('window_seconds')
+    billing_exhausted = storm.get('billing_exhausted_in_window', 0)
     detail = '\n'.join([
         f'project_root={project_root!r}',
         f'fail_opens_in_window={count!r}',
@@ -1482,6 +1501,7 @@ def emit_triage_fail_open_storm_escalation(
         # whichever write happened to cross the threshold.
         f'projects_in_window={storm.get("projects")!r}',
         f'mem0_intents_in_window={storm.get("mem0_intents_in_window")!r}',
+        f'billing_exhausted_in_window={billing_exhausted!r}',
         '',
         'add_memory write triage (PRD leaf beta, task 3127) FAILED OPEN '
         'repeatedly inside one rolling window. This is a DEGRADATION; data loss '
@@ -1531,11 +1551,7 @@ def emit_triage_fail_open_storm_escalation(
         agent_role=_AGENT_ROLE,
         category=_CATEGORY,
         severity='blocking',
-        summary=(
-            f'{count} add_memory write(s) triaged WITHOUT triage in '
-            f'{window_seconds}s — write triage is failing open '
-            f'(see {_PRD_PATH})'
-        ),
+        summary=_storm_summary(count, window_seconds, billing_exhausted),
         detail=detail,
         suggested_action=(
             'check MemoryService.search / mem0 reachability, then the '
@@ -1547,4 +1563,18 @@ def emit_triage_fail_open_storm_escalation(
         log_label='write_triage',
         context=f'fail-open storm {storm!r}',
         level=1,
+    )
+
+
+def _storm_summary(count: Any, window_seconds: Any, billing_exhausted: Any) -> str:
+    summary = (
+        f'{count} add_memory write(s) triaged WITHOUT triage in '
+        f'{window_seconds}s — write triage is failing open (see {_PRD_PATH})'
+    )
+    if not (isinstance(billing_exhausted, int) and billing_exhausted > 0):
+        return summary
+    return (
+        f'Provider credits exhausted behind {billing_exhausted} of these '
+        'fail-opens; not a transient outage, see the provider_billing_exhausted '
+        f'L2 for the provider and key. {summary}'
     )
