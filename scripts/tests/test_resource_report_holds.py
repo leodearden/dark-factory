@@ -430,6 +430,7 @@ class TestHoldMappingBothShapesEndToEnd:
 
     SOLAR_SERVICE = Consumer(Role.SERVICE, 'orchestrator-my-solar-challenge.service')
     SLICE = 'df-dark_factory.slice'
+    UNIT_SHAPE_SLICE = Consumer(Role.PROJECT, 'df-solar_challenge.slice')
 
     @pytest.fixture
     def roots(self, tmp_path: Path, make_runs_db) -> tuple[Path, Path]:
@@ -455,6 +456,7 @@ class TestHoldMappingBothShapesEndToEnd:
             Consumer(Role.SERVICE, self.SLICE): 30 * MiB,
             Consumer(Role.AGENTS, self.SLICE): 70 * MiB,
             Consumer(Role.PROJECT, self.SLICE): 5 * MiB,
+            self.UNIT_SHAPE_SLICE: 40 * MiB,
         }
         write_collections(
             store,
@@ -504,6 +506,29 @@ class TestHoldMappingBothShapesEndToEnd:
             Consumer(Role.VERIFY, scope_tag_for(factory))
         )
         assert project['verify']['status'] == 'absent'
+
+    def test_a_unit_shape_hold_beside_a_project_slice_does_not_claim_the_slice_is_missing(
+        self, report, roots
+    ):
+        solar, _factory = roots
+        slice_name = encode_consumer(self.UNIT_SHAPE_SLICE)
+
+        entry = self.entry_for(report, solar)
+        project = entry['holding_project']['project']
+        heading = f'hold {holds.format_utc(at(65))}  {solar}  '
+        block = next(
+            par for par in holds.render_text(report).split('\n\n') if par.startswith(heading)
+        )
+        slice_lines = [line for line in block.splitlines() if slice_name in line]
+
+        assert project['status'] == 'not_mapped'
+        assert project['consumer'] is None
+        assert 'has no project slice' not in project['reason']
+        assert 'not a project slice' in project['reason']
+        assert slice_name in [row['consumer'] for row in entry['who_grew']]
+        assert slice_lines
+        assert 'has no project slice' not in block
+        assert all("[this project's project]" not in line for line in slice_lines)
 
 
 class TestReclaimThreads:
