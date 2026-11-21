@@ -57,6 +57,12 @@ class FakeClock:
         self._now += seconds
 
     async def async_sleep(self, seconds: float) -> None:
-        """``sleep``, then one yield to the loop so a ready task runs before it returns."""
+        """``sleep``, then one yield to the loop so a ready task runs before it returns.
+
+        Concurrent sleeps add up rather than overlap: two tasks each awaiting
+        ``async_sleep(5)`` leave the clock at 10, where a real loop would read 5.
+        A scenario with concurrent sleepers belongs on
+        shared/src/shared/testing_virtual_clock.py::virtual_clock_test.
+        """
         self.sleep(seconds)
         await asyncio.sleep(0)
