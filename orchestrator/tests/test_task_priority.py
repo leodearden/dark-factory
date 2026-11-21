@@ -34,9 +34,11 @@ _NOW = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
 _PERIOD = 3600.0
 
 
-def _pending(task_id: str, priority: str, *, deps: tuple[str, ...] = ()) -> dict:
+def _pending(
+    task_id: str, priority: str, *, deps: tuple[str, ...] = (), status: str = 'pending',
+) -> dict:
     return {
-        'id': task_id, 'title': f'Task {task_id}', 'status': 'pending',
+        'id': task_id, 'title': f'Task {task_id}', 'status': status,
         'dependencies': [{'id': d} for d in deps],
         'metadata': {'files': [f'{task_id}/src']}, 'priority': priority,
     }
@@ -72,10 +74,29 @@ class TestSchedulerTaskPriority:
 
         await scheduler.acquire_next()
 
-        assert scheduler.task_priority('A') == TaskPriority(tier='high', pinned=False)
-        assert scheduler.task_priority('P') == TaskPriority(tier='low', pinned=True)
+        assert scheduler.task_priority('P') == TaskPriority(
+            tier=PINNED, pinned=True, base_tier='low', pin_order=1,
+        )
+        assert scheduler.task_priority('A') == TaskPriority(
+            tier='high', pinned=False, base_tier='high',
+        )
         assert scheduler.task_priority('unranked') == TaskPriority(tier=None, pinned=False)
-        assert scheduler.get_state_snapshot().effective_priorities['A'] == 'high'
+        effective = scheduler.get_state_snapshot().effective_priorities
+        assert (effective['A'], effective['P']) == ('high', 'low')
+
+    @pytest.mark.asyncio
+    async def test_pin_order_is_the_rows_order(self, tmp_path: Path) -> None:
+        scheduler, store = _scheduler(tmp_path, with_store=True)
+        assert store is not None
+        store.set_override(str(tmp_path), 'P', pinned=True, pin_order=2)
+        store.set_override(str(tmp_path), 'Q', pinned=True, pin_order=5)
+        scheduler.get_tasks = AsyncMock(return_value=[_pending('P', 'low'), _pending('Q', 'low')])
+
+        await scheduler.acquire_next()
+
+        assert (scheduler.task_priority('P').pin_order, scheduler.task_priority('Q').pin_order) == (
+            2, 5,
+        )
 
     @pytest.mark.asyncio
     async def test_no_override_store_leaves_the_pin_unknown(self, tmp_path: Path) -> None:
@@ -84,7 +105,23 @@ class TestSchedulerTaskPriority:
 
         await scheduler.acquire_next()
 
-        assert scheduler.task_priority('A') == TaskPriority(tier='medium', pinned=None)
+        assert scheduler.task_priority('A') == TaskPriority(
+            tier='medium', pinned=None, base_tier='medium',
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_in_progress_task_keeps_its_base_tier(self, tmp_path: Path) -> None:
+        scheduler, store = _scheduler(tmp_path, with_store=True)
+        assert store is not None
+        store.set_override(str(tmp_path), 'R', pinned=True)
+        scheduler.get_tasks = AsyncMock(return_value=[
+            _pending('R', 'low', status='in-progress'), _pending('A', 'medium'),
+        ])
+
+        await scheduler.acquire_next()
+
+        found = scheduler.task_priority('R')
+        assert (found.tier, found.base_tier) == (PINNED, 'low')
 
 
 class TestReadTaskPriority:
