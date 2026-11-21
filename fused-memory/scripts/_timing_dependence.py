@@ -10,6 +10,13 @@ Legs, each one site:
     A real clock read is the ``time`` module's or an event loop's, never an
     injected clock's, so the sanctioned ``fake_clock`` path is never a site.
     Names resolve through bindings in the assert's own innermost function.
+  LITERAL_DEADLINE: a non-zero numeric literal bound to a wall-clock DEADLINE
+    PARAMETER: ``timeout=`` on any call but a constructor or a pytest mark,
+    ``asyncio.wait_for``'s positional timeout, ``asyncio.timeout``'s delay (one
+    site per block), or a real clock read plus a literal.  Keyed on the
+    parameter, never on a callee list or a size threshold: a list or a
+    threshold cannot catch what lies outside it (Rule C's ruling, task 2376).
+    A node the caller already reported as Rule C's is not a second site here.
 
 Hang floor: a literal sleep of ``HANG_SIMULATOR_FLOOR_SECS`` or more, or inf,
 simulates a hang.  A passing test never waits one out, it cancels it, so it
@@ -18,7 +25,9 @@ cannot make a verdict load-sensitive; the census found no literal sleep between
 
 Residuals: a sleep whose duration is a named constant is not resolved, so it is
 a site whatever its value.  An elapsed value read off code under test
-(``result.duration_s``) is not seen.
+(``result.duration_s``) is not seen.  A constructor storing a deadline
+(``TimeoutExpired(cmd, timeout=5)``) is excluded, so a class that waits on its
+own constructor argument is missed.
 
 Per-node like Rules B and C, so the main checker folds it into its one walk.
 Stdlib only, for the reason _lint_cli.py gives.
@@ -39,11 +48,19 @@ try:
 finally:
     del sys.path[0]
 
+# shared/src: shared/__init__.py is a PEP 562 lazy package, so this stays stdlib-only.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'shared' / 'src'))
+try:
+    from shared.pytest_mark_grammar import marker_name
+finally:
+    del sys.path[0]
+
 RULE_CODE = 'timing-dependence'
 HANG_SIMULATOR_FLOOR_SECS = 60
 
 _FAKE_CLOCK_REF = 'shared/src/shared/pytest_fake_clock.py::fake_clock'
 _VIRTUAL_CLOCK_REF = 'shared/src/shared/testing_virtual_clock.py::virtual_clock_test'
+_OWN_TIME_REF = 'shared/src/shared/testing_own_time.py'
 _MARKER_CLAUSE = (
     " Mark the test @pytest.mark.timing(reason='<why>') only when a deadline is the"
     ' behaviour under test; the marker covers only with a non-empty literal reason=.'
@@ -53,6 +70,7 @@ _MARKER_CLAUSE = (
 class TimingKind(enum.Enum):
     SLEEP = 'sleep'
     ELAPSED_ASSERT = 'elapsed assert'
+    LITERAL_DEADLINE = 'literal deadline'
 
 
 class TimingSite(NamedTuple):
@@ -253,6 +271,89 @@ def _elapsed_assert_candidate(node: ast.Assert) -> ElapsedAssertCandidate | None
     )
 
 
+def _is_deadline_literal(node: ast.expr) -> bool:
+    value = _numeric_literal(node)
+    return value is not None and value != 0
+
+
+def _asyncio_function_name(call: ast.Call) -> str | None:
+    func = call.func
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return func.attr if func.value.id == 'asyncio' else None
+    return None
+
+
+def _is_constructor(call: ast.Call) -> bool:
+    """PEP 8 capitalises a class name, so a capitalised callee stores a deadline rather than waiting."""
+    func = call.func
+    name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ''
+    return name.lstrip('_')[:1].isupper()
+
+
+def _timeout_keyword_deadline(call: ast.Call) -> bool:
+    """L1: a ``timeout=`` literal on any call but a constructor or a pytest mark."""
+    if not any(kw.arg == 'timeout' and _is_deadline_literal(kw.value) for kw in call.keywords):
+        return False
+    return not _is_constructor(call) and marker_name(call) is None
+
+
+def _wait_for_positional_deadline(call: ast.Call) -> bool:
+    """L2: ``asyncio.wait_for``'s positional timeout literal."""
+    return (
+        len(call.args) >= 2
+        and _asyncio_function_name(call) == 'wait_for'
+        and _is_deadline_literal(call.args[1])
+    )
+
+
+def _call_deadline(call: ast.Call) -> TimingSite | None:
+    if not (_timeout_keyword_deadline(call) or _wait_for_positional_deadline(call)):
+        return None
+    return TimingSite(
+        call.lineno, call.col_offset, TimingKind.LITERAL_DEADLINE, ast.unparse(call), False
+    )
+
+
+def _timeout_block_delay(item: ast.withitem) -> ast.expr | None:
+    call = item.context_expr
+    if not isinstance(call, ast.Call) or _asyncio_function_name(call) != 'timeout':
+        return None
+    if call.args:
+        return call.args[0]
+    return next((kw.value for kw in call.keywords if kw.arg == 'delay'), None)
+
+
+def _timeout_block_deadline(node: ast.AsyncWith) -> TimingSite | None:
+    """L3: an ``async with asyncio.timeout(<literal>)`` block, one site at the block."""
+    for item in node.items:
+        delay = _timeout_block_delay(item)
+        if delay is not None and _is_deadline_literal(delay):
+            snippet = ast.unparse(item.context_expr)
+            return TimingSite(
+                node.lineno, node.col_offset, TimingKind.LITERAL_DEADLINE, snippet, False
+            )
+    return None
+
+
+def _clock_plus_literal(node: ast.BinOp) -> TimingSite | None:
+    """L4: a real clock read plus a literal, in either order."""
+    if not isinstance(node.op, ast.Add):
+        return None
+    pair = (node.left, node.right)
+    if not any(map(_is_real_clock_read, pair)) or not any(map(_is_deadline_literal, pair)):
+        return None
+    return TimingSite(
+        node.lineno, node.col_offset, TimingKind.LITERAL_DEADLINE, ast.unparse(node), False
+    )
+
+
+def _call_facts(call: ast.Call, *, deadline_already_reported: bool) -> tuple[TimingFact, ...]:
+    sleep = _sleep_site(call)
+    if sleep is not None:
+        return (sleep,)
+    return () if deadline_already_reported else _optional(_call_deadline(call))
+
+
 def _optional(fact: TimingFact | None) -> tuple[TimingFact, ...]:
     return (fact,) if fact is not None else ()
 
@@ -260,7 +361,11 @@ def _optional(fact: TimingFact | None) -> tuple[TimingFact, ...]:
 def timing_facts(node: ast.AST, *, deadline_already_reported: bool) -> tuple[TimingFact, ...]:
     """Rule D's facts about ONE node of a walk; ``timing_violations`` resolves them per file."""
     if isinstance(node, ast.Call):
-        return _optional(_sleep_site(node))
+        return _call_facts(node, deadline_already_reported=deadline_already_reported)
+    if isinstance(node, ast.BinOp):
+        return _optional(_clock_plus_literal(node))
+    if isinstance(node, ast.AsyncWith):
+        return () if deadline_already_reported else _optional(_timeout_block_deadline(node))
     if isinstance(node, ast.Assign | ast.AnnAssign):
         return _binding_facts(node)
     if isinstance(node, ast.Assert):
@@ -357,9 +462,22 @@ def _elapsed_assert_msg(site: TimingSite) -> str:
     )
 
 
+def _literal_deadline_msg(site: TimingSite) -> str:
+    return (
+        f'{RULE_CODE}: `{site.snippet}` bounds a wait with a written number of'
+        ' wall-clock seconds, so a loaded host expires it while the code under test is'
+        ' still correct. Derive the bound from a load-tolerant named constant, or run'
+        f' the scenario on virtual_clock_test ({_VIRTUAL_CLOCK_REF}). For a real child'
+        f' process, bound it by its own time: {_OWN_TIME_REF}::run_on_own_time in place'
+        ' of a subprocess.run timeout, or ::wait_on_own_time for a Popen.'
+        + _MARKER_CLAUSE
+    )
+
+
 _MESSAGES = {
     TimingKind.SLEEP: _sleep_msg,
     TimingKind.ELAPSED_ASSERT: _elapsed_assert_msg,
+    TimingKind.LITERAL_DEADLINE: _literal_deadline_msg,
 }
 
 
