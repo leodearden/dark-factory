@@ -45,6 +45,15 @@ class TestExhaustionIsRecognised:
         exc = make_insufficient_quota_error(with_code=False)
         _assert_api_key_exhaustion(classify_billing_exhaustion(exc))
 
+    def test_live_credit_balance_code_with_quota_type_classifies(self):
+        exc = make_insufficient_quota_error(code='credit_balance_exhausted')
+        _assert_api_key_exhaustion(classify_billing_exhaustion(exc))
+        _assert_api_key_exhaustion(classify_billing_exhaustion(wrap_like_graphiti(exc)))
+
+    def test_live_credit_balance_code_alone_classifies(self):
+        exc = make_insufficient_quota_error(code='credit_balance_exhausted', error_type=None)
+        _assert_api_key_exhaustion(classify_billing_exhaustion(exc))
+
     def test_graphiti_wrapper_classifies_through_cause(self):
         inner = make_insufficient_quota_error()
         result = _assert_api_key_exhaustion(classify_billing_exhaustion(wrap_like_graphiti(inner)))

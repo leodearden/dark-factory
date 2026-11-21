@@ -43,6 +43,7 @@ _FACTS_BY_SOURCE: Mapping[BillingSource, _SourceFacts] = MappingProxyType({
 
 _SOURCE_BY_EXHAUSTION_CODE: Mapping[str, BillingSource] = MappingProxyType({
     'insufficient_quota': BillingSource.API_KEY_CREDITS,
+    'credit_balance_exhausted': BillingSource.API_KEY_CREDITS,
 })
 
 _MAX_CHAIN_DEPTH = 8

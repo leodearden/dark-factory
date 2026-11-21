@@ -20,12 +20,12 @@ import pytest_asyncio
 from _fm_helpers import (
     make_insufficient_quota_error,
     make_transient_rate_limit_error,
+    mock_memory_backends,
     wrap_like_graphiti,
 )
 from _fm_polling import poll_until
 from shared.project_layout import escalation_queue_dir
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
-from test_e2e_durable_queue import _mock_backends
 
 from fused_memory.middleware import _folded_escalation
 from fused_memory.models.enums import SourceStore
@@ -50,7 +50,7 @@ async def billing_service(mock_config, tmp_path):
     from fused_memory.services.write_journal import WriteJournal
 
     mock_config.queue.retry_max_delay_seconds = 0.5
-    svc = _mock_backends(MemoryService(mock_config))
+    svc = mock_memory_backends(MemoryService(mock_config))
     await svc.initialize()
     journal = WriteJournal(tmp_path / 'wj_billing')
     await journal.initialize()
