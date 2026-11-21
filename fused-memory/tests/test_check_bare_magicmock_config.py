@@ -2485,14 +2485,16 @@ class TestWallClockDeadlineDebtSlack:
 
         Scans ``<tmp>/<pkg>/tests`` exactly as a package lint_command scans its tests
         dir.  Removing one wait without the budget edit exits 1 naming the edit;
-        applying the count the edit records exits 0.
+        applying the count the edit records exits 0.  The file also carries exactly
+        its Rule D budget, if it has one, so Rule C's is the only budget under test.
         """
         entry, budget = self._live_entry_of_at_least_2()
         debt_file = tmp_path / entry
         debt_file.parent.mkdir(parents=True)
         argv = [str(tmp_path.joinpath(*PurePosixPath(entry).parts[:2]))]
+        rule_d_at_budget = _RULE_D_SOURCE * _timing_debt.TIMING_DEPENDENCE_DEBT.get(entry, 0)
 
-        debt_file.write_text(_RULE_C_ONE_HIT * (budget - 1))
+        debt_file.write_text(_RULE_C_ONE_HIT * (budget - 1) + rule_d_at_budget)
         removed_exit = _checker.main(argv)
         removed = capsys.readouterr()
         assert removed_exit == 1, (
@@ -2504,7 +2506,7 @@ class TestWallClockDeadlineDebtSlack:
             f'the package lint must name the edit {edit!r}; got {removed.out!r}'
         )
 
-        debt_file.write_text(_RULE_C_ONE_HIT * budget)
+        debt_file.write_text(_RULE_C_ONE_HIT * budget + rule_d_at_budget)
         exact_exit = _checker.main(argv)
         exact = capsys.readouterr()
         assert exact_exit == 0, (

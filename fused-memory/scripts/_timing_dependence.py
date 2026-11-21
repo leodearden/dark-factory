@@ -431,8 +431,27 @@ def _optional(fact: TimingFact | None) -> tuple[TimingFact, ...]:
     return (fact,) if fact is not None else ()
 
 
+# Every node type ``timing_facts`` reads.  An exact-type membership test turns away
+# the great majority of a walk's nodes in one lookup, where the isinstance chain
+# below would make eight checks for each.
+_FACT_NODE_TYPES = frozenset({
+    ast.Call,
+    ast.BinOp,
+    ast.AsyncWith,
+    ast.Assign,
+    ast.AnnAssign,
+    ast.Assert,
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.Module,
+})
+
+
 def timing_facts(node: ast.AST, *, deadline_already_reported: bool) -> tuple[TimingFact, ...]:
     """Rule D's facts about ONE node of a walk; ``timing_violations`` resolves them per file."""
+    if type(node) not in _FACT_NODE_TYPES:
+        return ()
     if isinstance(node, ast.Call):
         return _call_facts(node, deadline_already_reported=deadline_already_reported)
     if isinstance(node, ast.BinOp):
