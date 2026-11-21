@@ -836,7 +836,8 @@ from it.
 | `enabled` | `true` | Kill switch — set `false` to disable the gate entirely |
 | `grace_cycles` | `3` | Consecutive FAILED ticks (per dependent, dep pair) before the born-at-L2 escalation fires |
 | `check_timeout_secs` | `120` | Per-check wall-clock timeout; a hung check maps to the same fail-safe outcome as a runner error |
-| `max_checks_per_tick` | `50` | Per-tick fan-out budget across all checked deps. It also bounds the scheduler's per-tick fetch of terminal dep records, which the scheduled self-deploy hold reads too (`docs/deterministic-runner.md` §2), so lowering it slows that hold's cold-cache warm-up |
+| `max_checks_per_tick` | `50` | Per-tick fan-out budget across all checked deps |
+| `max_record_fetches_per_tick` | `50` | Per-tick fetch budget for terminal dep records, which the delivered-check gate and the scheduled self-deploy hold read (`docs/deterministic-runner.md` §2). Lowering it slows the cold-cache warm-up after a restart; one slot per tick is kept for never-cached deps |
 
 **Manual re-pend recipe:** exactly like the external-dep gate, a dependent
 blocked by this escalation is **not auto-re-pended**. Once the underlying
