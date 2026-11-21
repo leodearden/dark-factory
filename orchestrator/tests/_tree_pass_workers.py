@@ -72,9 +72,34 @@ class _ImportedFrom:
 
 
 @dataclass(frozen=True)
-class _WorkerRequest:
+class _ParentResolution:
+    """How the parent process resolves imports: its ``sys.path``, and where it imported each top-level module it holds."""
+
     sys_path: tuple[str, ...]
-    parent_imports: dict[str, _ImportedFrom]
+    imports: dict[str, _ImportedFrom]
+
+    @classmethod
+    def captured(cls) -> _ParentResolution:
+        """This process's resolution, counting only the modules it holds from a file that still exists."""
+        imports = {
+            name: where
+            for name, module in list(sys.modules.items())
+            if '.' not in name
+            and (where := _imported_from(name, module)) is not None
+            and os.path.isfile(where.origin)
+        }
+        return cls(tuple(sys.path), imports)
+
+    def adopt(self) -> None:
+        """Makes this process resolve imports as the parent did; fails if it already holds another copy of a parent module."""
+        sys.path[:] = self.sys_path
+        _require_parent_files(self.imports)
+        sys.meta_path.insert(0, _ParentImportFinder(self.imports))
+
+
+@dataclass(frozen=True)
+class _WorkerRequest:
+    resolution: _ParentResolution
     guard_modules: tuple[str, ...]
     paths_by_analysis: dict[str, tuple[Path, ...]]
 
@@ -100,10 +125,9 @@ def run_across_workers(
     shares = partition_by_size(listing.union, min(workers, _usable_cpus()))
     if len(shares) < 2:
         return TreePass.assembled(listing, [extract_facts(listing.file_sets)])
-    sys_path = tuple(sys.path)
-    parent_imports = _parent_imports()
+    resolution = _ParentResolution.captured()
     requests = [
-        _WorkerRequest(sys_path, parent_imports, module_names, _assignment(listing, share))
+        _WorkerRequest(resolution, module_names, _assignment(listing, share))
         for share in shares
     ]
     return TreePass.assembled(listing, _extract_in_workers(requests))
@@ -130,9 +154,7 @@ def partition_by_size(paths: Iterable[Path], count: int) -> tuple[frozenset[Path
 def serve(request_path: str, reply_path: str) -> None:
     """One worker's whole life: extract the share at *request_path*, write the reply to *reply_path*."""
     request: _WorkerRequest = pickle.loads(Path(request_path).read_bytes())
-    sys.path[:] = request.sys_path
-    _require_parent_files(request.parent_imports)
-    sys.meta_path.insert(0, _ParentImportFinder(request.parent_imports))
+    request.resolution.adopt()
     analyses = _analyses_named(request.paths_by_analysis, request.guard_modules)
     reply = extract_facts({
         analyses[name]: frozenset(paths) for name, paths in request.paths_by_analysis.items()
@@ -154,17 +176,6 @@ def _imported_from(name: str, module: object) -> _ImportedFrom | None:
         return None
     locations = spec.submodule_search_locations
     return _ImportedFrom(spec.origin, None if locations is None else tuple(locations))
-
-
-def _parent_imports() -> dict[str, _ImportedFrom]:
-    """Where this process imported each top-level module it holds from a file that still exists."""
-    return {
-        name: where
-        for name, module in list(sys.modules.items())
-        if '.' not in name
-        and (where := _imported_from(name, module)) is not None
-        and os.path.isfile(where.origin)
-    }
 
 
 def _require_parent_files(imports: Mapping[str, _ImportedFrom]) -> None:
