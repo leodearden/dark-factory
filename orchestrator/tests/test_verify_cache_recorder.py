@@ -6,13 +6,13 @@ import hashlib
 import json
 import os
 import shlex
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _git_fixtures import RepoSeed, seed_repo
 from test_verify_events_units import (
     _TASK_ID,
     _forked_task_workflow,
@@ -229,7 +229,7 @@ class TestLegFacts:
             return by_module[module.prefix]
 
         monkeypatch.setattr('orchestrator.verify.run_verification', _module_verdict)
-        repo = _two_module_repo(tmp_path / 'repo')
+        repo = seed_repo(tmp_path / 'repo', _TWO_MODULE_SEED)
 
         result = await run_scoped_verification(
             repo, OrchestratorConfig(), [_module('alpha'), _module('beta')],
@@ -257,17 +257,10 @@ def _module(prefix: str) -> ModuleConfig:
     return ModuleConfig(prefix=prefix, test_command='true', lint_command='true', type_check_command='true')
 
 
-def _two_module_repo(root: Path) -> Path:
-    for module in ('alpha', 'beta'):
-        (root / module).mkdir(parents=True)
-        (root / module / 'core.py').write_text('x = 1\n')
-    for argv in (
-        ['git', 'init', '-q', '-b', 'main'],
-        ['git', '-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '-A'],
-        ['git', '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'],
-    ):
-        subprocess.run(argv, cwd=root, check=True)
-    return root
+_TWO_MODULE_SEED = RepoSeed(
+    files=(('alpha/core.py', 'x = 1\n'), ('beta/core.py', 'x = 1\n')),
+    message='init',
+)
 
 
 # ---------------------------------------------------------------------------
