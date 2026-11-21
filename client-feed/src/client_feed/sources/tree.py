@@ -9,8 +9,15 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
-from client_feed.contract import FileKind, NonNegativeInt, TreeFile, TreeSnapshot, TreeTotals
-from client_feed.policy import Policy, PositiveInt
+from client_feed.contract import (
+    FileKind,
+    NonNegativeInt,
+    PositiveInt,
+    TreeFile,
+    TreeSnapshot,
+    TreeTotals,
+)
+from client_feed.policy import Policy
 from client_feed.sources.git import (
     EntryKind,
     TreeEntry,
