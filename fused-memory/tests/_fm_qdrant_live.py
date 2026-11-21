@@ -7,6 +7,7 @@ _fm_helpers' module docstring.
 
 import contextlib
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -88,19 +89,28 @@ def assert_reapable(collection_name: str) -> None:
     )
 
 
+@dataclass(frozen=True)
+class _SettleCheck:
+    """One read of a collection after an abandoned meta-op: whether its effect shows, and what was seen."""
+
+    settled: bool
+    seen: str
+
+
 def _run_meta_op(
     request: Callable[[], Any],
     *,
-    reached: Callable[[], bool],
+    check: Callable[[], _SettleCheck],
     describe: str,
     expected: str,
     timeout: float,
 ) -> None:
-    """Send one collection meta-op; if its answer is abandoned on a read timeout, wait for *reached*.
+    """Send one collection meta-op; if its answer is abandoned on a read timeout, wait for *check* to settle.
 
     A read timeout means the server has the request and may still be applying
     it, so the outcome is judged by the observed state, never by re-sending.
-    Every other failure propagates unchanged.
+    A wait that times out names the state its last check saw. Every other
+    failure propagates unchanged.
     """
     import httpx
     from qdrant_client.http.exceptions import ResponseHandlingException
@@ -110,20 +120,26 @@ def _run_meta_op(
     except ResponseHandlingException as exc:
         if not isinstance(exc.source, httpx.ReadTimeout):
             raise
-        poll_until_sync(
-            reached,
-            timeout=timeout,
-            interval=0.05,
-            message=(
+        last_seen = ''
+
+        def settled() -> bool:
+            nonlocal last_seen
+            observed = check()
+            last_seen = observed.seen
+            return observed.settled
+
+        try:
+            poll_until_sync(settled, timeout=timeout, interval=0.05)
+        except AssertionError:
+            raise AssertionError(
                 f'{describe}: the client stopped waiting for the answer '
                 f'({type(exc.source).__name__}: {exc.source}), and the '
-                f'collection was not {expected} {timeout}s later'
-            ),
-        )
+                f'collection was not {expected} {timeout}s later; last seen: {last_seen}'
+            ) from exc
 
 
-def _takes_writes_and_is_empty(client: Any, collection_name: str) -> bool:
-    """Whether every local shard of *collection_name* is Active and it holds no points; a 404 reads as not yet.
+def _check_writable_and_empty(client: Any, collection_name: str) -> _SettleCheck:
+    """Settled once every local shard of *collection_name* is Active and it holds no points; a 404 reads as not yet.
 
     Qdrant lists and counts a collection whose create is still running while
     its shard is Initializing, and a write then answers 500.
@@ -133,13 +149,22 @@ def _takes_writes_and_is_empty(client: Any, collection_name: str) -> bool:
 
     try:
         shards = client.collection_cluster_info(collection_name).local_shards
-        if not shards or any(shard.state != ReplicaState.ACTIVE for shard in shards):
-            return False
-        return client.count(collection_name, exact=True).count == 0
+        if not shards:
+            return _SettleCheck(settled=False, seen='no local shards')
+        if any(shard.state != ReplicaState.ACTIVE for shard in shards):
+            states = ', '.join(shard.state.value for shard in shards)
+            return _SettleCheck(settled=False, seen=f'local shard states [{states}]')
+        points = client.count(collection_name, exact=True).count
+        return _SettleCheck(settled=points == 0, seen=f'every local shard Active, {points} points')
     except UnexpectedResponse as exc:
         if getattr(exc, 'status_code', None) != 404:
             raise
-        return False
+        return _SettleCheck(settled=False, seen='absent')
+
+
+def _check_absent(client: Any, collection_name: str) -> _SettleCheck:
+    present = client.collection_exists(collection_name)
+    return _SettleCheck(settled=not present, seen='present' if present else 'absent')
 
 
 def _create_collection(
@@ -149,7 +174,7 @@ def _create_collection(
         lambda: client.create_collection(
             collection_name=collection_name, vectors_config=vectors_config,
         ),
-        reached=lambda: _takes_writes_and_is_empty(client, collection_name),
+        check=lambda: _check_writable_and_empty(client, collection_name),
         describe=f'create of collection {collection_name!r}',
         expected='present, with every local shard Active, and empty',
         timeout=settle_timeout,
@@ -159,7 +184,7 @@ def _create_collection(
 def _delete_collection(client: Any, collection_name: str, *, settle_timeout: float) -> None:
     _run_meta_op(
         lambda: client.delete_collection(collection_name),
-        reached=lambda: not client.collection_exists(collection_name),
+        check=lambda: _check_absent(client, collection_name),
         describe=f'delete of collection {collection_name!r}',
         expected='absent',
         timeout=settle_timeout,

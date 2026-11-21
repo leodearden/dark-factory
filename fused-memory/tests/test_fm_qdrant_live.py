@@ -214,6 +214,7 @@ class TestEnsureFreshCollectionOutlastsAnAbandonedCreate:
 
             assert server.creates('c') == 1
             assert server.upserts('c') == 1
+            assert server.wait_upserted('c', 0) is True
 
     def test_a_create_that_never_lands_fails_naming_the_collection_and_the_create(self):
         from _fm_qdrant_live import ensure_fresh_collection
@@ -230,6 +231,25 @@ class TestEnsureFreshCollectionOutlastsAnAbandonedCreate:
 
             assert "'c'" in str(excinfo.value)
             assert 'create' in str(excinfo.value)
+            assert 'last seen: absent' in str(excinfo.value)
+            assert server.creates('c') == 1
+
+    def test_a_create_whose_shard_never_turns_active_fails_naming_the_shard_state(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from _stub_qdrant_server import stub_qdrant_server
+        from qdrant_client import QdrantClient
+
+        with stub_qdrant_server(
+            create_delay_s={'c': 3600}, initializing_during_create=['c'],
+        ) as server:
+            client = QdrantClient(url=server.url, timeout=1)
+            try:
+                with pytest.raises(AssertionError) as excinfo:
+                    ensure_fresh_collection(client, 'c', size=8, settle_timeout=0.5)
+            finally:
+                client.close()
+
+            assert 'last seen: local shard states [Initializing]' in str(excinfo.value)
             assert server.creates('c') == 1
 
     def test_a_late_conflict_against_a_surviving_collection_holding_points_fails_loud(self):
@@ -249,8 +269,44 @@ class TestEnsureFreshCollectionOutlastsAnAbandonedCreate:
 
             assert "'c'" in str(excinfo.value)
             assert 'empty' in str(excinfo.value)
+            assert 'last seen: every local shard Active, 3 points' in str(excinfo.value)
             assert server.creates('c') == 1
             assert server.deletes('c') == 0
+
+    def test_an_abandoned_create_seen_with_no_local_shards_is_not_accepted(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from qdrant_client.http.exceptions import ResponseHandlingException
+        from qdrant_client.models import CollectionClusterInfo
+
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        client.create_collection.side_effect = ResponseHandlingException(httpx.ReadTimeout('timed out'))
+        client.collection_cluster_info.return_value = CollectionClusterInfo(
+            peer_id=1, shard_count=0, local_shards=[], remote_shards=[], shard_transfers=[],
+        )
+
+        with pytest.raises(AssertionError) as excinfo:
+            ensure_fresh_collection(client, 'c', size=8, settle_timeout=0.2)
+
+        assert 'last seen: no local shards' in str(excinfo.value)
+
+    def test_a_cluster_info_error_other_than_not_found_while_settling_propagates(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
+
+        client = MagicMock()
+        client.collection_exists.return_value = False
+        client.create_collection.side_effect = ResponseHandlingException(httpx.ReadTimeout('timed out'))
+        client.collection_cluster_info.side_effect = UnexpectedResponse(
+            500, 'err', b'{}', httpx.Headers(),
+        )
+
+        with pytest.raises(UnexpectedResponse) as excinfo:
+            ensure_fresh_collection(client, 'c', size=8)
+
+        assert excinfo.value.status_code == 500
+        assert client.create_collection.call_count == 1
+        client.delete_collection.assert_not_called()
 
     def test_a_create_that_never_reached_the_server_propagates_without_waiting_on_state(self):
         from _fm_qdrant_live import ensure_fresh_collection
@@ -304,6 +360,7 @@ class TestEnsureFreshCollectionOutlastsAnAbandonedDelete:
 
             assert "'c'" in str(excinfo.value)
             assert 'delete' in str(excinfo.value)
+            assert 'last seen: present' in str(excinfo.value)
             assert server.deletes('c') == 1
 
 

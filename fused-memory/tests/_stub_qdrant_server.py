@@ -194,12 +194,13 @@ class StubQdrantServer:
         with self._state_lock:
             return name in self._initializing_shards
 
-    def _set_shard_initializing(self, name: str, initializing: bool) -> None:
+    def _mark_shard_initializing(self, name: str) -> None:
         with self._state_lock:
-            if initializing:
-                self._initializing_shards.add(name)
-            else:
-                self._initializing_shards.discard(name)
+            self._initializing_shards.add(name)
+
+    def _mark_shard_active(self, name: str) -> None:
+        with self._state_lock:
+            self._initializing_shards.discard(name)
 
     def _check_exists(self, name: str) -> tuple[int, dict[str, Any]]:
         with self._state_lock:
@@ -234,12 +235,10 @@ class StubQdrantServer:
             if name in self._create_status:
                 return self._create_status[name], _error(f'stub rejected the create of `{name}`')
             if name in self._initializing_during_create:
-                self._set_shard_initializing(name, True)
+                self._mark_shard_initializing(name)
                 self._created_event(name).set()
-                self.release_event.wait(self._create_delay_s.get(name, 0.0))
-                self._set_shard_initializing(name, False)
-                return 200, _ok(True)
             self.release_event.wait(self._create_delay_s.get(name, 0.0))
+            self._mark_shard_active(name)
             self._created_event(name).set()
             return 200, _ok(True)
 
@@ -250,7 +249,6 @@ class StubQdrantServer:
             self.release_event.wait(self._delete_delay_s.get(name, 0.0))
             existed = self._exists(name)
             self._created_event(name).clear()
-            self._set_shard_initializing(name, False)
             return 200, _ok(existed)
 
     def _cluster_info(self, name: str) -> tuple[int, dict[str, Any]]:
