@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from orchestrator.merge_verify_facts import ChainMembers, MergeVerifyDispatchFacts
 from orchestrator.task_priority import (
@@ -39,8 +39,24 @@ PICK_RECORD_CAP = 16
 """Most pick records held for an emit that never comes (an abandoned pick)."""
 
 
+class QueuedRequest(Protocol):
+    """What :func:`queued_request_fields` reads of a merge request."""
+
+    @property
+    def request_id(self) -> str: ...
+
+    @property
+    def lane(self) -> str: ...
+
+    @property
+    def snapshot_tip(self) -> str | None: ...
+
+    @property
+    def first_enqueued_at(self) -> float: ...
+
+
 def queued_request_fields(
-    req: MergeRequest, priority: TaskPriority, *, now: datetime,
+    req: QueuedRequest, priority: TaskPriority, *, now: datetime,
 ) -> dict[str, object]:
     """The keys ``merge_queued`` adds for *req*: its identity, lane, tiers, pin, and age at *now*."""
     age = task_age(

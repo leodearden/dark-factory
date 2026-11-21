@@ -5,6 +5,7 @@ waiting requests it left out, and never lets a failure reach the pick.
 """
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -75,11 +76,16 @@ def test_a_failure_while_recording_leaves_no_record_and_does_not_raise() -> None
     assert records.take('mr-1') == {}
 
 
-def _queued_req(*, waited: timedelta) -> Any:
-    return SimpleNamespace(
-        request_id='mr-q', lane='normal', snapshot_tip='abc123',
-        first_enqueued_at=(_NOW - waited).timestamp(),
-    )
+@dataclasses.dataclass(frozen=True)
+class _QueuedReq:
+    first_enqueued_at: float
+    request_id: str = 'mr-q'
+    lane: str = 'normal'
+    snapshot_tip: str | None = 'abc123'
+
+
+def _queued_req(*, waited: timedelta) -> _QueuedReq:
+    return _QueuedReq(first_enqueued_at=(_NOW - waited).timestamp())
 
 
 def test_merge_queued_keeps_the_keys_it_had() -> None:
@@ -117,8 +123,7 @@ def test_an_anchor_measures_the_age_from_the_anchor() -> None:
 
 @pytest.mark.parametrize('epoch', [float('nan'), float('inf'), 1.7e12])
 def test_an_epoch_naming_no_instant_still_records_the_keys(epoch: float) -> None:
-    req = _queued_req(waited=timedelta(0))
-    req.first_enqueued_at = epoch
+    req = _QueuedReq(first_enqueued_at=epoch)
 
     fields = queued_request_fields(req, TaskPriority(tier='low', base_tier='low'), now=_NOW)
 
@@ -131,8 +136,7 @@ def test_an_epoch_naming_no_instant_still_records_the_keys(epoch: float) -> None
 
 
 def test_an_anchor_still_measures_when_the_epoch_names_no_instant() -> None:
-    req = _queued_req(waited=timedelta(0))
-    req.first_enqueued_at = float('nan')
+    req = _QueuedReq(first_enqueued_at=float('nan'))
     priority = TaskPriority(tier='low', base_tier='low', age_anchor=_NOW - timedelta(hours=2))
 
     fields = queued_request_fields(req, priority, now=_NOW)
