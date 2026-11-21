@@ -353,7 +353,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'shared/tests/test_failover_integration.py': 11,
     'shared/tests/test_usage_gate.py': 10,
     'shared/tests/test_proc_group.py': 8,
-    'shared/tests/test_testing_virtual_clock.py': 8,
+    'shared/tests/test_testing_virtual_clock.py': 4,
     'shared/tests/test_usage_gate_exhaustive.py': 7,
     'shared/tests/test_usage_gate_park_visibility.py': 7,
     'shared/tests/test_verify_admission.py': 7,

@@ -1491,13 +1491,13 @@ class _Collected(NamedTuple):
     timing_facts: list[TimingFact]
 
 
-def _scan_tree(tree: ast.Module, lines: list[str], filename: str) -> _Collected:
+def _collect(tree: ast.Module, lines: list[str], filename: str) -> _Collected:
     """Walk *tree* ONCE for all four rules, collecting each budgeted rule apart.
 
     Rule C's violations and Rule D's facts are kept apart from the rest so each
     file's budget can be compared with the COUNT after the walk
-    (_lint_cli.py::apply_debt_budget), and so ``count_debt_in_tree`` reads the
-    same collection the gate does.
+    (_lint_cli.py::apply_debt_budget), and so ``scan_tree`` reports the gate's
+    verdict and the debt counts from one collection.
     """
     other: list[Violation] = []
     wall_clock: list[Violation] = []
@@ -1585,11 +1585,26 @@ def _scan_tree(tree: ast.Module, lines: list[str], filename: str) -> _Collected:
     return _Collected(other=other, wall_clock=wall_clock, timing_facts=timing)
 
 
-def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> list[Violation]:
-    """Return every violation of ALL FOUR rules in *tree*, the parse of *source*.
+class DebtCounts(NamedTuple):
+    """One file's raw, pre-budget count for each budgeted rule: what its baseline records."""
 
-    The seam for a caller that already holds the parse and runs other predicates
-    over the same tree, so that tree is parsed once.
+    wall_clock_deadline: int
+    timing_dependence: int
+
+
+class TreeScan(NamedTuple):
+    """One walk's two answers: the gate's verdict and the counts each debt baseline records."""
+
+    violations: list[Violation]
+    debt: DebtCounts
+
+
+def scan_tree(tree: ast.Module, source: str, filename: str) -> TreeScan:
+    """Walk *tree*, the parse of *source*, ONCE and return every violation and the debt counts.
+
+    The one deep seam: ``find_violations_in_tree`` and ``count_debt_in_tree`` are its
+    projections, so the gate and the census read one collection and cannot disagree,
+    and a caller that needs both pays for one walk.
 
     Rule A — ``bare-magicmock``: each ``<config_name> = MagicMock()`` that has at
     least one ast.Name target whose id matches the config-name set, calls MagicMock
@@ -1618,12 +1633,13 @@ def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> lis
     (``_WALL_CLOCK_DEADLINE_DEBT``, ``TIMING_DEPENDENCE_DEBT``), compared with the
     collected COUNT after the walk: a debt file is silent only at exactly its budget,
     reports its overrun above it and one file-level slack violation below it.  Rules
-    A and B have no baseline and apply in full to every file.
+    A and B have no baseline and apply in full to every file.  The debt counts are
+    taken BEFORE any budget, and a covered Rule D site is not counted.
 
-    Returned violations are sorted ascending by (lineno, col_offset) for
-    deterministic source-order output (ast.walk yields BFS order, not source order).
+    Violations are sorted ascending by (lineno, col_offset) for deterministic
+    source-order output (ast.walk yields BFS order, not source order).
     """
-    collected = _scan_tree(tree, source.splitlines(), filename)
+    collected = _collect(tree, source.splitlines(), filename)
     violations = [
         *collected.other,
         *apply_debt_budget(
@@ -1637,27 +1653,29 @@ def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> lis
             collected.timing_facts, filename=filename, budgets=TIMING_DEPENDENCE_BUDGETS
         ),
     ]
-    return sorted(violations, key=lambda v: (v.lineno, v.col_offset))
+    debt = DebtCounts(
+        wall_clock_deadline=len(collected.wall_clock),
+        timing_dependence=len(uncovered_timing_sites(collected.timing_facts)),
+    )
+    return TreeScan(sorted(violations, key=lambda v: (v.lineno, v.col_offset)), debt)
 
 
-class DebtCounts(NamedTuple):
-    """One file's raw, pre-budget count for each budgeted rule: what its baseline records."""
+def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> list[Violation]:
+    """Return every violation of ALL FOUR rules in *tree*: ``scan_tree``'s verdict.
 
-    wall_clock_deadline: int
-    timing_dependence: int
+    The seam for a caller that already holds the parse and runs other predicates
+    over the same tree, so that tree is parsed once.
+    """
+    return scan_tree(tree, source, filename).violations
 
 
 def count_debt_in_tree(tree: ast.Module, source: str, filename: str) -> DebtCounts:
     """Count *tree*'s Rule C violations and uncovered Rule D sites, before any budget.
 
-    The census seam: it reads the collection ``find_violations_in_tree`` budgets,
-    so the gate and the census cannot disagree.
+    The census seam: ``scan_tree``'s debt counts.  A caller that also needs the
+    verdict calls ``scan_tree`` once instead.
     """
-    collected = _scan_tree(tree, source.splitlines(), filename)
-    return DebtCounts(
-        wall_clock_deadline=len(collected.wall_clock),
-        timing_dependence=len(uncovered_timing_sites(collected.timing_facts)),
-    )
+    return scan_tree(tree, source, filename).debt
 
 
 # The files a DIRECTORY argument expands to, recursively: test modules, conftest

@@ -16,15 +16,18 @@ Legs, each one site:
     site per block), or a real clock read plus a literal.  Keyed on the
     parameter, never on a callee list or a size threshold: a list or a
     threshold cannot catch what lies outside it (Rule C's ruling, task 2376).
-    A node the caller already reported as Rule C's is not a second site here.
+    A node the caller already reported as Rule C's is not a second site here,
+    nor is a clock-plus-literal written directly as one of its arguments
+    (``asyncio.timeout_at(loop.time() + 5)``): one site, one code, one remedy.
 
 Escape: ONLY ``@pytest.mark.timing(reason='<non-blank literal>')``, on any
 enclosing def or class, a class-body ``pytestmark`` or the module ``pytestmark``.
 A mark on a helper def or a fake class is inert at runtime, so it reaches
 module-level helpers with no second mechanism.  Rule D has no per-site noqa
-code: one suppression mechanism per rule.  A ``@virtual_clock_test`` span
-covers every kind except a real-thread ``time.sleep``, which is real time even
-on a virtual loop.
+code: one suppression mechanism per rule.  A ``@virtual_clock_test`` span, or an
+``async def`` that its own enclosing scope runs as
+``run_on_virtual_clock(<name>(...))``, covers every kind except a real-thread
+``time.sleep``, which is real time even on a virtual loop.
 
 Budget: a shrink-only per-file baseline of uncovered violations,
 ``_timing_dependence_debt.py::TIMING_DEPENDENCE_DEBT``, applied after coverage.
@@ -38,7 +41,9 @@ Residuals: a sleep whose duration is a named constant is not resolved, so it is
 a site whatever its value.  An elapsed value read off code under test
 (``result.duration_s``) is not seen.  A constructor storing a deadline
 (``TimeoutExpired(cmd, timeout=5)``) is excluded, so a class that waits on its
-own constructor argument is missed.
+own constructor argument is missed.  An event loop is recognised by name: a
+receiver whose name ends in ``loop`` is taken for a real one, so a fake loop
+named ``vloop`` reads as a real clock.
 
 Per-node like Rules B and C, so the main checker folds it into its one walk.
 Stdlib only, for the reason _lint_cli.py gives.
@@ -137,8 +142,37 @@ class ClockSafeSpan(NamedTuple):
     covers_real_thread_sleep: bool
 
 
+class VirtualClockRun(NamedTuple):
+    """``run_on_virtual_clock(<coroutine>(...))``: that coroutine function runs on virtual time."""
+
+    coroutine: str
+    lineno: int
+
+
+class CoroutineDef(NamedTuple):
+    """An ``async def``, which a virtual clock run in its enclosing scope covers."""
+
+    name: str
+    span: ScopeSpan
+
+
+class ReportedDeadlineArgument(NamedTuple):
+    """Where an arithmetic argument of a node the caller reported as Rule C's starts."""
+
+    lineno: int
+    col_offset: int
+
+
 TimingFact = (
-    TimingSite | ScopeSpan | ClockBinding | ElapsedBinding | ElapsedAssertCandidate | ClockSafeSpan
+    TimingSite
+    | ScopeSpan
+    | ClockBinding
+    | ElapsedBinding
+    | ElapsedAssertCandidate
+    | ClockSafeSpan
+    | VirtualClockRun
+    | CoroutineDef
+    | ReportedDeadlineArgument
 )
 
 
@@ -301,13 +335,6 @@ def _is_deadline_literal(node: ast.expr) -> bool:
     return value is not None and value != 0
 
 
-def _asyncio_function_name(call: ast.Call) -> str | None:
-    func = call.func
-    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-        return func.attr if func.value.id == 'asyncio' else None
-    return None
-
-
 def _is_constructor(call: ast.Call) -> bool:
     """PEP 8 capitalises a class name, so a capitalised callee stores a deadline rather than waiting."""
     func = call.func
@@ -326,7 +353,7 @@ def _wait_for_positional_deadline(call: ast.Call) -> bool:
     """L2: ``asyncio.wait_for``'s positional timeout literal."""
     return (
         len(call.args) >= 2
-        and _asyncio_function_name(call) == 'wait_for'
+        and _module_function(call, ('asyncio',), 'wait_for') is not None
         and _is_deadline_literal(call.args[1])
     )
 
@@ -341,7 +368,7 @@ def _call_deadline(call: ast.Call) -> TimingSite | None:
 
 def _timeout_block_delay(item: ast.withitem) -> ast.expr | None:
     call = item.context_expr
-    if not isinstance(call, ast.Call) or _asyncio_function_name(call) != 'timeout':
+    if not isinstance(call, ast.Call) or _module_function(call, ('asyncio',), 'timeout') is None:
         return None
     if call.args:
         return call.args[0]
@@ -372,11 +399,35 @@ def _clock_plus_literal(node: ast.BinOp) -> TimingSite | None:
     )
 
 
+def _reported_deadline_arguments(calls: Iterable[ast.expr]) -> tuple[TimingFact, ...]:
+    """The arithmetic arguments of *calls*: a clock-plus-literal there is the caller's site."""
+    return tuple(
+        ReportedDeadlineArgument(argument.lineno, argument.col_offset)
+        for call in calls
+        if isinstance(call, ast.Call)
+        for argument in (*call.args, *(keyword.value for keyword in call.keywords))
+        if isinstance(argument, ast.BinOp)
+    )
+
+
 def _call_facts(call: ast.Call, *, deadline_already_reported: bool) -> tuple[TimingFact, ...]:
     sleep = _sleep_site(call)
     if sleep is not None:
         return (sleep,)
-    return () if deadline_already_reported else _optional(_call_deadline(call))
+    if deadline_already_reported:
+        return _reported_deadline_arguments((call,))
+    run = _virtual_clock_run(call)
+    if run is not None:
+        return (run,)
+    return _optional(_call_deadline(call))
+
+
+def _async_with_facts(
+    node: ast.AsyncWith, *, deadline_already_reported: bool
+) -> tuple[TimingFact, ...]:
+    if deadline_already_reported:
+        return _reported_deadline_arguments(item.context_expr for item in node.items)
+    return _optional(_timeout_block_deadline(node))
 
 
 def _is_valid_timing_mark(element: ast.expr) -> bool:
@@ -391,10 +442,24 @@ def _is_valid_timing_mark(element: ast.expr) -> bool:
     )
 
 
+def _names_virtual_clock(node: ast.expr, name: str) -> bool:
+    """*node* is testing_virtual_clock's *name*, bare or through a module attribute."""
+    if isinstance(node, ast.Name):
+        return node.id == name
+    return isinstance(node, ast.Attribute) and node.attr == name
+
+
 def _is_virtual_clock_decorator(decorator: ast.expr) -> bool:
-    if isinstance(decorator, ast.Name):
-        return decorator.id == 'virtual_clock_test'
-    return isinstance(decorator, ast.Attribute) and decorator.attr == 'virtual_clock_test'
+    return _names_virtual_clock(decorator, 'virtual_clock_test')
+
+
+def _virtual_clock_run(call: ast.Call) -> VirtualClockRun | None:
+    if len(call.args) != 1 or not _names_virtual_clock(call.func, 'run_on_virtual_clock'):
+        return None
+    scenario = call.args[0]
+    if not isinstance(scenario, ast.Call) or not isinstance(scenario.func, ast.Name):
+        return None
+    return VirtualClockRun(scenario.func.id, call.lineno)
 
 
 def _span(node: ast.stmt, *, covers_real_thread_sleep: bool) -> ClockSafeSpan:
@@ -424,7 +489,8 @@ def _module_coverage(node: ast.Module) -> ClockSafeSpan | None:
 
 def _function_facts(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[TimingFact, ...]:
     scope = ScopeSpan(node.lineno, node.end_lineno or node.lineno)
-    return (scope, *_optional(_definition_coverage(node)))
+    coroutine = CoroutineDef(node.name, scope) if isinstance(node, ast.AsyncFunctionDef) else None
+    return (scope, *_optional(coroutine), *_optional(_definition_coverage(node)))
 
 
 def _optional(fact: TimingFact | None) -> tuple[TimingFact, ...]:
@@ -457,7 +523,7 @@ def timing_facts(node: ast.AST, *, deadline_already_reported: bool) -> tuple[Tim
     if isinstance(node, ast.BinOp):
         return _optional(_clock_plus_literal(node))
     if isinstance(node, ast.AsyncWith):
-        return () if deadline_already_reported else _optional(_timeout_block_deadline(node))
+        return _async_with_facts(node, deadline_already_reported=deadline_already_reported)
     if isinstance(node, ast.Assign | ast.AnnAssign):
         return _binding_facts(node)
     if isinstance(node, ast.Assert):
@@ -527,6 +593,25 @@ def _elapsed_assert_sites(facts: tuple[TimingFact, ...]) -> list[TimingSite]:
     ]
 
 
+def _virtual_clock_run_spans(facts: tuple[TimingFact, ...]) -> list[ClockSafeSpan]:
+    """Each ``async def`` run on the virtual clock by name from its own enclosing scope."""
+    runs = [fact for fact in facts if isinstance(fact, VirtualClockRun)]
+    if not runs:
+        return []
+    spans = [fact for fact in facts if isinstance(fact, ScopeSpan)]
+    run_keys = {(_innermost_scope(run.lineno, spans), run.coroutine) for run in runs}
+    return [
+        ClockSafeSpan(fact.span.first, fact.span.last, covers_real_thread_sleep=False)
+        for fact in facts
+        if isinstance(fact, CoroutineDef)
+        and (_enclosing_scope(fact.span, spans), fact.name) in run_keys
+    ]
+
+
+def _enclosing_scope(span: ScopeSpan, spans: list[ScopeSpan]) -> ScopeSpan | None:
+    return _innermost_scope(span.first, [other for other in spans if other != span])
+
+
 def _is_covered(site: TimingSite, spans: Iterable[ClockSafeSpan]) -> bool:
     return any(
         span.first <= site.lineno <= span.last
@@ -535,13 +620,25 @@ def _is_covered(site: TimingSite, spans: Iterable[ClockSafeSpan]) -> bool:
     )
 
 
+def _is_reported_by_the_caller(site: TimingSite, reported: frozenset[tuple[int, int]]) -> bool:
+    return site.kind is TimingKind.LITERAL_DEADLINE and (site.lineno, site.col_offset) in reported
+
+
 def uncovered_timing_sites(facts: Iterable[TimingFact]) -> list[TimingSite]:
     """The sites among *facts*, a whole file's, that no coverage excuses."""
     facts = tuple(facts)
     sites = [fact for fact in facts if isinstance(fact, TimingSite)]
     sites += _elapsed_assert_sites(facts)
     safe = [fact for fact in facts if isinstance(fact, ClockSafeSpan)]
-    return [site for site in sites if not _is_covered(site, safe)]
+    safe += _virtual_clock_run_spans(facts)
+    reported = frozenset(
+        (fact.lineno, fact.col_offset) for fact in facts if isinstance(fact, ReportedDeadlineArgument)
+    )
+    return [
+        site
+        for site in sites
+        if not _is_covered(site, safe) and not _is_reported_by_the_caller(site, reported)
+    ]
 
 
 def _sleep_msg(site: TimingSite) -> str:

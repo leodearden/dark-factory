@@ -1336,8 +1336,8 @@ def test_the_repo_wide_scans_share_one_xdist_worker(request):
 class _ScannedTestFile(NamedTuple):
     """What the repo-wide scans need from one scanned file; its tree is not kept.
 
-    The two counts are the raw, pre-budget numbers each debt baseline records,
-    from ``check_bare_magicmock_config.py::count_debt_in_tree``.
+    The two counts are the raw, pre-budget numbers each debt baseline records, from
+    the same ``check_bare_magicmock_config.py::scan_tree`` walk as the gate's verdict.
     """
 
     path: Path
@@ -1356,13 +1356,13 @@ def _scan_test_file(path: Path, relpath: str) -> _ScannedTestFile:
         return _ScannedTestFile(
             path, relpath, gate_violations=(), rule_c_count=0, timing_count=0, syntax_error=exc
         )
-    counts = _checker.count_debt_in_tree(tree, source, relpath)
+    scan = _checker.scan_tree(tree, source, str(path))
     return _ScannedTestFile(
         path,
         relpath,
-        gate_violations=tuple(_checker.find_violations_in_tree(tree, source, str(path))),
-        rule_c_count=counts.wall_clock_deadline,
-        timing_count=counts.timing_dependence,
+        gate_violations=tuple(scan.violations),
+        rule_c_count=scan.debt.wall_clock_deadline,
+        timing_count=scan.debt.timing_dependence,
         syntax_error=None,
     )
 
@@ -2700,6 +2700,14 @@ class TestTimingDependenceComposition:
         assert sleep.lineno == _SLEEP_IN_THE_BLOCK_LINENO
         assert _rule_c(source) != []
 
+    def test_a_clock_plus_literal_argument_of_a_reported_block_is_not_a_rule_d_site(self):
+        source = _TIMEOUT_BLOCK_ON_A_BARRIER.replace(
+            'asyncio.timeout(5)', 'asyncio.timeout_at(asyncio.get_running_loop().time() + 5)'
+        )
+
+        assert _rule_c(source) != []
+        assert _rule_d(source) == []
+
 
 _ALL_FOUR_RULES = (
     _RULE_A_SOURCE + _RULE_B_SOURCE + _RULE_C_SOURCE + _UNBOUND_FETCH_WAIT + _RULE_D_SOURCE
@@ -2743,6 +2751,21 @@ class TestCountDebtInTree:
 
     def test_a_covered_timing_site_is_not_counted(self):
         assert _debt_counts(_COVERED_SLEEP) == (0, 0)
+
+
+class TestScanTree:
+    """One walk yields the budgeted verdict and the raw counts; the narrow seams project it."""
+
+    def test_on_a_debt_file_the_verdict_is_budgeted_and_the_counts_are_raw(self):
+        entry, budget = _live_rule_c_debt_entry()
+        source = _RULE_C_ONE_HIT * (budget + 1)
+        tree = ast.parse(source)
+
+        scan = _checker.scan_tree(tree, source, entry)
+
+        assert scan.violations == find_violations(source, entry) != []
+        assert scan.debt == _checker.count_debt_in_tree(tree, source, entry)
+        assert scan.debt.wall_clock_deadline == budget + 1
 
 
 def _assert_the_tree_seam_agrees(source: str, filename: str) -> list:

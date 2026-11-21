@@ -112,12 +112,9 @@ class TestSleepMessage:
     @pytest.mark.parametrize(
         'remedy',
         [
-            'event',
-            'polled predicate',
             'shared/src/shared/pytest_fake_clock.py::fake_clock',
             'shared/src/shared/testing_virtual_clock.py::virtual_clock_test',
             '@pytest.mark.timing(reason=',
-            'behaviour under test',
         ],
     )
     def test_names_each_remedy(self, message: str, remedy: str):
@@ -260,13 +257,12 @@ class TestElapsedAssertMessage:
     @pytest.mark.parametrize(
         'needle',
         [
-            'merge gate',
             'shared/src/shared/pytest_fake_clock.py::fake_clock',
             'shared/src/shared/testing_virtual_clock.py::virtual_clock_test',
             '@pytest.mark.timing(reason=',
         ],
     )
-    def test_names_why_and_each_remedy(self, message: str, needle: str):
+    def test_names_each_remedy(self, message: str, needle: str):
         assert needle in message
 
 
@@ -389,6 +385,36 @@ class TestLiteralDeadlinePrecedence:
         assert [site.kind for site in sites] == [_timing.TimingKind.SLEEP]
 
 
+    @pytest.mark.parametrize(
+        'statement',
+        [
+            'async with asyncio.timeout_at(loop.time() + 5):\n        await client.fetch()',
+            'await asyncio.wait_for(client.fetch(), timeout=loop.time() + 5)',
+        ],
+    )
+    def test_a_clock_plus_literal_argument_of_an_already_reported_node_is_not_a_site(self, statement):
+        tree = ast.parse(_in_async_test(statement))
+
+        def site_kinds(*, already_reported: bool) -> list:
+            facts = [
+                fact
+                for node in ast.walk(tree)
+                for fact in _timing.timing_facts(
+                    node, deadline_already_reported=already_reported and _is_the_deadline_node(node)
+                )
+            ]
+            return [site.kind for site in _timing.uncovered_timing_sites(facts)]
+
+        assert site_kinds(already_reported=False) == [_timing.TimingKind.LITERAL_DEADLINE]
+        assert site_kinds(already_reported=True) == []
+
+
+def _is_the_deadline_node(node: ast.AST) -> bool:
+    return isinstance(node, ast.AsyncWith) or (
+        isinstance(node, ast.Call) and ast.unparse(node).startswith('asyncio.wait_for')
+    )
+
+
 class TestLiteralDeadlineMessage:
     @pytest.mark.parametrize(
         ('statement', 'site_text'),
@@ -406,14 +432,12 @@ class TestLiteralDeadlineMessage:
     @pytest.mark.parametrize(
         'remedy',
         [
-            'load-tolerant named constant',
             'shared/src/shared/testing_virtual_clock.py::virtual_clock_test',
             'shared/src/shared/testing_own_time.py::run_on_own_time',
             'subprocess.run',
             '::wait_on_own_time',
             'Popen',
             '@pytest.mark.timing(reason=',
-            'behaviour under test',
         ],
     )
     def test_names_each_remedy(self, remedy: str):
@@ -441,6 +465,20 @@ def _coverage_source(header: str, body: str = _ALL_KINDS_BODY, *, method: bool =
     return _COVERAGE_PRELUDE + header + 'async def test_case(t0, fut):\n' + textwrap.indent(body, ' ' * 4)
 
 
+def _scenario_run_source(run: str, body: str = _VIRTUAL_LOOP_BODY, *, after: str = '') -> str:
+    """A test whose nested ``async def scenario`` holds *body*, then runs *run*; *after* follows."""
+    return (
+        _COVERAGE_PRELUDE
+        + 'from shared import testing_virtual_clock\n'
+        + 'from shared.testing_virtual_clock import run_on_virtual_clock\n\n\n'
+        + 'def test_case(t0, fut):\n'
+        + '    async def scenario():\n'
+        + textwrap.indent(body, ' ' * 8)
+        + f'    {run}\n'
+        + after
+    )
+
+
 _COVERED = {
     'marker_on_the_test': _coverage_source(f'@pytest.mark.timing({_REASON})\n'),
     'marker_on_the_class': _coverage_source(f'@pytest.mark.timing({_REASON})\nclass TestCase:\n', method=True),
@@ -462,6 +500,10 @@ _COVERED = {
         'from shared import testing_virtual_clock\n\n\n@testing_virtual_clock.virtual_clock_test\n',
         _VIRTUAL_LOOP_BODY,
     ),
+    'run_on_virtual_clock': _scenario_run_source('run_on_virtual_clock(scenario())'),
+    'run_on_virtual_clock_attribute': _scenario_run_source(
+        'testing_virtual_clock.run_on_virtual_clock(scenario())'
+    ),
 }
 
 _NOT_COVERED = {
@@ -473,6 +515,12 @@ _NOT_COVERED = {
     'positional_reason': _coverage_source("@pytest.mark.timing('x')\n"),
     'marker_on_a_sibling': _coverage_source(
         f'@pytest.mark.timing({_REASON})\ndef test_sibling():\n    pass\n\n\n'
+    ),
+    'virtual_clock_run_of_another_coroutine': _scenario_run_source(
+        'run_on_virtual_clock(other())', _ALL_KINDS_BODY
+    ),
+    'virtual_clock_run_from_another_scope': _scenario_run_source(
+        'pass', _ALL_KINDS_BODY, after='\n\ndef test_sibling():\n    run_on_virtual_clock(scenario())\n'
     ),
 }
 
@@ -505,10 +553,17 @@ class TestCoverage:
         for violation in found:
             assert 'the marker covers only with a non-empty literal reason=' in violation.message
 
-    def test_a_virtual_clock_does_not_cover_a_real_thread_sleep(self):
-        source = _coverage_source(
-            'from shared.testing_virtual_clock import virtual_clock_test\n\n\n@virtual_clock_test\n'
-        )
+    @pytest.mark.parametrize(
+        'source',
+        [
+            _coverage_source(
+                'from shared.testing_virtual_clock import virtual_clock_test\n\n\n@virtual_clock_test\n'
+            ),
+            _scenario_run_source('run_on_virtual_clock(scenario())', _ALL_KINDS_BODY),
+        ],
+        ids=['virtual_clock_test', 'run_on_virtual_clock'],
+    )
+    def test_a_virtual_clock_does_not_cover_a_real_thread_sleep(self, source: str):
         [violation] = _scan(source)
         assert 'time.sleep(0.1)' in violation.message
 
@@ -551,7 +606,6 @@ class TestTimingDependenceBudget:
             'recorded budget of 2',
             '3 were found',
             '1 over budget',
-            'positional',
             'shared/src/shared/pytest_fake_clock.py::fake_clock',
             'shared/src/shared/testing_virtual_clock.py::virtual_clock_test',
             '@pytest.mark.timing(reason=',
@@ -589,8 +643,8 @@ class TestTimingDependenceBudget:
         [slack] = _budgeted(_sleeps(1, covered=1))
         assert (slack.lineno, slack.col_offset) == (1, 0)
 
-    def test_the_live_budgets_index_exactly_the_debt_mapping(self):
+    def test_every_debt_row_resolves_to_its_own_budget(self):
+        """The live budgets are the debt mapping, and no row shadows another's."""
         debt = load_script_module(_SCRIPTS / '_timing_dependence_debt.py').TIMING_DEPENDENCE_DEBT
-        rebuilt = _lint_cli.DebtBaseline.from_mapping(debt)
-        for key in debt:
-            assert _timing.TIMING_DEPENDENCE_BUDGETS.entry_for(key) == rebuilt.entry_for(key)
+        for key, budget in debt.items():
+            assert _timing.TIMING_DEPENDENCE_BUDGETS.entry_for(key) == _lint_cli.DebtEntry(key, budget)
