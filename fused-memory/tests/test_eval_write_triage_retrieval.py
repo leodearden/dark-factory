@@ -8,6 +8,7 @@ obtained from the shipped function rather than restated as a literal.
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import types
 from pathlib import Path
@@ -210,6 +211,87 @@ class TestRetrievedSlates:
         with caplog.at_level(logging.WARNING):
             _slates([record], retrievals)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestSlateSnapshot:
+    """One measured retrieval, dumped and reloaded so several judge runs share it."""
+
+    @staticmethod
+    async def _snapshot():
+        records = [_record('d1', 'parent'), _record('d2', 'c1')]
+        rows = [_child('child', 0.95, 'parent'), _row('parent', 0.7), _row('c1', 0.6)]
+        slates = _slates(records, await _prefetch(FakeMemoryService(rows), records))
+        measured = _mod().Slate(
+            memory_id='d3', candidates=(), attach_target_id='c1', band=OUTCOME_RESTATED,
+            routed=OUTCOME_JUDGE, similarity=0.2, canonical_present=False,
+            retrieved_count=0, degraded=True, self_retrieved=True,
+        )
+        return _mod().SlateSnapshot(
+            project_id='reify', t_high=T_HIGH, t_low=T_LOW, candidate_k=5,
+            judge_candidate_count=3, slates=(*slates, measured),
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_dumped_snapshot_loads_back_equal(self, tmp_path: Path) -> None:
+        snapshot = await self._snapshot()
+        path = tmp_path / 'slates.json'
+        snapshot.dump(path)
+        loaded = _mod().SlateSnapshot.load(path)
+        assert loaded == snapshot
+        assert isinstance(loaded.slates, tuple)
+        assert all(isinstance(slate.candidates, tuple) for slate in loaded.slates)
+
+    @pytest.mark.asyncio
+    async def test_row_metadata_survives_whole(self, tmp_path: Path) -> None:
+        snapshot = await self._snapshot()
+        path = tmp_path / 'slates.json'
+        snapshot.dump(path)
+        [child] = [
+            row for row in _mod().SlateSnapshot.load(path).slates[0].candidates
+            if row['memory_id'] == 'child'
+        ]
+        assert child['metadata'] == {
+            'store_score': 0.95, 'kind': SIGHTING_KIND, PARENT_ID_KEY: 'parent',
+        }
+
+    @pytest.mark.asyncio
+    async def test_band_and_route_come_back_as_measured(self, tmp_path: Path) -> None:
+        snapshot = await self._snapshot()
+        path = tmp_path / 'slates.json'
+        snapshot.dump(path)
+        measured = _mod().SlateSnapshot.load(path).slates[-1]
+        assert (measured.band, measured.routed) == (OUTCOME_RESTATED, OUTCOME_JUDGE)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('field', ['t_low', 'slates'])
+    async def test_a_snapshot_missing_a_field_is_refused(self, tmp_path: Path, field: str) -> None:
+        path = tmp_path / 'slates.json'
+        (await self._snapshot()).dump(path)
+        payload = json.loads(path.read_text())
+        del payload[field]
+        path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match=field):
+            _mod().SlateSnapshot.load(path)
+
+    @pytest.mark.asyncio
+    async def test_a_slate_missing_a_field_is_refused(self, tmp_path: Path) -> None:
+        path = tmp_path / 'slates.json'
+        (await self._snapshot()).dump(path)
+        payload = json.loads(path.read_text())
+        del payload['slates'][0]['routed']
+        path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match='routed'):
+            _mod().SlateSnapshot.load(path)
+
+    @pytest.mark.asyncio
+    async def test_another_schema_version_is_refused(self, tmp_path: Path) -> None:
+        path = tmp_path / 'slates.json'
+        (await self._snapshot()).dump(path)
+        payload = json.loads(path.read_text())
+        payload['schema_version'] = _mod().SLATE_SNAPSHOT_SCHEMA_VERSION + 1
+        path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match='schema_version'):
+            _mod().SlateSnapshot.load(path)
 
 
 class TestNormalize:
