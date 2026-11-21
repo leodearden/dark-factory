@@ -880,6 +880,7 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             6 * _LANE_PASS_BOUND_SECS
         ),
         test_verify_usage_dump_on_two_spaced_passes_files_one_command_level_task: 2 * _LANE_PASS_BOUND_SECS,
+        test_a_red_path_pass_outlasting_the_lane_pass_bound_still_completes: _LANE_PASS_BOUND_SECS,
         test_b3_never_a_gate: (
             _LANE_PASS_BOUND_SECS
             + _NOTE_OFFLINE_LANE_BOUND_SECS
@@ -913,6 +914,9 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
         test_b6_a_red_the_narrowed_confirm_clears_ends_its_episode_and_files_nothing: two_pass_row,
         test_b7_a_cancelled_task_escalates_once_and_after_resolution_a_new_task_names_it: six_pass_row,
         test_verify_usage_dump_on_two_spaced_passes_files_one_command_level_task: two_pass_row,
+        test_a_red_path_pass_outlasting_the_lane_pass_bound_still_completes: (
+            _SPAWNS_PER_REPO_FIXTURE + _SPAWNS_PER_FIXTURE_COMMIT + _SPAWNS_PER_DRIVE_ADVANCE
+        ),
         test_b3_never_a_gate: (
             _SPAWNS_PER_REPO_FIXTURE
             + _SPAWNS_PER_DRIVE_ADVANCE
@@ -1427,6 +1431,25 @@ async def test_a_pass_that_raises_fails_its_drive_with_its_own_exception(harness
 
     with pytest.raises(RuntimeError, match='detect seam raised'):
         await _run_one_lane_pass(worker)
+
+
+# Priced by this test's rows in test_every_composing_caller_carries_a_timeout_override.
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+@pytest.mark.usefixtures('pytest_on_path')
+@pytest.mark.asyncio
+async def test_a_red_path_pass_outlasting_the_lane_pass_bound_still_completes(
+    harness, git_ops, repo, tmp_path, monkeypatch,
+):
+    """A red-path pass runs real sub-runs whose wall time scales with host
+    load, so its drive is not held to ``_LANE_PASS_BOUND_SECS``: shrinking the
+    bound below any real pass stands in for load stretching a pass past it."""
+    lane = await _pytest_fixture_lane(harness, git_ops, tmp_path)
+    monkeypatch.setattr(f'{__name__}._LANE_PASS_BOUND_SECS', 0.001)
+
+    first = await _drive_lane_pass(lane, 'red')
+
+    assert first.outcome == _confirmed(reproduced=[_TARGET])
+    assert first.effect['tasks_filed'] == []
 
 
 # ---------------------------------------------------------------------------
