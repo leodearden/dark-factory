@@ -95,3 +95,36 @@ def test_a_failed_archive_export_fails_before_fused_memory_is_stopped(tmp_path):
     assert result.returncode == 1
     assert ARCHIVE_FAILED in result.stdout, result.stdout + result.stderr
     assert "stop" not in systemctl_calls
+
+
+# --- import-data.sh section 2b ----------------------------------------------
+
+IMPORT_ARCHIVE_FAILED = "Recovery archives: the export's recovery-archive/ is missing"
+RESTORING_FALKORDB = "Restoring FalkorDB data"
+
+
+def _run_import(tmp_path: pathlib.Path, helper_rc: int):
+    _stand_in(tmp_path, helper_rc)
+    section = slice_section(
+        IMPORT_DATA_PATH, 'info "Restoring recovery archives"', f'info "{RESTORING_FALKORDB}"'
+    )
+    return run_with_preamble(tmp_path, _strict_preamble(tmp_path, IMPORT_DATA_PATH), section)
+
+
+def test_import_restores_the_archives_to_their_repo_paths_then_restores_live_data(tmp_path):
+    result = _run_import(tmp_path, helper_rc=0)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        f"{MARKER} command=copy source={tmp_path / 'export' / 'recovery-archive'} dest={tmp_path}"
+        in result.stdout
+    )
+    assert RESTORING_FALKORDB in result.stdout
+
+
+def test_a_failed_archive_restore_stops_the_import_before_any_live_data(tmp_path):
+    result = _run_import(tmp_path, helper_rc=1)
+
+    assert result.returncode == 1
+    assert IMPORT_ARCHIVE_FAILED in result.stdout, result.stdout + result.stderr
+    assert RESTORING_FALKORDB not in result.stdout
