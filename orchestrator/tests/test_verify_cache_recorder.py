@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
-from orchestrator.verify_cache.recorder import CacheRecord, LegRun
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig, VerifyCacheConfig
 from orchestrator.verify import (
@@ -20,6 +21,7 @@ from orchestrator.verify import (
 )
 from orchestrator.verify_cache.modes import CacheMode
 from orchestrator.verify_cache.policy import LegResult
+from orchestrator.verify_cache.recorder import CacheRecord, LegRun
 from orchestrator.verify_evidence import Leg
 from orchestrator.verify_runner import result_from_dict, result_to_dict
 
@@ -28,6 +30,18 @@ _PROGRESS_COLUMN = 73
 
 def _progress(statuses: str, percent: int) -> str:
     return f'{statuses.ljust(_PROGRESS_COLUMN)}[{percent:3d}%]'
+
+
+@pytest.fixture
+def pytest_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bare ``pytest`` on PATH running this interpreter's pytest: the launcher
+    the verify path injects ``--junitxml`` into (``python -m pytest`` gets none)."""
+    bin_dir = tmp_path / 'pytest-bin'
+    bin_dir.mkdir()
+    shim = bin_dir / 'pytest'
+    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -m pytest "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
 
 
 def _leg(leg: Leg = Leg.TEST, *, rc: int = 0) -> LegResult:
@@ -146,12 +160,13 @@ class TestLegFacts:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures('pytest_on_path')
     async def test_a_full_merge_pytest_leg_counts_its_junit_and_its_collection(self, tmp_path):
         suite = tmp_path / 'suite'
         suite.mkdir()
         (suite / 'test_two.py').write_text('def test_a():\n    pass\n\n\ndef test_b():\n    pass\n')
         module = ModuleConfig(
-            prefix='alpha', test_command=f'{sys.executable} -m pytest {suite} -q',
+            prefix='alpha', test_command=f'pytest {suite} -q -p no:cacheprovider',
             lint_command=None, type_check_command=None,
         )
         config = OrchestratorConfig(merge_verify_breadth='full')

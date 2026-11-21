@@ -49,7 +49,7 @@ from shared.python_env import without_python_env_selection
 from shared.secret_env import without_account_pool
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
-from orchestrator import verify_evidence, verify_fallback_floor, verify_plan
+from orchestrator import remote_gate, verify_evidence, verify_fallback_floor, verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
@@ -78,6 +78,8 @@ from orchestrator.verify_admission_record import (
     plan_request,
 )
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
+from orchestrator.verify_cache.policy import LegResult
+from orchestrator.verify_cache.recorder import CacheRecord, LegRun
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
@@ -783,6 +785,35 @@ def _reported_every_collected_test(stream: str) -> bool:
     return int(final_line.group(1)) == 100
 
 
+# One outcome count of a stats line that names a collected test's outcome:
+# not `deselected`, `warnings` or `rerun`.
+_PYTEST_COLLECTED_OUTCOME_RE = re.compile(r'(\d+) (?:passed|failed|errors?|skipped|xfailed|xpassed)\b')
+
+
+def pytest_reported_when_complete(output: str) -> int | None:
+    """The tests *output*'s pytest sessions reported, when every session reported all it collected.
+
+    Under ``-q`` pytest prints no ``collected N`` line. A final ``[100%]``
+    progress line above a session's tally is pytest's own attestation that the
+    tally counts every collected test. None when any session lacks one, when a
+    session never printed its tally, or when there is no session at all.
+    """
+    total = 0
+    tallies = 0
+    final_percent: int | None = None
+    for line in '\n'.join(_pytest_session_own_streams(output)).splitlines():
+        progress = _PYTEST_PROGRESS_PERCENT_RE.match(line)
+        if progress is not None:
+            final_percent = int(progress.group(1))
+        elif _PYTEST_STATS_LINE_RE.match(line):
+            if final_percent != 100:
+                return None
+            total += sum(int(count) for count in _PYTEST_COLLECTED_OUTCOME_RE.findall(line))
+            tallies += 1
+            final_percent = None
+    return total if tallies and final_percent is None else None
+
+
 def _crashed_session_stop_percent(stream: str) -> int | None:
     """Return the percentage of collected tests a crashed session stopped at.
 
@@ -1391,6 +1422,7 @@ class _JunitTestIds(NamedTuple):
 
     failing: list[str]
     skipped: list[str]
+    testcases: int
 
 
 # pytest's junitxml records two outcomes of tests that DID run as a
@@ -1463,12 +1495,14 @@ def _extract_test_ids_from_junit(path: Path) -> _JunitTestIds | None:
 
     failing: set[str] = set()
     skipped: set[str] = set()
+    testcases = 0
     for testcase in root.iter('testcase'):
+        testcases += 1
         if testcase.find('failure') is not None or testcase.find('error') is not None:
             failing.add(_junit_testcase_id(testcase))
         elif _junit_testcase_never_ran(testcase):
             skipped.add(_junit_testcase_id(testcase))
-    return _JunitTestIds(failing=sorted(failing), skipped=sorted(skipped))
+    return _JunitTestIds(failing=sorted(failing), skipped=sorted(skipped), testcases=testcases)
 
 
 def extract_test_outcomes_from_junit(path: Path) -> dict[str, str] | None:
@@ -5156,6 +5190,9 @@ class VerifyResult:
     units: tuple[verify_evidence.VerifyUnit, ...] | None = None
     # Task 5651: a plan-level fact like `plan`, stamped where `plan` is stamped.
     cache_mode: CacheMode = CacheMode.OFF
+    # Task 5653: what this verdict leaves for the verify-result cache. Off-wire:
+    # a runner's record is not shipped, and it never enters equality.
+    cache_record: CacheRecord | None = remote_gate.off_wire_field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         mismatch = _module_attribution_mismatch(
@@ -8503,16 +8540,20 @@ async def run_verification(
     # B3 degrade signal. See _extract_test_ids_from_junit's docstring.
     failing_test_ids: list[str] | None = None
     skipped_test_ids: list[str] | None = None
+    junit_testcases: int | None = None
     if junit.kind == 'attributing':
         assert junit.leg_path is not None  # _JunitReportPlan pairs them
         junit_ids = _extract_test_ids_from_junit(junit.leg_path)
         if junit_ids is not None:
-            failing_test_ids, skipped_test_ids = junit_ids
+            failing_test_ids, skipped_test_ids, junit_testcases = junit_ids
+    owned_reports = junit.reports_to_archive(attempt.test.segments)
+    if junit.kind == 'cost':
+        junit_testcases = await _junit_testcases_of(owned_reports)
     # The report dies with its worktree; the LOG archival above is gated on
     # `not passed`, this deliberately is not. The gzip runs off the event
     # loop, which also carries the scheduler, the MCP server and the merge
     # worker: ~0.2s per 6MB report, and a segmented task leg archives several.
-    for report, segment_label in junit.reports_to_archive(attempt.test.segments):
+    for report, segment_label in owned_reports:
         await asyncio.to_thread(
             _archive_junit_report,
             report, archive_root, task_id, _archive_attempt_id(attempt_id),
@@ -8550,6 +8591,10 @@ async def run_verification(
             verify_evidence.module_leg_unit(module_prefix, check.label, check.rc)
             for check in attempt.checks if check.cmd is not None
         ),
+        cache_record=CacheRecord(
+            role=role, modes=config.verify_cache,
+            legs=_leg_runs(attempt.checks, module_config, junit_testcases=junit_testcases),
+        ),
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -8585,6 +8630,34 @@ async def run_verification(
             else:
                 logger.info('Verification failed: %s%s', summary, detail_tail)
     return result
+
+
+async def _junit_testcases_of(reports: list[tuple[Path, str | None]]) -> int | None:
+    """The testcases the cost *reports* hold together; None when any is missing or unparseable."""
+    counts = [await asyncio.to_thread(_extract_test_ids_from_junit, report) for report, _ in reports]
+    if not counts or any(ids is None for ids in counts):
+        return None
+    return sum(ids.testcases for ids in counts if ids is not None)
+
+
+def _leg_runs(
+    checks: Iterable[CheckRun], module_config: ModuleConfig | None, *, junit_testcases: int | None,
+) -> tuple[LegRun, ...]:
+    """What each check that ran says about recording its green (verify_cache/policy.py::LegResult)."""
+    never_cache = module_config is not None and module_config.verify_cache == 'never'
+    prefix = module_config.prefix if module_config is not None else None
+    return tuple(
+        LegRun(verify_evidence.module_leg_name(prefix, check.label), LegResult(
+            leg=verify_evidence.Leg(check.label), rc=check.rc, timed_out=check.timed_out,
+            trivial=False, flake_suppressed=False, never_cache=never_cache,
+            junit_tests=junit_testcases if check.label == verify_evidence.Leg.TEST else None,
+            collected=(
+                pytest_reported_when_complete(check.output)
+                if check.label == verify_evidence.Leg.TEST else None
+            ),
+        ))
+        for check in checks if check.cmd is not None
+    )
 
 
 def _aggregate_failing_ids_by_module(
@@ -8749,6 +8822,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         test_leg_failed=any(r.test_leg_failed for r in results),
         admission_legs=tuple(leg for r in results for leg in (r.admission_legs or ())) or None,
         units=_aggregate_units(results),
+        cache_record=CacheRecord.concat(r.cache_record for r in results),
     )
 
 

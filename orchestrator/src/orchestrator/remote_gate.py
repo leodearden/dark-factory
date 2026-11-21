@@ -107,6 +107,19 @@ class GateReplyError(ValueError):
     """A gate's stdout is not the documented reply; the caller classes it 'gate'."""
 
 
+_WIRE_METADATA_KEY = 'df_wire'
+
+
+def off_wire_field(**field_kwargs: typing.Any) -> typing.Any:
+    """A dataclass field that never crosses the dispatcher/remote boundary."""
+    return dataclasses.field(**field_kwargs, metadata={_WIRE_METADATA_KEY: False})
+
+
+def wire_fields(cls: type) -> tuple[dataclasses.Field[typing.Any], ...]:
+    """*cls*'s fields that cross the dispatcher/remote boundary: all but its off-wire ones."""
+    return tuple(f for f in dataclasses.fields(cls) if f.metadata.get(_WIRE_METADATA_KEY, True))
+
+
 def _annotation_text(annotation: object) -> str:
     return annotation if isinstance(annotation, str) else inspect.formatannotation(annotation)
 
@@ -118,7 +131,7 @@ def _field_shapes(cls: type) -> list[list[str]]:
         hints = {}
     return [
         [f.name, _annotation_text(hints.get(f.name, f.type))]
-        for f in dataclasses.fields(cls)
+        for f in wire_fields(cls)
     ]
 
 

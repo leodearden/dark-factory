@@ -80,6 +80,7 @@ from orchestrator.remote_gate import (
     parse_ensure_report,
     reap_script_text,
     shim_suspected,
+    wire_fields,
 )
 from orchestrator.task_verify_spec import (
     TaskVerifySpec,
@@ -471,8 +472,17 @@ def result_to_dict(vr: VerifyResult) -> dict:
     dict here, and ``json.dumps`` flattens its ``StrEnum`` members to their values and
     its tuple to an array — so this direction still needs no special handling.  The
     asymmetry is entirely on the READ side; see :func:`result_from_dict`.
+
+    Off-wire fields (``remote_gate.wire_fields``) are left out, never walked: a
+    runner's cache record is shipped and recorded only after gamma2 (task 9123)
+    keys ``toolchain.runner``.
     """
-    return dataclasses.asdict(vr)
+    shipped = {f.name for f in wire_fields(VerifyResult)}
+    off_wire = [f.name for f in dataclasses.fields(vr) if f.name not in shipped]
+    wire = dataclasses.asdict(dataclasses.replace(vr, **dict.fromkeys(off_wire)))
+    for name in off_wire:
+        del wire[name]
+    return wire
 
 
 def result_from_dict(d: dict) -> VerifyResult:
