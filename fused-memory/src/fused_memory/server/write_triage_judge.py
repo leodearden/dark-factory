@@ -880,11 +880,11 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     in config.yaml). Reading the config section is for a deployment that pins a
     key or points at an OpenAI-compatible local endpoint.
 
-    ``base_url`` is ``write_triage.judge_api_url`` when set, else
-    ``llm.providers.<provider>.api_url``. The override is judge-only, so the
-    main LLM arm is unaffected; the ``api_key`` still comes from the provider
-    section (a judge-scoped key is task ν's, not this leaf's), and so does
-    ``serves_responses_api`` below.
+    ``base_url`` is ``write_triage.judge_api_url`` when set and ``api_key`` is
+    ``write_triage.judge_api_key`` when set; each otherwise comes from
+    ``llm.providers.<provider>``. Both overrides are judge-only, so the main
+    LLM arm is unaffected. ``serves_responses_api`` below still comes from
+    ``llm.client_class``.
 
     ``serves_responses_api`` is the deployment's existing declaration of what
     the configured OpenAI endpoint speaks — ``llm.client_class``, the same
@@ -900,7 +900,7 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     providers = getattr(llm, 'providers', None)
     section = getattr(providers, provider, None)
     client_kwargs: dict[str, Any] = {}
-    api_key = getattr(section, 'api_key', None)
+    api_key = resolve_judge_api_key(memory_service) or getattr(section, 'api_key', None)
     if isinstance(api_key, str) and api_key:
         client_kwargs['api_key'] = api_key
     api_url = resolve_judge_api_url(memory_service) or getattr(section, 'api_url', None)
