@@ -5,9 +5,9 @@ This script carries THREE INDEPENDENT RULES.  Rules A and B are mock-spec
 discipline and share the AST predicates ``_is_magicmock_call`` / ``_is_specced``;
 Rule C is a wait-deadline rule and shares none of them.  What ALL THREE share is
 only the exemption-comment contract (``_lint_cli.py::is_exempted``), the
-single ``ast.walk`` and the output format.  The per-file debt-budget machinery
-(``_debt_entry`` / ``_apply_debt_budget``) is Rule C's alone: Rules A and B are
-hot for every scanned file.  They have separate detection pipelines,
+single ``ast.walk`` and the output format.  Of the three, only Rule C carries a
+per-file debt budget (``_lint_cli.py::DebtBaseline`` / ``apply_debt_budget``):
+Rules A and B are hot for every scanned file.  They have separate detection pipelines,
 separate message vocabularies and separate ``# noqa`` codes.  Every statement in the
 "Rule A" section below is scoped to Rule A and says nothing about Rule B or Rule C.
 
@@ -281,7 +281,7 @@ from __future__ import annotations
 import ast
 import sys
 from collections.abc import Callable, Iterable, Iterator
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import NamedTuple, TypeGuard
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -289,7 +289,15 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # Sibling import that survives `python3 -I`: see _lint_cli.py's module docstring.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
-    from _lint_cli import Violation, discover_files, is_exempted, run_cli
+    from _lint_cli import (
+        DebtBaseline,
+        DebtEntry,
+        Violation,
+        apply_debt_budget,
+        discover_files,
+        is_exempted,
+        run_cli,
+    )
 finally:
     del sys.path[0]
 
@@ -507,94 +515,6 @@ def _dataclass_violation_msg(shape: _DataclassShape, kwargs: set[str]) -> str:
     )
 
 
-class _DebtEntry(NamedTuple):
-    """One file's row in a debt baseline.
-
-    *key* is the baseline's OWN spelling of the path, which a remedy must quote: the
-    scanned filename may be absolute, and only the key is an edit the author can apply
-    verbatim.
-    """
-
-    key: str
-    budget: int
-
-
-def _debt_entry(filename: str, debt: dict[str, int]) -> _DebtEntry | None:
-    """Return *filename*'s row in the *debt* mapping, or None if it is not a debt file.
-
-    Parameterised over *debt* so every baseline matches paths the same way (task 4246).
-
-    Compares TRAILING PATH COMPONENTS, not substrings: ``a/b/c.py`` matches an
-    entry ``b/c.py`` because its last two components are exactly ``b`` and ``c.py``.
-    Component-awareness is what stops ``orchestrator/tests/not_test_merge_queue.py``
-    — which merely contains a debt filename as a substring — from being grandfathered.
-
-    Trailing-component matching (rather than an exact string compare) is required
-    because the nine call sites pass repo-relative paths while pytest passes
-    absolutes; both must reach the same verdict.
-
-    Returns None (not a zero budget) for a non-debt file so callers can distinguish
-    "no budget recorded — report every site" from "budget of zero".
-    """
-    parts = PurePosixPath(filename.replace('\\', '/')).parts
-    for entry, allowed in debt.items():
-        entry_parts = PurePosixPath(entry).parts
-        if len(parts) >= len(entry_parts) and parts[-len(entry_parts) :] == entry_parts:
-            return _DebtEntry(entry, allowed)
-    return None
-
-
-def _apply_debt_budget(
-    found: list[Violation],
-    entry: _DebtEntry | None,
-    *,
-    filename: str,
-    build_overrun_msg: Callable[[_DebtEntry, int], str],
-    build_slack_msg: Callable[[_DebtEntry, int], str],
-) -> list[Violation]:
-    """Compare one rule's violation COUNT for a file against its debt budget.
-
-    This is the single place a file's count is compared with its budget.
-
-    Both builders are the caller's own ``(entry, found) -> str`` message builders,
-    REQUIRED and keyword-only (task 4246 amendment pass).  Each rule's report carries
-    its OWN remedy — telling a Rule C overrun to migrate a mock double would send the
-    reader down a dead end — so there is deliberately no default: a future Rule D
-    that forgets one fails at the call, rather than silently inheriting another
-    rule's remedy with no type error and no test failure.  They are passed as
-    builders rather than built strings so each message is computed only on its own
-    branch and no caller has to invent a value for the *entry is None* branch.
-
-    - Not a debt file (*entry* is None) → every violation is reported unchanged.
-    - Exactly at budget → silence: this is the grandfathering the baseline exists for.
-    - Over budget → report exactly ``found - budget`` violations, so the noise is
-      proportional to the overrun rather than dumping every violation of a large
-      debt file on someone who added one.  The reported sites are the last in source
-      order.  That choice is deterministic rather than diagnostic — the checker
-      cannot know which site is new — and the message says so explicitly.
-    - Under budget → ONE file-level violation at *filename* line 1, col 0, naming
-      the budget edit.  Slack has no site (the removed one is gone), and a budget
-      above the measurement would silently licence that many new violations (task
-      6202 moved this check here from another package's test suite).
-    """
-    if entry is None:
-        return found
-    if len(found) == entry.budget:
-        return []
-    if len(found) < entry.budget:
-        return [
-            Violation(
-                filename=filename,
-                lineno=1,
-                col_offset=0,
-                message=build_slack_msg(entry, len(found)),
-            )
-        ]
-    ordered = sorted(found, key=lambda v: (v.lineno, v.col_offset))
-    message = build_overrun_msg(entry, len(ordered))
-    return [v._replace(message=message) for v in ordered[entry.budget :]]
-
-
 def _literal_kwarg_names(call: ast.Call) -> set[str]:
     """Return *call*'s literal keyword-argument names.
 
@@ -734,7 +654,7 @@ def _dataclass_double_violation(
 # 3980 spent a task removing, and what makes it safe for task 4246 to delete that
 # module's file-local copy of this guard.
 #
-# Two entries share the trailing ``tests/test_harness.py``; ``_debt_entry`` matches
+# Two entries share the trailing ``tests/test_harness.py``; ``DebtBaseline`` matches
 # on trailing path COMPONENTS, so the package directory keeps them distinct.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     # orchestrator/tests
@@ -832,8 +752,11 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'escalation/tests/test_prefix_resolver_client.py': 2,
 }
 
+# The dict above is the source data; this is the one indexed lookup built from it.
+_WALL_CLOCK_DEADLINE_BUDGETS = DebtBaseline.from_mapping(_WALL_CLOCK_DEADLINE_DEBT)
 
-def _wall_clock_overrun_msg(entry: _DebtEntry, found: int) -> str:
+
+def _wall_clock_overrun_msg(entry: DebtEntry, found: int) -> str:
     """Build the message for a Rule C debt file that has grown past its budget.
 
     Carries Rule C's OWN remedy, never Rule B's: a wall-clock deadline is not fixed
@@ -857,7 +780,7 @@ def _wall_clock_overrun_msg(entry: _DebtEntry, found: int) -> str:
     )
 
 
-def _wall_clock_slack_msg(entry: _DebtEntry, found: int) -> str:
+def _wall_clock_slack_msg(entry: DebtEntry, found: int) -> str:
     """Build the message for a Rule C debt file carrying fewer violations than its budget.
 
     Names the one edit that fixes it, quoting the baseline's own key.  No per-site
@@ -1576,10 +1499,10 @@ def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> lis
     violations: list[Violation] = []
 
     # Rule C violations are collected separately so its debt file's budget can be
-    # compared with the COUNT after the walk (see _apply_debt_budget).  Looked up ONCE
-    # per file, not per node.
+    # compared with the COUNT after the walk (see _lint_cli.py::apply_debt_budget).
+    # Looked up ONCE per file, not per node.
     wall_clock: list[Violation] = []
-    wall_clock_debt = _debt_entry(filename, _WALL_CLOCK_DEADLINE_DEBT)
+    wall_clock_debt = _WALL_CLOCK_DEADLINE_BUDGETS.entry_for(filename)
 
     # ONE walk, ALL THREE rules.  Rule B was originally a second full ast.walk over the
     # same tree, which cost ~43% of total checker runtime (20.8s → 30.7s over the seven
@@ -1661,7 +1584,7 @@ def find_violations_in_tree(tree: ast.Module, source: str, filename: str) -> lis
     # individual sites: a grandfathered file stays silent only at exactly its budget,
     # reports exactly its overrun above it, and reports one slack violation below it.
     violations.extend(
-        _apply_debt_budget(
+        apply_debt_budget(
             wall_clock,
             wall_clock_debt,
             filename=filename,

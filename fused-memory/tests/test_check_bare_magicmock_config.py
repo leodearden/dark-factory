@@ -2524,7 +2524,7 @@ class TestWallClockDeadlineBaselineIntegrity:
     offending file the census missed is reported only as a wall of lint output.
 
     The per-file comparison of count against budget does NOT live here: the
-    checker's own ``_apply_debt_budget`` makes it at every lint call site (and
+    checker's ``_lint_cli.py::apply_debt_budget`` makes it at every lint call site (and
     TestAllScannedTestDirsClean runs that lint over every scanned dir), so a
     removal reds the owning package's lint_command naming the edit (task 6202).
     What a per-file lint cannot see is a debt file that no longer exists, which
