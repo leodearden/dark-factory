@@ -1030,7 +1030,7 @@ class TestLayeredConfig:
         assert config.max_turns.architect == 180
 
     @pytest.mark.parametrize('role', ['implementer', 'debugger', 'merger', 'deep_reviewer'])
-    def test_effort_defaults_are_xhigh_for_opus55_roles(self, tmp_path, role):
+    def test_packaged_effort_default_is_xhigh(self, tmp_path, role):
         """A project config with no effort block resolves these roles to xhigh."""
         project_cfg = tmp_path / 'config.yaml'
         project_cfg.write_text(yaml.dump({'max_concurrent_tasks': 8}))

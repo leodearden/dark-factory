@@ -294,14 +294,8 @@ class ReviewCheckpoint:
             role_name='deep_reviewer',
             role_defaults=RoleDefaults(
                 DEEP_REVIEWER.default_model,
-                # Layer-4 effort base kept == EffortConfig.deep_reviewer's
-                # default ('xhigh') — the value config-layer-3 always supplies
-                # today, and the site's own pre-η getattr fallback was
-                # getattr(config.effort,'deep_reviewer','max'). AgentRole has no
-                # default_effort field, so effort is the one RoleDefaults field
-                # not sourced from DEEP_REVIEWER; matching the config default
-                # means a future EffortConfig field removal degrades to the same
-                # effort, not a silent 'xhigh'→'high' drop.
+                # Kept == EffortConfig.deep_reviewer's default, pinned by
+                # orchestrator/tests/test_out_of_band_routing.py::TestDeepReviewerAdoptsResolveRoute
                 'xhigh',
                 DEEP_REVIEWER.default_budget, DEEP_REVIEWER.default_max_turns,
             ),
