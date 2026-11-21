@@ -1281,7 +1281,8 @@ class TestWarmLaneStealDispositions:
 class TestRestackFailureRows:
     """Re-stack failure rows (task 10473, PRD 5.3): only a conflict requeues,
     and uncounted; a re-stack that could not be done or undone cleanly, and a
-    stack-base record that does not read back, each block."""
+    stack-base record that does not read back, each block and go to a human,
+    as a branch reset does."""
 
     def test_restack_conflict_is_an_uncounted_requeue(self):
         from orchestrator.branch_stack import RestackConflict
@@ -1294,22 +1295,22 @@ class TestRestackFailureRows:
         assert disp.escalate_to_human is False
         assert disp.reason_prefix == 'restack_conflict'
 
-    def test_restack_blocked_blocks(self):
+    def test_restack_blocked_blocks_to_a_human(self):
         from orchestrator.branch_stack import RestackBlocked
         from orchestrator.workflow_types import RequeueKind, _lookup_disposition
 
         disp = _lookup_disposition(RestackBlocked)
         assert disp is not None
         assert disp.requeue_kind is RequeueKind.BLOCK
-        assert disp.escalate_to_human is False
+        assert disp.escalate_to_human is True
         assert disp.reason_prefix.startswith('Re-stack blocked')
 
-    def test_an_unconfirmed_stack_record_blocks(self):
+    def test_an_unconfirmed_stack_record_blocks_to_a_human(self):
         from orchestrator.git_ops import StackRecordUnconfirmed
         from orchestrator.workflow_types import RequeueKind, _lookup_disposition
 
         disp = _lookup_disposition(StackRecordUnconfirmed)
         assert disp is not None
         assert disp.requeue_kind is RequeueKind.BLOCK
-        assert disp.escalate_to_human is False
+        assert disp.escalate_to_human is True
         assert disp.reason_prefix.startswith('Stack-base record unconfirmed')
