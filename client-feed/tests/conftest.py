@@ -19,6 +19,7 @@ if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from df_pytest_isolation import arm_test_root_isolation, reject_unsafe_basetemp
+from shared.pytest_fake_clock import fake_clock  # noqa: F401  — the binding IS the wiring
 
 
 def pytest_configure(config):

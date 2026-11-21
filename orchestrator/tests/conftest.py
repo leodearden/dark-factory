@@ -93,6 +93,7 @@ from _orch_helpers import (  # noqa: E402
     stamp_stock_routing_config,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
+from shared.pytest_fake_clock import fake_clock  # noqa: E402, F401  — the binding IS the wiring
 
 from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402

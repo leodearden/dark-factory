@@ -139,6 +139,8 @@ if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
         if _p not in sys.path:
             sys.path.insert(0, _p)
 
+from shared.pytest_fake_clock import fake_clock  # noqa: E402, F401  — the binding IS the wiring
+
 # NOTE (task 3644, review finding #6): the `scripts/` path injection the
 # census<->escalation E2E contract test needs is NOT done here.  It lives in
 # that one test module (`test_legibility_census_escalation_e2e.py`), scoped to
