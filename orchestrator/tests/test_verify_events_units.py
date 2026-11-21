@@ -388,8 +388,8 @@ def _commit(cwd: Path, name: str) -> None:
     _git(cwd, 'commit', '-q', '-m', name)
 
 
-@pytest.fixture
-def config(tmp_path: Path) -> OrchestratorConfig:
+def task_scene_config(tmp_path: Path) -> OrchestratorConfig:
+    """A one-commit repo on main under *tmp_path*, and the config a TaskWorkflow over it runs under."""
     repo = tmp_path / 'repo'
     repo.mkdir()
     _git(repo, 'init', '-q', '-b', 'main')
@@ -403,6 +403,11 @@ def config(tmp_path: Path) -> OrchestratorConfig:
             main_branch='main', branch_prefix='task/', remote='origin', worktree_dir='.worktrees',
         ),
     )
+
+
+@pytest.fixture
+def config(tmp_path: Path) -> OrchestratorConfig:
+    return task_scene_config(tmp_path)
 
 
 @pytest.fixture

@@ -10,10 +10,21 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
+from test_verify_events_units import (
+    _TASK_ID,
+    _forked_task_workflow,
+    _git,
+    _task_workflow,
+    task_scene_config,
+)
 
+from orchestrator.artifacts import ReviewAggregation
 from orchestrator.config import ModuleConfig, OrchestratorConfig, VerifyCacheConfig
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps
 from orchestrator.verify import (
     VerifyResult,
     pytest_reported_when_complete,
@@ -30,10 +41,18 @@ from orchestrator.verify_cache.recorder import (
     consume_replayed,
     record_greens,
 )
-from orchestrator.verify_cache.registry import Entry, Registry
-from orchestrator.verify_cache.replay import ReplayPlan, UnitDecision
-from orchestrator.verify_evidence import Leg, UnitOutcome, UnitTier, VerifyUnit, module_leg_unit
+from orchestrator.verify_cache.registry import Entry, Registry, registry_db_path
+from orchestrator.verify_cache.replay import CacheAccess, ReplayPlan, UnitDecision
+from orchestrator.verify_evidence import (
+    Leg,
+    TipUnresolved,
+    UnitOutcome,
+    UnitTier,
+    VerifyUnit,
+    module_leg_unit,
+)
 from orchestrator.verify_runner import result_from_dict, result_to_dict
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 _PROGRESS_COLUMN = 73
 
@@ -568,3 +587,118 @@ class TestConsumeReplayed:
         assert outcome.backs_every_hit
         assert outcome.consumed == ()
         assert not db_path.exists()
+
+
+# The task role records its greens where its workflow_verify row is emitted (A3).
+
+_TASK_LOG = VerifyCacheConfig(task_mode=CacheMode.LOG)
+_TASK_UNIT = 'module:alpha:test'
+
+
+def _task_green() -> tuple[VerifyResult, UnitKey]:
+    """A passing task-role verdict whose one test leg ran clean under a keyed, admitted unit."""
+    key = _key(_TASK_UNIT)
+    replay = ReplayPlan(
+        role='task', modes=_TASK_LOG,
+        tree=_decided(Decision.MISS, key=_key('tree', tier=UnitTier.TREE)),
+        modules={_TASK_UNIT: _decided(Decision.MISS, key=key)},
+    )
+    units, record = replay.settle((_ran(_TASK_UNIT),), (LegRun(_TASK_UNIT, _clean(Leg.TEST)),))
+    return _result(units=units, cache_record=record, duration_secs=1.0), key
+
+
+class TestWorkflowRecordsTaskGreens:
+    @staticmethod
+    async def _scene(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, forked: bool = False,
+    ) -> tuple[OrchestratorConfig, EventStore, TaskWorkflow]:
+        config = task_scene_config(tmp_path)
+        config.pre_merge_reverify = forked
+        store = EventStore(tmp_path / 'events.db', run_id='r')
+        scene = _forked_task_workflow if forked else _task_workflow
+        workflow = await scene(config, GitOps(config.git, config.project_root), store, monkeypatch)
+        monkeypatch.setattr(workflow, '_review', AsyncMock(return_value=ReviewAggregation(
+            has_blocking_issues=False, blocking_issues=[], suggestions=[], reviews={'analyst': {}},
+        )))
+        return config, store, workflow
+
+    @staticmethod
+    def _verifies(monkeypatch: pytest.MonkeyPatch, result: VerifyResult) -> AsyncMock:
+        verify = AsyncMock(return_value=result)
+        monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify)
+        return verify
+
+    @staticmethod
+    async def _recorded_at(config: OrchestratorConfig, key: UnitKey) -> Entry:
+        return (await _recorded(Registry(registry_db_path(config.project_root)), key))[_TASK_UNIT]
+
+    @pytest.mark.asyncio
+    async def test_the_implement_site_records_its_green_against_the_review_edge_row(self, tmp_path, monkeypatch):
+        config, store, workflow = await self._scene(tmp_path, monkeypatch)
+        result, key = _task_green()
+        self._verifies(monkeypatch, result)
+
+        assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
+
+        [row] = store.fetch_events_by_type(EventType.workflow_verify)
+        entry = await self._recorded_at(config, key)
+        assert entry.evidence_event_id == row['id']
+        assert (entry.run_id, entry.sha) == ('r', row['data']['tip_sha'])
+
+    @pytest.mark.asyncio
+    async def test_the_pre_merge_site_records_its_green_and_verifies_through_the_dispatchers_registry(
+        self, tmp_path, monkeypatch,
+    ):
+        config, store, workflow = await self._scene(tmp_path, monkeypatch, forked=True)
+        result, key = _task_green()
+        verify = self._verifies(monkeypatch, result)
+
+        assert await workflow._rebase_before_enqueue() is True
+
+        [row] = store.fetch_events_by_type(EventType.workflow_verify)
+        entry = await self._recorded_at(config, key)
+        assert entry.evidence_event_id == row['id']
+        assert (entry.run_id, entry.sha) == ('r', row['data']['tip_sha'])
+        assert verify.await_args is not None
+        access = verify.await_args.kwargs['verify_cache']
+        assert isinstance(access, CacheAccess)
+        assert access.registry is not None
+        assert (await access.registry.summary()).path == registry_db_path(config.project_root)
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_without_a_cache_record_records_nothing(self, tmp_path, monkeypatch):
+        config, store, workflow = await self._scene(tmp_path, monkeypatch)
+        self._verifies(monkeypatch, _result(duration_secs=1.0))
+
+        assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
+
+        assert len(store.fetch_events_by_type(EventType.workflow_verify)) == 1
+        assert not registry_db_path(config.project_root).exists()
+
+    @pytest.mark.asyncio
+    async def test_an_unresolved_tip_records_nothing(self, tmp_path, monkeypatch):
+        config, store, workflow = await self._scene(tmp_path, monkeypatch)
+        self._verifies(monkeypatch, _task_green()[0])
+        monkeypatch.setattr(workflow, '_verified_tip', AsyncMock(return_value=TipUnresolved.HEAD_UNREADABLE))
+
+        assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
+
+        [row] = store.fetch_events_by_type(EventType.workflow_verify)
+        assert row['data']['tip_sha_unresolved'] is True
+        assert not registry_db_path(config.project_root).exists()
+
+    @pytest.mark.asyncio
+    async def test_a_checkpoint_hit_records_nothing(self, tmp_path, monkeypatch):
+        config, store, workflow = await self._scene(tmp_path, monkeypatch)
+        assert workflow.worktree is not None
+        head = _git(workflow.worktree, 'rev-parse', 'HEAD')
+        EventStore(tmp_path / 'events.db', run_id='prior').emit(
+            EventType.workflow_verify, task_id=_TASK_ID, data={'passed': True, 'tip_sha': head},
+        )
+        verify = self._verifies(monkeypatch, _task_green()[0])
+
+        assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
+
+        verify.assert_not_awaited()
+        assert store.fetch_events_by_type(EventType.workflow_verify) == []
+        assert not registry_db_path(config.project_root).exists()
