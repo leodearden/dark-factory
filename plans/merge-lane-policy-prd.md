@@ -124,9 +124,15 @@ merger has merged but the verifier has not yet seen; the dispatch-side re-anchor
 the rebased candidate becomes a `RealMergeItem` (`base_sha = rebased_onto`, merge commit = `rebased_sha`,
 `speculative=False`, `remerge_recovery` cleared) dispatched through `_dispatch_item` onto the fastest free
 host; its successors are re-anchored on `rebased_sha` by D1/D2 instead of voided. The gate decision row
-(`reverify_gate_decision.py`) is still written before the verify. Because the rebased head is itself an
-ordinary dispatch it may chain (D5). The 8329 class (void at adoption when the head was gate-rebased) is
-subsumed: the successor is re-anchored, not voided.
+(`reverify_gate_decision.py`) is still written before the verify. Amended 2026-11-18, Leo's ruling (task
+10721): the rebased head never chains. Its first verdict was about its own tree and the re-verify only covers
+the drift on main, so it verifies its own rebased tree alone. Its task carries the D6 un-chained mark from that
+dispatch until its request is retired, which also covers a dispatch-time re-merge onto a main that moved
+again. The successors re-parked behind it, and requests buffered in the lane, still stack speculatively behind
+it and may chain on their own dispatch. Measured: of five rebased heads re-verified as 6-chains on
+2026-11-17/18, four lost the landing (6836, 6904, 10423, 5897). The amendment does not reach task 8329, a
+chain built ON a head that the gate then rebases; that successor-side case is the next sentence's. The 8329
+class (void at adoption when the head was gate-rebased) is subsumed: the successor is re-anchored, not voided.
 
 **D4. K = hosts + 1 and the host lease is released at verdict.** `harness.py::Harness._speculation_k`
 returns `1 + enabled runners + 1`. `_finalize_inflight` → `_resolve_and_release` releases the host lease as
@@ -135,9 +141,10 @@ re-verify (D3) or a landing probe re-acquires a host through `HostAllocator.acqu
 policy rather than holding one. Landing itself (`finalizing`, ~3 min) does not need a verify host. The
 serial-laptop policy value is NOT added (Leo: straight to K = hosts + 1).
 
-**D5. The head chains when nothing else is in the frontier.** `_deep_chain_placement` guard 1 becomes
-"not speculative AND another entry is in the verify frontier → None". `_adopt_head_on_tip_authority` tolerates
-the chained item being the head (it currently excludes the tip's own entry and cancels `_inflight[0]`).
+**D5. The head chains when nothing else is in the frontier, except a gate-rebased head (D3).**
+`_deep_chain_placement` guard 1 becomes "not speculative AND another entry is in the verify frontier → None".
+`_adopt_head_on_tip_authority` tolerates the chained item being the head (it currently excludes the tip's own
+entry and cancels `_inflight[0]`).
 
 **D6. A red chain marks its members, and each verifies alone.** Amended 2026-11-18, Leo's ruling on
 esc-8528-11: the un-chained mark of tasks 10617/10723 owns red-chain isolation; the suspect bisect is retired.
@@ -146,8 +153,9 @@ are marked (`worker.py::_next_dispatch_unchained`) and the owner is requeued. A 
 owner nor a link, so its next verify covers its own tree alone and the verdict is its own: a passer lands and
 the red one is blocked with its findings. The mark is removed only when the task's request is retired (landed,
 blocked or dropped; `worker.py::_retire_item`). Requests that are not marked keep chaining at the depth D7
-gives. A chain verify that raises marks its owner the same way. `_chain_halving_state`, `select_chain_depth`
-and `next_halving_state` are retired. (D6 as first ruled, a suspect list searched by halving, never landed.)
+gives. A chain verify that raises marks its owner the same way, and a gate-rebased head's dispatch (D3)
+marks its own task. `_chain_halving_state`, `select_chain_depth` and `next_halving_state` are retired. (D6 as
+first ruled, a suspect list searched by halving, never landed.)
 
 **D7. Depth from a rolling pass-rate estimate, no fixed cap.** p̂ = per-item pass estimate from the last 30
 tip verdicts of the rounds the policy sized, p̂ = pass_rate^(1/mean k). A round the policy did not size (a
@@ -335,6 +343,7 @@ module and command named. The screen leg runs `scripts/merge_screen.yaml`'s node
 | 11 | staged `plans/x.capability-manifest.yaml` naming a script that does not exist | | commit refused by the screen leg naming the manifest test |
 | 12 | main-tip sweep reports `type_error` on `module:scripts:type` | 8411 landed | hold armed with F containing `module:scripts:type`; an item whose tree passes the module's type check verifies at once |
 | 13 | canary readout | 7 d after deploy | every §1 ratio computed from the new fields with the report's rules; a false predicate sets `chain_cap: 0` and files one L2 |
+| 14 | gate re-verify of a head alone in the frontier, queue ≥ 2 | D3, chain_cap > 0 | the rebased head's re-verify has `chain_items = 1`, a re-merge at its dispatch included; signal: no `merge_verify` with `chain_items > 1` follows a `merge_reverify_gate{reverify: true}` for the same request before its next `merge_finalized` (`test_merge_queue_deep_reservation.py::TestGTheRebasedHeadReverifiesItsOwnTreeUnchained`) |
 
 ## 8. Decomposition plan
 
