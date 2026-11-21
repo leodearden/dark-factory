@@ -1,10 +1,12 @@
 """What Scheduler.task_priority answers from between ticks (task 9933)."""
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
 import pytest
+from shared.scheduler_state import SchedulerStateSnapshot
 
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 from orchestrator.scheduler_priority_lookup import (
@@ -14,6 +16,10 @@ from orchestrator.scheduler_priority_lookup import (
     pin_orders,
 )
 from orchestrator.task_priority import PINNED, TaskPriority
+
+
+def _no_store() -> OverrideStore | None:
+    return None
 
 
 def _row(*, pinned: bool, pin_order: int | None = None) -> OverrideRow:
@@ -56,6 +62,8 @@ class TestLastWrittenTiers:
     @pytest.mark.parametrize('content', [
         b'not json {',
         b'{"effective_priorities": ["not", "a", "map"]}',
+        b'{"effective_priorities": {"P": "\xff"}}',
+        b'{"effective_priorities": ' + b'1' * 5000 + b'}',
     ])
     def test_an_unreadable_snapshot_reads_nothing_and_warns(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, content: bytes,
@@ -66,6 +74,14 @@ class TestLastWrittenTiers:
 
         assert last_written_tiers(path) == {}
         assert len(_warnings(caplog)) == 1
+
+    def test_a_pinned_entry_is_no_base_tier(self, tmp_path: Path) -> None:
+        path = tmp_path / 'scheduler_state.json'
+        path.write_text(json.dumps(SchedulerStateSnapshot(
+            effective_priorities={'P': PINNED, 'Q': 'low'},
+        ).to_json()))
+
+        assert last_written_tiers(path) == {'Q': 'low'}
 
 
 class TestPinOrders:
@@ -83,19 +99,34 @@ class TestPinOrders:
 class TestLookupPins:
 
     def test_without_a_store_the_pin_is_unknown(self) -> None:
-        pins = LookupPins(None, '/project', clock=lambda: 0.0)
+        pins = LookupPins(_no_store, '/project', clock=lambda: 0.0)
 
         assert pins.priority('X', 'low') == TaskPriority(tier='low', pinned=None, base_tier='low')
 
     def test_without_a_store_adopting_rows_changes_nothing(self) -> None:
-        pins = LookupPins(None, '/project', clock=lambda: 0.0)
+        pins = LookupPins(_no_store, '/project', clock=lambda: 0.0)
 
         pins.adopt({'X': _row(pinned=True, pin_order=1)})
 
         assert pins.priority('X', 'low').pinned is None
 
+    @pytest.mark.asyncio
+    async def test_a_store_wired_after_construction_is_the_one_read(self, tmp_path: Path) -> None:
+        now = [0.0]
+        wired: list[OverrideStore | None] = [None]
+        pins = LookupPins(lambda: wired[0], str(tmp_path), clock=lambda: now[0])
+        store = OverrideStore(tmp_path / 'overrides.db')
+        store.set_override(str(tmp_path), 'P', pinned=True, pin_order=2)
+        wired[0] = store
+
+        now[0] = PAUSED_PIN_REFRESH_SECS
+        await pins.refresh_if_due()
+
+        assert pins.priority('P', 'low').pin_order == 2
+
     def test_an_adopted_pin_answers_pinned_with_its_order(self, tmp_path: Path) -> None:
-        pins = LookupPins(OverrideStore(tmp_path / 'overrides.db'), str(tmp_path), clock=lambda: 0.0)
+        store = OverrideStore(tmp_path / 'overrides.db')
+        pins = LookupPins(lambda: store, str(tmp_path), clock=lambda: 0.0)
 
         pins.adopt({'P': _row(pinned=True, pin_order=2), 'U': _row(pinned=False)})
 
@@ -111,7 +142,8 @@ class TestLookupPins:
     ) -> None:
         caplog.set_level(logging.WARNING)
 
-        pins = LookupPins(_BrokenStore(tmp_path / 'overrides.db'), str(tmp_path), clock=lambda: 0.0)
+        store = _BrokenStore(tmp_path / 'overrides.db')
+        pins = LookupPins(lambda: store, str(tmp_path), clock=lambda: 0.0)
 
         assert pins.priority('X', 'low').pinned is None
         assert len(_warnings(caplog)) == 1
@@ -120,7 +152,7 @@ class TestLookupPins:
     async def test_a_paused_refresh_reads_at_most_once_a_period(self, tmp_path: Path) -> None:
         now = [0.0]
         store = _CountingStore(tmp_path / 'overrides.db')
-        pins = LookupPins(store, str(tmp_path), clock=lambda: now[0])
+        pins = LookupPins(lambda: store, str(tmp_path), clock=lambda: now[0])
         store.set_override(str(tmp_path), 'P', pinned=True)
 
         now[0] = PAUSED_PIN_REFRESH_SECS - 1

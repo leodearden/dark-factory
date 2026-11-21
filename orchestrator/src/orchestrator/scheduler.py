@@ -1664,7 +1664,8 @@ class Scheduler:
         # The legacy score's age anchors (age_anchors.py).
         self.age_anchors = AgeAnchors(self._project_root)
         # Test-injectable override for the _write_snapshot_best_effort write
-        # target (task 2418).  None (default) preserves current behavior: the
+        # target (task 2418), and so for the construction-time read of the
+        # last-written tiers just below.  None (default) preserves current behavior: the
         # path is derived from _project_root and the no-project-root guard
         # applies.  When set, the write goes to this exact path instead —
         # bypassing both the derivation and the guard, since an explicit path
@@ -1673,12 +1674,15 @@ class Scheduler:
         # lookup key.  Mirrors the _read_psi_sample-style constructor-vs-
         # instance-attr seam pattern used elsewhere in this class.
         self._state_snapshot_path: Path | None = state_snapshot_path
-        # Effective-priority cache: replaced at the end of each acquire_next tick
-        # so get_state_snapshot() can include it without re-fetching tasks.
+        # Effective-priority cache: seeded from the last-written snapshot, then
+        # replaced at the end of each acquire_next tick so get_state_snapshot()
+        # can include it without re-fetching tasks.
         self._last_effective_priorities: dict[str, str] = last_written_tiers(self._snapshot_path())
         # --- Priority-override state ---
         self._override_store: OverrideStore | None = override_store
-        self._lookup_pins = LookupPins(override_store, self._project_root, clock=self._time_source)
+        self._lookup_pins = LookupPins(
+            lambda: self._override_store, self._project_root, clock=self._time_source,
+        )
         # Public alias for shutdown-path callers (harness checkpoint) — read-only.
         self.override_store: OverrideStore | None = override_store
         # Snapshot from the previous tick, used to diff-detect override changes
