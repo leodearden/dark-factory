@@ -128,7 +128,7 @@ from orchestrator.recovery_emission import (
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.run_slots import DispatchScope
-from orchestrator.scheduler_priority_lookup import LookupPins
+from orchestrator.scheduler_priority_lookup import LookupPins, last_written_tiers
 from orchestrator.sentinel_l1 import file_sentinel_l1, resolve_sentinel_l1
 from orchestrator.starvation_cap import CapReport, cap_report, sync_cap_l1
 from orchestrator.starvation_state import WatchdogState
@@ -1663,10 +1663,19 @@ class Scheduler:
         self._dispatched_priority: dict[str, str] = {}
         # The legacy score's age anchors (age_anchors.py).
         self.age_anchors = AgeAnchors(self._project_root)
-        # Effective-priority cache: populated at the end of each acquire_next tick
+        # Test-injectable override for the _write_snapshot_best_effort write
+        # target (task 2418).  None (default) preserves current behavior: the
+        # path is derived from _project_root and the no-project-root guard
+        # applies.  When set, the write goes to this exact path instead —
+        # bypassing both the derivation and the guard, since an explicit path
+        # is always honored — decoupling the on-disk write target from
+        # _project_root, which some tests must also use as an OverrideStore
+        # lookup key.  Mirrors the _read_psi_sample-style constructor-vs-
+        # instance-attr seam pattern used elsewhere in this class.
+        self._state_snapshot_path: Path | None = state_snapshot_path
+        # Effective-priority cache: replaced at the end of each acquire_next tick
         # so get_state_snapshot() can include it without re-fetching tasks.
-        # Empty dict before the first tick.
-        self._last_effective_priorities: dict[str, str] = {}
+        self._last_effective_priorities: dict[str, str] = last_written_tiers(self._snapshot_path())
         # --- Priority-override state ---
         self._override_store: OverrideStore | None = override_store
         self._lookup_pins = LookupPins(override_store, self._project_root, clock=self._time_source)
@@ -1956,16 +1965,6 @@ class Scheduler:
         # tick. Default None so bare-Scheduler unit tests are unaffected.
         self._already_landed_gate: AlreadyLandedGate | None = None
         # --- Snapshot write throttle (task 1332) ---
-        # Test-injectable override for the _write_snapshot_best_effort write
-        # target (task 2418).  None (default) preserves current behavior: the
-        # path is derived from _project_root and the no-project-root guard
-        # applies.  When set, the write goes to this exact path instead —
-        # bypassing both the derivation and the guard, since an explicit path
-        # is always honored — decoupling the on-disk write target from
-        # _project_root, which some tests must also use as an OverrideStore
-        # lookup key.  Mirrors the _read_psi_sample-style constructor-vs-
-        # instance-attr seam pattern used elsewhere in this class.
-        self._state_snapshot_path: Path | None = state_snapshot_path
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
         # proceeds regardless of the throttle interval.
@@ -7760,6 +7759,14 @@ class Scheduler:
             payload = json.dumps(self.get_state_snapshot().to_json())
         safe_io.atomic_write_text(path, payload, encoding='utf-8', mkdir=True)
 
+    def _snapshot_path(self) -> Path | None:
+        """The state snapshot's file: the injected path, else under the project root; ``None`` for an unset root."""
+        if self._state_snapshot_path is not None:
+            return Path(self._state_snapshot_path)
+        if not self._project_root or self._project_root == 'None':
+            return None
+        return scheduler_state_json(self._project_root)
+
     async def _write_snapshot_best_effort(self, force: bool = False) -> None:
         """Write the scheduler state snapshot to the default path off the event loop.
 
@@ -7826,9 +7833,8 @@ class Scheduler:
         # 2418): an explicit injected path is always honored regardless of
         # ``_project_root``, which some callers must independently set to a
         # non-writable value for use as an OverrideStore lookup key.
-        if self._state_snapshot_path is None and (
-            not self._project_root or self._project_root == 'None'
-        ):
+        path = self._snapshot_path()
+        if path is None:
             if not self._snapshot_guard_warned:
                 self._snapshot_guard_warned = True
                 logger.warning(
@@ -7879,11 +7885,6 @@ class Scheduler:
                 # applies.  Passed directly to _write_state_snapshot_raw to avoid a
                 # second get_state_snapshot() call on the actual write path.
                 disk_payload = json.dumps(state.to_json())
-                path = (
-                    Path(self._state_snapshot_path)
-                    if self._state_snapshot_path is not None
-                    else scheduler_state_json(self._project_root)
-                )
                 await asyncio.to_thread(self._write_state_snapshot_raw, path, disk_payload)
                 # Bookkeeping advanced only after a confirmed successful write.
                 # _write_state_snapshot_raw propagates exceptions so these lines are
