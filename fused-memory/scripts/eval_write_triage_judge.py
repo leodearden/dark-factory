@@ -59,9 +59,13 @@ model effect. Run every command from the fused-memory package root.
   export OPENAI_PLAN_PROXY_URL=...   # the plan proxy's OpenAI-compatible base URL
   export OPENAI_PLAN_PROXY_KEY=...   # its client key
 
-  # 1. Smoke: one labelled record judged by gpt-6.2-sol, written to /tmp.
+  # 1. Smoke: two labelled records from two clusters judged by gpt-6.2-sol,
+  # written to /tmp. --limit 1 is refused: a single cluster leaves the
+  # distractor control an empty slate (EvalPlan.__post_init__, pinned by
+  # tests/test_eval_write_triage_judge_live_edge.py::TestTheLimitedCli::
+  # test_a_one_record_limit_is_refused_before_anything_is_written).
   # A completed report confirms the plan serves the model.
-  python scripts/eval_write_triage_judge.py --limit 1 --judge-model gpt-6.2-sol \\
+  python scripts/eval_write_triage_judge.py --limit 2 --judge-model gpt-6.2-sol \\
       --report-path /tmp/write_triage_judge_smoke.json
 
   # 2. The arbiter arm, shipped x gpt-6.1-sol: the committed artifact. It
