@@ -39,9 +39,10 @@ Row    Name                                        Seam(s) driven
 2      task-role signal                            producer+observable: ``run_scoped_verification``
                                                      (role='task' — the floor never widens beyond the
                                                      owning module)
-3      docs-only trivial, both roles                producer+consumer: ``run_scoped_verification`` at
-                                                     both role='task'/'merge' (TRIVIAL short-circuit,
-                                                     zero commands)
+3      prose-only trivial, both roles;              producer+consumer: ``run_scoped_verification`` at
+       behavioural artifact routed at task role     both role='task'/'merge' (TRIVIAL short-circuit,
+                                                     zero commands); a behavioural artifact runs its
+                                                     consumer tests at role='task'
 4      new-vs-preexisting baseline attribution      consumer: ``run_post_merge_verify`` (mixed
                                                      baseline — blocked citing only the NEW id)
 5      wholly pre-existing + cache hit              consumer: ``run_post_merge_verify`` x2 (MAIN_HEALTH_RED
@@ -108,6 +109,14 @@ from _merge_lane_fakes import lane_scene_config, merge_through_lane
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
 from test_train_integration import _SpyEventStore, build_group_merge_request, make_stacked_member
 from test_verify import _real_worktree_reader
+from test_verify_plan import (
+    _ARTIFACT_MODULES,
+    _ROOT_YAML,
+    _SKILL_PROMPT_CONSUMERS,
+    _SPAWN_CONSUMERS,
+    _SPAWN_SH,
+    _UNBLOCK_SKILL,
+)
 from test_verify_scope_kappa import (
     _FLEET_LINT_COMMAND,
     _FLEET_TEST_COMMAND,
@@ -164,10 +173,10 @@ MODB_SIBLING_TEST_CONTENT: str = (
 # modB — shaped like a real junit-derived id (VerifyResult.failing_test_ids).
 MODB_FAILING_TEST_ID: str = 'modb/tests/test_sibling.py::test_sibling_contract'
 
-# Row 3's docs-only diff — no `.py`/`.rs` extension, so it can never satisfy
-# verify_plan._has_source_files; the ScopeKind.TRIVIAL short-circuit fires
-# ahead of both the module-config and fallback branches, independent of role
-# or merge_verify_breadth (R2).
+# Row 3's prose-only diff — no `.py`/`.rs` source and no behavioural artifact,
+# so verify_plan.is_trivial_diff holds; the ScopeKind.TRIVIAL short-circuit
+# fires ahead of both the module-config and fallback branches, independent of
+# role or merge_verify_breadth (R2).
 DOCS_ONLY_PATH: str = 'skills/foo.md'
 DOCS_ONLY_CONTENT: str = '# foo\n'
 
@@ -513,8 +522,8 @@ class TestRow2TaskRoleSignal:
 
 
 # ---------------------------------------------------------------------------
-# Row 3: "docs-only trivial, both roles" — R2 parity survives the inversion.
-# A `.md`-only diff stays TRIVIAL (ScopeKind.TRIVIAL, verify_plan.py) at the
+# Row 3: "prose-only trivial, both roles" — R2 parity survives the inversion.
+# A prose-only diff stays TRIVIAL (ScopeKind.TRIVIAL, verify_plan.py) at the
 # PRODUCER seam (``run_scoped_verification`` with is_merge_verify=False) for
 # BOTH role='task'/'merge', breadth-independent — zero commands.
 #
@@ -534,14 +543,19 @@ class TestRow2TaskRoleSignal:
 ROW3_MAIN_SHA: str = 'r3main0000000000000000000000000000000000'
 
 
-class TestRow3DocsOnlyTrivialBothRoles:
-    """Row 3 (PRD boundary-test sketch): a docs-only diff (no ``.py``/``.rs``
-    file) short-circuits to ``ScopeKind.TRIVIAL`` ahead of BOTH the
-    module-config and fallback branches (verify_plan.derive_verify_plan) —
-    zero ``run_verification`` calls, independent of role or
+class TestRow3ProseOnlyTrivialBothRoles:
+    """Row 3 (PRD boundary-test sketch): a prose-only diff (no ``.py``/``.rs``
+    and no behavioural artifact; see
+    ``orchestrator/src/orchestrator/verify_artifact_consumers.py::BEHAVIOURAL_ARTIFACTS``)
+    short-circuits to ``ScopeKind.TRIVIAL`` ahead of BOTH the module-config
+    and fallback branches (verify_plan.derive_verify_plan) — zero
+    ``run_verification`` calls, independent of role or
     ``merge_verify_breadth`` (R2). This row pins that the inversion (κ/λ)
     never regresses this pre-existing invariant at the PRODUCER
     (``run_scoped_verification``, is_merge_verify=False) seam.
+
+    A behavioural-artifact diff at role='task' is NOT trivial: it runs its
+    consumer tests (task 5296). Merge role is unchanged.
 
     INV-1 (task 2883) amends the CONSUMER seam: the adoptable merge verdict
     (``run_post_merge_verify`` → is_merge_verify=True) no longer trivially
@@ -602,6 +616,100 @@ class TestRow3DocsOnlyTrivialBothRoles:
             f'to the global full gate and run it exactly once (never a '
             f'no-evidence trivial pass); got {consumer_fake.await_count} call(s)'
         )
+
+    @staticmethod
+    def _consumer_registry(
+        tmp_path: Path, *, breadth: Literal['scoped', 'full'] = 'scoped',
+    ) -> OrchestratorConfig:
+        """The modules owning every behavioural-artifact consumer test, registered
+        but never passed: a skills-only or root-yaml task's own set is ``[]``."""
+        config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth=breadth)
+        config._module_configs = {mc.prefix: mc for mc in _ARTIFACT_MODULES}
+        return config
+
+    @staticmethod
+    def _write_artifact(tmp_path: Path, path: str) -> list[str]:
+        full = tmp_path / path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text('# artifact\n')
+        return [path]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('artifact', 'consumers'),
+        [
+            pytest.param(_SPAWN_SH, _SPAWN_CONSUMERS, id='spawn-sh'),
+            pytest.param(_UNBLOCK_SKILL, {'orchestrator': _SKILL_PROMPT_CONSUMERS}, id='unblock-skill'),
+            pytest.param(_ROOT_YAML, {'tests/scripts': None}, id='root-yaml-full-suite'),
+        ],
+    )
+    async def test_behavioural_artifact_runs_its_consumers_at_task_role(
+        self, tmp_path: Path, artifact: str, consumers: dict[str, tuple[str, ...] | None],
+    ) -> None:
+        config = self._consumer_registry(tmp_path)
+        files = self._write_artifact(tmp_path, artifact)
+
+        result, executed, _fake = await _drive_producer(
+            tmp_path, config, [], task_files=files, role='task',
+        )
+
+        assert not result.trivial
+        assert set(executed) == set(consumers)
+        for prefix, tests in consumers.items():
+            mc = executed[prefix]
+            assert (mc.lint_command, mc.type_check_command) == (None, None), prefix
+            if tests is None:
+                assert mc.test_command == config.module_configs_or_empty[prefix].test_command
+            else:
+                assert mc.test_command is not None
+                assert all(test in mc.test_command for test in tests), mc.test_command
+        assert result.plan is not None
+        assert all(run['scope_kind'] != 'trivial' for run in result.plan['runs'])
+
+    @pytest.mark.asyncio
+    async def test_prose_stays_trivial_beside_a_consumer_registry(self, tmp_path: Path) -> None:
+        config = self._consumer_registry(tmp_path)
+        files = self._write_artifact(tmp_path, 'README.md')
+
+        result, executed, fake = await _drive_producer(
+            tmp_path, config, [], task_files=files, role='task',
+        )
+
+        assert result.trivial
+        assert fake.await_count == 0
+        assert executed == {}
+
+    @pytest.mark.asyncio
+    async def test_behavioural_artifact_stays_trivial_at_merge_role(self, tmp_path: Path) -> None:
+        config = self._consumer_registry(tmp_path, breadth='scoped')
+        files = self._write_artifact(tmp_path, _SPAWN_SH)
+
+        result, _executed, fake = await _drive_producer(
+            tmp_path, config, [], task_files=files, role='merge', is_merge_verify=False,
+        )
+
+        assert result.passed
+        assert result.trivial
+        assert fake.await_count == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('path', [_SPAWN_SH, _UNBLOCK_SKILL, _ROOT_YAML, 'README.md'])
+    async def test_run_scoped_verification_and_verify_plan_agree_on_trivial(
+        self, tmp_path: Path, path: str,
+    ) -> None:
+        config = self._consumer_registry(tmp_path)
+        files = self._write_artifact(tmp_path, path)
+
+        result, _executed, _fake = await _drive_producer(
+            tmp_path, config, [], task_files=files, role='task',
+        )
+        plan = verify_plan.derive_verify_plan(
+            files, verify_plan.with_artifact_consumer_modules(config, [], files, 'task'),
+            config, _real_worktree_reader(tmp_path), role='task',
+        )
+
+        plan_is_trivial = len(plan.runs) == 1 and plan.runs[0].scope_kind is verify_plan.ScopeKind.TRIVIAL
+        assert result.trivial is plan_is_trivial
 
 
 # ---------------------------------------------------------------------------
