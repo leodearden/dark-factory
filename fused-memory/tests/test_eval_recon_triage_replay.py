@@ -935,8 +935,10 @@ class TestTheCli:
         inputs = _e2e_inputs(tmp_path / 'in')
         sample, scratch = tmp_path / 'sample.jsonl', tmp_path / 'scratch'
         assert self._sample(inputs, sample) == 0
-        roots = [arg for arg in _ROOTS if not arg.startswith('reify=')]
-        roots.remove('--project-root')
+        roots = [
+            arg for project in _E2E_PROJECTS if project != 'reify'
+            for arg in ('--project-root', f'{project}=/srv/{project}')
+        ]
         assert self._run_fake(inputs, sample, scratch, *roots) == 2
         assert 'reify' in capsys.readouterr().err
         assert not scratch.exists()

@@ -25,19 +25,38 @@ recon's reach.
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import hashlib
+import json
+import logging
 import math
 import random
+import sys
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
+from uuid import uuid4
 
-from fused_memory.reconciliation.cli_stage_runner import STAGE3_DISALLOWED
+from shared.config_dir import TaskConfigDir
+from shared.safe_io import atomic_write_text
+from shared.usage_gate import UsageGate
+
+from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+from fused_memory.maintenance._utils import override_config_path
+from fused_memory.models.scope import configured_known_projects_map
+from fused_memory.reconciliation.cli_stage_runner import (
+    STAGE3_DISALLOWED,
+    StageResult,
+    run_stage_via_cli,
+)
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.stage1_payload_format import format_memories
+from fused_memory.reconciliation.stages.base import recon_core_mcp_servers
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     CONTESTED_METADATA_KEY,
@@ -134,12 +153,16 @@ def touched_states(records: Iterable[Mapping[str, Any]]) -> dict[str, str]:
     return {record['id']: record['state'] for record in records}
 
 
+SAMPLE_HEADER = 'recon_triage_replay_sample'
+DECISIONS_HEADER = 'recon_triage_replay_decisions'
+
+
 def sample_header(
     *, seed: int, allocation: Mapping[str, int], inputs: Mapping[str, Path],
 ) -> dict[str, Any]:
     """The sample file's first line: the seed, the allocation and each input file's sha256."""
     return {
-        'header': 'recon_triage_replay_sample',
+        'header': SAMPLE_HEADER,
         'seed': seed,
         'allocation': dict(sorted(allocation.items())),
         'inputs': {
@@ -312,7 +335,6 @@ Answer with one JSON object: {{"decisions": [{{"child_id": ..., "decision": ...,
 """
 
 
-
 REPLAY_SYSTEM_PROMPT = STAGE1_SYSTEM_PROMPT + _REPLAY_ADDENDUM
 """Stage 1's system prompt verbatim, then the replay's vocabulary and output rules."""
 
@@ -415,3 +437,574 @@ def _decision_row(row: Mapping[str, Any], decision: Mapping[str, Any]) -> dict[s
         'reason': reason,
         'evidence': list(evidence),
     }
+
+
+class ReplayRefused(Exception):
+    """The replay refused its inputs, or a scratch that does not match them."""
+
+
+@dataclass(frozen=True)
+class Worklist:
+    """One batch as recon is asked it: the batch and its Stage-1 payload."""
+
+    batch: Batch
+    payload: str
+
+
+def worklists(
+    batches: Iterable[Batch],
+    texts: Mapping[Pair, _rounds.ShardEntry],
+    *,
+    project_roots: Mapping[str, str],
+) -> list[Worklist]:
+    """Each batch rendered for its project's root; refused for a project with no root or a child with no text."""
+    rendered: list[Worklist] = []
+    for batch in batches:
+        root = project_roots.get(batch.project)
+        if root is None:
+            raise ReplayRefused(
+                f'batch {batch.name}: project {batch.project!r} has no project root (known:'
+                f' {sorted(project_roots)}); pass --project-root {batch.project}=PATH'
+            )
+        unrated = [
+            row['entry_id'] for row in batch.rows if (row['entry_id'], row['target_id']) not in texts
+        ]
+        if unrated:
+            raise ReplayRefused(f'batch {batch.name}: children {unrated} have no rated current-basis text')
+        rendered.append(Worklist(
+            batch=batch,
+            payload=render_worklist_payload(batch, texts, project_id=batch.project, project_root=root),
+        ))
+    return rendered
+
+
+@dataclass(frozen=True)
+class AskReply:
+    """What one ask of recon handed back: its report, what it cost, and any run error."""
+
+    report: Mapping[str, Any]
+    cost_usd: float
+    error: str
+    model: str
+
+
+class Asker(Protocol):
+    """An arm: asks one worklist and replies. *identity* is recorded in the scratch plan."""
+
+    @property
+    def identity(self) -> Mapping[str, str]: ...
+
+    async def __call__(self, worklist: Worklist) -> AskReply: ...
+
+
+RunStage = Callable[..., Awaitable[StageResult]]
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+class StageCliAsker:
+    """Asks recon one worklist through the real Stage-1 CLI invocation, read-only.
+
+    Each ask runs under a fresh session id and its own config dir under
+    *config_base*, so every transcript is kept; *usage_gate* is the gate
+    recon's harness runs its stages under.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: ReconciliationConfig,
+        model: str,
+        cwd: Path,
+        config_base: Path,
+        run_stage: RunStage = run_stage_via_cli,
+        mcp_candidates: list[Path] | None = None,
+        usage_gate: UsageGate | None = None,
+    ) -> None:
+        self._config = config
+        self._model = model
+        self._cwd = cwd
+        self._config_base = config_base
+        self._run_stage = run_stage
+        self._servers = recon_core_mcp_servers(mcp_candidates)
+        self._usage_gate = usage_gate
+
+    @property
+    def identity(self) -> Mapping[str, str]:
+        return {
+            'asker': 'stage', 'model': self._model,
+            'system_prompt_sha256': _sha256_text(REPLAY_SYSTEM_PROMPT),
+        }
+
+    async def __call__(self, worklist: Worklist) -> AskReply:
+        session_id = str(uuid4())
+        result = await self._run_stage(
+            system_prompt=REPLAY_SYSTEM_PROMPT,
+            payload=worklist.payload,
+            disallowed_tools=list(REPLAY_DISALLOWED),
+            config=self._config,
+            mcp_config={'mcpServers': dict(self._servers)},
+            usage_gate=self._usage_gate,
+            model=self._model,
+            cwd=self._cwd,
+            output_schema=dict(REPLAY_OUTPUT_SCHEMA),
+            session_id=session_id,
+            config_dir=TaskConfigDir(
+                task_id=f'recon-replay-{worklist.batch.name}-{session_id}', base_dir=self._config_base,
+            ),
+        )
+        return AskReply(
+            report=result.report, cost_usd=result.cost_usd, error=result.error,
+            model=result.model or self._model,
+        )
+
+
+FAKE_ASKER = 'fake'
+STAGE_ASKER = 'stage'
+
+
+class FakeAsker:
+    """A deterministic arm, pure in the payload: each child's action is picked from
+    those its outcome allows by the sha256 of the payload and the child's id."""
+
+    @property
+    def identity(self) -> Mapping[str, str]:
+        return {'asker': FAKE_ASKER}
+
+    async def __call__(self, worklist: Worklist) -> AskReply:
+        return AskReply(
+            report={'decisions': [_fake_decision(worklist.payload, row) for row in worklist.batch.rows]},
+            cost_usd=0.0, error='', model=FAKE_ASKER,
+        )
+
+
+def _fake_decision(payload: str, row: Mapping[str, Any]) -> dict[str, Any]:
+    choices = sorted(_scoring.allowed_actions(row['outcome']), key=lambda action: action.label)
+    digest = hashlib.sha256(f'{payload}\0{row["entry_id"]}'.encode()).digest()
+    action = choices[digest[0] % len(choices)]
+    return {
+        'child_id': row['entry_id'], 'decision': action.decision.value,
+        'relabel_to': action.relabel_to, 'reason': 'fake arm: payload hash', 'evidence': [],
+    }
+
+
+class BatchStatus(StrEnum):
+    """Whether a batch's recorded reply parsed."""
+
+    OK = 'ok'
+    FAILED = 'failed'
+
+
+def _plan_path(scratch: Path) -> Path:
+    return scratch / 'plan.json'
+
+
+def _batch_path(scratch: Path, name: str) -> Path:
+    return scratch / 'batches' / f'{name}.json'
+
+
+def _write_json(path: Path, value: Any) -> None:
+    atomic_write_text(path, json.dumps(value, indent=2, sort_keys=True) + '\n', mkdir=True)
+
+
+def _replay_plan(worklists: Sequence[Worklist], asker: Asker) -> dict[str, Any]:
+    return {
+        'asker': dict(asker.identity),
+        'batches': {
+            worklist.batch.name: {
+                'project': worklist.batch.project,
+                'children': [[row['entry_id'], row['target_id']] for row in worklist.batch.rows],
+                'payload_sha256': _sha256_text(worklist.payload),
+            }
+            for worklist in worklists
+        },
+    }
+
+
+def _claim_plan(scratch: Path, plan: Mapping[str, Any]) -> None:
+    """Record *plan* in a fresh scratch, or refuse a scratch that records another."""
+    path = _plan_path(scratch)
+    if not path.exists():
+        _write_json(path, plan)
+        return
+    recorded = json.loads(path.read_text(encoding='utf-8'))
+    differing = sorted(key for key in {*plan, *recorded} if plan.get(key) != recorded.get(key))
+    if differing:
+        raise ReplayRefused(
+            f'{path} records a different replay plan (differing: {differing}); its batches were'
+            ' asked under other batches, payloads or arm. Use a fresh --scratch.'
+        )
+
+
+def _recorded(scratch: Path, name: str) -> dict[str, Any] | None:
+    path = _batch_path(scratch, name)
+    return json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
+
+
+async def _asked(asker: Asker, worklist: Worklist) -> dict[str, Any]:
+    """*worklist*'s batch record: the reply, parsed, or why it failed."""
+    try:
+        reply = await asker(worklist)
+    except Exception as exc:  # recorded as a failed batch, which the next run re-asks
+        reply = AskReply(report={}, cost_usd=0.0, error=f'{type(exc).__name__}: {exc}', model='')
+    parsed = parse_batch_reply(worklist.batch, reply.report)
+    decided = isinstance(parsed, BatchDecisions)
+    return {
+        'batch': worklist.batch.name,
+        'project': worklist.batch.project,
+        'status': (BatchStatus.OK if decided else BatchStatus.FAILED).value,
+        'decisions': [dict(row) for row in parsed.rows] if decided else [],
+        'reason': None if decided else parsed.reason,
+        'model': reply.model,
+        'cost_usd': reply.cost_usd,
+        'error': reply.error,
+        'payload_sha256': _sha256_text(worklist.payload),
+        'report': dict(reply.report),
+    }
+
+
+async def run_replay(
+    worklists: Sequence[Worklist],
+    asker: Asker,
+    scratch: Path,
+    *,
+    concurrency: int = 3,
+    only: Collection[str] | None = None,
+) -> dict[str, BatchStatus]:
+    """Ask every worklist (or those *only* names) not yet parsed OK under *scratch*.
+
+    The first run records the plan (batches, payload hashes, the arm's
+    identity) in ``scratch/plan.json``; a later run must match it. Each
+    batch's record is written as soon as its reply is in, so a rerun resumes.
+    Returns each batch's status, in plan order.
+    """
+    if concurrency < 1:
+        raise ReplayRefused(f'concurrency {concurrency} is not a positive integer')
+    names = [worklist.batch.name for worklist in worklists]
+    unknown = sorted(set(only or ()) - set(names))
+    if unknown:
+        raise ReplayRefused(f'--only names batches {unknown} that the plan does not hold; planned: {names}')
+    _claim_plan(scratch, _replay_plan(worklists, asker))
+    chosen = [worklist for worklist in worklists if only is None or worklist.batch.name in only]
+    statuses: dict[str, BatchStatus] = {}
+    gate = asyncio.Semaphore(concurrency)
+
+    async def ask(worklist: Worklist) -> None:
+        name = worklist.batch.name
+        recorded = _recorded(scratch, name)
+        if recorded is not None and recorded['status'] == BatchStatus.OK:
+            statuses[name] = BatchStatus.OK
+            return
+        async with gate:
+            record = await _asked(asker, worklist)
+        _write_json(_batch_path(scratch, name), record)
+        statuses[name] = BatchStatus(record['status'])
+
+    await asyncio.gather(*(ask(worklist) for worklist in chosen))
+    return {name: statuses[name] for name in names if name in statuses}
+
+
+def _calibration_rows(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    decisions = record['decisions']
+    share = record['cost_usd'] / len(decisions) if decisions else 0.0
+    return [
+        {**decision, 'batch': record['batch'], 'model': record['model'], 'cost_usd': share}
+        for decision in decisions
+    ]
+
+
+def _write_jsonl(path: Path, header: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> None:
+    atomic_write_text(path, ''.join(json.dumps(line, sort_keys=True) + '\n' for line in (header, *rows)))
+
+
+def collect(
+    scratch: Path,
+    out: Path,
+    *,
+    allow_missing: bool = False,
+    tool_health: Any = None,
+) -> dict[str, Any]:
+    """Write every parsed decision under *scratch* to *out*, a header line first; return the header.
+
+    Refused while a planned batch is missing or failed, unless *allow_missing*:
+    its children then have no row, and the scorer counts them as no decision.
+    Each row's ``cost_usd`` is its batch's cost shared evenly over the batch.
+    """
+    plan_path = _plan_path(scratch)
+    if not plan_path.exists():
+        raise ReplayRefused(f'{plan_path} does not exist: run the replay into this scratch first')
+    plan = json.loads(plan_path.read_text(encoding='utf-8'))
+    records = {name: _recorded(scratch, name) for name in sorted(plan['batches'])}
+    missing = [name for name, record in records.items() if record is None]
+    failed = [
+        name for name, record in records.items()
+        if record is not None and record['status'] != BatchStatus.OK
+    ]
+    if (missing or failed) and not allow_missing:
+        raise ReplayRefused(
+            f'batches without decisions: missing {missing}, failed {failed}; re-run them, or'
+            ' collect with --allow-missing'
+        )
+    asked = [record for record in records.values() if record is not None]
+    rows = sorted(
+        (row for record in asked if record['status'] == BatchStatus.OK for row in _calibration_rows(record)),
+        key=lambda row: row['entry_id'],
+    )
+    header = {
+        'header': DECISIONS_HEADER,
+        'asker': plan['asker'],
+        'plan_sha256': hashlib.sha256(plan_path.read_bytes()).hexdigest(),
+        'batches': len(records),
+        'decided': len(rows),
+        'missing_batches': missing,
+        'failed_batches': failed,
+        'cost_usd': sum(record['cost_usd'] for record in asked),
+        'tool_health': tool_health,
+    }
+    _write_jsonl(out, header, rows)
+    return header
+
+
+# ── the CLI ────────────────────────────────────────────────────────────────
+
+EXIT_OK = 0
+EXIT_INCOMPLETE = 1
+EXIT_REFUSED = 2
+REFUSALS = (ReplayRefused, OSError, ValueError)
+
+_CALIBRATION = Path('calibration')
+DEFAULT_ITEMS = _CALIBRATION / 'write_triage_v2_soak_items.jsonl'
+DEFAULT_VERDICTS = _CALIBRATION / 'write_triage_v2_soak_verdicts_v2_2.jsonl'
+DEFAULT_STRATA = _CALIBRATION / 'write_triage_v2_soak_strata.json'
+DEFAULT_SAMPLE = _CALIBRATION / 'recon_triage_replay_sample.jsonl'
+DEFAULT_DECISIONS = _CALIBRATION / 'recon_triage_replay_decisions.jsonl'
+DEFAULT_SCORES_JSON = _CALIBRATION / 'recon_triage_replay_scores.json'
+DEFAULT_SCORES_MD = _CALIBRATION / 'recon_triage_replay_scores.md'
+_DATA = Path('/home/leo/src/dark-factory/data')
+DEFAULT_TEXTS_ROOT = _DATA / 'write-triage-v21-rebase-2026-10-21'
+DEFAULT_TOUCHED = _DATA / 'write-triage-soak-2026-10-19' / 'team' / 'D' / 'touched.json'
+DEFAULT_RUBRIC = 'v2.2'
+
+
+def load_config(config_path: str | None) -> FusedMemoryConfig:
+    """The config as its file reads now; ``$CONFIG_PATH`` when *config_path* is None."""
+    with override_config_path(config_path):
+        return FusedMemoryConfig()
+
+
+def registered_project_roots(config: FusedMemoryConfig) -> Mapping[str, str]:
+    """Project id to root, from the registry recon itself routes by."""
+    return configured_known_projects_map(config.taskmaster)
+
+
+def recon_usage_gate(config: ReconciliationConfig) -> UsageGate | None:
+    """The usage gate recon's harness runs its stages under, when the config enables one."""
+    return UsageGate(config.usage_cap) if config.usage_cap.enabled else None
+
+
+@dataclass(frozen=True)
+class ReplayEnv:
+    """What the replay reaches beyond its arguments. The defaults are production's."""
+
+    config_loader: Callable[[str | None], FusedMemoryConfig] = load_config
+    project_registry: Callable[[FusedMemoryConfig], Mapping[str, str]] = registered_project_roots
+    run_stage: RunStage = run_stage_via_cli
+    mcp_candidates: Sequence[Path] | None = None
+    usage_gate_for: Callable[[ReconciliationConfig], UsageGate | None] = recon_usage_gate
+
+
+def _json(path: Path, kind: type) -> Any:
+    try:
+        value = json.loads(path.read_text(encoding='utf-8'))
+    except json.JSONDecodeError as exc:
+        raise ReplayRefused(f'{path}: not JSON ({exc})') from exc
+    if not isinstance(value, kind):
+        raise ReplayRefused(f'{path}: not a JSON {kind.__name__}')
+    return value
+
+
+def _jsonl(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    for line_no, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ReplayRefused(f'{path} line {line_no}: not JSON ({exc})') from exc
+        if not isinstance(row, dict):
+            raise ReplayRefused(f'{path} line {line_no}: not a JSON object')
+        rows.append(row)
+    return rows
+
+
+def _headed_jsonl(path: Path, header: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    rows = _jsonl(path)
+    if not rows or rows[0].get('header') != header:
+        raise ReplayRefused(f'{path}: the first line is not a {header!r} header')
+    return rows[0], rows[1:]
+
+
+def _corpus_texts(root: Path, items: Iterable[Mapping[str, Any]]) -> dict[Pair, _rounds.ShardEntry]:
+    try:
+        return load_texts(root, {item['entry_id']: item['project'] for item in items})
+    except KeyError as exc:
+        raise ReplayRefused(f'{root / "texts.json"}: {exc} is not keyed by the corpus items') from exc
+
+
+def _sample_command(args: argparse.Namespace, _env: ReplayEnv) -> int:
+    items = _jsonl(args.items)
+    rows = draw_sample(
+        items, _scoring.corpus_derivations(items, _jsonl(args.verdicts)),
+        allocation=DEFAULT_ALLOCATION, seed=SAMPLE_SEED,
+        touched=touched_states(_json(args.touched, list)),
+    )
+    texts = _corpus_texts(args.texts_root, items)
+    unrated = [row['entry_id'] for row in rows if (row['entry_id'], row['target_id']) not in texts]
+    if unrated:
+        raise ReplayRefused(f'sampled children {unrated} have no rated current-basis text')
+    header = sample_header(seed=SAMPLE_SEED, allocation=DEFAULT_ALLOCATION, inputs={
+        'items': args.items, 'verdicts': args.verdicts, 'texts': args.texts_root / 'texts.json',
+        'touched': args.touched,
+    })
+    _write_jsonl(args.out, header, rows)
+    headline = sum(row['headline'] for row in rows)
+    print(f'sample: {headline} headline and {len(rows) - headline} report-only children -> {args.out}')
+    return EXIT_OK
+
+
+def _asker(args: argparse.Namespace, env: ReplayEnv, config: FusedMemoryConfig) -> Asker:
+    if args.asker == FAKE_ASKER:
+        return FakeAsker()
+    recon = config.reconciliation
+    return StageCliAsker(
+        config=recon,
+        model=args.model or recon.agent_llm_model,
+        cwd=args.cwd or Path(recon.explore_codebase_root),
+        config_base=args.config_base or args.scratch / 'config',
+        run_stage=env.run_stage,
+        mcp_candidates=None if env.mcp_candidates is None else list(env.mcp_candidates),
+        usage_gate=env.usage_gate_for(recon),
+    )
+
+
+def _run_command(args: argparse.Namespace, env: ReplayEnv) -> int:
+    _, rows = _headed_jsonl(args.sample, SAMPLE_HEADER)
+    texts = _corpus_texts(args.texts_root, _jsonl(args.items))
+    config = env.config_loader(args.config)
+    roots = {**env.project_registry(config), **dict(args.project_root or ())}
+    planned = worklists(
+        plan_batches(rows, size=args.batch_size, seed=SAMPLE_SEED), texts, project_roots=roots,
+    )
+    only = frozenset(args.only) if args.only else None
+
+    async def replay() -> dict[str, BatchStatus]:
+        return await run_replay(
+            planned, _asker(args, env, config), args.scratch, concurrency=args.concurrency, only=only,
+        )
+
+    statuses = asyncio.run(replay())
+    for name, status in statuses.items():
+        print(f'{name}: {status.value}')
+    return EXIT_OK if all(status is BatchStatus.OK for status in statuses.values()) else EXIT_INCOMPLETE
+
+
+def _collect_command(args: argparse.Namespace, _env: ReplayEnv) -> int:
+    tool_health = None if args.tool_health is None else _json(args.tool_health, dict)
+    header = collect(args.scratch, args.out, allow_missing=args.allow_missing, tool_health=tool_health)
+    print(
+        f'collect: {header["decided"]} decisions from {header["batches"]} batches'
+        f' (missing {header["missing_batches"]}, failed {header["failed_batches"]}) -> {args.out}'
+    )
+    return EXIT_OK
+
+
+def _score_command(args: argparse.Namespace, _env: ReplayEnv) -> int:
+    _, sample_rows = _headed_jsonl(args.sample, SAMPLE_HEADER)
+    _, decisions = _headed_jsonl(args.decisions, DECISIONS_HEADER)
+    report = _scoring.score_replay(
+        sample_rows, _jsonl(args.items), _jsonl(args.verdicts), decisions,
+        rubric=args.rubric, strata_populations=_json(args.strata, dict),
+    )
+    document = json.dumps(report, indent=2, sort_keys=True) + '\n'
+    atomic_write_text(args.out_json, document)
+    atomic_write_text(args.out_md, _scoring.render_markdown(json.loads(document)))
+    print(f'score: {args.out_json} and {args.out_md}')
+    return EXIT_OK
+
+
+def _project_root(text: str) -> tuple[str, str]:
+    project, separator, root = text.partition('=')
+    if not (separator and project and root):
+        raise argparse.ArgumentTypeError(f'{text!r} is not PROJECT=PATH')
+    return project, root
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='eval_recon_triage_replay.py',
+        description='Replay recon Stage-1 adjudication of rated write-triage attaches, read-only.',
+    )
+    commands = parser.add_subparsers(dest='command', required=True)
+
+    sample = commands.add_parser('sample', help='draw and write the frozen sample')
+    sample.add_argument('--items', type=Path, default=DEFAULT_ITEMS)
+    sample.add_argument('--verdicts', type=Path, default=DEFAULT_VERDICTS)
+    sample.add_argument('--texts-root', type=Path, default=DEFAULT_TEXTS_ROOT)
+    sample.add_argument('--touched', type=Path, default=DEFAULT_TOUCHED)
+    sample.add_argument('--out', type=Path, default=DEFAULT_SAMPLE)
+
+    run = commands.add_parser('run', help='ask recon each batch, resumably')
+    run.add_argument('--sample', type=Path, default=DEFAULT_SAMPLE)
+    run.add_argument('--items', type=Path, default=DEFAULT_ITEMS)
+    run.add_argument('--texts-root', type=Path, default=DEFAULT_TEXTS_ROOT)
+    run.add_argument('--scratch', type=Path, required=True)
+    run.add_argument('--asker', choices=(STAGE_ASKER, FAKE_ASKER), default=STAGE_ASKER)
+    run.add_argument('--batch-size', type=int, default=8)
+    run.add_argument('--concurrency', type=int, default=3)
+    run.add_argument('--only', action='append', metavar='BATCH', help='ask only this batch (repeatable)')
+    run.add_argument('--config', help='fused-memory config YAML (default: $CONFIG_PATH)')
+    run.add_argument('--model', help="default: the config's reconciliation.agent_llm_model")
+    run.add_argument('--cwd', type=Path, help="default: the config's reconciliation.explore_codebase_root")
+    run.add_argument('--project-root', type=_project_root, action='append', metavar='PROJECT=PATH',
+                     help='a project root the registry lacks (repeatable)')
+    run.add_argument('--config-base', type=Path, help='where per-ask config dirs go (default: SCRATCH/config)')
+
+    gather = commands.add_parser('collect', help='write the parsed decisions')
+    gather.add_argument('--scratch', type=Path, required=True)
+    gather.add_argument('--out', type=Path, default=DEFAULT_DECISIONS)
+    gather.add_argument('--allow-missing', action='store_true')
+    gather.add_argument('--tool-health', type=Path, metavar='JSON',
+                        help='a JSON object recording the tool-health check, kept in the header')
+
+    score = commands.add_parser('score', help='score the committed sample and decisions')
+    score.add_argument('--sample', type=Path, default=DEFAULT_SAMPLE)
+    score.add_argument('--decisions', type=Path, default=DEFAULT_DECISIONS)
+    score.add_argument('--items', type=Path, default=DEFAULT_ITEMS)
+    score.add_argument('--verdicts', type=Path, default=DEFAULT_VERDICTS)
+    score.add_argument('--strata', type=Path, default=DEFAULT_STRATA)
+    score.add_argument('--rubric', default=DEFAULT_RUBRIC)
+    score.add_argument('--out-json', type=Path, default=DEFAULT_SCORES_JSON)
+    score.add_argument('--out-md', type=Path, default=DEFAULT_SCORES_MD)
+    return parser
+
+
+_COMMANDS: Mapping[str, Callable[[argparse.Namespace, ReplayEnv], int]] = MappingProxyType({
+    'sample': _sample_command, 'run': _run_command, 'collect': _collect_command, 'score': _score_command,
+})
+
+
+def main(argv: Sequence[str] | None = None, *, env: ReplayEnv | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return _COMMANDS[args.command](args, env or ReplayEnv())
+    except REFUSALS as refusal:
+        print(f'eval_recon_triage_replay refused: {refusal}', file=sys.stderr)
+        return EXIT_REFUSED
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    sys.exit(main())
