@@ -196,6 +196,25 @@ class TestEnsureFreshCollectionOutlastsAnAbandonedCreate:
             assert server.wait_created('c', 0) is True
             assert server.creates('c') == 1
 
+    def test_an_abandoned_create_is_accepted_only_once_its_shard_takes_writes(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from _stub_qdrant_server import stub_qdrant_server
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import PointStruct
+
+        with stub_qdrant_server(
+            create_delay_s={'c': 2.5}, initializing_during_create=['c'],
+        ) as server:
+            client = QdrantClient(url=server.url, timeout=1)
+            try:
+                ensure_fresh_collection(client, 'c', size=8)
+                client.upsert('c', points=[PointStruct(id=1, vector=[0.5] * 8, payload={})])
+            finally:
+                client.close()
+
+            assert server.creates('c') == 1
+            assert server.upserts('c') == 1
+
     def test_a_create_that_never_lands_fails_naming_the_collection_and_the_create(self):
         from _fm_qdrant_live import ensure_fresh_collection
         from _stub_qdrant_server import stub_qdrant_server
