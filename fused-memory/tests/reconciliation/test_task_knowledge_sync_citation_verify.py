@@ -53,10 +53,9 @@ _STAGE2_POST_RUN_HELPERS = (
     '_sweep_stale_mem0_flag_for_stage2_markers',
 )
 
-# The Stage-3 finding-side filters. Each is a pass-through for the
-# 'test_project' scope used here, but they are patched to the identity so a
-# future policy change to one of them cannot silently turn these tests green
-# by dropping the finding under test instead of verifying its citations.
+# The Stage-3 finding-side filters, patched to the identity so a change to
+# one of them cannot silently turn these tests green by dropping the finding
+# under test instead of verifying its citations.
 _STAGE3_FINDING_FILTERS = (
     'filter_task_count_snapshot_findings',
     'filter_contamination_ceiling_findings',

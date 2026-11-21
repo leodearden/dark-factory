@@ -4310,10 +4310,10 @@ async def _discover_foreign_fix_task_citations(
 
 
 # --------------------------------------------------------------------------- #
-# Blocked-snapshot finding filter for Stage 3 (task-1840)
+# Task-count snapshot finding filter for Stage 3
 # --------------------------------------------------------------------------- #
 
-#: Categories that are subject to blocked-snapshot suppression.  Only flags
+#: Categories that are subject to snapshot suppression.  Only flags
 #: in these categories whose text matches the task-count-snapshot signature are
 #: dropped; all other categories pass through unchanged (fail-open).
 _SUPPRESSED_SNAPSHOT_CATEGORIES: frozenset[str] = frozenset({
