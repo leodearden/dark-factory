@@ -13,13 +13,25 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import PRIORITY_TIERS, OrchestratorConfig
 from orchestrator.merge_verify_facts import ChainMembers, MergeVerifyDispatchFacts, RunnerReason
 from orchestrator.overrides import OverrideStore
 from orchestrator.scheduler import Scheduler
-from orchestrator.task_priority import UNKNOWN_PRIORITY, TaskPriority, read_task_priority
+from orchestrator.task_priority import (
+    GATE_RANK,
+    PINNED,
+    UNKNOWN_PRIORITY,
+    TaskAge,
+    TaskPriority,
+    gate_rank,
+    order_key,
+    read_task_priority,
+    task_age,
+)
 
 _ANCHOR = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
+_NOW = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+_PERIOD = 3600.0
 
 
 def _pending(task_id: str, priority: str, *, deps: tuple[str, ...] = ()) -> dict:
@@ -139,6 +151,121 @@ class TestReadTaskPriority:
         assert all(
             getattr(UNKNOWN_PRIORITY, f.name) is None
             for f in dataclasses.fields(UNKNOWN_PRIORITY)
+        )
+
+
+def _key(
+    p: TaskPriority, *, waited: float = 0.0, period: float | None = None,
+    fallback: datetime | None = _ANCHOR,
+) -> tuple[int, int, float]:
+    return order_key(
+        p, now=_NOW, waited_secs=waited, promote_after_secs=period, fallback_anchor=fallback,
+    )
+
+
+def _rank(tier: str | None, *, waited: float = 0.0, period: float | None = _PERIOD) -> int:
+    return _key(TaskPriority(tier=tier), waited=waited, period=period)[0]
+
+
+class TestGateRank:
+
+    def test_pinned_ranks_ahead_of_every_tier(self) -> None:
+        assert PINNED == 'pinned'
+        assert GATE_RANK == (PINNED, *PRIORITY_TIERS)
+
+    def test_a_known_tier_ranks_by_its_place(self) -> None:
+        assert gate_rank('pinned') == 0
+        assert gate_rank('medium') == GATE_RANK.index('medium')
+
+    @pytest.mark.parametrize('tier', [None, 'urgent'])
+    def test_an_unknown_tier_has_no_rank(self, tier: str | None) -> None:
+        assert gate_rank(tier) is None
+
+
+class TestOrderKey:
+
+    def test_tiers_sort_pinned_first_then_by_tier(self) -> None:
+        waiters = [TaskPriority(tier=t) for t in reversed(PRIORITY_TIERS)]
+        waiters.append(TaskPriority(tier=PINNED, pin_order=1))
+
+        assert [p.tier for p in sorted(waiters, key=_key)] == [PINNED, *PRIORITY_TIERS]
+
+    def test_pin_order_orders_inside_pinned(self) -> None:
+        first, second = TaskPriority(tier=PINNED, pin_order=1), TaskPriority(tier=PINNED, pin_order=2)
+
+        assert sorted([second, first], key=_key) == [first, second]
+
+    def test_a_pin_with_no_order_keys_as_zero(self) -> None:
+        assert _key(TaskPriority(tier=PINNED))[1] == 0
+
+    def test_an_older_anchor_sorts_first_within_a_tier(self) -> None:
+        older = TaskPriority(tier='low', age_anchor=datetime(2026, 11, 1, 0, 0, tzinfo=UTC))
+        newer = TaskPriority(tier='low', age_anchor=datetime(2026, 11, 2, 0, 0, tzinfo=UTC))
+
+        assert sorted([newer, older], key=_key) == [older, newer]
+
+    def test_the_third_element_is_minus_the_age(self) -> None:
+        assert _key(TaskPriority(tier='low', age_anchor=_ANCHOR))[2] == -86400.0
+
+    def test_the_anchor_wins_over_the_fallback(self) -> None:
+        anchored = TaskPriority(tier='low', age_anchor=datetime(2026, 11, 2, 11, 0, tzinfo=UTC))
+
+        assert _key(anchored, fallback=_ANCHOR)[2] == -3600.0
+
+    def test_the_fallback_is_used_without_an_anchor(self) -> None:
+        assert _key(TaskPriority(tier='low'), fallback=_ANCHOR)[2] == -86400.0
+
+    def test_with_neither_anchor_the_age_is_zero(self) -> None:
+        assert _key(TaskPriority(tier='low'), fallback=None)[2] == 0.0
+
+    @pytest.mark.parametrize('tier', [None, 'urgent'])
+    def test_an_unknown_tier_keys_as_medium(self, tier: str | None) -> None:
+        assert _rank(tier, period=None) == gate_rank('medium')
+
+    @pytest.mark.parametrize('tier, waited_periods, promoted_to', [
+        ('low', 0.99, 'low'),
+        ('low', 1.0, 'medium'),
+        ('low', 2.9, 'high'),
+        ('polish', 10.0, 'high'),
+        ('critical', 10.0, 'critical'),
+        (PINNED, 10.0, PINNED),
+    ])
+    def test_a_long_wait_promotes_never_past_high(
+        self, tier: str, waited_periods: float, promoted_to: str,
+    ) -> None:
+        assert _rank(tier, waited=waited_periods * _PERIOD) == gate_rank(promoted_to)
+
+    def test_no_period_promotes_nothing(self) -> None:
+        assert _rank('polish', waited=1e9, period=None) == gate_rank('polish')
+
+    @pytest.mark.parametrize('waited', [float('nan'), float('inf'), -_PERIOD])
+    def test_an_odd_wait_promotes_nothing(self, waited: float) -> None:
+        assert _rank('low', waited=waited) == gate_rank('low')
+
+    @pytest.mark.parametrize('period', [0.0, -_PERIOD, float('nan')])
+    def test_an_odd_period_promotes_nothing(self, period: float) -> None:
+        assert _rank('low', waited=10 * _PERIOD, period=period) == gate_rank('low')
+
+    def test_a_naive_fallback_ages_nothing(self) -> None:
+        naive = datetime(2026, 11, 1, 12, 0)
+
+        assert _key(TaskPriority(tier='low'), fallback=naive) == (gate_rank('low'), 0, 0.0)
+
+
+class TestTaskAge:
+
+    def test_an_anchor_measures_from_the_anchor(self) -> None:
+        anchored = TaskPriority(age_anchor=_ANCHOR)
+
+        assert task_age(anchored, now=_NOW, fallback_anchor=None) == TaskAge(
+            86400.0, from_anchor=True,
+        )
+
+    def test_without_an_anchor_the_fallback_is_measured(self) -> None:
+        fallback = datetime(2026, 11, 2, 11, 0, tzinfo=UTC)
+
+        assert task_age(TaskPriority(), now=_NOW, fallback_anchor=fallback) == TaskAge(
+            3600.0, from_anchor=False,
         )
 
 
