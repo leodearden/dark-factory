@@ -1,18 +1,10 @@
-"""Tests for the architect eval harness (eval-revival θ).
+"""Tests for run_architect_eval's scoring outcome and the fields one architect cell persists.
 
-Hermetic: every test feeds SYNTHETIC inputs — synthetic produced-plan dicts,
-mocked ``invoke_agent`` (an AsyncMock returning a fixed structured verdict),
-synthetic ``EvalResult``s — with the git/worktree/LLM boundaries patched. No
-paid LLM run, no live worktree in CI.
-
-θ invokes the architect LIVE against ζ's fixtures, scores the produced plan
-against the real landed diff plus a plan-quality rubric, and emits a
-NON-sentinel per-fixture plan-quality score. Downstream roles are FROZEN when
-scoring the architect (decision 8: noise isolation + token savings), so the
-harness only ever runs the architect — never the implementer/verify/review.
-
-Mirrors ``test_eval_recovery.py`` — the recovery-scoring (η) blueprint θ
-follows precisely.
+Each cell runs through ``_architect_eval_harness.run_architect_eval_hermetic``
+with every git, worktree and LLM boundary injected. The pins cover the
+EvalMetrics defaults for those fields, then the score, the cap taint, reference
+validity and the terminal kind a cell persists, and a characterization table of
+every persisted scoring field.
 """
 
 from __future__ import annotations
@@ -1009,7 +1001,9 @@ class TestJudgedWithoutReference:
         assert 'EMPTY reference diff' not in fixture_lines[0]
 
 
-
+# ---------------------------------------------------------------------------
+# terminal_kind — why a cell persisted plan_steps == 0 (task 4760)
+# ---------------------------------------------------------------------------
 
 def _decline_artifact(reported_at: str = '2026-07-19T12:00:00+00:00') -> dict:
     """A decline artifact in the shape every ``artifacts.write_*`` persists."""
