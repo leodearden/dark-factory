@@ -14,12 +14,15 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.falkor_read_only import PagedQuery
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.reconciliation import task_filter
 from fused_memory.services import completion_claim_gate, overreach_guard
 from fused_memory.services.overreach_guard import is_guarded_category
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_ruling_overreach.py'
 
