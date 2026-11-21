@@ -61,6 +61,8 @@ from audit_wiped_metadata_files import (
     FIDELITY_LOCK_LEVEL,
     NO_MERGE_EVENT,
     NO_SUCCESSFUL_MERGE_SHA,
+    PLAN_EVENT_TYPES,
+    PLAN_EVENTS_SQL,
     AuditCoverage,
     WipeCandidate,
 )
@@ -110,6 +112,8 @@ from shared.testing_sqlite_spill import (
 )
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from tasks_db_schema import columns_outside, introspect, introspect_ddl
+
+from shared import project_layout
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -1644,22 +1648,20 @@ def test_main_dry_run_audits_an_event_log_whose_sort_spills_when_no_file_can_be_
             for i in range(SPILL_ROWS)
         ],
     )
-    runs_db = root / "data" / "orchestrator" / "runs.db"
+    runs_db = project_layout.runs_db(root)
     # The live store carries this index (orchestrator/src/orchestrator/event_store.py); it makes the IN ... ORDER BY id query sort.
     with contextlib.closing(sqlite3.connect(runs_db)) as c:
         c.execute("CREATE INDEX idx_events_type ON events(event_type)")
         c.commit()
-    require_sort_to_spill(
-        runs_db,
-        "SELECT id, task_id, event_type, data FROM events "
-        "WHERE event_type IN ('phase_skipped', 'set_to_plan') ORDER BY id",
-    )
+    require_sort_to_spill(runs_db, PLAN_EVENTS_SQL, PLAN_EVENT_TYPES)
 
-    result = run_unable_to_write_files([sys.executable, _SCRIPT, "--project-root", str(root)])
+    result = run_unable_to_write_files([sys.executable, _SCRIPT, "--project-root", str(root), "--json"])
 
     assert result.returncode == 0, result.stderr
     assert "unreadable" not in result.stderr
-    assert "DRY RUN" in result.stdout
+    project = json.loads(result.stdout)["projects"][0]
+    assert project["applied"] is False
+    assert [(o["task_id"], o["disposition"]) for o in project["outcomes"]] == [(1, REPAIR)]
 
 
 def test_main_json_emits_an_object_with_both_outcomes_and_coverage(tmp_path):

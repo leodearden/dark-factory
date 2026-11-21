@@ -38,6 +38,8 @@ from audit_wiped_metadata_files import (
     FIDELITY_LOCK_LEVEL,
     NO_MERGE_EVENT,
     NO_SUCCESSFUL_MERGE_SHA,
+    PLAN_EVENT_TYPES,
+    PLAN_EVENTS_SQL,
     AuditCoverage,
     PlanFilesRecord,
     ProjectAudit,
@@ -1506,11 +1508,7 @@ def test_main_audits_an_event_log_whose_sort_spills_when_no_file_can_be_written(
     with contextlib.closing(sqlite3.connect(runs_db)) as c:
         c.execute("CREATE INDEX idx_events_type ON events(event_type)")
         c.commit()
-    require_sort_to_spill(
-        runs_db,
-        "SELECT id, task_id, event_type, data FROM events "
-        "WHERE event_type IN ('phase_skipped', 'set_to_plan') ORDER BY id",
-    )
+    require_sort_to_spill(runs_db, PLAN_EVENTS_SQL, PLAN_EVENT_TYPES)
 
     result = run_unable_to_write_files([sys.executable, _SCRIPT, "--project-root", str(root), "--json"])
 

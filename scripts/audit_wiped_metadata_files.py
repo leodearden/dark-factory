@@ -157,6 +157,12 @@ _EVENT_PLAN_SOURCES = {
     "set_to_plan": ("files", "set_to_plan_event", FIDELITY_LOCK_LEVEL),
 }
 
+PLAN_EVENT_TYPES = tuple(_EVENT_PLAN_SOURCES)
+PLAN_EVENTS_SQL = (
+    "SELECT id, task_id, event_type, data FROM events "
+    f"WHERE event_type IN ({', '.join('?' for _ in PLAN_EVENT_TYPES)}) ORDER BY id"
+)
+
 # Higher rank wins. Compared before recency, so a file-level record beats a
 # lock-level one regardless of which event row is newer.
 _FIDELITY_RANK = {FIDELITY_LOCK_LEVEL: 0, FIDELITY_FILE_LEVEL: 1}
@@ -460,14 +466,9 @@ def load_plan_files_from_events(runs_db_path: str) -> dict[str, PlanFilesRecord]
     which are TEXT in the live schema.
     """
     records: dict[str, PlanFilesRecord] = {}
-    placeholders = ", ".join("?" for _ in _EVENT_PLAN_SOURCES)
     conn = connect_readonly(runs_db_path)
     try:
-        cursor = conn.execute(
-            "SELECT id, task_id, event_type, data FROM events "
-            f"WHERE event_type IN ({placeholders}) ORDER BY id",
-            tuple(_EVENT_PLAN_SOURCES),
-        )
+        cursor = conn.execute(PLAN_EVENTS_SQL, PLAN_EVENT_TYPES)
         for _event_id, task_id, event_type, data in cursor:
             if not task_id:
                 continue
