@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
+from _task_units import units_by_label
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from dashboard.config import DashboardConfig
@@ -23,11 +24,7 @@ from dashboard.data.escalation_corpus import QueueKind, corpus_queues
 from dashboard.data.merge_queue import MergeAttempts
 from dashboard.data.root_invariants import RootInvariants, ScanStatus
 from dashboard.data.scheduler import clear_scheduler_state, collect_scheduler_state
-from dashboard.data.task_snapshot import (
-    FRESHNESS_BOUND_SECONDS,
-    SnapshotFailure,
-    unmeasured_snapshot,
-)
+from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
 from dashboard.project_labels import ProjectLabels
 
 pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
@@ -210,12 +207,12 @@ class TestSchedulerCollector:
         )
 
     @staticmethod
-    async def _collect(client, roots, substrate, active, snapshots=None):
+    async def _collect(client, roots, substrate, active, *, offline=()):
         config = DashboardConfig(project_root=roots[0], known_project_roots=list(roots[1:]))
         clear_scheduler_state()
         with patch('dashboard.data.scheduler.mcp_tool_call', new=substrate), patch(
             'dashboard.data.scheduler.collect_tasks_with_counts',
-            new=AsyncMock(return_value=(active, snapshots or {})),
+            new=AsyncMock(return_value=([], units_by_label(active, offline=offline))),
         ):
             return await collect_scheduler_state(client, config, now=_NOW)
 
@@ -275,14 +272,11 @@ class TestSchedulerCollector:
     async def test_an_offline_root_skips_only_itself(
         self, dummy_client, scheduler_roots, substrate,
     ):
-        x, y = scheduler_roots
-        offline_x = unmeasured_snapshot(
-            x, now=_NOW, reason='test', failure=SnapshotFailure.UNREACHABLE,
-        )
+        _x, y = scheduler_roots
         rows, _modules, _pins, _events, offline_projects, _paused, recovery_events, _degraded = (
             await self._collect(
                 dummy_client, scheduler_roots, substrate,
-                [_active_row('y/proj', 7)], {'x/proj': offline_x},
+                [_active_row('y/proj', 7)], offline=['x/proj'],
             )
         )
 

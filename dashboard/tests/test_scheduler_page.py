@@ -21,10 +21,10 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from _task_units import units_by_label
 from shared.scheduler_state import SchedulerStateSnapshot
 
 from dashboard.data.scheduler import clear_scheduler_state
-from dashboard.data.task_snapshot import SnapshotFailure, unmeasured_snapshot
 
 
 @pytest.fixture(autouse=True)
@@ -36,21 +36,12 @@ def _forget_scheduler_state():
 
 
 def _tasks_read(active=(), *, offline=(), degraded=()):
-    """A ``collect_tasks_with_counts`` result: ``(active_rows, snapshots_by_label)``.
+    """A ``collect_tasks_with_counts`` result whose rows ride on the units.
 
-    Only the offline and degraded roots get a unit; the scheduler reads the
-    snapshots solely through ``task_snapshot.classify``, so a healthy root
-    needs none.
+    As on the real collector, each root's rows are carried by that root's
+    unit; the flat first half is left empty.
     """
-    now = datetime(2026, 1, 1, tzinfo=UTC)
-
-    def unit(label, failure):
-        return unmeasured_snapshot(label, now=now, reason='test', failure=failure)
-
-    return list(active), {
-        **{label: unit(label, SnapshotFailure.UNREACHABLE) for label in offline},
-        **{label: unit(label, SnapshotFailure.BUDGET) for label in degraded},
-    }
+    return [], units_by_label(active, offline=offline, degraded=degraded)
 
 
 # ---------------------------------------------------------------------------
