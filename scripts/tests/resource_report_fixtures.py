@@ -101,6 +101,7 @@ def write_collection(
             add(FIGURE_METRICS[figure].spec, value, encode_consumer(consumer))
     conn = sqlite3.connect(db)
     try:
+        conn.execute('PRAGMA synchronous = OFF')  # a throwaway fixture store needs no fsync
         conn.executemany(_INSERT, rows)
         conn.commit()
     finally:

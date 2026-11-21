@@ -14,27 +14,32 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import _checkout as _checkout
-from sampler.consumers import Consumer, Role, classify_member
+from sampler.consumers import Consumer, Figure, Role, classify_member, encode_consumer
+from sampler.metrics import FIGURE_METRICS, MetricSpec
 from shared.project_layout import runs_db
-from shared.psi import ARM_FIELDS
+from shared.psi import ARM_FIELDS, PsiSample
 from shared.verify_scope_tag import scope_tag_for
 
 __all__ = [
     'MEMORY_ARMS',
     'Hold',
     'HoldConsumers',
+    'HoldReading',
+    'HoldState',
     'HoldsReport',
     'RootRead',
     'RootStatus',
     'SamplesUnavailable',
+    'Window',
     'format_utc',
     'hold_consumers',
     'parse_utc',
@@ -45,14 +50,23 @@ __all__ = [
 ]
 
 
-def _gate_arms(arms: frozenset[str]) -> frozenset[str]:
-    strays = sorted(arms - ARM_FIELDS)
-    if strays:
-        raise ImportError(f'not shared.psi gate arms: {strays}; ARM_FIELDS is {sorted(ARM_FIELDS)}')
-    return arms
+def _memory_arms(sample_fields: Mapping[str, str]) -> Mapping[str, str]:
+    strays = sorted(set(sample_fields) - ARM_FIELDS)
+    unknown = sorted(set(sample_fields.values()) - {field.name for field in fields(PsiSample)})
+    if strays or unknown:
+        raise ImportError(
+            f'memory arms out of step with shared.psi: arms {strays} are not in ARM_FIELDS, '
+            f'fields {unknown} are not on PsiSample'
+        )
+    return MappingProxyType(dict(sample_fields))
 
 
-MEMORY_ARMS: frozenset[str] = _gate_arms(frozenset({'mem_full_avg10', 'mem_some_avg10'}))
+_ARM_SAMPLE_FIELDS: Mapping[str, str] = _memory_arms(
+    {'mem_full_avg10': 'mem_full10', 'mem_some_avg10': 'mem_some10'}
+)
+"""Each memory arm, and the PsiSample field carrying the avg10 value it held on."""
+
+MEMORY_ARMS: frozenset[str] = frozenset(_ARM_SAMPLE_FIELDS)
 """The gate arms whose holds are memory holds."""
 
 
@@ -65,6 +79,10 @@ def parse_utc(text: str) -> datetime:
 def format_utc(moment: datetime) -> str:
     """``YYYY-MM-DDTHH:MM:SSZ``: the one rendering of a time in the report."""
     return moment.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _utc(ts: float) -> datetime:
+    return datetime.fromtimestamp(ts, UTC)
 
 
 def _read_only(path: Path) -> sqlite3.Connection:
@@ -85,6 +103,7 @@ class Hold:
     task_id: str | None
     own_cgroup: str | None
     """The daemon's kernel path, '' when it was unresolved; None when the event carries none."""
+    arm_value: float | None
 
 
 class RootStatus(StrEnum):
@@ -139,7 +158,12 @@ def _memory_hold(root: Path, row: tuple[Any, ...], since: datetime) -> Hold | No
     own_cgroup = (sample or {}).get('own_cgroup')
     if own_cgroup is not None and not isinstance(own_cgroup, str):
         raise ValueError(f'event {event_id}: own_cgroup {own_cgroup!r}')
-    return Hold(root, event_id, at, arm, task_id, own_cgroup)
+    value = payload.get('value') if sample is None else sample.get(_ARM_SAMPLE_FIELDS[arm])
+    return Hold(root, event_id, at, arm, task_id, own_cgroup, _number(value))
+
+
+def _number(value: object) -> float | None:
+    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
 
 
 def read_root(root: Path, since: datetime) -> RootRead:
@@ -227,7 +251,22 @@ class SamplesUnavailable(Exception):
     """The samples store cannot be read, so no hold can be classified truthfully."""
 
 
+def _readability(spec: MetricSpec) -> MetricSpec:
+    if spec.readability is None:
+        raise ImportError(f'{spec.name} declares no readability metric: no collection clock')
+    return spec.readability
+
+
+_READ_OK = _readability(FIGURE_METRICS[Figure.ANON].spec)
+"""Written for every consumer at every collection, the kernel included: the collection clock."""
+
 _SAMPLES_TABLE_SQL = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'samples'"
+_FIRST_SQL = 'SELECT MIN(ts) FROM samples WHERE metric = ?'
+_LAST_SQL = 'SELECT MAX(ts) FROM samples WHERE metric = ?'
+_LATEST_SQL = 'SELECT MAX(ts) FROM samples WHERE metric = ? AND ts <= ?'
+_WINDOW_SQL = 'SELECT ts, metric, leaf, value FROM samples WHERE metric IN ({}) AND ts BETWEEN ? AND ?'
+
+_Row = tuple[int, str, str | None, float]
 
 
 def _open_samples(path: Path) -> sqlite3.Connection:
@@ -243,6 +282,90 @@ def _open_samples(path: Path) -> sqlite3.Connection:
     return conn
 
 
+class _Samples:
+    """The consumer collections, read through the (metric, ts, leaf) index on one connection."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def _ts(self, sql: str, *args: object) -> int | None:
+        (ts,) = self._conn.execute(sql, args).fetchone()
+        return ts
+
+    def first(self) -> int | None:
+        return self._ts(_FIRST_SQL, _READ_OK.name)
+
+    def last(self) -> int | None:
+        return self._ts(_LAST_SQL, _READ_OK.name)
+
+    def latest_at_or_before(self, moment: float) -> int | None:
+        return self._ts(_LATEST_SQL, _READ_OK.name, moment)
+
+    def rows(self, specs: Sequence[MetricSpec], start: int, end: int) -> list[_Row]:
+        sql = _WINDOW_SQL.format(', '.join('?' * len(specs)))
+        return self._conn.execute(sql, (*(spec.name for spec in specs), start, end)).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# The window before a hold
+# ---------------------------------------------------------------------------
+
+
+class HoldState(StrEnum):
+    RANKED = 'ranked'
+    NOT_LIVE = 'recorder_not_live'
+    NO_SAMPLES = 'no_samples'
+
+
+_STATE_TEXT: Mapping[HoldState, str] = MappingProxyType({
+    HoldState.RANKED: 'ranked over the window',
+    HoldState.NOT_LIVE: 'recorder not live at this hold',
+    HoldState.NO_SAMPLES: 'no samples: under two consumer collections in the window',
+})
+
+
+@dataclass(frozen=True)
+class Window:
+    """The collections a hold is read over: gauges at start and end, increments in (start, end]."""
+
+    start: datetime
+    end: datetime
+    collections: int
+
+
+@dataclass(frozen=True)
+class HoldReading:
+    hold: Hold
+    mapping: HoldConsumers
+    state: HoldState
+    window: Window | None
+    last_collection: datetime | None
+    """The latest collection at or before the hold."""
+
+
+def _read_hold(samples: _Samples, hold: Hold, window_seconds: int) -> HoldReading:
+    """Read *hold* over the window ending at the latest collection at or before it.
+
+    The window starts at the latest collection at or before ``hold - window``,
+    or at the first collection when the recorder went live inside the window.
+    """
+    mapping = hold_consumers(hold.own_cgroup, hold.project_root)
+    moment = hold.at.timestamp()
+    end = samples.latest_at_or_before(moment)
+    if end is None:
+        return HoldReading(hold, mapping, HoldState.NOT_LIVE, None, None)
+    opens = moment - window_seconds
+    start = samples.latest_at_or_before(opens)
+    if start is None:
+        start = samples.first()
+    if start is None or end < opens or start == end:
+        return HoldReading(hold, mapping, HoldState.NO_SAMPLES, None, _utc(end))
+    collections = len({row[0] for row in samples.rows((_READ_OK,), start, end)})
+    return HoldReading(
+        hold, mapping, HoldState.RANKED, Window(_utc(start), _utc(end), collections), _utc(end)
+    )
+
+
 # ---------------------------------------------------------------------------
 # The report
 # ---------------------------------------------------------------------------
@@ -252,9 +375,16 @@ def _open_samples(path: Path) -> sqlite3.Connection:
 class HoldsReport:
     roots: tuple[RootRead, ...]
     samples_db: Path
+    first_collection: datetime | None
+    last_collection: datetime | None
     since: datetime
     window_seconds: int
-    readings: tuple[Hold, ...]
+    readings: tuple[HoldReading, ...]
+    """In hold order."""
+
+
+def _hold_order(hold: Hold) -> tuple[datetime, str, int]:
+    return hold.at, str(hold.project_root), hold.event_id
 
 
 def read_holds_report(
@@ -262,10 +392,27 @@ def read_holds_report(
 ) -> HoldsReport:
     """Every memory hold the roots' runs.db files hold since *since*, read against *samples_db*."""
     conn = _open_samples(samples_db)
-    conn.close()
-    reads = tuple(read_root(root, since) for root in roots)
-    holds = sorted((hold for read in reads for hold in read.holds), key=lambda h: (h.at, str(h.project_root)))
-    return HoldsReport(reads, samples_db, since, window_seconds, tuple(holds))
+    try:
+        reads = tuple(read_root(root, since) for root in roots)
+        samples = _Samples(conn)
+        readings = tuple(
+            _read_hold(samples, hold, window_seconds)
+            for hold in sorted((hold for read in reads for hold in read.holds), key=_hold_order)
+        )
+        first, last = samples.first(), samples.last()
+    except sqlite3.Error as exc:
+        raise SamplesUnavailable(f'samples store unreadable: {samples_db} ({exc})') from exc
+    finally:
+        conn.close()
+    return HoldsReport(
+        roots=reads,
+        samples_db=samples_db,
+        first_collection=None if first is None else _utc(first),
+        last_collection=None if last is None else _utc(last),
+        since=since,
+        window_seconds=window_seconds,
+        readings=readings,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +431,15 @@ def _root_line(read: RootRead) -> str:
     return f'  {read.root}: {found}{skipped}'
 
 
+def _samples_line(report: HoldsReport) -> str:
+    first, last = report.first_collection, report.last_collection
+    if first is None or last is None:
+        span = 'no consumer collections'
+    else:
+        span = f'consumer collections {format_utc(first)} to {format_utc(last)}'
+    return f'samples db: {report.samples_db} ({span})'
+
+
 def _hold_count_line(report: HoldsReport) -> str:
     count = len(report.readings)
     noun = 'memory hold' if count == 1 else 'memory holds'
@@ -294,13 +450,45 @@ def _header(report: HoldsReport) -> list[str]:
     return [
         f'roots ({len(report.roots)}):',
         *(_root_line(read) for read in report.roots),
-        f'samples db: {report.samples_db}',
+        _samples_line(report),
+        f'window: {report.window_seconds} s before each hold',
         _hold_count_line(report),
     ]
 
 
+def _heading(hold: Hold) -> str:
+    value = 'n/a' if hold.arm_value is None else f'{hold.arm_value:g}'
+    return f'hold {format_utc(hold.at)}  {hold.project_root}  task {hold.task_id}  {hold.arm} {value}'
+
+
+def _window_lines(window: Window) -> list[str]:
+    return [
+        f'  window {format_utc(window.start)} to {format_utc(window.end)}, '
+        f'{window.collections} collections',
+        '  who grew: no consumer grew',
+        '  who paid: no consumer paid',
+    ]
+
+
+def _hold_block(reading: HoldReading) -> list[str]:
+    if reading.window is not None:
+        return [_heading(reading.hold), *_window_lines(reading.window)]
+    last = reading.last_collection
+    after = '' if last is None else f'; the last collection was {format_utc(last)}'
+    return [_heading(reading.hold), f'  {_STATE_TEXT[reading.state]}{after}']
+
+
 def render_text(report: HoldsReport, *, summary: bool = False) -> str:
-    return '\n'.join(_header(report))
+    sections = [_header(report), *(_hold_block(reading) for reading in report.readings)]
+    return '\n\n'.join('\n'.join(lines) for lines in sections)
+
+
+def _time_json(moment: datetime | None) -> str | None:
+    return None if moment is None else format_utc(moment)
+
+
+def _consumer_json(consumer: Consumer | None) -> str | None:
+    return None if consumer is None else encode_consumer(consumer)
 
 
 def _root_json(read: RootRead) -> dict[str, Any]:
@@ -313,22 +501,55 @@ def _root_json(read: RootRead) -> dict[str, Any]:
     }
 
 
-def _hold_json(hold: Hold) -> dict[str, Any]:
+def _mapping_json(mapping: HoldConsumers) -> dict[str, Any]:
     return {
+        'service': _consumer_json(mapping.service),
+        'agents': _consumer_json(mapping.agents),
+        'project': _consumer_json(mapping.project),
+        'verify': encode_consumer(mapping.verify),
+        'unmapped_reason': mapping.unmapped_reason,
+    }
+
+
+def _window_json(window: Window) -> dict[str, Any]:
+    return {
+        'window': {
+            'start': format_utc(window.start),
+            'end': format_utc(window.end),
+            'collections': window.collections,
+        },
+        'who_grew': [],
+        'who_paid': [],
+    }
+
+
+def _reading_json(reading: HoldReading) -> dict[str, Any]:
+    hold = reading.hold
+    entry: dict[str, Any] = {
         'at': format_utc(hold.at),
         'project_root': str(hold.project_root),
         'event_id': hold.event_id,
         'task_id': hold.task_id,
         'arm': hold.arm,
+        'arm_value': hold.arm_value,
         'own_cgroup': hold.own_cgroup,
+        'mapping': _mapping_json(reading.mapping),
+        'state': reading.state.value,
+        'last_collection': _time_json(reading.last_collection),
+        'window': None,
     }
+    if reading.window is not None:
+        entry.update(_window_json(reading.window))
+    return entry
 
 
 def report_json(report: HoldsReport, *, summary: bool = False) -> dict[str, Any]:
     return {
         'roots': [_root_json(read) for read in report.roots],
         'samples_db': str(report.samples_db),
+        'first_collection': _time_json(report.first_collection),
+        'last_collection': _time_json(report.last_collection),
         'since': format_utc(report.since),
         'window_seconds': report.window_seconds,
-        'holds': [_hold_json(hold) for hold in report.readings],
+        'holds': [_reading_json(reading) for reading in report.readings],
     }
