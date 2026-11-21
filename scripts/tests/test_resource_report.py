@@ -137,6 +137,45 @@ class TestNoMemoryHolds:
         assert report['holds'] == []
 
 
+class TestTheHoldEventsRead:
+    @pytest.fixture
+    def root(self, tmp_path, make_runs_db):
+        root = project_root(tmp_path, 'dark-factory')
+        pre_sample_payload = {'metric': 'mem_some_avg10', 'value': 40.15, 'in_flight': 11, 'floor': 1}
+        make_runs_db(
+            [
+                {
+                    'timestamp': '2026-11-20T12:00:00+00:00',
+                    'event_type': 'dispatch_deferred',
+                    'data': pre_sample_payload,
+                },
+                {
+                    'timestamp': '2026-11-20T12:00:05+00:00',
+                    'event_type': 'dispatch_deferred',
+                    'data': 'not json',
+                },
+            ],
+            directory=runs_db(root).parent,
+        )
+        return root
+
+    def test_a_hold_written_before_the_payload_carried_its_sample_is_still_a_hold(
+        self, root, store, capsys
+    ):
+        _rc, out, _err = run(capsys, *holds_argv(store, root, extra=('--since', '2026-11-14', '--json')))
+
+        report = json.loads(out)
+        assert [(hold['arm'], hold['own_cgroup']) for hold in report['holds']] == [
+            ('mem_some_avg10', None)
+        ]
+        assert report['roots'][0]['skipped'] == 1
+
+    def test_the_header_names_the_events_it_could_not_parse(self, root, store, capsys):
+        _rc, out, _err = run(capsys, *holds_argv(store, root, extra=('--since', '2026-11-14')))
+
+        assert '1 hold events skipped, unparseable' in out
+
+
 class TestParseSince:
     @pytest.mark.parametrize(
         ('text', 'expected'),
