@@ -1053,8 +1053,8 @@ def test_orchestrator_service_points_at_canonical_config_filename(
     canonical, required filename — the dashboard's escalation-URL discovery
     (``_discover_escalation_urls``) keys on it, and legacy spellings
     (``orchestrator.yaml``, ``orchestrator-config.yaml``,
-    ``orchestrator/config.yaml``) are honoured only as a discovery fallback for
-    not-yet-migrated projects, never as a supported choice.  Task 2698
+    ``orchestrator/config.yaml``) are not read by discovery at all (retired,
+    task 7138).  Task 2698
     canonicalized the filename; task 2719 then RETIRED dark-factory's own
     transitional symlinks (guarded by test_legacy_config_symlinks_retired.py),
     which is the precedent that makes the legacy spelling a defect here rather
