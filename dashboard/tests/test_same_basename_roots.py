@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import yaml
-from _task_units import units_by_label
+from _task_units import rows_in_root_order, units_by_label
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from dashboard.config import DashboardConfig
@@ -108,9 +108,7 @@ class TestTasksCollector:
 
     async def test_a_roots_runtime_reaches_only_that_roots_rows(self, config, dummy_client):
         snapshots = await collect_tasks_with_counts(dummy_client, config)
-        by_project = {
-            row['project']: row for unit in snapshots.values() for row in unit.rows.value or []
-        }
+        by_project = {row['project']: row for row in rows_in_root_order(snapshots)}
 
         assert by_project[B_LABEL]['lane'] == 'lane-b'
         assert by_project[B_LABEL]['runtime_status'] == 'ok'

@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _dashboard_helpers import bug_warnings
+from _task_units import measured_unit
 
 from dashboard.api.burndown import _BURNDOWN_WINDOWS
 from dashboard.api.window import ServedWindow, _parse_window, with_window
@@ -188,13 +189,11 @@ def _snapshot(*, health='ok', done=0):
     )
 
     as_of = datetime.now(UTC)
+    if health == 'ok':
+        return measured_unit(done=done, as_of=as_of)
     stale_age = timedelta(seconds=60)
     status_map = {task_id: 'done' for task_id in range(1, done + 1)}
     fresh_rows = Datum([], as_of, DatumState.FRESH, None, FRESHNESS_BOUND_SECONDS)
-    fresh_census = Datum(
-        build_census(status_map), as_of, DatumState.FRESH, None,
-        FRESHNESS_BOUND_SECONDS,
-    )
     stale_census = Datum(
         build_census(status_map), as_of - stale_age, DatumState.STALE,
         f'canned {health} root', FRESHNESS_BOUND_SECONDS,
@@ -204,7 +203,6 @@ def _snapshot(*, health='ok', done=0):
         FRESHNESS_BOUND_SECONDS,
     )
     failure, rows, census = {
-        'ok': (SnapshotFailure.NONE, fresh_rows, fresh_census),
         'offline': (SnapshotFailure.UNREACHABLE, unknown, unknown),
         'degraded': (SnapshotFailure.BUDGET, unknown, unknown),
         'count_unknown': (SnapshotFailure.NONE, fresh_rows, unknown),
