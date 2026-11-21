@@ -320,33 +320,55 @@ async def _drive_advance(
     return base_sha, head_sha
 
 
-async def _run_lane(
-    worker: OfflineLaneWorker, expected_passes: int, *, timeout: float = _LANE_PASS_BOUND_SECS,
-) -> None:
+async def _await_lane_passes(worker: OfflineLaneWorker, expected_passes: int) -> None:
     """Drive worker.run() as a real background task until *expected_passes*
-    full passes (``_run_once`` calls) have COMPLETED, then cancel the loop
-    task.
+    full passes (``_run_once`` calls, so INCLUDING each pass's confirm, engine
+    observe and filing) have completed, then cancel the loop task.
 
-    Wraps ``worker._run_once`` itself — NOT ``suite_runner`` alone — with a
-    call counter, so ``done`` is only set once a pass, INCLUDING its
-    confirm, the engine's observe and any filing or escalation it makes,
-    has fully returned. Counting at the detect seam instead would race the
-    red path, which awaits real I/O after detection returns. Restores the
-    original ``_run_once`` in the ``finally`` block so repeated calls
-    (:func:`_drive_lane_pass` is called up to six times per scenario) never
-    nest counting wrappers.
+    A pass that raises fails here at once with its own exception, rather than
+    being swallowed into ``run()``'s fail-open backoff and retried. Requires
+    ``worker._dirty`` (or the wake event) to already be set by a prior trigger,
+    exactly as production wiring would leave it.
+    """
+    inner_run_once = worker._run_once
+    completed = asyncio.get_running_loop().create_future()
+    count = {'n': 0}
+
+    async def _counting_run_once():
+        try:
+            result = await inner_run_once()
+        except Exception as exc:
+            if not completed.done():
+                completed.set_exception(exc)
+            raise
+        count['n'] += 1
+        if count['n'] >= expected_passes and not completed.done():
+            completed.set_result(None)
+        return result
+
+    worker._run_once = _counting_run_once
+    task = asyncio.create_task(worker.run())
+    try:
+        await completed
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        worker._run_once = inner_run_once
+
+
+async def _run_lane(worker: OfflineLaneWorker, expected_passes: int) -> None:
+    """:func:`_await_lane_passes`, bounded at ``_LANE_PASS_BOUND_SECS`` (read at
+    call time).
 
     Modeled on ``test_offline_lane.py``'s
     ``test_loop_coalesces_to_exactly_one_rerun`` cancel-after-N pattern,
     generalized from a fixed N=1 to an arbitrary pass count (B1's single
     pass via :func:`_run_one_lane_pass`; B2's held-pass-plus-one-coalesced-
-    rerun burst uses N=2). Requires ``worker._dirty`` (or the wake event) to
-    already be set by a prior trigger, exactly as production wiring would
-    leave it.
+    rerun burst uses N=2).
 
-    ``timeout`` defaults to 30.0, not a tight bound: the clock starts at
-    ``asyncio.create_task`` above, so it also covers the real-git test-body
-    work the caller does between entering the held pass and releasing it
+    The bound is 30.0, not a tight one: the clock starts with the drive, so
+    it also covers the real-git test-body work the caller does between entering the held pass and releasing it
     (each :func:`_drive_advance` costs `_SPAWNS_PER_DRIVE_ADVANCE` subprocess
     spawns — MEASURED, not hand-counted, by
     `test_out_of_bound_spawn_counts_are_measured_not_asserted`) — not just
@@ -390,31 +412,12 @@ async def _run_lane(
     was composition coverage (the override rule the preceding paragraph
     describes), not the bound value itself.
     """
-    inner_run_once = worker._run_once
-    done = asyncio.Event()
-    count = {'n': 0}
-
-    async def _counting_run_once():
-        result = await inner_run_once()
-        count['n'] += 1
-        if count['n'] >= expected_passes:
-            done.set()
-        return result
-
-    worker._run_once = _counting_run_once
-    task = asyncio.create_task(worker.run())
-    try:
-        await asyncio.wait_for(done.wait(), timeout=timeout)
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        worker._run_once = inner_run_once
+    await asyncio.wait_for(_await_lane_passes(worker, expected_passes), timeout=_LANE_PASS_BOUND_SECS)
 
 
-async def _run_one_lane_pass(worker: OfflineLaneWorker, *, timeout: float = _LANE_PASS_BOUND_SECS) -> None:
-    """Drive worker.run() as a real background task for exactly one pass (B1)."""
-    await _run_lane(worker, 1, timeout=timeout)
+async def _run_one_lane_pass(worker: OfflineLaneWorker) -> None:
+    """Drive worker.run() as a real background task for exactly one bounded pass (B1)."""
+    await _run_lane(worker, 1)
 
 
 class _ControllableSuiteRunner:
@@ -448,7 +451,7 @@ class _ControllableSuiteRunner:
         """Block until the held first call has actually started (is in-flight).
 
         ``timeout`` defaults to 30.0 for the same reason as ``_run_lane``'s
-        default above (see that function's docstring for the full FLOOR/
+        bound above (see that function's docstring for the full FLOOR/
         CEILING derivation): the ``_run_lane`` task created just before this
         call races the SAME clock, and this call is entered only after
         ``OfflineLaneWorker._run_once`` has already done its own real-git
