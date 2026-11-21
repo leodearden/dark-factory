@@ -506,16 +506,18 @@ class DurableWriteQueue:
         Callbacks run *before* marking completed so that a callback
         failure triggers retry instead of being silently lost.
 
-        Both post-commit hooks, by contrast, run AFTER the queue's own commit
+        The post-commit hooks, by contrast, run AFTER the queue's own commit
         and OUTSIDE the semaphore: ``_notify_terminal`` (the durable write-back
         onto the ``write_ops`` row) and then, for a dead item only,
         ``_notify_dead_letter`` (the operator alarm). A parked item is not
-        terminal; it reaches ``_notify_parked`` alone, under the same
-        discipline.
+        terminal; it reaches ``_notify_parked`` alone. A parked item that
+        lands reaches ``_release_parked``, which frees every other parked
+        row. All of them share the same discipline: none can send a settled
+        item back through ``_handle_failure``.
         """
         terminal: tuple[str, str | None] | None = None
         parked: ParkedWriteEvent | None = None
-        unparked: int | None = None
+        landed_after_park = False
         value: QueuedWrite | None = None
         write_op_id: str | None = None
         # Seeded from the row, since an earlier attempt may already have
@@ -551,8 +553,7 @@ class DurableWriteQueue:
                     await self._callbacks[callback](value, result)
                 await self._mark_completed(item)
                 terminal = ('completed', None)
-                if item.status == 'parked':
-                    unparked = await self._unpark_all(item)
+                landed_after_park = item.status == 'parked'
             except Exception as exc:
                 reason = self._park_reason(exc, executed=executed)
                 if reason is None:
@@ -562,9 +563,8 @@ class DurableWriteQueue:
 
         if parked is not None:
             await self._notify_parked(parked)
-        if unparked is not None:
-            await self._start_workers_for_pending_groups()
-            await self._notify_cleared()
+        if landed_after_park:
+            await self._release_parked(item)
         if terminal is not None:
             status, error = terminal
             if status == 'dead' and executed:
@@ -727,8 +727,30 @@ class DurableWriteQueue:
                 event.item_id, event.operation, event.group_id, exc_info=True,
             )
 
-    async def _unpark_all(self, landed: QueueItem) -> int:
-        """Release every parked row now that a parked write has landed.
+    async def _release_parked(self, landed: QueueItem) -> None:
+        """Free every parked row now that *landed*, a parked write, has landed.
+
+        Runs after *landed*'s completion is committed and outside
+        ``_process_item``'s handler, so it must not raise: an escape would
+        kill the group's worker, as ``_notify_dead_letter`` explains. A
+        failed release leaves the rows parked until their own probe horizon.
+        The clearing is reported either way, because the landing is what
+        proves the cause is gone.
+        """
+        try:
+            await self._unpark_all(landed)
+            await self._start_workers_for_pending_groups()
+        except Exception:
+            logger.warning(
+                'Item %d (%s, group_id=%s) landed after parking, but releasing '
+                'the other parked rows failed; they stay parked until their '
+                'next probe horizon',
+                landed.id, landed.operation, landed.group_id, exc_info=True,
+            )
+        await self._notify_cleared()
+
+    async def _unpark_all(self, landed: QueueItem) -> None:
+        """Set every parked row pending now that a parked write has landed.
 
         Only a parked write's success proves the parking cause is gone; any
         other write may never have touched the refusing provider. The rows keep
@@ -739,12 +761,10 @@ class DurableWriteQueue:
                 "UPDATE write_queue SET status = 'pending', next_retry_at = 0 "
                 "WHERE status = 'parked'"
             )
-        unparked = cursor.rowcount or 0
         logger.info(
             'Item %d (%s, group_id=%s) landed after parking; unparked %d other row(s)',
-            landed.id, landed.operation, landed.group_id, unparked,
+            landed.id, landed.operation, landed.group_id, cursor.rowcount or 0,
         )
-        return unparked
 
     async def _notify_cleared(self) -> None:
         """Tell the policy a parked write landed, never raising into the worker.
@@ -758,7 +778,7 @@ class DurableWriteQueue:
             await self._park_policy.on_cleared()
         except Exception:
             logger.warning(
-                'on_cleared hook failed; parked rows were released but the '
+                'on_cleared hook failed; a parked write landed but the '
                 'clearing was NOT reported', exc_info=True,
             )
 
