@@ -2126,19 +2126,19 @@ def _asr_scope() -> Scope:
 
 
 @pytest.fixture
-def _asr_config(mock_config):
-    """``mock_config`` with the collection prefix the reaper sweeps."""
+def _reapable_config(mock_config):
+    """``mock_config`` with the collection prefix scripts/cleanup_test_collections.py reaps."""
     config = mock_config.model_copy(deep=True)
     config.mem0.collection_prefix = EPHEMERAL_COLLECTION_PREFIX
     return config
 
 
 @pytest.fixture
-def _asr_run_id(_asr_scope, _asr_config):
+def _asr_run_id(_asr_scope, _reapable_config):
     """A run_id unique to this run; teardown deletes only this run's points, never the collection."""
     run_id = f'task-2222-add-system-record-probe-{uuid.uuid4().hex}'
     yield run_id
-    collection = _asr_scope.mem0_collection_name(_asr_config.mem0.collection_prefix)
+    collection = _asr_scope.mem0_collection_name(_reapable_config.mem0.collection_prefix)
     client = QdrantClient(url=QDRANT_URL, timeout=10)
     with contextlib.suppress(Exception):
         client.delete(
@@ -2153,10 +2153,10 @@ def _asr_run_id(_asr_scope, _asr_config):
 
 
 def test_the_add_system_record_probe_collection_is_one_the_reaper_can_reclaim(
-    _asr_config, _asr_scope,
+    _reapable_config, _asr_scope,
 ):
     """The probe collection outlives a run by design, so it must be one the reaper deletes."""
-    assert_reapable(_asr_scope.mem0_collection_name(_asr_config.mem0.collection_prefix))
+    assert_reapable(_asr_scope.mem0_collection_name(_reapable_config.mem0.collection_prefix))
 
 
 async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
@@ -2202,9 +2202,9 @@ class TestMem0BackendAddSystemRecordIntegration:
 
     @pytest.mark.asyncio
     async def test_identical_calls_all_land_distinct(
-        self, _asr_config, _asr_scope, _asr_run_id, monkeypatch,
+        self, _reapable_config, _asr_scope, _asr_run_id, monkeypatch,
     ):
-        backend = await _build_asr_backend(_asr_config, _asr_scope, monkeypatch)
+        backend = await _build_asr_backend(_reapable_config, _asr_scope, monkeypatch)
         run_id = _asr_run_id
         metadata = {'kind': 'cycle_summary', 'run_id': run_id}
         n = 6
