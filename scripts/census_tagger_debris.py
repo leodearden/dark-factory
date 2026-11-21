@@ -16,14 +16,15 @@ WHAT THIS IS FOR. PRD task epsilon of ``plans/module-tagger-retirement-prd.md``
 (decision 3). The retired module tagger stamped ``metadata.files_tagged_at``
 onto task records alongside a GUESSED file scope. This census enumerates every
 surviving stamp across all six project corpora and classifies each on three
-axes, so its two consumers can join a machine-readable candidate set instead of
-re-deriving one from prose:
+axes. Its consumer, DF 7271, used it to decide no dedicated tagger-debris repair
+is needed: DF 3113's plan-boundary heal
+(``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._heal_metadata_files_if_diverged``)
+restores metadata.files from plan.files before any live record executes. The
+measured basis is the PRD's "Debris repair disposition" section.
 
-  * DF 3113 P4a — the forward fix for the DONE-path ``metadata.files`` wipe.
-  * DF 3427 — the debris repair pipeline.
-
-Both already speak the audit's ``merge_finalized`` wipe-signature vocabulary,
-so every census row carries that verdict too, keyed to the same task ids.
+Every census row also carries the audit's ``merge_finalized`` wipe-signature
+verdict, keyed to the same task ids, so a consumer can join it to the audit's
+candidate sets.
 
 CORPUS ACCESS — WHY tasks.db, READ-ONLY (task 4525, esc-4525-1).
 Task 4525's text asks for "the fused-memory read path or each project's own
@@ -121,7 +122,7 @@ from shared.tasks_db_readonly import connect_ro
 # ---------------------------------------------------------------------------
 # The classification vocabulary.
 #
-# These six strings are the artifact's PUBLIC contract: DF 3113 P4a and DF 3427
+# These six strings are the artifact's PUBLIC contract: the artifact's consumers
 # read them out of the committed JSON, where they cannot see this module's
 # constants. tests/scripts/test_census_tagger_debris.py pins each literal so a
 # rename fails CI rather than silently producing an unjoinable artifact.
@@ -312,8 +313,8 @@ class CensusRecord(NamedTuple):
 
     ``merge_signature`` is the audit's OWN ``classify_wipe_signature`` verdict
     over this task's ``merge_finalized`` history — a second, independently
-    derived piece of evidence in a vocabulary DF 3113 P4a and DF 3427 already
-    consume, so they can join this artifact to their existing candidate sets
+    derived piece of evidence in a vocabulary the audit and the repair already
+    speak, so a consumer can join this artifact to the audit's candidate sets
     without a translation layer. When the event log could not be read it is
     the audit's ``EVENT_LOG_UNREAD``, never a verdict over a log nobody read.
     It is deliberately NOT the same field as ``wipe_signature``, which is this
@@ -914,6 +915,9 @@ def census_project(project_root: str) -> ProjectCensus:
 
 SCHEMA_VERSION = 3
 
+# Why 7271 and no repair owner: plans/module-tagger-retirement-prd.md "Debris repair disposition".
+ARTIFACT_CONSUMERS: tuple[str, ...] = ("dark_factory 7271",)
+
 # The vocabulary, ordered. Iterating THIS rather than the observed data is what
 # makes a zero-valued cell present rather than absent — a missing key must
 # never be readable as a zero.
@@ -1037,7 +1041,7 @@ def build_report(
                     "true is evidence, false proves nothing either way."
                 ),
             },
-            "consumers": ["dark_factory 3113 P4a", "dark_factory 3427"],
+            "consumers": list(ARTIFACT_CONSUMERS),
             "regen_command": " ".join(
                 [_REGEN_COMMAND_HEAD, *(f"--project-root {root}" for root in roots)]
             ),
@@ -1130,7 +1134,7 @@ def render_markdown(report: dict) -> str:
         f"  the `{NEVER_RECONCILED}` caveat below.",
         "- **merge_signature** — the audit's own `merge_finalized` verdict",
         "  (`audit_wiped_metadata_files.classify_wipe_signature`), carried as correlating",
-        "  evidence in the vocabulary both consumers already speak.",
+        "  evidence in the vocabulary the audit and the repair already speak.",
         "",
         f"### Why `{LOCK_RECONCILED}` is a weaker signal than `{RECONCILED}`",
         "",
