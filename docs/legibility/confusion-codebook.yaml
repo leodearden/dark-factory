@@ -4811,6 +4811,48 @@ entries:
     manifested_phase: recon
     note: The agent called the deferred mcp__fused-memory__get_task with an undeclared project_id argument before its schema was loaded. The server rejected the call before it ran, and the digest notes the schema was not in the prompt at call time. This is the guessed-parameter-before-ToolSearch mechanism the entry names.
     evidence_quote: This tool's input schema was not in your prompt when you called it.
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 02426319-c6c4-44c3-8a84-4d06c7d647dd
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called mcp__fused-memory__get_task with a guessed project_id argument before the tool's schema was loaded. Each call was rejected by validation with unknown_argument, and the agent repeated the same guess across five turns.
+    evidence_quote: 'This tool''s input schema was not in your prompt when you called it. ... get_task was called with argument(s) it does not declare: project_id'
+  - date: '2026-11-20'
+    project: dark_factory
+    session: f852b44a-d3e6-4fb0-be3c-0978341d01f2
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called the deferred mcp__fused-memory__get_task tool before loading its schema via ToolSearch, guessed a project_id parameter that the tool does not declare, and the call failed validation. The same guessed call was repeated on turns 23, 25 and 27.
+    evidence_quote: 'This tool''s input schema was not in your prompt when you called it. The input schema is: {"type":"object","properties":{"id":{"title":"Id","type":"string"},"project_root":{"title":"Project Root","type":"string"}'
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 2c88d2eb-a7e4-455b-a867-19f622957805
+    origin_phase: recon
+    manifested_phase: recon
+    note: A deferred MCP tool was called before its schema was loaded. The agent guessed the parameter name 'metadata' (declared parameters are 'project_id' and 'filters'), the call failed validation, and the same guess was repeated on later turns.
+    evidence_quote: 'count_memories_by_metadata was called with argument(s) it does not declare: metadata'
+  - date: '2026-11-20'
+    project: dark_factory
+    session: b801b3ae-b734-4644-b3f0-ce487e888fa8
+    origin_phase: recon
+    manifested_phase: recon
+    note: The recon agent called the deferred mcp__fused-memory__get_task tool without first loading its schema, guessed a project_id argument, and got rejected three times. The digest shows the schema was absent from the prompt at call time and the agent did not load it via ToolSearch before retrying.
+    evidence_quote: 'This tool''s input schema was not in your prompt when you called it. The input schema is:'
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 1fc233f9-8ec4-4ebc-9560-0c53b5f2350f
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called the deferred MCP tool get_task before its schema was loaded, guessed a project_id parameter that the tool does not declare, and got rejected on validation in turns 21, 23 and 25. The digest does not show a ToolSearch call before the retries.
+    evidence_quote: This tool's input schema was not in your prompt when you called it.
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 42c4c65c-9372-40cb-92e1-ff26df241246
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called the deferred mcp__fused-memory__get_task tool before loading its schema, guessed a project_id parameter that the tool does not declare, and was rejected at validation on turns 21 and 23. The digest states the schema was not in the prompt at call time, which is the mechanism the entry names.
+    evidence_quote: This tool's input schema was not in your prompt when you called it.
   last_seen_runs:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
@@ -13660,6 +13702,21 @@ entries:
     manifested_phase: unknown
     note: The Guard Trips section renders two df_guard signals as bare 'blocked:' lines with the matched text missing, which is the bare-template rendering the entry names.
     evidence_quote: '- (turn 73) blocked:'
+  - date: '2026-11-20'
+    project: dark_factory
+    session: e255534f-1327-4fd9-b812-acdb78a041d1
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Each df_guard trip renders as a bare 'blocked:' label with no matched text after it, consistent with the guard signal being rendered as a bare template that drops the matched substring.
+    evidence_quote: '- (turn 46) blocked:
+
+      - (turn 77) blocked:
+
+      - (turn 94) blocked:
+
+      - (turn 100) blocked:
+
+      - (turn 122) blocked:'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -24146,6 +24203,34 @@ entries:
     manifested_phase: unknown
     note: Orchestrated session in a dark-factory worktree (cwd .worktrees/6847) logged repeated 'no such file or directory' not_found signals (turns 90, 196, 337), with tool_error at 0 and no other diagnostic signal. The digest does not show the phase, so both phases are unknown.
     evidence_quote: '- (turn 196) no such file or directory'
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 82276b72-9753-4c2d-8745-197eb7b2f540
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated task running in a worktree (cwd .worktrees/7519) logs repeated not-found errors (not_found=10) with no further diagnosis in the digest; the commands behind most of them are not shown.
+    evidence_quote: (turn 155) no such file or directory
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 75eb6546-1266-47ed-b75e-3bc5daea0b41
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session running in a .worktrees/ cwd logs repeated not-found events with no other diagnostic signal (tool_error, self_correct, and interrupt are all 0), matching the entry's mechanism.
+    evidence_quote: '- (turn 54) no such file or directory'
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 9846a6be-47be-42fe-9a42-dd01ea3826b0
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Orchestrated worktree task (cwd .worktrees/8562) shows repeated not-found signals (not_found: 6) across several turns. The digest also contains an unrelated TypeError from an ad-hoc helper script, so the ''no other diagnostic signal'' part of the title is only partly supported.'
+    evidence_quote: '- (turn 33) no such file or directory'
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 657ee2fd-1e14-460b-be7d-a4d50c1bf2fd
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session in a dark-factory worktree cwd shows repeated not-found failures across turns while every other signal counter reads zero, so there is no additional diagnostic. The digest shows only one literal 'no such file or directory'; the other four not-found events use different wording. Phase is unknown because the digest does not establish which stage the session was in.
+    evidence_quote: 'agent_class: "orchestrated-task" ... cwd: "/home/leo/src/dark-factory/.worktrees/10940" ... signal_counts: tool_error: 0 ... not_found: 5 ... (turn 28) no such file or directory ... (turn 155) does not exist ... (turn 380) not found in ... (turn 543) does not exist ... (turn 580) modulenotfounderror'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -25417,6 +25502,13 @@ entries:
     manifested_phase: implement
     note: The agent tried to wait on a background run by chaining a foreground sleep with tail, and the Bash guard blocked it with a request to use a blocking wait primitive.
     evidence_quote: 'Blocked: sleep 60 followed by: tail -5 /tmp/claude-1000/-home-leo-src-dark-factory--worktrees-5270/03ae3244-0a22-4baf-85cc-749502b8604f/tasks/b8g6g7g7w.output. To wait for a condition, use Monitor with an until-loop'
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 2d3b41af-7b4e-47af-894b-b8f3f210d036
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The agent polled a background census run by chaining sleep 60 with cat on its task output in a foreground Bash call. The guard blocked the call and directed it to a blocking wait primitive (Monitor), which is the busy-poll-instead-of-wait-primitive mechanism the entry names. The digest does not show pytest or ps/pgrep, so this is a partial match on mechanism.
+    evidence_quote: 'Blocked: sleep 60 followed by: cat /tmp/claude-1000/-home-leo-src-dark-factory--worktrees-7095/2d3b41af-7b4e-47af-894b-b8f3f210d036/tasks/bitbwyxsg.output tail -5. To wait for a condition, use Monitor with an until-loop (e.g. `until <check>; do sleep 2; done`). To wait for a command you started, use run_in_background: true. Do not chain shorter sleeps to work around this block.'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -26512,6 +26604,15 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Digest shows agent_class 'interactive' with n_user_turns 0, the same contradiction the entry describes (INTERACTIVE returned as the unguarded catch-all when no agent-class marker matches). Phases are not determinable from the digest.
+  - date: '2026-11-20'
+    project: dark_factory
+    session: e255534f-1327-4fd9-b812-acdb78a041d1
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest shows agent_class 'interactive' alongside n_user_turns 0, the session-class contradiction this entry names.
+    evidence_quote: 'agent_class: "interactive"
+
+      n_user_turns: 0'
   filed_tickets:
   - ticket: tkt_0RW5FRC08TTDX8HFPEYMBKZKDV
     project_root: /home/leo/src/dark-factory
@@ -27580,6 +27681,13 @@ entries:
     manifested_phase: recon
     note: 'The ''User Corrections'' bucket captured an injected recon stage prompt (Stage 2 task-knowledge sync), not a user correction. The session has n_user_turns: 1 and no corrective signal counts fired, so the bucket entry is injected context mislabeled as a correction.'
     evidence_quote: '- (turn 3) ## Stage 2: Task-Knowledge Sync'
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 9fb8f0a1-68fd-4c65-9dde-09087f4d6db2
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket includes a provider context-handoff block that is injected historical context, not a user correction.
+    evidence_quote: '(turn 229) Context handoff (delta_since_target_last_seen):'
   filed_tickets:
   - ticket: tkt_0RW5FRC7ET51RZA763BVXH7ZAA
     project_root: /home/leo/src/dark-factory
@@ -27791,6 +27899,13 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The 'User Corrections' bucket records two slash-command invocations (turn 4 /doctor, turn 165 /reflect) as corrections. Neither is corrective feedback, and the signal_counts do not support that label. Turn 146 is a question, not a correction.
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 9fb8f0a1-68fd-4c65-9dde-09087f4d6db2
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket captures a skill invocation (/reflect) as if it were corrective user feedback.
+    evidence_quote: (turn 875) <command-message>reflect</command-message>
   filed_tickets:
   - ticket: tkt_0RW5FRCC10XP47EPHA3X9HRK50
     project_root: /home/leo/src/dark-factory
@@ -28150,6 +28265,27 @@ entries:
     origin_phase: verify
     manifested_phase: verify
     note: Post-merge verify failed, and the orchestrated-task agent's read-only Bash diagnostics (pytest tail, grep counts) were denied in don't-ask mode, so it had to diagnose the failure without running them.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 3f0b1f99-74fd-4ff9-953b-b5ee687fe8f5
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session was denied read-only Bash inspection (git log/diff/status, cat, ls) under don't-ask mode, and the denial recurs at turns 25 and 87. The agent was left to work from Grep/Glob, which then failed, so it had to guess at paths and state. The digest does not show the verify-failure context, so phases are unknown.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 1df59802-6896-4cb1-9d09-34cd7aeb8abe
+    origin_phase: verify
+    manifested_phase: verify
+    note: Orchestrated-task session was denied read-only Bash inspection (grep, git status, git grep) in don't-ask mode, five times, while investigating a test failure from verify logs.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 31855fd5-1c87-4fe2-a4ff-68d67b480464
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task sub-agent ran in don't-ask mode and its read-only Bash inspection (git log, git status, git diff, cat of .task/plan.json) was denied at turn 27. The digest does not show which phase the agent was in, so both phases are unknown.
     evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
   filed_tickets:
   - ticket: null
@@ -45923,6 +46059,19 @@ candidates:
     origin_phase: implement
     manifested_phase: verify
     evidence_quote: 'AssertionError: harness.py: expected >=26 Escalation(...) constructions, found 22 — if they moved to another module, scan that module here too, or this tripwire silently covers less.'
+- id: cand-20261120-1
+  title: Recon agent repeats get_task calls with an undeclared project_id after an explicit unknown_argument rejection and inline schema
+  cause: The agent passes a project_id argument that get_task does not declare, even though the rejection names the declared parameters and the inline schema lists only id, project_root and tag. It repeats the same rejected call across several turns instead of correcting the argument. Each rejection is loud and self-describing, so the failure comes from the agent's call shape, not from a silent or misleading tool contract.
+  area: fused-memory
+  first_seen: '2026-11-20'
+  disposition: pending
+  sightings:
+  - date: '2026-11-20'
+    project: dark_factory
+    session: 7365a53d-3287-4c49-9e4d-d3043ff847fa
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: 'get_task was called with argument(s) it does not declare: project_id'
 historical_backfill:
   run_id: census-dark_factory-20261024
   unmatched_task_ids:
