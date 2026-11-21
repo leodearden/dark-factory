@@ -14,6 +14,12 @@ asked sum, 0.0 when nothing was asked.
 A per-run metric added later needs no reset of the window: a series that
 predates it adds nothing to its sum. Only the metrics in
 :data:`CONTRACT_METRICS` must be carried by every series in the window.
+
+Every metric is a reported scalar: the sweep's escapes are filed by the sweep
+itself, and the gate on the week is θ's, so no M2 rule alarms on the series.
+Each run still judges its series into ``limits-current.json`` beside it, as the
+memory-eval runner does for its own evals, because every eval directory with
+runs on the shared root is read as one whose evaluator completes.
 """
 
 from __future__ import annotations
@@ -26,6 +32,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from shared.memory_eval_limits import (
+    LimitsConfig,
+    evaluate_series,
+    limits_artifact_path,
+    load_limits_artifact,
+    write_limits_artifact,
+)
 from shared.memory_eval_metrics import (
     Corpus,
     Metric,
@@ -34,6 +47,7 @@ from shared.memory_eval_metrics import (
     eval_dir,
     format_stamp,
     load_metric_series,
+    load_series_window,
     metrics_artifact_path,
     stamp_datetime,
     write_metric_series,
@@ -56,34 +70,30 @@ THETA_SUMMARY_KEYS: tuple[str, ...] = (
 )
 
 
+#: One nightly run a day; with only scalars in the series nothing spends the budget.
+LIMITS = LimitsConfig(runs_per_quarter=90, min_samples=1, baseline_window=7)
+
+
 @dataclass(frozen=True)
 class _RunMetric:
-    """A per-run metric: its id, how one run measures it, and whether a rise in it
-    is a regression (an alarmed count) or only reported (a scalar)."""
+    """A per-run metric: its id and how one run measures it."""
 
     metric_id: str
     measure: Callable[[SweepRunView], int]
-    alarmed: bool
 
 
 _FAILED, _ASKED = 'adjudication_failed', 'adjudications_asked'
 
 _RUN_METRICS: tuple[_RunMetric, ...] = (
-    _RunMetric('writing_runs', lambda view: int(view.apply is not None), alarmed=False),
+    _RunMetric('writing_runs', lambda view: int(view.apply is not None)),
     _RunMetric(
         'would_escape', lambda view: sum(len(run.counts.would_escape) for run in view.runs),
-        alarmed=True,
     ),
-    _RunMetric('actions_planned', lambda view: view.plan.counts.planned, alarmed=False),
-    _RunMetric(
-        'skipped_cap', lambda view: sum(run.counts.skipped_cap for run in view.runs),
-        alarmed=True,
-    ),
-    _RunMetric(_ASKED, lambda view: view.plan.counts.adjudications_asked, alarmed=False),
-    _RunMetric(_FAILED, lambda view: view.plan.counts.adjudication_failed, alarmed=True),
-    _RunMetric(
-        'adjudication_capped', lambda view: view.plan.counts.adjudication_capped, alarmed=True,
-    ),
+    _RunMetric('actions_planned', lambda view: view.plan.counts.planned),
+    _RunMetric('skipped_cap', lambda view: sum(run.counts.skipped_cap for run in view.runs)),
+    _RunMetric(_ASKED, lambda view: view.plan.counts.adjudications_asked),
+    _RunMetric(_FAILED, lambda view: view.plan.counts.adjudication_failed),
+    _RunMetric('adjudication_capped', lambda view: view.plan.counts.adjudication_capped),
 )
 
 #: The per-run metric ids; each one's 7-day sum is a summary key.
@@ -116,16 +126,30 @@ def sweep_metric_series(view: SweepRunView, *, project_id: str, stamp: str) -> M
             counts=dict(Counter(record.project_id for record in view.records)),
         ),
         metrics=[
-            Metric(
-                metric_id=metric.metric_id,
-                kind='count' if metric.alarmed else 'scalar',
-                value=metric.measure(view),
-                n=1,
-                direction='higher_is_worse' if metric.alarmed else None,
-            )
+            Metric(metric_id=metric.metric_id, kind='scalar', value=metric.measure(view), n=1)
             for metric in _RUN_METRICS
         ],
     )
+
+
+def judge_series(root: Path, series: MetricSeries) -> Path:
+    """Judge *series* against the earlier series under *root* and rewrite the
+    eval's ``limits-current.json``, resuming from the one an earlier run left, as
+    the memory-eval runner's ``evaluate_eval`` does; return its path. An earlier
+    artifact that does not parse raises."""
+    path = limits_artifact_path(root, EVAL_ID)
+    prior = load_limits_artifact(path) if path.is_file() else None
+    window = load_series_window(
+        root, EVAL_ID, limit=LIMITS.baseline_window, before_stamp=series.run_stamp,
+    )
+    result = evaluate_series(
+        series,
+        window,
+        LIMITS,
+        frozenset(prior.grandfather_set) if prior is not None else None,
+        prior.snapshotted_metric_ids if prior is not None else None,
+    )
+    return write_limits_artifact(result, path)
 
 
 def summary_path(root: Path) -> Path:
@@ -234,6 +258,7 @@ class SweepMetricsTarget:
         )
         try:
             write_metric_series(series, self.root)
+            judge_series(self.root, series)
             summary = summarize_series(self.root, now=now)
             atomic_write_text(emitted.summary_path, canonical_json_text(summary), mkdir=True)
         except (OSError, ValueError) as failure:

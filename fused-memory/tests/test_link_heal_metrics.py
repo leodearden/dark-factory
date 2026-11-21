@@ -28,6 +28,7 @@ from _link_heal_harness import (
     RecordingFiler,
     build_harness,
 )
+from shared.memory_eval_limits import limits_artifact_path, load_limits_artifact
 from shared.memory_eval_metrics import (
     Corpus,
     Metric,
@@ -176,16 +177,10 @@ class TestOneRunsSeries:
         assert values['adjudication_failed'] == 1
         assert values['adjudication_capped'] == 3
 
-    def test_a_rise_in_an_escape_cap_or_failure_is_the_alarmed_direction(self):
+    def test_every_metric_is_reported_and_none_is_alarmed(self):
         series = sweep_metric_series(_view(_run(1)), project_id=DF, stamp=STAMP)
 
-        alarmed = {
-            metric.metric_id for metric in series.metrics
-            if metric.kind == 'count' and metric.direction == 'higher_is_worse'
-        }
-        reported = {metric.metric_id for metric in series.metrics if metric.kind == 'scalar'}
-        assert alarmed == {'would_escape', 'skipped_cap', 'adjudication_failed', 'adjudication_capped'}
-        assert reported == {'writing_runs', 'actions_planned', 'adjudications_asked'}
+        assert {(metric.kind, metric.direction) for metric in series.metrics} == {('scalar', None)}
 
     def test_a_view_with_no_records_counts_no_project(self):
         series = sweep_metric_series(_view(_run(1)), project_id=DF, stamp=STAMP)
@@ -334,6 +329,39 @@ class TestTheThetaKeyContract:
 
         assert 'would_escape_7d' in str(excinfo.value)
         assert repr(value) in str(excinfo.value)
+
+
+class TestTheLimitsArtifact:
+    def test_each_run_leaves_a_limits_artifact_judging_its_own_series(self, tmp_path):
+        root = tmp_path / 'memory-evals'
+
+        SweepMetricsTarget(root, DF).write(_view(_run(1)), NOW)
+
+        limits = load_limits_artifact(limits_artifact_path(root, EVAL_ID))
+        assert (limits.eval_id, limits.run_stamp) == (EVAL_ID, STAMP)
+        assert {verdict.metric_id for verdict in limits.verdicts} == set(SUMMED_METRICS)
+        assert (limits.alarmed_metric_count, limits.alarms) == (0, [])
+
+    def test_a_later_run_resumes_from_it_and_rejudges_against_the_earlier_series(self, tmp_path):
+        root = tmp_path / 'memory-evals'
+        target = SweepMetricsTarget(root, DF)
+
+        target.write(_view(_run(1)), NOW - DAY)
+        target.write(_view(_run(2)), NOW)
+
+        limits = load_limits_artifact(limits_artifact_path(root, EVAL_ID))
+        assert limits.run_stamp == STAMP
+        assert limits.baseline_run_stamps == [format_stamp(NOW - DAY)]
+
+    def test_an_unparseable_one_is_reported_and_no_summary_is_written(self, tmp_path):
+        root = tmp_path / 'memory-evals'
+        limits_artifact_path(root, EVAL_ID).parent.mkdir(parents=True)
+        limits_artifact_path(root, EVAL_ID).write_text('{not json', encoding='utf-8')
+
+        emitted = SweepMetricsTarget(root, DF).write(_view(_run(1)), NOW)
+
+        assert emitted.unwritten is not None
+        assert not emitted.summary_path.exists()
 
 
 class TestTheTarget:

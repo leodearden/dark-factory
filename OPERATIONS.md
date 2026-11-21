@@ -4440,7 +4440,10 @@ check.
     append-only and never pruned.
   - The run's M1 metric series, through `shared.memory_eval_metrics`, in the
     main checkout's `fused-memory/data/memory-evals/link-heal/metrics-<STAMP>.json`
-    (with `report-<STAMP>.txt`), and the rolling `summary.json` beside it. The
+    (with `report-<STAMP>.txt`), its `limits-current.json` and the rolling
+    `summary.json` beside it. Every metric is a reported scalar, so the limits
+    artifact never alarms; it is there because the dashboard reads a
+    memory-eval directory with runs and no limits as a failed evaluator. The
     summary holds six top-level numbers over the runs stamped in the last 7
     days: `runs_7d`, `writing_runs_7d`, `would_escape_7d`,
     `adjudication_failure_rate_7d`, `actions_planned_7d` and `skipped_cap_7d`,
