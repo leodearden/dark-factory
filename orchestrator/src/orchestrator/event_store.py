@@ -1064,10 +1064,13 @@ class EventType(StrEnum):
     #   (landlock/bwrap) OR the explicit ``backend=none`` operator escape hatch
     #   (still emitted — data.backend lets γ1 distinguish deliberately-
     #   unsandboxed from real containment without a third event type).
-    #   role/task_id are first-class columns. Payload: {backend, digest} —
+    #   role/task_id are first-class columns. Payload:
+    #   {backend, digest[, docs_main_paths]} —
     #   ``digest`` is WriteSet.digest(), the STABLE sha256 of the resolved
     #   writable set so an operator can diff exactly what a given invocation
-    #   could touch (INV-2 structured facts). Consumed by γ1's soak predicate.
+    #   could touch (INV-2 structured facts). ``docs_main_paths`` is present
+    #   only when the docs-only project_root grant fired. Consumed by γ1's
+    #   soak predicate.
     sandbox_applied = 'sandbox_applied'
 
     # Recovery-decision emission (PRD plans/task-escalation-state-graph-prd.md

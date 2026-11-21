@@ -1945,7 +1945,7 @@
     "orchestrator/tests/test_workflow_preexisting_main_break.py": {"patch_targets": [], "private_reads": 15},
     "orchestrator/tests/test_workflow_ready_to_merge.py": {"patch_targets": [], "private_reads": 32},
     "orchestrator/tests/test_workflow_resume_attribution.py": {"patch_targets": [], "private_reads": 6},
-    "orchestrator/tests/test_workflow_sandbox_events.py": {"patch_targets": [], "private_reads": 6},
+    "orchestrator/tests/test_workflow_sandbox_events.py": {"patch_targets": [], "private_reads": 5},
     "orchestrator/tests/test_workflow_signature_loop_guard.py": {"patch_targets": [], "private_reads": 12},
     "orchestrator/tests/test_workflow_skew_surfacing.py": {"patch_targets": ["intake.enqueue_merge_request"], "private_reads": 17},
     "orchestrator/tests/test_workflow_state_machine_boundary.py": {"patch_targets": [], "private_reads": 98},
