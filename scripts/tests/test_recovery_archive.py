@@ -1,9 +1,56 @@
 """scripts/recovery_archive.py: carry the pinned FalkorDB recovery dumps through a host migration (task 7153)."""
 
+import hashlib
+import shutil
+from pathlib import Path
+
 import pytest
-from recovery_archive import RECOVERY_ARCHIVES, ArchiveDir, PinnedDump
+from recovery_archive import RECOVERY_ARCHIVES, ArchiveDir, PinnedDump, main
 
 GOOD_SHA = "0" * 64
+ARCH_A = "fused-memory/data/arch-a"
+ARCH_B = "data/backups/arch-b"
+DUMP_CONTENT = {
+    f"{ARCH_A}/first.rdb": b"first dump bytes",
+    f"{ARCH_A}/second.rdb": b"the second dump, a little longer",
+    f"{ARCH_B}/dump.rdb": b"the third dump",
+}
+SIBLING_CONTENT = {
+    f"{ARCH_A}/apply-report.json": b'{"moved": 13}',
+    f"{ARCH_A}/FINDINGS.md": b"# findings",
+    f"{ARCH_B}/logs/run.log": b"a log line",
+}
+
+
+def _pinned(repo_path: str) -> PinnedDump:
+    content = DUMP_CONTENT[repo_path]
+    name = Path(repo_path).name
+    return PinnedDump(
+        name=name,
+        size=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+        pre_state_of=f"the {name} test apply",
+    )
+
+
+ARCHIVES = tuple(
+    ArchiveDir(path=archive, dumps=tuple(_pinned(p) for p in DUMP_CONTENT if p.startswith(f"{archive}/")))
+    for archive in (ARCH_A, ARCH_B)
+)
+
+
+def _write_archives(root: Path) -> tuple[ArchiveDir, ...]:
+    for repo_path, content in {**DUMP_CONTENT, **SIBLING_CONTENT}.items():
+        (root / repo_path).parent.mkdir(parents=True, exist_ok=True)
+        (root / repo_path).write_bytes(content)
+    return ARCHIVES
+
+
+def _flip_first_byte(path: Path) -> str:
+    content = bytearray(path.read_bytes())
+    content[0] ^= 0xFF
+    path.write_bytes(bytes(content))
+    return hashlib.sha256(content).hexdigest()
 
 
 def _dump(name: str = "dump.rdb", size: int = 10, sha256: str = GOOD_SHA) -> PinnedDump:
@@ -75,3 +122,84 @@ def test_the_carried_set_is_the_q2_ruling_set():
     paths = [a.path for a in RECOVERY_ARCHIVES]
     assert len(paths) == len(set(paths))
     assert all(d.pre_state_of.strip() for a in RECOVERY_ARCHIVES for d in a.dumps)
+
+
+def test_check_passes_and_names_every_intact_dump_with_its_pre_state(tmp_path, capsys):
+    archives = _write_archives(tmp_path)
+
+    assert main(["check", str(tmp_path)], archives=archives) == 0
+
+    stderr = capsys.readouterr().err
+    for archive in archives:
+        for dump in archive.dumps:
+            assert f"{archive.path}/{dump.name}" in stderr
+            assert dump.pre_state_of in stderr
+
+
+def test_check_fails_on_a_missing_dump(tmp_path, capsys):
+    archives = _write_archives(tmp_path)
+    (tmp_path / ARCH_A / "second.rdb").unlink()
+
+    assert main(["check", str(tmp_path)], archives=archives) == 1
+
+    failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
+    assert any(f"{ARCH_A}/second.rdb" in line and "missing" in line for line in failed)
+
+
+@pytest.mark.parametrize("change", [b"extra", None])
+def test_check_fails_on_a_dump_whose_size_differs(tmp_path, capsys, change):
+    archives = _write_archives(tmp_path)
+    dump_path = tmp_path / ARCH_B / "dump.rdb"
+    pinned = DUMP_CONTENT[f"{ARCH_B}/dump.rdb"]
+    altered = pinned + change if change else pinned[:-3]
+    dump_path.write_bytes(altered)
+
+    assert main(["check", str(tmp_path)], archives=archives) == 1
+
+    failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
+    assert any(
+        f"{ARCH_B}/dump.rdb" in line and str(len(altered)) in line and str(len(pinned)) in line
+        for line in failed
+    )
+
+
+def test_check_fails_on_a_same_size_dump_with_a_flipped_byte(tmp_path, capsys):
+    archives = _write_archives(tmp_path)
+    actual_sha = _flip_first_byte(tmp_path / ARCH_A / "first.rdb")
+    pinned_sha = archives[0].dumps[0].sha256
+
+    assert main(["check", str(tmp_path)], archives=archives) == 1
+
+    failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
+    assert any(
+        f"{ARCH_A}/first.rdb" in line and actual_sha in line and pinned_sha in line
+        for line in failed
+    )
+
+
+def test_check_reports_every_problem_not_just_the_first(tmp_path, capsys):
+    archives = _write_archives(tmp_path)
+    (tmp_path / ARCH_A / "first.rdb").unlink()
+    _flip_first_byte(tmp_path / ARCH_B / "dump.rdb")
+
+    assert main(["check", str(tmp_path)], archives=archives) == 1
+
+    failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
+    assert any(f"{ARCH_A}/first.rdb" in line for line in failed)
+    assert any(f"{ARCH_B}/dump.rdb" in line for line in failed)
+
+
+def test_check_fails_on_a_missing_archive_directory(tmp_path, capsys):
+    archives = _write_archives(tmp_path)
+    shutil.rmtree(tmp_path / ARCH_B)
+
+    assert main(["check", str(tmp_path)], archives=archives) == 1
+
+    failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
+    assert any(ARCH_B in line for line in failed)
+
+
+def test_check_without_a_root_is_a_usage_error():
+    with pytest.raises(SystemExit) as raised:
+        main(["check"], archives=ARCHIVES)
+    assert raised.value.code == 2
