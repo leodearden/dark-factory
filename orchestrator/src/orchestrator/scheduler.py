@@ -5687,11 +5687,13 @@ class Scheduler:
         ``config.delivered_checks.max_record_fetches_per_tick``. A tick with
         more candidates than the budget fetches a deterministic prefix (see
         "Budget priority") and logs one bounded WARNING counting the
-        deferred ids by group. Deferral is fail-safe: a deferred id is
-        ``needed`` again next tick (never negatively cached), a deferred
-        cached record is still served, and a deferred never-cached dep is
-        named in ``ctx.deferred_terminal_deps`` so its dependents wait
-        (UNKNOWN on the scheduled-deploy arm) rather than fail open. Bound:
+        deferred ids by group. A deferred id is ``needed`` again next tick
+        (never negatively cached). Deferring a held record or a never-cached
+        dep is fail-safe: the held record is still served, and the
+        never-cached dep is named in ``ctx.deferred_terminal_deps`` so its
+        dependents wait (UNKNOWN on the scheduled-deploy arm). A deferred
+        checks-carrying re-validation is not served and fails open that
+        tick, like a failed fetch. Bound:
         never-cached ids get max(1, budget - H) slots per tick, H being
         that tick's held re-validations, so after a restart N of them are
         all fetched within ceil(N / max(1, budget - H)) ticks (H the largest
