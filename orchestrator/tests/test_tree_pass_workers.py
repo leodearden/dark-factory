@@ -280,6 +280,24 @@ def test_a_worker_imports_orchestrator_from_the_file_the_parent_did(
     }
 
 
+def test_a_worker_already_holding_another_copy_of_a_parent_module_fails_the_pass_naming_both_files(
+    tmp_path: Path, guard_module: GuardFactory, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _tree(tmp_path / 'tree', {'a.py': 'x = 1\n', 'b.py': 'x = 1\n'})
+    module = guard_module(_ORCHESTRATOR_FILE_GUARD.format(root=str(root)))
+    decoy = _tree(tmp_path / 'decoy', {'orchestrator/__init__.py': ''})
+    startup = _tree(tmp_path / 'startup', {'sitecustomize.py': 'import orchestrator\n'})
+    monkeypatch.setenv('PYTHONPATH', os.pathsep.join([str(startup), str(decoy)]))
+
+    with pytest.raises(TreePassWorkerError, match=r'exited with status 1;') as raised:
+        run_across_workers([module], workers=2)
+
+    message = str(raised.value)
+    assert 'orchestrator' in message
+    assert str(decoy / 'orchestrator' / '__init__.py') in message
+    assert orchestrator.__file__ in message
+
+
 _HANGING_GUARD = '''
 import os, time
 from pathlib import Path
