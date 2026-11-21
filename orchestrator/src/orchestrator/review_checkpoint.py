@@ -295,14 +295,14 @@ class ReviewCheckpoint:
             role_defaults=RoleDefaults(
                 DEEP_REVIEWER.default_model,
                 # Layer-4 effort base kept == EffortConfig.deep_reviewer's
-                # default ('max') — the value config-layer-3 always supplies
+                # default ('xhigh') — the value config-layer-3 always supplies
                 # today, and the site's own pre-η getattr fallback was
                 # getattr(config.effort,'deep_reviewer','max'). AgentRole has no
                 # default_effort field, so effort is the one RoleDefaults field
                 # not sourced from DEEP_REVIEWER; matching the config default
                 # means a future EffortConfig field removal degrades to the same
-                # effort, not a silent 'max'→'high' drop.
-                'max',
+                # effort, not a silent 'xhigh'→'high' drop.
+                'xhigh',
                 DEEP_REVIEWER.default_budget, DEEP_REVIEWER.default_max_turns,
             ),
             config=self.config,
