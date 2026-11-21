@@ -3111,6 +3111,13 @@ def _spt_clean_collection(_spt_scope, mock_config):
     client.close()
 
 
+def test_the_scan_payload_text_probe_collection_is_one_the_reaper_can_reclaim(
+    _reapable_config, _spt_scope,
+):
+    """The tripwire's collection outlives a run by design, so it must be one the reaper deletes."""
+    assert_reapable(_spt_scope.mem0_collection_name(_reapable_config.mem0.collection_prefix))
+
+
 class TestMem0BackendScanPayloadTextIntegration:
     """Pins the un-indexed MatchText substring semantics against live Qdrant."""
 
