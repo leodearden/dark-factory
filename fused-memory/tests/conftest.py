@@ -89,7 +89,9 @@ from _fm_helpers import (  # noqa: E402
     resolve_xdist_worker_id,
 )
 from _graphiti_fake import FakeGraphitiClient  # noqa: E402
-from shared.pytest_fake_clock import fake_clock  # noqa: E402, F401  — the binding IS the wiring
+from shared.pytest_fake_clock import (  # noqa: E402  # debt: ticket tkt_0RX7VH710F56TR7A4GHW9M6WNK
+    fake_clock as fake_clock,
+)
 
 from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: E402
 from fused_memory.config.schema import (  # noqa: E402

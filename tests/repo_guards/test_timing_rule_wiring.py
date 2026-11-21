@@ -39,7 +39,7 @@ _TIMING_MARKER_ENTRY = (
 
 _FAKE_CLOCK_MODULE = 'shared.pytest_fake_clock'
 _FAKE_CLOCK_BINDING = (
-    f'from {_FAKE_CLOCK_MODULE} import fake_clock  # noqa: F401  — the binding IS the wiring'
+    f'from {_FAKE_CLOCK_MODULE} import fake_clock as fake_clock'
 )
 
 
