@@ -351,3 +351,90 @@ class TestTheReplayContract:
             decision.value for decision in _scoring().Decision
         }
         assert set(item['required']) >= {'child_id', 'decision', 'relabel_to', 'reason', 'evidence'}
+
+
+# ── parsing a batch reply ──────────────────────────────────────────────────
+
+
+def _p1_batch() -> Any:
+    """p1's batch: E0 and E1 contested, E2 amended, E3 and E4 restated."""
+    return next(b for b in _mod().plan_batches(_worklist_rows(), size=8, seed=7161) if b.project == 'p1')
+
+
+_GOOD = {
+    'E0': ('contest_upheld', None), 'E1': ('detach', None), 'E2': ('relabel', OUTCOME_CONTESTED),
+    'E3': ('relabel', OUTCOME_AMENDED), 'E4': ('keep', None),
+}
+
+
+def _reply(choices: dict[str, tuple[str, str | None]] = _GOOD, **extra: Any) -> dict[str, Any]:
+    return {
+        'decisions': [
+            {'child_id': child, 'decision': decision, 'relabel_to': relabel_to,
+             'reason': f'why {child}', 'evidence': [f'read {child}']}
+            for child, (decision, relabel_to) in choices.items()
+        ],
+        **extra,
+    }
+
+
+def _refused(report: dict[str, Any]) -> str:
+    parsed = _mod().parse_batch_reply(_p1_batch(), report)
+    assert isinstance(parsed, _mod().BatchFailure), parsed
+    assert parsed.batch == _p1_batch().name
+    return parsed.reason
+
+
+class TestParsingABatchReply:
+    def test_a_well_formed_reply_gives_one_row_per_child(self) -> None:
+        batch = _p1_batch()
+        parsed = _mod().parse_batch_reply(batch, _reply(flagged_items=[]))
+        assert isinstance(parsed, _mod().BatchDecisions)
+        assert parsed.batch == batch.name
+        targets = {row['entry_id']: row['target_id'] for row in batch.rows}
+        assert sorted(parsed.rows, key=lambda row: row['entry_id']) == [
+            {'entry_id': child, 'target_id': targets[child], 'decision': decision,
+             'relabel_to': relabel_to, 'reason': f'why {child}', 'evidence': [f'read {child}']}
+            for child, (decision, relabel_to) in sorted(_GOOD.items())
+        ]
+
+    def test_a_missing_child_fails_the_batch(self) -> None:
+        choices = {child: choice for child, choice in _GOOD.items() if child != 'E3'}
+        assert 'E3' in _refused(_reply(choices))
+
+    def test_a_child_outside_the_batch_fails_it(self) -> None:
+        assert 'E9' in _refused(_reply({**_GOOD, 'E9': ('keep', None)}))
+
+    def test_a_duplicate_child_fails_the_batch(self) -> None:
+        report = _reply()
+        report['decisions'].append(dict(report['decisions'][0]))
+        assert 'E0' in _refused(report)
+
+    def test_an_unknown_decision_fails_the_batch_naming_child_and_value(self) -> None:
+        reason = _refused(_reply({**_GOOD, 'E4': ('merge', None)}))
+        assert 'E4' in reason
+        assert 'merge' in reason
+
+    def test_a_decision_the_outcome_does_not_allow_fails_the_batch(self) -> None:
+        reason = _refused(_reply({**_GOOD, 'E0': ('keep', None)}))
+        assert 'E0' in reason
+        assert 'keep' in reason
+
+    def test_a_relabel_without_a_target_fails_the_batch(self) -> None:
+        reason = _refused(_reply({**_GOOD, 'E3': ('relabel', None)}))
+        assert 'E3' in reason
+        assert 'relabel' in reason
+
+    def test_a_malformed_reason_or_evidence_fails_the_batch(self) -> None:
+        report = _reply()
+        report['decisions'][1]['evidence'] = 'not a list'
+        assert 'E1' in _refused(report)
+
+    @pytest.mark.parametrize('report', [
+        {},
+        {'summary': 'I could not finish', 'flagged_items': [], 'stats': {'raw_text_fallback': True}},
+        {'decisions': 'none'},
+        {'decisions': ['not an object']},
+    ])
+    def test_a_reply_without_a_decisions_list_fails_the_batch(self, report: dict[str, Any]) -> None:
+        assert _refused(report)
