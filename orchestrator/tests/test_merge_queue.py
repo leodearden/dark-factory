@@ -63,6 +63,7 @@ from orchestrator.git_ops import (
 from orchestrator.merge_lane.gates import (
     DropGuardResult,
     _check_plan_files_touched_in_branch,
+    _reverify_rebased_tree,
 )
 from orchestrator.merge_lane.intake import (
     MERGE_LANES,
@@ -109,7 +110,7 @@ from orchestrator.merge_lane.worker import (
     _is_speculation_race,
     item_merge_wt,
 )
-from orchestrator.verify import VerifyResult
+from orchestrator.verify import VerifyResult, cached_main_baseline_failing_ids
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 
 # Per-test ceiling for classes whose stacked wait_responsive merge waits outgrow
@@ -15898,6 +15899,8 @@ class TestReverifyRebasedTree:
         run_scoped_verification called exactly once, merge_wt still exists.
     (c) Overlapping, red verify → returns blocked MergeOutcome,
         merge_wt cleaned up.
+    (d) A green re-verify of a real advance_main rebase seeds main's baseline
+        at the rebased sha, and the follow-up advance lands exactly that sha.
     """
 
     async def _make_merge_wt(
@@ -15925,6 +15928,27 @@ class TestReverifyRebasedTree:
         rc, _, err = await _run(['git', 'rebase', rebased_onto], cwd=merge_wt)
         assert rc == 0, err
         return merge_wt, req, verified.strip(), rebased_from, rebased_onto
+
+    async def _advance_onto_drift(
+        self, git_ops: GitOps, config: OrchestratorConfig, branch_name: str,
+    ) -> tuple[Path, MergeRequest, str, str, str, str]:
+        """A real advance_main parked on a drift: (merge_wt, req, verified, rebased_from, rebased_onto, rebased_sha)."""
+        merge_wt, req = await self._make_merge_wt(git_ops, branch_name, config)
+        _, verified, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
+        base = await git_ops.get_main_sha()
+        (git_ops.project_root / f'{branch_name}_drift.py').write_text('d = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        outcome = await git_ops.advance_main(
+            verified.strip(), merge_wt,
+            branch=branch_name, expected_main=base, reverify_on_rebase=True,
+        )
+        assert outcome.result == 'rebased_pending_reverify', outcome
+        assert outcome.rebased_from and outcome.rebased_onto and outcome.advanced_sha, outcome
+        return (
+            merge_wt, req, verified.strip(),
+            outcome.rebased_from, outcome.rebased_onto, outcome.advanced_sha,
+        )
 
     async def test_same_tree_skips_without_a_verify(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -16300,6 +16324,59 @@ class TestReverifyRebasedTree:
         )
         # run_post_merge_verify cleans up merge_wt on failure
         assert not merge_wt.exists(), 'merge_wt must be cleaned up after red verify'
+
+    async def test_reverified_rebased_landing_seeds_landed_sha_baseline(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(d) The whole-tree gate re-verifies the rebased tree green, which seeds
+        main's baseline at the rebased sha before the follow-up advance lands it.
+        """
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+
+        branch_name = 'rvrt-seed-reverified'
+        merge_wt, req, verified, rebased_from, rebased_onto, rebased_sha = (
+            await self._advance_onto_drift(
+                git_ops, config.model_copy(update={'merge_verify_breadth': 'full'}), branch_name,
+            )
+        )
+        # failing_test_ids must be a set: a None leaves the baseline unseeded.
+        verify_mock = AsyncMock(return_value=fake_verify_result(
+            passed=True, summary='', failing_test_ids=frozenset(),
+        ))
+        try:
+            with patch('orchestrator.merge_lane.worker.run_scoped_verification', verify_mock):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    verified_merge_sha=verified,
+                    rebased_from=rebased_from,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha=rebased_sha,
+                    run_post_merge_verify=functools.partial(
+                        run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                    ),
+                    event_store=None,
+                )
+            assert result == GateClearance.reverified, result
+            verify_mock.assert_called_once()
+            assert cached_main_baseline_failing_ids(rebased_sha) == frozenset(), (
+                'a green re-verify must seed the rebased sha as every-module-green'
+            )
+
+            landed = await git_ops.advance_main(
+                rebased_sha, merge_wt,
+                branch=branch_name, expected_main=rebased_onto, reverify_on_rebase=True,
+            )
+            assert landed.result == 'advanced', landed
+            assert await git_ops.get_main_sha() == rebased_sha, (
+                'the seeded sha must be the one that lands on main'
+            )
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
 
     async def test_keep_worktrees_forwarded_to_run_post_merge_verify(self) -> None:
         """keep_worktrees kwarg must be forwarded verbatim to run_post_merge_verify.
