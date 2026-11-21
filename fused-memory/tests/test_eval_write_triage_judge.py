@@ -449,6 +449,9 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
             'cases_path': None,
             'canonical_aliases': None,
             'wording': 'shipped',
+            'judge_model': None,
+            'slates_in': None,
+            'slates_out': None,
             **overrides,
         })
         assert _mod()._run(args) == 0
@@ -580,6 +583,22 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
         recorded = self._captured(tmp_path, monkeypatch)['judge_system_prompt_sha256']
         assert recorded == hashlib.sha256(JUDGE_SYSTEM_PROMPT.encode('utf-8')).hexdigest()
         assert len(recorded) == 64 and set(recorded) <= set('0123456789abcdef')
+
+    def test_a_judge_model_override_is_recorded_and_applied_in_memory_only(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.config.schema import FusedMemoryConfig
+
+        monkeypatch.setenv('OPENAI_PLAN_PROXY_URL', 'http://plan-proxy.test/v1')
+        monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', 'plan-proxy-test-key')
+        config_yaml = SCRIPT_PATH.parent.parent / 'config' / 'config.yaml'
+        before = config_yaml.read_bytes()
+        captured = self._captured(
+            tmp_path, monkeypatch, judge_model='some-model', dry_run=False,
+        )
+        assert captured['judge_model'] == 'some-model'
+        assert config_yaml.read_bytes() == before
+        assert FusedMemoryConfig().write_triage.judge_model != 'some-model'
 
     def test_a_pre_psi_run_records_the_pre_psi_prompt_it_measured(
         self, tmp_path: Path, monkeypatch,
@@ -760,6 +779,24 @@ class TestGuardCommittedReport:
         assert _mod().guard_committed_report(
             committed, dry_run=False, limit=None,
             slate_mode=_scoring().SLATE_RETRIEVED, wording='shipped') == committed
+
+    def test_a_judge_model_override_cannot_overwrite_the_arbiter(self) -> None:
+        with pytest.raises(ValueError, match='--report-path'):
+            _mod().guard_committed_report(
+                _mod()._DEFAULT_REPORT_PATH, dry_run=False, limit=None,
+                slate_mode=_scoring().SLATE_RETRIEVED, judge_model='gpt-6.2-sol')
+
+    def test_a_judge_model_override_elsewhere_is_untouched(self, tmp_path: Path) -> None:
+        target = str(tmp_path / 'arm.json')
+        assert _mod().guard_committed_report(
+            target, dry_run=False, limit=None,
+            slate_mode=_scoring().SLATE_RETRIEVED, judge_model='gpt-6.2-sol') == target
+
+    def test_no_judge_model_override_may_write_the_arbiter(self) -> None:
+        committed = _mod()._DEFAULT_REPORT_PATH
+        assert _mod().guard_committed_report(
+            committed, dry_run=False, limit=None,
+            slate_mode=_scoring().SLATE_RETRIEVED, judge_model=None) == committed
 
     def test_a_pre_psi_run_elsewhere_is_untouched(self, tmp_path: Path) -> None:
         target = str(tmp_path / 'fixture-pre-psi.json')

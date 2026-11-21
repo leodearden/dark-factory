@@ -519,12 +519,14 @@ class TestTheRetrievedCli:
     """`main()` on a retrieved `--dry-run` over a stub store: what the plan is built from."""
 
     @staticmethod
-    def _main(tmp_path: Path, monkeypatch, *extra: str, rows=()) -> None:
-        """Every search answers *rows*."""
+    def _main(tmp_path: Path, monkeypatch, *extra: str, rows=(), searchable=True) -> None:
+        """Every search answers *rows*, or raises when not *searchable*."""
 
         class _LiveStore(FakeMemoryService):
             def __init__(self, config) -> None:
                 super().__init__(rows)
+                if not searchable:
+                    self.search.side_effect = AssertionError('the store was searched')
 
             async def initialize(self) -> None:
                 return None
@@ -548,6 +550,72 @@ class TestTheRetrievedCli:
         assert (row['attach_target_cluster_id'], row['attach_target_label']) == (
             'b-canon', 'duplicate',
         )
+
+
+    @staticmethod
+    def _report(tmp_path: Path, name: str) -> dict:
+        return json.loads((tmp_path / name).read_text())
+
+    def test_a_snapshot_written_by_one_run_is_judged_by_the_next_unchanged(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        snapshot = tmp_path / 'slates.json'
+        rows = [_hit('b-dup-1', 0.95), _hit('a-canon', 0.7), _hit('c-dup-1', 0.3)]
+        self._main(tmp_path, monkeypatch, '--slates-out', str(snapshot), rows=rows)
+        self._main(
+            tmp_path, monkeypatch, '--slates-in', str(snapshot), '--project-id', 'elsewhere',
+            '--report-path', str(tmp_path / 'r2.json'),
+            '--cases-path', str(tmp_path / 'cases2.jsonl'), searchable=False,
+        )
+        assert (tmp_path / 'cases2.jsonl').read_bytes() == (tmp_path / 'cases.jsonl').read_bytes()
+        keys = ('project_id', 't_high', 't_low', 'candidate_k')
+        first, second = (
+            self._report(tmp_path, name)['provenance'] for name in ('r.json', 'r2.json')
+        )
+        assert first['project_id'] == 'reify'
+        assert {key: second[key] for key in keys} == {key: first[key] for key in keys}
+
+    def test_a_snapshot_of_another_population_is_refused(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        snapshot = tmp_path / 'slates.json'
+        self._main(
+            tmp_path, monkeypatch, '--limit', '1', '--slates-out', str(snapshot),
+            '--report-path', str(tmp_path / 'limited.json'), rows=[_hit('b-dup-1', 0.7)],
+        )
+        with pytest.raises(ValueError, match='memory_id'):
+            self._main(
+                tmp_path, monkeypatch, '--slates-in', str(snapshot),
+                '--report-path', str(tmp_path / 'r2.json'), searchable=False,
+            )
+        assert not (tmp_path / 'r2.json').exists()
+
+    def test_a_snapshot_of_another_judge_width_is_refused(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        snapshot = tmp_path / 'slates.json'
+        self._main(
+            tmp_path, monkeypatch, '--slates-out', str(snapshot),
+            '--judge-candidate-count', '3', rows=[_hit('b-dup-1', 0.7)],
+        )
+        with pytest.raises(ValueError, match='judge_candidate_count'):
+            self._main(
+                tmp_path, monkeypatch, '--slates-in', str(snapshot),
+                '--judge-candidate-count', '4',
+                '--report-path', str(tmp_path / 'r2.json'), searchable=False,
+            )
+        assert not (tmp_path / 'r2.json').exists()
+
+    @pytest.mark.parametrize('flag', ['--slates-in', '--slates-out'])
+    def test_a_snapshot_flag_is_refused_on_a_seeded_run(
+        self, tmp_path: Path, monkeypatch, flag: str,
+    ) -> None:
+        monkeypatch.setattr(sys, 'argv', TestTheLimitedCli._argv(
+            tmp_path, '--slate-mode', 'seeded', flag, str(tmp_path / 'slates.json'),
+        ))
+        with pytest.raises(ValueError, match=flag):
+            _mod().main()
+        assert [path.name for path in tmp_path.iterdir()] == ['corpus.jsonl']
 
 
 class TestTheWordingCli:
@@ -579,6 +647,15 @@ class TestTheWordingCli:
 
         sent = self._instructions(tmp_path, monkeypatch, '--wording', 'pre-psi')
         assert set(sent) == {_wording().PRE_PSI_JUDGE_SYSTEM_PROMPT}
+        assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _wording().system_prompt('shipped')
+
+    def test_a_psi_run_sends_the_psi_prompt_and_restores_the_shipped_one(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.server import write_triage_judge
+
+        sent = self._instructions(tmp_path, monkeypatch, '--wording', 'psi')
+        assert set(sent) == {_wording().PSI_JUDGE_SYSTEM_PROMPT}
         assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _wording().system_prompt('shipped')
 
     def test_the_default_is_the_shipped_wording(self, tmp_path: Path, monkeypatch) -> None:
