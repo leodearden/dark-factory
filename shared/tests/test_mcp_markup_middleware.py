@@ -541,7 +541,7 @@ class TestB7ExemptTool:
     async def test_an_exempt_tool_emits_no_fact(self, policy):
         h = build_harness(policy, exempt_tools=frozenset({'scan_memory_content'}))
 
-        await h.call('scan_memory_content', {'needle': _closer('content')})
+        await h.call('scan_memory_content', {'needle': _closer('content') + INVOKE_CLOSER})
 
         assert h.facts == [], (
             'an exemption is a declaration that this is not a leak, so it must '
@@ -622,7 +622,7 @@ class TestB6DeliberateQuotingOverride:
             'submit_task',
             {
                 'title': 't',
-                'description': 'quoting ' + _closer('content'),
+                'description': 'quoting ' + _closer('content') + INVOKE_CLOSER,
                 'metadata': {'allow_mcp_markup': True, 'keep': 'this'},
             },
         )
@@ -643,7 +643,7 @@ class TestB6DeliberateQuotingOverride:
             'escalate_info',
             {
                 'summary': 's',
-                'detail': 'quoting ' + _closer('content'),
+                'detail': 'quoting ' + _closer('content') + INVOKE_CLOSER,
                 'metadata': {'allow_mcp_markup': True},
             },
         )
@@ -658,7 +658,7 @@ class TestB6DeliberateQuotingOverride:
             'submit_task',
             {
                 'title': 't',
-                'description': 'quoting ' + _closer('content'),
+                'description': 'quoting ' + _closer('content') + INVOKE_CLOSER,
                 'metadata': {'allow_mcp_markup': True},
             },
         )
@@ -687,7 +687,7 @@ class TestB6DeliberateQuotingOverride:
     @BOTH_POLICIES
     async def test_the_override_is_accepted_as_a_json_string(self, policy):
         """submit_task/update_task accept metadata as an object OR a JSON string."""
-        quoted = 'quoting ' + _closer('content')
+        quoted = 'quoting ' + _closer('content') + INVOKE_CLOSER
         h = build_harness(policy)
 
         await h.call(
@@ -771,7 +771,7 @@ class TestB6DeliberateQuotingOverride:
                 'escalate_info',
                 {
                     'summary': 's',
-                    'detail': 'quoting ' + _closer('content'),
+                    'detail': 'quoting ' + _closer('content') + INVOKE_CLOSER,
                     'metadata': {'allow_mcp_markup': True, 'keep': 'this'},
                 },
             )
@@ -3038,12 +3038,14 @@ class TestB10StormEscape:
         )
 
         for _ in range(6):
-            await h.call('scan_memory_content', {'needle': _closer('content')})
+            await h.call(
+                'scan_memory_content', {'needle': _closer('content') + INVOKE_CLOSER}
+            )
             await h.call(
                 'submit_task',
                 {
                     'title': 't',
-                    'description': 'quoting ' + _closer('content'),
+                    'description': 'quoting ' + _closer('content') + INVOKE_CLOSER,
                     'metadata': {'allow_mcp_markup': True},
                 },
             )
@@ -3846,7 +3848,7 @@ class TestB14OrderingDependsOnStrictInputValidationBeingOff:
 class TestSelfNameCloserIsSeenAtTheBoundary:
     """The dominant real leak dialect, pinned at the LIVE WRITE BOUNDARY.
 
-    ``_first_markup_argument`` asked the param-free ``detect``, whose fixed
+    The boundary scan (``_markup_arguments`` today) asked the param-free ``detect``, whose fixed
     six-literal union echoes NONE of the invoked tool's own parameter names.
     So a value mis-closed with its OWN name-echoing tag — and carrying no
     invoke closer and no parameter-open token to give it away — matched

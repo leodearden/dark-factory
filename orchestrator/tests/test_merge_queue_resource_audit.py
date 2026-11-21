@@ -112,7 +112,7 @@ class _FakeEscalationQueue:
         self._seq = 0
         self.submitted: list = []
 
-    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
+    def has_open_l1(self, task_id: str) -> bool:
         return self._open_l1
 
     def make_id(self, task_id: str) -> str:
@@ -546,7 +546,7 @@ class TestFinalizeHeadSpeculativeAccounting:
 # task 2096: dispatch-gap (in-dispatch item) speculative permit accounting
 #
 # _verifier_loop's DISPATCH-FILL pops an item off the redispatch park/_verifier_queue
-# then `entry = await self._dispatch_item(item)` — the item is off the queue
+# then `dispatched = await self._dispatch_deciding(item)` — the item is off the queue
 # but not yet appended to _inflight during that await (host-acquisition git
 # calls, in-dispatch speculative-remerge). A speculative item's `.speculative`
 # is stable across this await (Mechanism-2's chain-remerge is skipped for
@@ -1347,7 +1347,7 @@ class TestHeartbeatWiringRunsResourceAuditUnconditionally:
         req = _make_request('hb-task', 'hb-task', wt)
         worker._queue.put_nowait(req)  # non-zero depth so the depth heartbeat would fire
 
-        def _boom(now: float) -> None:  # noqa: ARG001
+        def _boom(now: float) -> None:
             raise RuntimeError('boom')
 
         monkeypatch.setattr(worker, '_check_resource_audit', _boom)

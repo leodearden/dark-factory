@@ -107,6 +107,7 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
 )
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
+    available_tree,
     detect_task_dump_contamination,
     filter_task_tree,
     format_task_list,
@@ -114,6 +115,7 @@ from fused_memory.reconciliation.task_filter import (
     render_active_section,
     render_retained_done_tasks,
     select_done_since_boundary,
+    tree_unavailable_notice,
 )
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.utils.async_utils import gather_collect
@@ -3956,15 +3958,12 @@ class TaskKnowledgeSync(BaseStage):
             if not mismatches:
                 return
             # Avoid a redundant get_tasks round-trip when the harness has
-            # already injected the full task tree into self.filtered_task_tree.
+            # already injected a FETCHED task tree into self.filtered_task_tree.
             existing_tasks: list[dict] | None = None
-            if self.filtered_task_tree is not None:
+            tree = available_tree(self.filtered_task_tree)
+            if tree is not None:
                 existing_tasks = list(
-                    itertools.chain(
-                        self.filtered_task_tree.active_tasks,
-                        self.filtered_task_tree.done_tasks,
-                        self.filtered_task_tree.cancelled_tasks,
-                    )
+                    itertools.chain(tree.active_tasks, tree.done_tasks, tree.cancelled_tasks)
                 )
             summary = await queue_briefing_refresh_tasks(
                 self.taskmaster,
@@ -4052,6 +4051,7 @@ class TaskKnowledgeSync(BaseStage):
         stage1_report = prior_reports[0] if prior_reports else None
 
         filtered, tree_read_at = await self._resolve_task_tree()
+        unavailable_notice = tree_unavailable_notice(filtered)
 
         # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
         self._check_filtered_tree_invariant(filtered)
@@ -4077,17 +4077,23 @@ class TaskKnowledgeSync(BaseStage):
 
         proactive_sample_section = ''
         if not self.remediation_mode:
-            # Pool intentionally excludes unknown-status tasks (dropped by
-            # filter_task_tree) and caps done_tasks at MAX_DONE_TASKS_RETAINED.
-            sample = _select_proactive_sample(
-                itertools.chain(
-                    filtered.active_tasks, filtered.done_tasks, filtered.cancelled_tasks
-                ),
-                self.MIN_TASK_SAMPLE,
-            )
-            proactive_sample_section = (
-                f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
-            )
+            if unavailable_notice is not None:
+                proactive_sample_section = (
+                    f'\n### Proactive Task Sample\n{unavailable_notice}\n'
+                )
+            else:
+                # Pool intentionally excludes unknown-status tasks (dropped by
+                # filter_task_tree) and caps done_tasks at MAX_DONE_TASKS_RETAINED.
+                sample = _select_proactive_sample(
+                    itertools.chain(
+                        filtered.active_tasks, filtered.done_tasks, filtered.cancelled_tasks
+                    ),
+                    self.MIN_TASK_SAMPLE,
+                )
+                proactive_sample_section = (
+                    f'\n### Proactive Task Sample ({len(sample)} tasks)\n'
+                    f'{format_task_list(sample)}\n'
+                )
 
         # Done-Task Completion-Memory Audit — enumerate EVERY task that
         # transitioned to `done` inside the task-change window, which starts when
@@ -4101,36 +4107,41 @@ class TaskKnowledgeSync(BaseStage):
         # (remediation is a focused second pass, not general sync).
         done_audit_section = ''
         if not self.remediation_mode:
-            boundary = watermark.last_task_change_timestamp
-            audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
-            total_audit = len(audit_tasks)
-            boundary_label = (
-                boundary.isoformat()
-                if boundary is not None
-                else 'no prior full-run boundary (first cycle — all done tasks in scope)'
-            )
-            # select_done_since_boundary sorts most-recent-first (and parse-failures
-            # to the front), so a clip drops only the oldest tasks.
-            audit_body = render_capped_task_list(
-                audit_tasks,
-                cap=self.MAX_DONE_AUDIT_RENDERED,
-                cap_name='MAX_DONE_AUDIT_RENDERED',
-                omitted_noun='done task(s) since the boundary',
-                dropped_first='the oldest since-boundary tasks',
-                log_event='reconciliation.done_task_audit_render_capped',
-                log_extra={
-                    'project_id': self.project_id,
-                    'run_id': self._current_run_id,
-                    'total_since_boundary': total_audit,
-                    'boundary': boundary_label,
-                },
-            )
-            done_audit_section = (
-                f'\n### Done-Task Completion-Memory Audit '
-                f'({total_audit} since last cycle)\n'
-                f'Boundary (previous full run started): {boundary_label}\n'
-                f'{audit_body}'
-            )
+            if unavailable_notice is not None:
+                done_audit_section = (
+                    f'\n### Done-Task Completion-Memory Audit\n{unavailable_notice}\n'
+                )
+            else:
+                boundary = watermark.last_task_change_timestamp
+                audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
+                total_audit = len(audit_tasks)
+                boundary_label = (
+                    boundary.isoformat()
+                    if boundary is not None
+                    else 'no prior full-run boundary (first cycle — all done tasks in scope)'
+                )
+                # select_done_since_boundary sorts most-recent-first (and parse-failures
+                # to the front), so a clip drops only the oldest tasks.
+                audit_body = render_capped_task_list(
+                    audit_tasks,
+                    cap=self.MAX_DONE_AUDIT_RENDERED,
+                    cap_name='MAX_DONE_AUDIT_RENDERED',
+                    omitted_noun='done task(s) since the boundary',
+                    dropped_first='the oldest since-boundary tasks',
+                    log_event='reconciliation.done_task_audit_render_capped',
+                    log_extra={
+                        'project_id': self.project_id,
+                        'run_id': self._current_run_id,
+                        'total_since_boundary': total_audit,
+                        'boundary': boundary_label,
+                    },
+                )
+                done_audit_section = (
+                    f'\n### Done-Task Completion-Memory Audit '
+                    f'({total_audit} since last cycle)\n'
+                    f'Boundary (previous full run started): {boundary_label}\n'
+                    f'{audit_body}'
+                )
 
         # Every blocked gate, not the MIN_TASK_SAMPLE survivors: in-progress tasks
         # sort ahead of blocked ones and evict them from the sample. Remediation-gated
@@ -4751,7 +4762,7 @@ class IntegrityCheck(BaseStage):
     def record_task_dump_spot_check(self, report: StageReport) -> None:
         """Spot-check the harness-injected filtered_task_tree for contamination signals.
 
-        If self.filtered_task_tree is set, builds a synthetic raw-dump dict from the
+        If self.filtered_task_tree is set and was really fetched, builds a synthetic raw-dump dict from the
         tree's task lists, runs detect_task_dump_contamination against it, and — when
         contamination is detected — records report.stats['task_dump_spot_check'] and
         emits a WARNING for operator triage.
@@ -4760,10 +4771,10 @@ class IntegrityCheck(BaseStage):
         Only records the stat key when contaminated=True (clean cycles leave stats
         untouched, matching the Stage 1 census-inconsistency pattern).
         """
-        if self.filtered_task_tree is None:
+        tree = available_tree(self.filtered_task_tree)
+        if tree is None:
             return
 
-        tree = self.filtered_task_tree
         # Build a synthetic dump from the tree's task lists, stamping self.project_id so
         # the dump mirrors what get_tasks now returns (task-1661 envelope stamp).
         #
@@ -5203,7 +5214,7 @@ def _select_proactive_sample(tasks: Iterable[dict], n: int) -> list[dict]:
     filter_task_tree already pre-validates to be dict-only.
     """
     # Import from task_filter — the single source of truth for status priority
-    from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY  # noqa: PLC0415
+    from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY
 
     def sort_key(t: dict) -> tuple[int, int]:
         status = t.get('status', 'pending')

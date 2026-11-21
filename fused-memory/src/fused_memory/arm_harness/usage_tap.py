@@ -226,13 +226,13 @@ def _handler_class(
     class TapHandler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
-        def log_message(self, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        def log_message(self, *args: Any) -> None:  # stdlib signature
             """The call log is the access log."""
 
-        def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+        def do_GET(self) -> None:  # stdlib naming
             self._proxy()
 
-        def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+        def do_POST(self) -> None:  # stdlib naming
             self._proxy()
 
         def _proxy(self) -> None:

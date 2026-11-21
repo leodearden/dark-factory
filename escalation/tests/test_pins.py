@@ -163,7 +163,7 @@ class _Rec:
 
 def _rec(
     *,
-    id: str = 'esc-42-1',  # noqa: A002 — mirrors the PinRecord attribute name
+    id: str = 'esc-42-1',  # mirrors the PinRecord attribute name
     level: int = 0,
     severity: str | None = 'blocking',
     filing: str | None = None,
@@ -746,7 +746,7 @@ class TestPurity:
 
 def _esc(
     *,
-    id: str = 'esc-42-1',  # noqa: A002 — mirrors the PinRecord attribute name
+    id: str = 'esc-42-1',  # mirrors the PinRecord attribute name
     level: int = 0,
     severity: str = 'blocking',
     filing_claimant_run_id: str | None = None,

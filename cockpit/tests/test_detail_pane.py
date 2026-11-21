@@ -12,13 +12,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from orchestrator import session_registry as sr
+from orchestrator import decision_registry as dr
+from orchestrator import session_records
 
 
 def _make_record(**overrides):
     fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
-        'status': sr.Status.RUNNING,
+        'status': session_records.Status.RUNNING,
         'title': 'unblock:df#2085 slug',
         'role': 'unblock',
         'project': 'df',
@@ -26,7 +27,7 @@ def _make_record(**overrides):
         'start_ts': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.SessionRecord(**fields)
+    return session_records.SessionRecord(**fields)
 
 
 class TestResultFileTail:
@@ -73,7 +74,7 @@ class TestRenderDetail:
             task_id='2085',
             escalation_id='esc-99',
             parent_session_id='parent-1',
-            question=sr.Question(
+            question=session_records.Question(
                 text='Which port should the server bind to?',
                 asked_at='2026-07-07T00:00:00+00:00',
             ),
@@ -138,7 +139,7 @@ def _make_decision(**overrides):
         'filed_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.DecisionRecord(**fields)
+    return dr.DecisionRecord(**fields)
 
 
 class TestRenderDecisionDetail:
@@ -151,7 +152,7 @@ class TestRenderDecisionDetail:
             task_id='2085',
             escalation_id='esc-99',
             severity='blocking',
-            state=sr.DecisionState.OPEN,
+            state=dr.DecisionState.OPEN,
         )
         now = datetime(2026, 7, 7, 0, 5, 0, tzinfo=UTC)
 

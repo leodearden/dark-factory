@@ -1,6 +1,6 @@
 """Internal task writers that never cross MCP dispatch meet the storage gate legibly.
 
-The MCP boundary guard (``server/markup_guard.py::install_markup_guard``)
+The MCP boundary guard (``server/boundary_guards.py::install_boundary_guards``)
 cannot see these writers: they run below it, in-process, and reach
 ``SqliteTaskBackend`` directly. Task 4419 guards the backend's two write
 sinks; these tests drive the two riskiest internal writers over a real

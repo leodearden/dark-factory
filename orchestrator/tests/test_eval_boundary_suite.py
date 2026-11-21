@@ -57,7 +57,7 @@ session and the eval fixtures + their ``evals/<id>`` branches / pre-task
 commits checked out::
 
     # From the repo root, one contender over one fixture. The eval runner's
-    # __main__ routes to orchestrator.cli:eval_cmd; select the task + config
+    # __main__ routes to orchestrator.evals.cli:eval_cmd; select the task + config
     # and (optionally) point memory writes at a RecordingMemorySink so the
     # intended writes are captured instead of dropped at the null sentinel:
     cd orchestrator

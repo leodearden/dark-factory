@@ -179,11 +179,35 @@ Three other shapes are not deferrals, and the `deferral_required` hint and the n
 
 ### 3. Write paths
 
-All deferral logic lives behind **one call** in `_apply_status_transition`:
-`deferral_gate.plan(before, status, request, expected_stamped_at, …) -> GateRefusal | DeferralWrite`.
-The call sits before the same-status no-op guard. `DeferralWrite` carries four things: the
-`audit_fields` delta, the keys to remove, the event fields, and whether this is a re-stamp.
-The interceptor applies `DeferralWrite`; it does not interpret deferrals (heuristics 4 and 9).
+All deferral logic lives in `deferral_gate`, which the interceptor calls at two points:
+- **Before the write lock**, `corroborate` runs once per `TaskInterceptor.set_task_status`
+  call, a CSV batch included. It makes the row-independent checks: the request's shape, the
+  parse of `expected_stamped_at`, and every check that needs I/O (the `/proc` holder read, the
+  carrier lookup). It returns a `DeferralCall` or a `DeferralInvalidRefusal`. A new check that
+  reads anything outside the row being written belongs here (INV-8), including §5's
+  escalation lookup for `until_escalation`.
+- **Under the write lock**, `_apply_status_transition` runs exactly one of two planners on the
+  stored row, chosen by whether `status == old_status`. Either may return a `GateRefusal`.
+  - `plan_same_status` decides a write that keeps the row at its status: a deferred row's
+    re-stamp (`Restamp`) or nothing (`NoWrite`). It runs before the same-status no-op guard.
+  - `plan_status_change` decides a write that moves the row: entering `deferred` stamps
+    (`Entry`), every exit from it clears (`Exit`), and any other move is `NoWrite`. It runs
+    last among the gates, after the terminal-exit and transition-legality gates, so a
+    refusal's self-correction hint never sends the caller into a gate above that refuses the
+    retry.
+
+`submit_task(planning_mode=True)` takes its `planning` record from
+`deferral_gate.planning_birth_record`, so the gate builds every server-side record.
+
+`NoWrite`, `Entry` and `Exit` ride the status write: `_apply_status_transition` applies their
+audit-field delta and cleared keys in the status write's transaction and reports them on
+`task_status_changed`. `Restamp` is not a status change and has a narrower shape, with no keys
+to clear and no `task_status_changed` fields: `TaskInterceptor._apply_restamp` writes its new
+record and builds `deferral_restamped` from its `old` and `new`. The interceptor applies the
+result; it does not interpret deferrals (heuristics 4 and 9). Signatures, `DeferralCall`'s
+fields and each variant's properties live in the code, not here:
+`fused-memory/src/fused_memory/middleware/deferral_gate.py::corroborate`, `::plan_same_status`,
+`::plan_status_change` and `::DeferralCall`.
 
 - **Entering `deferred`** via `set_task_status(status='deferred')` from `pending`,
   `in-progress` or `blocked`. A `deferral` is required.
@@ -221,7 +245,7 @@ The interceptor applies `DeferralWrite`; it does not interpret deferrals (heuris
     `planning`, or absent (the pre-migration window). Any other kind is refused
     (`reason_code='not_planning_hold'`), so a human hold or a live hand-carry can never be
     released by a batch commit. `commit_planning` reaches the choke point through the CSV
-    `TaskInterceptor.set_task_status`, so it passes `plan()` an internal commit-scope marker.
+    `TaskInterceptor.set_task_status`, so it passes the gate an internal commit-scope marker (`StatusWriteScope.COMMIT_PLANNING` on the `DeferralCall`).
     The marker is not a parameter of the MCP `set_task_status`. A plain
     `set_task_status(status='pending')` out of `deferred` stays legal for every kind.
   - `commit_planning(target_status='deferred')` requires `deferral` (a caller kind) and
@@ -248,7 +272,7 @@ The interceptor applies `DeferralWrite`; it does not interpret deferrals (heuris
 ### 4. Leaving `deferred` clears the record, and says what it cleared
 
 Every edge out of `deferred` (→ `pending`, `done`, `blocked`, `cancelled`) goes through
-`_apply_status_transition`. So `DeferralWrite` removes the key there, in the same transaction
+`_apply_status_transition`. So `Exit` (from `plan_status_change`) removes the key there, in the same transaction
 as the status write. That one site covers recon's `_sweep_cancel_orphan` and
 `_sweep_block_orphan`, a hand-carry's `deferred → done`, `commit_planning`, and the sweep's
 flip, with no per-caller code.
@@ -285,7 +309,7 @@ old and new records.
   and is `pending`. The server opens that queue as its escalators already do
   (`fused-memory/src/fused_memory/middleware/curator_escalator.py`:
   `EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)`), off the event loop and before the
-  write lock (INV-8). Refusals: `escalation_not_found`, `escalation_not_pending`. The
+  write lock, in `deferral_gate.corroborate` (INV-8). Refusals: `escalation_not_found`, `escalation_not_pending`. The
   escalation's `task_id` need not be the deferred task's, because one question can hold
   several tasks.
 - **Server-only kinds.** `planning` and `legacy_unknown` from a caller are refused
@@ -592,7 +616,8 @@ modules, each statable in one sentence and readable alone:
 `orchestrator/.../deferral_sweep.py` (the pass).
 
 The hosts gain thin wiring only:
-- `_apply_status_transition`: one `plan()` call and the application of its result;
+- `set_task_status`: one `corroborate` call;
+- `_apply_status_transition`: one planner call per transition, and the application of its result;
 - `tools.py`: argument pass-throughs;
 - `harness.py`: one service registration;
 - `scheduler.py`: one error mapping.
@@ -805,7 +830,7 @@ There is no external prerequisite.
 | Other PRD / surface | Direction | Seam mechanism | Owner | Status |
 |---|---|---|---|---|
 | `plans/task-status-authority-prd.md` (Table A, C1/D1/D5) | consumes | the choke point `_apply_status_transition`. Table A edges are unchanged. The deferral rule is a payload rule layered beside legality, not a new table, and it keys on data shape, not actor (D5) | **this PRD** | that PRD landed; enforce-mode live |
-| `docs/prds/claimant-invariant-enforcement.md` (4618 pending; carrier 4866 landed `bfc61f6624` 2026-10-07) | consumes read-only | `shared.task_claimant.has_live_claimant` is the sweep's guard. Entering `deferred` leaves claimant columns untouched (its B2), and the lease never writes them | **this PRD** owns the guard call; that PRD owns claimant semantics | 4866 landed terminal-claimant clearing and the post-lock recurrence mint in `_apply_status_transition`; neither changes a premise here (`has_live_claimant` unchanged; `plan()` files no task under the lock). This PRD's wiring there is one `plan()` call, with no dependency edge |
+| `docs/prds/claimant-invariant-enforcement.md` (4618 pending; carrier 4866 landed `bfc61f6624` 2026-10-07) | consumes read-only | `shared.task_claimant.has_live_claimant` is the sweep's guard. Entering `deferred` leaves claimant columns untouched (its B2), and the lease never writes them | **this PRD** owns the guard call; that PRD owns claimant semantics | 4866 landed terminal-claimant clearing and the post-lock recurrence mint in `_apply_status_transition`; neither changes a premise here (`has_live_claimant` unchanged; the gate's planners file no task under the lock). This PRD's wiring there is one planner call per transition, with no dependency edge |
 | `orchestrator/src/orchestrator/session_registry.py` (Attention Rail, task 4193) | consumes read-only | best-effort pid → slug resolution, to name a dead holder in its notice; no heartbeat is read | **this PRD** (reader); that module is not edited | landed |
 | `plans/scheduler-pause-halt-retirement-prd.md` (4686–4694, 5313, pending) | consumes | `Scheduler.is_paused` as "is dispatch halted"; the shape precedent for owner + expiry per hold class. Intentional divergence: an expired operator halt escalates and never resumes, while an expired session hold releases, because its owner is dead and leaving the work parked is the failure being fixed | that PRD owns the pause predicate. If it makes pauses class-scoped, `deferral_sweep` keeps asking the single question "is dispatch halted?" | pending |
 | `plans/stranding-remediation-scheduler-ergonomics-prd.md` β (5311, pending) | none | the sweep never re-pends into a paused scheduler, so it emits no `repend_while_paused` and depends on nothing there | 5311 | pending |
@@ -850,8 +875,8 @@ same file; the dependency edges serialize any re-grep overlap.
   writers.** [6525; high; normal; ~1,300–1,600 LOC; 13 files] depends on α. Intermediate: it
   unlocks γ, δ, ε and ζ.
   - Code:
-    - `fused-memory/src/fused_memory/middleware/deferral_gate.py` (new: `plan()`);
-    - `task_interceptor.py` (one `plan()` call and its application, the internal commit-scope
+    - `fused-memory/src/fused_memory/middleware/deferral_gate.py` (new: `corroborate`, the two planners and `planning_birth_record`);
+    - `task_interceptor.py` (the `corroborate` call, one planner call per transition and the application of its result, the internal commit-scope
       marker, the planning-birth stamp, the `submit_task` refusal, the re-stamp's early return
       before targeted reconciliation, event fields, the response echo);
     - `server/tools.py` (`deferral`, `expected_stamped_at` and `restamp_only` on

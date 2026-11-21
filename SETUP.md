@@ -61,6 +61,7 @@ The script is idempotent (safe to re-run) and self-reports each step with
 6. **jCodeMunch** — optional personal productivity tooling (AST-based code retrieval) the repo's original maintainer uses. Safe to let run; skip/ignore if you don't want it, but note that orchestrator agents and reconciliation stages are always given the `jcodemunch` MCP server (launched as `jcodemunch-mcp` from your PATH). If that launcher is missing the server fails to start, and those sessions run without the `mcp__jcodemunch__*` tools rather than failing. Step 6 also installs the version-pinned `jcodemunch-mcp` launcher with `uv tool install` (the pin lives in `shared/src/shared/jcodemunch_launch.py`) and registers it in your user-level Claude config, so uv's tool bin dir (`uv tool dir --bin`) must be on your PATH.
 7. **Dashboard systemd units** — renders and enables `dark-factory-dashboard` + its watchdog timer (installed, not started — see §7).
    - **7a. Client-feed publisher unit template** — renders `scripts/client-feed.service.template` into `~/.config/systemd/user/client-feed@.service` and enables nothing. An instance is per client project and is enabled by hand; see `OPERATIONS.md` §"Client feed". To install or refresh only this unit later, use the targeted `scripts/render_systemd_unit.py` command given there rather than re-running the whole script, which restarts fused-memory whenever `fused-memory/.env` exists.
+   - **7b. Expected user timers** — runs `scripts/user_timers.py arm`, which runs the installer of each nightly-ladder timer and of the load sampler that is not already armed (some installers kick one immediate run) and leaves masked ones alone. The timers and why each is expected: `OPERATIONS.md` §12 "The nightly ladder".
 8. **Claude Code skill symlinks** — wires the in-repo `skills/` into your Claude Code install. Covered in full in §8 below.
 9. **Git hooks** — runs `hooks/setup.sh`, which points `core.hooksPath` at `hooks/` (pre-commit, pre-merge-commit), then `python3 scripts/merge_lane_ratchet_merge.py install`, which writes dark-factory's own merge driver for the ratchet baseline (`merge.ratchet-baseline.driver`, named by `.gitattributes`) into the repo's `.git/config`. Without the driver a merge of two branches that both moved the baseline conflicts instead of composing.
 10. **Manual steps reminder** — printed only, for migrating data from another host (`export-data.sh`/`import-data.sh`); irrelevant on a genuinely fresh install.
@@ -276,6 +277,22 @@ start it explicitly the first time. Once running:
 
 - Dashboard UI: `http://127.0.0.1:8080` (task/escalation/memory state, polled
   live from fused-memory + each registered orchestrator).
+- `DASHBOARD_SAMPLERS` — an optional `Environment=` line on the dashboard
+  unit, `on` or `off` (case-insensitive, surrounding whitespace ignored).
+  Unset means `on`; any other value fails dashboard startup with a
+  `ValueError` naming the variable. `off` stops the three background samplers
+  (`dashboard/src/dashboard/loops.py::_burndown_loop`, `::_metrics_loop` and
+  `::_quality_loop`), the only writers of the history the charts read
+  (`data/burndown/burndown.db`, `metrics.db`, `quality.db`): every page still
+  serves, but that history stops accruing while the switch is off. Leave it
+  unset in production; the test suite is what runs with it off. The committed
+  unit does not set it, so an installed `Environment=DASHBOARD_SAMPLERS=` line
+  is reported as drift by the unit-parity check (`OPERATIONS.md`
+  §"Dashboard unit-parity check") and a drop-in carrying it as an override.
+  A `scripts/setup-host.sh` re-render drops the line, because the renderer
+  keeps only the dashboard's host-local names
+  (`scripts/systemd_unit_parity.py::ENV_POLICY`), and `DASHBOARD_SAMPLERS` is
+  not one.
 - `dark-factory-dashboard-watchdog.timer` curls `/healthz` every 30s and
   restarts the dashboard if it wedges.
 - `orchestrator-watchdog.timer` TCP-probes every *enabled* orchestrator's

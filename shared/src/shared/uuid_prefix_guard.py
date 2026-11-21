@@ -117,6 +117,7 @@ __all__ = [
     'ResolutionOutcome',
     'ResolverUnavailable',
     'ToolClass',
+    'UUID_PREFIX_REPAIR_META_KEY',
     'UUID_PREFIX_STORM_ERROR_TYPE',
     'UnavailableReason',
     'UuidPrefixGuardMiddleware',
@@ -315,6 +316,11 @@ STORM_COUNTED_OUTCOMES: frozenset[str] = frozenset({'forwarded_ambiguous', 'reso
 #: record's type from which callable it arrived on — ``FACT_MARKUP_DETECTED``'s
 #: convention, and the two streams are read side by side.
 FACT_UUID_PREFIX_DETECTED = 'uuid_prefix_detected'
+
+
+#: The ``meta`` key a forwarded call's report rides under. Public so a
+#: consumer that surfaces the report elsewhere names it without retyping it.
+UUID_PREFIX_REPAIR_META_KEY = 'uuid_prefix_repair'
 
 
 #: The C2 port, declared HERE because the guard is the party that depends on
@@ -1090,11 +1096,14 @@ class UuidPrefixGuardMiddleware(Middleware):
     async def _forward(context, call_next, report: dict[str, Any]):
         """Let the call through and fold the report into ``meta``.
 
-        The report rides on ``meta`` and NEVER on ``structured_content`` or an
-        extra content block. Both alternatives are ruled out by measurement:
-        a middleware-authored ``structured_content`` fails the tool's own
-        output schema, and an appended content block corrupts any caller that
-        indexes ``content[0]``.
+        The report rides on ``meta``; this middleware NEVER writes it into
+        ``structured_content`` or an extra content block. Both alternatives are
+        ruled out by measurement: a middleware-authored ``structured_content``
+        fails the tool's own output schema, and an appended content block
+        corrupts any caller that indexes ``content[0]``. A host may still echo
+        the key into the result after checking that schema, as
+        ``fused-memory/src/fused_memory/server/tool_middleware_bridge.py::install_tool_middleware``
+        does.
 
         FOLDED into whatever meta came back rather than replacing it —
         ``call_next``'s result already carries ``{'fastmcp': {'wrap_result':
@@ -1103,7 +1112,7 @@ class UuidPrefixGuardMiddleware(Middleware):
         """
         result = await call_next(context)
         meta = dict(result.meta or {})
-        meta['uuid_prefix_repair'] = report
+        meta[UUID_PREFIX_REPAIR_META_KEY] = report
         return ToolResult(
             content=result.content,
             structured_content=result.structured_content,

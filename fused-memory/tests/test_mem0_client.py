@@ -3,18 +3,26 @@
 import asyncio
 import contextlib
 import logging
+import uuid
 from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_qdrant_live import QDRANT_URL, collection_vector_size, qdrant_skipif
+from _fm_qdrant_live import (
+    EPHEMERAL_COLLECTION_PREFIX,
+    QDRANT_URL,
+    assert_reapable,
+    collection_vector_size,
+    qdrant_skipif,
+)
 from _qdrant_responses import missing_collection_404
 from _stub_qdrant_server import StubQdrantServer, stub_qdrant_server
 from mem0 import AsyncMemory
 from mem0.configs.base import MemoryConfig
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
+from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
 
 from fused_memory.backends.mem0_client import Mem0Backend, is_missing_collection_error
 from fused_memory.config.schema import Mem0BackendConfig
@@ -2102,28 +2110,53 @@ class TestMem0BackendMetadataReadsOnAbsentCollectionIntegration:
 # never dedup-drops), adapted to probe add_system_record instead of add().
 # This pins the SAME fresh-point-every-call guarantee for the new dedicated,
 # dedup-exempt method.
+#
+# One collection is shared by every xdist worker and session and reused across
+# runs; it is reaped by scripts/cleanup_test_collections.py, and each run is
+# isolated by its own run_id.
 
 
 @pytest.fixture
-def _asr_scope(worker_id) -> Scope:
-    """A recon-stage scope isolated per xdist worker for add_system_record tests."""
+def _asr_scope() -> Scope:
+    """The recon-stage scope every add_system_record run shares; runs are isolated by run_id."""
     return Scope(
-        project_id=f'_test_add_system_record_{worker_id}',
+        project_id='_test_add_system_record',
         agent_id='recon-stage-task_knowledge_sync',
     )
 
 
 @pytest.fixture
-def _asr_clean_collection(_asr_scope, mock_config):
-    """Delete the scope's Qdrant collection before AND after the test."""
-    collection = _asr_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
+def _asr_config(mock_config):
+    """``mock_config`` with the collection prefix the reaper sweeps."""
+    config = mock_config.model_copy(deep=True)
+    config.mem0.collection_prefix = EPHEMERAL_COLLECTION_PREFIX
+    return config
+
+
+@pytest.fixture
+def _asr_run_id(_asr_scope, _asr_config):
+    """A run_id unique to this run; teardown deletes only this run's points, never the collection."""
+    run_id = f'task-2222-add-system-record-probe-{uuid.uuid4().hex}'
+    yield run_id
+    collection = _asr_scope.mem0_collection_name(_asr_config.mem0.collection_prefix)
     client = QdrantClient(url=QDRANT_URL, timeout=10)
-    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
-        client.delete_collection(collection)
-    yield collection
     with contextlib.suppress(Exception):
-        client.delete_collection(collection)
+        client.delete(
+            collection_name=collection,
+            points_selector=FilterSelector(
+                filter=Filter(
+                    must=[FieldCondition(key='run_id', match=MatchValue(value=run_id))],
+                ),
+            ),
+        )
     client.close()
+
+
+def test_the_add_system_record_probe_collection_is_one_the_reaper_can_reclaim(
+    _asr_config, _asr_scope,
+):
+    """The probe collection outlives a run by design, so it must be one the reaper deletes."""
+    assert_reapable(_asr_scope.mem0_collection_name(_asr_config.mem0.collection_prefix))
 
 
 async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
@@ -2157,20 +2190,22 @@ async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
 class TestMem0BackendAddSystemRecordIntegration:
     """P4 boundary signal: N identical add_system_record calls -> N distinct points.
 
-    Real Qdrant, isolated collection, stubbed constant-vector embedder (the
-    worst-case cosine=1.0 duplicate signal) — mirrors
-    test_recon_dedup_premise.py's harness for backend.add(), applied to the
-    new dedup-exempt backend.add_system_record method.
+    Real Qdrant, one collection shared by every worker and reused across runs
+    (reaped by scripts/cleanup_test_collections.py) with each run isolated by
+    its own run_id, stubbed constant-vector embedder (the worst-case cosine=1.0
+    duplicate signal) — mirrors test_recon_dedup_premise.py's harness for
+    backend.add(), applied to the new dedup-exempt backend.add_system_record
+    method.
     """
 
     pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]
 
     @pytest.mark.asyncio
     async def test_identical_calls_all_land_distinct(
-        self, mock_config, _asr_scope, _asr_clean_collection, monkeypatch,
+        self, _asr_config, _asr_scope, _asr_run_id, monkeypatch,
     ):
-        backend = await _build_asr_backend(mock_config, _asr_scope, monkeypatch)
-        run_id = 'task-2222-add-system-record-probe'
+        backend = await _build_asr_backend(_asr_config, _asr_scope, monkeypatch)
+        run_id = _asr_run_id
         metadata = {'kind': 'cycle_summary', 'run_id': run_id}
         n = 6
         try:
@@ -3125,22 +3160,20 @@ class TestBuildConfigDictEndpointPlumbing:
     AsyncMemory, no _get_instance. Greenfield: nothing tested this dict before.
     """
 
-    # --- default (shipped-config) behaviour: must stay byte-identical ---
-
-    def test_default_omits_embedding_dims_entirely(self, backend):
-        """The load-bearing byte-identical assertion.
-
-        mem0/embeddings/openai.py sets
-        ``_pass_dimensions_to_api = self.config.embedding_dims is not None``.
-        We omit the key today, so ``dimensions`` is NEVER sent on an
-        embeddings request. Emitting the key at all — even as 1536 — would
-        start sending it on every request under the shipped config. Hence the
-        emit-only-when-non-default rule; do not "simplify" it away.
+    @pytest.mark.parametrize('dims', [768, 1024, 1536])
+    def test_no_width_ever_reaches_the_embedder_config(self, mock_config, dims):
+        """mem0/embeddings/openai.py sends ``dimensions`` exactly when
+        ``embedding_dims`` is set, and no client may send it (PRD C3), so the
+        key is absent at every width while the vector store follows the config.
         """
-        config_dict = backend._build_config_dict('some_collection')
+        mock_config.embedder.dimensions = dims
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
 
-        assert backend.config.embedder.dimensions == 1536
         assert 'embedding_dims' not in config_dict['embedder']['config']
+        assert (
+            config_dict['vector_store']['config']['embedding_model_dims']
+            == mock_config.embedder.dimensions
+        )
 
     def test_default_emits_incumbent_base_urls(self, backend):
         config_dict = backend._build_config_dict('some_collection')
@@ -3151,18 +3184,20 @@ class TestBuildConfigDictEndpointPlumbing:
             == 'https://api.openai.com/v1'
         )
 
-    def test_default_vector_store_dims_match_mem0s_own_default(self, backend):
-        """Emitting this key is a no-op at the shipped config — mem0's Qdrant
-        default is already 1536 — but it is required for a collection to be
-        CREATED at a non-default dimensionality."""
+    def test_vector_store_dims_follow_the_configured_width(self, backend):
+        """mem0's own Qdrant default is 1536, so this key is what lets a
+        collection be CREATED at any other configured width."""
         from mem0.configs.vector_stores.qdrant import QdrantConfig
 
         config_dict = backend._build_config_dict('some_collection')
 
-        assert config_dict['vector_store']['config']['embedding_model_dims'] == 1536
+        assert (
+            config_dict['vector_store']['config']['embedding_model_dims']
+            == backend.config.embedder.dimensions
+        )
         assert (
             QdrantConfig.model_fields['embedding_model_dims'].default == 1536
-        ), 'mem0 changed its Qdrant dims default — the no-op claim above no longer holds'
+        ), 'mem0 changed its Qdrant dims default — the claim above no longer holds'
 
     def test_preexisting_keys_are_unchanged(self, backend):
         config_dict = backend._build_config_dict('some_collection')
@@ -3181,7 +3216,7 @@ class TestBuildConfigDictEndpointPlumbing:
 
         embedder = config_dict['embedder']['config']
         assert config_dict['embedder']['provider'] == 'openai'
-        assert embedder['model'] == 'text-embedding-3-small'
+        assert embedder['model'] == backend.config.embedder.model
         assert embedder['api_key'] == 'test-key'
 
     # --- local-endpoint behaviour ---
@@ -3200,17 +3235,16 @@ class TestBuildConfigDictEndpointPlumbing:
             == 'http://127.0.0.1:5678/v1'
         )
 
-    def test_non_default_dims_emitted_under_both_key_names(self, mock_config):
-        """BOTH keys are required for a non-1536 arm, and they are NOT the same
-        key: the embedder key controls what dimensionality is requested from
-        the API, the vector-store key controls what Qdrant creates the
-        collection with. Setting only one silently yields a mismatch.
+    def test_a_non_default_width_sets_only_the_vector_store_dims(self, mock_config):
+        """The vector-store key sets the width Qdrant creates the collection
+        at; the embedder gets no width key, so it receives the model's native
+        width and the endpoint never sees ``dimensions``.
         """
         mock_config.embedder.dimensions = 768
         config_dict = Mem0Backend(mock_config)._build_config_dict('c')
 
-        assert config_dict['embedder']['config']['embedding_dims'] == 768
         assert config_dict['vector_store']['config']['embedding_model_dims'] == 768
+        assert 'embedding_dims' not in config_dict['embedder']['config']
 
     def test_anthropic_llm_block_carries_no_openai_base_url(self, mock_config):
         """openai_base_url is an OpenAIConfig-only parameter; passing it to the
@@ -3242,8 +3276,7 @@ class TestBuildConfigDictEndpointPlumbing:
         from mem0.configs.llms.openai import OpenAIConfig
         from mem0.configs.vector_stores.qdrant import QdrantConfig
 
-        # Non-default dims so every optional key is actually emitted.
-        mock_config.embedder.dimensions = 768
+        # Local endpoints, so the endpoint keys carry non-default values.
         mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:1234/v1'
         mock_config.embedder.providers.openai.api_url = 'http://127.0.0.1:5678/v1'
         config_dict = Mem0Backend(mock_config)._build_config_dict('c')

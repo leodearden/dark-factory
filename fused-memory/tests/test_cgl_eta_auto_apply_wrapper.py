@@ -182,15 +182,15 @@ def test_wrapper_resolves_uv_by_absolute_path_when_path_omits_it(tmp_path):
         f"finalize gate, and the EXIT-trap resume); calls={calls!r} "
         f"stderr={result.stderr!r}"
     )
-    # Every call must carry the `run --project <FM> python <script>` shape --
+    # Every call must carry the `run --no-sync --project <FM> python <script>` shape --
     # i.e. it is the resolved absolute uv being invoked, not a shell builtin
     # or some other binary that happened to be reachable.
     for argv in calls:
-        assert argv[:2] == ["run", "--project"], f"argv={argv!r}"
-        assert argv[3] == "python", f"argv={argv!r}"
-        assert argv[4].endswith(".py"), f"argv={argv!r}"
+        assert argv[:3] == ["run", "--no-sync", "--project"], f"argv={argv!r}"
+        assert argv[4] == "python", f"argv={argv!r}"
+        assert argv[5].endswith(".py"), f"argv={argv!r}"
 
-    scripts_invoked = [Path(argv[4]).name for argv in calls]
+    scripts_invoked = [Path(argv[5]).name for argv in calls]
     assert scripts_invoked == [
         "cgl_eta_scheduler_gate.py",     # halt
         "cgl_eta_auto_apply_impl.py",    # the apply itself

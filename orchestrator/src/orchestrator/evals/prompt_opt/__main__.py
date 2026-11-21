@@ -502,7 +502,7 @@ def smoke(artifacts_root: Path | None, split_seed: int) -> None:
         except KeyboardInterrupt:
             click.echo('\nInterrupted.')
             sys.exit(130)
-        except Exception as exc:  # noqa: BLE001 -- surface ANY run failure as a non-zero gate
+        except Exception as exc:  # surface ANY run failure as a non-zero gate
             click.echo(click.style(
                 f'Acceptance smoke FAILED to run: {exc!r}', fg='red', bold=True,
             ), err=True)

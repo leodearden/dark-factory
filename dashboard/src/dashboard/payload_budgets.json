@@ -24,6 +24,11 @@
           "budget_bytes": 5500000,
           "task": "5824",
           "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 4,351,859 bytes with no query. 4,953 active rows across 10 projects. Dominant fields: TASKS_SNAPSHOT.{}.rows.value[].meta_files 30%, .title 15%, .deps[].title 11%. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
+        },
+        {
+          "budget_bytes": 9100000,
+          "task": "10139",
+          "reason": "Measured 2026-11-15 10:27Z against the live dashboard (127.0.0.1:8080): 7,202,113 bytes with no query. 7,256 active rows across 12 projects (dark-factory 3,646, reify 2,760, solar-challenge-platform 576), against 4,953 across 10. Organic growth since task 5824's 2026-10-15 measurement, with no new field: rows grew 46% and bytes per row 13% (879 to 993) as dependencies per row grew (11,623 deps, 9,043 of them titled). Dominant fields: TASKS_SNAPSHOT.{}.rows.value[].meta_files 25%, .deps[].title 16%, .title 13%. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
         }
       ]
     },
@@ -111,6 +116,11 @@
           "budget_bytes": 580000,
           "task": "5824",
           "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 457,345 bytes with window=all. Ten projects, recent capped at 200 each. Dominant fields: MERGE_QUEUE.{}.recent[].title.reason 15%, recent[].timestamp 12%."
+        },
+        {
+          "budget_bytes": 840000,
+          "task": "10139",
+          "reason": "Measured 2026-11-15 10:27Z against the live dashboard (127.0.0.1:8080): 670,204 bytes with window=all. Twelve projects, against ten: eight have recent at the 200-row cap and dark-factory adds 50 train_events; pump-web-ui has 70 rows; autotrade, mission-control and market-predictor are empty. Organic growth since task 5824's 2026-10-15 measurement, with the field mix unchanged. Dominant fields: MERGE_QUEUE.{}.recent[].title.reason 14%, recent[].timestamp 12%. The payload is bounded per project: about 64-73 KB with the cap full, 95 KB for reify and 144 KB for dark-factory with their train events. If the three empty projects and pump-web-ui fill, the request reaches about 0.91 MB, above this budget."
         }
       ]
     },
@@ -129,6 +139,11 @@
           "budget_bytes": 1200000,
           "task": "5824",
           "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 891,450 bytes with window=90d. About 1,320 samples per project across 10 projects. Dominant field: BURNDOWN_BY_PROJECT.{}.labels 47%. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
+        },
+        {
+          "budget_bytes": 1200000,
+          "task": "6991",
+          "reason": "Re-measured 2026-11-17 05:48Z against the live dashboard (127.0.0.1:8080) after BURNDOWN_BY_PROJECT.{}.labels became label_spans, half-open [start, stop) index ranges into BURNDOWN.labels: the live body was 1,725,145 bytes with window=90d, and the same body with the span encoding applied is 950,875 (-44.9%). 12 projects; the union BURNDOWN.labels holds 2,661 labels; each project holds 1,177 to 2,164 measured rows (mean 1,958), sent as 30 to 470 spans (48,196 bytes in all). Dominant fields: BURNDOWN.labels 9.8%, then the per-project value series at about 5-9% each (BURNDOWN_BY_PROJECT.{}.done 9.1%, .pending 7.4%, label_spans 5.1%). 1,200,000 is the headroom convention over that measurement (1.25m = 1,188,594, rounded up). The 90d window is not yet full, since the store reaches back only to 2026-09-20, so the body keeps growing; full-window growth is task 10258."
         }
       ]
     },
@@ -150,6 +165,11 @@
           "budget_bytes": 6700000,
           "task": "5824",
           "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 5,333,368 bytes with no query. 4,953 rows and 8,278 modules. Dominant fields: SCHEDULER.rows[].lock_set 24%, rows[].title 12%, modules[].path 9%. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
+        },
+        {
+          "budget_bytes": 9600000,
+          "task": "10139",
+          "reason": "Measured 2026-11-15 10:27Z against the live dashboard (127.0.0.1:8080): 7,644,790 bytes with no query. 7,256 rows and 10,748 modules, against 4,953 and 8,278. Organic growth since task 5824's 2026-10-15 measurement, with the field mix unchanged. Dominant fields: SCHEDULER.rows[].lock_set 23%, rows[].title 13%, modules[].path 8%. This number GRANDFATHERS an unhealthy size; it is not an endorsement of it."
         }
       ]
     },

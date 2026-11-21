@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 
 from shared.elision import elide_at_word
 from shared.mcp_envelope import parse_tool_result
@@ -29,6 +30,13 @@ from orchestrator.main_health_actions import MainHealthNextAction
 logger = logging.getLogger(__name__)
 
 SIGNATURE_KEY = 'main_health_signature'
+
+
+def is_main_health_fix(task: Mapping[str, Any]) -> bool:
+    """Whether *task* is the fix owner of a confirmed main break."""
+    signature = (coerce_task_metadata(task.get('metadata')) or {}).get(SIGNATURE_KEY)
+    return isinstance(signature, str) and bool(signature.strip())
+
 
 _LOOKUP_TIMEOUT_SECS = 15.0
 

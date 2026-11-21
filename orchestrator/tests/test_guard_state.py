@@ -51,7 +51,7 @@ def _frozen_clock() -> tuple[list[datetime], Callable[[], datetime]]:
 def _spy_on_writes(monkeypatch) -> list[tuple]:
     """Record every ``atomic_write_text`` call, then perform it for real.
 
-    Mirrors the recorder in ``test_b3_gate.py`` /
+    Mirrors the recorder in ``test_b3_gate_state.py`` /
     ``test_landed_outbox.py``: patching the shared module attribute is what
     makes the delegation itself observable, so a hand-rolled tmp+rename would
     fail these tests as well as the repo's AST fence.

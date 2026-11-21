@@ -46,6 +46,7 @@ from orchestrator.git_ops import WorktreeConflictError
 from orchestrator.merge_lane.gates import PlanFilesTouchedResult
 from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.rebase_drops import DroppedCommit
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import (
     StewardInterrupted,
@@ -163,7 +164,7 @@ def _stub_architect(
     """
     invocations: list[object] = []
 
-    async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
+    async def fake_invoke(role, prompt, cwd, **_kw):
         invocations.append(role)
         assert wf.artifacts is not None
         wf.artifacts.write_plan({'files': list(files)})
@@ -199,10 +200,12 @@ class _CheckSequence:
     def __init__(self, results: list[PlanFilesTouchedResult]) -> None:
         self.results = list(results)
         self.calls = 0
+        self.call_kwargs: list[dict] = []
 
     async def __call__(self, *args, **kwargs) -> PlanFilesTouchedResult:
         idx = min(self.calls, len(self.results) - 1)
         self.calls += 1
+        self.call_kwargs.append(kwargs)
         return self.results[idx]
 
 
@@ -275,7 +278,7 @@ async def _drive_merge_submission(
         check_seq,
     )
 
-    async def fake_run(cmd, **kwargs):  # noqa: ARG001
+    async def fake_run(cmd, **kwargs):
         return 0, 'fake_head_sha\n', ''
     monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -505,7 +508,7 @@ class TestSubmitToMergeQueuePlanTightening:
             check_seq,
         )
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -547,7 +550,7 @@ class TestSubmitToMergeQueuePlanTightening:
             check_seq,
         )
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -611,11 +614,11 @@ class TestSubmitToMergeQueueCrossRepo:
         ``plan_files_not_touched`` escalation (the RED behaviour), giving a
         clean assertion failure rather than an ``await MagicMock`` crash.
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        async def fake_check(*a, **k):  # noqa: ARG001
+        async def fake_check(*a, **k):
             return PlanFilesTouchedResult(not_touched=['__unreached__'])
         monkeypatch.setattr(
             'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
@@ -684,6 +687,27 @@ class TestSubmitToMergeQueueCrossRepo:
         self._assert_cross_repo(outcome, events, narrow, mark_blocked)
 
 
+def _wire_plan_files_gate(wf, monkeypatch, results, *, narrowed=False):
+    """Stub the plan-files gate with *results* and the architect narrowing pass with *narrowed*; return the gate's call recorder, the event store and the _mark_blocked mock."""
+    check_seq = _CheckSequence(results)
+    monkeypatch.setattr(
+        'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
+        check_seq,
+    )
+
+    async def fake_run(cmd, **kwargs):
+        return 0, 'fake_head_sha\n', ''
+    monkeypatch.setattr('orchestrator.workflow._run', fake_run)
+
+    events = _RecordingEventStore()
+    wf.event_store = events
+
+    monkeypatch.setattr(wf, '_try_narrow_plan', AsyncMock(return_value=narrowed))
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+    return check_seq, events, mark_blocked
+
+
 @pytest.mark.asyncio
 class TestSubmitToMergeQueueStalePathMessage:
     """The failure message must not claim about the branch what it never
@@ -701,26 +725,6 @@ class TestSubmitToMergeQueueStalePathMessage:
     """
 
     _NEVER_TOUCHED_SENTENCE = 'no commit on the branch touched them'
-
-    def _wire(self, wf, monkeypatch, results):
-        """Stub the gate with *results*, record events and the block reason."""
-        check_seq = _CheckSequence(results)
-        monkeypatch.setattr(
-            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
-            check_seq,
-        )
-
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
-            return 0, 'fake_head_sha\n', ''
-        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
-
-        events = _RecordingEventStore()
-        wf.event_store = events
-
-        wf._try_narrow_plan = AsyncMock(return_value=False)  # type: ignore[method-assign]
-        mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-        wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-        return events, mark_blocked
 
     @staticmethod
     def _reason_of(mark_blocked) -> str:
@@ -744,7 +748,7 @@ class TestSubmitToMergeQueueStalePathMessage:
             missing_from_tree=[stale],
             resolved_renames={stale: resolved},
         )
-        events, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+        _, events, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
 
         outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
@@ -780,7 +784,7 @@ class TestSubmitToMergeQueueStalePathMessage:
             not_touched=[real, stale],
             missing_from_tree=[stale],
         )
-        _, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+        _, _, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
 
         await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
@@ -813,7 +817,7 @@ class TestSubmitToMergeQueueStalePathMessage:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.plan = {'files': ['a.py']}
         result = PlanFilesTouchedResult(not_touched=['a.py'], missing_from_tree=[])
-        _, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+        _, _, mark_blocked = _wire_plan_files_gate(wf, monkeypatch, [result, result])
 
         await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
@@ -821,6 +825,61 @@ class TestSubmitToMergeQueueStalePathMessage:
         assert self._NEVER_TOUCHED_SENTENCE in reason
         assert 'has not delivered against the plan' in reason
         assert 'does not exist in the tree' not in reason.lower()
+
+
+@pytest.mark.asyncio
+class TestSubmitToMergeQueueRebaseDroppedMessage:
+    """A plan file a rebase dropped is not an implementation gap (task 4669).
+
+    ``git rebase`` drops a branch commit whose change main already carries
+    (the 3490 cache-buster bump), so the gate's ``base..HEAD`` read sees the
+    file untouched.  The gate is handed the branch, attributes the entry to
+    the dropped commit, and the block reason says so instead of claiming
+    "Implementation has not delivered".  Routing is unchanged.  When the
+    architect narrowing pass reports a narrowed plan, the gate runs a second
+    time, and that re-check is handed the branch too.
+    """
+
+    _SHA = 'c2e8f8c14d' + '0' * 30
+    _SUBJECT = 'chore(3490): bump the redux cache-buster uniformly, 43 -> 44'
+
+    @pytest.mark.parametrize(
+        ('narrowed', 'gate_calls'), [(False, 1), (True, 2)],
+        ids=['no-narrowing', 'post-narrowing-recheck'],
+    )
+    async def test_dropped_entry_is_attributed_with_routing_unchanged(
+        self, tmp_path: Path, monkeypatch, narrowed: bool, gate_calls: int,
+    ):
+        from orchestrator.merge_lane.gates import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
+
+        wf = _make_workflow(tmp_path=tmp_path)
+        wf.plan = {'files': ['index.html']}
+        result = PlanFilesTouchedResult(
+            not_touched=['index.html'],
+            dropped_by_rebase={'index.html': (
+                DroppedCommit(sha=self._SHA, subject=self._SUBJECT, paths=('index.html',)),
+            )},
+        )
+        check_seq, events, mark_blocked = _wire_plan_files_gate(
+            wf, monkeypatch, [result, result], narrowed=narrowed,
+        )
+
+        outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+
+        mark_blocked.assert_awaited_once()
+        args, kwargs = mark_blocked.call_args
+        reason = args[0] if args else kwargs['reason']
+        assert reason.startswith(PLAN_FILES_NOT_TOUCHED_REASON_PREFIX)
+        assert 'c2e8f8c14d00' in reason
+        assert self._SUBJECT in reason
+        assert 'dropped by a rebase' in reason
+        assert 'Implementation has not delivered' not in reason
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert 'plan_files_not_touched' in _merge_attempt_outcomes(events)
+        assert kwargs.get('escalate_to_human') is True
+        assert [kw.get('branch') for kw in check_seq.call_kwargs] == [
+            f'{wf.config.git.branch_prefix}2656',
+        ] * gate_calls
 
 
 _PASSING_VERIFY_RESULT = VerifyResult(
@@ -1010,7 +1069,7 @@ class TestRunMergeDeferredGuard:
         submitting to the merge queue.  The execute/verify/review pipeline
         still runs (stubbed via _execute_verify_review_loop).
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -1034,7 +1093,7 @@ class TestRunMergeDeferredGuard:
         """A task without metadata.train must NOT call _enter_merge_deferred and
         must proceed to _submit_to_merge_queue — the pre-γ₁ merge path unchanged.
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -1245,7 +1304,7 @@ class TestMergePhaseGraceStampLifecycle:
         window the self-redeploy must not cancel)."""
         wf = _make_workflow(tmp_path=tmp_path, task_id='2656')
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -2190,7 +2249,7 @@ class TestHandleSoftCancelOutcome:
         assignment.task = {'id': '99', 'title': 'T', 'description': 'd'}
         assignment.modules = []
 
-        from _orch_helpers import pydantic_spec  # noqa: PLC0415
+        from _orch_helpers import pydantic_spec
 
         _spec = pydantic_spec(OrchestratorConfig)
         config = MagicMock(spec_set=_spec)
@@ -2615,7 +2674,7 @@ class _RecordingFakeSteward:
 
     instances: list[_RecordingFakeSteward] = []
 
-    def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+    def __init__(self, wt_path, cfg_dir):
         self.outcome_channel = None
         self.wip_probe = None
         type(self).instances.append(self)

@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _git_fixtures import seed_repo
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
@@ -494,27 +495,9 @@ class TestWarmLanePoolCensusClassification:
 @pytest.fixture
 def wl_git_repo(tmp_path: Path) -> Path:
     repo = seed_repo(tmp_path / 'repo')
-    # Task 2061: pre-create the DEFAULT derived warm-lane base
-    # (<repo>/.worktrees/_merge-verify/target, non-empty) so the
-    # acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK
-    # for the many tests in this file that use the default (unoverridden)
-    # warm_lane_base_target_dir — these tests exercise OTHER acquire_warm_lane
-    # behavior (create/reset/reuse/release/...) via stub seed scripts that
-    # ignore the base path entirely, so they never cared about the base's
-    # on-disk presence before this gate existed. Tests that specifically
-    # exercise base-absence/health use their own explicit
-    # warm_lane_base_target_dir override (see TestWarmLaneBaseResolvable,
-    # TestAcquireWarmLaneBaseAbsent) and are unaffected by this default.
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    # Task 2099: mark pool storage present so the NEW mount-presence guard on
-    # acquire_warm_lane/acquire_spec_lane's create-once discriminator does not
-    # false-trip for the many tests in this file, which simulate an
-    # already-running warm-lane host — an orthogonal concern to base health
-    # (TestAcquireWarmLaneBaseAbsent overrides warm_lane_base_target_dir only,
-    # not worktree_base itself, so it is unaffected by this default).
-    (repo / '.worktrees' / '.pool-root').touch()
+    # Base-absence tests override warm_lane_base_target_dir instead
+    # (TestWarmLaneBaseResolvable, TestAcquireWarmLaneBaseAbsent).
+    seed_default_warm_base(repo)
     return repo
 
 

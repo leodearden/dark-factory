@@ -523,11 +523,11 @@ async def _main(argv: list[str] | None = None) -> int:
         logger.error('cannot read --triage-note %s: %s', args.triage_note, exc)
         return EXIT_BAD_INPUT
 
-    from datetime import UTC, datetime  # noqa: PLC0415
+    from datetime import UTC, datetime
 
-    from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
-    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.backends.graphiti_client import GraphitiBackend
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import FusedMemoryConfig
 
     for _graph, root in projects:
         try:

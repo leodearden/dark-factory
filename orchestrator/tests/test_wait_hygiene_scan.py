@@ -7,7 +7,12 @@ edited.
 
 from __future__ import annotations
 
-from _wait_hygiene_scan import suppressed_result_wait_items, unguarded_worker_teardown_items
+from _wait_hygiene_scan import (
+    WorkerTeardownScan,
+    scan_worker_teardown,
+    suppressed_result_wait_items,
+    unguarded_worker_teardown_items,
+)
 
 
 class TestSuppressedWaitScanner:
@@ -541,6 +546,103 @@ class TestGuardedPollTeardown:
             f'be reported, got {result!r}.'
         )
 
+    def test_stop_on_a_receiver_run_as_a_task_is_reported(self) -> None:
+        """A `.stop()` on a receiver whose `.run()` the item hands to
+        `create_task(...)` counts as a worker stop whatever the variable is
+        called, so a straight-line one after a wait IS reported.
+        """
+        source = """
+class TestRunReceiver:
+    async def test_it(self):
+        lane = make_lane()
+        lane_task = asyncio.create_task(lane.run())
+        await wait_responsive(fut, timeout=5.0, label='x')
+        await lane.stop()
+"""
+        result = unguarded_worker_teardown_items(source)
+
+        assert result == ['TestRunReceiver::test_it'], (
+            f'Expected the straight-line stop of a receiver run as a task to '
+            f'be reported, got {result!r}.'
+        )
+
+    def test_stop_on_a_receiver_run_through_ensure_future_is_reported(self) -> None:
+        """`ensure_future(<receiver>.run())` runs the receiver as a task just
+        as `create_task(...)` does, so its straight-line stop IS reported.
+        """
+        source = """
+class TestEnsureFutureReceiver:
+    async def test_it(self):
+        lane = make_lane()
+        lane_task = asyncio.ensure_future(lane.run())
+        await wait_responsive(fut, timeout=5.0, label='x')
+        await lane.stop()
+"""
+        result = unguarded_worker_teardown_items(source)
+
+        assert result == ['TestEnsureFutureReceiver::test_it'], (
+            f'Expected the straight-line stop of a receiver run through '
+            f'ensure_future to be reported, got {result!r}.'
+        )
+
+    def test_stop_on_a_receiver_run_through_a_bare_create_task_is_reported(self) -> None:
+        """The `from asyncio import create_task` spelling runs the receiver
+        as a task too, so its straight-line stop IS reported.
+        """
+        source = """
+class TestBareCreateTaskReceiver:
+    async def test_it(self):
+        lane = make_lane()
+        lane_task = create_task(lane.run())
+        await wait_responsive(fut, timeout=5.0, label='x')
+        await lane.stop()
+"""
+        result = unguarded_worker_teardown_items(source)
+
+        assert result == ['TestBareCreateTaskReceiver::test_it'], (
+            f'Expected the straight-line stop of a receiver run through a '
+            f'bare create_task to be reported, got {result!r}.'
+        )
+
+    def test_stop_on_a_run_receiver_inside_a_guarding_finally_is_not_reported(self) -> None:
+        """The same run-as-a-task receiver, stopped from a `finally:` whose
+        `try:` encloses the wait, is NOT reported.
+        """
+        source = """
+class TestGuardedRunReceiver:
+    async def test_it(self):
+        lane = make_lane()
+        lane_task = asyncio.create_task(lane.run())
+        try:
+            await wait_responsive(fut, timeout=5.0, label='x')
+        finally:
+            await lane.stop()
+"""
+        result = unguarded_worker_teardown_items(source)
+
+        assert result == [], (
+            f'Expected a finally-guarded stop of a run-as-a-task receiver to '
+            f'NOT be reported, got {result!r}.'
+        )
+
+    def test_stop_on_a_receiver_never_run_as_a_task_is_not_reported(self) -> None:
+        """A `.stop()` on a receiver that is neither named `worker` nor run
+        as a task through `create_task`/`ensure_future` is NOT a worker stop: the
+        widening is structural, not "any `.stop()`".
+        """
+        source = """
+class TestUnrelatedStop:
+    async def test_it(self):
+        await wait_responsive(fut, timeout=5.0, label='x')
+        await server.stop()
+"""
+        result = unguarded_worker_teardown_items(source)
+
+        assert result == [], (
+            f'Expected a stop on a receiver never run as a task to NOT be '
+            f'reported, got {result!r}.'
+        )
+
     def test_a_module_level_test_function_is_scanned(self) -> None:
         """pytest collects a module-level `test*` function as an item of its
         own, so the scan reports it under its bare name.
@@ -565,4 +667,46 @@ async def test_x():
         assert result == [], (
             f'Expected unparseable source to return [] without raising, '
             f'got {result!r}.'
+        )
+
+
+class TestWorkerTeardownScan:
+    """Unit tests for `scan_worker_teardown`, the census behind
+    `unguarded_worker_teardown_items`: the items in the scan's scope, those
+    that stop a worker, and those that stop one unguarded.
+    """
+
+    def test_census_splits_waiting_stopping_and_unguarded_items(self) -> None:
+        source = """
+class TestA:
+    async def test_guarded(self):
+        try:
+            await wait_responsive(fut, timeout=5.0, label='x')
+        finally:
+            await worker.stop()
+
+    async def test_unguarded(self):
+        await wait_responsive(fut, timeout=5.0, label='x')
+        await worker.stop()
+
+    async def test_waits_only(self):
+        await wait_responsive(fut, timeout=5.0, label='x')
+
+    async def test_stops_only(self):
+        await worker.stop()
+"""
+        result = scan_worker_teardown(source)
+
+        assert result == WorkerTeardownScan(
+            waiting_items=('TestA::test_guarded', 'TestA::test_unguarded', 'TestA::test_waits_only'),
+            stopping_items=('TestA::test_guarded', 'TestA::test_unguarded'),
+            unguarded_items=('TestA::test_unguarded',),
+        ), f'Expected the census to split the four items by role, got {result!r}.'
+
+    def test_unparseable_source_yields_an_empty_scan(self) -> None:
+        result = scan_worker_teardown('def not valid python(:')
+
+        assert result == WorkerTeardownScan((), (), ()), (
+            f'Expected unparseable source to yield an empty scan without '
+            f'raising, got {result!r}.'
         )

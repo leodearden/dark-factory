@@ -8,7 +8,6 @@ empty.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -40,13 +39,6 @@ TASKS = '/api/v2/dashboard/tasks'
 CLAIMED, READY, CARRIED, HELD, BLOCKED = 9001, 9002, 9003, 9004, 9005
 TERMINAL = (9011, 9012, 9013, 9014)
 APPENDED = (CLAIMED, READY, CARRIED, HELD, BLOCKED, *TERMINAL)
-
-
-@pytest.fixture(scope='module', autouse=True)
-def _module_samplers_off() -> Iterator[None]:
-    with pytest.MonkeyPatch.context() as patched:
-        patched.setenv('DASHBOARD_SAMPLERS', 'off')
-        yield
 
 
 def _unprojected(task_id: int, status: str, metadata: dict[str, Any], **row: Any) -> dict[str, Any]:

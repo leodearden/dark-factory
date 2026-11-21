@@ -22,7 +22,12 @@
 # full in 80% of those minutes and an agent allowance that was capped for 24% of
 # them, so watch the merge-phase share of slot time after the redeploy.
 # Red tier: takes effect at the next redeploy.
-max_concurrent_tasks: 24
+# 24 -> 36 (Leo, 2026-11-15): the merge queue drained to depth 0, and every task
+# verify module now goes to leo-laptop (verify_task_host_policy: remote_all),
+# whose task slots went 1 -> 3, all in the same ruling. Applied at the gate-8273
+# drained fleet restart. Watch task-verify admission wait and local merge-verify
+# time after the redeploy.
+max_concurrent_tasks: 36
 
 # lock_depth 4→12 (Leo 2026-08-07): make module locks effectively file-granular.
 # Until now dark-factory never set this key at all — it silently inherited the
@@ -85,21 +90,29 @@ max_concurrent_tasks: 24
 # orchestrator/tests/test_operational_config_binding.py.
 lock_depth: 12
 
-# HUB-FILE LOCK WIDTH (limit 2 on exactly two files; Leo 2026-10-19). A BOUNDED
-# EXPERIMENT, not a standing setting; max_per_module stays 1 everywhere else.
-# Why: workflow.py and harness.py are the two most contended lock keys, and this
-# is the only lever that lets two orchestrator tasks hold one hub file at once.
+# HUB-FILE LOCK WIDTH (limit 2 on each hub file listed below; Leo 2026-10-19). A
+# BOUNDED EXPERIMENT, not a standing setting; max_per_module stays 1 everywhere else.
+# Why: each hub file is a heavily contended lock key (workflow.py and harness.py
+# were the two most contended; config.py's case is below), and this is the only
+# lever that lets two orchestrator tasks hold one hub file at once.
 # Correctness rests on BRE (acquire-before-edit) + full-workspace merge-verify,
 # as for lock_depth above; the price is paid at rebase/merge time.
 # The experiment, its 14d baseline and the REVERT CLAUSE live in task
 # 7202: a deterministic always_escalates human gate that fires 7 days
 # after the deploy task closes and re-measures. Read it there before changing or
 # keeping this key.
+# config.py joined the two-holder experiment on Leo's ruling of 2026-11-14 (lock
+# hand-off study): the scheduling fixes that were ruled waited on each other for
+# this one file; of its last 70 consecutive pairs of landed changes 1.4% touched
+# overlapping lines and 4.3% came within 10 lines (measured 2026-11-12). The review
+# gate is task 7202, whose amendment of 2026-11-14 covers this file and counts a
+# collision with a co-holder that has already landed.
 # Keys are depth-lock_depth paths (4 components, inside lock_depth 12), so they
 # match exactly what ModuleLockTable._limit_for looks up; a deeper key never would.
 # RED TIER: module_overrides is not in RELOADABLE_FIELDS and _limit_for memoises
-# per process, so this takes effect at the next orchestrator restart (the
-# explicit deploy task filed with this carrier), not on reload_config.
+# per process, so each entry takes effect at the next orchestrator restart, not on
+# reload_config: workflow.py and harness.py at the explicit deploy task filed with
+# their carrier, config.py at the next fleet redeploy (it has no deploy task).
 #
 # THE TWO RATCHET JSON PATHS (Leo's ruling 3 of 2026-10-21, task 7298) are
 # UNBOUNDED, not widened: 99 is above any max_concurrent_tasks this repo has run.
@@ -115,6 +128,7 @@ lock_depth: 12
 module_overrides:
   orchestrator/src/orchestrator/workflow.py: 2
   orchestrator/src/orchestrator/harness.py: 2
+  orchestrator/src/orchestrator/config.py: 2
   orchestrator/tests/merge_lane_ratchet_baseline.json: 99
   orchestrator/tests/merge_lane_ratchet_authorized_raises.json: 99
   orchestrator/tests/merge_lane_ratchet_raises/_README.json: 99
@@ -943,8 +957,9 @@ verify_admission_pytest_n: "8"
 # test legs run at once, admitted through the per-project flock; merge legs never
 # take a slot. The code default is 1
 # (config.py::OrchestratorConfig.verify_admission_task_slots).
-# 2 since 2026-11-12 04:27Z: stepped down from 3 under Leo's progressive-slot
-# rule (two local merge verifies over 46 min while reify rebuilt a warm lane).
+# 3 since 2026-11-15 ~14:40Z, by Leo's ruling: this key also sizes the task legs sent
+# to each remote verify host, so the laptop's 3 slots need it (step down on a
+# local merge verify over 46 min).
 # Basis, step-down triggers and the dated value history:
 # plans/verify-admission-task-slots-gate.md.
 # Any change to this value appends a dated entry there AND rewrites the
@@ -952,7 +967,7 @@ verify_admission_pytest_n: "8"
 # GREEN-tier (config.py::RELOADABLE_FIELDS) and re-read at each grant, so it
 # applies via reload_config with no restart, which matters: a restart destroys
 # the in-flight work this knob protects.
-verify_admission_task_slots: 2
+verify_admission_task_slots: 3
 
 # TASK-VERIFY ADMISSION ORDER (arrival; 2026-10-16, task 5629, PRD task beta of
 # plans/verify-admission-fifo-prd.md). Grant waiters in arrival order within a
@@ -1514,7 +1529,9 @@ recovery_emission:
 #
 # merge_verify_breadth: "full" makes merge-role verify run every REGISTERED
 # module's full suite instead of only the touched modules (Resolved decision
-# 5 in the PRD) — the λ knob, defaulting to "scoped" in defaults.yaml.
+# 5 in the PRD). "full" is also the shipped default since task 7008
+# (defaults.yaml); the key is declared here so this repo's whole-tree gate
+# does not depend on the shipped default.
 #
 # merge_train_former_enabled / merge_train_coalesce_enabled /
 # merge_train_max_members: turn on the train former + retroactive
@@ -1624,15 +1641,17 @@ verify_cross_check_remote_green: false
 # 2026-11-10, gate 6673 (task ε) step 4: the three-day parity window opens on these
 # values. Both parity knobs are on for the window only; Leo rules at its end (PRD §12
 # Q7: cross-check 0 and red-confirm off after a zero-disagreement window, the 5416
-# precedent). The laptop side (verify_admission_task_slots: 1,
+# precedent). The laptop side (verify_admission_task_slots: 3 since 2026-11-15,
 # verify_admission_pytest_n: "8") lives in leo-laptop's dark-factory-laptop.yaml.
 # 2026-11-13, gate 6673 step 6, Leo's ruling (esc-6673-1): keep remote legs on, turn
 # red-confirm off, and keep the cross-check at 5 until task 7030 lands. 7030 gives the
 # laptop a pinned reify checkout; until then three reify-dependent guards can skip
 # there silently. The cross-check then goes to 0. Measurements:
 # plans/merge-lane-throughput-prd.measurements/2026-11-10-task-6673-remote-task-leg-window.md.
-verify_task_host_policy: remote_modules        # local | remote_modules | remote_all
-verify_task_remote_modules: [orchestrator]     # must be non-empty under remote_modules
+# 2026-11-15, Leo: remote_modules [orchestrator] -> remote_all. Every task verify is
+# eligible for leo-laptop, whose dark-factory-laptop.yaml went to 3 task slots.
+verify_task_host_policy: remote_all            # local | remote_modules | remote_all
+verify_task_remote_modules: [orchestrator]     # read only under remote_modules
 verify_task_remote_red_confirms_locally: false # off after the window (2 raw / 0 adjudicated splits)
 verify_task_remote_cross_check_every_n: 5      # kept until task 7030 lands, then 0
 # ROLLBACK: verify_task_host_policy: local (or delete the keys) + mcp__escalation__reload_config.
@@ -1682,11 +1701,14 @@ git:
     - "dark-factory-orchestrator.yaml"
 
   offline_lane_commands:
+    # `uv run` binds pytest and python to THIS worktree's own venv. A bare
+    # name resolved through the daemon's PATH, i.e. main's .venv, which
+    # imports main's editable source rather than the commit under test.
     - name: qdrant-integration
-      command: "pytest -m integration"
+      command: "uv run pytest -m integration"
       cwd: "fused-memory"
       fix_task_priority: "medium"
-      outage_probe: "python scripts/lane_dependency_probe.py"
+      outage_probe: "uv run python scripts/lane_dependency_probe.py"
     # PRD §11 q4 RE-DECIDED (task 3349, 2026-08-01): the ported warm-lane bash
     # bucket moves OFF the verify hot path and onto this lane — the escape
     # plans/warm-lane-infra-repatriation-prd.md documented for exactly this
@@ -1728,7 +1750,7 @@ git:
     # originals on this suite's green, so a red here must not sit in a
     # low-priority queue.
     - name: warm-lane-bash
-      command: "pytest -m warm_lane_bash"
+      command: "uv run pytest -m warm_lane_bash"
       cwd: "orchestrator"
       fix_task_priority: "high"
 
@@ -1795,11 +1817,14 @@ psi_admission:           # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2
 # 2026-10-20: carry the flip (carrier 7619) one week after reify's canary 3189.
 # Reify's week was neutral: 122 merge verifies, 95 landings (66 the week before),
 # 2 deep verifies, 1 chain landing, 0 chain-attributed red.
-# STOP RULE: back to 0 if gates per landed item exceed 1.0, or on any
+# Since task 8528 chain_cap is the kill switch only: any positive value turns
+# chains on, and 6 is not a bound. merge_deep.depth_table sets the depth from
+# the rolling per-item pass estimate (plans/merge-lane-policy-prd.md D6/D7); it
+# is left at the code default (depth 3 at 0.75 up to depth 12 at 0.992), so no key here.
+# STOP RULE: chain_cap: 0 if gates per landed item exceed 1.0, or on any
 # chain-attributed red main or rebase-conflict cluster. Green tier: reload_config
-# applies a change without a restart; this carry issues none, so 6 goes live at
-# the next restart. The coalesce test this flip once redded pins chain_cap=0
-# since task 7279 (merge 58a69de6a5).
+# applies a change without a restart. The coalesce test this flip once redded
+# pins chain_cap=0 since task 7279 (merge 58a69de6a5).
 merge_deep:
   chain_cap: 6
   # No warm spec pool here, so builds are git-only (8 builds, max 31 s).

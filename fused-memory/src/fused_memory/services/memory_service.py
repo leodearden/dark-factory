@@ -17,7 +17,6 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, assert_never, cast
 
 from graphiti_core.nodes import EpisodeType
-from shared.storm_counter import KeyedStormCounters
 from shared.streak import KeyedStreaks
 
 from fused_memory.backends.graphiti_client import (
@@ -87,7 +86,6 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
-    StageAgentOutcome,
 )
 from fused_memory.models.scope import (
     Scope,
@@ -113,9 +111,11 @@ from fused_memory.reconciliation.standing_decision_constants import (
 from fused_memory.reconciliation.standing_decision_writer import (
     expire_entity_standing_decision,
 )
+from fused_memory.reconciliation.summary_pool import decode_cycle_summary_agent_outcome
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
+from fused_memory.services.agent_project_storm_counters import AgentProjectStormCounters
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
@@ -879,9 +879,7 @@ async def _apply_memory_metadata_validation(
     dropped by task GC; it yields the loop, which is the property that
     matters.
     """
-    violations = validate_memory_metadata(
-        meta, enforce_kind_registry=config.enforce_kind_registry
-    )
+    violations = validate_memory_metadata(meta)
 
     # parent_id LIVENESS (leaf δ). Gated on the SHAPE check having passed —
     # `validate_memory_metadata` emits `invalid_parent_id_shape` under the
@@ -985,9 +983,7 @@ async def _apply_memory_metadata_validation(
         before = dict(baseline)
         already = {
             (v.key, v.code)
-            for v in validate_memory_metadata(
-                before, enforce_kind_registry=config.enforce_kind_registry
-            )
+            for v in validate_memory_metadata(before)
         }
         violations = [
             v for v in violations
@@ -1504,11 +1500,10 @@ def _edge_to_dict(e: Any) -> dict:
     """Normalize a Graphiti edge into get_entity's edge dict shape.
 
     Accepts either a dict (exact-match path, from graphiti.get_valid_edges_for_node —
-    an EdgeDict {uuid, fact, name} with no temporal fields) or an object with
-    attributes (fuzzy-match path, from graphiti.search — a fact-search result
-    that may carry valid_at/invalid_at). Dict inputs yield temporal=None today
-    since EdgeDict has no valid_at/invalid_at keys; _serialize_temporal is used
-    regardless so this stays forward-compatible if EdgeDict is later enriched.
+    a DatedEdgeDict {uuid, fact, name, valid_at, invalid_at} carrying the stored
+    ISO-8601 validity window) or an object with attributes (fuzzy-match path, from
+    graphiti.search — a graphiti_core EntityEdge with valid_at/invalid_at). Both
+    shapes map their window through _serialize_temporal.
     """
     if isinstance(e, dict):
         return {
@@ -1533,6 +1528,65 @@ def _edge_is_retired(edge: Any) -> bool:
     keeps it).
     """
     return getattr(edge, 'invalid_at', None) is not None
+
+
+def _edge_provenance(edge: Any) -> list[str]:
+    return [str(ep) for ep in (getattr(edge, 'episodes', None) or [])]
+
+
+def _surviving_search_edges(
+    edges: Sequence[Any], planned_uuids: set[str], *, include_planned: bool, limit: int,
+) -> list[tuple[Any, bool]]:
+    """The first *limit* search edges a caller sees, each paired with whether it is planned-only.
+
+    A retired edge is dropped, and so is a planned-only edge (every provenance
+    episode planned) unless *include_planned*.
+    """
+    survivors: list[tuple[Any, bool]] = []
+    for edge in edges:
+        if len(survivors) >= limit:
+            break
+        if _edge_is_retired(edge):
+            continue
+        provenance = _edge_provenance(edge)
+        is_planned = bool(provenance) and all(ep in planned_uuids for ep in provenance)
+        if is_planned and not include_planned:
+            continue
+        survivors.append((edge, is_planned))
+    return survivors
+
+
+def _edge_endpoint_uuids(edge: Any) -> tuple[str, ...]:
+    """The distinct node uuids a graphiti-core ``EntityEdge`` joins, source first."""
+    ends = (getattr(edge, 'source_node_uuid', None), getattr(edge, 'target_node_uuid', None))
+    return tuple(dict.fromkeys(node_uuid for node_uuid in ends if node_uuid))
+
+
+def _graph_search_result(
+    edge: Any, rank: int, *, is_planned: bool, node_names: Mapping[str, str],
+) -> MemoryResult:
+    """A surviving search edge as a MemoryResult naming its endpoints, source first."""
+    metadata: dict[str, Any] = {'store_rank': rank, 'store_score': None}
+    if is_planned:
+        metadata['planned'] = True
+    return MemoryResult(
+        id=getattr(edge, 'uuid', str(rank)),
+        content=getattr(edge, 'fact', str(edge)),
+        category=None,
+        source_store=SourceStore.graphiti,
+        relevance_score=_rrf_score(rank),
+        provenance=_edge_provenance(edge),
+        temporal=_serialize_temporal(
+            getattr(edge, 'valid_at', None), getattr(edge, 'invalid_at', None),
+        ),
+        entities=list(dict.fromkeys(
+            node_names[node_uuid]
+            for node_uuid in _edge_endpoint_uuids(edge)
+            if node_uuid in node_names
+        )),
+        metadata=metadata,
+        created_at=_created_at_to_utc_iso(getattr(edge, 'created_at', None)),
+    )
 
 
 # Defensive: resolve the embedding-provider's RateLimitError class at module
@@ -2148,18 +2202,17 @@ class MemoryService:
         # service). An alarm bound to either would vanish in exactly the
         # degraded configuration where an unattended rewrite loop is least
         # likely to be noticed any other way.
-        self._mem0_update_storm_counters: KeyedStormCounters[tuple[str, str]] = (
-            KeyedStormCounters()
-        )
+        self._mem0_update_storm_counters = AgentProjectStormCounters()
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
         self.set_known_projects(build_known_projects_map(primary_root=''))
         # INV-4 storm escape for the ensure_entity_node MCP tool (task 4932),
-        # keyed per `agent_id` for the same attribution reason as the registry
-        # above.
+        # keyed per `(agent_id, project_id)` for the same attribution reason as
+        # the update_memory registry above: one agent's mints in another
+        # project cannot inflate the count filed into this project's queue.
         # No escalator OBJECT beside it: `middleware/entity_mint_storm_escalator`
         # is a module FUNCTION taking project_root explicitly, so there is no
         # queue cache to own and no set_known_projects lifecycle to keep in sync.
-        self._entity_mint_storm_counters: KeyedStormCounters[str] = KeyedStormCounters()
+        self._entity_mint_storm_counters = AgentProjectStormCounters()
         # Warn-ONCE latch for a corrupt/absent `entity_mint.storm_*` leaf. The
         # corrupt-leaf branch of `_record_entity_mint` is reached on EVERY mint
         # (unlike the `_known_projects` miss beside it, which only fires at a
@@ -2295,16 +2348,16 @@ class MemoryService:
         agents is a real memory bound on a long-lived server and belongs in the
         interface, as ``UnknownKeyStormDetector.tracked_writers`` argues.
         """
-        return frozenset(agent for agent, _ in self._mem0_update_storm_counters.tracked_keys)
+        return self._mem0_update_storm_counters.tracked_agents
 
     @property
     def entity_mint_storm_tracked_agents(self) -> frozenset[str]:
-        """The ``agent_id`` labels holding an ``ensure_entity_node`` storm window.
+        """The ``agent_id`` labels holding an ``ensure_entity_node`` storm window in any project.
 
         The same bound as :attr:`mem0_update_storm_tracked_agents`, for the
         entity-mint burst alarm.
         """
-        return self._entity_mint_storm_counters.tracked_keys
+        return self._entity_mint_storm_counters.tracked_agents
 
     def set_planned_registry(self, registry: PlannedEpisodeRegistry) -> None:
         """Wire the planned episode registry into the service."""
@@ -6217,7 +6270,7 @@ class MemoryService:
         for node_uuid in uuids:
             try:
                 await self.graphiti.refresh_entity_summary(node_uuid, group_id=group_id)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'post-ingest refresh_entity_summary failed for uuid=%s group=%s: %s',
                     node_uuid, group_id, exc,
@@ -7940,6 +7993,10 @@ class MemoryService:
 
         ``relevance_score`` is the ordinal ``_rrf_score(store_rank)``, not a
         similarity.
+
+        ``entities`` names each hit's endpoints, source first, from one
+        ``get_node_names_by_uuids`` read over the survivors; that read is not
+        caught, so its failure fails this leg.
         """
         edges = await self.graphiti.search(
             query=query,
@@ -7954,67 +8011,24 @@ class MemoryService:
                 scope.graphiti_group_id
             )
 
-        results = []
-        for edge in edges:
-            # Skip superseded edges (invalid_at set means the fact has been
-            # replaced by a newer edge).  Check this before anything else to
-            # avoid unnecessary work on edges that will be discarded, and so a
-            # dropped edge consumes no rank.
-            if _edge_is_retired(edge):
-                continue
-
-            fact = getattr(edge, 'fact', str(edge))
-            temporal = _serialize_temporal(
-                getattr(edge, 'valid_at', None),
-                getattr(edge, 'invalid_at', None),
+        survivors = _surviving_search_edges(
+            edges, planned_uuids, include_planned=include_planned, limit=limit,
+        )
+        endpoint_uuids = list(dict.fromkeys(
+            node_uuid for edge, _ in survivors for node_uuid in _edge_endpoint_uuids(edge)
+        ))
+        names = (
+            await self.graphiti.get_node_names_by_uuids(
+                endpoint_uuids, group_id=scope.graphiti_group_id,
             )
-
-            # Extract entity names from source/target nodes
-            entities = []
-            source_node = getattr(edge, 'source_node', None)
-            target_node = getattr(edge, 'target_node', None)
-            if source_node and hasattr(source_node, 'name'):
-                entities.append(source_node.name)
-            if target_node and hasattr(target_node, 'name'):
-                entities.append(target_node.name)
-
-            # Episode provenance
-            episodes = getattr(edge, 'episodes', None) or []
-            provenance = [str(ep) for ep in episodes]
-
-            # Determine whether this edge is purely aspirational (all episodes planned).
-            is_planned_edge = bool(provenance) and all(
-                ep in planned_uuids for ep in provenance
-            )
-
-            if is_planned_edge and not include_planned:
-                # Skip planning-only edges in normal search results.
-                continue
-
-            # Rank over SURVIVORS only (task 3658): the raw enumerate index
-            # counted edges skipped above, and since RRF maps rank directly to
-            # score, a gap would silently penalize Graphiti for facts the
-            # caller never sees.
-            rank = len(results) + 1
-
-            metadata: dict[str, Any] = {'store_rank': rank, 'store_score': None}
-            if is_planned_edge:
-                metadata['planned'] = True
-
-            results.append(MemoryResult(
-                id=getattr(edge, 'uuid', str(rank)),
-                content=fact,
-                category=None,
-                source_store=SourceStore.graphiti,
-                relevance_score=_rrf_score(rank),
-                provenance=provenance,
-                temporal=temporal,
-                entities=entities,
-                metadata=metadata,
-                created_at=_created_at_to_utc_iso(getattr(edge, 'created_at', None)),
-            ))
-        # Truncate to the original limit (over-fetch may have produced extras).
-        return results[:limit]
+            if endpoint_uuids else {}
+        )
+        # Rank over SURVIVORS only (task 3658): RRF maps rank directly to score,
+        # so a gap would silently penalize Graphiti for facts the caller never sees.
+        return [
+            _graph_search_result(edge, rank, is_planned=is_planned, node_names=names)
+            for rank, (edge, is_planned) in enumerate(survivors, start=1)
+        ]
 
     async def _search_mem0(
         self,
@@ -8910,11 +8924,8 @@ class MemoryService:
             # be trusted as a suppression signal for Stage 3 (task 2652
             # amendment).
             remediation = raw_remediation if isinstance(raw_remediation, bool) else None
-            raw_outcome = payload.get('agent_outcome') if isinstance(payload, dict) else None
-            try:
-                agent_outcome = StageAgentOutcome(raw_outcome).value
-            except ValueError:
-                agent_outcome = None
+            decoded = decode_cycle_summary_agent_outcome(record)
+            agent_outcome = decoded.value if decoded is not None else None
 
         reason, expected, run_status = await self._classify_summary_absence(
             journal,
@@ -9541,10 +9552,10 @@ class MemoryService:
         # agent_id is caller-supplied and unbounded; KeyedStormCounters sweeps
         # the dormant ones on every record.
         storm = self._mem0_update_storm_counters.record(
-            (label, project_id),
+            label,
+            project_id,
             threshold=threshold,
             window_seconds=float(window_seconds),
-            label=label,
             now=self._mem0_update_storm_time_provider(),
         )
         if storm is None:
@@ -10429,10 +10440,15 @@ class MemoryService:
         exactly the hold time the bounded acquire in ``ensure_entity_node``
         exists to bound, and would stall the event loop besides.
 
-        One counter per ``agent_id``, so two independently-busy agents cannot
-        sum into a false alarm. The threshold and window are read LIVE off the
-        shared config and passed INTO ``record()`` per call — captured once,
-        they would make both green-tier leaves restart-only in disguise.
+        One counter per ``(agent_id, project_id)``. Two independently-busy
+        agents cannot sum into a false alarm, and one agent's mints in another
+        project cannot inflate the count filed into this project's queue, so
+        the number is reproducible from this project's own
+        ``ensure_entity_node`` journal rows. Recon stage ids
+        (``recon-stage-<stage>``) are project-independent, which is why the
+        project is part of the key. The threshold and window are read LIVE off
+        the shared config and passed INTO ``record()`` per call — captured
+        once, they would make both green-tier leaves restart-only in disguise.
         """
         label = agent_id or '<unattributed>'
         cfg = getattr(self.config, 'entity_mint', None)
@@ -10471,9 +10487,9 @@ class MemoryService:
         # the dormant ones on every record.
         storm = self._entity_mint_storm_counters.record(
             label,
+            project_id,
             threshold=threshold,
             window_seconds=float(window_seconds),
-            label=label,
             now=self._entity_mint_storm_time_provider(),
         )
         if storm is None:

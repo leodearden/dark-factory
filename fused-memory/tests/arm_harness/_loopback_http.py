@@ -56,10 +56,10 @@ def held_upstream(received: threading.Event, release: threading.Event) -> Iterat
     class HeldHandler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
-        def log_message(self, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        def log_message(self, *args: Any) -> None:  # stdlib signature
             """Silent."""
 
-        def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+        def do_POST(self) -> None:  # stdlib naming
             self.rfile.read(int(self.headers.get('Content-Length') or 0))
             received.set()
             release.wait(timeout=30)

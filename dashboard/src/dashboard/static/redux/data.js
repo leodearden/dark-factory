@@ -61,8 +61,7 @@ function fromBody(bodyKey, spec) {
 // endpoint is registered here by searching this shipped source for `'KEY'` or
 // `"KEY"`. Unquoting them is silent: the registry still works and those four
 // tests fail with "add it as the mapped key", naming a key that is in fact
-// already present. Same reasoning as DEFAULT_TIMEOUT_MS further down, which
-// two other Python tests parse straight out of this file.
+// already present.
 function endpointsFor(win) {
   const w = encodeURIComponent(win);
   return {
@@ -276,7 +275,7 @@ window.DF_DATA = {
   //   bucket_minutes}), attempts: Datum ({outcomes, latency: {p50, p95, p99,
   //   mean_ms, with_duration, without_duration}}), recent, recent_total: Datum,
   //   speculative: Datum, active, in_queue: Datum, live_probe_configured,
-  //   active_spark, halt, train_events:
+  //   runs_db_present, active_spark, halt, train_events:
   //   [{event_type, task_id, run_id, timestamp, data: {train_id,
   //   member_task_ids, ...event-specific keys}}], train_throughput: Datum}};
   //   every recent and active row's title is a Datum. The payload's top-level
@@ -591,12 +590,7 @@ const JITTER_MAX_MS = 1500;
 // with an abort deadline; timing out is treated exactly like a thrown
 // fetch error (counts toward backoff, clears in-flight in `finally`).
 //
-// LEAVE THIS EXACTLY AS IT IS — same name, same literal, same assignment
-// shape. Two Python structural tests parse it straight out of this shipped
-// source with /DEFAULT_TIMEOUT_MS\s*=\s*(\d+)/ — test_tasks_budget.py and
-// test_fetch_tasks_whole_operation_budget.py — where it is the ONLY ceiling
-// on the server-side budgets. Renaming it, or tidying it into a computed
-// expression, fails both loudly.
+// The server-side budget tests read the delay refreshOne arms through dashboard/tests/js/_abort_delay_probe.mjs.
 const DEFAULT_TIMEOUT_MS = 30000; // 10x the poll interval
 
 // A shorter deadline for an endpoint that has already demonstrated it is

@@ -1,17 +1,18 @@
-"""Attach beta's markup guard to fused-memory's BUNDLED FastMCP (task 4458).
+"""Build beta's markup guard for fused-memory's BUNDLED FastMCP (task 4458).
 
 PRD ``plans/toolcall-markup-containment-prd.md``, leaf gamma-3. Task 3689
 (beta) delivered :class:`shared.mcp_markup_middleware.MarkupGuardMiddleware` as
 a :class:`fastmcp.server.middleware.Middleware`, attached with
 ``mcp.add_middleware(...)``. fused-memory does not run that FastMCP.
 
-fused-memory's server is the FastMCP BUNDLED inside the ``mcp`` SDK, which has
-no ``add_middleware``. :mod:`fused_memory.server.tool_middleware_bridge` runs the
-middleware UNMODIFIED at the bundled ``ToolManager.call_tool`` chokepoint, and
-says why a rejection RAISES ``ToolError`` and must sit outside
-``main._install_safe_tool_wrapper``. INV-5: no second implementation of
-detection, repair, policy or payload shape lives here, and nothing is imported
-from the middleware but its public names.
+:func:`build_markup_guard` builds the markup member, wired to this server's
+residue and storm escalation sinks, and installs nothing. The chain it joins,
+and the order, live in :mod:`fused_memory.server.boundary_guards`;
+:mod:`fused_memory.server.tool_middleware_bridge` runs that chain UNMODIFIED at
+the bundled ``ToolManager.call_tool`` chokepoint, and says why a rejection
+RAISES ``ToolError`` and must sit outside ``main._install_safe_tool_wrapper``.
+INV-5: no second implementation of detection, repair, policy or payload shape
+lives here, and nothing is imported from the middleware but its public names.
 
 Because argument validation runs inside ``Tool.run``, after that chokepoint, a
 leak that swallowed a REQUIRED parameter is repaired before pydantic ever sees
@@ -66,7 +67,6 @@ from fused_memory.server.markup_tripwire import (
     emit_markup_residue_escalation,
     emit_markup_storm_escalation,
 )
-from fused_memory.server.tool_middleware_bridge import install_tool_middleware
 
 logger = logging.getLogger(__name__)
 
@@ -120,10 +120,8 @@ _STORM_ERROR_TYPE = 'mcp_markup_storm'
 #: deduped (folding two residue records together would destroy one payload).
 _RESIDUE_ANCHOR_TASK_ID = 'markup-residue'
 
-_MARKUP_GUARDED_SENTINEL = '_fused_memory_markup_guarded'
 
-
-def _resolve_project_root(project: Any, known_projects: dict[str, str] | None) -> str | None:
+def _resolve_project_root(project: Any, known_projects: Mapping[str, str] | None) -> str | None:
     """Turn the middleware's ``project`` label into a filesystem project_root.
 
     ``MarkupGuardMiddleware._identity`` resolves ``project_root`` FIRST then
@@ -174,7 +172,7 @@ _REDERIVED_PROVENANCE = (
 
 
 def _rederive_project(
-    record: Mapping[str, Any], known_projects: dict[str, str] | None
+    record: Mapping[str, Any], known_projects: Mapping[str, str] | None
 ) -> str | None:
     """The queue root a refused payload names for itself, else ``None``.
 
@@ -230,7 +228,7 @@ class ResidueTier(enum.StrEnum):
 
 
 def _queue_residue(
-    record: dict[str, Any], known_projects: dict[str, str] | None
+    record: dict[str, Any], known_projects: Mapping[str, str] | None
 ) -> str | None:
     """Tier 1: file *record* into its project's escalation queue.
 
@@ -313,19 +311,19 @@ def _log_unpreserved(record: dict[str, Any], *, floor_wired: bool) -> None:
     )
 
 
-def install_markup_guard(
-    mcp: Any,
+def build_markup_guard(
     *,
     policy: RepairPolicy,
-    known_projects: dict[str, str] | None = None,
+    known_projects: Mapping[str, str] | None,
     exempt_tools: frozenset[str] = EXEMPT_TOOLS,
     residue_floor: ResidueFloor | None = None,
-) -> None:
-    """Wrap ``mcp._tool_manager.call_tool`` with the shared markup guard.
+) -> MarkupGuardMiddleware:
+    """The shared markup guard, wired to this server's escalation sinks.
 
     *policy* is REQUIRED and keyword-only: the declared tier for this server
     belongs at the interception point, never inferred per call from the shape of
     the damage or from a tool's name (INV-1).
+    ``fused_memory/server/boundary_guards.py::boundary_guard_chain`` declares it.
 
     *known_projects* is the ``project_id -> project_root`` registry the storm
     escalation sink uses to place a burst in the right queue. Accepted here and
@@ -337,27 +335,9 @@ def install_markup_guard(
     when the queue yields no id, and the path it returns reaches the refused
     caller as ``residue_spool_path``, never as ``escalation_id``.
 
-    Installed through
-    :func:`fused_memory.server.tool_middleware_bridge.install_tool_middleware`,
-    so it covers every registered tool, fails open on its own defects, and is
-    idempotent: re-entry leaves the existing wrapping in place, and a second
-    guard would count every rejection twice into the storm window.
-
-    Raises:
-        ValueError: for any *policy* but ``REJECT_WITH_REPAIR``. Not a
-            preference — ``MarkupGuardMiddleware._forward`` returns a fastmcp
-            ``ToolResult`` that the bundled dispatcher does not understand, so
-            ``FORWARD_REPAIR`` is genuinely unsupported at this site. A
-            declarable tier that cannot work must fail loudly at wiring time
-            rather than silently at the first repair.
+    Install the returned member through one chain, never twice: a second guard
+    would count every rejection twice into the storm window.
     """
-    if policy is not RepairPolicy.REJECT_WITH_REPAIR:
-        raise ValueError(
-            f'markup guard policy {policy!r} is not supported on the bundled '
-            f'FastMCP: MarkupGuardMiddleware._forward returns a fastmcp '
-            f'ToolResult that mcp.server.fastmcp\'s dispatcher cannot consume. '
-            f'Only {RepairPolicy.REJECT_WITH_REPAIR!r} is installable here.'
-        )
 
     def _file_residue(record: dict[str, Any]) -> ResiduePreservation:
         """Preserve one refused payload, and report where it went.
@@ -456,7 +436,7 @@ def install_markup_guard(
         # caller's data, and a burst summary holds no payload.
         return None
 
-    guard = MarkupGuardMiddleware(
+    return MarkupGuardMiddleware(
         policy,
         exempt_tools,
         escalation_sink=_escalation_sink,
@@ -471,12 +451,4 @@ def install_markup_guard(
         # operator (served by the storm escalation above). Left explicit so a
         # future consumer wires it deliberately rather than inheriting a guess.
         fact_sink=None,
-    )
-    install_tool_middleware(
-        mcp, guard, sentinel=_MARKUP_GUARDED_SENTINEL, label='markup guard'
-    )
-    logger.info(
-        'markup boundary guard installed at ToolManager.call_tool '
-        '(policy=%s, exempt=%s)',
-        policy, sorted(exempt_tools),
     )

@@ -1894,9 +1894,9 @@ class TestFingerprintExtractionConvergence:
 
     @pytest.mark.asyncio
     async def test_both_extractions_agree_on_category_and_agent_id(self, mock_config):
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService
 
         service = MemoryService(mock_config)
         service.mem0 = MagicMock()

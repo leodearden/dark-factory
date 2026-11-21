@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
-from collections.abc import Awaitable, Callable, Coroutine
-from contextlib import asynccontextmanager, contextmanager, suppress
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager, suppress
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -808,6 +808,58 @@ class TestSwapLeakGuard:
 
 
 # ---------------------------------------------------------------------------
+# One checkpoint parser, and one no-row contract for both checkpoint() methods
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointResultFromPragmaRows:
+    def test_parses_the_pragma_row(self) -> None:
+        assert CheckpointResult.from_pragma_rows([(0, 7, 7)]) == CheckpointResult(0, 7, 7)
+
+    def test_raises_on_no_row(self) -> None:
+        with pytest.raises(RuntimeError, match='PRAGMA wal_checkpoint returned no rows'):
+            CheckpointResult.from_pragma_rows([])
+
+
+@asynccontextmanager
+async def _open_atomic_connection(tmp_path: Path) -> AsyncIterator[AtomicConnection]:
+    conn = await connect_daemon(tmp_path / 'atomic.db')
+    try:
+        yield AtomicConnection(conn)
+    finally:
+        await conn.close()
+
+
+def _open_async_sqlite_base(tmp_path: Path) -> _SimpleStore:
+    return _SimpleStore(tmp_path / 'store.db')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'open_checkpointer',
+    [_open_atomic_connection, _open_async_sqlite_base],
+    ids=['AtomicConnection', 'AsyncSqliteBase'],
+)
+async def test_both_checkpoint_implementations_raise_on_a_no_row_result(
+    tmp_path: Path,
+    open_checkpointer: Callable[
+        [Path], AbstractAsyncContextManager[AtomicConnection | AsyncSqliteBase]
+    ],
+) -> None:
+    """Only the one-hop ``execute_fetchall`` read yields no row here.
+
+    A checkpoint still spelled as ``execute`` + ``fetch*`` reads a real row and
+    fails this test instead of matching it by accident.
+    """
+    async with open_checkpointer(tmp_path) as checkpointer:
+        with (
+            patch.object(aiosqlite.Connection, 'execute_fetchall', AsyncMock(return_value=[])),
+            pytest.raises(RuntimeError, match='PRAGMA wal_checkpoint returned no rows'),
+        ):
+            await checkpointer.checkpoint()
+
+
+# ---------------------------------------------------------------------------
 # Step-13: AsyncSqliteBase.checkpoint()
 # ---------------------------------------------------------------------------
 
@@ -832,29 +884,6 @@ class TestAsyncSqliteBaseCheckpoint:
         assert result.busy == 0
         # TRUNCATE moves all WAL frames into the main db; log == checkpointed
         assert result.log == result.checkpointed
-
-    async def test_checkpoint_raises_if_pragma_returns_no_rows(self, tmp_path: Path) -> None:
-        """checkpoint() raises RuntimeError when PRAGMA wal_checkpoint returns no rows.
-
-        Defensive guard: SQLite always returns a row for this PRAGMA in practice,
-        but the explicit check ensures callers get a loud failure rather than a
-        silent sentinel if the behaviour ever changes.
-        """
-        mock_cursor = AsyncMock()
-        mock_cursor.fetchone = AsyncMock(return_value=None)
-        mock_cursor.__aenter__ = AsyncMock(return_value=mock_cursor)
-        mock_cursor.__aexit__ = AsyncMock(return_value=False)
-
-        mock_conn = AsyncMock()
-        # execute() must return a sync value (the cursor) so `async with conn.execute(...)`
-        # can call __aenter__ on it directly.
-        mock_conn.execute = MagicMock(return_value=mock_cursor)
-
-        store = _SimpleStore(tmp_path / 'store.db')
-        store._conn = mock_conn  # type: ignore[assignment]
-
-        with pytest.raises(RuntimeError, match='PRAGMA wal_checkpoint returned no rows'):
-            await store.checkpoint()
 
     async def test_checkpoint_truncates_wal_after_writes(self, tmp_path: Path) -> None:
         """After inserting rows, checkpoint() flushes the WAL with busy==0.

@@ -8027,6 +8027,105 @@ class TestFindTerminalByCitation:
         )
 
 
+
+class TestNewestTerminalByTask:
+    """EscalationQueue.newest_terminal_by_task() — the targeted per-task terminal reader.
+
+    The caller states its own identity as a *matches* predicate; the queue owns
+    the targeted glob, the authoritative task_id and category filters, the
+    terminal-status filter and the newest-by-resolved_at selection.
+    ``find_terminal_by_citation`` is the predicate ``citation_sha == sha``.
+    """
+
+    CATEGORY = 'task_failure'
+
+    def _filed(
+        self, queue: EscalationQueue, esc_id: str, *, summary: str, task_id: str = '1',
+        category: str | None = None,
+    ) -> Escalation:
+        esc = _make_escalation(esc_id, task_id=task_id)
+        esc.summary = summary
+        if category is not None:
+            esc.category = category
+        _submit_escalation(queue, esc)
+        return esc
+
+    def _force_resolved_at(self, queue: EscalationQueue, esc_id: str, stamp: str) -> None:
+        (path,) = (queue.queue_dir / 'archive').rglob(f'{esc_id}.json')
+        data = json.loads(path.read_text())
+        data['resolved_at'] = stamp
+        path.write_text(json.dumps(data, indent=2))
+
+    @staticmethod
+    def _is_wanted(esc: Escalation) -> bool:
+        return esc.summary == 'wanted'
+
+    def test_newest_matching_terminal_record_wins_over_a_newer_rejected_one(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', summary='wanted')
+        queue.resolve('esc-1-1', 'first adjudication')
+        self._filed(queue, 'esc-1-2', summary='wanted')
+        queue.resolve('esc-1-2', 'second adjudication', dismiss=True)
+        self._filed(queue, 'esc-1-3', summary='unwanted')
+        queue.resolve('esc-1-3', 'newest, but rejected by the predicate')
+        self._force_resolved_at(queue, 'esc-1-1', '2026-01-01T00:00:00+00:00')
+        self._force_resolved_at(queue, 'esc-1-2', '2026-06-01T00:00:00+00:00')
+        self._force_resolved_at(queue, 'esc-1-3', '2026-09-01T00:00:00+00:00')
+
+        found = queue.newest_terminal_by_task('1', self.CATEGORY, self._is_wanted)
+
+        assert found is not None
+        assert found.id == 'esc-1-2', f'expected the newest MATCHING record esc-1-2; got {found.id!r}'
+
+    def test_pending_record_is_never_returned(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', summary='wanted')
+
+        assert queue.newest_terminal_by_task('1', self.CATEGORY, self._is_wanted) is None, (
+            'a still-pending record must not be reported as terminal'
+        )
+
+    def test_record_of_another_category_is_not_returned(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', summary='wanted', category='infra_issue')
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.newest_terminal_by_task('1', self.CATEGORY, self._is_wanted) is None
+
+    def test_glob_over_match_on_hyphenated_sibling_task_is_rejected(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-2-3-9', summary='wanted', task_id='1-2-3')
+        queue.resolve('esc-1-2-3-9', 'confirmed benign')
+
+        assert queue.newest_terminal_by_task('1-2', self.CATEGORY, self._is_wanted) is None, (
+            "task '1-2-3' record leaked into task '1-2' via the glob over-match"
+        )
+        assert queue.newest_terminal_by_task('1-2-3', self.CATEGORY, self._is_wanted) is not None
+
+    def test_returns_none_when_nothing_matches(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        assert queue.newest_terminal_by_task('1', self.CATEGORY, self._is_wanted) is None
+
+        self._filed(queue, 'esc-1-1', summary='unwanted')
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.newest_terminal_by_task('1', self.CATEGORY, self._is_wanted) is None
+
+    def test_archived_record_is_found(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', summary='wanted')
+        queue.resolve('esc-1-1', 'confirmed benign')
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'Pre-condition: the resolved record must have left the queue root'
+        )
+        assert len(list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))) == 1
+
+        found = queue.newest_terminal_by_task('1', self.CATEGORY, self._is_wanted)
+
+        assert found is not None and found.id == 'esc-1-1'
+
 class TestNoteSuppressedRefile:
     """EscalationQueue.note_suppressed_refile() — the INV-4 storm counter (task 4499).
 

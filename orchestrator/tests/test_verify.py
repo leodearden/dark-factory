@@ -2996,7 +2996,7 @@ class TestRunVerificationJunitxmlInjection:
         assert result.failing_test_ids is None
 
     async def test_scoped_breadth_does_not_inject_or_collect(self, tmp_path: Path):
-        """merge_verify_breadth='scoped' (the default) — merge role but no injection."""
+        """merge_verify_breadth='scoped' (the per-project opt-down) — merge role but no injection."""
         config = self._make_config(tmp_path, breadth='scoped')
         module_config = self._module_config()
         fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
@@ -5143,7 +5143,7 @@ class TestClassifyFailure:
     """
 
     def _classify(self, output: str, rc: int, timed_out: bool) -> str:
-        from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
+        from orchestrator.verify_classify import classify_failure
         return classify_failure(ToolKind.OPAQUE, rc, output, timed_out)
 
     # (a) rc == 0 → 'passed' regardless of output content
@@ -5552,7 +5552,7 @@ class TestPersistAttemptLogs:
     """
 
     def _persist(self, worktree, attempt_id, runs, category='cargo_cli_error', cause_hint='error: bad'):
-        from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
+        from orchestrator.verify import _persist_attempt_logs
         return _persist_attempt_logs(
             worktree, attempt_id, runs,
             _build_summary_payload(runs, category, cause_hint, role='task'),
@@ -5720,7 +5720,7 @@ class TestArchiveAttemptLog:
     """
 
     def _archive(self, worktree_log_paths, archive_root, task_id, attempt_id, category):
-        from orchestrator.verify import _archive_attempt_log, _archive_stamp  # noqa: PLC0415
+        from orchestrator.verify import _archive_attempt_log, _archive_stamp
         return _archive_attempt_log(
             worktree_log_paths, archive_root, task_id, attempt_id, category,
             stamp=_archive_stamp(),
@@ -5815,7 +5815,7 @@ class TestPruneArchive:
     """
 
     def _prune(self, archive_root, max_age_days=30, max_total_bytes=1_000_000_000):
-        from orchestrator.verify import _prune_archive  # noqa: PLC0415
+        from orchestrator.verify import _prune_archive
         return _prune_archive(archive_root, max_age_days=max_age_days, max_total_bytes=max_total_bytes)
 
     # (a) old files deleted, fresh files kept
@@ -6674,11 +6674,11 @@ class TestTaskPathSummaryArchival:
 
     @staticmethod
     def _load(path: Path) -> dict:
-        import json  # noqa: PLC0415
+        import json
         return json.loads(path.read_text())
 
     async def test_green_attempt_summary_survives_worktree_teardown(self, tmp_path: Path):
-        import shutil  # noqa: PLC0415
+        import shutil
         worktree = self._worktree(tmp_path)
         archive_root = tmp_path / 'data' / 'verify-logs'
 
@@ -6828,7 +6828,7 @@ class TestPersistAttemptLogsModulePrefix:
         cause_hint='error: bad',
         module_prefix=None,
     ):
-        from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
+        from orchestrator.verify import _persist_attempt_logs
 
         kwargs = {}
         if module_prefix is not None:
@@ -7026,7 +7026,7 @@ class TestShouldArchiveCategory:
     """
 
     def _should_archive(self, category: str) -> bool:
-        from orchestrator.verify import _should_archive_category  # noqa: PLC0415
+        from orchestrator.verify import _should_archive_category
         return _should_archive_category(category)
 
     # Categories that MUST be archived (human triage required)
@@ -8539,7 +8539,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
 
     @pytest.fixture(autouse=True)
     def _reset_prune_throttle(self, monkeypatch):
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
         monkeypatch.setattr(verify, '_LAST_PRUNE_AT', None)
 
     def _make_config(self, tmp_path: Path) -> OrchestratorConfig:
@@ -8572,8 +8572,8 @@ class TestPruneArchiveDedupedAtAggregateSite:
         ``_prune_archive`` belongs at the aggregate site in
         ``run_scoped_verification``, not inside the per-file copy loop.
         """
-        from orchestrator import verify  # noqa: PLC0415
-        from orchestrator.verify import _archive_attempt_log  # noqa: PLC0415
+        from orchestrator import verify
+        from orchestrator.verify import _archive_attempt_log
 
         log_file = tmp_path / 'attempt-1.test.log'
         log_file.write_text('cratea ERR\n')
@@ -8612,7 +8612,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
                 return 1, 'error: --exclude crateb\ncrateb ERR\n', False
             return 0, 'ok', False
 
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
                 patch.object(verify, '_prune_archive') as spy:
@@ -8641,7 +8641,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
         async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 1, 'error: --exclude\n', False
 
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
                 patch.object(verify, '_prune_archive') as spy:
@@ -8670,7 +8670,7 @@ class TestPruneArchiveDedupedAtAggregateSite:
         async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             return 1, 'error: --exclude\nfoo\n', False
 
-        from orchestrator import verify  # noqa: PLC0415
+        from orchestrator import verify
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
                 patch.object(verify, '_prune_archive') as spy:
@@ -9793,7 +9793,7 @@ class TestBuildSummaryPayload:
     """Tests for the extracted _build_summary_payload(runs, category, cause_hint) helper."""
 
     def _build(self, runs, category='test_failure', cause_hint=''):
-        from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
+        from orchestrator.verify import _build_summary_payload
         return _build_summary_payload(runs, category, cause_hint, role='task')
 
     def test_top_level_keys_present(self):
@@ -9901,7 +9901,7 @@ class TestArchiveVerifyLogs:
         json_files = list(task_dir.glob('*.json'))
         assert len(json_files) == 1, f'Expected 1 summary.json, got {json_files}'
 
-        import json  # noqa: PLC0415
+        import json
         payload = json.loads(json_files[0].read_text())
         assert payload['category'] == 'test_failure'
         assert payload['cause_hint'] == 'assert x == y'
@@ -9951,7 +9951,7 @@ class TestArchiveVerifyLogs:
     # (f) swallows OSError best-effort (no crash when dir unwritable)
     def test_swallows_oserror_best_effort(self, tmp_path: Path):
         """When the archive dir is unwritable, no exception is raised."""
-        import stat  # noqa: PLC0415
+        import stat
         runs = _make_runs(test_rc=1)
         archive_root = tmp_path / 'data' / 'verify-logs'
         archive_root.mkdir(parents=True)
@@ -10712,7 +10712,10 @@ class TestRunVerificationGovernRouting:
     equivalent to be covered by.
     """
 
-    def _make_govern_config(self, tmp_path, enabled=True, create_exec=True):
+    def _make_govern_config(
+        self, tmp_path, enabled=True, create_exec=True, *,
+        breadth: Literal['scoped', 'full'] = 'full',
+    ):
         """Build an OrchestratorConfig with cpu_governance wired to a tmp executable."""
         from orchestrator.config import CpuGovernConfig
         scripts = tmp_path / 'scripts'
@@ -10721,7 +10724,7 @@ class TestRunVerificationGovernRouting:
         if create_exec:
             exec_file.write_text('#!/bin/sh\nexec "$@"\n')
             exec_file.chmod(0o755)
-        config = OrchestratorConfig()
+        config = OrchestratorConfig(merge_verify_breadth=breadth)
         config.cpu_governance = CpuGovernConfig(
             enabled=enabled,
             exec_path='scripts/cpu-governed-exec.sh',
@@ -10898,7 +10901,9 @@ class TestRunVerificationGovernRouting:
         import shlex
 
         from orchestrator.config import ModuleConfig
-        config, exec_file = self._make_govern_config(tmp_path)
+        # Under 'full', role='merge' injects --junitxml into the test leg,
+        # which would change the exact inner command this test pins.
+        config, exec_file = self._make_govern_config(tmp_path, breadth='scoped')
         module_config = ModuleConfig(
             prefix='pkg',
             test_command='pytest tests/x.py -v',
@@ -11300,7 +11305,7 @@ class TestFailureAnchoredExcerpt:
 
     # (a) a buried failure marker deep inside a long PASS-wall must survive.
     def test_buried_failure_is_included_with_context(self):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         pass_lines = [f'tests/test_mod.py::test_pass_{i} PASSED' for i in range(200)]
         buried = 'FAILED tests/pkg/test_mod.py::test_buried - AssertionError'
@@ -11314,7 +11319,7 @@ class TestFailureAnchoredExcerpt:
 
     # (b) no marker anywhere -> tail fallback, byte-identical to today's slice.
     def test_no_marker_falls_back_to_tail_slice(self):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         output = '\n'.join(f'plain line {i}' for i in range(500))
 
@@ -11324,7 +11329,7 @@ class TestFailureAnchoredExcerpt:
 
     # (c) multiple markers: overlapping windows merge into one contiguous block.
     def test_overlapping_marker_windows_merge_without_elision_gap(self):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         lines = [f'noise line {i}' for i in range(200)]
         lines[50] = 'FAILED tests/test_mod.py::test_alpha - AssertionError'
@@ -11341,7 +11346,7 @@ class TestFailureAnchoredExcerpt:
 
     # (c) multiple far-apart markers: total excerpt is capped.
     def test_many_far_apart_markers_capped_to_budget(self):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         lines = []
         for i in range(40):
@@ -11363,7 +11368,7 @@ class TestFailureAnchoredExcerpt:
         ],
     )
     def test_marker_type_is_anchored(self, marker_line, needle):
-        from orchestrator.verify import _failure_anchored_excerpt  # noqa: PLC0415
+        from orchestrator.verify import _failure_anchored_excerpt
 
         pad = [f'noise line {i}' for i in range(100)]
         lines = pad[:50] + [marker_line] + pad[50:]

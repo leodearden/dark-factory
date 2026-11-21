@@ -1,8 +1,9 @@
 """Async LLM-as-judge that evaluates reconciliation run quality."""
 
+import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, MutableMapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -12,12 +13,17 @@ from typing import Any, NoReturn
 from pydantic import ValidationError
 from shared.cli_invoke import (
     AgentFailureKind,
+    AgentResult,
     AllAccountsCappedException,
     build_failure_message,
     classify_agent_failure,
+    classify_cap_kill,
     invoke_with_cap_retry,
     no_mcp_servers_config,
+    transcript_evidence_for_session,
 )
+from shared.config_dir import ambient_config_dir
+from shared.cost_store import CapReason
 from shared.phantom_verdict import (
     UNPARSEABLE_ISSUE_PREFIX,
     UNPARSEABLE_VERDICT_CODE,
@@ -28,16 +34,37 @@ from shared.streak import KeyedStreaks
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
+    JudgeInvocation,
     JudgeVerdict,
     StageReport,
     VerdictAction,
     VerdictSeverity,
 )
-from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+from fused_memory.reconciliation import (
+    _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+    RECONCILIATION_CLI_ENV_OVERRIDES,
+    RECONCILIATION_CLI_SETTING_SOURCES,
+)
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+class _FieldsInMessage(logging.LoggerAdapter[logging.Logger]):
+    """Appends each ``extra`` field to the message as ``k=v!r``, so a string value is
+    quoted and cannot split into further fields: the service's
+    fused-memory/src/fused_memory/server/main.py::LOG_FORMAT renders only %(message)s
+    (task 6829 covers the formatter)."""
+
+    def process(
+        self, msg: Any, kwargs: MutableMapping[str, Any],
+    ) -> tuple[Any, MutableMapping[str, Any]]:
+        fields = kwargs.get('extra') or {}
+        return ' '.join([str(msg), *(f'{k}={v!r}' for k, v in fields.items())]), kwargs
+
+
+_telemetry_logger = _FieldsInMessage(logger)
 
 
 # The judge's verdict contract, carried as ``--json-schema`` rather than as prose
@@ -99,6 +126,7 @@ JUDGE_VERDICT_SCHEMA: dict[str, Any] = {
 # path_scope_adjudicator ``ge=3``).  The judge's own prompt/schema shape has not
 # been measured, so 3 is the established value, not a revalidated one: run
 # fused-memory/scripts/probe_schema_max_turns.py --shape judge before retuning.
+# Retune trigger: the first production error_max_turns, recorded per invocation in reconciliation.db's judge_invocations (task 6573); see OPERATIONS.md 'Has the reconciliation judge hit its turn cap?'.
 #
 # Cost/duration exposure stays bounded by ``judge_cli_timeout_seconds``
 # (validated ≤ stage_timeout_seconds) and cli_invoke's ``max_budget_usd`` default.
@@ -405,7 +433,7 @@ class Judge:
 
             prompt = self._build_review_prompt(run, recent_verdicts, combined_actions)
             try:
-                response_text = await self._call_llm(prompt)
+                response_text = await self._call_llm(prompt, run_id=run_id)
             except JudgeInfraError as err:
                 # Transport/infra failure (cap-storm CLI failure, timeout,
                 # api_error, cap-wait exhaustion, …) carries NO verdict. Do NOT
@@ -646,7 +674,7 @@ class Judge:
 Review this run and provide your verdict as JSON.
 """
 
-    async def _call_llm(self, prompt: str) -> dict | str:
+    async def _call_llm(self, prompt: str, *, run_id: str) -> dict | str:
         """Single LLM call (not an agent loop).
 
         Returns a ``dict`` for the ``claude_cli`` provider (the schema-validated
@@ -656,7 +684,7 @@ Review this run and provide your verdict as JSON.
         ``_parse_verdict`` dispatches on the type.
         """
         if self.config.judge_llm_provider == 'claude_cli':
-            return await self._call_judge_cli(prompt)
+            return await self._call_judge_cli(prompt, run_id=run_id)
         elif self.config.judge_llm_provider == 'anthropic':
             import anthropic
 
@@ -682,7 +710,7 @@ Review this run and provide your verdict as JSON.
                 )
             return response.choices[0].message.content or ''
 
-    async def _call_judge_cli(self, prompt: str) -> dict | str:
+    async def _call_judge_cli(self, prompt: str, *, run_id: str) -> dict | str:
         """Delegate to shared.cli_invoke.invoke_with_cap_retry for judge evaluation.
 
         Returns the schema-validated verdict payload (a ``dict``) on success.  The
@@ -739,12 +767,12 @@ Review this run and provide your verdict as JSON.
                 max_turns=_JUDGE_CLI_MAX_TURNS,
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.judge_cli_timeout_seconds),
-                # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
-                # switched to a neutral cwd. JUDGE_SYSTEM_PROMPT rates factual
-                # grounding/proportionality ("were codebase verifications used
-                # when appropriate?"), which plausibly draws on the auto-loaded
-                # CLAUDE.md's project architecture context.
+                # Kept at explore_codebase_root (task 1989) so judge transcripts stay
+                # under the projects dir they are read from. It loads no CLAUDE.md,
+                # settings or memory index (reconciliation/__init__.py).
                 cwd=Path(self.config.explore_codebase_root),
+                setting_sources=list(RECONCILIATION_CLI_SETTING_SOURCES),
+                env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
                 cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             )
         except AllAccountsCappedException as e:
@@ -755,6 +783,8 @@ Review this run and provide your verdict as JSON.
             # propagate opaquely into review_run's broad except (which would
             # miscount it as a REVIEW_ERROR rather than a judge infra failure).
             raise JudgeInfraError(f'Claude CLI judge cap-wait exhausted: {e}') from e
+
+        await self._record_cli_invocation(run_id, result)
 
         if result.success:
             # The verdict lives in the schema-validated payload, NOT in the text
@@ -820,7 +850,7 @@ Review this run and provide your verdict as JSON.
             #
             # Why the raise lives HERE and not in _parse_verdict's dict branch:
             # review_run's ``except JudgeInfraError`` -> _record_no_verdict_failure
-            # diversion wraps ONLY the ``await self._call_llm(prompt)`` call.
+            # diversion wraps ONLY the ``await self._call_llm(prompt, run_id=run_id)`` call.
             # _parse_verdict runs OUTSIDE that inner try, so a JudgeInfraError
             # raised from there would fall through to the broad
             # ``except Exception`` and be counted as a REVIEW_ERROR, halting
@@ -917,6 +947,63 @@ Review this run and provide your verdict as JSON.
             return ''
 
         raise JudgeInfraError(build_failure_message('Claude CLI judge', result))
+
+    async def _record_cli_invocation(self, run_id: str, result: AgentResult) -> None:
+        """Record one judge invocation's turn-cap and rejected-call outcome. Never raises.
+
+        The turn-cap hit is logged before, and independently of, the row write,
+        so a failed write loses the row but not the event (task 6573).
+        """
+        ended = classify_cap_kill(result, budget_usd=None, max_turns=None) is CapReason.TURNS
+        # AgentResult.turns is 0 when the CLI reported no num_turns (a timeout, a killed run).
+        num_turns = result.turns or None
+        rejected = await self._rejected_tool_calls(result.session_id)
+        if ended:
+            _telemetry_logger.warning(
+                'reconciliation.judge_turn_cap_hit',
+                extra={
+                    'run_id': run_id,
+                    'num_turns': num_turns,
+                    'max_turns': _JUDGE_CLI_MAX_TURNS,
+                    'rejected_tool_calls': rejected,
+                    'schema_salvaged': result.schema_salvaged,
+                },
+            )
+        try:
+            await self.journal.record_judge_invocation(JudgeInvocation(
+                run_id=run_id,
+                completed_at=datetime.now(UTC),
+                ended_error_max_turns=ended,
+                schema_salvaged=result.schema_salvaged,
+                num_turns=num_turns,
+                rejected_tool_calls=rejected,
+            ))
+        except Exception:
+            _telemetry_logger.warning(
+                'reconciliation.judge_invocation_record_failed',
+                extra={'run_id': run_id, 'ended_error_max_turns': ended},
+                exc_info=True,
+            )
+
+    @staticmethod
+    async def _rejected_tool_calls(session_id: str) -> int | None:
+        """How many tool calls the CLI rejected in *session_id*; None when that is unknowable."""
+        if not session_id:
+            return None
+        try:
+            evidence = await asyncio.to_thread(
+                transcript_evidence_for_session, ambient_config_dir(), session_id,
+            )
+        except Exception:
+            _telemetry_logger.warning(
+                'reconciliation.judge_rejected_tool_count_failed',
+                extra={'session_id': session_id},
+                exc_info=True,
+            )
+            return None
+        # The judge's registry is empty (--tools '', see _call_judge_cli's
+        # docstring), so every non-StructuredOutput tool_use was rejected.
+        return None if evidence is None else len(evidence.other_tool_uses)
 
     def _raise_unusable_output(self, result, code: str, detail: str) -> NoReturn:
         """Log the forensics for a no-verdict CLI success, then raise JudgeInfraError.

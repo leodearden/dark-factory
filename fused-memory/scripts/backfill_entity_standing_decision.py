@@ -999,11 +999,11 @@ def main(argv: list[str] | None = None) -> int:
     async def _run_live() -> dict[str, Any]:
         # Deferred so importing this module — which the tests do, by path —
         # never constructs a backend.
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.reconciliation.recon_ledger import (  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import maintenance_service
+        from fused_memory.reconciliation.recon_ledger import (
             ReconLedgerStore,
         )
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
         config = FusedMemoryConfig()
         db_path = resolve_ledger_db_path(config)
@@ -1024,7 +1024,6 @@ def main(argv: list[str] | None = None) -> int:
             # the one an operator learns to skip.
             warn_unreadable_ledger_target(state, db_path)
 
-        memory = MemoryService(config)
         # A rehearsal must not CREATE the ledger whose absence the gate refuses.
         # ``ReconLedgerStore.initialize()`` mkdirs and runs CREATE TABLE IF NOT
         # EXISTS, so a dry run that opened one would hand the --apply after it a
@@ -1032,32 +1031,30 @@ def main(argv: list[str] | None = None) -> int:
         # docstring prescribes. Open a store only where there is something to
         # read; elsewhere the answer is known without opening anything.
         store = ReconLedgerStore(db_path) if state in READABLE_LEDGER_STATES else None
-        try:
-            await memory.initialize()
-            if store is not None:
-                await store.initialize()
-            # ``_AbsentLedger`` is deliberately NOT a ``ReconLedgerStore`` (see its
-            # docstring), so the setter's annotation rejects it. Suppressed at this
-            # one call site rather than widened on ``MemoryService``, which would
-            # license every OTHER caller to wire a partial ledger — the stand-in is
-            # sound only because ``run_backfill`` consults exactly one method.
-            ledger = store if store is not None else _AbsentLedger()
-            memory.set_recon_ledger(ledger)  # pyright: ignore[reportArgumentType]
-            report = await run_backfill(memory, apply=args.apply)
-            # Which file, what was at it, and whether anything reads it —
-            # carried in the ARTIFACT, on every run. A report that named none of
-            # these could not tell a landed migration from one that seeded an
-            # empty db in the wrong directory, which is the outcome the gate
-            # forbids and the dry run must still be able to diagnose.
-            report['ledger_db_path'] = str(db_path)
-            report['ledger_db_state'] = state
-            report['recon_ledger_enabled'] = ledger_enabled
-            return report
-        finally:
-            if store is not None:
-                await store.close()
-            if hasattr(memory, 'close'):
-                await memory.close()
+        async with maintenance_service(config=config) as (_, memory):
+            try:
+                if store is not None:
+                    await store.initialize()
+                # ``_AbsentLedger`` is deliberately NOT a ``ReconLedgerStore`` (see its
+                # docstring), so the setter's annotation rejects it. Suppressed at this
+                # one call site rather than widened on ``MemoryService``, which would
+                # license every OTHER caller to wire a partial ledger — the stand-in is
+                # sound only because ``run_backfill`` consults exactly one method.
+                ledger = store if store is not None else _AbsentLedger()
+                memory.set_recon_ledger(ledger)  # pyright: ignore[reportArgumentType]
+                report = await run_backfill(memory, apply=args.apply)
+                # Which file, what was at it, and whether anything reads it —
+                # carried in the ARTIFACT, on every run. A report that named none of
+                # these could not tell a landed migration from one that seeded an
+                # empty db in the wrong directory, which is the outcome the gate
+                # forbids and the dry run must still be able to diagnose.
+                report['ledger_db_path'] = str(db_path)
+                report['ledger_db_state'] = state
+                report['recon_ledger_enabled'] = ledger_enabled
+                return report
+            finally:
+                if store is not None:
+                    await store.close()
 
     report = asyncio.run(_run_live())
 

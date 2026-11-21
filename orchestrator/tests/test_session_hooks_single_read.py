@@ -19,7 +19,7 @@ from _session_hook_fixtures import (
 )
 
 from orchestrator import session_hooks as sh
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 from orchestrator.session_ownership_probes import EventProbes, ProcessTree
 
 
@@ -71,8 +71,8 @@ def test_notification_walks_proc_exactly_once(tmp_path: Path) -> None:
 
     assert len(walks) == 1
     # OUTCOME PARITY (mirrors test_owner_stop_is_not_withheld_...).
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status is sr.Status.AWAITING_INPUT
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.AWAITING_INPUT
     assert record.question is not None and record.question.text == 'may I proceed?'
     assert record.claude_session_id == 'uuid-owner'
 
@@ -89,8 +89,8 @@ def test_stop_walks_proc_exactly_once(tmp_path: Path) -> None:
     )
 
     assert len(walks) == 1
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status is sr.Status.IDLE
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.IDLE
     assert record.claude_session_id == 'uuid-owner'
 
 
@@ -110,10 +110,10 @@ def test_session_start_walks_proc_exactly_once(tmp_path: Path) -> None:
     )
 
     assert len(walks) == 1
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status is sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.RUNNING
     assert record.claude_session_id == 'uuid-owner'
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_nested_session_start_walks_proc_at_most_once(tmp_path: Path) -> None:
@@ -140,10 +140,10 @@ def test_nested_session_start_walks_proc_at_most_once(tmp_path: Path) -> None:
     sh.run_session_start(nested, env, root=tmp_path, process_tree=tree)
 
     assert len(walks) <= 1
-    spawn_record = sr.read_record(slug, root=tmp_path)
+    spawn_record = session_records.read_record(slug, root=tmp_path)
     assert spawn_record.claude_session_id is None
-    assert spawn_record.status is sr.Status.LAUNCHING
-    forked = sr.read_record(
+    assert spawn_record.status is session_records.Status.LAUNCHING
+    forked = session_records.read_record(
         sh.hook_session_slug(nested, env, root=tmp_path, process_tree=tree), root=tmp_path
     )
     assert forked.claude_session_id == 'uuid-nested'
@@ -156,7 +156,7 @@ def test_nested_session_start_walks_proc_at_most_once(tmp_path: Path) -> None:
 # One read must serve two consumers that want OPPOSITE things from a failed
 # one. The ownership probe must fail soft to "adopt" (_env_slug_ownership:
 # "every failure mode resolves to adopt (True), never to fork"), so it treats
-# corrupt and absent alike. The refresh must NOT: session_registry's
+# corrupt and absent alike. The refresh must NOT: session_records's
 # refresh_record guarantees "a *corrupt* existing body is NOT treated as
 # absent". A two-state record|None would let a hook synthesize a fresh record
 # over a corrupt body -- silent loss of the record holding role/prompt/
@@ -173,7 +173,7 @@ def test_record_snapshot_reads_an_existing_record(tmp_path: Path) -> None:
     assert snapshot.slug == slug
     assert snapshot.unreadable is False
     assert snapshot.record is not None
-    assert snapshot.record.to_dict() == sr.read_record(slug, root=tmp_path).to_dict()
+    assert snapshot.record.to_dict() == session_records.read_record(slug, root=tmp_path).to_dict()
 
 
 def test_record_snapshot_absent_is_not_unreadable_and_is_silent(
@@ -197,11 +197,11 @@ def test_record_snapshot_corrupt_body_is_unreadable_and_warns(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     slug = 'session-cockpit-4662012'
-    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    record_path = session_records.record_path_for_slug(slug, root=tmp_path)
     record_path.parent.mkdir(parents=True, exist_ok=True)
     record_path.write_text('not-json{{{')
-    with pytest.raises(sr.CorruptSessionRecord):
-        sr.read_record(slug, root=tmp_path)
+    with pytest.raises(session_records.CorruptSessionRecord):
+        session_records.read_record(slug, root=tmp_path)
 
     with caplog.at_level(logging.WARNING):
         snapshot = sh._read_record_snapshot(slug, tmp_path)
@@ -220,7 +220,7 @@ def test_record_snapshot_arbitrary_oserror_is_unreadable_and_warns(
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise OSError('disk on fire')
 
-    monkeypatch.setattr(sr, 'read_record', _boom)
+    monkeypatch.setattr(session_records, 'read_record', _boom)
 
     with caplog.at_level(logging.WARNING):
         snapshot = sh._read_record_snapshot('session-cockpit-4662013', tmp_path)
@@ -270,7 +270,7 @@ def test_resolution_adopts_and_carries_the_probes_snapshot(tmp_path: Path) -> No
     assert resolution.snapshot.record is not None
     assert (
         resolution.snapshot.record.to_dict()
-        == sr.read_record(slug, root=tmp_path).to_dict()
+        == session_records.read_record(slug, root=tmp_path).to_dict()
     )
     assert sh.hook_session_slug(hook_input, env, root=tmp_path) == resolution.slug
 
@@ -302,7 +302,7 @@ def test_resolution_reads_nothing_for_a_hand_launched_session(
     def _boom(*_args: object, **_kwargs: object) -> object:
         raise AssertionError('nothing to probe for a hand-launched session')
 
-    monkeypatch.setattr(sr, 'read_record', _boom)
+    monkeypatch.setattr(session_records, 'read_record', _boom)
     hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}
 
     probes = EventProbes({}, claude_process_tree(None))
@@ -322,7 +322,7 @@ def test_resolution_blank_stdin_session_id_reads_nothing(
     def _boom(*_args: object, **_kwargs: object) -> object:
         raise AssertionError('the blank-session_id early return reads no record')
 
-    monkeypatch.setattr(sr, 'read_record', _boom)
+    monkeypatch.setattr(session_records, 'read_record', _boom)
     slug = 'session-cockpit-4662022'
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
     hook_input = {'session_id': '  ', 'cwd': '/home/leo/src/dark-factory'}
@@ -391,21 +391,21 @@ class _RegistryIO:
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.reads: list[str] = []
-        self.writes: list[sr.SessionRecord] = []
-        real_read, real_write = sr.read_record, sr.write_record
+        self.writes: list[session_records.SessionRecord] = []
+        real_read, real_write = session_records.read_record, session_records.write_record
 
-        def _read(slug: str, *args: object, **kwargs: object) -> sr.SessionRecord:
+        def _read(slug: str, *args: object, **kwargs: object) -> session_records.SessionRecord:
             self.reads.append(slug)
             record = real_read(slug, *args, **kwargs)  # type: ignore[arg-type]
             record.cwd = f'read-{len(self.reads)}'
             return record
 
-        def _write(record: sr.SessionRecord, *args: object, **kwargs: object) -> None:
+        def _write(record: session_records.SessionRecord, *args: object, **kwargs: object) -> None:
             self.writes.append(record)
             real_write(record, *args, **kwargs)  # type: ignore[arg-type]
 
-        monkeypatch.setattr(sr, 'read_record', _read)
-        monkeypatch.setattr(sr, 'write_record', _write)
+        monkeypatch.setattr(session_records, 'read_record', _read)
+        monkeypatch.setattr(session_records, 'write_record', _write)
 
     def reads_of(self, slug: str) -> int:
         return self.reads.count(slug)
@@ -428,14 +428,14 @@ def test_refresh_path_reads_the_written_record_exactly_once(
 
     if handler == 'notification':
         sh.run_notification({**hook_input, 'message': 'may I proceed?'}, env, root=tmp_path)
-        expected = sr.Status.AWAITING_INPUT
+        expected = session_records.Status.AWAITING_INPUT
     else:
         sh.run_stop(hook_input, env, root=tmp_path)
-        expected = sr.Status.IDLE
+        expected = session_records.Status.IDLE
 
     assert io.reads_of(slug) == 1
     # OUTCOME PARITY.
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.status is expected
     if handler == 'notification':
         assert record.question is not None and record.question.text == 'may I proceed?'
@@ -454,7 +454,7 @@ def test_hand_launched_refresh_writes_the_body_its_decision_read(
     # Read 1 is the session-id pointer's vouch; read 2 is the one the decision and the write share.
     assert io.reads_of(slug) == 2
     assert [written.cwd for written in io.writes] == ['read-2']
-    assert sr.read_record(slug, root=tmp_path).status is sr.Status.IDLE
+    assert session_records.read_record(slug, root=tmp_path).status is session_records.Status.IDLE
 
 
 def test_refresh_writes_the_body_it_decided_on(
@@ -490,9 +490,9 @@ def test_first_bind_event_writes_exactly_once(
     slug = 'session-cockpit-4662033'
     # RUNNING + unbound: adoptable (not in the launch window), so this event
     # both refreshes the status and stamps the first binding.
-    sr.write_record(
-        sr.SessionRecord(
-            session_slug=slug, status=sr.Status.RUNNING, launcher_pid=4662033
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug, status=session_records.Status.RUNNING, launcher_pid=4662033
         ),
         root=tmp_path,
     )
@@ -513,7 +513,7 @@ def test_first_bind_event_writes_exactly_once(
     assert io.reads_of(slug) == 1
     assert len(io.writes) == 1
     written = io.writes[0]
-    assert written.status is sr.Status.AWAITING_INPUT
+    assert written.status is session_records.Status.AWAITING_INPUT
     assert written.question is not None and written.question.text == 'may I proceed?'
     assert written.claude_session_id == 'uuid-owner'
 
@@ -538,8 +538,8 @@ def test_fork_path_reads_each_of_its_two_slugs_at_most_once(
     assert io.reads_of(spawner) <= 1
     assert io.reads_of(forked) <= 1
     # The spawner's record is untouched; the fork carries the IDLE.
-    assert sr.read_record(spawner, root=tmp_path).status is sr.Status.RUNNING
-    assert sr.read_record(forked, root=tmp_path).status is sr.Status.IDLE
+    assert session_records.read_record(spawner, root=tmp_path).status is session_records.Status.RUNNING
+    assert session_records.read_record(forked, root=tmp_path).status is session_records.Status.IDLE
 
 
 def test_refresh_never_overwrites_a_corrupt_body(tmp_path: Path) -> None:
@@ -548,13 +548,13 @@ def test_refresh_never_overwrites_a_corrupt_body(tmp_path: Path) -> None:
     treated as absent" contract means run_stop must leave the bytes alone.
     """
     slug = 'session-cockpit-4662035'
-    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    record_path = session_records.record_path_for_slug(slug, root=tmp_path)
     record_path.parent.mkdir(parents=True, exist_ok=True)
     record_path.write_text('not-json{{{')
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
     hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
 
-    with contextlib.suppress(sr.CorruptSessionRecord):
+    with contextlib.suppress(session_records.CorruptSessionRecord):
         sh.run_stop(hook_input, env, root=tmp_path)
 
     assert record_path.read_text() == 'not-json{{{'
@@ -578,7 +578,7 @@ def test_session_start_reads_the_written_record_exactly_once(
     sh.run_session_start({**hook_input, 'source': 'startup'}, env, root=tmp_path)
 
     assert io.reads_of(slug) == 1
-    assert sr.read_record(slug, root=tmp_path).status is sr.Status.RUNNING
+    assert session_records.read_record(slug, root=tmp_path).status is session_records.Status.RUNNING
 
 
 def test_session_start_writes_the_body_it_read(
@@ -611,8 +611,8 @@ def test_session_start_fork_path_reads_each_slug_at_most_once(
 
     assert io.reads_of(spawner) <= 1
     assert io.reads_of(forked) <= 1
-    assert sr.read_record(spawner, root=tmp_path).status is sr.Status.RUNNING
-    assert sr.read_record(forked, root=tmp_path).parent_session_id == spawner
+    assert session_records.read_record(spawner, root=tmp_path).status is session_records.Status.RUNNING
+    assert session_records.read_record(forked, root=tmp_path).parent_session_id == spawner
 
 
 def test_session_start_hand_launched_reads_exactly_once(
@@ -625,7 +625,7 @@ def test_session_start_hand_launched_reads_exactly_once(
     sh.run_session_start(hook_input, {}, root=tmp_path)
 
     assert io.reads_of(slug) == 1
-    assert sr.read_record(slug, root=tmp_path).status is sr.Status.RUNNING
+    assert session_records.read_record(slug, root=tmp_path).status is session_records.Status.RUNNING
 
 
 def test_session_start_fault_lane_parity(
@@ -638,16 +638,16 @@ def test_session_start_fault_lane_parity(
     """
     slug = 'session-cockpit-4662043'
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
-    real_read = sr.read_record
+    real_read = session_records.read_record
     calls: list[int] = []
 
-    def _boom_once(*args: object, **kwargs: object) -> sr.SessionRecord:
+    def _boom_once(*args: object, **kwargs: object) -> session_records.SessionRecord:
         calls.append(1)
         if len(calls) == 1:
             raise OSError('disk on fire')
         return real_read(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(sr, 'read_record', _boom_once)
+    monkeypatch.setattr(session_records, 'read_record', _boom_once)
 
     sh.run_session_start(
         {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'},
@@ -656,10 +656,10 @@ def test_session_start_fault_lane_parity(
     )
 
     assert len(calls) >= 1
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status is sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.RUNNING
     assert record.claude_session_id is None
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_session_start_first_sight_still_captures_richly(tmp_path: Path) -> None:
@@ -686,7 +686,7 @@ def test_session_start_first_sight_still_captures_richly(tmp_path: Path) -> None
     assert record.cwd == '/home/leo/src/dark-factory'
     assert record.launcher_pid == 4662044
     assert record.start_ts
-    assert record.transcript_path == sr.transcript_path_for_cwd(
+    assert record.transcript_path == session_records.transcript_path_for_cwd(
         '/home/leo/src/dark-factory'
     )
 
@@ -720,16 +720,16 @@ def _boom_once_read(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     The suite's established ``_boom_once`` idiom, hoisted so the fault-lane
     tests below share one definition of "transient fault on the probe read".
     """
-    real_read = sr.read_record
+    real_read = session_records.read_record
     calls: list[int] = []
 
-    def _boom_once(*args: object, **kwargs: object) -> sr.SessionRecord:
+    def _boom_once(*args: object, **kwargs: object) -> session_records.SessionRecord:
         calls.append(1)
         if len(calls) == 1:
             raise OSError('disk on fire')
         return real_read(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(sr, 'read_record', _boom_once)
+    monkeypatch.setattr(session_records, 'read_record', _boom_once)
     return calls
 
 
@@ -739,10 +739,10 @@ def _spawn_launching_record(slug: str, root: Path) -> None:
     This is the record spawn-claude.sh's ``finish()`` writes ``exited`` to,
     so a nested inheritor rewriting it is not a cosmetic status lie.
     """
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.LAUNCHING,
+            status=session_records.Status.LAUNCHING,
             role='session',
             project='cockpit',
             prompt='/spawn cockpit',
@@ -779,13 +779,13 @@ def test_fault_lane_still_withholds_from_an_unbound_launching_record(
 
     # The probe was consulted (and degraded) rather than skipped.
     assert len(calls) >= 1
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status is sr.Status.LAUNCHING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.LAUNCHING
     assert record.question is None
     assert record.claude_session_id is None
     # Withholding is not forking: the event lands on this slug and is then
     # dropped -- it must not also mint a second, nested-owned row.
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_fault_lane_does_not_withhold_from_a_positively_identified_owner(
@@ -815,8 +815,8 @@ def test_fault_lane_does_not_withhold_from_a_positively_identified_owner(
     )
 
     assert len(calls) >= 1
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status is sr.Status.AWAITING_INPUT
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.AWAITING_INPUT
     assert record.question is not None and record.question.text == 'may I proceed?'
     # The spawn record's own payload survives the refresh untouched.
     assert record.prompt == '/spawn cockpit'
@@ -838,22 +838,22 @@ def test_fault_lane_reads_the_written_slug_at_most_twice(
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
     reads: list[str] = []
-    real_read = sr.read_record
+    real_read = session_records.read_record
 
-    def _counting_boom_once(slug_arg: str, *args: object, **kwargs: object) -> sr.SessionRecord:
+    def _counting_boom_once(slug_arg: str, *args: object, **kwargs: object) -> session_records.SessionRecord:
         reads.append(slug_arg)
         if len(reads) == 1:
             raise OSError('disk on fire')
         return real_read(slug_arg, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(sr, 'read_record', _counting_boom_once)
+    monkeypatch.setattr(session_records, 'read_record', _counting_boom_once)
 
     sh.run_stop(hook_input, env, root=tmp_path)
 
     assert reads.count(slug) <= 2
     # OUTCOME, so the bound cannot be satisfied by skipping the retry: the
     # retry is what supplies the observation the withhold decision needs.
-    assert sr.read_record(slug, root=tmp_path).status is sr.Status.LAUNCHING
+    assert session_records.read_record(slug, root=tmp_path).status is session_records.Status.LAUNCHING
 
 
 def test_fault_lane_propagates_a_persistently_corrupt_body(tmp_path: Path) -> None:
@@ -866,13 +866,13 @@ def test_fault_lane_propagates_a_persistently_corrupt_body(tmp_path: Path) -> No
     exactly as it found them.
     """
     slug = 'session-cockpit-4662054'
-    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    record_path = session_records.record_path_for_slug(slug, root=tmp_path)
     record_path.parent.mkdir(parents=True, exist_ok=True)
     record_path.write_text('not-json{{{')
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
     hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
 
-    with pytest.raises(sr.CorruptSessionRecord):
+    with pytest.raises(session_records.CorruptSessionRecord):
         sh.run_stop(hook_input, env, root=tmp_path)
 
     assert record_path.read_text() == 'not-json{{{'

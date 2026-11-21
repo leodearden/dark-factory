@@ -35,10 +35,10 @@ from pathlib import Path
 import pytest
 
 # All three modules live in <repo>/scripts, which tests/scripts/conftest.py puts
-# on sys.path at collection time. As of task 3456, scripts/ and
-# scripts/legibility/ are ALSO listed in [tool.pyright] extraPaths in the root
-# pyproject.toml — a precondition for the `scripts` module's own declared type
-# gate — so these imports resolve statically too and need no ignore. This comment
+# on sys.path at collection time. As of task 3456, scripts/ is ALSO listed in
+# [tool.pyright] extraPaths in the root pyproject.toml — a precondition for the
+# `scripts` module's own declared type gate — so these imports resolve
+# statically too and need no ignore. This comment
 # previously asserted the opposite ("deliberately absent from extraPaths"); 3456
 # falsified it. Same correction in
 # tests/scripts/test_migrate_metadata_modules_to_files.py.

@@ -102,7 +102,10 @@ async def _served_fused_memory(
     interceptor = TaskInterceptor(backend, None, event_buffer, ticket_store=ticket_store)
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
     _install_tool_dispatch_guards(
-        server, known_projects={}, residue_spool=MarkupResidueSpool(tmp_path / 'spool')
+        server,
+        known_projects={},
+        prefix_resolver=None,
+        residue_spool=MarkupResidueSpool(tmp_path / 'spool'),
     )
     server_config = ServerConfig()
     server.settings.stateless_http = server_config.stateless_http

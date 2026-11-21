@@ -22,9 +22,9 @@ running, then to idle or awaiting-input, then to exited. This was introduced
 by task 2511.
 
 A hand-launched session has no `CLAUDE_SPAWN_SESSION_ID`. It keys on the
-Claude Code `session_id` from the hook's stdin JSON, through
-`session_registry.build_session_slug`, with the `session_id` in the
-`launcher_pid` slot as the uniqueness token. That `session_id` is the same
+Claude Code `session_id` from the hook's stdin JSON, which reaches
+`session_records.build_session_slug` as its uniqueness token. That
+`session_id` is the same
 for SessionStart, Notification and Stop within one session, so all three
 resolve to the same `record.json`. Both kinds keep their record across a
 re-mint (see §Session-id re-mints).
@@ -383,5 +383,10 @@ reaper:
   an hour of heartbeat silence, so a fallback pid cannot reap a record that is
   still being written.
 
+Like the process tree, SessionStart's display resolution reads windows
+through an injected `session_windows.WindowProbe`
+(`run_session_start(..., windows=)`); None reads wmctrl.
+
 Code: `orchestrator/src/orchestrator/session_ownership_probes.py::ProcessTree`,
-`::EventProbes`, `::_owning_claude_pid`.
+`::EventProbes`, `::_owning_claude_pid`,
+`orchestrator/src/orchestrator/session_windows.py::WindowProbe`.

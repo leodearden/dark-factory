@@ -164,12 +164,13 @@ def _make_config(
 
     Mirrors _make_orch_config from test_warm_lane_integration_gate.py. Pool
     size == max_concurrent_tasks exactly (GitConfig.spare_warm_lanes
-    defaults to 0), giving K FREE lanes for the I1 dispatch-capacity
-    snapshot.
+    defaults to 0 and the main-health-fix reserve is pinned to 0), giving K
+    FREE lanes for the I1 dispatch-capacity snapshot.
     """
     return OrchestratorConfig(
         project_root=repo,
         max_concurrent_tasks=max_concurrent_tasks,
+        main_health_fix_reserved_slots=0,
         git=GitConfig(warm_lane_pool=True),
     )
 

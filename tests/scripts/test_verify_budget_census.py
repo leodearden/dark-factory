@@ -442,7 +442,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         return json.loads(out)
 
     def test_the_printed_floor_equals_the_familys_expression(self, tmp_path, capsys):
-        from module_budget_family import census_budget_floor  # noqa: PLC0415
+        from module_budget_family import census_budget_floor
 
         report = self._report(tmp_path, capsys, command_entry(duration_secs=4626.166946739017))
 
@@ -454,7 +454,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
     def test_it_agrees_at_every_measured_figure(self, tmp_path, capsys, worst):
         """Agreement at one value could be coincidence; at the three that
         matter it is the shared expression."""
-        from module_budget_family import census_budget_floor  # noqa: PLC0415
+        from module_budget_family import census_budget_floor
 
         report = self._report(tmp_path, capsys, command_entry(duration_secs=worst))
 
@@ -533,7 +533,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         would keep returning the real floor here and go red, which no
         source-text pattern over this file reliably distinguishes.
         """
-        import module_budget_family  # noqa: PLC0415
+        import module_budget_family
 
         monkeypatch.setattr(
             module_budget_family,
@@ -551,7 +551,7 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         """`format_report` is a second consumer of the same key, and the
         operator-facing one — the floor an operator copies out of the text
         report has to be the family's number, not a second opinion."""
-        import module_budget_family  # noqa: PLC0415
+        import module_budget_family
 
         monkeypatch.setattr(
             module_budget_family,
@@ -581,9 +581,9 @@ class TestTheCensusAndTheGuardShareOneDerivation:
         `_import_from_family_dir` re-inserts `_FAMILY_DIR` itself, so both have to
         go for the import to actually fail.
         """
-        import sys  # noqa: PLC0415
+        import sys
 
-        import verify_budget_census as mod  # noqa: PLC0415
+        import verify_budget_census as mod
 
         no_family = tmp_path / 'no-family'
         no_family.mkdir()

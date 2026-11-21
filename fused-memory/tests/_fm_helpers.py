@@ -150,8 +150,6 @@ class MockEdge:
 
     fact: str
     uuid: str = ''
-    source_node: MockNode | None = None
-    target_node: MockNode | None = None
     source_node_uuid: str = ''
     target_node_uuid: str = ''
     episodes: list[str] = field(default_factory=list)
@@ -1171,7 +1169,7 @@ def lease_dir_fixture(tmp_path, monkeypatch):
     case is one of the behaviours under test.
 
     Activation is by import, per module
-    (``from _fm_helpers import lease_dir_fixture  # noqa: F401``), and NEVER
+    (``from _fm_helpers import lease_dir_fixture as lease_dir_fixture``), and NEVER
     from conftest.py: an autouse fixture there would apply to every test in
     the package, redirecting the ``-m integration`` lane away from the
     directory the live cron reads and silently disabling the guard task 4775

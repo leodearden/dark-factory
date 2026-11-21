@@ -37,8 +37,8 @@ if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from legibility import detectors, digest, layout  # noqa: E402  # debt: task 6760
-from legibility.config import LegibilityConfig, load_config  # noqa: E402
-from legibility.inventory import (  # noqa: E402
+from legibility.config import LegibilityConfig, load_config
+from legibility.inventory import (
     SessionRecord,
     enumerate_sessions,
     iter_json_lines,
@@ -365,7 +365,7 @@ def digest_byte_cost_fn(
             text = renderer(
                 record.path, agent_class_override=record.stratum, max_bytes=max_bytes,
             )
-        except Exception as exc:  # noqa: BLE001 - degrade loud, never propagate
+        except Exception as exc:  # degrade loud, never propagate
             # Deliberately NOT cached: build_digests must re-attempt, raise
             # again, and report the failure via extractor_failures.
             logger.warning(

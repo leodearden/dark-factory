@@ -18,16 +18,21 @@ from legibility_carrier_fixtures import (
     HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT,
     NON_HUMAN_ORIGIN_IDS,
     NON_HUMAN_ORIGIN_TURNS,
+    SDK_GUI_CLIENT_HUMAN_TURNS,
     TRICKLE_CODER_PREAMBLE,
     UNKNOWN_PROVENANCE_TEXT,
+    UNMARKED_HEADLESS_SDK_PROMPTS,
     WATCHER_ROTATION_PROMPT,
     briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
     coder_judgment,
     json_fenced,
     merger_prompt,
     pre_5356_replan_prompt,
     prior_round_adjudicator_prompt,
     recon_run_review_text,
+    sdk_prompt,
     steward_continuation_prompt,
     user_record,
     with_origin,
@@ -249,6 +254,14 @@ class TestHarnessInjectedTurnFilter:
         # records carry no origin and no isMeta, so only this text rule sees them.
         assert reingestion.is_harness_injected_turn(prior_round_adjudicator_prompt()) is True
 
+    def test_census_verifier_prompt_is_excluded_lockstep(self):
+        # LOCKSTEP via the REAL builder: the cluster JSON it embeds quotes
+        # other sessions' signal, which must never count as this session's.
+        assert reingestion.is_harness_injected_turn(census_verifier_prompt()) is True
+
+    def test_census_synthesis_prompt_is_excluded_lockstep(self):
+        assert reingestion.is_harness_injected_turn(census_synthesis_prompt()) is True
+
     def test_pre_5356_replan_prompt_is_excluded(self):
         # A RETIRED shape held for the archived corpus, so it is restated, not built.
         assert reingestion.is_harness_injected_turn(pre_5356_replan_prompt()) is True
@@ -355,3 +368,59 @@ class TestNonHumanOriginFilter:
     )
     def test_unknown_provenance_falls_through_to_text_rules(self, record):
         assert reingestion.has_non_human_origin(record) is False
+
+
+# ---------------------------------------------------------------------------
+# is_headless_sdk_prompt (task 6953). A prompt delivered to headless
+# `claude --print` carries promptSource 'sdk' AND entrypoint 'sdk-cli'. Both
+# keys are needed: SDK GUI clients stamp human turns with promptSource 'sdk',
+# and every record of an sdk-cli session carries the entrypoint.
+# ---------------------------------------------------------------------------
+
+class TestHeadlessSdkPromptProvenance:
+    @pytest.mark.parametrize('text', UNMARKED_HEADLESS_SDK_PROMPTS)
+    def test_a_headless_sdk_prompt_is_excluded_by_provenance_alone(self, text):
+        rec = sdk_prompt(text)
+
+        assert reingestion.is_reingested_content(text) is False
+        assert reingestion.is_headless_sdk_prompt(rec) is True
+        assert reingestion.has_non_dialogue_provenance(rec) is True
+
+    @pytest.mark.parametrize(('text', 'entrypoint'), SDK_GUI_CLIENT_HUMAN_TURNS)
+    def test_an_sdk_gui_client_human_turn_is_kept(self, text, entrypoint):
+        rec = sdk_prompt(text, entrypoint=entrypoint)
+
+        assert reingestion.is_headless_sdk_prompt(rec) is False
+        assert reingestion.has_non_dialogue_provenance(rec) is False
+
+    @pytest.mark.parametrize('entrypoint', ['sdk-cli', 'cli'])
+    @pytest.mark.parametrize('prompt_source', ['typed', 'queued', 'suggestion_accepted', 'system'])
+    def test_an_interactive_or_system_prompt_source_is_not_headless_sdk(
+        self, prompt_source, entrypoint,
+    ):
+        rec = {**user_record(UNKNOWN_PROVENANCE_TEXT), 'promptSource': prompt_source, 'entrypoint': entrypoint}
+
+        assert reingestion.is_headless_sdk_prompt(rec) is False
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            {**user_record(UNKNOWN_PROVENANCE_TEXT), 'entrypoint': 'sdk-cli'},
+            {**user_record(UNKNOWN_PROVENANCE_TEXT), 'promptSource': 'sdk'},
+            {**user_record(UNKNOWN_PROVENANCE_TEXT), 'promptSource': ['sdk'], 'entrypoint': 'sdk-cli'},
+            {**user_record(UNKNOWN_PROVENANCE_TEXT), 'promptSource': 'sdk', 'entrypoint': None},
+        ],
+        ids=['entrypoint_without_prompt_source', 'prompt_source_without_entrypoint',
+             'non_str_prompt_source', 'none_entrypoint'],
+    )
+    def test_unknown_provenance_falls_through_to_text_rules(self, record):
+        assert reingestion.has_non_dialogue_provenance(record) is False
+
+    @pytest.mark.parametrize(('kind', 'text'), NON_HUMAN_ORIGIN_TURNS, ids=NON_HUMAN_ORIGIN_IDS)
+    def test_a_non_human_origin_is_non_dialogue_provenance(self, kind, text):
+        assert reingestion.has_non_dialogue_provenance(with_origin(user_record(text), kind)) is True
+
+    def test_a_human_origin_is_not_non_dialogue_provenance(self):
+        rec = with_origin(user_record(UNKNOWN_PROVENANCE_TEXT), 'human')
+
+        assert reingestion.has_non_dialogue_provenance(rec) is False

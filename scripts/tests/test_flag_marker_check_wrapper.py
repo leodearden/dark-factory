@@ -218,7 +218,7 @@ def test_wrapper_sources_dotenv_and_propagates_to_check(tmp_path):
 # ---------------------------------------------------------------------------
 
 _FAKE_UV_SRC = '''"""Fake `uv` shim for pinning fused-memory-flag-marker-check.sh's default
-FLAG_MARKER_SWEEP_CMD prefix (`uv run --frozen --project "$FM" python`).
+FLAG_MARKER_SWEEP_CMD prefix (`uv run --no-sync --project "$FM" python`).
 Records argv[1:] into a JSON state file at $FAKE_CHECK_STATE and exits 0.
 Never invokes real uv / fused_memory / live stores.
 """
@@ -280,8 +280,8 @@ def _empty_path_dir(tmp_path):
     return str(path_dir)
 
 
-def test_wrapper_default_prefix_invokes_uv_run_frozen_project(tmp_path):
-    """Pins the default FLAG_MARKER_SWEEP_CMD prefix -- `uv run --frozen
+def test_wrapper_default_prefix_invokes_uv_run_no_sync_project(tmp_path):
+    """Pins the default FLAG_MARKER_SWEEP_CMD prefix -- `uv run --no-sync
     --project "$FM" python`, built literally so "$FM" survives verbatim even
     when the repo path contains spaces."""
     uv_bin_dir, state_path = _fake_uv(tmp_path)
@@ -307,7 +307,7 @@ def test_wrapper_default_prefix_invokes_uv_run_frozen_project(tmp_path):
     calls = _recorded_calls(state_path)
     assert len(calls) == 1, f"calls={calls!r}"
     assert calls[0] == [
-        "run", "--frozen", "--project", str(fake_fm), "python",
+        "run", "--no-sync", "--project", str(fake_fm), "python",
         str(fake_fm / "scripts" / "sweep_orphan_flag_markers.py"),
         "--check", "--project-id", "reify",
     ], f"argv={calls[0]!r}"
@@ -447,7 +447,7 @@ def test_wrapper_resolves_uv_from_home_local_bin_when_path_omits_it(tmp_path):
         f"Expected the $HOME/.local/bin/uv fallback to actually be invoked; "
         f"calls={calls!r} stderr={result.stderr!r}"
     )
-    assert calls[0][:2] == ["run", "--frozen"], f"argv={calls[0]!r}"
+    assert calls[0][:2] == ["run", "--no-sync"], f"argv={calls[0]!r}"
 
 
 def test_wrapper_fails_loud_when_uv_bin_is_set_but_not_executable(tmp_path):

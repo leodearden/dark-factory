@@ -15,7 +15,7 @@ from _session_hook_fixtures import (
 )
 
 from orchestrator import session_hooks as sh
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 
 
 @pytest.fixture(autouse=True)
@@ -41,10 +41,10 @@ def test_refresh_path_does_not_bind_a_still_launching_record(tmp_path: Path) -> 
     # role/project/prompt/result_file and the one finish() writes `exited`
     # to.
     slug = 'session-cockpit-3215100'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.LAUNCHING,
+            status=session_records.Status.LAUNCHING,
             role='session',
             project='cockpit',
             prompt='/spawn cockpit',
@@ -58,18 +58,18 @@ def test_refresh_path_does_not_bind_a_still_launching_record(tmp_path: Path) -> 
 
     sh.run_stop(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_session_id is None
     # ...and the STATUS is withheld too, not just the binding. Asserting only
     # the binding once let the real defect through: refresh_record is a
     # read-modify-WRITE, so a guard sitting after it still left the nested
     # Stop advertising a still-launching spawn as `idle` in the cockpit.
-    assert record.status == sr.Status.LAUNCHING
+    assert record.status == session_records.Status.LAUNCHING
     # Blast radius, stated explicitly: withholding is not forking. The probe
     # ADOPTS an unbound record (that is the legacy-migration path), so the
     # event lands on this slug and is then dropped -- it must not also mint a
     # second, nested-owned row for the cockpit to show alongside the spawn.
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_refresh_path_withholds_a_question_during_the_unbound_launch_window(
@@ -89,9 +89,9 @@ def test_refresh_path_withholds_a_question_during_the_unbound_launch_window(
 
     sh.run_notification(hook_input, {'CLAUDE_SPAWN_SESSION_ID': slug}, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.question is None
-    assert record.status == sr.Status.LAUNCHING
+    assert record.status == session_records.Status.LAUNCHING
     assert record.claude_session_id is None
 
 
@@ -99,14 +99,14 @@ def test_refresh_path_writes_normally_to_a_bound_launching_record(
     tmp_path: Path,
 ) -> None:
     # The window is LAUNCHING *and unbound*. A LAUNCHING record that already
-    # carries a binding HAS a discriminator, so _env_slug_is_owned has proved
+    # carries a binding HAS a discriminator, so _env_slug_ownership has proved
     # this event belongs to the owner -- withholding there would strand a
     # legitimately-owned record at `launching`.
     slug = 'session-cockpit-3215104'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.LAUNCHING,
+            status=session_records.Status.LAUNCHING,
             launcher_pid=3215104,
             claude_session_id='uuid-owner',
         ),
@@ -116,8 +116,8 @@ def test_refresh_path_writes_normally_to_a_bound_launching_record(
 
     sh.run_stop(hook_input, {'CLAUDE_SPAWN_SESSION_ID': slug}, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.IDLE
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.IDLE
     assert record.claude_session_id == 'uuid-owner'
 
 
@@ -128,10 +128,10 @@ def test_owning_session_start_still_wins_the_launching_record_after_a_nested_sto
     # the owner's SessionStart binds, and from there the nested claude forks
     # onto its own record exactly as it should.
     slug = 'session-cockpit-3215101'
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.LAUNCHING,
+            status=session_records.Status.LAUNCHING,
             launcher_pid=3215101,
             result_file='/tmp/result-3215101.md',
         ),
@@ -149,19 +149,19 @@ def test_owning_session_start_still_wins_the_launching_record_after_a_nested_sto
     sh.run_stop(nested, env, root=tmp_path, process_tree=nested_tree)
     # Assert HERE, before run_session_start's unconditional `status = RUNNING`
     # masks it: that reset is what hid the original defect from this test.
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.LAUNCHING
     sh.run_session_start(owner, env, root=tmp_path, process_tree=owner_tree)
 
-    parent = sr.read_record(slug, root=tmp_path)
+    parent = session_records.read_record(slug, root=tmp_path)
     assert parent.claude_session_id == 'uuid-parent'
     assert parent.result_file == '/tmp/result-3215101.md'
 
     # The nested claude's next event now forks instead of flipping it.
     sh.run_stop(nested, env, root=tmp_path, process_tree=nested_tree)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.RUNNING
     forked_slug = sh.hook_session_slug(nested, env, root=tmp_path, process_tree=nested_tree)
-    forked = sr.read_record(forked_slug, root=tmp_path)
-    assert forked.status == sr.Status.IDLE
+    forked = session_records.read_record(forked_slug, root=tmp_path)
+    assert forked.status == session_records.Status.IDLE
     assert forked.claude_session_id == 'uuid-nested'
 
 
@@ -172,9 +172,9 @@ def test_refresh_path_still_binds_a_legacy_record_that_is_past_launching(
     # a pre-task-4193 in-flight record is RUNNING/AWAITING_INPUT/IDLE, never
     # LAUNCHING, so its proven owner still binds it on the very next event.
     slug = 'session-cockpit-3215102'
-    sr.write_record(
-        sr.SessionRecord(
-            session_slug=slug, status=sr.Status.AWAITING_INPUT, launcher_pid=3215102
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug, status=session_records.Status.AWAITING_INPUT, launcher_pid=3215102
         ),
         root=tmp_path,
     )
@@ -183,7 +183,7 @@ def test_refresh_path_still_binds_a_legacy_record_that_is_past_launching(
 
     sh.run_stop(hook_input, owner_ppid_env(slug, 3215520), root=tmp_path, process_tree=tree)
 
-    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
+    assert session_records.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
 
 
 # ---------------------------------------------------------------------------
@@ -217,12 +217,12 @@ def test_nested_session_start_cannot_capture_an_unbound_launching_record(
     nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
     sh.run_session_start(nested, env, root=tmp_path, process_tree=tree)
 
-    spawn_record = sr.read_record(slug, root=tmp_path)
+    spawn_record = session_records.read_record(slug, root=tmp_path)
     assert spawn_record.claude_session_id is None
-    assert spawn_record.status is sr.Status.LAUNCHING
+    assert spawn_record.status is session_records.Status.LAUNCHING
     assert spawn_record.role == 'cockpit'
     forked_slug = sh.hook_session_slug(nested, env, root=tmp_path, process_tree=tree)
-    forked = sr.read_record(forked_slug, root=tmp_path)
+    forked = session_records.read_record(forked_slug, root=tmp_path)
     assert forked.claude_session_id == 'uuid-nested'
     assert forked.parent_session_id == slug
 
@@ -241,10 +241,10 @@ def test_owner_session_start_binds_the_unbound_launching_record(
     owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
     sh.run_session_start(owner, env, root=tmp_path, process_tree=tree)
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_session_id == 'uuid-owner'
-    assert record.status is sr.Status.RUNNING
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert record.status is session_records.Status.RUNNING
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_nested_then_owner_session_start_leaves_the_spawn_record_with_the_owner(
@@ -262,15 +262,15 @@ def test_nested_then_owner_session_start_leaves_the_spawn_record_with_the_owner(
     nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
     sh.run_session_start(nested, env, root=tmp_path, process_tree=nested_tree)
     sh.run_stop(nested, env, root=tmp_path, process_tree=nested_tree)
-    assert sr.read_record(slug, root=tmp_path).status is sr.Status.LAUNCHING
+    assert session_records.read_record(slug, root=tmp_path).status is session_records.Status.LAUNCHING
 
     owner_tree = claude_process_tree(4193501, 4193500)
     owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
     sh.run_session_start(owner, env, root=tmp_path, process_tree=owner_tree)
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_session_id == 'uuid-owner'
-    assert record.status is sr.Status.RUNNING
+    assert record.status is session_records.Status.RUNNING
 
 
 def test_no_verdict_nested_session_start_leaves_the_spawn_record_for_its_owner(
@@ -294,7 +294,7 @@ def test_no_verdict_nested_session_start_leaves_the_spawn_record_for_its_owner(
 
     nested = {'session_id': 'uuid-NESTED', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
     sh.run_session_start(nested, env, root=tmp_path, process_tree=tree)
-    assert sr.read_record(slug, root=tmp_path).claude_session_id is None
+    assert session_records.read_record(slug, root=tmp_path).claude_session_id is None
 
     owner = {'session_id': 'uuid-OWNER', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
     sh.run_session_start(owner, env, root=tmp_path, process_tree=tree)
@@ -302,11 +302,11 @@ def test_no_verdict_nested_session_start_leaves_the_spawn_record_for_its_owner(
     # The owner still CONVERGES on the spawn record instead of forking, and
     # the record is still open (unbound) rather than claimed by the nested.
     assert sh.hook_session_slug(owner, env, root=tmp_path, process_tree=tree) == slug
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_session_id is None
-    assert record.status is sr.Status.RUNNING
+    assert record.status is session_records.Status.RUNNING
     assert record.role == 'cockpit'
-    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+    assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_owner_ppid_proof_still_binds_where_no_verdict_would_not(
@@ -323,16 +323,16 @@ def test_owner_ppid_proof_still_binds_where_no_verdict_would_not(
 
     owner = {'session_id': 'uuid-OWNER', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
     sh.run_session_start(owner, env, root=tmp_path, process_tree=claude_process_tree(4193601, 4193600))
-    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-OWNER'
+    assert session_records.read_record(slug, root=tmp_path).claude_session_id == 'uuid-OWNER'
 
     # Now a nested claude, with the probe gone dark (no /proc): the BINDING
     # is the discriminator from here on, so it forks on its own.
     nested = {'session_id': 'uuid-NESTED', 'cwd': '/home/leo/src/dark-factory'}
     sh.run_stop(nested, env, root=tmp_path, process_tree=claude_process_tree(None))
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.claude_session_id == 'uuid-OWNER'
-    assert record.status is sr.Status.RUNNING
+    assert record.status is session_records.Status.RUNNING
 
 
 def test_owner_stop_is_not_withheld_from_a_still_launching_record(
@@ -341,8 +341,8 @@ def test_owner_stop_is_not_withheld_from_a_still_launching_record(
     # Ruling item 4-iii. The launch-window withholding suppressed status AND
     # the pending question for EVERY event, including the legitimate
     # owner's. A SessionStart killed by _HOOK_TIMEOUT_SECS (reachable:
-    # _resolve_wm_window_id's own docstring prices the pathological wmctrl
-    # case at ~10.8s against a 10s budget) writes nothing, so the record
+    # session_windows.py::resolve_window_id_by_title's docstring prices the
+    # pathological wmctrl case at ~10.8s against a 10s budget) writes nothing, so the record
     # stays LAUNCHING+unbound and the session went invisible for its whole
     # life. An event whose OWNER_PPID matches must write.
     slug = 'session-cockpit-4193004'
@@ -353,8 +353,8 @@ def test_owner_stop_is_not_withheld_from_a_still_launching_record(
     owner = {'session_id': 'uuid-owner', 'cwd': '/home/leo/src/dark-factory'}
     sh.run_notification({**owner, 'message': 'may I proceed?'}, env, root=tmp_path, process_tree=tree)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status is sr.Status.AWAITING_INPUT
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.AWAITING_INPUT
     assert record.question is not None and record.question.text == 'may I proceed?'
     assert record.claude_session_id == 'uuid-owner'
 
@@ -376,8 +376,8 @@ def test_unknown_provenance_event_is_still_withheld_inside_the_window(
         process_tree=claude_process_tree(None),
     )
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status is sr.Status.LAUNCHING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.LAUNCHING
     assert record.claude_session_id is None
 
 
@@ -390,9 +390,9 @@ def test_withholding_expires_so_a_stuck_record_is_never_blind_forever(
     # bound, a possibly-wrong status beats a permanently blind record.
     slug = 'session-cockpit-4193006'
     stale = datetime.now(UTC) - timedelta(seconds=sh._LAUNCH_WINDOW_WITHHOLD_MAX_SECS + 60)
-    sr.write_record(
-        sr.SessionRecord(
-            session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=4193006,
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug, status=session_records.Status.LAUNCHING, launcher_pid=4193006,
             start_ts=stale.isoformat(),
         ),
         root=tmp_path,
@@ -406,8 +406,8 @@ def test_withholding_expires_so_a_stuck_record_is_never_blind_forever(
         process_tree=claude_process_tree(None),
     )
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status is sr.Status.IDLE
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.IDLE
     # The expiry buys VISIBILITY, not ownership: provenance is still
     # unproven, so the record stays unbound and open for its true owner
     # rather than being claimed by whoever broke the deadlock (esc-4193-10).
@@ -453,8 +453,8 @@ def test_unreadable_or_stale_start_ts_expires_immediately_instead_of_withholding
         process_tree=claude_process_tree(None),
     )
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status is sr.Status.IDLE
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.IDLE
     assert record.claude_session_id is None
 
 
@@ -479,8 +479,8 @@ def test_naive_start_ts_inside_the_window_still_withholds(
         process_tree=claude_process_tree(None),
     )
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status is sr.Status.LAUNCHING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.LAUNCHING
     assert record.claude_session_id is None
 
 
@@ -493,9 +493,9 @@ def test_sibling_mode_running_unbound_record_is_still_protected(
     # `status is LAUNCHING` predicate never matches it at all. Keying the
     # ownership probe on UNBOUND-ness instead covers it.
     slug = 'session-cockpit-4193007'
-    sr.write_record(
-        sr.SessionRecord(
-            session_slug=slug, status=sr.Status.RUNNING, launcher_pid=4193007, role='cockpit'
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug, status=session_records.Status.RUNNING, launcher_pid=4193007, role='cockpit'
         ),
         root=tmp_path,
     )
@@ -505,7 +505,7 @@ def test_sibling_mode_running_unbound_record_is_still_protected(
     nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory', 'source': 'startup'}
     sh.run_session_start(nested, env, root=tmp_path, process_tree=tree)
 
-    assert sr.read_record(slug, root=tmp_path).claude_session_id is None
-    assert sr.read_record(
+    assert session_records.read_record(slug, root=tmp_path).claude_session_id is None
+    assert session_records.read_record(
         sh.hook_session_slug(nested, env, root=tmp_path, process_tree=tree), root=tmp_path
     ).claude_session_id == 'uuid-nested'

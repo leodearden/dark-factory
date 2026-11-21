@@ -3,8 +3,8 @@
 build_spawn_argv is pure: it renders the verified spawn-claude.sh positional
 contract (`spawn-claude.sh <cwd> <skip_perms:true|false> <title> <prompt>`)
 as a plain, subprocess-ready list[str], with no process launched here. The
-SpawnScreen picker widget itself is covered by test_app.py's pilot tests (a
-later C5b step).
+SpawnScreen picker widget itself is covered by test_app_spawn.py's pilot tests
+(a later C5b step).
 """
 
 from __future__ import annotations

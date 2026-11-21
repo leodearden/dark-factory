@@ -167,7 +167,7 @@ class TestWithPytestNumprocessesStr:
 
     @staticmethod
     def _wrapper():
-        from orchestrator.verify import _with_pytest_numprocesses_str  # noqa: PLC0415
+        from orchestrator.verify import _with_pytest_numprocesses_str
 
         return _with_pytest_numprocesses_str
 

@@ -72,7 +72,7 @@ def _make_hanging_proc():
     TimeoutError on call 2 (the post-SIGTERM retry) → SIGKILL branch."""
     call_count = [0]
 
-    async def communicate_side_effect(input=None):  # noqa: A002
+    async def communicate_side_effect(input=None):
         call_count[0] += 1
         if call_count[0] == 1:
             # Hang until the watchdog cancels comm_task — CancelledError lands here.
@@ -124,7 +124,7 @@ def _make_delayed_success_proc(
     hanging until the suite timeout.
     """
 
-    async def communicate_side_effect(input=None):  # noqa: A002
+    async def communicate_side_effect(input=None):
         await asyncio.sleep(delay_secs)
         if reads_observed is not None:
             deadline = time.monotonic() + max_extra_wait_secs
@@ -712,7 +712,7 @@ class TestCompletionRecheckAfterOffLoopRead:
         comm_returned = threading.Event()  # thread-side: set by communicate()
         stdout_bytes = b'{"type":"result","subtype":"success"}'
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             await comm_gate.wait()
             comm_returned.set()
             return (stdout_bytes, b'')

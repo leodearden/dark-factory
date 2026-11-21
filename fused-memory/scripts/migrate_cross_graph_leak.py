@@ -101,10 +101,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import sys
 import types
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -950,36 +952,41 @@ async def run(args: Any, memory_service: Any) -> dict:
 # Backend construction
 # ---------------------------------------------------------------------------
 
-async def build_memory_service(args: Any, config: Any) -> Any:
-    """Build+initialize the backend/service run() drives, branching on args.apply.
+@contextlib.asynccontextmanager
+async def open_memory_service(args: Any, config: Any) -> AsyncIterator[Any]:
+    """Open the backend/service run() drives, branching on args.apply, and close it on exit.
 
     Dry-run (``args.apply`` False): the census/classify path only ever
     READS (``list_graphs``, ``ro_query``) -- it never needs a full
     ``MemoryService``, whose ``initialize()`` unconditionally runs the
     W6-ε startup identity scan (a dup-uuid-edge REPAIR, i.e. a write) and
-    builds indices. Build a lean ``GraphitiBackend`` directly and
-    initialize it with ``skip_maintenance=True`` so the default
+    builds indices. Open a lean ``GraphitiBackend`` directly with
+    ``skip_maintenance=True`` so the default
     ``python migrate_cross_graph_leak.py > manifest.json`` invocation no
     longer mutates on startup or contends with a running service's own
-    maintenance sweep. Returned as a tiny namespace exposing ``.graphiti``
-    (the backend itself) and an awaitable ``.close``, mirroring the shape
-    ``run()``/``_run_live`` expect from a full ``MemoryService``.
+    maintenance sweep. Yielded as a tiny namespace exposing ``.graphiti``
+    (the backend itself), the one attribute ``run()`` reads from a full
+    ``MemoryService``; the backend is closed when the block exits, and after
+    a failed ``initialize`` too.
 
-    Apply (``args.apply`` True): ``--apply`` legitimately mutates, so build
-    and initialize the full ``MemoryService``, unskipped, exactly as
-    before.
+    Apply (``args.apply`` True): ``--apply`` legitimately mutates, so the
+    full ``MemoryService`` is opened, unskipped, by ``maintenance_service``,
+    which also closes it.
     """
-    from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.backends.graphiti_client import GraphitiBackend
+    from fused_memory.maintenance._utils import maintenance_service
 
     if not args.apply:
         backend = GraphitiBackend(config)
-        await backend.initialize(skip_maintenance=True)
-        return types.SimpleNamespace(graphiti=backend, close=backend.close)
+        try:
+            await backend.initialize(skip_maintenance=True)
+            yield types.SimpleNamespace(graphiti=backend)
+        finally:
+            await backend.close()
+        return
 
-    memory = MemoryService(config)
-    await memory.initialize()
-    return memory
+    async with maintenance_service(config=config) as (_, memory):
+        yield memory
 
 
 # ---------------------------------------------------------------------------
@@ -1025,19 +1032,15 @@ def main() -> int:
     args = build_arg_parser().parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         config = FusedMemoryConfig()
-        built = await build_memory_service(args, config)
-        try:
+        async with open_memory_service(args, config) as built:
             return await run(args, built)
-        finally:
-            if hasattr(built, 'close'):
-                await built.close()
 
     report = asyncio.run(_run_live())
     print(json.dumps(report, indent=2, default=str))

@@ -36,7 +36,7 @@ from shared.git_async import GitResult, run_git
 from shared.git_read_rules import git_read_rules
 from shared.transcript_archive import archive_task_transcripts
 
-from orchestrator.agents.invoke import invoke_agent  # noqa: E402
+from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.sandbox_dispatch import (
     SandboxUnavailable,
     get_backend,
@@ -50,7 +50,7 @@ from orchestrator.merge_lane.completion import merge_completion_eligible
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.unblock_types import BlockClass, BlockRecord, classify_block_reason
-from orchestrator.workflow_types import BlockDisposition, classify_failure
+from orchestrator.workflow_types import BlockDisposition, WorkflowState, classify_failure
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +121,7 @@ _INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
 _DRY_RUN_CAP_WAIT_SANITY_SECS: float = 1800.0
 
 
-def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:  # noqa: ARG001
+def _is_budget_exhausted(result: Any, budget_usd: float) -> bool:
     """Return True only when the agent's subtype explicitly signals budget exhaustion.
 
     We avoid the ``cost >= budget_usd`` heuristic: an agent can spend close to
@@ -518,7 +518,7 @@ async def _skip_covered_reblock(
         event_store.emit(
             EventType.phase_skipped,
             task_id=task_id,
-            phase='blocked',
+            phase=WorkflowState.BLOCKED.value,
             role='unblock_auto',
             data={
                 'reason': 'dry_run_covered',
@@ -727,6 +727,7 @@ async def run_dry_run_unblock(
             event_store=event_store,
             scheduler=scheduler,
             cost_store=cost_store,
+            phase=WorkflowState.BLOCKED,
         )
 
         async def _one_attempt(session_id: str) -> Any:
@@ -1086,7 +1087,7 @@ async def run_dry_run_unblock(
             event_store.emit(
                 EventType.invocation_end,
                 task_id=task_id,
-                phase='blocked',
+                phase=WorkflowState.BLOCKED.value,
                 role='unblock_auto',
                 cost_usd=getattr(result, 'cost_usd', 0.0),
                 duration_ms=getattr(result, 'duration_ms', int((time.monotonic() - start_time) * 1000)),

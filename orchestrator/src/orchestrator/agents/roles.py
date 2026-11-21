@@ -10,11 +10,16 @@ from shared.followup_items import (
     MAX_FOLLOWUP_ITEMS,
     MAX_SUMMARY_CHARS,
 )
-from shared.governed_exceptions import DECLARATION_FORMS, INLINE_MARKER_FORMS
 from shared.prompt_artifact import PromptSpec
 
 from orchestrator.agents.briefing import OPEN_INFO_NOTES_HEADING
 from orchestrator.agents.code_quality import guidance
+from orchestrator.agents.detector_guidance import (
+    IMPLEMENTER_SUPPRESSION_RULES,
+    STEWARD_GUARD_INTENT_RULE,
+    STEWARD_SUPPRESSION_RULES,
+    TYPE_ESCAPES,
+)
 from orchestrator.agents.deviation_doctrine import render_deviation_doctrine
 from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
 from orchestrator.agents.harness_guidance import (
@@ -93,6 +98,15 @@ class AgentRole:
             tool.startswith(declared_prefixes)
             for tool in self.allowed_tools
             if tool.startswith('mcp__')
+        )
+
+    @property
+    def plan_tools_grants(self) -> frozenset[str]:
+        """The plan-tools tool names this role is granted: its allowed_tools
+        under the plan_tools family prefix, with the prefix stripped."""
+        (prefix,) = _FAMILY_TOOL_PREFIXES['plan_tools']
+        return frozenset(
+            tool.removeprefix(prefix) for tool in self.allowed_tools if tool.startswith(prefix)
         )
 
     def __post_init__(self) -> None:
@@ -876,11 +890,8 @@ partition it tried and the heuristic-13 symptom each candidate hit, or none.
 ALREADY_DONE_COMMIT_SEARCH = "git log main --reverse --format='%H %s' -S '<symbol>' -- <path>"
 
 
-ARCHITECT = AgentRole(
-    name='architect',
-    system_prompt="""\
-You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-""" + BASH_CAPABLE_ROLE_PREAMBLE + """
+# The architect's plan-tools call recipe; its one home, carried by ARCHITECT.system_prompt.
+ARCHITECT_PLAN_TOOLS_RECIPE = """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -899,7 +910,14 @@ Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
    low on budget or turns. A plan with no `confirm_plan()` call is treated as
    incomplete and will NOT advance to execution (a later session may resume and
    finish it, but this run's effort is wasted).
+"""
 
+
+ARCHITECT = AgentRole(
+    name='architect',
+    system_prompt="""\
+You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
+""" + BASH_CAPABLE_ROLE_PREAMBLE + ARCHITECT_PLAN_TOOLS_RECIPE + """
 ## Rules
 
 1. **Read before planning.** Thoroughly explore the codebase to understand existing patterns, utilities, and conventions before writing your plan.
@@ -1163,7 +1181,7 @@ the severity rules below say:
    (`git branch --show-current`).
 2. **Unrelated citation** — a marker cites a task or ticket that has nothing to do
    with the debt it excuses.
-3. **Type contortion** — an Any or cast introduced in place of a scoped ignore
+3. **Type contortion** — an """ + TYPE_ESCAPES + """ introduced in place of a scoped ignore
    (or in place of fixing the type).
 4. **Baseline growth** — any added line in the inline baseline
    (`scripts/inline_suppression_baseline.json`).
@@ -1613,35 +1631,8 @@ reaper to maybe recover:
     ),
 )
 
-_IMPLEMENTER_INV12_INSTRUCTIONS = (
-    """
-## Silencing a detector (INV-12: exceptions are owned or ratified)
-
-Every entry that silences a detector carries a disposition: a named owner who
-will remove it, or a recorded operator ruling that it stays. Accepted inline
-forms (a trailing comment on the suppressed line):
-
-"""
-    + '\n'.join(f'    {form}' for form in INLINE_MARKER_FORMS)
-    + """
-
-Accepted forms in a governed-list declaration:
-
-"""
-    + '\n'.join(f'    {form}' for form in DECLARATION_FORMS)
-    + """
-
-- Fix the type before suppressing it, and never trade an ignore for Any or cast.
-- File one follow-up ticket per branch and cite it on every marker you add.
-- Never cite your own task as the owner of a marker.
-- Edit `docs/legibility/exception-ratifications.yaml` only when your brief orders
-  it, and quote that order in the commit message: the reviewer sees your
-  commits, not your brief.
-"""
-)
-
 ARCHITECT.system_prompt += _FOLLOWUP_FILING_INSTRUCTIONS
-IMPLEMENTER.system_prompt += _FOLLOWUP_FILING_INSTRUCTIONS + _IMPLEMENTER_INV12_INSTRUCTIONS
+IMPLEMENTER.system_prompt += _FOLLOWUP_FILING_INSTRUCTIONS + IMPLEMENTER_SUPPRESSION_RULES
 
 
 MERGE_HALT_ESCALATION_CATEGORIES: tuple[str, ...] = (
@@ -1796,6 +1787,14 @@ human-readable rationale; `granted_files` is what actually widens scope — omit
 means the grant exists only as prose and the resumed agent's briefing will not reflect
 the expanded scope.
 
+**Declaring a pin (`mcp__escalation__declare_pin`).** A pin makes `resolve_issue`
+refuse every non-`park` close of a pending record, and there is no un-declare verb.
+Declare one only when something you can name relies on the record staying open — a
+deviation notice you are filing, or an operator gate your resolution records — and
+pass that thing in `declared_by`. Never declare a pin inferred from another record's
+prose: re-escalate it with `escalate_blocker(..., level=1)` as a candidate pin for a
+human to ratify.
+
 ### Review Suggestions
 Post-merge improvement suggestions from automated code reviewers.
 
@@ -1866,7 +1865,8 @@ wording differs.
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
    duplicates, then classify and act. Maximum 50 tasks per triage batch.
-""" + MERGE_HALT_SAFETY_RULE + STEWARD_MERGE_CONFLICT_RULE + """
+""" + MERGE_HALT_SAFETY_RULE + STEWARD_MERGE_CONFLICT_RULE + STEWARD_GUARD_INTENT_RULE
+    + STEWARD_SUPPRESSION_RULES + """
 ## CRITICAL: Git Staging Rules
 
 """ + _TASK_DIR_NEVER_COMMITTED + """
@@ -2004,8 +2004,11 @@ convert it into a task candidate and then close it:
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
         *_ESCALATION_TOOLS,
         'mcp__escalation__resolve_issue',
+        # Scoped by the prompt's "Declaring a pin" paragraph above.
+        'mcp__escalation__declare_pin',
         'mcp__escalation__get_escalation',
         'mcp__escalation__get_pending_escalations',
+        'mcp__escalation__get_task_escalation_history',
         'mcp__escalation__merge_request',
         # Read-only merge-state query. Required, not optional: the rc=1 arm of
         # ANCESTRY_CHECK_INSTRUCTIONS (spliced into this prompt at both

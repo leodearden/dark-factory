@@ -15,6 +15,7 @@ from legibility import (
     filing_policy,
     prescreen,
     session_ledger,
+    sighting_fit,
     similarity,
     synthesis,
 )
@@ -174,6 +175,7 @@ SECTION_FILED_TASKS = "filed-tasks"
 SECTION_STRUCTURAL = "structural"
 SECTION_DISPOSITIONS = "dispositions"
 SECTION_WITHHELD = "withheld-clusters"
+SECTION_SIGHTING_FIT = "sighting-fit"
 SECTION_COST = "cost"
 """Stable machine keys for the blocks :func:`census_report_sections` emits.
 
@@ -347,6 +349,7 @@ def build_census_record(
     dropped_verdicts: tuple[DroppedVerdict, ...] = (),
     mass_rejection: MassRejection | None = None,
     withheld: tuple[filing_policy.WithheldCluster, ...] = (),
+    fit_outcomes: Sequence[sighting_fit.FitOutcome] = (),
     findings: Sequence[Mapping[str, Any]] = (),
     area_map: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -359,8 +362,9 @@ def build_census_record(
     ``disposition.OutcomeReport.to_record``, *screened*
     ``prescreen.ScreenReport.to_record``, *adjudication*
     ``similarity.AdjudicationReport.to_record``, *synthesis*
-    ``synthesis.SynthesisReport.to_record``, and *project_root* the observed
-    project their decisions and outcomes are reported against."""
+    ``synthesis.SynthesisReport.to_record``, *fit_outcomes* the fit checks
+    ``sighting_fit.check`` ran, and *project_root* the observed project their
+    decisions and outcomes are reported against."""
     return {
         "record_version": CENSUS_RECORD_VERSION,
         "run_id": method["run_id"],
@@ -385,6 +389,7 @@ def build_census_record(
         "adjudication": dict(adjudication),
         "dry_run": _optional_asdict(dry_run),
         "withheld": [asdict(cluster) for cluster in withheld],
+        "sighting_fit": [outcome.to_record() for outcome in fit_outcomes],
         "findings": [dict(row) for row in findings],
         "area_map": None if area_map is None else dict(area_map),
         "cost_note": cost_note,
@@ -632,6 +637,9 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
             f"  - {cluster.title} (sightings: {cluster.sighting_count})" for cluster in withheld
         )
         emit(SECTION_WITHHELD, recorded_not_filed)
+
+    if record["sighting_fit"]:
+        emit(SECTION_SIGHTING_FIT, sighting_fit.report_lines(record["sighting_fit"]))
 
     # The trailing "" is the report's final newline, which the join would
     # otherwise not supply.

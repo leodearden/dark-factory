@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from orchestrator.session_registry import fleet_root
+from orchestrator.fleet_files import fleet_root
 from shared import safe_io
 
 logger = logging.getLogger(__name__)

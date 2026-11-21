@@ -33,17 +33,7 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 # hand-copy of the section parse; task 3913 retired it.
 from systemd_unit_invariants import parse_sections
 
-REPO_ROOT = pathlib.Path(__file__).parents[2]
-WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"
-
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
-# docstring exists to prevent. Mirrors test_deploy_clock_isolation.py.
-if str(REPO_ROOT.resolve()) not in sys.path:
-    sys.path.append(str(REPO_ROOT.resolve()))
-
-from df_pytest_isolation import (  # noqa: E402
+from df_pytest_isolation import (
     CLOCK_PROVENANCE_SESSION_KEY,
     CLOCK_PROVENANCE_SOURCE_KEY,
     PIPE_CLOSING_LEAKER_SRC,
@@ -60,6 +50,9 @@ from df_pytest_isolation import (  # noqa: E402
     wait_pid_gone,
     wait_proof_grace_secs,
 )
+
+REPO_ROOT = pathlib.Path(__file__).parents[2]
+WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -213,7 +206,7 @@ def test_probe_port_true_when_listening(monkeypatch: pytest.MonkeyPatch) -> None
     """probe_port returns True when ss reports a LISTEN row for the exact port."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout=_SS_LISTEN_8102, stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -224,7 +217,7 @@ def test_probe_port_false_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     """probe_port returns False when ss output has no LISTEN row for the port."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout=_SS_HEADER, stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -235,7 +228,7 @@ def test_probe_port_not_fooled_by_substring(monkeypatch: pytest.MonkeyPatch) -> 
     """probe_port must not match :81020 or :48102 when probing for :8102."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout=_SS_DECOYS, stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -252,7 +245,7 @@ def test_probe_port_returns_true_on_ss_error(monkeypatch: pytest.MonkeyPatch) ->
     wdog = _load_watchdog()
     log_messages: list[str] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         if cmd[0] == "ss":
             # Simulate ss exiting non-zero (e.g. binary missing / permission denied)
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Operation not permitted")
@@ -279,7 +272,7 @@ def test_probe_port_returns_true_on_missing_binary(monkeypatch: pytest.MonkeyPat
     wdog = _load_watchdog()
     log_messages: list[str] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         if cmd[0] == "ss":
             raise FileNotFoundError(2, "No such file or directory", "ss")
         # systemd-cat call from log()
@@ -305,7 +298,7 @@ def test_probe_port_returns_true_on_timeout(monkeypatch: pytest.MonkeyPatch) -> 
     wdog = _load_watchdog()
     log_messages: list[str] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         if cmd[0] == "ss":
             raise subprocess.TimeoutExpired(cmd, 5)
         # systemd-cat call from log()
@@ -347,7 +340,7 @@ def test_restart_unit_reset_failed_then_restart_no_block(
     wdog = _load_watchdog()
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -370,7 +363,7 @@ def test_restart_unit_never_stops_the_unit(monkeypatch: pytest.MonkeyPatch) -> N
     wdog = _load_watchdog()
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -386,7 +379,7 @@ def test_restart_unit_never_uses_kill(monkeypatch: pytest.MonkeyPatch) -> None:
     wdog = _load_watchdog()
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -413,7 +406,7 @@ def test_restart_unit_handles_reset_failed_timeout(monkeypatch: pytest.MonkeyPat
     calls: list[list[str]] = []
     log_messages: list[str] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         if cmd[:3] == ["systemctl", "--user", "reset-failed"]:
             raise subprocess.TimeoutExpired(cmd, 10)
@@ -439,7 +432,7 @@ def test_restart_unit_handles_restart_timeout(monkeypatch: pytest.MonkeyPatch) -
     wdog = _load_watchdog()
     log_messages: list[str] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         if cmd[:3] == ["systemctl", "--user", "restart"]:
             raise subprocess.TimeoutExpired(cmd, 45)
         if cmd[0] == "systemd-cat":
@@ -583,10 +576,10 @@ def test_elapsed_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_systemctl_show_result("5000000", rc=0)
 
-    def fake_clock_gettime(clk_id):  # noqa: ANN001
+    def fake_clock_gettime(clk_id):
         assert clk_id == wdog.time.CLOCK_MONOTONIC
         return 305.0
 
@@ -601,7 +594,7 @@ def test_elapsed_nonzero_rc_returns_none(monkeypatch: pytest.MonkeyPatch) -> Non
     """_unit_start_elapsed_secs returns None when systemctl exits non-zero."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_systemctl_show_result("5000000", rc=1)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -612,7 +605,7 @@ def test_elapsed_unparseable_value_returns_none(monkeypatch: pytest.MonkeyPatch)
     """_unit_start_elapsed_secs returns None when the property value is not an int."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_systemctl_show_result("notanint", rc=0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -623,7 +616,7 @@ def test_elapsed_zero_sentinel_returns_none(monkeypatch: pytest.MonkeyPatch) -> 
     """_unit_start_elapsed_secs returns None for the zero sentinel (unit never started)."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_systemctl_show_result("0", rc=0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -634,10 +627,10 @@ def test_elapsed_clock_failure_returns_none(monkeypatch: pytest.MonkeyPatch) -> 
     """_unit_start_elapsed_secs returns None when clock_gettime raises OSError."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_systemctl_show_result("5000000", rc=0)
 
-    def fake_clock_gettime(clk_id):  # noqa: ANN001
+    def fake_clock_gettime(clk_id):
         raise OSError("clock unavailable")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -652,10 +645,10 @@ def test_elapsed_clamp_future_start_returns_zero(monkeypatch: pytest.MonkeyPatch
     # start is in the future relative to now (clock drift or negative elapsed)
     start_us = int(310.0 * 1_000_000)  # 310 s
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_systemctl_show_result(str(start_us), rc=0)
 
-    def fake_clock_gettime(clk_id):  # noqa: ANN001
+    def fake_clock_gettime(clk_id):
         return 305.0  # now is BEFORE start → elapsed would be negative
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -669,7 +662,7 @@ def test_elapsed_empty_stdout_returns_none(monkeypatch: pytest.MonkeyPatch) -> N
     """_unit_start_elapsed_secs returns None when stdout has no '=' line."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout="\n", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -685,7 +678,7 @@ def test_elapsed_systemctl_timeout_returns_none(monkeypatch: pytest.MonkeyPatch)
     """
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 5)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -700,7 +693,7 @@ def test_elapsed_systemctl_not_found_returns_none(monkeypatch: pytest.MonkeyPatc
     """
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise FileNotFoundError(2, "No such file or directory", "systemctl")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -1212,7 +1205,7 @@ def test_unit_active_state_returns_stripped_value(monkeypatch: pytest.MonkeyPatc
     """_unit_active_state returns the trimmed --value output on a zero exit."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout="inactive\n", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -1224,7 +1217,7 @@ def test_unit_active_state_queries_value_only(monkeypatch: pytest.MonkeyPatch) -
     wdog = _load_watchdog()
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, stdout="active\n", stderr="")
 
@@ -1248,7 +1241,7 @@ def test_unit_active_state_none_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch)
     """_unit_active_state fails safe to None when systemctl exits non-zero."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no such unit")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -1259,7 +1252,7 @@ def test_unit_active_state_none_on_blank_output(monkeypatch: pytest.MonkeyPatch)
     """_unit_active_state fails safe to None on a zero exit with empty stdout."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout="\n", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -1270,7 +1263,7 @@ def test_unit_active_state_none_on_missing_binary(monkeypatch: pytest.MonkeyPatc
     """_unit_active_state fails safe to None when systemctl isn't on PATH."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise FileNotFoundError(2, "No such file or directory", "systemctl")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -1281,7 +1274,7 @@ def test_unit_active_state_none_on_timeout(monkeypatch: pytest.MonkeyPatch) -> N
     """_unit_active_state fails safe to None when the systemctl call times out."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 5)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -1980,7 +1973,7 @@ def test_enumerate_running_units_happy_path(monkeypatch: pytest.MonkeyPatch) -> 
     wdog = _load_watchdog()
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, stdout=_LIST_UNITS_SIX, stderr="")
 
@@ -2011,7 +2004,7 @@ def test_enumerate_running_units_empty_on_nonzero_rc(monkeypatch: pytest.MonkeyP
     """_enumerate_running_units returns [] when systemctl exits non-zero."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 1, stdout=_LIST_UNITS_SIX, stderr="error")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2022,7 +2015,7 @@ def test_enumerate_running_units_empty_on_missing_binary(monkeypatch: pytest.Mon
     """_enumerate_running_units returns [] when systemctl binary is not found."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise FileNotFoundError(2, "No such file or directory", "systemctl")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2033,7 +2026,7 @@ def test_enumerate_running_units_empty_on_timeout(monkeypatch: pytest.MonkeyPatc
     """_enumerate_running_units returns [] when the systemctl call times out."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 5)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2044,7 +2037,7 @@ def test_enumerate_running_units_empty_stdout(monkeypatch: pytest.MonkeyPatch) -
     """_enumerate_running_units returns [] when no orchestrator units are running."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2069,7 +2062,7 @@ def test_enumerate_running_units_excludes_self(monkeypatch: pytest.MonkeyPatch) 
         + "orchestrator-watchdog.service                  loaded active running Watchdog\n"
     )
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2104,7 +2097,7 @@ def test_unit_start_epoch_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     wdog = _load_watchdog()
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return _make_start_epoch_result("@1782996274")
 
@@ -2125,7 +2118,7 @@ def test_unit_start_epoch_nonzero_rc_returns_none(monkeypatch: pytest.MonkeyPatc
     """_unit_start_epoch returns None when systemctl exits non-zero."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_start_epoch_result("@1782996274", rc=1)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2136,7 +2129,7 @@ def test_unit_start_epoch_empty_value_returns_none(monkeypatch: pytest.MonkeyPat
     """_unit_start_epoch returns None when the property value is empty."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_start_epoch_result("")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2147,7 +2140,7 @@ def test_unit_start_epoch_zero_sentinel_returns_none(monkeypatch: pytest.MonkeyP
     """_unit_start_epoch returns None for the '@0' sentinel (unit never started)."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_start_epoch_result("@0")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2158,7 +2151,7 @@ def test_unit_start_epoch_unparseable_value_returns_none(monkeypatch: pytest.Mon
     """_unit_start_epoch returns None when the value is not an int."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_start_epoch_result("@notanint")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2169,7 +2162,7 @@ def test_unit_start_epoch_no_equals_line_returns_none(monkeypatch: pytest.Monkey
     """_unit_start_epoch returns None when stdout has no '=' line."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout="\n", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2180,7 +2173,7 @@ def test_unit_start_epoch_missing_binary_returns_none(monkeypatch: pytest.Monkey
     """_unit_start_epoch returns None when systemctl binary is not found."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise FileNotFoundError(2, "No such file or directory", "systemctl")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2191,7 +2184,7 @@ def test_unit_start_epoch_timeout_returns_none(monkeypatch: pytest.MonkeyPatch) 
     """_unit_start_epoch returns None when the systemctl call times out."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 5)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2217,7 +2210,7 @@ def test_newest_watched_commit_epoch_happy_path(monkeypatch: pytest.MonkeyPatch)
     wdog = _load_watchdog()
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, stdout="1783013906\n", stderr="")
 
@@ -2250,7 +2243,7 @@ def test_newest_watched_commit_epoch_empty_stdout_returns_none(
     """
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2263,7 +2256,7 @@ def test_newest_watched_commit_epoch_nonzero_rc_returns_none(
     """_newest_watched_commit_epoch returns None when git exits non-zero."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(
             cmd, 128, stdout="", stderr="fatal: not a git repository"
         )
@@ -2278,7 +2271,7 @@ def test_newest_watched_commit_epoch_unparseable_returns_none(
     """_newest_watched_commit_epoch returns None when stdout is not an int."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout="not-an-epoch\n", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2291,7 +2284,7 @@ def test_newest_watched_commit_epoch_missing_binary_returns_none(
     """_newest_watched_commit_epoch returns None when git binary is not found."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise FileNotFoundError(2, "No such file or directory", "git")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2304,7 +2297,7 @@ def test_newest_watched_commit_epoch_timeout_returns_none(
     """_newest_watched_commit_epoch returns None when the git call times out."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 5)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2331,10 +2324,10 @@ def test_unit_start_epoch_warning_log_failure_is_swallowed(
     """
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise RuntimeError("boom: systemctl subprocess exploded")
 
-    def fake_log(msg):  # noqa: ANN001
+    def fake_log(msg):
         raise FileNotFoundError(2, "No such file or directory", "systemd-cat")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2351,10 +2344,10 @@ def test_newest_watched_commit_epoch_warning_log_failure_is_swallowed(
     """
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise RuntimeError("boom: git subprocess exploded")
 
-    def fake_log(msg):  # noqa: ANN001
+    def fake_log(msg):
         raise OSError("journald socket unavailable")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -2372,7 +2365,7 @@ def test_journal_log_warning_swallows_log_failure_directly(
     """
     wdog = _load_watchdog()
 
-    def fake_log(msg):  # noqa: ANN001
+    def fake_log(msg):
         raise FileNotFoundError(2, "No such file or directory", "systemd-cat")
 
     monkeypatch.setattr(wdog, "log", fake_log)
@@ -3081,7 +3074,7 @@ def test_staleness_pass_isolates_per_unit_exception(monkeypatch: pytest.MonkeyPa
     boom_unit = "orchestrator-boom.service"
     stale_unit = "orchestrator-stale2.service"
 
-    def fake_start_epoch(unit: str):  # noqa: ANN001
+    def fake_start_epoch(unit: str):
         if unit == boom_unit:
             raise RuntimeError("systemctl exploded")
         return commit_epoch - 100  # stale
@@ -3349,7 +3342,7 @@ def test_delegate_fleet_restart_argv_shape(monkeypatch: pytest.MonkeyPatch) -> N
     wdog = _load_watchdog()
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -3377,7 +3370,7 @@ def test_delegate_fleet_restart_swallows_timeout(monkeypatch: pytest.MonkeyPatch
     wdog = _load_watchdog()
     log_messages: list[str] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 10)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -3394,7 +3387,7 @@ def test_delegate_fleet_restart_swallows_missing_binary(monkeypatch: pytest.Monk
     wdog = _load_watchdog()
     log_messages: list[str] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise FileNotFoundError(2, "No such file or directory", "systemd-run")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -4056,7 +4049,7 @@ def _fleet_fake_run(
     enabled = {} if enabled is None else enabled
     elapsed_secs = {} if elapsed_secs is None else elapsed_secs
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         recorded_calls.append(list(cmd))
         if cmd[:3] == ["systemctl", "--user", "list-units"]:
             stdout = "".join(f"{u} loaded active running desc\n" for u in units)
@@ -4360,7 +4353,7 @@ def test_report_mixed_fleet_returns_1_and_lists_all_units(
 
     recorded_calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         recorded_calls.append(list(cmd))
         if cmd[:3] == ["systemctl", "--user", "list-units"]:
             stdout = "".join(f"{u} loaded active running desc\n" for u in units)
@@ -4460,7 +4453,7 @@ def test_report_includes_deploy_age_column(
     unit = "orchestrator-unit0.service"
     start_epoch = commit_epoch + 100  # fresh
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         if cmd[:3] == ["systemctl", "--user", "list-units"]:
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=f"{unit} loaded active running desc\n", stderr=""
@@ -4510,7 +4503,7 @@ def test_report_deploy_age_unknown_when_clock_absent(
     unit = "orchestrator-unit0.service"
     start_epoch = commit_epoch + 100  # fresh
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         if cmd[:3] == ["systemctl", "--user", "list-units"]:
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=f"{unit} loaded active running desc\n", stderr=""
@@ -4568,7 +4561,7 @@ def test_report_includes_merge_idle_and_would_defer_columns(
     ]
     start_epochs = {u: commit_epoch + 100 for u in units}  # all fresh vs. commit
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         if cmd[:3] == ["systemctl", "--user", "list-units"]:
             stdout = "".join(f"{u} loaded active running desc\n" for u in units)
             return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
@@ -4667,7 +4660,7 @@ def test_report_merge_idle_degrades_to_unknown_when_drain_check_raises(
     unit = "orchestrator-foxtrot.service"
     start_epoch = commit_epoch + 100  # fresh vs. commit -- irrelevant to this test
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         if cmd[:3] == ["systemctl", "--user", "list-units"]:
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=f"{unit} loaded active running desc\n", stderr=""
@@ -4736,7 +4729,7 @@ def test_report_extended_columns_stay_read_only(
 
     recorded_calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         recorded_calls.append(list(cmd))
         if cmd[:3] == ["systemctl", "--user", "list-units"]:
             return subprocess.CompletedProcess(
@@ -6198,7 +6191,7 @@ def test_boundary9_report_mixed_fleet_seven_columns(
 
     recorded_calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         recorded_calls.append(list(cmd))
         if cmd[:3] == ["systemctl", "--user", "list-units"]:
             stdout = "".join(f"{u} loaded active running desc\n" for u in units)
@@ -6486,7 +6479,7 @@ def test_watchdog_probed_routes_are_registered_in_fused_memory_server() -> None:
         "decorator syntax changed and this drift guard has gone blind"
     )
 
-    import urllib.parse  # noqa: PLC0415
+    import urllib.parse
 
     for const_name in ("FUSED_MEMORY_ALIVE_URL", "FUSED_MEMORY_HEALTH_URL"):
         path = urllib.parse.urlsplit(getattr(wdog, const_name)).path
@@ -6541,7 +6534,7 @@ def test_probe_health_true_on_200(monkeypatch: pytest.MonkeyPatch) -> None:
     """probe_health returns True when urlopen succeeds with a 2xx response."""
     wdog = _load_watchdog()
 
-    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+    def fake_urlopen(*args, **kwargs):
         return _FakeHealthResponse(200)
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
@@ -6561,7 +6554,7 @@ def test_probe_health_true_on_503_degraded(monkeypatch: pytest.MonkeyPatch) -> N
     """
     wdog = _load_watchdog()
 
-    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+    def fake_urlopen(*args, **kwargs):
         raise wdog.urllib.error.HTTPError(
             "http://127.0.0.1:8002/health", 503, "Service Unavailable", None, None
         )
@@ -6577,7 +6570,7 @@ def test_probe_health_false_on_url_error(monkeypatch: pytest.MonkeyPatch) -> Non
     """probe_health returns False when urlopen raises URLError (no response received)."""
     wdog = _load_watchdog()
 
-    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+    def fake_urlopen(*args, **kwargs):
         raise wdog.urllib.error.URLError("connection refused")
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
@@ -6591,7 +6584,7 @@ def test_probe_health_false_on_connection_refused(monkeypatch: pytest.MonkeyPatc
     """probe_health returns False when urlopen raises ConnectionRefusedError directly."""
     wdog = _load_watchdog()
 
-    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+    def fake_urlopen(*args, **kwargs):
         raise ConnectionRefusedError("connection refused")
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
@@ -6609,7 +6602,7 @@ def test_probe_health_false_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     wdog = _load_watchdog()
 
-    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+    def fake_urlopen(*args, **kwargs):
         raise TimeoutError("timed out")
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
@@ -6643,7 +6636,7 @@ def _install_url_dispatching_urlopen(
     """
     asked: list[str] = []
 
-    def fake_urlopen(url, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+    def fake_urlopen(url, *args, **kwargs):
         asked.append(url)
         if url not in outcomes:
             pytest.fail(f"unexpected fetch of {url!r} (mapped: {sorted(outcomes)})")
@@ -6849,7 +6842,7 @@ def test_liveness_pass_no_restart_when_healthy(
     restarted: list[str] = []
     probed_urls: list[str] = []
 
-    def fake_probe_health(url, timeout=None, *a, **k):  # noqa: ANN001, ANN002, ANN003
+    def fake_probe_health(url, timeout=None, *a, **k):
         probed_urls.append(url)
         return True
 
@@ -6984,7 +6977,7 @@ def _fake_ss_run(
     """Fake subprocess.run answering the `ss` port probe; returns the call log."""
     recorded: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003
+    def fake_run(cmd, **kwargs):
         recorded.append(list(cmd))
         assert cmd[0] == "ss", f"unexpected subprocess.run call: {cmd}"
         return subprocess.CompletedProcess(cmd, 0, stdout=ss_stdout, stderr="")
@@ -7142,7 +7135,7 @@ def test_print_fused_memory_liveness_row(
         # otherwise reads whatever the name holds when it is CALLED, not when it
         # was defined (B023) — benign only while every call stays inside the same
         # iteration, which nothing here enforces.
-        def fake_urlopen(*args, _outcome=health_outcome, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        def fake_urlopen(*args, _outcome=health_outcome, **kwargs):
             if isinstance(_outcome, Exception):
                 raise _outcome
             return _FakeHealthResponse(_outcome)
@@ -7279,7 +7272,7 @@ def _run_recon_busy_verdict_with_body(
     """Drive _fused_memory_recon_busy_verdict() with a faked /health *body*
     flowing through the REAL lazy-imported recon_busy_check.classify()."""
 
-    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+    def fake_urlopen(*args, **kwargs):
         return _FakeHealthBodyResponse(body)
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
@@ -7332,7 +7325,7 @@ def test_fused_memory_recon_busy_verdict_unknown_on_fetch_exception(
     """Any fetch/import exception degrades to 'unknown' (fail-soft) and is logged."""
     wdog = _load_watchdog()
 
-    def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+    def fake_urlopen(*args, **kwargs):
         raise ConnectionRefusedError("connection refused")
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
@@ -7607,7 +7600,7 @@ def test_unit_active_enter_epoch_happy_path(monkeypatch: pytest.MonkeyPatch) -> 
     wdog = _load_watchdog()
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return _make_active_enter_epoch_result("@1782996274")
 
@@ -7631,7 +7624,7 @@ def test_unit_active_enter_epoch_nonzero_rc_returns_none(monkeypatch: pytest.Mon
     """_unit_active_enter_epoch returns None when systemctl exits non-zero."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_active_enter_epoch_result("@1782996274", rc=1)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -7642,7 +7635,7 @@ def test_unit_active_enter_epoch_empty_value_returns_none(monkeypatch: pytest.Mo
     """_unit_active_enter_epoch returns None when the property value is empty."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_active_enter_epoch_result("")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -7653,7 +7646,7 @@ def test_unit_active_enter_epoch_zero_sentinel_returns_none(monkeypatch: pytest.
     """_unit_active_enter_epoch returns None for the '@0' sentinel (never activated)."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_active_enter_epoch_result("@0")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -7666,7 +7659,7 @@ def test_unit_active_enter_epoch_unparseable_value_returns_none(
     """_unit_active_enter_epoch returns None when the value is not an int."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return _make_active_enter_epoch_result("@notanint")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -7679,7 +7672,7 @@ def test_unit_active_enter_epoch_missing_binary_returns_none(
     """_unit_active_enter_epoch returns None when systemctl binary is not found."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise FileNotFoundError(2, "No such file or directory", "systemctl")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -7690,7 +7683,7 @@ def test_unit_active_enter_epoch_timeout_returns_none(monkeypatch: pytest.Monkey
     """_unit_active_enter_epoch returns None when the systemctl call times out."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 5)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -7714,7 +7707,7 @@ def test_newest_fm_watched_commit_epoch_happy_path(monkeypatch: pytest.MonkeyPat
     wdog = _load_watchdog()
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, stdout="1783013906\n", stderr="")
 
@@ -7748,7 +7741,7 @@ def test_newest_fm_watched_commit_epoch_empty_stdout_returns_none(
     """
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -7761,7 +7754,7 @@ def test_newest_fm_watched_commit_epoch_nonzero_rc_returns_none(
     """_newest_fm_watched_commit_epoch returns None when git exits non-zero."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(
             cmd, 128, stdout="", stderr="fatal: not a git repository"
         )
@@ -7776,7 +7769,7 @@ def test_newest_fm_watched_commit_epoch_unparseable_returns_none(
     """_newest_fm_watched_commit_epoch returns None when stdout is not an int."""
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 0, stdout="not-an-epoch\n", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -7790,7 +7783,7 @@ def test_newest_fm_watched_commit_epoch_broad_error_returns_none_and_warns(
     wdog = _load_watchdog()
     logged: list[str] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise RuntimeError("boom: git subprocess exploded")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -8107,7 +8100,7 @@ def test_delegate_fm_restart_argv_shape(monkeypatch: pytest.MonkeyPatch) -> None
     wdog = _load_watchdog()
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -8174,7 +8167,7 @@ def test_delegate_fm_restart_forwards_clock_override_via_setenv(
 
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -8198,7 +8191,7 @@ def test_delegate_fm_restart_swallows_timeout(monkeypatch: pytest.MonkeyPatch) -
     wdog = _load_watchdog()
     log_messages: list[str] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 10)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -8215,7 +8208,7 @@ def test_delegate_fm_restart_swallows_missing_binary(monkeypatch: pytest.MonkeyP
     wdog = _load_watchdog()
     log_messages: list[str] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise FileNotFoundError(2, "No such file or directory", "systemd-run")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -8277,7 +8270,7 @@ def _registration_run(
     as well as what was logged.
     """
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         if cmd[0] == "systemd-run":
             if register_raises is not None:
@@ -8566,7 +8559,7 @@ def test_the_is_active_probe_never_raises_and_falls_to_not_in_flight(
     log_messages: list[str] = []
     unit = "orch-fleet-staleness-redeploy.service"
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003
+    def fake_run(cmd, **kwargs):
         raise probe_error
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -9429,7 +9422,7 @@ def test_log_bounds_systemd_cat_with_a_five_second_timeout(
     wdog = _load_watchdog()
     seen_kwargs: list[dict] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         seen_kwargs.append(kwargs)
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -9451,7 +9444,7 @@ def test_log_falls_through_to_stderr_on_missing_binary(
     """
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise FileNotFoundError(2, "No such file or directory", "systemd-cat")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -9472,7 +9465,7 @@ def test_log_falls_through_to_stderr_on_timeout(
     """
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, 5)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -9493,7 +9486,7 @@ def test_log_swallows_only_os_and_subprocess_errors(
     """
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise ValueError("not a systemd-cat failure at all")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -9533,7 +9526,7 @@ def _closed_stderr():
 )
 def test_log_never_raises_when_the_stderr_fallback_is_unusable(
     monkeypatch: pytest.MonkeyPatch,
-    make_stderr,  # noqa: ANN001
+    make_stderr,
 ) -> None:
     """The fallback print is best-effort too: an unusable stderr must not raise
     out of log(). Stderr is unusable in more than one way, and they do not
@@ -9546,7 +9539,7 @@ def test_log_never_raises_when_the_stderr_fallback_is_unusable(
     """
     wdog = _load_watchdog()
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         raise FileNotFoundError("systemd-cat not found")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -10068,7 +10061,7 @@ def test_clear_fm_liveness_streak_swallows_and_logs_oserror(
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
     monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
 
-    def boom(_path):  # noqa: ANN001
+    def boom(_path):
         raise PermissionError("read-only filesystem")
 
     monkeypatch.setattr(wdog.os, "unlink", boom)
@@ -10315,7 +10308,7 @@ def test_record_fm_liveness_failure_write_error_fails_safe(
     monkeypatch.setattr(wdog, "log", lambda _m: None)
     monkeypatch.setattr(wdog.time, "time", lambda: 1783000000.0)
 
-    def boom(_src, _dst):  # noqa: ANN001
+    def boom(_src, _dst):
         raise OSError("disk full")
 
     monkeypatch.setattr(wdog.os, "replace", boom)
@@ -10600,7 +10593,7 @@ def test_stamp_fm_liveness_restart_clock_reports_whether_the_cap_was_armed(
 
     assert wdog._stamp_fm_liveness_restart_clock() is True
 
-    def boom(_src, _dst):  # noqa: ANN001
+    def boom(_src, _dst):
         raise OSError("no space left on device")
 
     monkeypatch.setattr(wdog.os, "replace", boom)
@@ -10628,12 +10621,12 @@ def test_liveness_pass_unarmable_cap_is_logged_distinguishably(
     restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * 3)
     monkeypatch.setattr(wdog, "log", lambda m: logged.append(m))
 
-    def boom(_src, _dst):  # noqa: ANN001
+    def boom(_src, _dst):
         raise OSError("no space left on device")
 
     real_replace = os.replace
 
-    def replace_but_not_the_clock(src, dst):  # noqa: ANN001
+    def replace_but_not_the_clock(src, dst):
         # Streak writes keep succeeding — only the cap clock is unwritable.
         if str(dst) == wdog.FM_LIVENESS_RESTART_CLOCK_PATH:
             return boom(src, dst)
@@ -11360,7 +11353,7 @@ def test_liveness_pass_isolates_exception_from_any_internal(
     monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_THRESHOLD", 1)
     _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"])
 
-    def boom(*_a, **_k):  # noqa: ANN002, ANN003
+    def boom(*_a, **_k):
         raise RuntimeError(f"{target} exploded")
 
     monkeypatch.setattr(wdog, target, boom)
@@ -11390,7 +11383,7 @@ def test_cli_continues_past_a_liveness_persistence_failure(
     )
     _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"])
 
-    def boom(*_a, **_k):  # noqa: ANN002, ANN003
+    def boom(*_a, **_k):
         raise RuntimeError("streak persistence exploded")
 
     monkeypatch.setattr(wdog, "_record_fm_liveness_failure", boom)
@@ -11418,7 +11411,7 @@ def test_liveness_pass_http_error_is_healthy_and_never_restarts(
     restarted = _wire_liveness_pass(wdog, monkeypatch, tmp_path)
     monkeypatch.setattr(wdog, "probe_port", lambda _port: True)
 
-    def fake_urlopen(*_a, **_k):  # noqa: ANN002, ANN003
+    def fake_urlopen(*_a, **_k):
         raise wdog.urllib.error.HTTPError(
             wdog.FUSED_MEMORY_HEALTH_URL, 503, "Service Unavailable", {}, None  # type: ignore[arg-type]
         )
@@ -12388,7 +12381,7 @@ def _wire_report_fleet(
     unit = synthetic_unit("reported")
     recorded_calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
+    def fake_run(cmd, **kwargs):
         recorded_calls.append(list(cmd))
         if cmd[:3] == ["systemctl", "--user", "list-units"]:
             return subprocess.CompletedProcess(

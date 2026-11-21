@@ -156,7 +156,7 @@ def _build_slate(module: Any) -> tuple[list[Any], Any, int]:
                 canonical_id=_CANONICAL_ID,
             ),
         )
-    except Exception as exc:  # noqa: BLE001 - a raising selector is unverifiable
+    except Exception as exc:  # a raising selector is unverifiable
         raise Unverifiable(f'select_judge_candidates raised: {exc!r}') from exc
     ids = [getattr(c, 'id', None) for c in slate]
     if _CHILD_ID in ids and ids.index(_CHILD_ID) != 0:
@@ -327,7 +327,7 @@ def _render(
     args, kwargs = bound
     try:
         rendered = fn(*args, **kwargs)
-    except Exception as exc:  # noqa: BLE001 - any render failure is inconclusive
+    except Exception as exc:  # any render failure is inconclusive
         return None, f'raised: {exc!r}'
     if not isinstance(rendered, str):
         return None, f'returned {type(rendered).__name__}, not str'
@@ -610,14 +610,14 @@ def _occurrences(result: Any, ident: str, depth: int = _SCAN_DEPTH, seen: set[in
     for name in (slots,) if isinstance(slots, str) else slots:
         try:
             children.append(getattr(result, name, None))
-        except Exception:  # noqa: BLE001 - a hostile __getattr__ is not evidence
+        except Exception:  # a hostile __getattr__ is not evidence
             continue
 
     total = 0
     for child in children:
         try:
             total += _occurrences(child, ident, depth - 1, seen)
-        except Exception:  # noqa: BLE001 - a hostile container is not evidence
+        except Exception:  # a hostile container is not evidence
             continue
     return total
 
@@ -670,7 +670,7 @@ def _echoes_payload(
     control = {key: word, _DECOY_FIELD: ident}
     try:
         result = parse(json.dumps(control))
-    except Exception as exc:  # noqa: BLE001 - a refusal is a validating parser
+    except Exception as exc:  # a refusal is a validating parser
         # Not an error, and deliberately not fatal: a parser that REFUSES the
         # decoy is a validating one, which is the stricter option (a). But the
         # control then did NOT run, so a subsequent option-(a) PASS rests on
@@ -707,7 +707,7 @@ def _same_result(left: Any, right: Any) -> bool:
     """``left == right``, treating a raising/ambiguous ``__eq__`` as 'differs'."""
     try:
         return bool(left == right)
-    except Exception:  # noqa: BLE001 - numpy-style ambiguity is not sameness
+    except Exception:  # numpy-style ambiguity is not sameness
         return False
 
 
@@ -866,7 +866,7 @@ def _option_a_under(
                 payload = {key: word, field: ident}
                 try:
                     result = parse(json.dumps(payload))
-                except Exception as exc:  # noqa: BLE001 - a rejection is inconclusive
+                except Exception as exc:  # a rejection is inconclusive
                     errors.append(f'{payload!r} -> {exc!r}')
                     break
                 if isinstance(result, str):

@@ -21,6 +21,8 @@ from unittest.mock import patch
 import pytest
 from _review_loop_harness import review_loop_workflow
 from _review_payloads import blocking_review
+from _seed_script_stubs import seed_default_warm_base
+from _worktree_registrations import lane_admin_dir
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig
@@ -54,20 +56,11 @@ async def _init_repo(repo: Path) -> None:
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    """Temporary git repo with an initial commit + a resolvable warm base.
-
-    Pre-creates the default derived warm-lane base (task 2061 gate) so the
-    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK,
-    and marks `.worktrees/.pool-root` present (task 2099 create-once guard)
-    — mirrors test_warm_lane_abort_teardown.py's git_repo fixture.
-    """
+    """Temporary git repo with an initial commit + a resolvable warm base."""
     repo = tmp_path / 'repo'
     repo.mkdir()
     asyncio.run(_init_repo(repo))
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    seed_default_warm_base(repo)
     return repo
 
 
@@ -105,15 +98,6 @@ async def _get_head(repo: Path) -> str:
     rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
     assert rc == 0, f'git rev-parse HEAD failed (rc={rc})'
     return out.strip()
-
-
-def _lane_admin_dir(lane: Path) -> Path:
-    """Parse the ``.git/worktrees/<name>`` admin dir path out of a lane's
-    ``.git`` pointer file (``gitdir: <repo>/.git/worktrees/<name>``)."""
-    content = (lane / '.git').read_text().strip()
-    prefix = 'gitdir:'
-    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
-    return Path(content[len(prefix):].strip())
 
 
 def _assert_route_logged(caplog: pytest.LogCaptureFixture, route: AcquireRoute) -> None:
@@ -281,7 +265,7 @@ class TestAcquireRouteClassification:
         # DO NOT release — 'R' stays mapped, so the next acquire_for('R')
         # returns reused=True.
 
-        admin_dir = _lane_admin_dir(lane)
+        admin_dir = lane_admin_dir(lane)
         (admin_dir / 'gitdir').write_text('/tmp/bogus/.git\n')
         assert not await git_ops._is_registered_worktree(lane), (
             'lane must appear unregistered once its admin dir gitdir '

@@ -43,7 +43,7 @@ from typing import NamedTuple, assert_never
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import (  # noqa: E402
+from legibility import (
     alarm,
     census_trigger,
     codebook,
@@ -59,7 +59,7 @@ from legibility import (  # noqa: E402
     trickle_state,
     unlanded,
 )
-from legibility.config import (  # noqa: E402
+from legibility.config import (
     LegibilityConfig,
     TrickleCensusCaps,
     _require_absolute,
@@ -316,7 +316,7 @@ def build_digests(
             text = build(
                 record.path, agent_class_override=record.stratum, max_bytes=max_bytes,
             )
-        except Exception as exc:  # noqa: BLE001 - isolate, never propagate/fabricate
+        except Exception as exc:  # isolate, never propagate/fabricate
             extractor_failures.append((record.path.name, str(exc)))
             continue
         cache[key] = text
@@ -500,7 +500,7 @@ def evaluate_census_step(
 
     try:
         decision = decide(cfg, now=now, completion_runner=completion_runner)
-    except Exception as exc:  # noqa: BLE001 - the census trigger must never fail the run
+    except Exception as exc:  # the census trigger must never fail the run
         # The exception text is BOUNDED before it reaches either sink, and both
         # sinks are single-line: the WARNING becomes one nightly journal line,
         # and `census_line` is a one-line field on `NightlyResult`. An escaping
@@ -562,7 +562,7 @@ def evaluate_census_step(
 
     try:
         launcher(cfg.project_root, config_path=config_path, caps=cfg.census.trickle_caps)
-    except Exception as exc:  # noqa: BLE001 - best-effort, never fail the run
+    except Exception as exc:  # best-effort, never fail the run
         logger.warning('legibility trickle: census launcher failed (best-effort): %s', exc)
 
     return CensusEvaluation(line, True, completion)
@@ -1084,7 +1084,7 @@ def _record_trickle_progress(
         night = trickle_state.fold_night(
             trickle_state.read_prior(cfg.project_id), cfg.project_id, run
         )
-        streak_landed = trickle_state.barren_streak_reached(night, max_barren_runs) and (
+        streak_landed = trickle_state.barren_escalation_due(night, max_barren_runs) and (
             _escalate_barren_streak(
                 cfg, night.state, target_date,
                 max_barren_runs=max_barren_runs, raise_alarm=raise_alarm,
@@ -1145,7 +1145,7 @@ def _best_effort_recording(project_id: str, target_date: date) -> Iterator[None]
     failure must never mask or replace the run's own outcome."""
     try:
         yield
-    except Exception as exc:  # noqa: BLE001 — deliberately total
+    except Exception as exc:  # deliberately total
         logger.warning(
             'legibility trickle: could not record run state for project=%s '
             'date=%s (%s: %s); the run itself is unaffected, but the '
@@ -1212,8 +1212,8 @@ def _escalate_barren_streak(
     that is running."""
     counters = night.counters
     summary = (
-        f'legibility trickle has produced nothing for {max_barren_runs} '
-        f'consecutive runs'
+        f'legibility trickle has produced nothing for '
+        f'{night.consecutive_barren_runs} consecutive runs'
     )
     detail = (
         f'project={cfg.project_id} date={target_date.isoformat()} '
@@ -1223,7 +1223,7 @@ def _escalate_barren_streak(
         f'budget_skipped={counters.budget_skipped} '
         f'last_productive_at={trickle_state.isoformat_or_none(night.last_productive_at)}. '
         f'Real confusion signal reached the sampling/budget stage on each of '
-        f'those runs and NOTHING was digested -- {max_barren_runs} '
+        f'those runs and NOTHING was digested -- {max_barren_runs} or more '
         f'consecutive means persistent config state, not a run of bad luck. '
         f'Remedy: {trickle_state.barren_remedy(counters)}. '
         f'Probe on demand with: check_trickle_progress.py '
@@ -1322,14 +1322,18 @@ def run_nightly(
     distinction ``check_trickle_liveness.sh`` cannot make.
     *retry_recorder* (default :func:`trickle_state.record_retry`, which
     rewrites only the backlog) is the same seam for a retry pass.
-    *max_barren_runs* is the barren streak on which the pass posts its one
-    streak escalation.
+    *max_barren_runs* is the barren streak on which the pass first posts its
+    streak escalation; it re-posts at the multiples in
+    :data:`trickle_state.BARREN_ESCALATION_MULTIPLES`.
 
     *pass_kind* (:class:`PassKind`) has no default: it decides whether the
     pass moves the schedule cursor. A ``RETRY`` pass, run by
     :func:`run_scheduled_night` after the ``SCHEDULED`` one, skips sessions
     the session ledger already holds, never evaluates the census trigger,
-    and records through *retry_recorder*.
+    and records through *retry_recorder*. A ``SCHEDULED`` pass whose
+    *target_date* the recorded schedule cursor already reached
+    (:func:`trickle_state.schedule_reached`) draws the night's full sample
+    and codes only the selected sessions the ledger does not hold.
 
     The pass ends with one INFO line, :meth:`NightlyResult.journal_line`.
     """
@@ -1390,10 +1394,51 @@ def _ledgered_sessions(cfg: LegibilityConfig) -> frozenset[str]:
     if snapshot.state is session_ledger.LedgerState.UNREADABLE:
         logger.warning(
             'legibility trickle: session ledger unreadable, so no already-coded '
-            'session is skipped this retry: %s',
+            'session is skipped this pass: %s',
             snapshot.error,
         )
     return snapshot.sessions
+
+
+class _LedgerSkips(NamedTuple):
+    """The ledgered sessions a pass leaves out of its sample, or out of what
+    it codes from its selection."""
+
+    before_sampling: frozenset[str] = frozenset()
+    from_selection: frozenset[str] = frozenset()
+
+
+def _ledger_skips(cfg: LegibilityConfig, pass_kind: PassKind, target_date: date) -> _LedgerSkips:
+    """A retry samples without what the ledger holds; a scheduled pass over a
+    date the schedule already reached samples the whole night and codes only
+    the selected sessions the ledger does not hold."""
+    match pass_kind:
+        case PassKind.RETRY:
+            return _LedgerSkips(before_sampling=_ledgered_sessions(cfg))
+        case PassKind.SCHEDULED:
+            prior = trickle_state.read_prior(cfg.project_id)
+            if trickle_state.schedule_reached(prior, target_date=target_date):
+                return _LedgerSkips(from_selection=_ledgered_sessions(cfg))
+            return _LedgerSkips()
+        case PassKind.MANUAL:
+            return _LedgerSkips()
+        case _:
+            assert_never(pass_kind)
+
+
+def _uncoded(
+    cfg: LegibilityConfig, sample: sampling.SampleResult, coded: frozenset[str], target_date: date,
+) -> list[sampling.ScoredRecord]:
+    """*sample*'s selection, in order, without the sessions in *coded*."""
+    to_code = [record for record in sample.selected if record.session_id not in coded]
+    if len(to_code) < len(sample.selected):
+        logger.info(
+            'legibility trickle: project=%s date=%s %d of %d selected session(s) '
+            'already-coded, not re-coded',
+            cfg.project_id, target_date.isoformat(),
+            len(sample.selected) - len(to_code), len(sample.selected),
+        )
+    return to_code
 
 
 def _nothing_sampled() -> sampling.SampleResult:
@@ -1436,12 +1481,15 @@ def _run_configured_nightly(
     sample = _nothing_sampled()
     try:
         rendered: dict[tuple, str] = {}
-        sample = _select_stage(
-            cfg, seams.selector, projects_root, target_date, pass_kind, rendered=rendered,
+        skips = _ledger_skips(cfg, pass_kind, target_date)
+        sample = seams.selector(
+            cfg, projects_root if projects_root is not None else DEFAULT_PROJECTS_ROOT,
+            target_date, rendered=rendered, skip_sessions=skips.before_sampling,
         )
         _report_sample_outcome(cfg, sample, target_date, raise_alarm=raise_alarm)
         end = _code_and_land(
             cfg, resolved_config_path, seams, sample,
+            _uncoded(cfg, sample, skips.from_selection, target_date),
             rendered=rendered, target_date=target_date, now=now, pass_kind=pass_kind,
             raise_alarm=raise_alarm,
         )
@@ -1474,31 +1522,12 @@ def _crashed(exc: Exception, raise_alarm: _RaiseAlarm) -> _NightEnd:
     return _NightEnd(outcome=trickle_state.RunOutcome.FAILED, reason=summary)
 
 
-def _select_stage(
-    cfg: LegibilityConfig,
-    selector: Selector,
-    projects_root: Path | str | None,
-    target_date: date,
-    pass_kind: PassKind,
-    *,
-    rendered: dict[tuple, str],
-) -> sampling.SampleResult:
-    """The night's sample; a retry skips the sessions the ledger holds.
-    *rendered* is the render cache the digest stage reuses."""
-    skip_sessions = (
-        _ledgered_sessions(cfg) if pass_kind is PassKind.RETRY else frozenset()
-    )
-    return selector(
-        cfg, projects_root if projects_root is not None else DEFAULT_PROJECTS_ROOT,
-        target_date, rendered=rendered, skip_sessions=skip_sessions,
-    )
-
-
 def _code_and_land(
     cfg: LegibilityConfig,
     resolved_config_path: Path,
     seams: _NightSeams,
     sample: sampling.SampleResult,
+    to_code: Sequence[sampling.ScoredRecord],
     *,
     rendered: dict[tuple, str],
     target_date: date,
@@ -1508,7 +1537,7 @@ def _code_and_land(
 ) -> _NightEnd:
     """The stages after sampling, in order: digest, code, merge, commit,
     ledger, census. The first stage to end the night returns its end."""
-    digests = _digest_stage(seams.digest_builder, sample, rendered=rendered, raise_alarm=raise_alarm)
+    digests = _digest_stage(seams.digest_builder, to_code, rendered=rendered, raise_alarm=raise_alarm)
     if isinstance(digests, _NightEnd):
         return digests
     cb = _load_codebook(cfg)
@@ -1545,14 +1574,14 @@ def _code_and_land(
 
 def _digest_stage(
     digest_builder: DigestBuilder,
-    sample: sampling.SampleResult,
+    to_code: Sequence[sampling.ScoredRecord],
     *,
     rendered: dict[tuple, str],
     raise_alarm: _RaiseAlarm,
 ) -> list[str] | _NightEnd:
-    """One digest per selected session. A session the builder could not
+    """One digest per session to code. A session the builder could not
     digest fails the night loud (decision 8) before any coding."""
-    digests, extractor_failures = digest_builder(sample.selected, rendered=rendered)
+    digests, extractor_failures = digest_builder(to_code, rendered=rendered)
     if not extractor_failures:
         return digests
     summary = f'legibility trickle extractor crashed on {len(extractor_failures)} session(s)'
@@ -1790,6 +1819,18 @@ def _parse_date(value: str) -> date:
     return date.fromisoformat(value)
 
 
+def _parse_barren_threshold(value: str) -> int:
+    """``--max-barren-runs`` as an int >= 1. Below 1, no barren streak lands
+    on the escalation schedule, so the nightly's alarm would be silently off."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'expected an integer, got {value!r}') from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f'must be 1 or greater, got {value!r}')
+    return parsed
+
+
 def run_scheduled_night(
     *,
     config_path: Path | str | None = None,
@@ -1849,7 +1890,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     undated run is the scheduled night (yesterday UTC) plus any retry the
     backlog owes (:func:`run_scheduled_night`); a ``--date`` run is a single
     pass. ``--max-barren-runs`` is every pass's barren-streak escalation
-    threshold. ``--dry-run`` is accepted for forward operator visibility but not
+    threshold (first escalation; see
+    ``trickle_state.BARREN_ESCALATION_MULTIPLES``). ``--dry-run`` is accepted for forward operator visibility but not
     yet wired to any behavior change. Returns the first non-zero
     :attr:`NightlyResult.exit_code` among the passes, else 0.
 
@@ -1889,8 +1931,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     run_parser.add_argument(
-        '--max-barren-runs', type=int, default=trickle_state.DEFAULT_MAX_BARREN_RUNS,
-        help='Consecutive barren runs on which the nightly escalates (default: %(default)s).',
+        '--max-barren-runs', type=_parse_barren_threshold,
+        default=trickle_state.DEFAULT_MAX_BARREN_RUNS,
+        help=(
+            'Barren-streak threshold: the nightly escalates when the streak '
+            'reaches it and again at the multiples in '
+            'trickle_state.BARREN_ESCALATION_MULTIPLES (default: %(default)s).'
+        ),
     )
     run_parser.add_argument(
         '--dry-run', action='store_true',

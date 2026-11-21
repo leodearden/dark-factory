@@ -1,10 +1,11 @@
 """Static census of the escalation categories a source tree files.
 
 Walks every non-test ``.py`` under the given roots and resolves the category
-passed to ``Escalation``, ``has_open_l1``, ``find_terminal_by_citation`` and
-every function that forwards its own ``category`` parameter to one of them,
-following values through constants, imports, local and tuple-unpacked
-assignments, and the returns of functions defined in the same module. It
+passed to ``Escalation``, ``has_open_l1``, ``find_terminal_by_citation``,
+``newest_terminal_by_task`` and every function that forwards its own
+``category`` parameter to one of them, following values through constants,
+imports, local and tuple-unpacked assignments, and the returns of functions
+defined in the same module. It
 cannot see fully dynamic values (subscripts, calls into other modules); only
 the submit-time check in ``escalation.categories`` catches those.
 """
@@ -23,6 +24,7 @@ _SEEDS: Mapping[str, int | None] = {
     'Escalation': 4,
     'has_open_l1': None,
     'find_terminal_by_citation': 1,
+    'newest_terminal_by_task': 1,
 }
 _ESCALATION_CLASS = 'escalation.models.Escalation'
 _REGISTRY_CLASS = 'escalation.categories.EscalationCategory'

@@ -949,6 +949,47 @@ class TestFormatUnattributedLandingDetail:
         assert 'no delivered_checks' in none_declared
         assert 'cap-x' in evaluated
 
+    @staticmethod
+    def _differential_block(**probe_extra: object) -> str:
+        """The rendered differential paragraph alone, without the raw ``probe:`` dump."""
+        probe = {
+            'task_id': '42', 'diverged_paths': [], 'delivered_checks_state': 'evaluated',
+            'delivered_checks_outcome': 'no_signal', 'delivered_checks_parent_ref': None,
+            'delivered_checks_legs': [],
+        }
+        probe.update(probe_extra)
+        detail = format_unattributed_landing_detail(
+            '42', 'task/42',
+            LandingEvidenceVerdict(
+                accepted=False, evidence_sha=None, reason='effect_absent', probe=probe,
+            ),
+        )[1]
+        [block] = [
+            paragraph for paragraph in detail.split('\n\n')
+            if paragraph.startswith('delivered-checks differential:')
+        ]
+        return block
+
+    def test_detail_names_the_rung_that_chose_the_parent_leg(self) -> None:
+        """Which baseline the differential ran against is runtime data (task 7836)."""
+        block = self._differential_block(
+            delivered_checks_parent_ref='9' * 40,
+            delivered_checks_baseline='recorded_branch_base',
+        )
+
+        assert '9' * 40 in block
+        assert 'recorded_branch_base' in block
+
+    def test_an_unavailable_baseline_reads_apart_from_a_run_that_recorded_none(self) -> None:
+        """A merge-commit tip on main with no trusted record runs no check.
+        Its block must say so, not read like a legacy probe with no baseline
+        and no legs, or an operator needs the raw probe to tell them apart."""
+        unavailable = self._differential_block(delivered_checks_baseline='unavailable')
+        unrecorded = self._differential_block()
+
+        assert unavailable != unrecorded
+        assert 'unavailable' in unavailable
+
 
 class TestFileUnattributedLandingEscalationDedup:
     """Category-scoped L1 dedup (task 3116).
@@ -2124,7 +2165,7 @@ class TestFileUnattributedLandingEscalationStampsCitationSha:
     """
 
     def _queue(self, tmp_path):
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         return EscalationQueue(tmp_path / 'queue')
 
@@ -2219,7 +2260,7 @@ class TestResolvedCitationSuppressesIdenticalRefile:
     SHA_B = 'c' * 40
 
     def _queue(self, tmp_path):
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         return EscalationQueue(tmp_path / 'queue')
 
@@ -2269,7 +2310,7 @@ class TestResolvedCitationSuppressesIdenticalRefile:
         return queue, pending[0].id
 
     def _seq(self, queue) -> str:
-        from escalation.queue import SEQ_COUNTER_SUFFIX  # noqa: PLC0415
+        from escalation.queue import SEQ_COUNTER_SUFFIX
 
         return (queue.queue_dir / f'esc-{self.TASK}{SEQ_COUNTER_SUFFIX}').read_text().strip()
 
@@ -2395,7 +2436,7 @@ class TestResolvedCitationSuppressesIdenticalRefile:
         Mirrors task 3116's ruling on the pending guard: a new root cause must
         never hide behind an unrelated adjudication.
         """
-        from escalation.models import Escalation  # noqa: PLC0415
+        from escalation.models import Escalation
 
         queue = self._queue(tmp_path)
         unrelated = Escalation(
@@ -2428,7 +2469,7 @@ class TestSuppressedRefileIsCounted:
     SHA_B = 'c' * 40
 
     def _queue(self, tmp_path):
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         return EscalationQueue(tmp_path / 'queue')
 
@@ -2547,7 +2588,7 @@ class TestSuppressionFailsOpen:
     SHA = 'b' * 40
 
     def _queue(self, tmp_path):
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         return EscalationQueue(tmp_path / 'queue')
 
@@ -2930,7 +2971,7 @@ class TestReportedClaimEscalation:
         )
 
     def _queue(self, tmp_path):
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         return EscalationQueue(tmp_path / 'queue')
 
@@ -3428,3 +3469,271 @@ class TestDeliveredChecksLeafIsTheCallers:
 
         assert verdict.accepted is True
         assert verdict.rescued_by_delivered_checks is True
+
+
+_CAPABILITY_FILE = 'pkg/cap.py'
+_CAPABILITY_CONTENT = _numbered('cap', 30) + 'def new_capability():\n    return 1\n'
+
+
+def _add_capability(repo: _Repo) -> str:
+    """``task/6276``'s first commit: it makes ``def new_capability`` true."""
+    return repo.commit('feat(6276): add the capability', {_CAPABILITY_FILE: _CAPABILITY_CONTENT})
+
+
+_OWN_EXTENSION = 'feat(6276): extend the capability'
+#: The subject ``TaskWorkflow._commit_amendment_wip`` gives a factory WIP save: it cites no task.
+_WIP_EXTENSION = 'wip: amendment round 1'
+
+
+def _extend_capability(repo: _Repo, subject: str = _OWN_EXTENSION) -> str:
+    """``task/6276``'s second commit, titled *subject*: lines of its own on top of the first."""
+    current = (repo.root / _CAPABILITY_FILE).read_text()
+    return repo.commit(subject, {_CAPABILITY_FILE: current + _numbered('more', 30)})
+
+
+_REWRITTEN_CAPABILITY = 'def new_capability():\n    return 2\n'
+
+
+def _land_and_rewrite(repo: _Repo, rewrites: dict[str, str]) -> None:
+    """Fast-forward ``task/6276`` into main, then rewrite *rewrites* there so survival rejects."""
+    repo.git('checkout', 'main')
+    repo.git('merge', '--ff-only', 'task/6276')
+    repo.commit('refactor: rewrite the modules', rewrites)
+
+
+def _build_landed_capability(repo: _Repo, *, extension: str | None) -> tuple[str, str]:
+    """``task/6276`` fast-forwarded into main, then its file rewritten there.
+
+    The branch is :func:`_add_capability`, then, unless *extension* is None,
+    an :func:`_extend_capability` commit titled *extension*.  Returns
+    ``(base, tip)``: main before the branch, and the branch tip, which is now
+    an ancestor of main.  The rewrite keeps ``def new_capability`` but drops
+    every line the tip added, so survival rejects the landing.
+    """
+    base = repo.sha('main')
+    repo.git('checkout', '-b', 'task/6276', 'main')
+    tip = _add_capability(repo)
+    if extension is not None:
+        tip = _extend_capability(repo, extension)
+    _land_and_rewrite(repo, {_CAPABILITY_FILE: _REWRITTEN_CAPABILITY})
+    return base, tip
+
+
+def _build_partly_landed_capability(repo: _Repo) -> tuple[str, str, str]:
+    """``task/6276`` with commit 1 fast-forwarded into main and commit 2 not.
+
+    Returns ``(base, landed, tip)``: main before the branch, commit 1 (now an
+    ancestor of main) and commit 2, which is still only on the branch.
+    """
+    base = repo.sha('main')
+    repo.git('checkout', '-b', 'task/6276', 'main')
+    landed = _add_capability(repo)
+    repo.git('checkout', 'main')
+    repo.git('merge', '--ff-only', 'task/6276')
+    repo.git('checkout', 'task/6276')
+    tip = _extend_capability(repo)
+    repo.git('checkout', 'main')
+    return base, landed, tip
+
+
+def _build_foreign_capability_under_a_landed_branch(
+    repo: _Repo, *, integrate: str,
+) -> tuple[str, str]:
+    """Another task makes the check true; ``task/6276`` integrates it, lands, and is rewritten.
+
+    ``task/6276`` is cut at the returned base and commits only its own
+    ``pkg/work.py``.  Main then gains task 9999's ``def new_capability``.
+    The branch takes that commit in by *integrate* (``'rebase'`` or
+    ``'merge'``), is fast-forwarded into main, and main rewrites both files,
+    keeping ``def new_capability``, so survival rejects.  Returns ``(base, tip)``: the
+    dispatch-time main the task recorded, which now predates the foreign
+    commit, and the branch tip.
+    """
+    base = repo.sha('main')
+    repo.git('checkout', '-b', 'task/6276', 'main')
+    repo.commit('feat(6276): add the work', {'pkg/work.py': _numbered('work', 30)})
+    repo.git('checkout', 'main')
+    repo.commit(
+        'feat(9999): another task adds the capability',
+        {_CAPABILITY_FILE: _CAPABILITY_CONTENT},
+    )
+    repo.git('checkout', 'task/6276')
+    if integrate == 'rebase':
+        repo.git('rebase', 'main')
+    else:
+        repo.git('merge', '--no-ff', '--no-edit', 'main')
+    tip = repo.sha('HEAD')
+    _land_and_rewrite(
+        repo, {'pkg/work.py': 'rewritten = True\n', _CAPABILITY_FILE: _REWRITTEN_CAPABILITY},
+    )
+    return base, tip
+
+
+class _UnresolvedForkPointGitOps(GitOps):
+    """A real GitOps whose fork-point query fails, as a broken ``git merge-base`` would."""
+
+    async def merge_base_with_main(self, ref: str) -> str | None:
+        return None
+
+
+def _side_commit(repo: _Repo, base: str) -> str:
+    """A commit off *base* that no ``task/6276`` commit descends from."""
+    repo.git('checkout', '-b', 'side', base)
+    side = repo.commit('chore: side work', {'pkg/side.py': _numbered('side', 5)})
+    repo.git('checkout', 'main')
+    return side
+
+
+async def _discover_6276(
+    git_ops: GitOps, tip: str, *, branch_base_sha: str | None = None,
+) -> LandingVerdict:
+    return await validate_landing_evidence(
+        git_ops, '6276', 'task/6276', branch_tip_sha=tip,
+        delivered_checks=[_grep_check()], checks_enabled=True,
+        branch_base_sha=branch_base_sha,
+    )
+
+
+@pytest.mark.asyncio
+class TestDeliveredChecksDifferentialRealGitDiscovery:
+    """The differential's parent leg for a branch tip already on main (task 7836).
+
+    There the fork point from main IS the tip, so the parent leg must come
+    from the recorded ``branch_base_sha`` or, failing that, the tip's first
+    parent, and never from the tip itself.
+    """
+
+    async def test_ff_landed_branch_rescued_from_its_recorded_base(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        """Two-commit branch fast-forwarded into main, then rewritten there."""
+        repo = _Repo(real_git_repo)
+        base, tip = _build_landed_capability(repo, extension=_OWN_EXTENSION)
+        assert repo.is_ancestor(tip, 'main')
+
+        verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=base)
+
+        assert verdict.probe['effect_check_sha'] == tip
+        assert verdict.accepted is True
+        assert verdict.reason == 'ok'
+        assert verdict.method is LandingMethod.citation
+        assert verdict.evidence_sha == tip
+        assert verdict.probe['delivered_checks_outcome'] == 'confirmed'
+        assert verdict.probe['delivered_checks_parent_ref'] == base
+        assert verdict.probe['delivered_checks_baseline'] == 'recorded_branch_base'
+        [leg] = verdict.probe['delivered_checks_legs']
+        assert (leg['parent'], leg['citation'], leg['main']) == (
+            'failed', 'delivered', 'delivered',
+        )
+
+    async def test_single_commit_ff_landing_without_a_record_uses_the_tips_first_parent(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        """One-commit branch fast-forwarded into main, no recorded base."""
+        repo = _Repo(real_git_repo)
+        _base, tip = _build_landed_capability(repo, extension=None)
+
+        verdict = await _discover_6276(real_git_ops, tip)
+
+        assert verdict.accepted is True
+        assert verdict.probe['delivered_checks_outcome'] == 'confirmed'
+        assert verdict.probe['delivered_checks_parent_ref'] == f'{tip}^1'
+        assert verdict.probe['delivered_checks_baseline'] == 'first_parent'
+
+    @pytest.mark.parametrize('record', ['malformed', 'foreign', 'degenerate'])
+    async def test_an_unusable_record_is_never_trusted(
+        self, real_git_ops: GitOps, real_git_repo: Path, record: str,
+    ) -> None:
+        """A malformed, off-branch or tip-equal record falls through to ``tip^1``."""
+        repo = _Repo(real_git_repo)
+        base, tip = _build_landed_capability(repo, extension=_OWN_EXTENSION)
+        recorded = {
+            'malformed': lambda: 'not-a-sha',
+            'foreign': lambda: _side_commit(repo, base),
+            'degenerate': lambda: tip,
+        }[record]()
+
+        verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=recorded)
+
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_parent_ref'] == f'{tip}^1'
+        assert verdict.probe['delivered_checks_baseline'] == 'first_parent'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+
+    @pytest.mark.parametrize('integrate', ['rebase', 'merge'])
+    async def test_a_record_predating_foreign_commits_is_never_trusted(
+        self, real_git_ops: GitOps, real_git_repo: Path, integrate: str,
+    ) -> None:
+        """A rebased or main-merged branch keeps its dispatch-time record, so
+        ``record..tip`` carries another task's commit: the record falls
+        through, to ``tip^1`` for a rebased tip and to no baseline for a
+        merge-commit tip, and the capability is never credited to this task."""
+        repo = _Repo(real_git_repo)
+        base, tip = _build_foreign_capability_under_a_landed_branch(repo, integrate=integrate)
+        assert repo.is_ancestor(base, tip)
+        assert repo.is_ancestor(tip, 'main')
+
+        verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=base)
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+        if integrate == 'rebase':
+            assert verdict.probe['delivered_checks_baseline'] == 'first_parent'
+            assert verdict.probe['delivered_checks_parent_ref'] == f'{tip}^1'
+        else:
+            assert verdict.probe['delivered_checks_baseline'] == 'unavailable'
+            assert verdict.probe['delivered_checks_parent_ref'] is None
+            assert verdict.probe['delivered_checks_legs'] == []
+
+    async def test_the_tasks_own_uncited_wip_commit_refuses_the_record(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        """A pinned limit, not a defect: a factory WIP save cites no task, so
+        rung 3 cannot tell it from a foreign commit and refuses the record.
+        The differential falls back to ``tip^1``, which already carries the
+        capability, so a genuine landing reads no_signal (never a false accept)."""
+        repo = _Repo(real_git_repo)
+        base, tip = _build_landed_capability(repo, extension=_WIP_EXTENSION)
+
+        verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=base)
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_baseline'] == 'first_parent'
+        assert verdict.probe['delivered_checks_parent_ref'] == f'{tip}^1'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+
+    async def test_a_real_fork_point_outranks_the_record(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        """Commit 1 landed, commit 2 still only on the branch."""
+        repo = _Repo(real_git_repo)
+        base, landed, tip = _build_partly_landed_capability(repo)
+
+        verdict = await _discover_6276(real_git_ops, tip, branch_base_sha=base)
+
+        assert verdict.probe['citation'] == landed
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_parent_ref'] == landed
+        assert verdict.probe['delivered_checks_baseline'] == 'fork_point'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+
+    async def test_an_unresolved_fork_point_never_promotes_the_record(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        """Commit 2 off main, fork point unresolvable: the record stays unconsulted."""
+        repo = _Repo(real_git_repo)
+        base, _landed, tip = _build_partly_landed_capability(repo)
+        assert not repo.is_ancestor(tip, 'main')
+
+        verdict = await _discover_6276(
+            _UnresolvedForkPointGitOps(real_git_ops.config, real_git_repo),
+            tip, branch_base_sha=base,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_parent_ref'] == f'{tip}^1'
+        assert verdict.probe['delivered_checks_baseline'] == 'first_parent'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'

@@ -11,6 +11,7 @@ server went on to complete.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -75,13 +76,21 @@ async def test_a_new_collection_is_created_at_the_configured_width_under_cosine_
 async def test_a_create_overrunning_the_write_budget_raises_a_timeout_naming_it_and_the_next_call_adopts_the_server_completed_collection(
     config, target,
 ):
-    config.queue.backend_write_timeout_seconds = 0.5
-    with stub_qdrant_server(create_delay_s={target: 3.0}) as stub:
-        async with backend_against(stub.url, config) as backend:
-            with pytest.raises(TimeoutError, match=r'Mem0 create_collection timed out after 0\.5s'):
+    squeezed = config.model_copy(deep=True)
+    squeezed.queue.backend_write_timeout_seconds = budget = 0.5
+    with stub_qdrant_server(
+        create_delay_s={target: 2 * budget},
+        # mem0 lists collections while it builds an instance: held past the squeeze,
+        # so the next call fails outright, not flakily, if it ever inherits the squeeze.
+        list_collections_delay_s=2 * budget,
+    ) as stub:
+        async with backend_against(stub.url, squeezed) as backend:
+            with pytest.raises(TimeoutError, match=re.escape(f'Mem0 create_collection timed out after {budget}s')):
                 await backend.get(MEMORY_ID, SCOPE)
-            stub.release_event.set()
-            assert stub.wait_created(target, timeout=10)
+        assert stub.wait_created(target, timeout=10), (
+            f'create never completed server-side; creates received={stub.creates(target)}'
+        )
+        async with backend_against(stub.url, config) as backend:
             assert await backend.get(MEMORY_ID, SCOPE) is None
         assert stub.creates(target) == 1
 

@@ -152,6 +152,7 @@ marked `done` on the strength of an unverified claim.
 | `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required; `stamped_at` written server-side (see below) |
 | `deterministic-deploy` | `DeterministicRunner` cross-unit deploy completed | — |
 | `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run`; dependents wait until the restart is verified (see `docs/deterministic-runner.md` §2) | — |
+| `deterministic-deploy-unverified` | `DeterministicRunner` cross-unit deploy with no `before_done.target_unit`: the script exited 0 (or a human resolved its gate or failure); no unit was inspected or verified | — |
 | `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | `escalation_id` **required on write** — cites the resolving gate escalation, recorded verbatim (no cross-service lookup) |
 | `deterministic-milestone` | A `kind='predicate'` milestone check exited `0` | — |
 | `operational-verified` | A `normal`-task no-code operational ask closed via a resolved escalation, not a merge | `escalation_id` **and** `note` required |
@@ -186,7 +187,7 @@ callers, on both the fresh `done` transition and the same-status
 `done`→`done` repair path — a recon stage may never self-authorize an
 operational close.
 
-The four `deterministic-*` kinds carry a caller bar of the same shape, with
+The five `deterministic-*` kinds carry a caller bar of the same shape, with
 two factors (PRD `plans/memory-auto-consolidation-prd.md` C5/D11, where the
 rationale lives). They are accepted only from a caller whose resolved
 identity matches a prefix in
@@ -981,7 +982,7 @@ action); task goes `blocked` until resolved.
 |---|---|---|---|
 | present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
 | present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask (incompatible with `human_curator_gate`) |
-| absent | `true` | escalate born-at-L2 immediately; `done` after `resume`; re-fires instead if resumed behind a new dependency, external dependency or milestone | **pure gate** |
+| absent | `true` | escalate born-at-L2 immediately; `done` on `resume` (immediately, unless it waits on a dependency, milestone or `deferred_watch`, or carries any `external_deps` or delivered-check dependency — see `docs/deterministic-runner.md` §"Resuming a pure gate"); re-fires instead if resumed behind a new dependency, external dependency or milestone | **pure gate** |
 | absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
 
 **Validation (enforced at `submit_task`):** `task_kind='deterministic'`
@@ -1005,17 +1006,28 @@ open (quiescence guard — no re-dispatch, no churn).
   existence and the executable bit before the unit is registered; an
   unrunnable script blocks the task instead of marking it `scheduled`
   (`docs/deterministic-runner.md` §2).
-- `before_done.target_unit` differs from own unit (or is `None`) →
-  blocking subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify
-  against a pre-run baseline (done = `deployed-and-verified`).
+- `before_done.target_unit` names a unit other than own → blocking
+  subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify against a
+  pre-run baseline (done = deployed-and-verified, kind
+  `deterministic-deploy`).
+- `before_done.target_unit` is `None` or omitted → blocking subprocess
+  driven on the script's exit code ALONE, with no baseline inspect and no
+  fresh-PID verify, because there is no unit to inspect (task 2632 /
+  esc-2585-1). Done means the script exited 0. Every done write for such a
+  deploy, the crash, human-resolution and gate resumes included, records
+  kind `deterministic-deploy-unverified`; the rule's home is
+  `orchestrator/src/orchestrator/deterministic_runner.py::_deploy_done_kind`.
 
 **Runner stamps** (written by `DeterministicRunner`, never
 author-supplied): `before_done_ran_at`, `before_done_verified_at`,
 `gate_escalated_at`, `gate_escalated_preconditions` (pure gates only), and
-`done_provenance` (stamped for all four
+`done_provenance` (stamped for all five
 `deterministic-*` kinds — see the requirement table in §2 for
 per-kind semantics; `deterministic-milestone` is stamped on both the
 first-pass check and the post-escalation re-check described in §6).
+Both gate stamps are removed by fused-memory when the task enters or
+leaves `done`/`cancelled` (task 3638), so a closed gate carries neither
+and a reopened one files afresh.
 
 A **pure-gate** close cites the resolving `milestone_gate` record via
 `done_provenance.escalation_id`, exactly as the curator-gate close already
@@ -1031,13 +1043,14 @@ dependency (by CLAUDE.md's `planning_mode=True` → `add_dependency` →
 fresh gate escalation itself, because the task now waits on more than its
 `gate_escalated_preconditions` record (rationale:
 `docs/deterministic-runner.md` §3), so nobody clears `gate_escalated_at` by
-hand. Wiring the hold after the resume races: the task re-pends with
-nothing new to wait on and closes. One transitional exception: a gate
-whose metadata has no `gate_escalated_preconditions` record fired before
-task 9520 deployed, and closes when the hold lands. For it, set
-`gate_escalated_at` to null after wiring the hold and before the resume,
-so the gate files afresh. The exception can go once no blocked gate lacks
-the record.
+hand. The hold must be wired BEFORE the resume: a resume with nothing new
+to wait on closes the gate at once, at resolution time (task 3638). One
+transitional exception: a gate whose metadata has no
+`gate_escalated_preconditions` record fired before task 9520 deployed, and
+closes when the hold lands. For it, set `gate_escalated_at` to null after
+wiring the hold and before the resume; with no stamp it is not a held pure
+gate, so the resume re-pends it and it files afresh on dispatch. The
+exception can go once no blocked gate lacks the record.
 
 **`done_provenance.kind='operational-verified'`** — a related but distinct
 closure path (see §2), used for `normal`-task no-code operational asks
@@ -1565,7 +1578,7 @@ flows) — is exempted from the `unknown_key` scan even though these are not
 (yet) typed `TaskMetadata` fields. This is `_BLESSED_METADATA_KEYS` in
 `shared/src/shared/task_metadata.py`:
 
-<!-- tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:begin -->
 ```
 source, modules, spawn_context, complexity, force_full_path,
 branch_base_sha, _causation_id, dry_run_proposals, reblock_guard,
@@ -1579,14 +1592,14 @@ before_done_verified_pid, files_tagged_at, files_tagged_empty,
 source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
-human_curator_adjudicated_at, last_blocked_at, recurrence,
-execution_class, pure_gate_from, merge_lane, pending_since,
+human_curator_adjudicated_at, last_blocked_at, merge_first_enqueued_at,
+merge_phase_liveness, recurrence, execution_class, pure_gate_from, merge_lane, pending_since,
 pending_since_backfilled, claimant_exception, audit_trail_rotation,
 plan_text_fp, plan_authored_at,
 main_health_signature, superseded_by, cancel_dispositions, trigger_chain,
 predicate_recheck, predicate_verdict
 ```
-<!-- /tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:end -->
 
 This listing is **machine-checked** against the live frozenset by
 `tests/scripts/test_task_authoring_blessed_keys_drift.py` (task 3780), which
@@ -1950,7 +1963,7 @@ new row whose canonical is unblessed fails the suite rather than silently
 re-creating that task's defect, where authors were told to migrate to
 `related_tasks` and still minted a census line.
 
-<!-- tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:begin -->
 
 | Canonical | Aliases to avoid |
 |---|---|
@@ -1960,7 +1973,7 @@ re-creating that task's defect, where authors were told to migrate to
 | `source_finding_id` | `origin_finding_id`, `origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id` |
 | `superseded_by` | `x_superseded_by`, `x_subsumed_by`, `subsumed_by`, `x_coalesced_into`, `x_replacement` |
 
-<!-- /tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:end -->
 
 **The finding-provenance row splits into two classes** (ruling:
 `esc-3796-1`, 2026-08-17). `origin_finding_id` is the **retired** alias and
@@ -2127,6 +2140,23 @@ oblige every future task write quoting this section to set the override,
 which is precisely the loop this section exists to break. For the full
 picture see `docs/mcp-toolcall-xml-leak.md` §4, "The boundary rejection".
 
+### `allow_uuid_prefix`: a write-time flag, not a metadata key
+
+`metadata={'allow_uuid_prefix': True}` (a literal `True` only) is the
+sanctioned move for a write that **deliberately quotes a bare truncated
+uuid**, such as a correction record citing a bad citation verbatim: the
+uuid-prefix boundary guard then forwards the call without resolving or
+expanding the prefix. It is honoured only on tools that declare
+`metadata`, and it is stripped before persistence exactly as
+`allow_mcp_markup` is, so it never lands in stored metadata. It is
+**never** the remedy for an `ambiguous_uuid_prefix` rejection: that
+rejection means the prefix names more than one record, so put the full
+uuid you meant into the rejection's `original_call` and resubmit that. The
+guard's policy is stated once, in `plans/uuid-prefix-resolution-prd.md`
+§4 C3 (**Override.**), and the strip lives in
+`shared/src/shared/uuid_prefix.py::strip_uuid_prefix_override`; neither is
+restated here.
+
 ### Promoting a convention
 
 A key only stops warning once it's added to the `_BLESSED_METADATA_KEYS`
@@ -2157,15 +2187,30 @@ it. Generalising: prefer blessing when validation is context-dependent, when
 the live corpus already contains values a type would reject, or when the
 apparent enum is not the thing writers are actually held to.
 
-### Known gaps (re-measured 2026-10-02 — none open)
+### Known gaps (re-measured 2026-11-15 — one tracked by a follow-up ticket)
 
-No tracked `unknown_key` source is open. All counts are a snapshot of a
-**growing** corpus, not an invariant: 4748 tasks carried dict metadata at
-the latest corpus-wide measurement
-(2026-08-31), up from 4204 on 2026-08-18 and 3553 when this section was
-first written. Across that corpus 1516 tasks emit at least one
-`unknown_key` line, 3130 lines over 1028 distinct spellings; those are
-untracked Tier-C keys, not gaps this section owns.
+All counts are a snapshot of a **growing** corpus, not an invariant: 9950
+tasks carried dict metadata at the latest corpus-wide measurement
+(2026-11-15, submodel registrations imported), up from 4748 on 2026-08-31
+and 3553 when this section was first written. Across that corpus 1614 tasks
+emit at least one `unknown_key` line, 3416 lines over 1055 distinct
+spellings; most are untracked Tier-C keys, not gaps this section owns.
+
+The largest remaining machine-written `unknown_key` source is the flake
+ledger's `flake_debt_*` keys
+(`orchestrator/src/orchestrator/flake_ledger.py::_deflake_metadata`, 128
+carriers each for `test`, `open_count` and `opened_at`), filed as follow-up
+ticket `tkt_0RX0D4E9Y4DDHGVS4J3MSYFDQP`.
+
+**The merge-lane stamps `merge_first_enqueued_at` and
+`merge_phase_liveness` are CLOSED** — task 5281 blessed both into Tier-A.
+Recorded in the same shape as the rows below so a reader arriving from an
+older revision does not re-open them: the fork was **decided, not
+deferred**. Typing was rejected because `merge_phase_liveness` has no
+reader left, and `x_`-renaming because one key has a live writer and the
+other a live reader. See the frozenset entry in
+`shared/src/shared/task_metadata.py` for the census and the writer/reader
+trail; the figures are not restated here.
 
 **The two rows this table last carried are CLOSED**, recorded in the same
 shape as the `execution_class` row below so a reader arriving from an older

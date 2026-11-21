@@ -10,6 +10,7 @@ import posixpath
 import re
 import stat
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from types import UnionType
 from typing import Annotated, Any, Literal, NamedTuple, Union, get_args, get_origin
@@ -1440,6 +1441,15 @@ class VerifyCacheConfig(BaseModel):
         return CacheMode.OFF
 
 
+class DepthRow(NamedTuple):
+    """One ``merge_deep.depth_table`` row: chain ``depth`` items when the
+    rolling per-item pass estimate is at least ``min_pass_estimate``.
+    """
+
+    min_pass_estimate: float
+    depth: int
+
+
 class MergeDeepConfig(BaseModel):
     """Deep merge-ahead chains (task 3183, plans/deep-merge-ahead-prd.md α).
 
@@ -1447,20 +1457,17 @@ class MergeDeepConfig(BaseModel):
     worktree, sequential in-order merges, one verify on the tip) instead of one
     item at a time, so a passing tip lands the whole clean prefix in one round.
 
-    ``chain_cap`` is the single gate for the whole feature. The dispatch contract
-    it feeds (when a chain is built, and how ``target_depth`` is derived) and the
-    cap-staging plan live in the PRD, which is the ONE canonical narrative for
-    both — deliberately not restated here, because β (task 3184, the chain
-    builder) and γ (task 3185, the dispatch gate) are the consumers that
-    implement that contract and may change it.
+    ``chain_cap`` is the KILL SWITCH and nothing else (task 8528): 0 (the
+    shipped default) means no chain code runs on any dispatch path, so
+    behaviour is byte-identical to pre-PRD merging — the ``probe_fraction=0.0``
+    precedent in :class:`SpeculationProbeConfig`. Any positive value turns
+    chains on and bounds nothing. Depth comes from ``depth_table`` through the
+    rolling per-item pass estimate, and every member of a failed chain next
+    verifies alone; plans/merge-lane-policy-prd.md D6/D7 is the one canonical
+    narrative for both, deliberately not restated here.
 
     ``chain_build_timeout_secs`` bounds one chain build (lane acquisition plus
     the merges) inside ``SpeculativeMergeWorker._deep_chain_placement``.
-
-    ``chain_cap=0`` (the shipped default) is the KILL SWITCH: the gate can never
-    open, so no chain code runs on any dispatch path and behaviour is
-    byte-identical to pre-PRD merging — the ``probe_fraction=0.0`` precedent in
-    :class:`SpeculationProbeConfig`.
 
     Plain BaseModel (no ``frozen``, no ``validate_assignment``) so ``_set_leaf``
     can mutate it in place on hot-reload and held references observe the update
@@ -1475,13 +1482,28 @@ class MergeDeepConfig(BaseModel):
         default=0,
         ge=0,
         description=(
-            'Maximum number of queued items a single deep merge-ahead chain may '
-            'contain. 0 (the default) disables the feature entirely -- the kill '
-            'switch: no chain is ever built, so merge behaviour is byte-identical '
-            'to pre-task-3183 behaviour. Must be >= 0; a negative cap is rejected '
-            'at load rather than reaching dispatch. No upper bound is imposed. '
-            'See plans/deep-merge-ahead-prd.md for the dispatch contract this '
-            'gates and for the cap-staging plan.'
+            'Kill switch for deep merge-ahead chains. 0 (the default) disables '
+            'the feature entirely: no chain is ever built, so merge behaviour is '
+            'byte-identical to pre-task-3183 behaviour. Any positive value turns '
+            'chains on; it does not bound chain depth, which depth_table sets. '
+            'Must be >= 0; a negative cap is rejected at load rather than '
+            'reaching dispatch. See plans/merge-lane-policy-prd.md D6/D7.'
+        ),
+    )
+    depth_table: list[DepthRow] = Field(
+        default_factory=lambda: [
+            DepthRow(0.992, 12), DepthRow(0.990, 11), DepthRow(0.988, 10), DepthRow(0.984, 9),
+            DepthRow(0.979, 8), DepthRow(0.972, 7), DepthRow(0.959, 6), DepthRow(0.934, 5),
+            DepthRow(0.876, 4), DepthRow(0.75, 3),
+        ],
+        description=(
+            'Chain depth by rolling per-item pass estimate: the first row whose '
+            'min_pass_estimate the estimate meets gives the depth, and an '
+            'estimate below every row chains nothing (depth 1). Rows are '
+            '[min_pass_estimate, depth] pairs, thresholds in [0, 1] and depths '
+            '>= 2, both strictly descending. A [0.0, N] row always chains N. '
+            'The default puts each depth where it starts to cost fewer verifies '
+            'per item than the depth below. See plans/merge-lane-policy-prd.md D7.'
         ),
     )
     chain_build_timeout_secs: float = Field(
@@ -1504,6 +1526,39 @@ class MergeDeepConfig(BaseModel):
             'with a WARNING. Read live at each chain\'s confirm; must be > 0.'
         ),
     )
+
+    @field_validator('depth_table', mode='after')
+    @classmethod
+    def _validate_depth_table(cls, table: list[DepthRow]) -> list[DepthRow]:
+        if not table:
+            raise ValueError(
+                'depth_table must not be empty: depth 1 is the implicit else-row '
+                'and chain_cap: 0 is the only kill switch'
+            )
+        out_of_range = [row for row in table if not 0.0 <= row.min_pass_estimate <= 1.0]
+        if out_of_range:
+            raise ValueError(
+                f'depth_table thresholds must lie in [0, 1]; offending rows: {out_of_range!r}'
+            )
+        too_shallow = [row for row in table if row.depth < 2]
+        if too_shallow:
+            raise ValueError(
+                f'depth_table depths must be >= 2 (depth 1 is the implicit '
+                f'else-row); offending rows: {too_shallow!r}'
+            )
+        for column in ('min_pass_estimate', 'depth'):
+            unordered = [
+                later
+                for earlier, later in pairwise(table)
+                if getattr(later, column) >= getattr(earlier, column)
+            ]
+            if unordered:
+                label = 'thresholds' if column == 'min_pass_estimate' else 'depths'
+                raise ValueError(
+                    f'depth_table {label} must be strictly descending; offending '
+                    f'rows: {unordered!r}'
+                )
+        return table
 
 
 class RetentionConfig(BaseModel):
@@ -2507,7 +2562,8 @@ class GitConfig(BaseModel):
         ge=0,
         description=(
             'Extra warm task-lanes allocated ABOVE the derived pool size '
-            '(max_concurrent_tasks); effective pool N = max_concurrent_tasks + '
+            '(max_concurrent_tasks + main_health_fix_reserved_slots); effective '
+            'pool N = max_concurrent_tasks + main_health_fix_reserved_slots + '
             'spare_warm_lanes when warm_lane_pool is on (read once at startup by '
             'Harness, passed to GitOps). Gives acquire headroom so a transient '
             'lane-leak / stuck-ASSIGNED lane does not exhaust the pool and force '
@@ -2523,7 +2579,8 @@ class GitConfig(BaseModel):
             'warm-lane pool on disk at startup (GitOps.prewarm_pool), instead of '
             'letting each _lane-k be created lazily on its first acquire.  Root '
             'cause it addresses: the pool is effective_N = max_concurrent_tasks + '
-            'spare_warm_lanes FREE lanes in memory, but the on-disk git worktree '
+            'main_health_fix_reserved_slots + spare_warm_lanes FREE lanes in '
+            'memory, but the on-disk git worktree '
             'add for each lane happens only in the acquire create-once branch, '
             'lowest-numbered-first — so on a host peaking below effective_N the '
             'spare lanes are never demanded, never created, and the intended '
@@ -3824,6 +3881,10 @@ class OrchestratorConfig(BaseSettings):
 
     # Concurrency
     max_concurrent_tasks: int = Field(default=3)
+    # Run slots outside max_concurrent_tasks that only a main-health fix task may
+    # take, used when every general slot is held; 0 disables. Restart-only (not in
+    # RELOADABLE_FIELDS). Rationale: docs/main-health-fix-run-slot-reserve.md.
+    main_health_fix_reserved_slots: int = Field(default=1, ge=0)
     max_per_module: int = Field(default=1)
     lock_depth: int = Field(default=2)
     module_overrides: dict[str, int] = Field(default_factory=dict)
@@ -4283,18 +4344,16 @@ class OrchestratorConfig(BaseSettings):
     # configs that do not merge defaults.yaml keep the old fallback behaviour.
     merge_verify_cold_command_timeout_secs: float | None = Field(default=None)
     merge_verify_workspace: bool = Field(default=False)
-    # Staged-rollout gate for the broad merge gate (λ, task 2589).  'scoped'
-    # (default) is the legacy per-touched-module verify plan — byte-identical
-    # rollback path.  'full' makes merge-role (role='merge') verify run EVERY
-    # REGISTERED module's full suite (pytest+ruff+pyright, per configured
-    # command), not just the modules touched by the merging diff — closing
-    # the source-only-diff hole where an untouched sibling module's tests
-    # never ran at merge time.  Restart-only: deliberately NOT in
-    # RELOADABLE_FIELDS, because flipping the gate's breadth mid-process
-    # could split behaviour across an in-flight merge on the most
-    # load-bearing lane.  Flipped 'scoped' → 'full' by the σ capstone and
-    # activated by the τ deterministic-deploy fleet restart.
-    merge_verify_breadth: Literal['scoped', 'full'] = Field(default='scoped')
+    # Breadth of the merge-role (role='merge') verify gate.  'full' (the
+    # shipped default, task 7008) runs EVERY REGISTERED module's full suite
+    # (pytest+ruff+pyright, per configured command) on the merged tree,
+    # whatever the diff touched; 'scoped' is the per-project opt-down to the
+    # legacy per-touched-module plan.  The paired task/merge verify policy is
+    # stated once, in defaults.yaml's merge_verify_breadth comment.
+    # Restart-only: deliberately NOT in RELOADABLE_FIELDS, because flipping
+    # the gate's breadth mid-process could split behaviour across an
+    # in-flight merge on the most load-bearing lane.
+    merge_verify_breadth: Literal['scoped', 'full'] = Field(default='full')
     # Soundness narrowing for the CAS-loop disjoint-delta fast path (the
     # 2026-09-22 whole-tree-drift incident).  ``merge_gates._reverify_rebased_tree``
     # skips the post-rebase re-verify when the branch's touched files and the
@@ -4318,8 +4377,9 @@ class OrchestratorConfig(BaseSettings):
     # behaviour (disjointness alone clears the gate) if the extra re-verifies
     # ever have to be traded away under load; the P1 arm keyed on
     # ``merge_verify_breadth == 'full'`` is NOT covered by this switch,
-    # because a project that has declared a whole-tree gate has declared the
-    # skip unsound outright.
+    # because a project whose merge gate is whole-tree (breadth 'full', the
+    # shipped default unless it opts down to 'scoped') has made the skip
+    # unsound outright.
     #
     # GREEN TIER (see RELOADABLE_FIELDS below, and OPERATIONS.md
     # section "Config reload vs restart").  Unlike its restart-only
@@ -4358,7 +4418,7 @@ class OrchestratorConfig(BaseSettings):
     # local RunnerUnavailable -> fail-safe (trust the remote green, emit
     # verify_cross_check_inconclusive).  Default True is safety-first per the
     # loud-over-silent norm AND provably INERT on main today: reify's
-    # verify_runners is not yet enabled, so _run_post_merge_verify always gets
+    # verify_runners is not yet enabled, so merge_lane/post_merge_verify.py::run_post_merge_verify always gets
     # runner=None (local dispatch path) and the ``runner is not None``
     # cross-check branch never executes — zero behaviour change until Lever C
     # is turned on.  UNLIKE its restart-only merge_verify_workspace /
@@ -4424,9 +4484,9 @@ class OrchestratorConfig(BaseSettings):
     # Per-role cgroup v2 cpu.weight each verify scope is spawned with
     # (`systemd-run -p CPUWeight=`), only when verify_use_cgroup_scope is on.
     # nice orders threads only INSIDE one cgroup, so without a weight the role
-    # tiers are inert across sibling scopes. task/background are lowered rather than merge raised, so the
-    # merge scope stays at parity (100) with each orchestrator unit and the
-    # operator's terminals under app.slice; 33/10 keep the 3:1 merge:task intent.
+    # tiers are inert across sibling scopes. The weights split the project's
+    # df-<project_id>.slice among its verify scopes and its daemon (contract:
+    # docs/cgroup-slice-topology.md); 33/10 keep the 3:1 merge:task intent.
     verify_cgroup_cpu_weight_merge: int = Field(default=100, ge=1, le=10000)
     verify_cgroup_cpu_weight_task: int = Field(default=33, ge=1, le=10000)
     verify_cgroup_cpu_weight_background: int = Field(default=10, ge=1, le=10000)
@@ -5522,6 +5582,9 @@ class OrchestratorConfig(BaseSettings):
     test_command: str = Field(default='pytest')
     lint_command: str = Field(default='ruff check')
     type_check_command: str = Field(default='pyright')
+    # When a no-module-config fallback verify's test slot runs nothing, True lets it
+    # pass and False fails it as no_tests_ran; see docs/fallback-test-floor.md.
+    verify_allow_no_tests_ran: bool = Field(default=False)
 
     # Fused memory
     fused_memory: FusedMemoryConfig = Field(default_factory=FusedMemoryConfig)
@@ -6678,7 +6741,7 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
         hard_findings = [
             f for f in audit_census_ignore_entries(config_path) if f.kind in HARD_KINDS
         ]
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         # Deliberately broad but ALWAYS logged at WARNING, never a silent
         # swallow (which is what shared/tests/test_silent_fallthrough_gate.py
         # ratchets against).  Breadth is the point here: load_config runs on
@@ -6803,10 +6866,10 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # hot-reloadable with no separate RELOADABLE_FIELDS edit.
     _submodel_leaf_paths('speculation_probe', SpeculationProbeConfig),
     # Deep merge-ahead chains (task 3183, PRD alpha, decision #7) — a new
-    # dedicated submodel, same whole-submodel-group idiom: chain_cap (and any
-    # knob beta/gamma add later) is green-tier hot-reloadable with no separate
-    # RELOADABLE_FIELDS edit, so the cap can be raised, retuned, or killed
-    # (-> 0) without a restart. See MergeDeepConfig for the rest.
+    # dedicated submodel, same whole-submodel-group idiom: chain_cap,
+    # depth_table and any later knob are green-tier hot-reloadable with no
+    # separate RELOADABLE_FIELDS edit, so chains can be turned on, retuned or
+    # killed (chain_cap -> 0) without a restart. See MergeDeepConfig.
     _submodel_leaf_paths('merge_deep', MergeDeepConfig),
     # Verify-result cache (task 5652): read per verify decision, so green tier;
     # each role's mode is its own leaf, so a task-only edit applies alone.
@@ -6961,6 +7024,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # split), so an operator can tune or disable the pre-provision live
         # without a restart.
         'verify_cold_preprovision_command',
+        # Read fresh off the config at each fallback verify; decides one verdict only.
+        'verify_allow_no_tests_ran',
         # Per-land remote-green cross-check gate (task 2822, fix b) — green-tier
         # unlike its restart-only merge_verify_workspace/merge_verify_breadth
         # siblings: it only ever ADDS a second-opinion local verify, so flipping

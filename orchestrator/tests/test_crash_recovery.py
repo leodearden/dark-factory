@@ -4100,11 +4100,11 @@ class TestSessionResumeStorm:
         — so this one still covers EXACTLY the predicate, which is what makes
         its equality assertion meaningful.
         """
-        import ast  # noqa: PLC0415 — structural read of one method's source
-        import inspect  # noqa: PLC0415
-        import textwrap  # noqa: PLC0415
+        import ast  # structural read of one method's source
+        import inspect
+        import textwrap
 
-        import orchestrator.harness as harness_mod  # noqa: PLC0415
+        import orchestrator.harness as harness_mod
         from orchestrator.harness import _BY_DESIGN_SESSION_RESUME_REASONS
 
         # Strings the method uses that are NOT reasons. Every one is a key read
@@ -4182,13 +4182,13 @@ class TestSessionResumeStorm:
         producible set, nothing could feed the streak and INV-4's escape would
         be inert again — precisely the condition ε exists to end.
         """
-        import ast  # noqa: PLC0415 — structural read of one method's source
-        import inspect  # noqa: PLC0415
-        import textwrap  # noqa: PLC0415
+        import ast  # structural read of one method's source
+        import inspect
+        import textwrap
 
-        import orchestrator.workflow as workflow_mod  # noqa: PLC0415
-        from orchestrator.harness import _BY_DESIGN_RESTORE_OUTCOMES  # noqa: PLC0415
-        from orchestrator.workflow import TaskWorkflow  # noqa: PLC0415
+        import orchestrator.workflow as workflow_mod
+        from orchestrator.harness import _BY_DESIGN_RESTORE_OUTCOMES
+        from orchestrator.workflow import TaskWorkflow
 
         fn = ast.parse(
             textwrap.dedent(inspect.getsource(TaskWorkflow._invoke))
@@ -4690,7 +4690,7 @@ class TestSessionResumeStorm:
         RED phase fails only these rows instead of collection (the idiom
         ``_session_resume_emits`` already uses for EventType members).
         """
-        from orchestrator.workflow import ResumeFailure  # noqa: PLC0415
+        from orchestrator.workflow import ResumeFailure
         fields = {
             'task_id': f'task-{n}',
             'session_id': f'uuid-rf-{n}',
@@ -5103,7 +5103,7 @@ class TestSessionResumeStorm:
         rolling-window decay: the clock is advanced by rewinding the harness's
         own monotonic stamp, β's idiom.
         """
-        from orchestrator.storm_window_bound import (  # noqa: PLC0415
+        from orchestrator.storm_window_bound import (
             MEASURED_MIN_GAP_SECS,
         )
 

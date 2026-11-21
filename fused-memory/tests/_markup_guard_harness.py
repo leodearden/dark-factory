@@ -12,9 +12,7 @@ import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
-from shared.mcp_markup_middleware import RepairPolicy
-
-from fused_memory.server.markup_guard import install_markup_guard
+from fused_memory.server.boundary_guards import install_boundary_guards
 from fused_memory.server.tools import create_mcp_server
 
 _PROJECT_ID = 'dark_factory'
@@ -62,10 +60,10 @@ def _build_guarded_server(
     for method in methods:
         _pass_through(mock_service, method)
     server = create_mcp_server(mock_service)
-    install_markup_guard(
+    install_boundary_guards(
         server,
-        policy=RepairPolicy.REJECT_WITH_REPAIR,
         known_projects=_KNOWN_PROJECTS if known_projects is None else known_projects,
+        prefix_resolver=None,
         residue_floor=residue_floor,
     )
     return server, mock_service

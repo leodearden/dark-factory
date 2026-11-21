@@ -1803,6 +1803,7 @@ def _proj_raw(*roots: str) -> dict:
                 read_at, DatumState.FRESH, None, 30,
             ),
             'train_events': [],
+            'runs_db_present': True,
         }
         for root in roots or (_PROJ_ROOT,)
     }
@@ -1922,6 +1923,42 @@ def test_merge_queue_marks_a_project_with_no_configured_probe(client):
     assert unprobed['in_queue']['state'] == 'unknown'
     assert 'proj-b' in unprobed['in_queue']['reason']
     assert unprobed['active'] == []
+
+
+def test_merge_queue_tells_a_root_with_no_runs_db_from_one_it_cannot_read(client, tmp_path):
+    """A root with no runs.db file is absent; one whose runs.db does not read stays present.
+
+    Drives the real build over three roots. Absence is what keeps a project
+    out of the client's runs.db totals; an unreadable runs.db stays in them
+    as a hole the totals name.
+    """
+    from _runs_db_fixture import runs_db_path, write_runs_db
+
+    measured, unreadable, never_ran = (tmp_path / name for name in ('measured', 'unreadable', 'never-ran'))
+    write_runs_db(measured)
+    runs_db_path(unreadable).parent.mkdir(parents=True)
+    runs_db_path(unreadable).write_bytes(b'this is not a sqlite database\n' * 64)
+    never_ran.mkdir()
+    client.app.state.config = dataclasses.replace(
+        client.app.state.config, project_root=measured, known_project_roots=[unreadable, never_ran],
+    )
+
+    with (
+        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.fetch_live_merge_queues', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.lookup_tasks', new=AsyncMock(return_value={})),
+    ):
+        resp = client.get('/api/v2/dashboard/merge-queue')
+
+    assert resp.status_code == 200, resp.text
+    mq = resp.json()['MERGE_QUEUE']
+    assert {label: block['runs_db_present'] for label, block in mq.items()} == {
+        'measured': True, 'unreadable': True, 'never-ran': False,
+    }
+    assert mq['measured']['attempts']['state'] == 'fresh'
+    assert mq['unreadable']['attempts']['state'] == 'unknown'
+    assert mq['never-ran']['attempts']['state'] == 'unknown'
+    assert 'no runs.db file' in mq['never-ran']['attempts']['reason']
 
 
 def test_tasks_offline_flag_survives_a_hang_that_degrades_most_roots(client):

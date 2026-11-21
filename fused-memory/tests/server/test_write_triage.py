@@ -68,6 +68,10 @@ from fused_memory.utils.clip_disclosure import TruncationFact
 # than restated as the literal 60 — see test_near_duplicate_guard.py.
 _RRF_RANK1 = 1.0 / (RRF_K + 1)
 
+#: Every record's text unless a test says otherwise; a write of this text
+#: repeats it verbatim, which is what keeps a restate-band write `restated`.
+_RECORD_TEXT = 'some procedural content'
+
 
 def _result(
     id_: str,
@@ -75,7 +79,7 @@ def _result(
     *,
     category: MemoryCategory | None = MemoryCategory.procedural_knowledge,
     source_store: SourceStore = SourceStore.mem0,
-    content: str = 'some procedural content',
+    content: str = _RECORD_TEXT,
     relevance_score: float = _RRF_RANK1,
     store_rank: int = 1,
     omit_store_score: bool = False,
@@ -862,7 +866,7 @@ class TestTriageFailOpenCounter:
             assert counter.record(project='dark_factory') is None
 
     def test_the_crossing_call_returns_a_json_serializable_summary(self) -> None:
-        import json  # noqa: PLC0415
+        import json
 
         counter = TriageFailOpenCounter(time_provider=_Clock())
         summary = None
@@ -1297,7 +1301,7 @@ class TestTriageWriteFailsOpen:
             return verdict
 
         decision = await triage_write(
-            service, content='c', project_id='p', counter=counter, judge=_judge,
+            service, content=_RECORD_TEXT, project_id='p', counter=counter, judge=_judge,
         )
 
         assert decision.outcome == verdict
@@ -1335,7 +1339,7 @@ class TestTriageWriteFailsOpen:
         service = self._service(search=AsyncMock(return_value=[_result('m1', 0.97)]))
 
         decision = await triage_write(
-            service, content='c', project_id='p', counter=counter,
+            service, content=_RECORD_TEXT, project_id='p', counter=counter,
         )
 
         assert decision.outcome == OUTCOME_RESTATED
@@ -1418,7 +1422,7 @@ class TestAFailOpenNamesTheStageThatGaveUp:
     async def _triage(service, **kwargs):
         counter = TriageFailOpenCounter(time_provider=_Clock())
         return await triage_write(
-            service, content='c', project_id='p', counter=counter, **kwargs,
+            service, content=_RECORD_TEXT, project_id='p', counter=counter, **kwargs,
         )
 
     def _hoisting_service(self, cosine_to_memories: AsyncMock) -> types.SimpleNamespace:
@@ -1633,7 +1637,7 @@ class TestTheRetrievedCandidatesReachTheJudge:
 
         await triage_write(
             self._service(SearchResults([_result('m1', score)])),
-            content='c', project_id='p', counter=counter, judge=_judge,
+            content=_RECORD_TEXT, project_id='p', counter=counter, judge=_judge,
         )
 
         assert called == [], label
@@ -1700,13 +1704,13 @@ class TestTheDecisionDisclosesClippedCandidates:
         judge_fact = TruncationFact(field='judge_candidates', cap=2, elided=1)
 
         async def _judge(**_kwargs):
-            return TriageJudgeVerdict(OUTCOME_RESTATED, 'm0', truncation_facts=(judge_fact,))
+            return TriageJudgeVerdict(OUTCOME_AMENDED, 'm0', truncation_facts=(judge_fact,))
 
         results = [_result(f'm{i}', 0.75 - i / 1000) for i in range(3)]
 
         decision = await self._triage(self._service(results), judge=_judge)
 
-        assert decision.outcome == OUTCOME_RESTATED
+        assert decision.outcome == OUTCOME_AMENDED
         assert decision.truncation_facts == (self._RETRIEVAL_FACT, judge_fact)
 
 
@@ -1913,7 +1917,7 @@ class TestEmitTriageFailOpenStormEscalation:
     def test_files_afresh_once_the_prior_escalation_is_resolved(self, tmp_path) -> None:
         """Dedup must not silence a NEW outage after the old one was cleared."""
         pytest.importorskip('escalation')
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         first = emit_triage_fail_open_storm_escalation(str(tmp_path), _STORM)
         assert first is not None

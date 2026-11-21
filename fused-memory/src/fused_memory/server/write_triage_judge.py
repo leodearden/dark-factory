@@ -345,7 +345,7 @@ _DEFAULT_JUDGE_FIELD_CHARS: int = WriteTriageConfig.model_fields['judge_field_ch
 #: those up to a count no process could hold. That worst case is measured
 #: afresh on every run by
 #: fused-memory/tests/server/test_write_triage_judge.py::_worst_case_call_chars.
-JUDGE_PROMPT_CHAR_BUDGET = 27_100
+JUDGE_PROMPT_CHAR_BUDGET = 27_318
 
 
 def _elide(text: object, field_chars: int) -> str:
@@ -510,8 +510,11 @@ Answer with exactly one of these four words:
 
 - "distinct" — no candidate makes the same core claim as the new entry. \
 Shared wording alone neither makes a match nor rules one out.
-- "restates" — the new entry asserts what a candidate already asserts, adding \
-nothing new. A paraphrase restates.
+- "restates" — the new entry asserts what a candidate already asserts and \
+adds nothing a reader of that candidate would need: no new number, condition, \
+cause, fix, caveat or newer state. A paraphrase that adds nothing restates; \
+anything new makes it "amends", or "contests" if it says the candidate is \
+wrong, outdated or different.
 - "amends" — the new entry asserts what a candidate asserts AND adds \
 something the candidate does not have: a detail, a scope, a later \
 observation — without saying the candidate is wrong.
@@ -1001,7 +1004,7 @@ async def _call_openai_responses(
     Unset means a non-reasoning model, pinned to ``temperature=0.0`` as on the
     other two arms.
     """
-    import openai  # noqa: PLC0415 — per-call import, matching judge.py
+    import openai  # per-call import, matching judge.py
 
     sampling: dict[str, Any] = (
         {'temperature': 0.0}
@@ -1048,7 +1051,7 @@ async def _call_openai_chat(
     ``llm.client_class: openai_generic`` (llama.cpp, vLLM, LM Studio). Its
     compat 400s are task 5277 C's.
     """
-    import openai  # noqa: PLC0415 — per-call import, matching judge.py
+    import openai  # per-call import, matching judge.py
 
     async with openai.AsyncOpenAI(
         **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
@@ -1085,7 +1088,7 @@ async def _call_anthropic(
     ``temperature=0.0`` because Anthropic's default is 1.0, and the system
     prompt via ``system=`` because Anthropic has no system role.
     """
-    import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
+    import anthropic  # per-call import, matching judge.py
 
     async with anthropic.AsyncAnthropic(
         **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
@@ -1122,7 +1125,7 @@ async def judge_write(
     decision: Any,
     candidates: Any = (),
 ) -> TriageJudgeVerdict:
-    """Adjudicate one middle-band write, naming the candidate the verdict is about.
+    """Adjudicate one judged write, naming the candidate the verdict is about.
 
     This is what ``tools.py`` passes as ``triage_write(..., judge=...)``,
     replacing leaf beta's ``_stub_judge``. The signature is beta's, plus the
@@ -1189,7 +1192,7 @@ async def judge_write(
         # decision, not a failure.
         logger.info(
             'write_triage judge disabled by config '
-            '(write_triage.judge_enabled=false); middle-band write acked as '
+            '(write_triage.judge_enabled=false); judged write acked as '
             '%r without an LLM call',
             OUTCOME_STORED,
         )

@@ -321,7 +321,7 @@ def probe_health(url: str = PROBE_URL, timeout: float = PROBE_TIMEOUT) -> bool:
         # legitimately return anything else, so this is a real failure.
         log(f"probe_health({url!r}) got HTTP {exc.code} (expected 200)")
         return False
-    except Exception as exc:  # noqa: BLE001 -- any other failure means no 200
+    except Exception as exc:  # any other failure means no 200
         logger.warning(
             f"probe_health({url!r}) got no usable response "
             f"({type(exc).__name__}: {exc}); counting as a failed probe"
@@ -461,7 +461,7 @@ def save_state(state: dict, path: str = STATE_PATH) -> None:
             f.write(payload + "\n")
         os.replace(tmp_path, path)
         tmp_path = None  # renamed away — nothing to clean up
-    except Exception as exc:  # noqa: BLE001 -- a failed stamp must not crash the tick
+    except Exception as exc:  # a failed stamp must not crash the tick
         if tmp_path is not None:
             with contextlib.suppress(OSError):
                 os.unlink(tmp_path)
@@ -534,7 +534,7 @@ def _unit_active_enter_epoch(unit: str = DASHBOARD_UNIT) -> int | None:
                 return None
             return epoch
         return None
-    except Exception as exc:  # noqa: BLE001 -- a query failure must not crash the tick
+    except Exception as exc:  # a query failure must not crash the tick
         logger.warning(
             f"_unit_active_enter_epoch({unit!r}): swallowed {exc!r}; "
             "returning None (grace undeterminable this tick)"
@@ -585,7 +585,7 @@ def restart_unit(unit: str = DASHBOARD_UNIT) -> None:
             f"systemctl reset-failed {unit} timed out after 10s; "
             "attempting the restart anyway"
         )
-    except Exception as exc:  # noqa: BLE001 -- actuation must never crash the oneshot
+    except Exception as exc:  # actuation must never crash the oneshot
         logger.warning(f"systemctl reset-failed {unit} failed: {exc!r}")
 
     try:
@@ -594,7 +594,7 @@ def restart_unit(unit: str = DASHBOARD_UNIT) -> None:
         )
     except subprocess.TimeoutExpired:
         logger.warning(f"systemctl restart {unit} timed out after 45s")
-    except Exception as exc:  # noqa: BLE001 -- actuation must never crash the oneshot
+    except Exception as exc:  # actuation must never crash the oneshot
         logger.warning(f"systemctl restart {unit} failed: {exc!r}")
 
 
@@ -617,10 +617,12 @@ def _prune_restarts(restarts: list[int], now: int) -> list[int]:
 def file_ceiling_escalation(restart_count: int, window_secs: int) -> None:
     """File a born-at-L2 escalation reporting the restart ceiling.
 
-    Shells out to ``escalation submit`` through ``uv run --project`` rather
-    than importing it: this script is stdlib-only by design (it must run as a
-    bare ``Type=oneshot`` with no environment of its own), and ``escalation``
-    is not on its import path.
+    Shells out to ``escalation submit`` through ``uv run --no-sync --project``
+    rather than importing it: this script is stdlib-only by design (it must run
+    as a bare ``Type=oneshot`` with no environment of its own), and
+    ``escalation`` is not on its import path. ``--no-sync`` so filing the page
+    never re-syncs the shared root .venv
+    (tests/scripts/test_uv_run_venv_isolation.py).
 
     The argv is built against submit.py's ENFORCED argparse boundary, not
     against convenience. That CLI constructs ``Escalation(level=2, ...)``
@@ -685,6 +687,7 @@ def file_ceiling_escalation(restart_count: int, window_secs: int) -> None:
     argv = [
         UV_BIN,
         "run",
+        "--no-sync",
         "--project",
         os.path.join(REPO_DIR, "escalation"),
         "escalation",
@@ -715,7 +718,7 @@ def file_ceiling_escalation(restart_count: int, window_secs: int) -> None:
             )
             return
         log(f"filed born-at-L2 restart-ceiling escalation for {DASHBOARD_UNIT}")
-    except Exception as exc:  # noqa: BLE001 -- a failed submit must not resume the flap
+    except Exception as exc:  # a failed submit must not resume the flap
         logger.warning(
             f"file_ceiling_escalation: could not run `escalation submit` "
             f"({type(exc).__name__}: {exc}). The ceiling stays tripped, so the "
@@ -915,7 +918,7 @@ def main() -> int:
     """
     try:
         tick()
-    except Exception as exc:  # noqa: BLE001 -- a wedged tick must not fail the unit
+    except Exception as exc:  # a wedged tick must not fail the unit
         logger.warning(
             f"tick() raised {type(exc).__name__}: {exc}; skipping this tick. "
             "The unit still exits 0 so the timer keeps firing."

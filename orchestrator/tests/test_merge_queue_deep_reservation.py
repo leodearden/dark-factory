@@ -41,7 +41,7 @@ from _merge_lane_fakes import (
 from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, MERGE_RESULT_TIMEOUT, wait_responsive
 from test_merge_lane_coalesce_admission import _TrainHooks
 
-from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
+from orchestrator.config import DepthRow, GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane, MergeOutcome, MergeRequest, QueuedBranch
@@ -88,9 +88,12 @@ def _scene(
 
 
 def _deep(chain_cap: int = 3, *, reservation_timeout: float = 1e9) -> MergeDeepConfig:
+    """Deep chains switched on by *chain_cap* and bounded at that many items by
+    the one-row depth table ``[(0.0, chain_cap)]``."""
     return MergeDeepConfig(
         chain_cap=chain_cap, chain_build_timeout_secs=300,
         chain_reservation_timeout_secs=reservation_timeout,
+        depth_table=[DepthRow(0.0, max(chain_cap, 2))],
     )
 
 
@@ -375,26 +378,34 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
 
     No outcome is rendered for a link by that round, and nothing is blocked.
     A requeued S goes behind F2. Once H and P have landed, F1 is merged on
-    main and, alone in the verify frontier, re-chains the rest (PRD D5).
+    main and, alone in the verify frontier, re-chains the rest that may be
+    chained (PRD D5). A member of a red tip's chain may not be, nor the owner
+    of a tip that raised, until it has verified alone (task 10617).
     """
 
     async def _assert_released_links_land_by_a_later_round(
-        self, scene: _Scene, rnd: _Round, *, s_status: str = 'done',
+        self, scene: _Scene, rnd: _Round, *,
+        rechained: tuple[str, ...], alone: tuple[str, ...] = (),
     ) -> None:
+        """F1's round lands *rechained* (F1 first); then each of *alone* lands
+        on a round of its own."""
         reqs = rnd.reqs
         await _until(lambda: _reservations(rnd.lane) == [], label='the reservation released')
         for name in ('F1', 'F2'):
             assert not reqs[name].result.done(), name
         await rnd.land_head_and_p()
-        names = ('F1', 'F2') if s_status != 'done' else ('F1', 'F2', 'S')
+        names = (*rechained, *alone)
         outcomes = await _outcomes(rnd, names)
         assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(names, 'done')
-        assert {n: o.landed_via_chain for n, o in outcomes.items()} == dict.fromkeys(names, 1)
+        via_chain = 1 if len(rechained) > 1 else None
+        assert {n: o.landed_via_chain for n, o in outcomes.items()} == {
+            **dict.fromkeys(rechained, via_chain), **dict.fromkeys(alone, None),
+        }
         rechain = [
             (e['data']['chain_items'], e['data']['speculative'])
             for e in _verify_events_for(scene, {'F1'})
         ]
-        assert rechain == [(len(names), False)]
+        assert rechain == [(len(rechained), False)]
         assert await _landed_task_files(scene) == ['H', 'P', *names]
         assert _reservations(rnd.lane) == []
         assert rnd.lane.speculation_accounting_violations() == []
@@ -408,7 +419,9 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         async with _deep_round(scene, ('F1', 'F2'), s_script=red) as rnd:
             await wait_responsive(s_entered.wait(), label="S's tip verify under way")
             release_s.set()
-            await self._assert_released_links_land_by_a_later_round(scene, rnd)
+            await self._assert_released_links_land_by_a_later_round(
+                scene, rnd, rechained=('F1',), alone=('F2', 'S'),
+            )
 
     async def test_a_raised_tip_releases_the_links(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -419,7 +432,9 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         async with _deep_round(scene, ('F1', 'F2'), s_script=boom) as rnd:
             await wait_responsive(s_entered.wait(), label="S's tip verify under way")
             release_s.set()
-            await self._assert_released_links_land_by_a_later_round(scene, rnd)
+            await self._assert_released_links_land_by_a_later_round(
+                scene, rnd, rechained=('F1', 'F2'), alone=('S',),
+            )
 
     async def test_an_abandoned_round_releases_the_links(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -431,7 +446,9 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         ) as rnd:
             await wait_responsive(s_entered.wait(), label="S's tip verify under way")
             rnd.reqs['S'].result.cancel()
-            await self._assert_released_links_land_by_a_later_round(scene, rnd, s_status='abandoned')
+            await self._assert_released_links_land_by_a_later_round(
+                scene, rnd, rechained=('F1', 'F2'),
+            )
 
 
 async def _tip_passed_and_landed_its_head(

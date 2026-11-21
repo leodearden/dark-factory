@@ -34,11 +34,12 @@ from _markup_guard_harness import (
     _payload,
 )
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING, RepairPolicy
+from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-from fused_memory.server.markup_guard import ResidueTier, install_markup_guard
+from fused_memory.server.boundary_guards import install_boundary_guards
+from fused_memory.server.markup_guard import ResidueTier
 from fused_memory.server.markup_residue_spool import MarkupResidueSpool
 from fused_memory.server.tools import create_mcp_server
 
@@ -322,10 +323,10 @@ class TestRoutingIdentityIsRederivedFromTheResidue:
     @staticmethod
     async def _refuse(tmp_path, content: str, known_projects: dict[str, str] | None) -> dict:
         server = create_mcp_server(AsyncMock())
-        install_markup_guard(
+        install_boundary_guards(
             server,
-            policy=RepairPolicy.REJECT_WITH_REPAIR,
             known_projects=known_projects,
+            prefix_resolver=None,
             residue_floor=MarkupResidueSpool(tmp_path / 'spool').preserve,
         )
         return await _refused(server, 'add_memory', {'content': content})
@@ -530,10 +531,10 @@ class TestPreservationIsUnconditional:
         interceptor = AsyncMock()
         server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
         spool_dir = tmp_path / 'spool'
-        install_markup_guard(
+        install_boundary_guards(
             server,
-            policy=RepairPolicy.REJECT_WITH_REPAIR,
             known_projects={_PROJECT_ID: str(tmp_path)},
+            prefix_resolver=None,
             residue_floor=MarkupResidueSpool(spool_dir).preserve,
         )
 
@@ -591,10 +592,10 @@ class TestPreservationFailuresAreReadable:
         if spool is None:
             return create_mcp_server(mock_service), mock_service
         server = create_mcp_server(mock_service, markup_residue_spool=spool)
-        install_markup_guard(
+        install_boundary_guards(
             server,
-            policy=RepairPolicy.REJECT_WITH_REPAIR,
             known_projects=known_projects or {'some_other_project': '/elsewhere'},
+            prefix_resolver=None,
             residue_floor=spool.preserve,
         )
         return server, mock_service

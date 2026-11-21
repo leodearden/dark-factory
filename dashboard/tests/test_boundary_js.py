@@ -67,6 +67,7 @@ from shared.task_statuses import TaskStatus
 
 from dashboard.data.burndown import aggregate_forecast_confidence
 from dashboard.data.census import SERIES_KEYS
+from dashboard.data.label_spans import labels_from_spans
 from dashboard.data.prd_view import LANE_DISPLAY_ORDER, Lane
 
 _JS_DIR = Path(__file__).parent / 'js'
@@ -220,8 +221,11 @@ def test_sketch_6_the_sampler_persists_the_census_the_route_serves(served_bodies
     burndown = served_bodies['burndown_at_t']
     assert census['state'] == 'fresh', census
 
-    for block in (burndown['BURNDOWN'], burndown['BURNDOWN_BY_PROJECT']['dark-factory']):
-        assert datetime.fromisoformat(block['labels'][-1]) == datetime.fromisoformat(census['as_of'])
+    aggregate = burndown['BURNDOWN']
+    project = burndown['BURNDOWN_BY_PROJECT']['dark-factory']
+    project_labels = labels_from_spans(project['label_spans'], aggregate['labels'])
+    for block, labels in ((aggregate, aggregate['labels']), (project, project_labels)):
+        assert datetime.fromisoformat(labels[-1]) == datetime.fromisoformat(census['as_of'])
         for member, column in SERIES_KEYS.items():
             assert block[column][-1] == census['value']['counts'][member.value], (
                 f'{column}: one datum, two homes, at one instant'

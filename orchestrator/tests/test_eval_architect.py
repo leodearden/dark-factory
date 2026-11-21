@@ -1245,7 +1245,25 @@ class TestArchitectEvalConfigs:
             'architect-sonnet-high',
             'architect-fable-high',
             'architect-fable-max',
+            'architect-fable52-high',
+            'architect-fable52-max',
         }
+
+    @pytest.mark.parametrize(('name', 'effort'), [
+        ('architect-fable52-high', 'high'),
+        ('architect-fable52-max', 'max'),
+    ])
+    def test_architect_fable52_arms_field_shape(self, name, effort):
+        """Task 10488: Fable 5.2 arms are native claude architect candidates."""
+        from orchestrator.evals.configs import get_config_by_name
+
+        cfg = get_config_by_name(name)
+        assert cfg is not None
+        assert cfg.backend == 'claude'
+        assert cfg.model == 'claude-fable-5-2'
+        assert cfg.effort == effort
+        assert cfg.role == 'architect'
+        assert not cfg.env_overrides
 
     def test_architect_fable_max_is_effort_matched_to_opus_incumbent(self):
         """eval-revival ρ: architect-fable-max is the effort-matched fable variant.
@@ -1990,6 +2008,7 @@ class TestRunArchitectEval:
         # otherwise share one .task-meta/task-<id>.
         import sys
 
+        from orchestrator.agents.roles import ARCHITECT
         from orchestrator.workflow import _meta_root_for_worktree
 
         _, mocks = await _run_architect_eval_hermetic(
@@ -2008,6 +2027,11 @@ class TestRunArchitectEval:
             '--worktree', str(Path('/fake/wt')),
             '--meta-root', str(expected_meta_root),
             '--task-root', str(expected_meta_root),
+            '--grants-enforced',
+            *[
+                token for name in sorted(ARCHITECT.plan_tools_grants)
+                for token in ('--grant', name)
+            ],
         ]
 
 
@@ -3643,7 +3667,7 @@ def _fake_eval_result(**over):
 
 
 def _dispatch_single_eval(cfg, capsys, arch_metrics=None):
-    """Drive ``cli._run_single_eval`` with a resolved config, both runners patched.
+    """Drive ``orchestrator.evals.cli._run_single_eval`` with a resolved config, both runners patched.
 
     ``get_config_by_name`` is patched to return ``cfg`` so the dispatch is
     exercised purely on ``cfg.role``. ``arch_metrics`` overrides the fake
@@ -3657,8 +3681,7 @@ def _dispatch_single_eval(cfg, capsys, arch_metrics=None):
     and installing a SIGHUP handler). ``None`` is the ungated campaign, which is
     what every routing/echo case here already meant.
     """
-    from orchestrator import cli
-    from orchestrator.evals import eval_gate
+    from orchestrator.evals import cli, eval_gate
 
     arch_result = _fake_eval_result(
         config_name=cfg.name,
@@ -3688,7 +3711,7 @@ def _dispatch_single_eval(cfg, capsys, arch_metrics=None):
 
 
 def _dispatch_mixed_eval(cfgs, capsys, *, gate=None, raise_on: str | None = None):
-    """Drive ``cli._run_single_eval`` over a MIXED config list, gate seam patched.
+    """Drive ``orchestrator.evals.cli._run_single_eval`` over a MIXED config list, gate seam patched.
 
     The sibling of :func:`_dispatch_single_eval` for the CAMPAIGN question
     (task 4427): ``_run_single_eval``'s ``for cfg in configs`` loop is a second,
@@ -3703,8 +3726,7 @@ def _dispatch_mixed_eval(cfgs, capsys, *, gate=None, raise_on: str | None = None
     the loop" from "torn down between configs". ``raise_on=<config name>`` makes
     that config's executor raise, which propagates out of ``asyncio.run``.
     """
-    from orchestrator import cli
-    from orchestrator.evals import eval_gate
+    from orchestrator.evals import cli, eval_gate
 
     def _make(metrics):
         async def fake(_task_path, cfg, *_a, usage_gate=_NO_INJECTED_GATE, **_k):
@@ -3739,7 +3761,7 @@ def _dispatch_mixed_eval(cfgs, capsys, *, gate=None, raise_on: str | None = None
             cli._run_single_eval(
                 Path('/fake/task.json'), 'all', base_config=MagicMock(),
             )
-        except Exception as exc:  # noqa: BLE001 — surfaced to the caller below
+        except Exception as exc:  # surfaced to the caller below
             error = exc
     return capsys.readouterr().out, {
         'run_eval': mock_run_eval, 'run_arch': mock_run_arch,
@@ -4708,7 +4730,7 @@ class TestArchitectEvalInjectedGate:
 # The per-cell gate above is correct but STATELESS across cells: cell N+1
 # re-leases the account cell N proved capped, paying a wasted invocation plus a
 # cooldown every time. ``campaign_usage_gate`` hoists construction+teardown to
-# whoever loops the cells (the μ stage functions and ``cli._run_single_eval``),
+# whoever loops the cells (the μ stage functions and ``evals.cli._run_single_eval``),
 # so ONE cap-state view serves the whole campaign.
 #
 # The hoist rests on one load-bearing premise: the ``usage_cap`` a cell would

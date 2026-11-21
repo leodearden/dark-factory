@@ -1380,7 +1380,7 @@ class _RecordingMemoryHandler(BaseHTTPRequestHandler):
     routes every POST here regardless of path.
     """
 
-    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API name
+    def do_POST(self) -> None:  # BaseHTTPRequestHandler API name
         server: Any = self.server  # _RecordingMemoryServer (carries writes/_envelope)
         length = int(self.headers.get('Content-Length', 0) or 0)
         raw = self.rfile.read(length) if length > 0 else b''
@@ -1400,7 +1400,7 @@ class _RecordingMemoryHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 — stdlib API name
+    def log_message(self, format: str, *args: Any) -> None:  # stdlib API name
         """Silence the default stderr access log (no per-request spam)."""
 
 
@@ -1497,5 +1497,7 @@ class RecordingMemorySink:
 
 
 if __name__ == '__main__':
-    from orchestrator.cli import eval_cmd
+    from orchestrator.cli_config import load_program_dotenv
+    from orchestrator.evals.cli import eval_cmd
+    load_program_dotenv()
     eval_cmd()
