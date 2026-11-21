@@ -34,7 +34,8 @@ Covers:
               stamped with its dispatching incarnation's identity.
   task 4732   ``TestEveryHarnessEscalationStatesItsLevel``, an ast tripwire
               requiring ``level=`` on every ``Escalation(...)`` in
-              ``harness.py``, and ``TestReconcileFailureReachesL1ThroughTheReaper``,
+              ``harness.py``, ``l0_promotion.py`` and ``born_at_l2.py``, and
+              ``TestReconcileFailureReachesL1ThroughTheReaper``,
               the orphan reaper folding the reconcile-failure L0s into one L1.
 """
 
@@ -56,13 +57,17 @@ from shared.task_claimant import compose_claimant_run_id
 
 import orchestrator.born_at_l2 as born_at_l2_module
 import orchestrator.harness as harness_module
+import orchestrator.l0_promotion as l0_promotion_module
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.scheduler import SetTaskStatusRejected
 
 _HARNESS_SRC_PATH = Path(harness_module.__file__)
-# Task 8826 moved harness.py's four born-at-L2 constructions into this module's
-# single one, so both tripwires scan it too.
+# Task 7385 moved the orphan reaper's L1 construction into
+# orchestrator/l0_promotion.py::promote_l0_to_l1, and task 8826 moved
+# harness.py's four born-at-L2 constructions into born_at_l2.py's single one,
+# so the tripwires scan those modules too.
+_L0_PROMOTION_SRC_PATH = Path(l0_promotion_module.__file__)
 _BORN_AT_L2_SRC_PATH = Path(born_at_l2_module.__file__)
 
 
@@ -210,14 +215,15 @@ class TestHarnessFilingsCarryTheIdentity:
         assert report.vetoes_done_flip is True  # ...but the done-flip veto holds
 
 
-_FILING_CALLABLES = frozenset({'Escalation', 'file_or_refresh'})
+_FILING_CALLABLES = frozenset({'Escalation', 'file_or_refresh', 'promote_l0_to_l1'})
 
 
 def _filing_call_sites(
     module_path: Path, callables: frozenset[str] = _FILING_CALLABLES,
 ) -> list[ast.Call]:
     """Every filing site in *module_path*: an ``Escalation(...)`` construction,
-    or a ``file_or_refresh(...)`` call, which builds the Escalation for its caller.
+    or a ``file_or_refresh(...)`` or ``promote_l0_to_l1(...)`` call, each of
+    which builds the Escalation for its caller.
     *callables* narrows the scan to the named callables.
 
     MUST be ``ast``, never a regex: ``harness.py`` carries docstring and
@@ -252,15 +258,18 @@ class TestEveryHarnessFilingSiteIsStamped:
         # Lowered 28 -> 27 by task 7170, which folded the cross-repo,
         # substrate-flip and external-dep copies onto _file_harness_l1's
         # single stamped construction; those sites merged, they did not move
-        # out of the module.  Lowered 27 -> 23 by task 8826, which moved the
-        # four born-at-L2 copies onto born_at_l2.py's single construction,
-        # scanned below.
+        # out of the module.  Task 7385 moved the orphan reaper's L1
+        # construction into orchestrator/l0_promotion.py::promote_l0_to_l1,
+        # which is counted at its call like file_or_refresh.  Lowered 27 -> 23
+        # by task 8826, which moved the four born-at-L2 copies onto
+        # born_at_l2.py's single construction, scanned below.
         floors = {_HARNESS_SRC_PATH: 23, _BORN_AT_L2_SRC_PATH: 1}
         for path, floor in floors.items():
             calls = _filing_call_sites(path)
             assert len(calls) >= floor, (
-                f'{path.name}: expected >={floor} Escalation(...) or '
-                f'file_or_refresh(...) sites, found {len(calls)}'
+                f'{path.name}: expected >={floor} Escalation(...), '
+                f'file_or_refresh(...) or promote_l0_to_l1(...) sites, '
+                f'found {len(calls)}'
             )
 
             unstamped = [
@@ -268,7 +277,8 @@ class TestEveryHarnessFilingSiteIsStamped:
                 if not any(kw.arg == 'filing_claimant_run_id' for kw in node.keywords)
             ]
             assert not unstamped, (
-                f'{path.name}: Escalation(...) or file_or_refresh(...) without '
+                f'{path.name}: Escalation(...), file_or_refresh(...) or '
+                f'promote_l0_to_l1(...) without '
                 f'filing_claimant_run_id at lines {unstamped} — every filing site '
                 f'must stamp the filing incarnation (task 3550); use '
                 f'self._filing_claimant_run_id.'
@@ -293,10 +303,12 @@ class TestEveryHarnessEscalationStatesItsLevel:
 
     def test_every_escalation_construction_passes_level(self) -> None:
         # Task 7170 folds the dispatch-gate copies onto _file_harness_l1's single
-        # construction; those sites merged, they did not move out of this module.
-        # Task 8826 moved the four born-at-L2 copies to born_at_l2.py, so
-        # harness.py's floor dropped 26 -> 22 and that module is scanned too.
-        floors = {_HARNESS_SRC_PATH: 22, _BORN_AT_L2_SRC_PATH: 1}
+        # construction; those sites merged, they did not move out of harness.py.
+        # Task 7385 moved the orphan reaper's construction into
+        # orchestrator/l0_promotion.py::promote_l0_to_l1, and task 8826 moved
+        # the four born-at-L2 copies to born_at_l2.py, so harness.py's floor
+        # dropped 26 -> 21 and both of those modules are scanned too.
+        floors = {_HARNESS_SRC_PATH: 21, _L0_PROMOTION_SRC_PATH: 1, _BORN_AT_L2_SRC_PATH: 1}
         for path, floor in floors.items():
             calls = _filing_call_sites(path, frozenset({'Escalation'}))
             assert len(calls) >= floor, (

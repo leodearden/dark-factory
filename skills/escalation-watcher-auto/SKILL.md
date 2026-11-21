@@ -958,7 +958,7 @@ A done task's step-commit was flagged as an **orphan** by the harness orphan-L0 
 - `agent_role == "harness-orphan-reaper"`
 - `summary` contains the substring `"is orphaned and could not be auto-reconciled against WIP tip"`
 
-Match on the **summary signature**, never on `suggested_action` — the promoted record's `suggested_action == "manual_intervention"` is shared by many unrelated escalation classes across the harness and cannot discriminate this one by itself. The reaper wraps the original summary as `"Orphan L0 (<age>s old, no active workflow): <original summary>"`, so use a substring match, not an exact match — the signature survives the wrap.
+Match on the **summary signature**, never on `suggested_action`. The promoted record carries the L0's own `suggested_action`, falling back to `"manual_intervention"` when the L0 has none, but every record promoted before task 7385 carries `"manual_intervention"`, a value shared by many unrelated escalation classes across the harness, so the field cannot discriminate this class across the archive. The reaper wraps the original summary as `"Orphan L0 (<age>s old, no active workflow): <original summary>"`, so use a substring match, not an exact match — the signature survives the wrap.
 
 **Extraction.** Recover from `esc["detail"]`:
 - `stale_commit` (the full 40-hex SHA) and `step_id`, from the line `"Step <step_id> recorded commit <stale_commit>, which is no longer reachable from HEAD..."`. Always read the SHA from `detail`, never from `summary` — `summary` truncates it to 10 characters.

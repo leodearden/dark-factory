@@ -21316,13 +21316,17 @@ def _promote_like_orphan_reaper(queue, esc_id) -> str:
     """Simulate `orchestrator/harness.py::Harness._reap_orphan_l0_escalations` promotion.
 
     orchestrator is not a fused-memory dependency, so the record it builds is
-    reproduced here: a NEW L1 with a prefixed summary and a suffixed detail,
-    and the original L0 dismissed.
+    reproduced here. The shape's single home is
+    `orchestrator/src/orchestrator/l0_promotion.py::promote_l0_to_l1`: a NEW L1
+    carrying the L0's finding behind a prefixed summary, a detail with a
+    provenance line and the reaper's branch note appended, and the original L0
+    dismissed with a resolution naming the L1.
     """
     from escalation.models import Escalation  # type: ignore[import-untyped]
 
     esc = queue.get(esc_id)
     promoted_id = queue.make_id(esc.task_id)
+    why = f'orphan L0 for task_id={esc.task_id} (no active workflow)'
     queue.submit(Escalation(
         id=promoted_id,
         task_id=esc.task_id,
@@ -21331,16 +21335,20 @@ def _promote_like_orphan_reaper(queue, esc_id) -> str:
         category=esc.category,
         summary=f'Orphan L0 (900s old, no active workflow): {esc.summary}',
         detail=(
-            (esc.detail or '')
-            + '\n\n[note] originating worktree may be reaped; branch=task/'
-            + esc.task_id
+            f'{esc.detail}\n\n[promoted from {esc.id}: {why}]'
+            f'\n\n[note] originating worktree may be reaped; branch=task/{esc.task_id}'
         ),
-        suggested_action='manual_intervention',
+        suggested_action=esc.suggested_action or 'manual_intervention',
+        workflow_state=esc.workflow_state,
         level=1,
+        options=list(esc.options),
+        evidence=list(esc.evidence),
+        root_cause=esc.root_cause,
+        project_id=esc.project_id,
     ))
     queue.resolve(
         esc_id,
-        f'Auto-promoted to level 1 — orphan L0 for task_id={esc.task_id}',
+        f'Auto-promoted to level 1 as {promoted_id} — {why}',
         dismiss=True,
         resolved_by='harness-orphan-reaper',
     )
