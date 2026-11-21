@@ -13137,7 +13137,9 @@ class _AnswerListVerifier(FakeVerifier):
 
     Scoped ``answers`` ride the parent's ``sequence=``/``default=``, so the
     scoped entry recording is the parent's own — see
-    ``orchestrator/tests/_merge_lane_fakes.py::FakeVerifier``.
+    ``orchestrator/tests/_merge_lane_fakes.py::FakeVerifier``. They are the
+    whole scoped script: do not also set the parent's ``scripts`` or call
+    ``then``, which would silently change which answer repeats.
     """
 
     def __init__(
