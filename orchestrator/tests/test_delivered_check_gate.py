@@ -1855,6 +1855,18 @@ class TestDeliveredChecksConfig:
         budget via mcp__escalation__reload_config without a restart."""
         assert 'delivered_checks.max_checks_per_tick' in RELOADABLE_FIELDS
 
+    @pytest.mark.usefixtures("code_default_config")
+    def test_default_max_record_fetches_per_tick_is_50(self):
+        config = OrchestratorConfig()
+        assert config.delivered_checks.max_record_fetches_per_tick == 50
+
+    def test_max_record_fetches_per_tick_rejects_zero(self):
+        with pytest.raises(ValidationError):
+            DeliveredChecksConfig(max_record_fetches_per_tick=0)
+
+    def test_max_record_fetches_per_tick_is_hot_reloadable(self):
+        assert 'delivered_checks.max_record_fetches_per_tick' in RELOADABLE_FIELDS
+
     # --- task 2583 (epsilon) knobs: enabled / grace_cycles / check_timeout_secs -
 
     @pytest.mark.usefixtures("code_default_config")
