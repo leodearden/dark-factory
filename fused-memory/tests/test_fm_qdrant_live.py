@@ -173,7 +173,7 @@ class TestEnsureFreshCollection:
 
 
 class TestEnsureFreshCollectionOutlastsAnAbandonedCreate:
-    """A create the client stops waiting for is judged by whether the collection appears empty.
+    """A create the client stops waiting for is judged by whether the collection takes writes and is empty.
 
     Drives a real QdrantClient over a real socket: only a genuine read timeout
     produces the measured sequence, the client abandoning the answer while the

@@ -122,13 +122,19 @@ def _run_meta_op(
         )
 
 
-def _is_present_and_empty(client: Any, collection_name: str) -> bool:
-    """Whether *collection_name* exists and holds no points; a transient 404 on the count reads as not yet."""
-    from qdrant_client.http.exceptions import UnexpectedResponse
+def _takes_writes_and_is_empty(client: Any, collection_name: str) -> bool:
+    """Whether every local shard of *collection_name* is Active and it holds no points; a 404 reads as not yet.
 
-    if not client.collection_exists(collection_name):
-        return False
+    Qdrant lists and counts a collection whose create is still running while
+    its shard is Initializing, and a write then answers 500.
+    """
+    from qdrant_client.http.exceptions import UnexpectedResponse
+    from qdrant_client.models import ReplicaState
+
     try:
+        shards = client.collection_cluster_info(collection_name).local_shards
+        if not shards or any(shard.state != ReplicaState.ACTIVE for shard in shards):
+            return False
         return client.count(collection_name, exact=True).count == 0
     except UnexpectedResponse as exc:
         if getattr(exc, 'status_code', None) != 404:
@@ -143,9 +149,9 @@ def _create_collection(
         lambda: client.create_collection(
             collection_name=collection_name, vectors_config=vectors_config,
         ),
-        reached=lambda: _is_present_and_empty(client, collection_name),
+        reached=lambda: _takes_writes_and_is_empty(client, collection_name),
         describe=f'create of collection {collection_name!r}',
-        expected='present and empty',
+        expected='present, with every local shard Active, and empty',
         timeout=settle_timeout,
     )
 
@@ -179,8 +185,8 @@ def ensure_fresh_collection(
     ``UnexpectedResponse`` it deletes the stale collection and creates once more.
     Any other ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised — fail
     loud, no retry. A create or delete whose answer the client abandons on a
-    read timeout is judged by whether the collection appears empty, or
-    disappears, within *settle_timeout*. An abandoned create cannot tell its
+    read timeout is judged by whether the collection appears with every local
+    shard Active and empty, or disappears, within *settle_timeout*. An abandoned create cannot tell its
     own collection from a stale one whose 409 it never read, so one that
     appears holding points fails rather than passing as fresh.
 
@@ -192,7 +198,7 @@ def ensure_fresh_collection(
     Args:
         client: A ``qdrant_client.QdrantClient`` (or test double) exposing
             ``collection_exists`` / ``delete_collection`` / ``create_collection``
-            / ``count``.
+            / ``collection_cluster_info`` / ``count``.
         collection_name: The collection to (re)create.
         size: Vector dimensionality for the new collection.
         distance: Optional ``qdrant_client.models.Distance``; defaults to
