@@ -41,6 +41,7 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from fused_memory.server import markup_guard
 from fused_memory.server.boundary_guards import boundary_guard_chain, install_boundary_guards
 from fused_memory.server.main import _install_tool_dispatch_guards
+from fused_memory.server.markup_residue_spool import MarkupResidueSpool
 from fused_memory.server.tools import create_mcp_server, per_use_prefix_resolver
 from fused_memory.server.unknown_argument_guard import UnknownArgumentMiddleware
 from fused_memory.services.memory_service import MemoryService
@@ -437,14 +438,17 @@ class TestAResolverOutageForwardsUnchanged:
 
 class TestMainInstallsTheUuidMember:
     @pytest.mark.asyncio
-    async def test_the_dispatch_guards_helper_expands_a_unique_prefix(self):
+    async def test_the_dispatch_guards_helper_expands_a_unique_prefix(self, tmp_path):
         resolver = RecordingResolver(UNIQUE)
         mock_service = AsyncMock()
         _pass_through(mock_service, 'add_memory')
         server = create_mcp_server(mock_service)
 
         _install_tool_dispatch_guards(
-            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=resolver
+            server,
+            known_projects=_KNOWN_PROJECTS,
+            prefix_resolver=resolver,
+            residue_spool=MarkupResidueSpool(tmp_path / 'spool'),
         )
         result = await _wire(server, 'add_memory', _add_memory_citing())
 
@@ -452,13 +456,16 @@ class TestMainInstallsTheUuidMember:
         assert _repair(result)['substitutions'] == [_SUBSTITUTION]
 
     @pytest.mark.asyncio
-    async def test_the_dispatch_guards_helper_contains_a_tool_body_escape(self):
+    async def test_the_dispatch_guards_helper_contains_a_tool_body_escape(self, tmp_path):
         mock_service = AsyncMock()
         mock_service.add_memory.side_effect = SystemExit('escaped the tool body')
         server = create_mcp_server(mock_service)
 
         _install_tool_dispatch_guards(
-            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=RecordingResolver(UNIQUE)
+            server,
+            known_projects=_KNOWN_PROJECTS,
+            prefix_resolver=RecordingResolver(UNIQUE),
+            residue_spool=MarkupResidueSpool(tmp_path / 'spool'),
         )
         result = await server._tool_manager.call_tool(
             'add_memory', _add_memory_citing('a note citing nothing')

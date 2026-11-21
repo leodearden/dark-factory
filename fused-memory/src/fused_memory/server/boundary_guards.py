@@ -40,7 +40,7 @@ from shared.uuid_prefix_guard import (
     project_from_arguments,
 )
 
-from fused_memory.server.markup_guard import build_markup_guard
+from fused_memory.server.markup_guard import ResidueFloor, build_markup_guard
 from fused_memory.server.tool_middleware_bridge import install_tool_middleware
 from fused_memory.server.unknown_argument_guard import UnknownArgumentMiddleware
 
@@ -87,8 +87,13 @@ def boundary_guard_chain(
     *,
     known_projects: Mapping[str, str] | None,
     prefix_resolver: PrefixResolver | None,
+    residue_floor: ResidueFloor | None = None,
 ) -> tuple[Middleware, ...]:
     """The chain's members, outermost first.
+
+    *residue_floor* is the markup guard's floor under its residue queue
+    (``fused_memory/server/markup_guard.py::build_markup_guard`` says what it
+    takes and returns); a refused payload the queue cannot hold goes there.
 
     REJECT_WITH_REPAIR is the PRD's declared markup tier for fused-memory
     (``plans/toolcall-markup-containment-prd.md`` section 4, C2), declared HERE
@@ -96,7 +101,11 @@ def boundary_guard_chain(
     fused-memory should forward repairs instead is that PRD's open question 3.
     """
     members: tuple[Middleware, ...] = (
-        build_markup_guard(policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=known_projects),
+        build_markup_guard(
+            policy=RepairPolicy.REJECT_WITH_REPAIR,
+            known_projects=known_projects,
+            residue_floor=residue_floor,
+        ),
         UnknownArgumentMiddleware(),
     )
     if prefix_resolver is None:
@@ -121,12 +130,15 @@ def install_boundary_guards(
     *,
     known_projects: Mapping[str, str] | None,
     prefix_resolver: PrefixResolver | None,
+    residue_floor: ResidueFloor | None = None,
 ) -> None:
     """Install :func:`boundary_guard_chain` on *mcp* as one wrapping; idempotent.
 
-    Both arguments are keyword-only with no default, so every caller declares
-    them at the interception point. Without *prefix_resolver* the uuid-prefix
-    member is absent, and the first install says so once.
+    *known_projects* and *prefix_resolver* are keyword-only with no default, so
+    every caller declares them at the interception point. Without
+    *prefix_resolver* the uuid-prefix member is absent, and the first install
+    says so once. *residue_floor* reaches the markup guard unchanged;
+    ``fused_memory/server/main.py::_install_tool_dispatch_guards`` requires one.
     """
     if getattr(mcp._tool_manager, _BOUNDARY_GUARDED_SENTINEL, False):
         return
@@ -137,7 +149,11 @@ def install_boundary_guards(
         )
     install_tool_middleware(
         mcp,
-        boundary_guard_chain(known_projects=known_projects, prefix_resolver=prefix_resolver),
+        boundary_guard_chain(
+            known_projects=known_projects,
+            prefix_resolver=prefix_resolver,
+            residue_floor=residue_floor,
+        ),
         sentinel=_BOUNDARY_GUARDED_SENTINEL,
         label='boundary guards',
         echoed_meta_keys=_ECHOED_META_KEYS,
