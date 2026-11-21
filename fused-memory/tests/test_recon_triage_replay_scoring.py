@@ -581,3 +581,123 @@ class TestRefusals:
 class TestDeterminism:
     def test_the_same_inputs_give_a_byte_identical_report(self) -> None:
         assert json.dumps(_score(), sort_keys=False) == json.dumps(_report(), sort_keys=False)
+
+
+# ── render_markdown ────────────────────────────────────────────────────────
+
+_RATE_KEYS = ('n', 'hits', 'rate', 'wilson95', 'population_rate', 'population_interval95')
+
+
+def _cell(value: Any) -> str:
+    """How a report value reads in a table cell."""
+    if value is None:
+        return '—'
+    if isinstance(value, bool):
+        return 'yes' if value else 'no'
+    return str(value)
+
+
+def _section(markdown: str, heading: str) -> str:
+    """The text under the ``## `` heading starting with *heading*, up to the next one."""
+    parts = markdown.split('\n## ')
+    found = [part for part in parts if part.startswith(heading)]
+    assert len(found) == 1, (heading, [part.splitlines()[0] for part in parts])
+    return found[0]
+
+
+def _rows(section: str) -> list[list[str]]:
+    """Each table body row of *section*, as its cells."""
+    lines = [line for line in section.splitlines() if line.startswith('| ')]
+    return [line[2:-2].split(' | ') for line in lines[1:]]
+
+
+def _row(section: str, *key: str) -> list[str]:
+    found = [row for row in _rows(section) if tuple(row[:len(key)]) == key]
+    assert len(found) == 1, (key, _rows(section))
+    return found[0][len(key):]
+
+
+@functools.cache
+def _markdown() -> str:
+    return _mod().render_markdown(_report())
+
+
+class TestTheRenderedScores:
+    def test_the_headline_table_carries_every_metric_block(self) -> None:
+        section = _section(_markdown(), 'Headline')
+        for metric, block in _report()['headline'].items():
+            assert _row(section, metric) == [
+                *(_cell(block[key]) for key in _RATE_KEYS),
+                _cell(block.get('correct_contests_detached')),
+            ]
+
+    def test_action_accuracy_by_outcome(self) -> None:
+        section = _section(_markdown(), 'Action accuracy by outcome')
+        for outcome, block in _report()['action_accuracy_by_outcome'].items():
+            assert _row(section, outcome) == [_cell(block[key]) for key in _RATE_KEYS]
+
+    def test_the_per_project_table(self) -> None:
+        section = _section(_markdown(), 'By project')
+        for project, metrics in _report()['by_project'].items():
+            for metric, block in metrics.items():
+                assert _row(section, project, metric) == [
+                    *(_cell(block[key]) for key in _RATE_KEYS),
+                    _cell(block.get('correct_contests_detached')),
+                ]
+
+    def test_the_confusion_matrix(self) -> None:
+        confusion = _report()['confusion']
+        columns = sorted({recon for row in confusion.values() for recon in row})
+        section = _section(_markdown(), 'Confusion')
+        header = [line for line in section.splitlines() if line.startswith('| ')][0]
+        assert header[2:-2].split(' | ')[1:] == columns
+        for expected, row in confusion.items():
+            assert _row(section, expected) == [_cell(row.get(column, 0)) for column in columns]
+
+    def test_the_harm_table_is_labelled_with_the_weights_status(self) -> None:
+        report = _report()
+        harm = report['harm']
+        section = _section(_markdown(), 'Harm per write')
+        assert section.splitlines()[0] == f'Harm per write (weights: {report["harm_weights_status"]})'
+        regimes = ('judge', 'recon', 'status_quo')
+        figures = [('all', harm), *harm['by_project'].items()]
+        for scope, block in figures:
+            assert _row(section, scope, 'sample') == [
+                _cell(block['n']), *(_cell(block['per_write'][regime]) for regime in regimes),
+                _cell(block['delta_per_write']), _cell(block['delta_interval95']),
+            ]
+            assert _row(section, scope, 'population') == [
+                _cell(block['n']),
+                *(_cell(block['population_per_write'][regime]) for regime in regimes),
+                _cell(block['population_delta_per_write']),
+                _cell(block['population_delta_interval95']),
+            ]
+
+    def test_the_no_decision_and_unpriced_counts(self) -> None:
+        report = _report()
+        section = _section(_markdown(), 'Missing and unpriced')
+        assert _row(section, 'no_decision') == [
+            _cell(report['no_decision']['count']), ', '.join(report['no_decision']['entry_ids']),
+        ]
+        unpriced = report['harm']['unpriced']
+        assert _row(section, 'unpriced') == [
+            _cell(len(unpriced)),
+            ', '.join(f'{row["entry_id"]} ({row["action"]}, {row["derivation"]})' for row in unpriced),
+        ]
+
+    def test_the_touched_table(self) -> None:
+        section = _section(_markdown(), 'Touched')
+        for row in _report()['touched']:
+            assert _row(section, row['entry_id']) == [
+                _cell(row['project']), _cell(row['outcome']), _cell(row['headline']),
+                _cell(row['live_recon_state']), ', '.join(row['truth_cells']) or '—',
+                _cell(row['expected']), _cell(row['recon']), _cell(row['correct']),
+                _cell(row['judge_harm']), _cell(row['recon_harm']),
+            ]
+
+    def test_it_titles_the_rubric(self) -> None:
+        assert _markdown().splitlines()[0].endswith(f'(rubric {_report()["rubric"]})')
+
+    def test_it_re_renders_byte_for_byte_from_the_json_report(self) -> None:
+        assert _mod().render_markdown(json.loads(json.dumps(_report()))) == _markdown()
+        assert _markdown().endswith('\n')
