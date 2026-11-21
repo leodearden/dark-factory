@@ -387,8 +387,9 @@ class AgentResult:
       flaky candidate.  ``success`` stays False (NOT salvaged); callers should
       raise a loud, un-suppressed escalation so the substitution gets fixed.
     - ``ended_awaiting_background``: True when the run ended its turn while a
-      background task it started was still pending — a ``run_in_background``
-      Bash or a confirmed Monitor arm, never subsequently REAPED, where a reap
+      background task it started was still pending — a confirmed background
+      launch (see ``detect_ended_awaiting_background`` for the contract), never
+      subsequently REAPED, where a reap
       is a ``BashOutput``/``KillShell``/``KillBash`` poll-or-kill, a tool_use
       of any kind whose input references the launch's id / output-file path as
       recorded in its tool_result (task 3639), OR a delivered task-notification
@@ -1360,8 +1361,8 @@ def ended_awaiting_background_for_session(
     session_id: str,
 ) -> bool:
     """Return True when *session_id*'s on-disk transcript ended its turn with a
-    still-pending background task (a run_in_background Bash or a confirmed
-    Monitor arm).
+    still-pending background task (a confirmed background launch; see
+    ``detect_ended_awaiting_background`` for the contract).
 
     Mirrors ``count_transcript_turns``' shape: delegate to
     ``read_transcript_records``; if it returns None (transcript not located or a
@@ -2300,8 +2301,9 @@ class SubprocessResult:
     transcript_turns: int | None = None
     ended_awaiting_background: bool = False
     """True when the normal-exit transcript ended its turn with a still-pending
-    background task (a run_in_background Bash or a confirmed Monitor arm);
-    carried into AgentResult and used by
+    background task (a confirmed background launch; see
+    ``detect_ended_awaiting_background`` for the contract); carried into
+    AgentResult and used by
     parse_claude_output to downgrade success→failure.  Never set on the
     timeout path (a timed-out run is already non-success)."""
     model_id: str | None = None
@@ -4804,9 +4806,9 @@ async def run_cli_subprocess(
     #     classification lost the turn-count signal (carried None); deriving it
     #     from the records we already parse here restores it at zero extra I/O.
     #   • ended_awaiting_background — a run that exited subtype=success but whose
-    #     transcript tail launched a still-pending background task (a
-    #     run_in_background Bash or a confirmed Monitor arm) silently abandoned
-    #     the work.  Symmetric to the timeout path's
+    #     transcript tail launched a still-pending background task (a confirmed
+    #     background launch; see detect_ended_awaiting_background for the
+    #     contract) silently abandoned the work.  Symmetric to the timeout path's
     #     transcript re-read above; parse_claude_output owns the actual
     #     success→failure downgrade.
     #   • model_id — the exact CLI-served model id, which the caller's alias
