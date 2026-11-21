@@ -7,6 +7,7 @@ redirected through trickle_state's one supported lever.
 """
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import subprocess
@@ -327,6 +328,53 @@ def test_prune_compares_instants_not_local_clock_text(tmp_path):
     )
     assert snapshot.pruned == 1
     assert snapshot.sessions == frozenset({'after'})
+
+
+# ---------------------------------------------------------------------------
+# (j) already_coded: the sessions a coder skips
+# ---------------------------------------------------------------------------
+
+_CODER_LOG = logging.getLogger('legibility.test_already_coded')
+
+
+def _coder_warnings(caplog):
+    return [r for r in caplog.records if r.name == _CODER_LOG.name and r.levelno >= logging.WARNING]
+
+
+def test_already_coded_over_a_readable_ledger_is_its_sessions(tmp_path, caplog):
+    path = tmp_path / 'coded-sessions.sqlite'
+    session_ledger.record_codings(path, [_row('s1'), _row('s2')])
+    with caplog.at_level(logging.WARNING, logger=_CODER_LOG.name):
+        coded = session_ledger.already_coded(session_ledger.read_ledger(path), log=_CODER_LOG)
+    assert coded == frozenset({'s1', 's2'})
+    assert _coder_warnings(caplog) == []
+
+
+def test_already_coded_over_an_absent_ledger_is_empty_and_silent(tmp_path, caplog):
+    snapshot = session_ledger.read_ledger(tmp_path / 'missing.sqlite')
+    with caplog.at_level(logging.WARNING, logger=_CODER_LOG.name):
+        coded = session_ledger.already_coded(snapshot, log=_CODER_LOG)
+    assert coded == frozenset()
+    assert _coder_warnings(caplog) == []
+
+
+@pytest.mark.parametrize('read', [
+    pytest.param(session_ledger.read_ledger, id='read_ledger'),
+    pytest.param(
+        lambda path: session_ledger.open_for_census(path, prune_before=_NOW), id='open_for_census',
+    ),
+])
+def test_already_coded_over_an_unreadable_ledger_skips_none_and_warns_once(
+    tmp_path, caplog, read,
+):
+    path = _garbage_ledger(tmp_path)
+    with caplog.at_level(logging.WARNING, logger=_CODER_LOG.name):
+        coded = session_ledger.already_coded(read(path), log=_CODER_LOG)
+    assert coded == frozenset()
+    (warning,) = _coder_warnings(caplog)
+    assert warning.levelno == logging.WARNING
+    assert str(path) in warning.getMessage()
+    assert path.read_bytes() == _GARBAGE
 
 
 # ---------------------------------------------------------------------------
