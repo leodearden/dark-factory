@@ -46,6 +46,10 @@ COUNTER_KEYS = ('consecutive_infra_resume_failures', 'last_infra_resume_iteratio
 REPLACE_STRIPPED_KEYS = frozenset(
     {'append', 'metadata_mode', 'pending_since', 'pending_since_backfilled'},
 )
+# Some stored blobs already quote MCP markup; a replace echoes them back, so the
+# markup guard must be told it is deliberate. The server strips the flag before
+# the write (fused-memory/src/fused_memory/server/tools.py::update_task).
+MARKUP_OVERRIDE = 'allow_mcp_markup'
 
 
 class ToolClient(Protocol):
@@ -111,7 +115,7 @@ def build_update_payload(task_id: str, project_root: str, meta: dict) -> dict:
     return {
         'id': task_id,
         'project_root': project_root,
-        'metadata': json.dumps(meta),
+        'metadata': json.dumps({**meta, MARKUP_OVERRIDE: True}),
         'metadata_mode': 'replace',
     }
 
@@ -221,9 +225,12 @@ def write_backup(backup_path: Path, targets: Sequence[Target]) -> None:
 
 async def apply_target(client: ToolClient, target: Target, backup_path: Path) -> str | None:
     """Write *target*'s planned blob and read it back; the problem found, if any."""
-    reply = await client.call_tool(
-        'update_task', build_update_payload(target.task_id, target.project_root, target.plan.after),
-    )
+    try:
+        reply = await client.call_tool(
+            'update_task', build_update_payload(target.task_id, target.project_root, target.plan.after),
+        )
+    except RuntimeError as exc:
+        return f'{target.label}: update_task raised, nothing written: {exc}'
     reason = write_failure_reason(reply)
     if reason is not None:
         return f'{target.label}: update_task refused, nothing written: {reason}'

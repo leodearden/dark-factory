@@ -105,7 +105,7 @@ class TestBuildUpdatePayload:
         assert payload['id'] == '42'
         assert payload['project_root'] == '/proj'
         assert payload['metadata_mode'] == 'replace'
-        assert json.loads(payload['metadata']) == meta
+        assert json.loads(payload['metadata']) == {**meta, 'allow_mcp_markup': True}
         assert 'description' not in payload
         assert 'details' not in payload
 
@@ -159,9 +159,11 @@ class BackendToolClient:
         return await self.backend.get_task(arguments['id'], project_root=arguments['project_root'])
 
     async def update_task(self, arguments: dict) -> dict:
+        metadata = json.loads(arguments['metadata'])
+        metadata.pop('allow_mcp_markup', None)
         return dict(await self.backend.update_task(
             arguments['id'], project_root=arguments['project_root'],
-            metadata=arguments['metadata'], metadata_mode=arguments['metadata_mode'],
+            metadata=json.dumps(metadata), metadata_mode=arguments['metadata_mode'],
         ))
 
 
@@ -173,6 +175,19 @@ class LookupErrorClient(BackendToolClient):
 class RefusingWriteClient(BackendToolClient):
     async def update_task(self, arguments: dict) -> dict:
         return {'error': 'refused', 'error_type': 'LockCharterViolation'}
+
+
+class RaisingWriteClient(BackendToolClient):
+    """Refuses one task's write by raising, as the live client does on an ``isError`` reply."""
+
+    def __init__(self, backend: SqliteTaskBackend, refused_id: str):
+        super().__init__(backend)
+        self.refused_id = refused_id
+
+    async def call_tool(self, name: str, arguments: dict) -> dict:
+        if name == 'update_task' and arguments['id'] == self.refused_id:
+            raise RuntimeError('update_task failed: mcp_markup_unrepairable')
+        return await super().call_tool(name, arguments)
 
 
 class SilentlyDroppedWriteClient(BackendToolClient):
@@ -383,3 +398,17 @@ async def test_write_that_did_not_land_fails_the_read_back_naming_the_backup(
 
     captured = capsys.readouterr()
     assert str(backup_path) in captured.out + captured.err
+
+
+@pytest.mark.asyncio
+async def test_raised_write_is_a_problem_and_the_rest_still_migrate(
+    backend, root, seeded, tmp_path, capsys,
+):
+    client = RaisingWriteClient(backend, seeded['both'])
+
+    assert await run(client, [root], apply=True, backup_path=tmp_path / 'backup.json') != 0
+
+    assert FAILURES in await _stored(backend, root, seeded['both'])
+    conflicting = await _stored(backend, root, seeded['conflicting'])
+    assert FAILURES not in conflicting and ITERATION not in conflicting
+    assert f"#{seeded['both']}: update_task raised" in capsys.readouterr().err
