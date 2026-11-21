@@ -286,6 +286,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         SessionBudgetExhausted,
     )
 
+    from orchestrator.branch_stack import RestackBlocked, RestackConflict
     from orchestrator.git_ops import (
         BranchResetError,
         CitationPatternInvalid,
@@ -297,6 +298,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         MergeParkError,
         MergeVerifyLeaseContended,
         MergeVerifyLeaseHeld,
+        StackRecordUnconfirmed,
         WarmLaneDiskPressure,
         WarmLaneLockContention,
         WarmLaneLockTimeout,
@@ -623,6 +625,35 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Task branch checked out in another worktree',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Re-stacking a dependent onto its predecessor's new tip (task 10473,
+        # PRD early-start 5.3). A conflict left the branch, tree and record as
+        # they were, so it requeues without charging the task. Every other
+        # stop (refused, abort failed, record failed) blocks: the result's
+        # message names the branch, its old tip and base, and any recovery.
+        RestackConflict: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='restack_conflict',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        RestackBlocked: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Re-stack blocked: branch and record may need restoring',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        StackRecordUnconfirmed: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Stack-base record unconfirmed',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── BD-2 completeness rows: exported by the 4 covered modules, but

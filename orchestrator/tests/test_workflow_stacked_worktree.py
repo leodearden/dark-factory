@@ -153,7 +153,7 @@ class TestStackedDispatch:
         assert report.outcome == WorkflowOutcome.BLOCKED
         assert report.reason.startswith('Re-stack blocked')
         assert first_agent.base_commit is None
-        [escalation] = queue.get_by_task('D')
+        [escalation] = queue.get_by_task('D', level=0)
         assert 'task/D' in escalation.detail
         assert 'rebase --abort' in escalation.detail
         assert 'orchestrator.rebase_recovery preflight' in escalation.detail
