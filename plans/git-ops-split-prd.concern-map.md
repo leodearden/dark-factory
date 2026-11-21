@@ -4,6 +4,10 @@
 regenerate it in place. The PRD's α leaf re-measures post-S5 main against the same partition file and
 records what changed as a dated Correction in the PRD, beside this file, not in it.
 
+**Re-rendered 2026-11-21 by the extended instrument**, before this file reached main: the same source
+at `c787af9409`, with the residual line mix, `projected_lines`, the `methods` column and the cluster
+strata added to the rendering, and the `s5-split/main_park` cluster added to the partition.
+
 ## Reproduction
 
 ```
@@ -24,7 +28,8 @@ not). Cluster names carry their owner:
 - `s5/<module>`: a module that S5 (`plans/review-all-s5-gitops-ports-query-contract-and-the-git-runner-prd.md`,
   tasks 9255–9277) creates and moves this code into.
 - `s5-split/<module>`: a piece of an S5 module that is still over the 1,500-line ceiling, which this
-  PRD splits out after S5 lands.
+  PRD splits out after S5 lands. `s5-split/main_park` is D8's park and index-lock sink, taken out of
+  `s5/main_landing`: the park ref, WIP parking, recovery-branch restore and the index-lock wait.
 - `s5-unplaced/lane_paths`: units whose S5 placement would make a cycle (rule R6).
 - `residual/<module>`: S5's residual, meaning cluster (c) plus the non-class names S5 keeps in `git_ops.py`.
   This PRD splits it into these modules. `residual/git_ops` is what stays in `git_ops.py`: the
@@ -80,11 +85,75 @@ Every shared write below pairs `GitOps.__init__` with exactly one other cluster.
 same way: the owning collaborator's constructor initialises the attribute, so each attribute has
 one writer module.
 
+## Projection, preamble allowance and headroom
+
+**Projection.** A cluster's `lines` is the sum of its unit spans. It leaves out the separators between
+units, the import preamble and the class header, so it is not the size of the module the cluster
+becomes. `projected` adds the cluster's apportioned share of the separators. Each method unit takes
+232/225 lines: the class's 232 blank non-method lines over its 225 methods. Each module unit takes
+327/117 lines: the 327 inter-unit gap lines over the 117 module units. The share is rounded up once
+per cluster. The class's 281 non-method lines are 232 blank, 47 prose and 2 code: the class docstring
+is one line, the other 46 prose lines are comment blocks a blank line away from the method below them,
+and the code is the class line and `_VERIFY_ATTEMPT_COUNTER_FILENAME`.
+
+**Preamble allowance P = 50.** A new module needs lines that no unit carries. The budget per component:
+
+| Component | Lines |
+|---|---:|
+| module docstring, one paragraph (opening quotes, five lines, closing quotes) | 7 |
+| blank line | 1 |
+| top-level imports: the largest of the comparable set below | 34 |
+| blank line | 1 |
+| `logger = logging.getLogger(__name__)` | 1 |
+| two blank lines | 2 |
+| class line | 1 |
+| class docstring stating the one-sentence purpose | 3 |
+| **P** | **50** |
+
+The import budget is the largest, not the median, of the top-level `Import`/`ImportFrom` statement
+lines in six comparable modules at `c787af9409`, because each git-engine module takes several
+collaborators: `lane_lifecycle.py` 10, `warm_lane_pool.py` 10, `merge_lane/gates.py` 34,
+`merge_lane/intake.py` 34, `merge_lane/queue_store.py` 17, `merge_lane/landing_evidence.py` 13.
+The counts come from:
+
+```
+for f in orchestrator/src/orchestrator/lane_lifecycle.py orchestrator/src/orchestrator/warm_lane_pool.py \
+    orchestrator/src/orchestrator/merge_lane/{gates,intake,queue_store,landing_evidence}.py; do
+  printf '%s ' "$f"; git show "c787af9409:$f" | python3 -c 'import ast,sys; t=ast.parse(sys.stdin.read()); print(sum(s.end_lineno-s.lineno+1 for s in t.body if isinstance(s,(ast.Import,ast.ImportFrom))))'
+done
+```
+
+**Headroom H = 35.** H is the median `GitOps` method span in the Units table (225 methods). A module
+whose `projected` + P exceeds 1,500 − H = 1,465 is *near the ceiling*. H is one median method of growth
+room, so the next ordinary change does not breach the ceiling.
+
+Near the ceiling under this partition, and each over 1,500 itself: `s5/git_queries` 1,491 + 50 = 1,541,
+`s5/task_branch` 1,472 + 50 = 1,522 and `s5-split/merge_worktrees` 1,452 + 50 = 1,502. `s5/main_landing`
+was 1,533 + 50 = 1,583 before `s5-split/main_park` came out of it, and is 1,057 + 50 = 1,107 after.
+
+## Fallback sub-clusters (evaluated in variant partitions, not committed)
+
+Each near-ceiling module has a measured fallback. Each was chosen by what its units own and touch,
+never by name prefix: either the one piece of state the module writes, or a set of units closed under
+the module's own refs to it (every unit in the module that refs a member is a member) that no other
+cluster refs. To reproduce one, move the listed units out of their cluster into a new cluster and run
+the reproduction command with that partition. Each was evaluated alone and all three together. Every
+variant has no cyclic group, and the three together have none.
+
+| Fallback (from) | Units | Lines | Projected | Projected + P | Remaining module projected + P | New cross-cluster edges |
+|---|---|---:|---:|---:|---:|---|
+| `git_citations` (`s5/git_queries`): commit-citation and patch-id replay search; nothing outside it refs it | `CitationPatternInvalid`, `DEFAULT_COMMIT_CITATION_PATTERN`, `render_citation_pattern`, `task_citation_pattern`, `GitOps.find_task_citation_commit`, `GitOps.find_task_citation_commit_checked`, `ReplayMatch`, `RebasedCitation`, `GitOps._find_replay`, `GitOps._unambiguous_patch_ids`, `GitOps.find_equivalent_commit`, `GitOps.resolve_rebased_citation`, `GitOps.commits_named`, `_FULL_OID` | 474 | 501 | 551 | 990 + 50 = 1,040 | → `s5/git_queries` 3 (`GitOps.resolve_rebased_citation` → `GitOps._commit_paths`), → `s5/git_run` 9, → logger 2 |
+| `merge_markers` (`s5/task_branch`): the merge-marker index, the only state `task_branch` writes | `_MERGE_MARKER_INDEX_RECHECK_SECS`, `_MERGE_MARKER_LOG_FORMAT`, `_merge_markers_by_branch`, `GitOps._build_merge_marker_index`, `GitOps._lookup_merge_marker`, `GitOps._scan_merge_marker`, `GitOps.find_merge_marker`, `GitOps.find_merge_marker_checked` | 184 | 198 | 248 | 1,274 + 50 = 1,324 | → `s5/git_queries` 2 (`GitOps._lookup_merge_marker` → `GitOps.get_main_sha`), → `s5/git_run` 4; `s5-split/merge_worktrees` → it 1 (`GitOps._interactive_worktree_landed` → `GitOps._lookup_merge_marker`) |
+| `interactive_reaper` (`s5-split/merge_worktrees`): the interactive-worktree reap; nothing outside it refs it | `GitOps.reap_interactive_worktrees`, `GitOps._interactive_worktree_landed`, `GitOps._iter_interactive_worktrees`, `GitOps._worktree_dirty`, `GitOps._worktree_head_readable` | 315 | 321 | 371 | 1,131 + 50 = 1,181 | → `s5/worktrees` 2, → `s5/git_run` 4, → `residual/pool_storage`, `s5/git_queries`, `s5/task_branch`, `s5/warm_lane_scripts`, logger 1 each; `merge_worktrees` → `git_queries` and → `warm_lane_scripts` are gone |
+
+With `merge_markers` taken out, the three merge-marker attributes are written by it and by
+`GitOps.__init__`, and resolve like every other shared write.
+
 ---
 
 # Concern map: `orchestrator/src/orchestrator/git_ops.py`, class `GitOps`
 
-17010 lines: 16266 in 342 units, and the residual buckets module_preamble 136, class_non_method 281, module_other 0, inter_unit_gaps 327.
+17010 lines: 16266 in 342 units, and the residual buckets module_preamble 136 (0 blank, 40 prose, 96 code), class_non_method 281 (232 blank, 47 prose, 2 code), module_other 0 (0 blank, 0 prose, 0 code), inter_unit_gaps 327 (220 blank, 107 prose, 0 code).
 
 ## Units
 
@@ -100,15 +169,15 @@ one writer module.
 | RemovalOutcome | module | 35 | 31 |  |  |  | s5/worktrees |
 | WIP_SAFETY_COMMIT_PREFIXES | module | 7 | 6 |  |  |  | s5/task_branch |
 | is_wip_safety_commit | module | 9 | 7 |  |  | WIP_SAFETY_COMMIT_PREFIXES | s5/task_branch |
-| MERGE_PARK_REF | module | 7 | 6 |  |  |  | s5/main_landing |
-| _INDEX_LOCK_POLL_INTERVAL_S | module | 6 | 5 |  |  |  | s5/main_landing |
-| _INDEX_LOCK_WARN_INTERVAL_S | module | 1 | 0 |  |  |  | s5/main_landing |
-| _INDEX_LOCK_STALE_FLOOR_S | module | 19 | 18 |  |  |  | s5/main_landing |
+| MERGE_PARK_REF | module | 7 | 6 |  |  |  | s5-split/main_park |
+| _INDEX_LOCK_POLL_INTERVAL_S | module | 6 | 5 |  |  |  | s5-split/main_park |
+| _INDEX_LOCK_WARN_INTERVAL_S | module | 1 | 0 |  |  |  | s5-split/main_park |
+| _INDEX_LOCK_STALE_FLOOR_S | module | 19 | 18 |  |  |  | s5-split/main_park |
 | _WORKTREE_ADD_MAX_ATTEMPTS | module | 3 | 2 |  |  |  | s5/worktrees |
 | _worktree_add_failure_is_retryable | module | 16 | 14 |  |  |  | s5/worktrees |
-| MergeParkError | module | 11 | 10 |  |  |  | s5/main_landing |
-| MergeParkLockContentionError | module | 19 | 18 |  |  | MergeParkError | s5/main_landing |
-| MergeParkContentionError | module | 9 | 8 |  |  | MergeParkError | s5/main_landing |
+| MergeParkError | module | 11 | 10 |  |  |  | s5-split/main_park |
+| MergeParkLockContentionError | module | 19 | 18 |  |  | MergeParkError | s5-split/main_park |
+| MergeParkContentionError | module | 9 | 8 |  |  | MergeParkError | s5-split/main_park |
 | TrainMembership | module | 9 | 5 |  |  |  | s5/task_branch |
 | _is_train_successor | module | 4 | 2 |  |  | TrainMembership | s5/task_branch |
 | TrainPredecessor | module | 5 | 1 |  |  |  | s5/task_branch |
@@ -395,12 +464,12 @@ one writer module.
 | GitOps.advance_main | method | 690 | 317 | _last_overlap_files, _last_park_lock_info, _last_recovery_branch, _last_stash_dirty_files | config, project_root | AdvanceOutcome, GitOps._await_index_lock_clear, GitOps._detect_unmerged_paths, GitOps._index_lock_path, GitOps._index_lock_state, GitOps._park_wip_on_private_ref, GitOps._safe_restore_park_with_recovery, GitOps.get_main_sha, GitOps.resolve_queued_branch_ref, MERGE_PARK_REF, MergeParkContentionError, MergeParkError, MergeParkLockContentionError, _assert_no_conflict_markers, _run, logger | s5/main_landing |
 | GitOps.recover_red_main | method | 216 | 91 |  | config, project_root | RecoverResult, _run, logger | s5/main_landing |
 | GitOps.push_main | method | 46 | 16 |  | config, project_root | PushResult, _run, logger | s5/main_landing |
-| GitOps._index_lock_path | method | 35 | 15 | _index_lock_path_cache | project_root | _run | s5/main_landing |
-| GitOps._index_lock_state | method | 19 | 10 |  |  | GitOps._index_lock_path | s5/main_landing |
-| GitOps._await_index_lock_clear | method | 116 | 52 |  |  | GitOps._index_lock_path, GitOps._index_lock_state, _INDEX_LOCK_POLL_INTERVAL_S, _INDEX_LOCK_STALE_FLOOR_S, _INDEX_LOCK_WARN_INTERVAL_S, logger | s5/main_landing |
-| GitOps._park_wip_on_private_ref | method | 117 | 66 |  | project_root | GitOps._index_lock_path, GitOps._index_lock_state, MERGE_PARK_REF, MergeParkContentionError, MergeParkError, MergeParkLockContentionError, _run | s5/main_landing |
-| GitOps._create_recovery_branch_from_park_ref | method | 44 | 19 |  | project_root | MERGE_PARK_REF, _run, logger | s5/main_landing |
-| GitOps._safe_restore_park_with_recovery | method | 48 | 20 |  | project_root | GitOps._create_recovery_branch_from_park_ref, GitOps._detect_unmerged_paths, MERGE_PARK_REF, _run, logger | s5/main_landing |
+| GitOps._index_lock_path | method | 35 | 15 | _index_lock_path_cache | project_root | _run | s5-split/main_park |
+| GitOps._index_lock_state | method | 19 | 10 |  |  | GitOps._index_lock_path | s5-split/main_park |
+| GitOps._await_index_lock_clear | method | 116 | 52 |  |  | GitOps._index_lock_path, GitOps._index_lock_state, _INDEX_LOCK_POLL_INTERVAL_S, _INDEX_LOCK_STALE_FLOOR_S, _INDEX_LOCK_WARN_INTERVAL_S, logger | s5-split/main_park |
+| GitOps._park_wip_on_private_ref | method | 117 | 66 |  | project_root | GitOps._index_lock_path, GitOps._index_lock_state, MERGE_PARK_REF, MergeParkContentionError, MergeParkError, MergeParkLockContentionError, _run | s5-split/main_park |
+| GitOps._create_recovery_branch_from_park_ref | method | 44 | 19 |  | project_root | MERGE_PARK_REF, _run, logger | s5-split/main_park |
+| GitOps._safe_restore_park_with_recovery | method | 48 | 20 |  | project_root | GitOps._create_recovery_branch_from_park_ref, GitOps._detect_unmerged_paths, MERGE_PARK_REF, _run, logger | s5-split/main_park |
 | GitOps.has_dirty_working_tree | method | 17 | 6 |  | project_root | _run | s5/git_queries |
 | GitOps._detect_unmerged_paths | method | 22 | 8 |  |  | _run | s5/git_queries |
 | GitOps.unmerged_paths | method | 17 | 6 |  |  | _run | s5/git_queries |
@@ -435,31 +504,32 @@ one writer module.
 
 ## Clusters
 
-| cluster | units | lines | prose |
-| --- | ---: | ---: | ---: |
-| per-module/logger | 1 | 1 | 0 |
-| residual/git_ops | 7 | 1177 | 698 |
-| residual/lane_admission | 8 | 511 | 307 |
-| residual/lane_outcomes | 15 | 405 | 358 |
-| residual/lane_release | 15 | 702 | 335 |
-| residual/lane_reset | 8 | 628 | 311 |
-| residual/lane_seeding | 3 | 358 | 224 |
-| residual/pool_storage | 7 | 247 | 193 |
-| residual/spec_lanes | 6 | 241 | 119 |
-| residual/warm_acquire | 9 | 1298 | 744 |
-| s5-split/commit_effect | 17 | 1123 | 755 |
-| s5-split/merge_worktrees | 19 | 1428 | 867 |
-| s5-split/merging | 8 | 446 | 273 |
-| s5-split/worktree_relocation | 14 | 282 | 91 |
-| s5-unplaced/lane_paths | 7 | 96 | 73 |
-| s5/git_diff | 3 | 140 | 72 |
-| s5/git_queries | 46 | 1427 | 797 |
-| s5/git_run | 5 | 77 | 47 |
-| s5/lane_lease | 20 | 884 | 674 |
-| s5/main_landing | 21 | 1490 | 722 |
-| s5/task_branch | 50 | 1402 | 648 |
-| s5/warm_lane_scripts | 21 | 644 | 392 |
-| s5/worktrees | 32 | 1259 | 752 |
+| cluster | units | methods | lines | prose | projected |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| per-module/logger | 1 | 0 | 1 | 0 | 4 |
+| residual/git_ops | 7 | 7 | 1177 | 698 | 1185 |
+| residual/lane_admission | 8 | 7 | 511 | 307 | 522 |
+| residual/lane_outcomes | 15 | 0 | 405 | 358 | 447 |
+| residual/lane_release | 15 | 15 | 702 | 335 | 718 |
+| residual/lane_reset | 8 | 8 | 628 | 311 | 637 |
+| residual/lane_seeding | 3 | 2 | 358 | 224 | 363 |
+| residual/pool_storage | 7 | 7 | 247 | 193 | 255 |
+| residual/spec_lanes | 6 | 6 | 241 | 119 | 248 |
+| residual/warm_acquire | 9 | 7 | 1298 | 744 | 1311 |
+| s5-split/commit_effect | 17 | 10 | 1123 | 755 | 1153 |
+| s5-split/main_park | 13 | 6 | 451 | 247 | 477 |
+| s5-split/merge_worktrees | 19 | 17 | 1428 | 867 | 1452 |
+| s5-split/merging | 8 | 7 | 446 | 273 | 457 |
+| s5-split/worktree_relocation | 14 | 11 | 282 | 91 | 302 |
+| s5-unplaced/lane_paths | 7 | 5 | 96 | 73 | 107 |
+| s5/git_diff | 3 | 0 | 140 | 72 | 149 |
+| s5/git_queries | 46 | 37 | 1427 | 797 | 1491 |
+| s5/git_run | 5 | 0 | 77 | 47 | 91 |
+| s5/lane_lease | 20 | 5 | 884 | 674 | 932 |
+| s5/main_landing | 8 | 3 | 1039 | 475 | 1057 |
+| s5/task_branch | 50 | 40 | 1402 | 648 | 1472 |
+| s5/warm_lane_scripts | 21 | 10 | 644 | 392 | 686 |
+| s5/worktrees | 32 | 15 | 1259 | 752 | 1322 |
 
 ## Cross-cluster edges
 
@@ -535,6 +605,9 @@ one writer module.
 | residual/warm_acquire | s5/worktrees | 3 | GitOps._acquire_warm_lane_impl -> GitOps._is_registered_worktree |
 | s5-split/commit_effect | s5/git_queries | 1 | GitOps.describe_commit_effect_in_main -> GitOps.get_main_sha |
 | s5-split/commit_effect | s5/git_run | 7 | GitOps._anchor_diff_lines -> _run |
+| s5-split/main_park | per-module/logger | 3 | GitOps._await_index_lock_clear -> logger |
+| s5-split/main_park | s5/git_queries | 1 | GitOps._safe_restore_park_with_recovery -> GitOps._detect_unmerged_paths |
+| s5-split/main_park | s5/git_run | 4 | GitOps._create_recovery_branch_from_park_ref -> _run |
 | s5-split/merge_worktrees | per-module/logger | 9 | GitOps._create_merge_worktree -> logger |
 | s5-split/merge_worktrees | residual/pool_storage | 3 | GitOps.cleanup_merge_worktree -> GitOps._prune_registrations |
 | s5-split/merge_worktrees | s5-unplaced/lane_paths | 6 | GitOps._iter_merge_worktrees -> PERSISTENT_MERGE_WORKTREE_NAME |
@@ -558,9 +631,10 @@ one writer module.
 | s5/git_queries | s5/git_diff | 2 | GitOps.get_changed_line_ranges -> parse_diff_line_ranges |
 | s5/git_queries | s5/git_run | 38 | GitOps._commit_paths -> _git_query |
 | s5/lane_lease | per-module/logger | 2 | GitOps._lane_lock_self_owned_leak -> logger |
-| s5/main_landing | per-module/logger | 7 | GitOps._await_index_lock_clear -> logger |
-| s5/main_landing | s5/git_queries | 3 | GitOps._safe_restore_park_with_recovery -> GitOps._detect_unmerged_paths |
-| s5/main_landing | s5/git_run | 8 | GitOps._create_recovery_branch_from_park_ref -> _run |
+| s5/main_landing | per-module/logger | 4 | GitOps.advance_main -> logger |
+| s5/main_landing | s5-split/main_park | 9 | GitOps.advance_main -> GitOps._await_index_lock_clear |
+| s5/main_landing | s5/git_queries | 2 | GitOps.advance_main -> GitOps._detect_unmerged_paths |
+| s5/main_landing | s5/git_run | 4 | GitOps.advance_main -> _run |
 | s5/main_landing | s5/task_branch | 1 | GitOps.advance_main -> GitOps.resolve_queued_branch_ref |
 | s5/task_branch | per-module/logger | 14 | GitOps._cleanup_leftover_branch -> logger |
 | s5/task_branch | residual/lane_outcomes | 1 | GitOps.materialize_member_solo -> WorktreeInfo |
@@ -583,6 +657,19 @@ one writer module.
 
 none
 
+## Cluster strata (bottom first)
+
+- 0: per-module/logger, residual/lane_outcomes, s5-unplaced/lane_paths, s5/git_diff, s5/git_run
+- 1: s5/git_queries, s5/lane_lease, s5/warm_lane_scripts
+- 2: residual/pool_storage, s5-split/commit_effect, s5-split/main_park
+- 3: residual/lane_seeding, s5/task_branch
+- 4: s5/main_landing, s5/worktrees
+- 5: residual/lane_admission, s5-split/merge_worktrees, s5-split/worktree_relocation
+- 6: residual/lane_reset, residual/spec_lanes, s5-split/merging
+- 7: residual/lane_release
+- 8: residual/warm_acquire
+- 9: residual/git_ops
+
 ## Shared writes
 
 - `_consecutive_exhausted`: residual/git_ops, residual/warm_acquire
@@ -595,7 +682,7 @@ none
 
 | module unit | clusters |
 | --- | --- |
-| logger | residual/git_ops, residual/lane_admission, residual/lane_release, residual/lane_reset, residual/lane_seeding, residual/pool_storage, residual/spec_lanes, residual/warm_acquire, s5-split/merge_worktrees, s5-split/merging, s5-split/worktree_relocation, s5/git_queries, s5/lane_lease, s5/main_landing, s5/task_branch, s5/warm_lane_scripts, s5/worktrees |
+| logger | residual/git_ops, residual/lane_admission, residual/lane_release, residual/lane_reset, residual/lane_seeding, residual/pool_storage, residual/spec_lanes, residual/warm_acquire, s5-split/main_park, s5-split/merge_worktrees, s5-split/merging, s5-split/worktree_relocation, s5/git_queries, s5/lane_lease, s5/main_landing, s5/task_branch, s5/warm_lane_scripts, s5/worktrees |
 | AdvanceResult | s5/main_landing |
 | AdvanceOutcome | s5/main_landing |
 | PushResult | s5/main_landing |
@@ -605,15 +692,15 @@ none
 | RemovalOutcome | s5-split/merge_worktrees |
 | WIP_SAFETY_COMMIT_PREFIXES | s5/task_branch |
 | is_wip_safety_commit | none |
-| MERGE_PARK_REF | s5/main_landing |
-| _INDEX_LOCK_POLL_INTERVAL_S | s5/main_landing |
-| _INDEX_LOCK_WARN_INTERVAL_S | s5/main_landing |
-| _INDEX_LOCK_STALE_FLOOR_S | s5/main_landing |
+| MERGE_PARK_REF | s5-split/main_park, s5/main_landing |
+| _INDEX_LOCK_POLL_INTERVAL_S | s5-split/main_park |
+| _INDEX_LOCK_WARN_INTERVAL_S | s5-split/main_park |
+| _INDEX_LOCK_STALE_FLOOR_S | s5-split/main_park |
 | _WORKTREE_ADD_MAX_ATTEMPTS | s5/worktrees |
 | _worktree_add_failure_is_retryable | s5/worktrees |
-| MergeParkError | s5/main_landing |
-| MergeParkLockContentionError | s5/main_landing |
-| MergeParkContentionError | s5/main_landing |
+| MergeParkError | s5-split/main_park, s5/main_landing |
+| MergeParkLockContentionError | s5-split/main_park, s5/main_landing |
+| MergeParkContentionError | s5-split/main_park, s5/main_landing |
 | TrainMembership | residual/git_ops, s5/task_branch |
 | _is_train_successor | residual/git_ops |
 | TrainPredecessor | s5/task_branch |
@@ -703,7 +790,7 @@ none
 | _settled_lane_lock_holder_pids | residual/git_ops, s5-split/merge_worktrees |
 | _lane_lock_holder_facts | residual/git_ops, s5-split/merge_worktrees |
 | _utc_stamp | residual/lane_release, s5-split/worktree_relocation |
-| _run | residual/git_ops, residual/lane_admission, residual/lane_release, residual/lane_reset, residual/lane_seeding, residual/pool_storage, residual/spec_lanes, residual/warm_acquire, s5-split/commit_effect, s5-split/merge_worktrees, s5-split/merging, s5-split/worktree_relocation, s5/git_queries, s5/git_run, s5/main_landing, s5/task_branch, s5/warm_lane_scripts, s5/worktrees |
+| _run | residual/git_ops, residual/lane_admission, residual/lane_release, residual/lane_reset, residual/lane_seeding, residual/pool_storage, residual/spec_lanes, residual/warm_acquire, s5-split/commit_effect, s5-split/main_park, s5-split/merge_worktrees, s5-split/merging, s5-split/worktree_relocation, s5/git_queries, s5/git_run, s5/main_landing, s5/task_branch, s5/warm_lane_scripts, s5/worktrees |
 | _git_query | s5/git_queries |
 | _FULL_OID | s5/git_queries |
 | _git_clean_failure_is_benign | s5/worktrees |

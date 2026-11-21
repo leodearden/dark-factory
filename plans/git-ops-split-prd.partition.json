@@ -117,6 +117,21 @@
     "_EFFECT_SURVIVAL_PER_FILE_THRESHOLD",
     "_EMPTY_TREE_SHA"
   ],
+  "s5-split/main_park": [
+    "GitOps._await_index_lock_clear",
+    "GitOps._create_recovery_branch_from_park_ref",
+    "GitOps._index_lock_path",
+    "GitOps._index_lock_state",
+    "GitOps._park_wip_on_private_ref",
+    "GitOps._safe_restore_park_with_recovery",
+    "MERGE_PARK_REF",
+    "MergeParkContentionError",
+    "MergeParkError",
+    "MergeParkLockContentionError",
+    "_INDEX_LOCK_POLL_INTERVAL_S",
+    "_INDEX_LOCK_STALE_FLOOR_S",
+    "_INDEX_LOCK_WARN_INTERVAL_S"
+  ],
   "s5-split/merge_worktrees": [
     "GitOps._bump_host_verify_attempt_count",
     "GitOps._create_merge_worktree",
@@ -258,24 +273,11 @@
   "s5/main_landing": [
     "AdvanceOutcome",
     "AdvanceResult",
-    "GitOps._await_index_lock_clear",
-    "GitOps._create_recovery_branch_from_park_ref",
-    "GitOps._index_lock_path",
-    "GitOps._index_lock_state",
-    "GitOps._park_wip_on_private_ref",
-    "GitOps._safe_restore_park_with_recovery",
     "GitOps.advance_main",
     "GitOps.push_main",
     "GitOps.recover_red_main",
-    "MERGE_PARK_REF",
-    "MergeParkContentionError",
-    "MergeParkError",
-    "MergeParkLockContentionError",
     "PushResult",
     "RecoverResult",
-    "_INDEX_LOCK_POLL_INTERVAL_S",
-    "_INDEX_LOCK_STALE_FLOOR_S",
-    "_INDEX_LOCK_WARN_INTERVAL_S",
     "_assert_no_conflict_markers"
   ],
   "s5/task_branch": [

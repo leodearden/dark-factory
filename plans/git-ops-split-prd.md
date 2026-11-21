@@ -69,22 +69,27 @@ Measured at `c787af9409` (concern map; raw lines include prose):
 | Measure | Value |
 |---|---|
 | `git_ops.py` lines / prose lines | 17,010 / 9,646 (57%) |
-| Units | 342: 225 `GitOps` methods over 13,727 lines; 117 module-level units over 2,539 lines; residual buckets 744 (preamble 136, class non-method 281, gaps 327) |
+| Units | 342: 225 `GitOps` methods over 13,727 lines; 117 module-level units over 2,539 lines. Residual buckets 744: preamble 136 (96 code, 40 prose); class non-method 281, which is 232 blank separators between the 225 methods, 47 prose (a one-line class docstring and 46 comment lines a blank line away from the next method) and 2 code; module gaps 327 (220 blank, 107 prose) |
 | `GitOps` own mutable state | `config`, `project_root` and `worktree_base` are read by 70, 92 and 37 methods; `warm_lane_pool` by 21; the rest is 5 counters and caches plus 4 callbacks. A map keyed on self-attribute writes alone cannot partition it, so the instrument also records the intra-class ref graph. |
 | Comment lines inside method spans | worktrees 89, main advance 358, warm acquire 429, `GitOps` root and `create_worktree` 429. The rest of the prose is docstrings. |
 | `src` importers of `orchestrator.git_ops` names | 34 names across 48 modules (AST `ImportFrom`); `workflow_types.py` imports 21 |
 
-Projected module sizes under the committed partition (R1–R6; raw lines, of which prose):
+Projected module sizes under the committed partition (R1–R6). *Unit lines* is the sum of unit spans.
+It leaves out the separators, preamble and class header that a module also carries, which is why the
+*projected* column exists: it adds the units' apportioned share of the separators. *Projected + P*
+adds the 50-line preamble allowance, and H = 35 is one median method of headroom (concern map,
+"Projection, preamble allowance and headroom"). An S5-layout row is the sum of its constituent
+clusters' figures.
 
-| Module (owner) | Lines | Prose | Over 1,500? |
-|---|---:|---:|---|
-| `main_landing` as S5 lands it (advance + merging + merge-worktree lifecycle + interactive reap) | 3,364 | 1,862 | yes. Even with no prose, 1,502 lines of code. |
-| `git_queries` as reconstructed (reads + commit-effect probe) | 2,550 | 1,552 | yes. S5's own figure is 1,636; S5's text does not list cluster (f) membership, so R2 decides. |
-| `worktrees` (S5 ξ, after S5 γ takes the script wrappers) | 1,541 | 843 | by 41 |
-| `task_branch` (S5 λ) | 1,402 | 648 | no |
-| `lane_lease` (S5 θ) | 884 | 674 | no |
-| `warm_lane_scripts` (S5 γ, script halves only, R3) | 644 | 392 | no |
-| S5's residual in `git_ops.py` (this PRD's `residual/*` clusters) | 5,567 + buckets | 3,289 | yes |
+| Module (owner) | Unit lines | Prose | Projected | Projected + P | Over 1,500 − H (1,465)? |
+|---|---:|---:|---:|---:|---|
+| `main_landing` as S5 lands it (advance + park + merging + merge-worktree lifecycle + interactive reap) | 3,364 | 1,862 | 3,443 | 3,493 | yes. Even with no prose, 1,502 unit lines. |
+| `git_queries` as reconstructed (reads + commit-effect probe) | 2,550 | 1,552 | 2,644 | 2,694 | yes. S5's own figure is 1,636; S5's text does not list cluster (f) membership, so R2 decides. |
+| `worktrees` (S5 ξ, after S5 γ takes the script wrappers) | 1,541 | 843 | 1,624 | 1,674 | yes |
+| `task_branch` (S5 λ) | 1,402 | 648 | 1,472 | 1,522 | yes |
+| `lane_lease` (S5 θ) | 884 | 674 | 932 | 982 | no |
+| `warm_lane_scripts` (S5 γ, script halves only, R3) | 644 | 392 | 686 | 736 | no |
+| S5's residual in `git_ops.py` (this PRD's `residual/*` clusters) | 5,567 | 3,289 | 5,686 | 5,736 | yes |
 
 The lesson that shapes this PRD comes from `plans/merge-lane-quality-prd.md` §Background. The July merge-queue
 split went by topic. It produced function-bags over the worker's private state, stitched back by
@@ -93,8 +98,10 @@ prefix, and it measures every candidate.
 
 ### Heuristic-14 measurement (the partition tried, and the symptom each rejected candidate hit)
 
-Every candidate was evaluated with `scripts/concern_map.py --partition`. The commit message of the
-concern-map commit (`922bbd7fad` on `task/7140`) carries the same record.
+Every candidate was evaluated with `scripts/concern_map.py --partition`. The commit messages of the
+concern-map commits on `task/7140` carry the same record (subjects `docs(prd): git-ops split — measured
+concern map and partition at c787af9409` and `docs(prd): git-ops split — projected sizes, main_park,
+fallbacks and a measured layering`).
 
 1. **S5's placements as written.** These close three cycles, which R6 records and regroups:
    - `PERSISTENT_MERGE_WORKTREE_NAME` in `main_landing`: `worktrees.PROTECTED_PREFIXES` needs it, so
@@ -123,12 +130,32 @@ concern-map commit (`922bbd7fad` on `task/7140`) carries the same record.
    `worktree_relocation` is 282 lines and `worktrees` is 1,259.
 6. **`main_landing` split into merging, merge-worktree lifecycle, main advance and interactive reap.**
    Acyclic. The only internal edge is merging → lifecycle (`merge_to_main` → `_create_merge_worktree`,
-   `cleanup_merge_worktree`). Lifecycle plus interactive reap is 1,428 lines, which is one module.
-   Merging plus lifecycle would be 1,559, so that pairing was rejected.
+   `cleanup_merge_worktree`). Lifecycle plus interactive reap is 1,428 unit lines, one module that
+   projects to 1,452 + P = 1,502, so D12 names its fallback (item 11). Merging plus lifecycle would be
+   1,559 unit lines, so that pairing was rejected.
 7. **`git_queries` split into reads and commit-effect probe.** Acyclic. The only edge is
    `describe_commit_effect_in_main` → `get_main_sha`.
+8. **`main_landing` split into main advance and the park and index-lock sink (`main_park`).** Acyclic:
+   no symptom. The only new edge is `main_landing` → `main_park`, 9 refs (`GitOps.advance_main` →
+   `GitOps._await_index_lock_clear`), and `main_park` refs only `git_queries` and `git_run`. Main
+   advance is 1,039 unit lines (1,057 projected) and `main_park` 451 (477 projected); together they
+   projected 1,533 + P = 1,583.
+9. **`git_queries` fallback: `git_citations`.** The commit-citation and patch-id replay search, a set
+   of units closed under `git_queries`' own refs to it that no other cluster refs. Acyclic: no symptom.
+   474 unit lines (501 projected); it leaves `git_queries` at 953 (990 projected). New edges run only
+   out of it: `git_queries` 3, `git_run` 9.
+10. **`task_branch` fallback: `merge_markers`.** The merge-marker index, the only state `task_branch`
+    writes. Acyclic: no symptom. 184 unit lines (198 projected); it leaves `task_branch` at 1,218
+    (1,274 projected). New edges: it refs `git_queries` 2 and `git_run` 4, and `merge_worktrees` refs it 1.
+11. **`merge_worktrees` fallback: `interactive_reaper`.** The interactive-worktree reap, a set closed
+    under `merge_worktrees`' own refs to it that no other cluster refs. Acyclic: no symptom. 315 unit
+    lines (321 projected); it leaves `merge_worktrees` at 1,113 (1,131 projected). New edges run only
+    out of it, to modules below `merge_worktrees`.
 
-The committed partition is candidate 3 as resolved, plus candidates 5–7. It has no cyclic group. Each
+Candidates 9–11 were evaluated alone and all three together, in variant partitions that are not
+committed. Every variant has no cyclic group (concern map, "Fallback sub-clusters").
+
+The committed partition is candidate 3 as resolved, plus candidates 5–8. It has no cyclic group. Each
 of its five shared writes pairs `GitOps.__init__` with exactly one owner, and that owner's constructor
 initialises the attribute.
 
@@ -144,28 +171,44 @@ cluster this PRD splits. So the authoring map is a prediction, and α converts i
 
 The layering below runs lowest first. Each module imports only downward, and no module imports
 `git_ops.py`. Rows marked *S5* are S5's modules as S5 lands them. Rows marked *split* are this PRD's
-sub-splits of an S5 module. Rows marked *residual* are this PRD's split of S5's residual.
+sub-splits of an S5 module, and *fallback* rows exist only if D12 applies them. Rows marked *residual*
+are this PRD's split of S5's residual. The first group is the bottom stratum: none of its modules
+imports any module listed below it.
+
+The layering orders constructor collaborators (§Contract's Takes column) as well as unit refs, so a
+module may take only collaborators listed above it here. The order is a linear extension of the concern
+map's "Cluster strata", and α re-derives it from the post-S5 map plus the Takes column rather than
+maintaining it by hand. `lane_lifecycle` (868 lines) and `warm_lane_pool` (933 lines) stay outside
+`CLUSTER_PATHS`: they are existing modules, not moved code. B1 asserts that they import no git-engine
+module.
 
 ```
 shared.git_async, git_run, git_diff, worktree_list, block_disposition     S5 (α, ζ, δ)
-lane_lease                                                                S5 θ
-warm_lane_scripts      WarmLaneScripts, WarmBaseHealth, the default WarmBaseProbe   S5 γ
 lane_paths             persistent-lane and warm-base path facts            this PRD δ (R6; if S5 left them unplaced)
 lane_outcomes          WarmLaneUnavailable table, WarmLaneRequeue family,  this PRD δ (types leaf)
                        WorktreeInfo, PoolPrewarmResult
+lane_lifecycle         LaneLifecycle, LaneLiveness                         existing; S5 ι makes it the public owner
+warm_lane_pool         WarmLanePool                                        existing
+lane_lease                                                                S5 θ
+warm_lane_scripts      WarmLaneScripts, WarmBaseHealth, the default WarmBaseProbe   S5 γ
 pool_storage           PoolStorageGuard: the .pool-root guard and the one  this PRD δ
                        guarded `git worktree prune`
 lane_seeding           LaneSeeder: seed a lane, mark storage, refresh base this PRD δ
 git_queries            GitQueries (reads)                                  S5 ρ
 commit_effect          CommitEffectProbe and the effect-survival probe     split η
-lane_lifecycle         LaneLifecycle (public owner)                        S5 ι
+git_citations          commit-citation and patch-id replay search          fallback η (D12)
+merge_markers          the merge-marker index                              fallback η (D12)
 task_branch            TaskBranchRefs                                      S5 λ
 worktrees              WorktreeOps (primitives, ephemeral, interactive)    S5 ξ
 worktree_relocation    rename and quarantine relocation                    split η
-merge_worktrees        merge / host-verify / offline-deep / interactive    split θ
-                       worktree lifecycle and reaping
+merge_worktrees        merge / host-verify / offline-deep worktree         split θ
+                       lifecycle and reaping (and interactive reap, unless
+                       D12 applies)
+interactive_reaper     the interactive-worktree reap                       fallback θ (D12)
 merging                merge a branch into a worktree or into main         split θ
-main_landing           advance_main, recover_red_main, push_main, park     S5 ο, as θ leaves it
+main_park              the park ref, WIP parking, recovery-branch restore, split θ
+                       the index-lock wait
+main_landing           advance_main, recover_red_main, push_main           S5 ο, as θ leaves it
 spec_lanes             SpecLanes                                           residual ε
 lane_reset             LaneReset: reset, reseed, abort, prewarm            residual ε
 lane_admission         LaneAdmission: disk/soft pressure, gc reclaim,      residual ε
@@ -250,17 +293,35 @@ extraction leaf does the following:
   and α records which. δ makes them direct downward imports.
 - **D8 (sub-splits of S5's modules).**
   - η extracts `worktree_relocation` from `worktrees` and `commit_effect` from `git_queries`.
-  - θ extracts `merging` and `merge_worktrees` from `main_landing`, leaving the main-advance cluster
-    (1,490 lines).
-  - All three splits are measured acyclic (§Background items 5–7), and each is an S5 module that
+  - θ extracts `merging`, `merge_worktrees` and `main_park` from `main_landing`, leaving the
+    main-advance cluster at 1,039 unit lines (1,057 projected, 1,107 + P).
+  - `main_park` is a planned split, not a fallback. It is the park and index-lock sink:
+    `_park_wip_on_private_ref`, `_create_recovery_branch_from_park_ref`,
+    `_safe_restore_park_with_recovery`, `_index_lock_path`, `_index_lock_state`,
+    `_await_index_lock_clear`, `MERGE_PARK_REF`, the `MergePark*` errors and the `_INDEX_LOCK_*`
+    constants: 451 unit lines (477 projected). Its units ref nothing in the advance cluster. Advance
+    plus park projects to 1,533 + P = 1,583 before 5042 adds any def lines, so the breach is predicted,
+    not a risk.
+  - All four splits are measured acyclic (§Background items 5–8), and each is an S5 module that
     remains over the ceiling.
   - θ depends on task 5042, which decomposes `advance_main` in place into named steps, so θ splits a
-    stable function rather than racing it. 5042's named steps add def lines to the main-advance cluster,
-    so θ's measured fallback is the park and index-lock sink: `_park_wip_on_private_ref`,
-    `_create_recovery_branch_from_park_ref`, `_safe_restore_park_with_recovery`, `_index_lock_path`,
-    `_index_lock_state`, `_await_index_lock_clear`, `MERGE_PARK_REF`, the `MergePark*` errors and the
-    `_INDEX_LOCK_*` constants, about 450 lines. Its units ref nothing in the advance cluster.
-  - The fallback goes to a `main_park` module if `main_landing` measures over 1,500 after 5042.
+    stable function rather than racing it.
+- **D12 (measured fallbacks for the modules near the ceiling).** Three modules project over
+  1,500 − H after D8's splits (§Contract → Ceilings). Each has a named fallback, chosen by what its
+  units own and touch and measured acyclic alone and together (§Background items 9–11; concern map,
+  "Fallback sub-clusters"):
+  - η: `git_queries` → `git_citations`, the commit-citation and patch-id replay search, a unit set no
+    other cluster refs. 474 unit lines; `git_queries` keeps 953 (990 projected, 1,040 + P).
+  - η: `task_branch` → `merge_markers`, the merge-marker index, the only state `task_branch` writes.
+    184 unit lines; `task_branch` keeps 1,218 (1,274 projected, 1,324 + P). `MergeMarkers` then
+    initialises the three `_merge_marker_index*` attributes.
+  - θ: `merge_worktrees` → `interactive_reaper`, the interactive-worktree reap, a unit set no other
+    cluster refs. 315 unit lines; `merge_worktrees` keeps 1,113 (1,131 projected, 1,181 + P).
+
+  The trigger is measured, not judged: the owning leaf applies a fallback when its module's post-γ
+  `scripts/merge_lane_metrics.py --report` lines exceed 1,500 − H = 1,465, and records the measurement
+  in its commit message. Rationale: γ's rationale share is unmeasured at authoring, so γ may bring a
+  module under on its own; a split that a measurement does not need would only add a seam.
 - **D9 (seam rulings).**
   - Task 5042 keeps `advance_main`, and this PRD never edits that function.
   - 6432's proposed read probes (`second_parent`, `parent_count`, `path_has_history`) land on S5's
@@ -288,9 +349,9 @@ extraction leaf does the following:
     - `scripts/merge_lane_ratchet.py::_check_ceilings` and `--authorize-raise`;
     - `orchestrator/tests/merge_lane_ratchet_raises/` (one file per authorized raise, task 7298);
     - `scripts/merge_lane_metrics.py --report`;
-    - `scripts/exception_register.py --report`;
-    - `scripts/source_measures.py::prose_line_numbers_in_tree`.
-  - Built here, so on main once this branch merges: `scripts/concern_map.py`.
+    - `scripts/exception_register.py --report`.
+  - Built here, so on main once this branch merges: `scripts/concern_map.py` and
+    `scripts/source_measures.py::prose_line_numbers_in_tree`.
   - Not yet on main:
     - S5's modules and its `ScriptedGitRunner`, `WarmLaneScripts`, `GitOpsCallbacks` and B27 tripwire.
       α verifies each exists after π.
@@ -343,6 +404,10 @@ No reciprocal-ownership ambiguity remains.
 | `commit_effect.py` | `CommitEffectProbe` (value) and `CommitEffects`: `describe_in_main`, `present_in_main` | the effect-probe memo | runner, `GitQueries` | η |
 | `merge_worktrees.py` | `MergeWorktrees`: create / remove-guarded / cleanup / prune / reset persistent / host-verify / reap survivors / find in-flight; interactive reap | — | runner, config, worktree_base, `WorktreeOps`, `PoolStorageGuard`, lease primitives | θ |
 | `merging.py` | `Merging`: `merge_to_main`, `merge_branch_into_worktree`, conflict details, abort | — | runner, config, `MergeWorktrees`, `GitQueries` | θ |
+| `main_park.py` | `MainPark`: park WIP on the private ref, restore it with recovery, create a recovery branch from the park ref, wait for the index lock; `MERGE_PARK_REF`, the `MergePark*` errors | the index-lock path cache | runner, project_root, `GitQueries` | θ |
+| `git_citations.py` | `GitCitations`: find a task's citation commit, find an equivalent (replayed) commit, resolve a rebased citation; `task_citation_pattern`, `RebasedCitation`, `ReplayMatch` | — | runner, config, `GitQueries` | η, only if D12 applies |
+| `merge_markers.py` | `MergeMarkers`: find a branch's merge marker through the merge-marker index | the merge-marker index and its freshness stamps | runner, config, `GitQueries` | η, only if D12 applies |
+| `interactive_reaper.py` | `InteractiveReaper`: reap interactive worktrees that landed or were abandoned | — | runner, config, worktree_base, `WorktreeOps`, `PoolStorageGuard`, `WarmLaneScripts`, `TaskBranchRefs` (or `MergeMarkers`), `GitQueries` | θ, only if D12 applies |
 
 Rules:
 - No module imports `orchestrator.git_ops`, and imports run downward only, per §Sketch. B27 already
@@ -381,8 +446,8 @@ These are byte-identical before and after every leaf:
 
 | Measure | Ceiling | Basis (G6) |
 |---|---|---|
-| Lines per git-engine module | 1,500 (`FILE_LINE_CEILING`) | heuristic 14's soft ceiling and the merge-lane ceiling (merge-lane-quality §Ceilings: 1,500 sits below the 2,000-line single-`Read` alarm). Achievability: every module in §Contract measures at or under 1,500 raw lines, prose included, at `c787af9409`. The largest are `main_landing` 1,490, `merge_worktrees` 1,428, `git_queries` 1,427, `task_branch` 1,402, `warm_acquire` 1,298 and `worktrees` 1,259. The two caveats each have a named fallback: θ's park sink for `main_landing` after 5042 (D8), and `git_ops.py` (below). |
-| `git_ops.py` | 1,500 | measured upper bound 1,618: its 1,177 unit lines, plus the module preamble (136) and the class's non-method lines (281), plus its share of inter-unit gaps (≈24). Two reductions bring it under. S5 θ (9266) thins `merge_verify_lease`, 218 lines today. γ rehomes the class docstring's rationale, about 281 non-method lines, nearly all prose. If α measures it over after S5, the fallback is to move `create_worktree`'s cold path (`create_worktree`, `_reattach_cold_worktree`: 698 lines, measured acyclic as its own cluster) into `task_worktrees.py`. That is an Open question with a measurement rule, not a design fork. |
+| Lines per git-engine module | 1,500 (`FILE_LINE_CEILING`) | heuristic 14's soft ceiling and the merge-lane ceiling (merge-lane-quality §Ceilings: 1,500 sits below the 2,000-line single-`Read` alarm). Basis: a module's size is its cluster's projected lines (unit lines plus apportioned separators) plus the preamble allowance P = 50, held against 1,500 with a headroom band H = 35, so over 1,465 is near the ceiling (concern map, "Projection, preamble allowance and headroom"). At `c787af9409` four modules project over 1,500 before γ: `main_landing` with the park sink 1,533 + P = 1,583 (prose 722), `git_queries` 1,491 + P = 1,541 (prose 797), `task_branch` 1,472 + P = 1,522 (prose 648) and `merge_worktrees` 1,452 + P = 1,502 (prose 867). γ's rationale share is unmeasured at authoring, because γ builds `archaeology_blocks`. So γ is the expected first reduction, but none of the four relies on it: `main_landing` has θ's planned `main_park` split (D8), and the other three each have a named, measured-acyclic fallback (D12). Every other module projects at or under 1,465 with P; the largest are `worktrees` 1,322 + P = 1,372 and `warm_acquire` 1,311 + P = 1,361. `git_ops.py` is below. |
+| `git_ops.py` | 1,500 | measured bound 1,397, under 1,465 without γ or S5 θ: its 7 methods' 1,177 unit lines, plus their separator share ⌈7 × 232/225⌉ = 8, plus today's 136-line module preamble (an upper bound for the composition root's own docstring and imports), plus the class's 49 non-separator lines (47 prose, 2 code), plus one import line per composed collaborator module (27: the 17 modules of §Contract → Module ownership other than `git_ops.py`, fallbacks included, and S5's ten). The class's 281 non-method lines are not mostly prose: 232 are blank separators between methods, and the class docstring is one line. Open question 1's `task_worktrees` move stays a measured contingency: `create_worktree` and `_reattach_cold_worktree` are 698 unit lines (701 projected), acyclic as their own cluster, and leave 479 unit lines on `GitOps`. |
 | Cyclic groups among git-engine modules | 0 | the committed partition has none (concern map, "Cyclic cluster groups: none") |
 | Function-local imports / re-exports of git-engine names inside the engine | 0 | B27 (S5) and B1 |
 
@@ -394,7 +459,7 @@ every seam.
 
 | # | Scenario | Preconditions | Postconditions |
 |---|---|---|---|
-| B1 | Import layering (producer side) | every git-engine module in `CLUSTER_PATHS` | AST: each imports only modules below it in §Sketch; none imports `orchestrator.git_ops`; no function-local import of a git-engine module; no name re-exported from a module that does not define it |
+| B1 | Import layering (producer side) | every git-engine module in `CLUSTER_PATHS`, plus `lane_lifecycle` and `warm_lane_pool` (bottom stratum, outside `CLUSTER_PATHS`) | AST: each imports only modules below it in §Sketch; `lane_lifecycle` and `warm_lane_pool` import no git-engine module; none imports `orchestrator.git_ops`; no function-local import of a git-engine module; no name re-exported from a module that does not define it |
 | B2 | Importers repointed (consumer side) | all leaves landed | `git grep -nE "from orchestrator\.git_ops import" -- orchestrator/src escalation/src scripts` matches only `GitOps` (and S5's remaining names, if α records any); every moved name resolves from its new module |
 | B3 | Ceiling holds | the live tree | `scripts/merge_lane_metrics.py --report` rows for every git-engine module are ≤ 1,500 lines; the baseline records no git-engine path above 1,500 |
 | B4 | Regrowth is caught (D4) | a fixture baseline recording a path at 1,400 lines; a current report at 1,501 | `check_against_baseline` reports `new_file_over_ceiling` for it; the same path recorded at 1,600 (grandfathered) at 1,601 does not |
@@ -435,6 +500,10 @@ module (the overlay's same-file rule): **α → β → γ → δ → ε → ζ �
   - List every unit S5 left that the projection assumed moved, or the reverse.
   - Record where S5 placed the R6 units and how it routed the D7 refs.
   - Name every cycle found. Its resolution is a leaf of this batch, never a new topic split.
+  - Re-derive the §Sketch layering from the post-S5 map's "Cluster strata" plus the §Contract Takes
+    column, and re-measure projected lines + P for every module not yet created. Record the list of
+    modules near the ceiling (over 1,500 − H) in the Correction, with the D8 split or D12 fallback that
+    covers each.
   - Signal: the Correction is committed with the as-of SHA, and the post-S5 partition evaluates with
     exit 0 and "Cyclic cluster groups: none", or the Correction names each cycle and the leaf that cuts it.
   - Prereqs: S5 π 9275. It gates every other leaf.
@@ -445,7 +514,8 @@ module (the overlay's same-file rule): **α → β → γ → δ → ε → ζ �
     it names each over-ceiling module and its owning leaf η/θ), and the `CLUSTER_PATHS` pins in
     `orchestrator/tests/test_merge_lane_ratchet.py`.
   - Signal: `scripts/merge_lane_metrics.py --report` lists every S5 git-engine module, and the raise
-    entry names main_landing, git_queries and worktrees with their measured lines.
+    entry names every S5 git-engine module whose measured `--report` lines exceed 1,500, each with its
+    measured lines and owning leaf.
   - Prereqs: α.
 - **γ — Prose to its home** (D5; heuristic 14's measurement order; Comments stance; priority medium;
   ~1,500 LOC, mostly moved prose).
@@ -485,18 +555,27 @@ module (the overlay's same-file rule): **α → β → γ → δ → ε → ζ �
   - Signal: B7, B10 and B11. `git_ops.py` is ≤ 1,500 lines, recorded in the commit message with the
     partition, or the Open-question-1 fallback is applied and recorded.
   - Prereqs: ε.
-- **η — Sub-split `worktrees` and `git_queries`** (D8; priority medium; ~1,500 LOC moved).
-  - Modules: new `worktree_relocation.py` and `commit_effect.py`; `worktrees.py`, `git_queries.py`;
-    callers of `rename_worktree`, `quarantine_worktree`, `describe_commit_effect_in_main` and
-    `commit_effect_present_in_main`; `CLUSTER_PATHS` and the baseline; tests.
-  - Signal: B1 for both modules. `worktrees.py` and `git_queries.py` are each ≤ 1,500 lines in `--report`.
+- **η — Sub-split `worktrees`, `git_queries` and `task_branch`** (D8, D12; priority medium; ~2,200 LOC
+  moved with both fallbacks).
+  - Modules: new `worktree_relocation.py` and `commit_effect.py`, and `git_citations.py` and
+    `merge_markers.py` if D12 applies; `worktrees.py`, `git_queries.py`, `task_branch.py`; callers of
+    `rename_worktree`, `quarantine_worktree`, `describe_commit_effect_in_main` and
+    `commit_effect_present_in_main`, and of the citation, replay and merge-marker lookups if they move;
+    `CLUSTER_PATHS` and the baseline; tests.
+  - Signal: B1 for every module η creates. `worktrees.py`, `worktree_relocation.py`, `git_queries.py`,
+    `commit_effect.py` and `task_branch.py` (and `git_citations.py` and `merge_markers.py` if created)
+    each measure ≤ 1,500 − H in `--report`, or the D12 fallback for that module is applied and its
+    measurement recorded in the commit message.
   - Prereqs: ζ.
-- **θ — Sub-split `main_landing`** (D8; priority medium; ~2,000 LOC moved).
-  - Modules: new `merge_worktrees.py` and `merging.py` (and `main_park.py` only if the D8 fallback
-    measures necessary); `main_landing.py`; callers of the moved methods (S5 ο0's 99-test-file set,
+- **θ — Sub-split `main_landing`** (D8, D12; priority medium; ~2,500 LOC moved).
+  - Modules: new `merge_worktrees.py`, `merging.py` and `main_park.py`, and `interactive_reaper.py` if
+    D12 applies; `main_landing.py`; callers of the moved methods (S5 ο0's 99-test-file set,
     re-enumerated); `orchestrator/src/orchestrator/merge_lane/gates.py`'s merge-worktree factory call; `CLUSTER_PATHS` and the
     baseline; tests.
-  - Signal: B14. `main_landing.py` is ≤ 1,500 lines, and `async def merge_to_main(` is absent from it.
+  - Signal: B14, and `async def merge_to_main(` is absent from `main_landing.py`. `main_landing.py`,
+    `main_park.py`, `merging.py` and `merge_worktrees.py` (and `interactive_reaper.py` if created) each
+    measure ≤ 1,500 − H in `--report`, or the D12 fallback for `merge_worktrees` is applied and its
+    measurement recorded in the commit message.
   - Prereqs: η, and task 5042.
 - **ι — Integration gate** (signal leaf; priority high; ~500 LOC).
   - Modules: new `orchestrator/tests/test_git_engine_boundary_gate.py` (B1–B14, except B4, which ω's
@@ -568,11 +647,13 @@ module (the overlay's same-file rule): **α → β → γ → δ → ε → ζ �
 
 ## Open questions (tactical)
 
-1. **`create_worktree`'s home if `git_ops.py` measures over 1,500 after ζ.** Suggested resolution: if
-   ζ's measured `git_ops.py` exceeds 1,500 lines once γ's prose move and S5 θ's thinning are in, ζ
-   moves `create_worktree` and `_reattach_cold_worktree` into `task_worktrees.py::TaskWorktrees`.
-   Measured acyclic: the pair refs only collaborators below it. Callers are repointed to
-   `git_ops.task_worktrees.create(...)`. Decided by measurement in ζ.
+1. **`create_worktree`'s home if `git_ops.py` measures over 1,500 − H after ζ.** The authoring bound is
+   1,397 (§Contract → Ceilings), so this is a contingency, not a prediction. Suggested resolution: if
+   ζ's measured `git_ops.py` exceeds 1,465 lines, ζ moves `create_worktree` and
+   `_reattach_cold_worktree` (698 unit lines, 701 projected) into `task_worktrees.py::TaskWorktrees`,
+   leaving 479 unit lines on `GitOps`. Measured acyclic: the pair refs only collaborators below it,
+   and nothing refs it. Callers are repointed to `git_ops.task_worktrees.create(...)`. Decided by
+   measurement in ζ.
 2. **Collaborator attribute names on `GitOps`.** Suggested: the module's noun (`git_ops.spec_lanes`,
    `git_ops.lane_release`, `git_ops.merging`). Decide in each leaf, consistently with S5's
    `worktrees` / `landing` / `branches` / `queries`.
