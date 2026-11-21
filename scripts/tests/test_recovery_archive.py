@@ -171,7 +171,10 @@ def test_check_fails_on_a_dump_whose_size_differs(tmp_path, capsys, change):
 
     failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
     assert any(
-        f"{ARCH_B}/dump.rdb" in line and str(len(altered)) in line and str(len(pinned)) in line
+        f"{ARCH_B}/dump.rdb" in line
+        and f"size {len(altered)} bytes" in line
+        and f"pinned {len(pinned)} bytes" in line
+        and "sha256" not in line
         for line in failed
     )
 
@@ -200,6 +203,20 @@ def test_check_reports_every_problem_not_just_the_first(tmp_path, capsys):
     failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
     assert any(f"{ARCH_A}/first.rdb" in line for line in failed)
     assert any(f"{ARCH_B}/dump.rdb" in line for line in failed)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_check_reports_an_unreadable_dump_and_still_checks_the_rest(tmp_path, capsys):
+    archives = _write_archives(tmp_path)
+    unreadable = tmp_path / ARCH_A / "first.rdb"
+    unreadable.chmod(0)
+    (tmp_path / ARCH_B / "dump.rdb").unlink()
+
+    assert main(["check", str(tmp_path)], archives=archives) == 1
+
+    failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
+    assert any(str(unreadable) in line and "unreadable" in line for line in failed)
+    assert any(f"{ARCH_B}/dump.rdb" in line and "missing" in line for line in failed)
 
 
 def test_check_fails_on_a_missing_archive_directory(tmp_path, capsys):
@@ -264,7 +281,7 @@ def test_copy_over_an_earlier_copy_succeeds(tmp_path):
     assert _copy(src, dst, archives) == 0
 
 
-def test_copy_checks_the_destination_and_names_a_corrupt_dump_there(tmp_path, capsys):
+def test_copy_does_not_carry_an_archive_whose_source_dump_fails_its_pin(tmp_path, capsys):
     src, dst = tmp_path / "src", tmp_path / "dst"
     archives = _source_tree(src)
     _flip_first_byte(src / ARCH_A / "first.rdb")
@@ -272,7 +289,35 @@ def test_copy_checks_the_destination_and_names_a_corrupt_dump_there(tmp_path, ca
     assert _copy(src, dst, archives) == 1
 
     failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
-    assert any(str(dst / ARCH_A / "first.rdb") in line and "sha256" in line for line in failed)
+    assert any(str(src / ARCH_A / "first.rdb") in line and "sha256" in line for line in failed)
+    assert not (dst / ARCH_A).exists()
+    for repo_path in (*DUMP_CONTENT, *SIBLING_CONTENT):
+        if repo_path.startswith(f"{ARCH_B}/"):
+            assert (dst / repo_path).read_bytes() == (src / repo_path).read_bytes()
+
+
+def test_copy_checks_the_destination_after_copying(tmp_path, capsys):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    archives = _source_tree(src)
+    _flip_first_byte(src / ARCH_A / "first.rdb")
+
+    assert _copy(src, dst, archives) == 1
+
+    failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
+    assert any(str(dst / ARCH_A) in line and "missing" in line for line in failed)
+
+
+def test_copy_leaves_an_intact_destination_alone_when_its_source_dump_is_truncated(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    archives = _source_tree(src)
+    assert _copy(src, dst, archives) == 0
+    truncated = src / ARCH_A / "first.rdb"
+    truncated.write_bytes(truncated.read_bytes()[:-3])
+    before = _snapshot(dst)
+
+    assert _copy(src, dst, archives) == 1
+
+    assert _snapshot(dst) == before
 
 
 def test_copy_names_a_missing_source_archive_and_still_carries_the_others(tmp_path, capsys):
@@ -297,8 +342,11 @@ def test_copy_refuses_a_destination_that_is_the_source(tmp_path, capsys):
 
     assert main(["copy", str(src), str(same)], archives=archives) == 1
 
-    failed = [line for line in capsys.readouterr().err.splitlines() if "FAILED" in line]
-    assert any(str(src) in line and str(same) in line for line in failed)
+    stderr = capsys.readouterr().err
+    failed = [line for line in stderr.splitlines() if "FAILED" in line]
+    assert any("onto itself" in line and str(src) in line and str(same) in line for line in failed)
+    assert "copied" not in stderr
+    assert "copy to" not in stderr
     assert _snapshot(tmp_path) == before
 
 

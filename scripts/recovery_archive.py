@@ -155,7 +155,8 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         description="Carry the pinned FalkorDB recovery dumps through a host migration.")
     commands = parser.add_subparsers(dest="command", required=True)
     copy = commands.add_parser(
-        "copy", help="copy every archive dir from SOURCE to DEST, then check the dumps under DEST")
+        "copy", help="copy each archive dir whose dumps pass under SOURCE to DEST, "
+        "then check the dumps under DEST")
     copy.add_argument("source", type=Path, help="root holding the archive dirs at their repo paths")
     copy.add_argument("dest", type=Path, help="root to receive them at the same relative paths")
     check = commands.add_parser("check", help="check every pinned dump under ROOT")
@@ -168,6 +169,13 @@ def log(message: str) -> None:
 
 
 def dump_problems(path: Path, dump: PinnedDump) -> list[str]:
+    try:
+        return _pin_mismatches(path, dump)
+    except OSError as exc:
+        return [f"{path}: unreadable: {exc}"]
+
+
+def _pin_mismatches(path: Path, dump: PinnedDump) -> list[str]:
     if not path.is_file():
         return [f"{path}: missing"]
     size = path.stat().st_size
@@ -195,7 +203,7 @@ def _archive_problems(root: Path, archive: ArchiveDir) -> list[str]:
     for dump in archive.dumps:
         found = dump_problems(archive_dir / dump.name, dump)
         if not found:
-            log(f"ok {archive.path}/{dump.name} ({dump.size} bytes) - pre-state of {dump.pre_state_of}")
+            log(f"ok {archive_dir / dump.name} ({dump.size} bytes) - pre-state of {dump.pre_state_of}")
         problems += _logged_failures(found)
     return problems
 
@@ -206,12 +214,8 @@ def copy_archives(source: Path, dest: Path, archives: Sequence[ArchiveDir]) -> l
         return _logged_failures([refusal])
     problems: list[str] = []
     for archive in archives:
-        problems += _logged_failures(_copy_archive(source, dest, archive))
-    dest_problems = check_root(dest, archives)
-    if dest_problems:
-        log("to tell a corrupt source from a bad copy, run: "
-            f"python3 {Path(__file__).resolve()} check {source}")
-    return problems + dest_problems
+        problems += _copy_verified_archive(source, dest, archive)
+    return problems + check_root(dest, archives)
 
 
 def _copy_refusal(source: Path, dest: Path, archives: Sequence[ArchiveDir]) -> str | None:
@@ -225,10 +229,17 @@ def _copy_refusal(source: Path, dest: Path, archives: Sequence[ArchiveDir]) -> s
     return None
 
 
+def _copy_verified_archive(source: Path, dest: Path, archive: ArchiveDir) -> list[str]:
+    source_problems = _archive_problems(source, archive)
+    if source_problems:
+        log(f"not copying {archive.path}: its source fails its pins, "
+            f"so {dest / archive.path} is left as it was")
+        return source_problems
+    return _logged_failures(_copy_archive(source, dest, archive))
+
+
 def _copy_archive(source: Path, dest: Path, archive: ArchiveDir) -> list[str]:
     source_dir, dest_dir = source / archive.path, dest / archive.path
-    if not source_dir.is_dir():
-        return [f"{source_dir}: source archive directory missing"]
     try:
         shutil.copytree(source_dir, dest_dir, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns("__pycache__"))

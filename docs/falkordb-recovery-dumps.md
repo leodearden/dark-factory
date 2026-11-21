@@ -34,6 +34,12 @@ migration scripts carry them instead:
 - `scripts/verify-migration.sh` section 4b checks every pinned dump's size and
   sha256, and fails verification if one is missing or altered.
 
+Both copies check an archive's dumps at the source before copying it, and
+check them again at the destination afterwards. An archive that fails at the
+source is not copied. So a truncated transfer of the export cannot overwrite an
+intact copy already at the repo paths, for example one that `scripts/migrate.sh`
+carried over.
+
 They are never copied into `fused-memory/data/falkordb`: they are archives, not
 a graph to load, and `ArchiveDir` refuses any path at, under, or above that
 directory.
