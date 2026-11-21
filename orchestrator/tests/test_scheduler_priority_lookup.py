@@ -1,10 +1,13 @@
 """What Scheduler.task_priority answers from between ticks (task 9933)."""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
+import pytest
+
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
-from orchestrator.scheduler_priority_lookup import LookupPins, pin_orders
+from orchestrator.scheduler_priority_lookup import LookupPins, last_written_tiers, pin_orders
 from orchestrator.task_priority import PINNED, TaskPriority
 
 
@@ -13,6 +16,43 @@ def _row(*, pinned: bool, pin_order: int | None = None) -> OverrideRow:
         boost_tier=None, pinned=pinned, pin_order=pin_order, reserve_now=False,
         ttl_until=None, source=OverrideSource.OPERATOR,
     )
+
+
+class _BrokenStore(OverrideStore):
+    def get_overrides(self, project_root: str) -> dict[str, OverrideRow]:
+        raise OSError('store unreachable')
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+class TestLastWrittenTiers:
+
+    def test_no_path_reads_nothing(self) -> None:
+        assert last_written_tiers(None) == {}
+
+    def test_a_missing_file_reads_nothing_silently(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.WARNING)
+
+        assert last_written_tiers(tmp_path / 'absent.json') == {}
+        assert _warnings(caplog) == []
+
+    @pytest.mark.parametrize('content', [
+        b'not json {',
+        b'{"effective_priorities": ["not", "a", "map"]}',
+    ])
+    def test_an_unreadable_snapshot_reads_nothing_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, content: bytes,
+    ) -> None:
+        path = tmp_path / 'scheduler_state.json'
+        path.write_bytes(content)
+        caplog.set_level(logging.WARNING)
+
+        assert last_written_tiers(path) == {}
+        assert len(_warnings(caplog)) == 1
 
 
 class TestPinOrders:
@@ -52,3 +92,13 @@ class TestLookupPins:
         assert pins.priority('U', 'high') == TaskPriority(
             tier='high', pinned=False, base_tier='high',
         )
+
+    def test_a_failing_store_read_leaves_pins_unknown(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.WARNING)
+
+        pins = LookupPins(_BrokenStore(tmp_path / 'overrides.db'), str(tmp_path), clock=lambda: 0.0)
+
+        assert pins.priority('X', 'low').pinned is None
+        assert len(_warnings(caplog)) == 1

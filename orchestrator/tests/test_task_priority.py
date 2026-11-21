@@ -6,12 +6,15 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from shared.project_layout import scheduler_state_json
+from shared.scheduler_state import SchedulerStateSnapshot
 
 from orchestrator.config import PRIORITY_TIERS, OrchestratorConfig
 from orchestrator.merge_verify_facts import ChainMembers, MergeVerifyDispatchFacts, RunnerReason
@@ -44,6 +47,12 @@ def _pending(
     }
 
 
+def _write_snapshot(path: Path, effective_priorities: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = SchedulerStateSnapshot(effective_priorities=effective_priorities)
+    path.write_text(json.dumps(snapshot.to_json()))
+
+
 def _scheduler(tmp_path: Path, *, with_store: bool) -> tuple[Scheduler, OverrideStore | None]:
     config = OrchestratorConfig(max_per_module=1, project_root=tmp_path)
     store = OverrideStore(tmp_path / 'overrides.db') if with_store else None
@@ -56,12 +65,40 @@ def _scheduler(tmp_path: Path, *, with_store: bool) -> tuple[Scheduler, Override
 
 class TestSchedulerTaskPriority:
 
-    def test_everything_is_unknown_before_the_first_tick(self, tmp_path: Path) -> None:
-        scheduler, store = _scheduler(tmp_path, with_store=True)
-        assert store is not None
-        store.set_override(str(tmp_path), 'P', pinned=True)
+    def test_the_lookup_answers_from_the_last_snapshot_and_the_store_before_any_tick(
+        self, tmp_path: Path,
+    ) -> None:
+        _write_snapshot(tmp_path / 'scheduler_state.json', {'P': 'low', 'A': 'high'})
+        OverrideStore(tmp_path / 'overrides.db').set_override(
+            str(tmp_path), 'P', pinned=True, pin_order=4,
+        )
 
-        assert scheduler.task_priority('P') == TaskPriority(tier=None, pinned=None)
+        scheduler, _ = _scheduler(tmp_path, with_store=True)
+
+        assert scheduler.task_priority('P') == TaskPriority(
+            tier=PINNED, pinned=True, base_tier='low', pin_order=4,
+        )
+        assert scheduler.task_priority('A') == TaskPriority(
+            tier='high', pinned=False, base_tier='high',
+        )
+        assert scheduler.get_state_snapshot().effective_priorities == {'P': 'low', 'A': 'high'}
+
+    def test_no_snapshot_file_leaves_tiers_unknown_but_pins_known(self, tmp_path: Path) -> None:
+        OverrideStore(tmp_path / 'overrides.db').set_override(str(tmp_path), 'P', pinned=True)
+
+        scheduler, _ = _scheduler(tmp_path, with_store=True)
+
+        assert scheduler.task_priority('P') == TaskPriority(
+            tier=PINNED, pinned=True, base_tier=None, pin_order=1,
+        )
+        assert scheduler.task_priority('A') == TaskPriority(tier=None, pinned=False)
+
+    def test_the_snapshot_path_follows_the_project_root(self, tmp_path: Path) -> None:
+        _write_snapshot(scheduler_state_json(tmp_path), {'A': 'high'})
+
+        scheduler = Scheduler(OrchestratorConfig(project_root=tmp_path))
+
+        assert scheduler.task_priority('A').base_tier == 'high'
 
     @pytest.mark.asyncio
     async def test_a_tick_supplies_the_effective_tier_and_the_pin(self, tmp_path: Path) -> None:
