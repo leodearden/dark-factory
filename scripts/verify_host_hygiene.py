@@ -20,7 +20,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -33,6 +33,10 @@ MERGE_WORKTREE_NAME = re.compile(r"_merge-[0-9a-f]{8}")
 INFRA_BAND_PREFIXES = ("_", ".")
 GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")
 GIT_TIMEOUT_SECONDS = 120
+SCOPE_UNIT_GLOB = "df-verify-*.scope"
+SCOPE_UNIT_NAME = re.compile(r"df-verify-.+\.scope")
+SYSTEMCTL_TIMEOUT_SECONDS = 20
+UNIT_STILL_RUNNING = frozenset({"active", "activating", "deactivating"})
 EXIT_OK, EXIT_SOME_FAILED, EXIT_USAGE = 0, 1, 2
 PROG = "verify_host_hygiene"
 
@@ -419,6 +423,131 @@ def prune_registry(repo: Path) -> None:
         print(f"{PROG}: {exc}", file=sys.stderr)
 
 
+# --- verify scopes -----------------------------------------------------------
+
+@dataclass(frozen=True)
+class ScopeMember:
+    pid: int
+    ppid: int
+    parent_comm: str | None
+
+
+def scope_is_orphaned(members: Iterable[ScopeMember]) -> bool:
+    """True iff no member has an out-of-scope parent that could still be its controller.
+
+    Only PID 0/1 or a systemd instance rules a parent out; an unreadable one is live.
+    """
+    members = tuple(members)
+    pids = {member.pid for member in members}
+    return not any(member.ppid not in pids and member.ppid > 1
+                   and member.parent_comm != "systemd" for member in members)
+
+
+def systemctl(*args: str) -> subprocess.CompletedProcess[str] | None:
+    """`systemctl --user ARGS`, or None when it could not run to completion."""
+    try:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True,
+                              text=True, timeout=SYSTEMCTL_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def scope_units() -> list[tuple[str, str]] | None:
+    """(unit, active state) per df-verify scope, or None when the listing failed."""
+    proc = systemctl("list-units", "--all", "--plain", "--no-legend", SCOPE_UNIT_GLOB)
+    if proc is None or proc.returncode != 0:
+        return None
+    units = []
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and SCOPE_UNIT_NAME.fullmatch(fields[0]):
+            units.append((fields[0], fields[2]))
+    return units
+
+
+def read_comm(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return None
+
+
+def scope_member(pid: int) -> ScopeMember | None:
+    """*pid*'s parent facts, or None once it has exited. The comm may hold spaces or ')'."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    ppid = int(stat_text[stat_text.rindex(")") + 1:].split()[1])
+    return ScopeMember(pid=pid, ppid=ppid, parent_comm=read_comm(ppid))
+
+
+def scope_members(unit: str, cgroup_root: Path) -> tuple[ScopeMember, ...] | None:
+    """The live members of *unit*'s cgroup, or None when it cannot be read."""
+    proc = systemctl("show", "-p", "ControlGroup", "--value", unit)
+    cgroup = proc.stdout.strip() if proc is not None and proc.returncode == 0 else ""
+    if not cgroup:
+        return None
+    try:
+        pids = [int(line) for line in
+                (cgroup_root / cgroup.lstrip("/") / "cgroup.procs").read_text().split()]
+        members = [scope_member(pid) for pid in pids]
+    except (OSError, ValueError, IndexError):
+        return None
+    return tuple(member for member in members if member is not None)
+
+
+def reap_scope(unit: str) -> bool:
+    """SIGKILL, stop, then confirm, as verify.py::reap_leftover_verify_scopes does."""
+    systemctl("kill", "--signal=SIGKILL", unit)
+    systemctl("stop", unit)
+    probe = systemctl("is-active", unit)
+    state = probe.stdout.strip() if probe is not None else "unknown"
+    if probe is None or state in UNIT_STILL_RUNNING:
+        print(f"{PROG}: {unit} is still {state} after kill and stop", file=sys.stderr)
+        return False
+    return True
+
+
+def reset_failed(unit: str) -> bool:
+    proc = systemctl("reset-failed", unit)
+    if proc is None or proc.returncode != 0:
+        detail = proc.stderr.strip() if proc is not None else "did not complete"
+        print(f"{PROG}: reset-failed {unit}: {detail}", file=sys.stderr)
+        return False
+    return True
+
+
+def judge_scope(unit: str, state: str, cgroup_root: Path, apply: bool) -> Verdict:
+    candidate = Candidate(Kind.VERIFY_SCOPE, unit)
+    if state == "failed":
+        reason = Reason.UNIT_FAILED
+    elif state != "active":
+        return Verdict(candidate, Action.KEEP, Reason.CONTROLLER_ALIVE)
+    else:
+        members = scope_members(unit, cgroup_root)
+        if members is None:
+            return Verdict(candidate, Action.KEEP, Reason.CGROUP_UNREADABLE)
+        if not scope_is_orphaned(members):
+            return Verdict(candidate, Action.KEEP, Reason.CONTROLLER_ALIVE)
+        reason = Reason.ORPHANED
+    if not apply:
+        return Verdict(candidate, Action.RECLAIM, reason)
+    done = reset_failed(unit) if reason is Reason.UNIT_FAILED else reap_scope(unit)
+    return Verdict(candidate, Action.RECLAIMED if done else Action.FAILED, reason)
+
+
+def scope_pass(cgroup_root: Path, apply: bool) -> list[Verdict]:
+    if shutil.which("systemctl") is None:
+        print("verify-scope: systemctl not found, skipped")
+        return []
+    units = scope_units()
+    if units is None:
+        print("verify-scope: systemctl list-units failed, skipped")
+        return []
+    return [judge_scope(unit, state, cgroup_root, apply) for unit, state in units]
+
+
 # --- per-repo pass ----------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -489,20 +618,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def checked_repos(requested: list[Path] | None) -> list[Path] | None:
+    """Each repo's real top level, or None after naming the first that is not one."""
+    repos = []
+    for repo in requested or [DEFAULT_REPO]:
+        toplevel = checkout_toplevel(repo)
+        if toplevel is None:
+            print(f"{PROG}: --repo {repo} is not a git checkout's top level", file=sys.stderr)
+            return None
+        repos.append(toplevel)
+    return repos
+
+
 def run_local(ns: argparse.Namespace) -> int:
     kinds = frozenset(ns.classes or Kind)
-    repos: list[Path] = []
-    if kinds & WORKTREE_KINDS:
-        for repo in ns.repo or [DEFAULT_REPO]:
-            toplevel = checkout_toplevel(repo)
-            if toplevel is None:
-                print(f"{PROG}: --repo {repo} is not a git checkout's top level", file=sys.stderr)
-                return EXIT_USAGE
-            repos.append(toplevel)
-    cwds = process_cwds()
+    repos = checked_repos(ns.repo) if kinds & WORKTREE_KINDS else []
+    if repos is None:
+        return EXIT_USAGE
+    cwds = process_cwds() if repos else frozenset()
     reports = [repo_pass(repo, kinds, cwds, ns.min_age_hours * 3600, ns.apply)
                for repo in repos]
     verdicts = [verdict for report in reports for verdict in report.verdicts]
+    if Kind.VERIFY_SCOPE in kinds:
+        verdicts += scope_pass(ns.cgroup_root, ns.apply)
     for verdict in sorted(verdicts, key=lambda v: (v.candidate.kind, v.candidate.target)):
         print(verdict.line())
     for report in reports:
