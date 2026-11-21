@@ -134,7 +134,12 @@ whenever a finding or a design decision turns on it. An unnamed appeal to
   into a parent module, a function-local import placed to break a cycle, a
   re-export shim kept only so an old path resolves — is reportable as an
   interface-design finding, not a style nit. Reworking such seams is in scope
-  for quality work, not a distraction from it.
+  for quality work, not a distraction from it. A test depends on timing only
+  when timing is the behaviour under test — a deadline, grace period or
+  timeout path — and then it runs on an injected or virtual clock or, against
+  a real child process, counts the child's own CPU time; sleep-until-ready is
+  never justified, and a wall-clock performance assertion does not belong in a
+  merge gate.
 
 ## What to measure
 

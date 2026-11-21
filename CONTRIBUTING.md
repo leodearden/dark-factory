@@ -280,12 +280,14 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   `tests/`, where a directory scan covers `test_*.py`, `conftest.py` and
   `_*.py` helper modules — so see `lint_command` in
   `dark-factory-orchestrator.yaml` for the full chain. Despite its legacy
-  filename that script now carries **three
-  independent test-quality rules** — two about mock-spec discipline and one
-  about wait deadlines, which is not a mock rule at all — each with its own
-  suppression code (all three take the form
-  `# noqa: <code> — <reason>` on the **preceding** non-blank line; the reason
-  is mandatory and an inline trailing comment is deliberately not honored):
+  filename that script now carries **four
+  independent test-quality rules** — two about mock-spec discipline, one
+  about wait deadlines and one about timing dependence, neither of the last
+  two a mock rule at all. The first three each have their own suppression
+  code, and all three take the form `# noqa: <code> — <reason>` on the
+  **preceding** non-blank line; the reason is mandatory and an inline
+  trailing comment is deliberately not honored. The fourth is escaped by a
+  marker instead:
   - `bare-magicmock` — a config-named variable (`config`, `cfg`, `*_config`,
     `*_cfg`) assigned an unspecced `MagicMock()`. Remedy: the
     `mock_orch_config` fixture or `MagicMock(spec_set=pydantic_spec(...))`.
@@ -324,13 +326,33 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     importable only under `orchestrator/tests`, so in any other package the
     per-site `# noqa: wall-clock-deadline — <reason>` is the remedy. See the
     script's Rule C docstring. Pre-existing debt, across five packages, is
-    grandfathered in the script's `_WALL_CLOCK_DEADLINE_DEBT` baseline — the
-    last surviving baseline, and **shrink-only** and opt-out, so a new
-    offending file fails the gate by default. It is an **exact budget** rather than a bare list: a listed file is
+    grandfathered in the script's `_WALL_CLOCK_DEADLINE_DEBT` baseline —
+    **shrink-only** and opt-out, so a new offending file fails the gate by
+    default. It is an **exact budget** rather than a bare list: a listed file is
     silent only at EXACTLY its recorded count. Above it the checker reports the
     overrun; below it the checker reports the slack, naming the one-line edit,
     in the owning package's own `lint_command`. So a number must be lowered in
     the same change that removes a site, and is never raised.
+  - `timing-dependence` — a test whose verdict moves with host load: a real
+    `time.sleep`/`asyncio.sleep`, an assert comparing a real elapsed time with
+    a written number, or a numeric literal bound to a wall-clock deadline
+    (`timeout=` on any call but a constructor or a pytest mark,
+    `asyncio.wait_for`'s positional timeout, `asyncio.timeout`'s delay, or a
+    real clock read plus a literal). A literal sleep of 60 s or more, or
+    `inf`, simulates a hang and is not a site. It has **no `# noqa` code**:
+    its only escape is `@pytest.mark.timing(reason=...)` with a non-blank
+    literal reason, on any enclosing def or class, a class-body `pytestmark`
+    or the module `pytestmark`, and only when a deadline is itself the
+    behaviour under test. A `@virtual_clock_test` span covers every kind but
+    a real-thread `time.sleep`. Rule C has precedence: a wait Rule C reports
+    is not also reported here. Remedy: wait on the event the code under test
+    signals; to advance time, take the `fake_clock` fixture
+    (`shared.pytest_fake_clock.fake_clock`, bound in every scanned package's
+    conftest) or run the scenario on `shared.testing_virtual_clock`; bound a
+    real child process by its own time with
+    `shared.testing_own_time.run_on_own_time` / `wait_on_own_time`.
+    Pre-existing debt is grandfathered in the same shrink-only, exact-budget
+    shape, in `fused-memory/scripts/_timing_dependence_debt.py`.
 - **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
   of the toolchain** and is not enforced anywhere — not in `hooks/pre-commit`,
   not in any `orchestrator.yaml` `lint_command`, not in verify. There is no CI.
