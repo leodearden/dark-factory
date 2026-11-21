@@ -339,3 +339,79 @@ REPLAY_OUTPUT_SCHEMA: Mapping[str, Any] = MappingProxyType({
     },
     'required': ['decisions'],
 })
+
+
+@dataclass(frozen=True)
+class BatchDecisions:
+    """A batch reply that parsed: one decision row per child, in the batch's order."""
+
+    batch: str
+    rows: tuple[Mapping[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class BatchFailure:
+    """A batch reply that did not parse; *reason* names the child and value at fault."""
+
+    batch: str
+    reason: str
+
+
+class _Refused(ValueError):
+    pass
+
+
+def parse_batch_reply(batch: Batch, report: Mapping[str, Any]) -> BatchDecisions | BatchFailure:
+    """*report*'s decisions for *batch*, or why the whole batch failed.
+
+    Every child must be decided exactly once, with an action its triage
+    outcome allows (``recon_triage_replay_scoring.action_for``); anything else
+    fails the batch, so a partial reply never scores as a partial result.
+    """
+    try:
+        return BatchDecisions(batch=batch.name, rows=_decision_rows(batch, report))
+    except _Refused as refused:
+        return BatchFailure(batch=batch.name, reason=str(refused))
+
+
+def _decision_rows(batch: Batch, report: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    decisions = report.get('decisions')
+    if not isinstance(decisions, list):
+        raise _Refused(f'the reply has no decisions list (keys: {sorted(report)})')
+    children = {row['entry_id']: row for row in batch.rows}
+    decided: dict[str, dict[str, Any]] = {}
+    for position, decision in enumerate(decisions):
+        if not isinstance(decision, dict):
+            raise _Refused(f'decision {position} is not an object: {decision!r}')
+        child = decision.get('child_id')
+        if not isinstance(child, str) or child not in children:
+            raise _Refused(f'decision {position} names child {child!r}, which is not in the batch')
+        if child in decided:
+            raise _Refused(f'child {child!r} is decided twice')
+        decided[child] = _decision_row(children[child], decision)
+    missing = [entry for entry in children if entry not in decided]
+    if missing:
+        raise _Refused(f'children {missing} have no decision')
+    return tuple(decided[entry] for entry in children)
+
+
+def _decision_row(row: Mapping[str, Any], decision: Mapping[str, Any]) -> dict[str, Any]:
+    child = row['entry_id']
+    reason, evidence = decision.get('reason'), decision.get('evidence')
+    if not isinstance(reason, str):
+        raise _Refused(f'child {child!r}: reason {reason!r} is not a string')
+    if not (isinstance(evidence, list) and all(isinstance(item, str) for item in evidence)):
+        raise _Refused(f'child {child!r}: evidence {evidence!r} is not a list of strings')
+    word, relabel_to = decision.get('decision'), decision.get('relabel_to')
+    try:
+        action = _scoring.action_for(row['outcome'], str(word), relabel_to)
+    except ValueError as exc:
+        raise _Refused(f'child {child!r}: {exc}') from exc
+    return {
+        'entry_id': child,
+        'target_id': row['target_id'],
+        'decision': action.decision.value,
+        'relabel_to': action.relabel_to,
+        'reason': reason,
+        'evidence': list(evidence),
+    }
