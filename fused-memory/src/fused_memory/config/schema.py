@@ -2991,8 +2991,7 @@ class WriteTriageConfig(BaseModel):
             "the SDK's environment fallback. When set it is the judge's SDK "
             'client api_key and nothing else reads it: the main LLM arm and '
             'routing keep their own keys. Green-tier hot-reloadable, read live '
-            'per judge call. Paired with judge_api_url to route the judge onto '
-            'the ChatGPT-plan proxy (ruling esc-9522-1, task 9946).'
+            'per judge call.'
         ),
     )
     judge_timeout_seconds: float = Field(
