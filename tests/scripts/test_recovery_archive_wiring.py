@@ -128,3 +128,35 @@ def test_a_failed_archive_restore_stops_the_import_before_any_live_data(tmp_path
     assert result.returncode == 1
     assert IMPORT_ARCHIVE_FAILED in result.stdout, result.stdout + result.stderr
     assert RESTORING_FALKORDB not in result.stdout
+
+
+# --- verify-migration.sh section 4b -----------------------------------------
+# This script runs `set -uo pipefail` WITHOUT -e and its fail only prints, so
+# it gets its own preamble, with the shipped counters and check_* helpers.
+
+def _run_verify(tmp_path: pathlib.Path, helper_rc: int):
+    _stand_in(tmp_path, helper_rc)
+    preamble = (
+        "set -uo pipefail\n"
+        + slice_section(VERIFY_MIGRATION_PATH, "info()  {", "fail()  {")
+        + slice_section(VERIFY_MIGRATION_PATH, "CHECKS_PASSED=0", "check_warn() {")
+        + f'REPO_ROOT="{tmp_path}"\n'
+    )
+    section = slice_section(VERIFY_MIGRATION_PATH, 'info "Recovery archive checks"', "\nfi\n")
+    return run_with_preamble(
+        tmp_path, preamble, section + 'echo "passed=$CHECKS_PASSED failed=$CHECKS_FAILED"\n'
+    )
+
+
+def test_verify_passes_when_every_pinned_dump_checks_out(tmp_path):
+    result = _run_verify(tmp_path, helper_rc=0)
+
+    assert f"{MARKER} command=check source=None dest=None root={tmp_path}" in result.stdout
+    assert "passed=1 failed=0" in result.stdout, result.stdout + result.stderr
+
+
+def test_a_missing_or_altered_dump_is_a_critical_verify_failure(tmp_path):
+    result = _run_verify(tmp_path, helper_rc=1)
+
+    assert ARCHIVE_FAILED in result.stdout
+    assert "passed=0 failed=1" in result.stdout, result.stdout + result.stderr
