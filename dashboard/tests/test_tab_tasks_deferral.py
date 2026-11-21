@@ -98,7 +98,7 @@ async def _collected_entry(
     root.mkdir(parents=True, exist_ok=True)
     canned = CannedMCP(rows=raw_rows(fixture), status_map=status_map(fixture))
     with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
-        _active, snapshots = await collect_tasks_with_counts(
+        snapshots = await collect_tasks_with_counts(
             client, DashboardConfig(project_root=root), now=NOW,
         )
     ((label, snapshot),) = snapshots.items()

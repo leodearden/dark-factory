@@ -13,6 +13,15 @@ from sampler.store import SCHEMA
 
 from dashboard.data.load import KNOWN_METRICS, get_load_metrics
 
+
+def _group(name: GroupName):
+    (group,) = [group for group in METRIC_GROUPS if group.name is name]
+    return group
+
+
+# A served series the populated fixture DB leaves empty, for tests needing one of their own.
+_SERIES = min(_group(GroupName.VERIFY_SCOPES).exact)
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -93,7 +102,7 @@ async def test_returns_all_known_keys_with_values_or_placeholders(populated_load
     }
 
     # Unpopulated known metric → placeholder shape
-    assert result['verify_concurrency'] == {
+    assert result[_SERIES] == {
         'current': None,
         'sparkline': [],
         'window_mean': None,
@@ -150,14 +159,14 @@ async def test_none_db_returns_all_placeholders() -> None:
 
 @pytest.mark.asyncio
 async def test_sparkline_clamped_to_60_and_chronological(tmp_path: Path) -> None:
-    """75 rows for verify_concurrency → sparkline has exactly 60 entries (oldest 60..75th retained),
+    """75 rows for the verify-scope series → sparkline has exactly 60 entries (oldest 60..75th retained),
     in ascending ts order. current == 75.0."""
     db_path = tmp_path / 'capped-load.db'
     conn_sync = sqlite3.connect(str(db_path))
     conn_sync.executescript(SCHEMA)
     conn_sync.executemany(
         'INSERT INTO samples (ts, metric, value, window_mean, window_max) VALUES (?, ?, ?, ?, ?)',
-        [(ts, 'verify_concurrency', float(ts), None, None) for ts in range(1, 76)],
+        [(ts, _SERIES, float(ts), None, None) for ts in range(1, 76)],
     )
     conn_sync.commit()
     conn_sync.close()
@@ -166,12 +175,12 @@ async def test_sparkline_clamped_to_60_and_chronological(tmp_path: Path) -> None
         conn.row_factory = aiosqlite.Row
         result = await get_load_metrics(conn)
 
-    sparkline = result['verify_concurrency']['sparkline']
+    sparkline = result[_SERIES]['sparkline']
     assert len(sparkline) == 60
     # Oldest kept row (ts=16) is first; newest (ts=75) is last
     assert sparkline[0] == 16.0
     assert sparkline[-1] == 75.0
-    assert result['verify_concurrency']['current'] == 75.0
+    assert result[_SERIES]['current'] == 75.0
 
 
 # ---------------------------------------------------------------------------
@@ -194,15 +203,23 @@ def test_load_samples_db_property_points_to_canonical_path(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_every_psi_and_process_metric_in_the_table_is_served() -> None:
-    """The dashboard serves the PSI and process groups, under the table's names."""
-    groups = {group.name: group for group in METRIC_GROUPS}
-
+async def test_the_psi_process_and_verify_scope_groups_are_served() -> None:
+    """The dashboard serves exactly those groups' host-level names, under the table's names."""
     served = set(await get_load_metrics(None))
 
     assert served == set(KNOWN_METRICS)
-    assert groups[GroupName.PSI].exact <= served
-    assert groups[GroupName.PROCESS].exact <= served
+    assert served == (
+        _group(GroupName.PSI).exact
+        | _group(GroupName.PROCESS).exact
+        | _group(GroupName.VERIFY_SCOPES).exact
+    )
+
+
+def test_no_consumer_metric_is_served() -> None:
+    """The per-consumer group is for the hold report, not the overview tiles."""
+    consumers = _group(GroupName.CONSUMERS)
+
+    assert not (consumers.exact | consumers.per_leaf) & set(KNOWN_METRICS)
 
 
 def test_no_load_group_metric_is_served() -> None:
@@ -256,10 +273,10 @@ async def test_bound_excludes_ancient_rows_but_keeps_the_live_window(tmp_path: P
     conn_sync = sqlite3.connect(str(db_path))
     conn_sync.executescript(SCHEMA)
     base = 10_000_000
-    rows = [(base - 500_000, 'verify_concurrency', 1.0, None, None),
-            (base - 400_000, 'verify_concurrency', 2.0, None, None)]
+    rows = [(base - 500_000, _SERIES, 1.0, None, None),
+            (base - 400_000, _SERIES, 2.0, None, None)]
     # 10 live samples at the 5s tick, ending at `base`.
-    rows += [(base - (9 - i) * 5, 'verify_concurrency', 100.0 + i, None, None)
+    rows += [(base - (9 - i) * 5, _SERIES, 100.0 + i, None, None)
              for i in range(10)]
     conn_sync.executemany(
         'INSERT INTO samples (ts, metric, value, window_mean, window_max) VALUES (?, ?, ?, ?, ?)',
@@ -272,11 +289,11 @@ async def test_bound_excludes_ancient_rows_but_keeps_the_live_window(tmp_path: P
         conn.row_factory = aiosqlite.Row
         result = await get_load_metrics(conn)
 
-    sparkline = result['verify_concurrency']['sparkline']
+    sparkline = result[_SERIES]['sparkline']
     assert len(sparkline) == 10, 'ancient rows must not enter the sparkline'
     assert sparkline[0] == 100.0
     assert sparkline[-1] == 109.0
-    assert result['verify_concurrency']['current'] == 109.0
+    assert result[_SERIES]['current'] == 109.0
 
 
 @pytest.mark.asyncio
@@ -332,7 +349,7 @@ async def test_a_group_that_stops_writing_blanks_while_its_siblings_keep_ticking
     base = 10_000_000
     rows = [
         # The load group kept ticking right up to `base`.
-        (base - (9 - i) * 5, 'verify_concurrency', 100.0 + i, None, None)
+        (base - (9 - i) * 5, _SERIES, 100.0 + i, None, None)
         for i in range(10)
     ]
     # The PSI group stopped two hours ago — beyond the 1 h slack.
@@ -350,7 +367,7 @@ async def test_a_group_that_stops_writing_blanks_while_its_siblings_keep_ticking
         conn.row_factory = aiosqlite.Row
         result = await get_load_metrics(conn)
 
-    assert result['verify_concurrency']['current'] == 109.0
+    assert result[_SERIES]['current'] == 109.0
     assert result['psi_cpu_some_avg10'] == {
         'current': None, 'sparkline': [], 'window_mean': None, 'window_max': None,
     }, 'a collector stalled beyond the slack must read as no-data, not as live'
@@ -380,7 +397,7 @@ async def test_the_anchor_is_computed_over_the_allowlist_not_the_whole_table(
     conn_sync = sqlite3.connect(str(db_path))
     conn_sync.executescript(SCHEMA)
     base = 10_000_000
-    rows = [(base - (9 - i) * 5, 'verify_concurrency', 100.0 + i, None, None)
+    rows = [(base - (9 - i) * 5, _SERIES, 100.0 + i, None, None)
             for i in range(10)]
     # Two hours AHEAD of every served row, and beyond the 1 h slack -- so an
     # unscoped MAX(ts) would exclude every row above.
@@ -401,11 +418,11 @@ async def test_the_anchor_is_computed_over_the_allowlist_not_the_whole_table(
         conn.row_factory = aiosqlite.Row
         result = await get_load_metrics(conn)
 
-    assert result['verify_concurrency']['current'] == 109.0, (
+    assert result[_SERIES]['current'] == 109.0, (
         'a metric this endpoint does not serve dragged the anchor past one it '
         'does -- the anchor subquery is not scoped to the allowlist'
     )
-    assert result['verify_concurrency']['sparkline'] == [100.0 + i for i in range(10)]
+    assert result[_SERIES]['sparkline'] == [100.0 + i for i in range(10)]
     # And the unserved rows stay unserved: scoping the anchor must not leak them
     # into the result the way a bare MAX(ts) would have hidden everything else.
     assert set(result) == set(KNOWN_METRICS)
@@ -434,7 +451,7 @@ async def test_one_future_dated_row_does_not_blank_the_other_eight_metrics(
     conn_sync.executescript(SCHEMA)
     now = int(time.time())
     rows = [
-        (now - (59 - i) * 5, 'verify_concurrency', 100.0 + i, None, None)
+        (now - (59 - i) * 5, _SERIES, 100.0 + i, None, None)
         for i in range(60)
     ]
     rows += [(now - (59 - i) * 5, 'psi_cpu_some_avg10', 5.0 + i, None, None)
@@ -453,10 +470,10 @@ async def test_one_future_dated_row_does_not_blank_the_other_eight_metrics(
         conn.row_factory = aiosqlite.Row
         result = await get_load_metrics(conn)
 
-    assert result['verify_concurrency']['current'] == 159.0, (
+    assert result[_SERIES]['current'] == 159.0, (
         'a single future-dated row dragged the anchor past every real sample'
     )
-    assert len(result['verify_concurrency']['sparkline']) == 60
+    assert len(result[_SERIES]['sparkline']) == 60
     assert result['psi_cpu_some_avg10']['current'] == 64.0
     # The clamp bounds the anchor, not the rows: the skewed row is still the
     # newest sample of its own metric and still serves as that card's current,

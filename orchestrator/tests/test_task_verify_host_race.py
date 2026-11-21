@@ -674,7 +674,9 @@ class TestTheRace:
         laptop_holder = rig.hold()
         await _bounded(laptop_holder.granted.wait())
         call = rig.start()
-        await _until(lambda: rig.legs.spawned(_TEST), watching=call)
+        await _until(lambda: _holding(rig.local_gate) == ['7'], watching=call)
+        [plan] = rig.local.plans
+        assert plan is not None and plan.has_been_granted()
         next_waiter = rig.hold(task_id='next')
         await _until(lambda: _waiters(rig.laptop) == ['7', 'next'])
 
@@ -686,6 +688,7 @@ class TestTheRace:
         rig.legs.release(_TEST)
         result = await _bounded(call)
         assert result.passed
+        assert len(rig.legs.pids(_TEST)) == 1
         assert rig.sidecar()['reason'] == 'local_granted_first'
         assert rig.local.cancels == []
         assert rig.remotes['laptop'].log == []

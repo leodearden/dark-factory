@@ -383,7 +383,7 @@ class VerifyDispatcher:
             with contextlib.suppress(BaseException):
                 await self._worktrees.cleanup_owned(abandoned_wt)
         self._chain_invalidated = False
-        self._custody.record_unlanded_rebased_head(item)
+        self._custody.record_abandoned_item(item)
         self._custody.retire_item(item.request.request_id)
         return _predispatch(item, InflightStatus.ABANDONED_PREDISPATCH)
 
@@ -391,7 +391,7 @@ class VerifyDispatcher:
         """A halt holds the built item back; its Future stays pending for finalize to skip."""
         with contextlib.suppress(BaseException):
             await self._worktrees.cleanup_owned(item.merge_wt)
-        self._custody.requeue_request(item.request)
+        self._custody.requeue_built_item(item)
         self._chain_invalidated = False
         return _predispatch(item, InflightStatus.REQUEUED_PREDISPATCH)
 

@@ -25,6 +25,7 @@ import pytest
 from escalation.models import Escalation
 
 from orchestrator.config import GitConfig
+from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 
 # ---------------------------------------------------------------------------
@@ -160,6 +161,24 @@ class TestFileLaneRecordDriftL2:
 
         # Must not raise; must not require a queue.
         harness._file_lane_record_drift_l2(3)
+
+    def test_filing_emits_escalation_created_with_the_drift_reason(self, harness: Harness):
+        q = _make_mock_queue()
+        harness._escalation_queue = q
+        harness.event_store = MagicMock()
+
+        harness._file_lane_record_drift_l2(3)
+
+        (filed,) = q._submitted
+        assert filed.task_id == '__lane_record_drift__'
+        assert filed.suggested_action == 'investigate_lane_record_drift'
+        harness.event_store.emit.assert_called_once()
+        (event_type,) = harness.event_store.emit.call_args.args
+        assert event_type is EventType.escalation_created
+        assert harness.event_store.emit.call_args.kwargs['task_id'] == '__lane_record_drift__'
+        data = harness.event_store.emit.call_args.kwargs['data']
+        assert data['escalation_id'] == filed.id
+        assert data['reason'] == 'lane-record-drift-threshold'
 
 
 # ---------------------------------------------------------------------------

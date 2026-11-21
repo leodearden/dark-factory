@@ -677,6 +677,18 @@ def session_pointer_path_for_pid(pid: int, root: Path | str | None = None) -> Pa
     return session_pointers_dir(root) / str(pid)
 
 
+def is_session_pointer_pid(pid: int) -> bool:
+    """True iff *pid* can key a ``sessions-by-pid/`` entry, judged live from ``/proc``.
+
+    A shared ``claude agents`` host's pid is every hosted session's owning
+    claude, so a pointer keyed on it would name whichever hosted session
+    wrote last. Host-ness is read from ``/proc/<pid>/cmdline`` through
+    ``session_identity.is_shared_session_host`` on every call, so the answer
+    is an observation of the running process, not a property of the pid.
+    """
+    return pid > 0 and not session_identity.is_shared_session_host(pid)
+
+
 def is_record_key(slug: str) -> bool:
     """True iff *slug* can name a record dir directly inside ``sessions_dir``.
 
@@ -719,11 +731,12 @@ def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -
     ``$CLAUDE_PID`` carries), never the record's ``launcher_pid``.
 
     Returns True without rewriting when the pointer already holds *slug*.
-    Returns False without writing for a non-positive *pid* or a *slug* that
-    is not a record key, and False (after a WARNING) when the write itself
-    fails. Never raises: its callers are session hooks.
+    Returns False without writing for a *pid* that cannot key a pointer
+    (non-positive, or a shared ``claude agents`` host: ``is_session_pointer_pid``)
+    or a *slug* that is not a record key, and False (after a WARNING) when
+    the write itself fails. Never raises: its callers are session hooks.
     """
-    if pid <= 0 or not is_record_key(slug):
+    if not is_session_pointer_pid(pid) or not is_record_key(slug):
         return False
     return _write_pointer_file(session_pointer_path_for_pid(pid, root=root), slug)
 
@@ -738,11 +751,14 @@ def resolve_session_slug_for_pid(pid: int, root: Path | str | None = None) -> st
     caller-visible degradation signal; this function is read-only and never
     raises.
 
+    A *pid* that cannot key a pointer (``is_session_pointer_pid``) reads as
+    None, so a legacy host-keyed pointer still on disk is never followed.
+
     Contract limit: a new process that reuses a dead claude's pid can read
     that session's pointer until its own SessionStart hook overwrites it or
     ``session_reaper.py::reap_stale_session_pointers`` removes it.
     """
-    if pid <= 0:
+    if not is_session_pointer_pid(pid):
         return None
     slug = read_session_pointer(session_pointer_path_for_pid(pid, root=root))
     if slug is None or not is_record_key(slug):

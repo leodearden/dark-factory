@@ -1029,6 +1029,17 @@ class TestLayeredConfig:
         assert config.effort.architect == 'xhigh'
         assert config.max_turns.architect == 180
 
+    @pytest.mark.parametrize('role', ['implementer', 'debugger', 'merger', 'deep_reviewer'])
+    def test_packaged_effort_default_is_xhigh(self, tmp_path, role):
+        """A project config with no effort block resolves these roles to xhigh."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({'max_concurrent_tasks': 8}))
+        config = load_config(project_cfg)
+        assert getattr(config.effort, role) == 'xhigh'
+
+    def test_effort_config_deep_reviewer_field_default_is_xhigh(self):
+        assert EffortConfig().deep_reviewer == 'xhigh'
+
     def test_deep_merge_preserves_sibling_keys(self, tmp_path):
         """Overriding one key in a nested dict should not clobber siblings."""
         project_cfg = tmp_path / 'config.yaml'

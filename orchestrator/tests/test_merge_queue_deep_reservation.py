@@ -17,6 +17,7 @@ import contextlib
 import dataclasses
 import logging
 import sqlite3
+import subprocess
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
@@ -996,59 +997,142 @@ async def _main_sha(scene: _Scene) -> str:
     return sha.strip()
 
 
-class TestGTheRebasedHeadChainsAheadOfItsReparkedSuccessor:
-    """G: PRD D3 with D5. The gate re-verify dispatches H's rebased commit alone
-    in the verify frontier, so it chains the followers buffered in the lane,
-    and S, re-parked behind it, re-anchors on the chain tip.
+_GATE_SCENE = ('H', 'S', 'F1', 'F2')
 
-    ``chain_snapshot()`` reads the lane buffers and not the redispatch park, so
-    the newer F1 and F2 land before S: every tree is sound, FIFO is not.
+
+@contextlib.asynccontextmanager
+async def _gate_reverified_head(
+    scene: _Scene,
+) -> AsyncIterator[tuple[_Lane, dict[str, MergeOutcome]]]:
+    """H verifies on the one host while S merges on it and the merger holds F1
+    and F2 in the lane; main moves, H's verify passes, and H's gate decides a
+    full re-verify of its rebased commit. Yields once every request has an
+    outcome, with the lane still running."""
+    reqs = await _requests(scene, *_GATE_SCENE)
+    h_entered, release_h = asyncio.Event(), asyncio.Event()
+    verifier = _FirstVerifyScripted({'H': hangs_until(release_h, entered=h_entered)})
+    async with _running(scene, verifier=verifier, remotes=[], speculation_depth=3) as run:
+        run.put(reqs['H'])
+        await wait_responsive(
+            h_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT,
+            label="H's verify under way on local",
+        )
+        run.put(reqs['S'], reqs['F1'], reqs['F2'])
+        await _until(
+            lambda: (
+                lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH
+                and run.lane.unfrozen_suffix() == (
+                    reqs['F1'].request_id, reqs['F2'].request_id,
+                )
+            ),
+            label='S merged on H and waiting for the host, F1 and F2 buffered',
+        )
+        await _move_main_by_a_foreign_commit(scene)
+        release_h.set()
+        yield run, {
+            name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
+            for name in _GATE_SCENE
+        }
+
+
+def _h_verify_rows(scene: _Scene) -> list[tuple[int, bool]]:
+    return [
+        (event['data']['chain_items'], event['data']['speculative'])
+        for event in _verify_events_for(scene, {'H'})
+    ]
+
+
+async def _assert_h_landed_first_and_its_successors_chained(
+    scene: _Scene, run: _Lane, outcomes: dict[str, MergeOutcome],
+) -> None:
+    assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(_GATE_SCENE, 'done')
+    assert _gate_decided_reverify(scene, 'H')
+    landed = await _landed_task_files(scene)
+    assert (landed[:1], sorted(landed)) == (['H'], ['F1', 'F2', 'H', 'S']), landed
+    assert [outcomes[name].landed_via_chain for name in _GATE_SCENE[1:]] == [1, 1, 1]
+    assert run.lane.two_layer_invariants(await _main_sha(scene)) == []
+    _assert_no_live_permit(run.lane)
+    assert _reservations(run.lane) == []
+
+
+class _MainMovesAtTheGateOf(EventStore):
+    """An event store that moves main the moment *task_id*'s gate decides a
+    full re-verify: after the gate rebased the head, before its dispatch.
+
+    Plumbing takes no index lock and touches no worktree, so this synchronous
+    move inside the lane's loop cannot race the lane's merge worktrees. The
+    commit is tree-identical, so ``_landed_task_files`` reads nothing new.
     """
 
-    async def test_the_reparked_successor_lands_once_on_the_chain_tip(
+    def __init__(self, db_path: Path, run_id: str, *, repo: Path, task_id: str) -> None:
+        super().__init__(db_path, run_id)
+        self._repo = repo
+        self._task_id = task_id
+        self.moved_main = False
+
+    def emit(self, event_type: EventType, **fields: Any) -> None:
+        if not self.moved_main and self._gate_decides_reverify(event_type, fields):
+            self._move_main()
+            self.moved_main = True
+        super().emit(event_type, **fields)
+
+    def _gate_decides_reverify(self, event_type: EventType, fields: dict[str, Any]) -> bool:
+        return (
+            event_type is EventType.merge_reverify_gate
+            and fields.get('task_id') == self._task_id
+            and (fields.get('data') or {}).get('reverify') is True
+        )
+
+    def _move_main(self) -> None:
+        old = self._git('rev-parse', 'main')
+        new = self._git(
+            'commit-tree', f'{old}^{{tree}}', '-p', old, '-m', 'Foreign landing at the gate',
+        )
+        self._git('update-ref', 'refs/heads/main', new, old)
+
+    def _git(self, *argv: str) -> str:
+        done = subprocess.run(
+            ['git', *argv], cwd=self._repo, check=True, capture_output=True, text=True,
+        )
+        return done.stdout.strip()
+
+
+class TestGTheRebasedHeadReverifiesItsOwnTreeUnchained:
+    """G: PRD D3 as amended by task 10721.
+
+    A gate re-verify verifies the rebased head's own tree alone, and H lands
+    first. The successors re-parked and buffered behind it land after it, and
+    still chain on their own dispatch.
+    """
+
+    async def test_the_rebased_heads_reverify_is_unchained(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """S, merged on H, waits for the one host, so the merger holds F1 and F2
-        in the lane; main moves while H verifies, and H's gate re-verifies."""
         scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
-        reqs = await _requests(scene, 'H', 'S', 'F1', 'F2')
-        h_entered, release_h = asyncio.Event(), asyncio.Event()
-        verifier = _FirstVerifyScripted({'H': hangs_until(release_h, entered=h_entered)})
-        async with _running(scene, verifier=verifier, remotes=[], speculation_depth=3) as run:
-            run.put(reqs['H'])
-            await wait_responsive(
-                h_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT,
-                label="H's verify under way on local",
-            )
-            run.put(reqs['S'], reqs['F1'], reqs['F2'])
-            await _until(
-                lambda: (
-                    lane_state(run.lane, reqs['S'].request_id) in _AWAITING_DISPATCH
-                    and run.lane.unfrozen_suffix() == (
-                        reqs['F1'].request_id, reqs['F2'].request_id,
-                    )
-                ),
-                label='S merged on H and waiting for the host, F1 and F2 buffered',
-            )
+        async with _gate_reverified_head(scene) as (run, outcomes):
+            assert _h_verify_rows(scene) == [(1, False), (1, False)]
+            await _assert_h_landed_first_and_its_successors_chained(scene, run, outcomes)
 
-            await _move_main_by_a_foreign_commit(scene)
-            release_h.set()
-            names = ('H', 'S', 'F1', 'F2')
-            outcomes = {
-                name: await wait_responsive(reqs[name].result, label=f'{name} outcome')
-                for name in names
-            }
-            assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(names, 'done')
-            assert _gate_decided_reverify(scene, 'H')
+    async def test_a_rebased_head_re_merged_at_its_dispatch_still_verifies_unchained(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Main moves again between the gate's rebase and H's dispatch, so
+        Mechanism 2 replaces H with a fresh re-merge onto main."""
+        scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
+        events = _MainMovesAtTheGateOf(
+            db_path=tmp_path / 'events-gate.db', run_id='gate-moves-main',
+            repo=scene.git_ops.project_root, task_id='H',
+        )
+        scene = dataclasses.replace(scene, events=events)
+        async with _gate_reverified_head(scene) as (run, outcomes):
+            assert events.moved_main
             assert [
-                (e['data']['chain_items'], e['data']['speculative'])
-                for e in _verify_events_for(scene, {'H'})
-            ] == [(1, False), (3, False)]
-            assert [outcomes[n].landed_via_chain for n in ('F1', 'F2')] == [1, 1]
-            assert await _landed_task_files(scene) == ['H', 'F1', 'F2', 'S']
-            assert run.lane.two_layer_invariants(await _main_sha(scene)) == []
-            _assert_no_live_permit(run.lane)
-            assert _reservations(run.lane) == []
+                event['data']['reason']
+                for event in events.fetch_events_by_type(EventType.speculative_discard)
+                if event['task_id'] == 'H'
+            ] == ['main_advanced']
+            assert _h_verify_rows(scene) == [(1, False), (1, False)]
+            await _assert_h_landed_first_and_its_successors_chained(scene, run, outcomes)
 
 
 class TestCAnItemBehindTheChainStacksOnTheChainTip:

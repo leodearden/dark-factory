@@ -25,7 +25,7 @@ from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedR
 from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
 
 from fused_memory.backends.mem0_client import Mem0Backend, is_missing_collection_error
-from fused_memory.config.schema import Mem0BackendConfig
+from fused_memory.config.schema import FusedMemoryConfig, Mem0BackendConfig
 from fused_memory.models.scope import Scope
 
 # Sentinel distinguishing "caller passed vector=None" (model a Qdrant point
@@ -2102,47 +2102,35 @@ class TestMem0BackendMetadataReadsOnAbsentCollectionIntegration:
 
 
 # ---------------------------------------------------------------------------
-# Integration: add_system_record fresh-point-per-call (task 2222 / W5-δ, P4)
-# ---------------------------------------------------------------------------
+# Live-Qdrant probe harness, shared by the add_system_record probe and the
+# scan_payload_text tripwire below.
 #
-# Mirrors tests/test_recon_dedup_premise.py's real-Qdrant harness (task 2221 /
-# W5-γ, which already empirically proved the underlying infer=False primitive
-# never dedup-drops), adapted to probe add_system_record instead of add().
-# This pins the SAME fresh-point-every-call guarantee for the new dedicated,
-# dedup-exempt method.
-#
-# One collection is shared by every xdist worker and session and reused across
-# runs; it is reaped by scripts/cleanup_test_collections.py, and each run is
+# A probe's collection is shared by every xdist worker and session and reused
+# across runs; scripts/cleanup_test_collections.py reaps it, and each run is
 # isolated by its own run_id.
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def _asr_scope() -> Scope:
-    """The recon-stage scope every add_system_record run shares; runs are isolated by run_id."""
-    return Scope(
-        project_id='_test_add_system_record',
-        agent_id='recon-stage-task_knowledge_sync',
-    )
-
-
-@pytest.fixture
-def _asr_config(mock_config):
-    """``mock_config`` with the collection prefix the reaper sweeps."""
+def _reapable_config(mock_config):
+    """``mock_config`` with the collection prefix scripts/cleanup_test_collections.py reaps."""
     config = mock_config.model_copy(deep=True)
     config.mem0.collection_prefix = EPHEMERAL_COLLECTION_PREFIX
     return config
 
 
-@pytest.fixture
-def _asr_run_id(_asr_scope, _asr_config):
-    """A run_id unique to this run; teardown deletes only this run's points, never the collection."""
-    run_id = f'task-2222-add-system-record-probe-{uuid.uuid4().hex}'
+def _probe_collection(scope: Scope, config: FusedMemoryConfig) -> str:
+    return scope.mem0_collection_name(config.mem0.collection_prefix)
+
+
+def _isolated_run(scope: Scope, config: FusedMemoryConfig, label: str) -> Iterator[str]:
+    """Yield a fresh run_id, then best-effort delete that run's points; the collection stays."""
+    run_id = f'{label}-{uuid.uuid4().hex}'
     yield run_id
-    collection = _asr_scope.mem0_collection_name(_asr_config.mem0.collection_prefix)
     client = QdrantClient(url=QDRANT_URL, timeout=10)
     with contextlib.suppress(Exception):
         client.delete(
-            collection_name=collection,
+            collection_name=_probe_collection(scope, config),
             points_selector=FilterSelector(
                 filter=Filter(
                     must=[FieldCondition(key='run_id', match=MatchValue(value=run_id))],
@@ -2152,27 +2140,22 @@ def _asr_run_id(_asr_scope, _asr_config):
     client.close()
 
 
-def test_the_add_system_record_probe_collection_is_one_the_reaper_can_reclaim(
-    _asr_config, _asr_scope,
-):
-    """The probe collection outlives a run by design, so it must be one the reaper deletes."""
-    assert_reapable(_asr_scope.mem0_collection_name(_asr_config.mem0.collection_prefix))
-
-
-async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
+async def _build_stub_embedder_backend(
+    scope: Scope, config: FusedMemoryConfig, monkeypatch,
+) -> Mem0Backend:
     """Construct a real Mem0Backend with a stubbed constant-vector embedder.
 
-    Mirrors test_recon_dedup_premise._build_recon_backend's hermetic
-    (non-real-embedder) path: cosine=1.0 is the strongest-possible duplicate
-    signal the infer=False path could ever see.
+    Refuses, before anything is written, a config whose collection the reaper
+    would not reclaim. Mirrors test_recon_dedup_premise._build_recon_backend's
+    hermetic (non-real-embedder) path.
     """
+    collection = _probe_collection(scope, config)
+    assert_reapable(collection)
     monkeypatch.setattr('mem0.memory.main.capture_event', lambda *a, **kw: None)
 
-    config = mock_config.model_copy(deep=True)
-    backend = Mem0Backend(config)
+    backend = Mem0Backend(config.model_copy(deep=True))
     inst = await backend._get_instance(scope)
 
-    collection = scope.mem0_collection_name(config.mem0.collection_prefix)
     # Race-safe vector-dim read: under `-n auto` load the just-created
     # collection can transiently 404 before it is durably readable, so retry
     # the read via the shared bounded-poll helper rather than a single get.
@@ -2187,24 +2170,54 @@ async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
     return backend
 
 
+# ---------------------------------------------------------------------------
+# Integration: add_system_record fresh-point-per-call (task 2222 / W5-δ, P4)
+# ---------------------------------------------------------------------------
+#
+# Mirrors tests/test_recon_dedup_premise.py's real-Qdrant harness (task 2221 /
+# W5-γ, which already empirically proved the underlying infer=False primitive
+# never dedup-drops), adapted to probe add_system_record instead of add().
+# This pins the SAME fresh-point-every-call guarantee for the new dedicated,
+# dedup-exempt method.
+
+
+@pytest.fixture
+def _asr_scope() -> Scope:
+    """The recon-stage scope every add_system_record run shares."""
+    return Scope(
+        project_id='_test_add_system_record',
+        agent_id='recon-stage-task_knowledge_sync',
+    )
+
+
+@pytest.fixture
+def _asr_run_id(_asr_scope, _reapable_config):
+    yield from _isolated_run(_asr_scope, _reapable_config, 'task-2222-add-system-record-probe')
+
+
+def test_the_add_system_record_probe_collection_is_one_the_reaper_can_reclaim(
+    _reapable_config, _asr_scope,
+):
+    """The probe collection outlives a run by design, so it must be one the reaper deletes."""
+    assert_reapable(_probe_collection(_asr_scope, _reapable_config))
+
+
 class TestMem0BackendAddSystemRecordIntegration:
     """P4 boundary signal: N identical add_system_record calls -> N distinct points.
 
-    Real Qdrant, one collection shared by every worker and reused across runs
-    (reaped by scripts/cleanup_test_collections.py) with each run isolated by
-    its own run_id, stubbed constant-vector embedder (the worst-case cosine=1.0
-    duplicate signal) — mirrors test_recon_dedup_premise.py's harness for
-    backend.add(), applied to the new dedup-exempt backend.add_system_record
-    method.
+    Real Qdrant through the live-probe harness, stubbed constant-vector
+    embedder (the worst-case cosine=1.0 duplicate signal) — mirrors
+    test_recon_dedup_premise.py's harness for backend.add(), applied to the
+    new dedup-exempt backend.add_system_record method.
     """
 
     pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]
 
     @pytest.mark.asyncio
     async def test_identical_calls_all_land_distinct(
-        self, _asr_config, _asr_scope, _asr_run_id, monkeypatch,
+        self, _reapable_config, _asr_scope, _asr_run_id, monkeypatch,
     ):
-        backend = await _build_asr_backend(_asr_config, _asr_scope, monkeypatch)
+        backend = await _build_stub_embedder_backend(_asr_scope, _reapable_config, monkeypatch)
         run_id = _asr_run_id
         metadata = {'kind': 'cycle_summary', 'run_id': run_id}
         n = 6
@@ -3091,24 +3104,27 @@ class TestMem0BackendScanPayloadTextNamesItsCollection:
 # Correctness does not depend on this test passing: the mandatory Python
 # re-verify keeps the result exact either way, because tokenized matching is
 # strictly MORE permissive for these needles. Only speed would degrade.
+#
+# Runs through the live-probe harness; every scan is filtered to its run_id.
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def _spt_scope(worker_id) -> Scope:
-    return Scope(project_id=f'_test_scan_payload_text_{worker_id}')
+def _spt_scope() -> Scope:
+    """The scope every scan_payload_text tripwire run shares."""
+    return Scope(project_id='_test_scan_payload_text')
 
 
 @pytest.fixture
-def _spt_clean_collection(_spt_scope, mock_config):
-    collection = _spt_scope.mem0_collection_name(mock_config.mem0.collection_prefix)
-    client = QdrantClient(url=QDRANT_URL, timeout=10)
-    with contextlib.suppress(ResponseHandlingException, UnexpectedResponse):
-        client.delete_collection(collection)
-    yield collection
-    with contextlib.suppress(Exception):
-        client.delete_collection(collection)
-    client.close()
+def _spt_run_id(_spt_scope, _reapable_config):
+    yield from _isolated_run(_spt_scope, _reapable_config, 'task-3083-scan-payload-text-probe')
+
+
+def test_the_scan_payload_text_probe_collection_is_one_the_reaper_can_reclaim(
+    _reapable_config, _spt_scope,
+):
+    """The tripwire's collection outlives a run by design, so it must be one the reaper deletes."""
+    assert_reapable(_probe_collection(_spt_scope, _reapable_config))
 
 
 class TestMem0BackendScanPayloadTextIntegration:
@@ -3118,19 +3134,21 @@ class TestMem0BackendScanPayloadTextIntegration:
 
     @pytest.mark.asyncio
     async def test_matchtext_prefilter_is_a_literal_substring_match(
-        self, mock_config, _spt_scope, _spt_clean_collection, monkeypatch,
+        self, _reapable_config, _spt_scope, _spt_run_id, monkeypatch,
     ):
-        backend = await _build_asr_backend(mock_config, _spt_scope, monkeypatch)
+        backend = await _build_stub_embedder_backend(_spt_scope, _reapable_config, monkeypatch)
+        run_id = _spt_run_id
         try:
             await backend.add_system_record(
                 content='The reconciliation stage two judge halts on an empty backlog.',
                 scope=_spt_scope,
-                metadata={'kind': 'scan_payload_text_probe'},
+                metadata={'kind': 'scan_payload_text_probe', 'run_id': run_id},
             )
 
             # Mid-word substring: proves `contains`, not tokenization.
             midword = await backend.scan_payload_text(
-                scope=_spt_scope, needles=['econciliatio'], exhaustive=False
+                scope=_spt_scope, needles=['econciliatio'], exhaustive=False,
+                filters={'run_id': run_id},
             )
             assert midword['scanned'] == 1, (
                 'un-indexed MatchText must substring-match mid-word; a text '
@@ -3139,7 +3157,8 @@ class TestMem0BackendScanPayloadTextIntegration:
 
             # Reversed word order must NOT match a substring engine.
             reversed_order = await backend.scan_payload_text(
-                scope=_spt_scope, needles=['judge reconciliation'], exhaustive=False
+                scope=_spt_scope, needles=['judge reconciliation'], exhaustive=False,
+                filters={'run_id': run_id},
             )
             assert reversed_order['scanned'] == 0, (
                 'reversed word order matched — MatchText is tokenized here, so '
@@ -3149,7 +3168,7 @@ class TestMem0BackendScanPayloadTextIntegration:
             # Sanity: exhaustive mode ignores the prefilter entirely, so it
             # still walks the record regardless of MatchText semantics.
             assert (await backend.scan_payload_text(
-                scope=_spt_scope, exhaustive=True
+                scope=_spt_scope, exhaustive=True, filters={'run_id': run_id},
             ))['scanned'] == 1
         finally:
             await backend.close()

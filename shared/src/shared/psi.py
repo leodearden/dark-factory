@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     'ARM_FIELDS',
     'parse_pressure_file',
+    'parse_pressure_totals',
     'read_pressure',
     'PsiSample',
     'read_psi_sample',
@@ -60,10 +61,25 @@ __all__ = [
 ]
 
 _AVG_RE = re.compile(r'avg(10|60)=([0-9]+(?:\.[0-9]+)?)')
+_TOTAL_RE = re.compile(r'(?:^|\s)total=([0-9]+)')
 
 _PROC_STAT = '/proc/stat'
 _PROC_SELF_CGROUP = '/proc/self/cgroup'
 _CGROUP_ROOT = '/sys/fs/cgroup'
+
+
+def _pressure_lines(text: str) -> Iterator[tuple[str, str]]:
+    """Yield ``(prefix, line)`` for each ``some``/``full`` line of a pressure text.
+
+    The one line scanner of the pressure-file format: ``parse_pressure_file``
+    and ``parse_pressure_totals`` are two projections of it.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        for prefix in ('some', 'full'):
+            if line.startswith(prefix):
+                yield prefix, line
+                break
 
 
 def parse_pressure_file(text: str) -> dict[str, float] | None:
@@ -111,14 +127,7 @@ def parse_pressure_file(text: str) -> dict[str, float] | None:
         'full_avg60': 0.0,
     }
     found = False
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith('some'):
-            prefix = 'some'
-        elif line.startswith('full'):
-            prefix = 'full'
-        else:
-            continue
+    for prefix, line in _pressure_lines(text):
         # finditer, not search: one line carries BOTH windows, so a scan that
         # stops at the first match would silently drop avg60.
         for match in _AVG_RE.finditer(line):
@@ -128,6 +137,26 @@ def parse_pressure_file(text: str) -> dict[str, float] | None:
     if not found:
         return None
     return result
+
+
+def parse_pressure_totals(text: str) -> dict[str, int] | None:
+    """Parse the cumulative ``total=`` stall (µs) of each pressure line.
+
+    Keyed ``some_total`` and ``full_total``; an absent ``full`` line gives
+    ``full_total`` 0, the same partial-miss rule as ``parse_pressure_file``.
+    Returns ``None`` when no line carries a total, so a caller can tell an
+    unparseable file from zero stall. PRD
+    ``plans/per-consumer-resource-recording-prd.md`` D7 reads cgroup pressure
+    files for these totals.
+    """
+    result = {'some_total': 0, 'full_total': 0}
+    found = False
+    for prefix, line in _pressure_lines(text):
+        match = _TOTAL_RE.search(line)
+        if match is not None:
+            result[f'{prefix}_total'] = int(match.group(1))
+            found = True
+    return result if found else None
 
 
 def read_pressure(name: str) -> str:
