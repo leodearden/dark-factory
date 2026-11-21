@@ -1042,13 +1042,14 @@ def _h_verify_rows(scene: _Scene) -> list[tuple[int, bool]]:
     ]
 
 
-async def _assert_h_landed_first_and_the_lane_is_whole(
+async def _assert_h_landed_first_and_its_successors_chained(
     scene: _Scene, run: _Lane, outcomes: dict[str, MergeOutcome],
 ) -> None:
     assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(_GATE_SCENE, 'done')
     assert _gate_decided_reverify(scene, 'H')
     landed = await _landed_task_files(scene)
     assert (landed[:1], sorted(landed)) == (['H'], ['F1', 'F2', 'H', 'S']), landed
+    assert [outcomes[name].landed_via_chain for name in _GATE_SCENE[1:]] == [1, 1, 1]
     assert run.lane.two_layer_invariants(await _main_sha(scene)) == []
     _assert_no_live_permit(run.lane)
     assert _reservations(run.lane) == []
@@ -1099,8 +1100,9 @@ class _MainMovesAtTheGateOf(EventStore):
 class TestGTheRebasedHeadReverifiesItsOwnTreeUnchained:
     """G: PRD D3 as amended by task 10721.
 
-    A gate re-verify verifies the rebased head's own tree alone, and the
-    successors re-parked and buffered behind it still stack behind it.
+    A gate re-verify verifies the rebased head's own tree alone, and H lands
+    first. The successors re-parked and buffered behind it land after it, and
+    still chain on their own dispatch.
     """
 
     async def test_the_rebased_heads_reverify_is_unchained(
@@ -1109,7 +1111,7 @@ class TestGTheRebasedHeadReverifiesItsOwnTreeUnchained:
         scene = _scene(tmp_path, monkeypatch, merge_deep=_deep())
         async with _gate_reverified_head(scene) as (run, outcomes):
             assert _h_verify_rows(scene) == [(1, False), (1, False)]
-            await _assert_h_landed_first_and_the_lane_is_whole(scene, run, outcomes)
+            await _assert_h_landed_first_and_its_successors_chained(scene, run, outcomes)
 
     async def test_a_rebased_head_re_merged_at_its_dispatch_still_verifies_unchained(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1129,9 +1131,8 @@ class TestGTheRebasedHeadReverifiesItsOwnTreeUnchained:
                 for event in events.fetch_events_by_type(EventType.speculative_discard)
                 if event['task_id'] == 'H'
             ] == ['main_advanced']
-            rows = _h_verify_rows(scene)
-            assert len(rows) >= 2 and set(rows) == {(1, False)}, rows
-            await _assert_h_landed_first_and_the_lane_is_whole(scene, run, outcomes)
+            assert _h_verify_rows(scene) == [(1, False), (1, False)]
+            await _assert_h_landed_first_and_its_successors_chained(scene, run, outcomes)
 
 
 class TestCAnItemBehindTheChainStacksOnTheChainTip:
