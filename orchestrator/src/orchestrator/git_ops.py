@@ -8864,8 +8864,9 @@ class GitOps:
     ) -> None:
         """Re-stack the reused *full_branch*'s own delta onto *target* in
         *worktree*, in place of a rebase onto main.  Its own commits are cut
-        by :meth:`own_delta_cut`, the merge queue's rule.  Raises
-        ``branch_stack.restack_failure`` of any outcome but RESTACKED."""
+        by the merge queue's rule (:meth:`own_delta_cut`'s foreign-commit
+        cut).  Raises ``branch_stack.restack_failure`` of any outcome but
+        RESTACKED."""
         result = await self._restack_in(worktree, full_branch, target)
         if result.outcome is not RestackOutcome.RESTACKED:
             raise branch_stack.restack_failure(result)
@@ -8877,30 +8878,37 @@ class GitOps:
     async def _restack_in(
         self, worktree: Path, full_branch: str, target: StackTarget,
     ) -> RestackResult:
+        """The re-stack's verdict, from ONE ledger read: the cut and the
+        replay both use it, so a read that fails in between cannot turn
+        "cannot read" into "no record" and replay main..HEAD instead."""
+        stopped = branch_stack.RestackVerdict(full_branch, worktree, target.commit)
         old_tip = await self.resolve_branch_sha(full_branch)
-
-        def refused(detail: str, old_base: str | None = None) -> RestackResult:
-            return RestackResult(
-                outcome=RestackOutcome.REFUSED, branch=full_branch, worktree=worktree,
-                onto=target.commit, upstream=None, old_tip=old_tip, old_base=old_base,
-                detail=detail,
-            )
-
         holder = await self._worktree_holding_branch(full_branch)
         if holder is None or holder.resolve() != worktree.resolve():
-            return refused(f'{full_branch} is held by {holder}, not by {worktree}')
+            return stopped.refused(
+                old_tip, None, f'{full_branch} is held by {holder}, not by {worktree}',
+            )
         record = await self.stack_base_read(full_branch)
         if record.state is StackRecordState.UNREADABLE:
-            return refused(f'its stack-base record is unreadable: {record.detail}')
+            return stopped.refused(
+                old_tip, None, f'its stack-base record is unreadable: {record.detail}',
+            )
+        main_sha = await self.get_main_sha()
+        if not main_sha:
+            return stopped.refused(
+                old_tip, record.base, f'{self.config.main_branch} does not resolve',
+            )
         try:
-            upstream = await self.own_delta_cut(full_branch) or await self.get_main_sha()
+            cut = None if record.base is None else await self._foreign_cut(
+                full_branch, record.base, main_sha,
+            )
         except branch_stack.StackInspectionError as exc:
-            return refused(f'its own commits cannot be told apart: {exc}', record.base)
-        if not upstream:
-            return refused(f'{self.config.main_branch} does not resolve', record.base)
+            return stopped.refused(
+                old_tip, record.base, f'its own commits cannot be told apart: {exc}',
+            )
         return await branch_stack.restack_own_delta(
             _run, worktree, ledger=self._stack_ledger(), branch=full_branch,
-            onto=target.commit, upstream=upstream,
+            onto=target.commit, record=record, upstream=cut or main_sha,
         )
 
     async def rebind_branch_to_head(

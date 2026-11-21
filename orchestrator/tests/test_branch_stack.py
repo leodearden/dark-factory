@@ -549,10 +549,15 @@ async def conflicting_restack_scene(tmp_path: Path) -> RestackScene:
     return await build_restack_scene(await make_repo(tmp_path / 'repo'), conflicting=True)
 
 
-async def _restack(scene: RestackScene, ledger: StackBaseLedger | None = None) -> RestackResult:
+async def _restack(
+    scene: RestackScene, ledger: StackBaseLedger | None = None,
+    record: StackBaseRead | None = None,
+) -> RestackResult:
+    ledger = ledger or scene.ledger
     return await restack_own_delta(
         _run, scene.d_worktree,
-        ledger=ledger or scene.ledger, branch='task/D', onto=scene.p_new, upstream=scene.p_old,
+        ledger=ledger, branch='task/D', onto=scene.p_new,
+        record=record or await ledger.read('task/D'), upstream=scene.p_old,
     )
 
 
@@ -629,6 +634,19 @@ class TestRestackOwnDelta:
         assert result.blocks and not result.requeues
         await _assert_left_as_it_was(scene)
         assert (scene.d_worktree / D_FILE).read_text() == 'uncommitted\n'
+
+    async def test_an_unreadable_record_refuses_and_moves_nothing(
+        self, restack_scene: RestackScene,
+    ) -> None:
+        scene = restack_scene
+        unreadable = StackBaseRead(StackRecordState.UNREADABLE, detail='injected')
+
+        result = await _restack(scene, record=unreadable)
+
+        assert result.outcome is RestackOutcome.REFUSED
+        assert result.blocks and not result.requeues
+        assert 'injected' in result.detail
+        await _assert_left_as_it_was(scene)
 
     async def test_a_failed_abort_blocks(
         self, conflicting_restack_scene: RestackScene, tmp_path: Path,

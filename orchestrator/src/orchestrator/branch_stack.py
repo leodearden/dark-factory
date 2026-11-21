@@ -509,43 +509,49 @@ def restack_failure(result: RestackResult) -> RestackFailed:
 
 async def restack_own_delta(
     run: GitRunner, worktree: Path, *,
-    ledger: StackBaseLedger, branch: str, onto: str, upstream: str,
+    ledger: StackBaseLedger, branch: str, onto: str,
+    record: StackBaseRead, upstream: str,
 ) -> RestackResult:
     """Replay *branch*'s commits after *upstream* onto *onto*, in *worktree*,
     then make the ledger name *onto*.
 
-    The record is written only after the replay, so a replay that stops
-    leaves the branch and its record as they were.  A record that does not
-    read back rolls the branch back to its old tip, so the branch never sits
-    on a base its record does not name.
+    *record* is the ledger read *upstream* was derived from.  It is not read
+    again, so the replay starts from the cut its caller computed; an
+    UNREADABLE record refuses.  The record is written only after the
+    replay, so a replay that stops leaves the branch and its record as they
+    were.  A record that does not read back rolls the branch back to its old
+    tip, so the branch never sits on a base its record does not name.
     """
-    stopped = _RestackVerdict(branch, worktree, onto, upstream)
+    stopped = RestackVerdict(branch, worktree, onto, upstream)
     head_read = await _head(run, worktree)
     head = head_read.sha
     if head is None:
-        return stopped.refused(None, None, f'HEAD of {worktree} is {head_read.describe()}')
-    before = await ledger.read(branch)
-    if before.state is StackRecordState.UNREADABLE:
+        return stopped.refused(None, record.base, f'HEAD of {worktree} is {head_read.describe()}')
+    if record.state is StackRecordState.UNREADABLE:
         return stopped.refused(
-            head, None, f'the stack-base record of {branch} is unreadable: {before.detail}',
+            head, None, f'the stack-base record of {branch} is unreadable: {record.detail}',
         )
     rebased = await rebase_own_delta(run, worktree, onto=onto, cut=upstream)
     if not rebased.ok:
-        return await _stopped_replay(run, stopped, head, before.base, rebased)
+        return await _stopped_replay(run, stopped, head, record.base, rebased)
     new_tip = (await git_out(run, worktree, 'rev-parse', '--verify', 'HEAD')).strip()
     after = await ledger.ensure_record(branch, onto)
     if not after.names(onto):
-        detail = await _roll_back(run, ledger, stopped, head, before, after)
-        return stopped.verdict(RestackOutcome.RECORD_FAILED, head, before.base, detail=detail)
-    return stopped.verdict(RestackOutcome.RESTACKED, head, before.base, new_tip=new_tip)
+        detail = await _roll_back(run, ledger, stopped, head, record, after)
+        return stopped.verdict(RestackOutcome.RECORD_FAILED, head, record.base, detail=detail)
+    return stopped.verdict(RestackOutcome.RESTACKED, head, record.base, new_tip=new_tip)
 
 
 @dataclass(frozen=True)
-class _RestackVerdict:
+class RestackVerdict:
+    """Builds every :class:`RestackResult` of one re-stack of *branch* onto
+    *onto* in *worktree*.  *upstream* is None until it is known, and only a
+    refusal may be built without it."""
+
     branch: str
     worktree: Path
     onto: str
-    upstream: str
+    upstream: str | None = None
 
     def verdict(
         self, outcome: RestackOutcome, old_tip: str | None, old_base: str | None, *,
@@ -575,7 +581,7 @@ async def _head(run: GitRunner, worktree: Path) -> _HeadRead:
 
 
 async def _stopped_replay(
-    run: GitRunner, stopped: _RestackVerdict, old_tip: str, old_base: str | None,
+    run: GitRunner, stopped: RestackVerdict, old_tip: str, old_base: str | None,
     rebased: OwnDeltaRebase,
 ) -> RestackResult:
     paths = rebased.conflicted_paths
@@ -597,7 +603,7 @@ async def _stopped_replay(
 
 
 async def _roll_back(
-    run: GitRunner, ledger: StackBaseLedger, stopped: _RestackVerdict, old_tip: str,
+    run: GitRunner, ledger: StackBaseLedger, stopped: RestackVerdict, old_tip: str,
     before: StackBaseRead, after: StackBaseRead,
 ) -> str:
     """Put the branch back on *old_tip* and its record back on *before*;

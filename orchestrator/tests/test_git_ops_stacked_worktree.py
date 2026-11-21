@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from _git_fault_shim import fail_git
 from _stacked_repo import (
     D_FILE,
     RestackScene,
@@ -38,7 +39,9 @@ from _stacked_repo import (
 )
 
 from orchestrator.branch_stack import (
+    RestackBlocked,
     RestackConflict,
+    RestackOutcome,
     RestackTrialOutcome,
     StackBaseRead,
     StackRecordState,
@@ -284,6 +287,67 @@ class TestRestackThroughEachReuseRoute:
 
         await _assert_left_on_the_old_tip(scene, lane)
         assert (await git(lane, 'symbolic-ref', 'HEAD')).strip() == 'refs/heads/task/D'
+
+
+async def _held_by_another_worktree(scene: RestackScene) -> Path:
+    """task/D's registered worktree is detached, and task/D is checked out
+    in another worktree instead."""
+    await git(scene.d_worktree, 'checkout', '--detach')
+    other = scene.git_ops.worktree_base / 'D-elsewhere'
+    await git(scene.root, 'worktree', 'add', str(other), 'task/D')
+    return other
+
+
+@pytest.mark.asyncio
+class TestARefusedRestackMovesNothing:
+    """GitOps refuses a re-stack it cannot start from what it knows, before
+    any replay: task/D is held elsewhere, its stack-base record cannot be
+    read (which is NOT "no record", so no replay from main), or its own
+    commits cannot be told from its base's."""
+
+    async def _refused(self, scene: RestackScene) -> str:
+        with pytest.raises(RestackBlocked) as raised:
+            await scene.git_ops.create_worktree('D', stack_on=_new_tip(scene))
+        assert raised.value.result.outcome is RestackOutcome.REFUSED
+        return raised.value.result.detail
+
+    async def test_a_branch_held_by_another_worktree_is_refused(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = await build_restack_scene(await make_repo(tmp_path / 'repo'))
+        other = await _held_by_another_worktree(scene)
+
+        detail = await self._refused(scene)
+
+        assert str(other) in detail
+        await _assert_left_on_the_old_tip(scene, other)
+
+    async def test_an_unreadable_record_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scene = await build_restack_scene(await make_repo(tmp_path / 'repo'))
+        fail_git(
+            monkeypatch, tmp_path / 'shim' / 'bin',
+            'for-each-ref*refs/dark-factory/stack-base/*',
+        )
+
+        detail = await self._refused(scene)
+
+        monkeypatch.undo()
+        assert 'unreadable' in detail
+        await _assert_left_on_the_old_tip(scene, scene.d_worktree)
+
+    async def test_own_commits_that_cannot_be_told_apart_are_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scene = await build_restack_scene(await make_repo(tmp_path / 'repo'))
+        fail_git(monkeypatch, tmp_path / 'shim' / 'bin', 'cherry *')
+
+        detail = await self._refused(scene)
+
+        monkeypatch.undo()
+        assert 'cannot be told apart' in detail
+        await _assert_left_on_the_old_tip(scene, scene.d_worktree)
 
 
 @pytest.mark.asyncio
