@@ -169,6 +169,22 @@ class TestFallbackStampsTheTasksOwnCitation:
         assert kwargs['branch_base_sha'] == 'b' * 40
         assert 'candidate_sha' not in kwargs
 
+    async def test_forwards_only_the_declared_check_descriptors(
+        self, tmp_path: Path, guard: _Guard, note: str, tip: str,
+    ) -> None:
+        f = _fixture(tmp_path)
+        check = {'name': 'cap-x', 'kind': 'grep', 'pattern': 'y', 'expect': 'present'}
+        f.wf.task['metadata'] = {'delivered_checks': ['junk', check]}
+        validate = AsyncMock(return_value=SimpleNamespace(
+            accepted=False, evidence_sha=None, reason='no_citation',
+        ))
+
+        with patch(_VALIDATE_TARGET, validate):
+            await guard(f)
+
+        assert validate.await_args is not None
+        assert validate.await_args.kwargs['delivered_checks'] == [check]
+
     @pytest.mark.parametrize('enabled', [True, False])
     async def test_forwards_the_projects_delivered_checks_leaf(
         self, tmp_path: Path, guard: _Guard, note: str, tip: str, enabled: bool,

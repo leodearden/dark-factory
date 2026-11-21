@@ -781,6 +781,24 @@ consequence it does not spell out: a missing, non-executable, or malformed
 and no escalation. That is a SILENT, indefinite hold on the dependent. Pin the
 script's existence and executability with a test.
 
+Every orchestrator, escalation and shared reader takes
+`metadata.delivered_checks` through
+`shared/src/shared/declared_checks.py::declared_checks`, so all of them read a
+malformed declaration the same way. Three tooling readers still read the key
+raw, by their own rules, and are not migrated yet:
+`scripts/audit_manifest_descriptor_drift.py::_delivered_check_entries`,
+`skills/review-all/scripts/program/clerk_batch.py::_checks` and
+`skills/review-all/scripts/program/seam_scan.py::_anchored`.
+
+An entry that is not a dict (a JSON object), or a value that is neither a list
+nor empty (a bare dict, a string, a number), is never a check and never
+"nothing declared". Both gates count it as ERRORED, but they degrade
+differently. The dependency gate holds the dependent: the same silent
+fail-safe hold as above. The mark-done gate withholds done and logs a WARNING,
+and its caller takes its own no-landing-evidence path, which degrades toward
+re-delivery. Landing evidence ignores the entry, and the briefing shows it as
+a malformed entry. Repair the record rather than wait it out.
+
 See `plans/write-triage-attach-target-contradiction.md` for the worked example
 (tasks 4762 / 4810 / 3169).
 
