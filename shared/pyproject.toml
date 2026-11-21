@@ -71,7 +71,10 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-markers = ["integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')"]
+markers = [
+    "integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
+]
 addopts = "-m 'not integration'"
 asyncio_mode = "auto"
 filterwarnings = [

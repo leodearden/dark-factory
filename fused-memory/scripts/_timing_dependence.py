@@ -18,6 +18,14 @@ Legs, each one site:
     threshold cannot catch what lies outside it (Rule C's ruling, task 2376).
     A node the caller already reported as Rule C's is not a second site here.
 
+Escape: ONLY ``@pytest.mark.timing(reason='<non-blank literal>')``, on any
+enclosing def or class, a class-body ``pytestmark`` or the module ``pytestmark``.
+A mark on a helper def or a fake class is inert at runtime, so it reaches
+module-level helpers with no second mechanism.  Rule D has no per-site noqa
+code: one suppression mechanism per rule.  A ``@virtual_clock_test`` span
+covers every kind except a real-thread ``time.sleep``, which is real time even
+on a virtual loop.
+
 Hang floor: a literal sleep of ``HANG_SIMULATOR_FLOOR_SECS`` or more, or inf,
 simulates a hang.  A passing test never waits one out, it cancels it, so it
 cannot make a verdict load-sensitive; the census found no literal sleep between
@@ -51,7 +59,7 @@ finally:
 # shared/src: shared/__init__.py is a PEP 562 lazy package, so this stays stdlib-only.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'shared' / 'src'))
 try:
-    from shared.pytest_mark_grammar import marker_name
+    from shared.pytest_mark_grammar import marker_name, pytestmark_elements
 finally:
     del sys.path[0]
 
@@ -114,7 +122,17 @@ class ElapsedAssertCandidate(NamedTuple):
     left_names: tuple[str, ...]
 
 
-TimingFact = TimingSite | ScopeSpan | ClockBinding | ElapsedBinding | ElapsedAssertCandidate
+class ClockSafeSpan(NamedTuple):
+    """Lines a valid timing mark or a virtual clock covers."""
+
+    first: int
+    last: int
+    covers_real_thread_sleep: bool
+
+
+TimingFact = (
+    TimingSite | ScopeSpan | ClockBinding | ElapsedBinding | ElapsedAssertCandidate | ClockSafeSpan
+)
 
 
 def _numeric_literal(node: ast.expr) -> float | None:
@@ -354,6 +372,54 @@ def _call_facts(call: ast.Call, *, deadline_already_reported: bool) -> tuple[Tim
     return () if deadline_already_reported else _optional(_call_deadline(call))
 
 
+def _is_valid_timing_mark(element: ast.expr) -> bool:
+    """``pytest.mark.timing(reason='<non-blank literal>')``, and nothing looser."""
+    if not isinstance(element, ast.Call) or marker_name(element) != 'timing':
+        return False
+    reason = next((kw.value for kw in element.keywords if kw.arg == 'reason'), None)
+    return (
+        isinstance(reason, ast.Constant)
+        and isinstance(reason.value, str)
+        and bool(reason.value.strip())
+    )
+
+
+def _is_virtual_clock_decorator(decorator: ast.expr) -> bool:
+    if isinstance(decorator, ast.Name):
+        return decorator.id == 'virtual_clock_test'
+    return isinstance(decorator, ast.Attribute) and decorator.attr == 'virtual_clock_test'
+
+
+def _span(node: ast.stmt, *, covers_real_thread_sleep: bool) -> ClockSafeSpan:
+    return ClockSafeSpan(node.lineno, node.end_lineno or node.lineno, covers_real_thread_sleep)
+
+
+def _definition_coverage(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+) -> ClockSafeSpan | None:
+    marks = list(node.decorator_list)
+    if isinstance(node, ast.ClassDef):
+        marks += pytestmark_elements(node.body)
+    if any(map(_is_valid_timing_mark, marks)):
+        return _span(node, covers_real_thread_sleep=True)
+    if not isinstance(node, ast.ClassDef) and any(
+        map(_is_virtual_clock_decorator, node.decorator_list)
+    ):
+        return _span(node, covers_real_thread_sleep=False)
+    return None
+
+
+def _module_coverage(node: ast.Module) -> ClockSafeSpan | None:
+    if not node.body or not any(map(_is_valid_timing_mark, pytestmark_elements(node.body))):
+        return None
+    return ClockSafeSpan(1, node.body[-1].end_lineno or node.body[-1].lineno, True)
+
+
+def _function_facts(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[TimingFact, ...]:
+    scope = ScopeSpan(node.lineno, node.end_lineno or node.lineno)
+    return (scope, *_optional(_definition_coverage(node)))
+
+
 def _optional(fact: TimingFact | None) -> tuple[TimingFact, ...]:
     return (fact,) if fact is not None else ()
 
@@ -371,7 +437,11 @@ def timing_facts(node: ast.AST, *, deadline_already_reported: bool) -> tuple[Tim
     if isinstance(node, ast.Assert):
         return _optional(_elapsed_assert_candidate(node))
     if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-        return (ScopeSpan(node.lineno, node.end_lineno or node.lineno),)
+        return _function_facts(node)
+    if isinstance(node, ast.ClassDef):
+        return _optional(_definition_coverage(node))
+    if isinstance(node, ast.Module):
+        return _optional(_module_coverage(node))
     return ()
 
 
@@ -431,11 +501,21 @@ def _elapsed_assert_sites(facts: tuple[TimingFact, ...]) -> list[TimingSite]:
     ]
 
 
+def _is_covered(site: TimingSite, spans: Iterable[ClockSafeSpan]) -> bool:
+    return any(
+        span.first <= site.lineno <= span.last
+        and (span.covers_real_thread_sleep or not site.is_real_thread_sleep)
+        for span in spans
+    )
+
+
 def uncovered_timing_sites(facts: Iterable[TimingFact]) -> list[TimingSite]:
     """The sites among *facts*, a whole file's, that no coverage excuses."""
     facts = tuple(facts)
     sites = [fact for fact in facts if isinstance(fact, TimingSite)]
-    return sites + _elapsed_assert_sites(facts)
+    sites += _elapsed_assert_sites(facts)
+    safe = [fact for fact in facts if isinstance(fact, ClockSafeSpan)]
+    return [site for site in sites if not _is_covered(site, safe)]
 
 
 def _sleep_msg(site: TimingSite) -> str:
