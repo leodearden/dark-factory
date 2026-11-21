@@ -1,0 +1,28 @@
+window 60.7s  psi cpu some avg10=71.61  procs_running=239
+bucket                 family         nice role       procs     run    wait  stall%
+verify-scope:dark-factory pytest-master    15 task          22    2.29    6.44     74%
+other                  other             0 -           1284    3.45    4.40     56%
+verify-scope:solar-challenge-platform xdist-worker     15 task          16    2.43    5.40     69%
+other                  xdist-worker      0 -             16    0.16    5.58     97%
+df                     xdist-worker     19 background     8    1.33    4.21     76%
+df                     pytest-master    10 -             18    0.44    2.98     87%
+verify-scope:dark-factory xdist-worker     15 task           8    0.26    1.92     88%
+other                  claude-cli        0 -             28    0.04    0.92     95%
+df                     other            10 -             27    0.26    0.59     69%
+df                     claude-cli       10 -              6    0.04    0.67     94%
+other                  orch-main         0 -             14    0.11    0.35     76%
+reify                  other             0 -             19    0.05    0.34     88%
+df                     claude-cli        0 -              4    0.05    0.32     86%
+verify-scope:dark-factory pytest-master     5 merge          4    0.05    0.28     86%
+df                     orch-main         0 -              2    0.06    0.26     81%
+df                     xdist-worker      0 -              8    0.08    0.24     75%
+other                  pytest-master    19 background     7    0.10    0.22     69%
+other                  other           -20 -            135    0.16    0.04     21%
+reify                  orch-main         0 -              2    0.06    0.13     70%
+other                  claude-cli       10 -              3    0.03    0.13     81%
+reify                  claude-cli       10 -              1    0.02    0.12     83%
+other                  claude-cli        5 merge          4    0.00    0.10     98%
+verify-scope:solar-challenge pytest-master    15 task           2    0.06    0.04     35%
+other                  other            10 -             12    0.02    0.08     82%
+reify                  cargo            19 background     2    0.00    0.06     98%
+{"psi_cpu_some_avg10": "71.61", "procs_running": "239", "window_s": 60.7, "df_agents": {"run_cores": 0.1, "wait_cores": 0.99, "stall_pct": 91}, "df_merge_workers": {"run_cores": 0.05, "wait_cores": 0.28, "stall_pct": 86}, "df_task_workers": {"run_cores": 2.55, "wait_cores": 8.36, "stall_pct": 77}, "df_background_workers": {"run_cores": 1.33, "wait_cores": 4.25, "stall_pct": 76}, "reify_agents": {"run_cores": 0.02, "wait_cores": 0.12, "stall_pct": 83}, "reify_merge_verify": {"run_cores": 0.0, "wait_cores": 0.0, "stall_pct": null}, "reify_task_verify": {"run_cores": 0.0, "wait_cores": 0.04, "stall_pct": 100}}
