@@ -81,6 +81,7 @@ __all__ = [
     'collect_load_metrics',
     'FigureMetric',
     'FIGURE_METRICS',
+    'RECLAIM_METRICS',
     'collect_consumers',
     'collect_verify_scopes',
     'METRIC_GROUPS',
@@ -354,7 +355,7 @@ FIGURE_METRICS: Mapping[Figure, FigureMetric] = MappingProxyType({
 })
 """Each per-consumer figure's one metric: ``sampler.consumers`` never spells a name."""
 
-_RECLAIM_METRICS: Mapping[ReclaimThreadKind, MetricSpec] = MappingProxyType({
+RECLAIM_METRICS: Mapping[ReclaimThreadKind, MetricSpec] = MappingProxyType({
     ReclaimThreadKind.KSWAPD: _RECLAIM_KSWAPD_CPU,
     ReclaimThreadKind.KCOMPACTD: _RECLAIM_KCOMPACTD_CPU,
 })
@@ -655,7 +656,7 @@ def collect_consumers(
         _HOST_ANON: host_memory.anon_bytes,
         _HOST_FILE: host_memory.file_bytes,
         _HOST_USED: read_host_used_bytes(meminfo_path),
-        **{_RECLAIM_METRICS[kind]: usec for kind, usec in (reclaim or {}).items()},
+        **{RECLAIM_METRICS[kind]: usec for kind, usec in (reclaim or {}).items()},
     }
     samples = {
         **_consumer_samples(accounting.per_consumer),
@@ -732,7 +733,7 @@ METRIC_GROUPS: tuple[MetricGroup, ...] = _metric_table(
         metrics=(
             _CONSUMER_MEMBERS, _CONSUMER_READ_OK,
             *(metric.spec for metric in FIGURE_METRICS.values()),
-            _CONSUMER_INTERVAL, *_RECLAIM_METRICS.values(),
+            _CONSUMER_INTERVAL, *RECLAIM_METRICS.values(),
             _HOST_ANON, _HOST_FILE, _HOST_USED,
         ),
         windowed=False,

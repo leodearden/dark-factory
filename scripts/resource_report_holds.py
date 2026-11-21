@@ -32,7 +32,7 @@ from sampler.consumers import (
     encode_consumer,
     parse_consumer,
 )
-from sampler.metrics import FIGURE_METRICS, MetricSpec
+from sampler.metrics import FIGURE_METRICS, RECLAIM_METRICS, MetricSpec
 from shared.project_layout import runs_db
 from shared.psi import ARM_FIELDS, PsiSample
 from shared.verify_scope_tag import scope_tag_for
@@ -59,6 +59,7 @@ __all__ = [
     'holding_project',
     'incomplete',
     'parse_utc',
+    'reclaim_threads_share',
     'read_holds_report',
     'read_root',
     'render_text',
@@ -378,6 +379,10 @@ class Window:
     end: datetime
     collections: int
     consumers: Mapping[Consumer, ConsumerWindow]
+    reclaim_threads_cpu_usec: float | None
+    """The kernel's reclaim threads' CPU over (start, end]; None when no collection recorded it."""
+    host_cpu_usec: float
+    """Every consumer's CPU over (start, end], which D3 makes the root's."""
 
 
 _RECLAIM_FIGURES = (Figure.RECLAIM_KSWAPD_PAGES, Figure.RECLAIM_DIRECT_PAGES)
@@ -392,7 +397,12 @@ _WINDOW_FIGURES = (
 _FIGURE_NAMED: Mapping[str, Figure] = MappingProxyType(
     {FIGURE_METRICS[figure].spec.name: figure for figure in _WINDOW_FIGURES}
 )
-_WINDOW_SPECS = (_READ_OK, *(FIGURE_METRICS[figure].spec for figure in _WINDOW_FIGURES))
+_RECLAIM_THREADS = frozenset(spec.name for spec in RECLAIM_METRICS.values())
+_WINDOW_SPECS = (
+    _READ_OK,
+    *(FIGURE_METRICS[figure].spec for figure in _WINDOW_FIGURES),
+    *RECLAIM_METRICS.values(),
+)
 
 
 class _WindowRows:
@@ -405,8 +415,13 @@ class _WindowRows:
         self.increments: dict[Consumer, dict[Figure, float]] = {}
         """Every consumer with a row in the window, and its counters summed over (start, end]."""
         self.unreadable: set[Consumer] = set()
+        self.reclaim_threads_usec: float | None = None
 
     def add(self, ts: int, metric: str, leaf: str | None, value: float) -> None:
+        if metric in _RECLAIM_THREADS:
+            if ts > self.start:
+                self.reclaim_threads_usec = (self.reclaim_threads_usec or 0.0) + value
+            return
         if leaf is None:
             raise ValueError(f'a consumer metric row without a consumer: {metric} at {ts}')
         consumer = parse_consumer(leaf)
@@ -445,11 +460,14 @@ def _window(samples: _Samples, start: int, end: int) -> Window:
     rows = _WindowRows(start, end)
     for row in samples.rows(_WINDOW_SPECS, start, end):
         rows.add(*row)
+    consumers = {c: rows.consumer_window(c) for c in sorted(rows.increments)}
     return Window(
         start=_utc(start),
         end=_utc(end),
         collections=len(rows.collections),
-        consumers=MappingProxyType({c: rows.consumer_window(c) for c in sorted(rows.increments)}),
+        consumers=MappingProxyType(consumers),
+        reclaim_threads_cpu_usec=rows.reclaim_threads_usec,
+        host_cpu_usec=sum(c.cpu_usec for c in consumers.values()),
     )
 
 
@@ -531,6 +549,7 @@ def _share(part: float, whole: float) -> float | None:
 class Aside:
     """One aside role's figures, and its shares of all consumers' positive growth and pages."""
 
+    role: Role
     label: str
     grew: float
     reclaimed_pages: float
@@ -554,8 +573,17 @@ def aside(window: Window) -> tuple[Aside, ...]:
         members = [c for c in window.consumers.values() if c.consumer.role is role]
         grew = sum(c.grew for c in members)
         reclaimed = sum(c.reclaimed_pages for c in members)
-        rows.append(Aside(label, grew, reclaimed, _share(grew, growth), _share(reclaimed, pages)))
+        rows.append(
+            Aside(role, label, grew, reclaimed, _share(grew, growth), _share(reclaimed, pages))
+        )
     return tuple(rows)
+
+
+def reclaim_threads_share(window: Window) -> float | None:
+    """The reclaim threads' share of host CPU; None when either is unavailable or CPU is 0."""
+    if window.reclaim_threads_cpu_usec is None:
+        return None
+    return _share(window.reclaim_threads_cpu_usec, window.host_cpu_usec)
 
 
 def incomplete(window: Window) -> tuple[Consumer, ...]:
@@ -703,6 +731,7 @@ def _heading(hold: Hold) -> str:
 
 
 _TOP = 5
+_USEC_PER_SECOND = 1_000_000
 _MiB = 2**20
 _GiB = 2**30
 
@@ -754,11 +783,20 @@ def _ranking_lines(
     ]
 
 
-def _aside_line(row: Aside) -> str:
-    return (
+def _reclaim_threads(window: Window) -> str:
+    usec = window.reclaim_threads_cpu_usec
+    if usec is None:
+        return 'reclaim threads unavailable'
+    share = _percent(reclaim_threads_share(window))
+    return f'reclaim threads {usec / _USEC_PER_SECOND:.1f} s CPU ({share} of host CPU)'
+
+
+def _aside_line(row: Aside, window: Window) -> str:
+    line = (
         f'  {row.label}: grew {_bytes(row.grew)} ({_percent(row.growth_share)} of growth), '
         f'{_pages(row.reclaimed_pages)} reclaimed ({_percent(row.reclaim_share)} of pages)'
     )
+    return f'{line}; {_reclaim_threads(window)}' if row.role is Role.KERNEL else line
 
 
 def _ranks(row: ProjectConsumer) -> str:
@@ -800,7 +838,7 @@ def _window_lines(mapping: HoldConsumers, window: Window) -> list[str]:
             _paid,
             marks,
         ),
-        *(_aside_line(row) for row in aside(window)),
+        *(_aside_line(row, window) for row in aside(window)),
         '  this project:',
         *(_project_line(row) for row in holding_project(mapping, window)),
         *(
@@ -901,6 +939,9 @@ def _window_json(mapping: HoldConsumers, window: Window) -> dict[str, Any]:
             row.role.value: _project_json(row) for row in holding_project(mapping, window)
         },
         'incomplete': [encode_consumer(c) for c in incomplete(window)],
+        'reclaim_threads_cpu_usec': window.reclaim_threads_cpu_usec,
+        'host_cpu_usec': window.host_cpu_usec,
+        'reclaim_threads_share': reclaim_threads_share(window),
     }
 
 
