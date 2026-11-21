@@ -181,6 +181,61 @@ class TestUnitsOnResult:
         assert result.units == ()
 
 
+class TestUnitVocabulary:
+    def test_a_unit_reason_round_trips_the_wire_codec(self):
+        unit = dataclasses.replace(
+            _module_unit('alpha', 'test', UnitOutcome.UNAVAILABLE), reason='registry unreadable',
+        )
+
+        rebuilt = result_from_dict(json.loads(json.dumps(result_to_dict(_result(units=(unit,))))))
+
+        assert rebuilt.units == (unit,)
+        assert rebuilt.units[0].reason == 'registry unreadable'
+
+    def test_a_wire_unit_from_an_older_remote_rebuilds_without_a_reason(self):
+        wire = result_to_dict(_result())
+        wire['units'] = [{
+            'unit': 'module:alpha:test', 'tier': 'module', 'key': None,
+            'outcome': 'ran_green', 'evidence_event_id': None,
+        }]
+
+        (unit,) = result_from_dict(wire).units or ()
+
+        assert unit.reason is None
+
+    def test_every_outcome_but_ran_red_is_green(self):
+        green = verify_evidence.GREEN_OUTCOMES
+
+        assert green == frozenset({
+            UnitOutcome.RAN_GREEN, UnitOutcome.CACHE_HIT, UnitOutcome.WOULD_HIT, UnitOutcome.UNAVAILABLE,
+        })
+        assert set(UnitOutcome) - green == {UnitOutcome.RAN_RED}
+
+    @pytest.mark.parametrize(('outcome', 'evidence', 'leaked'), [
+        (UnitOutcome.RAN_RED, 7, True),
+        (UnitOutcome.RAN_RED, None, False),
+        (UnitOutcome.WOULD_HIT, 7, False),
+        (UnitOutcome.CACHE_HIT, 7, False),
+        (UnitOutcome.RAN_GREEN, None, False),
+    ])
+    def test_only_a_red_run_carrying_a_replayable_green_would_have_leaked(
+        self, outcome, evidence, leaked,
+    ):
+        unit = dataclasses.replace(_module_unit('alpha', 'test', outcome), evidence_event_id=evidence)
+
+        assert unit.would_have_leaked is leaked
+
+    def test_the_verify_event_carries_each_unit_reason(self):
+        units = (
+            dataclasses.replace(_module_unit('alpha', 'test', UnitOutcome.CACHE_HIT), reason='hit'),
+            _module_unit('alpha', 'lint', UnitOutcome.RAN_GREEN),
+        )
+
+        fields = verify_evidence.verify_event_fields(_result(units=units))
+
+        assert [unit['reason'] for unit in fields['units']] == ['hit', None]
+
+
 def _two_module_repo(root: Path) -> str:
     for module in ('alpha', 'beta'):
         (root / module).mkdir(parents=True)
@@ -242,7 +297,7 @@ class TestMergeVerifyEventCarriesUnits:
             {
                 'unit': f'module:{module}:{leg}', 'tier': 'module', 'key': None,
                 'outcome': 'ran_red' if (module, leg) == ('beta', 'test') else 'ran_green',
-                'evidence_event_id': None,
+                'evidence_event_id': None, 'reason': None,
             }
             for module in ('alpha', 'beta') for leg in ('lint', 'test', 'type')
         ]
