@@ -574,18 +574,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     # ---- reconciliation/stages/task_knowledge_sync.py ----
     (
         'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py',
-        '_write_task_count_snapshot',
-        'e08ddda37175',
-        'to_file',
-        'SAME ROOT CAUSE as the server/tools.py::_normalize_project_root '
-        'cluster: a cold miss in models/scope.py::resolve_main_checkout '
-        'runs subprocess.run(git) on the loop thread; _MAIN_CHECKOUT_CACHE '
-        'makes it cold-miss-only. Filed together with that cluster by task '
-        '4484 step-9, since one fix closes both.'
-        ' Ticket: tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ.',
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py',
         '_run_briefing_known_gaps_script',
         'a23d01e12b5a',
         'accepted',

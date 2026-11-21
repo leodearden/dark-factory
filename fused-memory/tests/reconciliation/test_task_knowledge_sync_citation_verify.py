@@ -47,8 +47,6 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 # returns exactly as tests/test_stages.py already does.
 _STAGE2_POST_RUN_HELPERS = (
     'write_cycle_summary',
-    '_write_task_count_snapshot',
-    '_verify_task_count_snapshot_written',
     '_gc_recon_markers',
     '_sweep_stale_persistence_markers',
     '_sweep_stale_mem0_flag_markers',

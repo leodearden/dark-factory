@@ -94,7 +94,6 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._run_remediation_pass::edd9a8720cf9': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._run_remediation_pass::a4c939b65449': Debt(TaskRef(5270)),
         'fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._run_remediation_pass::ec953752e2f1': Debt(TaskRef(5270)),
-        'fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::_write_task_count_snapshot::e08ddda37175': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/reconciliation/stale_priority_override_edge_sweep.py::read_live_override_state::7ebd882c849b': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
         'fused-memory/src/fused_memory/reconciliation/targeted.py::TargetedReconciler._sweep_cancelled_descendants::b9609c7cf5b4': Debt(TicketRef('tkt_0RT7RKWJG17W03JRC947R8FZZN')),
         'fused-memory/src/fused_memory/server/main.py::run_server::8a884f86a26c': Debt(TaskRef(7572)),
