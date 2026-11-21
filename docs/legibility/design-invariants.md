@@ -576,11 +576,11 @@ pick, batch, hold or verify decision reads? For each one:
 - Under (c): what is done differently after a restart, and which live task
   or ratification row owns that?
 
-**Evidence**: from 2026-11-17 to 11-19 the merge lane's un-chained mark
+**Evidence**: the merge lane's un-chained mark
 (`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._next_dispatch_unchained`,
-task 10617; as of 2026-11-21) lived only in memory, and all 31 red-batch
-members that were batched again before their solo verify had crossed an
-orchestrator restart (`plans/merge-pool-batches-prd.md` §2 and L7; counting
+task 10617; as of 2026-11-21) lives only in memory. Measured 2026-11-17 to
+11-19, all 31 red-batch members that were batched again before their solo
+verify had crossed an orchestrator restart (`plans/merge-pool-batches-prd.md` §2 and L7; counting
 rule in `plans/merge-pool-batches-prd.evidence/REPORT.md` §1). The same
 inventory (REPORT.md §5) found the conflict-bounce registry, the retry
 counters, an operator's halt and the redispatch park's front priority lost
@@ -595,7 +595,11 @@ finding on state that predates this invariant in either component is
 answered by that task, not filed again. State a change ADDS is that
 change's own.
 
-**House pattern**: (a) `orchestrator/src/orchestrator/guard_state.py::PersistentSet`.
+**House pattern**: (a) `orchestrator/src/orchestrator/guard_state.py::PersistentSet`
+for the write-on-every-mutation substrate. Its load fails open, which suits
+a one-strike guard; scheduling state restored through it must still surface
+a failed or corrupt load in a result (INV-11), as (b)'s `ok: false` row
+does.
 (b) `orchestrator/src/orchestrator/merge_halt_rehydration.py::rehydrate_merge_halt`,
 which re-asserts the WIP halts from preserved escalation records at start;
 and the rebuild design in `plans/merge-pool-batches-prd.md` §6.6 — a change
@@ -615,8 +619,8 @@ becomes of it at restart. A hold falls under both. INV-12
 borrows its vocabulary for runtime state. INV-13
 `readers-prove-their-producer` governs a reader whose producer never
 wrote; under (b), the rows are that producer. A walker facing a held state
-checks INV-7; facing in-memory state a pick, batch, hold or verify reads,
-INV-15.
+checks INV-7, and INV-15 as well when the hold lives only in memory; facing
+any other in-memory state a pick, batch or verify reads, INV-15.
 
 ## Census seam
 
