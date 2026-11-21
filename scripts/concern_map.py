@@ -16,6 +16,16 @@ assigns every unit to exactly one cluster; its evaluation reports what the
 split would cost in heuristic-13 terms: refs crossing clusters, cluster
 cycles, and attributes written from more than one cluster.
 
+Each residual bucket also carries its line mix: a line in the one prose
+definition is prose, otherwise a whitespace-only line is blank, otherwise it
+is code. A cluster's projected_lines is its unit lines plus its apportioned
+share of the separators between units: each method unit takes the class's
+blank non-method lines divided by the class's method units, and each module
+unit takes the inter-unit gap lines divided by the module units, summed in
+exact rationals and rounded up once per cluster. It excludes the import
+preamble and class header a new module needs; a consumer adds those as its
+own allowance.
+
 Exit codes
 ----------
 0  measured -- the map, and the partition report under ``--partition``, is
@@ -34,9 +44,11 @@ import ast
 import dataclasses
 import enum
 import json
+import math
 import sys
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from fractions import Fraction
 from pathlib import Path
 from types import MappingProxyType
 from typing import TypeGuard
@@ -49,6 +61,7 @@ __all__ = [
     'ClusterSize',
     'ConcernMap',
     'Edge',
+    'LineMix',
     'MetricsError',
     'PartitionError',
     'PartitionReport',
@@ -82,12 +95,37 @@ class Unit:
 
 
 @dataclasses.dataclass(frozen=True)
+class LineMix:
+    blank: int
+    prose: int
+    code: int
+
+    @property
+    def lines(self) -> int:
+        return self.blank + self.prose + self.code
+
+
+@dataclasses.dataclass(frozen=True)
 class ConcernMap:
     path: str
     class_name: str
     total_lines: int
     units: tuple[Unit, ...]
     residual: Mapping[str, int]
+    residual_mix: Mapping[str, LineMix]
+
+    def __post_init__(self) -> None:
+        if self.residual_mix.keys() != self.residual.keys():
+            raise MetricsError(
+                f'{self.path}: the residual mix covers buckets '
+                f'{sorted(self.residual_mix)} but the residual has {sorted(self.residual)}'
+            )
+        for bucket, mix in self.residual_mix.items():
+            if mix.lines != self.residual[bucket]:
+                raise MetricsError(
+                    f'{self.path}: residual bucket {bucket!r} mixes {mix.lines} lines '
+                    f'but counts {self.residual[bucket]}'
+                )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -129,9 +167,13 @@ def measure_module(source: str, *, path: str, class_name: str) -> ConcernMap:
     pieces = tuple(_pieces(tree, target, lines))
     scope = _Scope(class_name, _member_names(target), _module_names(tree, target))
     units = _units(pieces, prose, scope)
-    residual = _residual(tree, target, pieces, lines)
+    residual_lines = _residual_lines(tree, target, pieces, lines)
+    residual = {bucket: len(found) for bucket, found in residual_lines.items()}
+    mix = {bucket: _line_mix(found, prose, lines) for bucket, found in residual_lines.items()}
     _reconcile(path, len(lines), units, residual)
-    return ConcernMap(path, class_name, len(lines), units, MappingProxyType(residual))
+    return ConcernMap(
+        path, class_name, len(lines), units, MappingProxyType(residual), MappingProxyType(mix)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -321,19 +363,25 @@ def _residual_bucket(stmt: ast.stmt, tree: ast.Module, target: ast.ClassDef) -> 
     return 'module_other'
 
 
-def _residual(
+def _residual_lines(
     tree: ast.Module, target: ast.ClassDef, pieces: tuple[_Piece, ...], lines: list[str]
-) -> dict[str, int]:
+) -> dict[str, list[int]]:
     in_units = {line for piece in pieces for line in range(piece.first, piece.last + 1)}
     bucket_of: dict[int, str] = {}
     for stmt, first, last in _spans(tree.body, floor=0, lines=lines):
         for line in range(first, last + 1):
             bucket_of[line] = _residual_bucket(stmt, tree, target)
-    residual: dict[str, int] = dict.fromkeys(RESIDUAL_BUCKETS, 0)
+    residual: dict[str, list[int]] = {bucket: [] for bucket in RESIDUAL_BUCKETS}
     for line in range(1, len(lines) + 1):
         if line not in in_units:
-            residual[bucket_of.get(line, 'inter_unit_gaps')] += 1
+            residual[bucket_of.get(line, 'inter_unit_gaps')].append(line)
     return residual
+
+
+def _line_mix(numbers: Sequence[int], prose: frozenset[int], lines: list[str]) -> LineMix:
+    prose_count = sum(1 for number in numbers if number in prose)
+    blank = sum(1 for number in numbers if number not in prose and not lines[number - 1].strip())
+    return LineMix(blank=blank, prose=prose_count, code=len(numbers) - prose_count - blank)
 
 
 def _reconcile(path: str, total: int, units: tuple[Unit, ...], residual: Mapping[str, int]) -> None:
@@ -356,8 +404,10 @@ class PartitionError(MetricsError):
 @dataclasses.dataclass(frozen=True)
 class ClusterSize:
     units: int
+    method_units: int
     lines: int
     prose_lines: int
+    projected_lines: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -380,7 +430,7 @@ def evaluate_partition(cmap: ConcernMap, partition: Mapping[str, Sequence[str]])
     cluster_of = _cluster_of(cmap, partition)
     edges = _edges(cmap.units, cluster_of)
     return PartitionReport(
-        clusters=_cluster_sizes(cmap.units, partition),
+        clusters=_cluster_sizes(cmap, partition),
         edges=edges,
         cyclic_groups=_cyclic_groups(partition, edges),
         shared_writes=_shared_writes(cmap.units, cluster_of),
@@ -409,16 +459,37 @@ def _cluster_of(cmap: ConcernMap, partition: Mapping[str, Sequence[str]]) -> dic
     return {name: cluster for cluster, members in partition.items() for name in members}
 
 
-def _cluster_sizes(
-    units: tuple[Unit, ...], partition: Mapping[str, Sequence[str]]
-) -> Mapping[str, ClusterSize]:
-    by_name = {unit.name: unit for unit in units}
+def _separator_rates(cmap: ConcernMap) -> Mapping[UnitKind, Fraction]:
+    counts = Counter(unit.kind for unit in cmap.units)
+    separators = {
+        UnitKind.METHOD: cmap.residual_mix['class_non_method'].blank,
+        UnitKind.MODULE: cmap.residual['inter_unit_gaps'],
+    }
     return MappingProxyType({
-        cluster: ClusterSize(
-            units=len(members),
-            lines=sum(by_name[name].lines for name in members),
-            prose_lines=sum(by_name[name].prose_lines for name in members),
-        )
+        kind: Fraction(separators[kind], counts[kind]) if counts[kind] else Fraction(0)
+        for kind in UnitKind
+    })
+
+
+def _cluster_size(members: Sequence[Unit], rates: Mapping[UnitKind, Fraction]) -> ClusterSize:
+    lines = sum(unit.lines for unit in members)
+    overhead = sum((rates[unit.kind] for unit in members), Fraction(0))
+    return ClusterSize(
+        units=len(members),
+        method_units=sum(1 for unit in members if unit.kind is UnitKind.METHOD),
+        lines=lines,
+        prose_lines=sum(unit.prose_lines for unit in members),
+        projected_lines=lines + math.ceil(overhead),
+    )
+
+
+def _cluster_sizes(
+    cmap: ConcernMap, partition: Mapping[str, Sequence[str]]
+) -> Mapping[str, ClusterSize]:
+    by_name = {unit.name: unit for unit in cmap.units}
+    rates = _separator_rates(cmap)
+    return MappingProxyType({
+        cluster: _cluster_size([by_name[name] for name in members], rates)
         for cluster, members in partition.items()
     })
 
@@ -527,6 +598,9 @@ def _render_json(cmap: ConcernMap, report: PartitionReport | None) -> str:
         'class_name': cmap.class_name,
         'total_lines': cmap.total_lines,
         'residual': dict(cmap.residual),
+        'residual_mix': {
+            bucket: dataclasses.asdict(mix) for bucket, mix in cmap.residual_mix.items()
+        },
         'units': [_unit_json(unit) for unit in cmap.units],
     }
     if report is not None:
