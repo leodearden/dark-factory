@@ -176,6 +176,10 @@ async def _is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
     return rc == 0
 
 
+async def _committed_d_file(scene: RestackScene) -> str:
+    return (await git(scene.root, 'show', f'task/D:{D_FILE}')).strip()
+
+
 def _new_tip(scene: RestackScene) -> StackTarget:
     return StackTarget('task/P', scene.p_new)
 
@@ -233,7 +237,7 @@ class TestRestackThroughEachReuseRoute:
 
         assert info.path == scene.d_worktree
         await _assert_restacked_on_the_new_tip(scene, info.base_commit)
-        assert await git(scene.root, 'show', f'task/D:{D_FILE}') == _UNCOMMITTED
+        assert await _committed_d_file(scene) == _UNCOMMITTED.strip()
 
     async def test_a_removed_worktree_is_reattached_and_restacked(
         self, tmp_path: Path,
@@ -252,7 +256,7 @@ class TestRestackThroughEachReuseRoute:
 
         assert info.path == pool_lane(scene.git_ops)
         await _assert_restacked_on_the_new_tip(scene, info.base_commit)
-        assert await git(scene.root, 'show', f'task/D:{D_FILE}') == _UNCOMMITTED
+        assert await _committed_d_file(scene) == _UNCOMMITTED.strip()
 
     async def test_a_conflicting_registered_worktree_raises_and_moves_nothing(
         self, tmp_path: Path,

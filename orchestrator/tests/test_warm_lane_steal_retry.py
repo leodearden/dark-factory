@@ -670,7 +670,7 @@ class TestCreateWorktreeMapping:
         await _add_warm_lane_scripts(repo)
         git_ops = GitOps(_warm_config(), repo, warm_lane_pool_size=1)
 
-        async def _acquire(branch_name, start_ref, *, expected_title=None):
+        async def _acquire(branch_name, start_ref, *, expected_title=None, stack_on=None):
             return sentinel
 
         git_ops.acquire_warm_lane = _acquire  # type: ignore[method-assign]

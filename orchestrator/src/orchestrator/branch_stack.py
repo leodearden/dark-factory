@@ -421,8 +421,9 @@ class RestackResult:
     *upstream*, onto *onto* in *worktree*.
 
     ``old_tip`` and ``old_base`` are the branch tip and the recorded base
-    before (``old_tip`` is None only when HEAD did not resolve, and
-    ``old_base`` None when there was no record).  RESTACKED carries
+    before (``old_base`` is None when there was no record).  Only a REFUSED
+    re-stack may lack ``old_tip`` or ``upstream``: it can stop before
+    either is known.  RESTACKED carries
     ``new_tip``; CONFLICT names at least one conflicted path and left the
     branch, tree and record as they were.  ``detail`` says why a re-stack
     stopped, and for RECORD_FAILED whether the roll-back held.
@@ -432,7 +433,7 @@ class RestackResult:
     branch: str
     worktree: Path
     onto: str
-    upstream: str
+    upstream: str | None
     old_tip: str | None
     old_base: str | None
     new_tip: str | None = None
@@ -446,8 +447,11 @@ class RestackResult:
             )
         if self.outcome is RestackOutcome.CONFLICT and not self.conflicted_paths:
             raise ValueError(f'conflict re-stack of {self.branch} names no conflicted path')
-        if self.old_tip is None and self.outcome is not RestackOutcome.REFUSED:
-            raise ValueError(f'a {self.outcome} re-stack of {self.branch} needs its old tip')
+        unknown_start = self.old_tip is None or self.upstream is None
+        if unknown_start and self.outcome is not RestackOutcome.REFUSED:
+            raise ValueError(
+                f'a {self.outcome} re-stack of {self.branch} needs its old tip and upstream',
+            )
 
     @property
     def requeues(self) -> bool:
