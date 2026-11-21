@@ -545,6 +545,14 @@ def _awaits_curator(row: Mapping[str, Any]) -> bool:
     return row.get("ticket") is not None and row.get("resolution") is None
 
 
+def entry_routed(entry: Mapping[str, Any]) -> bool:
+    """Whether a C1 back-link of *entry* routes it: a row naming a task, or a
+    row whose ticket awaits the curator (``Decision.routed`` over its rows)."""
+    return any(
+        row.get("task_id") is not None or _awaits_curator(row) for row in entry.get("filed_tickets") or []
+    )
+
+
 def _open_tickets(cb: dict, run_id: str) -> list[_OpenTicket]:
     """Every row of *cb* awaiting the curator, carried-over rows first."""
     open_tickets = [

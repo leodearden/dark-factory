@@ -426,7 +426,7 @@ def test_the_release_loop_releases_an_entry_a_fit_verdict_carries_over_the_gate(
 
     [pending] = census_filing.filing_queue([], cb)
 
-    assert pending.withheld_entry_id == ENTRY_ID
+    assert pending.reoffered_entry_id == ENTRY_ID
 
 
 def _bare_entry(entry_id: str, **fields) -> dict:
