@@ -19,6 +19,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _transcript_fixtures import assistant_record, bash_launch, bg_launch_result
 
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import (
@@ -5918,39 +5919,11 @@ def _sigkill_proc() -> MagicMock:
 # ended_awaiting_background is True, model_id == 'claude-opus-5'.
 _MODEL_AND_ABANDONED_LAUNCH_RECORDS = [
     {'type': 'user', 'message': {'role': 'user', 'content': 'go'}},
-    {
-        'type': 'assistant',
-        'message': {
-            'model': 'claude-opus-5',
-            'role': 'assistant',
-            'content': [{'type': 'text', 'text': 'kick off the long build'}],
-        },
-    },
-    {
-        'type': 'assistant',
-        'message': {
-            'model': 'claude-opus-5',
-            'role': 'assistant',
-            'content': [{
-                'type': 'tool_use',
-                'id': 'toolu_1',
-                'name': 'Bash',
-                'input': {'command': './long-build.sh', 'run_in_background': True},
-            }],
-        },
-    },
-    {
-        'type': 'user',
-        'message': {
-            'role': 'user',
-            'content': [{
-                'type': 'tool_result',
-                'tool_use_id': 'toolu_1',
-                'content': 'Command running in background with ID: bz89cdzmh.',
-            }],
-        },
-        'toolUseResult': {'stdout': '', 'backgroundTaskId': 'bz89cdzmh'},
-    },
+    assistant_record(
+        [{'type': 'text', 'text': 'kick off the long build'}], model='claude-opus-5'
+    ),
+    assistant_record([bash_launch(command='./long-build.sh')], model='claude-opus-5'),
+    bg_launch_result(),
 ]
 
 
