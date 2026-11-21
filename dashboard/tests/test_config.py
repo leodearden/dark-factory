@@ -1,11 +1,12 @@
-"""Tests for dashboard.config — canonical-vs-legacy escalation URL discovery,
-plus the curator ledger path (``TestCuratorEventsDbPath``).
+"""Tests for dashboard.config — escalation URL discovery, plus the curator
+ledger path (``TestCuratorEventsDbPath``).
 
-``_discover_escalation_urls`` must prefer ``dark-factory-orchestrator.yaml``
-(the canonical top-level orchestrator config name) over the legacy spellings
-left behind by the 7-project migration (commit 97f0bd9f85), falling back to
-a legacy spelling only when the canonical file is absent — and logging a
-WARNING naming the project whenever that fallback is used.
+Discovery reads only ``dark-factory-orchestrator.yaml``, the canonical
+top-level orchestrator config name. Task 7138 retired the legacy spellings
+left behind by the 7-project migration (commit 97f0bd9f85): a stray
+``orchestrator.yaml``, ``orchestrator-config.yaml`` or
+``orchestrator/config.yaml`` is never read, with or without the canonical
+file beside it.
 """
 
 from __future__ import annotations
@@ -16,7 +17,11 @@ import logging
 import pytest
 import yaml
 
-from dashboard.config import DashboardConfig, _discover_escalation_urls
+from dashboard.config import (
+    DashboardConfig,
+    _discover_escalation_urls,
+    discover_root_escalation_url,
+)
 
 _LOGGER_NAME = 'dashboard.config'
 
@@ -34,7 +39,7 @@ def _write_raw(path, text: str) -> None:
 
 
 class TestCanonicalConfigPreferred:
-    """Scope 1: canonical name wins; legacy spellings are a warned fallback."""
+    """Scope 1: only the canonical name is read; legacy spellings are never consulted."""
 
     def test_canonical_only_resolves_with_no_warning(self, tmp_path, caplog):
         """A root with only the canonical config resolves, with zero warnings."""
@@ -48,7 +53,7 @@ class TestCanonicalConfigPreferred:
         assert [r for r in caplog.records if r.name == _LOGGER_NAME] == []
 
     def test_canonical_wins_over_legacy(self, tmp_path, caplog):
-        """When both canonical and legacy configs exist, canonical's port wins."""
+        """A stray legacy file beside the canonical one is never read."""
         root = tmp_path / 'myproj'
         _write_yaml(root / 'dark-factory-orchestrator.yaml', {'escalation': {'port': 9101}})
         _write_yaml(root / 'orchestrator.yaml', {'escalation': {'port': 9202}})
@@ -63,67 +68,24 @@ class TestCanonicalConfigPreferred:
         'legacy_rel_path',
         ['orchestrator.yaml', 'orchestrator-config.yaml', 'orchestrator/config.yaml'],
     )
-    def test_legacy_spelling_resolves_with_warning(self, tmp_path, caplog, legacy_rel_path):
-        """A root with only a legacy spelling still resolves, but warns naming the project."""
+    def test_legacy_spelling_alone_is_not_discovered(self, tmp_path, caplog, legacy_rel_path):
+        """A retired legacy spelling with no canonical file beside it is never read."""
         root = tmp_path / 'myproj'
-        _write_yaml(root / legacy_rel_path, {'escalation': {'port': 9202}})
+        legacy_path = root / legacy_rel_path
+        _write_yaml(legacy_path, {'escalation': {'port': 9202}})
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            url = discover_root_escalation_url(root)
             result = _discover_escalation_urls([root])
 
-        assert result == {'myproj': 'http://127.0.0.1:9202/mcp'}
+        assert url is None
+        assert result == {}
         records = [r for r in caplog.records if r.name == _LOGGER_NAME]
         assert len(records) == 1
         assert records[0].levelno == logging.WARNING
-        assert 'myproj' in records[0].getMessage()
-
-    @pytest.mark.parametrize(
-        ('earlier_raw', 'expect_parse_warning', 'expect_mapping_warning'),
-        [
-            (yaml.safe_dump({'escalation': {'host': '127.0.0.1'}}), False, False),
-            ('escalation: [unclosed', True, False),
-            ('escalation: not-a-dict', False, True),
-        ],
-        ids=['portless-earlier', 'unparseable-earlier', 'non-mapping-earlier'],
-    )
-    def test_legacy_fallthrough_past_bad_earlier_spelling(
-        self, tmp_path, caplog, earlier_raw, expect_parse_warning, expect_mapping_warning
-    ):
-        """A no-URL earlier legacy spelling does not halt the fallback loop.
-
-        With the canonical config absent, ``discover_root_escalation_url``
-        iterates ``_LEGACY_CONFIG_NAMES`` in order. A portless, unparseable,
-        or non-mapping-``escalation:`` config at an EARLIER spelling
-        (``orchestrator.yaml``) must not stop iteration nor be treated as
-        authoritative — resolution continues to a LATER legacy spelling
-        (``orchestrator/config.yaml``) that carries a valid port, still
-        emitting the 'please migrate' nudge naming the project. Guards
-        against a regression that stopped after the first legacy candidate
-        returned None.
-        """
-        root = tmp_path / 'myproj'
-        # Earlier spelling (first in _LEGACY_CONFIG_NAMES): yields no URL.
-        earlier = root / 'orchestrator.yaml'
-        _write_raw(earlier, earlier_raw)
-        # Later spelling (last in _LEGACY_CONFIG_NAMES): valid port.
-        _write_yaml(root / 'orchestrator/config.yaml', {'escalation': {'port': 9202}})
-
-        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
-            result = _discover_escalation_urls([root])
-
-        # Resolved via the LATER legacy spelling, not the bad earlier one.
-        assert result == {'myproj': 'http://127.0.0.1:9202/mcp'}
-        messages = [r.getMessage() for r in caplog.records if r.name == _LOGGER_NAME]
-        migrate_msgs = [m for m in messages if 'please migrate' in m]
-        assert len(migrate_msgs) == 1
-        assert 'myproj' in migrate_msgs[0]
-        assert str(root / 'orchestrator/config.yaml') in migrate_msgs[0]
-        # Unparseable earlier config additionally logs one parse-failure warning.
-        assert sum('Failed to read' in m for m in messages) == (1 if expect_parse_warning else 0)
-        # Non-mapping-escalation earlier config logs one mapping-type warning.
-        assert sum('not a mapping' in m for m in messages) == (1 if expect_mapping_warning else 0)
-        # The root DID resolve — no no-URL warning fired.
-        assert not any('No escalation URL discovered' in m for m in messages)
+        assert 'No escalation URL discovered' in records[0].getMessage()
+        assert str(root) in records[0].getMessage()
+        assert not any(str(legacy_path) in r.getMessage() for r in caplog.records)
 
 
 class TestNoUrlWarnsNamingRoot:
@@ -146,8 +108,7 @@ class TestNoUrlWarnsNamingRoot:
     def test_canonical_without_port_warns_naming_root(self, tmp_path, caplog):
         """Canonical config present but missing escalation.port still yields no entry.
 
-        This isolates the no-URL warning from the legacy-fallback warning —
-        no legacy file exists here, so exactly one (the no-URL) warning fires.
+        Exactly one warning, the no-URL one, fires.
         """
         root = tmp_path / 'myproj'
         _write_yaml(root / 'dark-factory-orchestrator.yaml', {'escalation': {'host': '127.0.0.1'}})
@@ -162,14 +123,10 @@ class TestNoUrlWarnsNamingRoot:
         assert str(root) in records[0].getMessage()
 
     def test_portless_canonical_is_authoritative_over_valid_legacy(self, tmp_path, caplog):
-        """A portless canonical config is NOT masked by a valid legacy config.
+        """A portless canonical config never takes a stray legacy file's port.
 
-        The canonical file existing at all makes it authoritative: it must
-        not silently fall through to a legacy spelling's port just because
-        the canonical config itself is misconfigured. This asserts the
-        no-URL warning (naming the root) fires instead of the legacy-
-        fallback warning (naming the project) and the legacy port is
-        ignored entirely.
+        The misconfigured canonical config is the real problem, so the no-URL
+        warning naming the root fires and the legacy port is ignored entirely.
         """
         root = tmp_path / 'myproj'
         _write_yaml(root / 'dark-factory-orchestrator.yaml', {'escalation': {'host': '127.0.0.1'}})
@@ -183,18 +140,14 @@ class TestNoUrlWarnsNamingRoot:
         assert len(records) == 1
         assert records[0].levelno == logging.WARNING
         assert str(root) in records[0].getMessage()
-        assert 'please migrate' not in records[0].getMessage()
 
     def test_malformed_canonical_is_authoritative_over_valid_legacy(self, tmp_path, caplog):
-        """A malformed canonical config is NOT masked by a valid legacy config.
+        """A malformed canonical config never takes a stray legacy file's port.
 
         Mirrors ``test_portless_canonical_is_authoritative_over_valid_legacy``
-        for the ``_read_escalation_url`` parse-failure branch: the canonical
-        file's mere presence — even unparseable — makes it authoritative, so
-        resolution never falls through to the legacy port. Two WARNINGs fire
-        (the parse-failure naming the file, plus the no-URL one naming the
-        root); neither is the legacy-fallback warning, and the legacy port
-        is ignored entirely.
+        for the ``_read_escalation_url`` parse-failure branch. Two WARNINGs
+        fire (the parse-failure naming the file, plus the no-URL one naming
+        the root), and the legacy port is ignored entirely.
         """
         root = tmp_path / 'myproj'
         _write_yaml(root / 'orchestrator.yaml', {'escalation': {'port': 9202}})
@@ -210,7 +163,6 @@ class TestNoUrlWarnsNamingRoot:
         messages = [r.getMessage() for r in records]
         assert sum('Failed to read' in m for m in messages) == 1
         assert sum('No escalation URL discovered' in m for m in messages) == 1
-        assert not any('please migrate' in m for m in messages)
 
 
 class TestNonMappingEscalationSection:
@@ -264,7 +216,6 @@ class TestNonMappingEscalationSection:
         ]
         assert len(mapping_msgs) == 1
         assert sum('No escalation URL discovered' in m for m in messages) == 1
-        assert not any('please migrate' in m for m in messages)
 
     @pytest.mark.parametrize(
         ('raw_body', 'type_name'),
@@ -309,12 +260,11 @@ class TestNonMappingEscalationSection:
         assert len(mapping_msgs) == 1
 
     def test_non_mapping_canonical_is_authoritative_over_valid_legacy(self, tmp_path, caplog):
-        """A non-mapping canonical config is NOT masked by a valid legacy config.
+        """A non-mapping canonical config never takes a stray legacy file's port.
 
         Mirrors ``test_malformed_canonical_is_authoritative_over_valid_legacy``
-        for the type-check branch: the canonical file's mere presence — even
-        with a wrong-typed ``escalation:`` — makes it authoritative, so
-        resolution never falls through to the legacy port.
+        for the type-check branch: a wrong-typed ``escalation:`` yields no
+        URL, and the legacy port is ignored entirely.
         """
         root = tmp_path / 'myproj'
         _write_yaml(root / 'orchestrator.yaml', {'escalation': {'port': 9202}})
@@ -330,7 +280,6 @@ class TestNonMappingEscalationSection:
         messages = [r.getMessage() for r in records]
         assert sum('not a mapping' in m for m in messages) == 1
         assert sum('No escalation URL discovered' in m for m in messages) == 1
-        assert not any('please migrate' in m for m in messages)
 
     @pytest.mark.parametrize(
         ('escalation_value', 'field_name', 'type_name'),
@@ -371,7 +320,6 @@ class TestNonMappingEscalationSection:
         ]
         assert len(leaf_msgs) == 1
         assert sum('No escalation URL discovered' in m for m in messages) == 1
-        assert not any('please migrate' in m for m in messages)
 
     def test_startup_survives_a_malformed_project_config(self, tmp_path, caplog):
         """``DashboardConfig()`` construction survives a malformed known-project config.
