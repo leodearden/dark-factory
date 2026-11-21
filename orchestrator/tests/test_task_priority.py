@@ -171,7 +171,7 @@ class TestGateRank:
 
     def test_pinned_ranks_ahead_of_every_tier(self) -> None:
         assert PINNED == 'pinned'
-        assert GATE_RANK == (PINNED, *PRIORITY_TIERS)
+        assert (PINNED, *PRIORITY_TIERS) == GATE_RANK
 
     def test_a_known_tier_ranks_by_its_place(self) -> None:
         assert gate_rank('pinned') == 0
