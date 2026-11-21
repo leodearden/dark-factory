@@ -14,7 +14,7 @@ Two mechanisms drive ``_execute_verify_review_loop``:
 
 These tests drive the loop with ``_execute_iterations`` /
 ``_verify_debugfix_loop`` / ``_review`` stubbed, via the shared
-``_review_loop_harness.review_loop_workflow`` harness.
+``orchestrator/tests/_review_loop_harness.py::review_loop_workflow`` harness.
 """
 
 from __future__ import annotations
