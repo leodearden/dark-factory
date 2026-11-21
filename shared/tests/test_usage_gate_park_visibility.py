@@ -47,7 +47,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
-from _usage_gate_test_helpers import make_gate
+from _usage_gate_test_helpers import SCOPE, make_gate
 
 from shared import usage_gate as usage_gate_mod
 from shared.invocation_outcome import AuthFailed, CapHit
@@ -55,6 +55,8 @@ from shared.invocation_outcome import AuthFailed, CapHit
 LOGGER_NAME = 'shared.usage_gate'
 
 PARK_EVENT = 'all_capped_park'
+
+SCOPE_PARK_EVENT = 'scope_exhausted_park'
 
 # The one-shot INFO line that predates this heartbeat. It fires once per
 # pass through the selection loop, which makes it a direct COUNT of loop
@@ -68,8 +70,10 @@ _LOOP_STALL_MARGIN_SECS = 0.1
 _PARK_VALVE_SECS = 10.0
 
 
-def _park_records(caplog) -> list[tuple[logging.LogRecord, dict]]:
-    """Every structured ``all_capped_park`` record, with its decoded payload."""
+def _park_records(
+    caplog, event: str = PARK_EVENT
+) -> list[tuple[logging.LogRecord, dict]]:
+    """Every structured *event* record, with its decoded payload."""
     found = []
     for rec in caplog.records:
         if rec.name != LOGGER_NAME:
@@ -78,7 +82,7 @@ def _park_records(caplog) -> list[tuple[logging.LogRecord, dict]]:
             payload = json.loads(rec.getMessage())
         except (ValueError, TypeError):
             continue  # the co-occurring plain-string logs are expected
-        if isinstance(payload, dict) and payload.get('event') == PARK_EVENT:
+        if isinstance(payload, dict) and payload.get('event') == event:
             found.append((rec, payload))
     return found
 
@@ -100,6 +104,27 @@ def _all_capped_gate(names: tuple[str, ...] = ('a', 'b')):
         acct.resets_at = datetime.now(UTC) + timedelta(hours=5)
     assert gate.is_paused, 'fixture must actually be parked, or every assertion is vacuous'
     return gate
+
+
+async def _scope_exhausted_gate(
+    resets_in: tuple[timedelta, ...] = (timedelta(hours=5), timedelta(hours=3)),
+):
+    """A gate whose every account is capped for SCOPE alone, one reset per account.
+
+    Capped through the public slot API: each scoped slot lands on the next
+    account with headroom, so the first delta goes to a and the next to b.
+    Returns the gate and the soonest reset it reported.
+    """
+    gate = make_gate(['a', 'b'], wait_for_reset=False)
+    now = datetime.now(UTC)
+    resets = [now + delta for delta in resets_in]
+    for resets_at in resets:
+        async with gate.invoke_slot(scope=SCOPE) as slot:
+            slot.report(CapHit(resets_at=resets_at, reason='test cap'))
+    assert not gate.is_paused, (
+        'fixture must leave the fleet open, or this is the all-capped park'
+    )
+    return gate, min(resets)
 
 
 async def _until(
@@ -124,17 +149,18 @@ async def _park_for(
     gate,
     seconds: float,
     *,
+    scope: str | None = None,
     until: Callable[[], bool] | None = None,
     valve_secs: float = _PARK_VALVE_SECS,
 ) -> None:
-    """Drive ``before_invoke`` into the park, hold it, then abandon it.
+    """Drive ``before_invoke`` for *scope* into the park, hold it, then abandon it.
 
     The park is held for at least *seconds*. When *until* is given it is held
     further, until the caller's precondition has actually been observed rather
     than for a fixed span, bounded by *valve_secs*. A park that returns early
     fails. The park is abandoned by cancellation, the routine production path.
     """
-    park = asyncio.create_task(gate.before_invoke())
+    park = asyncio.create_task(gate.before_invoke(scope=scope))
     try:
         await _until(
             lambda: park.done() or until is None or until(),
@@ -144,8 +170,8 @@ async def _park_for(
         if park.done():
             lease = park.result()
             raise AssertionError(
-                f'before_invoke returned early ({lease!r}) while every account '
-                'was capped: the park must block until an account reopens'
+                f'before_invoke returned early ({lease!r}) while no account was '
+                'admissible: the park must block until an account reopens'
             )
     finally:
         park.cancel()
@@ -196,6 +222,20 @@ def fast_heartbeat(monkeypatch):
     def _set(interval: float) -> float:
         monkeypatch.setattr(
             usage_gate_mod, '_ALL_CAPPED_PARK_LOG_INTERVAL_SECS', interval
+        )
+        return interval
+
+    return _set
+
+
+@pytest.fixture
+def fast_scope_heartbeat(monkeypatch):
+    """Shrink the scoped park's heartbeat interval, as ``fast_heartbeat`` does
+    the fleet park's."""
+
+    def _set(interval: float) -> float:
+        monkeypatch.setattr(
+            usage_gate_mod, '_SCOPE_PARK_LOG_INTERVAL_SECS', interval, raising=False
         )
         return interval
 
@@ -477,6 +517,75 @@ class TestAllCappedParkIsVisible:
             'no heartbeat survived a non-serialisable soonest_resets_at — '
             'json.dumps must be called with default=str so a bad value is '
             'stringified rather than raised out of before_invoke'
+        )
+
+
+class TestScopeExhaustedParkIsVisible:
+    """A caller parked on an exhausted model scope must be visible too (task 7243).
+
+    The fleet is open here, so the all-capped park never runs: the caller waits
+    on the per-scope waiter instead, toward a scope reset that can be hours
+    away. Its record mirrors ``all_capped_park``'s shape, so fleet log
+    consumers parse one schema, under a name that says the scope, not the
+    pool, is what ran out.
+    """
+
+    async def test_the_scoped_park_emits_a_structured_warning_heartbeat(
+        self, caplog, fast_scope_heartbeat
+    ) -> None:
+        fast_scope_heartbeat(0.02)
+        gate, soonest_reset = await _scope_exhausted_gate()
+
+        await _park_for(gate, 0.2, scope=SCOPE)
+
+        records = _park_records(caplog, SCOPE_PARK_EVENT)
+        assert records, (
+            'a caller parked on an exhausted scope emitted no scope_exhausted_park '
+            'record, so it is still indistinguishable from a hung run. Captured '
+            f'from {LOGGER_NAME}: {[r.getMessage() for r in caplog.records]!r}'
+        )
+        assert all(rec.levelno == logging.WARNING for rec, _ in records), (
+            'the scoped heartbeat must be WARNING so it survives default fleet '
+            f'log levels: {[logging.getLevelName(rec.levelno) for rec, _ in records]!r}'
+        )
+        _, payload = records[0]
+        assert payload['scope'] == SCOPE, payload
+        assert isinstance(payload['elapsed_s'], (int, float)), payload
+        assert payload['soonest_scope_reset_at'] == soonest_reset.isoformat(), (
+            "the heartbeat must name the scope's soonest reset (b's, the earlier "
+            f'of the two), which is when the caller can next be served: {payload!r}'
+        )
+        base_keys = {
+            'elapsed_s',
+            'account_count',
+            'capped_accounts',
+            'auth_failed_accounts',
+            'probe_in_flight_accounts',
+            'soonest_open_at',
+        }
+        assert base_keys <= payload.keys(), (
+            'the scoped record must carry the all_capped_park base fields, so '
+            f'fleet log consumers parse one schema: missing {base_keys - payload.keys()}'
+        )
+        assert payload['account_count'] == 2, payload
+        assert not _park_records(caplog), (
+            'a scope exhaustion emitted all_capped_park records while the fleet '
+            'was open, misreporting an exhausted scope as a frozen pool: '
+            f'{[p for _, p in _park_records(caplog)]!r}'
+        )
+
+    async def test_a_scoped_caller_with_headroom_emits_no_scope_park_record(
+        self, caplog
+    ) -> None:
+        gate = make_gate(['a', 'b'])
+
+        lease = await asyncio.wait_for(gate.before_invoke(scope=SCOPE), 1.0)
+
+        assert lease is not None
+        assert not _park_records(caplog, SCOPE_PARK_EVENT), (
+            'a scoped caller served at once emitted a scope_exhausted_park '
+            'record; a heartbeat that fires when nothing is wrong trains '
+            f'readers to ignore it: {[p for _, p in _park_records(caplog, SCOPE_PARK_EVENT)]!r}'
         )
 
 
