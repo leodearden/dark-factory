@@ -33,6 +33,7 @@ from shared.defects import (
     DeclareEvent,
     OutcomeEvent,
 )
+from shared.dependency_cycle import cycle_closed_by_edge
 from shared.elision import elide_at_word
 from shared.project_id import normalize_project_id
 from shared.project_layout import tasks_db
@@ -66,6 +67,7 @@ from fused_memory.backends.task_backend_errors import (
     AppendUnsupportedFieldError,
     DefectRecordsWriteAuthorityError,
     DeferralWriteAuthorityError,
+    DependencyCycle,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
     MetadataNotAnObjectError,
@@ -1745,6 +1747,22 @@ async def _fetch_task_dependencies(read_all: _ReadAll, tag: str, tid: int) -> li
         (tag, tid),
     )
     return [row['depends_on'] for row in rows]
+
+
+async def _refuse_cycle_closing_edges(
+    conn: aiosqlite.Connection, tag: str, tid: int, deps: Sequence[int], operation: str,
+) -> None:
+    """Raise :class:`DependencyCycle` for the first of *deps* whose edge from *tid* closes a cycle.
+
+    Walks one load of the tag's whole edge table. Call it only AFTER the unit's
+    first write: that write opens the transaction, so no other connection can
+    commit into the walk (shared/src/shared/async_sqlite_base.py::AtomicConnection.write).
+    """
+    edges = await _fetch_dependencies(conn.execute_fetchall, tag)
+    for dep in deps:
+        cycle = cycle_closed_by_edge(tid, dep, lambda task: edges.get(task, ()))
+        if cycle is not None:
+            raise DependencyCycle(operation, cycle)
 
 
 class SqliteTaskBackend:
@@ -3935,12 +3953,16 @@ class SqliteTaskBackend:
 
         * **Bare integer** (e.g. ``"3"``): the traditional integer-table path.
           Both the dependent task and the target must exist in this project.
+          An edge that would close a cycle is refused with
+          :class:`DependencyCycle`, path named, walked over the local
+          dependencies table at every status.
         * **Qualified** (e.g. ``"dark_factory:13"``): cross-project dependency
           stored in the dependent task's ``metadata.external_deps`` list.
           The foreign target is **not** verified at write time (lenient write —
           the target may be filed later or live in another project).
           ``'-'`` in the project_id portion is normalised to ``'_'`` before
-          storing.
+          storing. Qualified deps are not walked for cycles: the cycle rule
+          covers the local graph only.
         """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -4020,6 +4042,7 @@ class SqliteTaskBackend:
                 '(tag, task_id, depends_on) VALUES (?, ?, ?)',
                 (tag, tid, dep_tid),
             )
+            await _refuse_cycle_closing_edges(conn, tag, tid, (dep_tid,), 'add_dependency')
         return {
             'id': str(tid),
             'dependency_id': str(dep_tid),
