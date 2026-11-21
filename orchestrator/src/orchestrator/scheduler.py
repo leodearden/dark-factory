@@ -5684,10 +5684,7 @@ class Scheduler:
         restart resets the cache.
 
         Those still-uncached fetches are further bounded by
-        ``config.delivered_checks.max_checks_per_tick`` — reusing the same
-        knob ``_compute_delivered_check_cache`` applies to check RUNS (a
-        *dedicated* cap would need a new ``config.py`` field, outside this
-        task's scheduler.py-only scope). A tick with more newly-missing
+        ``config.delivered_checks.max_record_fetches_per_tick``. A tick with more newly-missing
         dep_ids than the budget fetches a deterministic (sorted) prefix and
         logs one bounded WARNING naming how many were deferred — the
         deferred ids are simply "needed" again next tick (they're never
@@ -5799,7 +5796,7 @@ class Scheduler:
             _ordered = (
                 sorted(_held_to_fetch) + sorted(_new_to_fetch) + sorted(_revalidate_to_fetch)
             )
-            _budget = self.config.delivered_checks.max_checks_per_tick
+            _budget = self.config.delivered_checks.max_record_fetches_per_tick
             if len(_ordered) > _budget:
                 _total = len(_ordered)
                 _deferred = set(_ordered[_budget:])
@@ -5809,7 +5806,7 @@ class Scheduler:
                     'acquire_next: terminal dep record backfill has %d '
                     'dep(s) to fetch this tick (%d held, %d new, %d '
                     're-validation), exceeding '
-                    'delivered_checks.max_checks_per_tick (%d) — fetching '
+                    'delivered_checks.max_record_fetches_per_tick (%d) — fetching '
                     '%d, deferring %d (%d held, %d new, %d re-validation) '
                     'to a later tick.',
                     _total, len(_held_to_fetch), len(_new_to_fetch),
