@@ -8,6 +8,7 @@ injected ParkPolicy names which failures park.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import sqlite3
@@ -237,15 +238,31 @@ def _make_due(tmp_path, item_id: int) -> None:
 
 
 class _Switchable:
-    """An execute_write that refuses until switched on."""
+    """An execute_write that refuses until switched on, recording each landing."""
 
     def __init__(self) -> None:
         self.succeeding = False
+        self.landed: list[str] = []
 
     async def __call__(self, value: QueuedWrite) -> dict:
         if not self.succeeding:
             raise _Exhausted('no credits remaining')
+        self.landed.append(value.written_text)
         return {'episode_uuid': 'ep-1'}
+
+
+_REFUSE_RELEASE = (
+    'CREATE TRIGGER refuse_release BEFORE UPDATE OF status ON write_queue '
+    "WHEN OLD.status = 'parked' AND NEW.status = 'pending' "
+    "BEGIN SELECT RAISE(ABORT, 'release refused'); END"
+)
+
+
+def _on_queue_db(tmp_path, statement: str) -> None:
+    db_path = tmp_path / 'queue' / 'write_queue.db'
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(statement)
+        conn.commit()
 
 
 async def _park_three(tmp_path, q: DurableWriteQueue) -> tuple[int, int, int]:
@@ -282,6 +299,44 @@ class TestUnparking:
                 await poll_until(_status_is(tmp_path, item_id, 'completed'), timeout=10.0)
             assert [_row(tmp_path, i)['attempts'] for i in (same_group, other_group)] == [1, 1]
             assert policy.cleared == 1
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_release_never_reruns_the_landed_write(self, tmp_path):
+        """The landed probe is settled before the release is attempted, so a
+        release the database refuses only delays the other parked rows to
+        their own horizon; it never re-runs the write that landed."""
+        policy = _RecordingParkPolicy()
+        execute = _Switchable()
+        q = _queue(tmp_path, execute, park_policy=policy, retry_max_delay_seconds=30.0)
+        await q.initialize()
+        try:
+            first, same_group, other_group = await _park_three(tmp_path, q)
+            _on_queue_db(tmp_path, _REFUSE_RELEASE)
+
+            execute.succeeding = True
+            _make_due(tmp_path, first)
+            await poll_until(_status_is(tmp_path, first, 'completed'), timeout=10.0)
+            # ~10x the retry backoff: a wrongly rescheduled `first` is due by now,
+            # and _claim_next takes it ahead of the later sentinel.
+            await asyncio.sleep(0.2)
+            sentinel = await q.enqueue(_write('sentinel', group_id='proj1'))
+            await poll_until(_status_is(tmp_path, sentinel, 'completed'), timeout=10.0)
+
+            assert execute.landed.count('first') == 1
+            first_row = _row(tmp_path, first)
+            assert (first_row['status'], first_row['attempts']) == ('completed', 1)
+            assert 'release refused' not in (first_row['error'] or '')
+            for item_id in (same_group, other_group):
+                assert _row(tmp_path, item_id)['status'] == 'parked'
+            assert policy.cleared == 1
+
+            _on_queue_db(tmp_path, 'DROP TRIGGER refuse_release')
+            _make_due(tmp_path, same_group)
+            for item_id in (same_group, other_group):
+                await poll_until(_status_is(tmp_path, item_id, 'completed'), timeout=10.0)
+            assert [execute.landed.count(c) for c in ('same group', 'other group')] == [1, 1]
         finally:
             await q.close()
 
