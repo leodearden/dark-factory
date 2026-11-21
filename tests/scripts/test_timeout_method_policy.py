@@ -132,7 +132,13 @@ import tomllib
 import types
 
 import pytest
-from host_pytest_temp_root import listing, seed_dead_session_dirs
+from host_pytest_temp_root import (
+    TEMPROOT_RECORDER_TEST,
+    listing,
+    recorded_temproot,
+    seed_dead_session_dirs,
+    temproot_recorder_source,
+)
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
@@ -240,20 +246,8 @@ def test_peer(peer):
 '''
 
 TEMPROOT_RECORDER_MODULE_NAME = 'test_temproot_recorder.py'
-TEMPROOT_RECORDER_TEST = 'test_records_the_temproot'
-TEMPROOT_RECORD_NAME = 'seen-temproot'
 
-_TEMPROOT_RECORDER_MODULE = f'''\
-import pathlib
-import tempfile
-
-import pytest
-
-
-@pytest.mark.timeout({NON_BLOCKING_TIMEOUT_SECS})
-def {TEMPROOT_RECORDER_TEST}():
-    pathlib.Path(__file__).with_name({TEMPROOT_RECORD_NAME!r}).write_text(tempfile.gettempdir())
-'''
+_TEMPROOT_RECORDER_MODULE = temproot_recorder_source(timeout_secs=NON_BLOCKING_TIMEOUT_SECS)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -546,8 +540,8 @@ def test_a_probe_suite_run_leaves_the_hosts_default_temp_root_untouched(
         f'the recorder probe exited {result.returncode}, not '
         f'{int(pytest.ExitCode.OK)} (OK).\n{_captured(result)}'
     )
-    seen = pathlib.Path((suite.root / TEMPROOT_RECORD_NAME).read_text(encoding='utf-8'))
-    assert seen.resolve() == host.resolve(), (
+    seen = recorded_temproot(suite.root)
+    assert seen is not None and seen.resolve() == host.resolve(), (
         f'the child ran against temp root {seen}, not the stand-in {host}, so '
         'the listing check below would pass vacuously.\n'
         f'{_captured(result)}'
@@ -583,7 +577,7 @@ def test_a_basetemp_smuggled_through_extra_is_refused_before_any_session_starts(
         _run_probe_suite(suite, '-k', TEMPROOT_RECORDER_TEST, '-n', '0', *smuggle)
 
     assert smuggle[0] in str(refused.value)
-    assert not (suite.root / TEMPROOT_RECORD_NAME).exists(), 'a session started anyway'
+    assert recorded_temproot(suite.root) is None, 'a session started anyway'
 
 
 @pytest.mark.parametrize(

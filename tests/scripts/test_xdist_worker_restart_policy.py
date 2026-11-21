@@ -61,7 +61,12 @@ import sys
 from collections.abc import Mapping
 
 import pytest
-from host_pytest_temp_root import listing, seed_dead_session_dirs
+from host_pytest_temp_root import (
+    listing,
+    recorded_temproot,
+    seed_dead_session_dirs,
+    temproot_recorder_source,
+)
 from pytest_config_discovery import discovered_pytest_configs
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -290,15 +295,7 @@ def test_three():
 
 _RECORDER_INI = '[pytest]\n'
 
-_TEMPROOT_RECORDER_MODULE = '''\
-import pathlib
-import tempfile
-
-
-def test_records_the_temproot(tmp_path):
-    record = pathlib.Path(__file__).resolve().with_name('seen-temproot')
-    record.write_text(tempfile.gettempdir())
-'''
+_TEMPROOT_RECORDER_MODULE = temproot_recorder_source()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -500,8 +497,8 @@ def test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched(
         f'{int(pytest.ExitCode.OK)} (OK).\n'
         f'{_captured(result)}'
     )
-    seen = pathlib.Path((suite.root / 'seen-temproot').read_text(encoding='utf-8'))
-    assert seen.resolve() == host.resolve(), (
+    seen = recorded_temproot(suite.root)
+    assert seen is not None and seen.resolve() == host.resolve(), (
         f'the child ran against temp root {seen}, not the stand-in {host}, so '
         'the listing check below would pass vacuously.\n'
         f'{_captured(result)}'
@@ -537,4 +534,4 @@ def test_an_argument_other_than_a_restart_flag_is_refused_before_any_session_sta
     assert smuggle in str(refused.value)
     assert not suite.basetemp.exists(), 'a session started anyway'
     assert not smuggled.exists(), 'a session started anyway'
-    assert not (suite.root / 'seen-temproot').exists(), 'a session started anyway'
+    assert recorded_temproot(suite.root) is None, 'a session started anyway'
