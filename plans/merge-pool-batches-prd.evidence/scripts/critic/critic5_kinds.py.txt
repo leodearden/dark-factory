@@ -1,0 +1,29 @@
+import sqlite3, json, collections
+REPO='/home/leo/src/dark-factory'
+db=sqlite3.connect(f'file:{REPO}/data/orchestrator/runs.db?mode=ro', uri=True)
+print([r[1] for r in db.execute("pragma table_info(flake_occurrence)")])
+row=db.execute("select * from flake_occurrence where call_site='merge_gate' order by rowid desc limit 1").fetchone()
+print(row)
+tips={}
+for id_,ts,task,data in db.execute("""select id,timestamp,task_id,data from events where event_type='merge_verify'
+  and timestamp>='2026-10-21' and json_extract(data,'$.chain_items')>1 and json_extract(data,'$.passed')=0"""):
+    d=json.loads(data); tips[d['merge_sha']]=d
+ids=collections.defaultdict(set); verd=collections.defaultdict(set)
+for test_id,verdict,sha in db.execute("select test_id,verdict,merge_sha from flake_occurrence where call_site='merge_gate' and observed_at>='2026-10-21'"):
+    if sha in tips: ids[sha].add(test_id); verd[sha].add(verdict)
+modlevel=sum(1 for s,v in ids.items() if any('::' not in t for t in v))
+print('red chain tips',len(tips),'with ids',len(ids),'tips with a module-level id (no ::):',modlevel)
+import re
+c=collections.Counter()
+for s,v in ids.items():
+    for t in v: c[t.split('::')[0]]+=1
+print(c.most_common(12))
+print('ids per tip dist', collections.Counter(len(v) for v in ids.values()).most_common())
+# units on red chain tips: which legs red
+uc=collections.Counter()
+for sha,d in tips.items():
+    u=d.get('units') or []
+    red=tuple(sorted({x['unit'] for x in u if isinstance(x,dict) and x.get('outcome')=='ran_red'}))
+    kinds=tuple(sorted({x.split(':')[-1] for x in red})) ; glob=any('__global__' in x for x in red)
+    uc[(kinds,'global' if glob else 'modules' if u else 'no-units')]+=1
+for k,v in uc.most_common(): print(v,k)

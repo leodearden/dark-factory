@@ -1,0 +1,328 @@
+"""Follow-up sweep plans (depth, base choice, J-opt, lane shape, naming).  Usage: python plans2.py <plan> ..."""
+import sys
+sys.path.insert(0, '/tmp/gate-10069/sim')
+import gridlib as G
+
+QS = (0.05, 0.08, 0.14, 0.20)
+TD = {0.02: 8, 0.03: 6, 0.05: 5, 0.08: 4, 0.14: 3, 0.20: 3}
+DEPTHS = [('+0', {}), ('+1', dict(cap_add=1)), ('+2', dict(cap_add=2)), ('+3', dict(cap_add=3)), ('+4', dict(cap_add=4)),
+          ('+6', dict(cap_add=6)), ('x2', dict(cap_mult=2))]
+ISO = [('J1d', dict(sus='J1d')), ('J2', dict(sus='J2', tau=0.5)), ("J2'", dict(sus='J2', tau=0.65))]
+NODL = dict(deadline_mult=99)
+
+
+def J(**kw):
+    d = dict(base='J', e_pol=0.009, theta=0.9)
+    d.update(kw)
+    return d
+
+
+def cell(q, dur='W1', env='on', tag='', mode='cap', **extra):
+    cfg = dict(q=q, e=0.01, dur=dur, horizon=144.0, warm=24.0)
+    if mode == 'cap':
+        cfg.update(closed_N=75)
+    if env == 'on':
+        cfg.update(mainred=True, restarts=True)
+    cfg.update(extra)
+    return '%s|q=%.2f|%s|env=%s%s' % (mode, q, dur, env, ('|' + tag) if tag else ''), cfg
+
+
+def _cfgfile(key, q):
+    import json
+    with open('/tmp/gate-10069/sim/best.json') as f:
+        d = json.load(f)
+    return dict(d[key]['%.2f' % q])
+
+
+def best(q):       # the best static depth x isolation of section A, per q
+    return _cfgfile('best', q)
+
+
+def winner(q):     # the best overall configuration of sections A-C, per q
+    return _cfgfile('winner', q)
+
+
+BASE = ('base', J(sus='J1d'))            # Jc-J1d as accepted: table depth, 2 x p95 deadline
+REF = [('T', dict(base='T')), ('T+', dict(base='T+')), BASE]
+
+
+def depth_pols(dl=NODL, isos=ISO, depths=DEPTHS):
+    out = []
+    for dn, dk in depths:
+        for iname, ik in isos:
+            kw = dict(ik); kw.update(dk); kw.update(dl)
+            out.append(('d%s %s' % (dn, iname), J(**kw)))
+    return out
+
+
+def plan(name, arg=None):
+    P = []
+    if name == 'A':
+        for q in QS:
+            P.append(cell(q) + (REF + depth_pols(), 60))
+        for q in (0.08, 0.14):
+            P.append(cell(q, 'W2') + (REF + depth_pols(), 60))
+    elif name == 'A_dl':     # the same sweep with the 2 x p95 suspect deadline kept
+        sub = [d for d in DEPTHS if d[0] in ('+0', '+2', '+4', 'x2')]
+        for q in QS:
+            P.append(cell(q) + ([BASE] + [(n + ' dl2', s) for n, s in depth_pols(dl={}, isos=ISO[:2], depths=sub)], 60))
+    elif name == 'A_ns':     # one host, one entry at a time: no stacking, nothing torn down
+        sub = [d for d in DEPTHS if d[0] != 'x2']
+        for q in QS:
+            for env in ('off', 'on'):
+                P.append(cell(q, env=env, tag='1host', hosts=1, K=1) + (depth_pols(isos=ISO[:2], depths=sub), 30))
+            P.append(cell(q, env='off') + (depth_pols(isos=ISO[:2], depths=sub), 40))
+    elif name in ('B_table', 'B_best'):
+        # what an entry is built on.  B0 the tip; B1 main when the tip's tree is risky (P < x) or stale;
+        # B2 the same for suspect verifies only; B3 hold behind a suspect test.  One cell per re-verify variant.
+        for q in QS:
+            core = dict(sus='J1d') if name == 'B_table' else best(q)
+            pols = [('B0', J(**core))]
+            for x in (0.3, 0.5, 0.7):
+                pols.append(('B1 x%.1f' % x, J(base_mode='B1', base_x=x, **core)))
+            for x in (0.3, 0.5, 0.7):
+                pols.append(('B2 x%.1f' % x, J(base_mode='B2', base_x=x, **core)))
+            pols.append(('B2 always', J(base_mode='B2', base_x=1.01, **core)))
+            pols.append(('B3 hold', J(nostack=True, **core)))
+            for rv in ('chain', 'solo', 'pool'):
+                P.append(cell(q, tag='reverify=' + rv, reverify=rv) + (pols, 60))
+    elif name == 'AB':
+        # depth x base choice, with stale passes returned to the pool as known-good (reverify='pool')
+        for q in QS:
+            pols = [BASE]
+            for x in (0.5, 0.7, 0.85, 1.01):
+                pols.append(('B1 x%.2f d+0 J1d' % x, J(sus='J1d', base_mode='B1', base_x=x, **NODL)))
+            for dn, dk in DEPTHS:
+                if dn in ('+1', '+2', '+4'):
+                    for iname, ik in ISO[:2]:
+                        kw = dict(ik); kw.update(dk); kw.update(NODL)
+                        pols.append(('B1 x0.70 d%s %s' % (dn, iname), J(base_mode='B1', base_x=0.7, **kw)))
+                        if dn == '+2':
+                            pols.append(('B1 x0.50 d%s %s' % (dn, iname), J(base_mode='B1', base_x=0.5, **kw)))
+                            pols.append(('B1 x0.85 d%s %s' % (dn, iname), J(base_mode='B1', base_x=0.85, **kw)))
+                            pols.append(('B0 d%s %s' % (dn, iname), J(**kw)))
+            for iname, ik in ISO[:2]:
+                kw = dict(ik); kw.update(NODL)
+                pols.append(('B1 x0.70 Jopt %s' % iname, J(base_mode='B1', base_x=0.7, member='opt', opt_form='ratio1', maxb=16, **kw)))
+                pols.append(('B0 Jopt %s' % iname, J(member='opt', opt_form='ratio1', maxb=16, **kw)))
+            P.append(cell(q, tag='reverify=pool', reverify='pool') + (pols, 60))
+    elif name == 'W':
+        # winner search: entries on main when the tip is risky (x), stale passes back to the pool,
+        # sub-batch isolation, depth pushed further; J-opt with riders left out of the depth decision
+        for q in QS:
+            pols = [('T', dict(base='T')), ('T+', dict(base='T+')), BASE]
+            deep = (('+2', dict(cap_add=2)), ('+4', dict(cap_add=4)), ('+6', dict(cap_add=6)), ('+9', dict(cap_add=9)), ('x2', dict(cap_mult=2)), ('x3', dict(cap_mult=3)))
+            shallow = (('+0', {}), ('+1', dict(cap_add=1)), ('+2', dict(cap_add=2)), ('+3', dict(cap_add=3)))
+            for dn, dk in (deep if q <= 0.08 else shallow):
+                for iname, ik in ISO[1:]:
+                    kw = dict(ik); kw.update(dk); kw.update(NODL)
+                    pols.append(('B1 x0.70 d%s %s' % (dn, iname), J(base_mode='B1', base_x=0.7, **kw)))
+            dbest = dict(cap_add=4) if q <= 0.08 else dict(cap_add=2)
+            for x in (0.6, 0.8):
+                pols.append(('B1 x%.2f d%s J2' % (x, '+4' if q <= 0.08 else '+2'), J(sus='J2', base_mode='B1', base_x=x, **dbest, **NODL)))
+            for iname, ik in ISO[:2]:
+                kw = dict(ik); kw.update(NODL)
+                pols.append(('B1 x0.70 Jopt %s' % iname, J(base_mode='B1', base_x=0.7, member='opt', opt_form='ratio1', **kw)))
+            pols.append(('B1 x0.70 Jopt J2 adaptive', J(sus='J2', base_mode='B1', base_x=0.7, member='opt', opt_form='ratio1', adaptive=60, **NODL)))
+            pols.append(('B0 Jopt J2', J(sus='J2', member='opt', opt_form='ratio1', **NODL)))
+            P.append(cell(q, tag='reverify=pool', reverify='pool') + (pols, 60))
+    elif name == 'W2':
+        WIN = dict(sus='J2', base_mode='B1', base_x=0.7, member='opt', opt_form='ratio1')
+        def wcell(q, dur):
+            pols = [('T', dict(base='T')), ('T+', dict(base='T+')), BASE,
+                    ('winner', J(**WIN, **NODL)),
+                    ('winner, 2xp95 suspect deadline', J(**WIN)),
+                    ('winner x0.5', J(**dict(WIN, base_x=0.5), **NODL)),
+                    ('winner J1d', J(**dict(WIN, sus='J1d'), **NODL)),
+                    ('winner, no base choice', J(sus='J2', member='opt', opt_form='ratio1', **NODL)),
+                    ('winner, adaptive prior', J(adaptive=60, **WIN, **NODL))]
+            for dn, dk in (('+0', {}), ('+2', dict(cap_add=2)), ('+4', dict(cap_add=4)), ('+6', dict(cap_add=6))):
+                pols.append(('table%s, riders free, B1 x0.7 J2' % dn, J(sus='J2', base_mode='B1', base_x=0.7, riders_free=True, **dk, **NODL)))
+            pols.append(('table+0, riders free, B1 x0.7 J1d', J(sus='J1d', base_mode='B1', base_x=0.7, riders_free=True, **NODL)))
+            return cell(q, dur, tag='reverify=pool', reverify='pool') + (pols, 60)
+        for q in QS:
+            P.append(wcell(q, 'W1'))
+        for q in (0.08, 0.14):
+            P.append(wcell(q, 'W2'))
+        for q in QS:   # what is left of the winner when a stale pass must be verified again as a batch
+            pols = [BASE]
+            for x in (0.3, 0.5):
+                pols.append(('Jopt J2, B1 x%.1f' % x, J(**dict(WIN, base_x=x), **NODL)))
+            pols.append(('Jopt J2, B2 x0.5', J(**dict(WIN, base_mode='B2', base_x=0.5), **NODL)))
+            pols.append(('Jopt J2, no base choice', J(sus='J2', member='opt', opt_form='ratio1', **NODL)))
+            P.append(cell(q, tag='reverify=chain', reverify='chain') + (pols, 60))
+    elif name == 'XB':
+        # section B again with today's cascade (a failed entry tears down EVERY entry behind it);
+        # the narrowed-cascade counterparts are plans B_table and W2 (same seeds)
+        WIN = dict(sus='J2', base_mode='B1', base_x=0.7, member='opt', opt_form='ratio1')
+        for q in QS:
+            pols = [BASE,
+                    ('B1 x0.5', J(sus='J1d', base_mode='B1', base_x=0.5)),
+                    ('B1 x0.7', J(sus='J1d', base_mode='B1', base_x=0.7)),
+                    ('B2 x0.5', J(sus='J1d', base_mode='B2', base_x=0.5)),
+                    ('B2 always', J(sus='J1d', base_mode='B2', base_x=1.01)),
+                    ('winner', J(**WIN, **NODL)),
+                    ('winner x0.5', J(**dict(WIN, base_x=0.5), **NODL)),
+                    ('winner, no base choice', J(sus='J2', member='opt', opt_form='ratio1', **NODL))]
+            for rv in ('solo', 'chain', 'pool'):
+                P.append(cell(q, tag='cascade=all|reverify=' + rv, cascade='all', reverify=rv) + (pols, 60))
+    elif name == 'XB2':
+        # the best configuration under the narrowed cascade when a stale pass is re-verified (solo / chain)
+        WIN = dict(sus='J2', base_mode='B1', base_x=0.7, member='opt', opt_form='ratio1')
+        for q in QS:
+            pols = [BASE, ('winner', J(**WIN, **NODL)), ('winner x0.5', J(**dict(WIN, base_x=0.5), **NODL))]
+            for rv in ('solo', 'chain'):
+                P.append(cell(q, tag='cascade=narrow|reverify=' + rv, cascade='narrow', reverify=rv) + (pols, 60))
+    elif name == 'XT':
+        # accidental unstacked dispatches under today's cascade; p = 0.265 gives 29% of two-host
+        # overlap hours unstacked, p = 0.15 matches the measured re-verify cost instead
+        pols = [('T', dict(base='T')), ('T+', dict(base='T+')), BASE,
+                ('d+2 J2', J(sus='J2', cap_add=2, **NODL)),
+                ('Jopt J2', J(sus='J2', member='opt', opt_form='ratio1', **NODL))]
+        WIN = dict(sus='J2', base_mode='B1', base_x=0.7, member='opt', opt_form='ratio1')
+        for q in QS:
+            P.append(cell(q, tag='accident=0') + (pols, 60))
+            P.append(cell(q, tag='accident=0.265|reverify=chain', accident=0.265, cascade='all', reverify='chain') + (pols, 60))
+            P.append(cell(q, tag='accident=0.265|reverify=solo', accident=0.265, cascade='all', reverify='solo') + (pols, 60))
+            P.append(cell(q, tag='accident=0.15|reverify=chain', accident=0.15, cascade='all', reverify='chain') + (pols, 60))
+            P.append(cell(q, tag='accident=0.265|reverify=chain|10995', accident=0.265, cascade='all', reverify='chain', adopt=True) + (pols[:3], 60))
+            P.append(cell(q, tag='accident=0.265|narrow|pool', accident=0.265, cascade='narrow', reverify='pool')
+                     + ([BASE, ('winner', J(**WIN, **NODL))], 60))
+        for q in (0.08, 0.14):
+            P.append(cell(q, 'W2', tag='accident=0') + (pols[:3], 60))
+            P.append(cell(q, 'W2', tag='accident=0.265|reverify=chain', accident=0.265, cascade='all', reverify='chain') + (pols[:3], 60))
+    elif name == 'X10995':
+        WIN = dict(sus='J2', base_mode='B1', base_x=0.7, member='opt', opt_form='ratio1')
+        for q in QS:
+            pols = [('T', dict(base='T')), ('T+', dict(base='T+')), BASE]
+            for dn, dk in (('+0', {}), ('+2', dict(cap_add=2)), ('+4', dict(cap_add=4))):
+                for iname, ik in ISO[:2]:
+                    kw = dict(ik); kw.update(dk); kw.update(NODL)
+                    pols.append(('d%s %s' % (dn, iname), J(**kw)))
+            pols.append(('Jopt J1d', J(sus='J1d', member='opt', opt_form='ratio1', **NODL)))
+            pols.append(('Jopt J2', J(sus='J2', member='opt', opt_form='ratio1', **NODL)))
+            pols2 = [BASE, ('B1 x0.7 d+0 J1d', J(sus='J1d', base_mode='B1', base_x=0.7, **NODL)), ('winner', J(**WIN, **NODL)),
+                     ('table+2, riders free, B1 x0.7 J2', J(sus='J2', base_mode='B1', base_x=0.7, riders_free=True, cap_add=2, **NODL))]
+            for ad in (False, True):
+                P.append(cell(q, tag='10995=%s' % ('on' if ad else 'off'), adopt=ad) + (pols, 60))
+                P.append(cell(q, tag='pool|10995=%s' % ('on' if ad else 'off'), adopt=ad, reverify='pool') + (pols2, 60))
+    elif name == 'S':
+        U = lambda **kw: dict(base='U', e_pol=0.009, theta=0.9, strict_conv=True, **kw)
+        def sc(ct=0.05, mode='lin', variant='A', flake='pass', miss=0.0):
+            return dict(ct=ct, mode=mode, miss=miss, flake=flake), dict(ct=ct, mode=mode, variant=variant, flake=flake)
+        ec, pc = sc()
+        for q in (0.03, 0.05, 0.08, 0.14, 0.20):
+            P.append(cell(q, tag='noscan', cascade='all') + ([('T', dict(base='T')), BASE, ('U', U())], 60))
+            P.append(cell(q, tag='scan', cascade='all', scan=ec) + ([
+                ('U+S', U(scan=pc)), ('U+S riders12', U(scan=pc, rider_only=12)),
+                ('U+S 24/48', U(scan=pc, max_fresh=24, max_total=48)), ('U+S 24/48 riders12', U(scan=pc, max_fresh=24, max_total=48, rider_only=12)),
+                ('U+S 48/96 riders12', U(scan=pc, max_fresh=48, max_total=96, rider_only=12)),
+                ('U+S 6/24 riders12', U(scan=pc, max_fresh=6, max_total=24, rider_only=12)),
+                ('U+S riders12, no conviction', U(scan=pc, rider_only=12, convict=False))], 60))
+            P.append(cell(q, tag='10995|noscan', cascade='all', adopt=True) + ([('U', U())], 60))
+            P.append(cell(q, tag='10995|scan', cascade='all', adopt=True, scan=ec) + ([('U+S riders12', U(scan=pc, rider_only=12))], 60))
+            P.append(cell(q, tag='narrow+riders|noscan', cascade='narrow', reverify='pool') + ([('U base by cost', U(ubase='cost'))], 60))
+            P.append(cell(q, tag='narrow+riders|scan', cascade='narrow', reverify='pool', scan=ec) + ([('U+S riders12 base by cost', U(scan=pc, rider_only=12, ubase='cost'))], 60))
+        for q in (0.05, 0.14):
+            for tag, kw in (('ct=0.02', dict(ct=0.02)), ('ct=0.10', dict(ct=0.10)), ('ct=0.20', dict(ct=0.20)), ('B', dict(variant='B')), ('binary', dict(mode='bin')),
+                            ('free', dict(mode='free')), ('miss=0.05', dict(miss=0.05)), ('miss=0.20', dict(miss=0.20)), ('flake stands', dict(flake='stand'))):
+                e2, p2 = sc(**kw)
+                P.append(cell(q, tag='scan|' + tag, cascade='all', scan=e2) + ([('U+S riders12', U(scan=p2, rider_only=12))], 60))
+            P.append(cell(q, tag='N150|noscan', cascade='all', closed_N=150) + ([('U', U())], 60))
+            P.append(cell(q, tag='N150|scan', cascade='all', closed_N=150, scan=ec) + ([('U+S riders12', U(scan=pc, rider_only=12)), ('U+S 48/96 riders12', U(scan=pc, max_fresh=48, max_total=96, rider_only=12))], 60))
+    elif name == 'Uf':
+        U = lambda **kw: dict(base='U', e_pol=0.009, theta=0.9, **kw)
+        pols = [BASE, ('best stacked', J(sus='J2', member='opt', opt_form='ratio1', **NODL)), ('U w0', U()),
+                ('U w1, tear-down term also in the going cost', U(w=1, w_in_a=True)),
+                ('U w0, 24 un-cleared members allowed', U(max_fresh=24)),
+                ('U w0 strict conviction', U(strict_conv=True))]
+        for q in (0.03, 0.05, 0.08, 0.14, 0.20):
+            P.append(cell(q, tag='today', cascade='all') + (pols, 60))
+    elif name in ('Ua', 'Ud', 'Ue'):
+        U = lambda **kw: dict(base='U', e_pol=0.009, theta=0.9, **kw)
+        T = ('T', dict(base='T'))
+        BEST = ('best stacked (closed-form depth + sub-batch)', J(sus='J2', member='opt', opt_form='ratio1', **NODL))
+        if name == 'Ua':
+            pols = [T, BASE, BEST, ('U w0', U()), ('U w1', U(w=1)), ('U w0 no deadline', U(deadline_mult=99)),
+                    ('U w0 elim', U(elim=True)), ('U w1 elim', U(w=1, elim=True)),
+                    ('U w0 strict conviction', U(strict_conv=True)), ('U w1 strict conviction', U(w=1, strict_conv=True)),
+                    ('U w1 no deferral', U(w=1, defer=False))]
+            for q in (0.03, 0.05, 0.08, 0.14, 0.20):
+                P.append(cell(q, tag='today', cascade='all') + (pols, 60))
+        elif name == 'Ud':
+            het = (0.12, 0.27, 0.115)
+            P.append(cell(0.134, tag='hetero', cascade='all', hetero=het) + ([
+                BASE, ('base, class prior', J(sus='J1d', prior_mode='class')),
+                ('U w0', U()), ('U w0, class prior', U(prior_mode='class')),
+                ('U w1', U(w=1)), ('U w1, class prior', U(w=1, prior_mode='class'))], 60))
+            for q in (0.05, 0.14):
+                for a, rho in ((0.5, 0.65), (0.8, 0.84), (0.95, 0.95)):
+                    P.append(cell(q, tag='a=%.2f' % a, cascade='all', name_acc=a) + ([
+                        BASE, ('U w1', U(w=1)), ('U w1, name as probability', U(w=1, name_rho=rho)),
+                        ('U w1 strict, name as probability', U(w=1, name_rho=rho, strict_conv=True)),
+                        ('U w0, name as probability', U(name_rho=rho))], 60))
+            for tag, qb in (('swing.07/.21x24h', (0.07, 0.21, 24.0)), ('swing.05/.23x48h', (0.05, 0.23, 48.0))):
+                P.append(cell(0.14, tag=tag, cascade='all', q_blocks=qb) + ([
+                    BASE, ('base, adaptive prior', J(sus='J1d', adaptive=60)),
+                    ('U w0', U()), ('U w0, adaptive prior', U(adaptive=60)),
+                    ('U w1', U(w=1)), ('U w1, adaptive prior', U(w=1, adaptive=60))], 60))
+        else:
+            WIN = dict(sus='J2', base_mode='B1', base_x=0.7, member='opt', opt_form='ratio1')
+            for q in QS:
+                for casc in ('all', 'narrow'):
+                    for rv in ('chain', 'pool'):
+                        pols = [BASE, ('separate best (main if P<0.7)', J(**WIN, **NODL)), ('U w1, always tip', U(w=1)),
+                                ('U w1, base by cost', U(w=1, ubase='cost')), ('U w0, base by cost', U(ubase='cost'))]
+                        P.append(cell(q, tag='cascade=%s|stale=%s' % (casc, rv), cascade=casc, reverify=rv) + (pols, 60))
+    elif name == 'C':
+        for q in QS:
+            pols = [BASE, ('best static', J(**best(q)))]
+            for form, w in (('ratio', 1.0), ('ratio1', 0.0), ('ratio1', 1.0), ('ratio1', 2.0), ('marg', 1.0), ('marg', 2.0)):
+                pols.append(('Jopt %s w%g J1d' % (form, w), J(sus='J1d', member='opt', opt_form=form, opt_w=w, **NODL)))
+            for form, w in (('ratio1', 1.0), ('ratio1', 2.0), ('marg', 1.0)):
+                pols.append(('Jopt %s w%g J2' % (form, w), J(sus='J2', member='opt', opt_form=form, opt_w=w, maxb=16, **NODL)))
+            P.append(cell(q) + (pols, 60))
+    elif name == 'C_regime':
+        b14 = best(0.14)
+        for tag, qb in (('swing.07/.21x24h', (0.07, 0.21, 24.0)), ('swing.05/.23x48h', (0.05, 0.23, 48.0))):
+            pols = [('T', dict(base='T')), ('T+', dict(base='T+')), BASE,
+                    ('base, adaptive prior', J(sus='J1d', adaptive=60)),
+                    ('base, rolling tip estimate', J(sus='J1d', depth_src='win')),
+                    ('best static', J(**b14)),
+                    ('best static, adaptive prior', J(adaptive=60, **b14)),
+                    ('best static, rolling tip estimate', J(depth_src='win', **b14))]
+            for form, w in (('ratio1', 1.0), ('ratio1', 2.0), ('marg', 1.0)):
+                pols.append(('Jopt %s w%g' % (form, w), J(sus='J1d', member='opt', opt_form=form, opt_w=w, **NODL)))
+                pols.append(('Jopt %s w%g, adaptive prior' % (form, w), J(sus='J1d', member='opt', opt_form=form, opt_w=w, adaptive=60, **NODL)))
+            P.append(cell(0.14, tag=tag, q_blocks=qb) + (pols, 60))
+    elif name == 'D':
+        for hosts in (2, 3):
+            for q in (0.02, 0.03, 0.05, 0.08, 0.14, 0.20):
+                pols = [('T', dict(base='T')), ('T+', dict(base='T+')), BASE, ('winner', J(**winner(q)))]
+                if q <= 0.03 or hosts == 3:
+                    for dn, dk in DEPTHS:
+                        if dn in ('+2', '+4', 'x2'):
+                            for iname, ik in ISO[:2]:
+                                kw = dict(ik); kw.update(dk); kw.update(NODL)
+                                pols.append(('d%s %s' % (dn, iname), J(**kw)))
+                P.append(cell(q, tag='hosts=%d' % hosts, hosts=hosts, K=hosts + 1, reverify='pool') + (pols, 60))
+    elif name == 'E':
+        # the failing test names a request: right with accuracy a, nobody with probability 0.2
+        sub = [d for d in DEPTHS if d[0] in ('+0', '+2', '+4', 'x2')]
+        for q in QS:
+            for a in (0.5, 0.8, 0.95):
+                pols = [BASE]
+                for dn, dk in sub:
+                    kw = dict(sus='J1d'); kw.update(dk); kw.update(NODL)
+                    pols.append(('d%s no naming' % dn, J(**kw)))
+                    pols.append(('d%s confirm-first' % dn, J(naming='confirm', **kw)))
+                    pols.append(('d%s block at once' % dn, J(naming='block', **kw)))
+                P.append(cell(q, tag='a=%.2f' % a, name_acc=a) + (pols, 50))
+    else:
+        raise SystemExit('unknown plan ' + name)
+    return P
+
+
+if __name__ == '__main__':
+    for nm in sys.argv[1:]:
+        G.run_plan(nm, plan(nm))

@@ -1,0 +1,185 @@
+"""Validations (b), (c), (d) for the gate-10069 lane model.
+
+(b) q = 0: every chaining policy lands at its depth multiple of OFF.
+(c) e = 0, no main-red: J never convicts a good request when it convicts on
+    certainty (policy e = 0); the same count is reported for the default
+    policy e = 0.01 at theta 0.8 / 0.9 / 0.95, where a conviction is a
+    probability statement.
+(d) the exact-enumeration posterior against an independent brute force on
+    hand-built cases.
+"""
+import itertools
+import math
+import sys
+from multiprocessing import Pool
+
+sys.path.insert(0, '/tmp/gate-10069/sim')
+import lane as L  # noqa: E402
+
+
+# ---------------------------------------------------------------- (d)
+def brute(priors, obs, e, query_good=None):
+    """priors: {name: p}; obs: list of sets (red observations). Enumerates every bad-set."""
+    names = sorted(priors)
+    Z = 0.0
+    marg = dict.fromkeys(names, 0.0)
+    qg = 0.0
+    for bits in itertools.product((0, 1), repeat=len(names)):
+        bad = {n for n, b in zip(names, bits) if b}
+        w = 1.0
+        for n in names:
+            w *= priors[n] if n in bad else 1.0 - priors[n]
+        for o in obs:
+            w *= 1.0 if (o & bad) else e
+        Z += w
+        for n in bad:
+            marg[n] += w
+        if query_good is not None and not (set(query_good) & bad):
+            qg += w
+    return {n: marg[n] / Z for n in names}, (qg / Z if query_good is not None else None)
+
+
+def belief(priors, e):
+    return L.Belief(lambda rid: priors[rid], e)
+
+
+def check_d():
+    print('== (d) exact enumeration vs brute force ==')
+    worst = 0.0
+    # case 1: one red batch {a,b,c}, prior 0.14 each, e = 0.01
+    pr = {0: 0.14, 1: 0.14, 2: 0.14}
+    B = belief(pr, 0.01)
+    B.add_red([0, 1, 2])
+    bf, bq = brute(pr, [{0, 1, 2}], 0.01, [0, 1])
+    closed = 0.14 / (1 - 0.86 ** 3 * 0.99)
+    print('case 1  obs {a,b,c} red; prior .14 each; e=.01')
+    print('   P(a bad): enumeration %.6f  brute %.6f  closed form q/[1-(1-q)^3(1-e)] = %.6f' % (B.p_bad(0), bf[0], closed))
+    print('   P(a,b both good): enumeration %.6f  brute %.6f' % (B.p_good([0, 1]), bq))
+    worst = max(worst, abs(B.p_bad(0) - bf[0]), abs(B.p_good([0, 1]) - bq), abs(B.p_bad(0) - closed))
+    # case 2: overlapping, not nested: {a,b} red and {a,c} red; priors .14,.14,.27; e = 0
+    pr = {0: 0.14, 1: 0.14, 2: 0.27}
+    B = belief(pr, 0.0)
+    B.add_red([0, 1])
+    B.add_red([0, 2])
+    bf, bq = brute(pr, [{0, 1}, {0, 2}], 0.0, [1, 2])
+    ca = 0.14 / (0.14 + 0.86 * 0.14 * 0.27)
+    cb = (0.14 * 0.14 + 0.86 * 0.14 * 0.27) / (0.14 + 0.86 * 0.14 * 0.27)
+    print('case 2  obs {a,b} red, {a,c} red; priors a=.14 b=.14 c=.27; e=0')
+    print('   P(a bad): enumeration %.6f  brute %.6f  closed form qa/[qa+(1-qa)qb qc] = %.6f' % (B.p_bad(0), bf[0], ca))
+    print('   P(b bad): enumeration %.6f  brute %.6f  closed form %.6f' % (B.p_bad(1), bf[1], cb))
+    print('   P(c bad): enumeration %.6f  brute %.6f' % (B.p_bad(2), bf[2]))
+    print('   P(b,c both good): enumeration %.6f  brute %.6f' % (B.p_good([1, 2]), bq))
+    worst = max(worst, abs(B.p_bad(0) - bf[0]), abs(B.p_bad(1) - bf[1]), abs(B.p_bad(2) - bf[2]), abs(B.p_good([1, 2]) - bq))
+    # case 3: three observations chained through shared members, mixed priors, e = .026,
+    #         then a pass clears d
+    pr = {0: 0.08, 1: 0.27, 2: 0.115, 3: 0.115, 4: 0.08, 5: 0.14}
+    obs = [{0, 1, 2}, {2, 3, 4}, {4, 5}]
+    B = belief(pr, 0.026)
+    for o in obs:
+        B.add_red(o)
+    bf, bq = brute(pr, obs, 0.026, [0, 3, 5])
+    print('case 3  obs {a,b,c} {c,d,e} {e,f} red; priors .08 .27 .115 .115 .08 .14; e=.026')
+    for i, nm in enumerate('abcdef'):
+        print('   P(%s bad): enumeration %.6f  brute %.6f' % (nm, B.p_bad(i), bf[i]))
+        worst = max(worst, abs(B.p_bad(i) - bf[i]))
+    print('   P(a,d,f all good): enumeration %.6f  brute %.6f' % (B.p_good([0, 3, 5]), bq))
+    worst = max(worst, abs(B.p_good([0, 3, 5]) - bq))
+    B.add_pass([3])   # a passing tree held d: d is good
+    pr2 = dict(pr)
+    del pr2[3]
+    bf2, _ = brute(pr2, [{0, 1, 2}, {2, 4}, {4, 5}], 0.026)
+    print('   after a pass that contained d (d good; obs become {a,b,c} {c,e} {e,f}):')
+    for i, nm in enumerate('abcdef'):
+        if i == 3:
+            print('   P(d bad): enumeration %.6f  (cleared)' % B.p_bad(3))
+            continue
+        print('   P(%s bad): enumeration %.6f  brute %.6f' % (nm, B.p_bad(i), bf2[i]))
+        worst = max(worst, abs(B.p_bad(i) - bf2[i]))
+    print('   max |enumeration - brute| over cases 1-3: %.2e' % worst)
+    # case 4: nested observations {a,b,c,d} red then {a,b} red (kept as two independent
+    #         pieces of evidence by default; the prune='always' variant sheds the superset)
+    pr = {0: 0.08, 1: 0.08, 2: 0.08, 3: 0.08}
+    for e in (0.0, 0.01, 0.026):
+        B = belief(pr, e)
+        B.add_red([0, 1, 2, 3])
+        B.add_red([0, 1])
+        B2 = L.Belief(lambda rid: pr[rid], e, prune='always')
+        B2.add_red([0, 1, 2, 3])
+        B2.add_red([0, 1])
+        bf, _ = brute(pr, [{0, 1, 2, 3}, {0, 1}], e)
+        print('case 4  obs {a,b,c,d} red then {a,b} red; prior .08; e=%.3f: P(a bad) enumeration %.6f brute %.6f | '
+              'P(c bad) enumeration %.6f brute %.6f | superset-shedding variant: P(a bad) %.6f P(c bad) %.6f' % (
+                  e, B.p_bad(0), bf[0], B.p_bad(2), bf[2], B2.p_bad(0), B2.p_bad(2)))
+        worst = max(worst, abs(B.p_bad(0) - bf[0]), abs(B.p_bad(2) - bf[2]))
+    print('   max |enumeration - brute| over cases 1-4: %.2e' % worst)
+    return worst
+
+
+# ---------------------------------------------------------------- (b)
+def work_b(a):
+    name, spec, s = a
+    cfg = dict(q=0.0, e=0.0, dur='W1', closed_N=150, horizon=96.0, warm=24.0)
+    m = L.run_one(cfg, (name, spec), s)
+    return name, m['thr'], m['verifies'] / max(1, m['landings'])
+
+
+def check_b(pool):
+    print('== (b) q = 0: depth multiple (closed waiting set 150, W1, e=0, 72 h after 24 h warm-up, n=20) ==')
+    specs = [('OFF', dict(base='OFF'), 1), ('T', dict(base='T'), 12), ('T+', dict(base='T+'), 12),
+             ('TB', dict(base='T+', pool=True, static_depth='table'), 12),
+             ('I(old table)', dict(base='I'), 8), ('M(cap 6)', dict(base='M'), 6),
+             ('Jc-J1', dict(base='J', sus='J1'), 12), ('Jc-J1d', dict(base='J', sus='J1d'), 12),
+             ('Jc-J2', dict(base='J', sus='J2'), 12), ('Jf-J2 (max 24)', dict(base='J', sus='J2', cap=None), 24),
+             ('O12', dict(base='O', cap=12), 12)]
+    res = pool.map(work_b, [(n, sp, s) for n, sp, _ in specs for s in range(20)])
+    off = sum(r[1] for r in res if r[0] == 'OFF') / 20
+    ED = 43 / 60 * math.exp(0.3 ** 2 / 2)
+    print('OFF: %.3f landings/h (2/E[D] = %.3f)' % (off, 2 / ED))
+    for n, _, d in specs[1:]:
+        rows = [r for r in res if r[0] == n]
+        thr = sum(r[1] for r in rows) / len(rows)
+        vpl = sum(r[2] for r in rows) / len(rows)
+        print('%-16s depth %2d: %.2f landings/h = %.2f x OFF; verifies/landing %.4f (1/depth = %.4f)' % (
+            n, d, thr, thr / off, vpl, 1 / d))
+
+
+# ---------------------------------------------------------------- (c)
+def work_c(a):
+    name, spec, q, restarts, s = a
+    cfg = dict(q=q, e=0.0, dur='W1', closed_N=75, horizon=144.0, warm=24.0, restarts=restarts)
+    m, eng = L.run_one(cfg, (name, spec), s, log=True)
+    wrong = [l for l in eng.log if 'WRONG' in l]
+    return name, q, restarts, m['conv_good'], m['conv_bad'], m['block_good'], m['bad_landed'], m['landings'], wrong[:2], s
+
+
+def check_c(pool):
+    print('== (c) e = 0, no main-red: wrong convictions (closed 75, W1, 120 h, n=15 seeds x 4 q x 2 restart settings = 120 runs per row; q in .05 .08 .14 .20; restarts off and on) ==')
+    var = []
+    for cap, cn in (('table', 'Jc'), (None, 'Jf')):
+        for sus in ('J1', 'J1d', 'J2', 'J2p'):
+            var.append(('%s-%s e_pol=0' % (cn, sus), dict(base='J', sus=sus, cap=cap, e_pol=0.0, theta=0.9)))
+            for th in (0.8, 0.9, 0.95):
+                var.append(('%s-%s e_pol=.01 th=%.2f' % (cn, sus, th), dict(base='J', sus=sus, cap=cap, e_pol=0.01, theta=th)))
+    tasks = [(n, sp, q, rs, s) for n, sp in var for q in (0.05, 0.08, 0.14, 0.20) for rs in (False, True) for s in range(15)]
+    res = pool.map(work_c, tasks, chunksize=20)
+    print('variant                      runs  convictions(bad)  WRONG convictions(good)  good blocked by own solo  bad landed  wrong/100 landings')
+    for n, _ in var:
+        rows = [r for r in res if r[0] == n]
+        cg = sum(r[3] for r in rows)
+        cb = sum(r[4] for r in rows)
+        bg = sum(r[5] for r in rows)
+        bl = sum(r[6] for r in rows)
+        la = sum(r[7] for r in rows)
+        print('%-28s %4d  %8d  %8d  %8d  %6d  %.4f' % (n, len(rows), cb, cg, bg, bl, 100.0 * cg / la))
+    shown = 0
+    for r in res:
+        if r[8] and shown < 6:
+            shown += 1
+            print('   example: %s q=%.2f restarts=%s seed %d: %s' % (r[0], r[1], r[2], r[9], r[8][0].strip()))
+
+
+if __name__ == '__main__':
+    check_d()
+    with Pool(4) as pool:
+        check_b(pool)
+        check_c(pool)

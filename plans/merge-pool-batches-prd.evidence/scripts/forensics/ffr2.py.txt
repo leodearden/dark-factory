@@ -1,0 +1,46 @@
+from common import *
+import chain_detail as CD
+MARK='2026-11-17T20:49:02'; D8528='2026-11-19T04:25:50'
+def era(ts): return 'A' if ts<MARK else ('B' if ts<D8528 else 'C')
+MAINRED={'LOOP':('2026-11-15T10:09','2026-11-15T22:55'),'RETIRED':('2026-11-17T14:07','2026-11-17T18:50')}
+def mainred_groups(v):
+    s=dt.datetime.fromtimestamp(v['start'],dt.timezone.utc).isoformat()[:16]
+    return {g for g,(a,b) in MAINRED.items() if a<=s and v['ts'][:16]<=b}
+def same_content(layer_a, tip_b, p1_b):
+    if layer_a['tip']==tip_b: return 'tip'
+    pa=CD.parents(layer_a['sha'])
+    a=CD.own_pid(pa[0],layer_a['tip']); b=CD.own_pid(p1_b,tip_b)
+    return 'owndiff' if a and a==b else None
+def cleared(v,l):
+    t=l['task']
+    for w in V:
+        if w['end']<=v['end'] or not w['passed']: continue
+        i,m=layer_of(w,t)
+        if m is None: continue
+        sc=same_content(l,m['tip'],CD.parents(m['sha'])[0])
+        if sc: return 'PASS %d k%d %s [%s]'%(w['vid'],w['k'],w['ts'][5:16],sc)
+    for c,h,ltip,lp1 in CD.LAND.get(t,[]):
+        if T(c)>v['start']:
+            sc=same_content(l,ltip,lp1)
+            if sc: return 'landed %s %s [%s]'%(h[:8],c[5:16],sc)
+    return None
+W=[v for v in V if v['ts']>='2026-11-15T11:19']
+tot=collections.Counter(); ff=[]
+for v in W:
+    e=era(v['ts']); kind='chain' if v['k']>1 else 'solo'
+    if v['passed']: tot[(e,kind,'PASS')]+=1; continue
+    k=v['k']; L=v['layers']; pred=L[k:]
+    unl=[l for l in pred if not l.get('on_main_now') and l.get('task')]
+    odd=[l for l in pred if not l.get('on_main_now') and not l.get('task')]
+    fs=fset(v) or set(); mr=mainred_groups(v)
+    if unl or (odd and v['base_relation']!='main'): tot[(e,kind,'RED base never landed')]+=1; continue
+    if fs and fs<=mr: tot[(e,kind,'RED main-red only')]+=1; continue
+    mem=[l for l in L[:k] if l.get('task')]
+    cl=[(l['task'],cleared(v,l)) for l in mem]
+    if mem and all(c for _,c in cl) and len(mem)==k:
+        tot[(e,kind,'RED sound base, ALL members same-content later cleared = FALSE FAILURE candidate')]+=1; ff.append((v,cl,fs,mr))
+    else: tot[(e,kind,'RED sound base, >=1 member never cleared with same content')]+=1
+for k_,c in sorted(tot.items()): print(c,k_)
+for v,cl,fs,mr in ff:
+    print(v['vid'],v['ts'][5:16],v['task'],'k%d'%v['k'],v['runner'],v['base_relation'],'fails',sorted(fs),'mainred',sorted(mr),'units',v['red_units'])
+    for t,c in cl: print('     ',t,c)

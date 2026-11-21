@@ -1,0 +1,7 @@
+import sqlite3, json, collections
+c=sqlite3.connect('file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro',uri=True,timeout=30)
+LO=595475
+cnt=collections.Counter(); sz=collections.Counter()
+for et,n,s in c.execute("select event_type,count(*),sum(length(data)) from events where id>=? group by event_type",(LO,)):
+    cnt[et]=n; sz[et]=s
+for et,n in cnt.most_common(): print(n, sz[et], et)

@@ -1,0 +1,31 @@
+import sys
+from common import *
+tasks=sys.argv[1].split(',')
+for t in tasks:
+    print('=====',t)
+    rows=[]
+    for v in V:
+        if v['ts']<'2026-11-15T11:00': continue
+        i,l=layer_of(v,t)
+        if l is None: continue
+        fs=fset(v)
+        rows.append((v['ts'],'V',v['vid'],'k%d'%v['k'],v['runner'][:3],role(v,i),(l['tip'] or '?')[:8],'PASS' if v['passed'] else 'RED',','.join(sorted(fs)) if fs else ('' if v['passed'] else 'nolog'),v['base_relation'][:5]))
+    for e in events():
+        if e['task']==t and e['ts']>='2026-11-15T11:00':
+            d=e['d']
+            if e['et']=='merge_finalized': rows.append((e['ts'],'FIN',e['id'],d['request_id'],d['state'],(d.get('reason') or '')[:50],'sha',(d.get('merge_sha') or '')[:8]))
+            elif e['et']=='merge_queued': rows.append((e['ts'],'Q',e['id'],d.get('request_id'),'head',(d.get('head_sha') or 'null')[:8]))
+            elif e['et']=='merge_attempt' and d.get('outcome')!='done': rows.append((e['ts'],'ATT',e['id'],d.get('outcome'),d.get('disposition') or ''))
+            elif e['et'] in('invocation_end',): rows.append((e['ts'],'INV',e['id'],e['role'] or d.get('role')))
+            elif e['et'] in('task_started','verdict_voided','merge_verify_cancelled','speculative_discard','merge_blocked'): rows.append((e['ts'],e['et'],e['id'],(d.get('cause') or d.get('reason') or '')[:40], json.dumps(d.get('killer')) if d.get('killer') else ''))
+            elif e['et']=='workflow_verify': rows.append((e['ts'],'WV',e['id'],'P' if d.get('passed') else 'F','tip',(d.get('tip_sha') or 'null')[:8]))
+    rows.sort()
+    # collapse V rows with identical (role,tip,result,fails)
+    prev=None; cnt=0
+    for r in rows:
+        key=(r[1],)+tuple(r[5:9]) if r[1]=='V' else None
+        if key is not None and key==prev: cnt+=1; last=r; continue
+        if cnt: print('      ... +%d similar, last %s %s'%(cnt,last[0][5:16],last[2]))
+        cnt=0; prev=key
+        print('  ',r[0][5:16],*r[1:])
+    if cnt: print('      ... +%d similar, last %s %s'%(cnt,last[0][5:16],last[2]))

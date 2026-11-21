@@ -1,0 +1,50 @@
+import json,os,re,glob,datetime as dt,collections,gzip
+V=json.load(open('/tmp/gate-10069/forensics/verifies.json'))
+ROOT='/home/leo/src/dark-factory/data/verify-logs/'
+def fts(name):
+    m=re.search(r'-(\d{8}T\d{6})_(\d+)Z',name)
+    if not m: return None
+    return dt.datetime.strptime(m.group(1),'%Y%m%dT%H%M%S').replace(tzinfo=dt.timezone.utc).timestamp()
+out={}
+for v in V:
+    if v['passed'] or v['ts']<'2026-11-15T11:00': continue
+    d=ROOT+str(v['task'])
+    fs=[]
+    if os.path.isdir(d):
+        for n in os.listdir(d):
+            t=fts(n)
+            if t is not None and v["start"]-10<=t<=v["end"]+90 and (n.endswith('.log') or 'summary' in n): fs.append(n)
+    failed=collections.Counter(); hints=[]; timed=False; cats=set()
+    for n in fs:
+        p=d+'/'+n
+        if n.endswith('.log'):
+            try:
+                for l in open(p,errors='replace'):
+                    if l.startswith('FAILED ') or l.startswith('ERROR '):
+                        t=l.split(' - ')[0].strip()
+                        failed[t]+=1
+                    elif 'Timeout' in l and 'pytest' in l: timed=True
+            except Exception as ex: pass
+        elif n.endswith('.json') and 'pass-summary' not in n:
+            try:
+                j=json.load(open(p)); cats.add(j.get('category'))
+                if j.get('timed_out'): timed=True
+                if j.get('cause_hint'): hints.append(j['cause_hint'][:300])
+            except Exception: pass
+    out[v['vid']]={'files':sorted(fs),'failed':sorted(failed),'hints':hints,'timed_out':timed,'cats':sorted(c for c in cats if c)}
+json.dump(out,open('/tmp/gate-10069/forensics/fails.json','w'))
+# compact print for chains
+allt=collections.Counter()
+for v in V:
+    if v['vid'] in out:
+        for t in out[v['vid']]['failed']: allt[t]+=1
+ab={}
+for i,(t,c) in enumerate(allt.most_common()): ab[t]='T%d'%i
+json.dump(ab,open('/tmp/gate-10069/forensics/test_abbrev.json','w'))
+for t,c in allt.most_common(70): print(ab[t],c,t[:230])
+print('distinct',len(allt))
+print()
+for v in V:
+    if v['vid'] in out:
+        o=out[v['vid']]
+        print(v['vid'],v['ts'][5:16],v['task'],'k%d'%v['k'],v['runner'][:3],'nfiles',len(o['files']),'cats',o['cats'],'TO' if o['timed_out'] else '','fail:',' '.join(ab[t] for t in o['failed'][:12]),('+%d'%(len(o['failed'])-12) if len(o['failed'])>12 else ''))

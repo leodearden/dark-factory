@@ -1,0 +1,15 @@
+import json,collections
+V=json.load(open('/tmp/gate-10069/forensics/verifies.json'))
+MARK='2026-11-17T20:49:02'; D8528='2026-11-19T04:25:50'
+def era(ts): return 'A-premark' if ts<MARK else ('B-mark' if ts<D8528 else 'C-8528')
+n=collections.Counter()
+for v in V:
+    if v['k']<=1 or v['passed'] or v['ts']<'2026-11-15T11:19': continue
+    L=v['layers']; k=v['k']
+    mem=L[:k]; pred=L[k:]
+    mt=[l.get('task') for l in mem][::-1]
+    ok=(v['tids'] is None) or (mt==v['tids'])
+    pd=[(l.get('task'),'L' if l.get('on_main_now') else 'x') for l in pred][::-1]
+    n[(era(v['ts']),v['base_relation'],'pred>0' if pred else 'pred=0')]+=1
+    print(v['vid'],v['ts'][5:16],era(v['ts'])[0],'own',v['task'],'k',k,v['runner'][:3],v['base_relation'],'sp',int(bool(v['speculative'])),'d',v['depth'],'att',v['attempt'],'memOK' if ok else 'memMISMATCH %s vs %s'%(mt,v['tids']),'| mem',','.join(map(str,v['tids'] or mt)),'| pred',' '.join('%s%s'%(a,'' if b=='x' else '(L)') for a,b in pd) or '-','| base',(v['base'] or 'NONE')[:8],'| red',','.join(u.replace('module:','').replace(':test','') for u in v['red_units']))
+for k_,c in sorted(n.items()): print(c,k_)

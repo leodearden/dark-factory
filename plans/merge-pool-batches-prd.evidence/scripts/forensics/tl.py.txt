@@ -1,0 +1,17 @@
+import sys
+from common import *
+tasks=sys.argv[1].split(',')
+for t in tasks:
+    print('=====',t)
+    for v in V:
+        if v['ts']<'2026-11-15T11:00': continue
+        i,l=layer_of(v,t)
+        if l is None:
+            if v['task']==t: print('  ',v['vid'],v['ts'][5:16],'OWNER-but-no-layer k%d'%v['k'],'P' if v['passed'] else 'F',fset(v))
+            continue
+        fs=fset(v)
+        print('  ',v['vid'],v['ts'][5:16],'k%d'%v['k'],v['runner'][:3],v['base_relation'][:5],role(v,i),'tip',(l['tip'] or '?')[:8],'PASS' if v['passed'] else 'RED ',','.join(sorted(fs)) if fs else ('' if v['passed'] else 'nolog'),'own',v['task'],'base',(v['base'] or '?')[:7])
+    # landed on main
+    for e in events():
+        if e['task']==t and e['et'] in('merge_finalized',) and e['ts']>='2026-11-15T11:00':
+            d=e['d']; print('     FIN',e['id'],e['ts'][5:16],d['request_id'],d['state'],(d.get('reason') or '')[:70],'sha',(d.get('merge_sha') or '')[:8],'via',d.get('landed_via_chain'),'sup',d.get('superseded_by'))

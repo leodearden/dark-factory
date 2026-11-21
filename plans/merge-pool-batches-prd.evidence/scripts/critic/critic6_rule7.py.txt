@@ -1,0 +1,99 @@
+"""Reference computation of the batch rule in the PRD's 6.5 (draft 7).
+Scanning is a yes/no input (decided per project, not per batch). All costs are in verifies."""
+import itertools
+
+def fallback_cost(n, p, a_new):
+    """Release rule: members verify alone in order; once one is blocked the rest return as new."""
+    if n <= 1: return 0.0
+    r_n = 1 - (1 - p) ** n
+    if r_n <= 0: return 0.0
+    b = sum((j - 1) * (1 - p) ** (j - 1) * p for j in range(1, n + 1)) / r_n
+    return b + 1 + (n - 1 - b) * a_new
+
+def batch_cost(f, c, q, r, u, scanning, a_new, a_cleared, fallback=fallback_cost):
+    n = f + c
+    if n == 1: return 1.0
+    P = 1 - (1 - q) ** f * (1 - r) ** c
+    if P <= 0: return 1.0
+    k = (f * q + c * r) / P
+    p = (f * q + c * r) / n
+    s = (1 - u) if scanning else 0.0
+    return 1 + P * (s * (n - k) * a_cleared + (1 - s) * fallback(n, p, a_new))
+
+def going_costs(q, r, u, scanning, max_fresh=12, max_total=24, fallback=fallback_cost, tol=1e-9, max_iter=500):
+    a_new, a_cleared = 1.0, 1.0
+    for i in range(max_iter):
+        nc = min(batch_cost(0, c, q, r, u, scanning, a_new, a_cleared, fallback) / c for c in range(1, max_total + 1))
+        nf = min(batch_cost(f, 0, q, r, u, scanning, a_new, nc, fallback) / f for f in range(1, max_fresh + 1))
+        if abs(nc - a_cleared) < tol and abs(nf - a_new) < tol:
+            return nf, nc, i
+        a_new, a_cleared = nf, nc
+    raise RuntimeError(f'no convergence q={q} r={r} u={u} scanning={scanning}')
+
+def plan_batch(front, cands, q, r, u, scanning, max_fresh=12, max_total=24, fallback=fallback_cost):
+    """The front's kind is sized directly: the count that minimises cost per member (ties to the larger).
+    Candidates of the other kind then join one at a time while the cost each adds is below its going cost."""
+    a_new, a_cleared, _ = going_costs(q, r, u, scanning, max_fresh, max_total, fallback)
+    C = lambda f, c: batch_cost(f, c, q, r, u, scanning, a_new, a_cleared, fallback)
+    n_new = (front == 'new') + sum(k == 'new' for k in cands)
+    n_cl = (front == 'cleared') + sum(k == 'cleared' for k in cands)
+    if front == 'new':
+        top = min(max_fresh, max_total, n_new)
+        f = min(range(1, top + 1), key=lambda x: (round(C(x, 0) / x, 12), -x)); c = 0
+        for _ in range(n_cl):
+            if f + c >= max_total or C(f, c + 1) - C(f, c) >= a_cleared: break
+            c += 1
+    else:
+        top = min(max_total, n_cl)
+        c = min(range(1, top + 1), key=lambda x: (round(C(0, x) / x, 12), -x)); f = 0
+        for _ in range(n_new):
+            if f + c >= max_total or f >= max_fresh or C(f + 1, c) - C(f, c) >= a_new: break
+            f += 1
+    return f, c
+
+if __name__ == '__main__':
+    R, U = 0.01, 0.15
+    print('== B3 at the starting rates r=0.01 u=0.15')
+    for scanning in (True, False):
+        for q in (0.03, 0.05, 0.08, 0.14, 0.20):
+            a_new, a_cl, it = going_costs(q, R, U, scanning)
+            print(f'scanning={scanning!s:5} q={q:.2f} A_new={a_new:.3f} A_cleared={a_cl:.3f} iters={it}',
+                  '| new front,20 new,10 cleared ->', plan_batch('new', ['new'] * 20 + ['cleared'] * 10, q, R, U, scanning),
+                  '| cleared front,10 cleared,20 new ->', plan_batch('cleared', ['cleared'] * 10 + ['new'] * 20, q, R, U, scanning))
+    print('== convergence and walk-reaches-preferred-size over the validated range')
+    bad_conv = 0; stall = []; cells = 0
+    qs = [0.01, 0.02, 0.03, 0.05, 0.08, 0.11, 0.14, 0.17, 0.20, 0.25, 0.30, 0.40, 0.50]
+    us = [0.0, 0.05, 0.10, 0.15, 0.25, 0.40, 0.60, 0.80, 1.0]
+    for q, u, scanning in itertools.product(qs, us, (True, False)):
+        for r in sorted({0.001, 0.005, 0.01, 0.02, min(0.05, q), q}):
+            if r > q: continue
+            cells += 1
+            try:
+                a_new, a_cl, it = going_costs(q, r, u, scanning)
+            except RuntimeError:
+                bad_conv += 1; continue
+            best = min(range(1, 13), key=lambda f: (batch_cost(f, 0, q, r, u, scanning, a_new, a_cl) / f, f))
+            got = plan_batch('new', ['new'] * 30, q, r, u, scanning)[0]
+            cost_best = batch_cost(best, 0, q, r, u, scanning, a_new, a_cl) / best
+            cost_got = batch_cost(got, 0, q, r, u, scanning, a_new, a_cl) / got
+            if cost_got > cost_best * 1.02: stall.append((q, r, u, scanning, got, best, round(cost_got, 3), round(cost_best, 3)))
+    print(f'cells={cells} non-converged={bad_conv} walk more than 2% above the preferred size cost: {len(stall)}')
+    for s in stall[:12]: print('  ', s)
+    print('== B1: table special case (scanning off, each member alone: F(n)=n)')
+    table = [(0.992,12),(0.990,11),(0.988,10),(0.984,9),(0.979,8),(0.972,7),(0.959,6),(0.934,5),(0.876,4),(0.75,3)]
+    def tdepth(pe):
+        for thr, d in table:
+            if pe >= thr: return d
+        return 1
+    alone = lambda n, p, a_new: float(n) if n > 1 else 0.0
+    mism = []
+    for i in range(750, 996):
+        pe = i / 1000; q = 1 - pe
+        got = plan_batch('new', ['new'] * 30, q, 0.0, 1.0, False, fallback=alone)[0]
+        if got != tdepth(pe): mism.append((pe, got, tdepth(pe)))
+    print(f'mismatches {len(mism)} of 246:', mism[:8])
+    print('== B2: both defect rates 0 ->', plan_batch('new', ['new'] * 5 + ['cleared'] * 3, 0.0, 0.0, U, True, max_fresh=4, max_total=4),
+          plan_batch('new', ['new'] * 30, 0.0, 0.0, U, False))
+    print('== scan off, release rule: size picked for new requests',
+          {q: plan_batch('new', ['new'] * 30, q, R, U, False)[0] for q in (0.05, 0.08, 0.14, 0.20)})
+    print('== break-even tree cost F(12)/14 at scanning costs', {q: round(fallback_cost(12, q, going_costs(q, R, U, True)[0]) / 14, 2) for q in (0.05, 0.08, 0.14, 0.20)})
