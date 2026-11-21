@@ -3,7 +3,8 @@
 Injected in place of the production adapters through
 ``MergeLane(..., verifier=FakeVerifier(...), clock=FakeClock(...))``.
 ``FakeVerifier`` scripts the verify outcome per task id or in call order,
-and records each scoped verify as a ``ScopedVerifyCall``;
+or hands a call to a delegate that does real work at verify time, and
+records each scoped verify as a ``ScopedVerifyCall``;
 ``FakeRemoteRunner`` is a remote verify host handed to the lane through
 ``remote_runners=``; ``FakeClock`` is a
 hand-advanced clock whose ``sleep`` advances it and waits at most
@@ -41,7 +42,15 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
-from collections.abc import AsyncIterator, Collection, Coroutine, Iterable, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Iterable,
+    Mapping,
+)
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -77,6 +86,9 @@ async def remerge_on_main(
     onto main, holding no permit."""
     claim = RemergeClaim(RemergeBase(None, RemergeReason.NO_TIP), None)
     return await worker._remerge(req, started_monotonic, claim=claim)
+
+#: A scoped verify a script hands its call to, called with ``run_scoped``'s own arguments.
+ScopedVerify = Callable[..., Awaitable[VerifyResult]]
 
 
 def lane_entry(lane: MergeLane, request_id: str) -> dict[str, Any] | None:
@@ -173,16 +185,26 @@ async def branch_merge_request(
 class VerifyScript:
     """What one ``FakeVerifier.run_scoped`` call does.
 
-    Exactly one of the shapes below applies: return ``result``, raise
-    ``error``, or wait for ``release`` first and then return ``result``.
-    *entered*, when given, is set the moment a call reaches this script,
-    before any release wait; it is the arrival half of a release gate.
+    A call that reaches this script sets *entered*, when given (the arrival
+    half of a release gate), then waits for *release*, when given. It then
+    ends in exactly one way: it raises *error*, or returns what *delegate*
+    returns, or returns *result*. *error* and *delegate* each end the call,
+    so construction rejects a script carrying both. A call that raises or
+    delegates never returns *result*.
     """
 
     result: VerifyResult
     error: BaseException | None = None
     release: asyncio.Event | None = None
     entered: asyncio.Event | None = None
+    delegate: ScopedVerify | None = None
+
+    def __post_init__(self) -> None:
+        if self.error is not None and self.delegate is not None:
+            raise ValueError(
+                f'a VerifyScript cannot both raise {self.error!r} and '
+                f'delegate to {self.delegate!r}: each one ends the call',
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -211,6 +233,10 @@ def raises(error: BaseException) -> VerifyScript:
     return VerifyScript(result=passes().result, error=error)
 
 
+def delegates_to(delegate: ScopedVerify) -> VerifyScript:
+    return VerifyScript(result=passes().result, delegate=delegate)
+
+
 def hangs_until(
     release: asyncio.Event, *, entered: asyncio.Event | None = None,
 ) -> VerifyScript:
@@ -229,22 +255,52 @@ class FakeVerifier:
 
     Each ``run_scoped`` call follows the next of the ordered ``sequence``
     scripts while any remain, then ``scripts[task_id]``, then ``default``.
+    A call whose behaviour is more than a verdict (a side effect at verify
+    time, a span recorder, production's own ``run_scoped_verification``) is
+    scripted with ``delegates_to(fn)``, and is recorded like any other call.
     It records every task id it was asked about in ``verified`` and what each
     call was handed in ``verify_calls``, one ``ScopedVerifyCall`` per entry
-    into the BASE ``run_scoped`` (an override that does not delegate records
-    only ``verified``/``entered_count``, through ``_note_entry``).
+    into the BASE ``run_scoped`` (an override that does not call
+    ``super().run_scoped`` records only ``verified``/``entered_count``,
+    through ``_note_entry``).
     ``await_entry(n)`` waits for the *n*-th entry into ``run_scoped``, which
     is how a test waits for a scripted hang to be genuinely under way before
     it probes the lane -- per CALL, so a test that drives two verifies can
     wait for the SECOND one instead of being let through early by the first.
-    The gates a merge passes through after a green scoped verify all report
-    clean, the disk guard reports *disk_reason* (``None``, the default, being
-    "proceed"), and dry-run investigations are recorded in ``investigations``
-    rather than run.
+    Its post-verify methods report clean, the disk guard reports
+    *disk_reason* (``None``, the default, being "proceed"), and dry-run
+    investigations are recorded in ``investigations`` rather than run.
 
     Script a per-CALL sequence with ``sequence=``; a subclass that must vary
     the selection further overrides ``next_script``. A legacy subclass that
     overrides ``run_scoped`` itself must still call ``_note_entry``.
+
+    WHAT INJECTING IT DOES AND DOES NOT STUB of the post-merge gate chain.
+    Measured by counting ``verifier.<method>`` call sites under
+    ``orchestrator/src/orchestrator/``, because the answer is narrower than
+    the port's method list suggests:
+
+    * ``check_post_merge_pyright`` and ``check_post_merge_equivalence`` have
+      ZERO lane call sites.
+      ``orchestrator/src/orchestrator/merge_lane/gates.py::_run_pyright_gate``
+      and ``::_run_equivalence_gate`` call ``::_check_post_merge_pyright`` and
+      ``::_check_post_merge_equivalence`` directly, so both gates run
+      PRODUCTION code under an injected verifier.
+    * ``run_unscoped_typechecks`` IS injected
+      (``run_unscoped=verifier.run_unscoped_typechecks`` in the lane's
+      ``worker.py``, ``drift.py`` and ``shadow.py``). Production
+      ``orchestrator/src/orchestrator/merge_lane/gates.py::_run_unscoped_typechecks``
+      returns a clean ``PostMergePyrightResult()`` when no module config
+      carries a ``type_check_command``, which is what this fake returns for a
+      request built with ``module_configs=[]``.
+    * ``ensure_disk_space`` IS injected, and is the one real narrowing.
+      Production
+      ``orchestrator/src/orchestrator/merge_lane/worker.py::_ensure_verify_disk_space``
+      proceeds whenever free bytes are at or above the threshold; its other
+      branch prunes stale ``_merge-*`` worktrees and is unit-covered by
+      ``orchestrator/tests/test_merge_queue.py::TestEnsureVerifyDiskSpace``.
+      Injecting the port also makes a test independent of the host's free
+      disk.
     """
 
     def __init__(
@@ -319,6 +375,10 @@ class FakeVerifier:
             await script.release.wait()
         if script.error is not None:
             raise script.error
+        if script.delegate is not None:
+            return await script.delegate(
+                worktree, config, module_configs, task_files, **options,
+            )
         return script.result
 
     async def run_unscoped_typechecks(

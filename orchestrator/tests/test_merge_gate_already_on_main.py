@@ -19,12 +19,13 @@ from typing import Any
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _merge_lane_fakes import (
+    FakeVerifier,
+    delegates_to,
     lane_scene_config,
     make_lane,
     merge_through_lane,
     running_lane,
 )
-from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import git_env_with_ceiling, wait_responsive
 from _recording_event_store import _RecordingEventStore
 from df_pytest_isolation import git_redirect_env
@@ -131,7 +132,7 @@ def _lane(
 ) -> tuple[MergeLane, asyncio.Queue[Any]]:
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
-        scene.git_ops, queue, verifier=ScriptedVerifier(verify), event_store=store,
+        scene.git_ops, queue, verifier=FakeVerifier(delegates_to(verify)), event_store=store,
     )
     return lane, queue
 
@@ -246,7 +247,7 @@ async def test_in_flight_follower_of_a_carried_head_is_not_cascaded(tmp_path: Pa
     store = _RecordingEventStore()
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
-        scene.git_ops, queue, verifier=ScriptedVerifier(head_parks),
+        scene.git_ops, queue, verifier=FakeVerifier(delegates_to(head_parks)),
         event_store=store,
     )
     async with running_lane(lane) as run:

@@ -19,23 +19,28 @@ Steps covered:
 These real-git cases observe the lane through an injected ``VerifyPort``
 rather than a patch of ``run_scoped_verification``.  What that does and
 does NOT stub of the post-merge gate chain is stated once, with the
-measurement behind it, in ``_merge_lane_verifier_doubles.py``'s module
-docstring.
+measurement behind it, in
+``orchestrator/tests/_merge_lane_fakes.py::FakeVerifier``'s docstring.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import lane_scene_config, main_health_probe_spawned
-from _merge_lane_verifier_doubles import ScriptedVerifier
+from _merge_lane_fakes import (
+    FakeVerifier,
+    fails,
+    hangs_until,
+    lane_scene_config,
+    main_health_probe_spawned,
+)
 from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT, stop_merge_worker
 from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
-from _verify_result_doubles import fake_verify_result
 
 # Reuse the γ harness two-host fakes (established cross-test-module import
 # pattern — see test_concurrent_verify_boundary.py / test_merge_speculation.py).
@@ -896,18 +901,12 @@ class TestCascadeErrorChokepoint:
         """
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
-        _local_calls: list[int] = [0]
-
-        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
-            call = _local_calls[0]
-            _local_calls[0] += 1
-            if call == 0:
-                # N's verify: gate and fail.
-                gate_a_entered.set()
-                await gate_a_release.wait()
-                return fake_verify_result(passed=False, summary='test_failure')
-            # Any subsequent call (req_c's local verify) passes immediately.
-            return fake_verify_result(passed=True)
+        # N's verify gates and fails; any later call (req_c's local verify)
+        # passes immediately.
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            fails(category='test_failure', summary='test_failure'),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -920,7 +919,7 @@ class TestCascadeErrorChokepoint:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=verifier,
         )
         _inject_two_host_allocator(worker, gated_remote)
         calls = _spy_on_resolve_and_release(worker)
@@ -1103,18 +1102,12 @@ class TestCascadeErrorChokepoint:
         """
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
-        _local_calls: list[int] = [0]
-
-        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
-            call = _local_calls[0]
-            _local_calls[0] += 1
-            if call == 0:
-                # N's verify: gate and fail.
-                gate_a_entered.set()
-                await gate_a_release.wait()
-                return fake_verify_result(passed=False, summary='test_failure')
-            # Any subsequent call (req_c's local verify) passes immediately.
-            return fake_verify_result(passed=True)
+        # N's verify gates and fails; any later call (req_c's local verify)
+        # passes immediately.
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            fails(category='test_failure', summary='test_failure'),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -1138,7 +1131,7 @@ class TestCascadeErrorChokepoint:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=verifier,
         )
         _inject_two_host_allocator(worker, gated_remote)
         calls = _spy_on_resolve_and_release(worker)
@@ -1291,16 +1284,10 @@ class TestCascadeErrorChokepoint:
         """
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
-        _local_calls: list[int] = [0]
-
-        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
-            call = _local_calls[0]
-            _local_calls[0] += 1
-            if call == 0:
-                gate_a_entered.set()
-                await gate_a_release.wait()
-                return fake_verify_result(passed=False, summary='test_failure')
-            return fake_verify_result(passed=True)
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            fails(category='test_failure', summary='test_failure'),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -1313,7 +1300,7 @@ class TestCascadeErrorChokepoint:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=verifier,
         )
         allocator = _inject_two_host_allocator(worker, gated_remote)
         calls = _spy_on_resolve_and_release(worker)
@@ -1471,10 +1458,7 @@ class TestCascadeErrorChokepoint:
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
 
-        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
-            gate_a_entered.set()
-            await gate_a_release.wait()
-            return fake_verify_result(passed=True)
+        verifier = FakeVerifier(hangs_until(gate_a_release, entered=gate_a_entered))
 
         gated_remote = _gated_runner(
             gate_b_release, gate_b_entered, passed=True, name='laptop',
@@ -1485,7 +1469,7 @@ class TestCascadeErrorChokepoint:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=verifier,
         )
         _inject_two_host_allocator(worker, gated_remote)
         worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism

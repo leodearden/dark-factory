@@ -4062,35 +4062,6 @@ def _assert_quiescent_registry(
     )
 
 
-class _HangThenPassVerify(FakeVerifier):
-    """A verify port that HANGS once, then PASSES.
-
-    Call 1 blocks on a never-set Event so trigger 3's no-progress budget
-    fires and the request is RE-QUEUED.  Call 2 passes, so the re-dispatched
-    merge actually lands.  ``.calls`` is the surface-1 assertion: it must
-    reach 2, proving the re-queued request genuinely re-entered the pipeline
-    rather than being swallowed by ``the intake's re-entrant coalesce``.
-
-    A per-CALL sequence, which ``FakeVerifier``'s per-task scripts cannot
-    express — hence the subclass rather than a script.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.calls = 0
-
-    async def run_scoped(self, *args: Any, **options: Any) -> Any:
-        self.calls += 1
-        if self.calls == 1:
-            # Record the entry through the base class's own bookkeeping, so
-            # `verified` and `entered_count` stay truthful for the call this
-            # override never delegates.
-            self._note_entry(options.get('task_id'))
-            await asyncio.Event().wait()
-            raise AssertionError('unreachable — never set')  # pragma: no cover
-        return await super().run_scoped(*args, **options)
-
-
 @pytest.mark.asyncio
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 3927: real (unmocked) worker.run()
 # loop with real git subprocesses: per drive cycle a wait_for(20) entry
@@ -4128,7 +4099,12 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
 
         fake_eq = RecordingEscalations()
         q: asyncio.Queue = asyncio.Queue()
-        gate = _HangThenPassVerify()
+        # Call 1 hangs on a never-set Event so trigger 3's no-progress budget
+        # fires and RE-QUEUES the request; call 2 passes, so the re-dispatched
+        # merge lands. gate.entered_count reaching 2 proves the re-queued
+        # request re-entered the pipeline rather than being swallowed by
+        # the intake's re-entrant coalesce.
+        gate = FakeVerifier(sequence=[hangs_until(asyncio.Event())])
         # PRODUCTION_CLOCK: this is the second of the two tests here that runs
         # the real `worker.run()` loop, whose heartbeat and reprobe loops sleep
         # on the clock port — a fake clock would spin them.  So the no-progress
@@ -4143,7 +4119,7 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         # widened 180s per-test timeout (see the class decorator above).
         worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         # task 3927 amend (reviewer finding, robustness): PROBE/BUDGET raised
-        # 0.02/0.2 -> 0.2/2.0 (same 1:10 ratio) to address the gate.calls
+        # 0.02/0.2 -> 0.2/2.0 (same 1:10 ratio) to address the gate.entered_count
         # load-sensitivity at its root, not just its symptom. Under host CPU
         # oversubscription the whole process can be descheduled for a
         # stretch; too small a budget mistakes that scheduling stall for
@@ -4213,15 +4189,15 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         # returns a result, so each CONSECUTIVE dead/no-progress abort counts
         # toward it; the MAX_INFLIGHT_DEAD_VERIFY_ABORTS-th one takes the
         # terminal 'blocked' branch instead of re-dispatching again. So
-        # gate.calls == worker.verify_dispatch.MAX_INFLIGHT_DEAD_VERIFY_ABORTS is the true
+        # gate.entered_count == worker.verify_dispatch.MAX_INFLIGHT_DEAD_VERIFY_ABORTS is the true
         # reachable ceiling -- a hardcoded 5 would be unreachable (vacuous)
         # and would silently stop catching a genuine redispatch-storm
         # regression anywhere below it. A busy-loop-cap trip is instead
         # caught by `outcome.status == 'done'` below (it would read
         # 'blocked').
-        assert 2 <= gate.calls <= worker.verify_dispatch.MAX_INFLIGHT_DEAD_VERIFY_ABORTS, (
+        assert 2 <= gate.entered_count <= worker.verify_dispatch.MAX_INFLIGHT_DEAD_VERIFY_ABORTS, (
             f'expected the abort to be followed by a genuine RE-DISPATCH '
-            f'(run_scoped_verification called >=2 times), got {gate.calls} '
+            f'(run_scoped_verification called >=2 times), got {gate.entered_count} '
             f'call(s) — a single call means the re-queued request was dropped '
             f'before re-dispatch, and >{worker.verify_dispatch.MAX_INFLIGHT_DEAD_VERIFY_ABORTS} '
             f'calls cannot happen without also tripping the busy-loop cap'
@@ -4362,9 +4338,9 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         # derived from worker.verify_dispatch.MAX_INFLIGHT_DEAD_VERIFY_ABORTS, not a
         # hardcoded literal -- see the sibling test above for why a fixed 5
         # is vacuous (unreachable given the untouched default cap of 3).
-        assert 2 <= gate.calls <= worker.verify_dispatch.MAX_INFLIGHT_DEAD_VERIFY_ABORTS, (
+        assert 2 <= gate.entered_count <= worker.verify_dispatch.MAX_INFLIGHT_DEAD_VERIFY_ABORTS, (
             f'the abort path must re-dispatch on its own, with no operator '
-            f'intervention; run_scoped_verification saw {gate.calls} call(s) '
+            f'intervention; run_scoped_verification saw {gate.entered_count} call(s) '
             f'(expected >=2, and <={worker.verify_dispatch.MAX_INFLIGHT_DEAD_VERIFY_ABORTS} to '
             f'still catch a redispatch storm)'
         )
