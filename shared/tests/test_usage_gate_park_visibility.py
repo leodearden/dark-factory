@@ -643,6 +643,73 @@ class TestScopeExhaustedParkIsVisible:
             f'interval, not by how often the park re-polls ({chances} chances)'
         )
 
+    async def test_the_scoped_heartbeat_repeats_and_its_clock_advances(
+        self, caplog, fast_scope_heartbeat, stall_the_loop
+    ) -> None:
+        """One record at the start of a park hours from its scope reset is not
+        visibility: that is the silent park this task replaces.
+
+        ``elapsed_s`` is asserted NON-DECREASING rather than strictly
+        increasing because the payload is rounded to 0.1s, so consecutive
+        fast-interval heartbeats legitimately tie.
+        """
+        interval = fast_scope_heartbeat(0.02)
+        heartbeat_chances = 25
+        gate, _ = await _scope_exhausted_gate()
+
+        async with _interval_ticks(interval) as ticks:
+            stall_the_loop(outlasting=interval * heartbeat_chances)
+            await _park_for(
+                gate, 0.0, scope=SCOPE, until=lambda: ticks() >= heartbeat_chances
+            )
+
+        records = _park_records(caplog, SCOPE_PARK_EVENT)
+        assert len(records) >= 2, (
+            f'the scoped park emitted {len(records)} heartbeat(s) across the whole '
+            'park: a park that announces itself once and then sleeps toward a '
+            'scope reset hours away is indistinguishable from a hung run'
+        )
+        elapsed = [payload['elapsed_s'] for _, payload in records]
+        assert elapsed == sorted(elapsed), (
+            f'elapsed_s went backwards across one scoped park: {elapsed!r}'
+        )
+        assert elapsed[-1] > elapsed[0], (
+            f'elapsed_s never advanced across the whole scoped park: {elapsed!r}. '
+            'A heartbeat that repeats a frozen number cannot tell a ten-minute '
+            'park from a two-day one'
+        )
+
+    async def test_an_abandoned_scoped_park_does_not_poison_the_next_one(
+        self, caplog, fast_scope_heartbeat
+    ) -> None:
+        """The scoped clock is per waiter, so a cancelled park takes it along.
+
+        Pins that against a refactor to shared instance state, which would
+        need the fleet park's release machinery to stay correct.
+        """
+        interval = fast_scope_heartbeat(0.05)
+        gate, _ = await _scope_exhausted_gate()
+
+        await _park_for(gate, interval * 2.4, scope=SCOPE)
+        assert _park_records(caplog, SCOPE_PARK_EVENT), (
+            'the first scoped park logged nothing, so this test cannot show that '
+            'its clock was or was not inherited'
+        )
+
+        caplog.clear()
+        await _park_for(gate, interval * 1.5, scope=SCOPE)
+
+        records = _park_records(caplog, SCOPE_PARK_EVENT)
+        assert records, (
+            'the second scoped park emitted no heartbeat: its first line was '
+            'throttled against a park that had already been abandoned'
+        )
+        first_elapsed = records[0][1]['elapsed_s']
+        assert first_elapsed < interval, (
+            f'the second scoped park opened at elapsed_s={first_elapsed!r}, '
+            "inheriting the abandoned park's start time"
+        )
+
 
 class TestAnAbandonedParkIsNotInherited:
     """A park that ends by cancellation must not bequeath its clock.
