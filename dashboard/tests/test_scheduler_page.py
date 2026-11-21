@@ -36,12 +36,8 @@ def _forget_scheduler_state():
 
 
 def _tasks_read(active=(), *, offline=(), degraded=()):
-    """A ``collect_tasks_with_counts`` result whose rows ride on the units.
-
-    As on the real collector, each root's rows are carried by that root's
-    unit; the flat first half is left empty.
-    """
-    return [], units_by_label(active, offline=offline, degraded=degraded)
+    """A ``collect_tasks_with_counts`` result: ``{label: unit}``, each carrying its root's rows."""
+    return units_by_label(active, offline=offline, degraded=degraded)
 
 
 # ---------------------------------------------------------------------------

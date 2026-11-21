@@ -86,7 +86,7 @@ async def _collect_modules(
         patch('dashboard.data.scheduler.mcp_tool_call', side_effect=mcp_tool_call),
         patch(
             'dashboard.data.scheduler.collect_tasks_with_counts',
-            AsyncMock(return_value=([], units_by_label(active))),
+            AsyncMock(return_value=units_by_label(active)),
         ),
     ):
         _rows, modules, *_ = await collect_scheduler_state(client, config)

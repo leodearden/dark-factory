@@ -254,7 +254,7 @@ measured "no project has any done tasks". The rows travel only as
 def test_tasks_endpoint_carries_no_flat_row_list(client):
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], {})),
+        new=AsyncMock(return_value={}),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -282,7 +282,7 @@ def test_tasks_endpoint_carries_a_validated_census_per_root(client):
 
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], _snapshots(['dark-factory'], done={'dark-factory': 7}))),
+        new=AsyncMock(return_value=_snapshots(['dark-factory'], done={'dark-factory': 7})),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -537,7 +537,7 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
         _install_roots(client, [Path('/proj') / label])
         with patch(
             'dashboard.api.tasks.collect_tasks_with_counts',
-            new=AsyncMock(return_value=([], {label: broken})),
+            new=AsyncMock(return_value={label: broken}),
         ), caplog.at_level(logging.WARNING):
             resp = client.get('/api/v2/dashboard/tasks')
     finally:
@@ -623,7 +623,7 @@ def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
     _install_roots(client, _fake_roots(1))
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], _snapshots(['dark-factory'], offline=['dark-factory']))),
+        new=AsyncMock(return_value=_snapshots(['dark-factory'], offline=['dark-factory'])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -657,7 +657,7 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
         'external_deps': [{'id': 'dark_factory:13', 'status': 'done'}],
     }
     rows = Datum([mock_row], datetime.now(UTC), DatumState.FRESH, None, FRESHNESS_BOUND_SECONDS)
-    mock = AsyncMock(return_value=([mock_row], {label: replace(_snapshot(), rows=rows)}))
+    mock = AsyncMock(return_value={label: replace(_snapshot(), rows=rows)})
 
     with patch('dashboard.api.tasks.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -689,7 +689,7 @@ def test_tasks_endpoint_asks_for_no_terminal_cap(client):
     would be the handler re-imposing a server-side render policy on a request
     that no longer asks for terminal rows at all.
     """
-    mock = AsyncMock(return_value=([], {}))
+    mock = AsyncMock(return_value={})
 
     with patch('dashboard.api.tasks.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -755,15 +755,12 @@ def _tasks_body(
         | {f'p{i}' for i in range(total_roots)}
     )
     collector = AsyncMock(
-        return_value=(
-            [],
-            _snapshots(
-                labels,
-                offline=offline_projects,
-                degraded=degraded_projects,
-                count_unknown=count_unknown_projects,
-                count_stale=count_stale_projects,
-            ),
+        return_value=_snapshots(
+            labels,
+            offline=offline_projects,
+            degraded=degraded_projects,
+            count_unknown=count_unknown_projects,
+            count_stale=count_stale_projects,
         )
     )
     _install_roots(client, _fake_roots(total_roots))
@@ -2085,7 +2082,7 @@ def test_last_good_rows_do_not_veto_the_outage_flag(client):
     _install_roots(client, _fake_roots(1))
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([row], {'p0': offline})),
+        new=AsyncMock(return_value={'p0': offline}),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
 
