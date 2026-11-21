@@ -103,7 +103,7 @@ from orchestrator.artifacts import (
 )
 from orchestrator.branch_base import own_work_base
 from orchestrator.branch_mergeability import Mergeability, read_branch_state
-from orchestrator.branch_stack import RestackConflict, StackTarget
+from orchestrator.branch_stack import RestackConflict, StackInspectionError, StackTarget
 from orchestrator.completion_record import completion_record_metadata
 from orchestrator.config import EscalationConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
@@ -11781,11 +11781,32 @@ class TaskWorkflow:
         return self.artifacts.aggregate_reviews()
 
     async def _own_work_base(self) -> str:
-        """The base whose ``...HEAD`` range in the worktree is this task's own work."""
+        """The base whose ``...HEAD`` range in the worktree is this task's own work.
+
+        A branch still stacked on an unlanded predecessor's commits measures
+        from the top of them (``GitOps.own_delta_cut``, the merge queue's
+        rule); any other branch from its fork point with main.
+        """
         assert self.worktree is not None and self.artifacts is not None
+        if not self._worktree_external:
+            stack_cut = await self._unlanded_stack_cut()
+            if stack_cut is not None:
+                return stack_cut
         return await own_work_base(
             self.worktree, self.config.git.main_branch, self.artifacts.read_base_commit(),
         )
+
+    async def _unlanded_stack_cut(self) -> str | None:
+        branch = f'{self.config.git.branch_prefix}{self.task_id}'
+        try:
+            return await self.git_ops.own_delta_cut(branch)
+        except StackInspectionError as exc:
+            logger.warning(
+                'Task %s: cannot tell whether %s still carries a stack base (%s); '
+                'its own work is measured from the fork point with main',
+                self.task_id, branch, exc,
+            )
+            return None
 
     async def _context_complete_review_subject(self) -> ReviewSubject:
         """The context-complete reviewer's inputs, from the worktree at its own-work base."""

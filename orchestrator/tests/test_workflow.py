@@ -95,6 +95,7 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
 
     scheduler = MagicMock()
     git_ops = MagicMock()
+    git_ops.own_delta_cut = AsyncMock(return_value=None)
 
     wf = TaskWorkflow(
         assignment=assignment,
