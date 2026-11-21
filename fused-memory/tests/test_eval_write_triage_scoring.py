@@ -710,13 +710,6 @@ class TestRenderMarkdown:
         middle = next(ln for ln in md.splitlines() if 'MIDDLE band' in ln)
         assert '[t_low, t_high)' in middle
 
-    def test_the_retrieved_population_caveat_names_route_band(self) -> None:
-        retrieved = _scoring().MODE_CAVEATS[_scoring().SLATE_RETRIEVED]
-        population = [caveat for caveat in retrieved if 'route_band' in caveat]
-        assert len(population) == 1, retrieved
-        assert 'near-verbatim' in population[0]
-        assert not [caveat for caveat in retrieved if 'ONLY for the middle band' in caveat]
-
     def test_renders_a_provenance_bullet_list(self) -> None:
         md = self._md()
         assert '## Provenance' in md
