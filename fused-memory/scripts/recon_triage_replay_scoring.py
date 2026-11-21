@@ -10,9 +10,12 @@ weights. Rationale and findings: ``fused-memory/calibration/recon_triage_replay_
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+import math
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from numbers import Real
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -38,6 +41,12 @@ else:
     _stats = load_script(_SCRIPTS / 'write_triage_stats.py', 'write_triage_stats')
 
 Cell = _rubric.Cell
+
+BOOTSTRAP_RESAMPLES = 10_000
+BOOTSTRAP_SEED = 7161
+NO_DECISION = 'no_decision'
+"""The confusion-matrix column of a sampled child recon gave no decision for."""
+PROVISIONAL_HARM_WEIGHTS = _reader.PROVISIONAL_HARM_WEIGHTS
 
 
 class Decision(StrEnum):
@@ -176,3 +185,482 @@ def repaired_item(row: Mapping[str, Any], action: Action) -> dict[str, Any]:
     elif action.decision is Decision.NOT_A_CONTEST:
         repaired['outcome'] = OUTCOME_AMENDED
     return repaired
+
+
+def sample_stratum(outcome: str, project: str) -> str:
+    """The replay sample's stratum of a child: its triage outcome and its project."""
+    return f'{outcome}|{project}'
+
+
+def derive_item(
+    row: Mapping[str, Any], judgements: Mapping[_rubric.PairKey, _rubric.Judgement],
+) -> _rubric.Derivation:
+    """*row*'s current-basis derivation, read the way ``score_write_triage_reader`` reads an item."""
+    item = _reader.ReaderItem.from_row(0, row)
+    return _rubric.derive(
+        item.outcome,
+        {
+            target: judgements.get(_rubric.PairKey(item.entry_id, target, _rubric.Basis.CURRENT))
+            for target in item.targets
+        },
+        supersedes_target=item.supersedes_target,
+        superseded_marks=item.superseded_marks,
+        in_m1_band=item.band == _rubric.M1_BAND,
+    )
+
+
+def corpus_derivations(
+    items: Iterable[Mapping[str, Any]], verdicts: Iterable[Mapping[str, Any]],
+) -> dict[str, _rubric.Derivation]:
+    """Each corpus item's derivation under *verdicts*, by entry id."""
+    judgements = _rubric.resolve_judgements(verdicts)
+    return {row['entry_id']: derive_item(row, judgements) for row in items}
+
+
+@dataclass(frozen=True)
+class _Replayed:
+    """One sampled child: the truth, the repair it needed, and recon's repair priced."""
+
+    entry_id: str
+    outcome: str
+    project: str
+    stratum: str
+    headline: bool
+    live_recon_state: str | None
+    truth: _rubric.Decided
+    expected: Action
+    action: Action | None
+    repaired: _rubric.Derivation
+
+    @property
+    def repaired_decided(self) -> _rubric.Decided | None:
+        return self.repaired if isinstance(self.repaired, _rubric.Decided) else None
+
+    @property
+    def correct(self) -> bool:
+        return self.action == self.expected
+
+
+_Predicate = Callable[[_Replayed], bool]
+
+_DERIVATION_KINDS: Mapping[type, str] = MappingProxyType({
+    _rubric.Incomplete: 'incomplete', _rubric.Unclear: 'unclear',
+})
+
+
+def score_replay(
+    sample_rows: Iterable[Mapping[str, Any]],
+    corpus_items: Iterable[Mapping[str, Any]],
+    verdicts: Iterable[Mapping[str, Any]],
+    decisions: Iterable[Mapping[str, Any]],
+    *,
+    rubric: str,
+    strata_populations: Mapping[str, int],
+    harm_weights: Mapping[str, float] = PROVISIONAL_HARM_WEIGHTS,
+) -> dict[str, Any]:
+    """Score recon's *decisions* on the sampled children against the rated corpus.
+
+    *rubric* labels the brief the verdicts were rated under. Headline figures
+    read only rows flagged ``headline``; every row carrying a live recon state
+    is also tabled in ``touched``. A sampled child with no decision is a miss
+    and is never a detach, and its harm is the judge's. The report carries no
+    timestamps, so the same inputs always give the same report.
+    """
+    weights = _validated_weights(harm_weights)
+    items = {row['entry_id']: row for row in corpus_items}
+    judgements = _rubric.resolve_judgements(verdicts)
+    sample = _sample(sample_rows, items)
+    chosen = _actions(decisions, sample)
+    replayed = [
+        _replay(row, items[row['entry_id']], chosen.get(row['entry_id']), judgements)
+        for row in sorted(sample.values(), key=lambda row: row['entry_id'])
+    ]
+    headline = [r for r in replayed if r.headline]
+    stratum_weights = _stratum_weights(headline, items.values(), strata_populations)
+    projects = sorted({r.project for r in headline})
+    return {
+        'rubric': rubric,
+        'harm_weights': {str(cell): weight for cell, weight in weights.items()},
+        'harm_weights_status': (
+            _reader.HARM_WEIGHTS_STATUS
+            if dict(weights) == dict(PROVISIONAL_HARM_WEIGHTS) else 'custom'
+        ),
+        'bootstrap': {'resamples': BOOTSTRAP_RESAMPLES, 'seed': BOOTSTRAP_SEED},
+        'sample': {
+            'n_headline': len(headline),
+            'n_report_only': len(replayed) - len(headline),
+            'n_touched': sum(r.live_recon_state is not None for r in replayed),
+            'by_stratum': dict(sorted(Counter(r.stratum for r in headline).items())),
+            'stratum_weights': {
+                stratum: round(weight, 4) for stratum, weight in stratum_weights.items()
+            },
+        },
+        'headline': _metric_blocks(headline, stratum_weights),
+        'action_accuracy_by_outcome': {
+            outcome: _action_accuracy([r for r in headline if r.outcome == outcome], stratum_weights)
+            for outcome in sorted({r.outcome for r in headline})
+        },
+        'by_project': {
+            project: _metric_blocks([r for r in headline if r.project == project], stratum_weights)
+            for project in projects
+        },
+        'confusion': _confusion(headline),
+        'harm': _harm(headline, weights, stratum_weights, projects),
+        'no_decision': _no_decision(headline),
+        'touched': [_touched_row(r, weights) for r in replayed if r.live_recon_state is not None],
+    }
+
+
+def _validated_weights(harm_weights: Mapping[str, float]) -> Mapping[str, float]:
+    cells = sorted(cell.value for cell in Cell)
+    for key, weight in harm_weights.items():
+        if key not in cells:
+            raise ValueError(f'harm weight {key!r}: {weight!r} names no cell; the cells are {cells}')
+        if isinstance(weight, bool) or not isinstance(weight, Real) or not (
+            math.isfinite(weight) and weight >= 0
+        ):
+            raise ValueError(f'harm weight {key!r}: {weight!r} is not a finite non-negative number')
+    return MappingProxyType(dict(harm_weights))
+
+
+_SAMPLE_FACTS = ('target_id', 'outcome', 'project')
+
+
+def _entry_id(row: Mapping[str, Any], what: str) -> str:
+    entry = row.get('entry_id')
+    if not isinstance(entry, str) or not entry:
+        raise ValueError(f'{what} {dict(row)!r}: entry_id {entry!r} is not a non-empty string')
+    return entry
+
+
+def _sample(
+    rows: Iterable[Mapping[str, Any]], items: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    """Every sample row by entry id, refused unless it agrees with its corpus item."""
+    sample: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        entry = _entry_id(row, 'sample row')
+        if entry in sample:
+            raise ValueError(f'sample row {entry!r}: duplicate entry_id')
+        item = items.get(entry)
+        if item is None:
+            raise ValueError(f'sample row {entry!r}: no corpus item has this entry_id')
+        disagree = [key for key in _SAMPLE_FACTS if row.get(key) != item[key]]
+        if disagree:
+            raise ValueError(
+                f'sample row {entry!r}: {", ".join(disagree)} disagree with the corpus item:'
+                f' {[(row.get(key), item[key]) for key in disagree]}'
+            )
+        if row.get('stratum') != sample_stratum(row['outcome'], row['project']):
+            raise ValueError(
+                f'sample row {entry!r}: stratum {row.get("stratum")!r} is not'
+                f' {sample_stratum(row["outcome"], row["project"])!r}'
+            )
+        if not isinstance(row.get('headline'), bool):
+            raise ValueError(f'sample row {entry!r}: headline {row.get("headline")!r} is not a bool')
+        sample[entry] = row
+    return sample
+
+
+def _actions(
+    decisions: Iterable[Mapping[str, Any]], sample: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Action]:
+    """Each decided child's action, refused unless it is sampled, unique and allowed."""
+    chosen: dict[str, Action] = {}
+    for row in decisions:
+        entry = _entry_id(row, 'decision')
+        sampled = sample.get(entry)
+        if sampled is None:
+            raise ValueError(f'decision for {entry!r}: the child is not in the sample')
+        if entry in chosen:
+            raise ValueError(f'decision for {entry!r}: a second decision for the same child')
+        if row.get('target_id') != sampled['target_id']:
+            raise ValueError(
+                f'decision for {entry!r}: target_id {row.get("target_id")!r} is not the'
+                f' sampled parent {sampled["target_id"]!r}'
+            )
+        decision = row.get('decision')
+        if not isinstance(decision, str):
+            raise ValueError(f'decision for {entry!r}: decision {decision!r} is not a string')
+        try:
+            chosen[entry] = action_for(sampled['outcome'], decision, row.get('relabel_to'))
+        except ValueError as exc:
+            raise ValueError(f'decision for {entry!r}: {exc}') from exc
+    return chosen
+
+
+def _replay(
+    row: Mapping[str, Any],
+    item: Mapping[str, Any],
+    action: Action | None,
+    judgements: Mapping[_rubric.PairKey, _rubric.Judgement],
+) -> _Replayed:
+    truth = derive_item(item, judgements)
+    if not isinstance(truth, _rubric.Decided):
+        raise ValueError(f'sample row {row["entry_id"]!r}: its rated truth is not Decided: {truth}')
+    return _Replayed(
+        entry_id=row['entry_id'],
+        outcome=row['outcome'],
+        project=row['project'],
+        stratum=row['stratum'],
+        headline=row['headline'],
+        live_recon_state=row.get('live_recon_state'),
+        truth=truth,
+        expected=expected_action(row['outcome'], truth),
+        action=action,
+        repaired=truth if action is None else derive_item(repaired_item(item, action), judgements),
+    )
+
+
+def _stratum_weights(
+    headline: Sequence[_Replayed],
+    corpus_items: Iterable[Mapping[str, Any]],
+    strata_populations: Mapping[str, int],
+) -> dict[str, float]:
+    """Each sample stratum's weight: its estimated population over the children drawn from it.
+
+    A sample stratum's population is, over each corpus stratum, that stratum's
+    population times its corpus items' share falling in the sample stratum.
+    """
+    corpus = list(corpus_items)
+    corpus_sizes = Counter(item['stratum'] for item in corpus)
+    shares = Counter(
+        (sample_stratum(item['outcome'], item['project']), item['stratum']) for item in corpus
+    )
+    weights: dict[str, float] = {}
+    for stratum, drawn in sorted(Counter(r.stratum for r in headline).items()):
+        sources = sorted(source for sampled, source in shares if sampled == stratum)
+        missing = [source for source in sources if source not in strata_populations]
+        if missing:
+            raise ValueError(
+                f'sample stratum {stratum!r} has no weight: corpus strata {missing} have no'
+                f' population; populations given: {sorted(strata_populations)}'
+            )
+        population = sum(
+            strata_populations[source] * shares[stratum, source] / corpus_sizes[source]
+            for source in sources
+        )
+        weights[stratum] = population / drawn
+    return weights
+
+
+def _rate_block(
+    rows: Sequence[_Replayed],
+    member: _Predicate,
+    hit: _Predicate,
+    weights: Mapping[str, float],
+) -> dict[str, Any]:
+    """*hit* among the *member* rows: the sample rate and the population-weighted rate.
+
+    Every row is a unit of its stratum, counted in the denominator only when it
+    is a member, so the bootstrap keeps each stratum's size.
+    """
+    units = [
+        _stats.StratumUnit(r.stratum, float(member(r) and hit(r)), float(member(r))) for r in rows
+    ]
+    n = sum(member(r) for r in rows)
+    hits = sum(member(r) and hit(r) for r in rows)
+    return {
+        'n': n,
+        'hits': hits,
+        'rate': _stats.rate(hits, n),
+        'wilson95': _stats.wilson95(hits, n),
+        'population_rate': _stats.stratified_ratio(units, weights) if n else None,
+        'population_interval95': _bootstrap(units, weights) if n else None,
+    }
+
+
+def _bootstrap(units: Sequence[_stats.StratumUnit], weights: Mapping[str, float]) -> list[float] | None:
+    return _stats.stratified_bootstrap95(
+        units, weights, resamples=BOOTSTRAP_RESAMPLES, seed=BOOTSTRAP_SEED,
+    )
+
+
+def _judge_wrong_home(r: _Replayed) -> bool:
+    return Cell.WRONG_HOME in r.truth.triage_cells
+
+
+def _contested(r: _Replayed) -> bool:
+    return r.outcome == OUTCOME_CONTESTED
+
+
+def _every(_: _Replayed) -> bool:
+    return True
+
+
+def _repair_clears_wrong_home(r: _Replayed) -> bool:
+    repaired = r.repaired_decided
+    return r.action is not None and repaired is not None and Cell.WRONG_HOME not in repaired.triage_cells
+
+
+def _detached(r: _Replayed) -> bool:
+    return r.action is not None and r.action.decision is Decision.DETACH
+
+
+def _correct(r: _Replayed) -> bool:
+    return r.correct
+
+
+def _misfile_detection(rows: Sequence[_Replayed], weights: Mapping[str, float]) -> dict[str, Any]:
+    """Among the judge's wrong homes, the share recon's repair leaves with no wrong home."""
+    return _rate_block(rows, _judge_wrong_home, _repair_clears_wrong_home, weights)
+
+
+def _wrong_detach_rate(rows: Sequence[_Replayed], weights: Mapping[str, float]) -> dict[str, Any]:
+    """Among children rightly homed, the share recon detached, and the true contests among them."""
+    def rightly_homed(r: _Replayed) -> bool:
+        return not _judge_wrong_home(r)
+
+    return {
+        **_rate_block(rows, rightly_homed, _detached, weights),
+        'correct_contests_detached': sum(
+            rightly_homed(r) and _contested(r) and r.truth.conflict and _detached(r) for r in rows
+        ),
+    }
+
+
+def _contest_resolution_accuracy(
+    rows: Sequence[_Replayed], weights: Mapping[str, float],
+) -> dict[str, Any]:
+    """Among contested children, the share whose repair is exactly the expected one."""
+    return _rate_block(rows, _contested, _correct, weights)
+
+
+def _action_accuracy(rows: Sequence[_Replayed], weights: Mapping[str, float]) -> dict[str, Any]:
+    """The share of children whose repair is exactly the expected one."""
+    return _rate_block(rows, _every, _correct, weights)
+
+
+def _judge_wrong_home_all(rows: Sequence[_Replayed], weights: Mapping[str, float]) -> dict[str, Any]:
+    """The judge's wrong-home share over every child (rubric v2.2 M4 on these rows)."""
+    return _rate_block(rows, _every, _judge_wrong_home, weights)
+
+
+def _judge_wrong_home_contested(
+    rows: Sequence[_Replayed], weights: Mapping[str, float],
+) -> dict[str, Any]:
+    """The judge's wrong-home share over contested children."""
+    return _rate_block(rows, _contested, _judge_wrong_home, weights)
+
+
+_METRICS: Mapping[str, Callable[[Sequence[_Replayed], Mapping[str, float]], dict[str, Any]]] = (
+    MappingProxyType({
+        'misfile_detection': _misfile_detection,
+        'wrong_detach_rate': _wrong_detach_rate,
+        'contest_resolution_accuracy': _contest_resolution_accuracy,
+        'action_accuracy': _action_accuracy,
+        'judge_wrong_home_all': _judge_wrong_home_all,
+        'judge_wrong_home_contested': _judge_wrong_home_contested,
+    })
+)
+METRIC_NAMES = tuple(_METRICS)
+
+
+def _metric_blocks(rows: Sequence[_Replayed], weights: Mapping[str, float]) -> dict[str, Any]:
+    return {name: metric(rows, weights) for name, metric in _METRICS.items()}
+
+
+def _recon_label(r: _Replayed) -> str:
+    return NO_DECISION if r.action is None else r.action.label
+
+
+def _confusion(rows: Sequence[_Replayed]) -> dict[str, dict[str, int]]:
+    """How many children of each expected repair recon gave each repair."""
+    counts = Counter((r.expected.label, _recon_label(r)) for r in rows)
+    return {
+        expected: {
+            recon: count for (row_expected, recon), count in sorted(counts.items())
+            if row_expected == expected
+        }
+        for expected in sorted({expected for expected, _ in counts})
+    }
+
+
+def _write_harm(cells: frozenset[_rubric.Cell], weights: Mapping[str, float]) -> float:
+    return sum(weights.get(cell, 0) for cell in sorted(cells))
+
+
+def _harm(
+    rows: Sequence[_Replayed],
+    weights: Mapping[str, float],
+    stratum_weights: Mapping[str, float],
+    projects: Sequence[str],
+) -> dict[str, Any]:
+    """Harm per write as the judge filed, as recon repaired, and stored flat, over priced rows."""
+    priced = [r for r in rows if r.repaired_decided is not None]
+    return {
+        **_harm_figures(priced, weights, stratum_weights),
+        'unpriced': [
+            {'entry_id': r.entry_id, 'action': _recon_label(r),
+             'derivation': _DERIVATION_KINDS[type(r.repaired)]}
+            for r in rows if r.repaired_decided is None
+        ],
+        'by_project': {
+            project: _harm_figures(
+                [r for r in priced if r.project == project], weights, stratum_weights,
+            )
+            for project in projects
+        },
+    }
+
+
+_REGIMES: Mapping[str, Callable[[_Replayed], frozenset[_rubric.Cell]]] = MappingProxyType({
+    'judge': lambda r: r.truth.triage_cells,
+    'recon': lambda r: _priced(r).triage_cells,
+    'status_quo': lambda r: r.truth.status_quo_cells,
+})
+
+
+def _priced(r: _Replayed) -> _rubric.Decided:
+    repaired = r.repaired_decided
+    if repaired is None:
+        raise ValueError(f'child {r.entry_id!r}: recon\'s repair has no priced derivation')
+    return repaired
+
+
+def _harm_figures(
+    priced: Sequence[_Replayed], weights: Mapping[str, float], stratum_weights: Mapping[str, float],
+) -> dict[str, Any]:
+    harms = {
+        regime: [_stats.StratumUnit(r.stratum, _write_harm(cells(r), weights), 1.0) for r in priced]
+        for regime, cells in _REGIMES.items()
+    }
+    delta = [
+        _stats.StratumUnit(r.stratum, mine.numerator - judge.numerator, 1.0)
+        for r, mine, judge in zip(priced, harms['recon'], harms['judge'], strict=True)
+    ]
+    uniform = {stratum: 1.0 for stratum in stratum_weights}
+    empty = not priced
+    return {
+        'n': len(priced),
+        'per_write': {regime: _stats.stratified_ratio(units, uniform) for regime, units in harms.items()},
+        'delta_per_write': _stats.stratified_ratio(delta, uniform),
+        'delta_interval95': None if empty else _bootstrap(delta, uniform),
+        'population_per_write': {
+            regime: _stats.stratified_ratio(units, stratum_weights) for regime, units in harms.items()
+        },
+        'population_delta_per_write': _stats.stratified_ratio(delta, stratum_weights),
+        'population_delta_interval95': None if empty else _bootstrap(delta, stratum_weights),
+    }
+
+
+def _no_decision(rows: Sequence[_Replayed]) -> dict[str, Any]:
+    missing = [r.entry_id for r in rows if r.action is None]
+    return {'count': len(missing), 'entry_ids': missing}
+
+
+def _touched_row(r: _Replayed, weights: Mapping[str, float]) -> dict[str, Any]:
+    repaired = r.repaired_decided
+    return {
+        'entry_id': r.entry_id,
+        'project': r.project,
+        'outcome': r.outcome,
+        'headline': r.headline,
+        'live_recon_state': r.live_recon_state,
+        'truth_cells': sorted(str(cell) for cell in r.truth.triage_cells),
+        'expected': r.expected.label,
+        'recon': None if r.action is None else r.action.label,
+        'correct': r.correct,
+        'judge_harm': _write_harm(r.truth.triage_cells, weights),
+        'recon_harm': None if repaired is None else _write_harm(repaired.triage_cells, weights),
+    }
