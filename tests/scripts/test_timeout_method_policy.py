@@ -295,7 +295,11 @@ def _run_probe_suite(
     default pytest temp root; why:
     ``test_timeout_method_policy.py::test_a_probe_suite_run_leaves_the_hosts_default_temp_root_untouched``.
     """
-    smuggled = [arg for arg in extra if arg == '--basetemp' or arg.startswith('--basetemp=')]
+    smuggled = [
+        extra[i:i + 2] if arg == '--basetemp' else (arg,)
+        for i, arg in enumerate(extra)
+        if arg == '--basetemp' or arg.startswith('--basetemp=')
+    ]
     if smuggled:
         raise ValueError(
             'a probe suite runs under its own basetemp (suite.basetemp); extra may '
@@ -576,7 +580,7 @@ def test_a_basetemp_smuggled_through_extra_is_refused_before_any_session_starts(
     with pytest.raises(ValueError, match='--basetemp') as refused:
         _run_probe_suite(suite, '-k', TEMPROOT_RECORDER_TEST, '-n', '0', *smuggle)
 
-    assert smuggle[0] in str(refused.value)
+    assert str(smuggled) in str(refused.value)
     assert recorded_temproot(suite.root) is None, 'a session started anyway'
 
 
