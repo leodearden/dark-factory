@@ -16,7 +16,7 @@ Fixture shape (``stacked`` fixture):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from pathlib import Path
 
 import pytest
@@ -24,12 +24,16 @@ import pytest_asyncio
 
 from orchestrator.branch_stack import (
     StackBaseLedger,
+    StackBaseRead,
     StackInspectionError,
+    StackRecordState,
+    StackTarget,
     base_owners,
     foreign_commit_cut,
 )
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.ref_ledger import GitRunner
 
 # ---------------------------------------------------------------------------
 # Helpers (copied locally from test_git_ops_train_solo.py, per-file convention)
@@ -212,6 +216,165 @@ class TestStackBaseLedger:
         assert await ledger.base_of('task/M') == stacked.p_tip
         object_type = await _git(stacked.repo, 'cat-file', '-t', stacked.p_tip)
         assert object_type.strip() == 'commit'
+
+
+# ---------------------------------------------------------------------------
+# StackBaseLedger.read / ensure_record, StackBaseRead, StackTarget (task 10473)
+# ---------------------------------------------------------------------------
+
+
+def _runner_failing(*prefix: str, seen: list[list[str]] | None = None) -> GitRunner:
+    """The real runner, except that a git call whose arguments start with
+    *prefix* answers rc 128; every call is appended to *seen* when given."""
+
+    async def run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
+        if seen is not None:
+            seen.append(list(cmd))
+        if prefix and tuple(cmd[1:1 + len(prefix)]) == prefix:
+            return 128, '', 'fatal: injected failure'
+        return await _run(cmd, cwd=cwd)
+
+    return run
+
+
+@pytest.mark.asyncio
+class TestStackBaseRead:
+    async def test_a_branch_with_no_record_reads_absent(self, stacked: Stacked) -> None:
+        read = await StackBaseLedger(stacked.repo, _run).read('task/M')
+
+        assert read.state is StackRecordState.ABSENT
+        assert read.base is None
+
+    async def test_a_recorded_branch_reads_its_base(self, stacked: Stacked) -> None:
+        ledger = StackBaseLedger(stacked.repo, _run)
+        await ledger.record('task/M', stacked.p_tip)
+
+        read = await ledger.read('task/M')
+
+        assert read.state is StackRecordState.RECORDED
+        assert read.base == stacked.p_tip
+        assert read.names(stacked.p_tip)
+        assert not read.names(stacked.p_first)
+
+    async def test_a_ledger_outside_any_repository_is_unreadable(
+        self, tmp_path: Path,
+    ) -> None:
+        outside = tmp_path / 'not-a-repo'
+        outside.mkdir()
+        ledger = StackBaseLedger(outside, _run)
+
+        read = await ledger.read('task/M')
+
+        assert read.state is StackRecordState.UNREADABLE
+        assert read.base is None
+        assert read.detail
+        assert await ledger.base_of('task/M') is None
+
+    async def test_a_failing_ref_listing_is_unreadable_not_absent(
+        self, stacked: Stacked,
+    ) -> None:
+        await StackBaseLedger(stacked.repo, _run).record('task/M', stacked.p_tip)
+        ledger = StackBaseLedger(stacked.repo, _runner_failing('for-each-ref'))
+
+        read = await ledger.read('task/M')
+
+        assert read.state is StackRecordState.UNREADABLE
+        assert read.base is None
+
+    async def test_base_of_answers_none_for_absent_and_the_base_once_recorded(
+        self, stacked: Stacked,
+    ) -> None:
+        ledger = StackBaseLedger(stacked.repo, _run)
+        assert await ledger.base_of('task/M') is None
+
+        await ledger.record('task/M', stacked.p_tip)
+
+        assert await ledger.base_of('task/M') == stacked.p_tip
+
+    async def test_ensure_record_writes_an_absent_record(self, stacked: Stacked) -> None:
+        ledger = StackBaseLedger(stacked.repo, _run)
+
+        read = await ledger.ensure_record('task/M', stacked.p_tip)
+
+        assert read == StackBaseRead(StackRecordState.RECORDED, stacked.p_tip)
+        assert await ledger.base_of('task/M') == stacked.p_tip
+
+    async def test_ensure_record_replaces_a_record_naming_another_base(
+        self, stacked: Stacked,
+    ) -> None:
+        ledger = StackBaseLedger(stacked.repo, _run)
+        await ledger.record('task/M', stacked.p_first)
+
+        read = await ledger.ensure_record('task/M', stacked.p_tip)
+
+        assert read.names(stacked.p_tip)
+
+    async def test_ensure_record_writes_nothing_when_the_record_names_the_base(
+        self, stacked: Stacked,
+    ) -> None:
+        await StackBaseLedger(stacked.repo, _run).record('task/M', stacked.p_tip)
+        seen: list[list[str]] = []
+        ledger = StackBaseLedger(stacked.repo, _runner_failing(seen=seen))
+
+        read = await ledger.ensure_record('task/M', stacked.p_tip)
+
+        assert read.state is StackRecordState.RECORDED
+        assert read.base == stacked.p_tip
+        assert not [cmd for cmd in seen if 'update-ref' in cmd]
+
+    async def test_ensure_record_whose_write_fails_reads_back_without_the_base(
+        self, stacked: Stacked,
+    ) -> None:
+        ledger = StackBaseLedger(stacked.repo, _runner_failing('update-ref'))
+
+        read = await ledger.ensure_record('task/M', stacked.p_tip)
+
+        assert not read.names(stacked.p_tip)
+        assert read.state is StackRecordState.ABSENT
+
+
+class TestStackBaseReadInvariants:
+    def test_recorded_without_a_base_is_rejected(self) -> None:
+        with pytest.raises(ValueError) as raised:
+            StackBaseRead(StackRecordState.RECORDED)
+
+        assert 'recorded' in str(raised.value)
+        assert 'None' in str(raised.value)
+
+    @pytest.mark.parametrize('state', [StackRecordState.ABSENT, StackRecordState.UNREADABLE])
+    def test_a_base_without_a_record_is_rejected(self, state: StackRecordState) -> None:
+        with pytest.raises(ValueError) as raised:
+            StackBaseRead(state, 'a' * 40)
+
+        assert str(state) in str(raised.value)
+        assert 'a' * 40 in str(raised.value)
+
+
+class TestStackTarget:
+    def test_holds_a_branch_and_a_full_sha(self) -> None:
+        target = StackTarget('task/P', 'a' * 40)
+
+        assert (target.branch, target.commit) == ('task/P', 'a' * 40)
+
+    def test_an_empty_branch_is_rejected(self) -> None:
+        with pytest.raises(ValueError) as raised:
+            StackTarget('', 'a' * 40)
+
+        assert "''" in str(raised.value)
+
+    @pytest.mark.parametrize('commit', ['abc123', 'main', 'g' * 40, 'A' * 40, ''])
+    def test_a_commit_that_is_not_a_full_hex_sha_is_rejected(self, commit: str) -> None:
+        with pytest.raises(ValueError) as raised:
+            StackTarget('task/P', commit)
+
+        assert repr(commit) in str(raised.value)
+
+    @pytest.mark.parametrize('field_name', ['branch', 'commit'])
+    def test_is_frozen(self, field_name: str) -> None:
+        target = StackTarget('task/P', 'a' * 40)
+
+        with pytest.raises(FrozenInstanceError):
+            setattr(target, field_name, 'b' * 40)
 
 
 # ---------------------------------------------------------------------------
