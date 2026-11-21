@@ -134,7 +134,9 @@ _MARKERLESS_CEILING_FRACTION = 0.6
 # `_run_lane` window -- the multiplier `_LANE_PASS_BOUND_SECS`'s floor check
 # is sized against. Measured in the SIBLING infra module's
 # `test_ib3_a_confirmed_infra_red_is_held_then_a_spaced_reproduction_files_one_task`: 3 git
-# spawns from `_run_once` plus 2 real infra `run_all.sh` spawns. See
+# spawns from `_run_once` plus 2 real infra `run_all.sh` spawns. In THIS
+# module only B1-B3's injected-seam passes sit inside a `_run_lane` window;
+# red-path passes are awaited unbounded through `_await_lane_passes`. See
 # `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` for the
 # full derivation.
 _SPAWNS_PER_LANE_PASS_WORST_CASE = 5
@@ -181,6 +183,11 @@ _SPAWNS_PER_ASSERT_NEVER_A_GATE = 7
 # `test_out_of_bound_spawn_counts_are_measured_not_asserted`): `_commit_files`
 # spawns one `add` and one `commit`.
 _SPAWNS_PER_FIXTURE_COMMIT = 2
+
+# Task 11153 — MEASURED by `test_out_of_bound_spawn_counts_are_measured_not_asserted`: a warm
+# pass's `get_main_sha`, `worktree list`, `reset --hard` and `clean -xfd`, plus its detect and
+# narrowed-confirm sub-runs (the cold pass's `worktree add` path is 5).
+_SPAWNS_PER_RED_PATH_PASS = 6
 
 
 # ---------------------------------------------------------------------------
@@ -392,19 +399,18 @@ async def _run_lane(worker: OfflineLaneWorker, expected_passes: int) -> None:
     ``test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling``
     below. Widening THIS bound alone can never make a broken
     staging pass — it only lengthens how long a genuinely broken SINGLE pass
-    takes to fail. That safety property does not compose for free: callers
-    chaining N passes (:func:`_drive_lane_pass`) sum this bound N times, so a
-    worst case can now approach or exceed the effective per-test timeout
-    before this function's own ``wait_for`` ever fires —
+    takes to fail. That safety property does not compose for free: a caller
+    that adds further bounded waits to this one (``test_b3_never_a_gate``)
+    can approach or exceed the effective per-test timeout before this
+    function's own ``wait_for`` ever fires —
     trading a clean, well-located ``TimeoutError`` here for pytest-timeout's
     blunter thread-mode worker kill instead (task 3832 review; see
     ``orchestrator/pyproject.toml``'s ``timeout``/``timeout_method``
-    comment). Multi-pass callers whose worst-case sum is at or above that
-    ceiling carry their own ``@pytest.mark.timeout`` override — see
-    ``test_b5_a_persistent_red_under_an_open_task_files_once_and_escalates_once``,
-    ``test_b7_a_cancelled_task_escalates_once_and_after_resolution_a_new_task_names_it``, and ``test_b3_never_a_gate``
-    below — a rule ``test_every_composing_caller_carries_a_timeout_override``
-    now enforces rather than merely describes.
+    comment). Such callers carry their own ``@pytest.mark.timeout``
+    override, a rule ``test_every_composing_caller_carries_a_timeout_override``
+    enforces rather than merely describes. This bound covers only B1-B3's
+    injected-seam passes; a red-path pass runs real sub-runs and is awaited
+    unbounded through :func:`_await_lane_passes`.
 
     The six 30.0 defaults rest on task 3451's measurement above, not on the
     retracted task 3491 claim — narrowing them would re-introduce the flake
@@ -770,7 +776,10 @@ def _materialized_worktree_names(worktree_base: Path) -> set[str]:
 # net never discovered it and it ran marker-less under the then-60s pyproject
 # default while requiring more than twice that.
 _LANE_PASS_COMPOSING_HELPER_NAMES = frozenset(
-    {'_run_lane', '_run_one_lane_pass', '_drive_lane_pass', '_await_lane_passes', '_assert_never_a_gate'},
+    {
+        '_run_lane', '_run_one_lane_pass', '_drive_lane_pass', '_await_lane_passes',
+        '_assert_never_a_gate',
+    },
 )
 
 
@@ -807,10 +816,10 @@ def _lane_pass_composing_callers(module_globals: dict) -> set[str]:
 
 
 def test_every_composing_caller_carries_a_timeout_override() -> None:
-    """Every test that composes bounded waits PAST a single `_run_lane` pass
-    must carry its own `@pytest.mark.timeout` override wide enough to cover
-    its own worst-case bounded-wait sum — otherwise it can silently collide
-    with the effective per-test timeout.
+    """Every test that composes bounded waits PAST a single `_run_lane` pass,
+    or drives unbounded red-path passes, must carry its own
+    `@pytest.mark.timeout` override wide enough to cover its own worst case —
+    otherwise it can silently collide with the effective per-test timeout.
 
     Makes WORK item 2's open re-verification question ("does EVERY chaining
     caller carry such an override?") executable rather than prose, in two
@@ -874,14 +883,12 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     END of the existing list and decorators apply bottom-up.
     """
     worst_case_secs = {
-        test_b4_a_confirmed_red_is_held_then_a_spaced_reproduction_files_one_task: 2 * _LANE_PASS_BOUND_SECS,
-        test_b5_a_persistent_red_under_an_open_task_files_once_and_escalates_once: 6 * _LANE_PASS_BOUND_SECS,
-        test_b6_a_red_the_narrowed_confirm_clears_ends_its_episode_and_files_nothing: 2 * _LANE_PASS_BOUND_SECS,
-        test_b7_a_cancelled_task_escalates_once_and_after_resolution_a_new_task_names_it: (
-            6 * _LANE_PASS_BOUND_SECS
-        ),
-        test_verify_usage_dump_on_two_spaced_passes_files_one_command_level_task: 2 * _LANE_PASS_BOUND_SECS,
-        test_a_red_path_pass_outlasting_the_lane_pass_bound_still_completes: _LANE_PASS_BOUND_SECS,
+        test_b4_a_confirmed_red_is_held_then_a_spaced_reproduction_files_one_task: 0.0,
+        test_b5_a_persistent_red_under_an_open_task_files_once_and_escalates_once: 0.0,
+        test_b6_a_red_the_narrowed_confirm_clears_ends_its_episode_and_files_nothing: 0.0,
+        test_b7_a_cancelled_task_escalates_once_and_after_resolution_a_new_task_names_it: 0.0,
+        test_verify_usage_dump_on_two_spaced_passes_files_one_command_level_task: 0.0,
+        test_a_red_path_pass_outlasting_the_lane_pass_bound_still_completes: 0.0,
         test_b3_never_a_gate: (
             _LANE_PASS_BOUND_SECS
             + _NOTE_OFFLINE_LANE_BOUND_SECS
@@ -897,27 +904,28 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
         ),
     }
     # Task 4203 — the other multiplicand `required_timeout_secs` needs per
-    # composing test: its counted out-of-bound real-git spawns (never
-    # `_run_one_lane_pass`'s spawns, which occur INSIDE the `_run_lane` 30s
-    # window and are already carried by worst_case_secs above). Each
-    # red-path row (task 6861) pays the repo fixture, one fixture commit and
-    # one `_drive_advance` per `_drive_lane_pass` call. b3 drives one direct
+    # composing test: its counted out-of-bound real-git spawns (never the
+    # spawns of a `_run_lane`-bounded pass, B1-B3 only, which occur INSIDE
+    # its 30s window and are already carried by worst_case_secs above). Each
+    # red-path row (task 6861) pays the repo fixture, one fixture commit and,
+    # per `_drive_lane_pass` call, one `_drive_advance` plus one unbounded
+    # pass (`_SPAWNS_PER_RED_PATH_PASS`, task 11153). b3 drives one direct
     # `_drive_advance` plus `_assert_never_a_gate`'s own unbounded
     # advance-and-notify work — MEASURED (reviewer amendment, task 4203) at
     # `_SPAWNS_PER_ASSERT_NEVER_A_GATE` = 7, not the earlier hand
     # approximation of one `_drive_advance`-equivalent round (4), which
     # undercounted by 3 (see that constant's comment for the breakdown).
-    two_pass_row = _SPAWNS_PER_REPO_FIXTURE + _SPAWNS_PER_FIXTURE_COMMIT + 2 * _SPAWNS_PER_DRIVE_ADVANCE
-    six_pass_row = _SPAWNS_PER_REPO_FIXTURE + _SPAWNS_PER_FIXTURE_COMMIT + 6 * _SPAWNS_PER_DRIVE_ADVANCE
+    red_path_pass = _SPAWNS_PER_DRIVE_ADVANCE + _SPAWNS_PER_RED_PATH_PASS
+    one_pass_row = _SPAWNS_PER_REPO_FIXTURE + _SPAWNS_PER_FIXTURE_COMMIT + red_path_pass
+    two_pass_row = _SPAWNS_PER_REPO_FIXTURE + _SPAWNS_PER_FIXTURE_COMMIT + 2 * red_path_pass
+    six_pass_row = _SPAWNS_PER_REPO_FIXTURE + _SPAWNS_PER_FIXTURE_COMMIT + 6 * red_path_pass
     out_of_bound_spawns = {
         test_b4_a_confirmed_red_is_held_then_a_spaced_reproduction_files_one_task: two_pass_row,
         test_b5_a_persistent_red_under_an_open_task_files_once_and_escalates_once: six_pass_row,
         test_b6_a_red_the_narrowed_confirm_clears_ends_its_episode_and_files_nothing: two_pass_row,
         test_b7_a_cancelled_task_escalates_once_and_after_resolution_a_new_task_names_it: six_pass_row,
         test_verify_usage_dump_on_two_spaced_passes_files_one_command_level_task: two_pass_row,
-        test_a_red_path_pass_outlasting_the_lane_pass_bound_still_completes: (
-            _SPAWNS_PER_REPO_FIXTURE + _SPAWNS_PER_FIXTURE_COMMIT + _SPAWNS_PER_DRIVE_ADVANCE
-        ),
+        test_a_red_path_pass_outlasting_the_lane_pass_bound_still_completes: one_pass_row,
         test_b3_never_a_gate: (
             _SPAWNS_PER_REPO_FIXTURE
             + _SPAWNS_PER_DRIVE_ADVANCE
@@ -1035,10 +1043,12 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     `_run_once`'s 3 git spawns (`get_main_sha`, `worktree list`, `worktree
     add`) plus the real infra seam spawning `run_all.sh` twice (the initial
     run and the isolated confirmation re-run). Later passes swap `worktree
-    add` for `reset --hard` + `clean -xfd` — 4 spawns, still under 5. This
-    module's own tests sit well under that shared worst case (the numeric
-    `suite_runner` seam here is always a bare injected callable, never a
-    real subprocess); the floor is still asserted here, AND additionally
+    add` for `reset --hard` + `clean -xfd` — 4 spawns, still under 5. In
+    this module `_LANE_PASS_BOUND_SECS` bounds only B1-B3's passes, which
+    sit well under that shared worst case (the numeric `suite_runner` seam
+    there is a bare injected callable, never a real subprocess); its
+    red-path passes run real sub-runs and are awaited unbounded through
+    `_await_lane_passes`. The floor is still asserted here, AND additionally
     checked for equality against the infra module's own copy immediately
     below — the floor/ceiling relation alone permits any value in
     [5x measured spawn latency, 0.6x effective timeout] for EACH module
@@ -1467,7 +1477,8 @@ async def test_a_pass_that_raises_fails_its_drive_with_its_own_exception(harness
         await _run_one_lane_pass(worker)
 
 
-# Priced by this test's rows in test_every_composing_caller_carries_a_timeout_override.
+# One red-path pass, awaited unbounded: 6 + 2 + (4 + 6) = 18 spawns x 4.71s = 84.78s,
+# enforced by this test's rows in test_every_composing_caller_carries_a_timeout_override.
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.usefixtures('pytest_on_path')
 @pytest.mark.asyncio
@@ -1593,10 +1604,8 @@ async def test_b3_never_a_gate(harness, git_ops, repo, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-# Two _drive_lane_pass calls: 2 x _LANE_PASS_BOUND_SECS = 60s bounded, plus the repo fixture,
-# the fixture commit and two _drive_advance rounds out of bound (6 + 2 + 2 x 4 = 16 spawns x
-# 4.71s = 75.36s); required = 135.36s, enforced by this test's rows in
-# test_every_composing_caller_carries_a_timeout_override.
+# Two red-path passes, awaited unbounded: 6 + 2 + 2 x (4 + 6) = 28 spawns x 4.71s = 131.88s,
+# enforced by this test's rows in test_every_composing_caller_carries_a_timeout_override.
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.usefixtures('pytest_on_path')
 @pytest.mark.asyncio
@@ -1642,9 +1651,8 @@ async def test_b4_a_confirmed_red_is_held_then_a_spaced_reproduction_files_one_t
 # ---------------------------------------------------------------------------
 
 
-# Six _drive_lane_pass calls: 6 x _LANE_PASS_BOUND_SECS = 180s bounded, plus 6 + 2 + 6 x 4 =
-# 32 out-of-bound spawns x 4.71s = 150.72s; required = 330.72s, so 360 (the next multiple of
-# the 60s grid), enforced by this test's rows in
+# Six red-path passes, awaited unbounded: 6 + 2 + 6 x (4 + 6) = 68 spawns x 4.71s = 320.28s,
+# so 360 (the next multiple of the 60s grid), enforced by this test's rows in
 # test_every_composing_caller_carries_a_timeout_override.
 @pytest.mark.timeout(360)
 @pytest.mark.usefixtures('pytest_on_path')
@@ -1693,7 +1701,7 @@ async def test_b5_a_persistent_red_under_an_open_task_files_once_and_escalates_o
 # ---------------------------------------------------------------------------
 
 
-# Two _drive_lane_pass calls; the same 135.36s requirement as B4.
+# Two red-path passes; the same 131.88s requirement as B4.
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.usefixtures('pytest_on_path')
 @pytest.mark.asyncio
@@ -1722,7 +1730,7 @@ async def test_b6_a_red_the_narrowed_confirm_clears_ends_its_episode_and_files_n
 # ---------------------------------------------------------------------------
 
 
-# Six _drive_lane_pass calls; the same 330.72s requirement as B5.
+# Six red-path passes; the same 320.28s requirement as B5.
 @pytest.mark.timeout(360)
 @pytest.mark.usefixtures('pytest_on_path')
 @pytest.mark.asyncio
@@ -1834,8 +1842,8 @@ _VERIFY_USAGE_DUMP = (
 )
 
 
-# Two _drive_lane_pass calls; the same 135.36s requirement as B4 (the stub commit is the
-# fixture commit).
+# Two red-path passes; the same 131.88s requirement as B4 (the stub commit is the fixture
+# commit).
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 @pytest.mark.asyncio
 async def test_verify_usage_dump_on_two_spaced_passes_files_one_command_level_task(
