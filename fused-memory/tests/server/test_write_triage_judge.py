@@ -40,7 +40,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import httpx
 import openai
 import pytest
-from _mock_openai_server import mock_openai_server
+from _mock_openai_server import mock_openai_server, responses_body
 from _real_openai_sdk import connect_error, connect_timeout, read_timeout, real_sdk_over
 from _sdk_client_stubs import sdk_client_double
 from _unreached_provider import FailOpenCauses, skip_if_provider_unreached
@@ -1806,17 +1806,72 @@ class TestProviderCredentials:
             'api_key': 'sk-p', 'base_url': 'https://main.example/v1',
         }
 
+    @pytest.mark.parametrize('provider', ['openai', 'anthropic'])
+    def test_the_judge_key_overrides_the_provider_key(self, provider: str) -> None:
+        """The key is swapped and the provider's URL is kept."""
+        service = _creds_svc(**{
+            provider: types.SimpleNamespace(
+                api_key='sk-p', api_url='https://main.example/v1',
+            ),
+        })
+        service.config.write_triage = types.SimpleNamespace(judge_api_key='sk-judge')
+        assert _provider_credentials(service, provider).client_kwargs == {
+            'api_key': 'sk-judge', 'base_url': 'https://main.example/v1',
+        }
+
+    def test_the_judge_key_applies_with_no_provider_section(self) -> None:
+        service = _creds_svc()
+        service.config.write_triage = types.SimpleNamespace(judge_api_key='sk-judge')
+        assert _provider_credentials(service, 'openai').client_kwargs == {
+            'api_key': 'sk-judge',
+        }
+
+    def test_the_judge_url_and_key_together_replace_the_provider_pair(self) -> None:
+        service = _creds_svc(
+            openai=types.SimpleNamespace(
+                api_key='sk-p', api_url='https://main.example/v1',
+            ),
+        )
+        service.config.write_triage = types.SimpleNamespace(
+            judge_api_url='http://localhost:8080/v1', judge_api_key='sk-judge',
+        )
+        assert _provider_credentials(service, 'openai').client_kwargs == {
+            'api_key': 'sk-judge', 'base_url': 'http://localhost:8080/v1',
+        }
+
+    @pytest.mark.parametrize('judge_api_key', [None, '', '   ', 0, b'sk-bytes'])
+    def test_an_unset_or_blank_judge_key_inherits_byte_for_byte(
+        self, judge_api_key: object,
+    ) -> None:
+        """`judge_api_key: null` reproduces today's credentials exactly."""
+        service = _creds_svc(
+            openai=types.SimpleNamespace(
+                api_key='sk-p', api_url='https://main.example/v1',
+            ),
+        )
+        service.config.write_triage = types.SimpleNamespace(
+            judge_api_key=judge_api_key,
+        )
+        assert _provider_credentials(service, 'openai').client_kwargs == {
+            'api_key': 'sk-p', 'base_url': 'https://main.example/v1',
+        }
+
 
 _MAIN_URL = 'https://main.example/v1'
 _JUDGE_URL = 'http://localhost:8080/v1'
 
 
-def _real_config(judge_api_url: str | None) -> FusedMemoryConfig:
+def _real_config(
+    judge_api_url: str | None, judge_api_key: str | None = None,
+) -> FusedMemoryConfig:
     """One REAL config shared by the judge and the main LLM arm.
 
     Built the way `conftest.py::mock_config` builds its llm section. The
     write_triage leaves are assigned after construction rather than merged
     through init kwargs, so the rest of that section stays the shipped one.
+    Both endpoint leaves are ALWAYS assigned, even as None: the shipped values
+    come from the environment, which server/main.py's import-time
+    load_dotenv() can fill from the main checkout's .env.
     """
     cfg = FusedMemoryConfig(
         llm=LLMConfig(
@@ -1832,6 +1887,7 @@ def _real_config(judge_api_url: str | None) -> FusedMemoryConfig:
     )
     object.__setattr__(cfg.write_triage, 'judge_provider', 'openai')
     object.__setattr__(cfg.write_triage, 'judge_api_url', judge_api_url)
+    object.__setattr__(cfg.write_triage, 'judge_api_key', judge_api_key)
     return cfg
 
 
@@ -1848,11 +1904,11 @@ async def _judge_once(memory_service: object) -> MagicMock:
 
 
 class TestTheJudgeEndpointOnOneRealConfig:
-    """`judge_api_url` on one real FusedMemoryConfig shared with the classifier.
+    """`judge_api_url` and `judge_api_key` on one real FusedMemoryConfig shared with the classifier.
 
-    The judge's client is built on the judge URL with the provider's key, the
-    add_memory classifier built from the same config is never handed that
-    URL, and a reload reaches the judge's next client.
+    The judge's client is built on the judge URL and key (each inheriting the
+    provider's when unset), the add_memory classifier built from the same
+    config is never handed either, and a reload reaches the judge's next client.
     """
 
     @pytest.mark.asyncio
@@ -1896,6 +1952,65 @@ class TestTheJudgeEndpointOnOneRealConfig:
         # The SAME service object, no reconstruction and no restart.
         after = await _judge_once(memory_service)
         assert after.call_args.kwargs['base_url'] == _JUDGE_URL
+
+    @pytest.mark.asyncio
+    async def test_the_judge_key_reaches_the_wire_and_the_classifier_keeps_the_provider_key(
+        self, monkeypatch,
+    ) -> None:
+        """Real SDK, real socket: each arm authenticates with its own key."""
+        monkeypatch.delenv('OPENAI_BASE_URL', raising=False)
+        monkeypatch.delenv('OPENAI_API_BASE', raising=False)
+        with mock_openai_server() as server:
+            server.set_response(
+                '/responses', responses_body('{"verdict": "distinct", "candidate_id": null}'),
+            )
+            cfg = _real_config(judge_api_url=server.base_url, judge_api_key='sk-plan-proxy')
+
+            await judge_write(
+                memory_service=types.SimpleNamespace(config=cfg),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+
+            judge_requests = server.requests_to('/responses')
+            assert len(judge_requests) == 1
+            judge_headers = {k.lower(): v for k, v in judge_requests[0]['headers'].items()}
+            assert judge_headers['authorization'] == 'Bearer sk-plan-proxy'
+            assert judge_requests[0]['json_body']['text']['format']['type'] == 'json_object'
+
+            cfg.routing.openai_api_url = server.base_url
+            server.chat_content = '{"primary": "procedural_knowledge", "confidence": 0.9}'
+            classifier = WriteClassifier(cfg)
+            try:
+                await classifier.classify('some content')
+            finally:
+                await classifier.close()
+
+            classifier_requests = server.requests_to('/chat/completions')
+            assert len(classifier_requests) == 1
+            classifier_headers = {
+                k.lower(): v for k, v in classifier_requests[0]['headers'].items()
+            }
+            assert classifier_headers['authorization'] == 'Bearer sk-main'
+
+        assert cfg.llm.providers.openai is not None
+        assert cfg.llm.providers.openai.api_key == 'sk-main'
+
+    @pytest.mark.asyncio
+    async def test_a_hot_reloaded_judge_key_reaches_the_next_client(self) -> None:
+        memory_service = types.SimpleNamespace(config=_real_config(judge_api_url=None))
+        before = await _judge_once(memory_service)
+        assert before.call_args.kwargs['api_key'] == 'sk-main'
+
+        report = apply_reload(
+            memory_service.config,
+            _real_config(judge_api_url=None, judge_api_key='sk-plan-proxy'),
+        )
+        assert 'write_triage.judge_api_key' in report['applied']
+
+        # The SAME service object, no reconstruction and no restart.
+        after = await _judge_once(memory_service)
+        assert after.call_args.kwargs['api_key'] == 'sk-plan-proxy'
 
 
 class TestTheVerdictCarriesTheCallsUsage:
