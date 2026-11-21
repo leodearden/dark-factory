@@ -54,9 +54,11 @@ def test_a_sort_that_outgrows_memory_needs_no_temp_file(tmp_path):
 def test_connect_readonly_connection_cannot_write(tmp_path):
     db = _make_db(tmp_path / "ro.db")
 
-    with contextlib.closing(connect_readonly(db)) as conn:
-        with pytest.raises(sqlite3.OperationalError) as refusal:
-            conn.execute("UPDATE t SET pad = 'changed'")
+    with (
+        contextlib.closing(connect_readonly(db)) as conn,
+        pytest.raises(sqlite3.OperationalError) as refusal,
+    ):
+        conn.execute("UPDATE t SET pad = 'changed'")
 
     assert "readonly" in str(refusal.value)
 
