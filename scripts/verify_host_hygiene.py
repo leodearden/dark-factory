@@ -39,6 +39,7 @@ SCOPE_UNIT_GLOB = "df-verify-*.scope"
 SCOPE_UNIT_NAME = re.compile(r"df-verify-.+\.scope")
 SYSTEMCTL_TIMEOUT_SECONDS = 20
 UNIT_STILL_RUNNING = frozenset({"active", "activating", "deactivating"})
+SERVICE_MANAGER_COMM = "systemd"
 EXIT_OK, EXIT_SOME_FAILED, EXIT_USAGE = 0, 1, 2
 PROG = "verify_host_hygiene"
 
@@ -237,7 +238,7 @@ def worktree_candidates(base: Path, kinds: frozenset[Kind]) -> list[Candidate]:
     found = []
     for entry in entries:
         kind = worktree_kind(entry.name)
-        if kind in kinds and entry.is_dir(follow_symlinks=False):
+        if kind is not None and kind in kinds and entry.is_dir(follow_symlinks=False):
             found.append(Candidate(kind, str(real(base) / entry.name)))
     return found
 
@@ -442,7 +443,7 @@ def scope_is_orphaned(members: Iterable[ScopeMember]) -> bool:
     members = tuple(members)
     pids = {member.pid for member in members}
     return not any(member.ppid not in pids and member.ppid > 1
-                   and member.parent_comm != "systemd" for member in members)
+                   and member.parent_comm != SERVICE_MANAGER_COMM for member in members)
 
 
 def systemctl(*args: str) -> subprocess.CompletedProcess[str] | None:
@@ -606,7 +607,7 @@ def non_negative_hours(text: str) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=PROG, description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(prog=PROG, description=(__doc__ or "").partition("\n")[0])
     parser.add_argument("--repo", action="append", type=Path,
                         help=f"checkout whose .worktrees/ to scan (repeatable; default {DEFAULT_REPO})")
     parser.add_argument("--class", dest="classes", action="append", type=Kind,

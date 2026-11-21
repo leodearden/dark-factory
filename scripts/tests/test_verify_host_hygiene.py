@@ -21,7 +21,7 @@ import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 from committed_git_repo import committed_repo
 from git_repo_probe import git
-from verify_host_hygiene import ScopeMember, scope_is_orphaned
+from verify_host_hygiene import SERVICE_MANAGER_COMM, ScopeMember, scope_is_orphaned
 
 SCRIPT = Path(__file__).resolve().parent.parent / "verify_host_hygiene.py"
 CLI_TIMEOUT = cli_timeout_from_env("VERIFY_HOST_HYGIENE_CLI_TIMEOUT")
@@ -90,7 +90,7 @@ def _plain_dir(path: Path) -> None:
 
 
 def build_mirror(tmp_path: Path) -> Mirror:
-    repo = Path(committed_repo(tmp_path / "mirror", {"README.md": "seed\n"}))
+    repo = Path(committed_repo(tmp_path / "mirror", {"seed.txt": "seed\n"}))
     base = repo / ".worktrees"
     base.mkdir()
     registered = ["_merge-aaaaaaaa", "_merge-bbbbbbbb", "_merge-cccccccc",
@@ -107,6 +107,7 @@ def build_mirror(tmp_path: Path) -> Mirror:
         [sys.executable, "-c", LOCK_HOLDER, str(base / "_merge-cccccccc.lock")],
         cwd=tmp_path, stdout=subprocess.PIPE, text=True,
     )
+    assert lock_holder.stdout is not None
     assert lock_holder.stdout.readline().strip() == "locked"
     mirror = Mirror(repo=repo, bin=tmp_path / "bin", state=tmp_path / "state",
                     lock_holder=lock_holder, children=[lock_holder])
@@ -315,11 +316,11 @@ def test_apply_failure_exits_nonzero_and_reports_failed(mirror, unremovable):
 
 @pytest.mark.parametrize("members", [
     (),
-    (ScopeMember(pid=100, ppid=1, parent_comm="systemd"),
+    (ScopeMember(pid=100, ppid=1, parent_comm=SERVICE_MANAGER_COMM),
      ScopeMember(pid=101, ppid=0, parent_comm=None)),
-    (ScopeMember(pid=100, ppid=50, parent_comm="systemd"),
+    (ScopeMember(pid=100, ppid=50, parent_comm=SERVICE_MANAGER_COMM),
      ScopeMember(pid=101, ppid=100, parent_comm="bash")),
-], ids=["empty", "parents-are-pid-0-or-1", "parents-are-systemd-or-members"])
+], ids=["empty", "parents-are-pid-0-or-1", "parents-are-the-service-manager-or-members"])
 def test_scope_without_a_live_controller_is_orphaned(members):
     assert scope_is_orphaned(members)
 
@@ -327,7 +328,7 @@ def test_scope_without_a_live_controller_is_orphaned(members):
 @pytest.mark.parametrize("members", [
     (ScopeMember(pid=100, ppid=4242, parent_comm="python3"),),
     (ScopeMember(pid=100, ppid=4242, parent_comm=None),),
-    (ScopeMember(pid=100, ppid=50, parent_comm="systemd"),
+    (ScopeMember(pid=100, ppid=50, parent_comm=SERVICE_MANAGER_COMM),
      ScopeMember(pid=101, ppid=4242, parent_comm="python3")),
 ], ids=["python-parent", "unreadable-parent", "one-of-two-roots-has-a-controller"])
 def test_scope_with_a_live_or_unknown_controller_is_not_orphaned(members):
@@ -355,6 +356,7 @@ def scopes(mirror, tmp_path):
     controller = _spawn([sys.executable, "-c", CONTROLLER], cwd=tmp_path,
                         stdout=subprocess.PIPE, text=True)
     mirror.children.append(controller)
+    assert controller.stdout is not None
     live_pid = int(controller.stdout.readline())
     reaped = _spawn(["true"], cwd=tmp_path)
     reaped.wait()
