@@ -23,6 +23,7 @@ from click.testing import CliRunner, Result
 from shared.config_models import UsageCapConfig
 
 import orchestrator.cli as cli_module
+import orchestrator.cli_config as cli_config
 import orchestrator.evals.runner as runner_module
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals import configs as configs_module
@@ -154,7 +155,7 @@ def events() -> list[tuple[str, ...]]:
 
 @pytest.fixture(autouse=True)
 def _cli_loads_base_config(monkeypatch: pytest.MonkeyPatch, base_config: OrchestratorConfig):
-    monkeypatch.setattr(cli_module, 'load_config', lambda _: base_config)
+    monkeypatch.setattr(cli_config, 'load_config', lambda _: base_config)
 
 
 def _invoke(

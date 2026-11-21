@@ -19,10 +19,22 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Protocol, TypeGuard, TypeVar
 
+from shared.claude_endpoint import ClaudeEndpoint
+from shared.claude_executable import ClaudeLaunchSurface, claude_executable, override_var
 from shared.cost_store import CapReason
-from shared.proc_group import snapshot_process_group, terminate_process_group
+from shared.proc_group import (
+    snapshot_process_group,
+    spawn_group_leader,
+    terminate_process_group,
+)
 from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
-from shared.secret_env import agent_subprocess_env
+from shared.secret_env import (
+    AGENT_CREDENTIAL_VAR,
+    AGENT_ENDPOINT_VARS,
+    ENDPOINT_BASE_URL_VAR,
+    agent_subprocess_env,
+    is_secret_env_name,
+)
 from shared.spawn_temp_files import MCP_CONFIG_TEMP_NAME, SYSPROMPT_TEMP_NAME
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
@@ -34,6 +46,7 @@ except ImportError:  # pragma: no cover - exercised only when aiohttp absent
     _VllmBridgeRuntime = None
 
 if TYPE_CHECKING:
+    from shared.account_reserve import WorkClassSource
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
     from shared.usage_gate import PoolFrozen, UsageGate
@@ -113,25 +126,6 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Claude backend binary resolution.
-#
-# WHY THIS EXISTS: argv[0] used to be the hardcoded bare PATH name 'claude',
-# resolved by the kernel against whatever PATH the spawning process happened
-# to inherit. On 2026-08-13→08-18 the fused-memory systemd user unit pinned no
-# Environment=PATH=, its inherited user-manager PATH lacked ~/.local/bin, and
-# so every curator LLM call raised FileNotFoundError for 80+ hours — with no
-# log line naming the binary that could not be found.
-#
-# _CLAUDE_BINARY_ENV_VAR is the operator escape hatch: an absolute path here
-# removes PATH from the equation entirely, and is the remediation the
-# unresolvable-binary escalation recommends.
-# ─────────────────────────────────────────────────────────────────────────────
-_CLAUDE_BINARY_ENV_VAR = 'CLAUDE_BINARY'
-# The historical argv[0]. Kept as the fallback so an environment that never
-# sets _CLAUDE_BINARY_ENV_VAR and does have `claude` on PATH is byte-identical
-# to the pre-task-4448 behaviour.
-_DEFAULT_CLAUDE_BINARY = 'claude'
 CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
@@ -212,11 +206,12 @@ __all__ = [
 
 
 def claude_binary_spec() -> str:
-    """Return the Claude CLI binary spec: the ``CLAUDE_BINARY`` override, else ``'claude'``.
+    """Return the fleet's Claude CLI binary spec: the ``CLAUDE_BINARY`` override, else ``'claude'``.
 
-    An empty ``CLAUDE_BINARY`` is treated as unset rather than as an empty
-    argv[0], so ``CLAUDE_BINARY=`` in a systemd unit or a shell profile
-    degrades to the default instead of producing an unspawnable command.
+    The fleet surface of ``shared/src/shared/claude_executable.py::claude_executable``
+    over ``os.environ``; an empty ``CLAUDE_BINARY`` counts as unset there, so
+    ``CLAUDE_BINARY=`` in a systemd unit or a shell profile degrades to the
+    default instead of producing an unspawnable argv[0].
 
     The spec may be a bare name (resolved against PATH) or an absolute path.
     Setting it to an absolute path is the remediation for the 2026-08-13→08-18
@@ -226,7 +221,7 @@ def claude_binary_spec() -> str:
 
     Never raises.
     """
-    return os.environ.get(_CLAUDE_BINARY_ENV_VAR) or _DEFAULT_CLAUDE_BINARY
+    return claude_executable(ClaudeLaunchSurface.FLEET, os.environ)
 
 
 def resolve_claude_binary() -> str | None:
@@ -264,7 +259,9 @@ class AllAccountsCappedException(Exception):
     - ``pool_frozen``: the gate's ``PoolFrozen`` when the deadline was spent
       parked, else ``None``.  It says which accounts were capped and which
       AUTH_FAILED, and the message is built from it, because a pool frozen on
-      rejected credentials is not a cap and will not clear at a reset.
+      rejected credentials is not a cap and will not clear at a reset; nor is
+      a caller refused the allowance reserve (``pool_frozen.reserved_account``
+      set), whose message names the reserve and its release time instead.
     """
 
     def __init__(
@@ -280,10 +277,13 @@ class AllAccountsCappedException(Exception):
         self.label = label
         self.pool_frozen = pool_frozen
         spent = f'after {retries} retries ({elapsed_secs:.1f}s elapsed)'
-        super().__init__(
-            f'{label}: all accounts capped {spent}' if pool_frozen is None
-            else f'{label}: cap-wait deadline spent parked {spent} — {pool_frozen}'
-        )
+        if pool_frozen is None:
+            message = f'{label}: all accounts capped {spent}'
+        elif pool_frozen.reserved_account is not None:
+            message = f'{label}: {pool_frozen} (patience spent waiting {spent})'
+        else:
+            message = f'{label}: cap-wait deadline spent parked {spent} — {pool_frozen}'
+        super().__init__(message)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1148,6 +1148,9 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     Reaps are positional, not per launch (accepted on the same grounds): an
     earlier launch's delivered completion that lands after a later launch
     clears the verdict while that later launch is still pending → False.
+    Per-launch tracking was measured and rejected by task 7127; the numbers
+    live at
+    shared/tests/test_cli_invoke_background.py::TestDeliveredNotificationIsAReap::test_earlier_completion_after_later_launch_is_false_documented_gap.
     """
     if not records:
         return False
@@ -2354,6 +2357,7 @@ async def invoke_with_cap_retry(
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     park_on_frozen_pool: bool = True,
+    work_class: WorkClassSource | None = None,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -2417,6 +2421,15 @@ async def invoke_with_cap_retry(
     to park and lets ``PoolFrozen`` propagate unconverted, for a caller that
     must defer rather than wait and must tell a cap from rejected
     credentials, which will not clear at a reset (task 6042).
+
+    *work_class* is the caller's class for the allowance reserve
+    (plans/allowance-reserve-by-account-prd.md §6.1): a ``WorkClass`` or a
+    function returning one, forwarded to ``usage_gate.invoke_slot`` only when
+    given, so a gate or double that knows nothing of it is called as before.
+    ``None`` is background work, recorded as unclassified. A wait on the
+    reserve happens inside the gate's park, so it counts nothing toward
+    *max_cap_retries*, and a spent park allowance names the reserve and its
+    release time rather than a cap.
 
     Only FAILED results are offered to the cap detector.
     ``UsageGate.detect_cap_hit`` classifies a synthetic ``success=False``
@@ -2711,22 +2724,28 @@ async def invoke_with_cap_retry(
                     None if cap_wait_deadline is None
                     else max(0.0, cap_wait_deadline - time.monotonic())
                 )
+                slot_kwargs = {} if work_class is None else {'work_class': work_class}
                 try:
                     slot = await slot_exit.enter_async_context(
                         usage_gate.invoke_slot(
                             scope=scope,
                             park=park_on_frozen_pool,
                             max_wait_secs=park_allowance,
+                            **slot_kwargs,
                         ),
                     )
                 except PoolFrozen as frozen:
                     if not park_on_frozen_pool:
                         raise
                     elapsed = time.monotonic() - retry_start
+                    why = (
+                        f'patience spent after {elapsed:.1f}s parked: {frozen}'
+                        if frozen.reserved_account is not None
+                        else f'cap-wait sanity bound ({cap_wait_sanity_secs}s) spent parked '
+                        f'after {elapsed:.1f}s: {frozen}'
+                    )
                     raise _cap_patience_spent(
-                        f'cap-wait sanity bound ({cap_wait_sanity_secs}s) spent parked '
-                        f'after {elapsed:.1f}s: {frozen}',
-                        consecutive_cap_hits, elapsed, pool_frozen=frozen,
+                        why, consecutive_cap_hits, elapsed, pool_frozen=frozen,
                     ) from frozen
                 # Consulted inside the acquired slot, after any cooldown or
                 # park, and before attribution and credentials: a declined
@@ -3494,7 +3513,7 @@ def build_claude_argv(
             'claude binary %r does not resolve on PATH — spawning it will fail. '
             'Set %s to an absolute path, or pin Environment=PATH= in the unit. '
             'PATH=%s',
-            _spec, _CLAUDE_BINARY_ENV_VAR, os.environ.get('PATH'),
+            _spec, override_var(ClaudeLaunchSurface.FLEET), os.environ.get('PATH'),
         )
     cmd = [_resolved or _spec, '--print', '--output-format', 'json']
 
@@ -3660,6 +3679,17 @@ def apply_spawn_env(env: dict[str, str], spawn_env: dict[str, str] | None) -> No
     env.pop('CLAUDE_SPAWN_LAUNCHER_PID', None)
 
 
+def _require_endpoint_is_sole_route(oauth_token: str | None, env_overrides: dict[str, str] | None) -> None:
+    """Refuse a second route alongside an explicit endpoint: one child, one endpoint, one credential."""
+    if oauth_token:
+        raise ValueError('an endpoint carries its own credential; oauth_token cannot be combined with it')
+    clashing = sorted(
+        name for name in env_overrides or {} if name in AGENT_ENDPOINT_VARS or is_secret_env_name(name)
+    )
+    if clashing:
+        raise ValueError(f'an endpoint cannot be combined with env_overrides setting {", ".join(clashing)}')
+
+
 async def _invoke_claude(
     prompt: str,
     system_prompt: str,
@@ -3689,6 +3719,7 @@ async def _invoke_claude(
     setting_sources: list[str] | None = None,
     resume_prior_total_cost_usd: float | None = None,
     *,
+    endpoint: ClaudeEndpoint | None = None,
     runner: CliRunner,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
@@ -3696,6 +3727,8 @@ async def _invoke_claude(
     # files: a blank prompt can never produce a useful run, so failing here
     # leaves nothing to clean up and never spawns a subprocess.
     require_non_blank_prompt(prompt, context='_invoke_claude')
+    if endpoint is not None:
+        _require_endpoint_is_sole_route(oauth_token, env_overrides)
     cmd, temp_files = build_claude_argv(
         model=model,
         max_budget_usd=max_budget_usd,
@@ -3735,7 +3768,10 @@ async def _invoke_claude(
     apply_spawn_env(env, spawn_env)
     # Multi-account failover: inject per-invocation OAuth token
     if oauth_token:
-        env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
+        env[AGENT_CREDENTIAL_VAR] = oauth_token
+    if endpoint is not None:
+        env.pop(AGENT_CREDENTIAL_VAR, None)
+        env.update(endpoint.env())
     # Per-task config dir: credential file + session isolation
     if config_dir:
         env['CLAUDE_CONFIG_DIR'] = str(config_dir)
@@ -3750,16 +3786,16 @@ async def _invoke_claude(
     # any partially-initialised AppRunner resources.
     bridge: VllmBridge | None = None
     try:
-        if env_overrides and env_overrides.get('ANTHROPIC_BASE_URL'):
+        if env_overrides and env_overrides.get(ENDPOINT_BASE_URL_VAR):
             BridgeCls = VllmBridge
             if BridgeCls is None:
                 raise RuntimeError(
                     'ANTHROPIC_BASE_URL is set but aiohttp is not installed; '
                     'install dark-factory-shared with the vllm extras to use VllmBridge.'
                 )
-            bridge = BridgeCls(upstream_url=env_overrides['ANTHROPIC_BASE_URL'])
+            bridge = BridgeCls(upstream_url=env_overrides[ENDPOINT_BASE_URL_VAR])
             await bridge.start()
-            env['ANTHROPIC_BASE_URL'] = bridge.url
+            env[ENDPOINT_BASE_URL_VAR] = bridge.url
 
         # The runner applies the caller-supplied sandbox wrap (e.g. Landlock or
         # bwrap confinement) once, before spawning, after the temp files above
@@ -4206,6 +4242,14 @@ async def _kill_group_on_flat_timeout(
     )
 
 
+_CANCEL_KILL_GRACE_SECS = 5.0
+
+
+async def _terminate_cancelled_group(proc: asyncio.subprocess.Process) -> None:
+    logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
+    await terminate_process_group(proc, proc.pid, grace_secs=_CANCEL_KILL_GRACE_SECS)
+
+
 async def run_cli_subprocess(
     cmd: list[str],
     cwd: Path,
@@ -4272,14 +4316,14 @@ async def run_cli_subprocess(
     # stdin_data is None must still yield stdin=None (inherited).
     stdin_file = _materialize_stdin(stdin_data) if stdin_data is not None else None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await spawn_group_leader(
             *spawn_cmd,
+            kill_group=_terminate_cancelled_group,
             cwd=str(cwd),
             env=spawn_env,
             stdin=stdin_file,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
         )
     finally:
         # Close the parent's handle as soon as the child has its own dup — this
@@ -4704,8 +4748,7 @@ async def run_cli_subprocess(
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await comm_task
         if proc.returncode is None:
-            logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
-            await terminate_process_group(proc, pgid, grace_secs=5.0)
+            await _terminate_cancelled_group(proc)
         raise
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
@@ -4811,6 +4854,7 @@ async def invoke_claude_agent(
     setting_sources: list[str] | None = None,
     resume_prior_total_cost_usd: float | None = None,
     *,
+    endpoint: ClaudeEndpoint | None = None,
     runner: CliRunner = run_cli_subprocess,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
@@ -4857,7 +4901,15 @@ async def invoke_claude_agent(
     with *resume_session_id* — when both are set, *resume_session_id* wins.
 
     *env_overrides*, when set, are merged into the subprocess environment.
-    Used to point Claude Code at a vLLM endpoint via ``ANTHROPIC_BASE_URL``.
+    Used to point Claude Code at a vLLM endpoint via ``ANTHROPIC_BASE_URL``,
+    which routes the child through a ``VllmBridge``.
+
+    *endpoint*, when set, sends the child straight to that Anthropic-protocol
+    endpoint (e.g. ``shared.cli_proxy.proxy_endpoint``), with no bridge and
+    with the endpoint's client key as its only credential: an inherited
+    ``CLAUDE_CODE_OAUTH_TOKEN`` is dropped.  It cannot be combined with
+    *oauth_token*, nor with endpoint or credential variables in
+    *env_overrides*.
 
     *spawn_env*, when set, carries ``CLAUDE_SPAWN_*`` spawn-identity vars
     (role/project/task/parent) for the SessionStart hook.  Merged into the
@@ -4918,5 +4970,6 @@ async def invoke_claude_agent(
         available_tools=available_tools,
         setting_sources=setting_sources,
         resume_prior_total_cost_usd=resume_prior_total_cost_usd,
+        endpoint=endpoint,
         runner=runner,
     )

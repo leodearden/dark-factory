@@ -1203,8 +1203,9 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
    (`already_merged` is a *submit* status the server collapses to `done` when observed by
    polling — see step 1 and
    `escalation/src/escalation/merge_status_answer.py::map_terminal_state`.)
-   After an orchestrator restart,
-   `{state: 'unknown', hint: 'check git log main'}` → fall back to `git log main` (PRD I3).
+   An epistemic answer describes the server's records, not the merge — switch on its `reason`
+   per [the shared reason switch](../_shared/merge-status-reasons.md#the-switch); never fall
+   back to `git log main`, and never direct-merge on one.
 
 3. **To abandon** a queued entry before it is picked up:
    ```
@@ -1466,8 +1467,10 @@ launch by `task_id` / background-task-id):
   pending, write only the digest line and file no DecisionRecord: whoever took the escalation
   owns it, and the merge carries on.
 - `outcome == "handed_off"`: neither a failure nor an abort. The merge `request_id` it returns
-  is either picked up by the merge worker and still live (merging or verifying), or, when the
-  result also carries `superseded_by`, superseded by a successor that has not resolved yet: an
+  is either still live (picked up by the merge worker, or, from step 9's re-poll hand-off, the
+  entry an `attached` submit joined, which may still be queued), or still
+  answering a wait-state reason (a **WAIT** row of [the shared reason
+  switch](../_shared/merge-status-reasons.md#the-switch)) and so possibly still in flight, or, when the result also carries `superseded_by`, superseded by a successor that has not resolved yet: an
   `mr-*` generation advance or a `coalesce-*` train. Either way the sub-agent did not cancel
   it, did not change the task status, and left the escalation pending. **Never
   `merge_cancel` it**, and never submit another merge for that `task_id`, whichever shape it is:
@@ -1482,7 +1485,7 @@ launch by `task_id` / background-task-id):
   is already charged, and `check` would report `already_attempted`. Keep the `task_id` in flight
   until that run completes; its completion is handled by this same list. **Resume once per B3
   launch:** if a resume-mode run itself returns `handed_off` (its 3 h backstop expired with the
-  merge still live or its successor still unresolved), do not resume again — leave the
+  merge still live, still answering a wait-state reason, or its successor still unresolved), do not resume again — leave the
   escalation pending, write the digest line, and file a DecisionRecord via `write-decision`
   whose `--text` names the `request_id`, the `superseded_by` when present, and the last state.
   Still never cancel. A resume-mode `merged` is handled by the `merged` bullet, and a
@@ -1734,6 +1737,9 @@ pending L2 (also runnable across all queues via `scripts/member-chain-sweep.py`,
 
 - For each id in `.members`, locate the member **across the archive** (`find <queue-dir> -name
   '<member-id>.json'` — every ruled member is archived by definition), never just the live dir.
+- For a dark-factory item, `get_task_escalation_history(task_id=<subject task>,
+  project_root=<root>)` lists every record ever filed on the subject task, archived rulings
+  included — it answers for this server's queue only.
 - If the member's status is terminal, **read its `resolution` TEXT — status alone is useless**
   (both shapes below show `dismissed`):
   - substantive ruling text ⇒ this L2 is ANSWERED. Recover the ruling verbatim from the record
@@ -1762,11 +1768,12 @@ on the drain; `pin_declared_reason` (the free-text why) is only on the full reco
 exists to spend a pin deliberately, not to clear an inconvenient error. None of that changes this
 check: it stays REPORT-ONLY, and an **unmarked** record is still not proof that nothing relies on
 it — the marker is opt-in, so absence means "not declared", not "safe". Reading the record and its
-companions before proposing any disposition remains the protection. Note also who can WRITE the
-marker: `declare_pin` is operator/steward-only today — it is not in the rotation's allowed tools
-(`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`) — so when this probe finds a
-likely pin that carries no `pin_declared_by`, the output is a REPORTED *candidate pin* naming what
-appears to rely on it, for a human to declare. esc-3105-3 itself is still in that state.
+companions before proposing any disposition remains the protection. This session can run
+`declare_pin` (who may declare is stated once, in `skills/escalation-watcher-auto/SKILL.md`
+"Declared pins"), but this check is REPORT-ONLY and declaring is a human ratification: when the
+probe finds a likely pin that carries no `pin_declared_by`, report it as a *candidate pin* naming
+what appears to rely on it, for the human to ratify and declare. esc-3105-3 itself is still in that
+state.
 
 **Carve-out: mechanically actioning a ruling Leo has ALREADY made.** You do not need Leo's
 permission a second time to do the bookkeeping on a decision he has already made and that has
@@ -1848,7 +1855,7 @@ of record and never writes them; its only files are under `data/sitting/`, plus
 `data/return-brief.md`. Every mutation below is an agent action from a pre-built payload, taken
 only for an item Leo has answered or one that clears the carve-out in "Ruled-elsewhere check
 (answered-but-unrecorded)" above, whose gates it evaluates and does not restate. Run it from the
-project root as `uv run --frozen --project shared python scripts/sitting/prepare_sitting.py
+project root as `uv run --no-sync --project shared python scripts/sitting/prepare_sitting.py
 <subcommand>`.
 
 #### When it runs
@@ -2048,6 +2055,7 @@ resolution, and is never a flake.
 **Never auto-resolve** — `manual_intervention` is authoritative. The human has to inspect `project_root`:
 - For `wip_conflict`: recovery branch named in the detail preserves the user's WIP; they may need to cherry-pick or reapply before resolving.
 - For `unmerged_state`: run `git status` in `project_root`; UU/AA/DD files need `git mergetool`, manual edit, or `git reset` depending on intent.
+- For a record carrying `halt_released_at` (any of the three; on the full record from `mcp__escalation__get_escalation`, not in a compact row): it was re-tested clean at a restart and no longer halts the queue, so it is not `get_merge_halt_status`'s `owner_esc_id`. Read its `halt_release_note`, then give it the disposition its category calls for here — still never auto-resolved. See `OPERATIONS.md` §"Merge-halt semantics" → "Across a restart".
 - For `stash_failed`: inspect the main checkout's uncommitted work and commit it — or get its owner to. **Do not reach for `git stash`**: CLAUDE.md forbids it in *any* dark-factory checkout, `project_root` or task worktree, because `refs/stash` is a single ref shared by every worktree in the checkout (it is not per-worktree) and the merge worker's advance path consumes the same stack — so a stash you push can be popped out from under you, and a pop on a clean tree can apply an unrelated task's WIP into it (incident 13674d3c68). Park WIP as commits on a branch.
   - **Sub-variant:** if the detail/log instead shows `CRITICAL: stale refs/dark-factory/merge-park present`, that's a stale `MERGE_PARK_REF` left over from a prior crash — it holds real, unrecovered WIP that the code deliberately refuses to overwrite. Committing `project_root`'s current dirty files is not enough here: the stale ref itself is what's blocking the next park attempt, so the halt recurs immediately on the next advance. Recovery means inspecting and draining that ref first — e.g. `git branch <recovery-name> refs/dark-factory/merge-park` to make its WIP reachable, then `git update-ref -d refs/dark-factory/merge-park` to free it — before cleaning up `project_root`.
 

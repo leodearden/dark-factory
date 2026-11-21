@@ -553,6 +553,7 @@ def test_submit_argv_is_the_born_at_l2_shape(tmp_path: pathlib.Path) -> None:
     assert argv == [
         "/x/uv",
         "run",
+        "--no-sync",
         "--project",
         str(tmp_path / "escalation"),
         "escalation",

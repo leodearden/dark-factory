@@ -143,6 +143,9 @@ class RepoTemplates:
         return self._templates[seed]
 
 
+#: The most git processes one seed spawns: a cold template build plus the copy's index refresh, measured by test_git_fixtures.py::test_seed_repo_max_git_spawns_is_the_costliest_seed_path.
+SEED_REPO_MAX_GIT_SPAWNS = 6
+
 _session: RepoTemplates | None = None
 
 

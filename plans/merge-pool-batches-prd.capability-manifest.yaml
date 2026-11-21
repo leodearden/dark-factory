@@ -1,0 +1,332 @@
+# Machine-readable twin of merge-pool-batches-prd.capability-manifest.md
+prd: plans/merge-pool-batches-prd.md
+schema_version: 1
+signal_leaves: ["ζ", "η", "θ", "ι2", "ι3"]
+tasks:
+  - label: "ι0"
+    task_id: 11047
+    title: "Merge lane: the un-chained mark survives an orchestrator restart (interim)"
+    capabilities:
+      - name: "persistent-set-substrate"
+        binding: "`grep:orchestrator/src/orchestrator/guard_state.py::PersistentSet` wired: the worker already backs a set with it (`grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.__init__`)"
+        verdict: PASS
+      - name: "mark-survives-restart"
+        binding: "built here: the un-chained mark is reloaded by a worker built after a restart"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["orchestrator/tests/test_merge_queue_unchained_mark_restart.py"]
+  - label: "α1"
+    task_id: 11048
+    title: "Merge lane: record the tested tree on each in-flight entry (root, base, members)"
+    capabilities:
+      - name: "entry-slot-publishes-once"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/types.py::InflightEntrySlot.publish_verify_base` wired: the precedent for a fact published once on an in-flight entry"
+        verdict: PASS
+      - name: "base-is-an-entry-commit"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/remerge_base.py::entry_bases` wired: a base can be an in-flight entry's tip or its owner's own commit"
+        verdict: PASS
+      - name: "tested-tree-on-the-entry"
+        binding: "built here: merge_lane/tested_tree.py and InflightEntry.tree"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["orchestrator/src/orchestrator/merge_lane/tested_tree.py"]
+  - label: "α2"
+    task_id: 11049
+    title: "Merge lane: the verdict's facts reach the lane; one merge_observation row per verdict"
+    capabilities:
+      - name: "final-result-in-one-place"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/post_merge_verify.py::_PostMergeVerify.run` wired: every path forms its final result here, after the cross-check"
+        verdict: PASS
+      - name: "verdict-known-before-links-release"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/inflight_verify.py::InflightVerifyRun.run` wired: it takes the verdict before it releases the chain's resources"
+        verdict: PASS
+      - name: "failing-ids-readable"
+        binding: "`grep:orchestrator/src/orchestrator/verify.py::_extract_failing_test_ids` wired: the flake gate reads a red result's failing ids with it"
+        verdict: PASS
+      - name: "verdict-facts-wire-types"
+        binding: "built here: shared/merge_evidence.py"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["shared/src/shared/merge_evidence.py"]
+      - name: "merge-observation-row"
+        binding: "built here: the merge_observation event type, written at the verdict"
+        verdict: PASS
+        delivered_check:
+          kind: "grep"
+          pattern: "merge_observation"
+          expect: "present"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+  - label: "σ1"
+    task_id: 11050
+    title: "Culprit scan engine: run a red batch's failing tests on the root, the base, the tip and each member alone"
+    capabilities:
+      - name: "node-id-run"
+        binding: "`grep:orchestrator/src/orchestrator/verify.py` built here as a production path: run_node_ids exists (task 7918) and has no production caller; this leaf is its first"
+        verdict: PASS
+      - name: "worktree-at-any-commit"
+        binding: "`grep:orchestrator/src/orchestrator/verify.py::_provisioned_ephemeral_worktree` wired: it opens GitOps.ephemeral_worktree at a commit and provisions it"
+        verdict: PASS
+      - name: "full-module-set"
+        binding: "`grep:orchestrator/src/orchestrator/config.py::OrchestratorConfig.module_configs_or_empty` wired: the project's module registry"
+        verdict: PASS
+      - name: "scan-engine"
+        binding: "built here: merge_lane/culprit_scan.py with its command"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["orchestrator/src/orchestrator/merge_lane/culprit_scan.py"]
+      - name: "scan-worktree-kind"
+        binding: "built here: WorktreeKind.CULPRIT_SCAN, protected and reclaimable"
+        verdict: PASS
+        delivered_check:
+          kind: "grep"
+          pattern: "CULPRIT_SCAN"
+          expect: "present"
+          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+  - label: "ρ"
+    task_id: 11051
+    title: "Merge lane: batch state that survives a restart (alone with its red set, cleared, outcomes); the un-chained mark becomes \"alone\""
+    capabilities:
+      - name: "mark-readers"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.chain_snapshot` wired: one of the readers of the mark that this leaf re-points"
+        verdict: PASS
+      - name: "merger-removes-a-waiting-request"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/intake_buffers.py::MergeIntake.remove_buffered` wired: the merger-owned removal a later conviction uses"
+        verdict: PASS
+      - name: "rows-read-back-at-start"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.seed_chain_policy` wired: the precedent for rebuilding lane state from event rows at start"
+        verdict: PASS
+      - name: "batch-state"
+        binding: "built here: merge_lane/batch_state.py with its rows, checkpoint and rebuild"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["orchestrator/src/orchestrator/merge_lane/batch_state.py"]
+      - name: "merge-evidence-config"
+        binding: "built here: orchestrator/merge_evidence_config.py"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["orchestrator/src/orchestrator/merge_evidence_config.py"]
+      - name: "mark-removed"
+        binding: "built here: no reader of the un-chained mark remains"
+        verdict: PASS
+        delivered_check:
+          kind: "grep"
+          pattern: "_next_dispatch_unchained"
+          expect: "absent"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+  - label: "σ2"
+    task_id: 11052
+    title: "Merge lane: scan a red batch and act on the verdict (convict, clear, release, fallback); dark_factory on scan: auto"
+    capabilities:
+      - name: "scan-engine-upstream"
+        binding: "producer:task-σ1 upstream: culprit_scan.run_scan and attribute"
+        verdict: PASS
+      - name: "batch-state-upstream"
+        binding: "producer:task-ρ upstream: BatchState.begin_scan, apply_scan and pending convictions"
+        verdict: PASS
+      - name: "red-single-outcome-shape"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/verify_failure_outcome.py::red_verify_outcome` wired: it builds the blocked outcome a red single gets, which a conviction reuses"
+        verdict: PASS
+      - name: "detached-task-off-the-verify-path"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/main_health_probe.py::spawn_main_health_probe` wired: the precedent for a detached task registered for shutdown, and the probe spawned when the root fails"
+        verdict: PASS
+      - name: "merge-scan-row"
+        binding: "built here: the merge_scan event type, written when a scan is applied or abandoned"
+        verdict: PASS
+        delivered_check:
+          kind: "grep"
+          pattern: "merge_scan"
+          expect: "present"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+      - name: "dark-factory-scans"
+        binding: "built here: dark-factory-orchestrator.yaml sets merge_evidence.scan"
+        verdict: PASS
+        delivered_check:
+          kind: "grep"
+          pattern: "merge_evidence"
+          expect: "present"
+          paths: ["dark-factory-orchestrator.yaml"]
+  - label: "β1"
+    task_id: 11053
+    title: "Batch cost rule and its fitted rates, in shadow; scan: auto"
+    capabilities:
+      - name: "rate-rows-upstream"
+        binding: "producer:task-ρ and producer:task-σ2 upstream: the outcome rows and merge_scan rows the rates are fitted from"
+        verdict: PASS
+      - name: "batch-rule"
+        binding: "built here: merge_lane/batch_rule.py, equal to the reference computation"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["orchestrator/src/orchestrator/merge_lane/batch_rule.py"]
+      - name: "rule-rates"
+        binding: "built here: merge_lane/rule_rates.py"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["orchestrator/src/orchestrator/merge_lane/rule_rates.py"]
+  - label: "σ3"
+    task_id: 11054
+    title: "Culprit scan: run a red lint or type-check leg alone on each tree"
+    capabilities:
+      - name: "scan-engine-upstream"
+        binding: "producer:task-σ1 upstream: the engine a leg check is added to"
+        verdict: PASS
+      - name: "leg-run-alone"
+        binding: "built here: one module's lint or type-check command run alone on a tree"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["orchestrator/tests/test_culprit_scan_legs.py"]
+  - label: "β2"
+    task_id: 11055
+    title: "Merge lane: the cost rule sizes and fills batches; cleared requests ride; the depth table is removed"
+    capabilities:
+      - name: "placement-site"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._deep_chain_placement` wired: where a batch's size is chosen today"
+        verdict: PASS
+      - name: "rule-upstream"
+        binding: "producer:task-β1 upstream: plan_batch and the fitted rates"
+        verdict: PASS
+      - name: "fast-landing-walk"
+        binding: "producer:task-10998 upstream: landing a batch of 12 without a type check per member"
+        verdict: PASS
+      - name: "depth-table-removed"
+        binding: "built here: merge_lane/chain_policy.py is deleted"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "absent"
+          paths: ["orchestrator/src/orchestrator/merge_lane/chain_policy.py"]
+      - name: "cost-rule-basis"
+        binding: "built here: chain_depth_reason.basis is cost_rule"
+        verdict: PASS
+        delivered_check:
+          kind: "grep"
+          pattern: "cost_rule"
+          expect: "present"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+  - label: "ε"
+    task_id: 11056
+    title: "Readout for the culprit scan and the batch rule (scripts/merge_evidence_readout.py)"
+    capabilities:
+      - name: "rows-upstream"
+        binding: "producer:task-α2, producer:task-ρ, producer:task-σ2 and producer:task-β1 upstream: the rows each section reads; a section with none prints \"no <kind> rows yet\""
+        verdict: PASS
+      - name: "readout"
+        binding: "built here: scripts/merge_evidence_readout.py"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["scripts/merge_evidence_readout.py"]
+  - label: "ζ"
+    task_id: 11057
+    title: "Integration gate: the merge-batches boundary rows against the real lane modules"
+    capabilities:
+      - name: "everything-upstream"
+        binding: "producer:task-β2, producer:task-σ3 and producer:task-ε upstream: the lane the boundary rows drive"
+        verdict: PASS
+      - name: "boundary-rows"
+        binding: "built here: section 7 rows 1 to 49 against the real lane modules"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["orchestrator/tests/test_merge_evidence_boundary.py"]
+  - label: "η"
+    task_id: 11058
+    title: "Human gate: design phase 2 of the merge pool batches (what an entry is built on, the statistical fallback, larger caps)"
+    capabilities:
+      - name: "phase-2-design"
+        binding: "a ruling this gate makes with Leo, from the readout of producer:task-ε"
+        verdict: PASS
+        delivered_check:
+          kind: "manual"
+          reason: "a design decision taken with Leo; its deliverable is a committed PRD or note"
+  - label: "θ"
+    task_id: 11059
+    title: "Human gate: revise the merge-chain visibility PRD for the scan and the batch rule (tasks 10759, 10761, 10762 wait)"
+    capabilities:
+      - name: "visibility-prd-revised"
+        binding: "`grep:plans/merge-chain-visibility-prd.md` a revision this gate makes with Leo"
+        verdict: PASS
+        delivered_check:
+          kind: "manual"
+          reason: "a design revision taken with Leo; its deliverable is a commit to that PRD and its tasks"
+  - label: "ι1"
+    task_id: 11060
+    title: "Design invariant INV-15 scheduling-state-survives-restart joins the checked list"
+    capabilities:
+      - name: "invariant-sites"
+        binding: "`grep:tests/repo_guards/test_design_invariants_consistency.py::PINNED_SITES` wired: the sites that must agree when an invariant is added"
+        verdict: PASS
+      - name: "inv-15"
+        binding: "built here: INV-15 scheduling-state-survives-restart on the checked list"
+        verdict: PASS
+        delivered_check:
+          kind: "grep"
+          pattern: "scheduling-state-survives-restart"
+          expect: "present"
+          paths: ["docs/legibility/design-invariants.md"]
+  - label: "κ"
+    task_id: 11061
+    title: "Merge lane: the bounce and retry budgets, the recent-verify window and an operator's halt survive a restart"
+    capabilities:
+      - name: "bounce-registry"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/intake_buffers.py::MergeIntake.bounce_registry` wired: the lane reads the conflict-bounce count (merge_lane/types.py MergeBounceRegistry) this leaf preserves"
+        verdict: PASS
+      - name: "operator-halt"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/halt.py::HaltState` wired: holds the operator halt this leaf preserves"
+        verdict: PASS
+      - name: "budgets-survive-restart"
+        binding: "built here: the bounce and retry budgets, the recent-verify window and an operator's halt are reloaded after a restart"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["orchestrator/tests/test_merge_lane_budgets_survive_restart.py"]
+  - label: "ι2"
+    task_id: 11062
+    title: "Merge lane: a register of its scheduling state and a guard that fails on undeclared state"
+    capabilities:
+      - name: "ratification-table"
+        binding: "`grep:docs/legibility/exception-ratifications.yaml` the table a dropped entry's ratification row goes in"
+        verdict: PASS
+      - name: "governed-exceptions"
+        binding: "`grep:shared/src/shared/governed_exceptions.py` the declaration INV-12 checks"
+        verdict: PASS
+      - name: "inv-15-upstream"
+        binding: "producer:task-ι1 upstream: the invariant the register answers"
+        verdict: PASS
+      - name: "restart-state-register"
+        binding: "built here: merge_lane/restart_state.py and its guard"
+        verdict: PASS
+        delivered_check:
+          kind: "path"
+          expect: "present"
+          paths: ["orchestrator/src/orchestrator/merge_lane/restart_state.py"]
+  - label: "ι3"
+    task_id: 11063
+    title: "Human gate: design the scheduler's register of restart-surviving state (INV-15)"
+    capabilities:
+      - name: "scheduler-register-design"
+        binding: "a ruling this gate makes with Leo, with the register of producer:task-ι2 as the pattern"
+        verdict: PASS
+        delivered_check:
+          kind: "manual"
+          reason: "a design decision taken with Leo; its deliverable is filed tasks"

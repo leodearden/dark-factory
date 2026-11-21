@@ -17,7 +17,6 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, assert_never, cast
 
 from graphiti_core.nodes import EpisodeType
-from shared.storm_counter import KeyedStormCounters
 from shared.streak import KeyedStreaks
 
 from fused_memory.backends.graphiti_client import (
@@ -87,7 +86,6 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
-    StageAgentOutcome,
 )
 from fused_memory.models.scope import (
     Scope,
@@ -113,9 +111,11 @@ from fused_memory.reconciliation.standing_decision_constants import (
 from fused_memory.reconciliation.standing_decision_writer import (
     expire_entity_standing_decision,
 )
+from fused_memory.reconciliation.summary_pool import decode_cycle_summary_agent_outcome
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
+from fused_memory.services.agent_project_storm_counters import AgentProjectStormCounters
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
@@ -879,9 +879,7 @@ async def _apply_memory_metadata_validation(
     dropped by task GC; it yields the loop, which is the property that
     matters.
     """
-    violations = validate_memory_metadata(
-        meta, enforce_kind_registry=config.enforce_kind_registry
-    )
+    violations = validate_memory_metadata(meta)
 
     # parent_id LIVENESS (leaf δ). Gated on the SHAPE check having passed —
     # `validate_memory_metadata` emits `invalid_parent_id_shape` under the
@@ -985,9 +983,7 @@ async def _apply_memory_metadata_validation(
         before = dict(baseline)
         already = {
             (v.key, v.code)
-            for v in validate_memory_metadata(
-                before, enforce_kind_registry=config.enforce_kind_registry
-            )
+            for v in validate_memory_metadata(before)
         }
         violations = [
             v for v in violations
@@ -2206,18 +2202,17 @@ class MemoryService:
         # service). An alarm bound to either would vanish in exactly the
         # degraded configuration where an unattended rewrite loop is least
         # likely to be noticed any other way.
-        self._mem0_update_storm_counters: KeyedStormCounters[tuple[str, str]] = (
-            KeyedStormCounters()
-        )
+        self._mem0_update_storm_counters = AgentProjectStormCounters()
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
         self.set_known_projects(build_known_projects_map(primary_root=''))
         # INV-4 storm escape for the ensure_entity_node MCP tool (task 4932),
-        # keyed per `agent_id` for the same attribution reason as the registry
-        # above.
+        # keyed per `(agent_id, project_id)` for the same attribution reason as
+        # the update_memory registry above: one agent's mints in another
+        # project cannot inflate the count filed into this project's queue.
         # No escalator OBJECT beside it: `middleware/entity_mint_storm_escalator`
         # is a module FUNCTION taking project_root explicitly, so there is no
         # queue cache to own and no set_known_projects lifecycle to keep in sync.
-        self._entity_mint_storm_counters: KeyedStormCounters[str] = KeyedStormCounters()
+        self._entity_mint_storm_counters = AgentProjectStormCounters()
         # Warn-ONCE latch for a corrupt/absent `entity_mint.storm_*` leaf. The
         # corrupt-leaf branch of `_record_entity_mint` is reached on EVERY mint
         # (unlike the `_known_projects` miss beside it, which only fires at a
@@ -2353,16 +2348,16 @@ class MemoryService:
         agents is a real memory bound on a long-lived server and belongs in the
         interface, as ``UnknownKeyStormDetector.tracked_writers`` argues.
         """
-        return frozenset(agent for agent, _ in self._mem0_update_storm_counters.tracked_keys)
+        return self._mem0_update_storm_counters.tracked_agents
 
     @property
     def entity_mint_storm_tracked_agents(self) -> frozenset[str]:
-        """The ``agent_id`` labels holding an ``ensure_entity_node`` storm window.
+        """The ``agent_id`` labels holding an ``ensure_entity_node`` storm window in any project.
 
         The same bound as :attr:`mem0_update_storm_tracked_agents`, for the
         entity-mint burst alarm.
         """
-        return self._entity_mint_storm_counters.tracked_keys
+        return self._entity_mint_storm_counters.tracked_agents
 
     def set_planned_registry(self, registry: PlannedEpisodeRegistry) -> None:
         """Wire the planned episode registry into the service."""
@@ -8929,11 +8924,8 @@ class MemoryService:
             # be trusted as a suppression signal for Stage 3 (task 2652
             # amendment).
             remediation = raw_remediation if isinstance(raw_remediation, bool) else None
-            raw_outcome = payload.get('agent_outcome') if isinstance(payload, dict) else None
-            try:
-                agent_outcome = StageAgentOutcome(raw_outcome).value
-            except ValueError:
-                agent_outcome = None
+            decoded = decode_cycle_summary_agent_outcome(record)
+            agent_outcome = decoded.value if decoded is not None else None
 
         reason, expected, run_status = await self._classify_summary_absence(
             journal,
@@ -9560,10 +9552,10 @@ class MemoryService:
         # agent_id is caller-supplied and unbounded; KeyedStormCounters sweeps
         # the dormant ones on every record.
         storm = self._mem0_update_storm_counters.record(
-            (label, project_id),
+            label,
+            project_id,
             threshold=threshold,
             window_seconds=float(window_seconds),
-            label=label,
             now=self._mem0_update_storm_time_provider(),
         )
         if storm is None:
@@ -10448,10 +10440,15 @@ class MemoryService:
         exactly the hold time the bounded acquire in ``ensure_entity_node``
         exists to bound, and would stall the event loop besides.
 
-        One counter per ``agent_id``, so two independently-busy agents cannot
-        sum into a false alarm. The threshold and window are read LIVE off the
-        shared config and passed INTO ``record()`` per call — captured once,
-        they would make both green-tier leaves restart-only in disguise.
+        One counter per ``(agent_id, project_id)``. Two independently-busy
+        agents cannot sum into a false alarm, and one agent's mints in another
+        project cannot inflate the count filed into this project's queue, so
+        the number is reproducible from this project's own
+        ``ensure_entity_node`` journal rows. Recon stage ids
+        (``recon-stage-<stage>``) are project-independent, which is why the
+        project is part of the key. The threshold and window are read LIVE off
+        the shared config and passed INTO ``record()`` per call — captured
+        once, they would make both green-tier leaves restart-only in disguise.
         """
         label = agent_id or '<unattributed>'
         cfg = getattr(self.config, 'entity_mint', None)
@@ -10490,9 +10487,9 @@ class MemoryService:
         # the dormant ones on every record.
         storm = self._entity_mint_storm_counters.record(
             label,
+            project_id,
             threshold=threshold,
             window_seconds=float(window_seconds),
-            label=label,
             now=self._entity_mint_storm_time_provider(),
         )
         if storm is None:

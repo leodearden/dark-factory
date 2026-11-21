@@ -33,6 +33,7 @@ from shared.merge_state import (
     CANCEL_STATES,
     EPISTEMIC_STATES,
     LIVE_STATES,
+    MERGE_REASONS,
     OUTCOME_STATES,
     POLL_STOP_STATES,
     SUBMIT_NON_TERMINAL,
@@ -197,6 +198,15 @@ class TestMergeReason:
     def test_is_distinct_from_merge_state(self):
         assert set() == {r.value for r in MergeReason} & {s.value for s in MergeState}
 
+    def test_merge_reasons_is_the_whole_vocabulary(self):
+        assert isinstance(MERGE_REASONS, frozenset)
+        assert all(isinstance(r, MergeReason) for r in MERGE_REASONS)
+        assert frozenset(MergeReason) == MERGE_REASONS, (
+            'MERGE_REASONS must be every MergeReason member — it is the partition the '
+            'scripts/tests drift guard pins the reason prose to; missing: '
+            f'{sorted(frozenset(MergeReason) - MERGE_REASONS)}'
+        )
+
 
 class TestPartitionsAreExhaustiveAndDisjoint:
     """The B9 drift mechanism.
@@ -300,6 +310,7 @@ class TestStandaloneLoadability:
             'POLL_STOP_STATES',
             'CANCEL_STATES',
             'MergeReason',
+            'MERGE_REASONS',
         ):
             assert hasattr(module, name), (
                 f'{name} does not resolve on a file-path load of {_MERGE_STATE_SOURCE}'

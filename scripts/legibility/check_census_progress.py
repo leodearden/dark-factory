@@ -26,10 +26,9 @@ from pathlib import Path
 
 # EXEC'd directly as a bound predicate with bare python3 (no venv, no
 # package context): see check_trickle_progress.py's identical shim.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import state_docs
-import trickle_state
+from legibility import state_docs, trickle_state
 
 USAGE = 'usage: check_census_progress.py <project_id> [max_unadvanced_fires]'
 

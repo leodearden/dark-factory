@@ -7,7 +7,7 @@ import os
 import re
 import shutil
 import time as _time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -381,10 +381,9 @@ class TestReconcileOneStrandedGroundTruthMarkDone:
 # task 2678 extends this refinement to the GONE_WITH_MERGE_MARKER sub-case
 # too (routed through validate_landing_evidence in CANDIDATE mode on
 # report.branch_state.sha, applied uniformly to both sub-cases): previously
-# the inline check here was gated on ``on_main``, so a branch-deleted merge
-# marker whose effect had been reverted at current main HEAD skipped the
-# guard entirely and was stamped done unconditionally — the task-1175
-# clobber shape, reproduced inside this sweep.
+# the inline check here was gated on ``on_main``, so the marker sub-case
+# skipped the guard and an empty-net-diff merge marker was stamped done —
+# the task-1175 shape, a re-derivation clobber rather than a revert.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -703,6 +702,44 @@ class TestReconcileOneStrandedLandingRejectEmission:
         cast(AsyncMock, scheduler.set_task_status).assert_awaited_once_with(tid, 'pending')
         [row] = landing_reject_rows(store)
         assert row['data']['delivered_checks_outcome'] == 'disabled'
+
+
+_ArrangeEffectAbsent = Callable[[Harness, str, pytest.MonkeyPatch], None]
+
+
+@pytest.mark.asyncio
+class TestReconcileSweepKeepsTheMergeMarkerPolicy:
+    @pytest.mark.parametrize(('arrange', 'status'), [
+        pytest.param(_on_main_effect_absent, 'in-progress', id='on_main'),
+        pytest.param(
+            lambda harness, tid, monkeypatch: _blocked_marker_effect_absent(
+                harness, tid, 'c8' * 20, monkeypatch,
+            ),
+            'blocked',
+            id='merge_marker',
+        ),
+    ])
+    async def test_the_reject_row_names_the_merge_marker_method(
+        self, harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        arrange: _ArrangeEffectAbsent, status: str,
+    ):
+        """Both sub-cases keep ``validate_landing_evidence`` CANDIDATE (task 4648).
+
+        Task 4648 moved the dispatch gate's live-branch arms to
+        ``branch_work_landed``; this sweep deliberately keeps the legacy
+        effect-present policy, so its verdict's method is ``merge_marker``,
+        never ``patch_id``.  The ruling and its reason are recorded in
+        ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7.
+        """
+        tid = '9030'
+        store = _bind_event_store(harness, tmp_path)
+        arrange(harness, tid, monkeypatch)
+
+        await _reconcile_stranded(harness, tid, status)
+
+        [row] = landing_reject_rows(store)
+        assert row['data']['site'] == 'reconcile_sweep'
+        assert row['data']['method'] == 'merge_marker'
 
 
 # ---------------------------------------------------------------------------
@@ -2653,6 +2690,8 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     config.review.enabled = False
     config.sandbox.backend = 'auto'
     config.max_concurrent_tasks = 2
+    # Harness.run builds RunSlots from this; a spec'd MagicMock raises TypeError in asyncio.Semaphore.
+    config.main_health_fix_reserved_slots = 1
     config.fused_memory.project_id = 'test'
     config.sandbox.backend = 'auto'
     point_harness_stores_at(config, tmp_path)
@@ -2718,7 +2757,7 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     h._reconcile_stranded_in_progress = _fake_reconcile
 
     # Track ordering: acquire_next — append then raise to break the loop
-    async def _fake_acquire():
+    async def _fake_acquire(*_args, **_kwargs):
         call_order.append('acquire')
         raise RuntimeError('stop the loop')
     h.scheduler.acquire_next = _fake_acquire

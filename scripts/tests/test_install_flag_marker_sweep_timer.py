@@ -2,23 +2,18 @@
 self-verifying installer for the fused-memory stage1_flag_marker sweep's
 systemd user timer (task 2693).
 
-Drives the script via subprocess with a FAKE `systemctl` shimmed onto PATH
-(records every invocation, minus `--user`, into a shared JSON state file --
-mirrors scripts/tests/test_install_trickle_timer.py). Real systemd is never
-touched. Unlike the trickle-timer installer, this job is a single
-non-templated dark_factory instance (no project_id argument, no per-project
-config resolution), so the driver has no
-INSTALL_TRICKLE_TIMER_PYTHON/LEGIBILITY_SEARCH_ROOTS equivalent. The fake
-systemctl additionally handles `start <unit>` (records the call and
-succeeds by default; set FAKE_SYSTEMCTL_FAIL_START=1 to make it fail
-instead, emitting systemd's own wording, so tests can pin that a failing
-one-time drain kick doesn't prevent -- or hide -- the self-verify) since
-this installer, unlike install-trickle-timer.sh, also kicks an immediate
-one-time drain of the current backlog.
+Drives the script via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl`
+first on PATH. Real systemd is never touched. Unlike the trickle-timer
+installer, this job is a single non-templated dark_factory instance (no
+project_id argument, no per-project config resolution), so the driver has no
+INSTALL_TRICKLE_TIMER_PYTHON/LEGIBILITY_SEARCH_ROOTS equivalent. This
+installer, unlike install-trickle-timer.sh, also kicks an immediate one-time
+drain of the current backlog with `systemctl start`. FAKE_SYSTEMCTL_FAIL_START=1
+makes that kick fail in systemd's own wording, so tests can pin that a failing
+kick neither prevents nor hides the self-verify.
 """
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 from pathlib import Path
@@ -36,128 +31,19 @@ TIMER_NAME = "fused-memory-flag-marker-sweep.timer"
 
 
 # ---------------------------------------------------------------------------
-# Fake systemctl (marker-file + canned enable/start/list-timers responses)
-# ---------------------------------------------------------------------------
-
-_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
-"""Fake `systemctl` for testing install-flag-marker-sweep-timer.sh.
-
-Records every invocation (minus `--user`) into a JSON state file at
-$FAKE_SYSTEMCTL_STATE. `enable --now <unit>` marks each non-flag arg as an
-enabled unit; `start <unit>` is recorded and succeeds (the immediate
-one-time drain kick), unless FAKE_SYSTEMCTL_FAIL_START=1 -- simulating a
-failed drain kick: the call is still recorded, then systemd's own failure
-wording is printed to stderr and the process exits non-zero; `list-timers`
-echoes back one line per *.timer unit enabled so far THIS RUN, unless
-FAKE_SYSTEMCTL_OMIT_LIST_TIMERS=1 -- simulating a self-verify failure where
-`enable` nominally succeeded but the unit is absent from `list-timers`.
-"""
-import json
-import os
-import sys
-
-STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
-
-
-def _load():
-    with open(STATE_PATH) as f:
-        return json.load(f)
-
-
-def _save(state):
-    with open(STATE_PATH, "w") as f:
-        json.dump(state, f)
-
-
-def main(argv):
-    args = [a for a in argv[1:] if a != "--user"]
-    if not args:
-        return 1
-    verb, rest = args[0], args[1:]
-
-    state = _load()
-    state.setdefault("calls", []).append(args)
-
-    if verb == "daemon-reload":
-        _save(state)
-        return 0
-
-    if verb == "enable":
-        units = [a for a in rest if not a.startswith("-")]
-        enabled = state.setdefault("enabled_timers", [])
-        for u in units:
-            if u not in enabled:
-                enabled.append(u)
-        _save(state)
-        return 0
-
-    if verb == "start":
-        _save(state)
-        if os.environ.get("FAKE_SYSTEMCTL_FAIL_START") == "1":
-            unit = rest[0] if rest else "<unit>"
-            print(
-                f'Job for {unit} failed. See "journalctl -xeu {unit}" for details.',
-                file=sys.stderr,
-            )
-            return 1
-        return 0
-
-    if verb == "list-timers":
-        _save(state)
-        if os.environ.get("FAKE_SYSTEMCTL_OMIT_LIST_TIMERS") == "1":
-            print("0 timers listed.")
-            return 0
-        enabled = state.get("enabled_timers", [])
-        for unit in enabled:
-            service = unit.replace(".timer", ".service")
-            print(f"Mon 2026-07-14 03:30:00 UTC  8h left  n/a  n/a  {unit}  {service}")
-        print(f"{len(enabled)} timers listed.")
-        return 0
-
-    return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv))
-'''
-
-
-def _fake_systemctl(tmp_path):
-    """Write an executable fake `systemctl` into <tmp_path>/bin/systemctl and
-    its backing JSON state file. Returns (bin_dir, state_path)."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    fake = bin_dir / "systemctl"
-    fake.write_text(_FAKE_SYSTEMCTL_SRC)
-    fake.chmod(0o755)
-
-    state_path = tmp_path / "systemctl_state.json"
-    state_path.write_text(json.dumps({"calls": [], "enabled_timers": []}))
-    return bin_dir, state_path
-
-
-def _systemctl_calls(tmp_path):
-    state_path = tmp_path / "systemctl_state.json"
-    if not state_path.is_file():
-        return []
-    return json.loads(state_path.read_text())["calls"]
-
-
-# ---------------------------------------------------------------------------
 # Script driver
 # ---------------------------------------------------------------------------
 
-def _run_script(tmp_path, *, env=None):
+def _run_script(fake_timer_systemctl, *, env=None):
     """Run install-flag-marker-sweep-timer.sh via subprocess.
 
-    Puts a fresh fake `systemctl` on PATH (state reset each call). Callers
+    Puts *fake_timer_systemctl* first on PATH, reset on every call. Callers
     supply XDG_CONFIG_HOME via *env*.
     """
-    bin_dir, state_path = _fake_systemctl(tmp_path)
+    fake_timer_systemctl.reset()
 
     full_env = dict(os.environ)
-    full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
-    full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
+    full_env["PATH"] = f"{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
     if env:
         full_env.update(env)
     return subprocess.run(
@@ -177,10 +63,10 @@ def test_script_is_executable():
     )
 
 
-def test_install_copies_units_enables_timer_and_kicks_drain(tmp_path):
+def test_install_copies_units_enables_timer_and_kicks_drain(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / "xdg-config"
 
-    result = _run_script(tmp_path, env={"XDG_CONFIG_HOME": str(xdg_config)})
+    result = _run_script(fake_timer_systemctl, env={"XDG_CONFIG_HOME": str(xdg_config)})
 
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -194,7 +80,7 @@ def test_install_copies_units_enables_timer_and_kicks_drain(tmp_path):
     assert service_path.read_bytes() == (TEMPLATES_DIR / SERVICE_NAME).read_bytes()
     assert timer_path.read_bytes() == (TEMPLATES_DIR / TIMER_NAME).read_bytes()
 
-    calls = _systemctl_calls(tmp_path)
+    calls = fake_timer_systemctl.calls()
     assert ["daemon-reload"] in calls, f"calls={calls!r}"
     assert ["enable", "--now", TIMER_NAME] in calls, f"calls={calls!r}"
     assert ["start", SERVICE_NAME] in calls, f"calls={calls!r}"
@@ -213,11 +99,11 @@ def test_install_copies_units_enables_timer_and_kicks_drain(tmp_path):
 # step-5: RED -- fail loud when the timer is absent from `list-timers`
 # ---------------------------------------------------------------------------
 
-def test_install_fails_loud_when_timer_absent_from_list_timers(tmp_path):
+def test_install_fails_loud_when_timer_absent_from_list_timers(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / "xdg-config"
 
     result = _run_script(
-        tmp_path,
+        fake_timer_systemctl,
         env={
             "XDG_CONFIG_HOME": str(xdg_config),
             "FAKE_SYSTEMCTL_OMIT_LIST_TIMERS": "1",
@@ -240,18 +126,18 @@ def test_install_fails_loud_when_timer_absent_from_list_timers(tmp_path):
 # attributed to the drain specifically) when the drain kick fails
 # ---------------------------------------------------------------------------
 
-def test_self_verify_runs_even_when_drain_kick_fails(tmp_path):
+def test_self_verify_runs_even_when_drain_kick_fails(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / "xdg-config"
 
     result = _run_script(
-        tmp_path,
+        fake_timer_systemctl,
         env={
             "XDG_CONFIG_HOME": str(xdg_config),
             "FAKE_SYSTEMCTL_FAIL_START": "1",
         },
     )
 
-    calls = _systemctl_calls(tmp_path)
+    calls = fake_timer_systemctl.calls()
     assert ["list-timers", "--all"] in calls, (
         f"Expected the list-timers self-verify to run even though the "
         f"drain kick (systemctl start) failed; calls={calls!r}"
@@ -292,7 +178,7 @@ def test_self_verify_runs_even_when_drain_kick_fails(tmp_path):
     )
 
 
-def test_installed_service_unit_carries_explicit_path_for_boot_catchup(tmp_path):
+def test_installed_service_unit_carries_explicit_path_for_boot_catchup(fake_timer_systemctl, tmp_path):
     """Task 2917 EDIT 3, unit half.
 
     The .timer unit sets `Persistent=true`, so a nightly firing missed while
@@ -315,7 +201,7 @@ def test_installed_service_unit_carries_explicit_path_for_boot_catchup(tmp_path)
     minimal boot env."""
     xdg_config = tmp_path / "xdg-config"
 
-    result = _run_script(tmp_path, env={"XDG_CONFIG_HOME": str(xdg_config)})
+    result = _run_script(fake_timer_systemctl, env={"XDG_CONFIG_HOME": str(xdg_config)})
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )

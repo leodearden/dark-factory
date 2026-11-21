@@ -50,20 +50,14 @@ class BlocklistEntry:
 
 
 def load_blocklist(path: Path | None) -> list[BlocklistEntry]:
-    """Load the cancelled-premise blocklist from a YAML file; never raises.
+    """Load the cancelled-premise blocklist from a YAML file.
 
-    File-level failures (unset path, missing / unreadable / undecodable file,
-    invalid YAML, non-list document) degrade to [] as specified by
-    fused_memory/utils/safe_yaml.py::load_yaml_list_file. Malformed individual
-    entries are skipped with one WARNING each.
+    An unset path yields []. Raises YamlListFileError
+    (fused_memory/utils/safe_yaml.py::load_yaml_list_file) on a file-level
+    failure; malformed entries are skipped with one WARNING each.
     """
     entries: list[BlocklistEntry] = []
-    for item in load_yaml_list_file(
-        path,
-        logger=logger,
-        label=_LOG_LABEL,
-        consequence="blocklist disabled",
-    ):
+    for item in load_yaml_list_file(path):
         if not isinstance(item, dict):
             logger.warning(
                 "%s: skipping non-dict entry in %s: %r",

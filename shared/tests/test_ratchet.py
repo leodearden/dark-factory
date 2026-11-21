@@ -688,10 +688,10 @@ class TestCommittedFileShape:
     def test_every_count_entry_occupies_exactly_one_line(self, tmp_path):
         """The only property that makes the baseline mergeable.
 
-        The same shape ``orchestrator/tests/test_merge_lane_ratchet.py::
-        test_every_per_path_entry_occupies_exactly_one_line`` pins, for the same
-        reason: concurrent branches editing disjoint keys must land in disjoint
-        hunks.  For THIS file it is sharper still — D7 says the inline
+        The same shape ``orchestrator/tests/test_merge_lane_ratchet_write_gate.py::
+        TestRenderBaseline::test_every_per_path_entry_occupies_exactly_one_line``
+        pins, for the same reason: concurrent branches editing disjoint keys must
+        land in disjoint hunks.  For THIS file it is sharper still — D7 says the inline
         baseline's only legal diff is deletions, and a deletion is only legible
         as one when it is a whole line.
 

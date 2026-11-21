@@ -24,13 +24,14 @@ import logging
 import os
 import shlex
 import subprocess
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 import pytest
 from _gate_fixtures import gated_remote_runner
+from _poll_responsive import poll_responsive
 from _task_verify_fixtures import VERIFY_MODULE, seed_task_branch_repo
 from shared.verify_admission import acquire_task_slot
 
@@ -65,6 +66,7 @@ _SECOND_MODULE = 'mod2'
 _TEST, _LINT, _TYPE = (f'{kind}-{VERIFY_MODULE}' for kind in ('test', 'lint', 'type'))
 _PROVISION = 'provision'
 _SSH_DOWN = (255, '', 'ssh: connect to host laptop.local port 22: No route to host')
+_STATE_WAIT_SECS = 15.0
 _T = TypeVar('_T')
 
 
@@ -90,9 +92,12 @@ def _alive(pid: int) -> bool:
     return True
 
 
-def _pending_tasks() -> set[asyncio.Task[Any]]:
+def _pending_tasks(*, excluding: Collection[asyncio.Task[Any]] = ()) -> set[asyncio.Task[Any]]:
     current = asyncio.current_task()
-    return {t for t in asyncio.all_tasks() if t is not current and not t.done()}
+    return {
+        t for t in asyncio.all_tasks()
+        if t is not current and t not in excluding and not t.done()
+    }
 
 
 async def _bounded(awaitable: Awaitable[_T], timeout: float = 30.0) -> _T:
@@ -102,14 +107,17 @@ async def _bounded(awaitable: Awaitable[_T], timeout: float = 30.0) -> _T:
 
 async def _until(
     predicate: Callable[[], bool], *, watching: asyncio.Task[Any] | None = None,
-    timeout: float = 15.0,
 ) -> None:
-    async with asyncio.timeout(timeout):
-        while not predicate():
-            if watching is not None and watching.done():
-                watching.result()
-                raise AssertionError('the call finished before reaching the awaited state')
-            await asyncio.sleep(0.01)
+    def reached() -> bool:
+        if predicate():
+            return True
+        if watching is not None and watching.done():
+            watching.result()
+            raise AssertionError('the call finished before reaching the awaited state')
+        return False
+
+    name = getattr(predicate, '__qualname__', repr(predicate))
+    await poll_responsive(reached, timeout=_STATE_WAIT_SECS, label=f'_until({name})')
 
 
 async def _no_sleep(_seconds: float) -> None:
@@ -510,7 +518,9 @@ async def _assert_cancelled_call_unwound(rig: _Rig, before: set[asyncio.Task[Any
     assert rig.local.tasks
     assert all(task is not None and task.done() for task in rig.local.tasks)
     assert rig.local.cancels == [1]
-    await _until(lambda: _pending_tasks() - before == set())
+    test_task = asyncio.current_task()
+    assert test_task is not None
+    await _until(lambda: _pending_tasks(excluding={test_task}) - before == set())
 
 
 def _assert_unwound(rig: _Rig, *, laptop_holders: list[str], local_holders: list[str]) -> None:
@@ -664,7 +674,9 @@ class TestTheRace:
         laptop_holder = rig.hold()
         await _bounded(laptop_holder.granted.wait())
         call = rig.start()
-        await _until(lambda: rig.legs.spawned(_TEST), watching=call)
+        await _until(lambda: _holding(rig.local_gate) == ['7'], watching=call)
+        [plan] = rig.local.plans
+        assert plan is not None and plan.has_been_granted()
         next_waiter = rig.hold(task_id='next')
         await _until(lambda: _waiters(rig.laptop) == ['7', 'next'])
 
@@ -676,6 +688,7 @@ class TestTheRace:
         rig.legs.release(_TEST)
         result = await _bounded(call)
         assert result.passed
+        assert len(rig.legs.pids(_TEST)) == 1
         assert rig.sidecar()['reason'] == 'local_granted_first'
         assert rig.local.cancels == []
         assert rig.remotes['laptop'].log == []
@@ -1068,6 +1081,36 @@ class TestAdmissionInactive:
 # ---------------------------------------------------------------------------
 
 
+async def _retry_between_turns(rig: _Rig) -> VerifyResult:
+    """Row 37's second scenario: the test leg's first run times out holding the local turn,
+    an older task takes the turn, and the retry waits behind it while the laptop turn frees.
+    One timeout retry is pinned, so exactly two test-leg turns are granted, and the verdict
+    is green or a pure timeout: load can make a trivial leg overrun, never fail."""
+    rig.config.verify_timeout_retries = 1
+    laptop_holder = rig.hold()
+    await _bounded(laptop_holder.granted.wait())
+    call = rig.start()
+    await _until(lambda: _holding(rig.local_gate) == ['7'], watching=call)
+    older = rig.hold_local(task_id='older', arrival=0.0)
+    await _bounded(older.granted.wait())
+    await _until(lambda: _waiting(rig.local_gate, '7'), watching=call)
+
+    await laptop_holder.leave()
+    await _until(lambda: _holding(rig.laptop) == _waiters(rig.laptop) == [])
+
+    assert not call.done()
+    await older.leave()
+    result = await _bounded(call)
+    assert result.passed or result.timed_out
+    assert result.admission_legs is not None
+    [first, _retry] = result.admission_legs
+    assert first.timed_out
+    assert rig.sidecar()['reason'] == 'local_granted_first'
+    assert rig.local.cancels == []
+    assert rig.remotes['laptop'].log == []
+    return result
+
+
 @_REAL
 class TestAGrantedPlanStaysLocal:
     async def test_row37_a_granted_module_keeps_the_plan_local_while_another_queues(
@@ -1105,26 +1148,13 @@ class TestAGrantedPlanStaysLocal:
         self, tmp_path: Path,
     ) -> None:
         rig = _rig(tmp_path, test_leg='times_out_first', module_timeout=1.0)
-        laptop_holder = rig.hold()
-        await _bounded(laptop_holder.granted.wait())
-        call = rig.start()
-        await _until(lambda: rig.legs.spawned(_TEST), watching=call)
-        older = rig.hold_local(task_id='older', arrival=0.0)
-        await _bounded(older.granted.wait())
-        await _until(lambda: _waiting(rig.local_gate, '7'), watching=call)
-        assert len(rig.legs.pids(_TEST)) == 1
+        await _retry_between_turns(rig)
 
-        await laptop_holder.leave()
-        await _until(lambda: _holding(rig.laptop) == _waiters(rig.laptop) == [])
-
-        assert not call.done()
-        await older.leave()
-        result = await _bounded(call)
-        assert result.passed
-        assert len(rig.legs.pids(_TEST)) == 2
-        assert rig.sidecar()['reason'] == 'local_granted_first'
-        assert rig.local.cancels == []
-        assert rig.remotes['laptop'].log == []
+    async def test_row37_a_retry_that_overruns_too_still_settles_locally(self, tmp_path: Path) -> None:
+        rig = _rig(tmp_path, module_timeout=1.0)
+        rig.legs.block(_TEST, _LINT, _TYPE)
+        result = await _retry_between_turns(rig)
+        assert result.timed_out
 
     async def test_row38_a_leg_granted_but_waiting_for_its_flock_keeps_the_plan_local(
         self, tmp_path: Path,

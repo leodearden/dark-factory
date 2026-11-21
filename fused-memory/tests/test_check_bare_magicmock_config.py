@@ -20,6 +20,7 @@ from typing import NamedTuple
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.testing_timeout_headroom import UNDER_LOAD_HEADROOM_FACTOR
 from shared.testing_xdist_groups import single_xdist_group
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -1266,8 +1267,6 @@ _REPO_SCAN_GROUP_NAME = 'bare_magicmock_repo_scan'
 
 # Worst root-bound wall clock of these scans under real load, task 5442; corpus is plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 _REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE = 61.52
-# Canonical home is orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR; fused-memory's tests cannot import orchestrator's test helpers.
-_UNDER_LOAD_HEADROOM_FACTOR = 8
 
 
 def _timeout_seconds(marker: pytest.Mark | None) -> float | None:
@@ -1291,13 +1290,13 @@ def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
     if not scan_items:
         pytest.skip('no repo-wide scan item is selected in this session')
     ini_default = float(request.config.getini('timeout'))
-    measured_need = _REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE * _UNDER_LOAD_HEADROOM_FACTOR
+    measured_need = _REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE * UNDER_LOAD_HEADROOM_FACTOR
     required = max(measured_need, ini_default)
     ceilings = {item.nodeid: _timeout_seconds(item.get_closest_marker('timeout')) for item in scan_items}
     short = {nodeid: ceiling for nodeid, ceiling in ceilings.items() if ceiling is None or ceiling < required}
     assert short == {}, (
         f'repo-wide scan items resolve a timeout below {required}s, the larger of the measured '
-        f'{_REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE}s x headroom {_UNDER_LOAD_HEADROOM_FACTOR} '
+        f'{_REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE}s x headroom {UNDER_LOAD_HEADROOM_FACTOR} '
         f'and the {ini_default}s ini default (None = no mark): {short}. Bind '
         '@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT) on the scan class; a closer mark '
         'on a scan test REPLACES it.'
@@ -2042,7 +2041,6 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_restart_hook.py',
     'orchestrator/tests/test_offline_lane_records.py',
     'orchestrator/tests/test_remote_gate.py',
-    'orchestrator/tests/test_task_verify_host_race.py',
     'orchestrator/tests/test_verify.py',
     'orchestrator/tests/test_verify_admission_cancel_release.py',
     'orchestrator/tests/test_verify_admission_executor_bypass.py',
@@ -2051,7 +2049,6 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_verify_admission_watch.py',
     'orchestrator/tests/test_verify_hosts.py',
     'orchestrator/tests/test_verify_plan_latch.py',
-    'orchestrator/tests/test_verify_run_cmd_reap.py',
     'orchestrator/tests/test_workflow_halt_owner.py',
     'dashboard/tests/test_db.py',
     'dashboard/tests/test_mcp_fanout.py',

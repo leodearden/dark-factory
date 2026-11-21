@@ -1,0 +1,306 @@
+"""Task 7112 study probe: reify local merge-gate latency, and the cores a local merge got, by era.
+
+One-off and read-only; not a maintained tool. Run from the dark-factory checkout root:
+
+    python3 plans/7112-verify-scope-weight-share/history.py.txt [JOURNAL_FILE] > plans/7112-verify-scope-weight-share/history.tsv
+
+JOURNAL_FILE, if given, is the saved output of JOURNAL_CMD below (the journal read takes ~15 min under load);
+without it the probe runs JOURNAL_CMD itself.
+
+Output is one TSV with a `section` first column:
+  era          the era table: name, start, end, and the record each boundary comes from
+  latency      (a) local merge_verify duration p50/p90/n per era, passed and failed apart
+  window       (a) the same over fixed sub-windows: the 14 days before the 48->24 cut, and #5205 landing
+               to the 2026-10-17 #7533 measurement (its own windows are lost with esc-7533-7)
+  admission    task-verify admission wait (verify_admission_plan legs, role task) p50/p90/n per era and window
+  scope        (b) every merge-role test-leg scope in the journal: its own wall time, CPU, cores while running
+  scope_era    (b) per-era p50 of those scopes' wall time and cores while running
+  merge        (b)+(c) every local merge_verify inside the journal's retention, joined to its scopes and runqueue
+  merge_era    (b)+(c) per-era means of the merge rows
+  merge_rq     (b)+(c) the merge rows bucketed by their median host runqueue ratio, all eras together
+  note         the rules used, stated once
+
+(b) Join rule. A scope is MERGE-role when its Started command carries the merge nice tier `nice -n 5 `
+(shared/src/shared/verify_admission.py::_NICE_TIERS: merge 5; task 15 + ionice -c2; background 19 + ionice -c3).
+Lint legs carry no tier: a lint scope is counted as the merge's when a merge-role scope Started within
+PAIR_S seconds after the lint scope's Consumed line (the lint leg hands straight to the test leg).
+Scopes attributed to a merge started at or after its window start - TOL_S and stopped by its end + TOL_S.
+Unpaired lint scopes in the window are reported as `ambiguous_lint`, never counted.
+"""
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import statistics
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+
+RUNS_DB = 'file:/home/leo/src/reify/data/orchestrator/runs.db?mode=ro'
+LOAD_DB = 'file:/home/leo/src/dark-factory/data/load-samples.db?immutable=1'
+JOURNAL_CMD = [
+    'journalctl', '--user', 'SYSLOG_IDENTIFIER=systemd', '-o', 'short-iso-precise',
+    '--no-pager', '--grep=df-verify-reify-',
+]
+TOL_S = 120.0
+PAIR_S = 2.0
+
+
+def ts(text: str) -> datetime:
+    return datetime.fromisoformat(text).astimezone(UTC)
+
+
+ERAS = [
+    ('48', ts('2026-06-01T00:00:00+00:00'), ts('2026-09-14T10:57:12+01:00'),
+     'start: before the first record; end: reify 3999a1a5f9 max_concurrent_tasks 48->24'),
+    ('24_pre5205', ts('2026-09-14T10:57:12+01:00'), ts('2026-10-04T18:26:07+01:00'),
+     'end: DF #5205 per-role CPUWeight, 1624fdc7c7/eede4a0353 on DF main'),
+    ('24_5205_gov_on', ts('2026-10-04T18:26:07+01:00'), ts('2026-10-13T22:22:54+01:00'),
+     'end: reify 5d76303d36 cpu_governance OFF'),
+    ('24_5205_gov_off', ts('2026-10-13T22:22:54+01:00'), ts('2026-11-02T18:24:47+00:00'),
+     'end: reify f8cdbf46ff max_concurrent_tasks 16'),
+    ('16_prepause', ts('2026-11-02T18:24:47+00:00'), ts('2026-11-08T16:00:00+00:00'),
+     'end: pause start, plans/cross-project-weights-study-2026-11-12/REPORT.md terms'),
+    ('16_resumed', None, ts('2026-11-16T06:43:40+00:00'),
+     'start: first reify merge_verify after the pause (derived); end: reify d2b6e4bc05 16->24'),
+    ('24_flat_nov', ts('2026-11-16T06:43:40+00:00'), ts('2026-11-19T00:23:57+00:00'),
+     'end: DF 3a8f8019ea Merge task/3394 (verify scopes move to df.slice)'),
+    ('24_slice', ts('2026-11-19T00:23:57+00:00'), datetime.now(UTC),
+     'start: 3394 merge; scopes move at each orchestrator restart after it'),
+]
+WINDOWS = [
+    ('48_last14d', ts('2026-08-31T10:57:12+01:00'), ts('2026-09-14T10:57:12+01:00')),
+    ('24_last14d_pre5205', ts('2026-09-20T18:26:07+01:00'), ts('2026-10-04T18:26:07+01:00')),
+    ('5205_to_1017_measurement', ts('2026-10-04T18:26:07+01:00'), ts('2026-10-17T18:20:00+00:00')),
+    ('last_7d', datetime.now(UTC) - timedelta(days=7), datetime.now(UTC)),
+]
+PAUSE_START = ts('2026-11-08T16:00:00+00:00')
+RESUME_SEARCH_FROM = ts('2026-11-10T00:00:00+00:00')
+
+
+@dataclass(frozen=True)
+class Merge:
+    end: datetime
+    seconds: float
+    passed: bool
+
+    @property
+    def start(self) -> datetime:
+        return self.end - timedelta(seconds=self.seconds)
+
+
+@dataclass
+class Scope:
+    name: str
+    start: datetime | None = None
+    end: datetime | None = None
+    cpu_s: float | None = None
+    command: str = ''
+
+    @property
+    def role(self) -> str:
+        if 'nice -n 5 ' in self.command:
+            return 'merge'
+        if 'nice -n 15 ' in self.command:
+            return 'task'
+        if 'nice -n 19 ' in self.command:
+            return 'background'
+        if 'verify.sh lint' in self.command:
+            return 'lint'
+        return 'other'
+
+
+def local_merges() -> list[Merge]:
+    with sqlite3.connect(RUNS_DB, uri=True) as db:
+        rows = db.execute(
+            "select timestamp, data from events where event_type='merge_verify' "
+            "and json_extract(data, '$.runner') = 'local' order by timestamp"
+        ).fetchall()
+    merges = []
+    for stamp, data in rows:
+        payload = json.loads(data)
+        if payload.get('duration_ms') is None:
+            continue
+        merges.append(Merge(ts(stamp), payload['duration_ms'] / 1000, bool(payload.get('passed'))))
+    return merges
+
+
+def task_admission_waits() -> list[tuple[datetime, float]]:
+    with sqlite3.connect(RUNS_DB, uri=True) as db:
+        rows = db.execute(
+            "select data from events where event_type='verify_admission_plan' "
+            "and json_extract(data, '$.role') = 'task'"
+        ).fetchall()
+    waits = []
+    for (data,) in rows:
+        for leg in json.loads(data).get('legs') or []:
+            if leg.get('granted_at') and leg.get('waited_secs') is not None:
+                waits.append((ts(leg['granted_at']), float(leg['waited_secs'])))
+    return waits
+
+
+def resolve_eras(merges: list[Merge]) -> list[tuple[str, datetime, datetime, str]]:
+    resume = min(m.end for m in merges if m.end >= RESUME_SEARCH_FROM)
+    return [(name, start or resume, end, source) for name, start, end, source in ERAS]
+
+
+def era_of(eras, moment: datetime) -> str:
+    for name, start, end, _ in eras:
+        if start <= moment < end:
+            return name
+    return 'paused' if PAUSE_START <= moment else 'none'
+
+
+def pct(values: list[float], q: float) -> float:
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, round(q * (len(ordered) - 1)))]
+
+
+def minutes(values: list[float]) -> tuple[str, str, int]:
+    if not values:
+        return '-', '-', 0
+    return f'{pct(values, 0.5) / 60:.1f}', f'{pct(values, 0.9) / 60:.1f}', len(values)
+
+
+CPU_PART = re.compile(r'(\d+(?:\.\d+)?)(d|h|min|ms|us|s)\b')
+CPU_UNIT_S = {'d': 86400, 'h': 3600, 'min': 60, 's': 1, 'ms': 1e-3, 'us': 1e-6}
+CONSUMED = re.compile(r'^(\S+) \S+ systemd\[\d+\]: (df-verify-reify-[0-9a-f-]+\.scope): Consumed (.+?) CPU time')
+STARTED = re.compile(r'^(\S+) \S+ systemd\[\d+\]: Started (df-verify-reify-[0-9a-f-]+\.scope) - (.*)$')
+
+
+def cpu_seconds(text: str) -> float:
+    return sum(float(value) * CPU_UNIT_S[unit] for value, unit in CPU_PART.findall(text))
+
+
+def journal_lines() -> list[str]:
+    if len(sys.argv) > 1:
+        with open(sys.argv[1]) as handle:
+            return handle.read().splitlines()
+    return subprocess.run(JOURNAL_CMD, capture_output=True, text=True, check=True).stdout.splitlines()
+
+
+def scopes_from_journal(lines: list[str]) -> list[Scope]:
+    scopes: dict[str, Scope] = {}
+    for line in lines:
+        if started := STARTED.match(line):
+            scope = scopes.setdefault(started[2], Scope(started[2]))
+            scope.start, scope.command = ts(started[1]), started[3]
+        elif consumed := CONSUMED.match(line):
+            scope = scopes.setdefault(consumed[2], Scope(consumed[2]))
+            scope.end, scope.cpu_s = ts(consumed[1]), cpu_seconds(consumed[3])
+    return [s for s in scopes.values() if s.start and s.end and s.cpu_s is not None]
+
+
+def merge_paired_lints(scopes: list[Scope]) -> set[str]:
+    merge_starts = sorted(s.start for s in scopes if s.role == 'merge' and s.start)
+    paired = set()
+    for scope in scopes:
+        if scope.role == 'lint' and scope.end and any(
+            timedelta(0) <= start - scope.end <= timedelta(seconds=PAIR_S) for start in merge_starts
+        ):
+            paired.add(scope.name)
+    return paired
+
+
+def runqueue_median(db: sqlite3.Connection, merge: Merge) -> tuple[str, int]:
+    rows = db.execute(
+        "select value from samples where metric='runqueue_ratio' and leaf is null and ts >= ? and ts <= ?",
+        (int(merge.start.timestamp()), int(merge.end.timestamp())),
+    ).fetchall()
+    values = [row[0] for row in rows]
+    return (f'{statistics.median(values):.2f}', len(values)) if values else ('-', 0)
+
+
+def emit(*cells: object) -> None:
+    print('\t'.join(str(cell) for cell in cells))
+
+
+def main() -> None:
+    merges = local_merges()
+    eras = resolve_eras(merges)
+    emit('section', 'era', 'start', 'end', 'source')
+    for name, start, end, source in eras:
+        emit('era', name, start.isoformat(timespec='seconds'), end.isoformat(timespec='seconds'), source)
+
+    emit('section', 'era', 'outcome', 'p50_min', 'p90_min', 'n')
+    for name, *_ in eras:
+        for label, wanted in (('passed', True), ('failed', False), ('all', None)):
+            durations = [m.seconds for m in merges if era_of(eras, m.end) == name and wanted in (None, m.passed)]
+            emit('latency', name, label, *minutes(durations))
+    for name, start, end in WINDOWS:
+        inside = [m for m in merges if start <= m.end < end]
+        for label, wanted in (('passed', True), ('failed', False), ('all', None)):
+            emit('window', name, label, *minutes([m.seconds for m in inside if wanted in (None, m.passed)]))
+
+    waits = task_admission_waits()
+    emit('section', 'era_or_window', 'p50_min', 'p90_min', 'n')
+    spans = [(name, start, end) for name, start, end, _ in eras] + WINDOWS
+    for name, start, end in spans:
+        emit('admission', name, *minutes([w for granted, w in waits if start <= granted < end]))
+
+    scopes = scopes_from_journal(journal_lines())
+    paired = merge_paired_lints(scopes)
+    journal_start = min(s.start for s in scopes if s.start)
+    emit('section', 'scope', 'era', 'start', 'wall_min', 'cpu_min', 'cores_while_running')
+    by_era: dict[str, list[tuple[float, float]]] = {}
+    for scope in sorted((s for s in scopes if s.role == 'merge'), key=lambda s: s.start or journal_start):
+        assert scope.start and scope.end and scope.cpu_s is not None
+        wall = (scope.end - scope.start).total_seconds()
+        era = era_of(eras, scope.end)
+        if wall:
+            by_era.setdefault(era, []).append((wall, scope.cpu_s / wall))
+        emit('scope', scope.name, era, scope.start.isoformat(timespec='seconds'),
+             f'{wall / 60:.1f}', f'{scope.cpu_s / 60:.1f}', f'{scope.cpu_s / wall:.2f}' if wall else '-')
+    emit('section', 'era', 'n', 'wall_min_p50', 'cores_while_running_p50', 'cores_while_running_p90')
+    for era, rows in by_era.items():
+        cores = [c for _, c in rows]
+        emit('scope_era', era, len(rows), f'{statistics.median(w for w, _ in rows) / 60:.1f}',
+             f'{statistics.median(cores):.2f}', f'{pct(cores, 0.9):.2f}')
+
+    emit('section', 'merge_end', 'era', 'passed', 'wall_min', 'merge_scopes', 'paired_lint', 'ambiguous_lint',
+         'merge_cpu_min', 'mean_cores', 'overlaps_other_local_merge', 'runqueue_median', 'runqueue_samples')
+    tol = timedelta(seconds=TOL_S)
+    rows_by_era: dict[str, list[tuple[float, str, float, float]]] = {}
+    with sqlite3.connect(LOAD_DB, uri=True) as load_db:
+        for merge in (m for m in merges if m.start >= journal_start):
+            inside = [s for s in scopes if s.start and s.end and s.start >= merge.start - tol and s.end <= merge.end + tol]
+            mine = [s for s in inside if s.role == 'merge' or s.name in paired]
+            ambiguous = sum(1 for s in inside if s.role == 'lint' and s.name not in paired)
+            cpu = sum(s.cpu_s or 0.0 for s in mine)
+            overlaps = any(o is not merge and o.start < merge.end and merge.start < o.end for o in merges)
+            runqueue, samples = runqueue_median(load_db, merge)
+            era = era_of(eras, merge.end)
+            cores = cpu / merge.seconds
+            if any(s.role == 'merge' for s in mine):
+                rows_by_era.setdefault(era, []).append((cores, runqueue, cpu / 60, merge.seconds / 60))
+            emit('merge', merge.end.isoformat(timespec='seconds'), era, merge.passed, f'{merge.seconds / 60:.1f}',
+                 sum(1 for s in mine if s.role == 'merge'), sum(1 for s in mine if s.name in paired), ambiguous,
+                 f'{cpu / 60:.1f}', f'{cores:.2f}', overlaps, runqueue, samples)
+
+    emit('section', 'era', 'merges_with_a_merge_scope', 'mean_cores_mean', 'mean_cores_p50', 'runqueue_median_p50',
+         'merge_cpu_min_p50', 'wall_min_p50')
+    for era, rows in rows_by_era.items():
+        cores = [c for c, *_ in rows]
+        runqueues = [float(r) for _, r, *_ in rows if r != '-']
+        emit('merge_era', era, len(rows), f'{statistics.fmean(cores):.2f}', f'{statistics.median(cores):.2f}',
+             f'{statistics.median(runqueues):.2f}' if runqueues else '-',
+             f'{statistics.median(cpu for *_, cpu, _ in rows):.1f}', f'{statistics.median(w for *_, w in rows):.1f}')
+
+    emit('section', 'runqueue_bucket', 'merges', 'mean_cores_p50', 'mean_cores_mean')
+    pooled = [(float(r), c) for rows in rows_by_era.values() for c, r, *_ in rows if r != '-']
+    for low, high in ((0.0, 2.0), (2.0, 3.0), (3.0, 4.0), (4.0, float('inf'))):
+        cores = [c for r, c in pooled if low <= r < high]
+        if cores:
+            emit('merge_rq', f'[{low:g},{high:g})', len(cores), f'{statistics.median(cores):.2f}',
+                 f'{statistics.fmean(cores):.2f}')
+
+    emit('note', f'journal retention starts {journal_start.isoformat(timespec="seconds")}; '
+                 f'TOL_S={TOL_S}; PAIR_S={PAIR_S}; load-samples.db read immutable (WAL frames not yet '
+                 'checkpointed are unseen); era boundaries are commit times, i.e. the earliest a change '
+                 'could take effect, not the restart that applied it')
+
+
+if __name__ == '__main__':
+    main()

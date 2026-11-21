@@ -28,6 +28,7 @@ from _briefing_helpers import (
 from _prompt_action_items import action_items
 from _roles_helpers import tool_is_granted
 from shared.capability_manifest import DeliveredCheckMeta
+from shared.declared_checks import declared_checks
 from shared.task_text_fingerprint import TaskTextDrift
 
 from orchestrator.agents.briefing import (
@@ -153,6 +154,11 @@ def _unwrapped(rendered: str) -> str:
     return ' '.join(rendered.split())
 
 
+def _render(value: object) -> str:
+    """The capability-gate block for a task whose ``metadata.delivered_checks`` is *value*."""
+    return _format_delivered_checks(declared_checks({'delivered_checks': value}))
+
+
 class TestFormatTaskMetadataInvariant:
     def test_dict_metadata_with_files(self, briefing: BriefingAssembler):
         task = {
@@ -254,7 +260,7 @@ class TestFormatDeliveredChecks:
     }
 
     def test_grep_entry_renders_its_descriptor(self):
-        bullet = '\n'.join(_bullet_lines(_format_delivered_checks([self.GREP_CHECK])))
+        bullet = '\n'.join(_bullet_lines(_render([self.GREP_CHECK])))
         assert 'cap-one' in bullet
         assert 'grep' in bullet
         assert 'FooBar' in bullet
@@ -262,7 +268,7 @@ class TestFormatDeliveredChecks:
         assert 'orchestrator' in bullet
 
     def test_script_entry_renders_its_descriptor(self):
-        bullet = '\n'.join(_bullet_lines(_format_delivered_checks([self.SCRIPT_CHECK])))
+        bullet = '\n'.join(_bullet_lines(_render([self.SCRIPT_CHECK])))
         assert 'cap-two' in bullet
         assert 'script' in bullet
         assert 'scripts/check.py' in bullet
@@ -270,20 +276,20 @@ class TestFormatDeliveredChecks:
         assert '30' in bullet
 
     def test_two_entries_render_two_bullets_in_order(self):
-        out = _format_delivered_checks([self.GREP_CHECK, self.SCRIPT_CHECK])
+        out = _render([self.GREP_CHECK, self.SCRIPT_CHECK])
         bullets = _bullet_lines(out)
         assert len(bullets) == 2
         assert out.index('cap-one') < out.index('cap-two')
 
     def test_none_renders_nothing(self):
         """The caller uses falsiness to omit the whole section."""
-        assert _format_delivered_checks(None) == ''
+        assert _render(None) == ''
 
     def test_empty_list_renders_nothing(self):
-        assert _format_delivered_checks([]) == ''
+        assert _render([]) == ''
 
     def test_block_labels_itself_as_the_capability_gate_against_main(self):
-        out = _format_delivered_checks([self.GREP_CHECK])
+        out = _render([self.GREP_CHECK])
         assert '## Declared Capability Gate' in out
         assert 'delivered_checks' in out
         assert 'main' in out
@@ -294,29 +300,29 @@ class TestFormatDeliveredChecks:
         and is green-tier hot-reloadable, so an unconditional "your mark-done IS
         gated" would be a false mechanical claim on a disarmed fleet.
         """
-        out = _unwrapped(_format_delivered_checks([self.GREP_CHECK]))
+        out = _unwrapped(_render([self.GREP_CHECK]))
         assert 'When the capability gate is enabled' in out
         assert 'delivered_checks.enabled' in out
 
     def test_block_binds_the_directive_regardless_of_the_gate(self):
         """The anti-gaming directive must not be read as conditional too."""
-        out = _unwrapped(_format_delivered_checks([self.GREP_CHECK]))
+        out = _unwrapped(_render([self.GREP_CHECK]))
         assert 'whether or not the gate is armed on this fleet' in out
 
     def test_block_carries_the_anti_gaming_directive(self):
         """Positive-directive assertions — the prose names what to DO."""
-        out = _format_delivered_checks([self.GREP_CHECK])
+        out = _render([self.GREP_CHECK])
         assert 'Deliver the BEHAVIOUR' in out
         assert 'is a defect, not a pass' in out
 
     def test_block_tells_the_agent_to_escalate_an_unsatisfiable_descriptor(self):
-        out = _format_delivered_checks([self.GREP_CHECK])
+        out = _render([self.GREP_CHECK])
         assert 'escalate_blocker' in out
         assert 'design_concern' in out
 
     def test_block_points_at_the_descriptor_contract_rather_than_restating_it(self):
         """INV-9: point at §3.3, do not restate the descriptor shape."""
-        out = _format_delivered_checks([self.GREP_CHECK])
+        out = _render([self.GREP_CHECK])
         assert 'docs/task-authoring.md' in out
 
     def test_render_mentions_every_live_descriptor_field(self):
@@ -334,8 +340,8 @@ class TestFormatDeliveredChecks:
         instead of the thing that drifts.
         """
         union = '\n'.join(
-            _bullet_lines(_format_delivered_checks([self.GREP_CHECK]))
-            + _bullet_lines(_format_delivered_checks([self.SCRIPT_CHECK]))
+            _bullet_lines(_render([self.GREP_CHECK]))
+            + _bullet_lines(_render([self.SCRIPT_CHECK]))
         )
         missing = [f for f in DeliveredCheckMeta.model_fields if f not in union]
         assert not missing, f'renderer omits live DeliveredCheckMeta fields: {missing}'
@@ -355,34 +361,41 @@ class TestFormatDeliveredChecksDegradesSafely:
         'paths': [],
     }
 
-    def test_bare_dict_is_accepted_as_a_one_element_list(self):
-        """A dict supplied where a list belongs validates quietly through
-        ``parse_metadata`` (shared/tests/test_capability_manifest.py), so a real
-        task can carry one — render it as the single bullet the author meant.
+    def test_bare_dict_value_is_one_malformed_entry(self):
+        """A dict supplied where a list belongs is not a check descriptor:
+        ``parse_metadata`` gives it a ``wrong_cardinality`` verdict, and the gate
+        can never evaluate it, so it is counted, never rendered as a bullet.
         """
-        out = _format_delivered_checks(
-            {'name': 'cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'},
-        )
-        assert isinstance(out, str)
-        assert len(_bullet_lines(out)) == 1
-        assert 'cap' in out
+        out = _render({'name': 'cap', 'kind': 'grep', 'pattern': 'X', 'expect': 'present'})
+        assert GATE_HEADING in out
+        assert _bullet_lines(out) == []
+        assert '1 malformed entry' in out
 
-    def test_string_value_renders_nothing(self):
-        """Never render a string per-character."""
-        assert _format_delivered_checks('cap-one') == ''
+    def test_string_value_is_one_malformed_entry(self):
+        """Never render a string per-character, and never hide it."""
+        out = _render('cap-one')
+        assert GATE_HEADING in out
+        assert _bullet_lines(out) == []
+        assert '1 malformed entry' in out
 
-    def test_int_value_renders_nothing(self):
-        assert _format_delivered_checks(7) == ''
+    def test_int_value_is_one_malformed_entry(self):
+        out = _render(7)
+        assert GATE_HEADING in out
+        assert '1 malformed entry' in out
+
+    @pytest.mark.parametrize('value', ['', {}], ids=['empty-str', 'empty-dict'])
+    def test_a_falsy_non_list_value_renders_nothing(self, value):
+        assert _render(value) == ''
 
     def test_non_dict_element_does_not_lose_the_valid_entry(self):
-        out = _format_delivered_checks(['nope', self.VALID])
+        out = _render(['nope', self.VALID])
         assert isinstance(out, str)
         assert 'cap-ok' in out
         assert len(_bullet_lines(out)) == 1
 
     def test_non_dict_element_is_counted_visibly(self):
         """A dropped element must leave a trace, not vanish."""
-        out = _format_delivered_checks(['nope', self.VALID])
+        out = _render(['nope', self.VALID])
         assert '1 malformed entry' in out
 
     def test_all_elements_malformed_still_renders_the_section(self):
@@ -395,26 +408,31 @@ class TestFormatDeliveredChecksDegradesSafely:
         Rendering '' would block the task from ever stamping done while showing
         its agent no gate at all.
         """
-        out = _format_delivered_checks(['cap-one'])
+        out = _render(['cap-one'])
         assert GATE_HEADING in out
         assert '1 malformed entry' in out
         assert 'metadata.delivered_checks' in out
 
+    def test_malformed_line_says_the_entry_can_never_pass_the_gate(self):
+        out = _unwrapped(_render(['nope', self.VALID]))
+        assert 'can never pass' in out
+        assert 'repair' in out
+
     def test_malformed_count_is_plural_for_several(self):
-        out = _format_delivered_checks(['a', 'b', 7])
+        out = _render(['a', 'b', 7])
         assert '3 malformed entries' in out
 
     def test_malformed_line_is_not_counted_as_a_descriptor_bullet(self):
-        assert _bullet_lines(_format_delivered_checks(['nope'])) == []
+        assert _bullet_lines(_render(['nope'])) == []
 
     def test_entry_missing_name_and_kind_still_renders_what_is_known(self):
-        out = _format_delivered_checks([{'pattern': 'OnlyAPattern', 'expect': 'present'}])
+        out = _render([{'pattern': 'OnlyAPattern', 'expect': 'present'}])
         assert len(_bullet_lines(out)) == 1
         assert 'OnlyAPattern' in out
         assert 'present' in out
 
     def test_unrecognised_kind_renders_a_visible_partial_bullet(self):
-        out = _format_delivered_checks(
+        out = _render(
             [{'name': 'cap-weird', 'kind': 'telepathy', 'pattern': 'Z'}],
         )
         assert len(_bullet_lines(out)) == 1
@@ -424,12 +442,12 @@ class TestFormatDeliveredChecksDegradesSafely:
         assert 'UNRECOGNISED' in out
 
     def test_unrecognised_kind_does_not_suppress_a_sibling_entry(self):
-        out = _format_delivered_checks([{'kind': 'telepathy'}, self.VALID])
+        out = _render([{'kind': 'telepathy'}, self.VALID])
         assert len(_bullet_lines(out)) == 2
         assert 'cap-ok' in out
 
     def test_non_string_paths_element_is_coerced(self):
-        out = _format_delivered_checks(
+        out = _render(
             [{'name': 'c', 'kind': 'grep', 'pattern': 'X', 'expect': 'present',
               'paths': ['orchestrator', 7]}],
         )
@@ -437,7 +455,7 @@ class TestFormatDeliveredChecksDegradesSafely:
         assert '7' in out
 
     def test_non_string_args_element_is_coerced(self):
-        out = _format_delivered_checks(
+        out = _render(
             [{'name': 'c', 'kind': 'script', 'script': 's.py', 'args': ['--a', 3],
               'timeout_secs': 5}],
         )
@@ -446,13 +464,13 @@ class TestFormatDeliveredChecksDegradesSafely:
 
     def test_over_the_limit_truncates_visibly(self):
         checks = [dict(self.VALID, name=f'cap-{i}') for i in range(DELIVERED_CHECK_BULLET_LIMIT + 3)]
-        out = _format_delivered_checks(checks)
+        out = _render(checks)
         assert len(_bullet_lines(out)) == DELIVERED_CHECK_BULLET_LIMIT
         assert '…and 3 more' in out
 
     def test_exactly_at_the_limit_renders_no_truncation_line(self):
         checks = [dict(self.VALID, name=f'cap-{i}') for i in range(DELIVERED_CHECK_BULLET_LIMIT)]
-        out = _format_delivered_checks(checks)
+        out = _render(checks)
         assert len(_bullet_lines(out)) == DELIVERED_CHECK_BULLET_LIMIT
         assert '…and' not in out
 
@@ -505,6 +523,13 @@ class TestDeliveredChecksReachDispatchedRoles:
         out = briefing._format_task({'id': '7', 'title': 'None metadata', 'metadata': None})
         assert '**ID:** 7' in out
         assert GATE_HEADING not in out
+
+    def test_format_task_counts_an_unreadable_declaration(self, briefing: BriefingAssembler):
+        out = briefing._format_task(
+            {'id': '8', 'title': 'Malformed checks', 'metadata': {'delivered_checks': ['cap-one']}},
+        )
+        assert GATE_HEADING in out
+        assert '1 malformed entry' in out
 
     def test_include_files_false_keeps_the_gate(
         self, briefing: BriefingAssembler, task_with_delivered_checks: dict,

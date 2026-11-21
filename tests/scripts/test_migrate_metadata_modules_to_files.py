@@ -41,9 +41,9 @@ from typing import Any
 import httpx
 
 # scripts/ is put on sys.path by tests/scripts/conftest.py at collection time,
-# and — as of task 3456 — is ALSO listed (with scripts/legibility) in
-# [tool.pyright] extraPaths in the root pyproject.toml, so this import resolves
-# statically too and needs no ignore. Before 3456 this comment claimed scripts/
+# and — as of task 3456 — is ALSO listed in [tool.pyright] extraPaths in the
+# root pyproject.toml, so this import resolves statically too and needs no
+# ignore. Before 3456 this comment claimed scripts/
 # was "deliberately absent" from that table; declaring the `scripts` module's
 # type gate required the opposite. Same correction in
 # tests/scripts/test_repair_wiped_metadata_files.py.

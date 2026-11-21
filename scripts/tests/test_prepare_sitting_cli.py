@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from escalation.models import Escalation
 from orchestrator.decision_registry import DecisionRecord, normalize_escalations_dir
-from orchestrator.session_registry import SessionRecord, Status
+from orchestrator.session_records import SessionRecord, Status
 from shared.project_id import fold_project_token
 from shared.task_statuses import TERMINAL
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT

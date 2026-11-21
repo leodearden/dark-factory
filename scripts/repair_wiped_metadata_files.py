@@ -64,7 +64,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 
-from _task_db_scan import UNREADABLE_STORE_ERRORS
+from _task_db_scan import UNREADABLE_STORE_ERRORS, discover_or_report_no_default_root
 from audit_wiped_metadata_files import (
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
@@ -1231,7 +1231,9 @@ async def main_async(args: argparse.Namespace) -> int:
     (:data:`EXIT_NOTHING_SCANNED`), so :data:`EXIT_WRITE_FAILED` keeps its one
     documented meaning.
     """
-    roots = discover_project_roots(project_roots=args.project_roots)
+    roots = discover_or_report_no_default_root(
+        lambda: discover_project_roots(project_roots=args.project_roots)
+    )
     if not roots:
         print(
             "no project root resolvable with a readable tasks.db (checked "

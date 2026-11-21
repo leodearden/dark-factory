@@ -258,7 +258,7 @@ tasks:
   - label: "ε3"
     task_id: 9829
     title: "Move fused-memory's memory-read and graph-admin tool families"
-    note: "Contributes to fk-45cf67bff540, fk-9214f842ca92. Depends on ε2. Moves search, get_entity, get_entity_by_uuid and get_episodes with their identity calls as S12 δ left them: the three reads keep the refusal, search keeps its exclusion."
+    note: "Contributes to fk-45cf67bff540, fk-9214f842ca92. Depends on ε2. Moves search, get_entity, get_entity_by_uuid and get_episodes with their identity calls as S12 δ left them: the three reads keep the refusal, search keeps its exclusion. AMENDED 2026-11-14 (fused-recall plan 1, R93): task 9829 now depends on tasks 10079 and 10083; it does not create server/task_status_facts.py, because task 10079 replaced the nested _batched_task_statuses helper with middleware/task_facts.py::read_task_facts. Check task-status-facts-leaf removed."
     capabilities:
       - name: "memory-read-family-module"
         binding: "producer (ε3) — server/tool_families/memory_read.py::register"
@@ -273,13 +273,6 @@ tasks:
         delivered_check:
           kind: path
           paths: ["fused-memory/src/fused_memory/server/tool_families/graph_admin.py"]
-          expect: present
-      - name: "task-status-facts-leaf"
-        binding: "producer (ε3) — server/task_status_facts.py, the batched task-status read graph_admin and memory_write share"
-        verdict: PASS
-        delivered_check:
-          kind: path
-          paths: ["fused-memory/src/fused_memory/server/task_status_facts.py"]
           expect: present
   - label: "ε4"
     task_id: 9830

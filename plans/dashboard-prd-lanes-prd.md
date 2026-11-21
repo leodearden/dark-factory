@@ -620,8 +620,9 @@ sidecar_path(prd_key: str) -> str          # 'plans/x-prd.md' -> 'plans/x-prd.ca
 - **Stamper.** `manifest_stamping.py::_stamp_capability_manifests_impl` uses `sidecar_path`
   and preserves `signal_leaves` across a stamp.
 - **Drift audit.** `scripts/audit_manifest_descriptor_drift.py` reports a signal label whose
-  bound task is missing or whose PRD field disagrees with the sidecar's `prd`. It reports only,
-  like the rest of that audit.
+  bound task is missing, or whose own PRD field, read by `prd_attribution.coalesce_prd` and
+  `normalise_prd_key` (§5.4) exactly as §4.7's cross-check reads it, does not name the
+  sidecar's `prd`. It reports only, like the rest of that audit.
 
 ### 5.3 Lineage datum (γ1, `data/task_lineage.py`)
 

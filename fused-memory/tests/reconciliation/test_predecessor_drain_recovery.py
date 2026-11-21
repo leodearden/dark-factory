@@ -44,6 +44,7 @@ from reconciliation.harness_fixtures import (
     open_event_buffer,
     open_journal,
 )
+from reconciliation.legacy_drains import drain_unattributed
 
 PROJECT_P = 'project-p'
 PROJECT_Q = 'project-q'
@@ -107,7 +108,7 @@ async def test_drained_runs_of_other_instances_names_each_run_with_the_instance_
     await stores.dead.drain_by_ids(PROJECT_P, [e1, e2], run_id='run-dead-chunk')
     await stores.live.drain(PROJECT_P, run_id='run-live')
     await _push_events(stores.dead, PROJECT_Q, 1)
-    await stores.live.drain(PROJECT_Q)
+    assert drain_unattributed(stores.db_path, PROJECT_Q, instance_id='live') == 1
 
     assert await stores.live.drained_runs_of_other_instances() == [
         DrainedRun(project_id=PROJECT_P, run_id='run-dead-chunk', instance_id=DEAD_INSTANCE),

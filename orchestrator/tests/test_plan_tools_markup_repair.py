@@ -40,12 +40,14 @@ import inspect
 import json
 import logging
 import stat
+import subprocess
 import tempfile
 import textwrap
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
+from _git_fixtures import RepoSeed, seed_repo
 from _markup_helpers import (
     INVOKE_CLOSER,
     closer,
@@ -66,7 +68,7 @@ from orchestrator.artifacts import (
     ArtifactWriteError,
     TaskArtifacts,
 )
-from orchestrator.mcp import plan_tools
+from orchestrator.mcp import plan_markup_repair, plan_tools
 
 # ---------------------------------------------------------------------------
 # The four REAL specimen shapes, measured on the 28 corrupted live plans.
@@ -291,11 +293,10 @@ def _plan_writing_tool_names(registered: frozenset[str] | None = None) -> tuple[
     survivor's own body, never a substring scan of the source text. A text
     scan would be actively WRONG here: this module's own comments and
     docstrings mention these method names in prose repeatedly — including this
-    very docstring. Measured on plan_tools, ``_repair_one_field`` discusses
-    ``write_plan`` and ``create_server`` discusses ``mark_step_committed``,
-    neither calling the method it names; a substring match would classify both
-    as writers. Other guards happen to exclude those two as well, which is
-    exactly the point — the AST walk is what makes the classification CORRECT
+    very docstring. Measured on plan_tools, ``create_server`` discusses
+    ``mark_step_committed`` without calling it; a substring match would
+    classify it as a writer. Other guards happen to exclude it as well, which
+    is exactly the point — the AST walk is what makes the classification CORRECT
     rather than accidentally correct, and it is the guard that survives a
     future helper that is artifacts-first, ``_``-prefixed, and merely
     discusses a write.
@@ -333,6 +334,16 @@ def _plan_writing_tool_names(registered: frozenset[str] | None = None) -> tuple[
     return tuple(sorted(names))
 
 
+#: A repo that ignores the artifacts dir, so ``.task/`` never lands in a commit.
+_TASK_IGNORING_SEED = RepoSeed(files=(('.gitignore', '.task/\n'),), message='Initial')
+
+
+def _head_sha(repo: Path) -> str:
+    return subprocess.run(
+        ['git', 'rev-parse', 'HEAD'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
 def _seed_plan_through_real_writers(root) -> TaskArtifacts:
     """Build a plan by calling the five REAL writer tools; return its artifacts.
 
@@ -345,7 +356,11 @@ def _seed_plan_through_real_writers(root) -> TaskArtifacts:
     Seeds THREE files, not one, so ``_drop_plan_file``'s never-narrow-to-empty
     guard does not fire — neither for the seeding drop below, nor for a probe
     that drops a second entry.
+
+    *root* is made a real git repo first, so a writer guarded on a sha being
+    on the branch is probed with :func:`_head_sha` rather than a stubbed guard.
     """
+    seed_repo(root, _TASK_IGNORING_SEED)
     artifacts = TaskArtifacts(root)
     artifacts.init('test-1', 'Test task', 'A test')
     plan_tools._create_plan(
@@ -426,10 +441,9 @@ def _alternate_writer_changed_the_cell(
     than by id, since there is no id to look up; probing one of their rows
     used to raise a bare ``KeyError`` before this existed.
 
-    An alternate whose guard depends on state this fixture cannot supply
-    (currently only ``mark_step_committed``, via ``_sha_exists_on_branch`` —
-    ``root`` here is not a git repository) is the CALLER's responsibility to
-    satisfy first, e.g. via ``monkeypatch``.
+    A sha parameter gets the seeded repo's HEAD, so ``mark_step_committed``'s
+    on-branch guard (``orchestrator/mcp/branch_probes.py::sha_exists_on_branch``)
+    passes for real.
     """
     artifacts = _seed_plan_through_real_writers(root)
 
@@ -476,7 +490,7 @@ def _alternate_writer_changed_the_cell(
         elif name == 'prose_only':
             kwargs[name] = False
         elif name in ('sha', 'commit_sha', 'commit'):
-            kwargs[name] = 'a' * 40
+            kwargs[name] = _head_sha(artifacts.worktree)
         elif name == 'disposition':
             kwargs[name] = 'orphan'
         elif name == 'authority':
@@ -521,7 +535,7 @@ def _alternate_writer_changed_the_cell(
 
 
 def _undeclared_alternates(
-    tmp_path, monkeypatch, registered: frozenset[str] | None = None
+    tmp_path, registered: frozenset[str] | None = None
 ) -> set[tuple[str, str | None, str]]:
     """Every (tool, collection, field) triple OBSERVED writing a cell while
     declared neither as that row's schema owner nor in its ``also_written_by``.
@@ -551,7 +565,6 @@ def _undeclared_alternates(
     see its docstring for why the candidate set is intersected with the
     server's own registered tool surface.
     """
-    monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
     # Derived ONCE, not once per row: the module walk (a `vars(plan_tools)`
     # scan plus an `inspect.getsource`/`ast.parse` per artifacts-first private
     # function) cannot change while this loop runs, and paying it per row made
@@ -712,7 +725,7 @@ class TestRepairableFieldTable:
             assert record.field in record.target_keys
             assert record.target_keys[record.field] == record.field
 
-    def test_every_alternate_writer_really_writes_that_field(self, tmp_path, monkeypatch):
+    def test_every_alternate_writer_really_writes_that_field(self, tmp_path):
         """``also_written_by`` must name real call sites that ACTUALLY write the field.
 
         The fact's ``tool`` is the collection's SCHEMA OWNER, which is not always
@@ -736,7 +749,6 @@ class TestRepairableFieldTable:
         AND one that names a real entry point that simply does not write the
         field (which the signature proxy could not).
         """
-        monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
         for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
             assert isinstance(record.also_written_by, tuple)
             owner = _COLLECTION_SCHEMA_TOOL_NAME[record.collection]
@@ -759,7 +771,7 @@ class TestRepairableFieldTable:
                     'that cell — it cannot actually write that field'
                 )
 
-    def test_no_plan_writing_tool_is_an_undeclared_alternate(self, tmp_path, monkeypatch):
+    def test_no_plan_writing_tool_is_an_undeclared_alternate(self, tmp_path):
         """Completeness half of ``also_written_by``: nothing UNDECLARED writes a cell.
 
         The soundness check above only proves every DECLARED alternate really
@@ -789,7 +801,7 @@ class TestRepairableFieldTable:
         row's schema owner, that row's current ``also_written_by``, and the
         one-word remedy.
         """
-        undeclared = _undeclared_alternates(tmp_path, monkeypatch)
+        undeclared = _undeclared_alternates(tmp_path)
         rows = {(r.collection, r.field): r for r in plan_tools._REPAIRABLE_PLAN_FIELDS}
         findings = []
         for tool_name, collection, field in sorted(
@@ -823,9 +835,7 @@ class TestRepairableFieldTable:
                 f'recovery targets {sorted(illegal)}'
             )
 
-    def test_a_tag_prepending_writer_is_declared_like_any_other(
-        self, tmp_path, monkeypatch
-    ):
+    def test_a_tag_prepending_writer_is_declared_like_any_other(self, tmp_path):
         """S3 (task 3982): ``mark_step_committed`` belongs in ``also_written_by``.
 
         It prepends a ``[COMMITTED <sha12>]`` provenance tag to ``description``
@@ -834,8 +844,6 @@ class TestRepairableFieldTable:
         first (the probe below), THEN assert the declaration — half (c) is the
         invariant; the table is only a restatement of it.
         """
-        monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
-
         for collection in ('steps', 'prerequisites'):
             changed, refusal = _alternate_writer_changed_the_cell(
                 tmp_path / collection, collection, 'description', 'mark_step_committed'
@@ -988,8 +996,8 @@ class TestRepairableFieldTable:
         assert derived, 'the derived candidate set must not be empty'
 
         floor = {n for n in _registered_plan_tool_names() if not n.startswith('report_')}
-        floor.update(plan_tools._COLLECTION_SCHEMA_TOOL.values())
         for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            floor.add(record.tool)
             floor.update(record.also_written_by)
 
         assert floor <= derived, (
@@ -1154,7 +1162,7 @@ class TestRepairableFieldTable:
         staged = _registered_plan_tool_names() | {'probe_writer', 'probe_flavoured'}
 
         undeclared = _undeclared_alternates(
-            tmp_path / 'completeness', monkeypatch, registered=staged
+            tmp_path / 'completeness', registered=staged
         )
         assert ('probe_writer', 'steps', 'description') in undeclared
 
@@ -1169,7 +1177,7 @@ class TestRepairableFieldTable:
 
         with pytest.raises(AssertionError) as exc_info:
             _undeclared_alternates(
-                tmp_path / 'unknown-param', monkeypatch, registered=staged
+                tmp_path / 'unknown-param', registered=staged
             )
         message = str(exc_info.value)
         assert 'probe_flavoured' in message
@@ -1179,6 +1187,12 @@ class TestRepairableFieldTable:
 # ---------------------------------------------------------------------------
 # step-3 — the pure repair pass over the DOMINANT trailing-residue shape.
 # ---------------------------------------------------------------------------
+
+
+def _repair_under_server_table(plan: dict) -> tuple[dict, list[dict]]:
+    """The repair pass under plan-tools' own field table."""
+    return plan_markup_repair.repair_plan_fields(plan, plan_tools._REPAIRABLE_PLAN_FIELDS)
+
 
 #: The trailing shape on a step/prerequisite ``description``. Built here rather
 #: than in the specimen block because the same field name serves two tools.
@@ -1243,7 +1257,7 @@ class TestRepairPlanFieldsTrailing:
         plan = corrupt_plan()
         plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         decision = repaired['design_decisions'][0]
         assert decision['rationale'] == _RATIONALE_PROSE
@@ -1273,7 +1287,7 @@ class TestRepairPlanFieldsTrailing:
         plan = corrupt_plan()
         plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
 
-        repaired, _facts = plan_tools._repair_plan_fields(plan)
+        repaired, _facts = _repair_under_server_table(plan)
 
         assert plan['design_decisions'][0]['rationale'] == TRAILING_RATIONALE, (
             'the caller\'s dict must not be mutated in place — the write-back '
@@ -1286,7 +1300,7 @@ class TestRepairPlanFieldsTrailing:
         plan = corrupt_plan()
         plan['reuse'][1]['how'] = TRAILING_HOW
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert repaired['reuse'][1]['how'] == _HOW_PROSE
         assert repaired['reuse'][0]['how'] == 'Clean reuse prose.'
@@ -1319,7 +1333,7 @@ class TestRepairPlanFieldsTrailing:
         plan = corrupt_plan()
         plan[collection][index][field] = poisoned
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert repaired[collection][index][field] == clean
         assert detect(repaired[collection][index][field]) is None
@@ -1333,7 +1347,7 @@ class TestRepairPlanFieldsTrailing:
     def test_top_level_field_reports_collection_and_index_none(self):
         plan = corrupt_plan(analysis=_TRAILING_ANALYSIS)
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert repaired['analysis'] == 'Clean analysis prose describing the approach.'
         assert len(facts) == 1
@@ -1351,7 +1365,7 @@ class TestRepairPlanFieldsTrailing:
         plan = corrupt_plan(design_decisions=decisions)
         before = dict(_all_strings(plan))
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert len(facts) == 4
         assert [f['index'] for f in facts] == [0, 1, 2, 3]
@@ -1370,7 +1384,7 @@ class TestRepairPlanFieldsTrailing:
     def test_clean_plan_is_returned_unchanged_with_no_facts(self):
         plan = corrupt_plan()
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert facts == []
         assert repaired == plan
@@ -1388,12 +1402,12 @@ class TestRepairPlanFieldsTrailing:
         copies: list = []
         real_deepcopy = copy.deepcopy
         monkeypatch.setattr(
-            plan_tools.copy,
+            copy,
             'deepcopy',
             lambda obj, *a, **kw: (copies.append(obj), real_deepcopy(obj, *a, **kw))[1],
         )
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert facts == []
         assert copies == [], 'a clean plan was deep-copied for nothing'
@@ -1409,12 +1423,12 @@ class TestRepairPlanFieldsTrailing:
         copies: list = []
         real_deepcopy = copy.deepcopy
         monkeypatch.setattr(
-            plan_tools.copy,
+            copy,
             'deepcopy',
             lambda obj, *a, **kw: (copies.append(obj), real_deepcopy(obj, *a, **kw))[1],
         )
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert len(facts) == 1
         assert copies == [plan]
@@ -1436,7 +1450,7 @@ class TestRepairPlanFieldsTrailing:
         plan = corrupt_plan()
         plan[collection][index][field] = poisoned
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         new_value = repaired[collection][index][field]
         assert poisoned.startswith(new_value)
@@ -1451,7 +1465,7 @@ class TestRepairPlanFieldsTrailing:
         plan['steps'][0]['description'] = _TRAILING_DESCRIPTION
         plan['analysis'] = _TRAILING_ANALYSIS
 
-        _repaired, facts = plan_tools._repair_plan_fields(plan)
+        _repaired, facts = _repair_under_server_table(plan)
 
         assert len(facts) == 4
         for fact in facts:
@@ -1491,7 +1505,7 @@ class TestRepairPlanFieldsRefuses:
         plan = corrupt_plan()
         plan['design_decisions'][0]['decision'] = PROSE_QUOTED
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert repaired['design_decisions'][0]['decision'] == PROSE_QUOTED
         # Nothing was shaved off the end: all three quoted sentinels survive.
@@ -1513,7 +1527,7 @@ class TestRepairPlanFieldsRefuses:
         plan = corrupt_plan()
         plan['reuse'][0]['how'] = _DOUBLY_CORRUPT_HOW
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert repaired['reuse'][0]['how'] == _DOUBLY_CORRUPT_HOW
         assert len(facts) == 1
@@ -1535,7 +1549,7 @@ class TestRepairPlanFieldsRefuses:
         plan['design_decisions'][0]['decision'] = PROSE_QUOTED
         before = dict(_all_strings(plan))
 
-        repaired, _facts = plan_tools._repair_plan_fields(plan)
+        repaired, _facts = _repair_under_server_table(plan)
 
         assert dict(_all_strings(repaired)) == before
 
@@ -1549,8 +1563,8 @@ class TestRepairPlanFieldsRefuses:
         return plan
 
     def test_is_deterministic_across_repeated_runs(self):
-        first_plan, first_facts = plan_tools._repair_plan_fields(self._mixed_plan())
-        second_plan, second_facts = plan_tools._repair_plan_fields(self._mixed_plan())
+        first_plan, first_facts = _repair_under_server_table(self._mixed_plan())
+        second_plan, second_facts = _repair_under_server_table(self._mixed_plan())
 
         assert first_plan == second_plan
         assert first_facts == second_facts
@@ -1563,8 +1577,8 @@ class TestRepairPlanFieldsRefuses:
         (zero further 'repaired' facts) while still reporting the residue that
         was, and remains, unrepairable.
         """
-        once, first_facts = plan_tools._repair_plan_fields(self._mixed_plan())
-        twice, second_facts = plan_tools._repair_plan_fields(once)
+        once, first_facts = _repair_under_server_table(self._mixed_plan())
+        twice, second_facts = _repair_under_server_table(once)
 
         assert twice == once
         assert [f for f in second_facts if f['outcome'] == 'repaired'] == []
@@ -1578,7 +1592,7 @@ class TestRepairPlanFieldsRefuses:
         plan = corrupt_plan()
         plan['design_decisions'][0]['rationale'] = value
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert facts == []
         assert repaired['design_decisions'][0]['rationale'] == value
@@ -1590,7 +1604,7 @@ class TestRepairPlanFieldsRefuses:
         plan['reuse'].append('not a dict at all')
         plan['steps'] = 'not a list at all'
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert facts == []
         assert 'rationale' not in repaired['design_decisions'][0]
@@ -1631,7 +1645,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
     def test_recovers_into_an_empty_sibling(self):
         plan = _absorbed_decision(rationale='')
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['decision'] == DECISION_PROSE
@@ -1651,7 +1665,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
         plan = _absorbed_decision()
         assert 'rationale' not in plan['design_decisions'][0]
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['decision'] == DECISION_PROSE
@@ -1663,7 +1677,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
     def test_whitespace_only_sibling_counts_as_a_hole(self):
         plan = _absorbed_decision(rationale='   \n\t  ')
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['decision'] == DECISION_PROSE
@@ -1694,7 +1708,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
             }],
         )
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['rationale'] == authored, (
@@ -1732,7 +1746,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
             }],
         )
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['rationale'] == authored, (
@@ -1766,7 +1780,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
             }],
         )
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['rationale'] == authored
@@ -1783,7 +1797,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
         """
         plan = _absorbed_decision(rationale=_AUTHORED_RATIONALE)
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['rationale'] == _AUTHORED_RATIONALE
@@ -1799,7 +1813,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
     def test_recovered_value_is_always_a_slice_of_the_original(self, sibling):
         plan = _absorbed_decision(rationale=sibling)
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert facts[0]['outcome'] == 'repaired'
@@ -1854,7 +1868,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         """Measured before the fix: ``plan['files']`` came back a ``str``."""
         plan = corrupt_plan(title=_ABSORBED_FILES_TITLE, files=[])
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert isinstance(repaired['files'], list), (
             'a recovered path string replaced the files LIST — the lock charter '
@@ -1871,7 +1885,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         original = ['orchestrator/src/orchestrator/mcp/plan_tools.py']
         plan = corrupt_plan(title=_ABSORBED_FILES_TITLE, files=list(original))
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert repaired['files'] == original
         assert repaired['title'] == _ABSORBED_FILES_TITLE
@@ -1893,7 +1907,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         }
         plan = corrupt_plan(steps=[step])
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['steps'][0]
         assert 'step_type' not in item, f'junk key written: {sorted(item)}'
@@ -1913,7 +1927,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         }
         plan = corrupt_plan(prerequisites=[prereq])
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['prerequisites'][0]
         assert 'prereq_id' not in item, f'junk key written: {sorted(item)}'
@@ -1958,7 +1972,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
             design_decisions=decisions,
         )
 
-        repaired, _facts = plan_tools._repair_plan_fields(plan)
+        repaired, _facts = _repair_under_server_table(plan)
 
         assert set(repaired) <= observed[None], (
             f'top-level junk keys: {sorted(set(repaired) - observed[None])}'
@@ -1981,7 +1995,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         plan['steps'][0]['description'] = _TRAILING_DESCRIPTION
         plan['analysis'] = _TRAILING_ANALYSIS
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         assert [f['outcome'] for f in facts] == ['repaired'] * 4
         assert all(f['recovered_params'] == [] for f in facts)
@@ -1994,7 +2008,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         """``rationale`` IS a declared target, so step-7's recovery is intact."""
         plan = _absorbed_decision(rationale='')
 
-        repaired, facts = plan_tools._repair_plan_fields(plan)
+        repaired, facts = _repair_under_server_table(plan)
 
         item = repaired['design_decisions'][0]
         assert item['decision'] == DECISION_PROSE
@@ -2110,7 +2124,7 @@ def _fact_payloads(caplog) -> list[dict]:
     """
     payloads = []
     for record in caplog.records:
-        if record.name != plan_tools.__name__ or record.levelno < logging.WARNING:
+        if record.name != plan_markup_repair.__name__ or record.levelno < logging.WARNING:
             continue
         payloads.append(json.loads(record.getMessage()))
     return payloads
@@ -2251,7 +2265,7 @@ class TestReadPlanRepaired:
         plan['design_decisions'][0]['decision'] = PROSE_QUOTED
         plan_artifacts.write_plan(plan)
 
-        with caplog.at_level(logging.DEBUG, logger=plan_tools.__name__):
+        with caplog.at_level(logging.DEBUG, logger=plan_markup_repair.__name__):
             _, first = plan_tools._read_plan_repaired(plan_artifacts)
             first_warnings = len(_fact_payloads(caplog))
             _, second = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2267,7 +2281,7 @@ class TestReadPlanRepaired:
         debug_payloads = [
             json.loads(r.getMessage())
             for r in caplog.records
-            if r.name == plan_tools.__name__ and r.levelno == logging.DEBUG
+            if r.name == plan_markup_repair.__name__ and r.levelno == logging.DEBUG
         ]
         assert [p['field'] for p in debug_payloads] == ['decision']
 
@@ -2314,7 +2328,7 @@ class TestReadPlanRepaired:
         risk hiding a field that got RE-corrupted between calls.
         """
         _seed_mixed_plan(plan_artifacts)
-        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+        with caplog.at_level(logging.WARNING, logger=plan_markup_repair.__name__):
             _, first = plan_tools._read_plan_repaired(plan_artifacts)
         assert sorted(f['outcome'] for f in first) == ['repaired', 'unrepairable']
 
@@ -2334,7 +2348,7 @@ class TestReadPlanRepaired:
     ):
         _seed_mixed_plan(plan_artifacts)
 
-        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+        with caplog.at_level(logging.WARNING, logger=plan_markup_repair.__name__):
             _, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
         payloads = _fact_payloads(caplog)
@@ -2352,7 +2366,7 @@ class TestReadPlanRepaired:
         plan['reuse'][1]['how'] = TRAILING_HOW
         plan_artifacts.write_plan(plan)
 
-        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+        with caplog.at_level(logging.WARNING, logger=plan_markup_repair.__name__):
             plan_tools._read_plan_repaired(plan_artifacts)
 
         payload = _fact_payloads(caplog)[0]
@@ -2368,11 +2382,11 @@ class TestReadPlanRepaired:
         """One fact per log record — never a multi-line blob to reassemble."""
         _seed_mixed_plan(plan_artifacts)
 
-        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+        with caplog.at_level(logging.WARNING, logger=plan_markup_repair.__name__):
             plan_tools._read_plan_repaired(plan_artifacts)
 
         messages = [
-            r.getMessage() for r in caplog.records if r.name == plan_tools.__name__
+            r.getMessage() for r in caplog.records if r.name == plan_markup_repair.__name__
         ]
         assert messages
         for message in messages:
@@ -2435,13 +2449,13 @@ class TestReadPlanRepaired:
 
         monkeypatch.setattr(TaskArtifacts, 'write_plan_model', boom)
 
-        with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
+        with caplog.at_level(logging.WARNING, logger=plan_markup_repair.__name__):
             plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
         assert plan['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
         assert any(f['outcome'] == 'repaired' for f in facts)
         assert 'disk on fire' in caplog.text, 'the write failure must be LOUD'
-        assert plan_tools._MARKUP_WRITE_FAILED_EVENT in caplog.text, (
+        assert plan_markup_repair.MARKUP_WRITE_FAILED_EVENT in caplog.text, (
             'the failure must be a STRUCTURED fact, not just prose'
         )
 
@@ -2496,22 +2510,19 @@ class TestUnresolvableLocatorIsNeverMemoized:
         fact = _unresolvable_refusal_fact()
         plan_path = tmp_path / 'plan.json'
 
-        with caplog.at_level(logging.DEBUG, logger=plan_tools.__name__):
-            first = plan_tools._report_markup_facts(plan_path, plan, [fact])
-            second = plan_tools._report_markup_facts(plan_path, plan, [fact])
+        with caplog.at_level(logging.DEBUG, logger=plan_markup_repair.__name__):
+            first = plan_markup_repair._report_markup_facts(plan_path, plan, [fact])
+            second = plan_markup_repair._report_markup_facts(plan_path, plan, [fact])
 
         assert first == [fact]
         assert second == [fact], (
             'an unresolvable locator must be reported every time, not '
             'suppressed on the second call'
         )
-        assert set() == plan_tools._REPORTED_REFUSALS, (
-            'no key that means nothing may ever be recorded'
-        )
         assert len(_fact_payloads(caplog)) == 2, 'both calls must log at WARNING'
         debug_records = [
             r for r in caplog.records
-            if r.name == plan_tools.__name__ and r.levelno == logging.DEBUG
+            if r.name == plan_markup_repair.__name__ and r.levelno == logging.DEBUG
         ]
         assert debug_records == [], (
             'an unresolvable refusal must never be suppressed to DEBUG'
@@ -2534,24 +2545,20 @@ class TestUnresolvableLocatorIsNeverMemoized:
         fact = _unresolvable_refusal_fact(index=0, field='not_a_real_field')
         plan_path = tmp_path / 'plan.json'
 
-        with caplog.at_level(logging.DEBUG, logger=plan_tools.__name__):
-            first = plan_tools._report_markup_facts(plan_path, plan, [fact])
-            second = plan_tools._report_markup_facts(plan_path, plan, [fact])
+        with caplog.at_level(logging.DEBUG, logger=plan_markup_repair.__name__):
+            first = plan_markup_repair._report_markup_facts(plan_path, plan, [fact])
+            second = plan_markup_repair._report_markup_facts(plan_path, plan, [fact])
 
         assert first == [fact]
         assert second == [], (
             'a resolvable locator whose field is legitimately absent must '
             'still converge to silence on repeat, unlike a broken locator'
         )
-        assert len(plan_tools._REPORTED_REFUSALS) == 1
 
 
 # ---------------------------------------------------------------------------
 # step-15 — EVERY read path repairs, and the triggering tool reports it.
 # ---------------------------------------------------------------------------
-
-_NEW_SHA = 'a' * 40
-
 
 def _seed_corrupt(artifacts) -> None:
     """Put a corrupted-but-otherwise-valid plan on disk for a tool to open."""
@@ -2560,69 +2567,70 @@ def _seed_corrupt(artifacts) -> None:
     artifacts.write_plan(plan)
 
 
-def _added_step(plan: dict) -> None:
+def _added_step(plan: dict, _sha: str) -> None:
     assert [s['id'] for s in plan['steps']] == ['step-1', 'step-2', 'step-9']
 
 
-def _added_prereq(plan: dict) -> None:
+def _added_prereq(plan: dict, _sha: str) -> None:
     assert [p['id'] for p in plan['prerequisites']] == ['pre-1', 'pre-9']
 
 
-def _added_decision(plan: dict) -> None:
+def _added_decision(plan: dict, _sha: str) -> None:
     assert plan['design_decisions'][2] == {
         'decision': 'A newly added decision.',
         'rationale': 'A newly added rationale.',
     }
 
 
-def _added_reuse(plan: dict) -> None:
+def _added_reuse(plan: dict, _sha: str) -> None:
     assert plan['reuse'][2]['what'] == 'A newly reused thing'
 
 
-def _step_marked_done(plan: dict) -> None:
+def _step_marked_done(plan: dict, sha: str) -> None:
     assert plan['steps'][0]['status'] == 'done'
-    assert plan['steps'][0]['commit'] == _NEW_SHA
+    assert plan['steps'][0]['commit'] == sha
 
 
-def _step_pre_committed(plan: dict) -> None:
+def _step_pre_committed(plan: dict, sha: str) -> None:
     assert plan['steps'][0]['status'] == 'done'
-    assert plan['steps'][0]['commit'] == _NEW_SHA
-    assert plan['steps'][0]['description'].startswith(f'[COMMITTED {_NEW_SHA[:12]}]')
+    assert plan['steps'][0]['commit'] == sha
+    assert plan['steps'][0]['description'].startswith(f'[COMMITTED {sha[:12]}]')
 
 
-def _metadata_updated(plan: dict) -> None:
+def _metadata_updated(plan: dict, _sha: str) -> None:
     assert plan['files'] == ['orchestrator/src/orchestrator/artifacts.py']
     assert plan['analysis'] == 'A newly written analysis.'
 
 
-def _step_removed(plan: dict) -> None:
+def _step_removed(plan: dict, _sha: str) -> None:
     assert [s['id'] for s in plan['steps']] == ['step-1']
 
 
-def _step_replaced(plan: dict) -> None:
+def _step_replaced(plan: dict, _sha: str) -> None:
     assert plan['steps'][1]['type'] == 'impl'
     assert plan['steps'][1]['description'] == 'A newly written step description.'
 
 
-def _plan_finalized(plan: dict) -> None:
+def _plan_finalized(plan: dict, _sha: str) -> None:
     assert plan['_finalized_at']
     assert plan['_revalidated_at']
 
 
-def _deviation_recorded(plan: dict) -> None:
+def _deviation_recorded(plan: dict, _sha: str) -> None:
     assert plan['steps'][0]['deviations'][0]['kind'] == 'other'
     assert plan['steps'][0]['status'] == 'pending'
 
 
-def _descope_recorded(plan: dict) -> None:
+def _descope_recorded(plan: dict, sha: str) -> None:
     assert [(d['step_id'], d['commit']) for d in plan['_descoped_steps']] == [
-        ('step-1', _NEW_SHA),
+        ('step-1', sha),
     ]
     assert plan['_rescoped_note'] == 'Descoped.'
 
 
 #: ``(id, call, expected-response-subset, on-disk-mutation-check)`` for every
-#: plan-tools entry point that OPENS an existing plan. ``_create_plan`` is
+#: plan-tools entry point that OPENS an existing plan. Each of the last three
+#: also takes the sha :func:`on_branch` committed, for the rows that record one. ``_create_plan`` is
 #: absent on purpose: it overwrites the document wholesale, so it has no read to
 #: repair — guarding its INBOUND arguments belongs to the write-time middleware.
 #:
@@ -2638,90 +2646,90 @@ def _descope_recorded(plan: dict) -> None:
 READ_PATH_CASES = [
     (
         'add_plan_step',
-        lambda a: plan_tools._add_plan_step(a, 'step-9', 'impl', 'A newly added step.'),
-        {'status': 'ok', 'step_id': 'step-9', 'total_steps': 3},
+        lambda a, _sha: plan_tools._add_plan_step(a, 'step-9', 'impl', 'A newly added step.'),
+        lambda _sha: {'status': 'ok', 'step_id': 'step-9', 'total_steps': 3},
         _added_step,
     ),
     (
         'add_prerequisite',
-        lambda a: plan_tools._add_prerequisite(a, 'pre-9', 'A newly added prerequisite.'),
-        {'status': 'ok', 'prereq_id': 'pre-9'},
+        lambda a, _sha: plan_tools._add_prerequisite(a, 'pre-9', 'A newly added prerequisite.'),
+        lambda _sha: {'status': 'ok', 'prereq_id': 'pre-9'},
         _added_prereq,
     ),
     (
         'add_design_decision',
-        lambda a: plan_tools._add_design_decision(
+        lambda a, _sha: plan_tools._add_design_decision(
             a, 'A newly added decision.', 'A newly added rationale.'
         ),
-        {'status': 'ok', 'total_decisions': 3},
+        lambda _sha: {'status': 'ok', 'total_decisions': 3},
         _added_decision,
     ),
     (
         'add_reuse_item',
-        lambda a: plan_tools._add_reuse_item(
+        lambda a, _sha: plan_tools._add_reuse_item(
             a, 'A newly reused thing', 'somewhere.py', 'By importing it.'
         ),
-        {'status': 'ok', 'total_reuse': 3},
+        lambda _sha: {'status': 'ok', 'total_reuse': 3},
         _added_reuse,
     ),
     (
         'mark_step_done',
-        lambda a: plan_tools._mark_step_done(a, 'step-1', _NEW_SHA),
-        {'status': 'ok', 'step_id': 'step-1', 'new_status': 'done', 'commit': _NEW_SHA},
+        lambda a, sha: plan_tools._mark_step_done(a, 'step-1', sha),
+        lambda sha: {'status': 'ok', 'step_id': 'step-1', 'new_status': 'done', 'commit': sha},
         _step_marked_done,
     ),
     (
         'record_step_deviation',
-        lambda a: plan_tools._record_step_deviation(
+        lambda a, _sha: plan_tools._record_step_deviation(
             a, 'step-1', 'other', 'Observed.', 'Expected.', 'Acted.'
         ),
-        {'status': 'ok', 'step_id': 'step-1', 'deviations': 1},
+        lambda _sha: {'status': 'ok', 'step_id': 'step-1', 'deviations': 1},
         _deviation_recorded,
     ),
     (
         'record_descoped_step',
-        lambda a: plan_tools._record_descoped_step(
-            a, 'step-1', _NEW_SHA, 'orphan', 'esc-probe', 'Descoped.'
+        lambda a, sha: plan_tools._record_descoped_step(
+            a, 'step-1', sha, 'orphan', 'esc-probe', 'Descoped.'
         ),
-        {'status': 'ok', 'step_id': 'step-1', 'commit': _NEW_SHA, 'descoped_steps': 1},
+        lambda sha: {'status': 'ok', 'step_id': 'step-1', 'commit': sha, 'descoped_steps': 1},
         _descope_recorded,
     ),
     (
         # Contract A1's DELIBERATELY divergent envelope — ``ok`` plus ``status``
         # meaning the step's NEW status. Adding markup_repairs must not disturb it.
         'mark_step_committed',
-        lambda a: plan_tools._mark_step_committed(a, 'step-1', _NEW_SHA),
-        {'ok': True, 'step_id': 'step-1', 'status': 'done'},
+        lambda a, sha: plan_tools._mark_step_committed(a, 'step-1', sha),
+        lambda _sha: {'ok': True, 'step_id': 'step-1', 'status': 'done'},
         _step_pre_committed,
     ),
     (
         'update_plan_metadata',
-        lambda a: plan_tools._update_plan_metadata(
+        lambda a, _sha: plan_tools._update_plan_metadata(
             a,
             files=['orchestrator/src/orchestrator/artifacts.py'],
             analysis='A newly written analysis.',
         ),
-        {'status': 'ok', 'files': 1},
+        lambda _sha: {'status': 'ok', 'files': 1},
         _metadata_updated,
     ),
     (
         'remove_plan_step',
-        lambda a: plan_tools._remove_plan_step(a, 'step-2'),
-        {'status': 'ok', 'removed': 'step-2', 'collection': 'steps'},
+        lambda a, _sha: plan_tools._remove_plan_step(a, 'step-2'),
+        lambda _sha: {'status': 'ok', 'removed': 'step-2', 'collection': 'steps'},
         _step_removed,
     ),
     (
         'replace_plan_step',
-        lambda a: plan_tools._replace_plan_step(
+        lambda a, _sha: plan_tools._replace_plan_step(
             a, 'step-2', 'impl', 'A newly written step description.'
         ),
-        {'status': 'ok', 'replaced': 'step-2'},
+        lambda _sha: {'status': 'ok', 'replaced': 'step-2'},
         _step_replaced,
     ),
     (
         'confirm_plan',
-        lambda a: plan_tools._confirm_plan(a),
-        {'status': 'ok', 'finalized': True, 'steps': 2, 'files': 1},
+        lambda a, _sha: plan_tools._confirm_plan(a),
+        lambda _sha: {'status': 'ok', 'finalized': True, 'steps': 2, 'files': 1},
         _plan_finalized,
     ),
 ]
@@ -2730,13 +2738,14 @@ READ_PATH_IDS = [case[0] for case in READ_PATH_CASES]
 
 
 @pytest.fixture()
-def on_branch(monkeypatch):
-    """``mark_step_committed``'s reachability guard, satisfied.
+def on_branch(plan_artifacts):
+    """*plan_artifacts*' worktree made a real repo; returns its HEAD sha.
 
-    Stubbed rather than staged as a real commit: this module tests the repair
-    surface, and the guard itself is covered by ``test_plan_tools_server``.
+    In a real repo a fabricated sha is unreachable, so a row that records a sha
+    takes this one and every on-branch guard passes for real.
     """
-    monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda worktree, sha: True)
+    seed_repo(plan_artifacts.worktree, _TASK_IGNORING_SEED)
+    return _head_sha(plan_artifacts.worktree)
 
 
 @pytest.mark.parametrize(
@@ -2757,9 +2766,9 @@ class TestPlanToolsReadPathsRepair:
     ):
         _seed_corrupt(plan_artifacts)
 
-        response = call(plan_artifacts)
+        response = call(plan_artifacts, on_branch)
 
-        for key, value in expected_response.items():
+        for key, value in expected_response(on_branch).items():
             assert response[key] == value, f'{key!r} changed shape'
 
     def test_the_on_disk_plan_is_repaired(
@@ -2767,7 +2776,7 @@ class TestPlanToolsReadPathsRepair:
     ):
         _seed_corrupt(plan_artifacts)
 
-        call(plan_artifacts)
+        call(plan_artifacts, on_branch)
 
         rationale = on_disk(plan_artifacts)['design_decisions'][0]['rationale']
         assert rationale == _RATIONALE_PROSE
@@ -2783,10 +2792,10 @@ class TestPlanToolsReadPathsRepair:
         """
         _seed_corrupt(plan_artifacts)
 
-        call(plan_artifacts)
+        call(plan_artifacts, on_branch)
 
         plan = on_disk(plan_artifacts)
-        check_mutation(plan)
+        check_mutation(plan, on_branch)
         assert plan['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
 
     def test_the_response_reports_what_was_repaired(
@@ -2795,7 +2804,7 @@ class TestPlanToolsReadPathsRepair:
         """The agent that opened the plan must SEE what changed under it."""
         _seed_corrupt(plan_artifacts)
 
-        response = call(plan_artifacts)
+        response = call(plan_artifacts, on_branch)
 
         repairs = response['markup_repairs']
         assert isinstance(repairs, list)
@@ -2815,7 +2824,7 @@ class TestPlanToolsReadPathsRepair:
         """
         plan_artifacts.write_plan(corrupt_plan())
 
-        response = call(plan_artifacts)
+        response = call(plan_artifacts, on_branch)
 
         assert 'markup_repairs' not in response
 

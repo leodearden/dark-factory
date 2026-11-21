@@ -13,7 +13,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from nested_pytest_session import binding_conftest, run_nested_pytest
+from nested_pytest_session import arming_conftest, run_nested_pytest
 from shared.cli_invoke import resolve_claude_binary
 
 import df_pytest_isolation
@@ -55,7 +55,7 @@ def test_an_ambient_claude_binary_never_reaches_a_test_body(
     result = run_nested_pytest(
         tmp_path / 'bound',
         {
-            'conftest.py': binding_conftest('_df_claude_binary_unset'),
+            'conftest.py': arming_conftest('_df_claude_binary_unset'),
             'test_probe.py': _SCRUBBED_TESTS,
         },
     )

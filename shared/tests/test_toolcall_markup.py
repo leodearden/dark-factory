@@ -21,8 +21,10 @@ appears verbatim in the file text. Leave it escaped.
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
+import toolcall_markup_corpus_extract as extract
 from toolcall_repair_invariants import assert_repair_invariants
 
 from shared import toolcall_markup
@@ -342,7 +344,7 @@ class TestTheWidenedGateCostsWhatItClaims:
     def test_a_param_outside_the_tag_name_shape_never_becomes_a_needle(self, param):
         """(3) The cache-thrash bound, and the coherence argument behind it.
 
-        ``param`` is CALLER-CONTROLLED: ``_first_markup_argument`` passes each
+        ``param`` is CALLER-CONTROLLED: ``_markup_arguments`` passes each
         key of the caller's ``arguments`` mapping straight through, so a caller
         sending unknown argument names would otherwise evict the bounded
         ``_widened_re`` cache with a fresh ``re.compile`` per name.
@@ -1892,3 +1894,108 @@ class TestNoSilentPartialRepairOfSelfNameMisclose:
         assert result.recovered == {'decision': 'Chose X.'}
         assert detect_for(result.clean_value, 'rationale', self._SCHEMA) is None
         assert_repair_invariants(value, result)
+
+
+def _canonical_item(name: str, value: str) -> str:
+    return CANONICAL_OPENER_PREFIX + f'"{name}">' + value + closer_for('parameter')
+
+
+def _echo_item(name: str, value: str, *, blend: bool = False) -> str:
+    opener = '\x3c' + name + ('"' if blend else '') + '>'
+    return opener + value + closer_for(name)
+
+
+def _unrepairable_add_memory_corpus() -> list[dict]:
+    corpus_path = Path(__file__).resolve().parent / 'fixtures' / 'toolcall_markup_corpus.jsonl'
+    specimens = [
+        record
+        for record in extract.load_corpus(corpus_path)
+        if record['expected_outcome'] == 'unrepairable'
+        and record['tool'] == 'mcp__fused-memory__add_memory'
+    ]
+    assert specimens, 'the unrepairable add_memory corpus slice is empty or has moved'
+    return specimens
+
+
+class TestScanParameterValues:
+    """``scan_parameter_values`` finds pseudo-parameter values in a residue.
+
+    It is for ROUTING a preservation record only. It is never believed for a
+    write and is independent of :func:`repair`, whose refusals it must not
+    loosen.
+    """
+
+    @staticmethod
+    def _scan(value: object, names) -> dict[str, str]:
+        return toolcall_markup.scan_parameter_values(value, names)
+
+    def test_it_recovers_a_canonical_dialect_value(self):
+        value = 'prose' + closer_for('content') + _canonical_item('project_id', 'reify')
+
+        assert self._scan(value, ('project_id',)) == {'project_id': 'reify'}
+
+    def test_it_recovers_a_name_echo_dialect_value(self):
+        value = 'prose' + closer_for('content') + _echo_item('project_id', 'reify')
+
+        assert self._scan(value, ('project_id',)) == {'project_id': 'reify'}
+
+    def test_it_recovers_a_blend_dialect_value(self):
+        """The opener carries a stray quote, as 3 committed residue losses do."""
+        value = 'prose' + closer_for('content') + _echo_item('project_id', 'reify', blend=True)
+
+        assert self._scan(value, ('project_id',)) == {'project_id': 'reify'}
+
+    def test_an_absent_name_yields_no_key(self):
+        value = 'prose' + closer_for('content') + _echo_item('agent_id', 'claude-x')
+
+        assert self._scan(value, ('project_id',)) == {}
+
+    def test_two_different_values_for_one_name_refuse(self):
+        value = _echo_item('project_id', 'reify') + 'more' + _echo_item('project_id', 'dark_factory')
+
+        assert self._scan(value, ('project_id',)) == {}
+
+    def test_the_same_value_twice_is_not_ambiguous(self):
+        """A residue that absorbed a second call repeats the same identity."""
+        value = _echo_item('project_id', 'reify') + 'more' + _canonical_item('project_id', 'reify')
+
+        assert self._scan(value, ('project_id',)) == {'project_id': 'reify'}
+
+    def test_only_requested_names_are_returned(self):
+        value = _echo_item('agent_id', 'claude-x') + _echo_item('project_id', 'reify')
+
+        assert self._scan(value, ('project_id', 'project_root')) == {'project_id': 'reify'}
+
+    def test_an_unterminated_final_opener_runs_to_end_of_string(self):
+        value = 'prose' + closer_for('content') + '\x3cproject_id>reify'
+
+        assert self._scan(value, ('project_id',)) == {'project_id': 'reify'}
+
+    @pytest.mark.parametrize(
+        'value',
+        [
+            closer_for('parameter') * 10_000,
+            '\x3cproject_id>' * 10_000,
+            ('\x3cagent_id>x' + closer_for('agent_id')) * 10_000,
+            12345,
+            None,
+            b'\x3cproject_id>reify',
+            '',
+        ],
+        ids=['many-closers', 'many-openers', 'many-unrequested-items', 'int', 'none', 'bytes', 'empty'],
+    )
+    def test_it_is_total(self, value):
+        assert isinstance(self._scan(value, ('project_id',)), dict)
+
+    def test_a_non_str_value_yields_nothing(self):
+        assert self._scan(12345, ('project_id',)) == {}
+
+    def test_it_does_not_loosen_repair(self):
+        """The explicit non-goal: the corpus add_memory refusals stay refusals."""
+        for specimen in _unrepairable_add_memory_corpus():
+            assert repair(
+                specimen['value'],
+                specimen['param'],
+                specimen['schema_params'],
+                specimen['supplied'],
+            ) is None, specimen['tool_use_id']

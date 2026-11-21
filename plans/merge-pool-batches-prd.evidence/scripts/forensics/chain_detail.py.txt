@@ -1,0 +1,60 @@
+import sys,hashlib
+from common import *
+rc,o=git('log','--since=2026-11-14','--first-parent','--format=%H%x00%P%x00%cI%x00%s','main')
+LAND=collections.defaultdict(list)
+for l in o.splitlines():
+    h,p,c,s=l.split('\x00'); m=re.match(r'Merge (?:task/)?(\S+) into main',s); p=p.split()
+    if m and len(p)>1: LAND[m.group(1)].append((c,h,p[1],p[0]))
+for t in LAND: LAND[t].sort()
+@functools.lru_cache(None)
+def own_pid(p1,p2):
+    """context-free hash of the branch's own diff: merge-base(p1,p2)..p2"""
+    rc,mb=git('merge-base',p1,p2)
+    if rc!=0 or not mb: return None
+    rc,out=git('diff','-U0','--no-color',mb,p2)
+    if rc!=0: return None
+    keep=[];f=None
+    for l in out.splitlines():
+        if l.startswith('+++ '): f=l[4:]; continue
+        if l.startswith('--- '): continue
+        if l[:1] in '+-': keep.append((f or '')+'|'+l)
+    return hashlib.sha1('\n'.join(sorted(keep)).encode()).hexdigest()[:10]
+@functools.lru_cache(None)
+def parents(sha):
+    rc,o=git('show','-s','--format=%P',sha); return o.split()
+def rel(layer_sha,tip,land):
+    c,h,ltip,lp1=land
+    if ltip==tip: return 'tip SAME'
+    p=parents(layer_sha)
+    a=own_pid(p[0],tip); b=own_pid(lp1,ltip)
+    rc,n=git('rev-list','--count','--no-merges',tip+'..'+ltip)
+    rc,o2=git('log','--no-merges','--format=%aI|%s',tip+'..'+ltip)
+    ls=[x for x in o2.splitlines()]
+    return 'tip %s->%s %s (+%s commits; e.g. %s)'%(tip[:8],ltip[:8],'own-diff IDENTICAL' if a and a==b else 'own-diff DIFFERS',n,' ;; '.join(x[5:16]+x[25:70] for x in ls[:2]))
+def tip_evidence(task,tip):
+    sol=[];trees=collections.Counter()
+    for v in V:
+        if v['ts']<'2026-11-15T11:00': continue
+        i,l=layer_of(v,task)
+        if l is None or l['tip']!=tip: continue
+        fs=fset(v)
+        if v['k']==1 and i==0:
+            npred=sum(1 for x in v['layers'][1:] if not x.get('on_main_now'))
+            nl=sum(1 for x in v['layers'][1:] if x.get('on_main_now'))
+            sol.append('%s@%s:%s%s%s'%(v['vid'],v['ts'][5:16],'P' if v['passed'] else 'F',('['+','.join(sorted(fs))+']') if fs else '',('/on-unlanded:'+','.join(str(x.get('task')) for x in v['layers'][1:] if not x.get('on_main_now'))) if npred else ('/on-later-landed' if nl else '')))
+        trees['P' if v['passed'] else 'F']+=1
+    return sol,dict(trees)
+def detail(vid,brief=False):
+    v=VB[vid]; k=v['k']; fs=fset(v)
+    print('\n#### chain',vid,v['ts'][:16],'owner',v['task'],'k',k,v['runner'],v['base_relation'],'spec',v['speculative'],'depth',v['depth'],'tested',v['merge_sha'][:8],'main-base',(v['base'] or '?')[:8],'| FAILS',sorted(fs) if fs else fs,'| start',dt.datetime.fromtimestamp(v['start'],dt.timezone.utc).strftime('%m-%dT%H:%M'))
+    for i,l in enumerate(v['layers'][::-1]):
+        idx=len(v['layers'])-1-i
+        r='MEM ' if idx<k else 'PRED'
+        t=l.get('task'); tip=l.get('tip')
+        if t is None: print('  ',r,'non-merge/odd commit',l['sha'][:8],l.get('subj'),'landed '+str(l.get('landed_ts'))[5:16] if l.get('on_main_now') else 'NOT on main'); continue
+        sol,trees=tip_evidence(t,tip)
+        later=[x for x in LAND.get(t,[]) if T(x[0])>v['start']]
+        ld='never landed' if not later else 'landed %s %s %s'%(later[0][0][5:16],later[0][1][:8],rel(l['sha'],tip,later[0]))
+        print('  ',r,t,tip[:8],'LANDED-AS-BUILT' if l.get('on_main_now') else '','| same-tip trees',trees,'solos',' '.join(sol) or '-','|',ld)
+if __name__=='__main__':
+    for a in sys.argv[1:]: detail(int(a))

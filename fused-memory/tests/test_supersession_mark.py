@@ -36,10 +36,8 @@ _NOT_FOUND = {'error_type': 'MemoryNotFound', 'error': 'no such memory'}
 
 
 class TestTheMarkKeyIsQuietVocabulary:
-    def test_the_mark_raises_no_violation_even_under_the_strict_registry(self):
-        assert validate_memory_metadata(
-            {SUPERSEDED_BY_METADATA_KEY: NEW_ID}, enforce_kind_registry=True
-        ) == []
+    def test_the_mark_raises_no_violation(self):
+        assert validate_memory_metadata({SUPERSEDED_BY_METADATA_KEY: NEW_ID}) == []
 
     def test_the_mark_is_not_an_unknown_key(self):
         assert classify_unknown_keys({SUPERSEDED_BY_METADATA_KEY: NEW_ID}) == []

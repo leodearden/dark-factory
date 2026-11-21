@@ -397,7 +397,9 @@ def _cap_every_root(cap: int) -> None:
     """Give every configured root an orchestrator config capping it at *cap* concurrent tasks."""
     config: DashboardConfig = app.state.config
     for root in (config.project_root, *config.known_project_roots):
-        (root / 'dark-factory-orchestrator.yaml').write_text(f'max_concurrent_tasks: {cap}\n')
+        (root / 'dark-factory-orchestrator.yaml').write_text(
+            f'max_concurrent_tasks: {cap}\nmain_health_fix_reserved_slots: 0\n'
+        )
 
 
 def _burndown_family(client: TestClient, workdir: Path) -> dict[str, Any]:

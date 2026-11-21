@@ -13,6 +13,10 @@ Four assertions per request:
   reaching the endpoint's data and a real shrink nobody recorded;
 * every declared data-keyed map is present, so a declaration cannot rot.
 
+A request whose route waits a bounded time on its reads is measured once those
+reads have landed, as a polled dashboard serves it
+(``dashboard/tests/_payload_fleet.py::get_landed``).
+
 The fleet is expensive to build, so the module runs in one xdist group.
 """
 
@@ -21,9 +25,12 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import pytest
-from _payload_fleet import open_fleet_client
-from fastapi.testclient import TestClient
+from _payload_fleet import FleetClient, get_landed, open_fleet_client
 
+import dashboard.api.prds
+from dashboard.data.datum import DatumState
+from dashboard.data.prd_view import ViewInput
+from dashboard.data.task_activity import clear_activity_state
 from dashboard.payload_budgets import (
     EndpointBudget,
     field_breakdown,
@@ -40,16 +47,16 @@ _SWEPT: tuple[EndpointBudget, ...] = load_budget_table().endpoints
 
 
 @pytest.fixture(scope='module')
-def fleet_client() -> Iterator[TestClient]:
-    with open_fleet_client() as client:
-        yield client
+def fleet_client() -> Iterator[FleetClient]:
+    with open_fleet_client() as served:
+        yield served
 
 
 @pytest.mark.parametrize('entry', _SWEPT, ids=[entry.url_suffix() for entry in _SWEPT])
 def test_request_is_within_its_budget(
-    fleet_client: TestClient, entry: EndpointBudget,
+    fleet_client: FleetClient, entry: EndpointBudget,
 ) -> None:
-    resp = fleet_client.get(entry.path, params=dict(entry.query))
+    resp = get_landed(fleet_client, entry)
     assert resp.status_code == 200, f'{entry.url_suffix()} answered {resp.status_code}'
 
     measured = len(resp.content)
@@ -76,3 +83,24 @@ def test_request_is_within_its_budget(
             'rotted (a key was renamed or moved); fix data_keyed_maps in '
             'payload_budgets.json.'
         )
+
+
+def test_a_prds_request_whose_activity_reads_miss_their_wait_is_measured_once_they_land(
+    fleet_client: FleetClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = next(entry for entry in _SWEPT if entry.path == '/api/v2/dashboard/prds')
+    get_landed(fleet_client, entry)
+    clear_activity_state()
+    monkeypatch.setattr(dashboard.api.prds, 'ACTIVITY_REQUEST_WAIT_SECONDS', 0.0)
+
+    missed = fleet_client.get(entry).json()['PRD_VIEW']
+    for root in fleet_client.fleet.roots:
+        if root.holds_tasks:
+            view = missed[root.label]
+            assert view['state'] == DatumState.UNKNOWN, (root.label, view['reason'])
+            assert f'{ViewInput.ACTIVITY}: ' in view['reason'], (root.label, view['reason'])
+
+    landed = get_landed(fleet_client, entry)
+
+    assert landed.status_code == 200
+    assert not slack_violation(entry.budget_bytes, len(landed.content))

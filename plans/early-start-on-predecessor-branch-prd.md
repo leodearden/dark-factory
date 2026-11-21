@@ -154,15 +154,18 @@ About the dependent:
 - it is an ordinary code task. A deterministic task or a human gate is never started early: its whole point is to
   act after the predecessor has landed;
 - it has no task branch yet; **or** its branch is one that an earlier early start stacked on this same
-  predecessor (the branch has a ledger record and the task's early-start mark names this predecessor), and it has
-  been stopped fewer than `early_start.max_stops_per_pair` times on it (choice 3). Any other existing branch
+  predecessor (the branch has a ledger record and the task's early-start mark names this predecessor) (choice 3). Any other existing branch
   refuses the pair (`has_branch`).
 
 About its files (the dependent's declared lock set, taken all or nothing): every key can be acquired under the
 rule of section 5.2, and no other task's reservation covers any of them.
 
 About the rest of the queue (ruling 3). No early start if some task T exists with all of:
-- strictly higher effective tier than the dependent (a pinned task counts as higher than every tier);
+- strictly higher effective tier than the dependent (a pinned task counts as higher than every tier). Leo's
+  ruling of 2026-11-17, one order at every gate: an unfinished prerequisite of a pinned task counts as pinned
+  (once task 9939 of `plans/priority-at-later-gates-prd.md` adds that inheritance); between two pinned-tier
+  tasks the lower pin order counts as higher; and a pin set by the starvation watchdog counts as pinned here.
+  Tasks 10477 and 9939 carry this as dated notes;
 - T needs one of the dependent's keys;
 - T's dependencies are all done, **or** the predecessor is T's only unfinished dependency;
 - every key T needs is free or held only by the predecessor, and no other task's reservation covers it.
@@ -213,10 +216,18 @@ The lock table records "D is the successor of P" from the early start until eith
   and treats "cannot read" as "unknown". The launch also writes an **early-start mark** on the dependent's task:
   which task it was stacked on. The commit itself lives only in the ledger. `early_start_dispatched` also records
   main's tip at that moment (section 5.6 uses it).
-  A stacked worktree is never taken from the warm-worktree pool: the exclusion that today covers train successors
-  in `create_worktree` covers the stack input too, because a released warm worktree does not keep uncommitted
-  work. The stop of section 5.6 commits the dependent's work in progress before its workflow exits, so nothing in
-  its worktree is left uncommitted when the worktree is released or reused.
+  A stacked worktree is made the way the project makes any task worktree: from the warm-worktree pool where
+  the project has one, otherwise cold (ruled by Leo, 2026-11-17; drafts 7 to 9 kept it out of the pool, which
+  in reify costs a full cold build per early start). The warm acquire already takes the commit to start from,
+  so the stack input passes the predecessor's tip, and the record is written and read back on that route as on
+  the cold one. Only declared-train successors stay out of the pool, as today.
+  A released warm worktree does not keep uncommitted work. So the stop of section 5.6 commits the dependent's
+  work in progress before its workflow exits, and a warm worktree goes back to the pool only after that commit
+  succeeded or the tree was clean. If the commit fails or is cut short, the worktree stays assigned to the
+  dependent, as it does after a hard cancel, and the next start's reuse route commits first, as it does today.
+  When the pool has no free worktree an early start behaves like any start: the acquire may take the worktree
+  of a task that is not running (that task's work is committed first), and an acquire that fails is the
+  ordinary requeue for its cause, after which the pair may be chosen again.
 - **A second early start: the re-stack.** A dependent that was stopped (section 5.6) keeps its branch, stacked on
   the predecessor's tip of that time. When the predecessor has repaired its work and waits on a new merge
   request, the dependent qualifies again.
@@ -375,8 +386,8 @@ lease); if it lasts longer than `early_start.merge_entry_alert_secs` it raises o
 **When the predecessor's slot ends and its work has not landed,** the dependent is stopped with a named cause: a
 soft cancel, followed by a hard cancel if it has not exited within `early_start.stop_hard_cancel_secs`. On both
 arms it is written back to `pending` before its owner stamp is cleared, and it releases its files. The stop is
-recorded as a requeue that does not count toward the task's retry limit or the no-progress alert; the stops of
-a pair are counted from the `early_start_stopped` events (section 5.7). The dependent's uncommitted work is
+recorded as a requeue that does not count toward the task's retry limit or the no-progress alert, and it emits
+one `early_start_stopped` event. The dependent's uncommitted work is
 committed before its workflow exits (section 5.3). Its work stays on its branch with the ledger record. Reason for stopping rather than waiting (choice 2): after a failure the
 predecessor needs its files and its slot for the repair, and a dependent that kept them would block the task it
 depends on (ruling 5). A stop caused by the orchestrator shutting down is not a stop in this sense: nothing is
@@ -411,11 +422,10 @@ pass fails, the dependent is stopped, and a human then cancels the predecessor i
 - One early start per predecessor at a time, and no cap on how many are live (choice 4). Each borrows the slot of
   a task that is waiting, so tasks running never exceed `max_concurrent_tasks` plus the live early starts, and
   live early starts never exceed the number of predecessors. The host-load gate holds new ones under load.
-- A dependent stopped `early_start.max_stops_per_pair` times on one predecessor (default 3) is not started early
-  on it again (`stop_limit`); it waits for the landing. The count is read from the `early_start_stopped` events for the pair;
-  nothing else stores it. The predecessor's own retry limits and the escalation ladder already bound how often a
-  pair can cycle (fourth critic); this bound is cheap insurance for the dependent's work, since stops do not
-  count toward the dependent's retry limit.
+- No bound on how often one dependent is stopped on one predecessor (ruled by Leo, 2026-11-17; drafts 5 to 9
+  had a bound of three). Every stop follows a merge pass of the predecessor that did not land, and the
+  predecessor comes back only through one of its own requeue limits or through a resumed escalation, so those
+  bound how often a pair can cycle (fourth critic). The self-pause below catches a run of stops across pairs.
 - If `early_start.stop_streak_pause` early starts in a row end in a stop (default 5), the feature pauses itself
   and raises one escalation. It resumes when the operator switches `early_start.enabled` off and on again, or at a
   restart.
@@ -445,7 +455,7 @@ Ruled as recommended: 1, 2, 5, 6. Ruled differently from the draft's recommendat
    recommended "at most once", to keep a single way of creating a stacked branch.)
 4. **Caps.** *Ruled by Leo: no cap on the number of live early starts.* One dependent per predecessor at a time
    stays, because the file sharing and the borrowed slot are between two tasks. The self-pause after 5 stops in
-   a row stays. A bound per pair is added with the second early start: 3 stops on one predecessor (section 5.7).
+   a row stays. There is no bound on stops per pair (ruled by Leo, 2026-11-17; section 5.7).
    (The draft had recommended a cap of 4 live early starts.)
 5. **After the landing.** *Recommended:* one more task verify unless the predecessor landed exactly what the
    dependent was built on (a merge commit of exactly the stacked base), and always after a conflict was
@@ -497,7 +507,9 @@ Names are proposals; the shapes and the invariants bind.
   conflict, a refused start and a failed abort apart. A trial of the same replay that touches nothing
   (`merge-tree --write-tree --merge-base`). Given no stack input, all three routes un-stack before a rebase onto
   main.
-- A stacked worktree is never taken from the warm-worktree pool.
+- A stacked worktree comes from the warm-worktree pool where the project has one (declared-train successors
+  excepted, as today); the record is written and read back on the warm route too. At a stop, a warm worktree
+  is released only after the work in progress is committed.
 - A replay entry point: replay a branch's own commits onto main, pause at a conflict without aborting, let the
   caller resolve and continue, and drop the record only when the replay is complete and checked.
 
@@ -536,7 +548,7 @@ Names are proposals; the shapes and the invariants bind.
   owner stamp is cleared. The stop commits the dependent's work in progress before the workflow exits.
 
 **Config** (`orchestrator/src/orchestrator/config.py`): a group `early_start`, hot-reloadable:
-`enabled` (off in the code until T7 turns the default on), `max_stops_per_pair` (3), `pass_interval_secs` (60), `picture_max_age_secs` (600),
+`enabled` (off in the code until T7 turns the default on), `pass_interval_secs` (60), `picture_max_age_secs` (600),
 `merge_entry_alert_secs` (43200), `stop_streak_pause` (5), `stop_hard_cancel_secs` (300),
 `unknown_streak_alert` (3).
 
@@ -553,7 +565,7 @@ the `code_default_config` fixture, and T7 changes that one value and that one te
   `has_milestone`, `ledger_write_failed`,
   `predecessor_branch_moved`, `key_unavailable`, `key_reserved`, `higher_tier_waiting` with the task that refused
   it, `host_load`, `scheduler_paused`, `review_checkpoint`, `warm_base_down`, `merge_queue_halted`, `usage_paused`, `cost_ceiling`, `predecessor_has_dependent`, `restack_conflict`,
-  `stop_limit`, `self_paused`). Emitted on a change of outcome, at most once per waiting predecessor per interval.
+  `self_paused`). Emitted on a change of outcome, at most once per waiting predecessor per interval.
 - `early_start_dispatched`: dependent, predecessor, stacked base, main's tip at that moment, co-held keys, own
   keys, and for a re-stack the base it replaced.
 - `early_start_settled`: dependent, predecessor, the answer to the landed question, whether its commits were
@@ -592,8 +604,7 @@ the `code_default_config` fixture, and T7 changes that one value and that one te
     predecessor, when it answers "not landed", and does no work while it answers "unknown".
 15. A re-stack either completes (the branch is the predecessor's tip plus the dependent's own commits, and the
     ledger answers that tip), or leaves the branch and the record exactly as they were, or blocks the dependent
-    with an escalation when git could not restore them. A dependent is stopped at most `max_stops_per_pair` times
-    on one predecessor; after that many stops it is not started early on that predecessor again.
+    with an escalation when git could not restore them.
 
 ## 8. Boundary tests (through the scheduler, the harness loop, a real git repository and a real merge worker)
 
@@ -645,11 +656,12 @@ P is the predecessor, D the dependent.
 | 42 | Second early start | After 22: P is repaired (its branch rebuilt on a newer main) and waits on a new request | D is started early again; its branch is P's new tip plus D's own commits; the ledger answers the new tip; `early_start_dispatched` names the base it replaced; no commit of P's old branch that is absent from the new tip is on D's branch |
 | 43 | Re-stack conflicts | As 42, but D's own commits conflict with P's new tip | The trial reports the conflict; D is not claimed; refusal `restack_conflict`; D's branch tip and ledger record are unchanged; the next selection does not try the same pair of tips |
 | 44 | A branch that was not stacked on this predecessor | D has a branch cut from main, or a ledger record with a mark naming another task | D is not started (`has_branch`) |
-| 45 | Stops per pair | D has been stopped three times on P; P waits on a new request | D is not started (`stop_limit`); it starts ordinarily after P lands |
+| 45 | Withdrawn 2026-11-17 | The bound on stops per pair was removed; the number is kept so that later rows keep theirs | Nothing to test |
 | 46 | Two dependents of one predecessor | D1 and D2 both qualify on P; D1 ranks higher | D1 is started; D2 is not (`predecessor_has_dependent`); P's lease lends once; after D1 is stopped, D2 may be considered |
 | 47 | Re-stack through each reuse route | As 42, with D's worktree (i) still registered, (ii) removed, (iii) a warm worktree | In each case D's branch is P's new tip plus D's own commits and the ledger answers the new tip; no un-stack onto main and no plain rebase onto main runs |
-| 48 | Stop with uncommitted work | D has uncommitted edits when P's slot ends not landed; then 42 | After the stop, D's branch carries the edits in a commit; after the re-stack they are on D's branch above P's new tip |
+| 48 | Stop with uncommitted work | D has uncommitted edits when P's slot ends not landed, on (i) a cold worktree and (ii) a warm one; then 42. (iii) As (ii), with the commit failing | (i), (ii) After the stop, D's branch carries the edits in a commit, and in (ii) the worktree is back in the pool only after that commit; after the re-stack the edits are on D's branch above P's new tip. (iii) The worktree stays assigned to D with the edits in place |
 | 49 | Switch off with a live pair | D early-started; `enabled` reloaded to false; P's slot then (i) ends not landed, (ii) lands | (i) D is stopped as in 22; (ii) D settles as in 13; no new early start begins |
+| 50 | First early start on a warm worktree | A project with a warm-worktree pool; D is stacked on P's tip through `create_worktree` | D's worktree is a pool worktree; D's branch starts at P's tip; the ledger answers that tip; a declared-train successor is still made cold |
 
 ## 9. Decomposition plan
 
@@ -664,12 +676,12 @@ T6a, T6b, T6c, T7. `workflow.py`: T2a, T2b, T6a, T6b. T1, T2a and T3 touch diffe
   boundary) and 12; the dependency half of 32.
 - **T2a. Stacked worktree, the re-stack, and own work.** `git_ops.py` (`create_worktree`'s "stack on this commit"
   input with a ledger record and its read-back; a read of the record that tells "no record" from "cannot read"
-  (today both read as nothing); stacked worktrees never from the warm pool; the re-stack mode of
+  (today both read as nothing); a stacked worktree from the warm pool where the project has one; the re-stack mode of
   the three reuse routes and its trial; without a stack input all three routes un-stack before a rebase onto
   main), `branch_stack.py`, `workflow.py` (worktree set-up passes the stack target; own work through the existing
   rule), tests on a real repository. Supersedes task 7660; after task 7736 (in progress; it edits the same
   worktree-reuse path). Unlocks T2b, T5b. Signal: test 28; the ledger answers the base of a branch
-  `create_worktree` stacked; the git halves of tests 42 and 43; test 47.
+  `create_worktree` stacked; the git halves of tests 42 and 43; tests 47 and 50.
 - **T2b. The landed question and the replay that pauses.** `git_ops.py`, `branch_stack.py`: the four-valued
   landed question; the replay onto main that pauses at a conflict and can be continued; tests on a real
   repository. After T2a. Unlocks T6a, T6b, T6c. Signal: the landed question answers each of its four values (the
@@ -696,9 +708,9 @@ T6a, T6b, T6c, T7. `workflow.py`: T2a, T2b, T6a, T6b. T1, T2a and T3 touch diffe
   by the test: a pending task with a stacked branch, a ledger record and a mark).
 - **T6a. Stop when the predecessor's work does not land.** `harness.py`, `workflow.py`, `scheduler.py`: the soft
   then hard stop, the commit of work in progress before the exit, `pending` before the owner stamp is cleared, a
-  requeue that does not count, the stop streak and self-pause, the stops-per-pair refusal counted from
-  `early_start_stopped` events, the re-asking of an "unknown" answer at slot end, the shutdown exclusion; tests through the harness loop. After T5b and T2b. Unlocks
-  T6b. Signal: tests 18 (i), 22, 23, 30, 31, 45, 48, 49 (i), and test 42 run from a real stop.
+  requeue that does not count, the stop streak and self-pause, the commit of work in progress before a warm worktree is
+  released, the re-asking of an "unknown" answer at slot end, the shutdown exclusion; tests through the harness loop. After T5b and T2b. Unlocks
+  T6b. Signal: tests 18 (i), 22, 23, 30, 31, 48, 49 (i), and test 42 run from a real stop.
 - **T6b. Settle when it lands.** `workflow.py`, the merge-conflict agent's brief for a paused
   replay: the settle, its use of T2b's replay and the conflict handling, the verify rule, the wait at merge entry and its
   alert; tests with a real merge worker and repository. After T6a. Unlocks T6c. Signal: tests 13 to 17, 18 (ii), 19 to 21, 27, 29,
@@ -728,8 +740,8 @@ T6a, T6b, T6c, T7. `workflow.py`: T2a, T2b, T6a, T6b. T1, T2a and T3 touch diffe
 - **T9. Gate: read two weeks of early starts.** A pure gate with `after_secs: 1209600` and a dependency on T7.
   Counts per week and per project of starts (first and second), stops by cause and per pair, re-cuts, refusals by
   reason, hours gained (early start to predecessor landing), verifies re-run, conflicts on a replay or a
-  re-stack, how often a landing read as "landed, changed", the peak number of live early starts, the first-build
-  cost of a stacked worktree per project, and the task-verify admission wait of ordinary tasks before and after
+  re-stack, how often a landing read as "landed, changed", the peak number of live early starts, the pool
+  worktrees that early starts took from tasks not running (reify has the only pool), and the task-verify admission wait of ordinary tasks before and after
   T7 (every early start, re-stack and settle adds a verify, and there is no cap); against section 2. If T8 closed without a completed pair, T9 shows T8's sequence for one real pair, or reports
   that no early start has settled in two weeks, which is a finding for Leo. Recommends on stage 2.
 
@@ -791,8 +803,9 @@ T6a, T6b, T6c, T7. `workflow.py`: T2a, T2b, T6a, T6b. T1, T2a and T3 touch diffe
 
 1. **Cross-project allowance weighting and the allowance reserve** with two running tasks on one slot: see the
    allowance-reserve row of section 11; T7 checks the weighting.
-2. **Warm worktrees.** Decided: a stacked worktree is cold (section 5.3), because a released warm worktree does
-   not keep uncommitted work. T9 measures the first-build cost, per project.
+2. **Warm worktrees.** Decided (Leo, 2026-11-17): a stacked worktree comes from the warm pool where the project
+   has one (section 5.3). T9 reports how many pool worktrees early starts took from tasks that were not
+   running.
 3. **Where the per-task "slot ended" signal lives** (the scheduler's release or the lease). Decide in T3.
 4. **`merge_entry_alert_secs`.** Suggested 12 h: the two merge-entry waits the first seat observed were 7.1 h and
    10.8 h. Decide in T6b.
@@ -802,7 +815,8 @@ T6a, T6b, T6c, T7. `workflow.py`: T2a, T2b, T6a, T6b. T1, T2a and T3 touch diffe
    the extra verify runs. T9 reports it.
 7. **Whether the containment classifier can call a range "contained" when the queue re-applied it with conflicts
    resolved.** It should not, and the plan relies on that; T2b tests it on a real repository.
-8. **`max_stops_per_pair`.** 3 is a judgement. T9 reports stops per pair.
+8. **Stops per pair.** No bound (ruled by Leo, 2026-11-17). T9 reports stops per pair, so that a pair that
+   cycles is seen.
 9. **Whether the start-up clean-up removes a pending task's cold worktree that still holds uncommitted work.**
    The stop commits first, so only a hard cancel cut short by a restart is exposed. T6a checks.
 
@@ -880,3 +894,12 @@ T6a, T6b, T6c, T7. `workflow.py`: T2a, T2b, T6a, T6b. T1, T2a and T3 touch diffe
 - From the critic of the assembled task batch: the settle leaves declared-train successors alone and asks the
   landed question itself; the cost ceilings are read without acting; the early-start mark is a registered
   metadata key; five more seam rows (tasks 9269, 9216, 9674, 7540, 7691).
+
+**From Leo's ruling of 2026-11-17:**
+- The bound of three stops per pair is removed: the key `max_stops_per_pair`, the `stop_limit` refusal and
+  test 45 are gone (5.1, 5.6, 5.7, invariant 15, the config and event lists). The predecessor's own requeue
+  limits and the escalation ladder bound how often a pair can cycle; T9 still reports stops per pair.
+- A stacked worktree comes from the warm-worktree pool where the project has one. The rule "always cold" was a
+  second fix for a hole that the commit at the stop already closes, and in reify it cost a full cold build per
+  early start. A warm worktree is released at a stop only after the work in progress is committed (5.3,
+  section 7, tests 48 and 50, T2a, T6a, T9, open question 2).

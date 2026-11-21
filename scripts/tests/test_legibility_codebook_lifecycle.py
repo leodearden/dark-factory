@@ -21,7 +21,8 @@ _EXPECTED_TABLE = {
     T.FIX: ("entry", "status", set(_LIVE_STATUSES), "fixed"),
     T.REOPEN: ("entry", "status", {"accepted", "fixed"}, "open"),
     T.WITHHOLD: ("entry", "filing", {None}, "withheld"),
-    T.FILE: ("entry", "filing", {"withheld"}, "filed"),
+    T.FILE: ("entry", "filing", {"withheld", "owed"}, "filed"),
+    T.OWE: ("entry", "filing", {None, "filed"}, "owed"),
 }
 
 _VOCABULARY = {
@@ -65,6 +66,7 @@ def test_every_target_is_of_its_fields_vocabulary():
 def test_a_legal_transition_writes_its_target(transition, state):
     kind, field, _, target = _EXPECTED_TABLE[transition]
     record = _record(kind, field, state)
+    assert codebook_lifecycle.allows(record, transition)
 
     codebook_lifecycle.transit(record, transition)
 
@@ -76,6 +78,7 @@ def test_an_illegal_source_is_refused_naming_everything_a_reader_needs(transitio
     kind, field, sources, _ = _EXPECTED_TABLE[transition]
     record = _record(kind, field, state)
     before = copy.deepcopy(record)
+    assert not codebook_lifecycle.allows(record, transition)
 
     with pytest.raises(codebook_lifecycle.IllegalTransition) as raised:
         codebook_lifecycle.transit(record, transition)
@@ -136,21 +139,29 @@ def _codebook_with_candidate(disposition: str = "pending") -> dict:
     return cb
 
 
-def _codebook_with_withheld_entry() -> dict:
+def _codebook_with_marked_entry(entry_id: str, marker: str) -> dict:
     cb = _minimal_v2_codebook()
     cb["entries"].append(
         {
-            "id": "entry-withheld",
-            "title": "A withheld confusion",
+            "id": entry_id,
+            "title": f"A confusion marked {marker}",
             "severity": "medium",
             "status": "open",
             "origin_phase": "implement",
             "manifested_phase": "verify",
             "sightings": [],
-            codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD,
+            codebook.ENTRY_FILING_KEY: marker,
         }
     )
     return cb
+
+
+def _codebook_with_withheld_entry() -> dict:
+    return _codebook_with_marked_entry("entry-withheld", codebook.ENTRY_FILING_WITHHELD)
+
+
+def _codebook_with_owed_entry() -> dict:
+    return _codebook_with_marked_entry("entry-owed", codebook.ENTRY_FILING_OWED)
 
 
 _PROMOTION_ENTRY_FIELDS = {
@@ -276,6 +287,31 @@ def test_mark_entry_filed_flips_the_marker_retained():
     )
 
 
+def test_mark_entry_owed_marks_an_unmarked_entry_retained():
+    before = _minimal_v2_codebook()
+    original = copy.deepcopy(before)
+
+    result = codebook_lifecycle.mark_entry_owed(before, "entry-a")
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_OWED
+    assert [e for e in result["entries"] if e["id"] != "entry-a"] == [
+        e for e in before["entries"] if e["id"] != "entry-a"
+    ]
+    assert len(result["entries"]) == len(before["entries"]), "entry is RETAINED"
+    assert codebook.validate(result) == []
+    codebook.assert_no_deletion(before, result)
+    assert before == original, "the input is never mutated"
+
+
+def test_mark_entry_filed_clears_an_owed_marker():
+    result = codebook_lifecycle.mark_entry_filed(_codebook_with_owed_entry(), "entry-owed")
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-owed")
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
+    assert codebook.validate(result) == []
+
+
 def test_mark_entry_filed_rejects_an_unknown_entry_id():
     with pytest.raises(ValueError, match="entry-nope"):
         codebook_lifecycle.mark_entry_filed(_codebook_with_withheld_entry(), "entry-nope")
@@ -297,6 +333,12 @@ _TRANSFORMS = [
         _codebook_with_withheld_entry,
         lambda cb: codebook_lifecycle.mark_entry_filed(cb, "entry-withheld"),
         id="file",
+    ),
+    pytest.param(_minimal_v2_codebook, lambda cb: codebook_lifecycle.mark_entry_owed(cb, "entry-a"), id="owe"),
+    pytest.param(
+        _codebook_with_owed_entry,
+        lambda cb: codebook_lifecycle.mark_entry_filed(cb, "entry-owed"),
+        id="file-owed",
     ),
 ]
 
@@ -344,6 +386,13 @@ def test_every_transform_returns_a_new_valid_codebook_and_leaves_its_input(build
             T.FILE,
             "entry-a",
             id="file-an-entry-never-withheld",
+        ),
+        pytest.param(
+            _codebook_with_withheld_entry,
+            lambda cb: codebook_lifecycle.mark_entry_owed(cb, "entry-withheld"),
+            T.OWE,
+            "entry-withheld",
+            id="owe-a-withheld-entry",
         ),
     ],
 )

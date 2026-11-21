@@ -79,7 +79,7 @@ tasks:
           reason: "a relaxed guard is a behaviour, not a new symbol; ι's readout observes chain_items > 1 on speculative=False rows"
   - label: "ζ"
     task_id: 8528
-    title: "Suspect-list bisect, depth table, chain_cap as kill switch"
+    title: "Depth table, chain_cap as kill switch, halving state deleted"
     capabilities:
       - name: "depth-table-config"
         binding: "capability→producer — built here; grep absent on main 72239dfd5d"
@@ -87,7 +87,7 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "depth_table"
-          paths: ["orchestrator/src/orchestrator/config.py"]
+          paths: ["orchestrator/src/orchestrator/"]
           expect: present
       - name: "chain-policy-state"
         binding: "capability→producer — built here; grep absent on main 72239dfd5d"

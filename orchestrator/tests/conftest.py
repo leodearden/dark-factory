@@ -26,7 +26,31 @@ from _live_mcp_guard import (
     assert_no_live_attempts,
     install_live_mcp_guard,
 )
-from _tree_scan import TreePass, analyses_requested_by
+from _tree_pass_workers import TreePass, pass_requested_by
+
+# Repo root of this worktree.  Also used by the autouse ``_isolate_orch_config``
+# fixture to pin ``ORCH_CONFIG_PATH`` at the canonical top-level
+# ``dark-factory-orchestrator.yaml`` (task 2719: the transitional
+# ``orchestrator/config.yaml`` symlink was retired, so the old CWD-relative
+# ``Path('config.yaml')`` fallback no longer resolves to the operational config).
+#
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd orchestrator && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so this suite wires
+# the defence itself.  APPEND the repo root, never insert(0, ...): at sys.path[0]
+# it would make orchestrator/, shared/ etc. resolve as namespace packages
+# pointing at the project folder instead of src/<pkg>/, and the src dirs
+# inserted below would lose.
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from df_pytest_isolation import (
+    arm_fleet_dir_isolation,
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    arm_usage_gate_sweep_confinement,
+    reject_unsafe_basetemp,
+)
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -48,27 +72,14 @@ _CROSS_SUITE_HELPERS_DIR = _TESTS_DIR / "cross_suite_helpers"
 if str(_CROSS_SUITE_HELPERS_DIR) not in sys.path:
     sys.path.insert(0, str(_CROSS_SUITE_HELPERS_DIR))
 
-# Repo root of this worktree.  Used by the autouse ``_isolate_orch_config``
-# fixture to pin ``ORCH_CONFIG_PATH`` at the canonical top-level
-# ``dark-factory-orchestrator.yaml`` (task 2719: the transitional
-# ``orchestrator/config.yaml`` symlink was retired, so the old CWD-relative
-# ``Path('config.yaml')`` fallback no longer resolves to the operational config).
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
-# runs `cd orchestrator && uv run pytest tests/`, which makes rootdir the
-# SUBPROJECT — the repo-root conftest.py is never loaded, so this suite wires
-# the defence itself.  APPEND the repo root, never insert(0, ...): at sys.path[0]
-# it would make orchestrator/, shared/ etc. resolve as namespace packages
-# pointing at the project folder instead of src/<pkg>/, and the src dirs
-# inserted above would lose.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
 
 # Suite-wide single-writer debug asserts (task 1999 / MQ-invariants ξ, I7).
 # Must be set BEFORE any `orchestrator.merge_lane.worker` import so the module-level
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
+
+# Why: test_suite_loads_no_dotenv.py.
+os.environ['PYTHON_DOTENV_DISABLED'] = '1'
 
 from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
@@ -80,17 +91,6 @@ from _orch_helpers import (  # noqa: E402
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
     stamp_stock_routing_config,
-)
-from df_pytest_isolation import (  # noqa: E402
-    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
-    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
-    _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
-    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
-    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
-    _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — the binding IS the wiring
-    arm_leaked_drain_process_guard,
-    arm_usage_gate_sweep_confinement,
-    reject_unsafe_basetemp,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
 
@@ -311,9 +311,9 @@ def tree_pass(request: pytest.FixtureRequest) -> TreePass:
     carries the whole-tree family mark.  NOT prebuilt at collection time
     (unlike shared/tests/session_prebuild.py): every xdist worker collects
     every item, so a prebuild would make every worker parse.  ``_tree_scan``
-    holds the mechanism.
+    holds the mechanism; ``_tree_pass_workers`` runs it in worker processes.
     """
-    return TreePass.run(analyses_requested_by(request.session.items))
+    return pass_requested_by(request.session.items)
 
 
 @pytest.fixture
@@ -366,7 +366,7 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     env value agrees with the YAML they write.  The opt-in
     ``code_default_config`` fixture runs after this autouse fixture and still
     wins (re-pointing ORCH_CONFIG_PATH at a guaranteed-absent file) for the
-    default-asserting / scoped-behaviour tests.
+    default-asserting tests.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
@@ -390,23 +390,23 @@ def code_default_config(monkeypatch, tmp_path):
     live operational overrides (commit b012af0e0e:
     ``merge_verify_breadth='full'``, ``merge_train_former_enabled=true``,
     ``merge_train_coalesce_enabled=true``) then bleed into any bare
-    ``OrchestratorConfig()``.
+    ``OrchestratorConfig()``.  Since task 7008 the code defaults carry
+    ``merge_verify_breadth='full'`` too, so breadth no longer differs between
+    them.
 
-    Tests that assert the CODE DEFAULTS (``defaults.yaml``:
-    ``merge_verify_breadth='scoped'``, trains OFF) — or that exercise the
-    default *scoped* merge-verify behaviour — must construct the config in
-    isolation from those live overrides.  Pointing ``ORCH_CONFIG_PATH`` at a
-    guaranteed-absent file makes ``YamlSettingsSource.__call__`` skip the
-    layer-2 project file (its ``.exists()`` is False) and load ONLY the
-    package-bundled ``defaults.yaml`` -> pure code defaults.  ``project_root``
-    still resolves to ``tmp_path`` via ``ORCH_PROJECT_ROOT`` (set by the autouse
-    fixture, which runs first), so bare-config tests still never write into the
-    live tree.
+    Tests that assert the CODE DEFAULTS (``defaults.yaml``: trains OFF) must be
+    isolated from those live overrides; scoped-merge tests pin breadth to
+    ``'scoped'`` explicitly rather than rely on this hatch.  Pointing
+    ``ORCH_CONFIG_PATH`` at a guaranteed-absent file makes
+    ``YamlSettingsSource.__call__`` skip the layer-2 project file (its
+    ``.exists()`` is False) and load ONLY the package-bundled ``defaults.yaml``
+    -> pure code defaults.  ``project_root`` still resolves to ``tmp_path`` via
+    ``ORCH_PROJECT_ROOT`` (set by the autouse fixture, which runs first), so
+    bare-config tests still never write into the live tree.
 
     Opt-in via ``@pytest.mark.usefixtures("code_default_config")`` (or a direct
-    request) on exactly the default-asserting / scoped-behaviour tests — NEVER
-    autouse, which would strip config.yaml from the ~10k tests that legitimately
-    rely on it.
+    request) on exactly the default-asserting tests — NEVER autouse, which
+    would strip config.yaml from the ~10k tests that legitimately rely on it.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
     monkeypatch.delenv("ORCH_VERIFY_RUNNERS", raising=False)
@@ -459,52 +459,6 @@ def _isolate_warm_lane_script_dir(monkeypatch):
     """
     monkeypatch.setenv(
         "ORCH_WARM_LANE_SCRIPT_DIR", _ABSENT_WARM_LANE_SCRIPT_DIR,
-    )
-
-
-@pytest.fixture(autouse=True)
-def _no_mock_derived_stray_dirs(request):
-    """Fail any test that leaves a ``MagicMock/`` DIRECTORY in the process CWD.
-
-    **Mechanism.**  ``unittest.mock.MagicMock`` configures ``__fspath__`` as a
-    supported magic method whose default return value is a genuine ``str``.  A
-    MagicMock is therefore a *fully valid* ``os.PathLike[str]``, and
-    ``os.fspath()`` of one is derived from its repr, so it ALWAYS begins with a
-    literal ``MagicMock`` path component::
-
-        os.fspath(MagicMock().project_root / 'data' / 'x.json')
-        # -> 'MagicMock/mock.project_root.__truediv__()...()/1404727137'
-
-    Any production code that coerces such an object with ``Path()`` and then
-    creates directories materialises that tree for real, relative to the
-    process CWD.  Task 3223 hit exactly this: ``merge_queue`` read
-    ``project_root`` off a MagicMock, handed the derived path to
-    ``LandedOutbox``, and ``shared.safe_io.atomic_write_text(..., mkdir=True)``
-    dutifully created it — landing a junk tree in a commit.  The write
-    primitive cannot detect this (there is no type-level signal separating a
-    mock from a genuine relative path), so the fence belongs here.
-
-    The fixture REMOVES the tree as well as failing, so a single polluting test
-    does not cascade into a failure for every subsequent test sharing the same
-    xdist worker's CWD.
-
-    **``os.fspath()`` shape only.**  This covers the ``MagicMock/`` tree; the
-    sibling :func:`_no_mock_repr_stray_entries` covers any file or directory
-    named by a mock's ``str()``/repr, ``<MagicMock name='...' id='...'>``.
-    """
-    yield
-    stray = Path.cwd() / "MagicMock"
-    if not stray.exists():
-        return
-    shutil.rmtree(stray, ignore_errors=True)
-    pytest.fail(
-        f"{request.node.nodeid} left a mock-derived directory at {stray}. "
-        "A MagicMock is a valid os.PathLike[str] whose os.fspath() is "
-        "repr-derived, so passing one where real code calls Path(...).mkdir() "
-        "creates a real tree under the CWD. Give the mock a genuine path "
-        "(e.g. `git_ops.project_root = tmp_path`) rather than leaving the "
-        "attribute to auto-spec into a child mock. The stray tree has been "
-        "removed so following tests are unaffected."
     )
 
 
@@ -616,7 +570,7 @@ def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Refuse an unsafe ``--basetemp``, arm the drain-leak guard, register the opt-out markers.
+    """Refuse an unsafe ``--basetemp``, arm the suite-wide defences, register the opt-out markers.
 
     The ``reject_unsafe_basetemp`` call comes FIRST and is unrelated to the
     marker below: it aborts collection when ``--basetemp`` points inside a live
@@ -638,6 +592,8 @@ def pytest_configure(config: pytest.Config) -> None:
     load-bearing yet.
     """
     reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
+    arm_fleet_dir_isolation(config)
     arm_leaked_drain_process_guard(config)
     from shared import usage_gate
 
@@ -1241,6 +1197,8 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # _claimant_heartbeat_loop (workflow.py:2113) under load-exposed
     # teardown ordering, raising TypeError.
     config.claimant_heartbeat_interval_secs = 60.0
+    # Harness.run builds RunSlots from this; a spec'd MagicMock raises TypeError in asyncio.Semaphore.
+    config.main_health_fix_reserved_slots = 1
     # Task 3540: harness._resume_repend_liveness feeds this straight into
     # timedelta(seconds=...); a spec_set MagicMock attribute raises
     # TypeError there. THIS is the single owner of the value for the suite —

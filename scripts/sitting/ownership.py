@@ -25,7 +25,7 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from _task_db_scan import tasks_db_path
-from orchestrator.session_registry import (
+from orchestrator.session_records import (
     OWNING_OUTCOMES,
     RESULT_FILENAME,
     TERMINAL_STATUSES,

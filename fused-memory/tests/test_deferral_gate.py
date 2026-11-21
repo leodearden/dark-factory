@@ -1038,6 +1038,27 @@ async def test_update_task_echo_of_stored_record_is_accepted(stack: Stack, mode:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('mode', _MODES)
+async def test_update_task_cannot_retype_a_carried_by_deferral(stack: Stack, mode: str) -> None:
+    carrier = await stack.seed('pending', f'row 8 retype carrier {mode}')
+    task_id = await stack.seed('pending', f'row 8 retype {mode}')
+    await _enter(stack, task_id, {'kind': 'carried_by', 'carrier_task_id': int(carrier)})
+    metadata = (await stack.read(task_id))['metadata']
+    deferral = metadata['deferral']
+    retyped = {**deferral, 'carrier_task_id': float(deferral['carrier_task_id'])}
+    payload = {**metadata, 'deferral': retyped} if mode == 'replace' else {'deferral': retyped}
+
+    with pytest.raises(DeferralWriteAuthorityError):
+        await stack.backend.update_task(
+            task_id, project_root=stack.root,
+            metadata=json.dumps(payload), metadata_mode=mode,
+        )
+
+    stored = (await stack.read(task_id))['metadata']['deferral']
+    assert type(stored['carrier_task_id']) is int
+
+
+@pytest.mark.asyncio
 async def test_rewrite_audit_trail_carries_deferral(stack: Stack) -> None:
     task_id, metadata = await _deferred_with_note(stack, 'row 8 rotation')
     without = {k: v for k, v in metadata.items() if k != 'deferral'}

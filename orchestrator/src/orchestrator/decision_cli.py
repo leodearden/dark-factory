@@ -115,7 +115,7 @@ def _run_write_decision(
     caller doesn't supply one.
 
     ``record_slug`` is best-effort enrichment derived from ``$CLAUDE_PID``'s
-    pid pointer (session_registry.py::resolve_own_record_slug), never typed
+    pid pointer (session_leases.py::resolve_own_record_slug), never typed
     by the caller and never a reason to refuse or delay a filing: an
     unresolvable one is filed as '', is announced by a WARNING at dispatch
     (session_registry.py::_resolve_filing_record_slug, run_verb's injected

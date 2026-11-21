@@ -1,9 +1,10 @@
 """Promote a level-0 escalation to level 1 without losing its finding.
 
-The L0's finding is copied verbatim into a new level-1 record, which is
-written first; only then is the L0 dismissed, with a resolution naming the
-L1 that now carries it. The two records cite each other, and a failure
-between the writes leaves the L0 pending rather than the finding nowhere.
+The L0's finding is copied verbatim, behind any caller prefix or suffix, into
+a new level-1 record, which is written first; only then is the L0 dismissed,
+with a resolution naming the L1 that now carries it. The two records cite each
+other, and a failure between the writes leaves the L0 pending rather than the
+finding nowhere.
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ def promote_l0_to_l1(
     detail_suffix: str,
     filing_claimant_run_id: str | None,
     resolved_by: str,
+    summary_prefix: str = '',
+    worktree: str | None = None,
 ) -> Escalation:
     if l0.level != 0 or l0.status != 'pending':
         raise ValueError(
@@ -37,10 +40,10 @@ def promote_l0_to_l1(
         agent_role=agent_role,
         severity=l0.severity,
         category=l0.category,
-        summary=l0.summary,
+        summary=f'{summary_prefix}{l0.summary}',
         detail=f'{l0.detail}\n\n[promoted from {l0.id}: {why}]{detail_suffix}',
         suggested_action=l0.suggested_action or 'manual_intervention',
-        worktree=None,
+        worktree=worktree,
         workflow_state=l0.workflow_state,
         level=1,
         options=list(l0.options),

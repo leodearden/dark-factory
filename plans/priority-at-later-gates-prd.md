@@ -326,6 +326,11 @@ Invariants:
 - **O2.** A request being merged or verified is never reordered, re-based or returned to the pool by a later
   arrival (R1).
 - **O3.** With `order=arrival` the sequence of picks is the same as before this PRD for the same arrivals.
+- **Changed 2026-11-20** (Leo; `plans/merge-pool-batches-prd.md`, part 2). No fronted suspect list exists: task
+  8528 landed without one, and part 2 replaces the un-chained mark with batch state. Under `priority`,
+  `pool_order()` is the high lane by `order_key`, then the rest by `order_key`. A request that is in scan,
+  verifies alone or is cleared is ordered like any other; the pick filter keeps part 2's in-scan predicate after
+  `pool_order()`. Boundary row 5 and open question 2 are void. Task 9935 depends on part 2's batch-state task.
 
 ## 7. Boundary-test sketch (B + H)
 
@@ -388,7 +393,9 @@ Notes for decompose:
 - κ1 and κ2 are the signal leaves.
 - Critical path to the priority pick: 9908 → α1 → γ (after 8528) → ι1 → ι2 (after α2 and after 8532 has read); β and α2 in
   parallel. Until α2 lands, age at the later gates is counted from the request's first enqueue or the plan's arrival. The pin tier at the
-  later gates arrives with α1; inside the scheduler it waits for the restructuring chain.
+  later gates arrives with α1; inside the scheduler it waits for the restructuring chain. (Changed 2026-11-17 by
+  Leo's ruling: θ1, task 9939, no longer waits on task 9683 or the restructuring chain; it waits on θ2 only, and
+  seam notes on tasks 9665, 9678 and 9679 carry its pin-order map through the restructuring.)
 
 ## 9. Out of scope
 

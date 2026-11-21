@@ -46,11 +46,11 @@ tasks:
       - orchestrator/src/orchestrator/scheduler.py
       expect: present
   - name: early-start-config-group
-    binding: built here; the early_start group with its eight keys, enabled off in the code until T7 (contract, Config)
+    binding: built here; the early_start group with its seven keys, enabled off in the code until T7 (contract, Config)
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: max_stops_per_pair
+      pattern: stop_streak_pause
       paths:
       - orchestrator/src/orchestrator/config.py
       expect: present
@@ -99,7 +99,7 @@ tasks:
     binding: '`grep:orchestrator/src/orchestrator/branch_stack.py::rebase_own_delta` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._rebase_off_base` wired: replays the commits after cut onto a named commit and aborts on a conflict'
     verdict: PASS
   - name: worktree-reuse-routes
-    binding: '`grep:orchestrator/src/orchestrator/git_ops.py::GitOps._reattach_cold_worktree` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._reuse_warm_lane` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._rebase_requeued_onto_main` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps.acquire_warm_lane` `grep:orchestrator/src/orchestrator/rebase_recovery.py::guarded_abort` the reuse routes that rebase an existing branch onto main today, the warm-worktree acquire a stacked worktree must skip, and the abort whose failure is only logged'
+    binding: '`grep:orchestrator/src/orchestrator/git_ops.py::GitOps._reattach_cold_worktree` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._reuse_warm_lane` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._rebase_requeued_onto_main` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps.acquire_warm_lane` `grep:orchestrator/src/orchestrator/rebase_recovery.py::guarded_abort` the reuse routes that rebase an existing branch onto main today, the warm-worktree acquire a stacked worktree goes through, and the abort whose failure is only logged'
     verdict: PASS
   - name: re-stack-in-reuse-routes
     binding: built here; given the stack input on an existing branch each reuse route commits work in progress, cuts the own commits with the own_delta_upstream rule, replays them onto the named commit and re-records the base; a conflict, a refused start and a failed abort are told apart; a trial that touches nothing (section 5.3)
@@ -128,12 +128,12 @@ tasks:
     delivered_check:
       kind: manual
       reason: own_delta_upstream already appears in workflow.py, so a grep would be green before T2 lands.
-  - name: stacked-worktree-is-cold
-    binding: built here; a stacked worktree is never taken from the warm-worktree pool (section 5.3)
+  - name: stacked-worktree-through-warm-pool
+    binding: built here; a stacked worktree comes from the warm-worktree pool where the project has one, with the record written and read back on that route; declared-train successors stay out (section 5.3)
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: An exclusion in create_worktree; test 47 (iii) and the T2a signal prove it.
+      reason: Behavioural; tests 50 and 47 (iii) prove it.
   - name: reuse-routes-un-stack-without-stack-input
     binding: built here; without a stack input all three reuse routes un-stack before a rebase onto main, the registered cold worktree included
     verdict: PASS
@@ -401,17 +401,8 @@ tasks:
     delivered_check:
       kind: manual
       reason: Behavioural (tests 22, 31); no name marks it.
-  - name: stops-per-pair-refusal
-    binding: built here; the selection refuses a dependent with max_stops_per_pair early_start_stopped events for the pair (stop_limit, test 45); the count is read from the events
-    verdict: PASS
-    delivered_check:
-      kind: grep
-      pattern: \.max_stops_per_pair
-      paths:
-      - orchestrator/src/orchestrator/
-      expect: present
   - name: work-in-progress-committed-at-stop
-    binding: built here; the stop commits the dependent's uncommitted work before the workflow exits (test 48)
+    binding: built here; the stop commits the dependent's uncommitted work before the workflow exits, and a warm worktree is released only after that commit (test 48)
     verdict: PASS
     delivered_check:
       kind: manual

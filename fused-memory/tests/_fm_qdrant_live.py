@@ -6,10 +6,12 @@ _fm_helpers' module docstring.
 """
 
 import contextlib
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
-from _fm_polling import poll_until
+from _fm_polling import poll_until, poll_until_sync
 
 # ---------------------------------------------------------------------------
 # Shared Qdrant test scaffolding (task 2277)
@@ -21,6 +23,17 @@ from _fm_polling import poll_until
 # ---------------------------------------------------------------------------
 
 QDRANT_URL = 'http://localhost:6333'
+
+#: The mem0 collection_prefix whose collections scripts/cleanup_test_collections.py reaps.
+#: Its PREFIX is this value plus Scope.mem0_collection_name's '_' separator, so check names with assert_reapable.
+EPHEMERAL_COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
+
+_COLLECTION_REAPER_SCRIPT = (
+    Path(__file__).resolve().parent.parent / 'scripts' / 'cleanup_test_collections.py'
+)
+
+#: Seconds an abandoned collection meta-op may take to show its effect (task 10599).
+META_OP_SETTLE_TIMEOUT_S = 15.0
 
 
 def _qdrant_available() -> bool:
@@ -59,12 +72,101 @@ def qdrant_skipif(reason: str = 'Qdrant not reachable'):
     return pytest.mark.skipif(not _qdrant_available(), reason=reason)
 
 
+def assert_reapable(collection_name: str) -> None:
+    """Fail unless scripts/cleanup_test_collections.py would delete *collection_name*.
+
+    Loads the reaper under the sys.modules key conftest.py's lease fixture
+    uses. ``_fm_helpers`` is imported lazily, so importing this module never
+    charges its importer for that module's dependencies.
+    """
+    from _fm_helpers import load_script_module
+
+    reaper = load_script_module(_COLLECTION_REAPER_SCRIPT, mod_name='cleanup_test_collections')
+    assert collection_name.startswith(reaper.PREFIXES), (
+        f'{collection_name!r} is not reapable by scripts/cleanup_test_collections.py '
+        f'(PREFIXES={reaper.PREFIXES!r})'
+    )
+
+
+def _run_meta_op(
+    request: Callable[[], Any],
+    *,
+    reached: Callable[[], bool],
+    describe: str,
+    expected: str,
+    timeout: float,
+) -> None:
+    """Send one collection meta-op; if its answer is abandoned on a read timeout, wait for *reached*.
+
+    A read timeout means the server has the request and may still be applying
+    it, so the outcome is judged by the observed state, never by re-sending.
+    Every other failure propagates unchanged.
+    """
+    import httpx
+    from qdrant_client.http.exceptions import ResponseHandlingException
+
+    try:
+        request()
+    except ResponseHandlingException as exc:
+        if not isinstance(exc.source, httpx.ReadTimeout):
+            raise
+        poll_until_sync(
+            reached,
+            timeout=timeout,
+            interval=0.05,
+            message=(
+                f'{describe}: the client stopped waiting for the answer '
+                f'({type(exc.source).__name__}: {exc.source}), and the '
+                f'collection was not {expected} {timeout}s later'
+            ),
+        )
+
+
+def _is_present_and_empty(client: Any, collection_name: str) -> bool:
+    """Whether *collection_name* exists and holds no points; a transient 404 on the count reads as not yet."""
+    from qdrant_client.http.exceptions import UnexpectedResponse
+
+    if not client.collection_exists(collection_name):
+        return False
+    try:
+        return client.count(collection_name, exact=True).count == 0
+    except UnexpectedResponse as exc:
+        if getattr(exc, 'status_code', None) != 404:
+            raise
+        return False
+
+
+def _create_collection(
+    client: Any, collection_name: str, vectors_config: Any, *, settle_timeout: float,
+) -> None:
+    _run_meta_op(
+        lambda: client.create_collection(
+            collection_name=collection_name, vectors_config=vectors_config,
+        ),
+        reached=lambda: _is_present_and_empty(client, collection_name),
+        describe=f'create of collection {collection_name!r}',
+        expected='present and empty',
+        timeout=settle_timeout,
+    )
+
+
+def _delete_collection(client: Any, collection_name: str, *, settle_timeout: float) -> None:
+    _run_meta_op(
+        lambda: client.delete_collection(collection_name),
+        reached=lambda: not client.collection_exists(collection_name),
+        describe=f'delete of collection {collection_name!r}',
+        expected='absent',
+        timeout=settle_timeout,
+    )
+
+
 def ensure_fresh_collection(
     client: Any,
     collection_name: str,
     *,
     size: int,
     distance: Any = None,
+    settle_timeout: float = META_OP_SETTLE_TIMEOUT_S,
 ) -> None:
     """Idempotently (re)create *collection_name* as an empty size-*size* collection.
 
@@ -76,7 +178,11 @@ def ensure_fresh_collection(
     next run. This helper self-heals that case: if the create raises a 409
     ``UnexpectedResponse`` it deletes the stale collection and creates once more.
     Any other ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised — fail
-    loud, no retry.
+    loud, no retry. A create or delete whose answer the client abandons on a
+    read timeout is judged by whether the collection appears empty, or
+    disappears, within *settle_timeout*. An abandoned create cannot tell its
+    own collection from a stale one whose 409 it never read, so one that
+    appears holding points fails rather than passing as fresh.
 
     Imports ``VectorParams``/``Distance``/``UnexpectedResponse`` lazily inside
     the body, mirroring ``_qdrant_available``'s convention (see its docstring):
@@ -85,11 +191,13 @@ def ensure_fresh_collection(
 
     Args:
         client: A ``qdrant_client.QdrantClient`` (or test double) exposing
-            ``collection_exists`` / ``delete_collection`` / ``create_collection``.
+            ``collection_exists`` / ``delete_collection`` / ``create_collection``
+            / ``count``.
         collection_name: The collection to (re)create.
         size: Vector dimensionality for the new collection.
         distance: Optional ``qdrant_client.models.Distance``; defaults to
             ``Distance.COSINE`` when None.
+        settle_timeout: Seconds to wait for an abandoned meta-op's effect.
     """
     from qdrant_client.http.exceptions import UnexpectedResponse
     from qdrant_client.models import Distance, VectorParams
@@ -97,19 +205,19 @@ def ensure_fresh_collection(
     vectors_config = VectorParams(size=size, distance=distance or Distance.COSINE)
 
     if client.collection_exists(collection_name):
-        client.delete_collection(collection_name)
+        _delete_collection(client, collection_name, settle_timeout=settle_timeout)
     try:
-        client.create_collection(
-            collection_name=collection_name, vectors_config=vectors_config,
+        _create_collection(
+            client, collection_name, vectors_config, settle_timeout=settle_timeout,
         )
     except UnexpectedResponse as exc:
         if getattr(exc, 'status_code', None) != 409:
             raise
         # Stale collection survived a swallowed teardown / lost create race:
         # delete it and create once more rather than propagating the conflict.
-        client.delete_collection(collection_name)
-        client.create_collection(
-            collection_name=collection_name, vectors_config=vectors_config,
+        _delete_collection(client, collection_name, settle_timeout=settle_timeout)
+        _create_collection(
+            client, collection_name, vectors_config, settle_timeout=settle_timeout,
         )
 
 

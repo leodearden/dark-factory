@@ -367,7 +367,7 @@ async def _collect_recovered(tmp_path: Path, task: dict, wf: MagicMock) -> EvalM
     ):
         return await collect_metrics(
             wf, worktree, {**task, 'pre_task_commit': base},
-            role=RoleUnderTest.IMPLEMENTER,
+            role=RoleUnderTest.IMPLEMENTER, sandbox_backend='none',
         )
 
 

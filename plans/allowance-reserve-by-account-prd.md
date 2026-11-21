@@ -114,7 +114,8 @@ Rulings by Leo, 2026-11-16:
 - **R1. Reserve by account, not shares per project.** "I now recommend the reserve by account over fixed shares" —
   "Agreed. Do this." It replaces the per-project trailing-spend budget recommended on 2026-11-12.
 - **R2. Who is admitted before the release:** tasks ranked high or critical, in every project. No ranking of
-  projects yet; the table takes a per-project list so one can be added later without code.
+  projects yet; the table takes a per-project list so one can be added later without code. (Widened by Leo on
+  2026-11-17: pinned work is admitted too, as the tier above critical; see D4.)
 - **R3. Release:** 36 hours before the reset, and the reserve is tried before the other accounts during it. (The
   question put to Leo gave the fleet's spend as $90 to $100 an hour; the recorded figure is $73. 36 hours is kept
   as the starting value; see section 2.)
@@ -135,12 +136,16 @@ Design decisions taken in authoring (Leo has not ruled these one by one; each is
 - **D3. The table lists admitted tiers; it does not rank them.** `admit_tiers` is a list of tier names per project
   with a default. The gate tests membership, so no tier order is needed in `shared/` (*SPOT*). The default is
   `[critical, high]`.
-- **D4. A pin is not a separate case.** Today a pin does not change a task's effective tier, and the starvation
-  watchdog also sets pins of its own, so "pinned" cannot mean "Leo wants this first". A pinned low task is not
-  admitted; an operator who wants it admitted raises its tier with the override's boost. When the priority PRD's
-  `pinned` tier lands (task 9938), adding `pinned` to `admit_tiers` admits pinned tasks and their prerequisites, by
-  config alone. That would admit the watchdog's pins as well, and those are dropped the moment the task is
-  started, so such a task would be started and then refused; the operator note in task 6 says so.
+- **D4. Pinned work is admitted, as the tier above critical** (replaced 2026-11-17 by Leo's ruling; it widens R2).
+  The priority PRD (`plans/priority-at-later-gates-prd.md`, D1 and D5) makes `pinned` the top tier of one order
+  for everything that depends on priority, and the reserve follows it: the default `admit_tiers` is
+  `[pinned, critical, high]`. Pinned here means an operator pin: the task's own pin, and, once the priority PRD's
+  task 9939 lands, an unfinished prerequisite of a pinned task. A pin set by the starvation watchdog does not
+  admit a task; that task is judged by its base tier. The watchdog's pin is dropped the moment the task starts,
+  so admitting on it would start the task and then refuse it at the gate, holding its slot and its files. The
+  later gates treat a watchdog pin the same way (the priority PRD's D5). Tasks 10430, 10431 and 10434 carry this
+  as dated amendments. (As first written on 2026-11-16, D4 said a pin was not a separate case and a pinned low
+  task was not admitted.)
 - **D5. Callers say what the work is; the gate decides.** A caller passes a `WorkClass`. The admission rule lives in
   one pure module. No caller tests the calendar or the table.
 - **D6. Three kinds of work.** *Task*: acts for one task, admitted by its tier. *Essential*: admitted always.
@@ -280,7 +285,7 @@ reserve:
   weekly_reset_utc: "mon 21:00"
   release_hours: 36
   admit_tiers:
-    default: [critical, high]
+    default: [pinned, critical, high]
     # per project_id, when a ranking exists:
     # dark_factory: [critical, high, medium]
 ```
@@ -292,7 +297,7 @@ Invariants:
    `weekly_reset_utc` must parse, `release_hours` must be more than 0 and less than 168. A failure makes the reserve
    *invalid*: inert, recorded (section 6.6), and reported by the gate as `reserve_state`.
 3. **Tier names are checked where the vocabulary lives.** At start-up the orchestrator checks every name in
-   `admit_tiers` against `PRIORITY_TIERS`. An unknown name marks the reserve invalid for that process and raises
+   `admit_tiers` against `PRIORITY_TIERS` plus `pinned` (D4). An unknown name marks the reserve invalid for that process and raises
    one escalation, keyed on the block's content so that repeated restarts add to the same one.
 4. **The calendar is pure.** `next_reset(now)`, `release_at(now)` and `in_release_window(now)` are functions of the
    config and a UTC clock. Nothing is stored, and no banner changes them (D11).
@@ -480,7 +485,7 @@ Caller side (`orchestrator/`, `fused-memory/`, `scripts/`):
 |---|---|---|---|
 | C1 | A task role passes its effective tier | a low task that a critical task waits on | class is task, tier critical |
 | C2 | Unknown tier | the scheduler has not ticked yet | the task's own tier is used; with none, `medium` |
-| C3 | The scheduler holds a refused task on every path | a real gate in B2's state; a low task in the scored list, a low task the starvation watchdog would promote, a pinned low task, a high task | only the high task is dispatched; the watchdog promotes none of the three while they are held; one `dispatch_reserve_hold` counting three distinct tasks, with the release time |
+| C3 | The scheduler holds a refused task on every path | a real gate in B2's state; a low task in the scored list, a low task the starvation watchdog would promote, a low task with a watchdog pin, a low task with an operator pin, a high task | the high task and the operator-pinned task are dispatched (D4, amended 2026-11-17); the watchdog promotes none of the three held tasks; one `dispatch_reserve_hold` counting three distinct tasks, with the release time |
 | C4 | The hold lifts by itself | C3, then the clock passes `release_at` | the next tick dispatches the held tasks; nothing was stored in between |
 | C4b | All candidates held is not an empty queue | every candidate held, no task running | the main loop does not write the idle summary or start the full review on that account |
 | C5 | A stale assignment is put back | one slot, busy; the loop holds a low assignment taken while all accounts were open; the gate reaches B2's state; the slot frees | the low task is not started and its status is unchanged; its locks and the slot are released; the next tick starts a waiting high task and does not choose the low one |
@@ -547,8 +552,8 @@ changes made then are marked *At decompose*.
 6. **Switch it on** (`config/usage-accounts.yaml`, `OPERATIONS.md`), task 10434. Depends on 2, 3 and 4.
    Adds the block of section 6.2 with Leo's values; corrects the file's header comment, which still says max-b and
    max-h are switched off; adds a short operator section on the reserve (what it does, how to turn it off by
-   removing the block, where the report is, how to admit `pinned` once that tier exists and why that also admits
-   the watchdog's pins). A process reads the file
+   removing the block, where the report is, that operator-pinned work is admitted and a watchdog pin is not, per D4
+   as amended 2026-11-17). A process reads the file
    only at start, so any process that sees the block is running code that has tasks 2, 3 and 4; the fleet is mixed
    until the next redeploy.
    Signal: loading the live file through `UsageCapConfig` yields an active reserve whose next release is a Sunday at

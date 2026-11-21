@@ -29,6 +29,7 @@ from _lane_test_helpers import (
     make_warm_lane_repo,
     wire_recovery_scheduler,
 )
+from _seed_script_stubs import seed_default_warm_base
 from _workflow_helpers import _build_harness, _init_git_repo
 from escalation.queue import EscalationQueue
 
@@ -51,6 +52,7 @@ def _make_config(
     warm_lane_pool: bool,
     spare_warm_lanes: int = 0,
     warm_lane_prewarm: bool = False,
+    main_health_fix_reserved_slots: int = 0,
     tmp_path: Path,
 ) -> OrchestratorConfig:
     """Build a minimal OrchestratorConfig with the given warm-lane settings."""
@@ -61,6 +63,7 @@ def _make_config(
     return OrchestratorConfig(
         project_root=repo,
         max_concurrent_tasks=max_concurrent_tasks,
+        main_health_fix_reserved_slots=main_health_fix_reserved_slots,
         git=GitConfig(
             warm_lane_pool=warm_lane_pool,
             spare_warm_lanes=spare_warm_lanes,
@@ -161,6 +164,31 @@ class TestHarnessWarmLaneWiring:
             max_concurrent_tasks=4,
             warm_lane_pool=False,
             spare_warm_lanes=5,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
+        assert harness.git_ops.warm_lane_pool is None
+
+    def test_main_health_fix_reserve_adds_to_pool_size(self, tmp_path: Path):
+        """Every run slot needs a lane, the main-health-fix reserve included (task 8480)."""
+        config = _make_config(
+            max_concurrent_tasks=7,
+            warm_lane_pool=True,
+            spare_warm_lanes=2,
+            main_health_fix_reserved_slots=1,
+            tmp_path=tmp_path,
+        )
+        harness = _build_harness(config)
+
+        assert harness.git_ops.warm_lane_pool is not None
+        assert harness.git_ops.warm_lane_pool.size == 10  # 7 + 1 + 2
+
+    def test_main_health_fix_reserve_no_effect_when_pool_off(self, tmp_path: Path):
+        config = _make_config(
+            max_concurrent_tasks=7,
+            warm_lane_pool=False,
+            main_health_fix_reserved_slots=1,
             tmp_path=tmp_path,
         )
         harness = _build_harness(config)
@@ -2275,16 +2303,8 @@ class TestReconcileLaneCheckouts:
         repo.mkdir()
         _init_git_repo(repo)
 
-        # Pre-create the default warm-lane CoW seed base so the pre-acquire
-        # base-health gate sees WarmBaseHealth.OK (mirrors wl_git_repo in
-        # test_warm_lane_pool.py), and a no-op seed script so a successful
-        # acquire's seed step succeeds.
-        default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-        default_base.mkdir(parents=True, exist_ok=True)
-        (default_base / '.keep').write_text('warm base sentinel\n')
-        # Task 2099: mark pool storage present so the create-once discriminator
-        # does not refuse the first lane creation below (mirrors wl_git_repo).
-        (repo / '.worktrees' / '.pool-root').touch()
+        seed_default_warm_base(repo)
+        # A no-op seed script so a successful acquire's seed step succeeds.
         scripts_dir = repo / 'scripts'
         scripts_dir.mkdir(parents=True, exist_ok=True)
         seed_script = scripts_dir / 'seed-warm-lane.sh'
@@ -2598,16 +2618,8 @@ class TestMidRunRecycleLeak:
         repo.mkdir()
         _init_git_repo(repo)
 
-        # Pre-create the default warm-lane CoW seed base so the pre-acquire
-        # base-health gate sees WarmBaseHealth.OK — it runs BEFORE the (here
-        # mocked-out) real seed step either way.
-        default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-        default_base.mkdir(parents=True, exist_ok=True)
-        (default_base / '.keep').write_text('warm base sentinel\n')
-        # Task 2099: mark pool storage present (mirrors wl_git_repo) — belt
-        # and braces even though this test's reset-in-place path does not
-        # exercise the create-once discriminator.
-        (repo / '.worktrees' / '.pool-root').touch()
+        # The base-health gate runs BEFORE the (here mocked-out) seed step.
+        seed_default_warm_base(repo)
 
         config = OrchestratorConfig(
             project_root=repo,
@@ -2682,7 +2694,7 @@ def _neutralise_prewarm_startup(harness: Harness) -> None:
     harness._load_persisted_scheduler_pause = AsyncMock()
     harness._dismiss_stale_escalations = AsyncMock()
     harness._file_dirty_tree_escalation = AsyncMock()
-    harness._rehydrate_merge_halt = MagicMock()
+    harness._rehydrate_merge_halt = AsyncMock()
     harness._recover_pending_merges = AsyncMock(return_value={})
     harness._reap_orphaned_merge_worktrees = AsyncMock()
     harness._reconcile_landed_outbox = AsyncMock()

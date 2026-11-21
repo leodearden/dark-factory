@@ -1,0 +1,65 @@
+q=0.03  [delta vs U]
+  T                          2.73 [-32±3] land/h 5.45 vpl 0.61 void 22% torn 14% scan 0.0% red 30% batch 0.0 wait 12/28 b2b 15/45 wrong 0.14 rider-wait 0.0h >4h 0% >12h 0%
+  base                       3.53 [-12±3] land/h 7.05 vpl 0.48 void 23% torn 15% scan 0.0% red 34% batch 0.0 wait 9/22 b2b 12/25 wrong 0.09 rider-wait 0.0h >4h 0% >12h 0%
+  U                          4.02  land/h 8.01 vpl 0.48 void 32% torn 20% scan 0.0% red 61% batch 9.7 wait 7/24 b2b 14/33 wrong 0.04 rider-wait 0.0h >4h 0% >12h 0%
+  U+S                        8.44 [+110±4] land/h 16.86 vpl 0.16 void 34% torn 18% scan 15.8% red 44% batch 14.5 wait 4/12 b2b 4/8 wrong 0.00 rider-wait 1.4h >4h 3% >12h 1%
+  U+S riders12               8.41 [+109±4] land/h 16.80 vpl 0.16 void 33% torn 18% scan 15.7% red 44% batch 14.4 wait 4/13 b2b 4/8 wrong 0.00 rider-wait 1.3h >4h 3% >12h 0%
+  U+S 24/48                  9.37 [+133±5] land/h 18.73 vpl 0.12 void 41% torn 25% scan 25.8% red 55% batch 26.1 wait 3/11 b2b 3/7 wrong 0.00 rider-wait 1.5h >4h 6% >12h 1%
+  U+S 24/48 riders12         9.66 [+140±5] land/h 19.31 vpl 0.12 void 37% torn 25% scan 21.4% red 48% batch 23.7 wait 3/9 b2b 3/7 wrong 0.00 rider-wait 1.0h >4h 2% >12h 0%
+  U+S 48/96 riders12         9.83 [+144±5] land/h 19.50 vpl 0.10 void 44% torn 29% scan 30.4% red 57% batch 37.2 wait 4/9 b2b 3/6 wrong 0.00 rider-wait 1.0h >4h 3% >12h 0%
+  U+S 6/24 riders12          5.71 [+42±4] land/h 11.40 vpl 0.26 void 25% torn 13% scan 5.8% red 30% batch 6.9 wait 6/16 b2b 6/16 wrong 0.00 rider-wait 1.2h >4h 3% >12h 0%
+  U+S riders12, no convictio 8.41 [+109±4] land/h 16.80 vpl 0.16 void 33% torn 18% scan 15.7% red 44% batch 14.4 wait 4/13 b2b 4/8 wrong 0.00 rider-wait 1.3h >4h 3% >12h 0%
+  10995 on: U 4.04, U+S riders12 8.63 [+114±4] | narrowed+riders+base by cost: U 4.38, U+S 8.41 [+92±7], sizes U+S riders12: 12:77% 22:6% 23:15%
+q=0.05  [delta vs U]
+  T                          2.06 [-28±3] land/h 4.10 vpl 0.83 void 24% torn 16% scan 0.0% red 36% batch 0.0 wait 15/34 b2b 19/51 wrong 0.19 rider-wait 0.0h >4h 0% >12h 0%
+  base                       2.65 [-7±3] land/h 5.28 vpl 0.66 void 25% torn 16% scan 0.0% red 40% batch 0.0 wait 13/25 b2b 15/27 wrong 0.11 rider-wait 0.0h >4h 0% >12h 0%
+  U                          2.85  land/h 5.69 vpl 0.69 void 32% torn 21% scan 0.0% red 64% batch 8.0 wait 11/27 b2b 17/34 wrong 0.08 rider-wait 0.0h >4h 0% >12h 0%
+  U+S                        6.59 [+131±6] land/h 13.18 vpl 0.21 void 39% torn 20% scan 20.6% red 57% batch 14.9 wait 5/14 b2b 4/13 wrong 0.00 rider-wait 1.5h >4h 3% >12h 1%
+  U+S riders12               6.59 [+131±5] land/h 13.17 vpl 0.21 void 39% torn 20% scan 20.5% red 56% batch 14.9 wait 5/14 b2b 4/13 wrong 0.00 rider-wait 1.5h >4h 3% >12h 1%
+  U+S 24/48                  7.69 [+170±5] land/h 15.38 vpl 0.15 void 38% torn 27% scan 24.1% red 55% batch 23.7 wait 4/13 b2b 4/8 wrong 0.00 rider-wait 1.0h >4h 3% >12h 0%
+  U+S 24/48 riders12         7.73 [+171±6] land/h 15.45 vpl 0.15 void 38% torn 27% scan 23.8% red 55% batch 23.5 wait 4/13 b2b 4/8 wrong 0.00 rider-wait 1.0h >4h 3% >12h 0%
+  U+S 48/96 riders12         8.14 [+185±5] land/h 16.18 vpl 0.12 void 45% torn 26% scan 34.0% red 64% batch 36.6 wait 4/12 b2b 3/6 wrong 0.00 rider-wait 1.0h >4h 3% >12h 0%
+  U+S 6/24 riders12          5.04 [+77±4] land/h 10.07 vpl 0.30 void 29% torn 15% scan 9.1% red 41% batch 7.3 wait 6/16 b2b 6/16 wrong 0.00 rider-wait 1.3h >4h 3% >12h 1%
+  U+S riders12, no convictio 6.59 [+131±5] land/h 13.17 vpl 0.21 void 39% torn 20% scan 20.5% red 56% batch 14.9 wait 5/14 b2b 4/13 wrong 0.00 rider-wait 1.5h >4h 3% >12h 1%
+  10995 on: U 2.88, U+S riders12 6.70 [+132±5] | narrowed+riders+base by cost: U 3.29, U+S 8.03 [+144±4], sizes U+S riders12: 12:72% 22:9% 23:14%
+q=0.08  [delta vs U]
+  T                          1.57 [-26±2] land/h 3.14 vpl 1.12 void 26% torn 18% scan 0.0% red 41% batch 0.0 wait 20/42 b2b 25/57 wrong 0.22 rider-wait 0.0h >4h 0% >12h 0%
+  base                       2.04 [-4±2] land/h 4.06 vpl 0.87 void 27% torn 18% scan 0.0% red 44% batch 0.0 wait 16/29 b2b 18/31 wrong 0.27 rider-wait 0.0h >4h 0% >12h 0%
+  U                          2.12  land/h 4.23 vpl 0.88 void 31% torn 20% scan 0.0% red 56% batch 4.7 wait 15/30 b2b 19/34 wrong 0.24 rider-wait 0.0h >4h 0% >12h 0%
+  U+S                        5.24 [+147±5] land/h 10.47 vpl 0.26 void 39% torn 21% scan 21.0% red 62% batch 13.7 wait 6/16 b2b 6/15 wrong 0.00 rider-wait 1.5h >4h 3% >12h 1%
+  U+S riders12               5.24 [+147±5] land/h 10.48 vpl 0.26 void 39% torn 21% scan 20.9% red 61% batch 13.7 wait 6/16 b2b 6/15 wrong 0.00 rider-wait 1.5h >4h 3% >12h 1%
+  U+S 24/48                  6.67 [+214±4] land/h 13.33 vpl 0.17 void 38% torn 28% scan 24.9% red 58% batch 23.3 wait 5/14 b2b 4/8 wrong 0.00 rider-wait 1.0h >4h 2% >12h 0%
+  U+S 24/48 riders12         6.67 [+214±4] land/h 13.33 vpl 0.17 void 38% torn 28% scan 24.9% red 58% batch 23.3 wait 5/14 b2b 4/8 wrong 0.00 rider-wait 1.0h >4h 2% >12h 0%
+  U+S 48/96 riders12         7.38 [+248±4] land/h 14.72 vpl 0.13 void 45% torn 28% scan 33.9% red 65% batch 36.7 wait 4/13 b2b 3/6 wrong 0.00 rider-wait 1.0h >4h 3% >12h 0%
+  U+S 6/24 riders12          4.21 [+98±3] land/h 8.41 vpl 0.36 void 35% torn 18% scan 12.6% red 53% batch 7.7 wait 7/18 b2b 7/18 wrong 0.00 rider-wait 1.5h >4h 3% >12h 1%
+  U+S riders12, no convictio 5.24 [+147±5] land/h 10.48 vpl 0.26 void 39% torn 21% scan 20.9% red 61% batch 13.7 wait 6/16 b2b 6/15 wrong 0.00 rider-wait 1.5h >4h 3% >12h 1%
+  10995 on: U 2.17, U+S riders12 5.28 [+143±5] | narrowed+riders+base by cost: U 2.44, U+S 6.85 [+181±5], sizes U+S riders12: 12:68% 17:16% 18:7%
+q=0.14  [delta vs U]
+  T                          1.11 [-21±2] land/h 2.21 vpl 1.61 void 28% torn 20% scan 0.0% red 46% batch 0.0 wait 29/48 b2b 32/54 wrong 0.42 rider-wait 0.0h >4h 0% >12h 0%
+  base                       1.40 [+0±1] land/h 2.80 vpl 1.30 void 30% torn 20% scan 0.0% red 52% batch 0.0 wait 22/36 b2b 24/38 wrong 0.34 rider-wait 0.0h >4h 0% >12h 0%
+  U                          1.40  land/h 2.78 vpl 1.32 void 30% torn 18% scan 0.0% red 53% batch 2.5 wait 23/36 b2b 24/39 wrong 0.40 rider-wait 0.0h >4h 0% >12h 0%
+  U+S                        4.24 [+204±4] land/h 8.49 vpl 0.34 void 34% torn 21% scan 18.8% red 59% batch 11.9 wait 7/17 b2b 6/16 wrong 0.00 rider-wait 1.0h >4h 2% >12h 0%
+  U+S riders12               4.24 [+204±4] land/h 8.48 vpl 0.34 void 34% torn 21% scan 18.9% red 59% batch 11.9 wait 7/17 b2b 6/16 wrong 0.00 rider-wait 1.0h >4h 2% >12h 0%
+  U+S 24/48                  5.78 [+314±4] land/h 11.56 vpl 0.20 void 38% torn 28% scan 25.6% red 60% batch 22.9 wait 5/15 b2b 4/9 wrong 0.00 rider-wait 1.0h >4h 2% >12h 0%
+  U+S 24/48 riders12         5.78 [+314±4] land/h 11.56 vpl 0.20 void 38% torn 28% scan 25.6% red 60% batch 22.9 wait 5/15 b2b 4/9 wrong 0.00 rider-wait 1.0h >4h 2% >12h 0%
+  U+S 48/96 riders12         6.80 [+387±4] land/h 13.59 vpl 0.14 void 45% torn 29% scan 33.7% red 66% batch 36.5 wait 4/13 b2b 4/6 wrong 0.00 rider-wait 1.0h >4h 3% >12h 0%
+  U+S 6/24 riders12          3.16 [+127±3] land/h 6.32 vpl 0.49 void 38% torn 19% scan 14.9% red 63% batch 7.4 wait 10/20 b2b 9/19 wrong 0.00 rider-wait 1.4h >4h 3% >12h 0%
+  U+S riders12, no convictio 4.24 [+204±4] land/h 8.48 vpl 0.34 void 34% torn 21% scan 18.9% red 59% batch 11.9 wait 7/17 b2b 6/16 wrong 0.00 rider-wait 1.0h >4h 2% >12h 0%
+  10995 on: U 1.43, U+S riders12 4.24 [+197±4] | narrowed+riders+base by cost: U 1.64, U+S 5.23 [+219±3], sizes U+S riders12: 10:17% 11:12% 12:66%
+q=0.20  [delta vs U]
+  T                          0.87 [-18±2] land/h 1.74 vpl 2.04 void 28% torn 21% scan 0.0% red 47% batch 0.0 wait 34/50 b2b 36/55 wrong 0.68 rider-wait 0.0h >4h 0% >12h 0%
+  base                       1.05 [-1±1] land/h 2.08 vpl 1.82 void 32% torn 23% scan 0.0% red 60% batch 0.0 wait 29/43 b2b 30/44 wrong 0.45 rider-wait 0.0h >4h 0% >12h 0%
+  U                          1.06  land/h 2.11 vpl 1.80 void 32% torn 21% scan 0.0% red 60% batch 2.3 wait 28/41 b2b 30/43 wrong 0.38 rider-wait 0.0h >4h 0% >12h 0%
+  U+S                        3.80 [+259±4] land/h 7.60 vpl 0.39 void 31% torn 21% scan 18.4% red 58% batch 11.2 wait 7/18 b2b 6/17 wrong 0.00 rider-wait 1.0h >4h 2% >12h 0%
+  U+S riders12               3.80 [+259±4] land/h 7.60 vpl 0.39 void 31% torn 21% scan 18.4% red 58% batch 11.2 wait 7/18 b2b 6/17 wrong 0.00 rider-wait 1.0h >4h 2% >12h 0%
+  U+S 24/48                  5.30 [+401±4] land/h 10.60 vpl 0.22 void 38% torn 28% scan 25.8% red 61% batch 22.4 wait 5/15 b2b 4/9 wrong 0.00 rider-wait 1.0h >4h 3% >12h 0%
+  U+S 24/48 riders12         5.30 [+401±4] land/h 10.60 vpl 0.22 void 38% torn 28% scan 25.8% red 61% batch 22.4 wait 5/15 b2b 4/9 wrong 0.00 rider-wait 1.0h >4h 3% >12h 0%
+  U+S 48/96 riders12         6.36 [+501±6] land/h 12.72 vpl 0.14 void 45% torn 30% scan 34.1% red 66% batch 36.3 wait 4/13 b2b 4/6 wrong 0.00 rider-wait 1.0h >4h 3% >12h 0%
+  U+S 6/24 riders12          2.58 [+144±4] land/h 5.16 vpl 0.61 void 40% torn 20% scan 16.3% red 69% batch 7.4 wait 11/22 b2b 10/21 wrong 0.00 rider-wait 1.5h >4h 3% >12h 0%
+  U+S riders12, no convictio 3.80 [+259±4] land/h 7.60 vpl 0.39 void 31% torn 21% scan 18.4% red 58% batch 11.2 wait 7/18 b2b 6/17 wrong 0.00 rider-wait 1.0h >4h 2% >12h 0%
+  10995 on: U 1.07, U+S riders12 3.80 [+255±4] | narrowed+riders+base by cost: U 1.28, U+S 4.63 [+262±3], sizes U+S riders12: 9:9% 10:10% 11:8% 12:64%
+sensitivity (U+S riders12; delta vs the default scan config ct=0.05, linear, A, flake->pass, miss 0)
+  q=0.05: ct=0.02 +28±1 (scan 10%, wrong 0.00) ; ct=0.10 -26±2 (scan 27%, wrong 0.00) ; ct=0.20 -49±2 (scan 32%, wrong 0.00) ; B -2±1 (scan 14%, wrong 0.00) ; binary +32±1 (scan 8%, wrong 0.00) ; free +53±2 (scan 0%, wrong 0.00) ; miss=0.05 -1±1 (scan 20%, wrong 0.00) ; miss=0.20 -7±1 (scan 18%, wrong 0.00) ; flake stands -0±0 (scan 20%, wrong 0.00)
+  q=0.05 waiting set 150: U 2.85 ; U+S riders12 6.59 [+131±5] land/h 13.17 ; U+S 48/96 riders12 8.33 [+192±5] land/h 16.65
+  q=0.14: ct=0.02 +28±1 (scan 13%, wrong 0.00) ; ct=0.10 -27±1 (scan 25%, wrong 0.00) ; ct=0.20 -54±1 (scan 32%, wrong 0.00) ; B -24±1 (scan 12%, wrong 0.00) ; binary +25±1 (scan 10%, wrong 0.00) ; free +69±2 (scan 0%, wrong 0.00) ; miss=0.05 -4±1 (scan 18%, wrong 0.00) ; miss=0.20 -13±1 (scan 17%, wrong 0.00) ; flake stands -0±0 (scan 19%, wrong 0.01)
+  q=0.14 waiting set 150: U 1.40 ; U+S riders12 4.24 [+204±4] land/h 8.48 ; U+S 48/96 riders12 7.02 [+403±4] land/h 14.03

@@ -1,0 +1,61 @@
+"""Build verify table with exact tested-tree stacks from git. Output verifies.json"""
+import json,collections,re,subprocess,functools,datetime as dt,sys
+REPO='/home/leo/src/dark-factory'
+E=[json.loads(l) for l in open('/tmp/gate-10069/forensics/ev.jsonl')]
+def T(s): return dt.datetime.fromisoformat(s).timestamp()
+def git(*a):
+    p=subprocess.run(['git','-C',REPO,*a],capture_output=True,text=True,errors='replace'); return p.returncode,p.stdout.strip()
+# landed map
+landed={}   # merge_sha -> (ts, task, rid)
+for e in E:
+    if e['et']=='merge_finalized' and e['d'].get('state')=='done' and e['d'].get('merge_sha'):
+        landed.setdefault(e['d']['merge_sha'],(e['ts'],e['task'],e['d']['request_id']))
+# batch commit info for main range to speed: get all main first-parent commits since 11-13
+rc,o=git('log','--since=2026-11-12','--format=%H%x00%P%x00%aI%x00%cI%x00%s','main')
+MAIN={}
+for l in o.splitlines():
+    h,p,a,c,s=l.split('\x00'); MAIN[h]={'sha':h,'parents':p.split(),'ad':a,'cd':c,'subj':s}
+print('main commits',len(MAIN),file=sys.stderr)
+@functools.lru_cache(None)
+def info(sha):
+    if sha in MAIN: return MAIN[sha]
+    rc,o=git('show','-s','--format=%H%x00%P%x00%aI%x00%cI%x00%s',sha)
+    if rc!=0 or not o: return None
+    h,p,a,c,s=o.split('\x00'); return {'sha':h,'parents':p.split(),'ad':a,'cd':c,'subj':s}
+@functools.lru_cache(None)
+def on_main(sha):
+    if sha in MAIN: return True
+    rc,_=git('merge-base','--is-ancestor',sha,'main'); return rc==0
+def walk(sha,start_t,maxn=40):
+    """first-parent walk. stop at first commit that was on main BEFORE start_t."""
+    out=[]; cur=sha
+    for _ in range(maxn):
+        i=info(cur)
+        if i is None: out.append({'sha':cur,'missing':True}); break
+        om=on_main(cur)
+        lt=None
+        if om:
+            if cur in landed: lt=landed[cur][0]
+            else: lt=i['cd']
+            if T(lt)<start_t-1:   # was main at dispatch
+                return out,cur
+        m=re.match(r'Merge (?:task/)?(\S+) into main',i['subj'])
+        out.append({'sha':cur,'task':m.group(1) if m else None,'tip':i['parents'][1] if len(i['parents'])>1 else None,'on_main_now':om,'landed_ts':lt,'cd':i['cd'],'subj':i['subj'][:60]})
+        if not i['parents']: break
+        cur=i['parents'][0]
+    return out,None
+V=[]
+for e in E:
+    if e['et']!='merge_verify': continue
+    d=e['d']
+    if d.get('runner')=='history-leg': continue
+    end=T(e['ts']); start=end-(d.get('duration_ms') or 0)/1000
+    layers,base=walk(d['merge_sha'],start)
+    red=[u['unit'] for u in (d.get('units') or []) if u.get('outcome')!='ran_green']
+    outc=collections.Counter(u.get('outcome') for u in (d.get('units') or []))
+    V.append({'vid':e['id'],'ts':e['ts'],'end':end,'start':start,'run':e['run'],'task':e['task'],'k':d.get('chain_items') or 1,'passed':bool(d['passed']),
+      'rids':d.get('chain_request_ids'),'tids':d.get('chain_task_ids'),'runner':d.get('runner'),'base_relation':d.get('base_relation'),'speculative':d.get('speculative'),
+      'depth':d.get('depth'),'attempt':d.get('attempt'),'merge_sha':d['merge_sha'],'red_units':red,'unit_outcomes':dict(outc),'layers':layers,'base':base,
+      'cdr':d.get('chain_depth_reason'),'retry_scope':d.get('retry_scope')})
+json.dump(V,open('/tmp/gate-10069/forensics/verifies.json','w'))
+print(len(V), 'chains',sum(v['k']>1 for v in V),'red chains',sum(v['k']>1 and not v['passed'] for v in V))

@@ -87,7 +87,7 @@ def architect_eval_mcp_scope(worktree: Path) -> dict[str, Any]:
     """
     meta_root = _meta_root_for_worktree(worktree)
     return {
-        'mcp_config': _inject_plan_tools_mcp(None, worktree, task_root=meta_root),
+        'mcp_config': _inject_plan_tools_mcp(None, worktree, ARCHITECT, task_root=meta_root),
         'strict_mcp_config': True,
     }
 

@@ -19,23 +19,28 @@ Steps covered:
 These real-git cases observe the lane through an injected ``VerifyPort``
 rather than a patch of ``run_scoped_verification``.  What that does and
 does NOT stub of the post-merge gate chain is stated once, with the
-measurement behind it, in ``_merge_lane_verifier_doubles.py``'s module
-docstring.
+measurement behind it, in
+``orchestrator/tests/_merge_lane_fakes.py::FakeVerifier``'s docstring.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import lane_scene_config, main_health_probe_spawned
-from _merge_lane_verifier_doubles import ScriptedVerifier
+from _merge_lane_fakes import (
+    FakeVerifier,
+    fails,
+    hangs_until,
+    lane_scene_config,
+    main_health_probe_spawned,
+)
 from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT, stop_merge_worker
 from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
-from _verify_result_doubles import fake_verify_result
 
 # Reuse the γ harness two-host fakes (established cross-test-module import
 # pattern — see test_concurrent_verify_boundary.py / test_merge_speculation.py).
@@ -394,7 +399,7 @@ async def _drive_verifier_loop_blocking_get(
 
 @pytest.mark.asyncio
 class TestDispatchErrorChokepoint:
-    """DISPATCH path fault injection: _dispatch_item raises.
+    """DISPATCH path fault injection: VerifyDispatcher.dispatch raises.
 
     RED until step-4 GREEN routes both dispatch except-handlers through
     _resolve_and_release. RED marker: the chokepoint spy call count is 0
@@ -420,10 +425,10 @@ class TestDispatchErrorChokepoint:
         item.permit = permit
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _raising_dispatch(_item: Any) -> Any:
+        async def _raising_dispatch(item: Any) -> Any:
             raise Exception('boom')
 
-        worker._dispatch_item = _raising_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _raising_dispatch
 
         depth0 = worker.snapshot()['speculation']['slot_available']
 
@@ -453,7 +458,7 @@ class TestDispatchErrorChokepoint:
     async def test_dispatch_cancelled_error_propagates_and_skips_chokepoint(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """CancelledError from _dispatch_item must propagate out of
+        """CancelledError from VerifyDispatcher.dispatch must propagate out of
         _verifier_loop untouched; the chokepoint must never see it.
         """
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -465,10 +470,10 @@ class TestDispatchErrorChokepoint:
         worker._register_owned_merge_worktree(item.merge_wt)
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _cancelling_dispatch(_item: Any) -> Any:
+        async def _cancelling_dispatch(item: Any) -> Any:
             raise asyncio.CancelledError()
 
-        worker._dispatch_item = _cancelling_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _cancelling_dispatch
 
         worker._verifier_queue.put_nowait(item)
         worker._verifier_queue.put_nowait(None)
@@ -499,10 +504,10 @@ class TestDispatchErrorChokepoint:
         item.permit = permit
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _raising_dispatch(_item: Any) -> Any:
+        async def _raising_dispatch(item: Any) -> Any:
             raise Exception('boom')
 
-        worker._dispatch_item = _raising_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _raising_dispatch
 
         # Simulate the waiter detaching before the dispatch error fires.
         assert req.result.cancel()
@@ -539,7 +544,7 @@ def _make_decided_item_and_entry(
 ) -> tuple[DecidedItem, InflightEntry]:
     """Build a DECIDED DecidedItem (immediate_outcome set, no real merge)
     and its passthrough InflightEntry (verify_task=None, lease=None,
-    merge_wt=None) — the shape _dispatch_item returns for conflict /
+    merge_wt=None) — the shape VerifyDispatcher.dispatch returns for conflict /
     already_merged / skip_verify items.
     """
     immediate_outcome = MergeOutcome('blocked', reason='decided-elsewhere')
@@ -587,13 +592,13 @@ class TestPassthroughFinalizeErrorChokepoint:
         item, entry = _make_decided_item_and_entry(req, was_speculative=True)
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _passthrough_dispatch(_item: Any) -> Any:
+        async def _passthrough_dispatch(item: Any) -> Any:
             return entry
 
         async def _raising_finalize(_entry: Any) -> Any:
             raise Exception('boom')
 
-        worker._dispatch_item = _passthrough_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _passthrough_dispatch
         worker._finalize_inflight = _raising_finalize  # type: ignore[method-assign]
 
         depth0 = worker.snapshot()['speculation']['slot_available']
@@ -640,13 +645,13 @@ class TestPassthroughFinalizeErrorChokepoint:
         item, entry = _make_decided_item_and_entry(req, was_speculative=True)
         calls = _spy_on_resolve_and_release(worker)
 
-        async def _passthrough_dispatch(_item: Any) -> Any:
+        async def _passthrough_dispatch(item: Any) -> Any:
             return entry
 
         async def _cancelling_finalize(_entry: Any) -> Any:
             raise asyncio.CancelledError()
 
-        worker._dispatch_item = _passthrough_dispatch  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _passthrough_dispatch
         worker._finalize_inflight = _cancelling_finalize  # type: ignore[method-assign]
 
         with pytest.raises(asyncio.CancelledError):
@@ -706,7 +711,7 @@ class TestFinalizeHeadErrorChokepoint:
             permit=permit,
         )
 
-        async def _dispatch_returns_entry(_item: Any) -> Any:
+        async def _dispatch_returns_entry(item: Any) -> Any:
             return entry
 
         async def _raising_finalize(_entry: Any) -> Any:
@@ -721,7 +726,7 @@ class TestFinalizeHeadErrorChokepoint:
             worker._speculation_ledger.release(_entry.permit)
             raise Exception('boom')
 
-        worker._dispatch_item = _dispatch_returns_entry  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _dispatch_returns_entry
         worker._finalize_inflight = _raising_finalize  # type: ignore[method-assign]
 
         class _StubAllocator:
@@ -811,13 +816,13 @@ class TestFinalizeHeadErrorChokepoint:
             was_speculative=True,
         )
 
-        async def _dispatch_returns_entry(_item: Any) -> Any:
+        async def _dispatch_returns_entry(item: Any) -> Any:
             return entry
 
         async def _cancelling_finalize(_entry: Any) -> Any:
             raise asyncio.CancelledError()
 
-        worker._dispatch_item = _dispatch_returns_entry  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = _dispatch_returns_entry
         worker._finalize_inflight = _cancelling_finalize  # type: ignore[method-assign]
 
         class _StubAllocator:
@@ -896,18 +901,12 @@ class TestCascadeErrorChokepoint:
         """
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
-        _local_calls: list[int] = [0]
-
-        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
-            call = _local_calls[0]
-            _local_calls[0] += 1
-            if call == 0:
-                # N's verify: gate and fail.
-                gate_a_entered.set()
-                await gate_a_release.wait()
-                return fake_verify_result(passed=False, summary='test_failure')
-            # Any subsequent call (req_c's local verify) passes immediately.
-            return fake_verify_result(passed=True)
+        # N's verify gates and fails; any later call (req_c's local verify)
+        # passes immediately.
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            fails(category='test_failure', summary='test_failure'),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -920,7 +919,7 @@ class TestCascadeErrorChokepoint:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=verifier,
         )
         _inject_two_host_allocator(worker, gated_remote)
         calls = _spy_on_resolve_and_release(worker)
@@ -1103,18 +1102,12 @@ class TestCascadeErrorChokepoint:
         """
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
-        _local_calls: list[int] = [0]
-
-        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
-            call = _local_calls[0]
-            _local_calls[0] += 1
-            if call == 0:
-                # N's verify: gate and fail.
-                gate_a_entered.set()
-                await gate_a_release.wait()
-                return fake_verify_result(passed=False, summary='test_failure')
-            # Any subsequent call (req_c's local verify) passes immediately.
-            return fake_verify_result(passed=True)
+        # N's verify gates and fails; any later call (req_c's local verify)
+        # passes immediately.
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            fails(category='test_failure', summary='test_failure'),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -1138,7 +1131,7 @@ class TestCascadeErrorChokepoint:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=verifier,
         )
         _inject_two_host_allocator(worker, gated_remote)
         calls = _spy_on_resolve_and_release(worker)
@@ -1291,16 +1284,10 @@ class TestCascadeErrorChokepoint:
         """
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
-        _local_calls: list[int] = [0]
-
-        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
-            call = _local_calls[0]
-            _local_calls[0] += 1
-            if call == 0:
-                gate_a_entered.set()
-                await gate_a_release.wait()
-                return fake_verify_result(passed=False, summary='test_failure')
-            return fake_verify_result(passed=True)
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            fails(category='test_failure', summary='test_failure'),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -1313,7 +1300,7 @@ class TestCascadeErrorChokepoint:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=verifier,
         )
         allocator = _inject_two_host_allocator(worker, gated_remote)
         calls = _spy_on_resolve_and_release(worker)
@@ -1471,10 +1458,7 @@ class TestCascadeErrorChokepoint:
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
 
-        async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
-            gate_a_entered.set()
-            await gate_a_release.wait()
-            return fake_verify_result(passed=True)
+        verifier = FakeVerifier(hangs_until(gate_a_release, entered=gate_a_entered))
 
         gated_remote = _gated_runner(
             gate_b_release, gate_b_entered, passed=True, name='laptop',
@@ -1485,10 +1469,10 @@ class TestCascadeErrorChokepoint:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=verifier,
         )
         _inject_two_host_allocator(worker, gated_remote)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
         calls = _spy_on_resolve_and_release(worker)
 
         loop = asyncio.get_running_loop()

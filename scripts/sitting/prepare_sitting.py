@@ -46,9 +46,7 @@ from orchestrator.decision_registry import (  # noqa: E402  # debt: task 6760
     list_decisions,
 )
 from orchestrator.fleet_files import fleet_root  # noqa: E402  # debt: task 6760
-from orchestrator.session_registry import (  # noqa: E402
-    sessions_dir,
-)
+from orchestrator.session_records import sessions_dir  # noqa: E402  # debt: task 6760
 from sitting import brief, gates, inventory, ownership, payloads  # noqa: E402
 from sitting import ledger as ledgers  # noqa: E402
 from sitting import preparation as preparations  # noqa: E402
@@ -753,7 +751,7 @@ def stores_arguments() -> argparse.ArgumentParser:
     stores.add_argument('--project-root', action='append', dest='project_roots',
                         help='repeatable; default: _task_db_scan.discover_project_roots()')
     stores.add_argument('--decisions-root', type=Path, help='fleet root holding decisions/ (default: fleet_root())')
-    stores.add_argument('--sessions-root', type=Path, help='default: session_registry.sessions_dir()')
+    stores.add_argument('--sessions-root', type=Path, help='default: session_records.sessions_dir()')
     stores.add_argument('--handover', type=parse_handover_override, metavar='PROJECT=PATH',
                         help="read PATH as PROJECT's handover; default: each project root's own, "
                              'via ownership.resolve_handover_path')

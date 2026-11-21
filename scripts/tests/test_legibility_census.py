@@ -32,6 +32,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
+import legibility_sighting_fit_fixtures as reify_fit
 import pytest
 import yaml
 from legibility import (
@@ -61,6 +62,7 @@ from legibility import (
     prescreen,
     session_ledger,
     session_runner,
+    sighting_fit,
     similarity,
     state_docs,
     synthesis,
@@ -193,16 +195,16 @@ def _minimal_v2_codebook() -> dict:
 # network call, or model.
 # ---------------------------------------------------------------------------
 
-def _make_fake_submit_fn():
+def _make_fake_submit_fn(*, first=1):
     """Fake curator-path `submit_fn(**kwargs) -> dict` seam. Records every
     call's kwargs in `.calls` and answers in the real curator-path shape
-    (disposition.ticket_id_from_submit_result) with an incrementing ticket
-    id, `{"ticket": "tkt_<n>"}`."""
+    (disposition.ticket_id_from_submit_result) with a ticket id incrementing
+    from *first*, `{"ticket": "tkt_<n>"}`."""
     calls = []
 
     def fake_submit_fn(**kwargs):
         calls.append(kwargs)
-        return {"ticket": f"tkt_{len(calls)}"}
+        return {"ticket": f"tkt_{first + len(calls) - 1}"}
 
     fake_submit_fn.calls = calls
     return fake_submit_fn
@@ -2513,6 +2515,7 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
             gate=_passing_gate,
             commit=_poison("commit"),
             roll_back=_poison("roll_back"),
+            fit_fn=_poison("fit_fn"),
         ),
         codebook_dict=_minimal_v2_codebook(),
         config=_census_config(tmp_path),
@@ -7504,6 +7507,7 @@ def test_synthesis_prompt_embeds_the_quality_definition_the_c6_reply_and_the_bri
     [call] = fake_invoke.calls
     prompt = call["prompt"]
     assert (reply, call["model"]) == ("the raw reply", "fable")
+    assert prompt == mod.synthesis_prompt(brief, quality_block=code_quality.guidance())
     assert quality_block_of(prompt) == code_quality.guidance()
     assert synthesis.reply_instructions() in prompt
     assert json.dumps(brief.to_record()) in prompt
@@ -7763,7 +7767,11 @@ def _withheld_entry_id(first, title=_GATED_TITLE):
 
 
 def _matches_reply(entry_id):
-    return {"matches": [{"entry_id": entry_id}], "candidates": []}
+    return {"matches": [{"entry_id": entry_id, "evidence_quote": "the same confusion again"}], "candidates": []}
+
+
+def _confirming_fit_fn():
+    return reify_fit.recording_fit_fn(reify_fit.judging(True))
 
 
 def _recurrence_kwargs(tmp_path, first, *, reply, title=_GATED_TITLE, **overrides):
@@ -7787,6 +7795,7 @@ def _recurrence_kwargs(tmp_path, first, *, reply, title=_GATED_TITLE, **override
         submit_fn=_make_fake_submit_fn(),
         escalate_fn=_make_fake_escalate_fn(),
         commit=_make_fake_commit(),
+        fit_fn=_confirming_fit_fn(),
         date="2026-07-21",
         report_path=tmp_path / "confusion-census-2026-07-21.md",
     )
@@ -7992,6 +8001,182 @@ def test_run_census_never_files_a_recurring_legacy_entry(tmp_path):
 
     assert kwargs["effects"].submit_fn.calls == []
     assert outcome.released_entry_ids == ()
+
+
+# ---------------------------------------------------------------------------
+# task 6787: a withheld entry's count includes only founding, rule-attached and
+# fit-confirmed sightings, and the census checks fit where a release is at stake.
+# ---------------------------------------------------------------------------
+
+_NO_JUDGMENT = json.dumps({"matches": [], "candidates": []})
+
+
+def _reify_kwargs(tmp_path, cb, **overrides):
+    """A census over *cb* whose one digest codes to nothing."""
+    kwargs = dict(
+        codebook_dict=cb,
+        batch_source=[[_hand_digest("s-unrelated", "an unrelated session")]],
+        invoke=make_fake_invoke(default=_NO_JUDGMENT),
+        verify_fn=_make_fake_verify_fn(remediation=None),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+    )
+    kwargs.update(overrides)
+    return _run_census_kwargs(tmp_path, **kwargs)
+
+
+def _reify_entry(kwargs):
+    return _persisted_entry(kwargs["codebook_path"], reify_fit.TITLE)
+
+
+def _persisted_sections(kwargs):
+    return census_report.census_report_sections(_run_record(kwargs))
+
+
+def _sighting_fit_section(kwargs) -> str:
+    return _section_text(_persisted_sections(kwargs), census_report.SECTION_SIGHTING_FIT)
+
+
+def test_run_census_keeps_the_reify_entry_withheld_without_a_fit_call(tmp_path):
+    kwargs = _reify_kwargs(tmp_path, reify_fit.reify_codebook_at_rest())
+
+    outcome = _done(census_run.run_census(**kwargs))
+
+    assert kwargs["effects"].submit_fn.calls == []
+    assert outcome.released_entry_ids == ()
+    assert _reify_entry(kwargs)[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
+    record = _run_record(kwargs)
+    assert record["sighting_fit"] == []
+    assert "sighting-fit" not in record["cost_note"]
+    assert census_report.SECTION_SIGHTING_FIT not in [section.key for section in _persisted_sections(kwargs)]
+
+
+def test_run_census_stamps_refuted_fits_and_keeps_the_reify_entry_withheld(tmp_path):
+    fit_fn = reify_fit.recording_fit_fn(reify_fit.judging(False))
+    kwargs = _reify_kwargs(tmp_path, reify_fit.reify_codebook_with_quotes(), fit_fn=fit_fn)
+
+    outcome = _done(census_run.run_census(**kwargs))
+
+    assert kwargs["effects"].submit_fn.calls == []
+    assert outcome.released_entry_ids == ()
+    entry = _reify_entry(kwargs)
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
+    assert [(row["session"], row["exhibits"], row["run_id"]) for row in entry[codebook.SIGHTING_FITS_KEY]] == [
+        (session, False, kwargs["run_id"]) for session in reify_fit.MISATTACHED_SESSIONS
+    ]
+    [call] = fit_fn.calls
+    assert call["model"] == kwargs["config"].models.census_verify
+    record = _run_record(kwargs)
+    [fit] = record["sighting_fit"]
+    assert (fit["entry_id"], fit["refuted"]) == (reify_fit.ENTRY_ID, list(reify_fit.MISATTACHED_SESSIONS))
+    assert f"{kwargs['config'].models.census_verify} sighting-fit=1" in record["cost_note"]
+    assert reify_fit.TITLE in _sighting_fit_section(kwargs)
+
+
+def test_run_census_files_the_reify_entry_once_a_fit_check_confirms_a_sighting(tmp_path):
+    kwargs = _reify_kwargs(
+        tmp_path, reify_fit.reify_codebook_with_quotes(), fit_fn=reify_fit.recording_fit_fn(reify_fit.judging(True, False)),
+    )
+
+    outcome = _done(census_run.run_census(**kwargs))
+
+    [filed] = kwargs["effects"].submit_fn.calls
+    assert filed["title"] == f"[legibility census] {reify_fit.TITLE}"
+    assert outcome.released_entry_ids == (reify_fit.ENTRY_ID,)
+    assert _reify_entry(kwargs)[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
+
+
+def test_run_census_leaves_the_reify_entry_unchecked_when_the_fit_judge_fails(tmp_path):
+    def unavailable(check):
+        raise session_runner.InvocationFailed("fit judge unavailable")
+
+    kwargs = _reify_kwargs(
+        tmp_path, reify_fit.reify_codebook_with_quotes(), fit_fn=reify_fit.recording_fit_fn(unavailable),
+    )
+
+    outcome = _done(census_run.run_census(**kwargs))
+
+    assert kwargs["effects"].submit_fn.calls == []
+    assert outcome.released_entry_ids == ()
+    assert codebook.SIGHTING_FITS_KEY not in _reify_entry(kwargs)
+    section = _sighting_fit_section(kwargs)
+    assert "fit judge unavailable" in section
+    assert all(session in section for session in reify_fit.MISATTACHED_SESSIONS)
+
+
+_FIT_ERROR = "InvocationFailed: fit judge unavailable"
+_UNREACHABLE_FIT = sighting_fit.FitOutcome(
+    entry_id=reify_fit.ENTRY_ID,
+    title=reify_fit.TITLE,
+    confirmed=(),
+    refuted=(),
+    unchecked=reify_fit.MISATTACHED_SESSIONS,
+    error=_FIT_ERROR,
+)
+
+
+def test_census_report_sections_sighting_fit_is_gated_and_positioned():
+    assert census_report.SECTION_SIGHTING_FIT not in _section_keys()
+    assert census_report.SECTION_SIGHTING_FIT not in _section_keys(fit_outcomes=())
+
+    keys = _section_keys(
+        withheld=(filing_policy.WithheldCluster(title=_GATED_TITLE, sighting_count=1),),
+        fit_outcomes=(_UNREACHABLE_FIT,),
+    )
+    assert keys.index(census_report.SECTION_WITHHELD) < keys.index(census_report.SECTION_SIGHTING_FIT)
+    assert keys.index(census_report.SECTION_SIGHTING_FIT) < keys.index(census_report.SECTION_COST)
+
+
+def test_census_report_sections_sighting_fit_renders_each_check_and_its_error():
+    record = _census_record(fit_outcomes=(_UNREACHABLE_FIT,))
+
+    section = _section(census_report.census_report_sections(record), census_report.SECTION_SIGHTING_FIT)
+
+    assert section.lines == tuple(sighting_fit.report_lines(record["sighting_fit"]))
+    assert reify_fit.TITLE in section.text
+    assert _FIT_ERROR in section.text
+
+
+def _reify_recurrence_reply(prompt, model):
+    if "s-recurrence" in prompt:
+        return json.dumps({
+            "matches": [],
+            "candidates": [{"title": reify_fit.TITLE, "origin_phase": "unknown", "manifested_phase": "unknown"}],
+        })
+    return _NO_JUDGMENT
+
+
+def _reify_codebook_with_a_fixed_twin() -> dict:
+    """The reify codebook plus a fixed entry of the same title, so a re-mined
+    cluster of that title is surfaced and verified, while the merge routes its
+    sighting to the open reify entry its promoted candidate points at."""
+    cb = reify_fit.reify_codebook_at_rest()
+    [entry] = cb["entries"]
+    twin = {key: value for key, value in copy.deepcopy(entry).items() if key != codebook.ENTRY_FILING_KEY}
+    cb["entries"].append({**twin, "id": "entry-fixed-twin", "status": "fixed", "sightings": []})
+    return cb
+
+
+def test_run_census_holds_back_a_verdict_dropped_on_an_entry_whose_other_sightings_carry_only_notes(tmp_path):
+    kwargs = _reify_kwargs(
+        tmp_path, _reify_codebook_with_a_fixed_twin(),
+        batch_source=[[_hand_digest("s-recurrence", "the same confusion again")]],
+        invoke=make_fake_invoke(_reify_recurrence_reply),
+        verify_fn=_make_fake_verify_fn(verified_titles={reify_fit.TITLE}, remediation=None),
+    )
+
+    outcome = _done(census_run.run_census(**kwargs))
+
+    dropped = _one_dropped(outcome)
+    assert (dropped.verdict, dropped.standing_id) == ("verified", reify_fit.CANDIDATE_ID)
+    persisted = codebook.load(kwargs["codebook_path"])
+    entry = codebook.record_by_id(persisted["entries"], reify_fit.ENTRY_ID, kind="entry")
+    assert census_filing.distinct_sessions(entry) >= filing_policy.MIN_UNREMEDIATED_SIGHTINGS
+    assert sighting_fit.counted_sessions(persisted, entry) == frozenset({reify_fit.FOUNDING_SESSION})
+    assert kwargs["effects"].submit_fn.calls == []
+    assert outcome.released_entry_ids == ()
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
 
 
 # ---------------------------------------------------------------------------
@@ -8333,6 +8518,7 @@ def test_run_census_files_a_released_legacy_entry_without_a_key(tmp_path):
         synthesize_fn=_make_fake_synthesize_fn(),
         escalate_fn=_make_fake_escalate_fn(),
         commit=_make_fake_commit(),
+        fit_fn=_confirming_fit_fn(),
     )
 
     census_run.run_census(**kwargs)
@@ -8540,6 +8726,98 @@ def test_run_census_writes_no_artifact_when_filing_leaves_the_codebook_invalid(t
     assert not kwargs["report_path"].exists()
     assert not kwargs["report_path"].with_suffix(".json").exists()
     assert not kwargs["codebook_path"].exists()
+
+
+# ---------------------------------------------------------------------------
+# task 7095: a fileable finding whose filing did not land is owed and
+# re-offered. A fresh promotion the dedup store, submit_task or its curator
+# ticket left with no work is marked `filing: owed`, and every later run
+# re-offers it through contract §8 until work is routed.
+# ---------------------------------------------------------------------------
+
+
+def _quiet_run_after(tmp_path, previous, store, **overrides):
+    """The run after *previous*, over its persisted codebook, sighting nothing new."""
+    later = {**_next_run(previous), "task_store": store, **overrides}
+    return _reify_kwargs(tmp_path, later.pop("codebook_dict"), **later)
+
+
+def _assert_the_owed_entry_files_once_then_rests(tmp_path, first, **second_overrides):
+    entry_id = _persisted_promoted_entry(first)["id"]
+    second = _quiet_run_after(tmp_path, first, FakeTaskStore(), **second_overrides)
+
+    outcome = _done(census_run.run_census(**second))
+
+    [payload] = second["effects"].submit_fn.calls
+    assert payload["title"] == disposition.task_title(_PROMOTED_TITLE)
+    assert outcome.released_entry_ids == (entry_id,)
+    entry = _persisted_promoted_entry(second)
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
+    [ticket] = outcome.filed_ticket_ids
+    assert ticket in [row["ticket"] for row in entry["filed_tickets"]]
+
+    third = _quiet_run_after(
+        tmp_path, second, FakeTaskStore(),
+        date="2026-07-28", run_id="census-dark_factory-20260728",
+        report_path=tmp_path / "confusion-census-2026-07-28.md",
+    )
+    _done(census_run.run_census(**third))
+    assert third["effects"].submit_fn.calls == []
+
+
+def test_run_census_owes_a_promotion_an_unreachable_store_left_unfiled_and_files_it_next_run(tmp_path):
+    store = task_store.McpTaskStore(url="http://fused-memory.invalid/mcp", post=_unreachable_post("raises"))
+    first = _keyed_kwargs(tmp_path, store)
+
+    census_run.run_census(**first)
+
+    assert first["effects"].submit_fn.calls == []
+    assert _persisted_promoted_entry(first)[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_OWED
+    _assert_the_owed_entry_files_once_then_rests(tmp_path, first)
+
+
+def test_run_census_owes_a_promotion_whose_submit_failed(tmp_path):
+    first = _keyed_kwargs(tmp_path, FakeTaskStore(), submit_fn=_make_rejecting_submit_fn())
+
+    census_run.run_census(**first)
+
+    assert len(first["effects"].submit_fn.calls) == 1
+    assert _persisted_promoted_entry(first)[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_OWED
+    _assert_the_owed_entry_files_once_then_rests(tmp_path, first)
+
+
+def test_run_census_owes_a_promotion_whose_ticket_failed(tmp_path):
+    store = FakeTaskStore(resolve_outcomes={
+        "tkt_1": task_store.TicketOutcome(task_store.TicketStatus.FAILED, None, "expired"),
+    })
+    first = _keyed_kwargs(tmp_path, store)
+
+    census_run.run_census(**first)
+
+    entry = _persisted_promoted_entry(first)
+    [row] = entry["filed_tickets"]
+    assert (row["ticket"], row["task_id"], row["resolution"]) == ("tkt_1", None, "failed")
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_OWED
+    # Real tickets are unique; a reused tkt_1 would share the failed row's
+    # (ticket, task_id) identity in disposition.with_back_links.
+    _assert_the_owed_entry_files_once_then_rests(tmp_path, first, submit_fn=_make_fake_submit_fn(first=2))
+
+
+def test_run_census_dry_run_reoffers_an_owed_entry_but_leaves_it_owed(tmp_path, caplog):
+    first = _keyed_kwargs(tmp_path, FakeTaskStore(), submit_fn=_make_rejecting_submit_fn())
+    census_run.run_census(**first)
+    payloads_path = tmp_path / "confusion-census-2026-07-21-payloads.json"
+    second = _quiet_run_after(
+        tmp_path, first, FakeTaskStore(), submit_fn=_poison("submit_fn"), dry_run_payloads_path=payloads_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        census_run.run_census(**second)
+
+    [payload] = json.loads(payloads_path.read_text(encoding="utf-8"))
+    assert payload["title"] == disposition.task_title(_PROMOTED_TITLE)
+    assert _persisted_promoted_entry(second)[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_OWED
+    assert "1 of those payload(s) re-offer withheld or owed codebook entries" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -8865,6 +9143,10 @@ def test_run_census_dry_run_with_an_unreachable_store_writes_every_payload(tmp_p
     section = _filed_tasks_text(kwargs)
     assert "_dry-run:" in section
     assert "NOTHING was filed" in section
+    assert all(
+        entry.get(codebook.ENTRY_FILING_KEY) != codebook.ENTRY_FILING_OWED
+        for entry in codebook.load(kwargs["codebook_path"])["entries"]
+    ), "a dry run's payloads file is the hand-filing handle; it owes nothing"
 
 
 # ---------------------------------------------------------------------------
@@ -9551,6 +9833,9 @@ def test_run_census_refiles_again_after_its_superseding_ticket_reached_no_curato
     _override(first, submit_fn=_make_rejecting_submit_fn())
     census_run.run_census(**first)
     assert disposition.FOLLOW_UP not in _persisted_entry_a(first)
+    assert codebook.ENTRY_FILING_KEY not in _persisted_entry_a(first), (
+        "the refiled entry has a task row: L5, not the owed marker, retries it"
+    )
     second = _later_outcome_run(tmp_path, first, "present", FakeTaskStore())
 
     census_run.run_census(**second)
@@ -9588,8 +9873,11 @@ def test_run_census_does_not_refile_a_recurring_abandoned_entry_the_curator_refu
 def test_run_census_carries_a_present_reverify_onto_a_released_withheld_entry(tmp_path):
     sightings = [
         {"date": "2026-07-01", "project": "dark_factory", "session": session,
-         "origin_phase": "implement", "manifested_phase": "merge"}
-        for session in ("s-old-1", "s-old-2")
+         "origin_phase": "implement", "manifested_phase": "merge", **attach}
+        for session, attach in (
+            ("s-old-1", {}),
+            ("s-old-2", {"attached_by": {"method": "title", "run_id": "census-dark_factory-20260701"}}),
+        )
     ]
     kwargs = _outcome_kwargs(
         tmp_path, "present", sightings=sightings, **{codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD},

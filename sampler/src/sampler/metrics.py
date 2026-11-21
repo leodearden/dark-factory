@@ -4,7 +4,8 @@
 every name, its group, its gate arm and its readability metric are declared
 there once, and every other spelling is a projection of it. The collectors
 above it are pure over their injected seams, with the live readers as
-defaults.
+defaults. ``sampler.consumers`` and ``sampler.host_memory`` report figures,
+never metric names; ``FIGURE_METRICS`` is where a consumer figure gets one.
 
 FD-9 heuristic
 --------------
@@ -17,6 +18,7 @@ script moves the pipe to another FD.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections import Counter
@@ -27,6 +29,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
+from shared.cgroup_stats import CGROUP_ROOT, CgroupReading
 from shared.psi import (
     RunqueueReading,
     parse_pressure_file,
@@ -34,12 +37,37 @@ from shared.psi import (
     read_runqueue_ratio,
     resolve_own_cgroup,
 )
+from shared.verify_scope_tag import parse_verify_scope_unit
+
+from sampler.consumers import (
+    Consumer,
+    ConsumerFigures,
+    Figure,
+    TreeState,
+    account,
+    encode_consumer,
+    read_cgroups,
+    read_tree,
+)
+from sampler.host_memory import (
+    MEMINFO,
+    PROC_ROOT,
+    ReclaimState,
+    ReclaimThreadKind,
+    read_host_memory_stat,
+    read_host_used_bytes,
+    read_reclaim_threads,
+    reclaim_increments,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     'SampleKey',
     'Samples',
+    'Collected',
+    'Collector',
+    'every_tick',
     'GroupName',
     'MetricSpec',
     'MetricGroup',
@@ -48,11 +76,13 @@ __all__ = [
     'ProcessRecord',
     'classify_process',
     'count_occt_queue_depth',
-    'count_verify_concurrency',
-    'sum_verify_rss',
     'collect_process_metrics',
     'discover_pressure_cgroups',
     'collect_load_metrics',
+    'FigureMetric',
+    'FIGURE_METRICS',
+    'collect_consumers',
+    'collect_verify_scopes',
     'METRIC_GROUPS',
     'arm_metrics',
     'ARM_METRICS',
@@ -78,12 +108,39 @@ class SampleKey(NamedTuple):
 Samples = Mapping[SampleKey, float]
 
 
+@dataclass(frozen=True)
+class Collected:
+    """One group's collection: its samples, and the state its next collection starts from.
+
+    ``state`` is opaque to everything but the group's own collector. None
+    carries nothing forward, and the store keeps whatever state it held.
+    """
+
+    samples: Samples
+    state: str | None = None
+
+
+Collector = Callable[[int, str | None], Collected]
+"""``collect(now, previous_state)``: every group's one collector signature."""
+
+
+def every_tick(collect: Callable[[], Samples]) -> Collector:
+    """Adapt a stateless zero-argument collector to the ``Collector`` signature."""
+
+    def collect_stateless(_now: int, _previous_state: str | None) -> Collected:
+        return Collected(collect())
+
+    return collect_stateless
+
+
 class GroupName(StrEnum):
     """The collection groups: each fails, is admitted and is windowed as a unit."""
 
     PSI = 'psi'
     PROCESS = 'process'
     LOAD = 'load'
+    CONSUMERS = 'consumers'
+    VERIFY_SCOPES = 'verify_scopes'
 
 
 def _repeated(names: Iterable[str]) -> list[str]:
@@ -126,17 +183,24 @@ class MetricSpec:
 class MetricGroup:
     """Metrics collected by one collector, admitted and windowed together.
 
-    ``collect`` is the live zero-argument collector. ``windowed`` is False when
-    the source is already windowed (PSI avg10), so its rows carry NULL window
-    columns.
+    ``collect`` is the live collector. ``windowed`` is False when the source is
+    already windowed (PSI avg10), so its rows carry NULL window columns.
+    ``due_seconds`` None collects the group on every tick; otherwise it is
+    collected when that many seconds have passed since its last attempt, and
+    must be unwindowed, because a trailing window is a row count and would
+    span a different time at another cadence. ``logs_rows`` False renders the
+    group in the tick line as a row and leaf count instead of every row.
     """
 
     name: GroupName
-    collect: Callable[[], Samples]
+    collect: Collector
     metrics: tuple[MetricSpec, ...]
     windowed: bool
+    due_seconds: int | None = None
+    logs_rows: bool = True
 
     def __post_init__(self) -> None:
+        self._check_cadence()
         repeated = _repeated(spec.name for spec in self.metrics)
         if repeated:
             raise ValueError(
@@ -151,6 +215,20 @@ class MetricGroup:
             raise ValueError(
                 f'a readability metric must belong to the same group: in {self.name}, '
                 f'{"; ".join(foreign)}, which the group does not declare'
+            )
+
+    def _check_cadence(self) -> None:
+        due = self.due_seconds
+        if due is None:
+            return
+        if isinstance(due, bool) or not isinstance(due, int) or due <= 0:
+            raise ValueError(
+                f'due_seconds must be a positive whole number of seconds: {self.name} has {due!r}'
+            )
+        if self.windowed:
+            raise ValueError(
+                f'a group with due_seconds must be unwindowed: {self.name} has '
+                f'due_seconds={due} and windowed=True'
             )
 
     @property
@@ -176,8 +254,6 @@ _PSI_IO_SOME = MetricSpec('psi_io_some_avg10', arm='io_some_avg10')
 _PSI_IO_FULL = MetricSpec('psi_io_full_avg10')
 
 _OCCT_QUEUE_DEPTH = MetricSpec('occt_queue_depth')
-_VERIFY_CONCURRENCY = MetricSpec('verify_concurrency')
-_VERIFY_RSS_TOTAL_BYTES = MetricSpec('verify_rss_total_bytes')
 
 _RUNQUEUE_READ_OK = MetricSpec('runqueue_read_ok')
 _RUNQUEUE_RATIO = MetricSpec(
@@ -188,11 +264,103 @@ _OWN_CPU_SOME10 = MetricSpec(
     'own_cpu_some10', per_leaf=True, arm='own_cpu_some_avg10', readability=_OWN_READ_OK
 )
 
+# Per consumer: the leaf is ``sampler.consumers.encode_consumer``'s name.
+_CONSUMER_READ_OK = MetricSpec('consumer_read_ok', per_leaf=True)
+_CONSUMER_MEMBERS = MetricSpec('consumer_members', per_leaf=True)
+_CONSUMER_MEMORY = MetricSpec(
+    'consumer_memory_bytes', per_leaf=True, readability=_CONSUMER_READ_OK
+)
+_CONSUMER_ANON = MetricSpec('consumer_anon_bytes', per_leaf=True, readability=_CONSUMER_READ_OK)
+_CONSUMER_FILE = MetricSpec('consumer_file_bytes', per_leaf=True, readability=_CONSUMER_READ_OK)
+_CONSUMER_SWAP = MetricSpec('consumer_swap_bytes', per_leaf=True, readability=_CONSUMER_READ_OK)
+_CONSUMER_CPU = MetricSpec('consumer_cpu_usec', per_leaf=True, readability=_CONSUMER_READ_OK)
+_CONSUMER_SWAPIN = MetricSpec(
+    'consumer_swapin_pages', per_leaf=True, readability=_CONSUMER_READ_OK
+)
+_CONSUMER_RECLAIM_KSWAPD = MetricSpec(
+    'consumer_reclaim_kswapd_pages', per_leaf=True, readability=_CONSUMER_READ_OK
+)
+_CONSUMER_RECLAIM_DIRECT = MetricSpec(
+    'consumer_reclaim_direct_pages', per_leaf=True, readability=_CONSUMER_READ_OK
+)
+_CONSUMER_REFAULT_ANON = MetricSpec(
+    'consumer_refault_anon_pages', per_leaf=True, readability=_CONSUMER_READ_OK
+)
+_CONSUMER_REFAULT_FILE = MetricSpec(
+    'consumer_refault_file_pages', per_leaf=True, readability=_CONSUMER_READ_OK
+)
+_CONSUMER_MEMORY_HIGH = MetricSpec(
+    'consumer_memory_high_events', per_leaf=True, readability=_CONSUMER_READ_OK
+)
+_CONSUMER_MEMORY_MAX = MetricSpec(
+    'consumer_memory_max_events', per_leaf=True, readability=_CONSUMER_READ_OK
+)
+_CONSUMER_OOM_KILLS = MetricSpec(
+    'consumer_oom_kills', per_leaf=True, readability=_CONSUMER_READ_OK
+)
+_CONSUMER_CPU_SOME_STALL = MetricSpec(
+    'consumer_cpu_some_stall_seconds', per_leaf=True, readability=_CONSUMER_READ_OK
+)
+_CONSUMER_MEMORY_SOME_STALL = MetricSpec(
+    'consumer_memory_some_stall_seconds', per_leaf=True, readability=_CONSUMER_READ_OK
+)
+_CONSUMER_MEMORY_FULL_STALL = MetricSpec(
+    'consumer_memory_full_stall_seconds', per_leaf=True, readability=_CONSUMER_READ_OK
+)
+_CONSUMER_IO_SOME_STALL = MetricSpec(
+    'consumer_io_some_stall_seconds', per_leaf=True, readability=_CONSUMER_READ_OK
+)
 
-# The cgroup v2 mountpoint: a default for the injected ``cgroup_root`` seam,
-# which every test overrides. shared.psi holds the same literal privately for
-# its own defaults and exports no constant to share.
-_CGROUP_ROOT = Path('/sys/fs/cgroup')
+# Host level, from the same collection as the consumers.
+_CONSUMER_INTERVAL = MetricSpec('consumer_interval_seconds')
+_RECLAIM_KSWAPD_CPU = MetricSpec('reclaim_kswapd_cpu_usec')
+_RECLAIM_KCOMPACTD_CPU = MetricSpec('reclaim_kcompactd_cpu_usec')
+_HOST_ANON = MetricSpec('host_anon_bytes')
+_HOST_FILE = MetricSpec('host_file_bytes')
+_HOST_USED = MetricSpec('host_used_bytes')
+
+_VERIFY_SCOPES_LIVE = MetricSpec('verify_scopes_live')
+_VERIFY_SCOPE_MEMORY = MetricSpec('verify_scope_memory_bytes')
+
+
+@dataclass(frozen=True)
+class FigureMetric:
+    """The metric recording one consumer figure; ``scale`` converts the figure's unit to it."""
+
+    spec: MetricSpec
+    scale: float = 1
+
+
+_SECONDS_PER_USEC = 1e-6
+
+FIGURE_METRICS: Mapping[Figure, FigureMetric] = MappingProxyType({
+    Figure.MEMORY: FigureMetric(_CONSUMER_MEMORY),
+    Figure.ANON: FigureMetric(_CONSUMER_ANON),
+    Figure.FILE: FigureMetric(_CONSUMER_FILE),
+    Figure.SWAP: FigureMetric(_CONSUMER_SWAP),
+    Figure.CPU_USEC: FigureMetric(_CONSUMER_CPU),
+    Figure.SWAPIN_PAGES: FigureMetric(_CONSUMER_SWAPIN),
+    Figure.RECLAIM_KSWAPD_PAGES: FigureMetric(_CONSUMER_RECLAIM_KSWAPD),
+    Figure.RECLAIM_DIRECT_PAGES: FigureMetric(_CONSUMER_RECLAIM_DIRECT),
+    Figure.REFAULT_ANON_PAGES: FigureMetric(_CONSUMER_REFAULT_ANON),
+    Figure.REFAULT_FILE_PAGES: FigureMetric(_CONSUMER_REFAULT_FILE),
+    Figure.MEMORY_HIGH_EVENTS: FigureMetric(_CONSUMER_MEMORY_HIGH),
+    Figure.MEMORY_MAX_EVENTS: FigureMetric(_CONSUMER_MEMORY_MAX),
+    Figure.OOM_KILLS: FigureMetric(_CONSUMER_OOM_KILLS),
+    Figure.CPU_SOME_STALL_USEC: FigureMetric(_CONSUMER_CPU_SOME_STALL, _SECONDS_PER_USEC),
+    Figure.MEMORY_SOME_STALL_USEC: FigureMetric(_CONSUMER_MEMORY_SOME_STALL, _SECONDS_PER_USEC),
+    Figure.MEMORY_FULL_STALL_USEC: FigureMetric(_CONSUMER_MEMORY_FULL_STALL, _SECONDS_PER_USEC),
+    Figure.IO_SOME_STALL_USEC: FigureMetric(_CONSUMER_IO_SOME_STALL, _SECONDS_PER_USEC),
+})
+"""Each per-consumer figure's one metric: ``sampler.consumers`` never spells a name."""
+
+_RECLAIM_METRICS: Mapping[ReclaimThreadKind, MetricSpec] = MappingProxyType({
+    ReclaimThreadKind.KSWAPD: _RECLAIM_KSWAPD_CPU,
+    ReclaimThreadKind.KCOMPACTD: _RECLAIM_KCOMPACTD_CPU,
+})
+
+# The default for every injected ``cgroup_root`` seam, which every test overrides.
+_CGROUP_ROOT = CGROUP_ROOT
 
 _USER_MANAGER_PREFIX = 'user@'
 _DF_LEAF_GLOB = '*/df-*.slice'
@@ -372,20 +540,18 @@ class ProcessRecord:
 
     pid: int
     is_occt: bool
-    is_verify: bool
 
 
 def classify_process(info: Mapping[str, Any]) -> ProcessRecord:
     """Classify one process from its ``proc.info``.
 
     An unreadable command line is ``None`` there (psutil's value for an
-    AccessDenied attribute) and classifies as neither.
+    AccessDenied attribute) and is not occt.
     """
     cmdline = info.get('cmdline') or []
     return ProcessRecord(
         pid=info['pid'],
         is_occt=any('cargo-test-occt-gated' in part for part in cmdline),
-        is_verify=bool(cmdline) and os.path.basename(cmdline[0]) == 'verify.sh',
     )
 
 
@@ -395,37 +561,6 @@ def count_occt_queue_depth(
 ) -> int:
     """Count the occt processes still waiting on the semaphore (see the FD-9 heuristic)."""
     return sum(1 for record in records if record.is_occt and not fd9_exists(record.pid))
-
-
-def count_verify_concurrency(records: Iterable[ProcessRecord]) -> int:
-    return sum(1 for record in records if record.is_verify)
-
-
-def sum_verify_rss(verify_roots: Iterable[Any]) -> int:
-    """Sum RSS (bytes) over the verify roots and their descendants, each pid once.
-
-    ``children(recursive=True)`` already returns every descendant in one flat
-    pass, so no child is recursed into. A process that vanished or is denied
-    (``psutil.Error``) is skipped; any other error propagates.
-    """
-    import psutil
-
-    seen_pids: set[int] = set()
-    total = 0
-    for root in verify_roots:
-        try:
-            tree = [root, *root.children(recursive=True)]
-        except psutil.Error:
-            tree = [root]
-        for proc in tree:
-            if proc.pid in seen_pids:
-                continue
-            seen_pids.add(proc.pid)
-            try:
-                total += proc.memory_info().rss
-            except psutil.Error:
-                continue
-    return total
 
 
 def _default_fd9_exists(pid: int) -> bool:
@@ -439,21 +574,122 @@ def collect_process_metrics(
 ) -> Samples:
     """Return the process group's metrics from one process scan.
 
-    The scan requests only ``pid`` and ``cmdline``, each process is classified
-    once from ``proc.info``, and memory is read only for verify trees. A
-    per-process ``psutil.Error`` is skipped there; anything else, a failed
-    scan included, propagates to ``sampler.__main__``'s per-group handler.
+    The scan requests only ``pid`` and ``cmdline``, and each process is
+    classified once from ``proc.info``; no memory is read. A failed scan
+    propagates to ``sampler.sampler.collect_tick``'s degrade handler. Verify
+    runs are counted by their cgroup scopes instead (``collect_verify_scopes``).
     """
     import psutil
 
-    procs = list((proc_iter or psutil.process_iter)(['pid', 'cmdline']))
+    procs = (proc_iter or psutil.process_iter)(['pid', 'cmdline'])
     records = [classify_process(proc.info) for proc in procs]
-    verify_roots = [proc for proc, record in zip(procs, records, strict=True) if record.is_verify]
-    return {
-        _OCCT_QUEUE_DEPTH.key(): float(count_occt_queue_depth(records, fd9_exists)),
-        _VERIFY_CONCURRENCY.key(): float(count_verify_concurrency(records)),
-        _VERIFY_RSS_TOTAL_BYTES.key(): float(sum_verify_rss(verify_roots)),
+    return {_OCCT_QUEUE_DEPTH.key(): float(count_occt_queue_depth(records, fd9_exists))}
+
+
+# The consumer and verify-scope groups' cadence, and the consumer accounting's
+# nominal interval, which its gap rule (D3: more than two intervals) reads.
+_COLLECTION_DUE_SECONDS = 30
+
+_CONSUMERS_STATE_VERSION = 1
+
+
+def _encode_consumers_state(tree: TreeState, reclaim: ReclaimState) -> str:
+    return json.dumps(
+        {'version': _CONSUMERS_STATE_VERSION, 'tree': tree.to_json(), 'reclaim': reclaim.to_json()}
+    )
+
+
+def _decode_consumers_state(text: str | None) -> tuple[TreeState | None, ReclaimState | None]:
+    """The carried states; absent, corrupt or foreign text is none, so the collection is a gap."""
+    if text is None:
+        return None, None
+    try:
+        data = json.loads(text)
+        if data['version'] != _CONSUMERS_STATE_VERSION:
+            return None, None
+        return TreeState.from_json(data['tree']), ReclaimState.from_json(data['reclaim'])
+    except (ValueError, KeyError, TypeError):
+        return None, None
+
+
+def _consumer_samples(per_consumer: Mapping[Consumer, ConsumerFigures]) -> dict[SampleKey, float]:
+    samples: dict[SampleKey, float] = {}
+    for consumer, figures in per_consumer.items():
+        leaf = encode_consumer(consumer)
+        samples[_CONSUMER_MEMBERS.key(leaf)] = float(figures.members)
+        samples[_CONSUMER_READ_OK.key(leaf)] = float(figures.readable)
+        for figure, value in {**figures.gauges, **(figures.increments or {})}.items():
+            metric = FIGURE_METRICS[figure]
+            samples[metric.spec.key(leaf)] = float(value * metric.scale)
+    return samples
+
+
+def collect_consumers(
+    now: int,
+    previous_state: str | None,
+    *,
+    cgroup_root: Path = _CGROUP_ROOT,
+    proc_root: Path = PROC_ROOT,
+    meminfo_path: Path = MEMINFO,
+) -> Collected:
+    """The consumer group (PRD C1): every consumer's figures and the host-level ones.
+
+    Increments are taken against *previous_state*, the state the last written
+    collection carried, and the new state carries both the cgroup tree's and
+    the reclaim threads'. A host-level figure that could not be read is
+    absent, never 0.
+    """
+    tree_before, reclaim_before = _decode_consumers_state(previous_state)
+    accounting = account(
+        tree_before, read_tree(cgroup_root), now=now, nominal_interval=_COLLECTION_DUE_SECONDS
+    )
+    reclaim, reclaim_state = reclaim_increments(
+        reclaim_before,
+        read_reclaim_threads(proc_root),
+        now=now,
+        nominal_interval=_COLLECTION_DUE_SECONDS,
+    )
+    host_memory = read_host_memory_stat(cgroup_root)
+    host = {
+        _CONSUMER_INTERVAL: accounting.interval_seconds,
+        _HOST_ANON: host_memory.anon_bytes,
+        _HOST_FILE: host_memory.file_bytes,
+        _HOST_USED: read_host_used_bytes(meminfo_path),
+        **{_RECLAIM_METRICS[kind]: usec for kind, usec in (reclaim or {}).items()},
     }
+    samples = {
+        **_consumer_samples(accounting.per_consumer),
+        **{spec.key(): float(value) for spec, value in host.items() if value is not None},
+    }
+    return Collected(
+        MappingProxyType(samples), _encode_consumers_state(accounting.state, reclaim_state)
+    )
+
+
+def _is_verify_scope(segments: tuple[str, ...]) -> bool:
+    return bool(segments) and parse_verify_scope_unit(segments[-1]) is not None
+
+
+def collect_verify_scopes(
+    _now: int, _previous_state: str | None, *, cgroup_root: Path = _CGROUP_ROOT
+) -> Collected:
+    """The verify-scope group: live ``df-verify-*.scope`` cgroups, in either placement.
+
+    A scope is recognised only by ``shared.verify_scope_tag``, from a listing
+    of the tree, and only the scopes' own files are read. Their memory is
+    written only when every live scope's could be read, so it is never an
+    undercount.
+    """
+    scopes = read_cgroups(_is_verify_scope, cgroup_root).values()
+    memory = [
+        figure for reading in scopes
+        if isinstance(reading, CgroupReading)
+        and (figure := Figure.MEMORY.source(reading)) is not None
+    ]
+    samples = {_VERIFY_SCOPES_LIVE.key(): float(len(scopes))}
+    if len(memory) == len(scopes):
+        samples[_VERIFY_SCOPE_MEMORY.key()] = float(sum(memory))
+    return Collected(MappingProxyType(samples))
 
 
 def _metric_table(*groups: MetricGroup) -> tuple[MetricGroup, ...]:
@@ -470,7 +706,7 @@ def _metric_table(*groups: MetricGroup) -> tuple[MetricGroup, ...]:
 METRIC_GROUPS: tuple[MetricGroup, ...] = _metric_table(
     MetricGroup(
         GroupName.PSI,
-        collect=collect_psi,
+        collect=every_tick(collect_psi),
         metrics=(
             _PSI_CPU_SOME, _PSI_CPU_FULL,
             _PSI_MEM_SOME, _PSI_MEM_FULL,
@@ -480,21 +716,44 @@ METRIC_GROUPS: tuple[MetricGroup, ...] = _metric_table(
     ),
     MetricGroup(
         GroupName.PROCESS,
-        collect=collect_process_metrics,
-        metrics=(_OCCT_QUEUE_DEPTH, _VERIFY_CONCURRENCY, _VERIFY_RSS_TOTAL_BYTES),
+        collect=every_tick(collect_process_metrics),
+        metrics=(_OCCT_QUEUE_DEPTH,),
         windowed=True,
     ),
     MetricGroup(
         GroupName.LOAD,
-        collect=collect_load_metrics,
+        collect=every_tick(collect_load_metrics),
         metrics=(_RUNQUEUE_RATIO, _RUNQUEUE_READ_OK, _OWN_CPU_SOME10, _OWN_READ_OK),
         windowed=True,
+    ),
+    MetricGroup(
+        GroupName.CONSUMERS,
+        collect=collect_consumers,
+        metrics=(
+            _CONSUMER_MEMBERS, _CONSUMER_READ_OK,
+            *(metric.spec for metric in FIGURE_METRICS.values()),
+            _CONSUMER_INTERVAL, *_RECLAIM_METRICS.values(),
+            _HOST_ANON, _HOST_FILE, _HOST_USED,
+        ),
+        windowed=False,
+        due_seconds=_COLLECTION_DUE_SECONDS,
+        logs_rows=False,
+    ),
+    MetricGroup(
+        GroupName.VERIFY_SCOPES,
+        collect=collect_verify_scopes,
+        metrics=(_VERIFY_SCOPES_LIVE, _VERIFY_SCOPE_MEMORY),
+        windowed=False,
+        due_seconds=_COLLECTION_DUE_SECONDS,
     ),
 )
 """The sampler's one metric table, in collection order.
 
-A complete tick writes one row per exact name of every group, plus one row
-per per-leaf name for each cgroup leaf discovered that tick.
+Every tick, the PSI, process and load groups write one row per exact name,
+plus one row per per-leaf name for each cgroup leaf discovered that tick.
+Every 30 seconds the verify-scope group writes its two names, and the
+consumer group writes, per consumer, its gauges, member count and readability
+flag, its increments unless the interval is a gap, and its host-level names.
 """
 
 

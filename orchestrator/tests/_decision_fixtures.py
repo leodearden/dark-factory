@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from orchestrator import decision_registry as dr
+from orchestrator import session_records
 from orchestrator import session_registry as sr
 
 
@@ -163,12 +164,12 @@ def file_from_a_linked_session(
     only while the record names that pid as its owner, so that is the one
     field set beyond the mandatory ones.
     """
-    record = sr.SessionRecord(
+    record = session_records.SessionRecord(
         session_slug='linked-watcher-record',
-        status=sr.Status.LAUNCHING,
+        status=session_records.Status.LAUNCHING,
         start_ts='2026-07-07T00:00:00+00:00',
         claude_owner_pid=pid,
     )
-    sr.write_record(record, root=root)
-    sr.write_session_pointer(pid, 'linked-watcher-record', root=root)
+    session_records.write_record(record, root=root)
+    session_records.write_session_pointer(pid, 'linked-watcher-record', root=root)
     monkeypatch.setenv('CLAUDE_PID', str(pid))

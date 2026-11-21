@@ -196,8 +196,8 @@ class TestDisallowListForAmendAndEpisodeTools:
         recon call site and exercise (not dodge) `build_claude_argv`'s
         schema-wildcard branch (the `'*'` -> `--tools ''` substitution, which
         removes built-in and deferred tools but not MCP). That branch only
-        rewrites disallowed_tools when '*' is present; DISALLOW_BUILTIN (['Bash', 'Edit', 'Write',
-        'NotebookEdit']) carries no '*', so STAGE3_DISALLOWED renders as a
+        rewrites disallowed_tools when '*' is present; DISALLOW_BUILTIN carries
+        no '*', so STAGE3_DISALLOWED renders as a
         straight passthrough here — confirmed against today's code.
         """
         from shared.cli_invoke import build_claude_argv

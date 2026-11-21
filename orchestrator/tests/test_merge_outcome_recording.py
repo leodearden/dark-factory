@@ -14,7 +14,6 @@ from _git_fixtures import seed_repo
 from _merge_lane_fakes import (
     FakeVerifier,
     fails,
-    healthy_verify_clock,
     lane_scene_config,
     make_lane,
     merge_through_lane,
@@ -144,7 +143,7 @@ class TestPostMergeVerifyBlocksAreTyped:
         req = await _prepare(git_ops, config, 'vf', 'vf.py', 'x = 1\n')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         verifier = FakeVerifier(scripts={'vf': fails(category=category, summary='orchestrator')})
-        lane = make_lane(git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue, verifier=verifier)
 
         outcome = await merge_through_lane(lane, queue, req)
 
@@ -240,7 +239,7 @@ async def _conflict_through_lane(
 ) -> tuple[MergeOutcome, dict[str, object]]:
     """Land conf-a, then finalize conf-b's add/add conflict; its outcome and conflict row data."""
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    lane = make_lane(git_ops, queue, event_store=store, clock=healthy_verify_clock())
+    lane = make_lane(git_ops, queue, event_store=store)
     # Both cut before either lands, so each ADDS clash.py: an add/add conflict.
     first = await _prepare(git_ops, config, 'conf-a', 'clash.py', 'x = 1\n')
     second = await _prepare(git_ops, config, 'conf-b', 'clash.py', 'x = 2\n')

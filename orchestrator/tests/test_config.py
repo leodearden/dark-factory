@@ -1029,6 +1029,17 @@ class TestLayeredConfig:
         assert config.effort.architect == 'xhigh'
         assert config.max_turns.architect == 180
 
+    @pytest.mark.parametrize('role', ['implementer', 'debugger', 'merger', 'deep_reviewer'])
+    def test_packaged_effort_default_is_xhigh(self, tmp_path, role):
+        """A project config with no effort block resolves these roles to xhigh."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({'max_concurrent_tasks': 8}))
+        config = load_config(project_cfg)
+        assert getattr(config.effort, role) == 'xhigh'
+
+    def test_effort_config_deep_reviewer_field_default_is_xhigh(self):
+        assert EffortConfig().deep_reviewer == 'xhigh'
+
     def test_deep_merge_preserves_sibling_keys(self, tmp_path):
         """Overriding one key in a nested dict should not clobber siblings."""
         project_cfg = tmp_path / 'config.yaml'
@@ -1273,19 +1284,18 @@ class TestMergeVerifyStormGuardFields:
 
 @pytest.mark.usefixtures("code_default_config")
 class TestMergeVerifyBreadthConfig:
-    """merge_verify_breadth (λ): restart-only knob gating the broad merge gate.
+    """merge_verify_breadth: restart-only knob setting the merge gate's breadth.
 
-    Default 'scoped' preserves legacy per-touched-module verify behaviour
-    (byte-identical rollback path). 'full' — flipped later by the σ
-    capstone — runs every REGISTERED module's full suite at merge-role
-    verify. See config.py's merge_verify_breadth field for the restart-only
-    rationale (task point 3 / design decision: mid-process flips could split
-    behaviour across an in-flight merge on the most load-bearing lane).
+    The shipped default is 'full' (task 7008): merge-role verify runs every
+    REGISTERED module's full suite. 'scoped' is the explicit per-project
+    opt-down to the legacy per-touched-module plan. The knob is restart-only
+    because a mid-process flip could split behaviour across an in-flight
+    merge on the most load-bearing lane. The paired task/merge verify policy
+    is stated once, in defaults.yaml's merge_verify_breadth comment.
     """
 
-    def test_defaults_to_scoped(self):
-        config = OrchestratorConfig()
-        assert config.merge_verify_breadth == 'scoped'
+    def test_pydantic_field_defaults_to_full(self):
+        assert OrchestratorConfig.model_fields['merge_verify_breadth'].default == 'full'
 
     def test_full_override_accepted(self):
         config = OrchestratorConfig(merge_verify_breadth='full')
@@ -1304,13 +1314,13 @@ class TestMergeVerifyBreadthConfig:
         """
         assert 'merge_verify_breadth' not in RELOADABLE_FIELDS, (
             'merge_verify_breadth requires a process restart to take effect '
-            '(flipped by the σ capstone, activated by the τ fleet restart) '
+            '(a mid-process flip could split an in-flight merge\'s breadth) '
             'and must NOT be in RELOADABLE_FIELDS'
         )
 
-    def test_defaults_yaml_carries_scoped(self, tmp_path):
+    def test_defaults_yaml_carries_full(self, tmp_path):
         """The shipped defaults.yaml explicitly carries merge_verify_breadth:
-        scoped (same guard pattern as test_defaults_yaml_has_park_stop_block
+        full (same guard pattern as test_defaults_yaml_has_park_stop_block
         above), and that value flows through both a bare OrchestratorConfig()
         and load_config() over an otherwise-empty explicit config file.
         """
@@ -1318,13 +1328,26 @@ class TestMergeVerifyBreadthConfig:
         assert 'merge_verify_breadth' in defaults, (
             "defaults.yaml is missing 'merge_verify_breadth'"
         )
-        assert defaults['merge_verify_breadth'] == 'scoped'
+        assert defaults['merge_verify_breadth'] == 'full'
 
         config = OrchestratorConfig()
-        assert config.merge_verify_breadth == 'scoped'
+        assert config.merge_verify_breadth == 'full'
 
         config_path = tmp_path / 'config.yaml'
         config_path.write_text(yaml.dump({'project_root': str(tmp_path)}))
+        loaded = load_config(config_path)
+        assert loaded.merge_verify_breadth == 'full'
+
+    def test_project_yaml_scoped_opts_down(self, tmp_path):
+        """A project yaml declaring merge_verify_breadth: scoped beats the
+        shipped 'full' default through the real layered load path
+        (defaults.yaml under the project file).
+        """
+        config_path = tmp_path / 'config.yaml'
+        config_path.write_text(yaml.dump({
+            'project_root': str(tmp_path),
+            'merge_verify_breadth': 'scoped',
+        }))
         loaded = load_config(config_path)
         assert loaded.merge_verify_breadth == 'scoped'
 
@@ -2562,6 +2585,25 @@ class TestPinReservationConfig:
 
         assert 'pin_reservations_enabled' in report['applied']
         assert live.pin_reservations_enabled is False
+
+
+class TestMainHealthFixReservedSlotsConfig:
+    """Run slots outside max_concurrent_tasks that only a main-health fix may take (task 8480)."""
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_one_slot_is_reserved_by_default(self):
+        assert OrchestratorConfig().main_health_fix_reserved_slots == 1
+
+    def test_zero_disables_the_reserve(self):
+        assert OrchestratorConfig(main_health_fix_reserved_slots=0).main_health_fix_reserved_slots == 0
+
+    def test_a_negative_reserve_is_rejected(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(main_health_fix_reserved_slots=-1)
+
+    def test_the_reserve_is_restart_only(self):
+        """The run loop builds its RunSlots once, like the max_concurrent_tasks pool beside it."""
+        assert 'main_health_fix_reserved_slots' not in RELOADABLE_FIELDS
 
 
 class TestTransientRequeueBackoffConfig:

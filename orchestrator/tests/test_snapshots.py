@@ -293,7 +293,7 @@ class TestEvalWorktreeHermeticity:
 
 
 class TestRunCleanupRelocated:
-    """cli._run_cleanup must discover eval worktrees at the RELOCATED root."""
+    """evals.cli._run_cleanup must discover eval worktrees at the RELOCATED root."""
 
     def test_cleanup_removes_relocated_worktree(
         self, tmp_repo: tuple[Path, str, str]
@@ -307,7 +307,7 @@ class TestRunCleanupRelocated:
         """
         from types import SimpleNamespace
 
-        from orchestrator.cli import _run_cleanup
+        from orchestrator.evals.cli import _run_cleanup
 
         repo, first, _second = tmp_repo
 
@@ -324,7 +324,7 @@ class TestRunCleanupRelocated:
             _run_cleanup(SimpleNamespace(project_root=repo))
 
             assert not worktree_path.exists(), (
-                'cli._run_cleanup did not remove the relocated eval worktree'
+                'evals.cli._run_cleanup did not remove the relocated eval worktree'
             )
         finally:
             subprocess.run(

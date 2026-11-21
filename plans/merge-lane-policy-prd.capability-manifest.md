@@ -55,10 +55,10 @@ rows (PRD §7); ι is the readout gate that proves the whole chain through the r
 | Head adoption path | `worker.py::_adopt_head_on_tip_authority`, `_land_chain_prefix` | PASS |
 | Link reservation | task 7720 (pending, upstream of ε). The lane-leak fix 7721 and the off-loop build 7824 were upstream of ε until 2026-11-10 and now follow it (PRD §8, note under ε) | PASS (producer upstream) |
 
-## ζ — bisect, depth table, kill switch
+## ζ — depth table, kill switch
 | Capability | Binding | Verdict |
 |---|---|---|
-| Halving state and its two writers | `worker.py::_chain_halving_state`, `next_halving_state`, `_note_chain_outcome` | PASS |
+| Halving state and its two writers, bound on main `72239dfd5d` and deleted by ζ | `worker.py::_chain_halving_state`, `next_halving_state`, `_note_chain_outcome` | PASS |
 | Config class, green-tier | `config.py::MergeDeepConfig` (`chain_cap`), `RELOADABLE_FIELDS` | PASS |
 | `merge_deep.depth_table` is delivered | built here; mechanical grep, absent today | PASS |
 

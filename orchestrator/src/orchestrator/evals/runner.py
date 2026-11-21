@@ -26,7 +26,6 @@ from orchestrator.config import (
     OrchestratorConfig,
     PriceEntry,
     RoutingConfig,
-    SandboxConfig,
 )
 from orchestrator.git_ops import GitOps
 from orchestrator.implementer_brief_variant import execute_iteration_cap
@@ -50,6 +49,7 @@ from .architect_eval import (
     open_eval_artifacts,
     read_reference_diff,
 )
+from .cell_sandbox import CellSandbox, bind_cell_sandbox_backend
 from .configs import (
     EVAL_CONFIGS,
     JUDGE_OFAT_IMPLEMENTER_PIN,
@@ -63,6 +63,7 @@ from .eval_gate import (
     campaign_usage_gate,
     owned_usage_gate,
 )
+from .fixture_agent_env import fixture_role_env_overrides
 from .fixture_gate import fixture_task_gate, run_fixture_gate
 from .hermeticity import (
     NO_PRODUCTION_WRITERS,
@@ -219,13 +220,23 @@ def build_eval_orch_config(
     ``snapshots._eval_setup_env`` reads from the SAME ``project_root`` (task
     2875, reverting task 2851's worktree-sourced pin). See the BUG 2a comment
     below.
+
+    A fixture from a project other than the base's runs with that project's
+    ``role_env_overrides`` in place of the base's, never merged with them, and
+    one that would outrank the candidate's ``env_overrides`` is refused
+    (``evals/fixture_agent_env.py``).
     """
     if base_config is None:
         raise ValueError('build_eval_orch_config requires an explicit base_config')
     # Re-rooted BEFORE profiling, so the profile's eval-root leaves resolve
     # against the fixture's project, the project its worktree is cut from.
     project_root = Path(task.get('project_root', str(base_config.project_root)))
-    base = base_config.model_copy(update={'project_root': project_root})
+    base = base_config.model_copy(update={
+        'project_root': project_root,
+        'role_env_overrides': fixture_role_env_overrides(
+            base_config, project_root, config.env_overrides,
+        ),
+    })
 
     # Architect pin: opus/claude/high by default (frozen-plan + plan-only paths),
     # or derived from architect_config for the both-live end-to-end run (μ). When
@@ -302,7 +313,6 @@ def build_eval_orch_config(
         'test_command': task.get('verify_commands', {}).get('test', base.test_command),
         'lint_command': task.get('verify_commands', {}).get('lint', base.lint_command),
         'type_check_command': task.get('verify_commands', {}).get('typecheck', base.type_check_command),
-        'sandbox': SandboxConfig(enabled=False),
         'env_overrides': config.env_overrides,
         'implementer_brief_variant': config.harness_variant,
         'routing': _admit_claude_role_models(profiled.routing, models, backends),
@@ -582,6 +592,7 @@ async def _run_workflow_cell(
     worktree, run_id = await _open_cell_worktree(task, worktree)
     address = CellName(task['id'], label, run_id)
     orch_config = build_orch_config()
+    sandbox_backend = bind_cell_sandbox_backend(orch_config)
     replay_frame = REPLAY_FRAME_ID if replay_framed else None
     async with owned_usage_gate(usage_gate, orch_config, label=cell) as gate:
         workflow = _cell_workflow(
@@ -594,6 +605,7 @@ async def _run_workflow_cell(
         wall_clock_ms = int(time.monotonic() * 1000) - start_ms
         metrics = await _cell_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
+            sandbox_backend=sandbox_backend,
         )
         result = EvalResult(
             task_id=address.task_id,
@@ -702,15 +714,20 @@ async def _cell_metrics(
     *,
     role: RoleUnderTest,
     replay_frame: str | None,
+    sandbox_backend: CellSandbox,
 ) -> dict[str, Any]:
     """The cell's metrics; a collection that raised leaves only the stamps the executor knows."""
     try:
         metrics = await collect_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
+            sandbox_backend=sandbox_backend,
         )
     except Exception as e:
         logger.warning(f'Metric collection failed: {e}')
-        return {'role_under_test': role, 'replay_frame': replay_frame}
+        return {
+            'role_under_test': role, 'replay_frame': replay_frame,
+            'sandbox_backend': sandbox_backend,
+        }
     return metrics.to_dict()
 
 
@@ -721,8 +738,9 @@ async def collect_metrics(
     *,
     role: RoleUnderTest,
     replay_frame: str | None = None,
+    sandbox_backend: CellSandbox,
 ) -> EvalMetrics:
-    """Collect metrics from a completed workflow run, stamped with *role* and *replay_frame*."""
+    """Collect metrics from a completed workflow run, stamped with *role*, *replay_frame* and *sandbox_backend*."""
     wf_metrics = workflow.metrics
 
     # Plan completion
@@ -800,6 +818,7 @@ async def collect_metrics(
         is_local_model=is_local,
         role_under_test=role,
         replay_frame=replay_frame,
+        sandbox_backend=sandbox_backend,
     )
     # False-green guard — catches the 404-bug signature so the same class of
     # silent failure doesn't need manual quarantine in future runs.
@@ -1497,6 +1516,7 @@ class RecordingMemorySink:
 
 
 if __name__ == '__main__':
-    from orchestrator.cli import eval_cmd, load_program_dotenv
+    from orchestrator.cli_config import load_program_dotenv
+    from orchestrator.evals.cli import eval_cmd
     load_program_dotenv()
     eval_cmd()

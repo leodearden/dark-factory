@@ -38,7 +38,7 @@ from review_all_program_fixture import (
     FIXTURE_DIR,
     PROGRAM_DIR,
     REPO_ROOT,
-    load_session_registry,
+    load_session_records,
     running_fake_store,
 )
 from review_all_program_seeded_run import StoreCopy
@@ -520,8 +520,8 @@ def test_a_spawned_author_brief_records_the_session_and_prints_one_pointer_promp
     assert SPAWN_SCRIPT.is_file()
     text = brief_path.read_text(encoding='utf-8')
     spawn = '\n'.join(section(text, _section_heading('SPAWN')))
-    registry = load_session_registry()
-    for outcome in (registry.ResultOutcome.IN_PROGRESS, *registry.TERMINAL_RESULT_OUTCOMES):
+    records = load_session_records()
+    for outcome in (records.ResultOutcome.IN_PROGRESS, *records.TERMINAL_RESULT_OUTCOMES):
         assert f'`{outcome}`' in spawn, outcome
     assert str(run.home / 'inbox' / 'S1.author.json') in spawn
     assert example_of(text)['session'] == {'kind': 'spawn', 'title': S1_TITLE}

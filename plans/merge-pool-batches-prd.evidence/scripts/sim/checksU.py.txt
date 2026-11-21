@@ -1,0 +1,65 @@
+"""Checks for rule U: going cost against the second run's analytic optimum, losslessness
+against the depth table, q = 0, and e = 0 safety."""
+import sys
+from multiprocessing import Pool
+sys.path.insert(0, '/tmp/gate-10069/sim')
+import lane as L, analytic as AN
+U = lambda **kw: dict(base='U', **kw)
+
+def depth_U(p, e, A, follow_one, kmax=12, w=0, D=1):
+    """Batch depth rule U picks for fresh requests all at p (nothing ahead)."""
+    a = lambda x: A[min(len(A) - 1, int(round(x * (len(A) - 1))))]
+    def C(k):
+        R = 1 - (1 - p) ** k * (1 - e)
+        if k == 1:
+            return 1 + w * R * D
+        return 1 + R * k * (1.0 if follow_one else a(min(1.0, p / R))) + w * R * D
+    k = 1
+    while k < kmax and C(k + 1) - C(k) < a(p):
+        k += 1
+    return k
+
+def work(a):
+    name, sp, cx, q, s = a
+    cfg = dict(q=q, e=0.0, dur='W1', closed_N=75, horizon=144.0, warm=24.0, restarts=bool(s % 2)); cfg.update(cx)
+    m, eng = L.run_one(cfg, (name, sp), s, log=True)
+    R = eng.reqs
+    assert eng.n_live == len(R) - sum(1 for r in R if r.state == 'done')
+    return name, m['conv_good'], m['conv_bad'], m['block_good'], m['bad_landed'], m['landings'], m['size_hist']
+
+if __name__ == '__main__':
+    print('== going cost a(p) at p = q (policy e 0.009, theta 0.9, k <= 12) against the second run (verifies per ITEM resolved, e = 0.009) ==')
+    print('q | a(q) as specified [k] | a(q) with the last-member credit [k] | Dorfman per item at its optimum | second-run closed form per item: one-at-a-time, sub-batch 0.5 (release on block, elimination where theta allows)')
+    for q in (0.03, 0.05, 0.08, 0.14, 0.20):
+        A, K = L.going_cost(0.009, 0.9, 12, False, False); Ae, Ke = L.going_cost(0.009, 0.9, 12, True, False)
+        i = int(round(q * (len(A) - 1)))
+        el = AN.elim_on(q, 0.009)
+        dorf = min(1 / k + 1 - (1 - q) ** k * (1 - 0.009) for k in range(2, 25))
+        one = min(L.cycle_ratio(k, q, 0.009, 'one', 0.5, el, per='item') for k in range(1, 25))
+        spl = min(L.cycle_ratio(k, q, 0.009, 'split', 0.5, el, per='item') for k in range(1, 25))
+        print('%.2f | %.3f [%d] | %.3f [%d] | %.3f | %.3f, %.3f' % (q, A[i], K[i], Ae[i], Ke[i], dorf, one, spl))
+    print('\n== losslessness: every request at one prior, a(p\') forced to 1 (each member of a red batch alone) ==')
+    print('estimate (1-p) | table depth | U depth, e=0 | U depth, e=0.009')
+    ests = [0.75, 0.80, 0.876, 0.90, 0.934, 0.95, 0.959, 0.965, 0.972, 0.975, 0.979, 0.982, 0.984, 0.986, 0.988, 0.989, 0.990, 0.991, 0.992, 0.995]
+    for est in ests:
+        p = 1 - est
+        A0, _ = L.going_cost(0.0, 0.9, 12, False, True); A9, _ = L.going_cost(0.009, 0.9, 12, False, True)
+        print('%.3f | %d | %d | %d' % (est, L.table_row(est, L.TABLE_NEW), depth_U(p, 0.0, A0, True), depth_U(p, 0.009, A9, True)))
+    print('  depth U picks with its own going cost (nested follow-up), w=0 / w=1, e=0.009: ' + ' ; '.join(
+        'q=%.2f: %d / %d' % (q, depth_U(q, 0.009, L.going_cost(0.009, 0.9, 12, False, False)[0], False), depth_U(q, 0.009, L.going_cost(0.009, 0.9, 12, False, False)[0], False, w=1)) for q in (0.03, 0.05, 0.08, 0.14, 0.20)))
+    VAR = [('U w0', U(), {}), ('U w1', U(w=1), {}), ('U w1 elim', U(w=1, elim=True), {}), ('U w1 no deferral', U(w=1, defer=False), {}),
+           ('U w1 base by cost, narrow+pool', U(w=1, ubase='cost'), dict(cascade='narrow', reverify='pool')),
+           ('U w1 base by cost, today+chain', U(w=1, ubase='cost'), dict(cascade='all', reverify='chain')),
+           ('U w0 base by cost, narrow+chain', U(ubase='cost'), dict(cascade='narrow', reverify='chain')),
+           ('U w1 base by cost, today+pool', U(w=1, ubase='cost'), dict(cascade='all', reverify='pool'))]
+    with Pool(4) as pool:
+        res = pool.map(work, [(n, sp, cx, q, s) for n, sp, cx in VAR for q in (0.03, 0.08, 0.14, 0.20) for s in range(8)], chunksize=4)
+        print('\n== e = 0, no main-red; 32 runs per row (4 q x 8 seeds, restarts on in half) ==')
+        print('variant | wrong convictions | right convictions | good blocked | bad landed')
+        for n, _, _ in VAR:
+            rows = [r for r in res if r[0] == n]
+            print('%-34s | %d | %d | %d | %d' % (n, sum(r[1] for r in rows), sum(r[2] for r in rows), sum(r[3] for r in rows), sum(r[4] for r in rows)))
+        res = pool.map(work, [(n, sp, {}, 0.0, s) for n, sp in (('U w0', U(prior=1e-9)), ('U w1', U(w=1, prior=1e-9))) for s in range(4)])
+        for n in ('U w0', 'U w1'):
+            sh = [sum(r[6][i] for r in res if r[0] == n) for i in range(26)]
+            print('q = 0, %s: batch sizes %s' % (n, {i: sh[i] for i in range(26) if sh[i]}))

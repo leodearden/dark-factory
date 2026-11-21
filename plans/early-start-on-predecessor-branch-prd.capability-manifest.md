@@ -34,8 +34,8 @@ Signal leaves: T8 and T9 (T9 carries the end-to-end proof if T8 closed without a
   - delivered_check: grep present, pattern `[Ss]uccessor`, paths `orchestrator/src/orchestrator/lock_table.py`
 - `successor-of-on-lock-event` → built here; lock_acquired for the dependent carries successor_of (contract, Events). **PASS**.
   - delivered_check: grep present, pattern `successor_of`, paths `orchestrator/src/orchestrator/scheduler.py`
-- `early-start-config-group` → built here; the early_start group with its eight keys, enabled off in the code until T7 (contract, Config). **PASS**.
-  - delivered_check: grep present, pattern `max_stops_per_pair`, paths `orchestrator/src/orchestrator/config.py`
+- `early-start-config-group` → built here; the early_start group with its seven keys, enabled off in the code until T7 (contract, Config). **PASS**.
+  - delivered_check: grep present, pattern `stop_streak_pause`, paths `orchestrator/src/orchestrator/config.py`
 - `early-start-group-hot-reloadable` → built here; early_start added to RELOADABLE_FIELDS (contract, Config: hot-reloadable). **PASS**.
   - delivered_check: grep present, pattern `["']early_start["']`, paths `orchestrator/src/orchestrator/config.py`
 - `early-start-dependency-answer` → built here; deps_verdict's opt-in input of waiting predecessors and its not-satisfied answer naming the predecessor (contract, Dependency test). **PASS**.
@@ -54,7 +54,7 @@ Signal leaves: T8 and T9 (T9 carries the end-to-end proof if T8 closed without a
 - `own-delta-rule` → `grep:orchestrator/src/orchestrator/git_ops.py::GitOps.own_delta_upstream` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._solo_upstream` wired: the merge queue's use of the one rule that knows stack bases. **PASS**.
 - `own-work-readers` → `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._own_work_base` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._review` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._context_complete_review_subject` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._detect_committed_branch_work` `grep:orchestrator/src/orchestrator/branch_base.py::own_work_base` wired: review and the scope readers all take their range from _own_work_base. **PASS**.
 - `replay-that-aborts` → `grep:orchestrator/src/orchestrator/branch_stack.py::rebase_own_delta` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._rebase_off_base` wired: replays the commits after cut onto a named commit and aborts on a conflict. **PASS**.
-- `worktree-reuse-routes` → `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._reattach_cold_worktree` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._reuse_warm_lane` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._rebase_requeued_onto_main` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps.acquire_warm_lane` `grep:orchestrator/src/orchestrator/rebase_recovery.py::guarded_abort` the reuse routes that rebase an existing branch onto main today, the warm-worktree acquire a stacked worktree must skip, and the abort whose failure is only logged. **PASS**.
+- `worktree-reuse-routes` → `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._reattach_cold_worktree` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._reuse_warm_lane` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._rebase_requeued_onto_main` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps.acquire_warm_lane` `grep:orchestrator/src/orchestrator/rebase_recovery.py::guarded_abort` the reuse routes that rebase an existing branch onto main today, the warm-worktree acquire a stacked worktree goes through, and the abort whose failure is only logged. **PASS**.
 - `re-stack-in-reuse-routes` → built here; given the stack input on an existing branch each reuse route commits work in progress, cuts the own commits with the own_delta_upstream rule, replays them onto the named commit and re-records the base; a conflict, a refused start and a failed abort are told apart; a trial that touches nothing (section 5.3). **PASS**.
   - delivered_check: grep present, pattern `[Rr]estack|RESTACK|[^p]re_stack`, paths `orchestrator/src/orchestrator/`
 - `stacked-create-worktree-writes-and-reads-back-record` → built here; create_worktree takes a stack-on-commit input, writes the ledger record before returning and returns the base; the train path uses it (closes task 7660). **PASS**.
@@ -63,8 +63,8 @@ Signal leaves: T8 and T9 (T9 carries the end-to-end proof if T8 closed without a
   - delivered_check: manual. Needed because StackBaseLedger.base_of folds a git error into None today; the name is the architect's.
 - `own-work-through-stack-rule` → built here; _own_work_base answers through own_delta_upstream when the branch has a ledger record (test 28). **PASS**.
   - delivered_check: manual. own_delta_upstream already appears in workflow.py, so a grep would be green before T2 lands.
-- `stacked-worktree-is-cold` → built here; a stacked worktree is never taken from the warm-worktree pool (section 5.3). **PASS**.
-  - delivered_check: manual. An exclusion in create_worktree; test 47 (iii) and the T2a signal prove it.
+- `stacked-worktree-through-warm-pool` → built here; a stacked worktree comes from the warm-worktree pool where the project has one, with the record written and read back on that route; declared-train successors stay out (section 5.3). **PASS**.
+  - delivered_check: manual. Behavioural; tests 50 and 47 (iii) prove it.
 - `reuse-routes-un-stack-without-stack-input` → built here; without a stack input all three reuse routes un-stack before a rebase onto main, the registered cold worktree included. **PASS**.
   - delivered_check: manual. Behavioural; proved on a real repository.
 
@@ -172,9 +172,7 @@ Signal leaves: T8 and T9 (T9 carries the end-to-end proof if T8 closed without a
   - delivered_check: grep present, pattern `\.stop_hard_cancel_secs`, paths `orchestrator/src/orchestrator/`
 - `stop-not-counted-and-shutdown-excluded` → built here; the stop is a requeue that does not count; a shutdown emits and counts nothing. **PASS**.
   - delivered_check: manual. Behavioural (tests 22, 31); no name marks it.
-- `stops-per-pair-refusal` → built here; the selection refuses a dependent with max_stops_per_pair early_start_stopped events for the pair (stop_limit, test 45); the count is read from the events. **PASS**.
-  - delivered_check: grep present, pattern `\.max_stops_per_pair`, paths `orchestrator/src/orchestrator/`
-- `work-in-progress-committed-at-stop` → built here; the stop commits the dependent's uncommitted work before the workflow exits (test 48). **PASS**.
+- `work-in-progress-committed-at-stop` → built here; the stop commits the dependent's uncommitted work before the workflow exits, and a warm worktree is released only after that commit (test 48). **PASS**.
   - delivered_check: manual. Behavioural; test 48 proves it.
 - `unknown-at-slot-end-re-asked` → built here; an unknown answer at slot end is asked again on the timer, with one escalation after unknown_streak_alert in a row (test 18 (i)). **PASS**.
   - delivered_check: manual. Behavioural; the alert key is checked at T6c.

@@ -2,7 +2,7 @@
 
 This file pins the harness's structural behaviour only: the nested session runs
 against its own copy of ``df_pytest_isolation`` in its own rootdir, the conftest
-template binds what it names, and the harness refuses inputs that would void
+template arms what it names, and the harness refuses inputs that would void
 that isolation. The guard modules' end-to-end classes, which drive every real
 nested run, remain the main regression detectors for it.
 """
@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from nested_pytest_session import (
     NESTED_SESSION_TIMEOUT_SECS,
-    binding_conftest,
+    arming_conftest,
     run_nested_pytest,
 )
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -45,11 +45,11 @@ def test_the_session_imports_the_copy_not_the_repo_module():
     assert copy.parent == HERE
 
 
-def test_setup_is_spliced_in_before_the_binding():
+def test_setup_is_spliced_in_before_the_arming():
     assert sys.modules['df_pytest_isolation'].HARNESS_SPLICE_PROBE == 'spliced'
 
 
-def test_the_binding_registers_the_named_fixture(request):
+def test_the_arming_registers_the_named_fixture(request):
     assert '_df_fleet_dir_redirect' in request.fixturenames
 '''
 
@@ -74,11 +74,11 @@ def _listing(root: Path) -> list[str]:
     return sorted(str(p.relative_to(root)) for p in root.rglob('*'))
 
 
-def test_a_bound_session_runs_against_its_own_copy_in_its_own_tree(tmp_path: Path) -> None:
+def test_an_armed_session_runs_against_its_own_copy_in_its_own_tree(tmp_path: Path) -> None:
     result = run_nested_pytest(
-        tmp_path / 'bound',
+        tmp_path / 'armed',
         {
-            'conftest.py': binding_conftest('_df_fleet_dir_redirect', setup=_PROBE_SETUP),
+            'conftest.py': arming_conftest('_df_fleet_dir_redirect', setup=_PROBE_SETUP),
             'test_probe.py': _PROBE_TESTS,
         },
     )

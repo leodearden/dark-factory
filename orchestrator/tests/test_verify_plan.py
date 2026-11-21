@@ -32,6 +32,7 @@ from _verify_config_corpus import (
     DASHBOARD_LINT_COMMAND,
     FM_LINT_COMMAND,
     MODULE_LINT_COMMANDS,
+    ROOT_LINT_CHECKER_CLAUSE,
     ROOT_LINT_COMMAND,
     ROOT_TEST_COMMAND,
     ROOT_TYPE_CHECK_COMMAND,
@@ -1461,10 +1462,7 @@ class TestScoperTrailingClausePreservation:
         """dark-factory-orchestrator.yaml::lint_command — the fallback path's own command."""
         scoped = _scope_to_keyword(ROOT_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
-            'uv run ruff check fused-memory/tests/test_harness.py'
-            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
-            ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-            ' sampler/tests cockpit/tests client-feed/tests'
+            f'uv run ruff check fused-memory/tests/test_harness.py && {ROOT_LINT_CHECKER_CLAUSE}'
         )
 
     def test_trailing_value_flag_still_truncates_at_the_keyword(self):
@@ -1714,15 +1712,18 @@ class TestDroppedChainClausesAreLogged:
     # (raw, keyword, dropped-clause count, expected level)
     #
     # The two root configs are the regression cases, and their counts are the
-    # SEGMENT DELTA across the retained prefix (measured, not assumed): the
-    # type-check chain is 16 segments retaining 2, the test chain 19 retaining
-    # 2. Both were over-reported by one when the count was taken over the whole
-    # original. The root `test_command` was additionally absent from this list
-    # entirely, which is exactly what let it emit at INFO claiming a dropped
-    # sibling check when every clause it drops is a pytest fan-out.
+    # SEGMENT DELTA across the retained prefix. Every top-level ` && ` is a
+    # clause boundary for the quote-only splitter (neither chain carries a
+    # quoted `&&`; the cockpit subshell's interior `&&` counts too), so a chain
+    # with `count` of them has `count + 1` clauses; the retained `cd X && tool`
+    # pair is 2, leaving `count - 1` dropped. Both were over-reported by one
+    # when the count was taken over the whole original. The root `test_command`
+    # was additionally absent from this list entirely, which is exactly what
+    # let it emit at INFO claiming a dropped sibling check when every clause it
+    # drops is a pytest fan-out.
     _DROP_CASES = [
-        (ROOT_TYPE_CHECK_COMMAND, 'pyright', 14, logging.DEBUG),
-        (ROOT_TEST_COMMAND, 'pytest', 17, logging.DEBUG),
+        (ROOT_TYPE_CHECK_COMMAND, 'pyright', ROOT_TYPE_CHECK_COMMAND.count(' && ') - 1, logging.DEBUG),
+        (ROOT_TEST_COMMAND, 'pytest', ROOT_TEST_COMMAND.count(' && ') - 1, logging.DEBUG),
         (_SIBLING_CHECKER_TEST_COMMAND, 'pytest', 1, logging.INFO),
         (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest', 1, logging.INFO),
         (_SIBLING_CHECKER_TYPE_CHECK_COMMAND, 'pyright', 1, logging.INFO),
