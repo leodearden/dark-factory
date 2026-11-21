@@ -86,7 +86,7 @@ def build_mirror(tmp_path: Path) -> Mirror:
     base.mkdir()
     registered = ["_merge-aaaaaaaa", "_merge-bbbbbbbb", "_merge-cccccccc",
                   "_merge-dddddddd", "_merge-eeeeeeee", "_merge-99999999",
-                  "_merge-verify", "123", "124"]
+                  "_merge-verify", "_offline-deep", "123", "124"]
     for name in registered:
         git(repo, "worktree", "add", "--detach", str(base / name))
     git(repo, "worktree", "lock", str(base / "_merge-99999999"))
@@ -207,7 +207,8 @@ def test_report_mode_classifies_and_changes_nothing(mirror):
     assert table["_merge-ffffffff"][3] > 0
     for line in result.stdout.splitlines():
         assert "_merge-verify" not in line
-        assert "/." not in line
+        assert "_offline-deep" not in line
+        assert ".merge_verify_pgids" not in line
     summary = [line for line in result.stdout.splitlines() if line.startswith("pgid-records")]
     assert len(summary) == 1
     assert "total=2" in summary[0]
