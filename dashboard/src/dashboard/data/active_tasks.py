@@ -964,12 +964,12 @@ async def collect_tasks_with_counts(
     resolve_external: bool = False,
     now: datetime | None = None,
     budget: TasksBudget = TASKS_BUDGET,
-) -> tuple[list[dict], dict[str, TaskSnapshot]]:
+) -> dict[str, TaskSnapshot]:
     """Aggregate every root's active rows and its task snapshot in one pass.
 
-    Returns ``(active_rows, snapshots_by_label)``, with an entry in the second
-    for EVERY configured root — including the ones this render never reached,
-    which carry a ``BUDGET``-kind unit rather than being absent.
+    Returns ``snapshots_by_label``, with an entry for EVERY configured root —
+    including the ones this render never reached, which carry a
+    ``BUDGET``-kind unit rather than being absent.
 
     ONE ENTRY PER ROOT, not a row list beside three parallel lists of labels.
     The previous 5-tuple made "which projects are offline" and "which
@@ -983,15 +983,13 @@ async def collect_tasks_with_counts(
     (see ``dashboard/project_labels.py::ProjectLabels``).
 
     **The units it returns carry the SHAPED rows**, not the raw rows
-    ``acquire_snapshot`` cached. Each measured unit comes back with
-    ``rows.value`` replaced by the very list of row dicts this function adds
-    to ``active_rows``. So ``active_rows`` IS the concatenation, in canonical
-    root order, of every unit's ``rows.value``, by construction rather than
-    by a rule a caller must remember. The external-dep tail's in-place status
-    overwrite therefore shows through both. ``dataclasses.replace`` on the
-    frozen records gives the wire its own unit and leaves the cached one's
-    raw rows for the next render to shape; ``TaskSnapshot.rows`` records why
-    the two cannot be one list. A unit whose rows were never measured keeps
+    ``acquire_snapshot`` cached. Each measured unit's ``rows.value`` is that
+    root's shaped row list: the very dicts the external-dep tail then
+    overwrites in place, so that overwrite reaches the wire through the
+    units. ``dataclasses.replace`` on the frozen records gives the wire its
+    own unit and leaves the cached one's raw rows for the next render to
+    shape; ``TaskSnapshot.rows`` records why the two cannot be one list. A
+    unit whose rows were never measured keeps
     ``value is None``, because ``[]`` would claim a measured zero.
 
     **Bounded as a whole, not merely per call.**  A ``loop.time()`` deadline
@@ -1155,7 +1153,7 @@ async def collect_tasks_with_counts(
                     else:
                         entry['status'] = status_map.get(entry['id'], 'unknown')
 
-    return all_active, snapshots
+    return snapshots
 
 
 async def collect_census_snapshots(
