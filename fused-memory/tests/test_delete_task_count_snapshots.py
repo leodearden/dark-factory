@@ -1,14 +1,17 @@
 """Tests for scripts/delete_task_count_snapshots.py.
 
 The script removes the Mem0 ``kind='task_count_snapshot'`` records that
-reconciliation stopped writing in task 10081. The memory double mirrors the
-real ``MemoryService.get_memories_by_metadata`` return shape: each record's
-``metadata`` is its full payload dict.
+reconciliation stopped writing in task 10081. The memory double is autospecced
+from ``MemoryService``, so a call that drifts from the real signatures raises
+here rather than in the one live run. It mirrors the real
+``get_memories_by_metadata`` return shape: each record's ``metadata`` is its
+full payload dict.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import NonCallableMagicMock, create_autospec
 
 import pytest
 from _fm_helpers import load_script_module
@@ -19,6 +22,7 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 
+from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'delete_task_count_snapshots.py'
@@ -45,14 +49,14 @@ def _record(memory_id: str, kind: str = SNAPSHOT_KIND) -> dict:
     }
 
 
-def _memory(records_by_project: dict[str, list[dict]]) -> AsyncMock:
-    memory = AsyncMock()
+def _memory(records_by_project: dict[str, list[dict]]) -> NonCallableMagicMock:
+    memory = create_autospec(MemoryService, instance=True)
 
     async def get_memories_by_metadata(project_id, filters, limit=1000):
         return list(records_by_project.get(project_id, []))
 
-    memory.get_memories_by_metadata = AsyncMock(side_effect=get_memories_by_metadata)
-    memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
+    memory.get_memories_by_metadata.side_effect = get_memories_by_metadata
+    memory.delete_memory.return_value = {'status': 'deleted'}
     return memory
 
 
@@ -154,7 +158,7 @@ async def test_a_failed_delete_is_reported_and_the_others_still_run():
             raise RuntimeError('qdrant unavailable')
         return {'status': 'deleted'}
 
-    memory.delete_memory = AsyncMock(side_effect=delete_memory)
+    memory.delete_memory.side_effect = delete_memory
 
     report = await _run(memory, '--apply', '--project-id', 'reify')
 
@@ -162,6 +166,43 @@ async def test_a_failed_delete_is_reported_and_the_others_still_run():
     assert report['projects']['reify']['deleted'] == ['snap-b']
     assert memory.delete_memory.await_count == 2
     assert _mod.resolve_exit_code(report) != 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_enumeration_is_reported_and_the_other_projects_still_run():
+    memory = _memory({'dark_factory': [_record('snap-df')]})
+    enumerate_readable_project = memory.get_memories_by_metadata.side_effect
+
+    async def reify_times_out(project_id, filters, limit=1000):
+        if project_id == 'reify':
+            raise TimeoutError('qdrant read timed out')
+        return await enumerate_readable_project(project_id, filters, limit)
+
+    memory.get_memories_by_metadata.side_effect = reify_times_out
+
+    report = await _run(memory, '--apply')
+
+    assert report['projects']['reify']['enumeration_error'] == 'qdrant read timed out'
+    assert report['projects']['reify']['deleted'] == []
+    assert report['projects']['dark_factory']['enumeration_error'] is None
+    assert report['projects']['dark_factory']['deleted'] == ['snap-df']
+    assert _mod.resolve_exit_code(report) != 0
+
+
+@pytest.mark.asyncio
+async def test_each_successful_delete_is_logged(caplog):
+    memory = _memory({'reify': [_record('snap-a'), _record('snap-b')]})
+
+    with caplog.at_level(logging.INFO, logger='delete_task_count_snapshots'):
+        await _run(memory, '--apply', '--project-id', 'reify')
+
+    deleted_messages = [
+        record.getMessage() for record in caplog.records
+        if record.levelno == logging.INFO and 'deleted' in record.getMessage()
+    ]
+    assert len(deleted_messages) == 2
+    for memory_id in ('snap-a', 'snap-b'):
+        assert any(memory_id in message and 'reify' in message for message in deleted_messages)
 
 
 @pytest.mark.asyncio

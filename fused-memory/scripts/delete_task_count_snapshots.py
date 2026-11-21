@@ -8,8 +8,10 @@ stored are stale counts that nothing refreshes. This script deletes them.
 
 It enumerates each selected project with a metadata-filtered scroll, then
 re-checks every returned record's ``metadata.kind`` before acting, so a backend
-that ignored the filter cannot turn ``--apply`` into a wider delete. A failed
-delete is reported for its id and the rest still run.
+that ignored the filter cannot turn ``--apply`` into a wider delete. A project
+whose enumeration fails, and a failed delete, are reported and the rest still
+run; each successful delete is logged, so a partial run can be reconstructed
+from its log alone.
 
 Run once per registered project (plans/live-task-facts-at-recall-prd.md, C6).
 
@@ -33,11 +35,14 @@ import json
 import logging
 import sys
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.maintenance._utils import override_config_path
 from fused_memory.maintenance.project_selection import select_projects
 from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
+
+if TYPE_CHECKING:
+    from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger('delete_task_count_snapshots')
 
@@ -52,7 +57,7 @@ def _registered_projects() -> dict[str, str]:
     return build_known_projects_map(config.taskmaster.project_root if config.taskmaster else '')
 
 
-async def _snapshot_ids(memory: Any, project_id: str) -> list[str]:
+async def _snapshot_ids(memory: MemoryService, project_id: str) -> list[str]:
     records = await memory.get_memories_by_metadata(
         project_id, {'kind': TASK_COUNT_SNAPSHOT_KIND},
     )
@@ -63,7 +68,7 @@ async def _snapshot_ids(memory: Any, project_id: str) -> list[str]:
 
 
 async def _delete_each(
-    memory: Any, project_id: str, memory_ids: list[str], causation_id: str,
+    memory: MemoryService, project_id: str, memory_ids: list[str], causation_id: str,
 ) -> tuple[list[str], list[str]]:
     deleted: list[str] = []
     failed: list[str] = []
@@ -83,20 +88,40 @@ async def _delete_each(
             )
             failed.append(memory_id)
         else:
+            logger.info(
+                'delete_task_count_snapshots: deleted %s in %s', memory_id, project_id,
+            )
             deleted.append(memory_id)
     return deleted, failed
+
+
+async def _process_project(
+    memory: MemoryService, project_id: str, *, apply: bool, causation_id: str,
+) -> dict[str, Any]:
+    try:
+        matched = await _snapshot_ids(memory, project_id)
+    except Exception as exc:
+        logger.error(
+            'delete_task_count_snapshots: failed to enumerate %s: %s', project_id, exc,
+        )
+        return {'enumeration_error': str(exc), 'matched': [], 'deleted': [], 'failed': []}
+    deleted, failed = (
+        await _delete_each(memory, project_id, matched, causation_id) if apply else ([], [])
+    )
+    return {'enumeration_error': None, 'matched': matched, 'deleted': deleted, 'failed': failed}
 
 
 async def run(
     args: argparse.Namespace,
     *,
-    memory: Any,
+    memory: MemoryService,
     known_projects_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Find, and under ``--apply`` delete, each selected project's snapshot records.
 
     Returns a JSON-serialisable report: ``dry_run``, ``aborted``, and per
-    project the ``matched``, ``deleted`` and ``failed`` record ids. An unknown
+    project its ``enumeration_error`` (None when it enumerated) and the
+    ``matched``, ``deleted`` and ``failed`` record ids. An unknown
     ``--project-id`` returns an aborted report before any read.
     """
     started_at = datetime.now(UTC).isoformat()
@@ -123,14 +148,12 @@ async def run(
         }
 
     causation_id = f'delete_task_count_snapshots-{started_at}'
-    projects: dict[str, dict[str, list[str]]] = {}
-    for project_id in project_ids:
-        matched = await _snapshot_ids(memory, project_id)
-        deleted, failed = (
-            await _delete_each(memory, project_id, matched, causation_id)
-            if args.apply else ([], [])
+    projects = {
+        project_id: await _process_project(
+            memory, project_id, apply=args.apply, causation_id=causation_id,
         )
-        projects[project_id] = {'matched': matched, 'deleted': deleted, 'failed': failed}
+        for project_id in project_ids
+    }
 
     return {
         'started_at': started_at,
@@ -141,10 +164,13 @@ async def run(
 
 
 def resolve_exit_code(report: dict[str, Any]) -> int:
-    """1 when the run aborted or any delete failed, else 0."""
+    """1 when the run aborted, a project failed to enumerate, or a delete failed, else 0."""
     if report.get('aborted'):
         return 1
-    if any(project['failed'] for project in report['projects'].values()):
+    if any(
+        project['enumeration_error'] is not None or project['failed']
+        for project in report['projects'].values()
+    ):
         return 1
     return 0
 
