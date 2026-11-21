@@ -6,7 +6,7 @@ import dataclasses
 import json
 import logging
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +15,7 @@ from _process_identity_variants import IdentityVariant, own_identity
 from _process_tree_fakes import claude_process_tree
 from _reap_report_wait import await_reap_report
 from _session_hook_fixtures import launching_record, owner_ppid_env
+from _shared_host_fixtures import REQUIRES_PROC, running_shared_host, write_legacy_host_pointer
 from shared.process_identity import ProcessIdentity
 
 from orchestrator import decision_registry as dr
@@ -30,6 +31,12 @@ _DEAD_PID = 2**31 - 1
 @pytest.fixture(autouse=True)
 def _isolate_fleet_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+
+@pytest.fixture
+def shared_host_pid(tmp_path_factory: pytest.TempPathFactory) -> Iterator[int]:
+    with running_shared_host(tmp_path_factory.mktemp('agents-host')) as pid:
+        yield pid
 
 
 def _record(
@@ -88,6 +95,16 @@ class TestSessionPointerPaths:
     def test_non_positive_pids_are_refused_without_writing(self, tmp_path: Path) -> None:
         assert session_records.write_session_pointer(0, 'role-proj-uuid', root=tmp_path) is False
         assert session_records.write_session_pointer(-1, 'role-proj-uuid', root=tmp_path) is False
+        assert not session_records.session_pointers_dir(tmp_path).exists()
+
+    @REQUIRES_PROC
+    def test_a_shared_host_pid_is_refused_without_writing(
+        self, tmp_path: Path, shared_host_pid: int
+    ) -> None:
+        assert (
+            session_records.write_session_pointer(shared_host_pid, 'role-proj-uuid', root=tmp_path)
+            is False
+        )
         assert not session_records.session_pointers_dir(tmp_path).exists()
 
     def test_slugs_that_are_not_record_keys_are_refused_without_writing(
@@ -194,6 +211,13 @@ class TestResolveSessionSlugForPid:
         _write_pointer_raw(self._PID, b'\xff\xfe' + self._SLUG.encode(), tmp_path)
 
         assert session_records.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+
+    @REQUIRES_PROC
+    def test_a_shared_host_pid_never_resolves(self, tmp_path: Path, shared_host_pid: int) -> None:
+        session_records.write_record(_record(self._SLUG, owner_pid=shared_host_pid), root=tmp_path)
+        write_legacy_host_pointer(shared_host_pid, self._SLUG, tmp_path)
+
+        assert session_records.resolve_session_slug_for_pid(shared_host_pid, root=tmp_path) is None
 
     @pytest.mark.parametrize('pid', [0, -1])
     def test_non_positive_pid_never_touches_the_filesystem(
@@ -326,6 +350,15 @@ class TestReapStaleSessionPointers:
 
     def test_an_absent_pointer_dir_is_an_empty_pass(self, tmp_path: Path) -> None:
         assert session_reaper.reap_stale_session_pointers(root=tmp_path) == []
+
+    @REQUIRES_PROC
+    def test_a_live_shared_hosts_pointer_is_removed(self, tmp_path: Path, shared_host_pid: int) -> None:
+        session_records.write_record(_record(self._SLUG, owner_pid=shared_host_pid), root=tmp_path)
+        pointer = write_legacy_host_pointer(shared_host_pid, self._SLUG, tmp_path)
+
+        assert session_reaper.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert not pointer.exists()
+        assert session_records.record_path_for_slug(self._SLUG, root=tmp_path).is_file()
 
     @pytest.mark.parametrize('variant', list(IdentityVariant))
     def test_a_live_pids_pointer_is_judged_by_its_records_owner_identity(
