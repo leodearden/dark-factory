@@ -1,9 +1,9 @@
 """The gate-rebased head as an ordinary dispatch item, and how the lane recognises work on it.
 
 When a head's gate re-verify becomes a dispatch (plans/merge-lane-policy-prd.md
-D3), the head is rebuilt as an item on its rebased commit and verified like any
-other dispatch. Its successors re-anchor on that commit at their own dispatch,
-which is a planned re-anchor rather than a void.
+D3), the head is rebuilt as an item on its rebased commit and verified alone,
+un-chained (D3, task 10721). Its successors re-anchor on that commit at their
+own dispatch, which is a planned re-anchor rather than a void.
 """
 
 from __future__ import annotations
