@@ -66,6 +66,23 @@ _MODEL_ROLE_CELLS_SQL = (
     ' GROUP BY i.model, i.role'
 )
 
+_MAX_TURNS_BY_ROLE_SQL = (
+    "SELECT role, MAX(json_extract(data, '$.max_turns')) AS max_turns "
+    f'  FROM {_EVENTS_TABLE} '
+    " WHERE event_type = 'routing_decision' "
+    '   AND timestamp BETWEEN ? AND ? '
+    '   AND role IS NOT NULL '
+    ' GROUP BY role'
+)
+
+_INVOCATION_END_TURNS_SQL = (
+    "SELECT role, json_extract(data, '$.turns') AS turns "
+    f'  FROM {_EVENTS_TABLE} '
+    " WHERE event_type = 'invocation_end' "
+    '   AND timestamp BETWEEN ? AND ? '
+    '   AND role IS NOT NULL'
+)
+
 
 def _window_bounds(days: int, *, now: datetime | None = None) -> tuple[str, str]:
     """Return ``(window_start_iso, window_end_iso)`` for ``[now - days, now]``."""
@@ -137,13 +154,7 @@ async def _compute_turn_cap_saturation_raw(
     saturation=None (fail-open) rather than a misleading 0.0.
     """
     max_turns_rows = await db.execute_fetchall(
-        "SELECT role, MAX(json_extract(data, '$.max_turns')) AS max_turns "
-        '  FROM events '
-        " WHERE event_type = 'routing_decision' "
-        '   AND timestamp BETWEEN ? AND ? '
-        '   AND role IS NOT NULL '
-        ' GROUP BY role',
-        (window_start_iso, window_end_iso),
+        _MAX_TURNS_BY_ROLE_SQL, (window_start_iso, window_end_iso),
     )
     max_turns_by_role: dict[str, float] = {
         row['role']: row['max_turns'] for row in max_turns_rows
@@ -151,12 +162,7 @@ async def _compute_turn_cap_saturation_raw(
     }
 
     turns_rows = await db.execute_fetchall(
-        "SELECT role, json_extract(data, '$.turns') AS turns "
-        '  FROM events '
-        " WHERE event_type = 'invocation_end' "
-        '   AND timestamp BETWEEN ? AND ? '
-        '   AND role IS NOT NULL',
-        (window_start_iso, window_end_iso),
+        _INVOCATION_END_TURNS_SQL, (window_start_iso, window_end_iso),
     )
 
     raw: dict[str, dict] = {}
