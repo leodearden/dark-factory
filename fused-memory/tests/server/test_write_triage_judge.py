@@ -34,7 +34,7 @@ import uuid
 from collections.abc import Callable, Iterator, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import httpx
@@ -1382,71 +1382,75 @@ class TestResolveJudgeReasoningEffort:
         assert resolve_judge_reasoning_effort(service) is None
 
 
-class TestResolveJudgeApiUrl:
-    """`judge_api_url` — the judge's OWN endpoint, else None meaning INHERIT.
+class _EndpointOverride(NamedTuple):
+    """One of the judge's endpoint override leaves and the SDK kwarg it replaces."""
 
-    None is not a default URL: it hands the choice back to
-    `llm.providers.<provider>.api_url`, the same inheritance `judge_provider`
-    and `judge_model` use.
+    resolver: Callable[[object], str | None]
+    leaf: str
+    kwarg: str
+    sample: str
+
+
+@pytest.fixture(
+    params=[
+        _EndpointOverride(
+            resolve_judge_api_url, 'judge_api_url', 'base_url', 'http://localhost:8080/v1',
+        ),
+        _EndpointOverride(resolve_judge_api_key, 'judge_api_key', 'api_key', 'sk-judge'),
+    ],
+    ids=['api_url', 'api_key'],
+)
+def endpoint_override(request: pytest.FixtureRequest) -> _EndpointOverride:
+    return request.param
+
+
+class TestResolveJudgeEndpointOverrides:
+    """`judge_api_url` / `judge_api_key` — the judge's OWN endpoint and key, else None meaning INHERIT.
+
+    None is not a default: it hands the choice back to
+    `llm.providers.<provider>.api_url` / `.api_key` (and through the key to the
+    SDK's environment fallback), the same inheritance `judge_provider` and
+    `judge_model` use. Both leaves share one rule.
     """
 
-    def test_a_configured_url_is_used_verbatim(self) -> None:
-        service = _svc(judge_api_url='http://localhost:8080/v1')
-        assert resolve_judge_api_url(service) == 'http://localhost:8080/v1'
+    def test_a_configured_value_is_used_verbatim(
+        self, endpoint_override: _EndpointOverride,
+    ) -> None:
+        service = _svc(**{endpoint_override.leaf: endpoint_override.sample})
+        assert endpoint_override.resolver(service) == endpoint_override.sample
 
     @pytest.mark.parametrize(
         ('label', 'service'), _MISSING_HOPS,
         ids=[label for label, _ in _MISSING_HOPS],
     )
-    def test_a_missing_hop_inherits(self, label: str, service: object) -> None:
-        assert resolve_judge_api_url(service) is None, label
+    def test_a_missing_hop_inherits(
+        self, endpoint_override: _EndpointOverride, label: str, service: object,
+    ) -> None:
+        assert endpoint_override.resolver(service) is None, label
 
-    @pytest.mark.parametrize('value', ['', '   ', None, 0, b'http://h/v1', True, []])
-    def test_a_blank_or_non_string_url_inherits(self, value: object) -> None:
-        """A blank base_url would fail every call, and read as a judge outage.
+    @pytest.mark.parametrize('value', ['', '   ', None, 0, b'bytes', True, []])
+    def test_a_blank_or_non_string_value_inherits(
+        self, endpoint_override: _EndpointOverride, value: object,
+    ) -> None:
+        """A blank base_url fails every call and a blank api_key 401s every call.
 
-        Same reason `_provider_credentials` refuses to forward a blank
-        credential: the operator who cleared the leaf is asking for the
-        provider's own endpoint back.
+        Either reads as a judge outage rather than as the cleared leaf it is,
+        which is why `_provider_credentials` refuses to forward a blank
+        credential too: the operator who cleared the leaf is asking for the
+        provider's own value back.
         """
-        assert resolve_judge_api_url(_svc(judge_api_url=value)) is None
+        service = _svc(**{endpoint_override.leaf: value})
+        assert endpoint_override.resolver(service) is None
 
-    def test_the_schema_default_inherits(self) -> None:
-        assert WriteTriageConfig().judge_api_url is None
-
-    @pytest.mark.parametrize('value', ['', '   '])
-    def test_the_schema_stores_a_blank_url_as_inherit(self, value: str) -> None:
-        assert WriteTriageConfig(judge_api_url=value).judge_api_url is None
-
-
-class TestResolveJudgeApiKey:
-    """`judge_api_key` — the judge's OWN key, else None meaning INHERIT.
-
-    None hands the choice back to `llm.providers.<provider>.api_key`, and
-    through it to the SDK's environment fallback.
-    """
-
-    def test_a_configured_key_is_used_verbatim(self) -> None:
-        assert resolve_judge_api_key(_svc(judge_api_key='sk-judge')) == 'sk-judge'
-
-    @pytest.mark.parametrize(
-        ('label', 'service'), _MISSING_HOPS,
-        ids=[label for label, _ in _MISSING_HOPS],
-    )
-    def test_a_missing_hop_inherits(self, label: str, service: object) -> None:
-        assert resolve_judge_api_key(service) is None, label
-
-    @pytest.mark.parametrize('value', ['', '   ', None, 0, b'sk-bytes', True, []])
-    def test_a_blank_or_non_string_key_inherits(self, value: object) -> None:
-        """A blank api_key 401s every call instead of falling back to the env."""
-        assert resolve_judge_api_key(_svc(judge_api_key=value)) is None
-
-    def test_the_schema_default_inherits(self) -> None:
-        assert WriteTriageConfig().judge_api_key is None
+    def test_the_schema_default_inherits(self, endpoint_override: _EndpointOverride) -> None:
+        assert getattr(WriteTriageConfig(), endpoint_override.leaf) is None
 
     @pytest.mark.parametrize('value', ['', '   '])
-    def test_the_schema_stores_a_blank_key_as_inherit(self, value: str) -> None:
-        assert WriteTriageConfig(judge_api_key=value).judge_api_key is None
+    def test_the_schema_stores_a_blank_value_as_inherit(
+        self, endpoint_override: _EndpointOverride, value: str,
+    ) -> None:
+        config = WriteTriageConfig.model_validate({endpoint_override.leaf: value})
+        assert getattr(config, endpoint_override.leaf) is None
 
 
 class TestEveryResolverReadsLive:
@@ -1757,144 +1761,6 @@ class TestProviderCredentials:
             'api_key': 'sk-wire', 'base_url': 'http://h/v1', 'max_retries': 0,
         }
 
-    @pytest.mark.parametrize('provider', ['openai', 'anthropic'])
-    def test_the_judge_url_overrides_the_provider_url(self, provider: str) -> None:
-        """The URL is swapped and the provider's key is kept."""
-        service = _creds_svc(**{
-            provider: types.SimpleNamespace(
-                api_key='sk-p', api_url='https://main.example/v1',
-            ),
-        })
-        service.config.write_triage = types.SimpleNamespace(
-            judge_api_url='http://localhost:8080/v1',
-        )
-        assert _provider_credentials(service, provider).client_kwargs == {
-            'api_key': 'sk-p', 'base_url': 'http://localhost:8080/v1',
-        }
-
-    @pytest.mark.parametrize('provider', ['openai', 'anthropic'])
-    def test_the_judge_url_applies_with_no_provider_section(
-        self, provider: str,
-    ) -> None:
-        service = _creds_svc()
-        service.config.write_triage = types.SimpleNamespace(
-            judge_api_url='http://localhost:8080/v1',
-        )
-        assert _provider_credentials(service, provider).client_kwargs == {
-            'base_url': 'http://localhost:8080/v1',
-        }
-
-    @pytest.mark.parametrize('judge_api_url', [None, '', '   ', 0, b'http://x/v1'])
-    def test_an_unset_or_blank_judge_url_inherits_byte_for_byte(
-        self, judge_api_url: object,
-    ) -> None:
-        """Null means today's inheritance, exactly."""
-        service = _creds_svc(
-            openai=types.SimpleNamespace(
-                api_key='sk-p', api_url='https://main.example/v1',
-            ),
-        )
-        service.config.write_triage = types.SimpleNamespace(
-            judge_api_url=judge_api_url,
-        )
-        assert _provider_credentials(service, 'openai').client_kwargs == {
-            'api_key': 'sk-p', 'base_url': 'https://main.example/v1',
-        }
-
-    @pytest.mark.parametrize('provider', ['openai', 'anthropic'])
-    def test_the_judge_key_overrides_the_provider_key(self, provider: str) -> None:
-        """The key is swapped and the provider's URL is kept."""
-        service = _creds_svc(**{
-            provider: types.SimpleNamespace(
-                api_key='sk-p', api_url='https://main.example/v1',
-            ),
-        })
-        service.config.write_triage = types.SimpleNamespace(judge_api_key='sk-judge')
-        assert _provider_credentials(service, provider).client_kwargs == {
-            'api_key': 'sk-judge', 'base_url': 'https://main.example/v1',
-        }
-
-    def test_the_judge_key_applies_with_no_provider_section(self) -> None:
-        service = _creds_svc()
-        service.config.write_triage = types.SimpleNamespace(judge_api_key='sk-judge')
-        assert _provider_credentials(service, 'openai').client_kwargs == {
-            'api_key': 'sk-judge',
-        }
-
-    def test_the_judge_url_and_key_together_replace_the_provider_pair(self) -> None:
-        service = _creds_svc(
-            openai=types.SimpleNamespace(
-                api_key='sk-p', api_url='https://main.example/v1',
-            ),
-        )
-        service.config.write_triage = types.SimpleNamespace(
-            judge_api_url='http://localhost:8080/v1', judge_api_key='sk-judge',
-        )
-        assert _provider_credentials(service, 'openai').client_kwargs == {
-            'api_key': 'sk-judge', 'base_url': 'http://localhost:8080/v1',
-        }
-
-    @pytest.mark.parametrize('judge_api_key', [None, '', '   ', 0, b'sk-bytes'])
-    def test_an_unset_or_blank_judge_key_inherits_byte_for_byte(
-        self, judge_api_key: object,
-    ) -> None:
-        """`judge_api_key: null` reproduces today's credentials exactly."""
-        service = _creds_svc(
-            openai=types.SimpleNamespace(
-                api_key='sk-p', api_url='https://main.example/v1',
-            ),
-        )
-        service.config.write_triage = types.SimpleNamespace(
-            judge_api_key=judge_api_key,
-        )
-        assert _provider_credentials(service, 'openai').client_kwargs == {
-            'api_key': 'sk-p', 'base_url': 'https://main.example/v1',
-        }
-
-
-_PLAN_PROXY_VARS = ('OPENAI_PLAN_PROXY_URL', 'OPENAI_PLAN_PROXY_KEY')
-
-
-class TestTheShippedJudgeRoute:
-    """The tracked config.yaml routes the judge by the plan-proxy variables.
-
-    Each test sets or deletes both variables itself: server/main.py's
-    import-time load_dotenv() can inject the main checkout's .env into this process.
-    """
-
-    def test_with_the_plan_proxy_variables_set_the_judge_is_routed_to_the_proxy(
-        self, monkeypatch,
-    ) -> None:
-        monkeypatch.setenv('OPENAI_PLAN_PROXY_URL', 'http://127.0.0.1:8317/v1')
-        monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', 'sk-fm-plan-proxy')
-        monkeypatch.setenv('OPENAI_API_KEY', 'sk-api')
-        service = types.SimpleNamespace(config=FusedMemoryConfig())
-        provider = resolve_judge_provider(service)
-        assert provider == 'openai'
-
-        creds = _provider_credentials(service, provider)
-
-        assert creds.client_kwargs == {
-            'api_key': 'sk-fm-plan-proxy', 'base_url': 'http://127.0.0.1:8317/v1',
-        }
-        assert creds.serves_responses_api is True
-        assert resolve_judge_model(service) == 'gpt-6.1-sol'
-        assert resolve_judge_reasoning_effort(service) == 'low'
-
-    def test_with_the_plan_proxy_variables_unset_the_judge_inherits_the_provider_pair(
-        self, monkeypatch,
-    ) -> None:
-        for name in (*_PLAN_PROXY_VARS, 'OPENAI_API_URL'):
-            monkeypatch.delenv(name, raising=False)
-        monkeypatch.setenv('OPENAI_API_KEY', 'sk-api')
-        service = types.SimpleNamespace(config=FusedMemoryConfig())
-
-        assert resolve_judge_api_url(service) is None
-        assert resolve_judge_api_key(service) is None
-        assert _provider_credentials(service, 'openai').client_kwargs == {
-            'api_key': 'sk-api', 'base_url': 'https://api.openai.com/v1',
-        }
-
 
 _MAIN_URL = 'https://main.example/v1'
 _JUDGE_URL = 'http://localhost:8080/v1'
@@ -1930,16 +1796,212 @@ def _real_config(
     return cfg
 
 
-async def _judge_once(memory_service: object) -> MagicMock:
-    """Run one openai-arm judge_write; return the patched SDK constructor."""
-    client = _openai_client(_payload('distinct'))
-    with patch('openai.AsyncOpenAI', return_value=client) as ctor:
+async def _judge_once(memory_service: object, provider: str = 'openai') -> MagicMock:
+    """Run one judge_write on *provider*'s arm; return the patched SDK constructor."""
+    if provider == 'anthropic':
+        target = 'anthropic.AsyncAnthropic'
+        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('distinct'))])
+    else:
+        target, client = 'openai.AsyncOpenAI', _openai_client(_payload('distinct'))
+    with patch(target, return_value=client) as ctor:
         await judge_write(
             memory_service=memory_service,
             content='c', project_id='p',
             decision=_decision('m1'), candidates=[_result('m1', 0.80)],
         )
     return ctor
+
+
+def _leaves_svc(
+    provider: str, section: object | None = None, **judge_leaves: object,
+) -> types.SimpleNamespace:
+    """A judge on *provider* whose `llm.providers.<provider>` is *section*."""
+    service = _creds_svc(**({} if section is None else {provider: section}))
+    service.config.write_triage = types.SimpleNamespace(
+        judge_provider=provider, judge_model='test-model', **judge_leaves,
+    )
+    return service
+
+
+def _provider_pair() -> types.SimpleNamespace:
+    return types.SimpleNamespace(api_key='sk-p', api_url=_MAIN_URL)
+
+
+class TestTheJudgeEndpointLeavesReachTheClient:
+    """Each override leaf replaces only its own half of the provider's pair, on both arms.
+
+    Asserted on the SDK constructor `judge_write` builds, so the pin is on
+    behaviour rather than on `_provider_credentials`'s signature.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('provider', ['openai', 'anthropic'])
+    async def test_a_judge_leaf_replaces_only_its_half_of_the_provider_pair(
+        self, provider: str, endpoint_override: _EndpointOverride,
+    ) -> None:
+        service = _leaves_svc(
+            provider, _provider_pair(),
+            **{endpoint_override.leaf: endpoint_override.sample},
+        )
+        ctor = await _judge_once(service, provider)
+        assert ctor.call_args.kwargs == {
+            'api_key': 'sk-p', 'base_url': _MAIN_URL, 'max_retries': 0,
+            endpoint_override.kwarg: endpoint_override.sample,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('provider', ['openai', 'anthropic'])
+    async def test_a_judge_leaf_applies_with_no_provider_section(
+        self, provider: str, endpoint_override: _EndpointOverride,
+    ) -> None:
+        service = _leaves_svc(
+            provider, **{endpoint_override.leaf: endpoint_override.sample},
+        )
+        ctor = await _judge_once(service, provider)
+        assert ctor.call_args.kwargs == {
+            endpoint_override.kwarg: endpoint_override.sample, 'max_retries': 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_judge_url_and_key_together_replace_the_provider_pair(self) -> None:
+        service = _leaves_svc(
+            'openai', _provider_pair(), judge_api_url=_JUDGE_URL, judge_api_key='sk-judge',
+        )
+        ctor = await _judge_once(service)
+        assert ctor.call_args.kwargs == {
+            'api_key': 'sk-judge', 'base_url': _JUDGE_URL, 'max_retries': 0,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('value', [None, '', '   ', 0, b'bytes'])
+    async def test_an_unset_or_blank_judge_leaf_inherits_byte_for_byte(
+        self, endpoint_override: _EndpointOverride, value: object,
+    ) -> None:
+        """Null reproduces today's credentials exactly."""
+        service = _leaves_svc('openai', _provider_pair(), **{endpoint_override.leaf: value})
+        ctor = await _judge_once(service)
+        assert ctor.call_args.kwargs == {
+            'api_key': 'sk-p', 'base_url': _MAIN_URL, 'max_retries': 0,
+        }
+
+
+def _unique_url() -> str:
+    """A judge URL no earlier test used, so the route it gives is a change."""
+    return f'http://judge-{uuid.uuid4().hex}.example:8317/v1'
+
+
+class TestTheJudgeRouteIsLogged:
+    """One INFO line names the judge's route and the leaf behind each credential, whenever it changes.
+
+    The two endpoint leaves inherit independently, so a half-set plan-proxy
+    pair or a fallen-back route would otherwise leave no trace.
+    """
+
+    @staticmethod
+    async def _route_lines(service: object, caplog: pytest.LogCaptureFixture) -> list[str]:
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=judge_module.logger.name):
+            await _judge_once(service)
+        return [
+            record.getMessage() for record in caplog.records
+            if 'judge route' in record.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_line_names_the_host_and_both_judge_leaves_never_the_key(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        url = _unique_url()
+        service = _leaves_svc(
+            'openai', _provider_pair(), judge_api_url=url, judge_api_key='sk-judge-secret',
+        )
+
+        [line] = await self._route_lines(service, caplog)
+
+        assert url.split('/')[2] in line, line
+        assert 'base_url from write_triage.judge_api_url' in line, line
+        assert 'api_key from write_triage.judge_api_key' in line, line
+        assert 'sk-judge-secret' not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_half_set_pair_names_the_inherited_key(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        service = _leaves_svc('openai', _provider_pair(), judge_api_url=_unique_url())
+
+        [line] = await self._route_lines(service, caplog)
+
+        assert 'base_url from write_triage.judge_api_url' in line, line
+        assert 'api_key from llm.providers.openai.api_key' in line, line
+        assert 'sk-p' not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_no_configured_credential_names_the_sdk_environment(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await self._route_lines(_leaves_svc('openai', judge_api_url=_unique_url()), caplog)
+
+        [line] = await self._route_lines(_leaves_svc('openai'), caplog)
+
+        assert 'the SDK default endpoint' in line, line
+        assert 'api_key from the SDK environment' in line, line
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_route_is_not_logged_again_and_a_changed_one_is(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        service = _leaves_svc('openai', _provider_pair(), judge_api_url=_unique_url())
+        assert len(await self._route_lines(service, caplog)) == 1
+
+        assert await self._route_lines(service, caplog) == []
+
+        service.config.write_triage.judge_api_url = _unique_url()
+        assert len(await self._route_lines(service, caplog)) == 1
+
+
+_PLAN_PROXY_VARS = ('OPENAI_PLAN_PROXY_URL', 'OPENAI_PLAN_PROXY_KEY')
+
+
+class TestTheShippedJudgeRoute:
+    """The tracked config.yaml routes the judge by the plan-proxy variables.
+
+    Each test sets or deletes both variables itself: server/main.py's
+    import-time load_dotenv() can inject the main checkout's .env into this process.
+    """
+
+    @pytest.mark.asyncio
+    async def test_with_the_plan_proxy_variables_set_the_judge_is_routed_to_the_proxy(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv('OPENAI_PLAN_PROXY_URL', 'http://127.0.0.1:8317/v1')
+        monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', 'sk-fm-plan-proxy')
+        monkeypatch.setenv('OPENAI_API_KEY', 'sk-api')
+
+        ctor = await _judge_once(types.SimpleNamespace(config=FusedMemoryConfig()))
+
+        assert ctor.call_args.kwargs == {
+            'api_key': 'sk-fm-plan-proxy', 'base_url': 'http://127.0.0.1:8317/v1',
+            'max_retries': 0,
+        }
+        request = ctor.return_value.responses.create.call_args.kwargs
+        assert request['model'] == 'gpt-6.1-sol'
+        assert request['reasoning'] == {'effort': 'low'}
+
+    @pytest.mark.asyncio
+    async def test_with_the_plan_proxy_variables_unset_the_judge_inherits_the_provider_pair(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        for name in (*_PLAN_PROXY_VARS, 'OPENAI_API_URL'):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv('OPENAI_API_KEY', 'sk-api')
+        service = types.SimpleNamespace(config=FusedMemoryConfig())
+
+        assert resolve_judge_api_url(service) is None
+        assert resolve_judge_api_key(service) is None
+        ctor = await _judge_once(service)
+        assert ctor.call_args.kwargs == {
+            'api_key': 'sk-api', 'base_url': 'https://api.openai.com/v1', 'max_retries': 0,
+        }
 
 
 class TestTheJudgeEndpointOnOneRealConfig:
@@ -3103,11 +3165,29 @@ async def _frontier_arm_triage(
     return decision
 
 
+def _pin_the_live_judge_route(write_triage: WriteTriageConfig) -> None:
+    """Route a live judge call explicitly: the plan proxy when both its variables are set, else the API key.
+
+    Assigned rather than read from the shipped config, whose leaves depend on
+    whether server/main.py's import-time load_dotenv() has run, so a half-set
+    pair never sends OPENAI_API_KEY to the proxy. Skips when the chosen route
+    has no credential.
+    """
+    proxy_url, proxy_key = (os.environ.get(name) for name in _PLAN_PROXY_VARS)
+    if proxy_url and proxy_key:
+        write_triage.judge_api_url = proxy_url
+        write_triage.judge_api_key = proxy_key
+        return
+    if not os.environ.get('OPENAI_API_KEY'):
+        pytest.skip(
+            'needs OPENAI_PLAN_PROXY_URL and OPENAI_PLAN_PROXY_KEY, or OPENAI_API_KEY, '
+            'for a live Responses API call',
+        )
+    write_triage.judge_api_url = None
+    write_triage.judge_api_key = None
+
+
 @pytest.mark.integration
-@pytest.mark.skipif(
-    not os.environ.get('OPENAI_API_KEY'),
-    reason='needs OPENAI_API_KEY for a live Responses API call',
-)
 class TestTheFrontierArmLive:
     """The live edge: a frontier reasoning model judges a fixture write through triage."""
 
@@ -3133,6 +3213,7 @@ class TestTheFrontierArmLive:
         write_triage.judge_reasoning_effort = 'low'
         write_triage.t_high = 0.95
         write_triage.t_low = 0.50
+        _pin_the_live_judge_route(write_triage)
         service = types.SimpleNamespace(
             config=config, search=AsyncMock(return_value=SearchResults(slate)),
         )
@@ -3403,10 +3484,6 @@ class TestTheLiveWordingBudgetGuard:
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(
-    not os.environ.get('OPENAI_API_KEY'),
-    reason='needs OPENAI_API_KEY for a live Responses API call',
-)
 class TestTheShippedWordingLive:
     """Boundary row 3 (flip-readiness PRD §11.4): `contests` covers an outdated candidate.
 
@@ -3467,6 +3544,7 @@ class TestTheShippedWordingLive:
         write_triage.judge_provider = 'openai'
         write_triage.judge_model = 'gpt-6.1-sol'
         write_triage.judge_reasoning_effort = 'low'
+        _pin_the_live_judge_route(write_triage)
         service = types.SimpleNamespace(config=config)
 
         verdict = await _live_judge_verdict(

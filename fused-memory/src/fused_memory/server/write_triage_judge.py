@@ -41,10 +41,12 @@ inject their own fakes and must not accidentally exercise a live LLM.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard, get_args
+from urllib.parse import urlsplit
 
 from fused_memory.config.schema import (
     JudgeReasoningEffort,
@@ -862,6 +864,16 @@ _JUDGE_MAX_OUTPUT_TOKENS = 2_048
 _JUDGE_SDK_MAX_RETRIES = 0
 
 
+class _JudgeRoute(NamedTuple):
+    """Where a judge call goes and which leaf supplied each credential; never the key itself."""
+
+    provider: str
+    #: ``host[:port]`` of the ``base_url``, or None for the SDK's default endpoint.
+    host: str | None
+    url_from: str
+    key_from: str
+
+
 class _ProviderCredentials(NamedTuple):
     """How to reach *provider*'s endpoint, and what that endpoint speaks."""
 
@@ -869,6 +881,47 @@ class _ProviderCredentials(NamedTuple):
     client_kwargs: dict[str, Any]
     #: Whether the endpoint serves the OpenAI Responses API.
     serves_responses_api: bool
+    route: _JudgeRoute
+
+
+def _judge_route(
+    provider: str,
+    client_kwargs: Mapping[str, Any],
+    *,
+    judge_url_set: bool,
+    judge_key_set: bool,
+) -> _JudgeRoute:
+    def source(judge_set: bool, kwarg: str, leaf: str) -> str:
+        if judge_set:
+            return f'write_triage.judge_{leaf}'
+        if kwarg in client_kwargs:
+            return f'llm.providers.{provider}.{leaf}'
+        return 'the SDK environment'
+
+    base_url = client_kwargs.get('base_url')
+    return _JudgeRoute(
+        provider=provider,
+        host=urlsplit(base_url).netloc.rpartition('@')[2] if base_url else None,
+        url_from=source(judge_url_set, 'base_url', 'api_url'),
+        key_from=source(judge_key_set, 'api_key', 'api_key'),
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _announce_judge_route(route: _JudgeRoute) -> None:
+    """Log *route* at INFO whenever it differs from the previous judge call's.
+
+    The endpoint leaves are read live and inherit independently, so a reload,
+    a half-set plan-proxy pair or an unset variable changes where the judge
+    goes with nothing else to show for it. One line per change, not per call.
+    """
+    logger.info(
+        'write_triage judge route: %s at %s (base_url from %s), api_key from %s',
+        route.provider,
+        route.host or 'the SDK default endpoint',
+        route.url_from,
+        route.key_from,
+    )
 
 
 def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCredentials:
@@ -900,16 +953,22 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     providers = getattr(llm, 'providers', None)
     section = getattr(providers, provider, None)
     client_kwargs: dict[str, Any] = {}
-    api_key = resolve_judge_api_key(memory_service) or getattr(section, 'api_key', None)
+    judge_key = resolve_judge_api_key(memory_service)
+    api_key = judge_key or getattr(section, 'api_key', None)
     if isinstance(api_key, str) and api_key:
         client_kwargs['api_key'] = api_key
-    api_url = resolve_judge_api_url(memory_service) or getattr(section, 'api_url', None)
+    judge_url = resolve_judge_api_url(memory_service)
+    api_url = judge_url or getattr(section, 'api_url', None)
     if isinstance(api_url, str) and api_url:
         client_kwargs['base_url'] = api_url
     serves_responses_api = (
         provider == 'openai' and _llm_attr(memory_service, 'client_class') != 'openai_generic'
     )
-    return _ProviderCredentials(client_kwargs, serves_responses_api)
+    route = _judge_route(
+        provider, client_kwargs,
+        judge_url_set=judge_url is not None, judge_key_set=judge_key is not None,
+    )
+    return _ProviderCredentials(client_kwargs, serves_responses_api, route)
 
 
 class _JudgeReply(NamedTuple):
@@ -989,6 +1048,7 @@ async def _call_llm(
             f'{list(_KNOWN_PROVIDERS)}',
         )
     creds = _provider_credentials(memory_service, provider)
+    _announce_judge_route(creds.route)
     if reasoning_effort is not None and not creds.serves_responses_api:
         why = (
             'the anthropic arm has no reasoning-effort parameter'
