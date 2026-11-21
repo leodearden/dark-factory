@@ -776,8 +776,17 @@ carrying their own designed-outcome count and the rules that fired (see
 priority order and no re-prioritisation is needed."""
 
 
+def _record_label(index: int) -> str:
+    """Render an item's '(record N)' label. N is the item's 0-based
+    position among the transcript's parsed records; every assistant,
+    tool_result and harness record counts toward it, so it is not a
+    user-turn ordinal -- frontmatter ``n_user_turns`` counts those.
+    Pinned by scripts/tests/test_legibility_digest.py::TestItemRecordLabels."""
+    return f'(record {index})'
+
+
 def _render_user_corrections(items: list[dict[str, Any]]) -> list[str]:
-    return [f"- (turn {item['index']}) {item['text']}" for item in items]
+    return [f"- {_record_label(item['index'])} {item['text']}" for item in items]
 
 
 def _exit_marker(exit_code: int | None) -> str:
@@ -795,7 +804,7 @@ def _render_error_neighborhoods(items: list[dict[str, Any]]) -> list[str]:
         summary = item['attempt_input_summary'] or ''
         marker = _exit_marker(item['exit_code'])
         lines.append(
-            f"- (turn {item['index']}) {tool}({summary}) -> "
+            f"- {_record_label(item['index'])} {tool}({summary}) -> "
             f"{marker}{item['error_content']}"
         )
     return lines
@@ -811,7 +820,7 @@ def _render_designed_outcomes(items: list[dict[str, Any]]) -> list[str]:
         summary = item['attempt_input_summary'] or ''
         marker = _exit_marker(item['exit_code'])
         lines.append(
-            f"- (turn {item['index']}) {tool}({summary}) -> "
+            f"- {_record_label(item['index'])} {tool}({summary}) -> "
             f"{marker}[{item['designed_outcome']}] {item['error_content']}"
         )
     return lines
@@ -819,7 +828,7 @@ def _render_designed_outcomes(items: list[dict[str, Any]]) -> list[str]:
 
 def _render_self_corrections(items: list[dict[str, Any]]) -> list[str]:
     return [
-        f"- (turn {item['index']}) [{item['pattern']}] {item['context']}"
+        f"- {_record_label(item['index'])} [{item['pattern']}] {item['context']}"
         for item in items
     ]
 
@@ -870,7 +879,7 @@ def _render_retry_loops(items: list[dict[str, Any]]) -> list[str]:
 
 
 def _render_scalar_signal(items: list[dict[str, Any]]) -> list[str]:
-    return [f"- (turn {item['index']}) {item['pattern']}" for item in items]
+    return [f"- {_record_label(item['index'])} {item['pattern']}" for item in items]
 
 
 @dataclass(frozen=True)

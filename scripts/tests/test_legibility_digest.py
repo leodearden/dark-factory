@@ -2942,7 +2942,9 @@ class TestItemRecordLabels:
         item_lines = [line for line in section[:section_end] if line.startswith('- ')]
 
         assert len(item_lines) == 3
-        for line, prefix in zip(item_lines, ('- (record 1) ', '- (record 3) ', '- (record 5) ')):
+        for line, prefix in zip(
+            item_lines, ('- (record 1) ', '- (record 3) ', '- (record 5) '), strict=True,
+        ):
             assert line.startswith(prefix), line
 
 
