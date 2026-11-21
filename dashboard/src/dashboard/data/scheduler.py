@@ -947,7 +947,14 @@ async def collect_scheduler_state(
             })
 
         # This root's shaped rows come from its own unit.
-        project_active = rows_by_label.get(label, [])
+        project_active = rows_by_label.get(label)
+        if project_active is None:
+            logger.warning(
+                'collect_tasks_with_counts returned no unit for %s, though it '
+                'promises one per configured root; showing no active tasks for it',
+                label,
+            )
+            project_active = []
 
         # Enrich active tasks with raw task_id, project label, and project_root
         # for snapshot lookups and downstream override POSTs.

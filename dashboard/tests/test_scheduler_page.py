@@ -21,7 +21,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from _task_units import units_by_label
+from _task_units import measured_unit, units_by_label
 from shared.scheduler_state import SchedulerStateSnapshot
 
 from dashboard.data.scheduler import clear_scheduler_state
@@ -2397,8 +2397,43 @@ async def test_collect_scheduler_state_refuses_a_malformed_reply_at_the_parse_bo
     assert pin_queue == []
     assert any(
         r.levelno == logging.WARNING and r.name == 'dashboard.data.scheduler'
+        and 'is not a scheduler snapshot' in r.getMessage()
         for r in caplog.records
     ), [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.parametrize('has_unit', [False, True], ids=['missing', 'present'])
+async def test_collect_scheduler_state_names_a_root_the_collector_gave_no_unit(
+    dummy_client, dummy_config, caplog, has_unit,
+):
+    """A configured root with no unit is a broken collector, said by name.
+
+    ``collect_tasks_with_counts`` promises a unit for every configured root.
+    The root still shows no active tasks either way, but only a MISSING unit
+    is logged, so a broken promise does not pass for a quiet project.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    label = dummy_config.project_root.name
+    units = {label: measured_unit()} if has_unit else {}
+    mock_mcp = AsyncMock(side_effect=[_scheduler_snapshot(), [], []])
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
+        patch(
+            'dashboard.data.scheduler.collect_tasks_with_counts',
+            AsyncMock(return_value=units),
+        ),
+        caplog.at_level(logging.WARNING, logger='dashboard.data.scheduler'),
+    ):
+        rows, *_ = await collect_scheduler_state(dummy_client, dummy_config)
+
+    messages = [r.getMessage() for r in caplog.records]
+    named = [m for m in messages if 'no unit for' in m and label in m]
+    assert rows == []
+    assert len(named) == (0 if has_unit else 1), messages
 
 
 async def test_collect_scheduler_state_ignores_an_unknown_key_from_a_newer_producer(
