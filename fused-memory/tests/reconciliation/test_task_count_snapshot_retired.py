@@ -8,18 +8,23 @@ project under test because it used to receive the deterministic write.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from escalation.queue import EscalationQueue
 
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId, Watermark
+from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import StageResult
 from fused_memory.reconciliation.stages.task_knowledge_sync import TaskKnowledgeSync
+from reconciliation.harness_fixtures import make_harness_config, open_harness, stub_stage_runs
 
 SNAPSHOT_KIND = 'task_count_snapshot'
 PROJECT_ID = 'reify'
+STALE_SNAPSHOT_CATEGORY = 'recon_stale_task_count_snapshot'
+PRE_RETIREMENT_MISSED_SNAPSHOT_STATS = {'task_count_snapshot_mem0_written': 0}
 
 
 def _memory_service() -> AsyncMock:
@@ -98,3 +103,39 @@ async def test_stage2_run_for_formerly_snapshotting_project_writes_no_snapshot()
     assert snapshot_writes == []
     assert snapshot_reads == []
     assert snapshot_stats == []
+
+
+async def _stage_report_shaped_before_retirement(
+    self, events, watermark, prior_reports, run_id, model=None,
+):
+    now = datetime.now(UTC)
+    stats = (
+        dict(PRE_RETIREMENT_MISSED_SNAPSHOT_STATS)
+        if self.stage_id == StageId.task_knowledge_sync
+        else {}
+    )
+    return StageReport(stage=self.stage_id, started_at=now, completed_at=now, stats=stats)
+
+
+@pytest.mark.asyncio
+async def test_consecutive_full_cycles_raise_no_stale_snapshot_alarm(tmp_path, monkeypatch):
+    escalation_queue = EscalationQueue(tmp_path / 'esc')
+    stub_stage_runs(monkeypatch, _stage_report_shaped_before_retirement)
+    taskmaster = AsyncMock()
+    taskmaster.get_tasks.return_value = {'tasks': []}
+
+    async with open_harness(
+        tmp_path,
+        taskmaster=taskmaster,
+        config=make_harness_config(judge_enabled=False),
+        known_projects={PROJECT_ID: '/tmp/test-project'},
+        escalation_queue=escalation_queue,
+    ) as harness:
+        for _ in range(3):
+            await harness.run_full_cycle(PROJECT_ID, 'test-trigger')
+
+    alarm_categories = [
+        esc.category for esc in escalation_queue.get_pending()
+        if esc.category == STALE_SNAPSHOT_CATEGORY
+    ]
+    assert alarm_categories == []
