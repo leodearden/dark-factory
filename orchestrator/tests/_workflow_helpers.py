@@ -35,7 +35,6 @@ from shared.task_submit import SubmitFailed, SubmitOutcome
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.review_briefing import ReviewBriefing, ReviewSubject
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.branch_stack import StackTarget
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.escalation_rulings import Ruling
 from orchestrator.git_ops import GitOps, _run
@@ -60,6 +59,9 @@ from orchestrator.scheduler import (
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow
 from orchestrator.workflow_types import PublishedStewardOutcome, StewardResolved
+
+if TYPE_CHECKING:
+    from orchestrator.branch_stack import StackTarget
 
 
 class FakeMcp:
