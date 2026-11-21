@@ -30,9 +30,9 @@ from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import AgentStub, _build_workflow, _make_git_ops, agent_side_artifacts
 
 from orchestrator.agents.invoke import AgentResult
-from orchestrator.branch_stack import StackBaseLedger, StackTarget
+from orchestrator.branch_stack import StackRecordState, StackTarget
 from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps
 from orchestrator.mcp.verdict_tools import _envelope
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
@@ -314,7 +314,8 @@ class TestStackedBranchIsNotSettled:
         assert stub.architect_saw_main is False
         assert _events(store, EVENT) == []
         _assert_main_not_merged_in(scene)
-        assert await StackBaseLedger(repo, _run).base_of('task/42') == scene.p_tip
+        record = await git_ops.stack_base_read('task/42')
+        assert (record.state, record.base) == (StackRecordState.RECORDED, scene.p_tip)
 
     async def test_an_unreadable_ledger_skips_the_settle(self, repo, git_ops, monkeypatch, tmp_path):
         scene = await _stacked_scene(git_ops)
