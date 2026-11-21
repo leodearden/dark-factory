@@ -4,6 +4,8 @@ fused-memory/scripts/_timing_dependence.py accepts a real sleep, an elapsed-vs-l
 assert or a literal wait deadline only under ``@pytest.mark.timing(reason=...)``.  An
 unregistered marker only warns, because ``--strict-markers`` is inert in addopts, so
 the repo root and each scanned package register it, as they do ``reads_git_history``.
+Each scanned package's tests/conftest.py also binds the sanctioned ``fake_clock``
+fixture (shared/src/shared/pytest_fake_clock.py::fake_clock) by import.
 
 The package list is DERIVED from the gate's own lint_command, so which packages the
 rule scans has one home.
@@ -11,6 +13,7 @@ rule scans has one home.
 
 from __future__ import annotations
 
+import ast
 import functools
 import re
 import shlex
@@ -31,6 +34,12 @@ _TIMING_MARKER_ENTRY = (
     ' named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py)'
     ' accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under'
     ' it. Not deselected by default."'
+)
+
+
+_FAKE_CLOCK_MODULE = 'shared.pytest_fake_clock'
+_FAKE_CLOCK_BINDING = (
+    f'from {_FAKE_CLOCK_MODULE} import fake_clock  # noqa: F401  — the binding IS the wiring'
 )
 
 
@@ -82,4 +91,28 @@ def test_every_scanned_package_registers_the_timing_marker():
         'these pyproject.toml files do not register the `timing` marker the timing-dependence'
         f' lint accepts: {missing}. Add this entry to each one\'s [tool.pytest.ini_options]'
         f' markers list: {_TIMING_MARKER_ENTRY}'
+    )
+
+
+def _binds_fake_clock(conftest: Path) -> bool:
+    module = ast.parse(conftest.read_text(encoding='utf-8'), filename=str(conftest))
+    return any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == _FAKE_CLOCK_MODULE
+        and any(alias.name == 'fake_clock' and alias.asname in (None, 'fake_clock') for alias in statement.names)
+        for statement in module.body
+    )
+
+
+def test_every_scanned_package_conftest_binds_fake_clock():
+    conftests = [REPO_ROOT / package / 'tests' / 'conftest.py' for package in _scanned_packages()]
+    missing = [
+        str(conftest.relative_to(REPO_ROOT))
+        for conftest in conftests
+        if not conftest.is_file() or not _binds_fake_clock(conftest)
+    ]
+    assert not missing, (
+        f'these conftests do not bind the fake_clock fixture at module level: {missing}.'
+        f' Add this line to each, after the sys.path setup that makes shared importable:'
+        f' {_FAKE_CLOCK_BINDING}'
     )
