@@ -7456,8 +7456,9 @@ class Scheduler:
         reserved run slot is free).
 
         Returns ``None`` immediately when the scheduler is paused (park-stop).
-        No MCP round-trips, no GC, no override snapshots are performed while
-        paused — all resume cleanly on the first unpaused tick.
+        The only work while paused is the priority lookup's pin re-read, at
+        most once a minute, into a map of its own (not the tick's override
+        snapshot); everything else resumes on the first unpaused tick.
         """
         assert self._started, (
             'acquire_next() called before finish_startup() — startup '
@@ -7469,6 +7470,7 @@ class Scheduler:
                 'acquire_next() short-circuit: scheduler is paused (reason=%r)',
                 self._pause_reason,
             )
+            await self._lookup_pins.refresh_if_due()
             return None
 
         try:
