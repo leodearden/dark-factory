@@ -335,7 +335,7 @@ class EffortConfig(BaseModel):
     steward: str = Field(default='high')
     triage: str = Field(default='medium')
     module_tagger: str = Field(default='medium')
-    deep_reviewer: str = Field(default='max')
+    deep_reviewer: str = Field(default='xhigh')
     judge: str = Field(default='medium')
     simple_task: str = Field(default='high')
 
