@@ -54,12 +54,16 @@ from escalation.pins import _norm_id, classify_pins
 from escalation.queue import EscalationQueue
 from shared.task_claimant import compose_claimant_run_id
 
+import orchestrator.born_at_l2 as born_at_l2_module
 import orchestrator.harness as harness_module
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
 from orchestrator.scheduler import SetTaskStatusRejected
 
 _HARNESS_SRC_PATH = Path(harness_module.__file__)
+# Task 8826 moved harness.py's four born-at-L2 constructions into this module's
+# single one, so both tripwires scan it too.
+_BORN_AT_L2_SRC_PATH = Path(born_at_l2_module.__file__)
 
 
 def _build_harness(mock_orch_config) -> Harness:
@@ -239,7 +243,6 @@ class TestEveryHarnessFilingSiteIsStamped:
     """
 
     def test_every_filing_site_passes_filing_claimant_run_id(self) -> None:
-        calls = _filing_call_sites(_HARNESS_SRC_PATH)
         # Baseline at the time of writing; a drop means sites moved out of
         # this module and the tripwire's coverage silently shrank.  Raised
         # 27 -> 28 when this branch rebased onto main: task 3172 step-14 added
@@ -249,22 +252,27 @@ class TestEveryHarnessFilingSiteIsStamped:
         # Lowered 28 -> 27 by task 7170, which folded the cross-repo,
         # substrate-flip and external-dep copies onto _file_harness_l1's
         # single stamped construction; those sites merged, they did not move
-        # out of the module.
-        assert len(calls) >= 27, (
-            f'expected >=27 Escalation(...) or file_or_refresh(...) sites, '
-            f'found {len(calls)}'
-        )
+        # out of the module.  Lowered 27 -> 23 by task 8826, which moved the
+        # four born-at-L2 copies onto born_at_l2.py's single construction,
+        # scanned below.
+        floors = {_HARNESS_SRC_PATH: 23, _BORN_AT_L2_SRC_PATH: 1}
+        for path, floor in floors.items():
+            calls = _filing_call_sites(path)
+            assert len(calls) >= floor, (
+                f'{path.name}: expected >={floor} Escalation(...) or '
+                f'file_or_refresh(...) sites, found {len(calls)}'
+            )
 
-        unstamped = [
-            node.lineno for node in calls
-            if not any(kw.arg == 'filing_claimant_run_id' for kw in node.keywords)
-        ]
-        assert not unstamped, (
-            f'{_HARNESS_SRC_PATH.name}: Escalation(...) or file_or_refresh(...) without '
-            f'filing_claimant_run_id at lines {unstamped} — every filing site '
-            f'must stamp the filing incarnation (task 3550); use '
-            f'self._filing_claimant_run_id.'
-        )
+            unstamped = [
+                node.lineno for node in calls
+                if not any(kw.arg == 'filing_claimant_run_id' for kw in node.keywords)
+            ]
+            assert not unstamped, (
+                f'{path.name}: Escalation(...) or file_or_refresh(...) without '
+                f'filing_claimant_run_id at lines {unstamped} — every filing site '
+                f'must stamp the filing incarnation (task 3550); use '
+                f'self._filing_claimant_run_id.'
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -284,24 +292,28 @@ class TestEveryHarnessEscalationStatesItsLevel:
     """
 
     def test_every_escalation_construction_passes_level(self) -> None:
-        calls = _filing_call_sites(_HARNESS_SRC_PATH, frozenset({'Escalation'}))
         # Task 7170 folds the dispatch-gate copies onto _file_harness_l1's single
         # construction; those sites merged, they did not move out of this module.
-        assert len(calls) >= 26, (
-            f'{_HARNESS_SRC_PATH.name}: expected >=26 Escalation(...) constructions, '
-            f'found {len(calls)} — if they moved to another module, scan that '
-            f'module here too, or this tripwire silently covers less.'
-        )
+        # Task 8826 moved the four born-at-L2 copies to born_at_l2.py, so
+        # harness.py's floor dropped 26 -> 22 and that module is scanned too.
+        floors = {_HARNESS_SRC_PATH: 22, _BORN_AT_L2_SRC_PATH: 1}
+        for path, floor in floors.items():
+            calls = _filing_call_sites(path, frozenset({'Escalation'}))
+            assert len(calls) >= floor, (
+                f'{path.name}: expected >={floor} Escalation(...) constructions, '
+                f'found {len(calls)} — if they moved to another module, scan that '
+                f'module here too, or this tripwire silently covers less.'
+            )
 
-        implicit = [
-            node.lineno for node in calls
-            if not any(kw.arg == 'level' for kw in node.keywords)
-        ]
-        assert not implicit, (
-            f'{_HARNESS_SRC_PATH.name}: Escalation(...) without level= at lines '
-            f'{implicit} — pass level= explicitly rather than relying on the '
-            f'dataclass default.'
-        )
+            implicit = [
+                node.lineno for node in calls
+                if not any(kw.arg == 'level' for kw in node.keywords)
+            ]
+            assert not implicit, (
+                f'{path.name}: Escalation(...) without level= at lines '
+                f'{implicit} — pass level= explicitly rather than relying on the '
+                f'dataclass default.'
+            )
 
 
 def _reconcile_reaper_harness(tmp_path: Path, mock_orch_config) -> Harness:
