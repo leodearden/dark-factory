@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -197,8 +198,17 @@ def client(backend) -> BackendToolClient:
     return BackendToolClient(backend)
 
 
-async def _seed(backend: SqliteTaskBackend, root: str, meta: dict[str, Any]) -> str:
-    added = await backend.add_task(project_root=root, title='t', metadata=json.dumps(meta))
+async def _seed(
+    backend: SqliteTaskBackend, root: str, meta: dict[str, Any], *, status: str = 'done',
+) -> str:
+    """Every live target is done or cancelled, and a done row carries no ``pending_since``.
+
+    Titles are unique because the store refuses a duplicate (title, files) key.
+    """
+    added = await backend.add_task(
+        project_root=root, title=f'seed {uuid.uuid4().hex}', metadata=json.dumps(meta),
+        status=status,
+    )
     return str(added['id'])
 
 
@@ -328,6 +338,22 @@ async def test_malformed_ledger_is_reported_without_blocking_the_rest(
 
     assert await _stored(backend, root, malformed) == malformed_meta
     assert (await _stored(backend, root, healthy))['retry_ledger'] == {FAILURES: 3, ITERATION: 7}
+
+
+@pytest.mark.asyncio
+async def test_blob_a_replace_write_would_strip_is_refused_before_writing(
+    backend, root, client, tmp_path,
+):
+    anchored = await _seed(backend, root, BOTH_COUNTERS_META, status='pending')
+    anchored_before = await _stored(backend, root, anchored)
+    assert 'pending_since' in anchored_before
+    healthy = await _seed(backend, root, BOTH_COUNTERS_META)
+
+    assert await run(client, [root], apply=True, backup_path=tmp_path / 'backup.json') != 0
+
+    assert [args['id'] for name, args in client.calls if name == 'update_task'] == [healthy]
+    assert await _stored(backend, root, anchored) == anchored_before
+    assert FAILURES not in await _stored(backend, root, healthy)
 
 
 @pytest.mark.asyncio
