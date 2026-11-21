@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import pathlib
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shell_sections import REPO_ROOT, run_with_preamble, slice_section, stub_bin_dir, write_stub
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 EXPORT_DATA_PATH = REPO_ROOT / "scripts" / "export-data.sh"
 IMPORT_DATA_PATH = REPO_ROOT / "scripts" / "import-data.sh"

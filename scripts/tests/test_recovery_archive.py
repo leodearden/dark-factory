@@ -7,6 +7,9 @@ from pathlib import Path
 
 import pytest
 from recovery_archive import RECOVERY_ARCHIVES, ArchiveDir, PinnedDump, main
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 GOOD_SHA = "0" * 64
 ARCH_A = "fused-memory/data/arch-a"
