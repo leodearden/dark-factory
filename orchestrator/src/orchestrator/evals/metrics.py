@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
 from orchestrator.shadow_types import ReferenceKind
 
+from .cell_sandbox import CellSandbox
 from .measurement import UnmeasuredRecord
 from .plan_predicates import is_scorable_plan
 
@@ -287,6 +288,13 @@ class EvalMetrics:
     # before task 4844, or a path with no live architect such as ``run_eval``.
     # The key is written unconditionally; see docs/eval-replay-frame.md.
     replay_frame: str | None = None
+
+    # What this cell's sandboxed agents ran under (evals/cell_sandbox.py::CellSandbox).
+    # None means an architect cell, whose agents are all unsandboxed roles, or a
+    # cell recorded before task 9849. Since that task an architect cell of a
+    # fixture from another project does run with that project's agent env
+    # (evals/fixture_agent_env.py).
+    sandbox_backend: CellSandbox | None = None
 
     # Live shadow eval (plans/live-shadow-eval-prd.md C1/C4): the shadow_cells row
     # is the record's home and this is its pointer. None on every non-shadow cell
