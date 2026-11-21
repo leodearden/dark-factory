@@ -22,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,7 @@ from escalation.authority import (
     REVERSIBLE_POLICY_ACTIONS,
     PolicyAction,
 )
-from escalation.classify import classify_resolver_tier
+from escalation.classify import SeatTier, classify_resolver_tier
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, iter_all_escalation_paths
 from escalation.shadow_ruling import (
@@ -602,6 +603,19 @@ def _stamped_note(ruling: ShadowRuling) -> str:
     return f'{_FRESHNESS_NOTE}\n{ruling.to_note_line()}'
 
 
+class _BySeat(Enum):
+    """The fixture's default ruling flag, derived from the resolver."""
+
+    DEFAULT = 'by-seat'
+
+
+def _ruled_by_human_for(resolved_by: str, flag: bool | None | _BySeat) -> bool | None:
+    """A human seat's close is a ruling; any other seat asserts nothing, as in production."""
+    if flag is not _BySeat.DEFAULT:
+        return flag
+    return True if classify_resolver_tier(resolved_by) is SeatTier.HUMAN else None
+
+
 class _Fixture:
     """Builds records through the REAL queue: submit -> stamp_triage -> resolve.
 
@@ -610,8 +624,9 @@ class _Fixture:
     load-bearing premise of the whole measurement is precisely that the real
     paths preserve the stamp into the archive.
 
-    A resolve is a human ruling (``ruled_by_human=True``) unless the test says
-    otherwise: that is the measurement's ordinary subject.
+    A resolve by a human seat is a human ruling (``ruled_by_human=True``) unless
+    the test says otherwise: that is the measurement's ordinary subject. Any
+    other resolver asserts nothing unless the test says so.
     """
 
     def __init__(self, tmp_path: Path, seq: int = 0):
@@ -640,11 +655,11 @@ class _Fixture:
 
     def resolve(
         self, record: Escalation, *, by: str, dismiss: bool = True,
-        ruled_by_human: bool | None = True,
+        ruled_by_human: bool | None | _BySeat = _BySeat.DEFAULT,
     ) -> Escalation:
         resolved = self.queue.resolve(
             record.id, 'ruled', dismiss=dismiss, resolved_by=by, resolution_class='actionable',
-            ruled_by_human=ruled_by_human,
+            ruled_by_human=_ruled_by_human_for(by, ruled_by_human),
         )
         assert resolved is not None
         return resolved
@@ -652,7 +667,8 @@ class _Fixture:
     def stamped_and_resolved(
         self, ruling: ShadowRuling, *, observed_action: str | None, stamped_by: str = 'watcher-a',
         resolved_by: str = 'interactive', category: str = 'risk_identified',
-        agent_role: str = 'claude-task-1-implementer', ruled_by_human: bool | None = True,
+        agent_role: str = 'claude-task-1-implementer',
+        ruled_by_human: bool | None | _BySeat = _BySeat.DEFAULT,
     ) -> Escalation:
         record = self.submit(
             category=category, agent_role=agent_role, resolution_action=observed_action,
@@ -1114,7 +1130,6 @@ class TestExclusionsAndWindow:
         fixture = _Fixture(tmp_path)
         fixture.stamped_and_resolved(
             _ruling(), observed_action='close_only', resolved_by='l2-cascade:esc-9-1',
-            ruled_by_human=None,
         )
 
         report = fixture.report()
@@ -1134,7 +1149,6 @@ class TestExclusionsAndWindow:
         fixture = _Fixture(tmp_path)
         fixture.stamped_and_resolved(
             _ruling(), observed_action='close_only', resolved_by='auto-dismissed',
-            ruled_by_human=None,
         )
 
         report = fixture.report()
@@ -1155,11 +1169,10 @@ class TestExclusionsAndWindow:
         fixture.stamped_and_resolved(_ruling(), observed_action='close_only')
         fixture.stamped_and_resolved(
             _ruling(), observed_action='close_only', resolved_by='l2-cascade:esc-9-1',
-            ruled_by_human=None,
         )
         fixture.stamped_and_resolved(
             _ruling(_VETO_STREAK), observed_action='close_only',
-            resolved_by='l2-cascade:esc-9-2', ruled_by_human=None,
+            resolved_by='l2-cascade:esc-9-2',
         )
 
         report = fixture.report()
@@ -1636,7 +1649,7 @@ class TestCliTable:
         for i in range(2):
             fixture.stamped_and_resolved(
                 _ruling(), observed_action='close_only',
-                resolved_by=f'l2-cascade:esc-9-{i}', ruled_by_human=None,
+                resolved_by=f'l2-cascade:esc-9-{i}',
             )
 
         assert main(['--queue-dir', str(fixture.queue.queue_dir)]) == 0
