@@ -51,7 +51,6 @@ members do not, because no measured need was found (task 5408); that side is
 from __future__ import annotations
 
 import dataclasses
-import getpass
 import importlib.util
 import os
 import pathlib
@@ -62,6 +61,7 @@ import sys
 from collections.abc import Mapping
 
 import pytest
+from host_pytest_temp_root import listing, seed_dead_session_dirs
 from pytest_config_discovery import discovered_pytest_configs
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -402,10 +402,6 @@ def _captured(result: subprocess.CompletedProcess[str]) -> str:
     return f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
 
 
-def _listing(root: pathlib.Path) -> list[str]:
-    return sorted(str(path.relative_to(root)) for path in root.rglob('*'))
-
-
 @pytest.mark.xdist_group(RESTART_REPRO_GROUP)
 @pytest.mark.timeout(300)
 def test_restarts_permitted_abort_the_session_unattributed(
@@ -488,8 +484,8 @@ def test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     host = tmp_path / 'host-temp'
-    (host / f'pytest-of-{getpass.getuser()}' / 'garbage-seeded' / 'leftover').mkdir(parents=True)
-    before = _listing(host)
+    seed_dead_session_dirs(host)
+    before = listing(host)
     monkeypatch.setenv('TMPDIR', str(host))
     suite = _write_suite(
         tmp_path,
@@ -510,7 +506,7 @@ def test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched(
         'the listing check below would pass vacuously.\n'
         f'{_captured(result)}'
     )
-    after = _listing(host)
+    after = listing(host)
     assert after == before, (
         'a synthetic suite run must not create, lock or clean dirs in the host '
         "default temp root: its exit-time sweep of other sessions' dead dirs "
