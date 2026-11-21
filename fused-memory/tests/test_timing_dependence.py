@@ -509,3 +509,86 @@ class TestCoverage:
         )
         [violation] = _scan(source)
         assert 'time.sleep(0.1)' in violation.message
+
+
+_DEBT_FILE = 'orchestrator/tests/test_x.py'
+_DEBT_KEY = f"TIMING_DEPENDENCE_DEBT['{_DEBT_FILE}']"
+_BUDGET_OF_TWO = _lint_cli.DebtBaseline.from_mapping({_DEBT_FILE: 2})
+_SLEEP_SITE = '    time.sleep(0.1)\n'
+_COVERED_HELPER = (
+    f'\n\n@pytest.mark.timing({_REASON})\ndef _covered_helper():\n{_SLEEP_SITE}'
+)
+
+
+def _sleeps(count: int, *, covered: int = 0) -> str:
+    return (
+        'import time\n\nimport pytest\n\n\ndef test_case():\n'
+        + _SLEEP_SITE * count
+        + '    pass\n'
+        + _COVERED_HELPER * covered
+    )
+
+
+def _budgeted(source: str, filename: str = _DEBT_FILE):
+    return _scan(source, filename=filename, budgets=_BUDGET_OF_TWO)
+
+
+class TestTimingDependenceBudget:
+    """Rule D's own shrink-only per-file budget, counted over UNCOVERED sites only."""
+
+    def test_a_debt_file_at_its_budget_is_silent(self):
+        assert _budgeted(_sleeps(2)) == []
+
+    def test_an_overrun_reports_the_last_site(self):
+        found = _budgeted(_sleeps(3))
+        assert [(v.lineno, v.col_offset) for v in found] == [(9, 4)], found
+
+    @pytest.mark.parametrize(
+        'needle',
+        [
+            'recorded budget of 2',
+            '3 were found',
+            '1 over budget',
+            'positional',
+            'shared/src/shared/pytest_fake_clock.py::fake_clock',
+            'shared/src/shared/testing_virtual_clock.py::virtual_clock_test',
+            '@pytest.mark.timing(reason=',
+            'Do NOT raise',
+            'TIMING_DEPENDENCE_DEBT',
+        ],
+    )
+    def test_the_overrun_message_names_the_budget_its_remedies_and_forbids_raising_it(self, needle):
+        [violation] = _budgeted(_sleeps(3))
+        _assert_owns_its_vocabulary(violation.message)
+        assert needle in violation.message
+
+    def test_slack_is_one_file_level_violation_naming_the_lowered_number(self):
+        [violation] = _budgeted(_sleeps(1))
+        assert (violation.lineno, violation.col_offset) == (1, 0)
+        _assert_owns_its_vocabulary(violation.message)
+        assert (
+            f'lower {_DEBT_KEY} from 2 to 1 in fused-memory/scripts/_timing_dependence_debt.py'
+            in violation.message
+        )
+
+    def test_a_fully_migrated_file_is_told_to_delete_its_entry(self):
+        [violation] = _budgeted(_sleeps(0))
+        _assert_owns_its_vocabulary(violation.message)
+        assert f'delete {_DEBT_KEY}' in violation.message
+        assert 'fused-memory/tests/test_fused_memory_governed_lists.py::TIMING_DEPENDENCE_BASELINE' in (
+            violation.message
+        )
+
+    def test_a_non_debt_file_reports_every_site(self):
+        assert len(_budgeted(_sleeps(3), filename=_NEW_FILE)) == 3
+
+    def test_a_covered_site_neither_fills_the_budget_nor_hides_an_overrun(self):
+        assert _budgeted(_sleeps(2, covered=1)) == []
+        [slack] = _budgeted(_sleeps(1, covered=1))
+        assert (slack.lineno, slack.col_offset) == (1, 0)
+
+    def test_the_live_budgets_index_exactly_the_debt_mapping(self):
+        debt = load_script_module(_SCRIPTS / '_timing_dependence_debt.py').TIMING_DEPENDENCE_DEBT
+        rebuilt = _lint_cli.DebtBaseline.from_mapping(debt)
+        for key in debt:
+            assert _timing.TIMING_DEPENDENCE_BUDGETS.entry_for(key) == rebuilt.entry_for(key)
