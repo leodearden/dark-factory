@@ -1060,6 +1060,7 @@ class TestTheCasesDump:
             'canonical_in_slate': True,
             'canonical_present': True,
             'band': OUTCOME_JUDGE,
+            'routed': OUTCOME_JUDGE,
             'similarity': 0.7,
             'verdict': OUTCOME_AMENDED,
             'outcome': OUTCOME_AMENDED,

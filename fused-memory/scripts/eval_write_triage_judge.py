@@ -276,6 +276,7 @@ def run_judge_eval(
         scored=scored,
         provenance=run_provenance,
         production_shape=_scoring.score_attachments(rows),
+        routing=_scoring.score_routing(rows),
     )
 
     # `markdown_path` was composed (and its collision with `report_path`
