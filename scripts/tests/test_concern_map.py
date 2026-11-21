@@ -345,3 +345,121 @@ class TestFailures:
             cmap.total_lines = 0  # type: ignore[misc]
         with pytest.raises(TypeError):
             cmap.residual['inter_unit_gaps'] = 0  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# evaluate_partition: what a proposed split of the units would cost.
+#
+# A refs B (poll -> helper_method), B refs A (describe -> size), B refs C
+# (helper -> LIMIT), and A and B both write _count (__init__, bump).
+
+PARTITION = {
+    'A': ['Engine.__init__', 'Engine.poll', 'Engine.size'],
+    'B': ['Engine.helper_method', 'Engine.describe', 'Engine.bump', 'helper'],
+    'C': ['LIMIT', 'Failure', 'Engine.other', 'Engine.wire'],
+}
+
+# A -> B -> C -> A: poll -> helper_method -> helper -> LIMIT.
+THREE_CYCLE = {
+    'A': ['Engine.poll', 'LIMIT'],
+    'B': ['Engine.helper_method'],
+    'C': ['helper'],
+    'D': [
+        'Failure', 'Engine.__init__', 'Engine.size', 'Engine.describe',
+        'Engine.bump', 'Engine.other', 'Engine.wire',
+    ],
+}
+
+
+def _report(partition=PARTITION) -> concern_map.PartitionReport:
+    return concern_map.evaluate_partition(_measure(), partition)
+
+
+class TestEvaluatePartition:
+    def test_cluster_totals_sum_to_the_measured_units(self) -> None:
+        cmap = _measure()
+        clusters = _report().clusters
+        assert sum(size.units for size in clusters.values()) == len(cmap.units)
+        assert sum(size.lines for size in clusters.values()) == sum(u.lines for u in cmap.units)
+        assert sum(size.prose_lines for size in clusters.values()) == sum(
+            u.prose_lines for u in cmap.units
+        )
+
+    def test_a_cluster_total_is_the_sum_of_its_units(self) -> None:
+        # __init__ 3 + poll 4 + size 3; C holds Failure's docstring and other's comments.
+        clusters = _report().clusters
+        assert (clusters['A'].units, clusters['A'].lines, clusters['A'].prose_lines) == (3, 10, 0)
+        assert clusters['C'].prose_lines == 3
+
+    def test_edges_count_cross_cluster_refs_with_a_sample_pair(self) -> None:
+        edges = _report().edges
+        assert {key: edge.count for key, edge in edges.items()} == {
+            ('A', 'B'): 1,
+            ('A', 'C'): 2,
+            ('B', 'A'): 1,
+            ('B', 'C'): 1,
+        }
+        assert edges[('A', 'B')].sample == ('Engine.poll', 'Engine.helper_method')
+        assert edges[('A', 'C')].sample in {
+            ('Engine.poll', 'LIMIT'), ('Engine.poll', 'Failure'),
+        }
+
+    def test_intra_cluster_refs_are_not_edges(self) -> None:
+        # wire -> other and helper_method -> helper stay inside their clusters.
+        assert not {key for key in _report().edges if key[0] == key[1]}
+        assert ('C', 'C') not in _report().edges
+
+    def test_a_two_cluster_cycle_is_one_cyclic_group(self) -> None:
+        assert _report().cyclic_groups == (frozenset({'A', 'B'}),)
+
+    def test_a_three_cluster_cycle_is_one_cyclic_group(self) -> None:
+        assert _report(THREE_CYCLE).cyclic_groups == (frozenset({'A', 'B', 'C'}),)
+
+    def test_an_acyclic_partition_has_no_cyclic_group(self) -> None:
+        acyclic = {
+            'top': ['Engine.poll', 'Engine.describe', 'Engine.wire', 'Engine.bump'],
+            'bottom': [
+                'Engine.helper_method', 'helper', 'LIMIT', 'Failure', 'Engine.size',
+                'Engine.other', 'Engine.__init__',
+            ],
+        }
+        assert _report(acyclic).cyclic_groups == ()
+
+    def test_an_attribute_written_from_two_clusters_is_a_shared_write(self) -> None:
+        assert dict(_report().shared_writes) == {'_count': frozenset({'A', 'B'})}
+
+    def test_module_unit_users_are_the_clusters_referencing_each_module_unit(self) -> None:
+        assert dict(_report().module_unit_users) == {
+            'LIMIT': frozenset({'A', 'B'}),
+            'helper': frozenset({'B'}),
+            'Failure': frozenset({'A'}),
+        }
+
+    def test_the_report_is_immutable(self) -> None:
+        report = _report()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            report.edges = {}  # type: ignore[misc]
+        with pytest.raises(TypeError):
+            report.clusters['A'] = report.clusters['B']  # type: ignore[index]
+
+
+class TestPartitionCoverage:
+    def test_the_error_is_a_metrics_error(self) -> None:
+        assert issubclass(concern_map.PartitionError, source_measures.MetricsError)
+
+    def test_every_unassigned_duplicate_and_unknown_unit_is_named(self) -> None:
+        broken = {
+            'A': ['Engine.__init__', 'Engine.poll', 'Engine.size', 'helper', 'Engine.ghost'],
+            'B': ['Engine.helper_method', 'Engine.describe', 'Engine.bump', 'helper'],
+            'C': ['LIMIT', 'Failure', 'nope'],
+        }
+        with pytest.raises(concern_map.PartitionError) as excinfo:
+            _report(broken)
+        message = str(excinfo.value)
+        for name in ('Engine.other', 'Engine.wire', 'helper', 'Engine.ghost', 'nope'):
+            assert name in message
+
+    def test_a_unit_listed_twice_in_one_cluster_is_a_duplicate(self) -> None:
+        twice = {**PARTITION, 'C': [*PARTITION['C'], 'LIMIT']}
+        with pytest.raises(concern_map.PartitionError, match='LIMIT'):
+            _report(twice)
