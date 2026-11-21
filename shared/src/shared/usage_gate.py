@@ -133,6 +133,12 @@ _EMPTY_POOL_FIX_HINT = (
 # constant, not an operator knob.
 _SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
 
+# How often a caller parked on an exhausted model scope re-announces itself
+# (task 7243): the same interval as the fleet park's
+# `_ALL_CAPPED_PARK_LOG_INTERVAL_SECS`. An internal observability constant,
+# not an operator knob.
+_SCOPE_PARK_LOG_INTERVAL_SECS = 600.0
+
 # How often a FULLY-CAPPED park re-announces itself (task 4945). The park
 # below used to log once at INFO and then block on a bare `_open.wait()`
 # with no further output for as long as the freeze lasted, which made a
@@ -527,6 +533,14 @@ class _ReserveView:
     rule: ReserveConfig
     caller: WorkClass
     now: datetime
+
+
+@dataclass(frozen=True)
+class _ParkClock:
+    """One waiter's heartbeat clock, on the monotonic clock."""
+
+    started: float
+    last_logged: float | None = None
 
 
 class SessionBudgetExhausted(Exception):
@@ -1480,6 +1494,7 @@ class UsageGate:
             raise RuntimeError(f'No OAuth accounts available {_EMPTY_POOL_FIX_HINT}')
 
         park_deadline = _park_deadline(park, max_wait_secs)
+        scope_park_clock: _ParkClock | None = None
         # Find first non-capped account (works with 1 or N)
         while True:
             async with self._lock:
@@ -1521,49 +1536,9 @@ class UsageGate:
                     park_left = _park_time_left(park_deadline)
                     if park_left is not None and park_left <= 0:
                         raise self._pool_frozen(scope)
-                    # Fleet is NOT frozen — at least one account is generally
-                    # serviceable, only this scope is exhausted. Park on the
-                    # per-scope waiter toward the soonest scope reset (or the
-                    # max-probe ceiling when unknown) WITHOUT ever touching _open
-                    # or _paused_reason, so scope exhaustion can never freeze the
-                    # fleet (S3) nor delay a concurrent scope=None caller. On
-                    # timeout the loop re-runs the selection-time sweep. INV-4:
-                    # this always eventually returns an account rather than
-                    # blocking indefinitely, so the caller's slot.report(CapHit)
-                    # re-detection advances consecutive_cap_hits and the existing
-                    # max_cap_retries/AllAccountsCappedException bound applies; the
-                    # reactive re-cap installs a FUTURE deadline so uncaps are
-                    # spaced, not a tight spin.
-                    soonest = self._soonest_scope_reset(scope)
-                    sleep_for = (
-                        max(0.0, (soonest - datetime.now(UTC)).total_seconds())
-                        if soonest is not None
-                        else float(self._config.max_probe_interval_secs)
+                    scope_park_clock = await self._park_on_exhausted_scope(
+                        scope, evt, park_left, scope_park_clock
                     )
-                    # Robustness (task 2857 amendment): the per-scope waiter is
-                    # set() ONLY by the scope-uncap sweep, so it does NOT wake on
-                    # an account-level transition that opens scope headroom. The
-                    # common such case is a PROBE_IN_FLIGHT account finishing its
-                    # probe and going AVAILABLE (confirm_account_ok) — is_paused
-                    # ignores probe_in_flight, so a scoped caller can park here
-                    # while the only otherwise-selectable account is mid-probe.
-                    # When a probe is outstanding, cap the park at a small
-                    # re-poll ceiling so the selection-time sweep re-runs within a
-                    # bounded delay instead of sleeping toward the full scope
-                    # deadline / max_probe_interval_secs. This still never touches
-                    # _open / _paused_reason (S3) and never tight-spins (the
-                    # ceiling is strictly positive); the pure scope-exhaustion
-                    # steady state (no probe in flight) is unchanged — it sleeps
-                    # toward the real deadline. (A bare `await self._open.wait()`
-                    # here would busy-spin: the fleet is NOT frozen precisely
-                    # because some account is generally AVAILABLE, so _open is
-                    # already set and would return at once.)
-                    if any(a.probe_in_flight for a in self._accounts):
-                        sleep_for = min(sleep_for, _SCOPE_WAIT_REPOLL_CEIL_SECS)
-                    if park_left is not None:
-                        sleep_for = min(sleep_for, park_left)
-                    with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(evt.wait(), timeout=sleep_for)
                     continue
                 # else: self.is_paused → the fleet is genuinely frozen (every
                 # account account-level capped/auth_failed). Fall through to the
@@ -1640,6 +1615,67 @@ class UsageGate:
             reserved_account=refused.account if refused is not None else None,
             release_at=refused.release_at if refused is not None else None,
         )
+
+    async def _park_on_exhausted_scope(
+        self,
+        scope: str,
+        evt: asyncio.Event,
+        park_left: float | None,
+        clock: _ParkClock | None,
+    ) -> _ParkClock:
+        """One pass of the scoped no-freeze park (task γ, S3/S6), announced as it waits.
+
+        Reached only while the fleet is OPEN: some account is generally
+        serviceable and only *scope* is exhausted. So it waits on the
+        per-scope waiter *evt*, toward the soonest scope reset or, when none is
+        known, ``max_probe_interval_secs``, and never touches ``_open`` or
+        ``_paused_reason``: scope exhaustion can neither freeze the fleet (S3)
+        nor delay a concurrent ``scope=None`` caller. A bare
+        ``self._open.wait()`` would busy-spin, ``_open`` being already set. On
+        return ``before_invoke`` re-runs selection and the sweeps, so it
+        eventually returns an account (INV-4): the caller's
+        ``slot.report(CapHit)`` then advances ``consecutive_cap_hits`` under the
+        ``max_cap_retries`` bound, and the reactive re-cap installs a FUTURE
+        deadline, spacing the uncaps rather than spinning.
+
+        PROBE RE-POLL (task 2857 amendment). Only the scope-uncap sweep sets
+        *evt*. An account-level transition that opens scope headroom, chiefly
+        a PROBE_IN_FLIGHT account confirming and going AVAILABLE, does not,
+        and ``is_paused`` ignores probe_in_flight. So while any probe is
+        outstanding the wait is capped at ``_SCOPE_WAIT_REPOLL_CEIL_SECS``,
+        strictly positive, so it never tight-spins. *park_left* is what remains
+        of the caller's ``max_wait_secs``.
+
+        THE HEARTBEAT (task 7243) is per waiter: *clock* is this caller's,
+        handed back for its next pass, and it dies with ``before_invoke``'s
+        frame, so an abandoned park has nothing to bequeath. It is purely
+        additive: it changes neither what ``before_invoke`` returns nor when
+        it unblocks.
+        """
+        now = time.monotonic()
+        clock = clock or _ParkClock(started=now)
+        soonest = self._soonest_scope_reset(scope)
+        logger.warning(
+            self._park_heartbeat(
+                'scope_exhausted_park',
+                now - clock.started,
+                scope=scope,
+                soonest_scope_reset_at=soonest.isoformat() if soonest is not None else None,
+            )
+        )
+        clock = replace(clock, last_logged=now)
+        sleep_for = (
+            max(0.0, (soonest - datetime.now(UTC)).total_seconds())
+            if soonest is not None
+            else float(self._config.max_probe_interval_secs)
+        )
+        if any(a.probe_in_flight for a in self._accounts):
+            sleep_for = min(sleep_for, _SCOPE_WAIT_REPOLL_CEIL_SECS)
+        if park_left is not None:
+            sleep_for = min(sleep_for, park_left)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(evt.wait(), timeout=sleep_for)
+        return clock
 
     async def _wait_for_any_account_to_reopen(self, deadline: float | None) -> None:
         """Block until ``_open`` is set or *deadline* passes, announcing the
