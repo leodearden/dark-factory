@@ -175,15 +175,13 @@ def select_scored_records(
             cfg.project_root, cfg.agent_transcript_roots
         ),
     )
-    if skip_sessions:
-        uncoded = sampling.drop_coded(sessions, skip_sessions)
-        if len(uncoded) < len(sessions):
-            logger.info(
-                'legibility trickle: project=%s date=%s skipped %d already-coded session(s)',
-                cfg.project_id, target_date.isoformat(), len(sessions) - len(uncoded),
-            )
-        sessions = uncoded
-    return [sampling.score_session(session) for session in sessions]
+    uncoded = sampling.drop_coded(sessions, skip_sessions)
+    if len(uncoded) < len(sessions):
+        logger.info(
+            'legibility trickle: project=%s date=%s skipped %d already-coded session(s)',
+            cfg.project_id, target_date.isoformat(), len(sessions) - len(uncoded),
+        )
+    return [sampling.score_session(session) for session in uncoded]
 
 
 def select_digest_sessions(
