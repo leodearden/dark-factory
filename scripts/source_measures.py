@@ -182,8 +182,15 @@ def file_size_measures_in_tree(
     source: str, tree: ast.Module, *, path: str
 ) -> FileSizeMeasures:
     """``file_size_measures`` over a tree the caller already parsed from *source*."""
-    prose = _docstring_lines(tree) | _comment_lines(source, path=path)
+    prose = prose_line_numbers_in_tree(source, tree, path=path)
     return FileSizeMeasures(lines=len(source.splitlines()), prose_lines=len(prose))
+
+
+def prose_line_numbers_in_tree(
+    source: str, tree: ast.Module, *, path: str
+) -> frozenset[int]:
+    """The line numbers behind ``FileSizeMeasures.prose_lines``: docstring spans unioned with COMMENT-token lines."""
+    return frozenset(_docstring_lines(tree) | _comment_lines(source, path=path))
 
 
 # ---------------------------------------------------------------------------
