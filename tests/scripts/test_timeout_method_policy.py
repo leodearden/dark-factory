@@ -260,10 +260,11 @@ def {TEMPROOT_RECORDER_TEST}():
 class _ProbeSuite:
     root: pathlib.Path
     ini: pathlib.Path
+    basetemp: pathlib.Path
 
 
 def _write_probe_suite(tmp_path: pathlib.Path, method: str) -> _ProbeSuite:
-    """The synthetic suite under *tmp_path*, its cap enforced by *method*."""
+    """The synthetic suite under *tmp_path*, its cap enforced by *method*; basetemp is a not-yet-created sibling of its root."""
     root = tmp_path / 'suite'
     root.mkdir()
     ini = root / 'pytest.ini'
@@ -272,7 +273,7 @@ def _write_probe_suite(tmp_path: pathlib.Path, method: str) -> _ProbeSuite:
         encoding='utf-8',
     )
     (root / PROBE_MODULE_NAME).write_text(_PROBE_MODULE, encoding='utf-8')
-    return _ProbeSuite(root=root, ini=ini)
+    return _ProbeSuite(root=root, ini=ini, basetemp=tmp_path / 'basetemp')
 
 
 def _run_probe_suite(
@@ -293,6 +294,10 @@ def _run_probe_suite(
     change what the child runs or suppress the literals asserted on. Only
     ``PYTEST_DISABLE_PLUGIN_AUTOLOAD`` is then set, so the child loads exactly
     ``PROBE_PLUGINS`` and nothing else installed in the venv.
+
+    The child runs under the suite's private basetemp, never in the host's
+    default pytest temp root; why:
+    ``test_timeout_method_policy.py::test_a_probe_suite_run_leaves_the_hosts_default_temp_root_untouched``.
     """
     missing = [
         plugin for plugin in ('xdist', 'pytest_timeout')
@@ -315,6 +320,7 @@ def _run_probe_suite(
                 '--dist', 'loadgroup',
                 '-rA',
                 *extra,
+                f'--basetemp={suite.basetemp}',
             ],
             cwd=suite.root,
             env=env,
