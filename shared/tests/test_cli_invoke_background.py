@@ -990,8 +990,15 @@ class TestDeliveredNotificationIsAReap:
 
         A notification arrives asynchronously, so it can land after a launch
         the agent made later, unlike a tool_use reap the agent issues itself.
-        Clearing only the launch a reap names would need per-launch tracking,
-        and the module errs toward not downgrading.  Sibling of
+        Per-launch tracking was measured and rejected (task 7127,
+        2026-11-21).  Over the dark-factory and reify transcript archives it
+        would have added 24 verdicts on sessions that ended a clean turn,
+        beside the positional rule's 191.  Only 10 of the 24 were waiting on
+        work they still needed.  11 had finished, and the pending launch was
+        a redundant waiter whose target had already reported.  2 had
+        finished with a non-essential check still running.  1 ended on an
+        API error.  A downgrade that is wrong about half the time is the
+        direction this module refuses.  Sibling of
         test_streamed_monitor_event_then_end_is_false_documented_gap.
         """
         records = [

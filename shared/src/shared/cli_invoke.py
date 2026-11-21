@@ -1144,6 +1144,8 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     Reaps are positional, not per launch (accepted on the same grounds): an
     earlier launch's delivered completion that lands after a later launch
     clears the verdict while that later launch is still pending → False.
+    Measured and rejected by task 7127; the numbers live at
+    shared/tests/test_cli_invoke_background.py::TestDeliveredNotificationIsAReap::test_earlier_completion_after_later_launch_is_false_documented_gap.
     """
     if not records:
         return False
