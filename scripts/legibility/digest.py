@@ -778,9 +778,9 @@ priority order and no re-prioritisation is needed."""
 
 def _record_label(index: int) -> str:
     """Render an item's '(record N)' label. N is the item's 0-based
-    position among the transcript's parsed records; every assistant,
-    tool_result and harness record counts toward it, so it is not a
-    user-turn ordinal -- frontmatter ``n_user_turns`` counts those.
+    position among the transcript's parsed records, whatever their type,
+    so it is not a user-turn ordinal; frontmatter ``n_user_turns`` counts
+    those.
     Pinned by scripts/tests/test_legibility_digest.py::TestItemRecordLabels."""
     return f'(record {index})'
 
