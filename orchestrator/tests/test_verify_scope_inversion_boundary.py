@@ -116,6 +116,7 @@ from test_verify_plan import (
     _SPAWN_CONSUMERS,
     _SPAWN_SH,
     _UNBLOCK_SKILL,
+    _artifact_registry_config,
 )
 from test_verify_scope_kappa import (
     _FLEET_LINT_COMMAND,
@@ -618,16 +619,6 @@ class TestRow3ProseOnlyTrivialBothRoles:
         )
 
     @staticmethod
-    def _consumer_registry(
-        tmp_path: Path, *, breadth: Literal['scoped', 'full'] = 'scoped',
-    ) -> OrchestratorConfig:
-        """The modules owning every behavioural-artifact consumer test, registered
-        but never passed: a skills-only or root-yaml task's own set is ``[]``."""
-        config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth=breadth)
-        config._module_configs = {mc.prefix: mc for mc in _ARTIFACT_MODULES}
-        return config
-
-    @staticmethod
     def _write_artifact(tmp_path: Path, path: str) -> list[str]:
         full = tmp_path / path
         full.parent.mkdir(parents=True, exist_ok=True)
@@ -646,7 +637,7 @@ class TestRow3ProseOnlyTrivialBothRoles:
     async def test_behavioural_artifact_runs_its_consumers_at_task_role(
         self, tmp_path: Path, artifact: str, consumers: dict[str, tuple[str, ...] | None],
     ) -> None:
-        config = self._consumer_registry(tmp_path)
+        config = _artifact_registry_config(tmp_path, _ARTIFACT_MODULES, breadth='scoped')
         files = self._write_artifact(tmp_path, artifact)
 
         result, executed, _fake = await _drive_producer(
@@ -668,7 +659,7 @@ class TestRow3ProseOnlyTrivialBothRoles:
 
     @pytest.mark.asyncio
     async def test_prose_stays_trivial_beside_a_consumer_registry(self, tmp_path: Path) -> None:
-        config = self._consumer_registry(tmp_path)
+        config = _artifact_registry_config(tmp_path, _ARTIFACT_MODULES, breadth='scoped')
         files = self._write_artifact(tmp_path, 'README.md')
 
         result, executed, fake = await _drive_producer(
@@ -681,7 +672,7 @@ class TestRow3ProseOnlyTrivialBothRoles:
 
     @pytest.mark.asyncio
     async def test_behavioural_artifact_stays_trivial_at_merge_role(self, tmp_path: Path) -> None:
-        config = self._consumer_registry(tmp_path, breadth='scoped')
+        config = _artifact_registry_config(tmp_path, _ARTIFACT_MODULES, breadth='scoped')
         files = self._write_artifact(tmp_path, _SPAWN_SH)
 
         result, _executed, fake = await _drive_producer(
@@ -697,7 +688,7 @@ class TestRow3ProseOnlyTrivialBothRoles:
     async def test_run_scoped_verification_and_verify_plan_agree_on_trivial(
         self, tmp_path: Path, path: str,
     ) -> None:
-        config = self._consumer_registry(tmp_path)
+        config = _artifact_registry_config(tmp_path, _ARTIFACT_MODULES, breadth='scoped')
         files = self._write_artifact(tmp_path, path)
 
         result, _executed, _fake = await _drive_producer(

@@ -2222,6 +2222,19 @@ _SKILL_PROMPT_CONSUMERS = (
 )
 
 
+def _artifact_registry_config(
+    tmp_path: Path,
+    registry: list[ModuleConfig],
+    *,
+    breadth: Literal['scoped', 'full'] = 'full',
+) -> OrchestratorConfig:
+    """A config whose module registry is *registry*, none of it passed as the
+    task's own module set: the shape of a skills-only or root-yaml task."""
+    config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth=breadth)
+    config._module_configs = {mc.prefix: mc for mc in registry}
+    return config
+
+
 def _is_trivial_plan(plan: VerifyPlan) -> bool:
     return len(plan.runs) == 1 and plan.runs[0].scope_kind is ScopeKind.TRIVIAL
 
@@ -2469,10 +2482,8 @@ class TestWithArtifactConsumerModules:
 
     @classmethod
     def _config(cls, tmp_path: Path, registry: list[ModuleConfig] | None = None) -> OrchestratorConfig:
-        config = OrchestratorConfig(project_root=tmp_path)
         modules = [*_ARTIFACT_MODULES, cls._DOCSMOD] if registry is None else registry
-        config._module_configs = {mc.prefix: mc for mc in modules}
-        return config
+        return _artifact_registry_config(tmp_path, modules)
 
     def test_a_skill_prompt_adds_the_module_owning_its_consumers(self, tmp_path):
         config = self._config(tmp_path)
