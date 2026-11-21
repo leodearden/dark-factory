@@ -1919,7 +1919,7 @@ cleanup. What bounds each class:
 | gate checkouts under `dark-factory-gate/` | one per gate sha | 6565's `orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.reap_idle_gates`, 7 days idle. `.build-*.lock` files are never reaped, by design |
 | reify `_merge-verify/target` | reify merge verifies | the 7042 trim timer (reify-owned) |
 | `_mainsweep-*` / `_mainprobe-*` | main-tip sweeps and probes | 5584 / 6794, on the workstation warm-lanes pool, not the laptop |
-| numeric task worktrees from 2026-03..04 | one-time residue; no orchestrator runs on the laptop | this tool; no live generator |
+| numeric task worktrees from 2026-03..04 | one-time residue; no orchestrator runs on the laptop | this tool; no live generator. The tool refuses any repo holding a task store, so it cannot reach a live orchestrator's task worktrees; `--class verify-scope` alone still runs on an orchestrator host |
 
 The tool never touches a checkout's untracked paths (SETUP.md §12), which
 include `fused-memory/data`, mounted by the laptop's running `docker-qdrant-1`
@@ -1937,14 +1937,23 @@ tab-separated line, `kind action reason bytes target`. `action` is `reclaim` or
 `keep` in a report, and `reclaimed`, `failed` or `keep` under `--apply`.
 `bytes` is counted only for reclaims. Each repo then gets a `pgid-records` line
 and a `free` line (`now=`, or `before=`/`after=`). Exit codes: 0 ok, 1 some
-reclaim failed, 2 usage (a `--repo` that is not a checkout top level),
-otherwise ssh's own code.
+reclaim failed, 2 usage (a `--repo` that is not a checkout top level, or,
+whenever a worktree class is requested, one holding
+`.taskmaster/tasks/tasks.db`, in report mode too), otherwise ssh's own code.
+Under `--apply`, a store that appears mid-run turns the pending removals into
+`failed` (exit 1).
 
 A worktree is kept by the first of these that holds: git `locked`; a held
 `<dir>.lock` (`--apply` takes that lock and holds it across the removal); a
 live `.merge_verify_pgids` record naming it; a process cwd inside it; a touch
 within the age floor; and, for task worktrees only, being unregistered or
-dirty (`git worktree remove` without `--force` refuses dirt as well). A scope
+dirty. Dirty means `git status --porcelain` output, so ignored files such as
+`.task/` do not count, and a non-force `git worktree remove` deletes them. That
+is why both worktree classes refuse a repo holding `.taskmaster/tasks/tasks.db`,
+an orchestrator's project root: there a clean, idle task worktree can still
+belong to a blocked, queued or in-review task, and a `_merge-*` dir belongs to
+that host's merge worker and its
+`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.reap_orphaned_merge_worktrees`. A scope
 is reclaimed only when no member has an out-of-scope parent other than PID 1 or
 a systemd instance. An unreadable cgroup or parent keeps the scope. A failed
 unit is `reset-failed`; an orphaned one is SIGKILLed, stopped and confirmed
