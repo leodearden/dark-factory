@@ -156,9 +156,9 @@ class _Ports:
             bench_unavailable_runner=lambda name, exc: self.record('bench_unavailable_runner', name),
             adopt_head_on_tip_authority=lambda item: self._async_record('adopt', item.request.task_id),
             admission_halted=lambda: self.admission_halted,
-            requeue_request=lambda req: self.record('requeue_request', req.task_id),
+            requeue_built_item=lambda item: self.record('requeue_built_item', item.request.task_id),
             retire_item=lambda rid: self.record('retire_item', rid),
-            record_unlanded_rebased_head=lambda item: self.record('record_unlanded_rebased_head'),
+            record_abandoned_item=lambda item: self.record('record_abandoned_item'),
             note_transition=lambda rid, before, after, live: self.record(
                 'note_transition', before, after,
             ),
@@ -572,7 +572,7 @@ class TestDispatch:
         assert isinstance(entry, InflightEntry)
         assert entry.status == InflightStatus.ABANDONED_PREDISPATCH
         assert entry.lease is None and entry.verify_task is None
-        assert scene.ports.names() == ['cleanup_owned', 'record_unlanded_rebased_head', 'retire_item']
+        assert scene.ports.names() == ['cleanup_owned', 'record_abandoned_item', 'retire_item']
         assert scene.hosts.acquired == []
 
     @pytest.mark.parametrize('halt', ['operator', 'admission'])
@@ -588,7 +588,7 @@ class TestDispatch:
 
         assert isinstance(entry, InflightEntry)
         assert entry.status == InflightStatus.REQUEUED_PREDISPATCH
-        assert scene.ports.names() == ['cleanup_owned', 'requeue_request']
+        assert scene.ports.names() == ['cleanup_owned', 'requeue_built_item']
         assert not item.request.result.done()
 
     async def test_a_decided_item_passes_through_a_halt(self, scene: _Scene) -> None:

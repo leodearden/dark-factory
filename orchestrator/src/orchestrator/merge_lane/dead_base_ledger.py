@@ -34,6 +34,10 @@ class DeadBaseSite(StrEnum):
     STALE_DISCARD = 'stale_discard'
     #: A deep chain tip whose reserved links did not all land (task 7720).
     CHAIN_RELEASED = 'chain_released'
+    #: A built item whose request went back to the queue to merge afresh.
+    REQUEUED = 'requeued'
+    #: A built item whose request was abandoned (its waiter gone) before it landed.
+    ABANDONED = 'abandoned'
 
 
 class VoidPoint(StrEnum):
