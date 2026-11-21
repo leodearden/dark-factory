@@ -466,9 +466,9 @@ The orchestrator's merge queue uses a **two-layer pipeline** to separate fast co
 
 ### Layer 1: Speculative merge graph (suffix)
 
-The unfrozen suffix (`_lane_buffers`) holds items that are queued but not yet verifying. The **conflict graph** (`suffix_conflict_graph`) tracks footprint overlaps between suffix items. At each recompute cycle (`recompute_suffix_conflict_graph()`), the queue detects textual conflicts and:
+The unfrozen suffix (the lane buffers in `MergeIntake`) holds items that are queued but not yet verifying. The **conflict graph** (`suffix_conflict_graph`) tracks footprint overlaps between suffix items. At each recompute cycle (`recompute_suffix_conflict_graph()`), the queue detects textual conflicts and:
 
-- **Bounces the younger conflicting suffix item** (`_bounce_conflicting_suffix_items`) — graph-time, disk-free, before any verify slot is consumed or `_merge-*` worktree is created.
+- **Bounces the younger conflicting suffix item** (`MergeIntake.bounce_conflicting_suffix_items`) — graph-time, disk-free, before any verify slot is consumed or `_merge-*` worktree is created.
 - Attempts a **mechanical speculative rebase** first: if clean, the item is re-queued with work preserved and `merge_first_enqueued_at` unchanged; if a real conflict is found, the bounce escalates; if the cap (`MERGE_BOUNCE_CAP=3`) is hit, the 1688 thrash-backstop triggers → blocked without further rebase.
 
 Reordering within the suffix is always disk-free (only recomputes the merge-tree for the affected suffix items, never touches in-flight verify state).
@@ -478,7 +478,7 @@ Reordering within the suffix is always disk-free (only recomputes the merge-tree
 The **frozen prefix** = {verifying} ∪ {landed}. Items in the frozen prefix are **immutable**:
 - A verify should be dispatched against the tip of the frozen prefix (`frozen_prefix_tip`). That rule is a dispatch-time detector, not a refusal: see `verify_base_divergences` below.
 - No reorder or re-base ever touches an in-flight verify item.
-- The suffix recompute only touches `_lane_buffers`; in-flight `_inflight` order and `base_sha` are unchanged.
+- The suffix recompute only touches the lane buffers in `MergeIntake`; in-flight `_inflight` order and `base_sha` are unchanged.
 
 Health check: `two_layer_invariants(main_sha)` → `[]` when INV-3 chain-intact (no frozen entry built on a recorded dead commit), the successor chain links, frozen∩suffix disjointness and the conflict-graph consistency checks all hold. It does not compare the frozen head with current main: main moving under an in-flight verify is not a violation (task 5302).
 
