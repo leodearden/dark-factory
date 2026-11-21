@@ -58,7 +58,7 @@ _STAGE2_POST_RUN_HELPERS = (
 # future policy change to one of them cannot silently turn these tests green
 # by dropping the finding under test instead of verifying its citations.
 _STAGE3_FINDING_FILTERS = (
-    'filter_blocked_snapshot_findings',
+    'filter_task_count_snapshot_findings',
     'filter_contamination_ceiling_findings',
 )
 

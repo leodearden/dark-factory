@@ -7167,24 +7167,18 @@ class TestFilterStaleCountSnapshotCorrections:
 
 
 # ---------------------------------------------------------------------------
-# filter_blocked_snapshot_findings (task-1840 step-3 RED / step-4 GREEN)
+# filter_task_count_snapshot_findings
 # ---------------------------------------------------------------------------
 
 
-class TestFilterBlockedSnapshotFindings:
-    """Pure-function tests for filter_blocked_snapshot_findings(flags, project_id).
-
-    All tests call the function directly — no mocks, no I/O.
-
-    RED until step-4 adds filter_blocked_snapshot_findings to flag_dedup.py.
-    """
-
-    # -----------------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------------
+class TestFilterTaskCountSnapshotFindings:
+    """No project keeps a task-count snapshot (task 10081), so a Stage-3
+    missing_knowledge or memory_stale finding that one is absent or stale is
+    dropped for every project. Other categories, and findings not about a
+    task-count snapshot, pass through."""
 
     @staticmethod
-    def _make_flag(category: str, description: str, suggested_action: str = '') -> dict:
+    def _flag(category: str, description: str, suggested_action: str = '') -> dict:
         return {
             'task_id': None,
             'flag_type': 'missing_knowledge',
@@ -7194,270 +7188,65 @@ class TestFilterBlockedSnapshotFindings:
             'actionable': False,
         }
 
-    # -----------------------------------------------------------------------
-    # Blocked project — dropped cases
-    # -----------------------------------------------------------------------
-
-    def test_missing_knowledge_absence_finding_dropped_for_blocked_project(self):
-        """Case (a): missing_knowledge finding about a task-count snapshot absence is DROPPED.
-
-        The description uses the 'task-count snapshot' marker phrase (no raw numbers),
-        which is the shape of an 'absence' finding from Stage 3.
-        """
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='autopilot_video has no task-count snapshot temporal_fact edge',
-            suggested_action='Add a count snapshot temporal_fact for autopilot_video',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert result == [], (
-            "missing_knowledge finding about task-count snapshot absence must be DROPPED "
-            f"for autopilot_video (snapshot writes blocked-by-design); got {result!r}"
+    def test_missing_knowledge_absence_finding_is_dropped(self):
+        flag = self._flag(
+            'missing_knowledge',
+            'reify has no task-count snapshot temporal_fact edge',
+            'Add a count snapshot temporal_fact for reify',
         )
 
-    def test_memory_stale_raw_count_finding_dropped_for_blocked_project(self):
-        """Case (b): memory_stale finding quoting raw paired count snapshot is DROPPED.
+        assert flag_dedup.filter_task_count_snapshot_findings([flag]) == []
 
-        The description contains a raw paired count snapshot string (e.g. '607 done /
-        148 cancelled') which is_count_snapshot() detects.
-        """
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='memory_stale',
-            description=(
-                'task-count snapshot edge records 607 done / 148 cancelled '
-                'but the tree shows more'
-            ),
-            suggested_action='Update the snapshot edge to reflect current counts',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert result == [], (
-            "memory_stale finding quoting raw count snapshot must be DROPPED "
-            f"for autopilot_video; got {result!r}"
+    def test_memory_stale_raw_count_finding_is_dropped(self):
+        flag = self._flag(
+            'memory_stale',
+            'task-count snapshot edge records 607 done / 148 cancelled but the tree shows more',
+            'Update the snapshot edge to reflect current counts',
         )
 
-    # -----------------------------------------------------------------------
-    # Blocked project — kept cases (category gate and signature gate)
-    # -----------------------------------------------------------------------
-
-    def test_missing_deliverable_finding_kept_for_blocked_project(self):
-        """Case (c): missing_deliverable finding is KEPT (category gate passes only missing_knowledge/memory_stale)."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='missing_deliverable',
-            description='autopilot_video task 42 has no task-count snapshot temporal_fact',
-            suggested_action='Add the deliverable',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert flag in result, (
-            "missing_deliverable finding must be KEPT (not in suppressed categories); "
-            f"got {result!r}"
-        )
-
-    def test_memory_contradiction_finding_kept_for_blocked_project(self):
-        """Case (c): memory_contradiction finding is KEPT (category gate)."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='memory_contradiction',
-            description='count snapshot contradicts task tree',
-            suggested_action='Investigate',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert flag in result, (
-            "memory_contradiction finding must be KEPT (category not in suppressed set); "
-            f"got {result!r}"
-        )
-
-    def test_missing_knowledge_unrelated_to_snapshot_kept(self):
-        """Case (d): missing_knowledge finding unrelated to snapshots is KEPT (signature gate)."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='task 5 has no design doc and no implementation notes',
-            suggested_action='Add a design doc for task 5',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert flag in result, (
-            "missing_knowledge finding unrelated to count snapshots must be KEPT; "
-            f"got {result!r}"
-        )
-
-    def test_empty_list_returns_empty(self):
-        """Case (e): empty list → empty list."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        result = filter_blocked_snapshot_findings([], project_id='autopilot_video')
-        assert result == []
-
-    # -----------------------------------------------------------------------
-    # Non-blocked project — fail-open (all flags pass through)
-    # -----------------------------------------------------------------------
-
-    def test_snapshot_absence_finding_kept_for_non_blocked_project(self):
-        """For reify (not in blocked set), same missing_knowledge absence finding is KEPT."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='reify has no task-count snapshot temporal_fact edge',
-            suggested_action='Add a count snapshot temporal_fact for reify',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='reify')
-        assert flag in result, (
-            "For non-blocked project 'reify', missing_knowledge snapshot finding "
-            f"must pass through unchanged (fail-open); got {result!r}"
-        )
-
-    def test_raw_count_finding_kept_for_non_blocked_project(self):
-        """For reify, same memory_stale raw-count finding is KEPT (fail-open)."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='memory_stale',
-            description='task-count snapshot edge records 607 done / 148 cancelled',
-            suggested_action='Update the snapshot',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='reify')
-        assert flag in result, (
-            "For non-blocked project 'reify', memory_stale count snapshot finding "
-            f"must pass through unchanged (fail-open); got {result!r}"
-        )
-
-    def test_both_snapshot_findings_survive_for_non_blocked_project(self):
-        """For reify both the snapshot-absence and raw-count findings survive."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        absence_flag = self._make_flag(
-            category='missing_knowledge',
-            description='reify has no task-count snapshot temporal_fact edge',
-        )
-        stale_flag = self._make_flag(
-            category='memory_stale',
-            description='count snapshot edge records 607 done / 148 cancelled',
-        )
-        result = filter_blocked_snapshot_findings(
-            [absence_flag, stale_flag], project_id='reify'
-        )
-        assert len(result) == 2, (
-            f"Both findings must survive for non-blocked 'reify'; got {result!r}"
-        )
-
-    # -----------------------------------------------------------------------
-    # Coverage-gap tests: suggested_action-only path + 'account snapshot' negative
-    # -----------------------------------------------------------------------
+        assert flag_dedup.filter_task_count_snapshot_findings([flag]) == []
 
     def test_marker_in_suggested_action_only_is_dropped(self):
-        """_is_task_count_snapshot_finding detects via suggested_action when description is empty.
-
-        The combined text is f'{description} {suggested_action}', so a marker phrase
-        appearing only in suggested_action must still trigger suppression.
-        """
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='',  # empty — marker only in suggested_action
-            suggested_action='Add a task-count snapshot temporal_fact edge for autopilot_video',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert result == [], (
-            "missing_knowledge finding whose marker phrase appears only in suggested_action "
-            f"must be DROPPED for autopilot_video; got {result!r}"
+        flag = self._flag(
+            'missing_knowledge',
+            '',
+            'Add a task-count snapshot temporal_fact edge for dark_factory',
         )
 
-    def test_account_snapshot_phrase_not_dropped(self):
-        """'account snapshot' must NOT be mistaken for a task-count snapshot finding.
+        assert flag_dedup.filter_task_count_snapshot_findings([flag]) == []
 
-        The bare substring 'count snapshot' was intentionally removed from the marker
-        list to avoid this false positive.  A finding mentioning 'account snapshot'
-        (with no task-count-snapshot marker and no raw count pairs) must be KEPT.
-        """
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
+    @pytest.mark.parametrize('category', ['missing_deliverable', 'memory_contradiction'])
+    def test_snapshot_finding_in_another_category_passes_through(self, category):
+        flag = self._flag(category, 'task 42 has no task-count snapshot temporal_fact')
 
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='autopilot_video account snapshot is missing from the knowledge graph',
-            suggested_action='Add the account snapshot edge for project tracking',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='autopilot_video')
-        assert flag in result, (
-            "Finding about 'account snapshot' must NOT be suppressed — "
-            f"'count snapshot' is a substring of 'account snapshot' but must not match; "
-            f"got {result!r}"
+        assert flag_dedup.filter_task_count_snapshot_findings([flag]) == [flag]
+
+    def test_finding_not_about_a_snapshot_passes_through(self):
+        flag = self._flag(
+            'missing_knowledge',
+            'task 5 has no design doc and no implementation notes',
+            'Add a design doc for task 5',
         )
 
-    # -----------------------------------------------------------------------
-    # know_live registration (task 1943 — mirrors autopilot_video / task 1840)
-    # -----------------------------------------------------------------------
+        assert flag_dedup.filter_task_count_snapshot_findings([flag]) == [flag]
 
-    def test_missing_knowledge_absence_finding_dropped_for_know_live(self):
-        """Case (a) mirrored for know_live: missing_knowledge absence finding is DROPPED."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='know_live has no task-count snapshot temporal_fact edge',
-            suggested_action='Add a count snapshot temporal_fact for know_live',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='know_live')
-        assert result == [], (
-            "missing_knowledge finding about task-count snapshot absence must be DROPPED "
-            f"for know_live (snapshot writes blocked-by-design); got {result!r}"
+    def test_account_snapshot_phrase_is_not_a_task_count_snapshot(self):
+        flag = self._flag(
+            'missing_knowledge',
+            'reify account snapshot is missing from the knowledge graph',
+            'Add the account snapshot edge for project tracking',
         )
 
-    def test_memory_stale_raw_count_finding_dropped_for_know_live(self):
-        """Case (b) mirrored for know_live: memory_stale raw-count finding is DROPPED."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
+        assert flag_dedup.filter_task_count_snapshot_findings([flag]) == [flag]
 
-        flag = self._make_flag(
-            category='memory_stale',
-            description=(
-                'task-count snapshot edge records 607 done / 148 cancelled '
-                'but the tree shows more'
-            ),
-            suggested_action='Update the snapshot edge to reflect current counts',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='know_live')
-        assert result == [], (
-            "memory_stale finding quoting raw count snapshot must be DROPPED "
-            f"for know_live; got {result!r}"
-        )
+    def test_only_the_snapshot_finding_is_dropped_from_a_mixed_list(self):
+        snapshot = self._flag('memory_stale', 'count snapshot edge records 607 done / 148 cancelled')
+        unrelated = self._flag('missing_knowledge', 'task 5 has no design doc')
 
-    def test_missing_knowledge_unrelated_to_snapshot_kept_for_know_live(self):
-        """Case (d) mirrored for know_live: unrelated missing_knowledge finding is KEPT (signature gate)."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
+        assert flag_dedup.filter_task_count_snapshot_findings([snapshot, unrelated]) == [unrelated]
 
-        flag = self._make_flag(
-            category='missing_knowledge',
-            description='task 5 has no design doc and no implementation notes',
-            suggested_action='Add a design doc for task 5',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='know_live')
-        assert flag in result, (
-            "missing_knowledge finding unrelated to count snapshots must be KEPT; "
-            f"got {result!r}"
-        )
-
-    def test_memory_contradiction_finding_kept_for_know_live(self):
-        """Case (c) mirrored for know_live: memory_contradiction finding is KEPT (category gate)."""
-        from fused_memory.reconciliation.flag_dedup import filter_blocked_snapshot_findings
-
-        flag = self._make_flag(
-            category='memory_contradiction',
-            description='count snapshot contradicts task tree',
-            suggested_action='Investigate',
-        )
-        result = filter_blocked_snapshot_findings([flag], project_id='know_live')
-        assert flag in result, (
-            "memory_contradiction finding must be KEPT (category not in suppressed set); "
-            f"got {result!r}"
-        )
+    def test_empty_list_returns_empty(self):
+        assert flag_dedup.filter_task_count_snapshot_findings([]) == []
 
 
 # ---------------------------------------------------------------------------
@@ -7467,10 +7256,8 @@ class TestFilterBlockedSnapshotFindings:
 
 class TestFilterContaminationCeilingFindings:
     """Pure-function tests for _is_contamination_ceiling_finding and
-    filter_contamination_ceiling_findings(flags, project_id).
-
-    Mirrors TestFilterBlockedSnapshotFindings one-to-one for the retired
-    autopilot_video Stage-1 task-ID "contamination ceiling" (task 2818/2826).
+    filter_contamination_ceiling_findings(flags, project_id), the gate for the
+    retired autopilot_video Stage-1 task-ID "contamination ceiling" (task 2818/2826).
     All tests call the functions directly — no mocks, no I/O.
 
     RED until step-4 adds the symbols to flag_dedup.py.

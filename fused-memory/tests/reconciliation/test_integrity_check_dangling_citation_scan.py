@@ -57,7 +57,7 @@ LLM_FINDING: dict[str, Any] = {
 }
 
 _STAGE3_FINDING_FILTERS = (
-    'filter_blocked_snapshot_findings',
+    'filter_task_count_snapshot_findings',
     'filter_contamination_ceiling_findings',
 )
 
