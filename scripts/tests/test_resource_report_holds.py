@@ -573,3 +573,169 @@ class TestReclaimThreads:
         assert (entry['reclaim_threads_cpu_usec'], entry['reclaim_threads_share']) == (None, None)
         assert entry['host_cpu_usec'] == 20_000_000
         assert 'reclaim threads unavailable' in kernel
+
+
+class TestSummary:
+    """Collections every 30 s over [T0, T0+900]; windows of 120 s ending at each ranked hold.
+
+    dark-factory: ranked holds at T0+120 and T0+360, and one before go-live.
+    solar-challenge: a ranked hold at T0+600, and one long after the last collection.
+    verify@<dark-factory tag> grows over [T0, T0+360], interactive@t3code over [T0+480, T0+600],
+    and t3code is the only consumer pages are reclaimed from.
+    """
+
+    T3CODE = Consumer(Role.INTERACTIVE, 't3code')
+    UNATTRIBUTED = Consumer(Role.OTHER, 'app.slice')
+    EXITED = Consumer(Role.EXITED, 'app.slice')
+
+    @pytest.fixture
+    def roots(self, tmp_path: Path, make_runs_db) -> tuple[Path, Path]:
+        factory = project_root(tmp_path, 'dark-factory')
+        make_runs_db(
+            [memory_hold(at(seconds), DF_UNIT) for seconds in (-100, 120, 360)],
+            directory=runs_db(factory).parent,
+        )
+        solar = project_root(tmp_path, 'solar-challenge')
+        solar_unit = f'{APP}/orchestrator-my-solar-challenge.service'
+        make_runs_db(
+            [memory_hold(at(seconds), solar_unit) for seconds in (600, 2000)],
+            directory=runs_db(solar).parent,
+        )
+        return factory, solar
+
+    @pytest.fixture
+    def verify(self, roots: tuple[Path, Path]) -> Consumer:
+        return Consumer(Role.VERIFY, scope_tag_for(roots[0]))
+
+    def collection(self, seconds: int, verify: Consumer) -> dict[Consumer, dict[Figure, float]]:
+        steps = seconds / 30
+        return {
+            verify: {
+                Figure.ANON: GiB + min(seconds, 360) / 30 * 100 * MiB,
+                Figure.CPU_USEC: 3_000_000,
+            },
+            self.T3CODE: {
+                Figure.ANON: 500 * MiB + max(0, seconds - 480) / 30 * 50 * MiB,
+                Figure.RECLAIM_KSWAPD_PAGES: 100,
+                Figure.MEMORY_SOME_STALL_USEC: 1.0,
+                Figure.MEMORY_FULL_STALL_USEC: 0.5,
+            },
+            KERNEL: {Figure.ANON: 100 * MiB + steps * MiB, Figure.RECLAIM_KSWAPD_PAGES: 10},
+            self.UNATTRIBUTED: {Figure.ANON: 50 * MiB + steps * 2 * MiB},
+            self.EXITED: {Figure.ANON: steps * MiB},
+        }
+
+    @pytest.fixture
+    def report(self, tmp_path: Path, roots: tuple[Path, Path], verify: Consumer) -> holds.HoldsReport:
+        store = samples_db(tmp_path / 'load-samples.db')
+        for seconds in range(0, 901, 30):
+            write_collection(
+                store,
+                ts(seconds),
+                self.collection(seconds, verify),
+                reclaim={ReclaimThreadKind.KSWAPD: 1_000_000},
+            )
+        return holds.read_holds_report(
+            list(roots), store, since=T0 - timedelta(hours=1), window_seconds=120
+        )
+
+    def test_the_fixture_holds_are_in_the_intended_states(self, report):
+        assert [reading.state for reading in report.readings] == [
+            holds.HoldState.NOT_LIVE,
+            holds.HoldState.RANKED,
+            holds.HoldState.RANKED,
+            holds.HoldState.RANKED,
+            holds.HoldState.NO_SAMPLES,
+        ]
+
+    def test_holds_per_project_by_state(self, report, roots):
+        factory, solar = roots
+
+        per_project = holds.summarise(report).holds_per_project
+
+        assert per_project == {
+            factory: {
+                holds.HoldState.RANKED: 2,
+                holds.HoldState.NOT_LIVE: 1,
+                holds.HoldState.NO_SAMPLES: 0,
+            },
+            solar: {
+                holds.HoldState.RANKED: 1,
+                holds.HoldState.NOT_LIVE: 0,
+                holds.HoldState.NO_SAMPLES: 1,
+            },
+        }
+
+    def test_how_often_each_consumer_tops_each_ranking(self, report, verify):
+        assert holds.summarise(report).tops == {
+            'who_grew': {verify: 2, self.T3CODE: 1},
+            'who_paid': {self.T3CODE: 3},
+        }
+
+    def test_totals_per_consumer_over_the_ranked_holds(self, report, verify):
+        totals = holds.summarise(report).totals
+
+        assert (totals[verify].grew, totals[verify].reclaimed_pages) == (800 * MiB, 0)
+        assert (
+            totals[self.T3CODE].grew,
+            totals[self.T3CODE].reclaimed_pages,
+            totals[self.T3CODE].memory_some_stall_seconds,
+            totals[self.T3CODE].memory_full_stall_seconds,
+        ) == (200 * MiB, 1200, 12.0, 6.0)
+
+    def test_the_aside_and_reclaim_thread_shares_across_the_ranked_holds(self, report):
+        summary = holds.summarise(report)
+        growth = 2 * (400 + 4 + 8 + 4) * MiB + (200 + 4 + 8 + 4) * MiB
+        pages = 3 * 4 * 100 + 3 * 4 * 10
+
+        assert summary.aside_shares['kernel'] == (
+            pytest.approx(12 * MiB / growth), pytest.approx(120 / pages)
+        )
+        assert summary.aside_shares['unattributed'] == (pytest.approx(24 * MiB / growth), 0)
+        assert summary.aside_shares['exited'] == (pytest.approx(12 * MiB / growth), 0)
+        assert summary.reclaim_thread_share == pytest.approx(1 / 3)
+
+    def test_the_json_summary_encodes_its_consumers(self, report, roots, verify):
+        factory, _solar = roots
+
+        summary = json.loads(json.dumps(holds.report_json(report, summary=True)))['summary']
+
+        assert summary['tops'] == {
+            'who_grew': {encode_consumer(verify): 2, encode_consumer(self.T3CODE): 1},
+            'who_paid': {encode_consumer(self.T3CODE): 3},
+        }
+        assert summary['holds_per_project'][str(factory)] == {
+            'total': 3, 'ranked': 2, 'recorder_not_live': 1, 'no_samples': 0
+        }
+        assert summary['totals'][encode_consumer(verify)]['grew_bytes'] == 800 * MiB
+        assert summary['reclaim_thread_share'] == pytest.approx(1 / 3)
+
+    def test_the_summary_is_only_there_when_asked_for(self, report):
+        def summary_sections(text: str) -> list[str]:
+            return [par for par in text.split('\n\n') if par.startswith('summary')]
+
+        assert 'summary' not in holds.report_json(report)
+        assert summary_sections(holds.render_text(report)) == []
+        (section,) = summary_sections(holds.render_text(report, summary=True))
+        assert encode_consumer(self.T3CODE) in section
+        assert 'unattributed' in section
+        assert 'reclaim threads' in section
+
+    def test_with_no_ranked_hold_every_share_is_n_a(self, tmp_path, roots):
+        empty = samples_db(tmp_path / 'empty' / 'load-samples.db')
+        report = holds.read_holds_report(
+            list(roots), empty, since=T0 - timedelta(hours=1), window_seconds=120
+        )
+
+        summary = holds.summarise(report)
+        (section,) = [
+            par
+            for par in holds.render_text(report, summary=True).split('\n\n')
+            if par.startswith('summary')
+        ]
+
+        assert set(summary.aside_shares.values()) == {(None, None)}
+        assert summary.reclaim_thread_share is None
+        assert holds.report_json(report, summary=True)['summary']['reclaim_thread_share'] is None
+        assert 'n/a' in section
+        assert '0.0%' not in section

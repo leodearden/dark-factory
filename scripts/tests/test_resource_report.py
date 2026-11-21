@@ -137,6 +137,30 @@ class TestNoMemoryHolds:
         assert report['holds'] == []
 
 
+class TestSummaryFlag:
+    def test_holds_summary_json_carries_the_summary(self, tmp_path, make_runs_db, store, capsys):
+        root = project_root(tmp_path, 'dark-factory')
+        make_runs_db(
+            [memory_hold(datetime(2026, 11, 20, 12, 0, tzinfo=UTC), DF_UNIT)],
+            directory=runs_db(root).parent,
+        )
+
+        rc, out, _err = run(
+            capsys, *holds_argv(store, root, extra=('--since', '2026-11-14', '--summary', '--json'))
+        )
+
+        assert rc == 0
+        assert 'summary' in json.loads(out)
+
+    def test_without_the_flag_there_is_no_summary(self, tmp_path, make_runs_db, store, capsys):
+        root = project_root(tmp_path, 'dark-factory')
+        make_runs_db([], directory=runs_db(root).parent)
+
+        _rc, out, _err = run(capsys, *holds_argv(store, root, extra=('--json',)))
+
+        assert 'summary' not in json.loads(out)
+
+
 class TestTheHoldEventsRead:
     @pytest.fixture
     def root(self, tmp_path, make_runs_db):
