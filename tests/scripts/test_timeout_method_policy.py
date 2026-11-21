@@ -283,6 +283,8 @@ def _run_probe_suite(
 ) -> subprocess.CompletedProcess[str]:
     """Run *suite* at ``-n PROBE_WORKERS --dist loadgroup -rA`` plus *extra*.
 
+    *extra* may not set --basetemp; one that does is refused before any session starts.
+
     A child still running after *budget_secs* fails the calling test with
     whatever it had printed and the live members of its process group. The
     whole group is killed when the run ends, so no descendant can hold the run
@@ -299,6 +301,12 @@ def _run_probe_suite(
     default pytest temp root; why:
     ``test_timeout_method_policy.py::test_a_probe_suite_run_leaves_the_hosts_default_temp_root_untouched``.
     """
+    smuggled = [arg for arg in extra if arg == '--basetemp' or arg.startswith('--basetemp=')]
+    if smuggled:
+        raise ValueError(
+            'a probe suite runs under its own basetemp (suite.basetemp); extra may '
+            f'not set --basetemp: {smuggled!r}'
+        )
     missing = [
         plugin for plugin in ('xdist', 'pytest_timeout')
         if importlib.util.find_spec(plugin) is None
