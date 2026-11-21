@@ -4,9 +4,10 @@
 The seeded slate (``eval_write_triage_cases.py::seeded_plan``) is a
 CONSTRUCTION — the correct canonical hoisted to position 0 with a synthetic
 top score. This module is the measured alternative: it drives the shipped
-``retrieve_candidates``, ``decide_band`` and ``select_judge_candidates`` so a
-case's slate, its attach target and its band are the ones production would
-have produced for that content against the live corpus.
+``retrieve_candidates``, ``decide_band``, ``route_band`` and
+``select_judge_candidates`` so a case's slate, its attach target, its band and
+its route are the ones production would have produced for that content against
+the live corpus.
 
 Nothing here decides what "correct" means, and nothing here calls an LLM. It
 produces :class:`Slate` values; ``eval_write_triage_cases.py::plan_from_slates``
@@ -27,6 +28,7 @@ from fused_memory.server.write_triage import (
     canonical_id_of,
     decide_band,
     retrieve_candidates,
+    route_band,
 )
 from fused_memory.server.write_triage_judge import select_judge_candidates
 
@@ -35,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Slate:
-    """One record's production-shaped candidate set and the band it fell in.
+    """One record's production-shaped candidate set, its band and its route.
 
     ``candidates`` are the records ``select_judge_candidates`` kept, in the
     order the prompt renders them; ``attach_target_id`` is
@@ -47,7 +49,10 @@ class Slate:
     memory_id: str
     candidates: tuple[Mapping[str, Any], ...]
     attach_target_id: str | None
+    #: The ``decide_band`` cosine label, which the band split reads.
     band: str
+    #: The outcome ``route_band`` routes the write to, i.e. what reaches the judge.
+    routed: str
     similarity: float | None
     canonical_present: bool
     retrieved_count: int
@@ -103,12 +108,13 @@ def retrieved_slates(
     t_low: float | None,
     judge_candidate_count: int,
 ) -> list[Slate]:
-    """Band and trim each record's retrieval exactly as ``triage_write`` does.
+    """Band, route and trim each record's retrieval exactly as ``triage_write`` does.
 
-    ``decide_band`` sees the WHOLE retrieval; ``select_judge_candidates`` trims
-    to what the prompt would carry. The trim is run for every band, not just
-    the middle one, so a deterministic or below-floor case still records the
-    slate its band was decided on.
+    ``decide_band`` labels the band and ``route_band`` routes the record's own
+    content, both over the WHOLE retrieval; ``select_judge_candidates`` trims
+    to what the prompt would carry. The trim is run for every route, not just
+    the judged one, so a deterministic or below-floor case still records the
+    slate its route was decided on.
 
     A degraded retrieval is a counted fail-open in production and reaches here
     as an ordinary empty result, so it is warned about rather than banded
@@ -130,7 +136,10 @@ def retrieved_slates(
         memory_id = str(record['memory_id'])
         retrieval = retrievals[memory_id]
         rows = list(retrieval['results'])
-        decision = decide_band(rows, t_high=t_high, t_low=t_low)
+        band = decide_band(rows, t_high=t_high, t_low=t_low)
+        decision = route_band(
+            rows, content=str(record['content']), t_high=t_high, t_low=t_low,
+        )
         selected = select_judge_candidates(
             rows, judge_candidate_count, canonical_id=decision.canonical_id,
         )
@@ -138,7 +147,8 @@ def retrieved_slates(
             memory_id=memory_id,
             candidates=tuple(normalize(row) for row in selected),
             attach_target_id=decision.canonical_id,
-            band=decision.outcome,
+            band=band.outcome,
+            routed=decision.outcome,
             similarity=decision.similarity,
             canonical_present=bool(retrieval['canonical_present']),
             retrieved_count=len(rows),
