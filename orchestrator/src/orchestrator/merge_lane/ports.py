@@ -73,6 +73,7 @@ class VerifyPort(Protocol):
         *,
         block_on_timeout: bool,
         task_id: str | None = None,
+        executed: VerifyResult | None = None,
     ) -> PostMergePyrightResult: ...
 
     async def check_post_merge_pyright(

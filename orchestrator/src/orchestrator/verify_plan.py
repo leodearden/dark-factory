@@ -12,10 +12,10 @@ from __future__ import annotations
 import logging
 import posixpath
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum, StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from shared.whole_tree_guard_family import is_whole_tree_guard_module
 
@@ -1539,20 +1539,42 @@ _LEG_BY_REASON_PREFIX: tuple[tuple[str, Leg], ...] = (
 )
 
 
-def planned_run_leg(run: PlannedRun) -> Leg | None:
-    """The check *run* plans, from its reason prefix; None for a run keyed to no
-    check, such as the fallback's single 'no .py files touched' SKIPPED run."""
+def _leg_of_reason(reason: str) -> Leg | None:
     for prefix, leg in _LEG_BY_REASON_PREFIX:
-        if run.reason.startswith(prefix):
+        if reason.startswith(prefix):
             return leg
     return None
 
 
+def planned_run_leg(run: PlannedRun) -> Leg | None:
+    """The check *run* plans, from its reason prefix; None for a run keyed to no
+    check, such as the fallback's single 'no .py files touched' SKIPPED run."""
+    return _leg_of_reason(run.reason)
+
+
+def _is_sentinel_prefix(module_prefix: str) -> bool:
+    return module_prefix in (_FALLBACK_PREFIX, '')
+
+
 def module_of(run: PlannedRun) -> str | None:
     """The registered module *run* belongs to; None for the fallback and TRIVIAL sentinels."""
-    if run.module_prefix in (_FALLBACK_PREFIX, ''):
+    if _is_sentinel_prefix(run.module_prefix):
         return None
     return run.module_prefix
+
+
+def full_suite_type_check_modules(plan: Mapping[str, Any] | None) -> frozenset[str]:
+    """The registered modules whose pyright *plan* ran unscoped, read from
+    :meth:`VerifyPlan.to_dict`'s shape (``VerifyResult.plan``)."""
+    if plan is None:
+        return frozenset()
+    return frozenset(
+        run['module_prefix'] for run in plan['runs']
+        if run['scope_kind'] == ScopeKind.FULL_SUITE
+        and run['cmd'] is not None
+        and _leg_of_reason(run['reason']) is Leg.TYPE
+        and not _is_sentinel_prefix(run['module_prefix'])
+    )
 
 
 # ---------------------------------------------------------------------------

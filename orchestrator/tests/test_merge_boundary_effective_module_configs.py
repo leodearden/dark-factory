@@ -1195,6 +1195,14 @@ def _scoped(plan_runs: list[PlannedRun], units: tuple[VerifyUnit, ...] | None) -
     )
 
 
+def _full_breadth_runs(modules: list[ModuleConfig], config: OrchestratorConfig) -> list[PlannedRun]:
+    """The runs a breadth-'full' merge verify plans for *modules*."""
+    assert config.merge_verify_breadth == 'full'
+    return list(verify_plan.derive_verify_plan(
+        [f'{modules[0].prefix}/mod.py'], modules, config, lambda _path: None, 'merge',
+    ).runs)
+
+
 def _file_scoped_pyright(mc: ModuleConfig) -> PlannedRun:
     assert mc.type_check_command is not None
     return PlannedRun(
@@ -1222,15 +1230,15 @@ class TestUnscopedTypecheckConsultsWhatTheScopedLegRan:
             update={'verify_cold_preprovision_command': '', **timeouts},
         )
 
-    @staticmethod
-    def _covered_plan(modules: list[ModuleConfig]) -> list[PlannedRun]:
+    @classmethod
+    def _covered_plan(cls, tmp_path: Path, modules: list[ModuleConfig]) -> list[PlannedRun]:
         alpha, beta, _gamma = modules
-        return [*verify_plan._derive_full_suite_runs(alpha), *verify_plan._derive_full_suite_runs(beta)]
+        return _full_breadth_runs([alpha, beta], cls._config(tmp_path, 'full'))
 
     @classmethod
-    def _alpha_ran_beta_replayed(cls, modules: list[ModuleConfig]) -> VerifyResult:
+    def _alpha_ran_beta_replayed(cls, tmp_path: Path, modules: list[ModuleConfig]) -> VerifyResult:
         return _scoped(
-            cls._covered_plan(modules),
+            cls._covered_plan(tmp_path, modules),
             (_type_unit('alpha', UnitOutcome.RAN_GREEN), _type_unit('beta', UnitOutcome.CACHE_HIT)),
         )
 
@@ -1251,7 +1259,7 @@ class TestUnscopedTypecheckConsultsWhatTheScopedLegRan:
         worktree, marker, modules = scene
 
         result = await self._gate(
-            worktree, self._config(tmp_path, 'full'), modules, self._alpha_ran_beta_replayed(modules),
+            worktree, self._config(tmp_path, 'full'), modules, self._alpha_ran_beta_replayed(tmp_path, modules),
         )
 
         assert self._typechecked(marker) == ['gamma']
@@ -1262,7 +1270,7 @@ class TestUnscopedTypecheckConsultsWhatTheScopedLegRan:
         worktree, marker, modules = scene
 
         result = await self._gate(
-            worktree, self._config(tmp_path, 'scoped'), modules, self._alpha_ran_beta_replayed(modules),
+            worktree, self._config(tmp_path, 'scoped'), modules, self._alpha_ran_beta_replayed(tmp_path, modules),
         )
 
         assert self._typechecked(marker) == ['alpha', 'beta', 'gamma']
@@ -1281,7 +1289,7 @@ class TestUnscopedTypecheckConsultsWhatTheScopedLegRan:
         worktree, marker, modules = scene
         alpha, beta, _gamma = modules
         executed = _scoped(
-            [_file_scoped_pyright(alpha), *verify_plan._derive_full_suite_runs(beta)],
+            [_file_scoped_pyright(alpha), *_full_breadth_runs([beta], self._config(tmp_path, 'full'))],
             (_type_unit('alpha', UnitOutcome.RAN_GREEN), _type_unit('beta', UnitOutcome.CACHE_HIT)),
         )
 
@@ -1293,7 +1301,7 @@ class TestUnscopedTypecheckConsultsWhatTheScopedLegRan:
     async def test_a_red_type_unit_is_not_coverage(self, tmp_path: Path, scene):
         worktree, marker, modules = scene
         executed = _scoped(
-            self._covered_plan(modules),
+            self._covered_plan(tmp_path, modules),
             (_type_unit('alpha', UnitOutcome.RAN_RED), _type_unit('beta', UnitOutcome.CACHE_HIT)),
         )
 
@@ -1304,7 +1312,7 @@ class TestUnscopedTypecheckConsultsWhatTheScopedLegRan:
     @pytest.mark.asyncio
     async def test_a_type_unit_missing_from_recorded_units_is_not_coverage(self, tmp_path: Path, scene):
         worktree, marker, modules = scene
-        executed = _scoped(self._covered_plan(modules), (_type_unit('beta', UnitOutcome.CACHE_HIT),))
+        executed = _scoped(self._covered_plan(tmp_path, modules), (_type_unit('beta', UnitOutcome.CACHE_HIT),))
 
         await self._gate(worktree, self._config(tmp_path, 'full'), modules, executed)
 
@@ -1313,7 +1321,7 @@ class TestUnscopedTypecheckConsultsWhatTheScopedLegRan:
     @pytest.mark.asyncio
     async def test_without_units_the_plan_alone_decides(self, tmp_path: Path, scene):
         worktree, marker, modules = scene
-        executed = _scoped(self._covered_plan(modules), None)
+        executed = _scoped(self._covered_plan(tmp_path, modules), None)
 
         await self._gate(worktree, self._config(tmp_path, 'full'), modules, executed)
 
@@ -1332,7 +1340,7 @@ class TestUnscopedTypecheckConsultsWhatTheScopedLegRan:
         )
 
         result = await self._gate(
-            worktree, config, [alpha, beta, hanging_gamma], self._alpha_ran_beta_replayed(modules),
+            worktree, config, [alpha, beta, hanging_gamma], self._alpha_ran_beta_replayed(tmp_path, modules),
         )
 
         assert self._typechecked(marker) == []
@@ -1340,12 +1348,12 @@ class TestUnscopedTypecheckConsultsWhatTheScopedLegRan:
         assert result.failing_subprojects == ['gamma']
         assert result.broken
 
-    def test_the_plan_reader_counts_only_green_capable_full_suite_pyright_runs_with_a_command(self, scene):
+    def test_the_plan_reader_counts_only_green_capable_full_suite_pyright_runs_with_a_command(self, tmp_path: Path, scene):
         _worktree, _marker, modules = scene
         alpha, beta, gamma = modules
         type_cmd = parse_config_command('pyright')
         plan = VerifyPlan(runs=(
-            *self._covered_plan(modules),
+            *self._covered_plan(tmp_path, modules),
             _file_scoped_pyright(gamma),
             PlannedRun('delta', None, ScopeKind.SKIPPED, 'pyright: no type_check_command configured'),
             PlannedRun('epsilon', None, ScopeKind.FULL_SUITE, 'pyright: no command, though full suite'),
@@ -1356,6 +1364,6 @@ class TestUnscopedTypecheckConsultsWhatTheScopedLegRan:
 
         assert verify_plan.full_suite_type_check_modules(plan) == frozenset({alpha.prefix, beta.prefix})
         assert verify_plan.full_suite_type_check_modules(
-            VerifyPlan(runs=tuple(self._covered_plan(modules))).to_dict(),
+            VerifyPlan(runs=tuple(self._covered_plan(tmp_path, modules))).to_dict(),
         ) == frozenset({'alpha', 'beta'})
         assert verify_plan.full_suite_type_check_modules(None) == frozenset()

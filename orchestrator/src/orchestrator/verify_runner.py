@@ -965,6 +965,7 @@ class LocalRunner:
             self._module_configs,
             block_on_timeout=True,
             task_id=self._task_id,
+            executed=scoped,
         )
         if gate.broken:
             failing = gate.failing_subprojects

@@ -50,6 +50,8 @@ from orchestrator.merge_lane.types import (
 )
 from orchestrator.rebase_drops import DroppedCommit, RebaseDropLedger
 from orchestrator.verify import VerifyResult, run_verification
+from orchestrator.verify_evidence import GREEN_OUTCOMES, Leg, module_leg_name, units_from_wire
+from orchestrator.verify_plan import _merge_breadth_is_full, full_suite_type_check_modules
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -88,6 +90,7 @@ async def _run_unscoped_typechecks(
     *,
     block_on_timeout: bool,
     task_id: str | None = None,
+    executed: VerifyResult | None = None,
 ) -> PostMergePyrightResult:
     """Run each module's ``type_check_command`` unscoped against a caller-owned worktree.
 
@@ -105,12 +108,19 @@ async def _run_unscoped_typechecks(
             When ``False``, a timed-out module is appended only to
             ``timed_out_subprojects`` (fail-open, for the post-advance check).
         task_id: Optional task identifier for log messages.
+        executed: The scoped verify this gate follows (pre-advance only). At
+            breadth ``'full'`` a module it already type-checked green is not
+            re-run; see :func:`_type_covered_modules`.
 
     Returns:
         :class:`PostMergePyrightResult` with the classification of each
         module's type-check outcome.
     """
-    active = [mc for mc in module_configs if mc.type_check_command is not None]
+    covered = _type_covered_modules(executed, config)
+    active = [
+        mc for mc in module_configs
+        if mc.type_check_command is not None and mc.prefix not in covered
+    ]
     if not active:
         return PostMergePyrightResult()
 
@@ -156,6 +166,24 @@ async def _run_unscoped_typechecks(
         timed_out_subprojects=timed_out_subprojects,
         detail=detail,
     )
+
+
+def _type_covered_modules(executed: VerifyResult | None, config: OrchestratorConfig) -> frozenset[str]:
+    """The modules whose unscoped pyright *executed* already ran green, or replayed.
+
+    Task 5294: the gate consults what the scoped leg ran rather than handing
+    ``LocalRunner`` a second module set (INV-5). Only breadth ``'full'``
+    consults, so ``'scoped'`` is unchanged. A module counts when the executed
+    plan holds a FULL_SUITE pyright run with a command and its type unit is
+    green; a result without units (an older remote) is decided by its plan.
+    """
+    if executed is None or not _merge_breadth_is_full(config):
+        return frozenset()
+    planned = full_suite_type_check_modules(executed.plan)
+    if executed.units is None:
+        return planned
+    green = {unit.unit for unit in units_from_wire(executed.units) if unit.outcome in GREEN_OUTCOMES}
+    return frozenset(prefix for prefix in planned if module_leg_name(prefix, Leg.TYPE) in green)
 
 
 def _elapsed_ms(start: float | None) -> int | None:
