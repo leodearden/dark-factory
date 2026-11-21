@@ -9,6 +9,7 @@ default, lists no units, so no test can ever reach the real user manager.
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import subprocess
 import sys
@@ -230,3 +231,75 @@ def test_repo_that_is_not_a_git_toplevel_is_a_usage_error(mirror, tmp_path):
 
     assert result.returncode == 2
     assert str(not_a_repo) in result.stderr
+
+
+APPLY_KEEPS = {name: verdict for name, verdict in EXPECTED_REPORT.items()
+               if verdict[1] == "keep"}
+APPLY_RECLAIMS = {"_merge-aaaaaaaa", "_merge-ffffffff", "123"}
+
+
+def lock_is_free(path: Path) -> bool:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+def free_lines(stdout: str) -> list[str]:
+    return [line for line in stdout.splitlines() if line.startswith("free\t")]
+
+
+def test_apply_reclaims_only_stale_worktrees(mirror):
+    records_before = pgid_records(mirror)
+
+    result = run(mirror, "--repo", str(mirror.repo), "--apply", *WORKTREE_CLASSES)
+
+    assert result.returncode == 0, result.stderr
+    table = verdicts(result.stdout)
+    for name in APPLY_RECLAIMS:
+        assert table[name][1:3] == ("reclaimed", "stale"), name
+        assert not mirror.wt(name).exists(), name
+    listing = git(mirror.repo, "worktree", "list", "--porcelain")
+    assert "_merge-aaaaaaaa" not in listing
+    assert f"{mirror.base}/123\n" not in listing
+    assert git(mirror.repo, "worktree", "prune", "--dry-run", "--verbose") == ""
+    assert not (mirror.base / "_merge-aaaaaaaa.lock").exists()
+    for name, verdict in APPLY_KEEPS.items():
+        assert action_reason(table, name) == verdict, name
+        assert mirror.wt(name).is_dir(), name
+    assert mirror.wt("_merge-verify").is_dir()
+    assert (mirror.base / "_merge-cccccccc.lock").exists()
+    assert mirror.lock_holder.poll() is None
+    assert not lock_is_free(mirror.base / "_merge-cccccccc.lock")
+    assert pgid_records(mirror) == records_before
+    free = free_lines(result.stdout)
+    assert free
+    assert all("before=" in line and "after=" in line for line in free)
+
+
+@pytest.fixture
+def unremovable(mirror):
+    victim = mirror.wt("_merge-77777777")
+    sealed = victim / "sealed"
+    sealed.mkdir(parents=True)
+    (sealed / "pinned.txt").write_text("cannot unlink me\n")
+    sealed.chmod(0o500)
+    _age(victim)
+    yield victim
+    sealed.chmod(0o700)
+
+
+def test_apply_failure_exits_nonzero_and_reports_failed(mirror, unremovable):
+    result = run(mirror, "--repo", str(mirror.repo), "--apply", *WORKTREE_CLASSES)
+
+    assert result.returncode == 1
+    table = verdicts(result.stdout)
+    assert table[unremovable.name][1] == "failed"
+    assert str(unremovable) in result.stderr
+    for name in APPLY_RECLAIMS:
+        assert table[name][1:3] == ("reclaimed", "stale"), name
+        assert not mirror.wt(name).exists(), name
