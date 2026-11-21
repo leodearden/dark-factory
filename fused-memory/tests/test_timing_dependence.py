@@ -266,3 +266,154 @@ class TestElapsedAssertMessage:
     )
     def test_names_why_and_each_remedy(self, message: str, needle: str):
         assert needle in message
+
+
+_DEADLINE_PRELUDE = (
+    'import asyncio\n'
+    'import subprocess\n'
+    'import time\n'
+    '\n'
+    '\n'
+    'async def test_case(client, task, cmd, thread, proc, pred, loop, fake_clock, pid, done):\n'
+)
+_DEADLINE_LINENO = _DEADLINE_PRELUDE.count('\n') + 1
+
+
+def _in_async_test(statement: str) -> str:
+    return _DEADLINE_PRELUDE + f'    {statement}\n'
+
+
+def _deadline_kind_sites(facts) -> list:
+    return [
+        fact
+        for fact in facts
+        if isinstance(fact, _timing.TimingSite) and fact.kind is _timing.TimingKind.LITERAL_DEADLINE
+    ]
+
+
+class TestLiteralDeadlineLeg:
+    """A numeric literal bound to a wall-clock DEADLINE PARAMETER, keyed structurally, never by callee."""
+
+    @pytest.mark.parametrize(
+        ('statement', 'anchor'),
+        [
+            ('await asyncio.wait_for(client.fetch(), timeout=5)', 'asyncio.wait_for'),
+            ('await asyncio.wait_for(task, 2.5)', 'asyncio.wait_for'),
+            ('subprocess.run(cmd, timeout=30)', 'subprocess.run'),
+            ('thread.join(timeout=1.0)', 'thread.join'),
+            ('proc.wait(timeout=10)', 'proc.wait'),
+            ('await poll_until(pred, timeout=5)', 'poll_until'),
+            ('async with asyncio.timeout(3):\n        await client.fetch()', 'async with'),
+            ('deadline = time.monotonic() + 10.0', 'time.monotonic'),
+            ('deadline = loop.time() + 60', 'loop.time'),
+            ('deadline = 5 + asyncio.get_running_loop().time()', '5 +'),
+        ],
+    )
+    def test_one_violation_at_the_deadline(self, statement: str, anchor: str):
+        found = _scan(_in_async_test(statement))
+        expected = (_DEADLINE_LINENO, 4 + statement.index(anchor))
+        assert [(v.lineno, v.col_offset) for v in found] == [expected], found
+
+    @pytest.mark.parametrize(
+        'statement',
+        [
+            'await asyncio.wait_for(client.fetch(), timeout=0)',
+            'await asyncio.wait_for(client.fetch(), timeout=None)',
+            'await asyncio.wait_for(client.fetch(), timeout=TIMEOUT)',
+            'raise subprocess.TimeoutExpired(cmd, timeout=5)',
+            'client = _FakeFalkorClient(timeout=3)',
+            'mark = pytest.mark.timeout(timeout=60)',
+            'deadline = fake_clock.monotonic() + 5',
+            'async with asyncio.timeout(None):\n        await client.fetch()',
+            'run_on_own_time(cmd, budget=5.0)',
+            'wait_on_own_time(pid, done, budget=5.0)',
+        ],
+    )
+    def test_not_a_literal_wall_clock_deadline(self, statement: str):
+        assert _scan(_in_async_test(statement)) == []
+
+    def test_a_pytest_timeout_mark_decorator_is_not_a_deadline(self):
+        source = """
+            import pytest
+
+            @pytest.mark.timeout(timeout=60)
+            def test_case():
+                pass
+            """
+        assert _scan(source) == []
+
+
+class TestLiteralDeadlinePrecedence:
+    """A node another rule already reported is not a second Rule D deadline site."""
+
+    @staticmethod
+    def _facts(source: str, node_type: type, *, already_reported: bool) -> list:
+        tree = ast.parse(textwrap.dedent(source))
+        [node] = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, node_type)
+            and (node_type is not ast.Call or ast.unparse(node).startswith('asyncio.wait_for'))
+        ]
+        return list(_timing.timing_facts(node, deadline_already_reported=already_reported))
+
+    @pytest.mark.parametrize(
+        ('statement', 'node_type'),
+        [
+            ('await asyncio.wait_for(client.fetch(), timeout=5)', ast.Call),
+            ('async with asyncio.timeout(3):\n        await client.fetch()', ast.AsyncWith),
+        ],
+    )
+    def test_an_already_reported_deadline_node_yields_no_deadline_site(self, statement, node_type):
+        source = _in_async_test(statement)
+        assert _deadline_kind_sites(self._facts(source, node_type, already_reported=False))
+        assert _deadline_kind_sites(self._facts(source, node_type, already_reported=True)) == []
+
+    @pytest.mark.parametrize(
+        'statement',
+        [
+            'await asyncio.wait_for(asyncio.sleep(0.1), timeout=5)',
+            'async with asyncio.timeout(3):\n        await asyncio.sleep(0.1)',
+        ],
+    )
+    def test_a_sleep_inside_an_already_reported_deadline_is_still_a_site(self, statement: str):
+        tree = ast.parse(_in_async_test(statement))
+        facts = [
+            fact
+            for node in ast.walk(tree)
+            for fact in _timing.timing_facts(node, deadline_already_reported=True)
+        ]
+        sites = _timing.uncovered_timing_sites(facts)
+        assert [site.kind for site in sites] == [_timing.TimingKind.SLEEP]
+
+
+class TestLiteralDeadlineMessage:
+    @pytest.mark.parametrize(
+        ('statement', 'site_text'),
+        [
+            ('subprocess.run(cmd, timeout=30)', 'subprocess.run(cmd, timeout=30)'),
+            ('async with asyncio.timeout(3):\n        await client.fetch()', 'asyncio.timeout(3)'),
+            ('deadline = time.monotonic() + 10.0', 'time.monotonic() + 10.0'),
+        ],
+    )
+    def test_names_the_rule_and_the_site_and_no_other_rules_vocabulary(self, statement, site_text):
+        [violation] = _scan(_in_async_test(statement))
+        _assert_owns_its_vocabulary(violation.message)
+        assert site_text in violation.message
+
+    @pytest.mark.parametrize(
+        'remedy',
+        [
+            'load-tolerant named constant',
+            'shared/src/shared/testing_virtual_clock.py::virtual_clock_test',
+            'shared/src/shared/testing_own_time.py::run_on_own_time',
+            'subprocess.run',
+            '::wait_on_own_time',
+            'Popen',
+            '@pytest.mark.timing(reason=',
+            'behaviour under test',
+        ],
+    )
+    def test_names_each_remedy(self, remedy: str):
+        [violation] = _scan(_in_async_test('thread.join(timeout=1.0)'))
+        assert remedy in violation.message
