@@ -158,9 +158,13 @@ class TestNeutraliseFixture:
         assert result is None
         assert caplog.records == []
 
-    def test_the_probe_leaves_the_redirected_directory_empty(
+    def test_the_probe_leaves_the_redirected_directory_as_it_found_it(
         self, tmp_path_factory: pytest.TempPathFactory
     ) -> None:
+        """The scratch directory is shared by every neutralised suite on the
+        worker, and mem0 drops its `config.json` into whatever `MEM0_DIR` is
+        set when `mem0.memory.main` is first imported, so only the probe's own
+        residue is this test's business."""
         mod = _stub_script_module()
         fx = neutralise_fixture(mod, note='a note')
 
@@ -168,8 +172,9 @@ class TestNeutraliseFixture:
         try:
             _underlying(fx)(mp, tmp_path_factory)
             redirected = pathlib.Path(os.environ['MEM0_DIR'])
+            before = sorted(redirected.iterdir())
             mod.assert_store_mutation_allowed(operation='sweep --apply')
-            assert list(redirected.iterdir()) == []
+            assert sorted(redirected.iterdir()) == before
         finally:
             mp.undo()
 
