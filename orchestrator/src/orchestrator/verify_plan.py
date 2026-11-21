@@ -25,6 +25,11 @@ from orchestrator.pytest_markers import (
     deselecting_expression_for_targets,
     locate_pytest_config,
 )
+from orchestrator.verify_artifact_consumers import (
+    BEHAVIOURAL_ARTIFACTS,
+    ConsumerDemand,
+    consumer_demand,
+)
 from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
@@ -1392,23 +1397,120 @@ def _fallback_pytest_decision(kinds: dict[str, FileKind], test_command: str) -> 
 
 
 # Extensions considered "real source" for the TRIVIAL / needs_pipeline_guard_check
-# short-circuit below — mirrors verify._has_source_files exactly. NOT the same
-# concept as FileKind.INERT: classify_file treats a .rs path as INERT too
+# short-circuit below. NOT the same concept as FileKind.INERT: classify_file treats a .rs path as INERT too
 # (cargo/.rs scoping is a separate concern left to run_scoped_verification's
 # execute step — see FileKind's docstring), but .rs is still real source for
 # the purposes of "is this diff trivially a no-op".
 _SOURCE_EXTENSIONS = ('.py', '.rs')
 
 
-def _has_source_files(files: list[str]) -> bool:
-    """Return True when *files* contains at least one ``.py`` or ``.rs`` path.
-
-    Duplicated from (not imported from) ``verify._has_source_files`` — this
-    module stays a standalone decision layer during the incremental rollout;
-    see :func:`classify_file`'s docstring for the same rationale re:
-    ``_PROTOCOL_RE``/``_TYPEDDICT_RE``.
-    """
+def _has_source_files(files: Sequence[str]) -> bool:
+    """Return True when *files* contains at least one ``.py`` or ``.rs`` path."""
     return any(f.endswith(_SOURCE_EXTENSIONS) for f in files)
+
+
+def _artifact_consumer_demand(
+    existing_files: Sequence[str],
+    module_configs: Sequence[ModuleConfig],
+    role: Literal['merge', 'task'],
+) -> dict[str, ConsumerDemand]:
+    """Per module, the behavioural-artifact consumers a verify at *role* must run.
+
+    ``{}`` at role='merge', whose gate already catches an artifact-only diff
+    (INV-1, ``merge_verify_breadth``, ``git.merge_config_only_full_gate_globs``),
+    so merge-role plans stay unchanged (task 5296). Only a module with a
+    ``test_command`` can own demand.
+    """
+    if role == 'merge':
+        return {}
+    return consumer_demand(
+        existing_files,
+        [mc.prefix for mc in module_configs if mc.test_command],
+        BEHAVIOURAL_ARTIFACTS,
+    )
+
+
+def is_trivial_diff(
+    existing_files: Sequence[str],
+    module_configs: Sequence[ModuleConfig],
+    role: Literal['merge', 'task'],
+) -> bool:
+    """The one TRIVIAL predicate, which derive_verify_plan and both verify.py sites consult."""
+    return not _has_source_files(existing_files) and not _artifact_consumer_demand(
+        existing_files, module_configs, role,
+    )
+
+
+_CONSUMER_ONLY_SKIP_REASON = 'no touched .py file under prefix — behavioural-artifact consumer tests only'
+
+
+def _with_consumer_tests(
+    runs: list[PlannedRun],
+    mc: ModuleConfig,
+    demand: ConsumerDemand | None,
+    worktree_reader: Callable[[str], str | None],
+) -> list[PlannedRun]:
+    """*mc*'s *runs* with *demand*'s consumer tests merged into its one pytest slot.
+
+    A FULL_SUITE pytest run already covers them. A module whose diff touched
+    no file under its prefix runs only the consumer tests, lint and pyright
+    SKIPPED with a reason.
+    """
+    if demand is None or not mc.test_command:
+        return runs
+    if len(runs) == 1 and planned_run_leg(runs[0]) is None:
+        return [
+            PlannedRun(mc.prefix, None, ScopeKind.SKIPPED, f'lint: {_CONSUMER_ONLY_SKIP_REASON}'),
+            PlannedRun(mc.prefix, None, ScopeKind.SKIPPED, f'pyright: {_CONSUMER_ONLY_SKIP_REASON}'),
+            _consumer_pytest_run(mc.prefix, mc.test_command, demand, None, worktree_reader),
+        ]
+    return [
+        _consumer_pytest_run(
+            mc.prefix, mc.test_command, demand,
+            run if run.scope_kind is ScopeKind.FILE_SCOPED else None, worktree_reader,
+        )
+        if planned_run_leg(run) is Leg.TEST and run.scope_kind is not ScopeKind.FULL_SUITE
+        else run
+        for run in runs
+    ]
+
+
+def _consumer_pytest_run(
+    prefix: str,
+    test_command: str,
+    demand: ConsumerDemand,
+    prior: PlannedRun | None,
+    worktree_reader: Callable[[str], str | None],
+) -> PlannedRun:
+    """The pytest run covering *demand*, extending the *prior* FILE_SCOPED run's targets.
+
+    Widens to the owning-module full suite when *demand* asks for it, or when
+    the module's own ``-m`` would deselect every target (arm 4a's remedy).
+    """
+    artifacts = ', '.join(demand.artifacts)
+    if demand.full_suite:
+        return PlannedRun(
+            prefix, parse_config_command(test_command), ScopeKind.FULL_SUITE,
+            f'pytest: behavioural artifact(s) {artifacts} touched — {prefix} full suite consumes them',
+        )
+    targets = tuple(dict.fromkeys((*(prior.scoped_targets if prior else ()), *demand.test_files)))
+    deselecting = deselecting_expression_for_command(test_command, targets, worktree_reader)
+    if deselecting is not None:
+        return PlannedRun(
+            prefix, parse_config_command(test_command), ScopeKind.FULL_SUITE,
+            f'pytest: selection {", ".join(targets)} for behavioural artifact(s) {artifacts} is '
+            f"ALL deselected by the module's -m {deselecting!r} — owning-module full suite instead "
+            'of a zero-collecting file-scoped run (rc=5); those file(s) stay deselected in this '
+            'run too and are NOT executed by it',
+        )
+    consumers = f'consumer test(s) of behavioural artifact(s) {artifacts}'
+    return PlannedRun(
+        prefix,
+        scope_prefix_to_keyword(test_command, 'pytest', list(targets)),
+        ScopeKind.FILE_SCOPED,
+        f'{prior.reason}; plus {consumers}' if prior else f'pytest: {consumers}',
+        scoped_targets=targets,
+    )
 
 
 _TRIVIAL_REASON = 'No source files changed — verify trivially passes'
@@ -1433,8 +1535,10 @@ def derive_verify_plan(
     unscoped pyright) are each expressed a single time instead of being
     reimplemented per call site.
 
-    TRIVIAL short-circuit: when *existing_files* has no ``.py``/``.rs`` file
-    at all, every module-path/fallback branch below would no-op anyway —
+    TRIVIAL short-circuit (:func:`is_trivial_diff`): when *existing_files* is
+    prose-only — no ``.py``/``.rs`` file and, at role='task', no behavioural
+    artifact whose consumer tests a passed module owns — every
+    module-path/fallback branch below would no-op anyway —
     this unifies the two near-identical "no source files" checks
     ``run_scoped_verification`` currently duplicates once per branch
     (module-config and fallback) into the ONE check here, ahead of both.
@@ -1447,7 +1551,9 @@ def derive_verify_plan(
     ``derive_verify_plan`` never executes that guard itself, staying pure.
 
     Module-config branch (*module_configs* non-empty): each ModuleConfig is
-    scoped independently via :func:`_derive_module_runs`. *list_pkg_tests*
+    scoped independently via :func:`_derive_module_runs`, and at role='task'
+    the consumer tests of a touched behavioural artifact join its pytest slot
+    (:func:`_with_consumer_tests`). *list_pkg_tests*
     (same contract as :func:`reverse_dependent_test_targets`' seam: a module
     prefix to the worktree-root-relative ``.py`` files under its tests tree,
     collectable or not) is how the task-role floor enumerates a module's
@@ -1488,7 +1594,7 @@ def derive_verify_plan(
     fallback-branch return value directly, bypassing that reconciliation,
     still gets only the decision, not the execution trace.
     """
-    if not _has_source_files(existing_files):
+    if is_trivial_diff(existing_files, module_configs, role):
         return VerifyPlan(
             runs=(PlannedRun('', None, ScopeKind.TRIVIAL, _TRIVIAL_REASON),),
             needs_pipeline_guard_check=(role == 'merge'),
@@ -1496,13 +1602,17 @@ def derive_verify_plan(
     if module_configs:
         runs: list[PlannedRun] = []
         merge_full = role == 'merge' and _merge_breadth_is_full(config)
+        demand = _artifact_consumer_demand(existing_files, module_configs, role)
         for mc in module_configs:
             if merge_full:
                 runs.extend(_derive_full_suite_runs(mc, role))
             else:
-                runs.extend(_derive_module_runs(
-                    mc, existing_files, worktree_reader, role=role,
-                    list_pkg_tests=list_pkg_tests,
+                runs.extend(_with_consumer_tests(
+                    _derive_module_runs(
+                        mc, existing_files, worktree_reader, role=role,
+                        list_pkg_tests=list_pkg_tests,
+                    ),
+                    mc, demand.get(mc.prefix), worktree_reader,
                 ))
         return VerifyPlan(runs=tuple(runs))
     return VerifyPlan(runs=tuple(_derive_fallback_runs(
