@@ -16,13 +16,12 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from _shared_host_fixtures import REQUIRES_PROC, running_shared_host, write_legacy_host_pointer
 
 from orchestrator import session_identity, session_leases, session_records
 from orchestrator import session_registry as sr
 
-pytestmark = pytest.mark.skipif(
-    not Path('/proc/self/cmdline').exists(), reason='host detection reads /proc'
-)
+pytestmark = REQUIRES_PROC
 
 _NAME = 'recon-watcher-df'
 _PAST_TTL_SECS = session_leases.LEASE_HEARTBEAT_TTL.total_seconds() + 60
@@ -30,34 +29,8 @@ _PAST_TTL_SECS = session_leases.LEASE_HEARTBEAT_TTL.total_seconds() + 60
 
 @pytest.fixture
 def shared_host_pid(tmp_path_factory: pytest.TempPathFactory) -> Iterator[int]:
-    """A live process whose argv is ``<python> agents --inherit-permission-mode ...``."""
-    host_dir = tmp_path_factory.mktemp('agents-host')
-    (host_dir / 'agents').write_text('import time\ntime.sleep(600)\n', encoding='utf-8')
-    proc = subprocess.Popen(
-        [sys.executable, 'agents', '--inherit-permission-mode', 'bypassPermissions'],
-        cwd=host_dir,
-    )
-    try:
-        _await_host_argv(proc.pid)
-        yield proc.pid
-    finally:
-        proc.kill()
-        proc.wait(timeout=10)
-
-
-def _await_host_argv(pid: int) -> None:
-    """Wait for ``/proc/<pid>/cmdline`` to show the host argv.
-
-    Popen returns once the child's exec has closed its CLOEXEC pipe, which the
-    kernel does before it publishes the new argv, so a loaded host can read an
-    empty cmdline for a moment after Popen returns.
-    """
-    cmdline = Path(f'/proc/{pid}/cmdline')
-    deadline = time.monotonic() + 10
-    while cmdline.read_bytes().split(b'\0')[1:2] != [b'agents']:
-        if time.monotonic() > deadline:
-            pytest.fail(f'{cmdline} never showed the `agents` argv')
-        time.sleep(0.01)
+    with running_shared_host(tmp_path_factory.mktemp('agents-host')) as pid:
+        yield pid
 
 
 @pytest.fixture
@@ -99,7 +72,7 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
 
 
 def _seed_sibling_record(tmp_path: Path, host: int) -> None:
-    """Point the host pid's sessions-by-pid entry at a record the host owns."""
+    """Seed a record the host owns and a legacy host-keyed sessions-by-pid entry naming it."""
     session_records.write_record(
         session_records.SessionRecord(
             session_slug='sibling-hosted-record',
@@ -109,8 +82,7 @@ def _seed_sibling_record(tmp_path: Path, host: int) -> None:
         ),
         root=tmp_path,
     )
-    session_records.write_session_pointer(host, 'sibling-hosted-record', root=tmp_path)
-    assert session_records.resolve_session_slug_for_pid(host, root=tmp_path) == 'sibling-hosted-record'
+    write_legacy_host_pointer(host, 'sibling-hosted-record', tmp_path)
 
 
 # --- resolution layer --------------------------------------------------------
@@ -417,7 +389,10 @@ def test_resolve_own_record_slug_is_none_for_a_shared_host(
     """The host's pointer is last-writer-wins across every hosted session.
 
     So it may name a SIBLING's record, and a DecisionRecord must read unlinked
-    rather than be mis-attributed.
+    rather than be mis-attributed. Two guards give this answer, and this pins
+    the answer rather than either guard: the store never follows a host-keyed
+    pointer (``session_records.is_session_pointer_pid``), and
+    ``SessionIdentity.session_scoped_pid`` is None under a host.
     """
     _seed_sibling_record(tmp_path, shared_host_pid)
     caplog.set_level(logging.DEBUG)

@@ -1,0 +1,18 @@
+import re,collections,statistics as st
+DF={'2507122','2382379','234358','1188485','3122652','2245511','2531748','1538594','1218128'}
+rows=[]
+for l in open('/tmp/gate-10069/conflicts/bc_all.txt'):
+    pid=re.search(r'uv\[(\d+)\]',l).group(1)
+    g=lambda k: (m.group(1) if (m:=re.search(k+r'=(\S+)',l)) else None)
+    rows.append(dict(ts=l[:19],proj='df' if pid in DF else 'reify',depth=int(g('depth')),built=int(g('built')),reason=g('reason'),
+        el=int(g('elapsed_ms')),acq=g('acquire_ms'),mrg=g('merge_ms')))
+import json; json.dump(rows,open('/tmp/gate-10069/conflicts/bc_rows.json','w'))
+for proj in ('df','reify','all'):
+    R=[r for r in rows if proj=='all' or r['proj']==proj]
+    print('==',proj,'n',len(R),R[0]['ts'],R[-1]['ts'])
+    t=collections.Counter((r['depth'],r['built']) for r in R)
+    print(' (req_links,built):',sorted(t.items()))
+    short=[r for r in R if r['built']<r['depth']]
+    print(' short',len(short),'of',len(R), collections.Counter(r['reason'] for r in short))
+    print(' shortfall',collections.Counter(r['depth']-r['built'] for r in short))
+    print(' reasons all',collections.Counter(r['reason'] for r in R))

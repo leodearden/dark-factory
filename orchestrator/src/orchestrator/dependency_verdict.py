@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from functools import partial
 
+from shared.declared_checks import declared_checks
 from shared.task_fields import dependency_ids
 from shared.task_metadata import parse_metadata
 
@@ -168,7 +169,7 @@ def deps_verdict(
     **Delivered checks** (capability-delivered-checks PRD, task delta):
     consulted only when *delivered_check_cache* is not ``None`` AND
     *tasks_by_id* is supplied.  Each TERMINAL (done/cancelled) local dep whose
-    record carries a truthy ``metadata.delivered_checks`` must resolve to
+    record declares any ``metadata.delivered_checks`` must resolve to
     exactly ``True`` in *delivered_check_cache* (keyed by dep task id) — this
     applies to a ``cancelled`` dep just as much as a ``done`` one, since the
     check trusts the state of ``main``, not the status label.  ``False`` (the
@@ -383,7 +384,7 @@ def _delivered_check_verdict(
             # never gated here, rather than fail-safe-blocking a dependent
             # whose dep record may never be fetchable.
             continue
-        if not (dep_task.get('metadata') or {}).get('delivered_checks'):
+        if declared_checks(dep_task.get('metadata')).is_empty:
             continue
         confirmed = delivered_check_cache.get(dep_id)
         if confirmed is True:

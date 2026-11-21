@@ -240,7 +240,7 @@ class TestReaperRoutesInfoOrphans:
         assert await harness._reap_orphan_l0_escalations() == 1
 
         (l1,) = _l1s(harness, agent_role='harness-orphan-reaper')
-        assert l1.suggested_action == 'manual_intervention'
+        assert l1.suggested_action == esc.suggested_action
         assert esc.summary in l1.summary
         assert _curator(harness).calls == []
 
@@ -355,7 +355,7 @@ class TestBlockingDedupIsCategoryScoped:
         assert await harness._reap_orphan_l0_escalations() == 1
 
         (l1,) = _l1s(harness, agent_role='harness-orphan-reaper')
-        assert (l1.suggested_action, l1.category) == ('manual_intervention', 'infra_issue')
+        assert (l1.suggested_action, l1.category) == (orphan.suggested_action, 'infra_issue')
         assert orphan.summary in l1.summary
         assert 'Auto-promoted to level 1' in (_current(harness, orphan.id).resolution or '')
 

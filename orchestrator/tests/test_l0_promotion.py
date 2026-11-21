@@ -20,7 +20,12 @@ WHY = 'architect filed it in lieu of a plan'
 SUFFIX = '\n\n[durable refs] branch=task/7533'
 
 
-def _submit_l0(queue: EscalationQueue, *, severity: str = 'blocking') -> Escalation:
+def _submit_l0(
+    queue: EscalationQueue,
+    *,
+    severity: str = 'blocking',
+    worktree: str | None = None,
+) -> Escalation:
     l0 = Escalation(
         id=queue.make_id(TASK_ID),
         task_id=TASK_ID,
@@ -38,12 +43,19 @@ def _submit_l0(queue: EscalationQueue, *, severity: str = 'blocking') -> Escalat
         }],
         options=['A: keep', 'B: lower'],
         root_cause='r',
+        worktree=worktree,
     )
     queue.submit(l0)
     return l0
 
 
-def _promote(queue: EscalationQueue, l0: Escalation) -> Escalation:
+def _promote(
+    queue: EscalationQueue,
+    l0: Escalation,
+    *,
+    summary_prefix: str = '',
+    worktree: str | None = None,
+) -> Escalation:
     return promote_l0_to_l1(
         queue, l0,
         agent_role='orchestrator-workflow',
@@ -51,6 +63,8 @@ def _promote(queue: EscalationQueue, l0: Escalation) -> Escalation:
         detail_suffix=SUFFIX,
         filing_claimant_run_id='run-x',
         resolved_by='orchestrator-workflow',
+        summary_prefix=summary_prefix,
+        worktree=worktree,
     )
 
 
@@ -103,6 +117,24 @@ class TestVerbatimPromotion:
         assert l1.id in stored.resolution
         assert WHY in stored.resolution
         assert stored.resolved_by == 'orchestrator-workflow'
+
+
+class TestCallerChoices:
+    def test_a_summary_prefix_leads_the_verbatim_summary(self, queue: EscalationQueue):
+        prefix = 'Orphan L0 (900s old, no active workflow): '
+        l0 = _submit_l0(queue)
+
+        l1 = _promote(queue, l0, summary_prefix=prefix)
+
+        assert l1.summary == prefix + l0.summary
+
+    def test_the_l1_worktree_is_the_callers_choice(self, queue: EscalationQueue):
+        worktree = '/home/leo/src/dark-factory'
+        dropped = _submit_l0(queue, worktree=worktree)
+        kept = _submit_l0(queue, worktree=worktree)
+
+        assert _promote(queue, dropped).worktree is None
+        assert _promote(queue, kept, worktree=kept.worktree).worktree == worktree
 
 
 def test_info_severity_is_never_inflated(queue: EscalationQueue):

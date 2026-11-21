@@ -207,7 +207,7 @@ class TestCollectCensusSnapshots:
 
         canned = _canned()
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
-            _rows, full = await collect_tasks_with_counts(dummy_client, two_roots, now=NOW)
+            full = await collect_tasks_with_counts(dummy_client, two_roots, now=NOW)
             reads = len(canned.calls)
             census = await collect_census_snapshots(
                 dummy_client, two_roots, now=NOW + timedelta(seconds=5),
@@ -249,7 +249,7 @@ class TestCollectCensusSnapshots:
                 dummy_client, two_roots, now=NOW, budget=budget,
             )
             reset_task_snapshot_state()
-            _rows, full = await collect_tasks_with_counts(
+            full = await collect_tasks_with_counts(
                 dummy_client, two_roots, now=NOW, budget=budget,
             )
 

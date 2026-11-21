@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -41,6 +42,7 @@ from shared.testing_fake_claude import install_fake_claude_cli
 _STATE_WAIT_SECS = 10.0
 _GROUP_GONE_SECS = 10.0
 _POLL_STEP_SECS = 0.05
+_MAX_YIELDS_TO_SPAWN = 100
 
 
 def _bare_env(**extra: str) -> dict[str, str]:
@@ -84,6 +86,21 @@ async def _wait_for_state(state_file: Path) -> dict[str, int]:
             f'the fake never wrote {state_file} within {_STATE_WAIT_SECS}s'
         )
         await asyncio.sleep(_POLL_STEP_SECS)
+    return json.loads(state_file.read_text())
+
+
+def _block_until_state(state_file: Path) -> dict[str, int]:
+    """``_wait_for_state`` without yielding.
+
+    It holds the loop thread, so a spawn in flight cannot connect its pipes
+    while the fake starts: what load does to the loop by accident.
+    """
+    deadline = time.monotonic() + _STATE_WAIT_SECS
+    while not state_file.exists():
+        assert time.monotonic() < deadline, (
+            f'the fake never wrote {state_file} within {_STATE_WAIT_SECS}s'
+        )
+        time.sleep(_POLL_STEP_SECS)
     return json.loads(state_file.read_text())
 
 
@@ -196,6 +213,63 @@ class TestCancellation:
             assert not pid_running(state['grandchild'])
         finally:
             _kill_leftover_group(state_file)
+
+    @pytest.mark.timeout(30)
+    async def test_cancel_mid_spawn_reaps_the_whole_group(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A cancel landing after the fork but before create_subprocess_exec
+        returns still kills the whole group, promptly.
+
+        The group is judged while the call is still in flight: a surviving
+        member holds the call's pipes open, so awaiting first would hang
+        rather than fail.
+        """
+        real_spawn = asyncio.create_subprocess_exec
+        entered: list[tuple[Any, ...]] = []
+        spawned: list[asyncio.subprocess.Process] = []
+
+        async def recording_spawn(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+            entered.append(args)
+            spawned.append(await real_spawn(*args, **kwargs))
+            return spawned[-1]
+
+        monkeypatch.setattr(asyncio, 'create_subprocess_exec', recording_spawn)
+        state_file = tmp_path / 'state.json'
+        task = asyncio.ensure_future(run_cli_subprocess(
+            [str(_grandchild_fake(tmp_path, state_file))], tmp_path, _bare_env(),
+            backend='codex', model='m', timeout_seconds=30.0,
+        ))
+        try:
+            for _ in range(_MAX_YIELDS_TO_SPAWN):
+                if entered:
+                    break
+                await asyncio.sleep(0)
+            if not entered:
+                pytest.fail(
+                    f'run_cli_subprocess never reached create_subprocess_exec within '
+                    f'{_MAX_YIELDS_TO_SPAWN} loop yields; the harness is broken, which '
+                    'says nothing either way about process-group containment.',
+                    pytrace=False,
+                )
+            state = _block_until_state(state_file)
+            assert not spawned, (
+                'create_subprocess_exec returned before the cancel: asyncio connected '
+                "the child's pipes ahead of this poll, so the test no longer reaches "
+                'the mid-spawn window'
+            )
+            task.cancel()
+
+            assert await _group_terminated_within(state['pid']), (
+                f"process group {state['pid']} survived a run_cli_subprocess "
+                'cancelled mid-spawn'
+            )
+            assert not pid_running(state['grandchild'])
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            _kill_leftover_group(state_file)
+            task.cancel()
 
     async def test_cancel_during_timeout_kill_still_reaps_group(self, tmp_path: Path) -> None:
         """A cancel landing inside the flat timeout's group kill retries the kill.

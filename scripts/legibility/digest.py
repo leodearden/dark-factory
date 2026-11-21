@@ -52,6 +52,8 @@ from legibility.inventory import (
     UNREADABLE_FILE_ERRORS,
     as_unreadable_file_error,
     encode_cwd,
+    first_transcript_identity,
+    transcript_encoded_dir,
 )
 
 logger = logging.getLogger('legibility.digest')
@@ -592,7 +594,7 @@ next census must be able to tell a pre-fix trace from a live regression.
 
 FRONTMATTER_KEYS: tuple[str, ...] = (
     'session', 'cwd', 'encoded_dir', 'agent_class', 'date', 'size_bytes', 'score',
-    'n_user_turns', 'truncated_items', 'instrument_version',
+    'n_user_turns', 'truncated_items', 'parent_session', 'instrument_version',
 )
 """Top-level frontmatter keys in the exact PRD Sec 7.2 order (everything
 before ``signal_counts``, which is rendered as its own nested block).
@@ -619,6 +621,10 @@ rendered body for :data:`ITEM_TRUNCATION_MARKER`, which item content can
 quote on its own), maintained over the POST-trim sections (see
 :func:`_truncate_sections`), so it describes the body that actually
 ships.
+
+``parent_session`` names the parent's ``sessionId`` for a sub-agent
+transcript, whose ``session`` is its
+:class:`~legibility.inventory.TranscriptIdentity` key, and is '' otherwise.
 
 ``instrument_version`` (task 3610) stays LAST of the top-level keys, and
 that position is pinned by its own test: a generation marker belongs after
@@ -686,7 +692,15 @@ def _first_present(records: list[dict[str, Any]], key: str) -> Any:
 
 
 def _derive_session(records: list[dict[str, Any]]) -> str:
-    return _first_present(records, 'sessionId') or 'unknown'
+    identity = first_transcript_identity(records)
+    return identity.key if identity is not None else 'unknown'
+
+
+def _derive_parent_session(records: list[dict[str, Any]]) -> str:
+    identity = first_transcript_identity(records)
+    if identity is None or identity.parent_session is None:
+        return ''
+    return identity.parent_session
 
 
 def _derive_cwd(records: list[dict[str, Any]]) -> str:
@@ -702,14 +716,15 @@ def _derive_date(records: list[dict[str, Any]]) -> str:
 
 
 def _derive_encoded_dir(records: list[dict[str, Any]], cwd: str, path: Any) -> str:
-    """Prefer the real transcript file's parent dir name (ground truth);
-    fall back to ``inventory.encode_cwd`` of the derived *cwd* when no *path*
-    is given or its parent dir name is empty, or to 'unknown' when *cwd*
-    itself could not be derived."""
+    """Prefer the encoded dir the real transcript file is filed under
+    (ground truth, :func:`inventory.transcript_encoded_dir`); fall back to
+    ``inventory.encode_cwd`` of the derived *cwd* when no *path* is given or
+    that dir name is empty, or to 'unknown' when *cwd* itself could not be
+    derived."""
     if path is not None:
-        parent_name = Path(path).parent.name
-        if parent_name:
-            return parent_name
+        encoded_dir = transcript_encoded_dir(Path(path))
+        if encoded_dir:
+            return encoded_dir
     if cwd == 'unknown':
         return 'unknown'
     return encode_cwd(cwd)
@@ -1230,7 +1245,8 @@ def render_digest(
     *agent_class* is the caller's already-resolved class (typically
     :func:`detectors.classify_agent_class`'s result) -- render_digest never
     classifies on its own. *path*, when given, sources ``encoded_dir``
-    from the transcript file's real parent dir name; otherwise it falls
+    from the encoded dir the transcript file is filed under
+    (:func:`inventory.transcript_encoded_dir`); otherwise it falls
     back to mirror-encoding the derived ``cwd`` (see
     :func:`_derive_encoded_dir`). When the unrestricted render exceeds
     *max_bytes*, :func:`_truncate_sections` trims lowest-signal sections
@@ -1256,6 +1272,7 @@ def render_digest(
         # the key; _truncate_sections resolves the real value against the
         # POST-trim sections it is about to render.
         'truncated_items': 0,
+        'parent_session': _derive_parent_session(records),
         'instrument_version': DIGEST_INSTRUMENT_VERSION,
         'signal_counts': counts,
     }

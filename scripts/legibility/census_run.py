@@ -1242,7 +1242,7 @@ class FilingPlan:
     synthesized: Synthesized
     codebook: dict
     filings: tuple[disposition.Filing, ...]
-    withheld_entry_ids: frozenset[str]
+    reoffered_entry_ids: frozenset[str]
     outcomes: disposition.Outcomes
     reverified: Mapping[str, disposition.Reverification]
     status_changes: tuple[disposition.StatusChange, ...]
@@ -1316,8 +1316,8 @@ def plan_filing(
         synthesized=synthesized,
         codebook=cb,
         filings=tuple(pending.filing(payload) for pending, payload in zip(queue, payloads, strict=True)),
-        withheld_entry_ids=frozenset(
-            pending.withheld_entry_id for pending in queue if pending.withheld_entry_id is not None
+        reoffered_entry_ids=frozenset(
+            pending.reoffered_entry_id for pending in queue if pending.reoffered_entry_id is not None
         ),
         outcomes=outcomes,
         reverified=reverified.reverifications,
@@ -1330,21 +1330,23 @@ def plan_filing(
 
 
 def _after_filing(plan: FilingPlan, disposal: disposition.Disposal) -> tuple[dict, tuple[str, ...]]:
-    """The plan's codebook with every withheld entry this run routed marked
-    filed, each routed decision's back-link and the run's follow-ups; and the
-    ids of those released entries."""
+    """The plan's codebook with every re-offered (withheld or owed) entry this
+    run routed marked filed, each routed decision's back-link, the run's
+    follow-ups, and every entry whose filing reached no work marked owed
+    (``census_filing.with_owed_after_filing``); and the ids of those released
+    entries."""
     run = plan.run
     released_entry_ids = tuple(dict.fromkeys(
         decision.filing.entry_id
         for decision in disposal.decisions
-        if decision.routed and decision.filing.entry_id in plan.withheld_entry_ids
+        if decision.routed and decision.filing.entry_id in plan.reoffered_entry_ids
     ))
     cb = plan.codebook
     for entry_id in released_entry_ids:
         cb = codebook_lifecycle.mark_entry_filed(cb, entry_id)
     if released_entry_ids:
         logger.info(
-            "census: %d withheld codebook entr(ies) recurred and were routed: %s",
+            "census: %d re-offered codebook entr(ies) (withheld or owed) were routed: %s",
             len(released_entry_ids), list(released_entry_ids),
         )
     cb = disposition.with_back_links(
@@ -1354,6 +1356,7 @@ def _after_filing(plan: FilingPlan, disposal: disposition.Disposal) -> tuple[dic
         cb, reverified=plan.reverified, refiled=plan.refiled, decisions=disposal.decisions,
         run_id=run.run_id, as_of_sha=run.as_of_sha,
     )
+    cb = census_filing.with_owed_after_filing(cb, disposal, dry_run=run.dry_run_payloads_path is not None)
     return cb, released_entry_ids
 
 
@@ -1518,11 +1521,12 @@ def persist(plan: FilingPlan, effects: CensusEffects) -> Done | Unlanded:
         dry_run = census_filing.write_dry_run_payloads(
             Path(run.dry_run_payloads_path),
             [dict(filing.payload) for filing in disposal.unfiled],
-            withheld_offered=sum(1 for filing in disposal.unfiled if filing.entry_id in plan.withheld_entry_ids),
+            reoffered=sum(1 for filing in disposal.unfiled if filing.entry_id in plan.reoffered_entry_ids),
             write_text=effects.write_text,
         )
     cb, released_entry_ids = _after_filing(plan, disposal)
     cb, resolutions = disposition.resolve_tickets(cb, store=effects.task_store, run_id=run.run_id)
+    cb = census_filing.with_owed_after_resolving(cb, resolutions)
     # Synthesis corrections land after filing, so this run's filing pairing
     # and sighting counts read the codebook the run verified.
     cb, synthesis_report = _apply_synthesis_corrections(

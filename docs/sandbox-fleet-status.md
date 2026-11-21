@@ -89,12 +89,13 @@ for p in $(grep -o 'DASHBOARD_KNOWN_PROJECT_ROOTS=[^"]*' ~/.config/systemd/user/
 
 - The shipped default `orchestrator/src/orchestrator/defaults.yaml` stays
   `enabled: false` (D7): enablement is explicit per-project, restart-tier config.
-- The eval runner forces `SandboxConfig(enabled=False)` (D12): eval worktrees
-  live under `/tmp`, where the restrictions are nullified anyway.
 
 ## Enforcement
 
 - `orchestrator/tests/test_sandbox_fleet_census.py` holds the in-repo half: both
   factory targets pinned, completeness over the repo's orchestrator configs, D7.
-- `orchestrator/tests/test_eval_profile.py` holds D12.
+- `orchestrator/tests/test_eval_corpus_sandbox.py` holds the eval inheritance
+  (boundary row 28): corpus and shadow cells inherit the base config's sandbox,
+  and their agents take their fixture project's `role_env_overrides`. It
+  replaced D12, the eval runner's forced `enabled: false` (S1 μ, task 9849).
 - Each sibling's own registry holds its row; nothing in this repo does.

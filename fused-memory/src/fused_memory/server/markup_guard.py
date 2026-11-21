@@ -46,15 +46,20 @@ why.
 
 from __future__ import annotations
 
+import enum
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
     MarkupGuardMiddleware,
     RepairPolicy,
+    ResiduePreservation,
+    SpooledResidue,
+    residue_payload_length,
 )
+from shared.toolcall_markup import scan_parameter_values
 
 from fused_memory.server.markup_tripwire import (
     _MARKUP_STORM_THRESHOLD,
@@ -154,11 +159,164 @@ def _resolve_project_root(project: Any, known_projects: Mapping[str, str] | None
     return None
 
 
+#: The pseudo-parameters a refused payload may name its own project with.
+_ROUTING_PARAMETERS = ('project_id', 'project_root')
+
+#: Prefixed to a re-derived residue copy's ``suggested_action``, so the
+#: operator reading the queue knows how the record got there.
+_REDERIVED_PROVENANCE = (
+    'UNVERIFIED ROUTING: this record was placed in this queue by scanning the '
+    "refused payload's own residue for its project, checked only against the "
+    'project registry. Believe it for queue placement, never for the write. '
+)
+
+
+def _rederive_project(
+    record: Mapping[str, Any], known_projects: Mapping[str, str] | None
+) -> str | None:
+    """The queue root a refused payload names for itself, else ``None``.
+
+    add_memory declares ``content`` before ``project_id``, so a leak in
+    ``content`` eats the routing key and the middleware's ``project`` is
+    ``None``. The id usually survives inside ``raw_value``. Every scanned token
+    goes through :func:`_resolve_project_root`, so a re-derived root is one the
+    registry vouches for. Two different roots are ambiguous and yield ``None``.
+    """
+    scanned = scan_parameter_values(record.get('raw_value'), _ROUTING_PARAMETERS)
+    roots = {
+        root: token
+        for token in scanned.values()
+        if (root := _resolve_project_root(token, known_projects)) is not None
+    }
+    if len(roots) != 1:
+        return None
+    [(root, token)] = roots.items()
+    logger.warning(
+        'markup_guard_residue: %s.%s carried no resolvable project, so its '
+        'queue was re-derived from the refused payload: scanned %r -> '
+        'project_root=%r (unverified provenance)',
+        record.get('tool'), record.get('field'), token, root,
+    )
+    return root
+
+
+def _with_rederived_provenance(record: Mapping[str, Any]) -> dict[str, Any]:
+    """A shallow copy of *record* whose ``suggested_action`` states how it was
+    routed. ``project`` is left as the identity actually resolved."""
+    return {
+        **record,
+        'suggested_action': _REDERIVED_PROVENANCE + str(record.get('suggested_action') or ''),
+    }
+
+
+#: The floor under the residue queue: takes a record, returns the absolute
+#: path of the file now holding it, or ``None``.
+ResidueFloor = Callable[[dict[str, Any]], 'str | None']
+
+
+class ResidueTier(enum.StrEnum):
+    """Which tier held a refused payload.
+
+    Every residue outcome logs one ERROR record carrying this as
+    ``extra={'residue_tier': ...}``, so an operator's log query, and a test,
+    reads the outcome as data rather than from the wording of the line.
+    """
+
+    QUEUE = 'queue'
+    FLOOR = 'floor'
+    UNPRESERVED = 'unpreserved'
+
+
+def _queue_residue(
+    record: dict[str, Any], known_projects: Mapping[str, str] | None
+) -> str | None:
+    """Tier 1: file *record* into its project's escalation queue.
+
+    The project is the caller's resolved identity, else the one the refused
+    payload names for itself (:func:`_rederive_project`).
+    """
+    project_root = _resolve_project_root(record.get('project'), known_projects)
+    filed = record
+    if project_root is None:
+        project_root = _rederive_project(record, known_projects)
+        if project_root is None:
+            return None
+        filed = _with_rederived_provenance(record)
+    # Purely additive, same as the storm branch: the refusal is already
+    # decided, and emit_markup_residue_escalation is itself built never to
+    # raise, so this guards only against a defect in it.
+    try:
+        escalation_id = emit_markup_residue_escalation(
+            project_root, filed, anchor_task_id=_RESIDUE_ANCHOR_TASK_ID
+        )
+    except Exception:
+        logger.exception(
+            'markup_guard: emit_markup_residue_escalation raised for '
+            'project_root=%r; residue of %r not filed',
+            project_root, record.get('tool'),
+        )
+        return None
+    if escalation_id is not None:
+        logger.error(
+            'markup_guard_residue: refused an unrepairable %s.%s and '
+            'preserved its payload in %s (%d chars); %s',
+            record.get('tool'), record.get('field'), escalation_id,
+            residue_payload_length(record), MARKUP_RECURRENCE_ROUTING,
+            extra={'residue_tier': ResidueTier.QUEUE, 'residue_locator': escalation_id},
+        )
+    return escalation_id
+
+
+def _floor_residue(
+    record: dict[str, Any], residue_floor: ResidueFloor | None
+) -> SpooledResidue | None:
+    """Tier 2: hand *record* to the durable floor, when one is wired."""
+    if residue_floor is None:
+        return None
+    try:
+        path = residue_floor(record)
+    except Exception:
+        logger.exception(
+            'markup_guard: the residue floor raised for %s.%s; falling through '
+            'to the log', record.get('tool'), record.get('field'),
+        )
+        return None
+    if path is None:
+        return None
+    logger.error(
+        'markup_guard_residue: refused an unrepairable %s.%s that no queue '
+        'took, and preserved its payload in the residue floor file %s (%d '
+        'chars); %s',
+        record.get('tool'), record.get('field'), path,
+        residue_payload_length(record), MARKUP_RECURRENCE_ROUTING,
+        extra={'residue_tier': ResidueTier.FLOOR, 'residue_locator': path},
+    )
+    return SpooledResidue(path)
+
+
+def _log_unpreserved(record: dict[str, Any], *, floor_wired: bool) -> None:
+    """Tier 3: no tier held *record*, so this log line carries it."""
+    floor = 'the residue floor failed' if floor_wired else 'no residue floor is wired'
+    logger.error(
+        'markup_guard_residue: refused an unrepairable %s.%s and preserved its '
+        'payload nowhere durable by this process: no queue took it '
+        '(project=%r) and %s. The caller was told to keep its own copy. '
+        'Record: %r; %s',
+        record.get('tool'), record.get('field'), record.get('project'), floor,
+        record, MARKUP_RECURRENCE_ROUTING,
+        extra={
+            'residue_tier': ResidueTier.UNPRESERVED,
+            'residue_floor_wired': floor_wired,
+        },
+    )
+
+
 def build_markup_guard(
     *,
     policy: RepairPolicy,
     known_projects: Mapping[str, str] | None,
     exempt_tools: frozenset[str] = EXEMPT_TOOLS,
+    residue_floor: ResidueFloor | None = None,
 ) -> MarkupGuardMiddleware:
     """The shared markup guard, wired to this server's escalation sinks.
 
@@ -173,52 +331,33 @@ def build_markup_guard(
 
     *exempt_tools* names the tools allowed to carry envelope literals as data.
 
+    *residue_floor* is the floor under the residue queue. It is called only
+    when the queue yields no id, and the path it returns reaches the refused
+    caller as ``residue_spool_path``, never as ``escalation_id``.
+
     Install the returned member through one chain, never twice: a second guard
     would count every rejection twice into the storm window.
     """
 
-    def _file_residue(record: dict[str, Any]) -> str | None:
-        """Preserve one refused payload durably, and report where it went.
+    def _file_residue(record: dict[str, Any]) -> ResiduePreservation:
+        """Preserve one refused payload, and report where it went.
 
-        The full record — which carries the caller's ``raw_value`` verbatim — is
-        logged ONLY when it could not be filed. Logging it on every refusal would
-        put the whole payload in the log on every call of the commonest rejection
-        shape, i.e. maximum log volume exactly when a leak is bursting, while the
-        queued record already holds it.
+        Queue, then floor, then log. The full record, which carries the
+        caller's ``raw_value`` verbatim, reaches the log ONLY when neither the
+        queue nor the floor held it. Logging it on every refusal would put the
+        whole payload in the log on every call of the commonest rejection
+        shape, i.e. maximum log volume exactly when a leak is bursting, while a
+        durable copy already exists.
         """
-        project_root = _resolve_project_root(record.get('project'), known_projects)
-        escalation_id = None
-        if project_root is not None:
-            # Purely additive, same as the storm branch below: the refusal is
-            # already decided, and emit_markup_residue_escalation is itself built
-            # never to raise, so this guards only against a defect in it.
-            try:
-                escalation_id = emit_markup_residue_escalation(
-                    project_root, record, anchor_task_id=_RESIDUE_ANCHOR_TASK_ID
-                )
-            except Exception:
-                logger.exception(
-                    'markup_guard: emit_markup_residue_escalation raised for '
-                    'project_root=%r; residue of %r not filed',
-                    project_root, record.get('tool'),
-                )
+        escalation_id = _queue_residue(record, known_projects)
         if escalation_id is not None:
-            logger.error(
-                'markup_guard_residue: refused an unrepairable %s.%s and '
-                'preserved its payload in %s (%d chars); %s',
-                record.get('tool'), record.get('field'), escalation_id,
-                len(record.get('raw_value') or ''), MARKUP_RECURRENCE_ROUTING,
-            )
             return escalation_id
-        logger.error(
-            'markup_guard_residue: refused an unrepairable call and could NOT '
-            'file its payload (project=%r), so THIS LOG LINE is the only copy '
-            'and the caller was handed a null escalation_id: %r; %s',
-            record.get('project'), record, MARKUP_RECURRENCE_ROUTING,
-        )
-        return None
+        spooled = _floor_residue(record, residue_floor)
+        if spooled is None:
+            _log_unpreserved(record, floor_wired=residue_floor is not None)
+        return spooled
 
-    def _escalation_sink(record: dict[str, Any]) -> str | None:
+    def _escalation_sink(record: dict[str, Any]) -> ResiduePreservation:
         """File a fired burst, and never change the rejection that fired it.
 
         ONE sink serves TWO record kinds — measured, not assumed. The middleware
@@ -240,10 +379,12 @@ def build_markup_guard(
         telling the caller its payload is preserved in the escalation named
         there. A sink that returns nothing makes that sentence a lie — and
         unrepairable is the COMMON outcome for the real corpus shapes, not an
-        edge case. When filing is genuinely impossible (an unresolvable project,
-        no escalation package, a queue outage) the caller does see a null id, and
-        THEN — only then — the full record is dumped to the log, because the log
-        line really is the only copy.
+        edge case. When no queue takes the record (an unresolvable project, no
+        escalation package, a queue outage) the floor's file is returned
+        instead, as a :class:`SpooledResidue` so the middleware reports it as a
+        path and never as an escalation id. Only when the floor is absent or
+        fails too is the caller told nothing was preserved, and THEN the full
+        record is dumped to the log.
 
         The middleware delegates dedup here on purpose — whether an open
         escalation already exists is queue knowledge the shared layer does not

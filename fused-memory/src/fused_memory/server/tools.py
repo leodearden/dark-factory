@@ -278,6 +278,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
+    from fused_memory.server.markup_residue_spool import MarkupResidueSpool
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
@@ -1435,6 +1436,7 @@ def create_mcp_server(
     known_projects: dict[str, str] | None = None,
     topic_cluster_store: TopicClusterStore | None = None,
     id_resolver: IdResolver | None = None,
+    markup_residue_spool: MarkupResidueSpool | None = None,
     embedder_probe: EmbedderEndpointProbe | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
@@ -7818,6 +7820,12 @@ def create_mcp_server(
         recipes probe it (skills/_shared/filing-the-trigger-chain.md §2)
         because it comes from the running process, not from main.
 
+        A top-level ``markup_residue`` field is present when the markup guard's
+        residue floor is wired (task 4809). A non-zero
+        ``preservation_failures`` counts refused payloads this process could
+        not preserve anywhere; ``spooled_files`` counts the payloads waiting in
+        ``spool_dir`` for an operator.
+
         When the server runs the startup embedder probe, the top-level
         ``embedder`` block reports the probed endpoint, and ``config_overlay``
         the active config overlay's provenance.
@@ -7897,6 +7905,16 @@ def create_mcp_server(
 
         if isinstance(result, dict) and 'error' not in result:
             result['task_metadata_capabilities'] = sorted(TASK_METADATA_CAPABILITIES)
+
+        # task 4809 (INV-4): refused payloads the markup guard lost. Top-level
+        # and present-when-wired for the same reasons as `journal_drops`. The
+        # status lists the spool dir, so it runs off the loop like event_dead.
+        if (
+            markup_residue_spool is not None
+            and isinstance(result, dict)
+            and 'error' not in result
+        ):
+            result['markup_residue'] = await asyncio.to_thread(markup_residue_spool.status)
 
         if embedder_probe is not None and isinstance(result, dict) and 'error' not in result:
             result.update(embedder_identity_status(memory_service.config, embedder_probe))

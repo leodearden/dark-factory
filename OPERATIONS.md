@@ -1909,6 +1909,263 @@ already running finishes where it is.
 
 ---
 
+## 5a. Reify's canonical build path and shared build cache
+
+Reify builds at one canonical path, `/opt/reify-canon/ws` (CANON), so that one
+compiler cache, a WebDAV store on the workstation, serves both hosts. The design
+and its rationale are in `plans/canonical-build-path-shared-cache-prd.md`; C13
+there specifies the tools below. This section is the runbook.
+
+### Provisioning `/opt/reify-canon/ws`
+
+Once per host, as root. It stays root-owned and empty; nothing ever populates it.
+
+```bash
+sudo install -d -o root -g root -m 0755 /opt/reify-canon /opt/reify-canon/ws
+```
+
+### The store (workstation)
+
+```bash
+scripts/deploy/install_build_cache_store.sh          # idempotent apply
+scripts/deploy/install_build_cache_store.sh --check  # read-only; exit 0 = healthy
+```
+
+It installs, as user units in `~/.config/systemd/user`:
+
+- `~/.cache/build-cache-store`, with its 4,368 directories down to the 4,096
+  `<k0>/<k1>/<k2>` leaves pre-created;
+- `build-cache-store.service`: `rclone serve webdav` on port **4227**, bound to
+  127.0.0.1 and the tailscale address only, `Restart=always`;
+- `~/.config/build-cache-store/credentials` (mode 0600, `RCLONE_USER=` and
+  `RCLONE_PASS=`), the unit's `EnvironmentFile`, so the password is in neither
+  argv nor the unit;
+- `build-cache-store-prune.service` and its daily `.timer`, running a copy of
+  the pruner in `~/.local/lib/build-cache-store/`.
+
+Preflight writes nothing and refuses when lingering is off, when
+`tailscale ip -4` gives no address or `0.0.0.0`, or when rclone is not on
+`PATH`. A re-run writes only what differs. It restarts the store only when its
+unit changed, when the credentials differ from those it was last started with
+(their digest is kept in `~/.local/state/build-cache-store/`), or when it is
+not running, so a re-run that changes nothing never cuts in-flight builds. To rotate the
+password, edit `RCLONE_PASS=` in the credentials file and re-run the
+installer. Re-copy the credentials file to every other host (the `scp` and
+`chmod 600` of the laptop steps below), then re-run `--host-config` and
+`--check --host-config` on each host. `--check` also reports a
+hand-edited unit as drift. Overrides: `BUILD_CACHE_STORE_PORT`,
+`BUILD_CACHE_STORE_CAP_BYTES`, `BUILD_CACHE_STORE_DIR`,
+`BUILD_CACHE_STORE_CREDENTIALS`.
+
+Boot order rests on `Restart=always`, not on unit ordering. A user manager
+cannot see `tailscaled.service` or `network-online.target`, so the unit has no
+`After=`. Until tailscaled assigns its address, rclone fails to bind it, and
+that failure takes the loopback address down too. The unit retries every 2 s,
+and `StartLimitIntervalSec=0` keeps a slow tailscale start from tripping the
+start limit.
+
+### The host configuration file
+
+`~/.config/reify-canon/host.toml`, mode 0600, is read by reify's primitive
+(`REIFY_CANON_HOST_CONFIG` overrides the path). Its seven keys are C13's:
+`enabled`, `store_url`, `store_user`, `store_password`, `fallback_dir`,
+`fallback_cap` and `policy`. The keys, their defaults and their value rules
+have one home, `scripts/deploy/reify_canon_host_config.py`. The installer's
+`--host-config` mode calls it to write the file, and installs no store:
+
+```bash
+REIFY_CANON_ENABLED=true REIFY_CANON_POLICY=shared \
+  scripts/deploy/install_build_cache_store.sh --host-config
+scripts/deploy/install_build_cache_store.sh --check --host-config
+```
+
+| Variable | Key |
+|---|---|
+| `REIFY_CANON_ENABLED` | `enabled` |
+| `REIFY_CANON_POLICY` | `policy` |
+| `BUILD_CACHE_STORE_URL` | `store_url` |
+| `REIFY_CANON_FALLBACK_DIR` | `fallback_dir` |
+| `REIFY_CANON_FALLBACK_CAP` | `fallback_cap` |
+| `BUILD_CACHE_STORE_CREDENTIALS` | the file `store_user` and `store_password` are always read from |
+
+An unset variable keeps the existing file's value, so a re-run changes only
+what you pass, and each change is logged old -> new. Defaults apply only where
+there is no file yet. Among them, `enabled = false` and a loopback `store_url`,
+which is why the laptop passes `BUILD_CACHE_STORE_URL`. `--check --host-config`
+checks the file's mode, keys and values under the same rules. It then proves
+the store accepts this host's credentials over `store_url`: 404 for a missing
+key with them, 401 without.
+
+On the laptop, copy the workstation's credentials file, then point at the
+workstation's tailscale address:
+
+```bash
+install -d -m 0700 ~/.config/build-cache-store
+scp <workstation>:.config/build-cache-store/credentials ~/.config/build-cache-store/credentials
+chmod 600 ~/.config/build-cache-store/credentials
+REIFY_CANON_ENABLED=true BUILD_CACHE_STORE_URL=http://<workstation tailscale address>:4227 \
+  scripts/deploy/install_build_cache_store.sh --host-config
+```
+
+### Enabling, disabling and rolling back a host
+
+To enable:
+
+1. Provision `/opt/reify-canon/ws`.
+2. Write host.toml with `REIFY_CANON_ENABLED=true` and pass
+   `--check --host-config`.
+3. Set `build_canon.root: /opt/reify-canon/ws` and
+   `build_canon.shim_dir: ~/.local/share/reify-canon/bin` (absolute) in the
+   host's own reify orchestrator yaml, never in `verify_env`. Apply with
+   `mcp__escalation__reload_config`; the section is hot-reloadable.
+4. Reset the host's task-verify lanes so their build directories are
+   recreated at CANON. `orchestrator verify-lanes reset --config <host yaml>`
+   does this (exit 3 means a busy lane was skipped, so re-run it), but it is
+   delivered by the task-verify-lanes PRD (`plans/task-verify-lanes-prd.md`
+   C10, tasks 10736–10739) and does not exist until those land. Until then,
+   halt the merge queue, wait for in-flight verifies to finish, and remove
+   the lanes' build directories by hand. Then drop the merge lane's build directory, as in
+   [Rebuilding the warm base](#rebuilding-the-warm-base).
+5. Once verifies have run, compare the drift probe on both hosts and run the
+   in-service check. Only when it exits 0, set `build_canon.expect_canon: true`.
+
+To disable or roll back, follow PRD decision 22's order:
+
+1. Write host.toml with `enabled = false` (`--host-config` with
+   `REIFY_CANON_ENABLED=false`). New build directories are then real-path.
+2. Rebuild the warm base ([below](#rebuilding-the-warm-base)).
+3. Only then unset `build_canon.root` and `expect_canon`, and reload.
+
+Existing CANON directories keep working throughout. A leg about to run
+unprefixed in a CANON-stamped directory gets a fresh build directory (C8).
+
+### Changing a host's policy
+
+1. Re-run `--host-config` with the new `REIFY_CANON_POLICY`; every other value
+   is kept.
+2. [Rebuild the warm base](#rebuilding-the-warm-base) under the new policy.
+
+Every workspace unit's identity changes with the policy (C12). Old units are
+never reused, which is why the base is dropped.
+
+### Rebuilding the warm base
+
+The persistent merge lane's build directory is what the warm base is refreshed
+from, so dropping it rebuilds the base under the host's current host.toml:
+
+1. Halt the merge queue (`mcp__escalation__halt_merge_queue`) and wait for it
+   to be idle.
+2. In reify's main checkout, `rm -rf .worktrees/_merge-verify/target`.
+3. Release the queue (`mcp__escalation__unhalt_merge_queue`).
+
+The next merge verify builds it cold, through `canon_run.py exec` (C12). On
+landing, reify's `scripts/refresh-warm-base.sh` refreshes
+`$REIFY_WARM_LANE_MOUNT/base/target` from it. To rebuild before the next
+merge, run reify's `scripts/seed-warm-base-initial.sh` between steps 2 and 3.
+
+### Reading observations
+
+- `<project>/data/verify-logs/build-cache-observations.jsonl` holds one row per
+  verify result that carried a `build_cache` fact. Its keys are `time`, `host`,
+  `role`, the task id or merge commit, and `build_cache` (C9: `mode`,
+  `backend`, `policy`, `reason`, the counters, `wall_secs` and `cpu_secs`).
+  The in-service check reads only `time`, `host` and `build_cache`; the names'
+  home is its `ROW_*` constants
+  (`scripts/deploy/check_build_cache_in_service.py::ROW_TIME` and siblings).
+- `<build dir>/.reify-canon-journal.jsonl` holds the same record plus the cargo
+  subcommand for every outermost invocation. That includes agent and
+  interactive builds, which emit no event (C6).
+
+### The in-service check
+
+```bash
+scripts/deploy/check_build_cache_in_service.py \
+  --observations <project>/data/verify-logs/build-cache-observations.jsonl \
+  --host leo-laptop --since 2026-11-20T00:00:00Z --min-runs 5 \
+  --canon-root /opt/reify-canon/ws --status-json <file holding canon_run.py status output>
+```
+
+Exit 0 means in service. PRD C13 specifies the exit table.
+`check_build_cache_in_service.py --help` prints it, with the order it is
+evaluated in and the tool's own codes for a usage error and an unreadable
+observations file. Stdout is one JSON line carrying `verdict`, the counts,
+`latest` and `per_policy` sums of runs, hits, misses and cpu_secs.
+
+### The alarm
+
+Each executing host has the sentinel `__build_cache_degraded__<host>`, category
+`infra_issue`. Its ladder is PRD decision 18's, and "degraded" is defined by
+C10. When it fires: run `--check` on the workstation and
+`--check --host-config` on the host, then read that host's latest rows.
+
+### Pruning
+
+`build-cache-store-prune.timer` runs daily, delayed at random by up to an hour,
+and catches up after downtime. It prunes to `BUILD_CACHE_STORE_CAP_BYTES`
+(default 300 GiB, PRD open question 5):
+
+- least recently used first, by the later of atime and mtime;
+- never a file modified in the last ten minutes, and never a directory.
+
+After removing anything it sends the store's main process SIGHUP, so rclone
+drops its directory cache. Without it, rclone serves a removed object as a
+truncated 200. To change the cap, re-run the installer with
+`BUILD_CACHE_STORE_CAP_BYTES`. A dry run, and the last real one:
+
+```bash
+~/.local/lib/build-cache-store/build_cache_store_prune.py ~/.cache/build-cache-store \
+  --cap-bytes $((300 << 30)) --check
+journalctl --user -u build-cache-store-prune.service -n 20
+```
+
+It exits 0 even when still over cap: the young files age out, and the JSON
+says `over_cap`.
+
+### The drift probe
+
+On each host, against its reify checkout, then diff the two outputs:
+
+```bash
+scripts/deploy/build_cache_drift_probe.sh ~/src/reify > /tmp/drift-$(hostname).tsv
+diff /tmp/drift-<workstation>.tsv /tmp/drift-leo-laptop.tsv
+```
+
+Zero differences outside `#info` lines are required before gates ι and κ.
+Each pkg-config module that reify's dependencies probe has its own
+`pkg-config.<module>` line, carrying its version and `libdir`, or `ABSENT`, so
+the diff names the module. α's cross-host misses were `xscrnsaver` present on
+the laptop only (libxss-dev, esc-10782-1). The module list is derived from the
+checkout's `Cargo.lock` on every run: each locked registry crate's
+`[package.metadata.system-deps]` entries, read from its source under
+`$CARGO_HOME/registry/src`, plus the pkg-config names in x11-dl's `build.rs`.
+`#info.cargo.registry-sources-missing` names locked registry crates whose
+source is not on that host. It is informational and never compared: it lists
+what the host has not fetched, mostly target-specific crates a Linux build
+never downloads. If a missing crate declares system-deps, its
+`pkg-config.<module>` lines are absent on that host only, so the diff shows
+it. Run `cargo fetch` in the reify checkout on that host and probe again. Whole-system
+package and module lists are not compared, because the hosts legitimately
+differ in hundreds of unrelated packages. A probe of a checkout with no
+`Cargo.lock` exits 2.
+
+`REIFY_PROBE_DEEP=1` adds the digests of the C++ wrappers' header closures.
+
+### Shrinking the old host sccache cache
+
+The workstation's host sccache, the `sccache.service` user unit on port 4226
+with `SCCACHE_CACHE_SIZE=500G` over `~/.cache/sccache`, still serves real-path
+builds. Lower its cap once the store holds a week of builds:
+
+```bash
+systemctl --user edit sccache.service   # [Service] Environment=SCCACHE_CACHE_SIZE=<new>
+```
+
+Restart it only with the merge queue halted and idle. The home filesystem was
+91% full when this was planned, and the store replaces that cache rather than
+adding to it.
+
+---
+
 ## 6. Config reload vs restart
 
 `mcp__escalation__reload_config` hot-applies an edited
@@ -6003,6 +6260,15 @@ Every path that deletes a per-task config dir now goes through
 deletes only what it has made durable. The three sites are
 `TaskWorkflow._cleanup_config_dir`, `_recycle_config_dir`, and the
 `GitOps.cleanup_worktree` backstop.
+
+Reconciliation runs are covered too (task 3972):
+`fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::gc_run_config_dir`
+archives each recon stage transcript to
+`data/orchestrator/agent-transcripts/recon-<run_id>/<enc>/<sid>.jsonl` before it
+removes `data/reconciliation/recon-config/claude-config-<run_id>/`, unless
+`transcript_archive_enabled` is off. To list a day's archived runs, use
+`python scripts/legibility/inventory.py --cwd-prefix <root> --date <d> --agent-transcript-root data/orchestrator/agent-transcripts`;
+each line's path names its `recon-<run_id>`.
 
 The call is **synchronous** on purpose. It used to be
 `await asyncio.to_thread(...)`, which meant a SIGTERM arriving mid-teardown

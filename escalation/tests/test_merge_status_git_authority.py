@@ -1106,6 +1106,36 @@ class TestMergeStatusGitAuthority:
             f'got: {calls[0].kwargs.get("delivered_checks")!r}'
         )
 
+    @pytest.mark.parametrize(
+        ('declaration', 'forwarded'),
+        [
+            pytest.param(
+                ['junk', {'kind': 'grep', 'pattern': 'def bar', 'expect': 'absent'}],
+                [{'kind': 'grep', 'pattern': 'def bar', 'expect': 'absent'}],
+                id='non-dict-entry-dropped',
+            ),
+            pytest.param(
+                {'kind': 'grep', 'pattern': 'def bar', 'expect': 'absent'},
+                [],
+                id='bare-dict-value-never-iterated-by-key',
+            ),
+        ],
+    )
+    async def test_marker_arm_forwards_only_declared_check_descriptors(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        declaration: Any, forwarded: list[dict[str, Any]],
+    ) -> None:
+        calls = _record_validate_landing_evidence(monkeypatch)
+        server, _ = self._marker_arm_server(
+            tmp_path, marker='d' * 40, marker_predates_base=False,
+            metadata={'branch_base_sha': 'b' * 40, 'delivered_checks': declaration},
+        )
+
+        await call_merge_status(server, task_id='4498')
+
+        assert len(calls) == 1
+        assert calls[0].kwargs['delivered_checks'] == forwarded
+
     async def test_marker_arm_forwards_empty_list_never_none(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -1,0 +1,73 @@
+import math
+TABLE=[(0.992,12),(0.990,11),(0.988,10),(0.984,9),(0.979,8),(0.972,7),(0.959,6),(0.934,5),(0.876,4),(0.75,3)]
+def table_depth(p):
+    for thr,d in TABLE:
+        if p>=thr: return d
+    return 1
+def P_red(f,c,q,r): return 1-(1-q)**f*(1-r)**c
+def C(f,c,q,r,t,u,a0):
+    n=f+c
+    if n<=1: return 1.0
+    pr=P_red(f,c,q,r)
+    if pr<=0: return 1.0
+    sound=n-(f*q+c*r)/pr
+    return 1+pr*((1-u)*(t*(n+1)+sound*a0)+u*n)
+def going(q,r,t,u,maxf):
+    a0=1/maxf
+    return min(C(k,0,q,r,t,u,a0)/k for k in range(1,maxf+1)), a0
+def plan(nfresh_avail,ncleared_avail,q,r,t,u,maxf,maxt,order='fresh_first'):
+    aq,a0=going(q,r,t,u,maxf)
+    f,c=1,0   # dispatching request is first member (fresh)
+    while f<maxf and f-1<nfresh_avail-1:
+        if C(f+1,c,q,r,t,u,a0)-C(f,c,q,r,t,u,a0) < aq: f+=1
+        else: break
+    took=0
+    while f+c<maxt and took<ncleared_avail:
+        if C(f,c+1,q,r,t,u,a0)-C(f,c,q,r,t,u,a0) < a0: c+=1; took+=1
+        else: break
+    return f,c,aq,a0
+print('== B1: u=1 vs depth table (max_fresh 12), pass estimate p=1-q')
+mism=[]
+p=0.75
+while p<=0.9951:
+    q=1-p
+    f,c,aq,a0=plan(100,0,q,0.01,0.05,1.0,12,24)
+    td=table_depth(p)
+    if f!=td: mism.append((round(p,4),td,f))
+    p+=0.0005
+print('grid points',int((0.995-0.75)/0.0005)+1,'mismatches',len(mism))
+# summarise mismatch ranges
+if mism:
+    runs=[];s=mism[0];prev=mism[0]
+    for m in mism[1:]:
+        if m[1:]!=prev[1:] or m[0]-prev[0]>0.00051: runs.append((s[0],prev[0],prev[1],prev[2])); s=m
+        prev=m
+    runs.append((s[0],prev[0],prev[1],prev[2]))
+    for r_ in runs: print('  p in [%.4f,%.4f]: table %d, rule %d'%r_)
+print('== rule depth at u=1 for sample p:', [(p,plan(100,0,1-p,0.01,0.05,1.0,12,24)[0],table_depth(p)) for p in (0.75,0.80,0.86,0.876,0.90,0.934,0.95,0.959,0.972,0.979,0.984,0.988,0.99,0.992,0.995)])
+print('== starting rates q=.14 r=.01 t=.05 u=.16, caps 12/24')
+for q in (0.03,0.05,0.08,0.14,0.20,0.30):
+    f,c,aq,a0=plan(100,24,q,0.01,0.05,0.16,12,24)
+    print(' q=%.2f fresh=%d cleared=%d a(q)=%.3f a0=%.3f P_red(f)=%.3f'%(q,f,c,aq,a0,P_red(f,0,q,0.01)))
+print('== u=0 (sim cost) ')
+for q in (0.03,0.05,0.08,0.14,0.20):
+    f,c,aq,a0=plan(100,24,q,0.0,0.05,0.0,12,24)
+    print(' q=%.2f fresh=%d cleared=%d a(q)=%.3f'%(q,f,c,aq))
+print('== B3: cleared joins? r=0, batch of f fresh; dC vs a0')
+for u in (0.0,0.16):
+  for q in (0.05,0.14):
+    a0=1/12
+    row=[]
+    for f in (1,2,3,6,12):
+        d=C(f,1,q,0.0,0.05,u,a0)-C(f,0,q,0.0,0.05,u,a0)
+        row.append((f,round(d,3),d<a0))
+    print(' u=%.2f q=%.2f'%(u,q),row,'a0=%.3f'%a0)
+print('== row 16: 12 fresh + cleared at start rates: joins?', [(q, C(12,1,q,0.01,0.05,0.16,1/12)-C(12,0,q,0.01,0.05,0.16,1/12)) for q in (0.05,0.14)])
+print('== riders-only batch: c cleared, 0 fresh (first member cleared): cost per member')
+for c in (2,6,12,24):
+    print('  c=%d C=%.3f per-member=%.4f'%(c,C(0,c,0.14,0.01,0.05,0.16,1/12),C(0,c,0.14,0.01,0.05,0.16,1/12)/c))
+print('== B2: q=0 -> P_red=0 -> sound term 0/0 in the formula as written (guarded here)')
+print('== where does marginal fresh stop at start rates, by u:')
+for u in (0.0,0.16,0.3,0.5,1.0):
+    print('  u=%.2f'%u,[(q,plan(100,0,q,0.01,0.05,u,12,24)[0]) for q in (0.05,0.08,0.14,0.20)])
+print('== t sensitivity (u=.16) fresh size:', [(t,[plan(100,0,q,0.01,t,0.16,12,24)[0] for q in (0.05,0.14)]) for t in (0.02,0.05,0.10,0.20)])

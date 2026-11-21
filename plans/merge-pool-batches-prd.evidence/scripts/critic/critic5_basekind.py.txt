@@ -1,0 +1,32 @@
+import sqlite3, json, collections, subprocess
+REPO='/home/leo/src/dark-factory'
+db=sqlite3.connect(f'file:{REPO}/data/orchestrator/runs.db?mode=ro', uri=True)
+rows=[]
+for ts,data in db.execute("select timestamp,data from events where event_type='merge_verify' and timestamp>='2026-11-12' order by id"):
+    d=json.loads(data)
+    if d.get('attempt') not in (None,0): continue
+    rows.append((ts,d))
+def git(*a):
+    r=subprocess.run(['git','-C',REPO,*a],capture_output=True,text=True)
+    return r.stdout.strip() if r.returncode==0 else None
+tips={}      # tip -> n
+own={}       # owner own commit -> (tip, n)
+for ts,d in rows:
+    sha=d.get('merge_sha'); n=d.get('chain_items') or 1
+    if not sha: continue
+    tips[sha]=n
+    if n>1:
+        o=git('rev-parse',f'{sha}~{n-1}')
+        if o: own[o]=(sha,n)
+c=collections.Counter(); ex=[]
+for ts,d in rows:
+    sha=d.get('merge_sha'); n=d.get('chain_items') or 1
+    if d.get('base_relation')!='stacked' or not sha: continue
+    base=git('rev-parse',f'{sha}~{n}')
+    kind='batch' if n>1 else 'single'
+    if base is None: c[(kind,'no-commit')]+=1; continue
+    if base in own and own[base][0]!=base: c[(kind,'on a batch owner OWN commit (not its tip)')]+=1; ex.append((ts[:16],sha[:8],n,own[base][1]))
+    elif base in tips: c[(kind,'on a tip (successor base)' if tips[base]>1 else 'on a single commit')]+=1
+    else: c[(kind,'other/unknown')]+=1
+for k,v in sorted(c.items(), key=lambda x:-x[1]): print(v,k)
+print(ex[:6])

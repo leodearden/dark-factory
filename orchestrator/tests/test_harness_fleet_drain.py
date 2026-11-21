@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
-from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until, lane_scene_config, make_lane
+from _merge_lane_fakes import FakeVerifier, hangs_until, lane_scene_config, make_lane
 from _orch_helpers import wait_responsive
 from _recording_event_store import _RecordingEventStore
 
@@ -97,10 +97,7 @@ async def test_the_heartbeat_halts_the_lane_and_the_stop_reports_what_it_kills(
     release = asyncio.Event()
     verifier = FakeVerifier(scripts={'held': hangs_until(release)})
     queue: asyncio.Queue[Any] = asyncio.Queue()
-    lane = make_lane(
-        git_ops, queue, verifier=verifier,
-        clock=FakeClock(content_mtime=1.0, content_tick=1.0),
-    )
+    lane = make_lane(git_ops, queue, verifier=verifier)
     harness._merge_worker = lane
     harness._merge_worker_task = asyncio.create_task(lane.run())
     try:

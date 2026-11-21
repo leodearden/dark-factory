@@ -13,6 +13,7 @@ from typing import Any
 
 from escalation.models import Escalation
 from shared.briefing_queries import BriefingScope
+from shared.declared_checks import DeclaredChecks, declared_checks
 from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, parse_item
 from shared.task_text_fingerprint import TaskTextDrift
 
@@ -280,11 +281,11 @@ the meaning rather than a bare ``[]`` keeps the bullet readable for an agent.
 """
 
 
-def _format_delivered_checks(checks: object) -> str:
+def _format_delivered_checks(declared: DeclaredChecks) -> str:
     """Render a task's ``metadata.delivered_checks`` as an agent-readable block.
 
-    Returns '' for a falsy input so ``BriefingAssembler._format_task`` can omit
-    the whole section on the common path (most tasks declare no capability).
+    Returns '' when nothing is declared so ``BriefingAssembler._format_task`` can
+    omit the whole section on the common path (most tasks declare no capability).
 
     One bullet per descriptor, field-labelled so the rendered text names every
     field of :class:`shared.capability_manifest.DeliveredCheckMeta` — a field
@@ -294,22 +295,11 @@ def _format_delivered_checks(checks: object) -> str:
     "…and N more" line, the never-silent-truncation convention
     :func:`_format_commit_bullets` documents.
 
-    ``metadata`` is persisted, untyped data and ``_format_task`` runs on every
-    dispatch, so this fails OPEN the way
-    ``BriefingAssembler._format_prior_proposal`` does for ``files_referenced``:
-    a bare dict is accepted as a one-element list (a shape ``parse_metadata``
-    accepts, so a real task can carry one), ``paths``/``args`` elements are
-    ``str()``-coerced, and an entry whose ``kind`` is missing or unrecognised
-    degrades to a VISIBLE partial bullet rather than being dropped — dropping it
-    would reproduce this section's own reason for existing one level down, since
-    an unseen check still blocks mark-done. An element that is not a dict at all
-    cannot be given a bullet, so it is COUNTED visibly instead and the section is
-    still emitted: ``parse_metadata`` preserves a wrong-shaped slice with only a
-    ``SchemaWarning``, ``run_delivered_check`` maps such an entry to ERRORED, and
-    the gate turns that into a withheld mark-done — so returning '' would block a
-    task from ever stamping done while showing its agent no gate at all. '' is
-    reserved for a value that is neither a dict nor a list/tuple, i.e. genuinely
-    nothing to show.
+    The reading rule is ``shared/src/shared/declared_checks.py::declared_checks``'s,
+    and within it this fails OPEN because an unseen entry still withholds
+    mark-done: an unrecognised ``kind`` gets a VISIBLE partial bullet,
+    ``paths``/``args`` elements are ``str()``-coerced, and every unreadable entry
+    is COUNTED visibly.
 
     The gate's own arming is CONDITIONAL (``delivered_checks.enabled``,
     green-tier hot-reloadable), and this renderer is pure with no view of
@@ -327,30 +317,27 @@ def _format_delivered_checks(checks: object) -> str:
     a teach-to-the-test hazard unless the same text tells it that matching the
     pattern without delivering the behaviour is a defect.
     """
-    if not checks:
-        return ''
-    if isinstance(checks, dict):
-        checks = [checks]
-    if not isinstance(checks, (list, tuple)):
+    if declared.is_empty:
         return ''
 
-    entries = [check for check in checks if isinstance(check, dict)]
-    dropped = len(checks) - len(entries)
-
-    shown = entries[:DELIVERED_CHECK_BULLET_LIMIT]
+    shown = declared.checks[:DELIVERED_CHECK_BULLET_LIMIT]
     lines = [_delivered_check_bullet(check) for check in shown]
-    hidden = len(entries) - len(shown)
+    hidden = len(declared.checks) - len(shown)
     if hidden > 0:
         lines.append(
             f'- …and {hidden} more declared check(s) (not shown — read the full '
             f'list from this task\'s `metadata.delivered_checks`)'
         )
-    if dropped > 0:
-        noun = 'entry' if dropped == 1 else 'entries'
+    unreadable = len(declared.unreadable)
+    if unreadable:
+        noun, what = (
+            ('entry', 'is not a check descriptor') if unreadable == 1
+            else ('entries', 'are not check descriptors')
+        )
         lines.append(
-            f'- ⚠ {dropped} malformed {noun} on this task\'s '
-            f'`metadata.delivered_checks` could not be rendered here — still '
-            f'evaluated by the gate, so read the raw list from the task record.'
+            f'- ⚠ {unreadable} malformed {noun} on this task\'s '
+            f'`metadata.delivered_checks` {what} and can never pass the gate — '
+            f'repair the task record, or escalate if this task cannot.'
         )
     bullets = '\n'.join(lines)
 
@@ -1924,7 +1911,7 @@ A prior block-time investigation concluded the following; verify against the cur
         body = '\n'.join(lines) if lines else json.dumps(dict(task), indent=2)
         blocks = (
             body,
-            _format_delivered_checks(metadata.get('delivered_checks')),
+            _format_delivered_checks(declared_checks(metadata)),
             _format_followup_items(metadata.get(FOLLOWUP_ITEMS_METADATA_KEY)),
         )
         return '\n\n'.join(block for block in blocks if block)

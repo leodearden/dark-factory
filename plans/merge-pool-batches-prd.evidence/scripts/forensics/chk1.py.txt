@@ -1,0 +1,23 @@
+from common import *
+C=json.load(open('/tmp/gate-10069/forensics/cond.json'))
+W=[x for x in C['verifies'] if x['in_window']]
+print(collections.Counter((x['state'],x['base_relation'],bool(x['speculative'])) for x in W))
+EV=events()
+landed={}
+for e in EV:
+    if e['et']=='merge_finalized' and e['d'].get('state')=='done' and e['d'].get('merge_sha'): landed.setdefault(e['d']['merge_sha'],e['ts'])
+# speculative_merge events by task
+SM=collections.defaultdict(list)
+for e in EV:
+    if e['et']=='speculative_merge': SM[e['task']].append((T(e['ts']),e['d'].get('base_sha'),e['d'].get('depth')))
+bad=0; rowsout=[]
+for x in W:
+    if x['state']=='MAIN' and x['base_relation'] in('stacked','rebased_head','stale'):
+        b=x['base']; inl=b in landed
+        rc,o=git('show','-s','--format=%cI %s',b) if b else (1,'')
+        sm=[s for s in SM.get(x['task'],[]) if s[0]<=x['start']+5]
+        smb=sm[-1][1] if sm else None
+        st=dt.datetime.fromtimestamp(x['start'],dt.timezone.utc).isoformat()[5:16]
+        rowsout.append((x['vid'],x['ts'][5:16],'start',st,x['task'],'k%d'%x['k'],x['base_relation'],'P' if x['passed'] else 'F','base',(b or '?')[:8],'landed_ev' if inl else 'CD-FALLBACK',(landed.get(b) or o)[:16],o[26:60],'| spec_merge base',(smb or '?')[:8],'same' if smb==b else 'DIFF'))
+for r in rowsout: print(*r)
+print(len(rowsout))

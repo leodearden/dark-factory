@@ -47,6 +47,9 @@ from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
 from fused_memory.server.boundary_guards import (  # noqa: E402  # debt: task 10130
     install_boundary_guards,
 )
+from fused_memory.server.markup_residue_spool import (  # noqa: E402  # debt: task 10130
+    MarkupResidueSpool,
+)
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
     create_mcp_server,
@@ -1035,6 +1038,9 @@ async def run_server():
     # way, and the leaf is read live at each of them.
     topic_cluster_store = build_topic_cluster_store(resolve_data_dir(config))
 
+    # The floor under the markup guard's residue queue (task 4809).
+    markup_residue_spool = MarkupResidueSpool(resolve_data_dir(config) / 'markup_residue')
+
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
         memory_service, task_interceptor, write_journal,
@@ -1044,6 +1050,7 @@ async def run_server():
         curator_usage_gate=curator_usage_gate,
         known_projects=_known_projects_map,
         topic_cluster_store=topic_cluster_store,
+        markup_residue_spool=markup_residue_spool,
         embedder_probe=embedder_probe,
     )
 
@@ -1055,6 +1062,7 @@ async def run_server():
         mcp,
         known_projects=_known_projects_map,
         prefix_resolver=per_use_prefix_resolver(memory_service),
+        residue_spool=markup_residue_spool,
     )
 
     mcp.settings.host = config.server.host
@@ -1945,7 +1953,8 @@ def resolve_data_dir(config: FusedMemoryConfig) -> Path:
     """The server's absolute reconciliation data dir: ``reconciliation.data_dir`` when reconciliation is configured, else ``<checkout>/data``.
 
     It holds the reconciliation-family stores: journal, ledger, event buffer,
-    tickets, curator and report state, write journal and topic clusters.
+    tickets, curator and report state, write journal, topic clusters and the
+    markup residue spool.
     """
     return Path(anchor_at_checkout(config.reconciliation.data_dir if config.reconciliation else 'data'))
 
@@ -2178,6 +2187,7 @@ def _install_tool_dispatch_guards(
     *,
     known_projects: Mapping[str, str] | None,
     prefix_resolver: PrefixResolver | None,
+    residue_spool: MarkupResidueSpool,
 ) -> None:
     """Install the three ``ToolManager.call_tool`` wrappers, in the ONE order that works.
 
@@ -2221,12 +2231,22 @@ def _install_tool_dispatch_guards(
     hosts no write tools and gets no boundary chain; it gets the str
     passthrough, the safe wrapper and the unknown-argument guard through
     :func:`_install_recon_report_guards`.
+
+    *residue_spool* is REQUIRED: its ``preserve`` is the floor under the
+    markup guard's residue queue. ``add_memory`` declares ``content`` before
+    ``project_id``, so a forward-consuming leak in ``content`` eats the routing
+    key, and preservation therefore may not depend on routing (task 4809).
     """
     from fused_memory.server.str_argument_passthrough import install_str_argument_passthrough
 
     install_str_argument_passthrough(mcp)
     _install_safe_tool_wrapper(mcp)
-    install_boundary_guards(mcp, known_projects=known_projects, prefix_resolver=prefix_resolver)
+    install_boundary_guards(
+        mcp,
+        known_projects=known_projects,
+        prefix_resolver=prefix_resolver,
+        residue_floor=residue_spool.preserve,
+    )
 
 
 def _install_recon_report_guards(mcp: Any) -> None:

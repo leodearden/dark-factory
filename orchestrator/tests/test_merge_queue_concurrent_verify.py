@@ -31,7 +31,6 @@ import contextlib
 import dataclasses
 import inspect
 import logging
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, TypeGuard
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -40,7 +39,6 @@ import pytest
 from _merge_lane_fakes import (
     FakeClock,
     FakeVerifier,
-    VerifyScript,
     fails,
     hangs_until,
     lane_scene_config,
@@ -262,53 +260,6 @@ def _make_config_with_runner(
 # ---------------------------------------------------------------------------
 # (b) _gated_runner factory: slow fake verify gated on asyncio.Event
 # ---------------------------------------------------------------------------
-
-
-class _GatedVerifier(FakeVerifier):
-    """``FakeVerifier`` plus the two things every gated test here needs.
-
-    * ``entered`` -- the ARRIVAL half of a gate.  A script carries only the
-      release half (``hangs_until``, or ``dataclasses.replace(fails(...),
-      release=...)``), so a test otherwise has no way to know a verify is
-      genuinely in flight before it releases that gate.
-      ``entered[task_id]`` -- or the ``None`` catch-all, for a test that
-      gates whichever verify arrives first -- is set the moment that task's
-      scoped verify starts, ahead of the script's own release wait.
-    * ``first`` -- a script governing ONLY the first scoped verify of the run;
-      every later one falls through to ``scripts``/``default``.  That is what
-      these tests mean by "N's verify fails, and the re-dispatch passes": the
-      head's initial attempt is the gated one, and the cascade re-dispatches
-      the SAME task as often as its successor, so keying the failure on task
-      id instead would re-fail the re-dispatched head.
-    """
-
-    def __init__(
-        self,
-        *,
-        entered: Mapping[str | None, asyncio.Event] | None = None,
-        first: VerifyScript | None = None,
-        **scripting: Any,
-    ) -> None:
-        super().__init__(**scripting)
-        self.entered = dict(entered or {})
-        self.first = first
-
-    async def run_scoped(self, *args: Any, **options: Any) -> VerifyResult:
-        task_id = options.get('task_id')
-        gate = self.entered.get(task_id) or self.entered.get(None)
-        if gate is not None:
-            gate.set()
-        script = self.first if not self.verified else None
-        if script is None:
-            return await super().run_scoped(*args, **options)
-        # Inlined rather than delegated: ``first`` is keyed on call ORDER,
-        # which the shared fake's per-task-id dispatch cannot express.
-        self.verified.append(task_id)
-        if script.release is not None:
-            await script.release.wait()
-        if script.error is not None:
-            raise script.error
-        return script.result
 
 
 def _gated_runner(
@@ -2003,9 +1954,7 @@ class TestOverlapSignal:
         gated_remote = _gated_runner(gate_b_release, gate_b_entered, name='laptop')
 
         # Local verify (N's verify host) — gated through the injected port
-        verifier = _GatedVerifier(
-            entered={None: gate_a_entered}, default=hangs_until(gate_a_release),
-        )
+        verifier = FakeVerifier(hangs_until(gate_a_release, entered=gate_a_entered))
 
         # ── Branches ───────────────────────────────────────────────────────
         wt_a = await _make_branch_with_file(git_ops, 'task/ov-a', 'ov_a.py', 'a = 1\n')
@@ -2155,9 +2104,7 @@ class TestLastItemOfBurstFinalizes:
         gate_release = asyncio.Event()
         gate_entered = asyncio.Event()
 
-        verifier = _GatedVerifier(
-            entered={None: gate_entered}, default=hangs_until(gate_release),
-        )
+        verifier = FakeVerifier(hangs_until(gate_release, entered=gate_entered))
 
         # Remote runner exists (→ free_host_count()>1 so the fill loop continues
         # past the local dispatch) but is never used by this single-item burst.
@@ -2262,13 +2209,10 @@ class TestChainInvalidationUnderOverlap:
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
 
-        verifier = _GatedVerifier(
-            entered={None: gate_a_entered},
-            first=dataclasses.replace(
-                fails(category='test_failure', summary='test_failure'),
-                release=gate_a_release,
-            ),
-        )
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            fails(category='test_failure', summary='test_failure'),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
         gate_b_release = asyncio.Event()
@@ -2426,13 +2370,10 @@ class TestChainInvalidationUnderOverlap:
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
 
-        verifier = _GatedVerifier(
-            entered={None: gate_a_entered},
-            first=dataclasses.replace(
-                fails(category='test_failure', summary='test_failure'),
-                release=gate_a_release,
-            ),
-        )
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            fails(category='test_failure', summary='test_failure'),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
         gate_b_release = asyncio.Event()
@@ -2625,9 +2566,7 @@ class TestHaltAndUnavailable:
         gate_b_entered = asyncio.Event()
 
         # N's local verify: gated (passes when released)
-        verifier = _GatedVerifier(
-            entered={None: gate_a_entered}, default=hangs_until(gate_a_release),
-        )
+        verifier = FakeVerifier(hangs_until(gate_a_release, entered=gate_a_entered))
 
         # N+1's remote verify: gated (passes when released)
         gated_remote = _gated_runner(
@@ -2738,9 +2677,7 @@ class TestHaltAndUnavailable:
         gate_b_entered = asyncio.Event()
 
         # N's local verify: gated (passes when released)
-        verifier = _GatedVerifier(
-            entered={None: gate_a_entered}, default=hangs_until(gate_a_release),
-        )
+        verifier = FakeVerifier(hangs_until(gate_a_release, entered=gate_a_entered))
 
         # N+1's remote runner: gates on entered, then raises RunnerUnavailable
         async def _unavailable_side(*args: Any, **kwargs: Any) -> Any:
@@ -3414,13 +3351,10 @@ class TestRunnerUnavailableHeadCascade:
         gate_b_entered = asyncio.Event()
         gated_remote = _gated_runner(gate_b_release, gate_b_entered, passed=True, name='remote-b')
 
-        verifier = _GatedVerifier(
-            entered={None: gate_a_entered},
-            first=dataclasses.replace(
-                raises(RunnerUnavailable('simulated host failure for cascade test')),
-                release=gate_a_release,
-            ),
-        )
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            raises(RunnerUnavailable('simulated host failure for cascade test')),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         # ── Branches ─────────────────────────────────────────────────────────
         wt_a = await _make_branch_with_file(git_ops, 'task/rucascade-a', 'rucascade_a.py', 'a=1\n')
@@ -3727,9 +3661,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
 
         # Gated scoped verify, injected through the worker's verifier port, so
         # the local arm blocks inside run_post_merge_verify until released.
-        verifier = _GatedVerifier(
-            entered={None: gate_entered}, default=hangs_until(gate_release),
-        )
+        verifier = FakeVerifier(hangs_until(gate_release, entered=gate_entered))
 
         req, item = await self._make_merged_item(
             git_ops, config, 'rca-local-a', 'rca_local_a.py', 'l=1\n',
@@ -3940,13 +3872,10 @@ class TestCascadeFiresRemoteCancel:
         # ── N's gated local verify: fails when gate_a_release is set ─────────
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
-        verifier = _GatedVerifier(
-            entered={None: gate_a_entered},
-            first=dataclasses.replace(
-                fails(category='test_failure', summary='test_failure'),
-                release=gate_a_release,
-            ),
-        )
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            fails(category='test_failure', summary='test_failure'),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         # ── N+1's remote verify: id-liveness fake ────────────────────────────
         gate_b_release = asyncio.Event()
@@ -4089,13 +4018,10 @@ class TestCascadeErrorContainment:
         # ── N's local verify: gated (fails on first call, passes thereafter) ─
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
-        verifier = _GatedVerifier(
-            entered={None: gate_a_entered},
-            first=dataclasses.replace(
-                fails(category='test_failure', summary='test_failure'),
-                release=gate_a_release,
-            ),
-        )
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            fails(category='test_failure', summary='test_failure'),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         # ── N+1's remote verify: gated (passes when gate_b_release is set) ──
         gate_b_release = asyncio.Event()
@@ -4313,13 +4239,10 @@ class TestCascadeErrorContainment:
         # ── N's local verify: gated (fails on first call, passes thereafter) ─
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
-        verifier = _GatedVerifier(
-            entered={None: gate_a_entered},
-            first=dataclasses.replace(
-                fails(category='test_failure', summary='test_failure'),
-                release=gate_a_release,
-            ),
-        )
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            fails(category='test_failure', summary='test_failure'),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         # ── N+1's remote verify: gated ────────────────────────────────────────
         gate_b_release = asyncio.Event()
@@ -5371,13 +5294,10 @@ class TestRedispatchSpeculativeConservation:
         caplog.set_level(logging.WARNING, logger='orchestrator.merge_lane')
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
-        verifier = _GatedVerifier(
-            entered={None: gate_a_entered},
-            first=dataclasses.replace(
-                fails(category='test_failure', summary='test_failure'),
-                release=gate_a_release,
-            ),
-        )
+        verifier = FakeVerifier(sequence=[dataclasses.replace(
+            fails(category='test_failure', summary='test_failure'),
+            release=gate_a_release, entered=gate_a_entered,
+        )])
 
         wt_a = await _make_branch_with_file(git_ops, 'task/rc-a', 'rc_a.py', 'a = 1\n')
         wt_b = await _make_branch_with_file(git_ops, 'task/rc-b', 'rc_b.py', 'b = 2\n')

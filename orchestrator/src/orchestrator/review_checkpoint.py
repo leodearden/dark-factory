@@ -21,6 +21,7 @@ from shared.cli_invoke import (
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
 from orchestrator.config import OrchestratorConfig
+from orchestrator.l0_promotion import promote_l0_to_l1
 from orchestrator.relocated_venv import retire_relocated_venvs
 from orchestrator.review_pre_test import (
     PreTestCommandResult,
@@ -294,15 +295,9 @@ class ReviewCheckpoint:
             role_name='deep_reviewer',
             role_defaults=RoleDefaults(
                 DEEP_REVIEWER.default_model,
-                # Layer-4 effort base kept == EffortConfig.deep_reviewer's
-                # default ('max') — the value config-layer-3 always supplies
-                # today, and the site's own pre-η getattr fallback was
-                # getattr(config.effort,'deep_reviewer','max'). AgentRole has no
-                # default_effort field, so effort is the one RoleDefaults field
-                # not sourced from DEEP_REVIEWER; matching the config default
-                # means a future EffortConfig field removal degrades to the same
-                # effort, not a silent 'max'→'high' drop.
-                'max',
+                # Kept == EffortConfig.deep_reviewer's default, pinned by
+                # orchestrator/tests/test_out_of_band_routing.py::TestDeepReviewerAdoptsResolveRoute
+                'xhigh',
                 DEEP_REVIEWER.default_budget, DEEP_REVIEWER.default_max_turns,
             ),
             config=self.config,
@@ -486,8 +481,6 @@ class ReviewCheckpoint:
         if self.escalation_queue is None:
             return 0
 
-        from escalation.models import Escalation
-
         synthetic_task_id = review_escalation_task_id(review_id)
         pending = self.escalation_queue.get_by_task(
             synthetic_task_id, status='pending', level=0,
@@ -497,25 +490,14 @@ class ReviewCheckpoint:
 
         promoted = 0
         for esc in pending:
-            reesc = Escalation(
-                id=self.escalation_queue.make_id(synthetic_task_id),
-                task_id=synthetic_task_id,
+            promote_l0_to_l1(
+                self.escalation_queue, esc,
                 agent_role='review-checkpoint',
-                severity=esc.severity,
-                category=esc.category,
-                summary=esc.summary,
-                detail=esc.detail,
-                suggested_action='manual_intervention',
-                worktree=esc.worktree,
-                workflow_state=esc.workflow_state,
-                level=1,
-            )
-            self.escalation_queue.submit(reesc)
-            self.escalation_queue.resolve(
-                esc.id,
-                'Auto-promoted to level 1 — review checkpoint has no steward',
-                dismiss=True,
+                why='review checkpoint has no steward',
+                detail_suffix='',
+                filing_claimant_run_id=None,
                 resolved_by='review-checkpoint',
+                worktree=esc.worktree,
             )
             promoted += 1
 

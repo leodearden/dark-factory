@@ -40,6 +40,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
+from shared.declared_checks import declared_checks
 from shared.elision import elide_at_word
 from shared.eval_lane import eval_lane_provenance
 from shared.loop_stall import LoopStallMonitor
@@ -136,6 +137,7 @@ from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrain
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.fm_retry import is_fm_null_sentinel
 from orchestrator.git_ops import GitOps, classify_worktree_entry
+from orchestrator.l0_promotion import promote_l0_to_l1
 from orchestrator.landing_reject_emission import LandingRejectRecorder, LandingRejectSite
 from orchestrator.lane_lifecycle import LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
@@ -1605,17 +1607,6 @@ def _extract_tagger_entries(payload: Any) -> list:
         else:
             break
     return payload if isinstance(payload, list) else []
-
-
-def _declared_delivered_checks(metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
-    """The task's declared ``delivered_checks`` for ``validate_landing_evidence``.
-
-    Never None, which that function reads as "call site unwired".  A failed
-    metadata read yields ``[]``: the checks can only upgrade a reject, so that
-    is the fail-safe direction (the same trade as
-    ``escalation/src/escalation/git_authority.py::_evidence_verdict``).
-    """
-    return list((metadata or {}).get('delivered_checks') or [])
 
 
 def _already_landed_gate_shape(*, has_open_escalation: bool | None) -> str:
@@ -6872,7 +6863,7 @@ class Harness:
                 self.git_ops, tid, branch,
                 branch_tip_sha=branch_tip_sha,
                 candidate_sha=report.branch_state.sha,
-                delivered_checks=_declared_delivered_checks(metadata),
+                delivered_checks=list(declared_checks(metadata).checks),
                 checks_enabled=self.config.delivered_checks.enabled,
             )
             self._landing_rejects.observe(
@@ -14147,7 +14138,7 @@ class Harness:
                     self.git_ops, task_id, branch,
                     branch_tip_sha=None,
                     candidate_sha=marker,
-                    delivered_checks=_declared_delivered_checks(metadata),
+                    delivered_checks=list(declared_checks(metadata).checks),
                     checks_enabled=self.config.delivered_checks.enabled,
                 )
                 if not verdict.accepted:
@@ -14501,8 +14492,6 @@ class Harness:
         if self._escalation_queue is None:
             return 0
 
-        from escalation.models import Escalation
-
         timeout = self.config.orphan_l0_timeout_secs
         now = datetime.now(UTC)
         promoted = 0
@@ -14670,45 +14659,26 @@ class Harness:
             # the orphan's worktree is ephemeral and likely reaped before a
             # human reads the promoted L1 (see workflow._durable_ref_suffix).
             branch = f'{self.config.git.branch_prefix}{esc.task_id}'
-            # Both strings below are branched on `liveness_note` (task 3541)
-            # rather than asserting "no active workflow" unconditionally.  That
-            # claim was true while the reaper skipped every task with a live
-            # signal; the filing-incarnation arm promotes precisely when a
-            # workflow IS live and only the FILER is gone, so the old wording
-            # would be false in exactly the case this arm adds.  It is not
-            # cosmetic: `TaskWorkflow._wait_for_resolution` polls `get_by_task`
+            # The summary prefix and `why` are both branched on `liveness_note`
+            # (task 3541) rather than asserting "no active workflow"
+            # unconditionally.  That claim was true while the reaper skipped
+            # every task with a live signal; the filing-incarnation arm promotes
+            # precisely when a workflow IS live and only the FILER is gone, so
+            # the old wording would be false in exactly the case this arm adds.
+            # It is not cosmetic: `why` lands in the L0's dismissal note, and
+            # `TaskWorkflow._wait_for_resolution` polls `get_by_task`
             # TASK-scoped, not incarnation-scoped, so this dismissal wakes the
             # live run and its note is the resolution a live agent reads on
             # resume.
-            reesc = Escalation(
-                id=self._escalation_queue.make_id(esc.task_id),
-                task_id=esc.task_id,
+            promote_l0_to_l1(
+                self._escalation_queue, esc,
                 agent_role='harness-orphan-reaper',
-                severity=esc.severity,
-                category=esc.category,
-                summary=(
-                    f'Orphan L0 ({age_secs:.0f}s old, {liveness_note}): '
-                    f'{esc.summary}'
+                summary_prefix=f'Orphan L0 ({age_secs:.0f}s old, {liveness_note}): ',
+                why=f'orphan L0 for task_id={esc.task_id} ({liveness_note})',
+                detail_suffix=(
+                    f'\n\n[note] originating worktree may be reaped; branch={branch}'
                 ),
-                detail=(
-                    (esc.detail or '')
-                    + f'\n\n[note] originating worktree may be reaped; '
-                    f'branch={branch}'
-                ),
-                suggested_action='manual_intervention',
-                worktree=None,
-                workflow_state=esc.workflow_state,
-                level=1,
                 filing_claimant_run_id=self._filing_claimant_run_id,
-            )
-            self._escalation_queue.submit(reesc)
-            self._escalation_queue.resolve(
-                esc.id,
-                (
-                    f'Auto-promoted to level 1 — orphan L0 for '
-                    f'task_id={esc.task_id} ({liveness_note})'
-                ),
-                dismiss=True,
                 resolved_by='harness-orphan-reaper',
             )
             promoted += 1
