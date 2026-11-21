@@ -1679,31 +1679,63 @@ class TestPhaseBackfillTerminalDepRecords:
         assert scheduler._terminal_dep_record_cache['20'] == verified
 
     @pytest.mark.asyncio
-    async def test_budget_prioritizes_held_revalidation_over_new_dep(
+    async def test_budget_reserves_a_slot_for_a_never_cached_dep_over_held_revalidation(
         self, scheduler: Scheduler
     ):
-        """A deferred held record would fail open, so it outranks a new dep_id
-        (which only waits a tick).  '21' < '29' so plain sort would pick the new
-        dep first."""
+        """Held re-validations recur every tick until the settler releases them,
+        so held-first would starve a never-cached dep forever once they fill the
+        budget.  A deferred held record keeps serving from cache, hold in place.
+        '21' < '29', so held-first or a plain sort would pick the held dep."""
         scheduler.config.delivered_checks.max_record_fetches_per_tick = 1
-        scheduler._terminal_dep_record_cache['29'] = self._scheduled_deploy_record(
-            '29', 'scheduled'
-        )
-        task_a = self._dependent(task_id='10', dep_id='29')  # held re-validation
-        task_b = self._dependent(task_id='11', dep_id='21')  # never cached
+        held = self._scheduled_deploy_record('21', 'scheduled')
+        scheduler._terminal_dep_record_cache['21'] = held
+        task_a = self._dependent(task_id='10', dep_id='21')  # held re-validation
+        task_b = self._dependent(task_id='11', dep_id='29')  # never cached
         ctx = TickContext(
             tasks=[task_a, task_b],
             status_map={'21': 'done', '29': 'done'},
             tasks_by_id={'10': task_a, '11': task_b},
         )
-        still_held = self._scheduled_deploy_record('29', 'scheduled')
-        scheduler.get_task = AsyncMock(return_value=still_held)
+        new_record = {'id': '29', 'status': 'done', 'metadata': {}}
+        scheduler.get_task = AsyncMock(return_value=new_record)
 
         result = await scheduler._phase_backfill_terminal_dep_records(ctx)
 
         assert result is _CONTINUE
         scheduler.get_task.assert_awaited_once_with('29')
-        assert ctx.terminal_dep_records == {'29': still_held}
+        assert ctx.terminal_dep_records == {'21': held, '29': new_record}
+        assert ctx.deferred_terminal_deps == frozenset()
+
+    @pytest.mark.asyncio
+    async def test_held_revalidations_keep_all_but_one_slot_while_a_never_cached_dep_waits(
+        self, scheduler: Scheduler
+    ):
+        scheduler.config.delivered_checks.max_record_fetches_per_tick = 2
+        held_22 = self._scheduled_deploy_record('22', 'scheduled')
+        scheduler._terminal_dep_record_cache['20'] = self._scheduled_deploy_record('20', 'scheduled')
+        scheduler._terminal_dep_record_cache['22'] = held_22
+        dependents = [
+            self._dependent(task_id=task_id, dep_id=dep_id)
+            for task_id, dep_id in (('10', '20'), ('11', '22'), ('12', '29'))
+        ]
+        ctx = TickContext(
+            tasks=dependents,
+            status_map={'20': 'done', '22': 'done', '29': 'done'},
+            tasks_by_id={str(t['id']): t for t in dependents},
+        )
+
+        async def _fake_get_task(task_id):
+            if task_id == '29':
+                return {'id': '29', 'status': 'done', 'metadata': {}}
+            return self._scheduled_deploy_record(task_id, 'scheduled')
+
+        scheduler.get_task = AsyncMock(side_effect=_fake_get_task)
+
+        await scheduler._phase_backfill_terminal_dep_records(ctx)
+
+        assert {c.args[0] for c in scheduler.get_task.await_args_list} == {'20', '29'}
+        assert ctx.terminal_dep_records['22'] is held_22
+        assert ctx.deferred_terminal_deps == frozenset()
 
     # --- (l) a held record survives a failed or deferred re-fetch ----------
 
