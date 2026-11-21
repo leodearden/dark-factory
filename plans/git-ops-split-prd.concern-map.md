@@ -182,8 +182,8 @@ one writer module.
 | WarmLaneLockContention | module | 20 | 19 |  |  | WarmLaneRequeue | residual/lane_outcomes |
 | WorktreeConflictError | module | 30 | 19 |  |  |  | s5/worktrees |
 | BranchResetError | module | 63 | 34 |  |  |  | s5/task_branch |
-| _ParkedBranchStranded | module | 9 | 1 |  |  |  | s5/worktrees |
-| _stranded_branch | module | 3 | 1 |  |  | _ParkedBranchStranded | s5/worktrees |
+| _ParkedBranchStranded | module | 9 | 1 |  |  |  | s5-split/worktree_relocation |
+| _stranded_branch | module | 3 | 1 |  |  | _ParkedBranchStranded | s5-split/worktree_relocation |
 | MergeVerifyLeaseHeld | module | 27 | 17 |  |  |  | s5/lane_lease |
 | MergeVerifyLeaseContended | module | 92 | 67 |  |  |  | s5/lane_lease |
 | LaneLockSelfOwnedLeak | module | 95 | 63 |  |  | MergeVerifyLeaseContended | s5/lane_lease |
@@ -197,7 +197,7 @@ one writer module.
 | _LANE_LOCK_HOLDER_SETTLE_INTERVAL_SECS | module | 4 | 3 |  |  |  | s5/lane_lease |
 | _settled_lane_lock_holder_pids | module | 157 | 138 |  |  | _LANE_LOCK_HOLDER_SETTLE_INTERVAL_SECS, _LANE_LOCK_HOLDER_SETTLE_SECS, _lane_lock_identity | s5/lane_lease |
 | _lane_lock_holder_facts | module | 48 | 29 |  |  |  | s5/lane_lease |
-| _utc_stamp | module | 3 | 1 |  |  |  | s5/worktrees |
+| _utc_stamp | module | 3 | 1 |  |  |  | s5-split/worktree_relocation |
 | _run | module | 47 | 35 |  |  | WorktreeMissing | s5/git_run |
 | _git_query | module | 8 | 1 |  |  | GitQueryFailed, _run | s5/git_run |
 | _FULL_OID | module | 1 | 0 |  |  |  | s5/git_queries |
@@ -407,20 +407,20 @@ one writer module.
 | GitOps._conflicted_paths_or_none | method | 17 | 7 |  |  | GitOps.unmerged_paths, logger | s5-split/merging |
 | GitOps.get_conflict_details | method | 13 | 1 |  |  | _run | s5-split/merging |
 | GitOps.abort_merge | method | 4 | 1 |  |  | _run, logger | s5-split/merging |
-| GitOps.rename_worktree | method | 53 | 22 |  | config, project_root | GitOps._carry_branch_records, GitOps._move_registered_worktree, _run, logger | s5/worktrees |
+| GitOps.rename_worktree | method | 53 | 22 |  | config, project_root | GitOps._carry_branch_records, GitOps._move_registered_worktree, _run, logger | s5-split/worktree_relocation |
 | GitOps.cleanup_worktree | method | 125 | 65 |  | config, project_root, spec_warm_lane_pool, transcript_archive, warm_lane_pool | GitOps._delete_branch_if_on_main, GitOps.release_spec_lane, GitOps.release_warm_lane, _run, logger | residual/lane_release |
 | GitOps.reclaim_worktree_build_artifacts | method | 49 | 22 |  | config | logger | s5/worktrees |
-| GitOps.quarantine_base | method | 9 | 6 |  | worktree_base |  | s5/worktrees |
+| GitOps.quarantine_base | method | 9 | 6 |  | worktree_base |  | s5-split/worktree_relocation |
 | GitOps.worktree_has_unsaved_work | method | 35 | 10 |  | config, project_root | WorktreeMissing, _run, logger | s5/git_queries |
-| GitOps.quarantine_worktree | method | 52 | 28 |  | config | GitOps._parked_outcome, GitOps._relocate_into_quarantine, GitOps.quarantine_base, _stranded_branch, _utc_stamp, logger | s5/worktrees |
-| GitOps._relocate_into_quarantine | method | 29 | 7 |  | config | GitOps._move_registered_worktree, GitOps._move_with_branch_parked, GitOps._rename_unregistered, GitOps._worktree_checkouts, GitOps.commit, logger | s5/worktrees |
-| GitOps._worktree_checkouts | method | 16 | 1 |  | project_root | _run | s5/worktrees |
-| GitOps._move_registered_worktree | method | 10 | 0 |  | project_root | _run | s5/worktrees |
-| GitOps._move_with_branch_parked | method | 27 | 7 |  | config, project_root | GitOps._carry_branch_records, GitOps._rename_branch_back, GitOps.resolve_branch_sha, _ParkedBranchStranded, _run | s5/worktrees |
-| GitOps._rename_branch_back | method | 10 | 1 |  | project_root | _run, logger | s5/worktrees |
-| GitOps._rename_unregistered | method | 23 | 6 |  |  | GitOps._sever_parked_gitfile, logger | s5/worktrees |
-| GitOps._sever_parked_gitfile | method | 22 | 9 |  | project_root | _run | s5/worktrees |
-| GitOps._parked_outcome | method | 16 | 1 |  |  | GitOps.commits_beyond_main, GitOps.resolve_branch_sha, logger | s5/worktrees |
+| GitOps.quarantine_worktree | method | 52 | 28 |  | config | GitOps._parked_outcome, GitOps._relocate_into_quarantine, GitOps.quarantine_base, _stranded_branch, _utc_stamp, logger | s5-split/worktree_relocation |
+| GitOps._relocate_into_quarantine | method | 29 | 7 |  | config | GitOps._move_registered_worktree, GitOps._move_with_branch_parked, GitOps._rename_unregistered, GitOps._worktree_checkouts, GitOps.commit, logger | s5-split/worktree_relocation |
+| GitOps._worktree_checkouts | method | 16 | 1 |  | project_root | _run | s5-split/worktree_relocation |
+| GitOps._move_registered_worktree | method | 10 | 0 |  | project_root | _run | s5-split/worktree_relocation |
+| GitOps._move_with_branch_parked | method | 27 | 7 |  | config, project_root | GitOps._carry_branch_records, GitOps._rename_branch_back, GitOps.resolve_branch_sha, _ParkedBranchStranded, _run | s5-split/worktree_relocation |
+| GitOps._rename_branch_back | method | 10 | 1 |  | project_root | _run, logger | s5-split/worktree_relocation |
+| GitOps._rename_unregistered | method | 23 | 6 |  |  | GitOps._sever_parked_gitfile, logger | s5-split/worktree_relocation |
+| GitOps._sever_parked_gitfile | method | 22 | 9 |  | project_root | _run | s5-split/worktree_relocation |
+| GitOps._parked_outcome | method | 16 | 1 |  |  | GitOps.commits_beyond_main, GitOps.resolve_branch_sha, logger | s5-split/worktree_relocation |
 | GitOps.park_prior_incarnation | method | 37 | 6 |  | config, warm_lane_pool | GitOps._park_meta_roots, GitOps._quarantine_cold_incarnation, GitOps._rename_branch_aside, GitOps.release_warm_lane, GitOps.resolve_branch_sha, _utc_stamp, logger | residual/lane_release |
 | GitOps._quarantine_cold_incarnation | method | 11 | 1 |  | worktree_base | GitOps._is_registered_worktree, GitOps.quarantine_worktree | residual/lane_release |
 | GitOps._rename_branch_aside | method | 14 | 1 |  | config, project_root | GitOps._carry_branch_records, GitOps._free_lane_checkout, _run | residual/lane_release |
@@ -450,6 +450,7 @@ one writer module.
 | s5-split/commit_effect | 17 | 1123 | 755 |
 | s5-split/merge_worktrees | 19 | 1428 | 867 |
 | s5-split/merging | 8 | 446 | 273 |
+| s5-split/worktree_relocation | 14 | 282 | 91 |
 | s5-unplaced/lane_paths | 7 | 96 | 73 |
 | s5/git_diff | 3 | 140 | 72 |
 | s5/git_queries | 46 | 1427 | 797 |
@@ -458,7 +459,7 @@ one writer module.
 | s5/main_landing | 21 | 1490 | 722 |
 | s5/task_branch | 50 | 1402 | 648 |
 | s5/warm_lane_scripts | 21 | 644 | 392 |
-| s5/worktrees | 46 | 1541 | 843 |
+| s5/worktrees | 32 | 1259 | 752 |
 
 ## Cross-cluster edges
 
@@ -472,12 +473,13 @@ one writer module.
 | residual/git_ops | residual/lane_seeding | 1 | GitOps.create_worktree -> _SEED_WARM_LANE_LOCK_WAIT_SECS |
 | residual/git_ops | residual/warm_acquire | 3 | GitOps._reattach_cold_worktree -> GitOps._reuse_warm_lane |
 | residual/git_ops | s5-split/commit_effect | 1 | GitOps.__init__ -> CommitEffectProbe |
+| residual/git_ops | s5-split/worktree_relocation | 3 | GitOps.__init__ -> GitOps.quarantine_worktree |
 | residual/git_ops | s5-unplaced/lane_paths | 2 | GitOps.merge_verify_lease -> GitOps.is_persistent_merge_lane |
 | residual/git_ops | s5/git_run | 2 | GitOps._reattach_cold_worktree -> _run |
 | residual/git_ops | s5/lane_lease | 10 | GitOps.merge_verify_lease -> GitOps._acquire_lane_flock_off_thread |
 | residual/git_ops | s5/task_branch | 7 | GitOps.create_worktree -> GitOps._branch_has_commits_beyond_main |
 | residual/git_ops | s5/warm_lane_scripts | 1 | GitOps.create_worktree -> GitOps._provision_reify_debug_port |
-| residual/git_ops | s5/worktrees | 9 | GitOps.__init__ -> GitOps.quarantine_worktree |
+| residual/git_ops | s5/worktrees | 6 | GitOps.create_worktree -> GitOps._freshen_main |
 | residual/lane_admission | per-module/logger | 6 | GitOps._assemble_warm_lane_census -> logger |
 | residual/lane_admission | residual/pool_storage | 1 | GitOps._run_warm_lane_gc_reclaim -> GitOps._reconcile_pool_storage_before_sweep |
 | residual/lane_admission | s5/git_run | 1 | GitOps._run_warm_lane_gc_reclaim -> _run |
@@ -487,20 +489,22 @@ one writer module.
 | residual/lane_release | per-module/logger | 6 | GitOps.cleanup_worktree -> logger |
 | residual/lane_release | residual/pool_storage | 3 | GitOps.thin_warm_lane -> GitOps._note_pool_storage_absent |
 | residual/lane_release | residual/spec_lanes | 1 | GitOps.cleanup_worktree -> GitOps.release_spec_lane |
+| residual/lane_release | s5-split/worktree_relocation | 3 | GitOps._park_meta_roots -> GitOps.quarantine_base |
 | residual/lane_release | s5/git_queries | 2 | GitOps.park_prior_incarnation -> GitOps.resolve_branch_sha |
 | residual/lane_release | s5/git_run | 6 | GitOps._rename_branch_aside -> _run |
 | residual/lane_release | s5/task_branch | 3 | GitOps._rename_branch_aside -> GitOps._carry_branch_records |
 | residual/lane_release | s5/warm_lane_scripts | 1 | GitOps.thin_warm_lane -> GitOps._resolve_warm_lane_script_logged |
-| residual/lane_release | s5/worktrees | 6 | GitOps._park_meta_roots -> GitOps.quarantine_base |
+| residual/lane_release | s5/worktrees | 3 | GitOps._quarantine_cold_incarnation -> GitOps._is_registered_worktree |
 | residual/lane_reset | per-module/logger | 6 | GitOps._abort_lane_acquisition -> logger |
 | residual/lane_reset | residual/lane_outcomes | 3 | GitOps._reset_and_seed_recycled_lane -> WarmLaneUnavailable |
 | residual/lane_reset | residual/lane_seeding | 2 | GitOps._reset_and_seed_recycled_lane -> GitOps._seed_warm_lane |
 | residual/lane_reset | residual/pool_storage | 1 | GitOps._teardown_prewarm_lane -> GitOps._prune_registrations |
+| residual/lane_reset | s5-split/worktree_relocation | 1 | GitOps._relocate_foreign_meta_root -> GitOps.quarantine_base |
 | residual/lane_reset | s5-unplaced/lane_paths | 1 | GitOps.prewarm_pool -> GitOps.warm_lane_base_target_path |
 | residual/lane_reset | s5/git_run | 5 | GitOps._abort_lane_acquisition -> _run |
 | residual/lane_reset | s5/task_branch | 1 | GitOps._abort_lane_acquisition -> GitOps._delete_branch_if_on_main |
 | residual/lane_reset | s5/warm_lane_scripts | 3 | GitOps._abort_lane_acquisition -> GitOps.warm_lane_ref_is_degenerate |
-| residual/lane_reset | s5/worktrees | 4 | GitOps._abort_lane_acquisition -> GitOps.commit |
+| residual/lane_reset | s5/worktrees | 3 | GitOps._abort_lane_acquisition -> GitOps.commit |
 | residual/lane_seeding | per-module/logger | 2 | GitOps._seed_warm_lane -> logger |
 | residual/lane_seeding | residual/lane_outcomes | 1 | GitOps._seed_warm_lane -> _SEED_WARM_LANE_LOCK_TIMEOUT_RC |
 | residual/lane_seeding | residual/pool_storage | 1 | GitOps._seed_warm_lane -> GitOps.mark_pool_storage_present |
@@ -545,6 +549,11 @@ one writer module.
 | s5-split/merging | s5/git_queries | 2 | GitOps._conflicted_paths_or_none -> GitOps.unmerged_paths |
 | s5-split/merging | s5/git_run | 5 | GitOps._run_no_ff_merge -> _run |
 | s5-split/merging | s5/task_branch | 1 | GitOps._resolve_merge_branch_names -> GitOps.resolve_queued_branch_ref |
+| s5-split/worktree_relocation | per-module/logger | 6 | GitOps._parked_outcome -> logger |
+| s5-split/worktree_relocation | s5/git_queries | 2 | GitOps._move_with_branch_parked -> GitOps.resolve_branch_sha |
+| s5-split/worktree_relocation | s5/git_run | 6 | GitOps._move_registered_worktree -> _run |
+| s5-split/worktree_relocation | s5/task_branch | 3 | GitOps._move_with_branch_parked -> GitOps._carry_branch_records |
+| s5-split/worktree_relocation | s5/worktrees | 1 | GitOps._relocate_into_quarantine -> GitOps.commit |
 | s5/git_queries | per-module/logger | 10 | GitOps.find_equivalent_commit -> logger |
 | s5/git_queries | s5/git_diff | 2 | GitOps.get_changed_line_ranges -> parse_diff_line_ranges |
 | s5/git_queries | s5/git_run | 38 | GitOps._commit_paths -> _git_query |
@@ -561,13 +570,13 @@ one writer module.
 | s5/warm_lane_scripts | per-module/logger | 10 | GitOps._provision_reify_debug_port -> logger |
 | s5/warm_lane_scripts | s5-unplaced/lane_paths | 1 | GitOps._warm_lane_base_resolvable -> GitOps.warm_lane_base_target_path |
 | s5/warm_lane_scripts | s5/git_run | 5 | GitOps._provision_reify_debug_port -> _run |
-| s5/worktrees | per-module/logger | 16 | GitOps._clean_lane_retaining_artifacts -> logger |
+| s5/worktrees | per-module/logger | 10 | GitOps._clean_lane_retaining_artifacts -> logger |
 | s5/worktrees | residual/lane_seeding | 2 | GitOps._warm_seed_ephemeral_worktree -> GitOps._seed_warm_lane |
 | s5/worktrees | residual/pool_storage | 1 | GitOps.prune_worktrees -> GitOps._prune_registrations |
 | s5/worktrees | s5-unplaced/lane_paths | 2 | PROTECTED_PREFIXES -> PERSISTENT_MERGE_WORKTREE_NAME |
-| s5/worktrees | s5/git_queries | 3 | GitOps._move_with_branch_parked -> GitOps.resolve_branch_sha |
-| s5/worktrees | s5/git_run | 14 | GitOps._clean_lane_retaining_artifacts -> _run |
-| s5/worktrees | s5/task_branch | 4 | GitOps._move_with_branch_parked -> GitOps._carry_branch_records |
+| s5/worktrees | s5/git_queries | 1 | GitOps.commit -> GitOps._detect_unmerged_paths |
+| s5/worktrees | s5/git_run | 8 | GitOps._clean_lane_retaining_artifacts -> _run |
+| s5/worktrees | s5/task_branch | 1 | GitOps.create_interactive_worktree -> GitOps._cleanup_leftover_branch |
 | s5/worktrees | s5/warm_lane_scripts | 3 | GitOps._warm_seed_ephemeral_worktree -> GitOps._warm_lane_base_resolvable |
 
 ## Cyclic cluster groups
@@ -586,7 +595,7 @@ none
 
 | module unit | clusters |
 | --- | --- |
-| logger | residual/git_ops, residual/lane_admission, residual/lane_release, residual/lane_reset, residual/lane_seeding, residual/pool_storage, residual/spec_lanes, residual/warm_acquire, s5-split/merge_worktrees, s5-split/merging, s5/git_queries, s5/lane_lease, s5/main_landing, s5/task_branch, s5/warm_lane_scripts, s5/worktrees |
+| logger | residual/git_ops, residual/lane_admission, residual/lane_release, residual/lane_reset, residual/lane_seeding, residual/pool_storage, residual/spec_lanes, residual/warm_acquire, s5-split/merge_worktrees, s5-split/merging, s5-split/worktree_relocation, s5/git_queries, s5/lane_lease, s5/main_landing, s5/task_branch, s5/warm_lane_scripts, s5/worktrees |
 | AdvanceResult | s5/main_landing |
 | AdvanceOutcome | s5/main_landing |
 | PushResult | s5/main_landing |
@@ -678,8 +687,8 @@ none
 | WarmLaneLockContention | residual/git_ops |
 | WorktreeConflictError | s5/worktrees |
 | BranchResetError | residual/warm_acquire, s5/task_branch |
-| _ParkedBranchStranded | s5/worktrees |
-| _stranded_branch | s5/worktrees |
+| _ParkedBranchStranded | s5-split/worktree_relocation |
+| _stranded_branch | s5-split/worktree_relocation |
 | MergeVerifyLeaseHeld | s5-split/merge_worktrees |
 | MergeVerifyLeaseContended | residual/git_ops, s5-split/merge_worktrees, s5/lane_lease |
 | LaneLockSelfOwnedLeak | s5/lane_lease |
@@ -693,8 +702,8 @@ none
 | _LANE_LOCK_HOLDER_SETTLE_INTERVAL_SECS | s5/lane_lease |
 | _settled_lane_lock_holder_pids | residual/git_ops, s5-split/merge_worktrees |
 | _lane_lock_holder_facts | residual/git_ops, s5-split/merge_worktrees |
-| _utc_stamp | residual/lane_release, s5/worktrees |
-| _run | residual/git_ops, residual/lane_admission, residual/lane_release, residual/lane_reset, residual/lane_seeding, residual/pool_storage, residual/spec_lanes, residual/warm_acquire, s5-split/commit_effect, s5-split/merge_worktrees, s5-split/merging, s5/git_queries, s5/git_run, s5/main_landing, s5/task_branch, s5/warm_lane_scripts, s5/worktrees |
+| _utc_stamp | residual/lane_release, s5-split/worktree_relocation |
+| _run | residual/git_ops, residual/lane_admission, residual/lane_release, residual/lane_reset, residual/lane_seeding, residual/pool_storage, residual/spec_lanes, residual/warm_acquire, s5-split/commit_effect, s5-split/merge_worktrees, s5-split/merging, s5-split/worktree_relocation, s5/git_queries, s5/git_run, s5/main_landing, s5/task_branch, s5/warm_lane_scripts, s5/worktrees |
 | _git_query | s5/git_queries |
 | _FULL_OID | s5/git_queries |
 | _git_clean_failure_is_benign | s5/worktrees |
