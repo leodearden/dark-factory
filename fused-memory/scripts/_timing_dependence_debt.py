@@ -16,8 +16,10 @@
 # Provenance: measured 2026-11-21 by task 8254 when Rule D was wired, over the tree
 # at c0413e5694 (task/8254 on main c787af9409): 1,848 violations in 436 files across
 # 7 packages, of 2,731 files scanned in the eight lint_command dirs.  By leg: 1,263
-# literal deadlines, 542 sleeps and 43 elapsed asserts.  Every one was already in
-# the tree, newly SEEN rather than new debt.
+# literal deadlines, 542 sleeps and 43 elapsed asserts.  Re-measured over
+# f5902cd44f (task/8254 merged with main 7ee2b5f2a1): main had meanwhile landed
+# three sleeps and one literal deadline in three files, so 1,852 in 439.  Every
+# one was already in the tree, newly SEEN rather than new debt.
 TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     # orchestrator/tests
     'orchestrator/tests/test_merge_queue_request_liveness.py': 46,
@@ -142,6 +144,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_shadow_storm.py': 2,
     'orchestrator/tests/test_suggestion_triage.py': 2,
     'orchestrator/tests/test_t3_mcp_client.py': 2,
+    'orchestrator/tests/test_tree_pass_workers.py': 2,
     'orchestrator/tests/test_verify_admission_call_sites.py': 2,
     'orchestrator/tests/test_verify_admission_cancel_release.py': 2,
     'orchestrator/tests/test_verify_admission_executor_bypass.py': 2,
@@ -202,6 +205,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_merge_queue_host_observability.py': 1,
     'orchestrator/tests/test_merge_queue_metrics.py': 1,
     'orchestrator/tests/test_merge_queue_permit_conservation.py': 1,
+    'orchestrator/tests/test_merge_queue_undead_speculative_base.py': 1,
     'orchestrator/tests/test_merge_speculation.py': 1,
     'orchestrator/tests/test_merge_verify_survivor_barrier.py': 1,
     'orchestrator/tests/test_offline_lane_records.py': 1,
@@ -333,6 +337,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'fused-memory/tests/test_score_write_triage_pairs.py': 1,
     'fused-memory/tests/test_score_write_triage_reader.py': 1,
     'fused-memory/tests/test_scripts_cli_boundary_wiring.py': 1,
+    'fused-memory/tests/test_seed_scratch_reference_graph.py': 1,
     'fused-memory/tests/test_sqlite_task_backend_rewrite_audit_trail.py': 1,
     'fused-memory/tests/test_stages.py': 1,
     'fused-memory/tests/test_task_curator.py': 1,
