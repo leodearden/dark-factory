@@ -51,6 +51,7 @@ from audit_wiped_metadata_files import (
 )
 from census_tagger_debris import (
     _RECONCILIATIONS,
+    ARTIFACT_CONSUMERS,
     DEFAULT_JSON_OUT,
     DEFAULT_MD_OUT,
     EXIT_NO_ROOT,
@@ -1598,6 +1599,17 @@ def test_coverage_reports_an_empty_shortfall_list_rather_than_omitting_it(tmp_pa
     assert coverage["projects_without_event_log"] == []
 
 
+def test_the_artifact_names_7271_as_its_sole_consumer(tmp_path):
+    """DF 3427 only re-ran the emptiness-keyed DONE-path repair and never read
+    the census; DF 7271 consumed it to decide no dedicated repair is needed
+    (plans/module-tagger-retirement-prd.md "Debris repair disposition")."""
+    report = build_report([_census(tmp_path, tasks=[_stamped(1)])])
+
+    assert report["params"]["consumers"] == ["dark_factory 7271"]
+    assert report["params"]["consumers"] == list(ARTIFACT_CONSUMERS)
+    assert not any("3427" in consumer for consumer in report["params"]["consumers"])
+
+
 # ---------------------------------------------------------------------------
 # render_markdown / write_artifacts — the committed pair.
 # ---------------------------------------------------------------------------
@@ -1658,10 +1670,13 @@ def test_the_markdown_says_which_file_is_authoritative(tmp_path):
     """(c) The markdown is CAPPED and the JSON is not, so the markdown must
     say so — otherwise a consumer could read a truncated table as the whole
     population."""
-    markdown = render_markdown(build_report([_census(tmp_path, tasks=[_stamped(1)])]))
+    report = build_report([_census(tmp_path, tasks=[_stamped(1)])])
+    markdown = render_markdown(report)
 
     assert "module-tagger-debris-census.json" in markdown
-    assert "3113" in markdown and "3427" in markdown
+    for consumer in report["params"]["consumers"]:
+        assert "Consumers: " in markdown
+        assert consumer in markdown
 
 
 def test_the_markdown_names_an_unreadable_event_log_rather_than_omitting_it(tmp_path):
