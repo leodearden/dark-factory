@@ -705,16 +705,16 @@ async def _drive_lane_pass(lane: _RedLane, target: str | None = None, *, minutes
     """One lane pass *minutes* after the last, with ``test_target`` set to *target*; returns its pass blocks.
 
     The pass is a real advance and the real on_merge_landed fan-out
-    (:func:`_drive_advance`) followed by one full ``run()`` pass
-    (:func:`_run_one_lane_pass`), so a caller composing several carries its own
-    ``@pytest.mark.timeout`` (enforced by
-    ``test_every_composing_caller_carries_a_timeout_override``).
+    (:func:`_drive_advance`) followed by one full ``run()`` pass awaited to
+    completion with no wall-clock deadline (:func:`_await_lane_passes`), so a
+    caller carries its own ``@pytest.mark.timeout`` sized for its passes
+    (enforced by ``test_every_composing_caller_carries_a_timeout_override``).
     """
     if target is not None:
         (lane.control / 'test_target').write_text(target)
     lane.clock.advance(minutes=minutes)
     await _drive_advance(lane.harness, lane.project_root)
-    await _run_one_lane_pass(lane.worker)
+    await _await_lane_passes(lane.worker, 1)
     pass_id = lane.record().last_pass_id
     assert pass_id is not None, 'the engine records every pass it observes'
     record = lane.worker.records.load_pass(lane.command, pass_id)
@@ -753,9 +753,10 @@ def _materialized_worktree_names(worktree_base: Path) -> set[str]:
 # Helper names whose presence in a test's OWN source means that test drives
 # bounded waits its own body does not spell out. Widened by task 4203's
 # review remediation from "drives at least one `_run_lane`-bounded pass" to
-# that broader membership rule: `_run_lane` / `_run_one_lane_pass` /
-# `_drive_lane_pass` each compose `_LANE_PASS_BOUND_SECS`-bounded passes, and
-# `_assert_never_a_gate` composes its own `_NOTE_OFFLINE_LANE_BOUND_SECS` +
+# that broader membership rule: `_run_lane` / `_run_one_lane_pass` each
+# compose `_LANE_PASS_BOUND_SECS`-bounded passes, `_drive_lane_pass` /
+# `_await_lane_passes` drive passes with no deadline of their own whose real
+# work a marker must still cover, and `_assert_never_a_gate` composes its own `_NOTE_OFFLINE_LANE_BOUND_SECS` +
 # `_NOTE_MERGE_ALL_BOUND_SECS` pair (0.5 + 15.0 = 15.5s) without any lane
 # pass at all. Used by `_lane_pass_composing_callers` below to DISCOVER the
 # set of tests `test_every_composing_caller_carries_a_timeout_override` must
@@ -769,7 +770,7 @@ def _materialized_worktree_names(worktree_base: Path) -> set[str]:
 # net never discovered it and it ran marker-less under the then-60s pyproject
 # default while requiring more than twice that.
 _LANE_PASS_COMPOSING_HELPER_NAMES = frozenset(
-    {'_run_lane', '_run_one_lane_pass', '_drive_lane_pass', '_assert_never_a_gate'},
+    {'_run_lane', '_run_one_lane_pass', '_drive_lane_pass', '_await_lane_passes', '_assert_never_a_gate'},
 )
 
 
