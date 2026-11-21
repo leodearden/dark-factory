@@ -8,7 +8,9 @@ Source: `data/reconciliation/write_journal.db`, table `write_ops`, opened read-o
 - First 429 row: 2026-10-03T23:23:19Z. Last 429 row: 2026-10-04T09:22:36Z. (The window opens
   before the 2026-10-04T00:00Z start the task suggested: 19 rows are on 2026-10-03.)
 - Matched: **244** rows (206 `add_memory`, 38 `add_system_record`), every one `success=0`,
-  `result_summary` stores `[]`, error `429 ... credit_balance_exhausted`.
+  `result_summary` memory_ids `[]`, error `429 ... credit_balance_exhausted`. 22 of the
+  `add_system_record` rows falsely report stores `["mem0"]` (the stale stores_written claim,
+  task 6259), so matching on stores `[]` finds only 222.
 - By project: solar_challenge 74, dark_factory 71, reify 41, solar_challenge_platform 40,
   pump_web_ui 6, autopilot_video 6, know_live 6.
 
@@ -22,32 +24,54 @@ characters is complete; a row at exactly 200 is a digest.
 | Matched | 244 |
 | Full content in journal | 69 (67 distinct texts; two snapshot texts were journaled twice) |
 | Already present in Mem0 (exact and loose-needle check of every `fused_<project>` Qdrant collection, read-only) | 0 |
-| Re-added from journal | 67 |
+| Re-added from journal (`add_memory` rows) | 29 |
+| Not re-added: superseded recon cycle summaries (`add_system_record` rows, withdrawn) | 38 |
 | Re-added from escalation esc-375-2 (digest-only row of `claude-task-375-implementer`) | 1 |
 | Unrecoverable (digest only, 200-char prefix) | 174 |
 
-The 67 + 1 re-adds were submitted with `add_memory` under their original project and category,
-with metadata `x_readded_from_write_op=<first 8 chars of the write_ops id>` (`esc-375-2` for
+The 29 + 1 re-adds were submitted with `add_memory` under their original project and category
+(their originals carried no agent_id either, except the esc-375-2 one, which kept it), with
+metadata `x_readded_from_write_op=<first 8 chars of the write_ops id>` (`esc-375-2` for
 the escalation one) and `x_outage=2026-10-04`. The esc-375-2 text was re-checked against
 solar-challenge main (`COLOUR_PALETTE`, `_with_alpha`, `_FIGURES`, `monkeypatch.setitem` all
 still present) and no existing memory covers it; task 829's convention refines where the palette
 is defined but does not replace it.
 
+### The 38 recon cycle summaries were withdrawn
+
+The 38 full-content `add_system_record` rows are reconciliation cycle summaries ("Stage ...
+cycle summary for run_id: ...") from `recon-stage-task_knowledge_sync` (20) and
+`recon-stage-memory_consolidator` (18). They were first re-queued through `add_memory`. That
+dropped their agent_id and the `kind`, `stage`, `recon_pool` and `run_id` tags that
+`reconciliation/summary_pool.py::enforce_summary_pool_cap` and
+`fused-memory/scripts/prune_recon_cycle_summaries.py` select on, so once landed they would have
+sat outside both bounds for good. Re-issuing them correctly tagged is no better: the pool cap evicts
+oldest-first by `created_at`, and a re-add is stamped today, so seven-week-old summaries would
+push current ones out of the pool. On 2026-11-21 their 38
+`mem0_intents` rows were moved from `retrying` to `failed` with a compare-and-set on
+`status='retrying'` (the same update as
+`services/write_journal.py::WriteJournal.resolve_mem0_intent`), with a reason naming this task. None
+had landed. `failed` is never retried and ages out with the retention sweep. write_ops id
+prefixes: 1407dcb1 193a1ff2 22c9829c 28693398 2d9a5098 3732eb1b 5f0b75ce 60590a22 618ea8d2
+67b6e4fe 6960fa0c 69cfd802 6bbee068 6f9dbd7d 73a85e82 805ac439 8783f9ba 88558a7d 89686f9c
+8a418287 8cfbcca8 8e939cd9 91edb18c 93854867 99f0f4b8 9dd74b57 b5ebc38e c1de0943 c668bb2b
+cb81f26a d0f3c6af e05a47de ebe8c38f ef9a65e6 f1d5646d f4b16e25 f850c0bf fa2131ed.
+
 ## Caveat: the re-adds are queued, not yet landed
 
 On 2026-11-21 OpenAI credits were exhausted again, so every re-add returned
-`stores_pending_retry=["mem0"]` and sits in `mem0_intents` with status `retrying` (68 rows
-whose metadata carries `x_readded_from_write_op`). They land when credits return. Do not
-resubmit them. To confirm:
+`stores_pending_retry=["mem0"]` and sat in `mem0_intents` with status `retrying` (68 rows
+whose metadata carries `x_readded_from_write_op`). The 30 kept re-adds are still `retrying` and
+land when credits return; the 38 withdrawn ones are `failed`. Do not resubmit either. To confirm:
 
 ```sql
 select status, count(*) from mem0_intents
 where metadata like '%x_readded_from_write_op%' group by 1;
 ```
 
-Done means `completed` = 68. A `dead` row needs its text re-added by hand from this journal.
+Done means `completed` = 30 and `failed` = 38. A `dead` row needs its text re-added by hand from this journal.
 
-## Unrecoverable rows (digest only), by project, category and agent_id
+## Digest-only rows (174 unrecoverable, 1 recovered from esc-375-2), by project, category and agent_id
 
 The first 200 characters of each are still in `write_ops.params`. Other possible sources
 (not searched): the task agents' transcripts under `data/orchestrator/agent-transcripts/`.
@@ -168,4 +192,4 @@ The first 200 characters of each are still in `write_ops.params`. Other possible
 | solar_challenge_platform | procedural_knowledge | claude-task-770-implementer | 1 | 766a578f |
 | solar_challenge_platform | procedural_knowledge | claude-task-782-implementer | 1 | 98daee7d |
 
-This list has 175 rows. One of them, the `claude-task-375-implementer` row, was recovered from esc-375-2 and re-added, which is why the table above says 174.
+This list has 175 rows. One of them, the `claude-task-375-implementer` row, was recovered from esc-375-2 and re-added, which is why the Recoverability table says 174.
