@@ -9,18 +9,25 @@ which never raises.
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime
 from typing import Protocol
 
 
 @dataclasses.dataclass(frozen=True)
 class TaskPriority:
-    """The scheduler's effective tier for a task and whether it is pinned.
+    """A task's priority as the later gates see it; ``None`` always means unknown.
 
-    ``None`` in either field means unknown, never a default.
+    ``tier`` is the effective tier, ``PINNED`` exactly when ``pin_order`` is
+    set, and ``base_tier`` the tier with pins ignored. ``pinned`` says the
+    task's own override row is pinned; ``age_anchor`` is when the task first
+    became eligible.
     """
 
     tier: str | None = None
     pinned: bool | None = None
+    base_tier: str | None = dataclasses.field(default=None, kw_only=True)
+    pin_order: int | None = dataclasses.field(default=None, kw_only=True)
+    age_anchor: datetime | None = dataclasses.field(default=None, kw_only=True)
 
 
 UNKNOWN_PRIORITY = TaskPriority()
@@ -49,4 +56,15 @@ def read_task_priority(lookup: TaskPriorityLookup | None, task_id: object) -> Ta
     return TaskPriority(
         tier=found.tier if isinstance(found.tier, str) else None,
         pinned=found.pinned if isinstance(found.pinned, bool) else None,
+        base_tier=found.base_tier if isinstance(found.base_tier, str) else None,
+        pin_order=found.pin_order if _is_plain_int(found.pin_order) else None,
+        age_anchor=found.age_anchor if _is_aware_datetime(found.age_anchor) else None,
     )
+
+
+def _is_plain_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_aware_datetime(value: object) -> bool:
+    return isinstance(value, datetime) and value.utcoffset() is not None
