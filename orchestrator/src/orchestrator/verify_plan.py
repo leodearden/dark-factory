@@ -1113,6 +1113,30 @@ def effective_merge_module_configs(
     return list(config.module_configs_or_empty.values()) or module_configs
 
 
+def with_artifact_consumer_modules(
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    files: Sequence[str],
+    role: Literal['merge', 'task'],
+) -> list[ModuleConfig]:
+    """*module_configs* widened by the registered modules whose tests consume a touched behavioural artifact.
+
+    An empty set with ``.py``/``.rs`` source in *files* stays empty: the
+    fallback's configured chain already runs every suite, and widening would
+    drop the source file no module owns. Merge role returns the set unchanged
+    (see :func:`_artifact_consumer_demand`).
+    """
+    if not module_configs and _has_source_files(files):
+        return list(module_configs)
+    registry = list(config.module_configs_or_empty.values())
+    demand = _artifact_consumer_demand(files, registry, role)
+    present = {mc.prefix for mc in module_configs}
+    return [
+        *module_configs,
+        *(mc for mc in registry if mc.prefix in demand and mc.prefix not in present),
+    ]
+
+
 def _derive_full_suite_runs(
     mc: ModuleConfig,
     role: Literal['merge', 'task'] = 'merge',
