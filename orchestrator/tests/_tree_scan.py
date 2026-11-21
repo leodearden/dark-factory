@@ -4,11 +4,13 @@ whole-tree guards: a single streaming pass that keeps facts, never trees.
 A guard module declares its :class:`TreeAnalysis` objects in a module-level
 ``TREE_ANALYSES`` and takes the session ``tree_pass`` fixture
 (``conftest.py::tree_pass``).  The fixture discovers every analysis requested by
-the collected items and runs them all in one :meth:`TreePass.run`: each file is
-read and parsed at most once, lazily, handed to every interested extractor, and
-dropped before the next, so at most one tree is ever live.  Extractors return
-immutable, AST-free facts; anything else is recorded as a failure of that
-analysis, because a retained node pins its whole tree.
+the collected items and runs them all in one pass, its files shared out across
+a few worker processes (``_tree_pass_workers.py``); :meth:`TreePass.run` is the
+same pass in this process.  Either way each file is read and parsed at most
+once, lazily, by one process, handed to every interested extractor, and
+dropped before the next, so at most one tree is ever live per process.
+Extractors return immutable, AST-free facts; anything else is recorded as a
+failure of that analysis, because a retained node pins its whole tree.
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ import unicodedata
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 from typing import Any, Generic, TypeVar
 
 T = TypeVar('T')
@@ -223,11 +225,19 @@ def _is_frozen(dataclass_instance: object) -> bool:
     return params is not None and params.frozen
 
 
+@dataclass(frozen=True)
+class AnalysisExtraction:
+    """What one analysis extracted from some of its files: a fact or a failure per file."""
+
+    facts: tuple[tuple[Path, Any], ...]
+    failures: tuple[ExtractionFailure, ...]
+
+
 def _dispatch_one_file(
     module: ParsedModule,
     interested: Iterable[TreeAnalysis[Any]],
     facts: dict[TreeAnalysis[Any], dict[Path, Any]],
-    failures: dict[TreeAnalysis[Any], list[AnalysisFailure]],
+    failures: dict[TreeAnalysis[Any], list[ExtractionFailure]],
 ) -> None:
     for analysis in interested:
         try:
@@ -241,7 +251,27 @@ def _dispatch_one_file(
             facts[analysis][module.path] = fact
 
 
-def _require_unique_names(analyses: tuple[TreeAnalysis[Any], ...]) -> None:
+def extract_facts(
+    file_sets: Mapping[TreeAnalysis[Any], frozenset[Path]],
+) -> dict[str, AnalysisExtraction]:
+    """Each analysis's extraction over its file set, keyed by analysis name.
+
+    Streams the union in sorted order, so each file is read and parsed at most
+    once and dropped before the next.
+    """
+    facts: dict[TreeAnalysis[Any], dict[Path, Any]] = {a: {} for a in file_sets}
+    failures: dict[TreeAnalysis[Any], list[ExtractionFailure]] = {a: [] for a in file_sets}
+    for path in sorted(frozenset().union(*file_sets.values())):
+        interested = [a for a in file_sets if path in file_sets[a]]
+        _dispatch_one_file(ParsedModule(path), interested, facts, failures)
+    return {
+        a.name: AnalysisExtraction(tuple(facts[a].items()), tuple(failures[a]))
+        for a in file_sets
+    }
+
+
+def require_unique_names(analyses: Iterable[TreeAnalysis[Any]]) -> None:
+    """Raise unless every analysis in *analyses* has its own name, which is how a pass keys them."""
     names = [analysis.name for analysis in analyses]
     duplicates = sorted({name for name in names if names.count(name) > 1})
     if duplicates:
@@ -260,11 +290,20 @@ def _anchored(path: Path) -> Path:
     return path.parent.resolve() / path.name
 
 
-def _anchored_file_sets(
-    analyses: tuple[TreeAnalysis[Any], ...],
-    failures: dict[TreeAnalysis[Any], list[AnalysisFailure]],
-) -> dict[TreeAnalysis[Any], frozenset[Path]]:
-    """Each analysis's :func:`_anchored` file set; one that cannot list its files gets none and a failure."""
+@dataclass(frozen=True)
+class FileListing:
+    """Each analysis's :func:`_anchored` file set; one that could not list its files has none and a failure."""
+
+    file_sets: Mapping[TreeAnalysis[Any], frozenset[Path]]
+    failures: Mapping[TreeAnalysis[Any], tuple[ListingFailure, ...]]
+
+    @property
+    def union(self) -> frozenset[Path]:
+        return frozenset().union(*self.file_sets.values())
+
+
+def list_files(analyses: Iterable[TreeAnalysis[Any]]) -> FileListing:
+    """Call each analysis's ``files()`` once and anchor what it returns."""
     anchored: dict[Path, Path] = {}
 
     def anchor(path: Path) -> Path:
@@ -273,13 +312,23 @@ def _anchored_file_sets(
         return anchored[path]
 
     file_sets: dict[TreeAnalysis[Any], frozenset[Path]] = {}
+    failures: dict[TreeAnalysis[Any], tuple[ListingFailure, ...]] = {}
     for analysis in analyses:
         try:
             file_sets[analysis] = frozenset(anchor(path) for path in analysis.files())
+            failures[analysis] = ()
         except Exception as error:
-            failures[analysis].append(ListingFailure(type(error).__name__, str(error)))
+            failures[analysis] = (ListingFailure(type(error).__name__, str(error)),)
             file_sets[analysis] = frozenset()
-    return file_sets
+    return FileListing(MappingProxyType(file_sets), MappingProxyType(failures))
+
+
+def _by_path(path_and_fact: tuple[Path, Any]) -> Path:
+    return path_and_fact[0]
+
+
+def _failure_path(failure: ExtractionFailure) -> Path:
+    return failure.path
 
 
 class TreePass:
@@ -295,17 +344,35 @@ class TreePass:
 
     @classmethod
     def run(cls, analyses: Iterable[TreeAnalysis[Any]]) -> TreePass:
+        """Every analysis in *analyses* over its files, in this process."""
         declared = tuple(analyses)
-        _require_unique_names(declared)
-        facts: dict[TreeAnalysis[Any], dict[Path, Any]] = {a: {} for a in declared}
-        failures: dict[TreeAnalysis[Any], list[AnalysisFailure]] = {a: [] for a in declared}
-        file_sets = _anchored_file_sets(declared, failures)
-        for path in sorted(frozenset().union(*file_sets.values())):
-            interested = [a for a in declared if path in file_sets[a]]
-            _dispatch_one_file(ParsedModule(path), interested, facts, failures)
+        require_unique_names(declared)
+        listing = list_files(declared)
+        return cls.assembled(listing, [extract_facts(listing.file_sets)])
+
+    @classmethod
+    def assembled(
+        cls, listing: FileListing, extractions: Iterable[Mapping[str, AnalysisExtraction]],
+    ) -> TreePass:
+        """The pass *listing*'s analyses add up to across *extractions*, each covering a share of the files.
+
+        Facts and failures are put in path order, so the result does not depend
+        on how the files were shared out.
+        """
+        require_unique_names(listing.file_sets)
+        by_name = {analysis.name: analysis for analysis in listing.file_sets}
+        facts: dict[TreeAnalysis[Any], dict[Path, Any]] = {a: {} for a in listing.file_sets}
+        failures: dict[TreeAnalysis[Any], list[ExtractionFailure]] = {a: [] for a in listing.file_sets}
+        for extraction in extractions:
+            for name, share in extraction.items():
+                facts[by_name[name]].update(share.facts)
+                failures[by_name[name]].extend(share.failures)
         return cls(
-            {a: MappingProxyType(found) for a, found in facts.items()},
-            {a: tuple(failed) for a, failed in failures.items()},
+            {a: MappingProxyType(dict(sorted(found.items(), key=_by_path))) for a, found in facts.items()},
+            {
+                a: (*listing.failures[a], *sorted(failed, key=_failure_path))
+                for a, failed in failures.items()
+            },
         )
 
     def facts(self, analysis: TreeAnalysis[T]) -> Mapping[Path, T]:
@@ -328,20 +395,29 @@ class TreePass:
         return self._facts[analysis]
 
 
-def analyses_requested_by(items: Iterable[object]) -> tuple[TreeAnalysis[Any], ...]:
-    """The ``TREE_ANALYSES`` of every module with an item requesting the tree pass.
+def modules_requesting_the_pass(items: Iterable[object]) -> tuple[ModuleType, ...]:
+    """Every module with an item requesting the tree pass, deduplicated, in first-seen order.
 
     ``fixturenames`` is pytest's transitive closure, so an indirect request
-    counts.  Deduplicated by identity, in first-seen order.
+    counts.
     """
     requesting_modules = (
         getattr(item, 'module', None)
         for item in items
         if TREE_PASS_FIXTURE in getattr(item, 'fixturenames', ())
     )
+    return tuple(dict.fromkeys(module for module in requesting_modules if module is not None))
+
+
+def declared_analyses(modules: Iterable[ModuleType]) -> tuple[TreeAnalysis[Any], ...]:
+    """The ``TREE_ANALYSES`` of every module in *modules*, deduplicated by identity, in first-seen order."""
     return tuple(dict.fromkeys(
         analysis
-        for module in requesting_modules
-        if module is not None
+        for module in modules
         for analysis in getattr(module, 'TREE_ANALYSES', ())
     ))
+
+
+def analyses_requested_by(items: Iterable[object]) -> tuple[TreeAnalysis[Any], ...]:
+    """The ``TREE_ANALYSES`` of every module with an item requesting the tree pass."""
+    return declared_analyses(modules_requesting_the_pass(items))
