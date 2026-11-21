@@ -4020,21 +4020,6 @@ def _apply_cargo_scope(
     )
 
 
-# Source-file extensions that warrant running verify at all. Markdown / YAML /
-# TOML / JSON diffs are inert: every existing scoping branch
-# (scope_module_config filters .py, _build_fallback_config filters .py,
-# _apply_cargo_scope filters .rs) would no-op on them anyway, so the
-# previous global-pytest fall-through was the only path that actually fired
-# — and it was unsafe (see plans/fix-all-root-causes-humble-dream.md R1/R2).
-_SOURCE_EXTENSIONS: frozenset[str] = frozenset({'.py', '.rs'})
-
-
-def _has_source_files(task_files: list[str]) -> bool:
-    """Return True when *task_files* contains at least one .py or .rs path."""
-    exts = tuple(_SOURCE_EXTENSIONS)
-    return any(f.endswith(exts) for f in task_files)
-
-
 def _trivial_pass(reason: str) -> 'VerifyResult':
     """Build a VerifyResult that represents 'verify trivially passed'.
 
@@ -9589,6 +9574,20 @@ async def _run_scoped_verification_body(
                 role=role,
                 admission_request=plan_request(admission_plan, None),
             )
+        if task_files:
+            # Task 5296: a touched behavioural artifact (a skills/ script, an
+            # agent-prompt SKILL.md, the root yaml) runs the registered
+            # modules whose tests consume it, even when the task owns none.
+            widened_modules = verify_plan.with_artifact_consumer_modules(
+                config, module_configs, task_files, role,
+            )
+            added = [mc.prefix for mc in widened_modules[len(module_configs):]]
+            if added:
+                logger.info(
+                    'Verification scope: adding %d behavioural-artifact consumer module(s): %s',
+                    len(added), ', '.join(added),
+                )
+            module_configs = widened_modules
         if module_configs:
             # λ (task 2589, R1): the broad merge gate. role=='merge' +
             # merge_verify_breadth=='full' expands module_configs from the
@@ -9662,7 +9661,8 @@ async def _run_scoped_verification_body(
                     )
                 if not scoped:
                     # No subproject has matching files. Two sub-cases:
-                    #   (a) Diff has no .py/.rs at all (docs, YAML, JSON …) —
+                    #   (a) nothing in the diff needs verifying
+                    #       (verify_plan.is_trivial_diff) —
                     #       every existing scope branch would no-op anyway; the
                     #       previous global-pytest fall-through was unsafe in
                     #       this layout. Trivially pass — UNLESS the merge-role
@@ -9673,7 +9673,7 @@ async def _run_scoped_verification_body(
                     #       (e.g. root-level conftest.py + skills/*.md). Fan
                     #       out per-subproject so each runs in its own venv
                     #       with its own pyproject options.
-                    if not _has_source_files(existing_files):
+                    if verify_plan.is_trivial_diff(existing_files, module_configs, role):
                         if role == 'merge' and is_merge_verify:
                             # INV-1 (task 2883): the ADOPTABLE merge verdict must
                             # never trivially pass a no-evidence resolution. Any
@@ -9856,7 +9856,7 @@ async def _run_scoped_verification_body(
             # Mirror the same docs-only short-circuit as the module_configs
             # branch: with no .py/.rs files _build_fallback_config would
             # return None and we'd fall through to the unsafe global pytest.
-            if not _has_source_files(existing_files):
+            if verify_plan.is_trivial_diff(existing_files, module_configs, role):
                 if role == 'merge' and is_merge_verify:
                     # INV-1 (task 2883): the ADOPTABLE merge verdict must never
                     # trivially pass a no-evidence resolution. Escalate to the
