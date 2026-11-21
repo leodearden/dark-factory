@@ -955,8 +955,8 @@ watcher_backend: claude
 #   Trip reason: cost_ceiling_orch_exceeded (default 10000.0).
 #
 # Disable a ceiling by setting it to a very high value.  The orch-wide
-# default is already effectively off: it stays as an opt-in tripwire
-# (portfolio review Q12, task 8262).
+# default is effectively off: it stays as an opt-in tripwire (task 8262;
+# ruling in plans/cross-project-weights-study-2026-11-12/rulings.md).
 watcher_daily_cost_ceiling_usd: 150.0
 orch_daily_cost_ceiling_usd: 10000.0
 
