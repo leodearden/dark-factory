@@ -128,6 +128,7 @@ from orchestrator.recovery_emission import (
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.run_slots import DispatchScope
+from orchestrator.scheduler_priority_lookup import LookupPins
 from orchestrator.sentinel_l1 import file_sentinel_l1, resolve_sentinel_l1
 from orchestrator.starvation_cap import CapReport, cap_report, sync_cap_l1
 from orchestrator.starvation_state import WatchdogState
@@ -1668,6 +1669,7 @@ class Scheduler:
         self._last_effective_priorities: dict[str, str] = {}
         # --- Priority-override state ---
         self._override_store: OverrideStore | None = override_store
+        self._lookup_pins = LookupPins(override_store, self._project_root, clock=self._time_source)
         # Public alias for shutdown-path callers (harness checkpoint) — read-only.
         self.override_store: OverrideStore | None = override_store
         # Snapshot from the previous tick, used to diff-detect override changes
@@ -6761,6 +6763,7 @@ class Scheduler:
             override_boosts=override_boosts or None,
         )
         self._last_effective_priorities = dict(effective_priorities)
+        self._lookup_pins.adopt(ctx.overrides)
         transitive_counts = self._compute_transitive_counts(
             ctx.tasks_by_id, reverse_index, ctx.status_map
         )
@@ -7631,19 +7634,14 @@ class Scheduler:
             logger.warning('scheduler_tick telemetry emit failed', exc_info=True)
 
     def task_priority(self, task_id: str) -> TaskPriority:
-        """*task_id*'s live effective tier and pin, read from this scheduler's memory.
+        """*task_id*'s effective tier, base tier and pin, read from this scheduler's memory.
 
-        The tier is the one :meth:`get_state_snapshot` exports as
-        ``effective_priorities``; the pin is the override row the last tick
-        loaded. Both are unknown (None) before the first tick, the tier also
-        for a task that tick did not rank, and the pin when no override store
-        is wired. A pure dict read: never touches the override store.
+        The base tier is the one :meth:`get_state_snapshot` exports as
+        ``effective_priorities`` (unknown for a task no tick ranked); the pin
+        comes from the lookup's own pin map (unknown when no override store is
+        wired). A pure dict read: never touches the override store.
         """
-        pinned = None
-        if self._override_store is not None and self._overrides_initialized:
-            row = self._prev_overrides_snapshot.get(task_id)
-            pinned = row is not None and row.pinned
-        return TaskPriority(tier=self._last_effective_priorities.get(task_id), pinned=pinned)
+        return self._lookup_pins.priority(task_id, self._last_effective_priorities.get(task_id))
 
     def get_state_snapshot(self) -> SchedulerStateSnapshot:
         """Return a frozen copy of the scheduler's current state.
