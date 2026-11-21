@@ -9,7 +9,11 @@ that makes those commits separable again — the base the branch was stacked
 onto, recorded at the moment of stacking — and computes the cut between the
 foreign prefix and the branch's own delta.  It also names the tip each
 member had immediately before stacking (task 4953), so a train that does not
-land can hand every member back on it.
+land can hand every member back on it.  A dependent started early on a
+predecessor's branch is re-stacked when that branch is rebuilt (task
+10473): :func:`restack_own_delta` moves the dependent's own delta onto the
+new tip and the record with it, and :func:`restack_trial` asks first whether
+that would conflict.
 
 The record is one git ref per stacked branch under
 :data:`STACK_BASE_REF_NAMESPACE`.  A ref is atomic, survives restarts, is
@@ -38,11 +42,16 @@ from pathlib import Path
 from typing import NamedTuple
 
 from orchestrator.rebase_drops import run_rebase_reporting_drops
-from orchestrator.rebase_recovery import guarded_abort, operation_still_in_progress
+from orchestrator.rebase_recovery import (
+    RECOVERY_GIT,
+    guarded_abort,
+    operation_still_in_progress,
+)
 from orchestrator.ref_ledger import (
     GitReadError,
     GitRunner,
     git_lines,
+    git_out,
     move_branch_records,
     prune_orphaned_records,
 )
@@ -390,6 +399,264 @@ async def rebase_own_delta(
     return OwnDeltaRebase(
         ok=False, conflicted_paths=conflicted, stderr=rebased.stderr,
         abort_failed=abort_failed,
+    )
+
+
+class RestackOutcome(StrEnum):
+    RESTACKED = 'restacked'
+    CONFLICT = 'conflict'
+    REFUSED = 'refused'
+    ABORT_FAILED = 'abort_failed'
+    RECORD_FAILED = 'record_failed'
+
+
+_BLOCKING_RESTACK_OUTCOMES = frozenset({
+    RestackOutcome.REFUSED, RestackOutcome.ABORT_FAILED, RestackOutcome.RECORD_FAILED,
+})
+
+
+@dataclass(frozen=True)
+class RestackResult:
+    """Verdict of re-stacking *branch*'s own delta, the commits after
+    *upstream*, onto *onto* in *worktree*.
+
+    ``old_tip`` and ``old_base`` are the branch tip and the recorded base
+    before (``old_tip`` is None only when HEAD did not resolve, and
+    ``old_base`` None when there was no record).  RESTACKED carries
+    ``new_tip``; CONFLICT names at least one conflicted path and left the
+    branch, tree and record as they were.  ``detail`` says why a re-stack
+    stopped, and for RECORD_FAILED whether the roll-back held.
+    """
+
+    outcome: RestackOutcome
+    branch: str
+    worktree: Path
+    onto: str
+    upstream: str
+    old_tip: str | None
+    old_base: str | None
+    new_tip: str | None = None
+    conflicted_paths: tuple[str, ...] = ()
+    detail: str = ''
+
+    def __post_init__(self) -> None:
+        if (self.outcome is RestackOutcome.RESTACKED) != (self.new_tip is not None):
+            raise ValueError(
+                f'a {self.outcome} re-stack of {self.branch} cannot have new tip {self.new_tip}',
+            )
+        if self.outcome is RestackOutcome.CONFLICT and not self.conflicted_paths:
+            raise ValueError(f'conflict re-stack of {self.branch} names no conflicted path')
+        if self.old_tip is None and self.outcome is not RestackOutcome.REFUSED:
+            raise ValueError(f'a {self.outcome} re-stack of {self.branch} needs its old tip')
+
+    @property
+    def requeues(self) -> bool:
+        return self.outcome is RestackOutcome.CONFLICT
+
+    @property
+    def blocks(self) -> bool:
+        return self.outcome in _BLOCKING_RESTACK_OUTCOMES
+
+    def failure_message(self) -> str:
+        """The one message a stopped re-stack carries."""
+        if self.outcome is RestackOutcome.RESTACKED:
+            raise ValueError(f'the re-stack of {self.branch} onto {self.onto} did not stop')
+        clauses = [
+            f'Re-stack of {self.branch} onto {self.onto} stopped ({self.outcome}):',
+            f'the branch was on {self.old_tip or "an unresolved HEAD"}'
+            f' with recorded base {self.old_base or "none"};',
+        ]
+        if self.conflicted_paths:
+            clauses.append(f'conflicted paths: {", ".join(self.conflicted_paths)};')
+        clauses.append(f'{self.detail}.' if self.detail else 'no further detail.')
+        if self.outcome is RestackOutcome.ABORT_FAILED:
+            clauses.append(
+                'Recovery: python -m orchestrator.rebase_recovery preflight --worktree '
+                f'{self.worktree}, then git -C {self.worktree} {" ".join(RECOVERY_GIT[1:])} '
+                'rebase --abort',
+            )
+        return ' '.join(clauses)
+
+
+class RestackFailed(Exception):
+    """A re-stack stopped; ``result`` is its verdict."""
+
+    def __init__(self, result: RestackResult) -> None:
+        super().__init__(result.failure_message())
+        self.result = result
+
+
+class RestackConflict(RestackFailed):
+    """The dependent's own delta conflicts with the new base: requeue it."""
+
+
+class RestackBlocked(RestackFailed):
+    """The re-stack could not be done or undone cleanly: block with the remedy."""
+
+
+def restack_failure(result: RestackResult) -> RestackFailed:
+    """THE mapping from a stopped re-stack's outcome to the exception it raises."""
+    if result.outcome is RestackOutcome.RESTACKED:
+        raise ValueError(f'the re-stack of {result.branch} onto {result.onto} did not stop')
+    if result.requeues:
+        return RestackConflict(result)
+    return RestackBlocked(result)
+
+
+async def restack_own_delta(
+    run: GitRunner, worktree: Path, *,
+    ledger: StackBaseLedger, branch: str, onto: str, upstream: str,
+) -> RestackResult:
+    """Replay *branch*'s commits after *upstream* onto *onto*, in *worktree*,
+    then make the ledger name *onto*.
+
+    The record is written only after the replay, so a replay that stops
+    leaves the branch and its record as they were.  A record that does not
+    read back rolls the branch back to its old tip, so the branch never sits
+    on a base its record does not name.
+    """
+    stopped = _RestackVerdict(branch, worktree, onto, upstream)
+    head_read = await _head(run, worktree)
+    head = head_read.sha
+    if head is None:
+        return stopped.refused(None, None, f'HEAD of {worktree} is {head_read.describe()}')
+    before = await ledger.read(branch)
+    if before.state is StackRecordState.UNREADABLE:
+        return stopped.refused(
+            head, None, f'the stack-base record of {branch} is unreadable: {before.detail}',
+        )
+    rebased = await rebase_own_delta(run, worktree, onto=onto, cut=upstream)
+    if not rebased.ok:
+        return await _stopped_replay(run, stopped, head, before.base, rebased)
+    new_tip = (await git_out(run, worktree, 'rev-parse', '--verify', 'HEAD')).strip()
+    after = await ledger.ensure_record(branch, onto)
+    if not after.names(onto):
+        detail = await _roll_back(run, ledger, stopped, head, before, after)
+        return stopped.verdict(RestackOutcome.RECORD_FAILED, head, before.base, detail=detail)
+    return stopped.verdict(RestackOutcome.RESTACKED, head, before.base, new_tip=new_tip)
+
+
+@dataclass(frozen=True)
+class _RestackVerdict:
+    branch: str
+    worktree: Path
+    onto: str
+    upstream: str
+
+    def verdict(
+        self, outcome: RestackOutcome, old_tip: str | None, old_base: str | None, *,
+        new_tip: str | None = None, conflicted_paths: tuple[str, ...] = (), detail: str = '',
+    ) -> RestackResult:
+        return RestackResult(
+            outcome=outcome, branch=self.branch, worktree=self.worktree, onto=self.onto,
+            upstream=self.upstream, old_tip=old_tip, old_base=old_base, new_tip=new_tip,
+            conflicted_paths=conflicted_paths, detail=detail,
+        )
+
+    def refused(self, old_tip: str | None, old_base: str | None, detail: str) -> RestackResult:
+        return self.verdict(RestackOutcome.REFUSED, old_tip, old_base, detail=detail)
+
+
+class _HeadRead(NamedTuple):
+    sha: str | None
+    err: str
+
+    def describe(self) -> str:
+        return self.sha or f'unresolved ({self.err})'
+
+
+async def _head(run: GitRunner, worktree: Path) -> _HeadRead:
+    rc, out, err = await run(['git', 'rev-parse', '--verify', 'HEAD'], cwd=worktree)
+    return _HeadRead(out.strip() if rc == 0 else None, err.strip())
+
+
+async def _stopped_replay(
+    run: GitRunner, stopped: _RestackVerdict, old_tip: str, old_base: str | None,
+    rebased: OwnDeltaRebase,
+) -> RestackResult:
+    paths = rebased.conflicted_paths
+    stderr = rebased.stderr.strip()
+    if rebased.abort_failed:
+        return stopped.verdict(
+            RestackOutcome.ABORT_FAILED, old_tip, old_base, conflicted_paths=paths,
+            detail=f'the abort left the rebase in progress after: {stderr}',
+        )
+    if not paths:
+        return stopped.refused(old_tip, old_base, f'git refused the replay: {stderr}')
+    head = await _head(run, stopped.worktree)
+    if head.sha != old_tip:
+        return stopped.verdict(
+            RestackOutcome.ABORT_FAILED, old_tip, old_base, conflicted_paths=paths,
+            detail=f'after the abort HEAD is {head.describe()}, not the old tip',
+        )
+    return stopped.verdict(RestackOutcome.CONFLICT, old_tip, old_base, conflicted_paths=paths)
+
+
+async def _roll_back(
+    run: GitRunner, ledger: StackBaseLedger, stopped: _RestackVerdict, old_tip: str,
+    before: StackBaseRead, after: StackBaseRead,
+) -> str:
+    """Put the branch back on *old_tip* and its record back on *before*;
+    return the detail clause saying whether that held."""
+    rc, _, err = await run(['git', 'reset', '--hard', old_tip], cwd=stopped.worktree)
+    if after.base != before.base:
+        if before.base is None:
+            await ledger.forget(stopped.branch)
+        else:
+            await ledger.record(stopped.branch, before.base)
+    restored = await ledger.read(stopped.branch)
+    branch_clause = (
+        'the branch is back on its old tip' if rc == 0
+        else f'rolling the branch back FAILED: {err.strip()}'
+    )
+    record_clause = (
+        'the record is as it was' if restored.base == before.base
+        else f'the record now reads {restored.state} {restored.base}'
+    )
+    return (
+        f'the record read back {after.state} {after.base} instead of {stopped.onto}; '
+        f'{branch_clause}; {record_clause}'
+    )
+
+
+class RestackTrialOutcome(StrEnum):
+    CLEAN = 'clean'
+    CONFLICT = 'conflict'
+    UNKNOWN = 'unknown'
+
+
+@dataclass(frozen=True)
+class RestackTrial:
+    outcome: RestackTrialOutcome
+    conflicted_paths: tuple[str, ...] = ()
+    detail: str = ''
+
+
+async def restack_trial(
+    run: GitRunner, repo_root: Path, *, base: str, onto: str, tip: str,
+) -> RestackTrial:
+    """Would moving *tip*'s commits after *base* onto *onto* conflict?
+
+    A three-way merge in the object store only: no ref, index or worktree
+    moves.  git answers rc 1 both for a conflict and for an object it cannot
+    merge, so only an rc 1 that wrote a tree is a CONFLICT.
+    """
+    rc, out, err = await run(
+        [
+            'git', 'merge-tree', '--write-tree', '--name-only', '--no-messages', '-z',
+            '--merge-base', base, onto, tip,
+        ],
+        cwd=repo_root,
+    )
+    tree, *paths = out.split('\x00') if out else ('',)
+    wrote_tree = _FULL_SHA.fullmatch(tree) is not None
+    if rc == 0 and wrote_tree:
+        return RestackTrial(RestackTrialOutcome.CLEAN)
+    if rc == 1 and wrote_tree:
+        conflicted = tuple(dict.fromkeys(path for path in paths if path))
+        return RestackTrial(RestackTrialOutcome.CONFLICT, conflicted_paths=conflicted)
+    return RestackTrial(
+        RestackTrialOutcome.UNKNOWN, detail=err.strip() or f'git merge-tree exited {rc}',
     )
 
 
