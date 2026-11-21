@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -549,7 +550,7 @@ class BaseStage:
         return {'mcpServers': servers}
 
 
-def recon_core_mcp_servers(candidates: list[Path] | None = None) -> dict[str, dict]:
+def recon_core_mcp_servers(candidates: list[Path] | None = None) -> dict[str, Mapping[str, object]]:
     """Recon's core MCP servers: fused-memory (HTTP, or stdio) and jcodemunch.
 
     A stdio fused-memory entry carries ``OPENAI_API_KEY`` from the process env
