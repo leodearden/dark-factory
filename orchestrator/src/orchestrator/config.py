@@ -53,8 +53,10 @@ from orchestrator.config_census_ignore import (  # noqa: F401 (re-exported for t
     parse_census_ignore_entries,
 )
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant
+from orchestrator.merge_pool_config import MergePoolConfig
 from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
+from orchestrator.task_priority import PRIORITY_TIERS
 from orchestrator.verify_admission_gate import AdmissionOrder
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 
@@ -82,14 +84,14 @@ VerifyTaskHostPolicy = Literal['local', 'remote_modules', 'remote_all']
 
 # --- Priority-tier constants (value/h scheduler) ---
 #
-# Canonical 5-tier priority order.  Lower rank = higher priority.  An unset
-# (None) priority silently coerces to DEFAULT_TIER — that is a normal,
+# The canonical 5-tier order is orchestrator/task_priority.py::PRIORITY_TIERS.
+# Lower rank = higher priority.  An unset (None) priority silently coerces
+# to DEFAULT_TIER — that is a normal,
 # expected state (e.g. subtasks in this repo's tasks.json routinely carry no
 # priority), not an anomaly.  An unrecognized non-None value (a typo or a
 # stale tier string) also coerces to DEFAULT_TIER so it never crashes the
 # scheduler, but that path is logged loudly instead, since it means some
 # upstream caller passed something the config layer doesn't understand.
-PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish')
 PRIORITY_RANK: dict[str, int] = {tier: i for i, tier in enumerate(PRIORITY_TIERS)}
 DEFAULT_TIER: str = 'medium'
 
@@ -5645,6 +5647,10 @@ class OrchestratorConfig(BaseSettings):
     # defaults.yaml declares the block explicitly so the knob is discoverable.
     merge_deep: MergeDeepConfig = Field(default_factory=MergeDeepConfig)
 
+    # The merge pool's order, promotion period and bounce cap (task 9933,
+    # plans/priority-at-later-gates-prd.md). Nothing reads it yet.
+    merge_pool: MergePoolConfig = Field(default_factory=MergePoolConfig)
+
     # Verify-result cache modes per role (task 5652, plans/verify-result-cache-prd.md).
     # An absent stanza is OFF for both roles.
     verify_cache: VerifyCacheConfig = Field(default_factory=VerifyCacheConfig)
@@ -6889,6 +6895,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # separate RELOADABLE_FIELDS edit, so chains can be turned on, retuned or
     # killed (chain_cap -> 0) without a restart. See MergeDeepConfig.
     _submodel_leaf_paths('merge_deep', MergeDeepConfig),
+    # The merge pool's knobs (task 9933): every leaf hot, as merge_deep's are.
+    _submodel_leaf_paths('merge_pool', MergePoolConfig),
     # Verify-result cache (task 5652): read per verify decision, so green tier;
     # each role's mode is its own leaf, so a task-only edit applies alone.
     _submodel_leaf_paths('verify_cache', VerifyCacheConfig),

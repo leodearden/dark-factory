@@ -5,11 +5,23 @@ waiting requests it left out, and never lets a failure reach the pick.
 """
 from __future__ import annotations
 
+import dataclasses
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
-from orchestrator.merge_pool_facts import PICK_RECORD_CAP, WAITING_CAP, PickRecords
+import pytest
+
+from orchestrator.merge_pool_facts import (
+    PICK_RECORD_CAP,
+    WAITING_CAP,
+    PickRecords,
+    queued_request_fields,
+)
 from orchestrator.suffix_graph import EMPTY_SUFFIX_CONFLICT_GRAPH
+from orchestrator.task_priority import TaskPriority
+
+_NOW = datetime(2026, 11, 21, 12, 0, tzinfo=UTC)
 
 
 def _req(n: int) -> Any:
@@ -62,3 +74,71 @@ def test_a_failure_while_recording_leaves_no_record_and_does_not_raise() -> None
     records.record(_req(1), 'normal', {'high': [], 'normal': [_req(2)]}, broken_graph)
 
     assert records.take('mr-1') == {}
+
+
+@dataclasses.dataclass(frozen=True)
+class _QueuedReq:
+    first_enqueued_at: float
+    request_id: str = 'mr-q'
+    lane: str = 'normal'
+    snapshot_tip: str | None = 'abc123'
+
+
+def _queued_req(*, waited: timedelta) -> _QueuedReq:
+    return _QueuedReq(first_enqueued_at=(_NOW - waited).timestamp())
+
+
+def test_merge_queued_keeps_the_keys_it_had() -> None:
+    req = _queued_req(waited=timedelta(seconds=5))
+
+    fields = queued_request_fields(req, TaskPriority(tier='high', pinned=False), now=_NOW)
+
+    assert {k: fields[k] for k in (
+        'request_id', 'lane', 'tier', 'pinned', 'head_sha', 'first_enqueued_at',
+    )} == {
+        'request_id': 'mr-q', 'lane': 'normal', 'tier': 'high', 'pinned': False,
+        'head_sha': 'abc123', 'first_enqueued_at': req.first_enqueued_at,
+    }
+
+
+def test_without_an_anchor_the_age_is_from_the_first_enqueue() -> None:
+    req = _queued_req(waited=timedelta(seconds=3600.5))
+    priority = TaskPriority(tier='pinned', pinned=True, base_tier='low', pin_order=1)
+
+    fields = queued_request_fields(req, priority, now=_NOW)
+
+    assert (fields['base_tier'], fields['age_from'], fields['age_secs']) == (
+        'low', 'enqueue', 3600.5,
+    )
+
+
+def test_an_anchor_measures_the_age_from_the_anchor() -> None:
+    req = _queued_req(waited=timedelta(seconds=5))
+    priority = TaskPriority(tier='low', base_tier='low', age_anchor=_NOW - timedelta(hours=2))
+
+    fields = queued_request_fields(req, priority, now=_NOW)
+
+    assert (fields['age_from'], fields['age_secs']) == ('anchor', 7200.0)
+
+
+@pytest.mark.parametrize('epoch', [float('nan'), float('inf'), 1.7e12])
+def test_an_epoch_naming_no_instant_still_records_the_keys(epoch: float) -> None:
+    req = _QueuedReq(first_enqueued_at=epoch)
+
+    fields = queued_request_fields(req, TaskPriority(tier='low', base_tier='low'), now=_NOW)
+
+    assert {k: fields[k] for k in (
+        'request_id', 'tier', 'base_tier', 'age_from', 'age_secs',
+    )} == {
+        'request_id': 'mr-q', 'tier': 'low', 'base_tier': 'low',
+        'age_from': 'enqueue', 'age_secs': 0.0,
+    }
+
+
+def test_an_anchor_still_measures_when_the_epoch_names_no_instant() -> None:
+    req = _QueuedReq(first_enqueued_at=float('nan'))
+    priority = TaskPriority(tier='low', base_tier='low', age_anchor=_NOW - timedelta(hours=2))
+
+    fields = queued_request_fields(req, priority, now=_NOW)
+
+    assert (fields['age_from'], fields['age_secs']) == ('anchor', 7200.0)
