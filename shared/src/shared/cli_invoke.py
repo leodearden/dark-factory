@@ -790,6 +790,11 @@ _BG_LOG_PATH_RE = re.compile(r'Output is being written to:\s*(\S+?)\.?(?=\s|$)')
 _MIN_BG_TOKEN_LEN = 6
 
 
+def _is_usable_token(value: object) -> TypeGuard[str]:
+    """True when *value* can identify a background task (see ``_MIN_BG_TOKEN_LEN``)."""
+    return isinstance(value, str) and len(value) >= _MIN_BG_TOKEN_LEN
+
+
 _FieldT = TypeVar('_FieldT')
 
 
@@ -906,11 +911,11 @@ def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
     tur = record.get('toolUseResult')
     if isinstance(tur, dict):
         task_id = tur.get(_BASH_LAUNCH_ID_FIELD)
-        if isinstance(task_id, str) and len(task_id) >= _MIN_BG_TOKEN_LEN:
+        if _is_usable_token(task_id):
             tokens.add(task_id)
     for text in _iter_result_texts(record):
         for match in _BG_LOG_PATH_RE.findall(text):
-            if len(match) >= _MIN_BG_TOKEN_LEN:
+            if _is_usable_token(match):
                 tokens.add(match)
 
 
@@ -952,7 +957,7 @@ def _confirmed_launch_task_id(record: dict, launch_calls: Mapping[str, str]) -> 
         if not isinstance(call_id, str) or call_id not in launch_calls:
             continue
         task_id = tur.get(launch_calls[call_id])
-        if isinstance(task_id, str) and len(task_id) >= _MIN_BG_TOKEN_LEN:
+        if _is_usable_token(task_id):
             return task_id
     return None
 
