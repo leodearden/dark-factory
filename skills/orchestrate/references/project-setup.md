@@ -34,7 +34,7 @@ Both forms behave identically. When both are set, `--config` wins. If neither is
 
 ## Setting up a new project
 
-1. **Name the config file `dark-factory-orchestrator.yaml`, at the repo root.** This is the canonical, required filename — it's what the dashboard's escalation-URL discovery keys on. The orchestrator binary itself never auto-discovers the file (`--config`/`ORCH_CONFIG_PATH` always name it explicitly), but dashboard discovery reads only the canonical name: a project under any other name is invisible to the dashboard.
+1. **Name the config file `dark-factory-orchestrator.yaml`, at the repo root.** This is the canonical, required filename — it's what the dashboard's escalation-URL discovery keys on. The orchestrator binary itself never auto-discovers the file (`--config`/`ORCH_CONFIG_PATH` always name it explicitly), but dashboard discovery reads only the canonical name. A project under any other name still shows its tasks, but its escalation-backed views (escalations, merge queue and halt status, task runtime state) go dark and its burndown run-slot capacity reads as unknown.
 
 2. **Write the minimum required keys**:
    ```yaml

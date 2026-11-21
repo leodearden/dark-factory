@@ -50,8 +50,9 @@ ls "$TARGET_CONFIG"
 As of 2026-09-29 every project under `DASHBOARD_KNOWN_PROJECT_ROOTS` carries that file.
 Dashboard discovery reads only that name: task 7138 retired the legacy spellings
 (`orchestrator.yaml`, `orchestrator-config.yaml`, `orchestrator/config.yaml`), and a bare
-`config.yaml` was never read, so a project using any other name is invisible to the dashboard
-until renamed. A stray legacy file can still sit BESIDE the canonical one (autopilot-video has a
+`config.yaml` was never read. A project using any other name still shows its tasks, but until
+renamed its escalation-backed views (escalations, merge queue and halt status, task runtime
+state) go dark and its burndown run-slot capacity reads as unknown. A stray legacy file can still sit BESIDE the canonical one (autopilot-video has a
 `config.yaml`, solar-challenge-platform an `orchestrator.yaml` symlink), so never let a glob over
 the legacy names win over the canonical path when both exist.
 

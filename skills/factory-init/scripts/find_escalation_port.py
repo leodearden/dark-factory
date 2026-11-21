@@ -36,10 +36,9 @@ RESERVED = {
 # Dashboard discovery reads only the canonical name (task 7138 retired the
 # legacy spellings there), but this port survey still scans them: a survey
 # errs toward over-inclusion, so a port named by a stale legacy-only
-# checkout (such checkouts exist on leo-laptop, measured 2026-11-21) is
-# treated as claimed and never handed out. No bare "config.yaml": it was
-# never one of the three legacy spellings the 7-project migration (commit
-# 97f0bd9f85) actually found in use.
+# checkout is treated as claimed and never handed out. No bare
+# "config.yaml": it was never one of the three legacy spellings the
+# 7-project migration (commit 97f0bd9f85) actually found in use.
 CONFIG_NAMES = (
     "dark-factory-orchestrator.yaml",
     "orchestrator.yaml",
