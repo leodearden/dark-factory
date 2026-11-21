@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
-from _task_verify_fixtures import seed_verify_repo, task_verify_spec
+from _task_verify_fixtures import seed_task_branch_repo, seed_verify_repo, task_verify_spec
 
 from orchestrator.config import OrchestratorConfig, VerifyCacheConfig
 from orchestrator.git_ops import GitOps
@@ -68,8 +68,12 @@ async def test_run_task_verify_on_a_fresh_worktree_persists_logs_and_strips_path
 @pytest.mark.asyncio
 async def test_a_runners_task_verify_consults_no_registry(tmp_path: Path) -> None:
     """Task 5653: the runner joins the cache with no registry, so every unit is
-    UNAVAILABLE naming why, and no registry file appears on either side."""
-    repo, head_sha = seed_verify_repo(tmp_path)
+    UNAVAILABLE naming why, and no registry file appears on either side.
+
+    The repo ignores ``.task/``, as a real project does, so the cold verify's
+    own writes there leave the working copy clean enough to key.
+    """
+    repo, _base, head_sha = seed_task_branch_repo(tmp_path)
     config = OrchestratorConfig(
         project_root=repo, verify_cold_preprovision_command='',
         verify_cache=VerifyCacheConfig(task_mode=CacheMode.LOG),
