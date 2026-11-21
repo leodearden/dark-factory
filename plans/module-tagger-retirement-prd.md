@@ -9,9 +9,9 @@ bare B (G5 prompt resolved: no new seam contract is created; the
 
 Delete the LLM module tagger (`Harness._tag_task_modules` and its entire
 supporting surface) from dark-factory, close the one real coverage gap its
-absence opens (undeclared `complexity='simple'` submissions), and hand the
-existing repair pipeline a census of the records the tagger already
-damaged. After this PRD lands, an operator observes:
+absence opens (undeclared `complexity='simple'` submissions), and publish a
+census of the records the tagger already damaged (whether they need repair:
+Debris repair disposition). After this PRD lands, an operator observes:
 
 - Orchestrator startup no longer runs the "Tag tasks with code modules"
   step; `--retag-modules` is an unknown CLI argument.
@@ -19,7 +19,7 @@ damaged. After this PRD lands, an operator observes:
   `metadata.files` is rejected at the fused-memory boundary with a
   structured error; the same submission with declared files succeeds.
 - A committed census artifact enumerates every tagger-stamped record
-  across all six project corpora, classified for the repair pipeline.
+  across all six project corpora, keyed by project/task/classification.
 
 ## Background — why delete (measured 2026-08-20 unless marked inherited)
 
@@ -79,8 +79,7 @@ Three independent leaves plus decompose-session coordination actions:
    (γ lock-charter-guard territory; `lock_charter_error` structured-error
    precedent, `routing_intent_guard` lint precedent nearby).
 3. **ε — debris census**: deterministic sweep of all six corpora emitting
-   a committed, machine-readable artifact for the repair pipeline — see
-   Debris repair disposition.
+   a committed, machine-readable artifact — see Debris repair disposition.
 
 No replacement predictor is built. Undeclared never-planned tasks run on
 the synthetic `task-<id>` lock until plan reconcile — accepted on the
@@ -169,7 +168,7 @@ census.
 |---|---|---|---|---|
 | DF 3260 (owned-field single-writer redesign) | this PRD shrinks the writer set 3260 charters | `metadata.files` writer charter | 3260 | amend 3260's record at decompose |
 | DF 3122 / 3121 (misfile soft signals) | this PRD deletes signal (c) `files_tagged_empty` after 3122 lands | tagger empty-verdict persistence in `harness.py` | this PRD (β) | β depends on 3122 |
-| DF 3113 P4a / DF 3427 (repair pipeline) | ε produces their input | census artifact (victim list keyed by project/task/classification) | 3113 P4a self-heal covers live records; no dedicated repair (7271) | resolved — see disposition |
+| DF 3113 P4a / DF 3427 (repair pipeline) | ε measured the population; neither consumes the census | census artifact (victim list keyed by project/task/classification) | 3113 P4a self-heal covers live records; no dedicated repair (7271) | resolved — see disposition |
 | DF 4504, 4191, 3380 | superseded / mooted | — | this PRD | cancel at decompose |
 | `plans/capability-delivered-checks-prd.md` | consumes | manifest YAML sidecar | that PRD's stamper | standard |
 
@@ -233,8 +232,9 @@ All three tasks are leaves (no intra-batch dependencies).
   records carrying `files_tagged_at`, classifying each: terminal vs
   non-terminal; plan-reconciled since tagging vs never-reconciled
   (tagger guess still live); known post-wipe signature. Emits a committed
-  machine-readable artifact (+ md summary) keyed for repair-pipeline
-  consumption (consumer: DF 7271). Read-only against task corpora (fused-memory read path,
+  machine-readable artifact (+ md summary) keyed by
+  project/task/classification (consumer: DF 7271, see Debris repair
+  disposition). Read-only against task corpora (fused-memory read path,
   never raw `tasks.db`).
   **Observable signal:** the committed artifact exists with per-project
   counts; it contains the known positives (reify 6068/5602/5632, DF 3113's
