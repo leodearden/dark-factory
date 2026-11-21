@@ -622,6 +622,55 @@ def test_gpu_admission_matches_collector() -> None:
 {"anchor": "sampler/src/sampler/gpu.py::_GPU_METRICS", "tags": ["inv-14"], "severity": "medium", "statement": "the admission set _GPU_METRICS and collect_gpu_metrics each spell gpu_busy_avg10 and gpu_read_ok, and neither is computed from sampler.metrics.METRIC_GROUPS — two homes for one vocabulary, held together only by a parity test"}
 ```
 
+## INV-15 `scheduling-state-survives-restart`
+
+### PRD-leaf-shaped (`INV-15-PRD`)
+
+> After a red batch, mark each member to verify alone: the merge worker keeps
+> `_verify_alone: set[str]` of request ids, and the placement does not batch
+> an id in it until that id's solo verify returns. Signal: a lane test makes
+> a batch red and asserts each member's next dispatch has no links.
+
+**Expected disposition**: `flag: scheduling-state-survives-restart`
+
+**Redesign that clears it**: Give the mark one declared restart
+disposition. Either restore or rebuild it: write each mark and each
+clearing to a named store, or as named rows, in the same step as the
+change, read them back before the first pick, and add a restart scene in
+which a fresh lane over the same store (a second `make_lane`) dispatches
+the marked member alone again. Or declare it dropped: state what happens
+after a restart (the marked members are batched again and their solo
+verifies are lost) and cite the owner task that will make the mark
+survive, or a ratification row in
+`docs/legibility/exception-ratifications.yaml`. A unit test of the mark
+that never restarts the lane proves the mark, never its survival.
+
+### Code-snippet-shaped (`INV-15-CODE`)
+
+File `orchestrator/src/orchestrator/merge_lane/solo_marks.py` (new, the
+violation — illustrative, not a real file in this repo):
+
+```python
+class SoloMarks:
+    def __init__(self) -> None:
+        self._verify_alone: set[str] = set()
+
+    def mark_red_batch(self, request_ids: Iterable[str]) -> None:
+        self._verify_alone.update(request_ids)
+
+    def may_batch(self, request_id: str) -> bool:
+        return request_id not in self._verify_alone
+
+    def solo_verified(self, request_id: str) -> None:
+        self._verify_alone.discard(request_id)
+```
+
+**Expected `findings` entry**:
+
+```json
+{"anchor": "orchestrator/src/orchestrator/merge_lane/solo_marks.py::SoloMarks", "tags": ["inv-15"], "severity": "medium", "statement": "_verify_alone decides whether a request may be batched and lives only in memory; it is neither restored from a store, rebuilt from rows, nor declared dropped with an owner, so after an orchestrator restart every marked request is batched again before its solo verify, and no test restarts the lane to observe the mark"}
+```
+
 ## Rehearsal verdict table
 
 Walked 2026-07-14 against `skills/prd/references/gates.md` §"G7 — Design
