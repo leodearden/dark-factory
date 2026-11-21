@@ -1,14 +1,16 @@
 """A dependent dispatched on a predecessor's branch (task 10473, early start T2a).
 
-Drives the public ``TaskWorkflow.run()`` over a real GitOps and repo, built
-through ``build_workflow`` with a stack target, as the harness's launch will.
+Drives the public ``TaskWorkflow.run()`` over a real GitOps and repo. The
+workflow is built by the shared
+``_workflow_helpers.py::_build_workflow_with_escalation`` builder with a stack
+target; ``build_workflow``'s pass-through of ``stack_target`` is pinned in
+``test_workflow_factory.py``.
 Task D's worktree is created, or re-stacked, by the workflow's own
 ``create_worktree``; the scenes are the ones ``_stacked_repo`` builds.
 """
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -27,14 +29,20 @@ from _stacked_repo import (
     make_repo,
     rev_parse,
 )
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler, _make, agent_side_artifacts
+from _workflow_helpers import (
+    AgentStub,
+    FakeScheduler,
+    _build_workflow_with_escalation,
+    _make,
+    agent_side_artifacts,
+)
 from escalation.queue import EscalationQueue
 
 from orchestrator.branch_stack import StackRecordState, StackTarget
 from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, build_workflow
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.workflow_types import TerminalReport
 
 _GUARDED_REBASE_ABORT = '-c rerere.enabled=false rebase --abort'
@@ -69,19 +77,11 @@ def _assignment() -> TaskAssignment:
 
 
 def _workflow(
-    git_ops: GitOps, target: StackTarget, *, escalation_queue: EscalationQueue | None = None,
+    git_ops: GitOps, target: StackTarget, tmp_path: Path, *, escalation_queue: EscalationQueue | None = None,
 ) -> tuple[TaskWorkflow, FakeScheduler]:
-    scheduler = FakeScheduler()
-    workflow = build_workflow(
-        assignment=_assignment(),
-        config=_config(git_ops.project_root),
-        git_ops=git_ops,
-        scheduler=scheduler,  # type: ignore[arg-type]
-        briefing=FakeBriefing(),  # type: ignore[arg-type]
-        mcp=FakeMcp(),  # type: ignore[arg-type]
-        escalation_queue=escalation_queue,
-        merge_queue=asyncio.Queue(),
-        stack_target=target,
+    workflow, scheduler, _ = _build_workflow_with_escalation(
+        _config(git_ops.project_root), git_ops, _assignment(), AgentStub(), tmp_path,
+        spawn_merge_worker=False, queue=escalation_queue, stack_target=target,
     )
     return workflow, scheduler
 
@@ -117,7 +117,7 @@ class TestStackedDispatch:
         git_ops = await make_repo(tmp_path / 'repo')
         p_wt = await add_worktree(git_ops, 'P', 'main')
         p_tip = await commit_files(p_wt, {'p.txt': 'p\n'}, 'p1: write p.txt')
-        workflow, _ = _workflow(git_ops, StackTarget('task/P', p_tip))
+        workflow, _ = _workflow(git_ops, StackTarget('task/P', p_tip), tmp_path)
 
         _, first_agent = await _run(workflow, monkeypatch)
 
@@ -132,7 +132,7 @@ class TestStackedDispatch:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         scene = await build_restack_scene(await make_repo(tmp_path / 'repo'), conflicting=True)
-        workflow, scheduler = _workflow(scene.git_ops, StackTarget('task/P', scene.p_new))
+        workflow, scheduler = _workflow(scene.git_ops, StackTarget('task/P', scene.p_new), tmp_path)
 
         report, first_agent = await _run(workflow, monkeypatch)
 
@@ -149,7 +149,9 @@ class TestStackedDispatch:
         scene = await build_restack_scene(await make_repo(tmp_path / 'repo'), conflicting=True)
         fail_git_calls_starting(monkeypatch, tmp_path / 'shim', _GUARDED_REBASE_ABORT)
         queue = EscalationQueue(tmp_path / 'escalation_queue')
-        workflow, _ = _workflow(scene.git_ops, StackTarget('task/P', scene.p_new), escalation_queue=queue)
+        workflow, _ = _workflow(
+            scene.git_ops, StackTarget('task/P', scene.p_new), tmp_path, escalation_queue=queue,
+        )
 
         report, first_agent = await _run(workflow, monkeypatch)
 
