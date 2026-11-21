@@ -5,9 +5,13 @@ migration, checking each dump's size and sha256 at every hop.
 Why they are kept, and the retention rule: docs/falkordb-recovery-dumps.md.
 """
 
+import argparse
+import hashlib
 import re
+import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 LIVE_FALKORDB_DIR = PurePosixPath("fused-memory/data/falkordb")
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
@@ -142,3 +146,72 @@ RECOVERY_ARCHIVES: tuple[ArchiveDir, ...] = (
         ),
     ),
 )
+
+
+def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Carry the pinned FalkorDB recovery dumps through a host migration.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    copy = commands.add_parser(
+        "copy", help="copy every archive dir from SOURCE to DEST, then check the dumps under DEST")
+    copy.add_argument("source", type=Path, help="root holding the archive dirs at their repo paths")
+    copy.add_argument("dest", type=Path, help="root to receive them at the same relative paths")
+    check = commands.add_parser("check", help="check every pinned dump under ROOT")
+    check.add_argument("root", type=Path, help="root holding the archive dirs at their repo paths")
+    return parser.parse_args(argv)
+
+
+def log(message: str) -> None:
+    print(f"[recovery-archive] {message}", file=sys.stderr, flush=True)
+
+
+def dump_problems(path: Path, dump: PinnedDump) -> list[str]:
+    if not path.is_file():
+        return [f"{path}: missing"]
+    size = path.stat().st_size
+    if size != dump.size:
+        return [f"{path}: size {size} bytes, pinned {dump.size} bytes"]
+    with path.open("rb") as dump_file:
+        sha256 = hashlib.file_digest(dump_file, "sha256").hexdigest()
+    if sha256 != dump.sha256:
+        return [f"{path}: sha256 {sha256}, pinned {dump.sha256}"]
+    return []
+
+
+def check_root(root: Path, archives: Sequence[ArchiveDir]) -> list[str]:
+    problems: list[str] = []
+    for archive in archives:
+        problems += _archive_problems(root, archive)
+    return problems
+
+
+def _archive_problems(root: Path, archive: ArchiveDir) -> list[str]:
+    archive_dir = root / archive.path
+    if not archive_dir.is_dir():
+        return _logged_failures([f"{archive_dir}: archive directory missing"])
+    problems: list[str] = []
+    for dump in archive.dumps:
+        found = dump_problems(archive_dir / dump.name, dump)
+        if not found:
+            log(f"ok {archive.path}/{dump.name} ({dump.size} bytes) - pre-state of {dump.pre_state_of}")
+        problems += _logged_failures(found)
+    return problems
+
+
+def _logged_failures(problems: list[str]) -> list[str]:
+    for problem in problems:
+        log(f"FAILED {problem}")
+    return problems
+
+
+def main(argv: Sequence[str] | None = None, *,
+         archives: Sequence[ArchiveDir] = RECOVERY_ARCHIVES) -> int:
+    args = parse_args(argv)
+    if args.command == "copy":
+        raise NotImplementedError("copy lands in task 7153 step-6")
+    problems = check_root(args.root, archives)
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
