@@ -930,6 +930,9 @@ _TASK_NOTIFICATION = 'task-notification'
 class _BackgroundEvent(enum.Enum):
     LAUNCH = 'launch'
     REAP = 'reap'
+    # A terminal verdict submission: a reap that also outranks a launch whose
+    # call it follows, however late that launch is confirmed.
+    SUBMISSION = 'submission'
 
 
 def _mentions_token(texts: Iterable[str], tokens: set[str]) -> bool:
@@ -938,8 +941,9 @@ def _mentions_token(texts: Iterable[str], tokens: set[str]) -> bool:
     return any(token in text for text in texts for token in tokens)
 
 
-def _confirmed_launch_task_id(record: dict, launch_calls: Mapping[str, str]) -> str | None:
-    """Return the started task's id when *record* confirms a launch, else None.
+def _confirmed_launch(record: dict, launch_calls: Mapping[str, str]) -> tuple[str, str] | None:
+    """Return ``(call id, started task's id)`` when *record* confirms a launch,
+    else None.
 
     A confirmation is a tool_result answering a call in *launch_calls* (call id
     → confirming field, from ``_launch_call``) whose ``toolUseResult`` holds
@@ -958,7 +962,7 @@ def _confirmed_launch_task_id(record: dict, launch_calls: Mapping[str, str]) -> 
             continue
         task_id = tur.get(launch_calls[call_id])
         if _is_usable_token(task_id):
-            return task_id
+            return call_id, task_id
     return None
 
 
@@ -1021,23 +1025,23 @@ def _launch_call(block: dict) -> tuple[str, str] | None:
 
 
 def _classify_tool_use(block: dict, tokens: set[str]) -> _BackgroundEvent | None:
-    """Classify one tool_use *block* as a reap, or neither.
+    """Classify one tool_use *block* as a submission, a reap, or neither.
 
     A launch is never classified at its call: it is positioned at the result
-    that confirms it (``_confirmed_launch_task_id``).  Branch order is
-    load-bearing: ``Monitor`` call → named reap tool → token reference.  A
-    ``Monitor`` call is neither, so a Monitor naming a pending launch's token
-    does not reap it; any other call naming one, a backgrounded Bash included,
-    does.
+    that confirms it (``_confirmed_launch``).  Branch order is load-bearing:
+    ``Monitor`` call → terminal submission → named reap tool → token
+    reference.  A ``Monitor`` call is neither, so a Monitor naming a pending
+    launch's token does not reap it; any other call naming one, a backgrounded
+    Bash included, does.
     """
     name = block.get('name')
     if not isinstance(name, str):
         name = ''  # a malformed name matches no tool and must not raise on lookup
     if name == _MONITOR_TOOL:
         return None
-    if name in _BACKGROUND_REAP_TOOLS or (
-        _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS
-    ):
+    if _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS:
+        return _BackgroundEvent.SUBMISSION
+    if name in _BACKGROUND_REAP_TOOLS:
         return _BackgroundEvent.REAP
     if tokens and _mentions_token(_iter_input_strings(block.get('input')), tokens):
         return _BackgroundEvent.REAP
@@ -1045,13 +1049,16 @@ def _classify_tool_use(block: dict, tokens: set[str]) -> _BackgroundEvent | None
 
 
 def _background_events(records: list[dict]) -> Iterator[_BackgroundEvent]:
-    """Yield the background LAUNCH and REAP events of *records*, in record order.
+    """Yield the background events of *records*, in record order.
 
-    Owns the identity tokens harvested so far and the launch calls seen so far,
-    each mapped to the ``toolUseResult`` field that would confirm it.
+    Owns the identity tokens harvested so far, the launch calls seen so far
+    (each mapped to the ``toolUseResult`` field that would confirm it), and the
+    launch calls a terminal submission followed, which no later confirmation
+    makes a launch.
     """
     tokens: set[str] = set()
     launch_calls: dict[str, str] = {}
+    submitted_after_calls: set[str] = set()
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -1062,10 +1069,12 @@ def _background_events(records: list[dict]) -> Iterator[_BackgroundEvent]:
             continue
         if record.get('type') == 'user':
             _collect_bg_tokens(record, tokens)
-            task_id = _confirmed_launch_task_id(record, launch_calls)
-            if task_id is not None:
+            confirmed = _confirmed_launch(record, launch_calls)
+            if confirmed is not None:
+                call_id, task_id = confirmed
                 tokens.add(task_id)
-                yield _BackgroundEvent.LAUNCH
+                if call_id not in submitted_after_calls:
+                    yield _BackgroundEvent.LAUNCH
             continue
         if record.get('type') != 'assistant':
             continue
@@ -1077,6 +1086,8 @@ def _background_events(records: list[dict]) -> Iterator[_BackgroundEvent]:
                 call_id, confirming_field = launch_call
                 launch_calls[call_id] = confirming_field
             event = _classify_tool_use(block, tokens)
+            if event is _BackgroundEvent.SUBMISSION:
+                submitted_after_calls.update(launch_calls)
             if event is not None:
                 yield event
 
@@ -1119,13 +1130,23 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
       * a terminal verdict submission (one of ``_TERMINAL_SUBMISSION_TOOLS``,
         matched on the segment after the last ``__``) — calling one writes the
         role's whole deliverable to ``verdicts/<role>.json``, so the session has
-        finished its job and cannot still be waiting on anything.
+        finished its job and cannot still be waiting on anything.  It also
+        outranks a launch whose call it follows, even one confirmed after it.
 
     Fire (True) iff the final background event is a launch — the session's
     final background event was a launch never followed by a reap.  Any
     engagement with a background task (a reap of any kind after it) clears the
     verdict, keeping precision high and avoiding fragile shell-id /
     result-text parsing that differs across CLI versions.
+
+    Ordering in a parallel batch: the CLI writes every tool_use of a message
+    before any tool_result, so a reap issued beside a launch call sits before
+    that launch's confirmation.  It cannot engage a task not yet started, so
+    the launch outranks it.  A terminal submission is the exception, since it
+    ends the job whatever is still pending.  Both verdicts are pinned:
+    shared/tests/test_cli_invoke_background.py::TestBashLaunchNeedsConfirmation::test_reap_beside_the_launch_call_does_not_outrank_it
+    and
+    shared/tests/test_cli_invoke_background.py::TestVerdictSubmissionClearsVerdict::test_submission_beside_the_launch_call_is_false.
 
     RCA for the second reap clause (task 3639): the original vocabulary named
     only the three background-management tools, so the very common shape of

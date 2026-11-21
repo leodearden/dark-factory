@@ -241,6 +241,13 @@ def _monitor_rejected(tool_id: str = 'toolu_mon1') -> dict:
     }
 
 
+# The call and its confirming result, for each launch kind.
+_EACH_LAUNCH_KIND = [
+    pytest.param(bash_launch(), bg_launch_result(), id='bash'),
+    pytest.param(_monitor_call(), _monitor_armed(), id='monitor'),
+]
+
+
 def _monitor_event_text(
     task_id: str = MONITOR_TASK_ID,
     event: str = '4953 passed, 1 skipped in 262.80s',
@@ -714,6 +721,21 @@ class TestVerdictSubmissionClearsVerdict:
         ]
         assert detect_ended_awaiting_background(records) is True
 
+    @pytest.mark.parametrize(('launch_call', 'confirmation'), _EACH_LAUNCH_KIND)
+    def test_submission_beside_the_launch_call_is_false(
+        self, launch_call: dict, confirmation: dict
+    ) -> None:
+        """A parallel batch.  The CLI writes every tool_use of a message before
+        any tool_result, so a submission issued beside a launch call sits
+        before the launch's confirmation.  The deliverable is written whatever
+        is still pending, so the submission outranks that launch → False."""
+        records = [
+            assistant_record([launch_call]),
+            assistant_record([_verdict_submit('mcp__verdict-tools__submit_review_verdict')]),
+            confirmation,
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
     def test_submit_task_is_not_a_terminal_submission(self) -> None:
         """NEGATIVE control (no over-widening): filing a follow-up task is not a
         terminal verdict — agents call it mid-session while a background command
@@ -999,6 +1021,63 @@ class TestBashLaunchNeedsConfirmation:
             _user_result('toolu_some', 'ok', {'backgroundTaskId': 'bq9imj9co'}, is_error=False),
         ]
         assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize(
+        ('launch_call', 'other_kinds_confirmation'),
+        [
+            pytest.param(
+                bash_launch(),
+                _user_result(
+                    'toolu_1',
+                    'Command running in background with ID: bq9imj9co.',
+                    {'stdout': '', 'taskId': 'bq9imj9co'},
+                    is_error=False,
+                ),
+                id='bash-answered-by-taskId',
+            ),
+            pytest.param(
+                _monitor_call(),
+                _user_result(
+                    'toolu_mon1',
+                    f'Monitor started (task {MONITOR_TASK_ID}, timeout 900000ms).',
+                    {'backgroundTaskId': MONITOR_TASK_ID},
+                    is_error=False,
+                ),
+                id='monitor-answered-by-backgroundTaskId',
+            ),
+        ],
+    )
+    def test_a_launch_is_confirmed_only_by_its_own_kinds_field(
+        self, launch_call: dict, other_kinds_confirmation: dict
+    ) -> None:
+        """Each launch kind has one confirming field: ``backgroundTaskId`` for
+        a run_in_background Bash, ``taskId`` for a Monitor.  The other kind's
+        field confirms nothing."""
+        records = [
+            assistant_record([launch_call]),
+            other_kinds_confirmation,
+            assistant_record([_text('Waiting for it to finish.')]),
+        ]
+        assert detect_ended_awaiting_background(records) is False
+
+    @pytest.mark.parametrize(('launch_call', 'confirmation'), _EACH_LAUNCH_KIND)
+    def test_reap_beside_the_launch_call_does_not_outrank_it(
+        self, launch_call: dict, confirmation: dict
+    ) -> None:
+        """A launch is ordered at its confirmation.  A reap issued beside its
+        call, in the same parallel batch, sits before that confirmation and
+        cannot engage a task not yet started, so the launch stays the final
+        event → True.  Contrast
+        TestVerdictSubmissionClearsVerdict::test_submission_beside_the_launch_call_is_false."""
+        records = [
+            *confirmed_bash_launch(command='job-a', tool_id='toolu_a', task_id='aaa11111'),
+            assistant_record([launch_call]),
+            assistant_record(
+                [{'type': 'tool_use', 'name': 'TaskStop', 'input': {'task_id': 'aaa11111'}}]
+            ),
+            confirmation,
+        ]
+        assert detect_ended_awaiting_background(records) is True
 
     def test_auto_backgrounded_foreground_bash_is_false_documented_gap(self) -> None:
         """DOCUMENTED, ACCEPTED false negative.  Specimen dark-factory 3799: the
