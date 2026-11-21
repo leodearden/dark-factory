@@ -701,12 +701,14 @@ def test_a_target_the_same_act_co_cancels_is_refused(
     assert refusal == (Reason.TARGET_CANCELLED, field, 7008)
 
 
-def test_a_path_through_a_co_cancelled_task_closes_no_cycle():
-    _check(
+def test_a_path_through_a_co_cancelled_task_is_refused():
+    refusal = _refusal_of(
         {7007: RepointDisposition(onto=(SUPERSEDER,))},
         depends_on={SUPERSEDER: [7008], 7008: [7007]},
         co_cancelled=(7008,),
     )
+
+    assert refusal == (Reason.REPOINT_CYCLE, 'children.7007.onto', SUPERSEDER)
 
 
 @pytest.mark.parametrize(
