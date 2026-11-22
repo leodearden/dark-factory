@@ -10,6 +10,8 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -128,9 +130,17 @@ class TestTheArms:
         assert mod.ARMS['o1'].instructions_version == mod.O1_INSTRUCTIONS_VERSION
         assert mod.ARMS['control'].instructions_version == mod.NO_INSTRUCTIONS
 
-    def test_o6_is_two_arms_one_per_reasoning_effort(self) -> None:
-        """esc-9065-2: 'o6' could only ever mean one effort, so each measured effort is its own arm."""
-        assert sorted(mod.ARMS) == ['control', 'o1', 'o6-low', 'o6-medium']
+    def test_the_registry_is_one_o6_arm_per_effort_and_the_luna_arm(self) -> None:
+        """esc-9065-2: 'o6' could only ever mean one effort, so each measured effort is its own arm.
+        Task 9945 adds the one luna arm its migration eval measures."""
+        assert sorted(mod.ARMS) == ['control', 'luna-low', 'o1', 'o6-low', 'o6-medium']
+
+    def test_the_luna_arm_is_the_controls_instructions_on_luna_at_low_on_the_plan_proxy(self) -> None:
+        assert mod.LUNA_MODEL == 'gpt-6-luna'
+        assert mod.ARMS['luna-low'] == mod.ReplayArm(
+            'luna-low', None, mod.NO_INSTRUCTIONS,
+            mod.ExtractionLlm(mod.LUNA_MODEL, 'low', mod.ArmEndpoint.plan_proxy),
+        )
 
     @pytest.mark.parametrize('effort', ['low', 'medium'])
     def test_each_o6_arm_is_the_controls_instructions_on_the_stronger_model_at_its_effort(
@@ -144,7 +154,7 @@ class TestTheArms:
     def test_the_control_and_o1_extract_on_the_configured_client(self, arm: str) -> None:
         llm = mod.ARMS[arm].llm
         assert llm == mod.ExtractionLlm()
-        assert (llm.model, llm.reasoning_effort) == (None, None)
+        assert (llm.model, llm.reasoning_effort, llm.endpoint) == (None, None, mod.ArmEndpoint.configured)
 
     def test_an_extraction_llm_is_a_frozen_hashable_key(self) -> None:
         llm = mod.ExtractionLlm(mod.O6_MODEL, 'low')
@@ -286,6 +296,21 @@ class TestTheResult:
         control = await _replay(_FakeLLM(), 'control')
         assert mod.replayed_record(o6_low, _input())['reasoning_effort'] == 'low'
         assert mod.replayed_record(control, _input())['reasoning_effort'] is None
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_record_carries_its_arms_endpoint(self) -> None:
+        luna = await _replay(_FakeLLM(model=mod.LUNA_MODEL, reasoning_effort='low'), 'luna-low')
+        control = await _replay(_FakeLLM(), 'control')
+        assert (luna.endpoint, control.endpoint) == (mod.ArmEndpoint.plan_proxy, mod.ArmEndpoint.configured)
+        assert mod.replayed_record(luna, _input())['endpoint'] == 'plan_proxy'
+        assert mod.replayed_record(control, _input())['endpoint'] == 'configured'
+
+    def test_a_failed_record_carries_its_arms_endpoint(self) -> None:
+        llm = _FakeLLM(model=mod.LUNA_MODEL, reasoning_effort='low')
+        record = mod.failed_record(mod.ARMS['luna-low'], llm, _worksheet_row(), RuntimeError('proxy down'))
+        assert (record['arm'], record['model'], record['endpoint']) == ('luna-low', mod.LUNA_MODEL, 'plan_proxy')
+        control = mod.failed_record(mod.ARMS['control'], _FakeLLM(), _worksheet_row(), RuntimeError('down'))
+        assert control['endpoint'] == 'configured'
 
     def test_a_failed_record_carries_the_clients_model_and_reasoning_effort(self) -> None:
         llm = _FakeLLM(model=mod.O6_MODEL, reasoning_effort='medium')
@@ -472,6 +497,59 @@ class TestBuildArmLlm:
         with pytest.raises(mod.ArmClientMismatch) as raised:
             mod.build_arm_llm(generic, mod.ExtractionLlm(mod.O6_MODEL, 'low'))
         assert 'openai_generic' in str(raised.value) and 'low' in str(raised.value)
+
+
+PROXY_URL, PROXY_KEY = 'http://127.0.0.1:8317/v1', 'proxy-test-key'
+CONFIGURED_URL = 'https://configured.example/v1'
+
+
+@pytest.fixture
+def plan_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('OPENAI_PLAN_PROXY_URL', PROXY_URL)
+    monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', PROXY_KEY)
+
+
+def _sdk_endpoint(client: Any) -> tuple[str, str]:
+    return str(client.client.base_url).rstrip('/'), client.client.api_key
+
+
+@pytest.mark.usefixtures('plan_proxy_env')
+class TestThePlanProxyEndpoint:
+    def test_the_variables_are_the_plan_proxys(self) -> None:
+        assert (mod.PLAN_PROXY_URL_ENV, mod.PLAN_PROXY_KEY_ENV) == ('OPENAI_PLAN_PROXY_URL', 'OPENAI_PLAN_PROXY_KEY')
+
+    def test_a_plan_proxy_llm_builds_the_effort_client_on_the_proxy(self, mock_config: FusedMemoryConfig) -> None:
+        before = mock_config.model_dump()
+        client = mod.build_arm_llm(mock_config, mod.ARMS['luna-low'].llm)
+        assert isinstance(client, mod.ExplicitEffortOpenAIClient)
+        assert (client.model, client.reasoning_effort) == (mod.LUNA_MODEL, 'low')
+        assert _sdk_endpoint(client) == (PROXY_URL, PROXY_KEY)
+        assert isinstance(client.token_tracker, AttributingTokenUsageTracker)
+        assert mock_config.model_dump() == before
+
+    @pytest.mark.parametrize('llm', [mod.ExtractionLlm(), mod.ExtractionLlm(mod.O6_MODEL, 'low')])
+    def test_a_configured_endpoint_llm_builds_on_the_configs_url_and_key(
+        self, mock_config: FusedMemoryConfig, llm: Any,
+    ) -> None:
+        cfg = mock_config.model_copy(deep=True)
+        cfg.llm.providers.openai.api_url = CONFIGURED_URL
+        client = mod.build_arm_llm(cfg, llm)
+        assert client is not None and _sdk_endpoint(client) == (CONFIGURED_URL, 'test-key')
+
+    @pytest.mark.parametrize('missing', ['OPENAI_PLAN_PROXY_URL', 'OPENAI_PLAN_PROXY_KEY'])
+    @pytest.mark.parametrize('unset', ['absent', 'blank'])
+    def test_the_resolver_refuses_an_unset_variable_by_name(
+        self, monkeypatch: pytest.MonkeyPatch, missing: str, unset: str,
+    ) -> None:
+        if unset == 'absent':
+            monkeypatch.delenv(missing)
+        else:
+            monkeypatch.setenv(missing, '')
+        with pytest.raises(mod.ArmClientMismatch, match=missing):
+            mod.plan_proxy_endpoint(dict(os.environ))
+
+    def test_the_resolver_reads_the_url_and_key(self) -> None:
+        assert mod.plan_proxy_endpoint(dict(os.environ)) == (PROXY_URL, PROXY_KEY)
 
 
 # --------------------------------------------------------------------------- #
@@ -877,6 +955,47 @@ class TestReplayCommand:
         assert _run_replay_on(paths, factory, 'control', 'o6-low') == 1
         assert not paths['replay'].exists()
         assert all(client.calls == [] for client in factory.clients.values())
+
+    @pytest.mark.usefixtures('plan_proxy_env')
+    @pytest.mark.parametrize('missing', ['OPENAI_PLAN_PROXY_URL', 'OPENAI_PLAN_PROXY_KEY'])
+    def test_a_luna_replay_without_the_proxy_env_exits_2_naming_it_and_writes_nothing(
+        self, tmp_path: Path, mock_config: FusedMemoryConfig, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture, missing: str,
+    ) -> None:
+        monkeypatch.delenv(missing)
+        paths = _cli_inputs(tmp_path)
+        with caplog.at_level(logging.ERROR):
+            code = _run_replay_on(paths, lambda spec: mod.build_arm_llm(mock_config, spec), 'control', 'luna-low')
+        assert code == 2 and not paths['replay'].exists()
+        assert missing in caplog.text
+
+    def test_a_luna_record_names_the_plan_proxy_endpoint(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay_on(paths, _ClientsByLlm(), 'control', 'luna-low') == 0
+        endpoints = {(r['arm'], r['endpoint']) for r in _records(paths['replay'])}
+        assert endpoints == {('control', 'configured'), ('luna-low', 'plan_proxy')}
+
+    def test_a_recorded_arm_on_another_endpoint_than_its_clients_exits_2(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay_on(paths, _ClientsByLlm(), 'luna-low') == 0
+        rewritten = [r | {'endpoint': 'configured'} for r in _records(paths['replay'])]
+        paths['replay'].write_text(''.join(json.dumps(r) + '\n' for r in rewritten))
+        before = paths['replay'].read_bytes()
+        factory = _ClientsByLlm()
+        assert _run_replay_on(paths, factory, 'luna-low') == 2
+        assert paths['replay'].read_bytes() == before
+        assert all(client.calls == [] for client in factory.clients.values())
+
+    def test_a_record_written_before_9945_resumes_on_the_configured_endpoint(self, tmp_path: Path) -> None:
+        """A record with no 'endpoint' key was replayed on the configured client's endpoint."""
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay_on(paths, _ClientsByLlm(), 'control') == 0
+        legacy = [{k: v for k, v in r.items() if k != 'endpoint'} for r in _records(paths['replay'])]
+        paths['replay'].write_text(''.join(json.dumps(r) + '\n' for r in legacy))
+        second = _ClientsByLlm()
+        assert _run_replay_on(paths, second, 'control', 'luna-low') == 0
+        assert second.clients[CONTROL_LLM].calls == []
+        assert len(_records(paths['replay'])) == 6
 
     def test_the_retired_o6_arm_is_refused(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
