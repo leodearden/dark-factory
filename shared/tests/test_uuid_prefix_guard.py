@@ -2545,3 +2545,76 @@ class TestADeclaredExemptPathIsNeverRepaired:
                 lambda arguments: PROJECT,
                 exempt_paths={'update_task': frozenset({()})},
             )
+
+
+# ---------------------------------------------------------------------------
+# A JSON-string metadata is walked as structure.
+# ---------------------------------------------------------------------------
+#
+# The shape task 7135's migration script sends. Its values get the same
+# structured paths a dict metadata's do, so a declared exempt path holds in
+# both wire shapes, and the tool receives the string shape it was sent.
+
+
+class TestAJsonStringMetadataIsWalkedAsStructure:
+    async def test_the_exempt_value_survives_and_a_sibling_key_is_expanded(self) -> None:
+        h = path_exempt_harness()
+        sent = json.dumps({
+            'done_provenance': {'kind': 'merged', 'note': f'per observation {BFF}'},
+            'x_note': f'see {BFF}',
+        })
+        result = await h.call('update_task', {'task_id': '7', 'project_root': PROJECT, 'metadata': sent})
+        received = h.recorder.args['metadata']
+        assert isinstance(received, str)
+        decoded = json.loads(received)
+        assert decoded['done_provenance']['note'] == f'per observation {BFF}'
+        assert decoded['x_note'] == f'see {BFF_FULL}'
+        repair = repair_of(result)
+        assert repair is not None
+        assert [(r['path'], r['field']) for r in repair['substitutions']] == [
+            (['metadata', 'x_note'], 'metadata')
+        ]
+
+    async def test_a_string_whose_only_token_is_exempt_is_forwarded_byte_identical(self) -> None:
+        h = path_exempt_harness()
+        sent = json.dumps(
+            {'done_provenance': {'kind': 'merged', 'note': f'per observation {BFF}'}}, indent=2
+        )
+        result = await h.call('update_task', {'task_id': '7', 'project_root': PROJECT, 'metadata': sent})
+        assert h.recorder.args['metadata'] == sent
+        assert h.resolver.prefixes == []
+        assert repair_of(result) is None
+
+    async def test_an_untouched_string_beside_an_expansion_is_forwarded_byte_identical(self) -> None:
+        h = path_exempt_harness()
+        sent = json.dumps({'kind': 'merged', 'note': 'no identifiers'}, indent=2)
+        await h.call(
+            'update_task',
+            {'task_id': '7', 'project_root': PROJECT, 'description': f'see {BFF}', 'metadata': sent},
+        )
+        assert h.recorder.args['description'] == f'see {BFF_FULL}'
+        assert h.recorder.args['metadata'] == sent
+
+    async def test_the_decoded_walk_is_uniform_across_tools(self) -> None:
+        h = build_harness(answers={BFF: unique(BFF_FULL)})
+        sent = json.dumps({'source': f'see {BFF}'})
+        result = await h.call(
+            'add_memory', {'content': 'c', 'project_id': PROJECT, 'metadata': sent}
+        )
+        received = h.recorder.args['metadata']
+        assert isinstance(received, str)
+        assert json.loads(received) == {'source': f'see {BFF_FULL}'}
+        repair = repair_of(result)
+        assert repair is not None
+        assert [r['path'] for r in repair['substitutions']] == [['metadata', 'source']]
+
+    async def test_a_rejection_bounces_the_callers_own_string(self) -> None:
+        h = build_harness(answers={AMB: AMBIGUOUS})
+        sent = json.dumps({'supersedes': f'see {AMB}'}, indent=2)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'submit_task',
+                {'title': 't', 'description': 'd', 'project_root': PROJECT, 'metadata': sent},
+            )
+        assert h.recorder.calls == []
+        assert rejection_payload(excinfo)['original_call']['metadata'] == sent
