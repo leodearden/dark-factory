@@ -35,6 +35,7 @@ __all__ = [
     'ReserveClock',
     'cap_account',
     'cap_all_but_reserve',
+    'fake_tokens',
     'reserve_gate',
     'write_reserve_accounts_file',
 ]
@@ -68,6 +69,11 @@ class ReserveClock:
 
 def _token_env(name: str) -> str:
     return f'TEST_TOKEN_{name.upper().replace("-", "_")}'
+
+
+def fake_tokens(account_names: Sequence[str] = POOL) -> dict[str, str]:
+    """The environment that resolves a fake token for each account the accounts file names."""
+    return {_token_env(name): f'fake-token-{name}' for name in account_names}
 
 
 def write_reserve_accounts_file(
@@ -108,8 +114,7 @@ def reserve_gate(
             **usage_cap,
         }
     )
-    tokens = {_token_env(name): f'fake-token-{name}' for name in account_names}
-    with patch.dict(os.environ, tokens):
+    with patch.dict(os.environ, fake_tokens(account_names)):
         return UsageGate(config, cost_store=cost_store, reserve_clock=clock)
 
 
