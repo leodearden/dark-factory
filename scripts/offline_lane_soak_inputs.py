@@ -68,9 +68,14 @@ class Unjudgeable:
 
 class TaskReader(Protocol):
     """``flake_ledger.FlakeLedgerTaskClient.get_task``'s convention: ``(task, None)`` read,
-    ``(None, None)`` a corroborated absence, ``(None, error)`` a failed read."""
+    ``(None, None)`` a corroborated absence, ``(None, error)`` a failed read.
+
+    :meth:`task_ids_with_metadata` answers the id of every task, any status, whose top-level
+    ``metadata[key]`` equals *value*, in id order, or ``(None, error)`` for a failed read."""
 
     async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]: ...
+
+    async def task_ids_with_metadata(self, key: str, value: str) -> tuple[list[str] | None, Exception | None]: ...
 
 
 class ToolClient(Protocol):
@@ -81,6 +86,23 @@ class ToolClient(Protocol):
 
 _TASK_NOT_FOUND = 'TaskNotFoundError'
 _FAILED_CALL_ERRORS = (httpx.HTTPError, RuntimeError, ValueError, AttributeError, KeyError, TypeError)
+# The server's cap on one lookup page (fused-memory/src/fused_memory/server/tools.py::find_tasks_by_metadata).
+_LOOKUP_PAGE = 100
+
+
+def _lookup_page(reply: Any) -> tuple[list[str], bool] | str:
+    """One ``find_tasks_by_metadata`` page as (its task ids, has_more), or why the reply is not one."""
+    problem = write_failure_reason(reply)
+    if problem is not None:
+        return problem
+    rows = reply.get('results')
+    pagination = reply.get('pagination')
+    has_more = pagination.get('has_more') if isinstance(pagination, Mapping) else None
+    if not isinstance(rows, list) or not all(isinstance(row, Mapping) and 'task_id' in row for row in rows):
+        return 'the reply carries no list of task rows'
+    if not isinstance(has_more, bool):
+        return 'the reply carries no boolean pagination.has_more'
+    return [str(row['task_id']) for row in rows], has_more
 
 
 class FusedMemoryTaskReader:
@@ -92,6 +114,9 @@ class FusedMemoryTaskReader:
     failure, a JSON-RPC error (RuntimeError), a body that is not JSON (ValueError), or one
     that is not a JSON-RPC object (AttributeError, KeyError or TypeError, from reading it as
     one).  Any other exception propagates.
+
+    :meth:`task_ids_with_metadata` reads ``find_tasks_by_metadata`` page by page, and answers
+    a failed reply, a reply that is not a page of task rows, or such a raise as a failed read.
     """
 
     def __init__(self, client: ToolClient, project_root: str) -> None:
@@ -109,6 +134,29 @@ class FusedMemoryTaskReader:
         if problem is not None:
             return None, RuntimeError(f'get_task {task_id}: {problem}')
         return reply, None
+
+    async def task_ids_with_metadata(self, key: str, value: str) -> tuple[list[str] | None, Exception | None]:
+        task_ids: list[str] = []
+        has_more = True
+        while has_more:
+            page = await self._lookup(key, value, offset=len(task_ids))
+            if isinstance(page, Exception):
+                return None, page
+            found, has_more = page
+            task_ids.extend(found)
+            has_more = has_more and bool(found)
+        return task_ids, None
+
+    async def _lookup(self, key: str, value: str, *, offset: int) -> tuple[list[str], bool] | Exception:
+        arguments = {
+            'project_root': self._project_root, 'key': key, 'value': value, 'limit': _LOOKUP_PAGE, 'offset': offset,
+        }
+        try:
+            reply: Any = await self._client.call_tool('find_tasks_by_metadata', arguments)
+        except _FAILED_CALL_ERRORS as exc:
+            return exc
+        page = _lookup_page(reply)
+        return RuntimeError(f'find_tasks_by_metadata {key}={value}: {page}') if isinstance(page, str) else page
 
 
 @dataclass(frozen=True)

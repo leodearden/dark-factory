@@ -155,13 +155,16 @@ class FakeTaskStore:
     """The ledger's task seam (``flake_ledger.FlakeLedgerTaskClient``) and the soak report's task reader.
 
     An id told :meth:`answer_absent` reads as a corroborated absence, and one told
-    :meth:`fail` as a failed read, by the ``(task, error)`` convention.
+    :meth:`fail` as a failed read, by the ``(task, error)`` convention.  A metadata lookup
+    answers the ids of :attr:`tasks` carrying the value, but not those told
+    :meth:`answer_absent`; after :meth:`fail_lookups` every lookup is a failed read.
     """
 
     def __init__(self) -> None:
         self.tasks: dict[str, dict[str, Any]] = {}
         self.absent: set[str] = set()
         self.failing: set[str] = set()
+        self.lookups_fail = False
         self._next_id = 9000
 
     def answer_absent(self, task_id: str) -> None:
@@ -169,6 +172,9 @@ class FakeTaskStore:
 
     def fail(self, task_id: str) -> None:
         self.failing.add(task_id)
+
+    def fail_lookups(self) -> None:
+        self.lookups_fail = True
 
     async def submit_task(self, arguments: dict) -> SubmittedTask:
         self._next_id += 1
@@ -193,6 +199,15 @@ class FakeTaskStore:
         if task_id in self.absent or task_id not in self.tasks:
             return None, None
         return copy.deepcopy(self.tasks[task_id]), None
+
+    async def task_ids_with_metadata(self, key: str, value: str) -> tuple[list[str] | None, Exception | None]:
+        if self.lookups_fail:
+            return None, ConnectionError(f'task store unreachable looking up {key}={value}')
+        found = [
+            task_id for task_id, task in self.tasks.items()
+            if task_id not in self.absent and task.get('metadata', {}).get(key) == value
+        ]
+        return sorted(found, key=int), None
 
     async def commit_planning(self, task_ids: list[str]) -> None:
         for task_id in task_ids:
