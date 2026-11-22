@@ -375,7 +375,8 @@
    "Extraction: replay.jsonl, the replay log and anything scored from them were not opened while labelling. After labelling, validate_verdicts read replay.jsonl to check coverage and printed only the accepted and stale counts.",
    "Extraction: near-duplicate facts sat side by side within an episode, so an adjudicator could infer that the two copies come from different arms. Edges also differed in surface style (e.g. 'Task 166 (solar_challenge_platform)' against 'Task 166'; 'Liveness-snapshot memory' against 'liveness-snapshot memory'). No style-to-arm mapping was checked, and near-duplicates were labelled alike.",
    "Extraction: the running label tally over the UNION of arms was printed once, after all 54 episodes were labelled; it was never printed per arm.",
-   "resolve_edge: before labelling, the adjudicator saw the worksheet's 200 rows, their field names (fact, fixture_id, invalidation_candidates, related) and the totals of related facts (566, 1 to 10 per fixture) and invalidation candidates (1844, 0 to 10 per fixture). No arm output was opened while labelling. Some related and candidate facts were near-duplicates in different wording; they carry no arm attribution, since they were drawn from the stored graph before either arm ran."
+   "resolve_edge: before labelling, the adjudicator saw the worksheet's 200 rows, their field names (fact, fixture_id, invalidation_candidates, related) and the totals of related facts (566, 1 to 10 per fixture) and invalidation candidates (1844, 0 to 10 per fixture). No arm output was opened while labelling. Some related and candidate facts were near-duplicates in different wording; they carry no arm attribution, since they were drawn from the stored graph before either arm ran.",
+   "routing: the worksheet's line count (230 discordant classifier and router items, of 503 fixtures) was seen in the step-25 session before any routing labelling. Each row shows both arms' labels in sha256(fixture_id:label) order, so the adjudicator saw which two labels were in dispute but not which arm gave which. The classifier inputs are the write journal's stored content, at most 200 characters, the same text both arms classified."
   ],
   "extraction": {
    "adjudicator": "claude-task-9945-implementer, the role that ran the arms, in a later session of the same task; single, self-blinded, no sub-agents",
@@ -424,6 +425,58 @@
     "unjudgeable": 0
    },
    "validated": "luna_eval_score.py::load_resolve_gold over the worksheet rows: 200 accepted. Only the counts above were printed."
+  },
+  "routing": {
+   "adjudicator": "claude-task-9945-implementer, the role that ran the arms, in a later session of the same task; single, self-blinded, no sub-agents",
+   "procedure": "one sitting in the same session as the resolve_edge gold, after its commit 980459bd4e. The worksheet /tmp/9945-routing.jsonl had been written by `luna_migration_eval.py worksheet --kind routing --dir $EVAL --runs $EVAL/runs.jsonl --out /tmp/9945-routing.jsonl` (rc 0) in the step-25 session. Items were labelled in worksheet order 000..229 (95 classifier, then 135 router), each shown as its site, its text and its two labels in sha256 order, in batches of 40 to 70, every batch written to disk before the next was shown. Each item was judged against the production prompt's own definitions, routing/classifier.py::CLASSIFICATION_SYSTEM_PROMPT and routing/router.py::ROUTING_SYSTEM_PROMPT, on the text the arms saw. runs.jsonl and the fixture files' reference_category were not opened.",
+   "rubric": "design.md §2.6 routing: the correct label from the site's full vocabulary, which may be neither arm's",
+   "conventions": [
+    "temporal_facts: the record's point is a status or a change event: \"Task '...' completed. Landed in commit ...\", \"As of D ...\", \"no longer lives in X; moved to Y\", \"seeded ... on D\".",
+    "entities_and_relations: the point is how code or project things are structured or connected, even when a task or plan is credited with it.",
+    "decisions_and_rationale: the point is a choice and why (\"Decision: ...\", ruled, chose, declined).",
+    "preferences_and_norms: a rule for how things should be done: a convention, a style or placement rule, a norm for addressing Leo.",
+    "procedural_knowledge: how to do something: steps, a workflow, a gotcha with how to avoid or reproduce it.",
+    "observations_and_summaries: a high-level takeaway or session recap, not one structural fact.",
+    "judged on the query's own wording against the prompt's cue phrases; a query that names a topic with no cue phrase is broad.",
+    "(added at item 042, before it was written; 031/033 already agree) a record that calls itself a gotcha is procedural_knowledge, the project's own category for gotcha-class entries, unless it is phrased as a convention or rule.",
+    "(added at item 085) a naming, style, shape or placement rule for tests is preferences_and_norms; \"use helper X to do Y\" is procedural_knowledge.",
+    "a \"Completed: <title> / Description: ...\" record is a completion event, like \"Task '...' completed.\": temporal_facts.",
+    "'conventions and gotchas for ...', or a query that asks for a convention, is preference (\"what's the convention\").",
+    "'blockers for: ...' is relational (\"what depends on X\").",
+    "'resolution for: ...' asks how an issue was settled; no type names that, so it is broad.",
+    "a task title, a review finding, a bug title or a keyword string over a topic is broad.",
+    "a short query (about 6 words or fewer) that names only specific identifiers (a symbol, file, field or device name) is entity_lookup (\"what is X\", \"how are X and Y related\").",
+    "'recent', 'history', 'since', 'what changed' make it temporal; 'status' alone does not.",
+    "an error message plus the command that hit it asks how to fix it: procedural."
+   ],
+   "verdict_file": "verdicts-routing.json",
+   "verdicts": {
+    "classifier": 95,
+    "router": 135
+   },
+   "label_counts": {
+    "classifier": {
+     "temporal_facts": 29,
+     "preferences_and_norms": 25,
+     "procedural_knowledge": 27,
+     "entities_and_relations": 12,
+     "decisions_and_rationale": 1,
+     "observations_and_summaries": 1
+    },
+    "router": {
+     "broad": 104,
+     "temporal": 1,
+     "procedural": 6,
+     "preference": 15,
+     "entity_lookup": 7,
+     "relational": 2
+    }
+   },
+   "gold_neither_offered_label": {
+    "classifier": 29,
+    "router": 13
+   },
+   "validated": "luna_eval_score.py::load_routing_verdicts over the worksheet rows: 230 accepted. Only the counts above, over the union of arms, were printed."
   }
  }
 }
