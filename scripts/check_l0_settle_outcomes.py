@@ -2,7 +2,8 @@
 """Count stranded and wrongly dismissed blocking L0 escalations in one escalation queue directory.
 
 ``--queue-dir DIR --window-days N --baseline-stranded-per-100 F --ratio R --min-stranded K
---max-reaper-wrong M --max-pending-hours H`` reads DIR's live records and its dated archive, writes
+--baseline-non-startup-wrong-per-100 G --min-non-startup-wrong J --max-reaper-wrong M
+--max-pending-hours H`` reads DIR's live records and its dated archive, writes
 nothing, and prints human lines followed by a compact JSON object as the last line. It exits 1 when a
 threshold is breached, 0 otherwise, and 2 when it cannot judge: the queue directory could not be read,
 or no blocking L0 was filed in the post window. The rules and thresholds are
@@ -20,7 +21,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, ClassVar, Final
+from typing import Any, ClassVar, Final, Literal
 
 # orchestrator/src/orchestrator/harness.py::Harness._reap_orphan_l0_escalations
 REAPER_RESOLVER: Final = 'harness-orphan-reaper'
@@ -403,32 +404,72 @@ def measure(records: Sequence[Record], *, now: datetime, window_days: int, max_p
 
 class Breach(enum.StrEnum):
     STRANDED_RATE = 'stranded_rate'
+    NON_STARTUP_WRONG_RATE = 'non_startup_wrong_rate'
     REAPER_WRONG = 'reaper_wrong'
     PENDING_OVER_H = 'pending_over_h'
 
 
 @dataclass(frozen=True)
+class RateRule:
+    baseline_per_100: float
+    minimum: int
+
+
+@dataclass(frozen=True)
 class Thresholds:
-    baseline_stranded_per_100: float
     ratio: float
-    min_stranded: int
+    stranded: RateRule
+    non_startup_wrong: RateRule
     max_reaper_wrong: int
 
 
-def stranded_bar_per_100(report: Report, thresholds: Thresholds) -> float:
-    """R * max(pre rate, F): an empty pre window counts as 0, so the baseline floor F applies."""
-    return thresholds.ratio * max(report.pre.stranded_per_100 or 0.0, thresholds.baseline_stranded_per_100)
+@dataclass(frozen=True)
+class RateCheck:
+    """Breached when post rate >= R * max(pre rate, F) and post count >= K; an empty pre window counts as 0."""
+
+    count_name: str
+    post_rate: float | None
+    pre_rate: float | None
+    post_count: int
+    ratio: float
+    rule: RateRule
+
+    @property
+    def bar_per_100(self) -> float:
+        return self.ratio * max(self.pre_rate or 0.0, self.rule.baseline_per_100)
+
+    @property
+    def breached(self) -> bool:
+        return self.post_rate is not None and self.post_rate >= self.bar_per_100 and self.post_count >= self.rule.minimum
+
+    def measured(self) -> str:
+        return (
+            f'post {_shown_rate(self.post_rate)} >= bar {_shown_rate(self.bar_per_100)} '
+            f'(ratio {self.ratio:g} x max(pre {_shown_rate(self.pre_rate)}, '
+            f'baseline {self.rule.baseline_per_100:g}/100)) '
+            f'and post {self.count_name} {self.post_count} >= {self.rule.minimum}'
+        )
+
+
+RateBreach = Literal[Breach.STRANDED_RATE, Breach.NON_STARTUP_WRONG_RATE]
+
+
+def rate_checks(report: Report, thresholds: Thresholds) -> dict[RateBreach, RateCheck]:
+    pre, post = report.pre, report.post
+    return {
+        Breach.STRANDED_RATE: RateCheck(
+            'stranded', post.stranded_per_100, pre.stranded_per_100, post.stranded,
+            thresholds.ratio, thresholds.stranded,
+        ),
+        Breach.NON_STARTUP_WRONG_RATE: RateCheck(
+            'non-startup wrong', post.non_startup_wrong_per_100, pre.non_startup_wrong_per_100,
+            post.non_startup_wrong, thresholds.ratio, thresholds.non_startup_wrong,
+        ),
+    }
 
 
 def judge(report: Report, thresholds: Thresholds) -> list[Breach]:
-    post_rate = report.post.stranded_per_100
-    breaches: list[Breach] = []
-    if (
-        post_rate is not None
-        and post_rate >= stranded_bar_per_100(report, thresholds)
-        and report.post.stranded >= thresholds.min_stranded
-    ):
-        breaches.append(Breach.STRANDED_RATE)
+    breaches: list[Breach] = [breach for breach, check in rate_checks(report, thresholds).items() if check.breached]
     if report.post.reaper_wrong >= thresholds.max_reaper_wrong:
         breaches.append(Breach.REAPER_WRONG)
     if report.pending_over_h > 0:
@@ -457,11 +498,12 @@ def _window_lines(label: str, counts: WindowCounts) -> list[str]:
         f'{label}: filed {counts.filed}, stranded {counts.stranded} '
         f'({counts.reaper_promotions} reaper promotions + {counts.stale_strands} stale-strand) '
         f'= {_shown_rate(counts.stranded_per_100)}',
+        f'  non-startup dismissals {counts.non_startup_dismissals}, wrong {counts.non_startup_wrong} '
+        f'= {_shown_rate(counts.non_startup_wrong_per_100)}',
         f'  reaper dismissals {counts.reaper_dismissals}, wrong {counts.reaper_wrong}',
         f'  promotions by other resolvers {counts.other_promotions} (reported, not judged)',
         f'  startup dismissals {counts.startup_dismissals}, wrong {counts.startup_wrong} (reported, not judged)',
-        f'  workflow auto-dismissals {counts.workflow_auto_dismissals}, '
-        f'wrong {counts.workflow_auto_wrong} (reported, not judged)',
+        f'  workflow auto-dismissals {counts.workflow_auto_dismissals}, wrong {counts.workflow_auto_wrong}',
     ]
 
 
@@ -476,27 +518,22 @@ def render(report: Report) -> list[str]:
 
 
 def breach_line(breach: Breach, report: Report, thresholds: Thresholds) -> str:
-    post = report.post
     match breach:
-        case Breach.STRANDED_RATE:
-            measured = (
-                f'post {_shown_rate(post.stranded_per_100)} >= bar '
-                f'{_shown_rate(stranded_bar_per_100(report, thresholds))} '
-                f'(ratio {thresholds.ratio:g} x max(pre {_shown_rate(report.pre.stranded_per_100)}, '
-                f'baseline {thresholds.baseline_stranded_per_100:g}/100)) '
-                f'and post stranded {post.stranded} >= {thresholds.min_stranded}'
-            )
+        case Breach.STRANDED_RATE | Breach.NON_STARTUP_WRONG_RATE:
+            measured = rate_checks(report, thresholds)[breach].measured()
         case Breach.REAPER_WRONG:
-            measured = f'post reaper_wrong {post.reaper_wrong} >= {thresholds.max_reaper_wrong}'
+            measured = f'post reaper_wrong {report.post.reaper_wrong} >= {thresholds.max_reaper_wrong}'
         case Breach.PENDING_OVER_H:
             measured = f'{report.pending_over_h} blocking L0s pending longer than {report.max_pending_hours:g}h'
     return f'breach: {breach}: {measured}'
 
 
 def verdict_json(report: Report, thresholds: Thresholds, breaches: Sequence[Breach]) -> dict[str, Any]:
+    checks = rate_checks(report, thresholds)
     return {
         **report.as_json(),
-        'stranded_bar_per_100': round(stranded_bar_per_100(report, thresholds), RATE_DIGITS),
+        'stranded_bar_per_100': round(checks[Breach.STRANDED_RATE].bar_per_100, RATE_DIGITS),
+        'non_startup_wrong_bar_per_100': round(checks[Breach.NON_STARTUP_WRONG_RATE].bar_per_100, RATE_DIGITS),
         'breaches': [breach.value for breach in breaches],
         'follow_up': REDESIGN_FOLLOW_UP if breaches else None,
     }
@@ -513,6 +550,8 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument('--baseline-stranded-per-100', type=float, required=True)
     parser.add_argument('--ratio', type=float, required=True)
     parser.add_argument('--min-stranded', type=int, required=True)
+    parser.add_argument('--baseline-non-startup-wrong-per-100', type=float, required=True)
+    parser.add_argument('--min-non-startup-wrong', type=int, required=True)
     parser.add_argument('--max-reaper-wrong', type=int, required=True)
     parser.add_argument('--max-pending-hours', type=float, required=True)
     return parser.parse_args(argv)
@@ -521,9 +560,11 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     thresholds = Thresholds(
-        baseline_stranded_per_100=args.baseline_stranded_per_100,
         ratio=args.ratio,
-        min_stranded=args.min_stranded,
+        stranded=RateRule(baseline_per_100=args.baseline_stranded_per_100, minimum=args.min_stranded),
+        non_startup_wrong=RateRule(
+            baseline_per_100=args.baseline_non_startup_wrong_per_100, minimum=args.min_non_startup_wrong,
+        ),
         max_reaper_wrong=args.max_reaper_wrong,
     )
     try:

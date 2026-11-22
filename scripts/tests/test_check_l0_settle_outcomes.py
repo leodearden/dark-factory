@@ -419,15 +419,19 @@ def test_non_startup_wrong_rate_bar_scales_the_pre_window_rate(
 ) -> None:
     _, permissive = run_main(capsys, settle_queue.queue_dir)
     post_rate = trailing_json(permissive)['post']['non_startup_wrong_per_100']
-    pre_rate = trailing_json(permissive)['pre']['non_startup_wrong_per_100']
+    pre = trailing_json(permissive)['pre']
+    unrounded_pre_rate = 100 * pre['non_startup_wrong'] / pre['filed']
     ratio = float(NON_STARTUP_WRONG_UNDER_PRE_BAR['ratio'])
     floor = float(NON_STARTUP_WRONG_UNDER_PRE_BAR['baseline_non_startup_wrong_per_100'])
-    assert ratio * floor < post_rate < ratio * pre_rate
+    assert ratio * floor < post_rate < ratio * unrounded_pre_rate
 
     code, lines = run_main(capsys, settle_queue.queue_dir, **NON_STARTUP_WRONG_UNDER_PRE_BAR)
 
     assert_clean(code, lines)
-    assert trailing_json(lines)['non_startup_wrong_bar_per_100'] == pytest.approx(ratio * pre_rate)
+    shown_to_two_places = 0.005
+    assert trailing_json(lines)['non_startup_wrong_bar_per_100'] == pytest.approx(
+        ratio * unrounded_pre_rate, abs=shown_to_two_places,
+    )
 
 
 def test_reaper_wrong_breach(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
