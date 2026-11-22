@@ -5135,7 +5135,7 @@ class TaskInterceptor:
                         task_id_str,
                         e,
                     )
-            if birth_holder is None:
+            if birth_holder is None and kwargs.get('dependencies'):
                 await self._promote_born_with_edges(tm, project_root, task_id_str, result_dict)
 
             # note_created + record_task under curator_lock + write_lock
