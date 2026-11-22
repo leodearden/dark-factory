@@ -11,7 +11,9 @@ from shared.task_statuses import TaskStatus
 from orchestrator.agents.steward_digest import (
     DIGEST_MAX_ENTRIES,
     DIGEST_RESOLUTION_MAX_CHARS,
+    EarlierAttempts,
     HandledL0,
+    render_earlier_attempts,
     render_handled_digest,
 )
 from orchestrator.workflow_types import (
@@ -130,3 +132,37 @@ def test_handled_l0_is_frozen():
     pytest.raises(
         dataclasses.FrozenInstanceError, setattr, _resolved('esc-a'), 'escalation_id', 'esc-b',
     )
+
+
+class TestEarlierAttempts:
+    def test_no_earlier_attempt_renders_nothing(self):
+        assert render_earlier_attempts(EarlierAttempts()) == ''
+
+    @pytest.mark.parametrize(
+        ('attempts', 'meaning'),
+        [
+            (EarlierAttempts(timed_out=2), 'time limit'),
+            (EarlierAttempts(left_pending=2), 'still pending'),
+            (EarlierAttempts(no_output=2), 'no output'),
+        ],
+    )
+    def test_each_kind_of_attempt_is_counted_on_its_own_line(self, attempts, meaning):
+        [line] = [
+            line for line in render_earlier_attempts(attempts).splitlines()
+            if line.startswith('- ')
+        ]
+        assert line.startswith('- 2 ')
+        assert meaning in line
+
+    def test_only_the_kinds_that_happened_are_listed(self):
+        block = render_earlier_attempts(EarlierAttempts(timed_out=1, no_output=3))
+        entries = [line for line in block.splitlines() if line.startswith('- ')]
+        assert len(entries) == 2
+        assert 'still pending' not in block
+
+    def test_block_framing_and_lead_sentence(self):
+        block = render_earlier_attempts(EarlierAttempts(timed_out=1))
+        assert block.startswith('\n## ')
+        assert block.endswith('\n')
+        assert not block.endswith('\n\n')
+        assert 'fresh session' in block.lower()

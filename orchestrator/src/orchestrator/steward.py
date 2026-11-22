@@ -3,7 +3,8 @@
 ``steward_session_mode`` decides what one escalation's session inherits from the
 last.  Under the default ``fresh_per_l0`` every handling starts a new Claude
 session with the full briefing plus a digest of the L0s this steward already
-concluded (``orchestrator/agents/steward_digest.py::render_handled_digest``);
+concluded and a count of the sessions that already ran on this L0 without
+concluding it (both rendered by ``orchestrator/agents/steward_digest.py``);
 under ``resume`` one session is carried across escalations via ``--resume``.
 Both share the cap-hit resume within one L0.  The steward handles both blocking
 escalations (code fixes) and review suggestion triage (create tasks / write
@@ -66,7 +67,7 @@ from shared.process_cost import next_resume_prior
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
-from orchestrator.agents.steward_digest import HandledL0
+from orchestrator.agents.steward_digest import EarlierAttempts, HandledL0
 from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
 from orchestrator.routing import RoleDefaults
@@ -318,6 +319,22 @@ class TaskSteward:
         the shadow-eval comparison arm (task 5820).
         """
         return () if self._carries_session_across_l0s() else self._handled
+
+    def _earlier_attempts(self, escalation_id: str) -> EarlierAttempts:
+        """The sessions that already ran on *escalation_id* without concluding it, for a full briefing.
+
+        Read off the per-escalation guard counters under ``fresh_per_l0``, so a
+        re-handle after a timeout kill, a left-pending attempt or an empty
+        output knows it is not the first.  Under ``resume`` it is always empty,
+        for the same byte parity as :meth:`_briefing_digest`.
+        """
+        if self._carries_session_across_l0s():
+            return EarlierAttempts()
+        return EarlierAttempts(
+            timed_out=self._timeout_counts.get(escalation_id, 0),
+            left_pending=self._retry_counts.get(escalation_id, 0),
+            no_output=self._empty_output_counts.get(escalation_id, 0),
+        )
 
     async def stop(self) -> None:
         """Cancel the steward loop and cleanup."""
@@ -684,6 +701,7 @@ class TaskSteward:
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
                 handled=self._briefing_digest(),
+                earlier_attempts=self._earlier_attempts(escalation.id),
             )
         else:
             prompt = await self.briefing.build_steward_continuation_prompt(
@@ -914,6 +932,7 @@ class TaskSteward:
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
                 handled=self._briefing_digest(),
+                earlier_attempts=self._earlier_attempts(escalation.id),
             )
 
         # Route resolution (task η): resolve model/effort/max_turns through the

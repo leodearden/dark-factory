@@ -482,7 +482,8 @@ starts a per-task `TaskSteward`
 a lifetime budget, and owning every escalation for that task. Under the
 default `steward_session_mode: fresh_per_l0` it handles each L0 in a fresh
 Claude session, briefed in full plus a digest of the L0s it already concluded
-(`orchestrator/src/orchestrator/agents/steward_digest.py::render_handled_digest`);
+and a count of the sessions that already ran on this L0 without concluding it
+(both rendered by `orchestrator/src/orchestrator/agents/steward_digest.py`);
 `resume` keeps one resumed session across L0s, the comparison arm of the
 steward shadow eval (task 5820). `steward` is the **only** role permitted to
 call `set_task_status` (enforced by an `AgentRole` capability assertion at
@@ -972,8 +973,9 @@ flowchart LR
   budget (§4), is the first responder for any workflow failure. Under the
   default `steward_session_mode: fresh_per_l0` it handles each L0 in a fresh
   Claude session with a full briefing plus a digest of the L0s it already
-  concluded
-  (`orchestrator/src/orchestrator/agents/steward_digest.py::render_handled_digest`);
+  concluded and a count of the sessions that already ran on this L0 without
+  concluding it (both rendered by
+  `orchestrator/src/orchestrator/agents/steward_digest.py`);
   `resume` keeps one resumed session across L0s, the comparison arm of the
   steward shadow eval (task 5820). An info L0 is consumed by
   the chain in §3.6, not by the steward ladder.

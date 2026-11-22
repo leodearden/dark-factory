@@ -19,6 +19,7 @@ from shared.cli_invoke import AllAccountsCappedException
 from shared.testing_resume_rejection import measured_resume_rejection
 from shared.usage_gate import AccountLease, InvokeSlot
 
+from orchestrator.agents.steward_digest import EarlierAttempts
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.event_store import EventType
 from orchestrator.steward import (
@@ -516,6 +517,7 @@ class TestStewardInvokeWithCapRetryWiring:
             pending_escalations=[e.to_dict() for e in fresh_pending],
             worktree=steward.worktree,
             handled=(),
+            earlier_attempts=EarlierAttempts(),
         )
         assert result == mock_briefing.build_steward_initial_prompt.return_value
 

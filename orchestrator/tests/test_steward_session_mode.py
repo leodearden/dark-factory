@@ -19,13 +19,14 @@ from shared.testing import make_gate_mock
 from test_steward import _make_escalation, _make_result
 
 from orchestrator.agents.briefing import BriefingAssembler
-from orchestrator.agents.steward_digest import HandledL0
+from orchestrator.agents.steward_digest import EarlierAttempts, HandledL0
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow_types import StewardInterrupted, StewardResolved
 
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
 _RESUME_KEYS = ('resume_session_id', 'resume_prior_total_cost_usd')
 _DIGEST_HEADING = '## Escalations This Steward Already Handled'
+_ATTEMPTS_HEADING = '## Earlier Attempts at This Escalation'
 
 
 def _resolution(escalation_id: str) -> str:
@@ -99,6 +100,12 @@ def _carries_no_resume(dispatch: dict) -> bool:
     return not any(key in dispatch for key in _RESUME_KEYS)
 
 
+def _timed_out(session_id: str) -> AgentResult:
+    return _make_result(
+        session_id=session_id, success=False, timed_out=True, duration_ms=900_000,
+    )
+
+
 @pytest.mark.asyncio
 class TestFreshPerL0:
     async def test_every_l0_gets_a_new_session_and_the_full_briefing(
@@ -120,6 +127,8 @@ class TestFreshPerL0:
         assert first_call.kwargs['handled'] == ()
         assert second_call.kwargs['handled'] == (_resolved_entry(first),)
         assert second_call.kwargs['pending_escalations'] == pending_at_second
+        assert first_call.kwargs['earlier_attempts'] == EarlierAttempts()
+        assert second_call.kwargs['earlier_attempts'] == EarlierAttempts()
 
     async def test_the_real_briefing_carries_the_digest_into_the_second_prompt(
         self, make_steward, queue, driver, two_l0s, tmp_path,
@@ -140,17 +149,12 @@ class TestFreshPerL0:
         assert 'esc-42-1' in second_prompt
         assert _resolution('esc-42-1') in second_prompt
 
-    async def test_a_timeout_re_handle_of_the_same_l0_starts_fresh_without_it_in_the_digest(
+    async def test_a_timeout_re_handle_starts_fresh_told_of_its_timed_out_attempt(
         self, make_steward, queue, driver, two_l0s,
     ):
         first, _ = two_l0s
         steward = _build(make_steward, queue, 'fresh_per_l0')
-        driver.scripted = [
-            _make_result(
-                session_id='sess-timed-out', success=False, timed_out=True,
-                duration_ms=900_000,
-            ),
-        ]
+        driver.scripted = [_timed_out('sess-timed-out')]
 
         await driver.handle(steward, first)
         assert queue.get(first.id).status == 'pending'
@@ -158,8 +162,29 @@ class TestFreshPerL0:
 
         assert len(driver.dispatches) == 2
         assert _carries_no_resume(driver.dispatches[1])
-        second_call = steward.briefing.build_steward_initial_prompt.await_args_list[1]
+        first_call, second_call = steward.briefing.build_steward_initial_prompt.await_args_list
+        assert first_call.kwargs['earlier_attempts'] == EarlierAttempts()
         assert second_call.kwargs['handled'] == ()
+        assert second_call.kwargs['earlier_attempts'] == EarlierAttempts(timed_out=1)
+
+    async def test_the_real_briefing_tells_a_re_handle_about_its_timed_out_attempt(
+        self, make_steward, queue, driver, two_l0s, tmp_path,
+    ):
+        first, _ = two_l0s
+        steward = _build(make_steward, queue, 'fresh_per_l0')
+        steward.briefing = BriefingAssembler(OrchestratorConfig(project_root=tmp_path))
+        driver.scripted = [_timed_out('sess-timed-out')]
+
+        with patch.object(
+            BriefingAssembler, '_get_memory_context', return_value='# Context\n\n_stub_',
+        ):
+            await driver.handle(steward, first)
+            await driver.handle(steward, first)
+
+        first_prompt, second_prompt = (d['prompt'] for d in driver.dispatches)
+        assert _ATTEMPTS_HEADING not in first_prompt
+        assert _ATTEMPTS_HEADING in second_prompt
+        assert 'time limit' in second_prompt
 
     async def test_in_ladder_cap_hit_recovery_still_resumes_the_capped_attempt(
         self, make_steward, queue, driver, two_l0s,
@@ -229,11 +254,26 @@ class TestResumeParity:
             pending_escalations=pending_at_first,
             worktree=steward.worktree,
             handled=(),
+            earlier_attempts=EarlierAttempts(),
         )
         steward.briefing.build_steward_continuation_prompt.assert_awaited_once_with(
             task=steward.task,
             escalation=second.to_dict(),
         )
+
+    async def test_a_sessionless_re_handle_gets_the_full_briefing_with_no_history(
+        self, make_steward, queue, driver, two_l0s,
+    ):
+        first, _ = two_l0s
+        steward = _build(make_steward, queue, 'resume')
+        driver.scripted = [_timed_out('')]
+
+        await driver.handle(steward, first)
+        await driver.handle(steward, first)
+
+        second_call = steward.briefing.build_steward_initial_prompt.await_args_list[1]
+        assert second_call.kwargs['handled'] == ()
+        assert second_call.kwargs['earlier_attempts'] == EarlierAttempts()
 
 
 @pytest.mark.asyncio

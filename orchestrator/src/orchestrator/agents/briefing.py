@@ -26,7 +26,12 @@ from orchestrator.agents.review_briefing import (
     render_context_complete_review,
     review_action_section,
 )
-from orchestrator.agents.steward_digest import HandledL0, render_handled_digest
+from orchestrator.agents.steward_digest import (
+    EarlierAttempts,
+    HandledL0,
+    render_earlier_attempts,
+    render_handled_digest,
+)
 from orchestrator.artifacts import format_issue_section
 from orchestrator.config import OrchestratorConfig
 from orchestrator.escalation_rulings import (
@@ -1691,13 +1696,16 @@ change. Do not edit `.task/plan.json`.
         worktree: Path,
         *,
         handled: Sequence[HandledL0],
+        earlier_attempts: EarlierAttempts,
     ) -> str:
         """Build the full briefing prompt for a fresh steward session.
 
-        Includes memory context, task details, the escalation, the other
-        pending escalations, the digest of L0s this steward already concluded
-        (*handled*, rendered by ``render_handled_digest``; empty renders
-        nothing), and action instructions.
+        Includes memory context, task details, the escalation, the sessions
+        that already ran on it without concluding it (*earlier_attempts*), the
+        other pending escalations, the digest of L0s this steward already
+        concluded (*handled*), and action instructions.  Both histories are
+        rendered by ``orchestrator/agents/steward_digest.py``, and an empty one
+        renders nothing.
         """
         preamble = await self._task_preamble(task, 'steward', None)
         esc_block = self._format_escalation(escalation)
@@ -1721,7 +1729,7 @@ change. Do not edit `.task/plan.json`.
 # Escalation
 
 {esc_block}
-{pending_block}{render_handled_digest(handled)}
+{render_earlier_attempts(earlier_attempts)}{pending_block}{render_handled_digest(handled)}
 # Parameters
 
 - **project_id:** `{self.project_id}`

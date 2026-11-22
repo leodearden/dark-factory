@@ -14,7 +14,12 @@ import pytest
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.landed_sha_searches import LandedShaSearches, already_merged_step
-from orchestrator.agents.steward_digest import HandledL0, render_handled_digest
+from orchestrator.agents.steward_digest import (
+    EarlierAttempts,
+    HandledL0,
+    render_earlier_attempts,
+    render_handled_digest,
+)
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.workflow_types import StewardResolved
 
@@ -36,6 +41,9 @@ _ESCALATION = {
 }
 
 
+_NO_EARLIER_ATTEMPTS = EarlierAttempts()
+
+
 def _fixture_git() -> GitConfig:
     return GitConfig(
         main_branch='main',
@@ -54,6 +62,7 @@ async def _initial_prompt(
     worktree: Path,
     handled: tuple[HandledL0, ...] = (),
     pending_escalations: list[dict] | None = None,
+    earlier_attempts: EarlierAttempts = _NO_EARLIER_ATTEMPTS,
 ) -> str:
     with patch.object(
         BriefingAssembler,
@@ -66,6 +75,7 @@ async def _initial_prompt(
             pending_escalations=pending_escalations or [],
             worktree=worktree,
             handled=handled,
+            earlier_attempts=earlier_attempts,
         )
 
 
@@ -180,3 +190,29 @@ class TestHandledDigest:
         tail = _steward_owned_tail(prompt)
         assert '- **Detail:** Agent ran out of iterations.\n' + render_handled_digest(_HANDLED) in tail
         assert render_handled_digest(_HANDLED) + '\n# Parameters\n' in tail
+
+
+_EARLIER = EarlierAttempts(timed_out=1)
+
+
+@pytest.mark.asyncio
+class TestEarlierAttempts:
+    async def test_earlier_attempts_follow_the_escalation_block_before_the_pending_block(
+        self, briefing: BriefingAssembler, tmp_path: Path,
+    ) -> None:
+        prompt = await _initial_prompt(
+            briefing, tmp_path, handled=_HANDLED, pending_escalations=[_OTHER_PENDING],
+            earlier_attempts=_EARLIER,
+        )
+
+        tail = _steward_owned_tail(prompt)
+        attempts = render_earlier_attempts(_EARLIER)
+        assert '- **Detail:** Agent ran out of iterations.\n' + attempts + '\n## Other Pending' in tail
+        assert tail.index(attempts) < tail.index(render_handled_digest(_HANDLED))
+
+    async def test_earlier_attempts_alone_end_before_parameters(
+        self, briefing: BriefingAssembler, tmp_path: Path,
+    ) -> None:
+        prompt = await _initial_prompt(briefing, tmp_path, earlier_attempts=_EARLIER)
+
+        assert render_earlier_attempts(_EARLIER) + '\n# Parameters\n' in _steward_owned_tail(prompt)

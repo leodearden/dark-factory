@@ -1,4 +1,10 @@
-"""The record of L0s a steward instance concluded, and the one function that renders it into a fresh-session briefing."""
+"""What a fresh steward session is told about its steward's earlier work, and the one renderer for each part.
+
+Two records: the L0s the steward instance concluded (``HandledL0``, rendered by
+``render_handled_digest``) and the sessions that already ran on the L0 in hand
+without concluding it (``EarlierAttempts``, rendered by
+``render_earlier_attempts``).
+"""
 
 from __future__ import annotations
 
@@ -18,7 +24,9 @@ from orchestrator.workflow_types import (
 __all__ = [
     'DIGEST_MAX_ENTRIES',
     'DIGEST_RESOLUTION_MAX_CHARS',
+    'EarlierAttempts',
     'HandledL0',
+    'render_earlier_attempts',
     'render_handled_digest',
 ]
 
@@ -31,6 +39,16 @@ _LEAD = (
     'This list is the only record of the escalations this steward already '
     'handled for this task, most recent first.'
 )
+_ATTEMPTS_HEADING = '## Earlier Attempts at This Escalation'
+_ATTEMPTS_LEAD = (
+    'This is a fresh session: it does not remember them. Earlier sessions of '
+    'this steward worked on this escalation and ended without concluding it:'
+)
+_ATTEMPTS_ADVICE = (
+    'Their work is not in your context. Check the worktree (`git log`, '
+    '`git status`) for what they left before you repeat an approach, and '
+    'prefer a narrower one if a session already ran out of time.'
+)
 
 
 @dataclass(frozen=True)
@@ -38,6 +56,13 @@ class HandledL0:
     escalation_id: str
     category: str
     outcome: StewardOutcome
+
+
+@dataclass(frozen=True)
+class EarlierAttempts:
+    timed_out: int = 0
+    left_pending: int = 0
+    no_output: int = 0
 
 
 def _describe(outcome: StewardOutcome) -> str:
@@ -78,3 +103,16 @@ def render_handled_digest(handled: Sequence[HandledL0]) -> str:
         lines.append(f'- … {hidden} older not shown')
     entries = '\n'.join(lines)
     return f'\n{_HEADING}\n\n{_LEAD}\n\n{entries}\n'
+
+
+def render_earlier_attempts(attempts: EarlierAttempts) -> str:
+    counted = (
+        (attempts.timed_out, 'killed at the session time limit'),
+        (attempts.left_pending, 'ended with the escalation still pending'),
+        (attempts.no_output, 'exited with no output'),
+    )
+    lines = [f'- {count} {what}' for count, what in counted if count]
+    if not lines:
+        return ''
+    entries = '\n'.join(lines)
+    return f'\n{_ATTEMPTS_HEADING}\n\n{_ATTEMPTS_LEAD}\n\n{entries}\n\n{_ATTEMPTS_ADVICE}\n'
