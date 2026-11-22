@@ -12,16 +12,22 @@ import sys
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from shared.followup_hold_records import FOLLOWUP_HOLD_METADATA_KEY, FOLLOWUP_HOLDER_METADATA_KEY
 
 from fused_memory.middleware.followup_hold import (
     FollowupHolderProtectedError,
     HolderProtection,
+    PromotionDeferral,
+    citation_ref,
+    held_by,
     hold_at_create,
     hold_scope,
     is_holder,
+    may_strip_holder_edge,
     protected_status,
     protected_update,
+    releases_holder,
 )
 
 _MARKER = {'project_id': 'dark_factory', 'minted_at': '2026-11-08T00:00:00+00:00'}
@@ -261,3 +267,123 @@ def test_the_refusal_carries_the_holder_and_its_held_count() -> None:
     assert error.event_payload() == {
         'holder_id': '9', 'attempted_status': 'cancelled', 'protection': 'protected_status', 'held_count': 2,
     }
+
+
+_HOLD_RECORD = {'holder': 9, 'held_at': _HELD_AT}
+
+
+def _held_row(status: str = 'pending', *, dependencies: list[Any] | None = None, record: Any = None) -> dict[str, Any]:
+    return {
+        'id': 12,
+        'status': status,
+        'dependencies': [3, 9] if dependencies is None else dependencies,
+        'metadata': {**_FOLLOWUP, FOLLOWUP_HOLD_METADATA_KEY: _HOLD_RECORD if record is None else record},
+    }
+
+
+@pytest.mark.parametrize('status', ['pending', 'deferred', 'in-progress', 'blocked'])
+def test_a_row_with_its_record_and_holder_edge_is_held_by_that_holder(status: str) -> None:
+    assert held_by(_held_row(status)) == 9
+
+
+def test_a_row_whose_metadata_is_a_json_string_is_read_the_same() -> None:
+    row = {**_held_row(), 'metadata': json.dumps(_held_row()['metadata'])}
+
+    assert held_by(row) == 9
+
+
+def test_string_dependency_ids_name_the_holder_edge() -> None:
+    assert held_by(_held_row(dependencies=['3', '9'])) == 9
+
+
+@pytest.mark.parametrize('row', [
+    {'id': 12, 'status': 'pending', 'dependencies': [9], 'metadata': dict(_FOLLOWUP)},
+    _held_row(dependencies=[3]),
+    _held_row(dependencies=[]),
+    {**_held_row(), 'dependencies': None},
+    _held_row('done'),
+    _held_row('cancelled'),
+], ids=['record-absent', 'edge-absent', 'no-dependencies', 'dependencies-none', 'done', 'cancelled'])
+def test_a_row_without_both_record_and_edge_or_settled_is_not_held(row: dict[str, Any]) -> None:
+    assert held_by(row) is None
+
+
+def test_a_promoted_row_keeps_its_record_but_is_not_held() -> None:
+    promoted = {**_HOLD_RECORD, 'promoted': {'by': 'citation', 'at': _HELD_AT, 'ref': 'fk-1'}}
+
+    assert held_by(_held_row(dependencies=[3], record=promoted)) is None
+
+
+@pytest.mark.parametrize('record', [
+    {'holder': 'x', 'held_at': _HELD_AT},
+    {**_HOLD_RECORD, 'extra': 1},
+    'held',
+], ids=['holder-not-int', 'extra-key', 'not-an-object'])
+def test_a_malformed_record_is_not_held_and_warns(record: Any, caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
+        assert held_by(_held_row(record=record)) is None
+
+    assert any('12' in message for message in caplog.messages)
+
+
+@pytest.mark.parametrize(('payload', 'expected'), [
+    ({'x_finding_key': 'fk-1'}, 'fk-1'),
+    ({'x_finding_key': ['fk-1', 'fk-2']}, 'fk-1'),
+    ({'prd_path': 'plans/x-prd.md'}, 'plans/x-prd.md'),
+    ({'x_finding_key': 'fk-1', 'prd_path': 'plans/x-prd.md'}, 'fk-1'),
+    (json.dumps({'x_finding_key': ['fk-1']}), 'fk-1'),
+    ({}, None),
+    (None, None),
+    ({'x_finding_key': []}, None),
+    ({'x_finding_key': ''}, None),
+    ({'prd_path': ''}, None),
+    ({'x_finding_key': 7}, None),
+    ({'prd_path': ['plans/x-prd.md']}, None),
+], ids=[
+    'finding-key', 'finding-key-list', 'prd-path', 'finding-key-wins', 'json-string', 'empty',
+    'none', 'empty-list', 'empty-string', 'empty-prd-path', 'non-string-key', 'non-string-prd-path',
+])
+def test_citation_ref_names_the_first_citation(payload: Any, expected: str | None) -> None:
+    assert citation_ref(payload) == expected
+
+
+@pytest.mark.parametrize('status', ['done', 'cancelled', 'deferred'])
+def test_an_explicit_release_of_the_holder_releases_its_held_tasks(status: str) -> None:
+    assert releases_holder(_HOLDER_ROW, status, release_holder=True)
+
+
+@pytest.mark.parametrize(('task', 'status', 'release_holder'), [
+    (_HOLDER_ROW, 'cancelled', False),
+    (_HOLDER_ROW, 'cancelled', 'true'),
+    (_PLAIN_ROW, 'cancelled', True),
+    (_HOLDER_ROW, 'pending', True),
+], ids=['not-released', 'truthy-string', 'non-holder', 'pending'])
+def test_anything_short_of_an_explicit_release_releases_nothing(
+    task: dict[str, Any], status: str, release_holder: Any,
+) -> None:
+    assert not releases_holder(task, status, release_holder=release_holder)
+
+
+@pytest.mark.parametrize('agent_id', [None, 'claude-task-8418-architect'], ids=['header-less', 'agent-session'])
+def test_a_human_actor_may_strip_the_holder_edge(agent_id: str | None) -> None:
+    assert may_strip_holder_edge(agent_id)
+
+
+@pytest.mark.parametrize('agent_id', [
+    'orchestrator', 'harness-x', 'steward-1', 'recon-stage-2', 'escalation-watcher',
+    'orchestrator-deterministic',
+])
+def test_a_machine_actor_may_not_strip_the_holder_edge(agent_id: str) -> None:
+    assert not may_strip_holder_edge(agent_id)
+
+
+def test_a_promotion_deferral_is_frozen() -> None:
+    deferral = PromotionDeferral(guard='g', reason='r')
+
+    with pytest.raises(ValidationError):
+        deferral.guard = 'other'  # type: ignore[misc]
+
+
+def test_a_promotion_deferral_refuses_an_extra_key() -> None:
+    with pytest.raises(ValidationError):
+        PromotionDeferral(guard='g', reason='r', extra='x')  # type: ignore[call-arg]
