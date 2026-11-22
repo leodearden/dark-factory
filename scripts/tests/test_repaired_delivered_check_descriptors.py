@@ -7,9 +7,9 @@ gate, which a docstring had been satisfying as a grep. Tasks 5256 and 6209
 resynced sidecars, sidecar-only, to task records that had already been repaired. CI can never see the tasks.db half, so
 either way these pins guard the SIDECAR half: a stale sidecar would be
 re-stamped over the repaired record by the next re-decompose. Every resynced
-producer is done, so the resynced rows are also evaluated at HEAD through the
-runtime grep primitive. They read only tracked files in this checkout and open
-no database. Task 6047 re-pointed a FOREIGN descriptor, warm-lane κ, whose
+producer is done, as is 8461, so those rows are also evaluated at HEAD through
+the runtime primitive for their kind. They read only tracked files in this
+checkout and open no database. Task 6047 re-pointed a FOREIGN descriptor, warm-lane κ, whose
 task-record half lives in reify's store; reify's tree is not this checkout, so
 its non-vacuity is checked behaviourally against committed fixture trees rather
 than at HEAD.
@@ -25,15 +25,11 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from audit_delivered_checks import load_manifest_checks, structural_findings
+from audit_delivered_checks import evaluate_row, load_manifest_checks, structural_findings
 from committed_git_repo import committed_repo
 from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
-from shared.delivered_check_polarity import (
-    CheckOutcome,
-    evaluate_grep_at_tree,
-    evaluate_path_at_tree,
-)
+from shared.delivered_check_polarity import CheckOutcome, evaluate_path_at_tree
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -183,18 +179,20 @@ def _kappa_check():
     return check
 
 
-def _quality_boundary_check():
-    relpath, _task_id, label, capability, _expected = _QUALITY_BOUNDARY
-    check = _the_one_capability(
-        checkout_root_or_skip(), relpath, label, capability).delivered_check
+@pytest.fixture(scope="module")
+def sidecar_rows():
+    """Every tracked sidecar's grep and path descriptors, as the drift audit reads them."""
+    return load_manifest_checks(checkout_root_or_skip(), {})[0]
 
-    assert check is not None
-    assert check.kind == "path" and check.expect == "present", (
-        f"{relpath} label {label} capability {capability} is kind={check.kind!r} "
-        f"expect={check.expect!r}, not path/present: either the content grep for "
-        f"the test file's name is back or the check changed kind."
+
+def _the_one_row(rows, relpath: str, label: str, capability: str):
+    matches = [row for row in rows
+               if (row.manifest, row.task_label, row.name) == (relpath, label, capability)]
+    assert len(matches) == 1, (
+        f"expected exactly one grep or path {capability!r} under label {label!r} "
+        f"in {relpath}, found {len(matches)}"
     )
-    return check
+    return matches[0]
 
 
 def _reify_tree_holding(tmp_path: Path, scripts) -> str:
@@ -220,30 +218,21 @@ def test_repaired_sidecar_carries_the_repaired_descriptor(
     )
 
 
-assert all(r[4]["kind"] == "grep" for r in _RESYNCED_TO_TASK_RECORD), (
-    "test_resynced_sidecar_descriptor_delivers_at_head evaluates only grep gates; "
-    "teach it the new kind before adding a non-grep row to _RESYNCED_TO_TASK_RECORD"
-)
-_RESYNCED_HEADS = [r[:4] for r in _RESYNCED_TO_TASK_RECORD]
+# Rows whose producer is done. The rest of _REANCHORED is left out: it holds a
+# pending producer (5324) whose forward-looking gate legitimately fails at HEAD.
+_DONE_PRODUCER_HEADS = [r[:4] for r in [*_RESYNCED_TO_TASK_RECORD, _QUALITY_BOUNDARY]]
 
 
 @pytest.mark.parametrize(
     "relpath,task_id,label,capability",
-    _RESYNCED_HEADS,
-    ids=[f"{r[1]}-{r[3]}" for r in _RESYNCED_HEADS],
+    _DONE_PRODUCER_HEADS,
+    ids=[f"{r[1]}-{r[3]}" for r in _DONE_PRODUCER_HEADS],
 )
-def test_resynced_sidecar_descriptor_delivers_at_head(relpath, task_id, label, capability):
-    """Every producer in _RESYNCED_TO_TASK_RECORD is done, so its sidecar gate must
-    deliver at HEAD; _REANCHORED is excluded because it holds a pending producer
-    (5324) whose forward-looking gate legitimately fails at HEAD."""
-    root = checkout_root_or_skip()
-    check = _the_one_capability(root, relpath, label, capability).delivered_check
+def test_done_producer_sidecar_descriptor_delivers_at_head(
+        sidecar_rows, relpath, task_id, label, capability):
+    row = _the_one_row(sidecar_rows, relpath, label, capability)
 
-    assert check is not None
-    outcome = evaluate_grep_at_tree(
-        check.pattern or "", list(check.paths),
-        expect=check.expect, repo_root=root, ref="HEAD",
-    )
+    outcome = evaluate_row(row, repo_root=checkout_root_or_skip(), ref="HEAD")
     assert outcome is CheckOutcome.PASS, (
         f"{relpath} label {label} capability {capability} (task {task_id}) evaluates "
         f"{outcome.value} at HEAD, but its producer is done, so its sidecar "
@@ -271,11 +260,10 @@ def test_retired_capability_is_manual_in_its_sidecar(relpath, task_id, label, ca
     assert isinstance(check.reason, str) and check.reason.strip()
 
 
-def test_audit_structural_section_names_no_reanchored_grep_capability():
+def test_audit_structural_section_names_no_reanchored_grep_capability(sidecar_rows):
     root = checkout_root_or_skip()
     reanchored_greps = {(r[1], r[3]) for r in _REANCHORED if r[4]["kind"] == "grep"}
-    rows = [row for row in load_manifest_checks(root, {})[0]
-            if (row.task_id, row.name) in reanchored_greps]
+    rows = [row for row in sidecar_rows if (row.task_id, row.name) in reanchored_greps]
 
     assert {(row.task_id, row.name) for row in rows} == reanchored_greps
 
@@ -330,35 +318,17 @@ def test_kappa_gate_opens_once_only_the_contract_primitives_remain(tmp_path):
         ),
     ],
 )
-def test_quality_boundary_gate_follows_the_test_file_not_the_prose(tmp_path, files, expected):
+def test_quality_boundary_gate_follows_the_test_file_not_the_prose(
+        tmp_path, sidecar_rows, files, expected):
     """esc-8461-1's two failure modes, inverted: prose naming the file must not
     deliver, and the file must deliver whatever it says."""
-    check = _quality_boundary_check()
+    relpath, _task_id, label, capability, _expected = _QUALITY_BOUNDARY
+    row = _the_one_row(sidecar_rows, relpath, label, capability)
     repo = committed_repo(tmp_path / "dashboard", files)
 
-    outcome = evaluate_path_at_tree(
-        list(check.paths), expect=check.expect, repo_root=repo, ref="HEAD",
-    )
+    outcome = evaluate_row(row, repo_root=repo, ref="HEAD")
     assert outcome is expected, (
-        f"task 8461's delivered_check evaluates {outcome.value} on a tree holding "
-        f"only {sorted(files)}; it must follow the test file's existence, not any "
-        f"mention of its name."
-    )
-
-
-def test_quality_boundary_gate_delivers_at_head():
-    """Producer 8461 is done, so its sidecar path gate must deliver at HEAD."""
-    relpath, task_id, label, capability, _expected = _QUALITY_BOUNDARY
-    check = _quality_boundary_check()
-
-    outcome = evaluate_path_at_tree(
-        list(check.paths), expect=check.expect, repo_root=checkout_root_or_skip(),
-        ref="HEAD",
-    )
-    assert outcome is CheckOutcome.PASS, (
-        f"{relpath} label {label} capability {capability} (task {task_id}) evaluates "
-        f"{outcome.value} at HEAD, but its producer is done, so its sidecar "
-        f"delivered_check must deliver. If the test file moved, repath BOTH halves "
-        f"(the task record via update_task, the sidecar here) and update "
-        f"_QUALITY_BOUNDARY per the MAINTENANCE CONTRACT."
+        f"task 8461's delivered_check (kind={row.kind!r}) evaluates {outcome.value} "
+        f"on a tree holding only {sorted(files)}; it must follow the test file's "
+        f"existence, not any mention of its name."
     )
