@@ -221,7 +221,7 @@ class TestJudgeSystemPromptOverride:
                 pytest.raises(RuntimeError, match='pre-psi') as excinfo,
                 _mod().judge_system_prompt('PROMPT-X', label='lever-x'),
             ):
-                pass  # pragma: no cover - the enter refuses
+                pass
             assert 'lever-x' in str(excinfo.value)
             assert write_triage_judge.JUDGE_SYSTEM_PROMPT == _mod().PRE_PSI_JUDGE_SYSTEM_PROMPT
         assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _mod().system_prompt(
@@ -234,7 +234,7 @@ class TestJudgeSystemPromptOverride:
                 pytest.raises(RuntimeError, match='lever-x') as excinfo,
                 _mod().judge_wording(_mod().WORDING_PRE_PSI),
             ):
-                pass  # pragma: no cover - the enter refuses
+                pass
             assert 'pre-psi' in str(excinfo.value)
             assert write_triage_judge.JUDGE_SYSTEM_PROMPT == 'PROMPT-X'
         assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _mod().system_prompt(
@@ -246,7 +246,7 @@ class TestJudgeSystemPromptOverride:
             pytest.raises(ValueError, match='lever-x'),
             _mod().judge_system_prompt('', label='lever-x'),
         ):
-            pass  # pragma: no cover - the enter refuses
+            pass
         assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _mod().system_prompt(
             _mod().WORDING_SHIPPED,
         )

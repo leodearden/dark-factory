@@ -53,6 +53,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import openai
+from shared.safe_io import atomic_write_text
 
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
@@ -818,9 +819,7 @@ def _complete_parent_rows(
 
 def _write_sorted(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
     ordered = sorted(rows, key=lambda row: row['entry_id'])
-    scratch = path.with_suffix('.jsonl.tmp')
-    scratch.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in ordered))
-    os.replace(scratch, path)
+    atomic_write_text(path, ''.join(json.dumps(row, sort_keys=True) + '\n' for row in ordered))
 
 
 def _build_parser() -> argparse.ArgumentParser:
