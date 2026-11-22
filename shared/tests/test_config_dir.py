@@ -387,9 +387,10 @@ class TestSweepStalePidDirsBounding:
         def stepping_monotonic() -> float:
             return next(ticks, 99.0)
 
-        with caplog.at_level(logging.WARNING, logger='shared.config_dir'), \
-                patch('shared.config_dir.time.monotonic', side_effect=stepping_monotonic):
-            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path, deadline_secs=1.0)
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'):
+            removed = sweep_stale_pid_dirs(
+                PROBE_PREFIX, base_dir=tmp_path, deadline_secs=1.0, clock=stepping_monotonic,
+            )
 
         assert 0 < removed < len(planted)
         survivors = [p for p in planted if p.exists()]
@@ -406,6 +407,31 @@ class TestSweepStalePidDirsBounding:
         assert sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path) == len(survivors)
         assert not any(p.exists() for p in planted)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_deadline_bounds_the_directory_read_not_only_the_matches(self, tmp_path, caplog):
+        """Path.glob lists the whole directory before its first yield, so the read must be lazy.
+
+        Task 11171: a >300s hang in UsageGate.__init__ reading a /tmp of ~300k entries.
+        """
+        unrelated = [tmp_path / f'unrelated-{i}' for i in range(50)]
+        for path in unrelated:
+            path.touch()
+        ticks = iter([0.0])
+
+        def clock() -> float:
+            return next(ticks, 99.0)
+
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'):
+            removed = sweep_stale_pid_dirs(
+                PROBE_PREFIX, base_dir=tmp_path, deadline_secs=1.0, clock=clock,
+            )
+
+        assert removed == 0
+        assert any(
+            r.name == 'shared.config_dir' and r.levelno == logging.WARNING
+            for r in caplog.records
+        ), "a sweep that ran out of time reading the directory must report itself INCOMPLETE, never read as 'swept everything'"
+        assert all(path.exists() for path in unrelated)
 
     def test_generous_deadline_sweeps_everything_and_stays_quiet(self, tmp_path, caplog):
         """The bounded-stop WARNING must not fire on the normal path."""
