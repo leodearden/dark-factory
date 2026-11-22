@@ -246,6 +246,27 @@ class TestDeclarationGuards:
         self._assert_raises_naming(table, 'D', ['a.py'], 'P', 'D')
 
 
+class _LimitReadFails(OrchestratorConfig):
+    """Fails the holder-limit read for ``broken.py``, as a malformed module config would."""
+
+    def for_module(self, module_path):
+        if module_path == 'broken.py':
+            raise RuntimeError('module config read failed')
+        return super().for_module(module_path)
+
+
+def test_an_error_in_the_admit_check_declares_no_relation():
+    table = ModuleLockTable(_LimitReadFails(max_per_module=1, lock_depth=12))
+    assert table.try_acquire('P', ['a.py'])
+
+    with pytest.raises(RuntimeError, match='module config read failed'):
+        table.try_acquire_as_successor('D', ['broken.py'], predecessor='P')
+
+    assert table.successor_relation('P') is None
+    assert table.snapshot_successor_of() == {}
+    assert table.snapshot_held_by_task() == {'P': ('a.py',)}
+
+
 GRID_KEYS: tuple[str, ...] = ('a.py', 'c.py', 'two.py', 'b.py', 'u.py')
 GRID_KEY_SETS: list[list[str]] = [
     list(keys)

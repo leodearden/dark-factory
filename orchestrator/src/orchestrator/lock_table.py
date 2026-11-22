@@ -161,17 +161,19 @@ class ModuleLockTable:
             and any(self._conflicts(held, module) for held in task_modules)
         }
 
-    def _holders_counted_against(self, module: str, requester: str) -> set[str]:
+    def _holders_counted_against(
+        self, module: str, requester: str, partner: str | None
+    ) -> set[str]:
         """The holders of ``module`` that count against *requester*'s holder limit.
 
-        The plain :meth:`_conflicting_holders`, less *requester*'s successor
-        partner when ``module`` allows one holder (PRD section 5.2).  The one
-        home of that exception: both acquires and :meth:`blocking_holders`
-        count through here, so the gates and the views naming blockers cannot
-        disagree (INV-5).  The reservation paths keep the plain count.
+        The plain :meth:`_conflicting_holders`, less *partner*, *requester*'s
+        successor partner, when ``module`` allows one holder (PRD section
+        5.2).  The one home of that exception: both acquires and
+        :meth:`blocking_holders` count through here, so the gates and the views
+        naming blockers cannot disagree (INV-5).  The reservation paths keep
+        the plain count.
         """
         holders = self._conflicting_holders(module, exclude_task=requester)
-        partner = self._partner_of(requester)
         if partner is not None and self._limit_for(module) == 1:
             holders.discard(partner)
         return holders
@@ -181,12 +183,18 @@ class ModuleLockTable:
         task_id: str,
         modules: Iterable[str],
         *,
+        partner: str | None,
         admitted_parks: frozenset[str] = frozenset(),
     ) -> bool:
-        """Would every one of the normalized *modules* pass the held-lock gate and the park gate now?"""
+        """Would every one of the normalized *modules* pass the held-lock gate and the park gate now?
+
+        *partner* is *task_id*'s successor partner, the one holder the gate
+        sets aside on a single-holder key (:meth:`_holders_counted_against`).
+        """
         for module in modules:
             # INV-3: live held-lock state, never bypassed by admitted_parks.
-            if len(self._holders_counted_against(module, task_id)) >= self._limit_for(module):
+            counted = self._holders_counted_against(module, task_id, partner)
+            if len(counted) >= self._limit_for(module):
                 return False
             if self._is_parked_blocks(module, task_id, ignore_owners=admitted_parks):
                 return False
@@ -382,8 +390,9 @@ class ModuleLockTable:
         """
         depth = self._config.lock_depth
         result: dict[str, list[str]] = {}
+        partner = self._partner_of(exclude_task)
         for module in {normalize_lock(m, depth) for m in modules}:
-            holders = self._holders_counted_against(module, exclude_task)
+            holders = self._holders_counted_against(module, exclude_task, partner)
             if holders and len(holders) >= self._limit_for(module):
                 result[module] = sorted(holders)
         return result
@@ -1040,7 +1049,12 @@ class ModuleLockTable:
         """
         depth = self._config.lock_depth
         normalized = list({normalize_lock(m, depth) for m in modules})
-        if not self._admits(task_id, normalized, admitted_parks=admitted_parks):
+        if not self._admits(
+            task_id,
+            normalized,
+            partner=self._partner_of(task_id),
+            admitted_parks=admitted_parks,
+        ):
             return False
 
         self._held[task_id] = set(normalized)
@@ -1052,11 +1066,12 @@ class ModuleLockTable:
     ) -> bool:
         """Declare *successor* the successor of *predecessor* and take *modules*, in one step.
 
-        The acquire is :meth:`try_acquire`'s, counted with the relation in
-        force (:meth:`_holders_counted_against`), so *successor* may share a
-        single-holder key *predecessor* holds.  A refusal returns False and
-        leaves no relation behind.  The relation lasts until either member's
-        :meth:`release`.
+        The acquire is :meth:`try_acquire`'s, counted with *predecessor* as
+        *successor*'s partner (:meth:`_holders_counted_against`), so
+        *successor* may share a single-holder key *predecessor* holds.  The
+        relation is recorded only once the acquire is admitted, so a refusal
+        (False) or an error in the check leaves none behind.  It lasts until
+        either member's :meth:`release`.
 
         Invariant 1 (PRD section 5.2) raises ValueError: *predecessor* must
         hold locks, *successor* must hold none, and neither may already be in
@@ -1066,11 +1081,10 @@ class ModuleLockTable:
         self._check_declarable(relation)
         depth = self._config.lock_depth
         normalized = list({normalize_lock(m, depth) for m in modules})
-        self._relations[successor] = self._relations[predecessor] = relation
-        if not self._admits(successor, normalized):
-            self._drop_relation(successor)
+        if not self._admits(successor, normalized, partner=predecessor):
             return False
 
+        self._relations[successor] = self._relations[predecessor] = relation
         self._held[successor] = set(normalized)
         logger.info(
             f'Task {successor} acquired locks as successor of {predecessor}: {normalized}'
@@ -1157,7 +1171,7 @@ class ModuleLockTable:
         ]
         if not new_modules:
             return True
-        if not self._admits(task_id, new_modules):
+        if not self._admits(task_id, new_modules, partner=self._partner_of(task_id)):
             return False
 
         self._held.setdefault(task_id, set()).update(new_modules)
