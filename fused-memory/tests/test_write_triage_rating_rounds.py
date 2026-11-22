@@ -5,6 +5,7 @@ Synthetic rows and a tmp scratch only. The module is loaded by path
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 import json
@@ -954,6 +955,54 @@ class TestBriefVersion:
     def test_refuses_any_other_label_naming_it(self, label: str) -> None:
         with pytest.raises(ValueError, match=re.escape(f'brief version label {label!r} ')):
             _mod().brief_version(label)
+
+
+class TestRaterBrief:
+    def test_keeps_its_version_and_sha256_and_is_frozen(self) -> None:
+        brief = _mod().RaterBrief('v2.2', 'a' * 64)
+        assert (brief.version, brief.sha256) == ('v2.2', 'a' * 64)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            brief.version = 'v2.3'
+
+    def test_refuses_a_version_that_is_not_a_brief_version_label(self) -> None:
+        with pytest.raises(ValueError, match='brief version label'):
+            _mod().RaterBrief('2.2', 'a' * 64)
+
+    @pytest.mark.parametrize('sha', ['xyz', 'A' * 64])
+    def test_refuses_a_sha256_that_is_not_64_lowercase_hex_naming_it(self, sha: str) -> None:
+        with pytest.raises(ValueError, match=re.escape(repr(sha))):
+            _mod().RaterBrief('v2.2', sha)
+
+    def test_brief_v2_1_is_the_v2_1_label_and_its_sha256(self) -> None:
+        rounds = _mod()
+        expected = rounds.RaterBrief('v2.1', rounds.BRIEF_V2_1_SHA256)
+        assert expected == rounds.BRIEF_V2_1
+
+    def test_the_latest_rerate_brief_of_a_summary_is_its_last_rerates(self) -> None:
+        record = {'rerates': [
+            {'version': 'v2.2', 'round': 1, 'pairs': 3, 'brief_sha256': 'b' * 64},
+            {'version': 'v2.3', 'round': 2, 'pairs': 1, 'brief_sha256': 'c' * 64},
+        ]}
+        assert _mod().latest_rerate_brief(record) == _mod().RaterBrief('v2.3', 'c' * 64)
+
+    def test_the_latest_rerate_brief_of_a_scratch_key_is_the_brief_it_was_keyed_under(
+        self, tmp_path: Path, old_brief: Path, new_brief: Path,
+    ) -> None:
+        rounds, entries = _mod(), _two_writes()
+        first = rounds.RatingScratch(tmp_path / 'scratch', brief=old_brief)
+        key = first.load_key()
+        first.add_shards(key, list(entries.values()), seed=7)
+        first.save_key(key)
+        revised = rounds.RatingScratch(first.root, brief=new_brief)
+        rounds.rerate_round(revised, revised.load_key(), entries, [('w', 'p1')], version='v2.2')
+        key = revised.load_key()
+        assert key['rerates'][-1]['pairs'] == [['w', 'p1']]
+        assert rounds.latest_rerate_brief(key) == rounds.RaterBrief('v2.2', _sha(new_brief))
+
+    @pytest.mark.parametrize('record', [{'rerates': []}, {'shards': {}, 'items': {}}])
+    def test_a_record_without_a_rerate_is_refused(self, record: dict[str, Any]) -> None:
+        with pytest.raises(ValueError, match='no re-rate'):
+            _mod().latest_rerate_brief(record)
 
 
 def _never_called() -> dict[tuple[str, str], Any]:

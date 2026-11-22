@@ -860,15 +860,21 @@ def _primary_shard_of(key: dict[str, Any], keyed: tuple[str, str, str]) -> str:
 CORPUS_FILES = ('items.jsonl', 'verdicts.jsonl', 'strata.json', 'derivation.json')
 
 
-def _score(out: Path, *, verdicts: str = 'verdicts.jsonl', rubric: str = 'v2.1') -> int:
+def _score(out: Path, *, verdicts: str = 'verdicts.jsonl', corpus_record: str | None = None) -> int:
     """The scorer's exit code over the corpus ``assemble`` wrote into *out*, its verdicts
-    read from ``write_triage_v2_soak_<verdicts>``."""
+    read from ``write_triage_v2_soak_<verdicts>``.
+
+    The brief is the latest re-rate's of ``write_triage_v2_soak_<corpus_record>``
+    when given; else, for a corpus with no re-rate, v2.1 named explicitly.
+    """
     score = load_script_module(SCRIPTS / 'score_write_triage_reader.py',
                                mod_name='score_write_triage_reader')
     paths = {name: out / f'write_triage_v2_soak_{name}' for name in ('items.jsonl', verdicts, 'strata.json')}
+    brief = (['--rubric', 'v2.1', '--brief-sha256', BRIEF_SHA256] if corpus_record is None
+             else ['--corpus-record', str(out / f'write_triage_v2_soak_{corpus_record}')])
     return score.main([
         '--items', str(paths['items.jsonl']), '--verdicts', str(paths[verdicts]),
-        '--strata', str(paths['strata.json']), '--rubric', rubric,
+        '--strata', str(paths['strata.json']), *brief,
     ])
 
 
@@ -1214,7 +1220,7 @@ class TestTheRerate:
         assert {name: spec['brief_sha256'] for name, spec in derivation['shards'].items()} == {
             name: _sha(brief) if name in rerate['shards'] else BRIEF_SHA256 for name in key['shards']}
         assert derivation['check']['brief_sha256'] == BRIEF_SHA256
-        assert _score(out, verdicts='verdicts_v2_2.jsonl', rubric='v2.2') == 0
+        assert _score(out, verdicts='verdicts_v2_2.jsonl', corpus_record='derivation_v2_2.json') == 0
 
     def test_assemble_refuses_a_pair_reading_loss_outside_the_latest_rerate(
         self, rerated: _Bundle, brief: Path, tmp_path: Path,

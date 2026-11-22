@@ -105,10 +105,12 @@ def _current_rows_by_pair() -> dict[tuple[str, str], list[dict[str, Any]]]:
 class TestTheCommittedV22SoakReport:
 
     def test_rescoring_the_inputs_under_v2_2_reproduces_the_report(self) -> None:
-        rescored = _score().score_reader(_items(), _verdicts(), rubric='v2.2',
+        rescored = _score().score_reader(_items(), _verdicts(),
+                                         brief=_rounds().latest_rerate_brief(_derivation()),
                                          strata=_json('strata.json'))
         assert rescored == _report()
         assert _report()['rubric'] == 'v2.2'
+        assert _report()['brief_sha256'] == _rerate()['brief_sha256']
 
     def test_the_markdown_is_the_rendered_report(self) -> None:
         markdown = (CALIBRATION / f'{STEM}_baseline_v2_2.md').read_text()
