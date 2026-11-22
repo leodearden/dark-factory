@@ -3,8 +3,9 @@
 One report-mode sweep over the in-process server in ``_link_heal_harness`` writes
 ``summary.json``. θ's predicate, ``scripts/check_write_triage_readiness_gate.py``,
 then runs over it with θ's own summary bounds, so a key θ requires that the
-producer stops writing fails here. The predicate is reached through the
-repository, which is why this module is apart from ``test_link_heal_metrics``.
+producer stops writing fails here, and so does a summary no run has replaced
+since it expired. The predicate is reached through the repository, which is why
+this module is apart from ``test_link_heal_metrics``.
 """
 
 from __future__ import annotations
@@ -29,13 +30,16 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from fused_memory.maintenance.link_heal import HealAction, Verdict
 from fused_memory.maintenance.link_heal_executor import RunLimits
 from fused_memory.maintenance.link_heal_ledger import LinkHealLedger
-from fused_memory.maintenance.link_heal_metrics import SweepMetricsTarget, summary_path
+from fused_memory.maintenance.link_heal_metrics import (
+    SUMMARY_TTL,
+    SweepMetricsTarget,
+    summary_path,
+)
 from fused_memory.maintenance.link_heal_sweep import SweepSettings, run_sweep
 from fused_memory.server.grouped_read import SIGHTING_KIND
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
-NOW = datetime(2026, 11, 15, 2, 15, tzinfo=UTC)
 GATE_SCRIPT = Path(__file__).resolve().parents[2] / 'scripts' / 'check_write_triage_readiness_gate.py'
 #: Gate θ's three summary bounds, copied verbatim from task 6191's metadata.before_done.args.
 THETA_SUMMARY_REQUIRES = (
@@ -61,11 +65,15 @@ def ledger(tmp_path: Path):
     opened.close()
 
 
-async def _report_mode_sweep(harness, ledger, tmp_path: Path) -> Path:
-    """Sweep one in-window sighting without writes; the summary it leaves."""
+def _now() -> datetime:
+    return datetime.now(UTC).replace(microsecond=0)
+
+
+async def _report_mode_sweep(harness, ledger, tmp_path: Path, now: datetime) -> Path:
+    """Sweep, at *now*, one in-window sighting without writes; the summary it leaves."""
     harness.seed_link(
         kind=SIGHTING_KIND, child_text='a sighting', parent_text='its parent',
-        meta={'created_at': (NOW - timedelta(hours=12)).isoformat()},
+        meta={'created_at': (now - timedelta(hours=12)).isoformat()},
     )
     root = tmp_path / 'memory-evals'
     await run_sweep(
@@ -84,10 +92,19 @@ async def _report_mode_sweep(harness, ledger, tmp_path: Path) -> Path:
         ),
         filer=RecordingFiler(),
         reports_dir=tmp_path / 'reports',
-        now=NOW,
+        now=now,
         metrics=SweepMetricsTarget(root, DF),
     )
     return summary_path(root)
+
+
+def _theta(summary: Path) -> dict:
+    """θ's full verdict over *summary* with θ's own summary bounds."""
+    argv = [sys.executable, str(GATE_SCRIPT), '--gate', 'theta', '--report', 's', str(summary)]
+    for require in THETA_SUMMARY_REQUIRES:
+        argv += ['--require', *require]
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    return json.loads(completed.stdout.strip().splitlines()[-2])
 
 
 class TestThetaReadsTheSummary:
@@ -95,19 +112,30 @@ class TestThetaReadsTheSummary:
     async def test_every_theta_summary_bound_resolves_to_a_number(
         self, harness, ledger, tmp_path,
     ):
-        summary = await _report_mode_sweep(harness, ledger, tmp_path)
-        argv = [sys.executable, str(GATE_SCRIPT), '--gate', 'theta', '--report', 's', str(summary)]
-        for require in THETA_SUMMARY_REQUIRES:
-            argv += ['--require', *require]
+        summary = await _report_mode_sweep(harness, ledger, tmp_path, _now())
 
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        verdict = _theta(summary)
 
-        verdict = json.loads(completed.stdout.strip().splitlines()[-2])
-        assert len(verdict['checks']) == 3
-        for check in verdict['checks']:
+        expiry, *requires = verdict['checks']
+        assert expiry['check'] == 's:expires_at' and expiry['ok'], expiry
+        assert len(requires) == 3
+        for check in requires:
             assert check['note'] is None, check
             assert isinstance(check['actual'], int | float), check
             assert not isinstance(check['actual'], bool), check
         assert [check['check'] for check in verdict['checks'] if not check['ok']] == [
             's:runs_7d >= 6',
         ]
+
+    @pytest.mark.asyncio
+    async def test_a_summary_no_run_replaced_for_over_a_ttl_fails_theta(
+        self, harness, ledger, tmp_path,
+    ):
+        swept_at = _now() - SUMMARY_TTL - timedelta(hours=1)
+        summary = await _report_mode_sweep(harness, ledger, tmp_path, swept_at)
+
+        verdict = _theta(summary)
+
+        failed = [check for check in verdict['checks'] if not check['ok']]
+        assert failed[0]['check'] == 's:expires_at'
+        assert failed[0]['actual'] == json.loads(summary.read_text())['expires_at']

@@ -52,6 +52,7 @@ from fused_memory.maintenance.link_heal_ledger import LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_metrics import (
     CONTRACT_METRICS,
     EVAL_ID,
+    SUMMARY_TTL,
     SUMMED_METRICS,
     THETA_SUMMARY_KEYS,
     SweepMetrics,
@@ -262,6 +263,18 @@ class TestTheSummary:
 
         assert summary['runs_7d'] == 4
         assert summary['run_days_7d'] == 3
+
+    def test_the_summary_expires_one_ttl_after_its_window_ends(self, tmp_path):
+        summary = summarize_series(tmp_path, now=NOW)
+
+        assert isinstance(summary['expires_at'], str)
+        expires_at = datetime.fromisoformat(summary['expires_at'])
+        assert expires_at.tzinfo is not None
+        assert expires_at == NOW + SUMMARY_TTL
+        assert summary['window']['until'] == format_stamp(NOW)
+
+    def test_the_ttl_outlives_one_nightly_interval_but_not_a_missed_night(self):
+        assert timedelta(days=1) < SUMMARY_TTL < timedelta(days=2)
 
 
 #: The per-run metrics behind θ's keys: each _7d sum in THETA_KEYS, and the rate's two terms.
