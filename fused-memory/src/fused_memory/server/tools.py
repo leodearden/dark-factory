@@ -177,6 +177,7 @@ from fused_memory.server.grouped_read import (
     group_search_results,
 )
 from fused_memory.server.guard_excerpt import excerpt_fields
+from fused_memory.server.manifest_root import resolve_manifest_root
 from fused_memory.server.manifest_stamping import (
     stamp_capability_manifests,
     stamping_action_required,
@@ -10306,7 +10307,12 @@ def create_mcp_server(
         batch names and attaches the ``manifest_stamping`` report, plus
         ``manifest_stamping_action_required`` when it needs repair; it never
         blocks the flip. The contract is the
-        ``fused_memory.server.manifest_stamping`` module docstring.
+        ``fused_memory.server.manifest_stamping`` module docstring. A
+        ``manifest_root`` that is not an existing worktree of *project_root*'s
+        repository, or that is the main checkout itself, is refused with
+        ``error_type='ManifestRootRefused'`` and a ``reason_code`` before
+        anything is read or flipped; the rules live in
+        ``fused_memory.server.manifest_root``.
 
         Returns ``{success, results: [{task_id, result: ...}, ...]}`` matching
         the multi-id ``set_task_status`` response shape.
@@ -10347,6 +10353,13 @@ def create_mcp_server(
                     ),
                     'error_type': 'ValidationError',
                 }
+
+        accepted_manifest_root: Path | None = None
+        if manifest_root is not None:
+            accepted = await resolve_manifest_root(project_root, manifest_root)
+            if isinstance(accepted, dict):
+                return accepted
+            accepted_manifest_root = accepted
 
         # Lock-charter guard γ: batch-read all tasks concurrently, then
         # scan for directory entries before flipping status.  asyncio.gather
@@ -10467,7 +10480,7 @@ def create_mcp_server(
                 tasks_data=list(tasks_data),
                 task_interceptor=task_interceptor,
                 agent_id=agent_id,
-                manifest_root=Path(manifest_root) if manifest_root is not None else None,
+                manifest_root=accepted_manifest_root,
             )
             if manifest_report is not None and isinstance(result, dict):
                 result['manifest_stamping'] = manifest_report
