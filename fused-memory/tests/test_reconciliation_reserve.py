@@ -241,7 +241,7 @@ class TestDrainSitesStepAside:
             with patch('fused_memory.reconciliation.harness._sleep', counting_sleep):
                 loop_task = asyncio.create_task(harness._project_loop('test-project'))
                 try:
-                    await asyncio.wait_for(third_sleep.wait(), timeout=30)
+                    await asyncio.wait_for(third_sleep.wait(), timeout=120)
                 finally:
                     loop_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):

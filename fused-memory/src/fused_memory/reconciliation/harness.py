@@ -85,6 +85,7 @@ from fused_memory.reconciliation.overreach_flags import (
 )
 from fused_memory.reconciliation.predecessor_drain_recovery import recover_predecessor_drains
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
+from fused_memory.reconciliation.reserve_step_aside import ReserveStepAside, StepAsideSite
 from fused_memory.reconciliation.scope_freshness import (
     ScopeFreshnessResult,
     compute_scope_signature,
@@ -815,6 +816,7 @@ class ReconciliationHarness:
         escalation_listener: socket.socket | None = None,
         full_cycle_deadline: Callable[[float], asyncio.Timeout] = asyncio.timeout,
         escalation_queue: EscalationQueue | None = None,
+        usage_gate: UsageGate | None = None,
     ):
         self.memory = memory_service
         # systemd-held listening socket for the escalation port, so it stays
@@ -920,10 +922,11 @@ class ReconciliationHarness:
         # SOONER than the bound would have — the fail-safe direction.
         self._remediation_deferrals: dict[str, int] = {}
 
-        # Usage gate (multi-account cap failover)
-        self.usage_gate: UsageGate | None = None
-        if hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
+        # Usage gate (multi-account cap failover): the injected one, else one from config.
+        self.usage_gate: UsageGate | None = usage_gate
+        if self.usage_gate is None and hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
             self.usage_gate = UsageGate(self.config.usage_cap)
+        self._reserve_step_aside = ReserveStepAside(self.usage_gate)
 
         # Judge — receives a callback that clears _halt_escalated so a
         # subsequent halt in the same process re-fires the escalation.
@@ -3130,6 +3133,9 @@ class ReconciliationHarness:
                     continue
 
                 idle_ticks = 0
+                if await self.reserve_steps_aside(project_id, site=StepAsideSite.PROJECT_LOOP):
+                    await _sleep(5)
+                    continue
                 acquired = await self.buffer.mark_run_active(project_id)
                 if not acquired:
                     await _sleep(5)
@@ -3307,6 +3313,20 @@ class ReconciliationHarness:
                 await self.buffer.heartbeat(project_id)
             except Exception as e:
                 logger.warning(f'Heartbeat failed for {project_id}: {e}')
+
+    async def reserve_steps_aside(self, project_id: str, *, site: StepAsideSite) -> bool:
+        """Whether *site* defers now because the allowance reserve refuses reconciliation.
+
+        The policy is fused_memory/reconciliation/reserve_step_aside.py's. On the
+        first check after a refusal ends, the judges it left pending are recovered.
+        """
+        check = self._reserve_step_aside.check(project_id, site=site)
+        if check.refusal_ended:
+            try:
+                await self._recover_pending_judge_reviews()
+            except Exception as e:
+                logger.warning(f'_recover_pending_judge_reviews after a reserve refusal failed: {e}')
+        return check.refused
 
     async def _spawn_judge(self, run_id: str, project_id: str) -> None:
         """Durably mark a judge review pending, then fire a tracked judge task.
@@ -6136,6 +6156,11 @@ class BacklogIterator:
                     )
                     yielded = True
                     break
+                if await self.harness.reserve_steps_aside(
+                    project_id, site=StepAsideSite.BACKLOG_CHUNK,
+                ):
+                    yielded = True
+                    break
 
                 # Peek at up to 1000 events (far more than a single budget can hold)
                 peeked = await self.buffer.peek_buffered(
@@ -6154,9 +6179,9 @@ class BacklogIterator:
                     return  # Stop iteration on failure
 
             # Final consolidation pass — skipped when the loop yielded on the
-            # cumulative budget (task 2040): the remaining backlog stays
-            # buffered for the next cycle instead of forcing an extra
-            # consolidation cycle past the budget.
+            # cumulative budget (task 2040) or on a reserve refusal (task 10432):
+            # the remaining backlog stays buffered for the next cycle instead of
+            # forcing an extra consolidation cycle.
             if chunk_num > 0 and not yielded:
                 await self._run_final_consolidation(project_id, opus_tier)
 
