@@ -5,9 +5,10 @@ pre-registered in `design.md` §2, and the reading of these results is in
 `design.md` §3 onward. Every number below comes from `report.json` in this
 directory, abbreviated `r.`; the exceptions are computed from it, and the
 arithmetic is shown. `report.json` was written by
-`luna_migration_eval.py score` on 2026-11-22. Its sha256 is
-`05f9a311d5bc5e7d96d0419e422d72577dd75522cf97ffab583d571676346b34`, and the
-run is in `provenance.json` `runs[step=score]`.
+`luna_migration_eval.py score` on 2026-11-22 and re-scored the same day after
+one summary rating was corrected (§1, last bullet). Its sha256 is
+`a1d616c50b91b3462728410f6921ba8ae8dd8cfbd953e2c23ec8c24aaee8d68b`; the first
+score run is in `provenance.json` `runs[step=score]`.
 
 The candidate arm is `luna-low`: gpt-6-luna at reasoning effort low, on the
 plan proxy. The control is gpt-4o-mini at today's settings, on
@@ -22,7 +23,7 @@ fixtures both arms ran. No arm left a failure line on any site.
 | | E2 | holding retention 1.2261 (`…statistics.holding_retention`) | ≥ 0.8 | pass | |
 | resolve_edge | R1 | merge accuracy +0.035 [−0.0117, 0.0817] (`r.sites.resolve_edge.decision.statistics.merge_accuracy`) | lower ≥ −0.05 | pass | **FAIL** (`r.sites.resolve_edge.decision.passes`) |
 | | R2 | no-false-merge −0.01 [−0.0466, 0.0266] (`…statistics.no_false_merge`) | lower ≥ −0.03 | **fail** | |
-| summaries | S1 | faithful rate +0.1375 [0.0411, 0.2339] (`r.sites.summaries.decision.statistics.faithful_rate`) | lower ≥ −0.10 | pass | **PASS** (`r.sites.summaries.decision.passes`) |
+| summaries | S1 | faithful rate +0.125 [0.0309, 0.2191] (`r.sites.summaries.decision.statistics.faithful_rate`) | lower ≥ −0.10 | pass | **PASS** (`r.sites.summaries.decision.passes`) |
 | classifier | C1 | label accuracy +0.0591 [−0.0189, 0.1371] (`r.sites.classifier.decision.statistics.label_accuracy`) | lower ≥ −0.05 | pass | **PASS** (`r.sites.classifier.decision.passes`) |
 | router | Q1 | label accuracy −0.2667 [−0.3322, −0.2011] (`r.sites.router.decision.statistics.label_accuracy`) | lower ≥ −0.05 | **fail** | **FAIL** (`r.sites.router.decision.passes`) |
 
@@ -33,6 +34,16 @@ fixtures both arms ran. No arm left a failure line on any site.
 * **Paired n**: resolve_edge 200, summaries 80 items over 45 fixtures,
   classifier 203, router 300 (`r.sites.<site>.decision.statistics.<metric>.n`).
   Extraction covers 54 episodes per arm (`r.extraction.arms.<arm>.episodes`).
+* **One summary rating was corrected after scoring** (esc-9945-3). luna's
+  answer for reify episode ea2a4400…, node 661ececa…, omitted that node, so
+  graphiti kept its stored summary and the run recorded the echo: 2,248
+  chars, byte-identical to the input summary, past the 500-char cap graphiti
+  applies to every summary it writes. It had been rated faithful. Under
+  `design.md` §2.4 it is `dropped`, and S1 moved from +0.1375 [0.0411, 0.2339]
+  (b = 14) to +0.125 [0.0309, 0.2191] (b = 13). The verdict is unchanged.
+  It is the only arm summary in `runs.jsonl` that matches its input's
+  `summary_sha256`. `luna_eval_sites.py::run_summaries` now records None for
+  an omitted node, so a re-run shows it to the rater as dropped.
 
 ## 2. The routing layer's joint verdict
 
@@ -115,7 +126,7 @@ Each is read in full in `design.md` §7.
   * the extraction status-record holding reading (E2);
   * the summaries supersession reading (S1). All five of the ratings that
     rule decided fell on the control. Without the rule, S1 is still
-    +0.075 [−0.0083, 0.1583], a pass (`design.md` §4.3).
+    +0.0625 [−0.0176, 0.1426], a pass (`design.md` §4.3).
 * **R2 is underpowered at this n.** Only 14 fixtures split the arms on
   no-false-merge. At n = 200 with b + c = 14, even a zero difference gives a
   lower bound of −0.0367, below the −0.03 bar. So R2 could pass only with

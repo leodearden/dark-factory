@@ -153,6 +153,12 @@ class TestRunSummaries:
         assert record['summaries'] == {'A': 'Alpha runs the merge queue.', 'B': 'Beta is served by the queue.'}
 
     @pytest.mark.asyncio
+    async def test_a_node_the_answer_omits_records_none(self) -> None:
+        answer = {SUMMARY_PROMPT: {'summaries': [{'name': 'Alpha', 'summary': 'Alpha runs the merge queue.'}]}}
+        record = await sites.run_summaries(_luna(answer), SUMMARY_FIXTURE, PREVIOUS, sites.SITE_ARMS['luna-low'])
+        assert record['summaries'] == {'A': 'Alpha runs the merge queue.', 'B': None}
+
+    @pytest.mark.asyncio
     async def test_the_episode_its_previous_episodes_and_the_summaries_reach_the_prompt(self) -> None:
         llm = _SiteLLM(SUMMARY_ANSWER)
         await sites.run_summaries(llm, SUMMARY_FIXTURE, PREVIOUS, sites.SITE_ARMS['control'])

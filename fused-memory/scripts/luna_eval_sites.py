@@ -176,6 +176,9 @@ async def run_summaries(
     ``episode_content``, ``nodes`` (node_uuid, node_name, summary) and ``edges`` (uuid,
     source_node_uuid, target_node_uuid, fact). *previous* is the previous episodes' contents,
     oldest first, as replay_overreach_extraction.EpisodeContextReader reads them.
+
+    A node the model's answer omits records None. graphiti overwrites only the summaries the
+    answer names and leaves the rest as they came in, so an unchanged summary is a dropped node.
     """
     await check_arm_client(llm, arm)
     graph = fixture['graph']
@@ -190,6 +193,7 @@ async def run_summaries(
                    summary=node['summary'], created_at=valid_at)
         for node in fixture['nodes']
     ]
+    given = {node.uuid: node.summary for node in nodes}
     edges = [
         _entity_edge(graph, {**edge, 'created_at': fixture['episode_valid_at']}) for edge in fixture['edges']
     ]
@@ -198,7 +202,7 @@ async def run_summaries(
         await extract_attributes_from_nodes(clients, nodes, episode, previous_nodes, entity_types=None, edges=edges)
     return _record(
         Site.summaries, arm, _graphiti_client(llm), fixture, measured_usage(tokens),
-        summaries={node.uuid: node.summary for node in nodes},
+        summaries={node.uuid: None if node.summary == given[node.uuid] else node.summary for node in nodes},
     )
 
 

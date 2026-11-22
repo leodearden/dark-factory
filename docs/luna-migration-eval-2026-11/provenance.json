@@ -412,6 +412,52 @@
     "Every script this run executed has the same blob as at the router run, so no instrument changed between the arms and the score.",
     "After scoring, and only then, the classifier and router run logs' ERROR/WARNING lines were read and attributed to an arm by the request line just before each (api.openai.com or the plan proxy). Classifier: 14 luna and 1 control \"'null' is not a valid MemoryCategory\", matching runs.jsonl's fallback field. Router: 6 luna unparsed completions (5 truncated at max_completion_tokens 256, 1 empty) and 4 control answers naming a store that is not a SourceStore. design.md §3 reports them."
    ]
+  },
+  {
+   "step": "rescore",
+   "argv": [
+    "uv",
+    "run",
+    "python",
+    "scripts/luna_migration_eval.py",
+    "score",
+    "--dir",
+    "../docs/luna-migration-eval-2026-11",
+    "--calls-per-day",
+    "/tmp/9945-calls-per-day.json",
+    "--plan-window-usd-per-week",
+    "280",
+    "470",
+    "--out",
+    "../docs/luna-migration-eval-2026-11/report.json"
+   ],
+   "cwd": "/home/leo/src/dark-factory/.worktrees/9945/fused-memory",
+   "exit_code": 0,
+   "invocations": 1,
+   "git_sha": "2192aad359082e9d6c2d88ff4cd40336d38b2fd2",
+   "code_blobs": {
+    "fused-memory/scripts/luna_migration_eval.py": "3c71d16244361f5f66b393141ad8dbc6fd2b7a2f",
+    "fused-memory/scripts/luna_eval_score.py": "b36df2371ca17640e05d6cae79dd225b2972c770",
+    "fused-memory/scripts/luna_eval_frame.py": "0e13da23296c4832f51fd95a4b5003fa2d12cfd3",
+    "fused-memory/scripts/luna_eval_sites.py": "779548b336f7e28a97e5a293a2f7684180e2de68",
+    "fused-memory/scripts/replay_overreach_extraction.py": "2d124e2826327593db3fd516643f154d2970bc00",
+    "fused-memory/scripts/audit_ruling_overreach.py": "ed4667d89a800f7e9fb6c699b5805de81a4675f2",
+    "fused-memory/scripts/_graph_script_cli.py": "0031a78823833af525840c841c1942664892af56",
+    "fused-memory/scripts/score_write_triage_pairs.py": "ffed4f3c506764167b8d3b287a596ed9f0472295"
+   },
+   "output": "report.json",
+   "output_sha256": "a1d616c50b91b3462728410f6921ba8ae8dd8cfbd953e2c23ec8c24aaee8d68b",
+   "inputs": {
+    "calls_per_day_file": "/tmp/9945-calls-per-day.json",
+    "calls_per_day_sha256": "36e950896928070e743892acde2106bc99b720e5390f06b19600c2a1e85c9e77",
+    "ratings_summaries_sha256": "48c31bc25e3ae7b3e064864c84f42aaa4a647720df5bdbefb7c69efa539cd4ac"
+   },
+   "notes": [
+    "Re-run on 2026-11-22 for esc-9945-3 after one summary rating was corrected; no LLM, graph or network call.",
+    "Correction: ratings-summaries.json item reify/ea2a4400-9469-4784-84e8-8fc16892e9b8 node 661ececa-32ab-440f-a29f-0f832826b807 letter A (luna-low under the key) faithful -> dropped. The arm's answer omitted the node; graphiti kept the stored summary and run_summaries recorded it. The recorded text's sha256 equals fixtures-summaries.json summary_sha256 for the item (2,248 chars, past graphiti's 500-char applied cap). It is the only one of the 160 arm summaries that matches its input's sha256. design.md §2.4 rates it dropped.",
+    "Only sites.summaries.decision.statistics.faithful_rate changed: difference 0.1375 -> 0.125, ci [0.0411, 0.2339] -> [0.0309, 0.2191], candidate_only 14 -> 13. passes is unchanged (true).",
+    "luna_eval_sites.py differs from the score run's blob: run_summaries now records None for a node whose summary is unchanged by the call. score does not execute that function."
+   ]
   }
  ],
  "adjudication": {

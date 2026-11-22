@@ -525,17 +525,26 @@ provenance is in `provenance.json`. §1 and §2 are unchanged.*
 
 ### 4.3 summaries: PASS
 
-* **S1 passes**: +0.1375 [0.0411, 0.2339], with b = 14 and c = 3, over 80 items
+* **S1 passes**: +0.125 [0.0309, 0.2191], with b = 13 and c = 3, over 80 items
   (`r.sites.summaries.decision.statistics.faithful_rate`).
-* **Ratings, after the key was opened**: luna 77 faithful and 3 unsupported;
-  the control 66 faithful and 14 unsupported. No summary was dropped.
+* **Ratings, after the key was opened**: luna 76 faithful, 3 unsupported and
+  1 dropped; the control 66 faithful and 14 unsupported.
+* **Correction, 2026-11-22 (esc-9945-3).** This section first read S1 as
+  +0.1375 [0.0411, 0.2339] with b = 14, and said no summary was dropped.
+  luna's answer for reify episode ea2a4400…, node 661ececa…, omitted the
+  node. graphiti leaves an unreturned node's summary as it came in, and
+  `run_summaries` recorded that echo as the arm's summary, so the rater saw
+  the stored 2,248-char input and rated it faithful. §2.4 rates a node an
+  arm returned no summary for `dropped`; the rating was corrected and
+  `score` re-run. §1–§2 are unchanged. `run_summaries` now records None for
+  an omitted node, and no other arm summary matches its input's sha256.
 * **S1 depends on a reading fixed while blind** (step-26 deviation;
   `provenance.json` `adjudication.summaries.conventions`). A claim was rated
   unsupported when it states as current a state that an input in view
   explicitly retires, removes or supersedes.
   * That rule decided 5 ratings: items 030 A, 040 A, 050 B, 051 B and 056 B.
     The key shows all 5 are the control's.
-  * Rated faithful instead, S1 would be +0.075 [−0.0083, 0.1583]: b = 9,
+  * Rated faithful instead, S1 would be +0.0625 [−0.0176, 0.1426]: b = 8,
     c = 3, still a pass. That is a sensitivity reading, not part of the
     decision.
 

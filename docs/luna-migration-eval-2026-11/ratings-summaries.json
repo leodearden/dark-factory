@@ -298,8 +298,8 @@
    "fixture_id": "reify/ea2a4400-9469-4784-84e8-8fc16892e9b8",
    "node_uuid": "661ececa-32ab-440f-a29f-0f832826b807",
    "summary": "A",
-   "rating": "faithful",
-   "rationale": "Every sentence is a previous-summary sentence restated (\"Defect 5 is the only divergence in the bash corpus comparison\", \"The defect was caused by folding correct short entries into the long canonical\", \"A defect destroyed 100% of remote verify capacity\", ...); nothing is added."
+   "rating": "dropped",
+   "rationale": "Corrected 2026-11-22 (esc-9945-3), after the key was opened: this arm's answer omitted the node, so graphiti left its stored summary in place and the run recorded that echo. The text is byte-identical to the input summary (sha256 matches fixtures-summaries.json summary_sha256) and 2,248 chars, past the 500-char cap graphiti applies to every summary it writes. Under design.md §2.4 a node an arm returned no summary for is `dropped`. Originally rated faithful as: Every sentence is a previous-summary sentence restated (\"Defect 5 is the only divergence in the bash corpus comparison\", \"The defect was caused by folding correct short entries into the long canonical\", \"A defect destroyed 100% of remote verify capacity\", ...); nothing is added."
   },
   {
    "fixture_id": "reify/ea2a4400-9469-4784-84e8-8fc16892e9b8",

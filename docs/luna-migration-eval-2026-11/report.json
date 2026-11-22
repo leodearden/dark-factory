@@ -1044,13 +1044,13 @@
             "fixtures": 45
           },
           "faithful_rate": {
-            "candidate_only": 14,
+            "candidate_only": 13,
             "ci": [
-              0.0411,
-              0.2339
+              0.0309,
+              0.2191
             ],
             "control_only": 3,
-            "difference": 0.1375,
+            "difference": 0.125,
             "margin": 0.1,
             "n": 80,
             "passes": true
