@@ -72,6 +72,19 @@ async def startup_scan_live_graph():
             await client.aclose()
 
 
+async def _seed_relates_to_edge(graph, src, dst, edge_uuid, fact, embedding=None):
+    """Seed a legacy RELATES_TO edge between two existing :Entity nodes."""
+    query = (
+        'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
+        'CREATE (a)-[e:RELATES_TO {uuid: $edge_uuid, name: $name, fact: $fact}]->(b)'
+    )
+    params = {'src': src, 'dst': dst, 'edge_uuid': edge_uuid, 'name': 'rel', 'fact': fact}
+    if embedding is not None:
+        query += ' SET e.fact_embedding = vecf32($embedding)'
+        params['embedding'] = embedding
+    await graph.query(query, params)
+
+
 # ---------------------------------------------------------------------------
 # step-1/step-2: GraphitiBackend._scan_duplicate_entity_names — B5 dup-node alarm
 # ---------------------------------------------------------------------------
@@ -562,23 +575,12 @@ class TestRepairDuplicateEdgeUuidsLiveFalkorDB:
             "(:Entity {uuid: 'd', name: 'D'})"
         )
 
-        async def seed_edge(src, dst, edge_uuid, fact, embedding):
-            await graph.query(
-                'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
-                'CREATE (a)-[e:RELATES_TO {uuid: $edge_uuid, name: $name, fact: $fact}]->(b) '
-                'SET e.fact_embedding = vecf32($embedding)',
-                {
-                    'src': src, 'dst': dst, 'edge_uuid': edge_uuid,
-                    'name': 'rel', 'fact': fact, 'embedding': embedding,
-                },
-            )
-
         # One distinct-uuid edge (must be left untouched) plus a
         # PRE-EXISTING dup-uuid pair ('dup') between two DIFFERENT node
         # pairs.
-        await seed_edge('a', 'b', 'distinct1', 'a relates to b', [1.0, 2.0])
-        await seed_edge('c', 'd', 'dup', 'c relates to d', [3.0, 4.0])
-        await seed_edge('a', 'd', 'dup', 'a relates to d', [5.0, 6.0])
+        await _seed_relates_to_edge(graph, 'a', 'b', 'distinct1', 'a relates to b', [1.0, 2.0])
+        await _seed_relates_to_edge(graph, 'c', 'd', 'dup', 'c relates to d', [3.0, 4.0])
+        await _seed_relates_to_edge(graph, 'a', 'd', 'dup', 'a relates to d', [5.0, 6.0])
 
         backend = GraphitiBackend.with_driver(
             mock_config,
@@ -672,53 +674,70 @@ class TestRepairDuplicateEdgeUuidsLiveFalkorDB:
             await client.aclose()
 
 
+async def _seed_dup_uuid_pair(graph) -> None:
+    """Seed two RELATES_TO edges sharing the uuid 'dup', from one node to two others."""
+    await graph.query(
+        "CREATE (:Entity {uuid: 'a', name: 'A'}), "
+        "(:Entity {uuid: 'b', name: 'B'}), "
+        "(:Entity {uuid: 'c', name: 'C'})"
+    )
+    await _seed_relates_to_edge(graph, 'a', 'b', 'dup', 'a relates to b')
+    await _seed_relates_to_edge(graph, 'a', 'c', 'dup', 'a relates to c')
+
+
+async def _sweep_with_registry(mock_config, registered_graph_ids) -> dict:
+    backend = GraphitiBackend.with_driver(
+        mock_config,
+        _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT),
+        registered_graph_ids=registered_graph_ids,
+    )
+    try:
+        return await backend._run_startup_identity_scan()
+    finally:
+        await backend.close()
+
+
+async def _edge_uuids_and_supersessions(graph) -> list[list]:
+    return (await graph.query(
+        'MATCH ()-[e:RELATES_TO]->() RETURN e.uuid, e.superseded_edge_uuid'
+    )).result_set
+
+
 @falkor_skipif()
 @pytest.mark.timeout(15)
 @pytest.mark.integration
 class TestStartupIdentityScanScopeLiveFalkorDB:
-    """Pin the sweep's scope against a REAL FalkorDB server's graph listing:
-    a backend whose registry does not name a graph leaves that graph's
-    deliberately duplicated edge uuids exactly as seeded (task 11326). The
-    unregistered graph stands in for a concurrent test's private graph on the
-    shared scratch server."""
+    """Pin the sweep's scope against a REAL FalkorDB server's graph listing
+    (task 11326): a backend whose registry does not name a graph leaves that
+    graph's deliberately duplicated edge uuids exactly as seeded, and one whose
+    registry does name it still repairs them. The unregistered graph stands in
+    for a concurrent test's private graph on the shared scratch server; the
+    registered one proves the registry ids still match raw GRAPH.LIST names."""
 
     @pytest.mark.asyncio
     async def test_a_sweep_leaves_an_unregistered_graphs_dup_uuids_untouched(
         self, mock_config, startup_scan_live_graph,
     ):
+        _, graph = startup_scan_live_graph
+        await _seed_dup_uuid_pair(graph)
+
+        await _sweep_with_registry(mock_config, ())
+
+        assert await _edge_uuids_and_supersessions(graph) == [['dup', None], ['dup', None]]
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_repairs_a_registered_graphs_dup_uuids(
+        self, mock_config, startup_scan_live_graph,
+    ):
         graph_name, graph = startup_scan_live_graph
+        await _seed_dup_uuid_pair(graph)
 
-        await graph.query(
-            "CREATE (:Entity {uuid: 'a', name: 'A'}), "
-            "(:Entity {uuid: 'b', name: 'B'}), "
-            "(:Entity {uuid: 'c', name: 'C'})"
-        )
+        stats = await _sweep_with_registry(mock_config, (graph_name,))
 
-        async def seed_edge(src, dst, edge_uuid, fact, embedding):
-            await graph.query(
-                'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
-                'CREATE (a)-[e:RELATES_TO {uuid: $edge_uuid, name: $name, fact: $fact}]->(b) '
-                'SET e.fact_embedding = vecf32($embedding)',
-                {
-                    'src': src, 'dst': dst, 'edge_uuid': edge_uuid,
-                    'name': 'rel', 'fact': fact, 'embedding': embedding,
-                },
-            )
-
-        await seed_edge('a', 'b', 'dup', 'a relates to b', [1.0, 2.0])
-        await seed_edge('a', 'c', 'dup', 'a relates to c', [3.0, 4.0])
-
-        backend = GraphitiBackend.with_driver(
-            mock_config,
-            _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT),
-            registered_graph_ids=(),
-        )
-        try:
-            await backend._run_startup_identity_scan()
-        finally:
-            await backend.close()
-
-        rows = (await graph.query(
-            'MATCH ()-[e:RELATES_TO]->() RETURN e.uuid, e.superseded_edge_uuid'
-        )).result_set
-        assert rows == [['dup', None], ['dup', None]]
+        assert stats['graphs_scanned'] == 1
+        assert stats['edges_repaired'] == 1
+        rows = await _edge_uuids_and_supersessions(graph)
+        assert len(rows) == 2
+        assert {(edge_uuid == 'dup', superseded) for edge_uuid, superseded in rows} == {
+            (True, None), (False, 'dup'),
+        }
