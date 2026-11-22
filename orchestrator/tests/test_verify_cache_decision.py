@@ -6,6 +6,7 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar, Literal
+from unittest.mock import patch
 
 import pytest
 from _git_fixtures import seed_repo
@@ -22,23 +23,26 @@ from _verify_cache_fixtures import (
     put_pytest_on_path,
 )
 
-from orchestrator import verify_plan
+from orchestrator import deployed_sha, verify_plan
 from orchestrator.config import (
     ModuleConfig,
     OrchestratorConfig,
     VerifyCacheConfig,
 )
+from orchestrator.deployed_sha import DeployedSha
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.harness import Harness
 from orchestrator.verify import VerifyResult, is_no_verdict_summary, run_scoped_verification
 from orchestrator.verify_cache.keys import TREE_UNIT_ID, UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import Decision
 from orchestrator.verify_cache.recorder import VerifyEvidenceRef, record_greens
-from orchestrator.verify_cache.registry import Entry, Registry
+from orchestrator.verify_cache.registry import Entry, Registry, registry_db_path
 from orchestrator.verify_cache.replay import CacheAccess, ReplayPlan, plan_replay
 from orchestrator.verify_evidence import (
     Leg,
     UnitOutcome,
+    UnitTier,
     VerifyUnit,
     module_leg_name,
     module_leg_unit,
@@ -228,7 +232,7 @@ class TestPlanReplay:
 
     @pytest.mark.asyncio
     async def test_a_runner_consults_no_registry(self, repo, modules):
-        replay = await _replay(repo, modules, CacheAccess.on_runner())
+        replay = await _replay(repo, modules, await CacheAccess.on_runner())
 
         for decided in (*replay.modules.values(), replay.tree):
             assert decided.decision.decision is Decision.UNAVAILABLE
@@ -704,3 +708,143 @@ class TestMergeGateRecordsAndConsumes:
         assert result.passed, result.summary
         assert await _entries_for(registry, result) == {}
         assert await registry.consumed_for(merge_sha) == ()
+
+
+# ---------------------------------------------------------------------------
+# The key's code identity: the process's DeployedSha, never wherever the code
+# checkout's HEAD has moved since. D1 and D2 name no commit of any checkout.
+
+_D1 = 'd' * 40
+_D2 = 'e' * 40
+
+
+def _deployed(sha: str = _D1, *, indeterminate: bool = False, dirty_wire_path: bool = False) -> DeployedSha:
+    return DeployedSha(sha=sha, indeterminate=indeterminate, dirty_wire_path=dirty_wire_path)
+
+
+def _keys(replay: ReplayPlan) -> dict[str, UnitKey | None]:
+    return {TREE_UNIT_ID: replay.tree.key, **{unit_id: decided.key for unit_id, decided in replay.modules.items()}}
+
+
+class TestCodeIdentity:
+    def test_the_dispatcher_access_carries_its_deployed_sha(self, repo):
+        assert CacheAccess.on_dispatcher(repo, deployed=_deployed(_D1)).orchestrator_code == _D1
+
+    @pytest.mark.asyncio
+    async def test_keys_follow_the_injected_identity(self, repo, modules, registry):
+        d1 = _keys(await _replay(repo, modules, CacheAccess(registry=registry, orchestrator_code=_D1)))
+        d1_again = _keys(await _replay(repo, modules, CacheAccess(registry=registry, orchestrator_code=_D1)))
+        d2 = _keys(await _replay(repo, modules, CacheAccess(registry=registry, orchestrator_code=_D2)))
+
+        assert set(d1) == set(d2) == {TREE_UNIT_ID} | _units('alpha') | _units('beta')
+        assert all(key is not None for key in (*d1.values(), *d2.values()))
+        assert d1 == d1_again
+        for unit_id, key in d1.items():
+            assert key != d2[unit_id], unit_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures('seam')
+    async def test_greens_recorded_under_one_deployed_sha_serve_only_that_sha(self, repo, modules, registry, markers):
+        config = cache_config(repo)
+        d1 = CacheAccess(registry=registry, orchestrator_code=_D1)
+        await _record_run(registry, await _gate(repo, config, modules, d1))
+        _clear(markers)
+
+        replayed = await _gate(repo, config, modules, d1)
+
+        assert _ran_legs(markers) == set()
+        assert _outcomes(replayed, _units('alpha') | _units('beta')) == {UnitOutcome.CACHE_HIT}
+        _clear(markers)
+
+        rerun = await _gate(repo, config, modules, CacheAccess(registry=registry, orchestrator_code=_D2))
+
+        assert _ran_legs(markers) == _legs('alpha') | _legs('beta')
+        assert _outcomes(rerun, _units('alpha') | _units('beta')) == {UnitOutcome.RAN_GREEN}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('deployed', 'reason'), [
+        pytest.param(None, ['no deployed sha'], id='none'),
+        pytest.param(_deployed(indeterminate=True), ['indeterminate', _D1], id='indeterminate'),
+        pytest.param(_deployed(dirty_wire_path=True), ['uncommitted', _D1], id='dirty-wire-path'),
+    ])
+    async def test_a_deployed_sha_that_cannot_name_the_code_makes_every_unit_unavailable(
+        self, tmp_path, repo, modules, deployed, reason,
+    ):
+        elsewhere = tmp_path / 'elsewhere'
+        access = CacheAccess.on_dispatcher(elsewhere, deployed=deployed)
+
+        replay = await _replay(repo, modules, access)
+
+        for decided in (*replay.modules.values(), replay.tree):
+            assert decided.decision.decision is Decision.UNAVAILABLE
+            for fragment in reason:
+                assert fragment in decided.decision.reason
+        assert not registry_db_path(elsewhere).exists()
+        assert not elsewhere.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_runner_keys_on_its_pinned_gate_checkout(self):
+        access = await CacheAccess.on_runner()
+
+        assert access.registry is None
+        checkout = deployed_sha.resolve_code_checkout()
+        assert checkout is not None
+        assert access.orchestrator_code == deployed_sha.checkout_head(checkout)
+
+
+# ---------------------------------------------------------------------------
+# The composition root keys its one dispatcher access on its own DeployedSha.
+
+
+def _harness_over(config: OrchestratorConfig, deployed: DeployedSha | None) -> Harness:
+    with patch('orchestrator.harness.McpLifecycle'), \
+         patch('orchestrator.harness.Scheduler'), \
+         patch('orchestrator.harness.BriefingAssembler'):
+        return Harness(config, deployed_sha=deployed)
+
+
+@pytest.mark.usefixtures('seam', 'code_default_config')
+class TestHarnessKeysTheCacheOnItsDeployedSha:
+    _TASK_FILES: ClassVar[tuple[str, ...]] = ('alpha/src/alpha/__init__.py', 'beta/src/beta/__init__.py')
+
+    @pytest.fixture
+    def config(self, repo: Path) -> OrchestratorConfig:
+        """The registry lives under the project's ignored ``data/``, so recording keeps the working copy at HEAD."""
+        _commit_edit(repo, '.gitignore', (repo / '.gitignore').read_text() + 'data/\n')
+        (repo / '.task').mkdir()
+        return cache_config(repo, LOG_MODES)
+
+    async def _seed_d1_greens(self, repo: Path, config: OrchestratorConfig, modules: list[ModuleConfig]) -> set[str]:
+        registry = Registry(registry_db_path(repo))
+        access = CacheAccess(registry=registry, orchestrator_code=_D1)
+        recorded = await _record_run(registry, await _task_verify(repo, config, modules, access, list(self._TASK_FILES)))
+        return set(recorded) - {TREE_UNIT_ID}
+
+    async def _module_units(
+        self, harness: Harness, repo: Path, config: OrchestratorConfig, modules: list[ModuleConfig],
+    ) -> dict[str, VerifyUnit]:
+        result = await harness._task_verify_dispatcher(
+            repo, config, modules, list(self._TASK_FILES), attempt_id=1, task_id='5653', archive_root=None,
+        )
+        assert result.passed, result.summary
+        return {unit.unit: unit for unit in result.units or () if unit.tier is UnitTier.MODULE}
+
+    @pytest.mark.asyncio
+    async def test_a_harness_deployed_at_d1_would_replay_the_d1_greens(self, repo, config, modules):
+        seeded = await self._seed_d1_greens(repo, config, modules)
+
+        units = await self._module_units(_harness_over(config, _deployed(_D1)), repo, config, modules)
+
+        assert set(units) == seeded == _units('alpha') | _units('beta')
+        assert {unit.outcome for unit in units.values()} == {UnitOutcome.WOULD_HIT}
+
+    @pytest.mark.asyncio
+    async def test_a_harness_with_no_deployed_sha_keys_no_unit(self, repo, config, modules):
+        await self._seed_d1_greens(repo, config, modules)
+
+        units = await self._module_units(_harness_over(config, None), repo, config, modules)
+
+        assert set(units) == _units('alpha') | _units('beta')
+        for unit in units.values():
+            assert unit.outcome is UnitOutcome.UNAVAILABLE, unit
+            assert 'no deployed sha' in (unit.reason or ''), unit
