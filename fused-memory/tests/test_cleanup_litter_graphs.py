@@ -8,6 +8,10 @@ scratch server only, over two graphs it creates; run it with
 
 from __future__ import annotations
 
+import json
+import re
+from collections.abc import Callable, Mapping
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -16,6 +20,48 @@ from _fm_helpers import load_script_module
 CLEANUP = load_script_module(
     Path(__file__).resolve().parents[1] / 'scripts' / 'cleanup_litter_graphs.py'
 )
+
+TARGET = 'redis://localhost:6379'
+
+
+class FakeGraphServer:
+    """A GraphServer over a dict of graph name to node count, recording every call.
+
+    *on_run_id* runs at the start of each ``run_id()`` call, after
+    ``run_id_calls`` counts it, so a test can restart the server or shrink a
+    graph mid-run.
+    """
+
+    def __init__(
+        self,
+        counts: Mapping[str, int],
+        run_id: str = 'run-a',
+        *,
+        on_run_id: Callable[[FakeGraphServer], None] | None = None,
+    ) -> None:
+        self.counts = dict(counts)
+        self.current_run_id = run_id
+        self.on_run_id = on_run_id
+        self.run_id_calls = 0
+        self.counted: list[str] = []
+        self.deleted: list[str] = []
+
+    def graph_names(self) -> tuple[str, ...]:
+        return tuple(self.counts)
+
+    def node_count(self, name: str) -> int:
+        self.counted.append(name)
+        return self.counts[name]
+
+    def delete(self, name: str) -> None:
+        self.deleted.append(name)
+        del self.counts[name]
+
+    def run_id(self) -> str:
+        self.run_id_calls += 1
+        if self.on_run_id is not None:
+            self.on_run_id(self)
+        return self.current_run_id
 
 LITTER = (
     '_probe4748b_bbd3e6b1',
@@ -118,3 +164,93 @@ def test_require_litter_refuses_a_kept_graph_by_name():
 
 def test_require_litter_returns_a_litter_name_unchanged():
     assert CLEANUP.require_litter('probe_e1_gw29') == 'probe_e1_gw29'
+
+
+# --- the census and the reviewed listing ------------------------------------------------
+
+
+def test_the_census_reads_the_run_id_and_only_the_named_graphs():
+    server = FakeGraphServer({'_probe': 0, 'dark_factory': 41, 'probe_e1_gw0': 3}, 'run-a')
+
+    census = CLEANUP.take_census(server, ['dark_factory', '_probe'])
+
+    assert census.run_id == 'run-a'
+    assert dict(census.counts) == {'dark_factory': 41, '_probe': 0}
+    assert server.counted == ['dark_factory', '_probe']
+
+
+def test_the_census_is_immutable():
+    census = CLEANUP.take_census(FakeGraphServer({'dark_factory': 41}), ['dark_factory'])
+
+    with pytest.raises(AttributeError):
+        census.run_id = 'run-b'
+    with pytest.raises(TypeError):
+        census.counts['dark_factory'] = 0
+
+
+def test_the_listing_splits_every_graph_into_delete_and_keep_counts():
+    server = FakeGraphServer(
+        {'_probe': 0, 'dark_factory': 41, 'probe_e1_gw0': 3, 'default_db': 0}, 'run-a'
+    )
+
+    listing = CLEANUP.build_listing(TARGET, server)
+
+    assert listing.target == TARGET
+    assert listing.run_id == 'run-a'
+    assert datetime.fromisoformat(listing.taken_at).tzinfo is not None
+    assert dict(listing.delete) == {'_probe': 0, 'probe_e1_gw0': 3}
+    assert dict(listing.keep) == {'dark_factory': 41, 'default_db': 0}
+
+
+def test_a_written_listing_reads_back_equal(tmp_path):
+    listing = CLEANUP.build_listing(
+        TARGET, FakeGraphServer({'evalmem_test_0123abcd': 2, 'reify': 7})
+    )
+    path = tmp_path / 'listing.json'
+
+    CLEANUP.write_listing(path, listing)
+
+    assert CLEANUP.read_listing(path) == listing
+
+
+def _valid_listing_json() -> dict[str, object]:
+    return {
+        'target': TARGET,
+        'run_id': 'run-a',
+        'taken_at': '2026-11-21T00:00:00+00:00',
+        'delete': {'_probe': 0},
+        'keep': {'dark_factory': 41},
+    }
+
+
+@pytest.mark.parametrize(
+    'content',
+    [
+        pytest.param('{"target": ', id='malformed-json'),
+        pytest.param(
+            json.dumps({k: v for k, v in _valid_listing_json().items() if k != 'delete'}),
+            id='no-delete-key',
+        ),
+        pytest.param(
+            json.dumps({k: v for k, v in _valid_listing_json().items() if k != 'target'}),
+            id='no-target-key',
+        ),
+        pytest.param(json.dumps([_valid_listing_json()]), id='not-an-object'),
+        pytest.param(json.dumps({**_valid_listing_json(), 'delete': ['_probe']}), id='delete-not-a-map'),
+        pytest.param(json.dumps({**_valid_listing_json(), 'delete': {'_probe': '0'}}), id='count-not-int'),
+        pytest.param(json.dumps({**_valid_listing_json(), 'target': 6379}), id='target-not-str'),
+    ],
+)
+def test_an_unreadable_listing_is_refused_naming_its_path(tmp_path, content):
+    path = tmp_path / 'listing.json'
+    path.write_text(content)
+
+    with pytest.raises(CLEANUP.UnreadableListing, match=re.escape(str(path))):
+        CLEANUP.read_listing(path)
+
+
+def test_a_missing_listing_is_refused_naming_its_path(tmp_path):
+    path = tmp_path / 'absent.json'
+
+    with pytest.raises(CLEANUP.UnreadableListing, match=re.escape(str(path))):
+        CLEANUP.read_listing(path)
