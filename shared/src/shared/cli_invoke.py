@@ -13,7 +13,7 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,7 +22,11 @@ from typing import IO, TYPE_CHECKING, Any, Protocol, TypeGuard, TypeVar
 from shared.claude_endpoint import ClaudeEndpoint
 from shared.claude_executable import ClaudeLaunchSurface, claude_executable, override_var
 from shared.cost_store import CapReason
-from shared.proc_group import snapshot_process_group, terminate_process_group
+from shared.proc_group import (
+    snapshot_process_group,
+    spawn_group_leader,
+    terminate_process_group,
+)
 from shared.process_cost import ProcessCostBasis, derive_process_cost, next_resume_prior
 from shared.secret_env import (
     AGENT_CREDENTIAL_VAR,
@@ -383,8 +387,9 @@ class AgentResult:
       flaky candidate.  ``success`` stays False (NOT salvaged); callers should
       raise a loud, un-suppressed escalation so the substitution gets fixed.
     - ``ended_awaiting_background``: True when the run ended its turn while a
-      background task it started was still pending — a ``run_in_background``
-      Bash or a confirmed Monitor arm, never subsequently REAPED, where a reap
+      background task it started was still pending — a confirmed background
+      launch (see ``detect_ended_awaiting_background`` for the contract), never
+      subsequently REAPED, where a reap
       is a ``BashOutput``/``KillShell``/``KillBash`` poll-or-kill, a tool_use
       of any kind whose input references the launch's id / output-file path as
       recorded in its tool_result (task 3639), OR a delivered task-notification
@@ -785,6 +790,11 @@ _BG_LOG_PATH_RE = re.compile(r'Output is being written to:\s*(\S+?)\.?(?=\s|$)')
 _MIN_BG_TOKEN_LEN = 6
 
 
+def _is_usable_token(value: object) -> TypeGuard[str]:
+    """True when *value* can identify a background task (see ``_MIN_BG_TOKEN_LEN``)."""
+    return isinstance(value, str) and len(value) >= _MIN_BG_TOKEN_LEN
+
+
 _FieldT = TypeVar('_FieldT')
 
 
@@ -900,22 +910,29 @@ def _collect_bg_tokens(record: dict, tokens: set[str]) -> None:
     """
     tur = record.get('toolUseResult')
     if isinstance(tur, dict):
-        task_id = tur.get('backgroundTaskId')
-        if isinstance(task_id, str) and len(task_id) >= _MIN_BG_TOKEN_LEN:
+        task_id = tur.get(_BASH_LAUNCH_ID_FIELD)
+        if _is_usable_token(task_id):
             tokens.add(task_id)
     for text in _iter_result_texts(record):
         for match in _BG_LOG_PATH_RE.findall(text):
-            if len(match) >= _MIN_BG_TOKEN_LEN:
+            if _is_usable_token(match):
                 tokens.add(match)
 
 
 _MONITOR_TOOL = 'Monitor'
+# The ``toolUseResult`` field in which the CLI reports the id of the task a
+# launch call started: a confirmed Monitor arm, a backgrounded Bash.
+_MONITOR_LAUNCH_ID_FIELD = 'taskId'
+_BASH_LAUNCH_ID_FIELD = 'backgroundTaskId'
 _TASK_NOTIFICATION = 'task-notification'
 
 
 class _BackgroundEvent(enum.Enum):
     LAUNCH = 'launch'
     REAP = 'reap'
+    # A terminal verdict submission: a reap that also outranks a launch whose
+    # call it follows, however late that launch is confirmed.
+    SUBMISSION = 'submission'
 
 
 def _mentions_token(texts: Iterable[str], tokens: set[str]) -> bool:
@@ -924,26 +941,28 @@ def _mentions_token(texts: Iterable[str], tokens: set[str]) -> bool:
     return any(token in text for text in texts for token in tokens)
 
 
-def _monitor_arm_task_id(record: dict, monitor_call_ids: set[str]) -> str | None:
-    """Return the armed task's id when *record* confirms a Monitor arm, else None.
+def _confirmed_launch(record: dict, launch_calls: Mapping[str, str]) -> tuple[str, str] | None:
+    """Return ``(call id, started task's id)`` when *record* confirms a launch,
+    else None.
 
-    A confirmation answers one of *monitor_call_ids* with a tool_result and
-    carries a structured ``toolUseResult.taskId`` that is a usable token (see
-    ``_MIN_BG_TOKEN_LEN``).  A rejected call carries no such field.  Never
+    A confirmation is a tool_result answering a call in *launch_calls* (call id
+    → confirming field, from ``_launch_call``) whose ``toolUseResult`` holds
+    that field as a usable token (see ``_MIN_BG_TOKEN_LEN``).  A call the CLI
+    ran in the foreground anyway, or rejected, carries no such field.  Never
     raises.
     """
     tur = record.get('toolUseResult')
     if not isinstance(tur, dict):
         return None
-    task_id = tur.get('taskId')
-    if not isinstance(task_id, str) or len(task_id) < _MIN_BG_TOKEN_LEN:
-        return None
     for block in _content_blocks(record):
         if not isinstance(block, dict) or block.get('type') != 'tool_result':
             continue
         call_id = block.get('tool_use_id')
-        if isinstance(call_id, str) and call_id in monitor_call_ids:
-            return task_id
+        if not isinstance(call_id, str) or call_id not in launch_calls:
+            continue
+        task_id = tur.get(launch_calls[call_id])
+        if _is_usable_token(task_id):
+            return call_id, task_id
     return None
 
 
@@ -983,35 +1002,46 @@ def _delivered_notification_texts(record: dict) -> list[str] | None:
     return None
 
 
-def _monitor_call_id(block: dict) -> str | None:
-    """Return the id of a ``Monitor`` tool_use *block*, else None."""
+def _launch_call(block: dict) -> tuple[str, str] | None:
+    """Return ``(call id, confirming field)`` when tool_use *block* asks the CLI
+    to start a background task, else None.
+
+    A ``Monitor`` call is confirmed by ``_MONITOR_LAUNCH_ID_FIELD``, and a
+    ``Bash`` call with a truthy ``input.run_in_background`` by
+    ``_BASH_LAUNCH_ID_FIELD``.  A block whose ``id`` is not a ``str`` is never
+    a launch call.  Never raises.
+    """
     call_id = block.get('id')
-    if block.get('name') == _MONITOR_TOOL and isinstance(call_id, str):
-        return call_id
+    if not isinstance(call_id, str):
+        return None
+    name = block.get('name')
+    if name == _MONITOR_TOOL:
+        return call_id, _MONITOR_LAUNCH_ID_FIELD
+    if name == 'Bash':
+        inp = block.get('input')
+        if isinstance(inp, dict) and inp.get('run_in_background'):
+            return call_id, _BASH_LAUNCH_ID_FIELD
     return None
 
 
 def _classify_tool_use(block: dict, tokens: set[str]) -> _BackgroundEvent | None:
-    """Classify one tool_use *block* as a launch, a reap, or neither.
+    """Classify one tool_use *block* as a submission, a reap, or neither.
 
-    Branch order is load-bearing: launch → ``Monitor`` call → named reap tool →
-    token reference.  A ``run_in_background`` Bash that mentions an earlier
-    token is a LAUNCH, and a ``Monitor`` call is neither: only its confirmed
-    arm (``_monitor_arm_task_id``) is a launch, so a Monitor naming a pending
-    launch's token does not reap it.
+    A launch is never classified at its call: it is positioned at the result
+    that confirms it (``_confirmed_launch``).  Branch order is load-bearing:
+    ``Monitor`` call → terminal submission → named reap tool → token
+    reference.  A ``Monitor`` call is neither, so a Monitor naming a pending
+    launch's token does not reap it; any other call naming one, a backgrounded
+    Bash included, does.
     """
     name = block.get('name')
     if not isinstance(name, str):
         name = ''  # a malformed name matches no tool and must not raise on lookup
-    if name == 'Bash':
-        inp = block.get('input')
-        if isinstance(inp, dict) and inp.get('run_in_background'):
-            return _BackgroundEvent.LAUNCH
-    elif name == _MONITOR_TOOL:
+    if name == _MONITOR_TOOL:
         return None
-    elif name in _BACKGROUND_REAP_TOOLS or (
-        _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS
-    ):
+    if _tool_base_name(name) in _TERMINAL_SUBMISSION_TOOLS:
+        return _BackgroundEvent.SUBMISSION
+    if name in _BACKGROUND_REAP_TOOLS:
         return _BackgroundEvent.REAP
     if tokens and _mentions_token(_iter_input_strings(block.get('input')), tokens):
         return _BackgroundEvent.REAP
@@ -1019,13 +1049,16 @@ def _classify_tool_use(block: dict, tokens: set[str]) -> _BackgroundEvent | None
 
 
 def _background_events(records: list[dict]) -> Iterator[_BackgroundEvent]:
-    """Yield the background LAUNCH and REAP events of *records*, in record order.
+    """Yield the background events of *records*, in record order.
 
-    Owns the identity tokens of the launches seen so far and the ids of the
-    Monitor calls awaiting confirmation.
+    Owns the identity tokens harvested so far, the launch calls seen so far
+    (each mapped to the ``toolUseResult`` field that would confirm it), and the
+    launch calls a terminal submission followed, which no later confirmation
+    makes a launch.
     """
     tokens: set[str] = set()
-    monitor_call_ids: set[str] = set()
+    launch_calls: dict[str, str] = {}
+    submitted_after_calls: set[str] = set()
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -1036,41 +1069,46 @@ def _background_events(records: list[dict]) -> Iterator[_BackgroundEvent]:
             continue
         if record.get('type') == 'user':
             _collect_bg_tokens(record, tokens)
-            task_id = _monitor_arm_task_id(record, monitor_call_ids)
-            if task_id is not None:
+            confirmed = _confirmed_launch(record, launch_calls)
+            if confirmed is not None:
+                call_id, task_id = confirmed
                 tokens.add(task_id)
-                yield _BackgroundEvent.LAUNCH
+                if call_id not in submitted_after_calls:
+                    yield _BackgroundEvent.LAUNCH
             continue
         if record.get('type') != 'assistant':
             continue
         for block in _content_blocks(record):
             if not isinstance(block, dict) or block.get('type') != 'tool_use':
                 continue
-            call_id = _monitor_call_id(block)
-            if call_id is not None:
-                monitor_call_ids.add(call_id)
+            launch_call = _launch_call(block)
+            if launch_call is not None:
+                call_id, confirming_field = launch_call
+                launch_calls[call_id] = confirming_field
             event = _classify_tool_use(block, tokens)
+            if event is _BackgroundEvent.SUBMISSION:
+                submitted_after_calls.update(launch_calls)
             if event is not None:
                 yield event
 
 
 def detect_ended_awaiting_background(records: list[dict]) -> bool:
     """Return True when the transcript's final background event was an unreaped
-    launch — i.e. the agent ended its turn while a background task it started (a
-    ``run_in_background`` Bash or a confirmed Monitor arm) was still pending,
-    silently abandoning the work (the Reify-5164 RCA).
+    launch — i.e. the agent ended its turn while a background task it started
+    was still pending, silently abandoning the work (the Reify-5164 RCA).
 
     Contract (high-precision, no fragile parsing).  Over the ordered transcript
     *records*:
 
-    - a **launch** = either of:
-
-      * a ``Bash`` tool_use whose ``input.run_in_background`` is truthy;
-      * a CONFIRMED ``Monitor`` arm, positioned at its confirming ``user``
-        record: a tool_result answering an earlier ``Monitor`` call, carrying a
-        structured ``toolUseResult.taskId`` of at least ``_MIN_BG_TOKEN_LEN``
-        characters.  A rejected call, or a call with no confirmed arm, is not a
-        launch, and the ``Monitor`` call itself is neither a launch nor a reap;
+    - a **launch** = a CONFIRMED background start, positioned at its
+      confirming ``user`` record: a tool_result answering an earlier
+      ``run_in_background`` ``Bash`` call or ``Monitor`` call, whose structured
+      ``toolUseResult`` carries the started task's id (``backgroundTaskId`` /
+      ``taskId``) of at least ``_MIN_BG_TOKEN_LEN`` characters.  Not a launch:
+      a call the CLI ran in the foreground anyway, a rejected or errored call,
+      a call with no result, and the call itself.  A ``Bash`` call can still
+      reap by token like any tool_use; a ``Monitor`` call is neither a launch
+      nor a reap;
 
     - a **reap** = any of:
 
@@ -1092,13 +1130,23 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
       * a terminal verdict submission (one of ``_TERMINAL_SUBMISSION_TOOLS``,
         matched on the segment after the last ``__``) — calling one writes the
         role's whole deliverable to ``verdicts/<role>.json``, so the session has
-        finished its job and cannot still be waiting on anything.
+        finished its job and cannot still be waiting on anything.  It also
+        outranks a launch whose call it follows, even one confirmed after it.
 
     Fire (True) iff the final background event is a launch — the session's
     final background event was a launch never followed by a reap.  Any
     engagement with a background task (a reap of any kind after it) clears the
     verdict, keeping precision high and avoiding fragile shell-id /
     result-text parsing that differs across CLI versions.
+
+    Ordering in a parallel batch: the CLI writes every tool_use of a message
+    before any tool_result, so a reap issued beside a launch call sits before
+    that launch's confirmation.  It cannot engage a task not yet started, so
+    the launch outranks it.  A terminal submission is the exception, since it
+    ends the job whatever is still pending.  Both verdicts are pinned:
+    shared/tests/test_cli_invoke_background.py::TestBashLaunchNeedsConfirmation::test_reap_beside_the_launch_call_does_not_outrank_it
+    and
+    shared/tests/test_cli_invoke_background.py::TestVerdictSubmissionClearsVerdict::test_submission_beside_the_launch_call_is_false.
 
     RCA for the second reap clause (task 3639): the original vocabulary named
     only the three background-management tools, so the very common shape of
@@ -1118,6 +1166,13 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     no CLI-issued token exists to key on and parsing the command's redirection
     target would reintroduce exactly the fragility this rule avoids.  That
     shape keeps today's (firing) behaviour.
+
+    ACCEPTED gap: a foreground ``Bash`` the CLI auto-moved to the background
+    after its timeout answers no launch call, so it is not a launch, and a
+    session that ends waiting on it → False.  Counting it was measured and
+    rejected by task 11122; the numbers live at
+    shared/tests/test_cli_invoke_background.py::TestBashLaunchNeedsConfirmation::test_auto_backgrounded_foreground_bash_is_false_documented_gap,
+    and the census behind the confirmed-launch rule in that class's docstring.
 
     Fail-safe / conservative by construction — a ``success``→failure downgrade
     must NEVER re-run a genuinely complete task on ambiguous data:
@@ -1144,6 +1199,9 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     Reaps are positional, not per launch (accepted on the same grounds): an
     earlier launch's delivered completion that lands after a later launch
     clears the verdict while that later launch is still pending → False.
+    Per-launch tracking was measured and rejected by task 7127; the numbers
+    live at
+    shared/tests/test_cli_invoke_background.py::TestDeliveredNotificationIsAReap::test_earlier_completion_after_later_launch_is_false_documented_gap.
     """
     if not records:
         return False
@@ -1329,8 +1387,8 @@ def ended_awaiting_background_for_session(
     session_id: str,
 ) -> bool:
     """Return True when *session_id*'s on-disk transcript ended its turn with a
-    still-pending background task (a run_in_background Bash or a confirmed
-    Monitor arm).
+    still-pending background task (a confirmed background launch; see
+    ``detect_ended_awaiting_background`` for the contract).
 
     Mirrors ``count_transcript_turns``' shape: delegate to
     ``read_transcript_records``; if it returns None (transcript not located or a
@@ -2269,8 +2327,9 @@ class SubprocessResult:
     transcript_turns: int | None = None
     ended_awaiting_background: bool = False
     """True when the normal-exit transcript ended its turn with a still-pending
-    background task (a run_in_background Bash or a confirmed Monitor arm);
-    carried into AgentResult and used by
+    background task (a confirmed background launch; see
+    ``detect_ended_awaiting_background`` for the contract); carried into
+    AgentResult and used by
     parse_claude_output to downgrade success→failure.  Never set on the
     timeout path (a timed-out run is already non-success)."""
     model_id: str | None = None
@@ -4235,6 +4294,14 @@ async def _kill_group_on_flat_timeout(
     )
 
 
+_CANCEL_KILL_GRACE_SECS = 5.0
+
+
+async def _terminate_cancelled_group(proc: asyncio.subprocess.Process) -> None:
+    logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
+    await terminate_process_group(proc, proc.pid, grace_secs=_CANCEL_KILL_GRACE_SECS)
+
+
 async def run_cli_subprocess(
     cmd: list[str],
     cwd: Path,
@@ -4301,14 +4368,14 @@ async def run_cli_subprocess(
     # stdin_data is None must still yield stdin=None (inherited).
     stdin_file = _materialize_stdin(stdin_data) if stdin_data is not None else None
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await spawn_group_leader(
             *spawn_cmd,
+            kill_group=_terminate_cancelled_group,
             cwd=str(cwd),
             env=spawn_env,
             stdin=stdin_file,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
         )
     finally:
         # Close the parent's handle as soon as the child has its own dup — this
@@ -4733,8 +4800,7 @@ async def run_cli_subprocess(
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await comm_task
         if proc.returncode is None:
-            logger.warning(f'Subprocess cancelled — terminating process group for pid {proc.pid}')
-            await terminate_process_group(proc, pgid, grace_secs=5.0)
+            await _terminate_cancelled_group(proc)
         raise
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
@@ -4766,9 +4832,9 @@ async def run_cli_subprocess(
     #     classification lost the turn-count signal (carried None); deriving it
     #     from the records we already parse here restores it at zero extra I/O.
     #   • ended_awaiting_background — a run that exited subtype=success but whose
-    #     transcript tail launched a still-pending background task (a
-    #     run_in_background Bash or a confirmed Monitor arm) silently abandoned
-    #     the work.  Symmetric to the timeout path's
+    #     transcript tail launched a still-pending background task (a confirmed
+    #     background launch; see detect_ended_awaiting_background for the
+    #     contract) silently abandoned the work.  Symmetric to the timeout path's
     #     transcript re-read above; parse_claude_output owns the actual
     #     success→failure downgrade.
     #   • model_id — the exact CLI-served model id, which the caller's alias

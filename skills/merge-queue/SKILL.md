@@ -73,7 +73,7 @@ The call returns with **either** a **terminal** status **or** a **non-terminal**
      enum and this list goes red until it matches. -->
 - **Terminal at submit time** (`done`, `already_merged`, `done_wip_recovery`, `conflict`, `blocked`, `unknown_branch`, `unmerged_state`, `stash_failed`, `wip_halted`, `wip_recovery_no_advance`, `error`, `superseded`): the merge resolved within the bounded wait. Jump straight to step 4.
   <!-- merge-state-vocab:end -->
-  - The six worker-internal outcomes (`wip_halted`, `done_wip_recovery`, `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare; `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when observed by polling (`escalation/src/escalation/server.py::_map_terminal_state`) — handle them as `blocked`. (`failed`, which this list named until task 4829, is not a value the server ever returns; the real one is `error`.)
+  - The six worker-internal outcomes (`wip_halted`, `done_wip_recovery`, `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare; `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when observed by polling (`escalation/src/escalation/merge_status_answer.py::map_terminal_state`) — handle all of them but `done_wip_recovery` (which landed — treat it as `done`) as `blocked`. (`failed`, which this list named until task 4829, is not a value the server ever returns; the real one is `error`.)
   - `already_merged` means the branch tip was already an ancestor of main — treat it the same as `done` **only when** the response carries a `commit`, or the [canonical ancestry check](#canonical-ancestry-check)'s exact-subject marker search finds the merge on main. A branch that never advanced past its creation point is an ancestor of main too, so the ancestry fact alone does not establish that anything landed: when `commit` is falsy **and** that search comes back empty, do not stamp done — run that check and treat "nothing on main cites the task" as not landed.
   - `superseded` means your request was replaced by a successor before it could be individually processed. The response includes `superseded_by: "<mr-* request id | coalesce-* train id>"`. See [Follow the superseded successor](#follow-the-superseded-successor) below to determine how to resolve it.
 
@@ -373,22 +373,18 @@ The outcome arrives from either the submit call (terminal at submit time) or the
 - Rebase onto current main again (main may have moved).
 - Resubmit to the merge queue (go back to step 3).
 
-**`blocked`** — Post-merge verification failed, or CAS retries exhausted. The `reason` field explains why.
+**`blocked`** — Post-merge verification failed, CAS retries exhausted, or the branch was bounced at conflict-graph time and needs a rebase. The `reason` field explains why.
 - Read the reason carefully. Common causes:
   - Verification failure (tests/lint broke after merge) — fix in your worktree, resubmit.
   - CAS retry limit — main was moving too fast (rare at normal concurrency). Wait a moment and retry.
   - `.task/` contamination detected — check that `.task/` isn't committed on your branch.
+  - Needs rebase — a `reason` starting with the needs-rebase prefix (`orchestrator/src/orchestrator/merge_lane/worker.py::NEEDS_REBASE_REASON_PREFIX`) means your branch was bounced at conflict-graph time against the frozen-prefix tip, before any verify slot was consumed: either the mechanical rebase hit a real conflict, or the branch was bounced more than `MERGE_BOUNCE_CAP` times. Fix the conflict against current main in your worktree and resubmit. A **clean** auto-rebase produces no outcome at all: the request stays live (`queued`) with its aging priority (`merge_first_enqueued_at`) unchanged — keep polling.
 
-**`failed`** — The merge worker encountered an unexpected error (surfaces from the submit call only; `merge_status` collapses this into `blocked`). Treat it the same as `blocked`: read any `failure_diagnostic` or `reason` field, fix the underlying problem, and resubmit.
+**`error`** — The merge worker encountered an unexpected error (surfaces from the submit call only; `merge_status` collapses this into `blocked`). Treat it the same as `blocked`: read any `failure_diagnostic` or `reason` field, fix the underlying problem, and resubmit.
 
 **`unknown_branch`** — The branch ref does not exist in the target repository (surfaces from the submit call only). Likely causes: the branch name is wrong, the branch was deleted before submission, or the request was routed to the wrong repo's escalation MCP. Verify the branch exists locally (`git branch -a`) and that you're submitting to the correct escalation server.
 
 **`abandoned`** — The submission was cancelled via `merge_cancel` before it finished (surfaces from the poll loop). If the merge is still wanted, resubmit (go back to step 3); otherwise, no further action is needed.
-
-**`needs_rebase`** — Your branch was **bounced at conflict-graph time** (disk-free, before any verify slot was consumed) because it has a textual conflict with another branch already in the queue. The merge worker attempted a mechanical speculative rebase:
-- **Clean auto-rebase:** your branch was re-queued automatically with work preserved; no agent was dispatched, and `merge_first_enqueued_at` (your aging priority) was unchanged. No action required — the queue will re-process it.
-- **Real conflict:** the rebase failed; the merge was bounced with a conflict that requires resolution. Fix the conflict in your worktree and resubmit.
-- **Bounce cap reached (`MERGE_BOUNCE_CAP=3`):** the 1688 thrash-backstop triggered — the task is blocked without further rebase. Read the reason, resolve the underlying conflict, and unblock manually.
 
 **`superseded`** — Your request was superseded (surfaces from either the submit call or the poll loop). The response includes `superseded_by: "<mr-* request id | coalesce-* train id>"`.
 
@@ -455,8 +451,7 @@ After a successful direct merge:
 | Outcome `blocked` | Read reason, fix, resubmit |
 | Outcome `done` or `already_merged` | Update task status, clean up |
 | Outcome `superseded` | `mr-*` → poll by `request_id` (rc=1 there still means not-landed). `coalesce-*` → not pollable; use the branch handle + ancestry check — rc=128-with-empty-marker **or** rc=1 license the two landing signals (tip's merge marker; scheduler status), which establish that it **landed** but license no write — **never self-stamp on either arm**; report landed-but-not-credited at the 20-min ceiling. Never direct-merge, never resubmit. See [Follow the superseded successor](#follow-the-superseded-successor). |
-| Outcome `needs_rebase` — auto-rebase succeeded | Queue re-processed automatically; no action needed |
-| Outcome `needs_rebase` — real conflict or cap | Fix conflict in worktree, resubmit (or unblock if cap reached) |
+| Outcome `blocked` with a needs-rebase `reason` | Fix conflict in worktree, resubmit |
 | Abandon a queued submission | `merge_cancel(request_id)` — the only explicit-cancellation path |
 | Unsure if orchestrator is running | Probe `get_pending_escalations()` — if it responds, use the queue |
 
@@ -466,9 +461,9 @@ The orchestrator's merge queue uses a **two-layer pipeline** to separate fast co
 
 ### Layer 1: Speculative merge graph (suffix)
 
-The unfrozen suffix (`_lane_buffers`) holds items that are queued but not yet verifying. The **conflict graph** (`suffix_conflict_graph`) tracks footprint overlaps between suffix items. At each recompute cycle (`recompute_suffix_conflict_graph()`), the queue detects textual conflicts and:
+The unfrozen suffix (the lane buffers in `MergeIntake`) holds items that are queued but not yet verifying. The **conflict graph** (`suffix_conflict_graph`) tracks footprint overlaps between suffix items. At each recompute cycle (`recompute_suffix_conflict_graph()`), the queue detects textual conflicts and:
 
-- **Bounces the younger conflicting suffix item** (`_bounce_conflicting_suffix_items`) — graph-time, disk-free, before any verify slot is consumed or `_merge-*` worktree is created.
+- **Bounces the younger conflicting suffix item** (`MergeIntake.bounce_conflicting_suffix_items`) — graph-time, disk-free, before any verify slot is consumed or `_merge-*` worktree is created.
 - Attempts a **mechanical speculative rebase** first: if clean, the item is re-queued with work preserved and `merge_first_enqueued_at` unchanged; if a real conflict is found, the bounce escalates; if the cap (`MERGE_BOUNCE_CAP=3`) is hit, the 1688 thrash-backstop triggers → blocked without further rebase.
 
 Reordering within the suffix is always disk-free (only recomputes the merge-tree for the affected suffix items, never touches in-flight verify state).
@@ -478,7 +473,7 @@ Reordering within the suffix is always disk-free (only recomputes the merge-tree
 The **frozen prefix** = {verifying} ∪ {landed}. Items in the frozen prefix are **immutable**:
 - A verify should be dispatched against the tip of the frozen prefix (`frozen_prefix_tip`). That rule is a dispatch-time detector, not a refusal: see `verify_base_divergences` below.
 - No reorder or re-base ever touches an in-flight verify item.
-- The suffix recompute only touches `_lane_buffers`; in-flight `_inflight` order and `base_sha` are unchanged.
+- The suffix recompute only touches the lane buffers in `MergeIntake`; in-flight `_inflight` order and `base_sha` are unchanged.
 
 Health check: `two_layer_invariants(main_sha)` → `[]` when INV-3 chain-intact (no frozen entry built on a recorded dead commit), the successor chain links, frozen∩suffix disjointness and the conflict-graph consistency checks all hold. It does not compare the frozen head with current main: main moving under an in-flight verify is not a violation (task 5302).
 

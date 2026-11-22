@@ -620,12 +620,15 @@ mem0_update:
 link_heal:
   # The projects with write-triage children in the 2026-10-19 soak.
   projects: [dark_factory, reify, solar_challenge, solar_challenge_platform, scoping_intake]
-  # Writes need a passing soak calibration and an operator flip (INV-12 owned hold; runbook: OPERATIONS.md).
+  # Writes stay off until gate θ (task 6191, the report-mode week) and task ξ (6192) turn them on;
+  # a writing sweep also needs a passing calibration (INV-12 owned hold; runbook: OPERATIONS.md).
   writes: false
 #   # Heal actions a sweep may stage; the rest are recorded as not_enabled.
 #   sweep_actions: [detach, relabel]
 #   # How far back the first sweep looks; later sweeps resume from the last complete one.
 #   sweep_window_hours: 24
+#   # Most pairs one sweep run asks the adjudicator; the rest wait for the next run.
+#   max_adjudications_per_run: 200
 #   # Calibration passes at no less than the raters' own kappa minus this.
 #   calibration_kappa_margin: 0.10
 #   # Rated pairs a project needs before calibration gates on it.
@@ -838,8 +841,12 @@ write_triage:
   # llm.model, which scored worse than the status quo on the comparative.
   judge_provider: openai
   judge_model: gpt-6.1-sol
-  # judge_api_url: the judge's OWN endpoint (null inherits llm.providers.<provider>.api_url); see plans/write-triage-flip-readiness-prd.md task σ.
-  judge_api_url: null
+  # judge_api_url / judge_api_key: the judge's OWN endpoint and key, each null
+  # inheriting llm.providers.<provider>.api_url / api_key. Both point at the
+  # ChatGPT-plan proxy (CLIProxyAPI) per ruling esc-9522-1, task 9946. An unset
+  # variable expands to null and so inherits the API-key route.
+  judge_api_url: ${OPENAI_PLAN_PROXY_URL}
+  judge_api_key: ${OPENAI_PLAN_PROXY_KEY}
   # judge_timeout_seconds: NOT optional. No LLM call elsewhere in fused-memory
   # sets a timeout and the openai SDK default is 600s; on the synchronous
   # add_memory write path that is a wedge, not a degradation. A timeout

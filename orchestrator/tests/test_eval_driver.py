@@ -1160,8 +1160,8 @@ def _ofat_task_loader(path: Path) -> dict:
 # wall-clock win φ's failover was added for, which a per-cell gate forfeits.
 #
 # The probe, the sentinels and the assertion bodies live in
-# _campaign_gate_helpers so test_runner_matrix and test_eval_architect pin the
-# same contract from the same code.
+# _campaign_gate_helpers so test_runner_matrix and test_eval_architect_usage_gate
+# pin the same contract from the same code.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio

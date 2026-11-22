@@ -434,15 +434,16 @@ effort:
   # Leo 2026-11-03: xhigh, as max is no longer a good choice since Opus 5.5
   # (reviewer moved to xhigh 2026-10-31, task 7972).
   architect: "xhigh"
-  implementer: "max"
-  debugger: "max"
+  # Leo 2026-11-16: xhigh, as max is no longer a good choice since Opus 5.5.
+  implementer: "xhigh"
+  debugger: "xhigh"
   # Leo 2026-10-31 (task 7972); evidence and revert: gate task 7973.
   reviewer: "xhigh"
-  merger: "max"
+  merger: "xhigh"
   steward: "high"
   triage: "medium"
   module_tagger: "medium"
-  deep_reviewer: "max"
+  deep_reviewer: "xhigh"
   judge: "medium"
   simple_task: "high"
 
@@ -947,15 +948,17 @@ watcher_backend: claude
 # watcher_daily_cost_ceiling_usd: ceiling for escalation-watcher invocations
 #   only (role LIKE '%watcher%').  This is the early-warning trip — runaway
 #   watcher dispatch is the most likely cost source during AFK windows.
-#   Trip reason: cost_ceiling_watcher_exceeded (default 50.0).
+#   Trip reason: cost_ceiling_watcher_exceeded (default 150.0).
 #
 # orch_daily_cost_ceiling_usd: ceiling for ALL orchestrator invocations
 #   (entire invocations table, trailing 24h).  Final safety net.
-#   Trip reason: cost_ceiling_orch_exceeded (default 200.0).
+#   Trip reason: cost_ceiling_orch_exceeded (default 10000.0).
 #
-# Disable a ceiling by setting it to a very high value.
-watcher_daily_cost_ceiling_usd: 50.0
-orch_daily_cost_ceiling_usd: 200.0
+# Disable a ceiling by setting it to a very high value.  The orch-wide
+# default is effectively off: it stays as an opt-in tripwire (task 8262;
+# ruling in plans/cross-project-weights-study-2026-11-12/rulings.md).
+watcher_daily_cost_ceiling_usd: 150.0
+orch_daily_cost_ceiling_usd: 10000.0
 
 # Merge-queue train coalescing (tasks 1717-1722)
 #

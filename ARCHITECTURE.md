@@ -783,13 +783,13 @@ matter most for reasoning about safety:
 | Role | Stage | Purpose | Model / effort / budget / turns |
 |---|---|---|---|
 | `architect` | PLAN | Explores the codebase, verifies premises, builds the TDD plan | opus / xhigh / $15 / 180 |
-| `implementer` | EXECUTE | RED test → GREEN implementation → commit, per plan step; sandboxed | sonnet / max / $10 / 80 (routed to opus above ~12 steps or ~3 modules) |
-| `debugger` | VERIFY failure loop | Fixes test/lint/typecheck failures with minimal changes; sandboxed | sonnet / max / $5 / 50 |
+| `implementer` | EXECUTE | RED test → GREEN implementation → commit, per plan step; sandboxed | sonnet / xhigh / $10 / 80 (routed to opus above ~12 steps or ~3 modules) |
+| `debugger` | VERIFY failure loop | Fixes test/lint/typecheck failures with minimal changes; sandboxed | sonnet / xhigh / $5 / 50 |
 | `reviewer_comprehensive` | REVIEW | Sole reviewer: test quality, reuse, architecture, performance, robustness; read-only | opus / high / $5 / 30 (config resolves `reviewer_comprehensive` → the `reviewer` config key) |
 | `judge` | Post-EXECUTE-iteration | Read-only completion verdict on the diff vs. the plan | sonnet / medium / $0.50 / 15 |
-| `merger` | Merge-conflict resolution | Conservative conflict resolution with a drop-aware protocol | opus / max / $5 / 50 |
+| `merger` | Merge-conflict resolution | Conservative conflict resolution with a drop-aware protocol | opus / xhigh / $5 / 50 |
 | `steward` | ESCALATED (persistent, per task) | L0 escalation handling; the only role that may set task status | opus / high / $5 / 100 |
-| `deep_reviewer` | ReviewCheckpoint (every ~40 merges) | Cross-task integration review; can file its own tasks/escalations | opus / max / $15 / 100 |
+| `deep_reviewer` | ReviewCheckpoint (every ~40 merges) | Cross-task integration review; can file its own tasks/escalations | opus / xhigh / $15 / 100 |
 | `simple_task` | Fast path (`complexity='simple'`) | Single-agent explore → plan → implement → commit; sandboxed | sonnet / high / $2.50 / 50 |
 | `triage` (defined in `agents/triage.py`, outside `ROLES`) | Steward pre-triage of large suggestion batches | ACCEPT/SKIP classification of review suggestions | sonnet / medium / $2 / 25 |
 | `module_tagger` (no `AgentRole`) | Pre-dispatch batch | Predicts `metadata.files` for module-lock prediction | haiku / medium / $2 / 30 |
@@ -824,10 +824,31 @@ there is no separate merge process).
 `already_merged` immediately (fast path) or enqueues via
 `coalesce_or_enqueue_merge_request`, which dedupes an in-flight branch by
 marking the new request `attached` rather than double-queuing it.
-`merge_status(request_id)` reports a live state
-(`queued`/`verifying`/`gate`/`finalizing`) or a terminal one
-(`done`/`conflict`/`blocked`/`abandoned`/`superseded`/`already_merged`/
-`unknown_branch`/`failed`). `merge_cancel` is the only way to actually
+`merge_status(request_id)` answers one of three kinds of `state`:
+
+<!-- merge-state-vocab:begin partition=LIVE_STATES
+     Mirrors shared/src/shared/merge_state.py::LIVE_STATES. Pinned by
+     scripts/tests/test_merge_state_vocabulary_consistency.py. -->
+- **live** (`queued`, `verifying`, `gate`, `finalizing`) — keep polling;
+<!-- merge-state-vocab:end -->
+<!-- merge-state-vocab:begin partition=TERMINAL_STATES
+     Mirrors shared/src/shared/merge_state.py::TERMINAL_STATES. Pinned by
+     scripts/tests/test_merge_state_vocabulary_consistency.py. -->
+- **terminal** (`done`, `conflict`, `blocked`, `abandoned`, `superseded`);
+<!-- merge-state-vocab:end -->
+<!-- merge-state-vocab:begin partition=EPISTEMIC_STATES
+     Mirrors shared/src/shared/merge_state.py::EPISTEMIC_STATES. Pinned by
+     scripts/tests/test_merge_state_vocabulary_consistency.py. -->
+- **epistemic** (`no_record`, `stale_record`, `journaled`, `unknown`) — what
+  the server knows rather than what happened, each paired with a closed
+  `reason`.
+<!-- merge-state-vocab:end -->
+
+`merge_request`'s own `status` is a separate vocabulary
+(`shared/src/shared/merge_state.py::MergeSubmitStatus`), and `merge_status`
+collapses its submit-only terminal values onto the poll terminal states
+(`escalation/src/escalation/merge_status_answer.py::map_terminal_state`).
+`merge_cancel` is the only way to actually
 cancel a request — a disconnected client does **not** implicitly cancel; the
 intent persists. The `/merge-queue` skill implements the correct
 submit→poll contract for both humans and agents; prefer it over raw
@@ -838,8 +859,10 @@ submit→poll contract for both humans and agents; prefer it over raw
 - **Layer 1 — the speculative suffix.** A reorderable graph of queued
   requests, ordered by conflict footprint. A younger request that conflicts
   with an older one is bounced (a mechanical speculative rebase is tried
-  first; a real conflict escalates to the `merger` role); a request bounced
-  `MERGE_BOUNCE_CAP` (3) times is blocked with `needs_rebase`.
+  first, and a clean rebase simply stays queued); a request whose rebase hits
+  a real conflict, or that is bounced more than `MERGE_BOUNCE_CAP` times,
+  resolves `blocked` with a needs-rebase `reason` (block category
+  `merge_needs_rebase`).
 - **Layer 2 — the frozen verify frontier.** The prefix of
   `{verifying} ∪ {landed}` requests is immutable; the actively-verifying
   request's tests run against that frozen prefix's tip, not a

@@ -487,6 +487,39 @@ class TestPeekSessionId:
         assert mod.peek_session_id(path) == 'sess-c'
 
 
+class TestDropCoded:
+    """drop_coded keeps, in order, the sessions whose transcript identity
+    (peek_session_id's key) is not in the coded set."""
+
+    @staticmethod
+    def _sessions(tmp_path: Path, *session_ids: str) -> list[inventory.SessionRecord]:
+        return [
+            _session_on_disk(tmp_path, session_id, [_with_session(_clean_record(0), session_id)])
+            for session_id in session_ids
+        ]
+
+    def test_drops_the_coded_session_and_keeps_input_order(self, tmp_path):
+        a, b, c = self._sessions(tmp_path, 'sess-a', 'sess-b', 'sess-c')
+        assert mod.drop_coded([a, b, c], frozenset({'sess-b'})) == [a, c]
+
+    def test_keys_on_the_first_record_carrying_a_session_id(self, tmp_path):
+        late = _session_on_disk(tmp_path, 'late', [
+            _queue_operation_record(), _with_session(_clean_record(0), 'sess-b'),
+        ])
+        assert mod.drop_coded([late], frozenset({'sess-b'})) == []
+
+    def test_keeps_a_session_with_no_readable_id(self, tmp_path):
+        missing = inventory.SessionRecord(
+            path=tmp_path / 'missing.jsonl', encoded_dir=tmp_path.name, cwd=MAIN_CWD,
+            date=dt_date(2026, 7, 13), size_bytes=0,
+        )
+        assert mod.drop_coded([missing], frozenset({'sess-b'})) == [missing]
+
+    def test_an_empty_coded_set_keeps_every_session(self, tmp_path):
+        sessions = self._sessions(tmp_path, 'sess-a', 'sess-b', 'sess-c')
+        assert mod.drop_coded(sessions, frozenset()) == sessions
+
+
 class TestScoreSession:
     """score_session is the one scan + classify + first-turn-text step every
     consumer of enumerated sessions shares."""

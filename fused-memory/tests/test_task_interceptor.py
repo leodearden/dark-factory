@@ -33,7 +33,7 @@ from shared.task_statuses import TaskStatus
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_metadata_mode
-from fused_memory.backends.task_backend_errors import TaskmasterError
+from fused_memory.backends.task_backend_errors import DependencyCycle, TaskmasterError
 from fused_memory.config.schema import (
     CuratorConfig,
     FusedMemoryConfig,
@@ -2512,6 +2512,33 @@ async def test_dependency_operations_emit_events(interceptor, event_buffer):
     await interceptor.remove_dependency('2', '1', '/project')
     stats = await event_buffer.get_buffer_stats('project')
     assert stats['size'] == 2
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_returns_the_dependency_cycle_refusal(
+    interceptor, taskmaster, event_buffer,
+):
+    refusal = DependencyCycle('add_dependency', (3, 1, 2, 3))
+    taskmaster.add_dependency = AsyncMock(side_effect=refusal)
+
+    result = await interceptor.add_dependency('3', '1', '/project')
+
+    assert result == refusal.to_error_dict()
+    assert (result['error_type'], result['cycle']) == ('DependencyCycle', [3, 1, 2, 3])
+    assert (await event_buffer.get_buffer_stats('project'))['size'] == 0
+
+
+@pytest.mark.asyncio
+async def test_update_task_returns_the_dependency_cycle_refusal(
+    interceptor, taskmaster, event_buffer,
+):
+    refusal = DependencyCycle('update_task', (1, 3, 1))
+    taskmaster.update_task = AsyncMock(side_effect=refusal)
+
+    result = await interceptor.update_task('1', '/project', dependencies=['3'])
+
+    assert result == refusal.to_error_dict()
+    assert (await event_buffer.get_buffer_stats('project'))['size'] == 0
 
 
 @pytest.mark.asyncio

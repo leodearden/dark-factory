@@ -229,7 +229,7 @@ def _is_stale_session_pointer(path: Path, root: Path | str | None) -> bool:
         pid = int(path.name)
     except ValueError:
         return True
-    if pid <= 0 or path.name != str(pid):
+    if path.name != str(pid) or not session_records.is_session_pointer_pid(pid):
         return True
     slug = session_records.read_session_pointer(path)
     if (
@@ -319,8 +319,10 @@ def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
     """Remove every pointer entry that can no longer serve a reader.
 
     A ``sessions-by-pid/`` entry is stale when its name is not a canonical
-    positive pid, its content is not a record key, the record it names has no
-    ``record.json``, or its pid is judged DEAD by
+    positive pid, it names a shared ``claude agents`` host, which no reader
+    follows (``session_records.is_session_pointer_pid``), its content is not
+    a record key, the record it names has no ``record.json``, or its pid is
+    judged DEAD by
     ``shared/src/shared/session_liveness.py::judge`` against that record's
     ``claude_owner_identity`` when it names the same pid, so each such entry
     costs one record read.

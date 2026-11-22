@@ -58,6 +58,8 @@ import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from _transcript_fixtures import assistant_record, confirmed_bash_launch
+
 from shared.cli_invoke import TranscriptWatch, run_cli_subprocess
 
 # ── Fake process builders ───────────────────────────────────────────────────
@@ -519,31 +521,18 @@ class TestTimeoutPathRereadOffLoop:
 
 
 # ── Normal-exit fixture ─────────────────────────────────────────────────────
-# Two assistant records whose tail is an unreaped background launch.  Borrowed
-# from TestDetectEndedAwaitingBackground::test_single_abandoned_launch_is_true
-# (in test_cli_invoke_background.py) so the expected ended_awaiting_background
-# value is one the detector's own suite already pins, not one invented here.
+# Two assistant records, the second launching a background task, then the
+# result confirming the launch, which nothing reaps.  Built from the
+# _transcript_fixtures confirmed launch that
+# TestDetectEndedAwaitingBackground::test_single_abandoned_launch_is_true
+# (in test_cli_invoke_background.py) pins, so the expected
+# ended_awaiting_background value is one the detector's own suite already
+# pins, not one invented here.
 #   → transcript_turns == 2 (two type='assistant' records)
 #   → ended_awaiting_background is True (launch never followed by a reap)
 _ABANDONED_LAUNCH_RECORDS = [
-    {
-        'type': 'assistant',
-        'message': {
-            'role': 'assistant',
-            'content': [{'type': 'text', 'text': 'kick off the long build'}],
-        },
-    },
-    {
-        'type': 'assistant',
-        'message': {
-            'role': 'assistant',
-            'content': [{
-                'type': 'tool_use',
-                'name': 'Bash',
-                'input': {'command': './occt-test.sh', 'run_in_background': True},
-            }],
-        },
-    },
+    assistant_record([{'type': 'text', 'text': 'kick off the long build'}]),
+    *confirmed_bash_launch(command='./occt-test.sh'),
 ]
 
 

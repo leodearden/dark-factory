@@ -1419,6 +1419,13 @@ LOOPBACK_SSH_HOST: str = 'loopback-verify-host'
 STARVED_HEARTBEAT_INTERVAL_SECS: float = 3600.0
 
 
+#: CLI startup, then one watchdog window plus load headroom: a wedge detector
+#: that costs nothing on the success path.
+STARVATION_DISPATCH_CEILING_SECS: float = (
+    ROW_DISCOVERY_CEILING_MAX_SECS + ROW_TREE_KILL_CEILING_SECS
+)
+
+
 @pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)
 def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_warning(
     tmp_path, monkeypatch, caplog
@@ -1439,9 +1446,6 @@ def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_wa
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = write_verify_config(tmp_path / 'config.yaml', repo, persistent_merge_worktree=False)
     tag = uuid.uuid4().hex
-    # CLI startup, then one watchdog window plus load headroom: a wedge
-    # detector that costs nothing on the success path.
-    dispatch_ceiling = row_discovery_ceiling_secs() + ROW_TREE_KILL_CEILING_SECS
 
     with monkeypatch.context() as env:
         apply_dispatcher_env(env)
@@ -1461,11 +1465,12 @@ def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_wa
         try:
             with pytest.raises(RunnerUnavailable) as excinfo:
                 asyncio.run(asyncio.wait_for(
-                    runner.run_merge_verify(head_sha, sleeper_spec(300.0)), dispatch_ceiling,
+                    runner.run_merge_verify(head_sha, sleeper_spec(300.0)),
+                    STARVATION_DISPATCH_CEILING_SECS,
                 ))
         except TimeoutError:
             pytest.fail(
-                f'the remote dispatch did not end within {dispatch_ceiling}s: the starved '
+                f'the remote dispatch did not end within {STARVATION_DISPATCH_CEILING_SECS}s: the starved '
                 f'leader\'s watchdog never fired, so its self-kill could not be attributed'
             )
         finally:

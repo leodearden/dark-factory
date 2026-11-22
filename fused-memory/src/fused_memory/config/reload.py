@@ -161,6 +161,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'write_triage.judge_provider',
     'write_triage.judge_model',
     'write_triage.judge_api_url',
+    'write_triage.judge_api_key',
     'write_triage.judge_timeout_seconds',
     'write_triage.judge_candidate_count',
     'write_triage.judge_reasoning_effort',
@@ -299,11 +300,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'link_heal.misfile_share_ceiling',
     'link_heal.corrects_share_ceiling',
     'link_heal.shard_failure_streak',
-    # The scheduled sweep and its calibration gate (task 7159): same consumers.
+    # The scheduled sweep, its calibration gate and its adjudication cap
+    # (tasks 7159, 6188): same consumers.
     'link_heal.projects',
     'link_heal.writes',
     'link_heal.sweep_actions',
     'link_heal.sweep_window_hours',
+    'link_heal.max_adjudications_per_run',
     'link_heal.calibration_kappa_margin',
     'link_heal.calibration_min_project_items',
 })

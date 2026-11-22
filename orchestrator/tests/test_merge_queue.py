@@ -62,6 +62,8 @@ from orchestrator.git_ops import (
 from orchestrator.merge_lane.gates import (
     DropGuardResult,
     _check_plan_files_touched_in_branch,
+    _reverify_rebased_tree,
+    note_queue_verified_main_tip,
 )
 from orchestrator.merge_lane.intake import (
     MERGE_LANES,
@@ -108,7 +110,7 @@ from orchestrator.merge_lane.worker import (
     _is_speculation_race,
     item_merge_wt,
 )
-from orchestrator.verify import VerifyResult
+from orchestrator.verify import VerifyResult, cached_main_baseline_failing_ids
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 
 # Per-test ceiling for classes whose stacked wait_responsive merge waits outgrow
@@ -204,9 +206,14 @@ def _gated_verify(
     return AsyncMock(side_effect=_side_effect)
 
 
-def _mock_verify_pass():
-    """Return a mock that makes run_scoped_verification always pass."""
-    return AsyncMock(return_value=fake_verify_result(passed=True, summary=''))
+def _mock_verify_pass(*, failing_test_ids: frozenset[str] | None = None):
+    """Return a mock that makes run_scoped_verification always pass.
+
+    Only a non-None *failing_test_ids* lets the pass seed main's baseline.
+    """
+    return AsyncMock(return_value=fake_verify_result(
+        passed=True, summary='', failing_test_ids=failing_test_ids,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -13116,27 +13123,23 @@ def _infra_category_verify_result(category: str = 'semaphore_timeout') -> Verify
     )
 
 
-class _ScriptedVerifier(FakeVerifier):
-    """A :class:`FakeVerifier` that answers per CALL instead of per task id.
+class _AnswerListVerifier(FakeVerifier):
+    """A :class:`FakeVerifier` whose every step answers from a call-ordered
+    list whose last entry repeats.
 
     The direct ``run_post_merge_verify`` tests each drive ONE task, and most
     of them are about what the SECOND answer does — an infra-transient
     failure that clears on the bounded retry, a narrowed retry budget running
-    out, a disk guard that relents after a prune. ``answers`` and
-    ``disk_reasons`` are consumed one entry per call and the last entry
-    repeats once exhausted, so a test scripts only the calls whose answer it
-    cares about.
+    out, a disk guard that relents after a prune — so a test scripts only the
+    calls whose answer it cares about. Unlike a mock's ``side_effect`` list,
+    an exhausted script repeats rather than raising, so an over-eager caller
+    is caught by the call-count assertion the test already makes.
 
-    Unlike a mock's ``side_effect`` list, an exhausted script repeats rather
-    than raising, so an over-eager caller is caught by the call-count
-    assertion the test already makes rather than by an opaque StopIteration.
-
-    ``scoped_calls`` and ``disk_guard_calls`` record what each step was asked,
-    the way the parent records ``verified`` and ``investigations``.
-
-    Per-CALL and the parent's per-TASK-ID scripting are mutually exclusive:
-    the parent resolves ``scripts[task_id]`` first, so a caller that supplied
-    both would silently never run its ``answers``.
+    Scoped ``answers`` ride the parent's ``sequence=``/``default=``, so the
+    scoped entry recording is the parent's own — see
+    ``orchestrator/tests/_merge_lane_fakes.py::FakeVerifier``. They are the
+    whole scoped script: do not also set the parent's ``scripts`` or call
+    ``then``, which would silently change which answer repeats.
     """
 
     def __init__(
@@ -13145,22 +13148,16 @@ class _ScriptedVerifier(FakeVerifier):
         answers: Sequence[VerifyScript] = (),
         gates: Sequence[Any] = (),
         disk_reasons: Sequence[str | None] = (None,),
-        **kwargs: Any,
     ) -> None:
-        if answers and 'scripts' in kwargs:
-            raise TypeError(
-                '_ScriptedVerifier answers per call: `answers` and the parent '
-                "FakeVerifier's per-task `scripts` cannot both be supplied, "
-                'because the task-id script wins and no answer would ever run.'
-            )
         if not disk_reasons:
             raise ValueError(
                 '`disk_reasons` must name at least one outcome — the last entry '
                 'is what repeats once the script is exhausted. Omit the argument '
                 'for the always-free default.'
             )
-        super().__init__(**kwargs)
-        self.answers = list(answers)
+        super().__init__(
+            default=answers[-1] if answers else None, sequence=answers[:-1],
+        )
         self.gates = list(gates)
         self.disk_reasons = list(disk_reasons)
         self.scoped_calls: list[dict[str, Any]] = []
@@ -13170,9 +13167,9 @@ class _ScriptedVerifier(FakeVerifier):
     def _consume(script: list[Any]) -> Any:
         """Take the next entry, or keep answering with the last one.
 
-        Every caller guarantees a non-empty script — ``answers`` and ``gates``
-        at their call sites, ``disk_reasons`` in ``__init__`` — so this says so
-        by name rather than letting an empty list surface as an IndexError from
+        Every caller guarantees a non-empty script — ``gates`` at its call
+        sites, ``disk_reasons`` in ``__init__`` — so this says so by name
+        rather than letting an empty list surface as an IndexError from
         somewhere inside the step it was scripting.
         """
         assert script, '_consume called with an empty script'
@@ -13180,15 +13177,7 @@ class _ScriptedVerifier(FakeVerifier):
 
     async def run_scoped(self, *args: Any, **options: Any) -> VerifyResult:
         self.scoped_calls.append(options)
-        if not self.answers:
-            return await super().run_scoped(*args, **options)
-        # This call's answer is played through a parent instance holding it as
-        # its only script: how a VerifyScript resolves (release / error /
-        # result) stays defined in exactly one place, and `self.default` is
-        # never rewritten to smuggle the answer down into the parent.
-        self.verified.append(options.get('task_id'))  # recorded as the parent would
-        answer = FakeVerifier(default=self._consume(self.answers))
-        return await answer.run_scoped(*args, **options)
+        return await super().run_scoped(*args, **options)
 
     async def run_unscoped_typechecks(self, *args: Any, **options: Any) -> Any:
         if not self.gates:
@@ -13236,6 +13225,45 @@ def _production_verifier_with(**steps: Any) -> VerifyPort:
 
 
 @pytest.mark.asyncio
+class TestAnswerListVerifier:
+    """The per-call verifier double keeps its parent's recording contract."""
+
+    async def test_answers_play_in_call_order_and_the_last_repeats(self) -> None:
+        verifier = _AnswerListVerifier(answers=[
+            fails(category='env_transient', summary='first'),
+            passes(summary='then'),
+        ])
+
+        results = [
+            await verifier.run_scoped(Path('wt'), None, [], task_id='t')
+            for _ in range(3)
+        ]
+
+        assert [r.summary for r in results] == ['first', 'then', 'then']
+
+    async def test_every_answered_call_is_a_recorded_entry(self) -> None:
+        verifier = _AnswerListVerifier(answers=[passes()])
+
+        await verifier.run_scoped(Path('wt'), None, [], task_id='a')
+        await verifier.run_scoped(Path('wt'), None, [], task_id='b')
+
+        assert verifier.verified == ['a', 'b']
+        assert verifier.entered_count == len(verifier.verified)
+        assert [c.task_id for c in verifier.verify_calls] == ['a', 'b']
+        await wait_responsive(
+            verifier.await_entry(2), label='second answered scoped verify entry',
+        )
+
+    async def test_no_answers_falls_back_to_a_passing_verify(self) -> None:
+        verifier = _AnswerListVerifier()
+
+        result = await verifier.run_scoped(Path('wt'), None, [], task_id='t')
+
+        assert result.passed is True
+        assert verifier.entered_count == 1
+
+
+@pytest.mark.asyncio
 class TestRunPostMergeVerify:
     """Direct unit tests for the run_post_merge_verify module-level helper.
 
@@ -13276,7 +13304,7 @@ class TestRunPostMergeVerify:
         enospc_retries: dict[str, int] = {}
 
         passed_result = fake_verify_result(passed=True, summary='', timed_out=False)
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=passed_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=passed_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries=enospc_retries,
@@ -13296,7 +13324,7 @@ class TestRunPostMergeVerify:
         merge_wt = MagicMock()
         disk_reason = f'{TRANSIENT_INFRA_REASON_PREFIX}: no space'
 
-        verifier = _ScriptedVerifier(disk_reasons=[disk_reason])
+        verifier = _AnswerListVerifier(disk_reasons=[disk_reason])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -13328,7 +13356,7 @@ class TestRunPostMergeVerify:
         failed_result.lint_output = ''
         failed_result.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=failed_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=failed_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -13360,7 +13388,7 @@ class TestRunPostMergeVerify:
         timed_out_result.lint_output = ''
         timed_out_result.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=timed_out_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=timed_out_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries={},
@@ -13385,7 +13413,7 @@ class TestRunPostMergeVerify:
 
         enospc_result = _enospc_verify_result()
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=enospc_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries,
@@ -13425,7 +13453,7 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result(category=category)), VerifyScript(result=passing)],
         )
         result = await run_post_merge_verify(
@@ -13462,7 +13490,7 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result(category=category)
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=infra_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries=enospc_retries,
@@ -13522,7 +13550,7 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result(category='env_transient')), VerifyScript(result=passing)],
         )
         result = await run_post_merge_verify(
@@ -13565,7 +13593,7 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result()
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=infra_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries=enospc_retries,
@@ -13616,7 +13644,7 @@ class TestRunPostMergeVerify:
             category='test_failure',
         )
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_failure_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=test_failure_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -13644,7 +13672,7 @@ class TestRunPostMergeVerify:
         req = self._make_req()
         merge_wt = MagicMock()
 
-        verifier = _ScriptedVerifier(answers=[raises(RuntimeError('boom'))])
+        verifier = _AnswerListVerifier(answers=[raises(RuntimeError('boom'))])
         with pytest.raises(RuntimeError, match='boom'):
             await run_post_merge_verify(
                 git_ops, req, merge_wt,
@@ -13675,7 +13703,7 @@ class TestRunPostMergeVerify:
         failing_verify.lint_output = ''
         failing_verify.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=failing_verify)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=failing_verify)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -13703,7 +13731,7 @@ class TestRunPostMergeVerify:
         l2 = Path('/fake/_merge-l2')
 
         passed_result = fake_verify_result(passed=True, summary='', timed_out=False)
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=passed_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=passed_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -13728,7 +13756,7 @@ class TestRunPostMergeVerify:
         enospc_retries: dict[str, int] = {}
 
         enospc_result = _enospc_verify_result()
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=enospc_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries,
@@ -13752,7 +13780,7 @@ class TestRunPostMergeVerify:
         enospc_retries: dict[str, int] = {}
 
         enospc_result = _enospc_verify_result()
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=enospc_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries,
@@ -13783,7 +13811,7 @@ class TestRunPostMergeVerify:
 
         expected_archive_root = tmp_path / 'data' / 'verify-logs'
 
-        verifier = _ScriptedVerifier(answers=[passes(summary='ok')])
+        verifier = _AnswerListVerifier(answers=[passes(summary='ok')])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -13817,7 +13845,7 @@ class TestRunPostMergeVerify:
         timed_out_result.lint_output = ''
         timed_out_result.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=timed_out_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=timed_out_result)])
         with patch('orchestrator.merge_lane.verify_failure_outcome.classify_main_health_red', AsyncMock(return_value=None)):
             result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
@@ -13852,7 +13880,7 @@ class TestRunPostMergeVerify:
         test_fail_result.lint_output = ''
         test_fail_result.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_fail_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=test_fail_result)])
         with patch('orchestrator.merge_lane.verify_failure_outcome.classify_main_health_red', AsyncMock(return_value=None)):
             result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
@@ -13894,7 +13922,7 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=passing)],
         )
         with (
@@ -13952,7 +13980,7 @@ class TestRunPostMergeVerify:
             category='test_failure',
         )
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_failure_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=test_failure_result)])
         with (
             patch(
                 'orchestrator.merge_lane.post_merge_verify.build_attempt0_payload',
@@ -14011,7 +14039,7 @@ class TestRunPostMergeVerify:
             category='test_failure',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=test_failure_result)],
         )
         with (
@@ -14072,7 +14100,7 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result('semaphore_timeout')
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=infra_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=(er := {}),
@@ -14113,7 +14141,7 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result('semaphore_timeout')
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=infra_result)])
         with (
             patch(
                 'orchestrator.merge_lane.post_merge_verify.build_attempt0_payload',
@@ -14168,7 +14196,7 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=passing)],
         )
         with (
@@ -15896,6 +15924,10 @@ class TestReverifyRebasedTree:
         run_scoped_verification called exactly once, merge_wt still exists.
     (c) Overlapping, red verify → returns blocked MergeOutcome,
         merge_wt cleaned up.
+    (d) A green re-verify of a real advance_main rebase seeds main's baseline
+        at the rebased sha, and the follow-up advance lands exactly that sha.
+    (e) A trusted disjoint skip clears with no verify and seeds NO baseline
+        at the rebased sha: an unverified tree is never every-module-green.
     """
 
     async def _make_merge_wt(
@@ -15909,6 +15941,14 @@ class TestReverifyRebasedTree:
         req = _make_request(branch_name, branch_name, wt, config)
         return result.merge_worktree, req
 
+    @staticmethod
+    async def _commit_drift(git_ops: GitOps, branch_name: str) -> str:
+        """Commit a file disjoint from *branch_name*'s onto main; return main's new sha."""
+        (git_ops.project_root / f'{branch_name}_drift.py').write_text('d = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        return await git_ops.get_main_sha()
+
     async def _rebased_onto_drift(
         self, git_ops: GitOps, config: OrchestratorConfig, branch_name: str,
     ) -> tuple[Path, MergeRequest, str, str, str]:
@@ -15916,20 +15956,35 @@ class TestReverifyRebasedTree:
         merge_wt, req = await self._make_merge_wt(git_ops, branch_name, config)
         rebased_from = await git_ops.get_main_sha()
         _, verified, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
-        (git_ops.project_root / f'{branch_name}_drift.py').write_text('d = 1\n')
-        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
-        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
-        rebased_onto = await git_ops.get_main_sha()
+        rebased_onto = await self._commit_drift(git_ops, branch_name)
         rc, _, err = await _run(['git', 'rebase', rebased_onto], cwd=merge_wt)
         assert rc == 0, err
         return merge_wt, req, verified.strip(), rebased_from, rebased_onto
+
+    async def _advance_onto_drift(
+        self, git_ops: GitOps, config: OrchestratorConfig, branch_name: str,
+    ) -> tuple[Path, MergeRequest, str, str, str, str]:
+        """A real advance_main parked on a drift: (merge_wt, req, verified, rebased_from, rebased_onto, rebased_sha)."""
+        merge_wt, req = await self._make_merge_wt(git_ops, branch_name, config)
+        _, verified, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
+        base = await git_ops.get_main_sha()
+        await self._commit_drift(git_ops, branch_name)
+        outcome = await git_ops.advance_main(
+            verified.strip(), merge_wt,
+            branch=branch_name, expected_main=base, reverify_on_rebase=True,
+        )
+        assert outcome.result == 'rebased_pending_reverify', outcome
+        assert outcome.rebased_from and outcome.rebased_onto and outcome.advanced_sha, outcome
+        return (
+            merge_wt, req, verified.strip(),
+            outcome.rebased_from, outcome.rebased_onto, outcome.advanced_sha,
+        )
 
     async def test_same_tree_skips_without_a_verify(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """(s) A rebased sha whose tree IS the verified tree clears with no verify."""
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         merge_wt, req, verified, rebased_from, rebased_onto = await self._rebased_onto_drift(
             git_ops,
@@ -15975,7 +16030,6 @@ class TestReverifyRebasedTree:
     ) -> None:
         """(s) Fail closed: no tree to compare means the whole-tree gate re-verifies."""
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         merge_wt, req, _, rebased_from, rebased_onto = await self._rebased_onto_drift(
             git_ops,
@@ -16019,9 +16073,7 @@ class TestReverifyRebasedTree:
         is one this queue landed green: gate returns None and does NOT call
         run_scoped_verification.  merge_wt still exists.
         """
-        from orchestrator.merge_lane.gates import note_queue_verified_main_tip
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         # This repo's own config declares merge_verify_breadth='full' (a
         # whole-tree merge gate), which alone denies the fast path.  Exercise
@@ -16087,7 +16139,6 @@ class TestReverifyRebasedTree:
         not one this queue landed green.
         """
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         # Diff-scoped breadth, so the ONLY thing denying the fast path is the
         # drift's unknown provenance.
@@ -16147,9 +16198,7 @@ class TestReverifyRebasedTree:
         a tip this queue landed green — and the P2 kill switch does not cover
         this arm.
         """
-        from orchestrator.merge_lane.gates import note_queue_verified_main_tip
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         merge_wt, req = await self._make_merge_wt(
             git_ops, 'rvrt-whole-tree', config,
@@ -16209,7 +16258,6 @@ class TestReverifyRebasedTree:
         run_scoped_verification called exactly once, merge_wt still exists.
         """
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-overlap-green', config)
         fork_sha = await git_ops.get_main_sha()
@@ -16257,7 +16305,6 @@ class TestReverifyRebasedTree:
         merge_wt cleaned up.
         """
         from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-overlap-red', config)
         fork_sha = await git_ops.get_main_sha()
@@ -16299,13 +16346,105 @@ class TestReverifyRebasedTree:
         # run_post_merge_verify cleans up merge_wt on failure
         assert not merge_wt.exists(), 'merge_wt must be cleaned up after red verify'
 
+    async def test_reverified_rebased_landing_seeds_landed_sha_baseline(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(d) The whole-tree gate re-verifies the rebased tree green, which seeds
+        main's baseline at the rebased sha before the follow-up advance lands it.
+
+        Covers the inline re-verify arm (dispatch_reverify=False), which only the
+        train path takes. The single-branch loop's dispatched arm is not pinned here.
+        """
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+
+        branch_name = 'rvrt-seed-reverified'
+        merge_wt, req, verified, rebased_from, rebased_onto, rebased_sha = (
+            await self._advance_onto_drift(
+                git_ops, config.model_copy(update={'merge_verify_breadth': 'full'}), branch_name,
+            )
+        )
+        verify_mock = _mock_verify_pass(failing_test_ids=frozenset())
+        try:
+            with patch('orchestrator.merge_lane.worker.run_scoped_verification', verify_mock):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    verified_merge_sha=verified,
+                    rebased_from=rebased_from,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha=rebased_sha,
+                    run_post_merge_verify=functools.partial(
+                        run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                    ),
+                    event_store=None,
+                )
+            assert result == GateClearance.reverified, result
+            verify_mock.assert_called_once()
+            assert cached_main_baseline_failing_ids(rebased_sha) == frozenset(), (
+                'a green re-verify must seed the rebased sha as every-module-green'
+            )
+
+            landed = await git_ops.advance_main(
+                rebased_sha, merge_wt,
+                branch=branch_name, expected_main=rebased_onto, reverify_on_rebase=True,
+            )
+            assert landed.result == 'advanced', landed
+            assert await git_ops.get_main_sha() == rebased_sha, (
+                'the seeded sha must be the one that lands on main'
+            )
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_disjoint_skip_clearance_seeds_no_baseline(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(e) Real git disjointness over a queue-verified drift clears with no
+        verify, so nothing may record the rebased sha's tree as green.
+        """
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+
+        scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
+        merge_wt, req, verified, rebased_from, rebased_onto, rebased_sha = (
+            await self._advance_onto_drift(git_ops, scoped, 'rvrt-seed-disjoint')
+        )
+        note_queue_verified_main_tip(git_ops.project_root, rebased_onto)
+        verify_mock = _mock_verify_pass(failing_test_ids=frozenset())
+        try:
+            with patch('orchestrator.merge_lane.worker.run_scoped_verification', verify_mock):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    verified_merge_sha=verified,
+                    rebased_from=rebased_from,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha=rebased_sha,
+                    run_post_merge_verify=functools.partial(
+                        run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                    ),
+                    event_store=None,
+                )
+            assert result == GateClearance.disjoint, result
+            verify_mock.assert_not_called()
+            assert cached_main_baseline_failing_ids(rebased_sha) is None, (
+                'a tree no verify ran on must not be seeded as every-module-green'
+            )
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
     async def test_keep_worktrees_forwarded_to_run_post_merge_verify(self) -> None:
         """keep_worktrees kwarg must be forwarded verbatim to run_post_merge_verify.
 
         RED: TypeError because the parameter doesn't exist yet.
         GREEN after step-10 adds keep_worktrees param and forwards it.
         """
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         git_ops = MagicMock()
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -16363,7 +16502,6 @@ class TestReverifyRebasedTree:
         Regression guard: after step-10 adds keep_worktrees to the signature,
         the default None must be forwarded (not omitted).
         """
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         git_ops = MagicMock()
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -16612,7 +16750,6 @@ class TestSpeculativeMergeWorkerGate:
         Fast path: the gate detects no overlap and skips re-verify.
         run_scoped_verification called exactly once (initial verify only).
         """
-        from orchestrator.merge_lane.gates import note_queue_verified_main_tip
 
         branch = 'smwg-disjoint'
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -20908,7 +21045,7 @@ class TestRunPostMergeVerifyRouting:
         )
         clean_gate = MagicMock(broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[])
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=passed_result)],
             gates=[clean_gate],
         )
@@ -20992,7 +21129,7 @@ class TestRunPostMergeVerifyRouting:
             summary='test-fail',
         )
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=failed_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=failed_result)])
         with patch('orchestrator.merge_lane.verify_failure_outcome.classify_main_health_red', AsyncMock(return_value=None)) as mock_mh:
             result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
@@ -21027,7 +21164,7 @@ class TestRunPostMergeVerifyRouting:
             timed_out_subprojects=[], detail='type errors here',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=passed_scoped)],
             gates=[broken_gate],
         )
@@ -21067,7 +21204,7 @@ class TestRunPostMergeVerifyRouting:
         )
 
         timeouts: dict = {}
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=passed_scoped)],
             gates=[timeout_gate],
         )
@@ -21105,7 +21242,7 @@ class TestRunPostMergeVerifyRouting:
             lint_output='', type_output='', summary='disk full',
         )
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=enospc_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -21137,7 +21274,6 @@ class TestMergeShaThreading:
         RED: TypeError because the parameter doesn't exist yet.
         GREEN after step-14 adds merge_sha param and forwards it to run_post_merge_verify.
         """
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         git_ops = MagicMock()
         git_ops.cleanup_merge_worktree = AsyncMock()

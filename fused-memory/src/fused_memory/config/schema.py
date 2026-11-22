@@ -2977,10 +2977,21 @@ class WriteTriageConfig(BaseModel):
             "the judge's SDK base_url for whichever provider arm the judge "
             'resolves, and nothing else reads it: the main LLM arm keeps '
             'llm.providers.*.api_url, and add_memory auto-classification uses '
-            'routing.openai_api_url, which inherits it. The '
-            'api_key still comes from the provider section. Blank means '
+            'routing.openai_api_url, which inherits it. Its key is '
+            "judge_api_key's, which inherits on its own. Blank means "
             'inherit. Green-tier hot-reloadable, read live per judge call. See '
             "plans/write-triage-flip-readiness-prd.md C1' (task σ)."
+        ),
+    )
+    judge_api_key: str | None = Field(
+        default=None,
+        description=(
+            "The judge's OWN API key. None or blank INHERITS "
+            'llm.providers.<resolved judge provider>.api_key, and through it '
+            "the SDK's environment fallback. When set it is the judge's SDK "
+            'client api_key and nothing else reads it: the main LLM arm and '
+            'routing keep their own keys. Green-tier hot-reloadable, read live '
+            'per judge call.'
         ),
     )
     judge_timeout_seconds: float = Field(
@@ -3139,10 +3150,10 @@ class WriteTriageConfig(BaseModel):
         ),
     )
 
-    @field_validator('judge_api_url')
+    @field_validator('judge_api_url', 'judge_api_key')
     @classmethod
-    def _blank_judge_api_url_inherits(cls, value: str | None) -> str | None:
-        """A blank endpoint is stored as None, the leaf's one spelling of inherit.
+    def _blank_judge_endpoint_leaf_inherits(cls, value: str | None) -> str | None:
+        """A blank endpoint leaf is stored as None, its one spelling of inherit.
 
         The judge's resolver applies the same rule at use; normalising here
         too means a reload of a blank value reports null rather than an
@@ -3712,7 +3723,7 @@ class ConsolidationAutoConfig(BaseModel):
 
 class LinkHealConfig(BaseModel):
     """Caps, storm escapes, adjudicator knobs and the scheduled sweep for link
-    healing (tasks 6181, 6184, 7159).
+    healing (tasks 6181, 6184, 7159, 6188).
 
     Contract: ``plans/write-triage-link-healing-prd.md`` H1, "Caps and storm
     escapes", and H2, the link adjudicator. The consumers are
@@ -3827,6 +3838,18 @@ class LinkHealConfig(BaseModel):
             'How far back the first scheduled sweep looks for newly created '
             'children; later sweeps start where the last complete one ended. '
             'Read by maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    max_adjudications_per_run: int = Field(
+        default=200,
+        ge=1,
+        description=(
+            'The most pairs one scheduled sweep run asks the link adjudicator '
+            'about. Verdicts already ledgered at the current texts are reused '
+            'and do not count. The rest are recorded unexamined, the run is '
+            'partial and holds the sweep window, so a later sweep asks them. '
+            'Read by maintenance/link_heal_sweep.py at each run start. PRD ε, '
+            'task 6188.'
         ),
     )
     calibration_kappa_margin: float = Field(

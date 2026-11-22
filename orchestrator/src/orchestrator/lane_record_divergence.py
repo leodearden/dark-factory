@@ -39,7 +39,7 @@ _HOLDING_STATES: Final = frozenset({LaneState.ASSIGNED, LaneState.IN_USE})
 
 _ALARM: Final = BornAtL2Alarm(
     root_cause=LANE_RECORD_DIVERGENCE,
-    sentinel_task='__lane_record_divergence__',
+    task_id='__lane_record_divergence__',
     role='orchestrator-lane-record-divergence',
     category=EscalationCategory.INFRA_ISSUE,
     suggested_action='investigate_lane_record_divergence',

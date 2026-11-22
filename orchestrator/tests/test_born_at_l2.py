@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
 from escalation.categories import EscalationCategory
+from escalation.models import HARNESS_SENTINEL_ROLE_PREFIXES
 from escalation.queue import EscalationQueue
 
 from orchestrator.born_at_l2 import BornAtL2Alarm, file_deduped_born_at_l2
@@ -13,7 +16,7 @@ from orchestrator.event_store import EventStore, EventType
 
 _ALARM = BornAtL2Alarm(
     root_cause='probe_condition',
-    sentinel_task='__probe_condition__',
+    task_id='__probe_condition__',
     role='orchestrator-probe-condition',
     category=EscalationCategory.INFRA_ISSUE,
     suggested_action='investigate_probe_condition',
@@ -45,6 +48,28 @@ def _logged_warning_for(caplog, error: BaseException) -> bool:
     )
 
 
+@pytest.mark.parametrize('role', [
+    'reblock-guard',
+    'orchestrator',
+    'architect',
+    'Orchestrator-probe',
+    ' orchestrator-probe',
+    '',
+])
+def test_alarm_refuses_a_role_outside_the_sentinel_namespace(role):
+    with pytest.raises(ValueError, match=re.escape(repr(role))) as excinfo:
+        replace(_ALARM, role=role)
+
+    assert all(prefix in str(excinfo.value) for prefix in HARNESS_SENTINEL_ROLE_PREFIXES)
+
+
+@pytest.mark.parametrize('prefix', HARNESS_SENTINEL_ROLE_PREFIXES)
+def test_alarm_accepts_each_sentinel_prefix(prefix):
+    alarm = replace(_ALARM, role=f'{prefix}probe')
+
+    assert alarm.role == f'{prefix}probe'
+
+
 def test_files_an_urgent_level_two_escalation_for_a_human(queue, event_store):
     escalation = _file(queue, event_store)
 
@@ -52,7 +77,7 @@ def test_files_an_urgent_level_two_escalation_for_a_human(queue, event_store):
     (pending,) = queue.get_pending()
     assert pending.id == escalation.id
     assert (pending.level, pending.severity) == (2, 'urgent')
-    assert pending.task_id == _ALARM.sentinel_task
+    assert pending.task_id == _ALARM.task_id
     assert pending.agent_role == _ALARM.role
     assert pending.category == _ALARM.category
     assert pending.category == 'infra_issue'
@@ -69,10 +94,23 @@ def test_emits_escalation_created_with_the_alarm_reason(queue, event_store):
     event_store.emit.assert_called_once()
     (event_type,) = event_store.emit.call_args.args
     assert event_type is EventType.escalation_created
-    assert event_store.emit.call_args.kwargs['task_id'] == _ALARM.sentinel_task
+    assert event_store.emit.call_args.kwargs['task_id'] == _ALARM.task_id
     data = event_store.emit.call_args.kwargs['data']
     assert data['escalation_id'] == escalation.id
     assert data['reason'] == _ALARM.created_reason
+
+
+def test_filed_warning_carries_the_summary(queue, caplog):
+    with caplog.at_level('WARNING'):
+        escalation = _file(queue, summary='probe tripped: 3 lanes drifted')
+
+    assert escalation is not None
+    assert any(
+        r.levelname == 'WARNING'
+        and escalation.id in r.getMessage()
+        and 'probe tripped: 3 lanes drifted' in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_long_summary_is_cut_to_one_line_limit(queue):

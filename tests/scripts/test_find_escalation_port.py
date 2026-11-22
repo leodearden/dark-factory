@@ -645,10 +645,9 @@ def test_config_name_precedence_holds_for_every_pair(
        is a property of the assertions and not a loader artifact. Since
        ``find_config`` returns the FIRST match, that order is a behavioural
        specification and not a stylistic list, so it gets a literal ratchet. If a
-       reorder is ever deliberate, update the literal here and say why: the tuple is
-       documented as kept in sync with ``dashboard.config``'s _CANONICAL_CONFIG_NAME
-       + _LEGACY_CONFIG_NAMES, and a spelling recognized by one but not the other is
-       the latent trap the module's own comment warns about.
+       reorder is ever deliberate, update the literal here and say why: the comment
+       above ``CONFIG_NAMES`` in find_escalation_port.py records why the survey
+       scans each spelling.
 
     MEASURED RED, scratch mutation reverted before commit: reversing CONFIG_NAMES
     entirely — RED (this test, on the ratchet)::

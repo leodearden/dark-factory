@@ -85,6 +85,7 @@ __all__ = [
     "SYSTEMCTL_LOG",
     "checker_repo",
     "enabled_units",
+    "install_recording_systemctl",
     "run_section",
     "setup_host_text",
     "slice_section",
@@ -175,6 +176,17 @@ def slice_shell_function(name: str) -> str:
     return _slice_shell_function(SETUP_HOST_PATH, name)
 
 
+def install_recording_systemctl(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Write the exit-0 `systemctl` stub whose log `systemctl_calls` reads; return its dir."""
+    stub_bin = stub_bin_dir(tmp_path)
+    write_stub(
+        stub_bin,
+        "systemctl",
+        f"printf '%s\\n' \"$*\" >> {tmp_path / SYSTEMCTL_LOG}\nexit 0\n",
+    )
+    return stub_bin
+
+
 def run_section(
     tmp_path: pathlib.Path,
     section_text: str,
@@ -191,11 +203,7 @@ def run_section(
     ``tmp_path / SYSTEMCTL_LOG`` before exiting 0 — see the module docstring
     for why that is unconditional.
     """
-    write_stub(
-        stub_bin_dir(tmp_path),
-        "systemctl",
-        f"printf '%s\\n' \"$*\" >> {tmp_path / SYSTEMCTL_LOG}\nexit 0\n",
-    )
+    install_recording_systemctl(tmp_path)
     return run_with_preamble(
         tmp_path,
         _preamble(repo_root, unit_dir),

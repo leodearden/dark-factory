@@ -310,6 +310,18 @@ mechanism. A task dispatches only once every local dependency reaches a
 TERMINAL status (`done`/`cancelled`); an intra-atomic-train
 `merge-deferred` sibling is also accepted as satisfying.
 
+The store refuses an edge that would close a cycle.
+`add_dependency(A, B)` and `update_task(A, dependencies=[…B…])` walk from
+B over the local table at every status: a `done` or `cancelled` task's
+edges count, so reopening it cannot revive a cycle. A refusal carries
+`error_type` `DependencyCycle` and `cycle` `[A, B, …, A]`, and nothing is
+written: remove one of the named edges rather than retrying the call.
+Self-loops and missing ids are refused on both; `update_task` exempts a
+missing id already stored for the task, since writing it back adds no
+edge. The graph is local only:
+qualified external deps (§3.2) are not walked. The rule's home is
+`shared/src/shared/dependency_cycle.py`.
+
 ### 3.2 Cross-project external dependencies
 
 A task can declare a dependency on a task in **another** project using the

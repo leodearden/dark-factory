@@ -138,6 +138,14 @@ def peek_session_id(path: Path) -> str | None:
     return None
 
 
+def drop_coded(sessions: Sequence[SessionRecord], coded: frozenset[str]) -> list[SessionRecord]:
+    """The *sessions*, in order, whose :func:`peek_session_id` (the key every
+    coding record and ledger row carries) is not in *coded*."""
+    if not coded:
+        return list(sessions)
+    return [s for s in sessions if peek_session_id(s.path) not in coded]
+
+
 def scan_transcript(path: Path) -> TranscriptScan:
     """Read *path* once, producing everything the sampler needs from it.
 

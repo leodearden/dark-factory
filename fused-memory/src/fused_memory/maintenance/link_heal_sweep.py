@@ -8,9 +8,10 @@ a dry run, and the exact model and prompt version the adjudicator asks under has
 a passing calibration, and its own plan run finished. At write time,
 ``link_heal_executor.py::run_apply`` re-checks that each sweep heal's verdict
 came from an adjudicator with a passing calibration, and withholds any other.
-Every run, writing or not, leaves its records in the ledger, one report on disk
-and one info escalation naming the report, or naming why the report could not
-be written.
+Every run, writing or not, leaves its records in the ledger, one report on disk,
+its metric series and the rolling summary under the metrics root, and one info
+escalation naming the report and the summary, or naming why either could not be
+written.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     RunSource,
     plan_document_path,
 )
+from fused_memory.maintenance.link_heal_metrics import SweepMetrics, SweepMetricsTarget
 from fused_memory.maintenance.link_heal_report import (
     CalibrationStatus,
     LedgerRun,
@@ -60,8 +62,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class SweepSettings:
-    """What one sweep covers, which heals it may stage, and whether it asks to write.
+    """What one sweep covers, which heals it may stage, how much it may ask, and
+    whether it asks to write.
 
+    *max_adjudications* is the most pairs the run asks the adjudicator about; the
+    rest are recorded unexamined and leave the run partial, so its window holds.
     *presence_projects* always includes *projects*: they are where a parent missing
     from its child's project is looked for, so a sweep over a subset of the
     configured projects reports a parent hosted in another one instead of
@@ -73,6 +78,7 @@ class SweepSettings:
     dry_run: bool
     actions: frozenset[HealAction]
     window_hours: int
+    max_adjudications: int
     presence_projects: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -86,6 +92,11 @@ class SweepSettings:
             raise ValueError(
                 'a link-heal sweep covers at least one project: set link_heal.projects '
                 'or name one with --project',
+            )
+        if self.max_adjudications < 1:
+            raise ValueError(
+                'link_heal.max_adjudications_per_run must be at least 1, '
+                f'got {self.max_adjudications}',
             )
 
     @classmethod
@@ -103,6 +114,7 @@ class SweepSettings:
             dry_run=dry_run,
             actions=_heal_actions(config.sweep_actions),
             window_hours=config.sweep_window_hours,
+            max_adjudications=config.max_adjudications_per_run,
             presence_projects=tuple(config.projects),
         )
 
@@ -153,16 +165,19 @@ def resolve_window(
 
 @dataclass(frozen=True)
 class SweepReport:
-    """One sweep run: what its report says, where the report is, and its escalation.
+    """One sweep run: what its report says, where the report and its metrics are,
+    and its escalation.
 
     *report_unwritten* is why the report files could not be written, when they
     could not; the escalation then names that failure in place of the report.
+    *metrics* says the same of the metric series and the summary.
     """
 
     view: SweepRunView
     json_path: Path
     report_path: Path
     escalation_id: str | None
+    metrics: SweepMetrics
     report_unwritten: str | None = None
 
     @property
@@ -189,6 +204,7 @@ async def run_sweep(
     settings: SweepSettings,
     filer: EscapeFiler,
     reports_dir: Path,
+    metrics: SweepMetricsTarget,
     now: datetime,
     since: datetime | None = None,
     plan_path_for: Callable[[str], Path] | None = None,
@@ -199,8 +215,9 @@ async def run_sweep(
     The plan document goes to ``plan_path_for(run_id)``, beside the ledger by
     default. A plan run that stopped recorded no examinations, so no heal is
     written after it, older pending ones included: the run is withheld as
-    :attr:`WritesWithheld.PLAN_STOPPED`. A report that cannot be written is still
-    escalated, naming why.
+    :attr:`WritesWithheld.PLAN_STOPPED`. The run's metric series and the rolling
+    summary are written under *metrics* after the report. A report or metrics that
+    cannot be written are still escalated, naming why.
 
     The window is recorded for each project the sweep covers, and only a complete
     plan run moves a project's watermark, so links a failed read or adjudication
@@ -231,6 +248,7 @@ async def run_sweep(
         created_in=window,
         filer=filer if withheld is None else None,
         presence_projects=settings.presence_projects,
+        max_adjudications=settings.max_adjudications,
     )
     ledger.record_sweep_window(
         plan.run_id, window, projects=settings.projects, complete=plan.counts.complete,
@@ -254,12 +272,16 @@ async def run_sweep(
     )
     json_path, report_path = report_paths(reports_dir, now, plan.run_id)
     unwritten = _write_report(view, json_path, report_path)
+    emitted = metrics.write(view, now)
     escalation_id = filer(run_report_escape(
-        {**run_headline(view), 'report_json': str(json_path)}, report_path, unwritten=unwritten,
+        {**run_headline(view), 'report_json': str(json_path), **emitted.as_detail()},
+        report_path,
+        unwritten=unwritten,
+        metrics_unwritten=emitted.unwritten,
     ))
     return SweepReport(
         view=view, json_path=json_path, report_path=report_path, escalation_id=escalation_id,
-        report_unwritten=unwritten,
+        metrics=emitted, report_unwritten=unwritten,
     )
 
 

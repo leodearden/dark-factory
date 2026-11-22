@@ -1701,7 +1701,7 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # ask to be merged ahead of the normal queue. Writers and reader are
         # named because that is what a future reader greps when deciding
         # whether the key is still load-bearing (all re-verified 2026-09-17):
-        # writers `orchestrator/src/orchestrator/merge_queue.py::
+        # writers `orchestrator/src/orchestrator/merge_lane/worker.py::
         # SpeculativeMergeWorker::_spawn_main_health_fix_task` (auto-heal
         # main-health fix task, 'high'), `orchestrator/src/orchestrator/
         # offline_lane_filing.py::build_lane_fix_task_arguments` and
@@ -1710,8 +1710,10 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # TaskWorkflow::_spawn_main_health_fix_task` (fix-main brief, 'high'),
         # plus the operator tool `escalation/src/escalation/server.py::
         # merge_relane` (task 5246, either value, on every task it re-lanes);
-        # reader `orchestrator/src/orchestrator/merge_queue.py::
-        # lane_for_task_metadata` -> `intake.py::normalize_lane`, consumed at
+        # reader `orchestrator/src/orchestrator/merge_lane/worker.py::
+        # lane_for_task_metadata` ->
+        # `orchestrator/src/orchestrator/merge_lane/intake.py::normalize_lane`,
+        # consumed at
         # `orchestrator/src/orchestrator/workflow.py::TaskWorkflow::
         # _submit_to_merge_queue` to set `MergeRequest.lane` and -- as of this
         # task -- by `escalation/src/escalation/merge_lane_resolution.py::

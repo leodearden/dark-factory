@@ -66,7 +66,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
 
-from dashboard.config import DashboardConfig
+from dashboard.config import _CANONICAL_CONFIG_NAME, DashboardConfig
 
 logger = logging.getLogger(__name__)
 
@@ -257,59 +257,6 @@ def _coerce_slot_count(
     return count
 
 
-def _resolve_orchestrator_config(
-    project_root: Path | str,
-) -> tuple[Path, Mapping[str, object]] | None:
-    """Find *project_root*'s orchestrator config: its path and parsed mapping.
-
-    ``None`` means no config file exists, or the authoritative one cannot be
-    read as a mapping.
-
-    The resolved file is authoritative for EVERY key read from it: a key it
-    omits takes the orchestrator default and a key it spells badly is
-    unknown, but neither is ever supplied by another file. Mixing two files
-    would describe an orchestrator that runs from neither.
-
-    Resolution mirrors ``dashboard.config.discover_root_escalation_url`` and
-    reuses its filename constants so the two cannot fork: the canonical
-    ``dark-factory-orchestrator.yaml`` is authoritative once it exists on
-    disk (a live config must not be masked by a stale legacy file), and only
-    its outright absence falls through to ``_LEGACY_CONFIG_NAMES`` in order,
-    where the first one that parses to a mapping is authoritative the same
-    way.
-
-    Unlike that startup-time discovery helper, the legacy-spelling nudge here
-    is logged at DEBUG, not WARNING: this runs every collection cycle
-    (~10 min per project), so a WARNING would be recurring log spam rather
-    than the bounded once-per-process reminder that one is.
-
-    Never raises — see :func:`_load_config_mapping`.
-    """
-    from dashboard.config import _CANONICAL_CONFIG_NAME, _LEGACY_CONFIG_NAMES
-
-    root = Path(project_root)
-
-    canonical = root / _CANONICAL_CONFIG_NAME
-    if canonical.is_file():
-        data = _load_config_mapping(canonical)
-        return None if data is None else (canonical, data)
-
-    for legacy_name in _LEGACY_CONFIG_NAMES:
-        legacy_path = root / legacy_name
-        if not legacy_path.is_file():
-            continue
-        data = _load_config_mapping(legacy_path)
-        if data is not None:
-            logger.debug(
-                'Project %s: using legacy config path %s (expected %s)',
-                root.name,
-                legacy_path,
-                _CANONICAL_CONFIG_NAME,
-            )
-            return legacy_path, data
-    return None
-
-
 def read_run_slot_capacity(project_root: Path | str) -> int | None:
     """Read *project_root*'s run-slot capacity, or ``None`` if unknown.
 
@@ -328,18 +275,20 @@ def read_run_slot_capacity(project_root: Path | str) -> int | None:
     after a raise and invent one after a cut. Callers must treat ``None`` as
     UNKNOWN, never as "not breaching".
 
-    Both keys come from the one file :func:`_resolve_orchestrator_config`
-    picks. One it OMITS gets the orchestrator's own default
+    Both keys come from *project_root*'s ``dark-factory-orchestrator.yaml``,
+    the only file read; an absent or non-mapping file makes the capacity
+    unknown. A key it OMITS gets the orchestrator's own default
     (:data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`,
     :data:`_ORCHESTRATOR_DEFAULT_MAIN_HEALTH_FIX_RESERVED_SLOTS`), because
     ``orchestrator.config`` deep-merges ``defaults.yaml`` under every project
     config. Either key being malformed makes the whole capacity unknown:
     dropping only a bad reserve would understate capacity and false-alarm.
+    Never raises — see :func:`_load_config_mapping`.
     """
-    resolved = _resolve_orchestrator_config(project_root)
-    if resolved is None:
+    path = Path(project_root) / _CANONICAL_CONFIG_NAME
+    data = _load_config_mapping(path)
+    if data is None:
         return None
-    path, data = resolved
     general = _coerce_slot_count(
         data, 'max_concurrent_tasks', _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS, path
     )

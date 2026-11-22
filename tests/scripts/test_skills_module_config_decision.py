@@ -451,7 +451,7 @@ def _pytest_segment(cmd: str) -> str | None:
     module to declare ``cargo test`` fail BOTH ratchets in this file with a
     message naming an unrelated module and saying nothing about ``skills/``,
     which invites suppressing the guard instead of fixing anything. That
-    module is not hypothetical policy: ``verify._has_source_files`` already
+    module is not hypothetical policy: ``verify_plan._has_source_files`` already
     keys on ``.py`` AND ``.rs``, and ``tests/scripts/orchestrator.yaml``
     documents a ``config.test_command != 'pytest'`` branch.
 
@@ -803,11 +803,10 @@ def test_every_skills_consuming_test_stays_under_a_gated_directory() -> None:
     is asserted, because an emptied tuple would make the whole test vacuous.
 
     Note what this does NOT claim. These suites run on THEIR OWN diffs and on
-    full verify; they do NOT run on a diff that changes the skills/ artifact
-    they read, because ``verify.run_scoped_verification`` short-circuits on
-    ``_has_source_files`` for a .md/.sh-only diff. That residual gap is
-    recorded in the DECIDED block with its own follow-up ticket; this guard
-    pins only what the decision actually relies on.
+    full verify. A diff touching an artifact listed in
+    ``orchestrator/src/orchestrator/verify_artifact_consumers.py::BEHAVIOURAL_ARTIFACTS``
+    also runs its consumers at the task leg (task 5296); other skills/
+    artifacts still do not, and this guard does not pin either.
 
     MEASURED RED at base main ``7c6039327d``, both halves, each against its own
     uncommitted scratch mutation. Renaming one inventory entry to a path that

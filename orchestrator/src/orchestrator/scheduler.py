@@ -102,6 +102,7 @@ from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.park_refusal import ParkRefusalEpisodes, is_park_refusal
 from orchestrator.pause_policy import PauseClass, PausePolicy, policy_for
 from orchestrator.pending_age import AnchorReading, read_pending_age
 from orchestrator.pin_reservation import (
@@ -113,6 +114,7 @@ from orchestrator.pin_reservation import (
     park_rank,
     pin_release_reason,
     priority_payload,
+    rank_payload,
 )
 from orchestrator.recovery_emission import (
     LeaveReason,
@@ -129,6 +131,7 @@ from orchestrator.recovery_emission import (
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.run_slots import DispatchScope
+from orchestrator.scheduler_priority_lookup import LookupPins, last_written_tiers
 from orchestrator.sentinel_l1 import file_sentinel_l1, resolve_sentinel_l1
 from orchestrator.starvation_cap import CapReport, cap_report, sync_cap_l1
 from orchestrator.starvation_state import WatchdogState
@@ -1657,18 +1660,35 @@ class Scheduler:
         # Per-pin pin_blocked cadence (task 6040): a pin's blocked episode
         # ends when it dispatches or leaves the pin queue.
         self._pin_blocked = PinBlockedLimiter()
+        # Per-candidate park_refused cadence (task 6328): an episode ends on a
+        # dispatch, a refusal by anything else, or leaving candidacy.
+        self._park_refusals = ParkRefusalEpisodes()
         # Per-tier cap bookkeeping: remember the effective priority of every
         # currently-dispatched task so acquire_next can count slots at-or-below
         # a candidate's tier without re-walking the full task graph.
         self._dispatched_priority: dict[str, str] = {}
         # The legacy score's age anchors (age_anchors.py).
         self.age_anchors = AgeAnchors(self._project_root)
-        # Effective-priority cache: populated at the end of each acquire_next tick
-        # so get_state_snapshot() can include it without re-fetching tasks.
-        # Empty dict before the first tick.
-        self._last_effective_priorities: dict[str, str] = {}
+        # Test-injectable override for the _write_snapshot_best_effort write
+        # target (task 2418), and so for the construction-time read of the
+        # last-written tiers just below.  None (default) preserves current behavior: the
+        # path is derived from _project_root and the no-project-root guard
+        # applies.  When set, the write goes to this exact path instead —
+        # bypassing both the derivation and the guard, since an explicit path
+        # is always honored — decoupling the on-disk write target from
+        # _project_root, which some tests must also use as an OverrideStore
+        # lookup key.  Mirrors the _read_psi_sample-style constructor-vs-
+        # instance-attr seam pattern used elsewhere in this class.
+        self._state_snapshot_path: Path | None = state_snapshot_path
+        # Effective-priority cache: seeded from the last-written snapshot, then
+        # replaced at the end of each acquire_next tick so get_state_snapshot()
+        # can include it without re-fetching tasks.
+        self._last_effective_priorities: dict[str, str] = last_written_tiers(self._snapshot_path())
         # --- Priority-override state ---
         self._override_store: OverrideStore | None = override_store
+        self._lookup_pins = LookupPins(
+            lambda: self._override_store, self._project_root, clock=self._time_source,
+        )
         # Public alias for shutdown-path callers (harness checkpoint) — read-only.
         self.override_store: OverrideStore | None = override_store
         # Snapshot from the previous tick, used to diff-detect override changes
@@ -1955,16 +1975,6 @@ class Scheduler:
         # tick. Default None so bare-Scheduler unit tests are unaffected.
         self._already_landed_gate: AlreadyLandedGate | None = None
         # --- Snapshot write throttle (task 1332) ---
-        # Test-injectable override for the _write_snapshot_best_effort write
-        # target (task 2418).  None (default) preserves current behavior: the
-        # path is derived from _project_root and the no-project-root guard
-        # applies.  When set, the write goes to this exact path instead —
-        # bypassing both the derivation and the guard, since an explicit path
-        # is always honored — decoupling the on-disk write target from
-        # _project_root, which some tests must also use as an OverrideStore
-        # lookup key.  Mirrors the _read_psi_sample-style constructor-vs-
-        # instance-attr seam pattern used elsewhere in this class.
-        self._state_snapshot_path: Path | None = state_snapshot_path
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
         # proceeds regardless of the throttle interval.
@@ -4818,8 +4828,8 @@ class Scheduler:
 
         THE single place a dispatch settles fairness state, called for EVERY
         dispatch — pin loop and scored loop, top or not: the skip count,
-        blocked-install streak and ``pin_blocked`` episode (task 6040) are
-        dropped, and the task's own parks are
+        blocked-install streak, ``pin_blocked`` episode (task 6040) and
+        ``park_refused`` episode (task 6328) are dropped, and the task's own parks are
         consumed (``reservation_used``, plus ``reservation_restored`` for each
         shadow the clear exposes).  A running task's park would otherwise
         block the installs of every owner it outranks (INV-3) until release,
@@ -4830,6 +4840,7 @@ class Scheduler:
         self._skip_count.pop(task_id, None)
         self._streak_park_install_blocked.clear(task_id)
         self._pin_blocked.forget(task_id)
+        self._park_refusals.end(task_id)
         if not self.lock_table.has_parks(task_id):
             return
         source = self.lock_table.reservation_source(task_id)
@@ -6769,6 +6780,7 @@ class Scheduler:
             override_boosts=override_boosts or None,
         )
         self._last_effective_priorities = dict(effective_priorities)
+        self._lookup_pins.adopt(ctx.overrides)
         transitive_counts = self._compute_transitive_counts(
             ctx.tasks_by_id, reverse_index, ctx.status_map
         )
@@ -7337,6 +7349,10 @@ class Scheduler:
         numeric one, in string order.
         """
         self._poll_work_product()
+        # A scoped tick's candidates are filtered (task 8480), so only an ANY
+        # tick can tell that a task has left candidacy.
+        if ctx.scope is DispatchScope.ANY:
+            self._park_refusals.retain(str(t.get('id', '')) for t in ctx.candidates)
         scored = self._score_candidates(ctx)
 
         # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
@@ -7403,6 +7419,7 @@ class Scheduler:
                             grant = None
                 if not acquired:
                     refused.append(task_id)
+                    self._note_park_refusal(ctx, task_id, modules, pri)
                 if acquired:
                     self._dispatched.add(task_id)
                     self._watchdog_state.note_scan(refused)
@@ -7450,6 +7467,67 @@ class Scheduler:
         await self._write_snapshot_best_effort()
         return TickOutcome(None)
 
+    def _note_park_refusal(
+        self, ctx: TickContext, task_id: str, modules: list[str], tier: str
+    ) -> None:
+        """Track *task_id*'s refusal by parks alone, and emit ``park_refused`` when due (task 6328).
+
+        Called at refusal time, before a winner changes the lock table, so the
+        blockers are exactly what refused this acquire (INV-5).  A refusal
+        outside the class (:func:`orchestrator.park_refusal.is_park_refusal`)
+        ends the episode.
+        """
+        blockers = self.lock_table.blockers(task_id, modules)
+        if not is_park_refusal(tier, blockers, self.lock_table.top_park_rank):
+            self._park_refusals.end(task_id)
+            return
+        episode_secs = self._park_refusals.observe(
+            task_id,
+            now=self._time_source(),
+            interval=self.config.park_refused_emit_interval_secs,
+        )
+        if episode_secs is None or not self.event_store:
+            return
+        ranks = {
+            blocker.owner: self.lock_table.top_park_rank(blocker.owner)
+            for blocker in blockers
+        }
+        self.event_store.emit(
+            EventType.park_refused,
+            task_id=task_id,
+            data={
+                'task_id': task_id,
+                'priority': tier,
+                'episode_secs': episode_secs,
+                'blockers': [blocker.as_payload() for blocker in blockers],
+                'park_owners': [
+                    self._park_owner_entry(ctx, owner, rank)
+                    for owner, rank in sorted(ranks.items())
+                    if rank is not None
+                ],
+            },
+        )
+
+    def _park_owner_entry(self, ctx: TickContext, owner: str, rank: int) -> dict:
+        """One ``park_refused`` park owner: the priority behind its *rank*, its park age, and its own wait.
+
+        ``waiting_on`` is None, meaning unknown, when *owner* is not in this
+        tick's task list.  That is a fail-safe, not an expected case:
+        ``_phase_park_gc`` runs earlier in the tick and expires the parks of
+        every owner missing from it.
+        """
+        owner_task = ctx.tasks_by_id.get(owner)
+        waiting_on = None if owner_task is None else [
+            blocker.as_payload()
+            for blocker in self.lock_table.blockers(owner, self._get_modules(owner_task))
+        ]
+        return {
+            'owner': owner,
+            **rank_payload(rank),
+            'park_age_secs': self.lock_table.park_age_secs(owner, now=self._wall_now()),
+            'waiting_on': waiting_on,
+        }
+
     async def acquire_next(self, scope: DispatchScope = DispatchScope.ANY) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
@@ -7462,8 +7540,9 @@ class Scheduler:
         reserved run slot is free).
 
         Returns ``None`` immediately when the scheduler is paused (park-stop).
-        No MCP round-trips, no GC, no override snapshots are performed while
-        paused — all resume cleanly on the first unpaused tick.
+        The only work while paused is the priority lookup's pin re-read, at
+        most once a minute, into a map of its own (not the tick's override
+        snapshot); everything else resumes on the first unpaused tick.
         """
         assert self._started, (
             'acquire_next() called before finish_startup() — startup '
@@ -7475,6 +7554,7 @@ class Scheduler:
                 'acquire_next() short-circuit: scheduler is paused (reason=%r)',
                 self._pause_reason,
             )
+            await self._lookup_pins.refresh_if_due()
             return None
 
         try:
@@ -7639,19 +7719,14 @@ class Scheduler:
             logger.warning('scheduler_tick telemetry emit failed', exc_info=True)
 
     def task_priority(self, task_id: str) -> TaskPriority:
-        """*task_id*'s live effective tier and pin, read from this scheduler's memory.
+        """*task_id*'s effective tier, base tier and pin, read from this scheduler's memory.
 
-        The tier is the one :meth:`get_state_snapshot` exports as
-        ``effective_priorities``; the pin is the override row the last tick
-        loaded. Both are unknown (None) before the first tick, the tier also
-        for a task that tick did not rank, and the pin when no override store
-        is wired. A pure dict read: never touches the override store.
+        The base tier is the one :meth:`get_state_snapshot` exports as
+        ``effective_priorities`` (unknown for a task no tick ranked); the pin
+        comes from the lookup's own pin map (unknown when no override store is
+        wired). A pure dict read: never touches the override store.
         """
-        pinned = None
-        if self._override_store is not None and self._overrides_initialized:
-            row = self._prev_overrides_snapshot.get(task_id)
-            pinned = row is not None and row.pinned
-        return TaskPriority(tier=self._last_effective_priorities.get(task_id), pinned=pinned)
+        return self._lookup_pins.priority(task_id, self._last_effective_priorities.get(task_id))
 
     def get_state_snapshot(self) -> SchedulerStateSnapshot:
         """Return a frozen copy of the scheduler's current state.
@@ -7770,6 +7845,14 @@ class Scheduler:
             payload = json.dumps(self.get_state_snapshot().to_json())
         safe_io.atomic_write_text(path, payload, encoding='utf-8', mkdir=True)
 
+    def _snapshot_path(self) -> Path | None:
+        """The state snapshot's file: the injected path, else under the project root; ``None`` for an unset root."""
+        if self._state_snapshot_path is not None:
+            return Path(self._state_snapshot_path)
+        if not self._project_root or self._project_root == 'None':
+            return None
+        return scheduler_state_json(self._project_root)
+
     async def _write_snapshot_best_effort(self, force: bool = False) -> None:
         """Write the scheduler state snapshot to the default path off the event loop.
 
@@ -7836,9 +7919,8 @@ class Scheduler:
         # 2418): an explicit injected path is always honored regardless of
         # ``_project_root``, which some callers must independently set to a
         # non-writable value for use as an OverrideStore lookup key.
-        if self._state_snapshot_path is None and (
-            not self._project_root or self._project_root == 'None'
-        ):
+        path = self._snapshot_path()
+        if path is None:
             if not self._snapshot_guard_warned:
                 self._snapshot_guard_warned = True
                 logger.warning(
@@ -7889,11 +7971,6 @@ class Scheduler:
                 # applies.  Passed directly to _write_state_snapshot_raw to avoid a
                 # second get_state_snapshot() call on the actual write path.
                 disk_payload = json.dumps(state.to_json())
-                path = (
-                    Path(self._state_snapshot_path)
-                    if self._state_snapshot_path is not None
-                    else scheduler_state_json(self._project_root)
-                )
                 await asyncio.to_thread(self._write_state_snapshot_raw, path, disk_payload)
                 # Bookkeeping advanced only after a confirmed successful write.
                 # _write_state_snapshot_raw propagates exceptions so these lines are

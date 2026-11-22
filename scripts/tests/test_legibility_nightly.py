@@ -5391,6 +5391,21 @@ def _ledger_census_coding(session: str) -> None:
     ])
 
 
+def _garble_testproj_ledger() -> Path:
+    path = session_ledger.ledger_path('testproj')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'this is not an sqlite database, just bytes\n' * 8)
+    return path
+
+
+def _already_coded_warnings(caplog) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == 'legibility.nightly' and record.levelno == logging.WARNING
+        and 'already-coded' in record.getMessage()
+    ]
+
+
 def _seed_state(*, day: int, exit_code: int) -> None:
     trickle_state.record_run(
         'testproj',
@@ -5553,6 +5568,20 @@ class TestRetryPass:
         scheduled_prompts: list[str] = []
         runner.night(13, 'productive', invoke=_counting_invoke(scheduled_prompts))
         assert len(scheduled_prompts) == 1, 'a manual pass does not skip ledgered sessions'
+
+    def test_a_retry_over_an_unreadable_ledger_skips_nothing_and_warns_once(
+        self, tmp_path, caplog,
+    ):
+        runner, _before = _owed_after_storm_then_productive(tmp_path)
+        path = _garble_testproj_ledger()
+        prompts: list[str] = []
+
+        with caplog.at_level(logging.WARNING, logger='legibility.nightly'):
+            runner.retry(13, on_night=14, invoke=_counting_invoke(prompts))
+
+        assert len(prompts) == 1
+        (warning,) = _already_coded_warnings(caplog)
+        assert str(path) in warning
 
     def test_a_retry_never_refires_the_barren_streak_escalation(self, tmp_path):
         runner = _NightRunner(tmp_path)
@@ -5883,6 +5912,21 @@ class TestScheduledPassOverAReachedDate:
         ]
         assert len(skipped_lines) == 1
         assert ' 1 of 1 selected ' in skipped_lines[0]
+
+    def test_a_re_targeting_pass_over_an_unreadable_ledger_re_codes_and_warns_once(
+        self, tmp_path, caplog,
+    ):
+        runner = _NightRunner(tmp_path)
+        runner.scheduled_night(13, 'productive')
+        path = _garble_testproj_ledger()
+        again: list[str] = []
+
+        with caplog.at_level(logging.WARNING, logger='legibility.nightly'):
+            runner.scheduled_night(13, 'productive', invoke=_counting_invoke(again))
+
+        assert len(again) == 1
+        (warning,) = _already_coded_warnings(caplog)
+        assert str(path) in warning
 
     def test_a_re_targeting_pass_codes_the_selected_sessions_the_catch_up_did_not_land(
         self, tmp_path,

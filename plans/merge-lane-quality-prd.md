@@ -680,3 +680,26 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
    task signal. No trustworthy signal exists — task metadata is author-supplied,
    and 5342 itself arrived as an ordinary bug-fix task carrying no such marker.
    Hence the scoping is prose (this entry) and the enforcement is mechanical.
+
+9. **Decision 9's and Out of scope's "follow-up PRD: git engine" is now
+   `plans/git-ops-split-prd.md`** (2026-11-21, task 7140). That PRD owns
+   retiring `scripts/merge_lane_cluster.py::SIZE_CEILING_EXEMPT`. Its ω deletes
+   the list, its declaration in
+   `scripts/tests/test_scripts_governed_lists.py::SIZE_CEILING_EXEMPT_LIST`,
+   and every test that pins the exemption. Two edits of that PRD touch this
+   PRD's instrument, and this entry records both here:
+
+   - Its β adds every git-engine module to `CLUSTER_PATHS` through
+     Correction 8's authorized-raise path.
+   - Its ω changes `scripts/merge_lane_ratchet.py::_check_ceilings` so that a
+     baseline entry grandfathers a path only while its recorded `lines` exceed
+     `FILE_LINE_CEILING`. An entry at or under the ceiling is held to it.
+
+   Decision 1 is unchanged by the second edit: a key over the ceiling stays
+   grandfathered, so the ratchet is still not a day-one gate. The change binds
+   every cluster file under 1,500 lines, merge-lane files included. Lines are
+   reported in the baseline but never ratcheted, so without the change a
+   split file could regrow unseen. That is the growth-outran-the-refactor
+   failure this PRD's Background records. `git_ops.py`'s own split still does
+   not edit `GitOps.advance_main`, which remains μ's (task 5042). The git-ops
+   PRD's main_landing sub-split depends on 5042.

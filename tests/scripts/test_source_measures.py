@@ -128,6 +128,54 @@ class TestFileSizeMeasures:
             measures.lines = 99  # type: ignore[misc]
 
 
+class TestProseLineNumbers:
+    """The line SET behind ``FileSizeMeasures.prose_lines``."""
+
+    _SOURCE = (
+        '"""Module doc."""\n'
+        'import os\n'
+        '\n'
+        '# a standalone comment\n'
+        'def f():\n'
+        '    """Line one.\n'
+        '\n'
+        '    Line three."""\n'
+        '    x = 1  # trailing\n'
+        "    url = 'http://x/#frag'\n"
+        '    return x\n'
+        '\n'
+        'def g():\n'
+        '    """Doc."""  # both\n'
+        '    return 2\n'
+    )
+
+    def _prose(self, source: str) -> frozenset[int]:
+        tree = source_measures.parse_source(source, path='t.py')
+        return source_measures.prose_line_numbers_in_tree(source, tree, path='t.py')
+
+    def test_the_set_is_docstring_spans_unioned_with_comment_lines(self) -> None:
+        assert self._prose(self._SOURCE) == frozenset({1, 4, 6, 7, 8, 9, 14})
+
+    def test_a_hash_inside_a_string_literal_is_not_prose(self) -> None:
+        assert 10 not in self._prose(self._SOURCE)
+
+    def test_the_set_is_immutable(self) -> None:
+        assert isinstance(self._prose(self._SOURCE), frozenset)
+
+    def test_its_size_is_the_file_measures_prose_count(self) -> None:
+        tree = source_measures.parse_source(self._SOURCE, path='t.py')
+        measures = source_measures.file_size_measures_in_tree(
+            self._SOURCE, tree, path='t.py'
+        )
+        assert measures.prose_lines == len(self._prose(self._SOURCE))
+
+    def test_untokenizable_source_raises_naming_the_path(self) -> None:
+        tree = source_measures.parse_source('x = 1\n', path='broken.py')
+        with pytest.raises(source_measures.MetricsError) as excinfo:
+            source_measures.prose_line_numbers_in_tree('x = (\n', tree, path='broken.py')
+        assert 'broken.py' in str(excinfo.value)
+
+
 # ---------------------------------------------------------------------------
 # Structural import measures: function-local (reach-back) imports, and
 # re-export shim names.

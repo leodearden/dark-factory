@@ -20,10 +20,12 @@ Every project targeted by Dark Factory — this repo included — must expose
 its top-level orchestrator config at
 `<project_root>/dark-factory-orchestrator.yaml`. That is the canonical,
 required filename: it's what the dashboard's escalation-URL discovery
-(`_discover_escalation_urls`) keys on. Legacy spellings (`orchestrator.yaml`,
-`orchestrator-config.yaml`, `orchestrator/config.yaml`) are honored only as
-a discovery fallback for not-yet-migrated projects, not a supported choice
-for new ones.
+(`_discover_escalation_urls`) keys on. Discovery reads no other name (task
+7138 retired the legacy spellings `orchestrator.yaml`,
+`orchestrator-config.yaml` and `orchestrator/config.yaml`). A project still
+using one keeps its dashboard row and its tasks still show, but until renamed
+its escalation-backed views (escalations, merge queue and halt status, task
+runtime state) go dark and its burndown run-slot capacity reads as unknown.
 
 This repo uses `ruff check` only; `ruff format` is deliberately NOT adopted
 and most files are not format-clean. Do not file or perform
@@ -351,6 +353,25 @@ type and the Python type its values arrive as, and refuses loudly rather than
 reporting an empty schema. It states no column names of its own, deliberately:
 the store is the only copy of them that cannot be stale.
 
+The reconciliation TICKET store, which holds the `tkt_…` ids `submit_task`
+returns, is a second store with the same two traps. WHERE it is: one
+fused-memory server serves every project on this host, so ONE ticket store
+serves them all, in that server's reconciliation data dir:
+`/home/leo/src/dark-factory/data/reconciliation/tickets.db`. `data/` is
+untracked, so no worktree has one, and `fused-memory/data/tickets.db` is a
+0-byte decoy. The location's one home is
+`fused-memory/src/fused_memory/server/main.py::resolve_data_dir`
+(`reconciliation.data_dir` in `fused-memory/config/config.yaml`, overridable by
+`RECONCILIATION_DATA_DIR`). WHAT SHAPE it is: its key is not a task store's
+`id`, and the same tool answers with `--db`.
+
+<!-- tickets-db-schema-lookup:begin
+     EXECUTED by tests/scripts/test_tasks_db_schema_convention.py, with the
+     store swapped for a fixture. Degrade it into a hand-written sqlite query
+     and that guard goes red. -->
+- **Ticket store shape**: `python scripts/tasks_db_schema.py --db /home/leo/src/dark-factory/data/reconciliation/tickets.db`
+<!-- tickets-db-schema-lookup:end -->
+
 ## Model Routing
 
 The orchestrator resolves `(model, effort, budget_usd, max_turns)` for
@@ -404,8 +425,10 @@ workflow: **`OPERATIONS.md` §"Config reload vs restart"** and
 Three deliberately orthogonal restart mechanisms act on the fleet:
 watchdog **liveness** probes (revive a wedged unit immediately, no clock),
 the watchdog **staleness** backstop and the merge-landed **coordinator**
-(both invoke `scripts/restart-all-orchestrators.sh` and read one 8h
-fleet-deploy clock). Don't conflate them when debugging a
+(both invoke `scripts/restart-all-orchestrators.sh` and read one 72h
+fleet-deploy clock; the long window is deliberate, amortizing the throughput
+cost of deploys, and deliberate deploy tasks are allowed for high-value
+changes). Don't conflate them when debugging a
 restart, and run `scripts/orchestrator-watchdog.py --report` (strictly
 read-only) before manually restarting anything. Full model, `--report`
 column reference, and the soak signal to watch:
