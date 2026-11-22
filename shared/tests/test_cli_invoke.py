@@ -4602,6 +4602,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
+        snapshot_side_effect, decided_at = _kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4609,6 +4610,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.snapshot_process_group', side_effect=snapshot_side_effect),
             patch('shared.cli_invoke.count_transcript_turns', side_effect=self._grow_then_plateau_turns(3)),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
             patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
@@ -4619,33 +4621,21 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
                 backend='claude', model='opus', timeout_seconds=0.05,
                 transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.02, working_idle_secs=0.3, absolute_cap_secs=20.0),
             )
-            wall = _time.monotonic() - t0
 
         assert result.timed_out is True
         terminate_pg_mock.assert_called_once()
-        # idle_bound = max(0.3, 0.05) = 0.3s of no-progress, on top of the ~0.06s
-        # growth phase → kill at ~0.36s.  Well past the old 0.05s ceiling (proves
-        # it wasn't killed there) and well under the 20s absolute cap (proves it
-        # wasn't killed there either; widened 5.0s → 10.0s in task 2723, then
-        # 10.0s → 20.0s in task 4234 — see the teardown-drift note below).
-        assert wall >= 0.2, (
+        assert len(decided_at) == 1, f'Expected exactly one kill decision, got {len(decided_at)}'
+        # idle_bound = max(0.3, 0.05) = 0.3s of no progress after the ~0.06s growth
+        # phase → kill at ~0.36s.  The bounds time the kill decision, not the
+        # teardown after it, so they separate it from the old 0.05s ceiling and
+        # from the wrong 20.0s absolute cap under any load.
+        decision = decided_at[0] - t0
+        assert decision >= 0.2, (
             f'Expected idle-kill at ~0.36s (after progress stalls), '
-            f'killed too early at {wall:.3f}s — looks like the old ceiling fired'
+            f'killed too early at {decision:.3f}s — looks like the old ceiling fired'
         )
-        # Discriminates the correct ~0.36s idle-kill from the WRONG 20.0s absolute
-        # cap. wall additionally captures real post-kill teardown (unmocked
-        # snapshot_process_group /proc walk, comm_task cancellation/await, the
-        # second communicate() call, event-loop scheduling), which under a full
-        # parallel verify run drifts far past the kill itself: ~2.5s when this
-        # bound was last widened (519331f59f), then 6.215s observed during task
-        # 4234's verify attempt-1 — with the captured log confirming the watchdog
-        # fired correctly at 0.4s, so every excess second was teardown, not a
-        # missed kill. 10.0s keeps full discriminating power against the 20.0s
-        # wrong ceiling while tolerating that teardown latency — same load-drift
-        # de-flake shape as the sibling tests in this class (commits fda97df621af,
-        # 2b2916a663, 519331f59f).
-        assert wall < 10.0, (
-            f'Expected idle-kill well under the 20s absolute cap, got {wall:.3f}s'
+        assert decision < 10.0, (
+            f'Expected idle-kill at ~0.36s, not at the 20.0s absolute cap ({decision:.3f}s)'
         )
 
     async def test_b6_long_synchronous_tool_call_survives_between_ceiling_and_idle_bound(self, tmp_path):
