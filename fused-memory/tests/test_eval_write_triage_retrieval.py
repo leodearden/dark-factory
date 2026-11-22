@@ -8,6 +8,7 @@ obtained from the shipped function rather than restated as a literal.
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import types
 from pathlib import Path
@@ -20,11 +21,13 @@ from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import PARENT_ID_KEY, SIGHTING_KIND
 from fused_memory.server.write_triage import (
+    OUTCOME_AMENDED,
     OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     decide_band,
     retrieve_candidates,
+    route_band,
 )
 from fused_memory.server.write_triage_judge import select_judge_candidates
 
@@ -148,6 +151,48 @@ class TestRetrievedSlates:
         assert slate.attach_target_id == 'parent'
 
     @pytest.mark.asyncio
+    async def test_a_restate_band_write_that_adds_to_its_winner_is_routed_to_the_judge(
+        self,
+    ) -> None:
+        record = _record('d1', 'c1')
+        rows = [_row('c1', 0.95), _row('x', 0.6)]
+        [slate] = _slates([record], await _prefetch(FakeMemoryService(rows), [record]))
+        band = decide_band(rows, t_high=T_HIGH, t_low=T_LOW)
+        routed = route_band(rows, content=record['content'], t_high=T_HIGH, t_low=T_LOW)
+        assert (band.outcome, routed.outcome) == (OUTCOME_RESTATED, OUTCOME_JUDGE)
+        assert (slate.band, slate.routed) == (band.outcome, routed.outcome)
+        assert slate.attach_target_id == band.canonical_id == routed.canonical_id
+        assert slate.similarity == band.similarity == routed.similarity
+
+    @pytest.mark.asyncio
+    async def test_a_restate_band_write_repeating_its_winner_keeps_restated(self) -> None:
+        record = {**_record('d1', 'c1'), 'content': '  THE text   of C1 '}
+        rows = [_row('c1', 0.95), _row('x', 0.6)]
+        [slate] = _slates([record], await _prefetch(FakeMemoryService(rows), [record]))
+        routed = route_band(rows, content=record['content'], t_high=T_HIGH, t_low=T_LOW)
+        assert routed.outcome == OUTCOME_RESTATED
+        assert (slate.band, slate.routed) == (OUTCOME_RESTATED, routed.outcome)
+
+    @pytest.mark.asyncio
+    async def test_a_child_winner_whose_parent_is_repeated_keeps_restated(self) -> None:
+        record = {**_record('d1', 'parent'), 'content': 'the text of parent'}
+        rows = [_child('child', 0.95, 'parent'), _row('parent', 0.7)]
+        [slate] = _slates([record], await _prefetch(FakeMemoryService(rows), [record]))
+        routed = route_band(rows, content=record['content'], t_high=T_HIGH, t_low=T_LOW)
+        assert routed.outcome == OUTCOME_RESTATED
+        assert (slate.band, slate.routed) == (OUTCOME_RESTATED, routed.outcome)
+        assert slate.attach_target_id == 'parent'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('top_cosine', [0.7, 0.3])
+    async def test_outside_the_restate_band_the_route_is_the_band(self, top_cosine: float) -> None:
+        record = _record('d1', 'c1')
+        rows = [_row('c1', top_cosine), _row('x', top_cosine - 0.1)]
+        [slate] = _slates([record], await _prefetch(FakeMemoryService(rows), [record]))
+        routed = route_band(rows, content=record['content'], t_high=T_HIGH, t_low=T_LOW)
+        assert slate.routed == slate.band == routed.outcome
+
+    @pytest.mark.asyncio
     async def test_a_degraded_retrieval_is_warned_about_by_memory_id(self, caplog) -> None:
         degraded, healthy = _record('d-degraded', 'c1'), _record('d-healthy', 'c1')
         retrievals = {
@@ -167,6 +212,107 @@ class TestRetrievedSlates:
         with caplog.at_level(logging.WARNING):
             _slates([record], retrievals)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestSlateSnapshot:
+    """One measured retrieval, dumped and reloaded so several judge runs share it."""
+
+    @staticmethod
+    async def _snapshot():
+        records = [_record('d1', 'parent'), _record('d2', 'c1')]
+        rows = [_child('child', 0.95, 'parent'), _row('parent', 0.7), _row('c1', 0.6)]
+        slates = _slates(records, await _prefetch(FakeMemoryService(rows), records))
+        measured = _mod().Slate(
+            memory_id='d3', candidates=(), attach_target_id='c1', band=OUTCOME_RESTATED,
+            routed=OUTCOME_JUDGE, similarity=0.2, canonical_present=False,
+            retrieved_count=0, degraded=True, self_retrieved=True,
+        )
+        return _mod().SlateSnapshot(
+            project_id='reify', t_high=T_HIGH, t_low=T_LOW, candidate_k=5,
+            judge_candidate_count=3, slates=(*slates, measured),
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_dumped_snapshot_loads_back_equal(self, tmp_path: Path) -> None:
+        snapshot = await self._snapshot()
+        path = tmp_path / 'slates.json'
+        snapshot.dump(path)
+        loaded = _mod().SlateSnapshot.load(path)
+        assert loaded == snapshot
+        assert isinstance(loaded.slates, tuple)
+        assert all(isinstance(slate.candidates, tuple) for slate in loaded.slates)
+
+    @pytest.mark.asyncio
+    async def test_row_metadata_survives_whole(self, tmp_path: Path) -> None:
+        snapshot = await self._snapshot()
+        path = tmp_path / 'slates.json'
+        snapshot.dump(path)
+        [child] = [
+            row for row in _mod().SlateSnapshot.load(path).slates[0].candidates
+            if row['memory_id'] == 'child'
+        ]
+        assert child['metadata'] == {
+            'store_score': 0.95, 'kind': SIGHTING_KIND, PARENT_ID_KEY: 'parent',
+        }
+
+    @pytest.mark.asyncio
+    async def test_band_and_route_come_back_as_measured(self, tmp_path: Path) -> None:
+        snapshot = await self._snapshot()
+        path = tmp_path / 'slates.json'
+        snapshot.dump(path)
+        measured = _mod().SlateSnapshot.load(path).slates[-1]
+        assert (measured.band, measured.routed) == (OUTCOME_RESTATED, OUTCOME_JUDGE)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('field', ['t_low', 'slates'])
+    async def test_a_snapshot_missing_a_field_is_refused(self, tmp_path: Path, field: str) -> None:
+        path = tmp_path / 'slates.json'
+        (await self._snapshot()).dump(path)
+        payload = json.loads(path.read_text())
+        del payload[field]
+        path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match=field):
+            _mod().SlateSnapshot.load(path)
+
+    @pytest.mark.asyncio
+    async def test_a_slate_missing_a_field_is_refused(self, tmp_path: Path) -> None:
+        path = tmp_path / 'slates.json'
+        (await self._snapshot()).dump(path)
+        payload = json.loads(path.read_text())
+        del payload['slates'][0]['routed']
+        path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match='routed'):
+            _mod().SlateSnapshot.load(path)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('field', ['band', 'routed'])
+    async def test_a_slate_outside_the_band_vocabulary_is_refused_naming_it(
+        self, tmp_path: Path, field: str,
+    ) -> None:
+        path = tmp_path / 'slates.json'
+        (await self._snapshot()).dump(path)
+        payload = json.loads(path.read_text())
+        payload['slates'][1][field] = OUTCOME_AMENDED
+        path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match=f"slate 1 \\(d2\\): {field} '{OUTCOME_AMENDED}'"):
+            _mod().SlateSnapshot.load(path)
+
+    @pytest.mark.asyncio
+    async def test_a_dump_creates_its_directory(self, tmp_path: Path) -> None:
+        snapshot = await self._snapshot()
+        path = tmp_path / 'not' / 'yet' / 'slates.json'
+        snapshot.dump(path)
+        assert _mod().SlateSnapshot.load(path) == snapshot
+
+    @pytest.mark.asyncio
+    async def test_another_schema_version_is_refused(self, tmp_path: Path) -> None:
+        path = tmp_path / 'slates.json'
+        (await self._snapshot()).dump(path)
+        payload = json.loads(path.read_text())
+        payload['schema_version'] = _mod().SLATE_SNAPSHOT_SCHEMA_VERSION + 1
+        path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match='schema_version'):
+            _mod().SlateSnapshot.load(path)
 
 
 class TestNormalize:
