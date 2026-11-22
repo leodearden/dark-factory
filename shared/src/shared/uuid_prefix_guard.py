@@ -94,12 +94,11 @@ from shared.boundary_storm_escape import BoundaryStormEscape, Sink, call_sink
 from shared.mcp_tool_schema import live_tool_parameters
 from shared.uuid_prefix import (
     PrefixToken,
+    WalkableArguments,
     find_prefix_tokens,
-    in_sent_shape,
     strip_uuid_prefix_override,
     substitute_all,
     uuid_prefix_override_requested,
-    walkable_arguments,
 )
 
 __all__ = [
@@ -722,16 +721,19 @@ class UuidPrefixGuardMiddleware(Middleware):
         if name in self.exempt_tools:
             return await call_next(context)
 
+        # The walk's view decodes a JSON-string metadata once, and the
+        # override check below reads that same decoding.
+        walk = WalkableArguments(arguments)
+
         # B17 — the author means the bare token. Forward it, with no fact: a
         # declared intent is not a detection. Whether the flag itself travels
         # onward is the invoked tool's own schema's business — see
         # :meth:`_apply_override`.
-        if uuid_prefix_override_requested(arguments.get('metadata')):
+        if uuid_prefix_override_requested(walk.view.get('metadata')):
             await self._apply_override(context, name, arguments)
             return await call_next(context)
 
-        walked = walkable_arguments(arguments)
-        tokens = self._repairable(name, find_prefix_tokens(walked))
+        tokens = self._repairable(name, find_prefix_tokens(walk.view))
         if not tokens:
             return await call_next(context)
 
@@ -766,7 +768,7 @@ class UuidPrefixGuardMiddleware(Middleware):
         if not plan:
             return await call_next(context)
 
-        return await self._deliver(context, call_next, name, arguments, walked, project, plan)
+        return await self._deliver(context, call_next, name, arguments, walk, project, plan)
 
     # -- the call whose resolution is not attempted ------------------------
 
@@ -1014,7 +1016,7 @@ class UuidPrefixGuardMiddleware(Middleware):
 
     # -- delivery ---------------------------------------------------------
 
-    async def _deliver(self, context, call_next, name, arguments, walked, project, plan):
+    async def _deliver(self, context, call_next, name, arguments, walk, project, plan):
         """Perform the actions the matrix chose. It decides; this executes.
 
         Facts are emitted BEFORE the outcome is delivered, so a tool body that
@@ -1042,7 +1044,7 @@ class UuidPrefixGuardMiddleware(Middleware):
 
         await self._record_storms(plan, project, report)
 
-        self._expand(arguments, walked, expansions)
+        self._expand(arguments, walk, expansions)
         return await self._forward(context, call_next, report)
 
     def _reject(self, name: str, arguments: Mapping[str, Any], planned: _Planned) -> NoReturn:
@@ -1103,13 +1105,13 @@ class UuidPrefixGuardMiddleware(Middleware):
     @staticmethod
     def _expand(
         arguments: dict[str, Any],
-        walked: Mapping[str, Any],
+        walk: WalkableArguments,
         expansions: tuple[_Planned, ...],
     ) -> None:
         """Apply every substitution in ONE batch, then write the result back IN PLACE.
 
-        The batch runs on *walked*, the view the tokens were found in, and the
-        result is put back in the wire shape *arguments* sent ``metadata`` in.
+        The batch runs on *walk*'s view, where the tokens were found, and
+        *walk* puts the result back in the wire shape ``metadata`` was sent in.
 
         Ordering is the batch door's own concern — ``substitute_all`` sorts the
         spans it is given per path — so this hands it every planned expansion
@@ -1137,12 +1139,11 @@ class UuidPrefixGuardMiddleware(Middleware):
         if not expansions:
             return
         repaired = substitute_all(
-            walked,
+            walk.view,
             ((p.token, p.resolution.candidates[0].id) for p in expansions),
         )
-        shaped = in_sent_shape(arguments, walked, repaired)
         arguments.clear()
-        arguments.update(shaped)
+        arguments.update(walk.as_sent(repaired))
 
     @staticmethod
     async def _forward(context, call_next, report: dict[str, Any]):

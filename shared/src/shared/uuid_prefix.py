@@ -62,13 +62,12 @@ from typing import Any, NamedTuple
 __all__ = [
     'UUID_PREFIX_OVERRIDE_KEY',
     'PrefixToken',
+    'WalkableArguments',
     'find_prefix_tokens',
-    'in_sent_shape',
     'strip_uuid_prefix_override',
     'substitute',
     'substitute_all',
     'uuid_prefix_override_requested',
-    'walkable_arguments',
 ]
 
 
@@ -313,45 +312,51 @@ def _as_metadata_dict(metadata: object) -> dict[str, Any] | None:
     return None
 
 
-def walkable_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
-    """A shallow copy of *arguments* whose JSON-object-string ``metadata`` is decoded.
+class WalkableArguments:
+    """An argument map as the C1 walk sees it, able to put a repair back in the sent shape.
 
-    The walk then gives that metadata's values structured paths and leaves its
-    keys unscanned, exactly as for a dict ``metadata`` (PRD §4-C1 Walk,
-    erratum 2026-11-22). Any other ``metadata`` is kept as sent. INV-8 cost:
-    one JSON decode per call, and :func:`in_sent_shape` adds at most one
-    encode. Never raises.
+    :attr:`view` is a shallow copy of the sent map whose JSON-object-string
+    ``metadata`` is decoded, so the walk gives that metadata's values
+    structured paths and leaves its keys unscanned, exactly as for a dict
+    ``metadata`` (PRD §4-C1 Walk, erratum 2026-11-22). Any other ``metadata``
+    is kept as sent.
+
+    The view and the caller's own string are held together, so
+    :meth:`as_sent` needs only the repair and no caller can pair a view with
+    the wrong original. INV-8 cost: one JSON decode at construction, and at
+    most one encode in :meth:`as_sent`. Never raises.
     """
-    walked = dict(arguments)
-    metadata = walked.get('metadata')
-    if isinstance(metadata, str):
-        decoded = _as_metadata_dict(metadata)
+
+    __slots__ = ('_sent_metadata', '_view')
+
+    def __init__(self, sent: Mapping[str, Any]) -> None:
+        view = dict(sent)
+        metadata = view.get('metadata')
+        decoded = _as_metadata_dict(metadata) if isinstance(metadata, str) else None
         if decoded is not None:
-            walked['metadata'] = decoded
-    return walked
+            view['metadata'] = decoded
+        self._view = view
+        self._sent_metadata: str | None = metadata if decoded is not None else None
 
+    @property
+    def view(self) -> Mapping[str, Any]:
+        return self._view
 
-def in_sent_shape(
-    sent: Mapping[str, Any],
-    walked: Mapping[str, Any],
-    repaired: Mapping[str, Any],
-) -> dict[str, Any]:
-    """*repaired* with ``metadata`` back in the wire shape *sent* used.
+    def as_sent(self, repaired: Mapping[str, Any]) -> dict[str, Any]:
+        """*repaired*, a repair of :attr:`view`, with ``metadata`` in the shape it was sent in.
 
-    *walked* is ``walkable_arguments(sent)`` and *repaired* is
-    :func:`substitute_all` over it. A decoded string that no substitution
-    touched is the caller's own string again, byte-identical; a touched one is
-    re-encoded. Untouched is identity, because :func:`substitute_all` shares
-    every substructure off a token's path by reference.
-    """
-    shaped = dict(repaired)
-    was_decoded = isinstance(sent.get('metadata'), str) and isinstance(walked.get('metadata'), dict)
-    if was_decoded:
-        if repaired['metadata'] is walked['metadata']:
-            shaped['metadata'] = sent['metadata']
-        else:
-            shaped['metadata'] = json.dumps(repaired['metadata'])
-    return shaped
+        A decoded metadata the repair left EQUAL to the decoding is the
+        caller's own string again, byte-identical; a changed one is
+        re-encoded. Equality rather than identity, so the result does not rest
+        on how the repair shared structure with the view.
+        """
+        shaped = dict(repaired)
+        if self._sent_metadata is not None:
+            if repaired['metadata'] == self._view['metadata']:
+                shaped['metadata'] = self._sent_metadata
+            else:
+                shaped['metadata'] = json.dumps(repaired['metadata'])
+        return shaped
 
 
 def uuid_prefix_override_requested(metadata: object) -> bool:
