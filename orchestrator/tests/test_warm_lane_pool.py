@@ -10,6 +10,7 @@ Step-5: RED — GitOps._seed_warm_lane absent.
 import asyncio
 import dataclasses
 import logging
+import re
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -2907,6 +2908,59 @@ class TestAcquireWarmLaneReuse:
 
         assert git_ops.warm_lane_pool is not None
         assert git_ops.warm_lane_pool.assignment_for('task-A') == info1.path
+
+
+@pytest.mark.asyncio
+class TestReclaimWipCommitSubject:
+    """The reclaim-on-exhaustion WIP safety commit is attributed to its victim.
+
+    Regression for the hardcoded "(task 1933)" subject (task 3105) — and the
+    subject must not match the victim's landing-citation pattern, or the WIP
+    commit would read as a landing of the victim task.
+    """
+
+    async def test_subject_names_victim_and_is_not_a_landing_citation(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        from orchestrator.git_ops import (
+            is_wip_safety_commit,
+            task_citation_pattern,
+        )
+
+        sha_a, _sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        victim = await git_ops.acquire_warm_lane('3105', sha_a)
+        assert isinstance(victim, WorktreeInfo)
+        (victim.path / 'task_work.txt').write_text('victim WIP\n')
+
+        async def _all_candidates(candidates):
+            return set(candidates)
+
+        git_ops.warm_lane_reclaim_candidate_provider = _all_candidates
+        git_ops.warm_lane_dispatched_predicate = lambda b: False
+
+        thief = await git_ops.acquire_warm_lane('4242', sha_a)
+        assert isinstance(thief, WorktreeInfo)
+
+        _, subjects_out, _ = await _run(
+            ['git', 'log', '--format=%s', 'task/3105', f'^{sha_a}'],
+            cwd=wl_git_repo,
+        )
+        subjects = [s for s in subjects_out.splitlines() if 'warm-lane reclaim' in s]
+        assert len(subjects) == 1, f'expected one reclaim WIP commit: {subjects_out}'
+        subject = subjects[0]
+
+        assert is_wip_safety_commit(subject)
+        assert '3105' in subject
+        assert '1933' not in subject
+        pattern = task_citation_pattern(
+            '3105', branch_prefix='task/', main_branch='main',
+        )
+        assert pattern is not None
+        assert not re.search(pattern, subject), (
+            f'reclaim WIP subject must not cite the victim task: {subject!r}'
+        )
 
 
 # ===========================================================================
