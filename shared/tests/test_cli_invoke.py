@@ -4102,6 +4102,24 @@ class TestReadTranscriptRecords:
 
 # ── Two-regime liveness watchdog tests ──────────────────────────────────────
 
+def _kill_decision_clock():
+    """snapshot_process_group side_effect recording time.monotonic() per call.
+
+    run_cli_subprocess calls snapshot_process_group as the first statement of
+    its TimeoutError handler, right after the watchdog decides to kill, so
+    each recorded time is a kill decision and excludes post-kill teardown.
+    """
+    import time as _time
+
+    decided_at: list[float] = []
+
+    def _side_effect(pgid):
+        decided_at.append(_time.monotonic())
+        return f'snapshot_process_group({pgid}): stubbed'
+
+    return _side_effect, decided_at
+
+
 @pytest.mark.asyncio
 class TestRunSubprocessWatchdog:
     """Two-regime liveness watchdog tests for run_cli_subprocess.
@@ -4486,24 +4504,6 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         return _side_effect
 
-    @staticmethod
-    def _kill_decision_clock():
-        """snapshot_process_group side_effect recording time.monotonic() per call.
-
-        run_cli_subprocess calls snapshot_process_group as the first statement of
-        its TimeoutError handler, right after the watchdog decides to kill, so
-        each recorded time is a kill decision and excludes post-kill teardown.
-        """
-        import time as _time
-
-        decided_at: list[float] = []
-
-        def _side_effect(pgid):
-            decided_at.append(_time.monotonic())
-            return f'snapshot_process_group({pgid}): stubbed'
-
-        return _side_effect, decided_at
-
     @classmethod
     def _recorded_with_held_read(cls, turns_side_effect, reads, *, held_secs):
         """count_transcript_turns side_effect appending each read's index to *reads*
@@ -4722,7 +4722,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
-        snapshot_side_effect, decided_at = self._kill_decision_clock()
+        snapshot_side_effect, decided_at = _kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4770,7 +4770,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
-        snapshot_side_effect, decided_at = self._kill_decision_clock()
+        snapshot_side_effect, decided_at = _kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
