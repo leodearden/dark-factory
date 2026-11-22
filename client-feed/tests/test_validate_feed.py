@@ -33,8 +33,10 @@ from client_feed.contract import (
     parse_feed_line,
     split_jsonl,
 )
+from client_feed.envelope import Stamp
 from client_feed.fold import fold
 from client_feed.validate import Problem, ProblemKind, ValidationReport, validate_out_dir
+from client_feed.value_events import prd_events
 
 FIXTURES = Path(__file__).parent / 'fixtures'
 FEED_V1 = FIXTURES / 'feed-v1'
@@ -84,6 +86,25 @@ def test_the_fixture_carries_every_known_type_and_one_unknown() -> None:
 def test_the_committed_state_is_the_fold_at_its_watermark() -> None:
     state = committed_state(FEED_V1)
     assert fold(feed_lines(FEED_V1), project_id='demo-client', upto_seq=state.watermark_seq) == state
+
+
+def test_every_pass_of_the_fixture_ends_with_each_prd_counting_its_tasks_as_the_publisher_would() -> None:
+    lines = feed_lines(FEED_V1)
+    pass_ends = [ln for ln in lines if isinstance(ln, Heartbeat)]
+    assert committed_state(FEED_V1).watermark_seq in {hb.seq for hb in pass_ends}
+    for hb in pass_ends:
+        folded = fold(lines, project_id='demo-client', upto_seq=hb.seq)
+        corrections = prd_events(
+            tasks=folded.tasks.values(),
+            state=folded,
+            summaries=None,
+            stamp=Stamp(project_id='demo-client', first_seq=hb.seq + 1),
+            now=hb.at,
+        )
+        assert corrections == (), (
+            f'the pass ending at heartbeat seq {hb.seq} leaves stale PRD counts; the publisher would say '
+            f'{[(prd.prd_path, prd.task_counts) for prd in corrections]}'
+        )
 
 
 def test_the_watermark_leaves_lines_for_a_resuming_reader() -> None:
