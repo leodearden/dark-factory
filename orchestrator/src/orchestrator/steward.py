@@ -309,7 +309,14 @@ class TaskSteward:
         return self.config.steward_session_mode == 'resume'
 
     def _briefing_digest(self) -> tuple[HandledL0, ...]:
-        """The concluded L0s a full briefing carries: none when the session already holds them."""
+        """The concluded L0s a full briefing carries: ``self._handled`` under ``fresh_per_l0``.
+
+        Under ``resume`` it is ``()`` on every full briefing, including the ones
+        built for a session that holds no history (the first L0, the L0 after an
+        empty-output drop, a fresh retry after a rejected resume). That keeps the
+        resume arm byte-identical to the pre-5819 steward, which is what makes it
+        the shadow-eval comparison arm (task 5820).
+        """
         return () if self._carries_session_across_l0s() else self._handled
 
     async def stop(self) -> None:
