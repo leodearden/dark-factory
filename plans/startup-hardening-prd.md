@@ -250,11 +250,27 @@ dispatched agent shell (task 8274's worktree) on host leo-MS-7C35. The journal w
 
 | item | rule | figure | verdict |
 |---|---|---|---|
-| 1. `runs` rows started in the window | every row has `startup_completed_at` or `exit_reason` non-NULL; a both-NULL row is a γ defect | dark-factory: 6 rows, 4 `cancelled`, 2 both-NULL. reify: 6 rows, 4 `cancelled`, 2 both-NULL. All 4 both-NULL rows had completed startup: 2 are live, 2 were SIGKILLed after startup. 0 `startup_crash:*` | **FAIL**: γ (task 8269) persists `startup_completed_at` only at exit. Follow-up: _pending in this commit_ |
+| 1. `runs` rows started in the window | every row has `startup_completed_at` or `exit_reason` non-NULL; a both-NULL row is a γ defect | dark-factory: 6 rows, 4 `cancelled`, 2 both-NULL. reify: 6 rows, 4 `cancelled`, 2 both-NULL. All 4 both-NULL rows had completed startup: 2 are live, 2 were SIGKILLed after startup. 0 `startup_crash:*` | **FAIL**: γ (task 8269) persists `startup_completed_at` only at exit. Follow-up: ticket `tkt_0RX9DGW8JRC36T4XYS31M0BQBN`. The SIGKILLs belong to task 7247 |
 | 2. watchdog restart-rate sampling, `--report RESTARTS` | every WATCHED unit has an entry with `sampling_since` ≤ window start and a last sample ≤ ~3 min old; the watchdog timer ran across the whole window with no gap far above its 60 s tick; `--report` prints `RESTARTS` for every running unit. (δ keeps only the last 1800 s of samples by design, so §6's "≥ 7 days of samples" is read as `sampling_since` plus timer continuity.) | 7/7 WATCHED units present, each with `sampling_since` 2026-11-11T17:55:04Z and a last sample 2 s old (30 samples, all NRestarts 0). 10 095 timer ticks in the window, median gap 60.2 s, largest 120.4 s (one missed tick). `RESTARTS` printed for 9/9 running units, all `0/success`. Not sampled: scoping-intake and stream-touch, which are not in WATCHED | **PASS**. The WATCHED gap is owned by pending tasks 9321 and 9815 |
 | 3. crash-loop pages | each in-window `orchestrator-crash-loop-*` or `orchestrator-startup-crash-loop` record matches a journal `Scheduled restart job` burst (≥ 5 within 1800 s, or `start-limit-hit`; ≥ 3 consecutive startup crashes for γ's page). Conversely, every such burst has a record | 0 records in the window across the 9 hosted queues. 0 `Scheduled restart job` lines and 0 start-limit hits on all 9 units. 0 `startup_crash:*` rows in all 9 runs.db | **no episode, detector unexercised**: no false page, no missed page |
 | 4. startup-step L1s | list each in-window `orchestrator-startup-<step>` L1 with its `dedupe_count`, and say whether it names a real fault | 0 L1s in the window across the 9 queues. 0 `startup_step_failed` events in the window in all 9 runs.db | **no step failure in the window, runner's failure path unexercised** |
 | 5. merge-lane cost per restart | per restart, at most one `MERGE_WORKER_SHUTDOWN_REASON` burst, with events = distinct request_ids; no burst from a `startup_crash:*` run and none per crash iteration; every burst attributable to one sweep or one deliberate restart | 6 fleet-sweep waves in the window, ζ's included. dark-factory: 4 bursts, 57 / 52 / 66 / 33 events. reify: 5 bursts, 2 / 3 / 6 / 4 / 6 events. Every burst lasts < 1 s and has events = distinct request_ids. 0 `startup_crash:*` runs. 3 run ends were SIGKILLed and emitted no burst | **PASS** |
+
+**Overall:** items 2 (restart-rate sampling and `RESTARTS`) and 5 (merge-lane cost) PASS. Item 1 FAILS on the
+γ defect that `startup_completed_at` is persisted only at exit. Items 3 (crash-loop pages) and 4 (startup-step
+L1s) were unexercised: there was no crash loop and no step failure in the window, so neither a false nor a
+missed page occurred.
+
+**Follow-ups:**
+
+- `tkt_0RX9DGW8JRC36T4XYS31M0BQBN`, filed by this record: "γ (task 8269) defect: runs.startup_completed_at is
+  persisted only at exit, so a live or post-startup-SIGKILLed run reads both-NULL — stamp it at
+  finish_startup()" (item 1).
+- Task 7247, pending: the shutdown drain bound. In the window, 4 run ends were SIGKILLed by the 90 s
+  stop-sigterm timeout: dark-factory twice, reify, and solar-challenge-platform (items 1 and 5).
+- Tasks 9321 and 9815, both pending: orchestrator-scoping-intake.service and orchestrator-stream-touch.service
+  are outside `WATCHED`, so they get no crash-loop sampling (item 2).
+- None for items 3–4. No false or missed page was found, so nothing is filed against δ (task 8270).
 
 **Item 1 evidence** (measured 2026-11-22T11:19–11:26Z). The query was `SELECT run_id, started_at, completed_at,
 startup_completed_at, exit_reason, code_sha FROM runs WHERE started_at >= '2026-11-15T10:24:00' ORDER BY
