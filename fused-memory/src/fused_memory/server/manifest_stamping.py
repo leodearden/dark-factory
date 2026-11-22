@@ -191,7 +191,9 @@ async def stamp_capability_manifests(
 
     Args:
         project_root: Absolute project root (matches ``commit_planning``'s
-            already-normalized value); sidecar paths resolve under this.
+            already-normalized value): the task-store and polarity-lint
+            root; sidecar paths resolve under it unless ``manifest_root``
+            is given.
         ids: The batch's task ids, id-aligned with ``tasks_data`` (same
             ordering ``commit_planning`` used for its ``asyncio.gather``
             read).
@@ -719,8 +721,8 @@ def _select_sidecar(
             # a server-side signal even so.
             logger.warning(
                 'stamp_capability_manifests: derived sidecar path(s) resolve '
-                'outside project_root, refusing to read/write: %r',
-                unsafe_rel_paths,
+                'outside the sidecar root %s, refusing to read/write: %r',
+                root, unsafe_rel_paths,
             )
         return None
 
@@ -737,7 +739,7 @@ def _select_sidecar(
         )
     if unsafe_rel_paths:
         extra = ', '.join(unsafe_rel_paths)
-        errors.append(f'sidecar path(s) resolved outside project_root, refused: {extra}')
+        errors.append(f'sidecar path(s) resolved outside the sidecar root {root}, refused: {extra}')
     return _SidecarSelection(
         chosen=existing_rel_paths[0] if existing_rel_paths else None,
         not_found=tuple(absent_rel_paths),
