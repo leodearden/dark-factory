@@ -143,7 +143,6 @@ escalation the audit already created:
 ```json
 "f_infra": {
   "audit_skill_present": true,
-  "since_iso": "<committer date of since>",
   "escalated": [{"pattern": "P5", "escalation_id": "esc-3520-2", "key": "fk-…"}],
   "filed_task_ids": [3681, 3682],
   "logged_only": 3
