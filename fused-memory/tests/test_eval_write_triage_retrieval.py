@@ -21,6 +21,7 @@ from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import PARENT_ID_KEY, SIGHTING_KIND
 from fused_memory.server.write_triage import (
+    OUTCOME_AMENDED,
     OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
@@ -282,6 +283,26 @@ class TestSlateSnapshot:
         path.write_text(json.dumps(payload))
         with pytest.raises(ValueError, match='routed'):
             _mod().SlateSnapshot.load(path)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('field', ['band', 'routed'])
+    async def test_a_slate_outside_the_band_vocabulary_is_refused_naming_it(
+        self, tmp_path: Path, field: str,
+    ) -> None:
+        path = tmp_path / 'slates.json'
+        (await self._snapshot()).dump(path)
+        payload = json.loads(path.read_text())
+        payload['slates'][1][field] = OUTCOME_AMENDED
+        path.write_text(json.dumps(payload))
+        with pytest.raises(ValueError, match=f"slate 1 \\(d2\\): {field} '{OUTCOME_AMENDED}'"):
+            _mod().SlateSnapshot.load(path)
+
+    @pytest.mark.asyncio
+    async def test_a_dump_creates_its_directory(self, tmp_path: Path) -> None:
+        snapshot = await self._snapshot()
+        path = tmp_path / 'not' / 'yet' / 'slates.json'
+        snapshot.dump(path)
+        assert _mod().SlateSnapshot.load(path) == snapshot
 
     @pytest.mark.asyncio
     async def test_another_schema_version_is_refused(self, tmp_path: Path) -> None:

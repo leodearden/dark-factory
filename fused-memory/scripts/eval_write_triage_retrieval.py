@@ -15,7 +15,8 @@ pairs them with the curator labels, and the eval scores them. A
 :class:`SlateSnapshot` keeps one retrieval on disk so several runs judge it.
 
 Imported by path, the same way the eval script imports the calibrator —
-``scripts/`` is not an importable package.
+``scripts/`` is not an importable package. It imports only
+``eval_write_triage_scoring.py``, for the band vocabulary a snapshot is held to.
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
@@ -34,8 +35,21 @@ from fused_memory.server.write_triage import (
     route_band,
 )
 from fused_memory.server.write_triage_judge import select_judge_candidates
+from fused_memory.utils.script_loader import load_script
 
 logger = logging.getLogger(__name__)
+
+_SCRIPTS = Path(__file__).resolve().parent
+
+
+# Pyright cannot follow the by-path loader, so it alone resolves `_scoring` through
+# the scripts/ extraPath; at runtime the module is always the by-path load.
+if TYPE_CHECKING:
+    import eval_write_triage_scoring as _scoring
+else:
+    _scoring = load_script(
+        _SCRIPTS / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring',
+    )
 
 
 @dataclass(frozen=True)
@@ -73,6 +87,20 @@ def _require_fields(payload: Mapping[str, Any], cls: type, where: str) -> None:
         raise ValueError(f'{where} is missing field(s) {missing}')
 
 
+def _require_bands(entry: Mapping[str, Any], where: str) -> None:
+    """Refuse a slate whose ``band`` or ``routed`` no ``decide_band``/``route_band`` returns.
+
+    Checked on load, so a corrupt snapshot is refused before any case is judged
+    and paid for, rather than at scoring after all of them.
+    """
+    for name in ('band', 'routed'):
+        if entry[name] not in _scoring.EVAL_BANDS:
+            raise ValueError(
+                f'{where} ({entry["memory_id"]}): {name} {entry[name]!r} is outside '
+                f'{list(_scoring.EVAL_BANDS)}',
+            )
+
+
 @dataclass(frozen=True)
 class SlateSnapshot:
     """A measured retrieval: one retrieval, banded, routed and trimmed, that several judge runs can be judged over.
@@ -90,6 +118,8 @@ class SlateSnapshot:
     slates: tuple[Slate, ...]
 
     def dump(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         payload = {f.name: getattr(self, f.name) for f in fields(self)}
         payload['slates'] = [
             {
@@ -98,7 +128,7 @@ class SlateSnapshot:
             }
             for slate in self.slates
         ]
-        Path(path).write_text(json.dumps(
+        path.write_text(json.dumps(
             {'schema_version': SLATE_SNAPSHOT_SCHEMA_VERSION, **payload}, indent=2,
         ) + '\n')
 
@@ -115,6 +145,7 @@ class SlateSnapshot:
         slates = []
         for index, entry in enumerate(payload['slates']):
             _require_fields(entry, Slate, f'{path}: slate {index}')
+            _require_bands(entry, f'{path}: slate {index}')
             slates.append(Slate(**{
                 **{f.name: entry[f.name] for f in fields(Slate)},
                 'candidates': tuple(entry['candidates']),

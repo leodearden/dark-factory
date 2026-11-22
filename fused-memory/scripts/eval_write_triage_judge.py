@@ -118,6 +118,7 @@ refuses arms whose population provenance differs.
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import logging
 import sys
@@ -143,6 +144,9 @@ _DEFAULT_REPORT_PATH = str(
     _PACKAGE_ROOT / 'calibration' / 'write_triage_judge_accuracy_report.json'
 )
 
+#: The corpus a retrieved run retrieves against when ``--project-id`` is omitted.
+_DEFAULT_PROJECT_ID = 'reify'
+
 
 def _load_calibrate() -> types.ModuleType:
     """Load leaf alpha's script as a module.
@@ -163,10 +167,12 @@ _calibrate = _load_calibrate()
 
 # Pyright cannot follow the by-path loader, so it alone resolves `_scoring`,
 # `_cases` and `_live_judge` through the scripts/ extraPath; at runtime each is
-# the by-path load.
+# the by-path load. `_retrieval` is a type-checking name only: at runtime the
+# retrieval edge is loaded lazily, by `load_retrieval`.
 if TYPE_CHECKING:
     import eval_write_triage_cases as _cases
     import eval_write_triage_live_judge as _live_judge
+    import eval_write_triage_retrieval as _retrieval
     import eval_write_triage_scoring as _scoring
 else:
     _scoring = load_script(
@@ -603,7 +609,7 @@ def _retrieved_plan(
     ``--slates-in`` replays a :func:`_retrieve_snapshot` an earlier run wrote
     with ``--slates-out``, so several runs judge one retrieval; its project,
     band edges and width are the provenance, since they are what the slates
-    were measured at.
+    were measured at, and a ``--project-id`` naming another project is refused.
     """
     retrieval = load_retrieval()
     labelled = [r for r in records if str(r['label']) != _scoring.LABEL_CANONICAL]
@@ -611,7 +617,7 @@ def _retrieved_plan(
         snapshot = retrieval.SlateSnapshot.load(args.slates_in)
         _check_snapshot(
             snapshot, labelled, judge_candidate_count=judge_candidate_count,
-            path=args.slates_in,
+            project_id=args.project_id, path=args.slates_in,
         )
         logger.info(
             'Judging %d slate(s) retrieved from project_id=%s, read from %s',
@@ -642,7 +648,7 @@ def _retrieve_snapshot(
     labelled: Sequence[Mapping[str, Any]],
     *,
     judge_candidate_count: int,
-) -> Any:
+) -> _retrieval.SlateSnapshot:
     """One production retrieval of *labelled*, banded, routed and trimmed.
 
     The retrieval width and both band edges come from the SAME config the
@@ -660,15 +666,16 @@ def _retrieve_snapshot(
     service = types.SimpleNamespace(config=config)
     k = resolve_candidate_k(service)
     t_high, t_low = resolve_bands(service)
+    project_id = _DEFAULT_PROJECT_ID if args.project_id is None else args.project_id
     logger.info(
         'Retrieving %d slate(s) from project_id=%s at k=%d, bands t_high=%s '
-        't_low=%s', len(labelled), args.project_id, k, t_high, t_low,
+        't_low=%s', len(labelled), project_id, k, t_high, t_low,
     )
 
     async def prefetch() -> dict[str, dict[str, Any]]:
         async with maintenance_service(config=config) as (_, memory):
             return await retrieval.prefetch_retrievals(
-                memory, labelled, project_id=args.project_id, k=k,
+                memory, labelled, project_id=project_id, k=k,
             )
 
     slates = retrieval.retrieved_slates(
@@ -677,32 +684,55 @@ def _retrieve_snapshot(
         judge_candidate_count=judge_candidate_count,
     )
     return retrieval.SlateSnapshot(
-        project_id=args.project_id, t_high=t_high, t_low=t_low, candidate_k=k,
+        project_id=project_id, t_high=t_high, t_low=t_low, candidate_k=k,
         judge_candidate_count=judge_candidate_count, slates=tuple(slates),
     )
 
 
 def _check_snapshot(
-    snapshot: Any,
+    snapshot: _retrieval.SlateSnapshot,
     labelled: Sequence[Mapping[str, Any]],
     *,
     judge_candidate_count: int,
+    project_id: str | None,
     path: str,
 ) -> None:
-    """Refuse a snapshot that is not a retrieval of this run's population at its width."""
+    """Refuse a snapshot that is not a retrieval of this run's population at its width.
+
+    *project_id* is the run's ``--project-id`` as given, ``None`` when omitted:
+    omitted, the run takes the snapshot's project.
+    """
     expected = [str(record['memory_id']) for record in labelled]
     measured = [slate.memory_id for slate in snapshot.slates]
     if measured != expected:
         raise ValueError(
-            f'{path}: its slates\' memory_ids ({len(measured)}) are not this run\'s '
-            f'{len(expected)} labelled record(s) in order; write the snapshot with '
-            'the same --fixture and --limit',
+            f'{path}: its slates\' memory_ids are not this run\'s {len(expected)} '
+            f'labelled record(s) in order: {_first_divergence(measured, expected)}; '
+            'write the snapshot with the same --fixture and --limit',
         )
     if snapshot.judge_candidate_count != judge_candidate_count:
         raise ValueError(
             f'{path}: judge_candidate_count {snapshot.judge_candidate_count} is not '
             f"this run's {judge_candidate_count}",
         )
+    if project_id is not None and project_id != snapshot.project_id:
+        raise ValueError(
+            f'{path}: retrieved from project_id {snapshot.project_id!r}, not the '
+            f'--project-id {project_id!r} given; omit --project-id to judge it',
+        )
+
+
+def _first_divergence(measured: Sequence[str], expected: Sequence[str]) -> str:
+    """Where a snapshot's slate ids first part from the run's record ids, as an operator reads it."""
+    pairs = itertools.zip_longest(measured, expected)
+    index, (slate_id, record_id) = next(
+        (index, pair) for index, pair in enumerate(pairs) if pair[0] != pair[1]
+    )
+    if record_id is None:
+        return f'slate {index} ({slate_id}) is past this run\'s last record'
+    if slate_id is None:
+        return f'record {index} ({record_id}) has no slate'
+    return f'slate {index} is {slate_id} where this run\'s record {index} is {record_id}'
 
 
 def _run(args: Any) -> int:
@@ -858,9 +888,11 @@ def main() -> int:
                              'winner and the band all come from a real '
                              'retrieval against the live store, as production '
                              'would produce them (default: seeded)')
-    parser.add_argument('--project-id', dest='project_id', default='reify',
-                        help='the corpus retrieved against under '
-                             '--slate-mode retrieved (default: reify)')
+    parser.add_argument('--project-id', dest='project_id', default=None,
+                        help='the corpus retrieved against under --slate-mode '
+                             f'retrieved (default: {_DEFAULT_PROJECT_ID}). Under '
+                             "--slates-in the snapshot's project is used, and "
+                             'any other given here is refused')
     parser.add_argument('--field-chars', dest='field_chars', type=int, default=None,
                         help="override the judge's per-field prompt budget for "
                              'this run; 0 renders every field UN-elided. '

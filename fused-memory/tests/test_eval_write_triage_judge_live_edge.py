@@ -556,14 +556,15 @@ class TestTheRetrievedCli:
     def _report(tmp_path: Path, name: str) -> dict:
         return json.loads((tmp_path / name).read_text())
 
+    @pytest.mark.parametrize('project', [(), ('--project-id', 'reify')])
     def test_a_snapshot_written_by_one_run_is_judged_by_the_next_unchanged(
-        self, tmp_path: Path, monkeypatch,
+        self, tmp_path: Path, monkeypatch, project: tuple[str, ...],
     ) -> None:
         snapshot = tmp_path / 'slates.json'
         rows = [_hit('b-dup-1', 0.95), _hit('a-canon', 0.7), _hit('c-dup-1', 0.3)]
         self._main(tmp_path, monkeypatch, '--slates-out', str(snapshot), rows=rows)
         self._main(
-            tmp_path, monkeypatch, '--slates-in', str(snapshot), '--project-id', 'elsewhere',
+            tmp_path, monkeypatch, '--slates-in', str(snapshot), *project,
             '--report-path', str(tmp_path / 'r2.json'),
             '--cases-path', str(tmp_path / 'cases2.jsonl'), searchable=False,
         )
@@ -583,9 +584,24 @@ class TestTheRetrievedCli:
             tmp_path, monkeypatch, '--limit', '1', '--slates-out', str(snapshot),
             '--report-path', str(tmp_path / 'limited.json'), rows=[_hit('b-dup-1', 0.7)],
         )
-        with pytest.raises(ValueError, match='memory_id'):
+        with pytest.raises(ValueError, match='memory_id') as refused:
             self._main(
                 tmp_path, monkeypatch, '--slates-in', str(snapshot),
+                '--report-path', str(tmp_path / 'r2.json'), searchable=False,
+            )
+        assert 'record 1 (a-dup-2) has no slate' in str(refused.value)
+        assert not (tmp_path / 'r2.json').exists()
+
+    def test_a_project_id_other_than_the_snapshots_is_refused(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        snapshot = tmp_path / 'slates.json'
+        self._main(
+            tmp_path, monkeypatch, '--slates-out', str(snapshot), rows=[_hit('b-dup-1', 0.7)],
+        )
+        with pytest.raises(ValueError, match="'reify'.*'elsewhere'"):
+            self._main(
+                tmp_path, monkeypatch, '--slates-in', str(snapshot), '--project-id', 'elsewhere',
                 '--report-path', str(tmp_path / 'r2.json'), searchable=False,
             )
         assert not (tmp_path / 'r2.json').exists()
