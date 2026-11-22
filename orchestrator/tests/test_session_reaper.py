@@ -953,15 +953,14 @@ class TestReapStaleSessionPointers:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         raced, kept = self._write_orphan_pointers(tmp_path, 'raced-session', 'orphan-session')
-        original = session_reaper._is_stale_claude_session_pointer
+        original_unlink = Path.unlink
 
-        def stale_then_removed_by_rival(path: Path, root: Path | str | None) -> bool:
-            stale = original(path, root)
-            if path == raced:
-                path.unlink()
-            return stale
+        def unlink_after_rival(self: Path, missing_ok: bool = False) -> None:
+            if self == raced:
+                original_unlink(self)
+            original_unlink(self, missing_ok=missing_ok)
 
-        monkeypatch.setattr(session_reaper, '_is_stale_claude_session_pointer', stale_then_removed_by_rival)
+        monkeypatch.setattr(Path, 'unlink', unlink_after_rival)
 
         with caplog.at_level(logging.WARNING, logger=session_reaper.__name__):
             removed = session_reaper.reap_stale_session_pointers(root=tmp_path)
