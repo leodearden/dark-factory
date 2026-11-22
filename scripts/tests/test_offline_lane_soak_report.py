@@ -506,12 +506,20 @@ def test_a_window_with_no_filing_and_no_crossing_has_no_data_to_bound(tmp_path: 
 # --- (d) ledger_rows_per_pass ----------------------------------------------------------
 
 
-def _reproduced_and_cleared(project: SoakProject, at: datetime, *, cleared_row: FlakeCallSite | None) -> LanePass:
-    """A confirmed pass reproducing NODE_A and clearing NODE_B, with NODE_A's row and, at *cleared_row*, NODE_B's."""
+def _reproduced_and_cleared(
+    project: SoakProject, at: datetime, *, cleared_row: FlakeCallSite | None, debt_fields: bool = True,
+) -> LanePass:
+    """A confirmed pass reproducing NODE_A and clearing NODE_B, with NODE_A's row and, at *cleared_row*, NODE_B's.
+
+    *debt_fields* False writes its effect block as the lane did before ε2, and, as the lane did then, no row.
+    """
     lane_pass = project.add_pass(
         UNIT, at=at, detect=[failure(NODE_A), failure(NODE_B)], confirm=[failure(NODE_A)],
         outcome=Confirmed(ConfirmMode.NARROWED, (NODE_A,), (NODE_B,), ()), effect=effect(tests_counted=(NODE_A,)),
+        debt_fields=debt_fields,
     )
+    if not debt_fields:
+        return lane_pass
     project.occurrence(lane_pass, [NODE_A], FlakeVerdict.fails_in_isolation)
     if cleared_row is not None:
         project.occurrence(lane_pass, [NODE_B], FlakeVerdict.passes_in_isolation, call_site=cleared_row)
@@ -593,6 +601,70 @@ def test_unconfirmable_outage_and_green_passes_examine_nothing(tmp_path: Path, c
     assert code == 0
     check = _check(report, 'ledger_rows_per_pass')
     assert (check['verdict'], check['examined']) == ('no_data', 0)
+
+
+def _before_epsilon2(project: SoakProject) -> list[LanePass]:
+    """Two confirmed passes written before ε2, at T0-2h and T0-1h: each owes rows the lane never wrote."""
+    return [
+        _reproduced_and_cleared(project, T0 - timedelta(hours=hours), cleared_row=None, debt_fields=False)
+        for hours in (2, 1)
+    ]
+
+
+def _spanning_window(project: SoakProject, capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, Any]]:
+    code, report, _ = _report(project, capsys, '--since', (T0 - timedelta(hours=3)).isoformat())
+    return code, report
+
+
+def test_a_window_spanning_the_ledger_cut_over_judges_only_passes_from_it(tmp_path: Path, capsys):
+    project = SoakProject(tmp_path)
+    project.provision(UNIT)
+    earlier = _before_epsilon2(project)
+    _reproduced_and_cleared(project, T0, cleared_row=FlakeCallSite.offline_lane)
+
+    code, report = _spanning_window(project, capsys)
+
+    assert code == 0
+    check = _check(report, 'ledger_rows_per_pass')
+    assert (check['verdict'], check['examined'], check['failures']) == ('pass', 2, [])
+    assert _check(report, 'records_well_formed')['examined'] == 3
+    assert len(check['notes']) == len(earlier)
+    for note, lane_pass in zip(check['notes'], earlier, strict=True):
+        assert f'{UNIT}/{lane_pass.pass_id}' in note
+        assert 'not judged' in note
+        assert T0.isoformat() in note
+
+
+def test_an_epsilon2_pass_missing_its_row_still_fails_in_a_window_spanning_the_cut_over(tmp_path: Path, capsys):
+    project = SoakProject(tmp_path)
+    project.provision(UNIT)
+    earlier = _before_epsilon2(project)
+    last = _reproduced_and_cleared(project, T0, cleared_row=None)
+
+    code, report = _spanning_window(project, capsys)
+
+    assert code == 1
+    (failure_line,) = _check(report, 'ledger_rows_per_pass')['failures']
+    assert last.pass_id in failure_line
+    assert NODE_B in failure_line
+    assert not any(lane_pass.pass_id in failure_line for lane_pass in earlier)
+
+
+def test_a_window_with_only_passes_before_the_ledger_cut_over_has_no_ledger_data(tmp_path: Path, capsys):
+    project = SoakProject(tmp_path)
+    project.provision(UNIT)
+    earlier = _before_epsilon2(project)
+
+    code, report = _spanning_window(project, capsys)
+
+    assert code == 0
+    assert report['ledger_cut_over'] is None
+    check = _check(report, 'ledger_rows_per_pass')
+    assert (check['verdict'], check['examined']) == ('no_data', 0)
+    assert len(check['notes']) == len(earlier)
+    for note, lane_pass in zip(check['notes'], earlier, strict=True):
+        assert f'{UNIT}/{lane_pass.pass_id}' in note
+        assert 'not judged' in note
 
 
 # --- (e) deflake_tasks_carry_evidence and (g) offered_debts_owned_or_due ---------------
