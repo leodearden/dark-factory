@@ -243,6 +243,36 @@ INTERRUPT_PATTERN = 'request interrupted by user'
 """The literal Claude-Code-injected marker for a user-interrupted tool call
 (e.g. "[Request interrupted by user for tool use]")."""
 
+_INTERRUPT_MARKER_TURN_RE = re.compile(
+    r'\[' + re.escape(INTERRUPT_PATTERN) + r'[^\]]*\]', re.IGNORECASE,
+)
+
+_LOCAL_COMMAND_OUTPUT_TURN_RE = re.compile(
+    r'<local-command-(?P<stream>stdout|stderr)>'
+    r'(?:(?!</local-command-).)*'
+    r'</local-command-(?P=stream)>',
+    re.DOTALL,
+)
+
+
+def is_client_rendered_turn(text: str) -> bool:
+    """Whether the WHOLE turn is one the client composed from a UI action: a
+    slash command with no typed args, one local command's output echo, or the
+    bare interrupt marker, so it holds no prose a human typed.
+
+    Asked by the gold-turn filter only, never by :func:`is_non_dialogue_carrier`:
+    the interrupt marker is this session's own INTERRUPT signal, which the
+    dialogue carriers must keep.
+    """
+    expansion = parse_slash_command_expansion(text)
+    if expansion is not None:
+        return not (expansion.args or '').strip() and not expansion.trailing.strip()
+    stripped = text.strip()
+    return any(
+        rule.fullmatch(stripped)
+        for rule in (_LOCAL_COMMAND_OUTPUT_TURN_RE, _INTERRUPT_MARKER_TURN_RE)
+    )
+
 
 @dataclass(frozen=True)
 class TextSignal:
