@@ -81,6 +81,8 @@ def build_landlock_command(
       subpaths are supplied here via ``writable_extras`` (e.g.
       ``~/.claude/fleet/``, as computed by
       ``orchestrator.agents.write_set.compute_write_set``)
+    - An extra may be a single file; the existence and file-or-directory
+      check lives in ``landlock_exec._add_path``
 
     Returns argv suitable for ``asyncio.create_subprocess_exec``.
     """

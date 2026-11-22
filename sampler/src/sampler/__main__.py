@@ -25,8 +25,8 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from sampler.metrics import METRIC_GROUPS, MetricGroup, Samples
-from sampler.sampler import run_tick
+from sampler.metrics import METRIC_GROUPS, Collected, MetricGroup
+from sampler.sampler import Failed, Outcome, Skipped, collect_tick, run_tick
 from sampler.store import LoadSampleStore
 
 logging.basicConfig(
@@ -45,7 +45,8 @@ def main(groups: Sequence[MetricGroup] = METRIC_GROUPS) -> None:
     This allows relocating the checkout without editing the unit file.
 
     A group whose collector fails writes no rows this tick and the others are
-    still written; only a store that cannot be opened exits non-zero.
+    still written; only a store that cannot be opened exits non-zero. One
+    ``tick ts=...`` line names every group's disposition.
     """
     root = os.environ.get('DARK_FACTORY_ROOT', '.')
     db_path = Path(root) / 'data/load-samples.db'
@@ -57,30 +58,27 @@ def main(groups: Sequence[MetricGroup] = METRIC_GROUPS) -> None:
         sys.exit(1)
 
     now = int(time.time())
-    collected = {group: _collect(group) for group in groups}
-    written = run_tick(store, now, collected)
+    dispositions = run_tick(store, now, collect_tick(store, now, groups))
     store.maybe_vacuum(now)
 
     logger.info(
         'tick ts=%d %s',
         now,
-        ' '.join(f'{group.name}={_render(written.get(group))}' for group in groups),
+        ' '.join(f'{group.name}={_render(group, dispositions[group])}' for group in groups),
     )
 
 
-def _collect(group: MetricGroup) -> Samples:
-    """The one degrade handler: a failed collection is ``{}``, never a fabricated 0.0."""
-    try:
-        return group.collect()
-    except Exception:
-        logger.exception('Failed to collect %s metrics; writing the other groups only', group.name)
-        return {}
-
-
-def _render(samples: Samples | None) -> str:
-    if samples is None:
-        return 'dropped'
-    return str({key.label(): f'{value:.2f}' for key, value in samples.items()})
+def _render(group: MetricGroup, disposition: Outcome) -> str:
+    match disposition:
+        case Skipped():
+            return disposition.value
+        case Failed(kind=kind):
+            return f'failed:{kind}'
+        case Collected(samples=samples) if group.logs_rows:
+            return str({key.label(): f'{value:.2f}' for key, value in samples.items()})
+        case Collected(samples=samples):
+            leaves = {key.leaf for key in samples if key.leaf is not None}
+            return f'rows:{len(samples)} leaves:{len(leaves)}'
 
 
 if __name__ == '__main__':

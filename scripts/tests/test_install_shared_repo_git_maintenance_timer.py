@@ -1,13 +1,10 @@
 """Tests for scripts/install-shared-repo-git-maintenance-timer.sh, the two units it
 installs, and the wrapper the service runs (task 8076).
 
-Drives the installer via subprocess with a FAKE ``systemctl`` first on PATH, and
-parses the committed units with ``systemd_unit_parity.parse_unit_directives``
-rather than grepping their text. The fake-systemctl harness is a copy of the one
-in scripts/tests/test_install_memory_eval_timer.py, under the house
-duplicate-with-docstring convention; its rationale lives in
-scripts/tests/test_install_memory_metadata_coverage_census_timer.py. Real systemd
-is never touched. The wrapper is driven end to end against a real tmp repo.
+Drives the installer via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl`
+first on PATH, and reads the committed units through
+`scripts/tests/conftest.py::unit_values` rather than grepping their text. Real
+systemd is never touched. The wrapper is driven end to end against a real tmp repo.
 """
 from __future__ import annotations
 
@@ -18,7 +15,6 @@ import sys
 from pathlib import Path
 
 import pytest
-import systemd_unit_parity
 from committed_git_repo import committed_repo
 from git_repo_probe import loose_count
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -39,107 +35,14 @@ SERVICE_NAME = 'shared-repo-git-maintenance.service'
 TIMER_NAME = 'shared-repo-git-maintenance.timer'
 
 
-_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
-"""Fake `systemctl`, copied from scripts/tests/test_install_memory_eval_timer.py.
-
-Records every invocation (minus `--user`) into $FAKE_SYSTEMCTL_STATE.
-`enable --now <unit>` marks each non-flag arg enabled; `start` is recorded;
-`list-timers` echoes one line per timer enabled so far, unless
-FAKE_SYSTEMCTL_OMIT_LIST_TIMERS=1 simulates an enable that left no timer.
-"""
-import json
-import os
-import sys
-
-STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
-
-
-def _load():
-    with open(STATE_PATH) as f:
-        return json.load(f)
-
-
-def _save(state):
-    with open(STATE_PATH, "w") as f:
-        json.dump(state, f)
-
-
-def main(argv):
-    args = [a for a in argv[1:] if a != "--user"]
-    if not args:
-        return 1
-    verb, rest = args[0], args[1:]
-
-    state = _load()
-    state.setdefault("calls", []).append(args)
-
-    if verb in ("daemon-reload", "start"):
-        _save(state)
-        return 0
-
-    if verb == "enable":
-        enabled = state.setdefault("enabled_timers", [])
-        for unit in (a for a in rest if not a.startswith("-")):
-            if unit not in enabled:
-                enabled.append(unit)
-        _save(state)
-        return 0
-
-    if verb == "list-timers":
-        _save(state)
-        if os.environ.get("FAKE_SYSTEMCTL_OMIT_LIST_TIMERS") == "1":
-            print("0 timers listed.")
-            return 0
-        enabled = state.get("enabled_timers", [])
-        for unit in enabled:
-            print(f"Tue 2026-10-20 03:15:00 BST 11h left n/a n/a {unit} {unit.replace('.timer', '.service')}")
-        print(f"{len(enabled)} timers listed.")
-        return 0
-
-    return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv))
-'''
-
-
-def _fake_systemctl(tmp_path):
-    bin_dir = tmp_path / 'bin'
-    bin_dir.mkdir(exist_ok=True)
-    fake = bin_dir / 'systemctl'
-    fake.write_text(_FAKE_SYSTEMCTL_SRC)
-    fake.chmod(0o755)
-    state_path = tmp_path / 'systemctl_state.json'
-    state_path.write_text(json.dumps({'calls': [], 'enabled_timers': []}))
-    return bin_dir, state_path
-
-
-def _systemctl_calls(tmp_path):
-    state_path = tmp_path / 'systemctl_state.json'
-    if not state_path.is_file():
-        return []
-    return json.loads(state_path.read_text())['calls']
-
-
-def _run_script(tmp_path, *, env=None, reset_state=True):
-    bin_dir, state_path = _fake_systemctl(tmp_path) if reset_state else (
-        tmp_path / 'bin', tmp_path / 'systemctl_state.json')
+def _run_script(fake_timer_systemctl, *, env=None, reset_state=True):
+    if reset_state:
+        fake_timer_systemctl.reset()
     full_env = dict(os.environ)
-    full_env['PATH'] = f'{bin_dir}{os.pathsep}{full_env["PATH"]}'
-    full_env['FAKE_SYSTEMCTL_STATE'] = str(state_path)
+    full_env['PATH'] = f'{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env["PATH"]}'
     if env:
         full_env.update(env)
     return subprocess.run(['bash', str(SCRIPT)], env=full_env, capture_output=True, text=True, timeout=60)
-
-
-def _unit(path: Path) -> dict[str, dict[str, list[str]]]:
-    return systemd_unit_parity.parse_unit_directives(path.read_text(encoding='utf-8'))
-
-
-def _values(path: Path, section: str, key: str) -> list[str]:
-    """Every value for ``key`` under ``[section]``; ``== ['x']`` also pins that it is declared once."""
-    return _unit(path).get(section, {}).get(key, [])
 
 
 # ── the installer ───────────────────────────────────────────────────────────
@@ -149,15 +52,15 @@ def test_script_is_executable():
     assert os.access(SCRIPT, os.X_OK), f'chmod +x {SCRIPT}'
 
 
-def test_install_copies_both_units_enables_the_timer_and_kicks_a_non_blocking_run(tmp_path):
+def test_install_copies_both_units_enables_the_timer_and_kicks_a_non_blocking_run(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / 'xdg-config'
-    result = _run_script(tmp_path, env={'XDG_CONFIG_HOME': str(xdg_config)})
+    result = _run_script(fake_timer_systemctl, env={'XDG_CONFIG_HOME': str(xdg_config)})
     assert result.returncode == 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
 
     unit_dir = xdg_config / 'systemd' / 'user'
     for name in (SERVICE_NAME, TIMER_NAME):
         assert (unit_dir / name).read_bytes() == (TEMPLATES_DIR / name).read_bytes()
-    calls = _systemctl_calls(tmp_path)
+    calls = fake_timer_systemctl.calls()
     assert (
         calls.index(['daemon-reload'])
         < calls.index(['enable', '--now', TIMER_NAME])
@@ -165,22 +68,22 @@ def test_install_copies_both_units_enables_the_timer_and_kicks_a_non_blocking_ru
     ), calls
 
 
-def test_install_is_idempotent(tmp_path):
+def test_install_is_idempotent(fake_timer_systemctl, tmp_path):
     env = {'XDG_CONFIG_HOME': str(tmp_path / 'xdg-config')}
-    first = _run_script(tmp_path, env=env)
-    first_calls = _systemctl_calls(tmp_path)
-    second = _run_script(tmp_path, env=env)
+    first = _run_script(fake_timer_systemctl, env=env)
+    first_calls = fake_timer_systemctl.calls()
+    second = _run_script(fake_timer_systemctl, env=env)
     assert first.returncode == 0, first.stderr
     assert second.returncode == 0, second.stderr
 
-    assert _systemctl_calls(tmp_path) == first_calls
+    assert fake_timer_systemctl.calls() == first_calls
     unit_dir = tmp_path / 'xdg-config' / 'systemd' / 'user'
     for name in (SERVICE_NAME, TIMER_NAME):
         assert (unit_dir / name).read_bytes() == (TEMPLATES_DIR / name).read_bytes()
 
 
-def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(tmp_path):
-    result = _run_script(tmp_path, env={
+def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_timer_systemctl, tmp_path):
+    result = _run_script(fake_timer_systemctl, env={
         'XDG_CONFIG_HOME': str(tmp_path / 'xdg'),
         'FAKE_SYSTEMCTL_OMIT_LIST_TIMERS': '1',
     })
@@ -191,42 +94,42 @@ def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(tmp_path):
 # ── the committed units ─────────────────────────────────────────────────────
 
 
-def test_timer_fires_daily_at_0200_catching_up_a_missed_day():
+def test_timer_fires_daily_at_0200_catching_up_a_missed_day(unit_values):
     """02:00 is the slot the already-filed deploy task 8087 checks list-timers for."""
     timer = TEMPLATES_DIR / TIMER_NAME
-    assert _values(timer, 'Timer', 'OnCalendar') == ['*-*-* 02:00:00']
-    assert _values(timer, 'Timer', 'Persistent') == ['true']
-    assert _values(timer, 'Timer', 'RandomizedDelaySec') == ['300']
-    assert _values(timer, 'Install', 'WantedBy') == ['timers.target']
+    assert unit_values(timer, 'Timer', 'OnCalendar') == ['*-*-* 02:00:00']
+    assert unit_values(timer, 'Timer', 'Persistent') == ['true']
+    assert unit_values(timer, 'Timer', 'RandomizedDelaySec') == ['300']
+    assert unit_values(timer, 'Install', 'WantedBy') == ['timers.target']
 
 
-def test_timer_does_not_collide_with_an_occupied_slot():
+def test_timer_does_not_collide_with_an_occupied_slot(unit_values):
     """Parsed on both sides, so a commented-out slot can neither manufacture nor mask a clash."""
-    ours = set(_values(TEMPLATES_DIR / TIMER_NAME, 'Timer', 'OnCalendar'))
+    ours = set(unit_values(TEMPLATES_DIR / TIMER_NAME, 'Timer', 'OnCalendar'))
     assert ours, 'the timer declares no OnCalendar at all'
     for other in sorted(TEMPLATES_DIR.glob('*.timer')):
         if other.name == TIMER_NAME:
             continue
-        clash = ours & set(_values(other, 'Timer', 'OnCalendar'))
+        clash = ours & set(unit_values(other, 'Timer', 'OnCalendar'))
         assert not clash, (
             f'{TIMER_NAME} shares {sorted(clash)!r} with {other.name} — pick a free slot '
             f'and update the OPERATIONS.md section 12 nightly ladder table'
         )
 
 
-def test_service_is_a_journalled_oneshot_around_the_wrapper():
+def test_service_is_a_journalled_oneshot_around_the_wrapper(unit_values):
     service = TEMPLATES_DIR / SERVICE_NAME
-    assert _values(service, 'Service', 'Type') == ['oneshot']
-    assert _values(service, 'Service', 'ExecStart') == [
+    assert unit_values(service, 'Service', 'Type') == ['oneshot']
+    assert unit_values(service, 'Service', 'ExecStart') == [
         f'{PRODUCTION_ROOT}/scripts/shared-repo-git-maintenance.sh',
     ]
-    assert _values(service, 'Service', 'WorkingDirectory') == [PRODUCTION_ROOT]
-    assert _values(service, 'Service', 'StandardOutput') == ['journal']
-    assert _values(service, 'Service', 'StandardError') == ['journal']
+    assert unit_values(service, 'Service', 'WorkingDirectory') == [PRODUCTION_ROOT]
+    assert unit_values(service, 'Service', 'StandardOutput') == ['journal']
+    assert unit_values(service, 'Service', 'StandardError') == ['journal']
 
 
-def test_service_documents_the_safety_envelope():
-    named, = _values(TEMPLATES_DIR / SERVICE_NAME, 'Unit', 'Documentation')
+def test_service_documents_the_safety_envelope(unit_values):
+    named, = unit_values(TEMPLATES_DIR / SERVICE_NAME, 'Unit', 'Documentation')
     prefix = f'file://{PRODUCTION_ROOT}/'
     assert named.startswith(prefix), named
     assert named.endswith('/docs/shared-repo-git-maintenance.md'), named
@@ -234,8 +137,8 @@ def test_service_documents_the_safety_envelope():
     assert here.is_file(), here
 
 
-def test_service_execstart_points_at_a_real_executable_wrapper():
-    named, = _values(TEMPLATES_DIR / SERVICE_NAME, 'Service', 'ExecStart')
+def test_service_execstart_points_at_a_real_executable_wrapper(unit_values):
+    named, = unit_values(TEMPLATES_DIR / SERVICE_NAME, 'Service', 'ExecStart')
     assert named.startswith(f'{PRODUCTION_ROOT}/scripts/'), named
     here = TEMPLATES_DIR / named.split('/scripts/', 1)[1]
     assert here.is_file(), here

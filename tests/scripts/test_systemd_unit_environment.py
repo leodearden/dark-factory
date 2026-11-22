@@ -11,7 +11,6 @@ from __future__ import annotations
 import errno
 import json
 import os
-import re
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
@@ -471,16 +470,13 @@ def test_a_malformed_reply_is_systemd_unanswered(
 
 
 def _recipe_command() -> str:
-    return vci.marked_span(
+    return vci.marked_bullet_command(
         (REPO_ROOT / 'OPERATIONS.md').read_text(),
-        begin=f'{RECIPE_MARKER}:begin',
-        end=f'{RECIPE_MARKER}:end',
-        pattern=re.compile(r'- \*\*' + re.escape(RECIPE_LABEL) + r'\*\*: `([^`]+)`'),
-        what=f'`- **{RECIPE_LABEL}**: <command>` bullet',
+        slug=RECIPE_MARKER,
+        bullet_label=RECIPE_LABEL,
         source='OPERATIONS.md',
-        label=f'the {RECIPE_LABEL!r} command',
         task='5978',
-    ).strip()
+    )
 
 
 def test_the_operations_recipe_runs_verbatim_and_reports_the_unit(

@@ -80,7 +80,7 @@ if [[ -z "${SMOKE_SKIP_EVAL:-}" ]]; then
   cp "$REPO_ROOT/orchestrator/src/orchestrator/evals/tasks/${FIXTURE}.json" "$tasks_dir/"
 
   echo "SMOKE: running eval-ofat over ${FIXTURE} (timeout ${TIMEOUT}m/run)..."
-  uv run --project "$REPO_ROOT/orchestrator" orchestrator eval-ofat \
+  uv run --no-sync --project "$REPO_ROOT/orchestrator" orchestrator eval-ofat \
     --config "$CONFIG" --tasks-dir "$tasks_dir" \
     --max-parallel 1 --trials 1 --timeout "$TIMEOUT"
 

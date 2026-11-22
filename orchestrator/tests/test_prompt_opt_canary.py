@@ -322,7 +322,7 @@ class TestLoadWindowRows:
         """load_window_rows must not silently CREATE an empty runs.db when
         called directly on a nonexistent path (e.g. a library caller that
         bypasses the CLI's `runs_db.is_file()` pre-flight check) -- that
-        would mask a misconfigured --runs-db/PROMPT_OPT_RUNS_DB path as an
+        would mask a misconfigured --runs-db path as an
         innocuous empty-window result instead of failing loud. Opening
         read-only (mode=ro) makes sqlite3 raise instead of auto-vivifying
         the file (round-2 review finding #2)."""

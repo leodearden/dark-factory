@@ -269,11 +269,11 @@ class TestNoGenericTaskIdFilter:
 class TestTheOrchestratorsCompletionMetadata:
     """The writer's half of the contract matches fused-memory's half."""
 
-    def test_it_validates_under_kind_enforcement(self) -> None:
-        """If the kind registry is ever enforced, completion writes must not start failing."""
+    def test_it_validates_with_no_violation(self) -> None:
+        """Completion writes carry a registered kind and raise no violation."""
         metadata = completion_record_metadata('4102')
 
-        assert memory_metadata.validate_memory_metadata(metadata, enforce_kind_registry=True) == []
+        assert memory_metadata.validate_memory_metadata(metadata) == []
         assert metadata['kind'] not in CHILD_KINDS
 
     def test_it_carries_the_source_fused_memory_owns(self) -> None:

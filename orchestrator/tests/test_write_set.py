@@ -21,6 +21,7 @@ Test coverage:
 from __future__ import annotations
 
 import dataclasses
+import os
 import subprocess
 from pathlib import Path
 
@@ -385,7 +386,7 @@ class TestGitdirParsingRobustness:
 def _make_write_set(**overrides: Path) -> WriteSet:
     """Construct a WriteSet from dummy Paths (hermetic — digest() depends
     ONLY on writable_paths(), which needs no filesystem)."""
-    fields: dict[str, Path] = dict(
+    base = WriteSet(
         worktree=Path('/wt'),
         task_meta=Path('/base/.task-meta/wt'),
         task_root=Path('/base/.task-meta/task-1'),
@@ -398,8 +399,7 @@ def _make_write_set(**overrides: Path) -> WriteSet:
         tmp=Path('/tmp'),
         dev=Path('/dev'),
     )
-    fields.update(overrides)
-    return WriteSet(**fields)
+    return dataclasses.replace(base, **overrides)
 
 
 class TestWriteSetDigest:
@@ -491,3 +491,200 @@ class TestEnsureClaudeFleetDir:
 
         assert ensure_claude_fleet_dir(ws) is False
         assert not claude_fleet.exists()
+
+
+# ---------------------------------------------------------------------------
+# task 4627: the conditional docs-only project_root grant
+# ---------------------------------------------------------------------------
+
+
+_DOCS_ONLY = ['docs/existing.md', 'CLAUDE.md', 'docs/prds/new.md']
+
+
+@pytest.fixture
+def docs_root(main_repo: Path) -> Path:
+    """`main_repo` seeded with the docs, source and `.taskmaster` layout the
+    grant resolver distinguishes; returns the resolved project root."""
+    (main_repo / 'docs' / 'prds').mkdir(parents=True)
+    (main_repo / 'docs' / 'existing.md').write_text('existing\n')
+    (main_repo / 'CLAUDE.md').write_text('claude\n')
+    (main_repo / 'src').mkdir()
+    (main_repo / 'src' / 'x.py').write_text('')
+    (main_repo / '.taskmaster').mkdir()
+    (main_repo / '.taskmaster' / 'tasks.db').write_text('')
+    return main_repo.resolve()
+
+
+class TestDocsMainGrant:
+    """A task whose declared files are all docs also gets the main checkout's
+    `.git` and the narrowest grant for each declared path; every other
+    invocation's write set and digest are unchanged."""
+
+    def _ws(self, worktree: Path, home: Path, declared: object = None) -> WriteSet:
+        return compute_write_set(worktree, task_id='2904', home=home, declared_files=declared)
+
+    def test_default_has_no_grant_and_is_unchanged(
+        self, docs_root: Path, worktree: Path, tmp_home: Path,
+    ):
+        default = compute_write_set(worktree, task_id='2904', home=tmp_home)
+        explicit_none = self._ws(worktree, tmp_home, None)
+        assert default.docs_main_git is None
+        assert default.docs_main_paths == ()
+        assert explicit_none == default
+        assert explicit_none.writable_paths() == default.writable_paths()
+        assert explicit_none.digest() == default.digest()
+
+    def test_non_docs_list_has_no_grant_and_is_unchanged(
+        self, docs_root: Path, worktree: Path, tmp_home: Path,
+    ):
+        default = compute_write_set(worktree, task_id='2904', home=tmp_home)
+        mixed = self._ws(worktree, tmp_home, ['docs/existing.md', 'src/x.py'])
+        assert mixed.docs_main_git is None
+        assert mixed.docs_main_paths == ()
+        assert mixed.writable_paths() == default.writable_paths()
+        assert mixed.digest() == default.digest()
+
+    def test_docs_only_list_grants_git_and_narrowest_paths(
+        self, docs_root: Path, worktree: Path, tmp_home: Path,
+    ):
+        default = compute_write_set(worktree, task_id='2904', home=tmp_home)
+        ws = self._ws(worktree, tmp_home, _DOCS_ONLY)
+        expected_paths = (
+            docs_root / 'docs' / 'existing.md',
+            docs_root / 'CLAUDE.md',
+            docs_root / 'docs' / 'prds',
+        )
+        assert ws.docs_main_git == docs_root / '.git'
+        assert ws.docs_main_paths == expected_paths
+        assert ws.writable_paths()[-4:] == [docs_root / '.git', *expected_paths]
+        assert ws.writable_paths()[:-4] == default.writable_paths()
+        assert ws.digest() != default.digest()
+
+    def test_declared_existing_directory_is_granted_itself(
+        self, docs_root: Path, worktree: Path, tmp_home: Path,
+    ):
+        ws = self._ws(worktree, tmp_home, ['docs'])
+        assert ws.docs_main_paths == (docs_root / 'docs',)
+
+    def test_new_file_nested_in_docs_grants_its_nearest_existing_docs_dir(
+        self, docs_root: Path, worktree: Path, tmp_home: Path,
+    ):
+        ws = self._ws(worktree, tmp_home, ['docs/a/b/c.md'])
+        assert ws.docs_main_paths == (docs_root / 'docs',)
+
+    @pytest.mark.parametrize(('declared', 'reason'), [
+        ('BRAND-NEW.md', 'not strictly inside'),
+        ('docs/out.md', 'not strictly inside'),
+        ('.taskmaster/notes.md', '.taskmaster, which is never granted'),
+        ('docs/link.md', '.taskmaster, which is never granted'),
+        ('.git/notes.md', '.git, which is never granted'),
+        ('src/pkg/NOTES.md', 'outside a top-level docs dir'),
+        ('docs/existing.md/x.md', 'nearest existing ancestor'),
+        ('docs/fifo.md', 'not a regular file or directory'),
+    ])
+    def test_refused_path_is_warned_with_its_reason_and_not_granted(
+        self, declared: str, reason: str, docs_root: Path, worktree: Path, tmp_home: Path,
+        tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        (docs_root / 'docs' / 'link.md').symlink_to(docs_root / '.taskmaster' / 'tasks.db')
+        outside = tmp_path / 'outside.md'
+        outside.write_text('outside\n')
+        (docs_root / 'docs' / 'out.md').symlink_to(outside)
+        (docs_root / '.git' / 'notes.md').write_text('notes\n')
+        (docs_root / 'src' / 'pkg').mkdir()
+        os.mkfifo(docs_root / 'docs' / 'fifo.md')
+
+        with caplog.at_level('WARNING', logger='orchestrator.agents.write_set'):
+            ws = self._ws(worktree, tmp_home, ['docs/existing.md', declared])
+
+        assert ws.docs_main_paths == (docs_root / 'docs' / 'existing.md',)
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == 'WARNING']
+        assert any(declared in m and reason in m for m in warnings), warnings
+
+    def test_nothing_in_or_over_the_configured_lane_base_is_granted(
+        self, docs_root: Path, tmp_home: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        lanes = docs_root / 'lanes'
+        lanes.mkdir()
+        lane = lanes / '2905'
+        _git(['worktree', 'add', '-b', 'task/2905', str(lane), 'main'], docs_root)
+        meta = TaskArtifacts.task_root_for(lanes, '77')
+        meta.mkdir(parents=True)
+        (meta / 'plan.md').write_text('plan\n')
+        declared = ['docs/existing.md', 'lanes/2905/README.md', 'lanes/.task-meta/task-77/plan.md']
+
+        with caplog.at_level('WARNING', logger='orchestrator.agents.write_set'):
+            ws = compute_write_set(lane, task_id='2905', home=tmp_home, declared_files=declared)
+
+        assert ws.docs_main_paths == (docs_root / 'docs' / 'existing.md',)
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == 'WARNING']
+        for rel in declared[1:]:
+            assert any(rel in m and 'which is never granted' in m for m in warnings), warnings
+
+    def test_lane_base_holding_the_project_root_beside_its_lanes_still_grants(
+        self, docs_root: Path, tmp_home: Path,
+    ):
+        lane = docs_root.parent / '2906'
+        _git(['worktree', 'add', '-b', 'task/2906', str(lane), 'main'], docs_root)
+
+        ws = compute_write_set(
+            lane, task_id='2906', home=tmp_home, declared_files=['docs/existing.md'],
+        )
+
+        assert ws.docs_main_paths == (docs_root / 'docs' / 'existing.md',)
+
+    def test_common_dir_not_named_git_makes_no_grant(
+        self, tmp_path: Path, tmp_home: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        common = tmp_path / 'common.git'
+        (common / 'worktrees' / 'lane').mkdir(parents=True)
+        lane = tmp_path / 'lanes' / 'lane'
+        lane.mkdir(parents=True)
+        (lane / '.git').write_text(f'gitdir: {common}/worktrees/lane\n')
+
+        with caplog.at_level('WARNING', logger='orchestrator.agents.write_set'):
+            ws = compute_write_set(lane, task_id='2904', home=tmp_home, declared_files=['CLAUDE.md'])
+
+        assert ws.docs_main_git is None
+        assert ws.docs_main_paths == ()
+        assert any(
+            'is not a <project_root>/.git' in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_every_path_refused_makes_no_grant_at_all(
+        self, docs_root: Path, worktree: Path, tmp_home: Path,
+    ):
+        ws = self._ws(worktree, tmp_home, ['BRAND-NEW.md', '.taskmaster/notes.md'])
+        assert ws.docs_main_git is None
+        assert ws.docs_main_paths == ()
+
+    def test_paths_without_git_violates_the_invariant(
+        self, docs_root: Path, worktree: Path, tmp_home: Path,
+    ):
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
+        with pytest.raises(ValueError, match='docs_main_paths') as excinfo:
+            dataclasses.replace(ws, docs_main_paths=(docs_root / 'CLAUDE.md',))
+        assert 'docs_main_git' in str(excinfo.value)
+
+    @pytest.mark.parametrize('rel', ['.taskmaster/tasks.db', '.git/config', '.'])
+    def test_ungrantable_path_violates_the_invariant(
+        self, rel: str, docs_root: Path, worktree: Path, tmp_home: Path,
+    ):
+        ws = self._ws(worktree, tmp_home, _DOCS_ONLY)
+        with pytest.raises(ValueError, match='ungrantable'):
+            dataclasses.replace(ws, docs_main_paths=((docs_root / rel).resolve(),))
+
+    def test_git_without_paths_violates_the_invariant(
+        self, docs_root: Path, worktree: Path, tmp_home: Path,
+    ):
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
+        with pytest.raises(ValueError, match='docs_main_git') as excinfo:
+            dataclasses.replace(ws, docs_main_git=docs_root / '.git')
+        assert 'docs_main_paths' in str(excinfo.value)
+
+    def test_docs_only_call_creates_nothing_on_disk(
+        self, docs_root: Path, worktree: Path, tmp_home: Path,
+    ):
+        self._ws(worktree, tmp_home, _DOCS_ONLY)
+        assert not (docs_root / 'docs' / 'prds' / 'new.md').exists()
+        assert not (tmp_home / '.cache' / 'uv').exists()

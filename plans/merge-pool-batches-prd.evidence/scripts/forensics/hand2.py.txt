@@ -1,0 +1,19 @@
+import sqlite3, json
+c=sqlite3.connect('file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro',uri=True,timeout=60)
+def row(i):
+    r=c.execute("select id,timestamp,task_id,event_type,data from events where id=?",(i,)).fetchone()
+    d=json.loads(r[4]); u=d.pop('units',None)
+    if u is not None: d['RED_UNITS']=[x['unit'] for x in u if x['outcome']!='ran_green']; d['n_units']=len(u)
+    for k in ('plan_hash','cache_mode','chain_build_ms','retry_scope','retry_subset_sizes','runner_reason','waiting','overlap_files','snapshot_tip','superseded_by','generation','absorbed_request_ids','attempt','chain_depth_reason'): d.pop(k,None)
+    if 'reason' in d and d['reason']: d['reason']=d['reason'][:90]
+    print('  ',r[0],r[1][:19],r[2],r[3],json.dumps(d)[:470])
+def win(task,lo,hi,types=('merge_verify','merge_finalized','merge_attempt','speculative_merge','speculative_discard','verdict_voided','merge_verify_cancelled')):
+    q="select id from events where task_id=? and timestamp>=? and timestamp<=? and event_type in (%s) order by id"%','.join('?'*len(types))
+    for (i,) in c.execute(q,(task,lo,hi)+tuple(types)): row(i)
+print('### H1. 612686 (owner 4643 k6) red at 05:29 on the still-unverified entry of owner 5145')
+win('4643','2026-11-17T04:40','2026-11-17T05:40'); win('5145','2026-11-17T04:30','2026-11-17T05:45')
+print('### H2. 637195 (owner 6960 k4) red at 08:52 on the unverified entry of owner 6951 (red 09:32); members afterwards')
+win('6960','2026-11-19T07:30','2026-11-20T01:00'); win('6951','2026-11-19T06:55','2026-11-19T09:40',('merge_verify','speculative_merge','merge_verify_cancelled','verdict_voided'))
+for t in ('9636','6979','6984'): win(t,'2026-11-19T09:00','2026-11-20T02:30',('merge_verify','merge_finalized'))
+print('### H3. 610436 (6161 solo) red on 6825; 6825 red; 6161 passes without it')
+win('6161','2026-11-16T07:00','2026-11-16T09:10'); win('6825','2026-11-16T07:00','2026-11-16T08:00')

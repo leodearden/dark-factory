@@ -504,6 +504,49 @@ test('tabs.jsx::MergeTab counts a measured window\'s attempts with attemptCount'
   }
 });
 
+// ── The headline totals over several projects (merge_queue.js::totalHint) ──
+// A present-but-unread project makes a total a '≥' over the readable ones,
+// and the tile's hint names it; a project with no runs.db file is outside the
+// runs.db totals, so it is named nowhere. Its own pips still read unknown.
+
+test('tabs.jsx::MergeTab serves a lower-bound total naming the unreadable project, and leaves a project with no runs.db out', t => {
+  const harness = openWindow(t);
+  const stoppedProbe = wireDatum(null, { as_of: null, state: 'unknown', reason: 'connect refused; no sample in the history window' });
+  seedDashboardData(harness.window, {
+    MERGE_QUEUE: {
+      [PROJECT]: mergeQueueBlock({ bucketMinutes: 60, outcomes: { done: 3 } }),
+      hive: { ...mergeQueueBlock({ bucketMinutes: 60, unread: true }), in_queue: stoppedProbe, active_spark: { labels: [], values: [] } },
+      ghost: mergeQueueBlock({ bucketMinutes: 60, noRunsDb: true }),
+    },
+    __receipt: receiptsFor(harness.window.DF_DATA_LOADER, ['MERGE_QUEUE']),
+  });
+  const { container } = harness.mount(harness.window.DF_TABS.MergeTab, { projectFilter: [] });
+  const DF = harness.window.DF_DATA;
+  const { attemptsOver, inQueueOver, projectAttempts, totalHint } = harness.window.DF_MERGE_QUEUE;
+  const { datumView, LOWER_BOUND_PREFIX, EM_DASH } = harness.window.DF_DATUM;
+  const hintOf = tile => tile.querySelector('.lbl > span')?.textContent ?? '';
+
+  const mergesTile = statTile(container, 'Merges (window)');
+  const merges = attemptsOver(DF, null);
+  assert.equal(mergesTile.querySelector('.val').textContent, datumView(merges).text);
+  assert.ok(datumView(merges).text.startsWith(LOWER_BOUND_PREFIX), datumView(merges).text);
+  const mergesHint = hintOf(mergesTile);
+  assert.ok(mergesHint.endsWith(totalHint(merges)), `"${mergesHint}" must end with totalHint()`);
+  assert.ok(mergesHint.includes('hive'), mergesHint);
+  assert.ok(!mergesHint.includes('ghost'), `a project with no runs.db is named: ${mergesHint}`);
+
+  const queueTile = statTile(container, 'In queue now');
+  const inQueue = inQueueOver(DF, null);
+  assert.equal(queueTile.querySelector('.val').textContent, datumView(inQueue).text);
+  assert.ok(datumView(inQueue).text.startsWith(LOWER_BOUND_PREFIX), datumView(inQueue).text);
+  assert.equal(hintOf(queueTile), ` · ${totalHint(inQueue)}`);
+
+  const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
+  const hivePip = `${datumView(projectAttempts(DF, 'hive')).text} attempts`;
+  assert.equal(hivePip, `${EM_DASH} attempts`);
+  assert.ok(pips.includes(hivePip), JSON.stringify(pips));
+});
+
 function withDepthValues(block, values) {
   return { ...block, depth: { ...block.depth, value: { ...block.depth.value, values } } };
 }

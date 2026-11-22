@@ -25,6 +25,7 @@ from fused_memory.server.main import (
     _build_recon_report_components,
     _install_tool_dispatch_guards,
 )
+from fused_memory.server.markup_residue_spool import MarkupResidueSpool
 from fused_memory.server.tools import create_mcp_server
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -47,9 +48,14 @@ def task_interceptor() -> AsyncMock:
 
 
 @pytest.fixture
-def server(task_interceptor: AsyncMock) -> Any:
+def server(task_interceptor: AsyncMock, tmp_path) -> Any:
     built = create_mcp_server(AsyncMock(), task_interceptor=task_interceptor)
-    _install_tool_dispatch_guards(built, known_projects={'dark_factory': _PROJECT_ROOT})
+    _install_tool_dispatch_guards(
+        built,
+        known_projects={'dark_factory': _PROJECT_ROOT},
+        prefix_resolver=None,
+        residue_spool=MarkupResidueSpool(tmp_path / 'spool'),
+    )
     return built
 
 
@@ -152,9 +158,14 @@ async def test_the_markup_override_on_a_tool_without_metadata_still_runs(
 
 
 @pytest.mark.asyncio
-async def test_an_unknown_tool_fails_open_to_the_dispatcher():
+async def test_an_unknown_tool_fails_open_to_the_dispatcher(tmp_path):
     built = FastMCP('unknown-tool')
-    _install_tool_dispatch_guards(built)
+    _install_tool_dispatch_guards(
+        built,
+        known_projects=None,
+        prefix_resolver=None,
+        residue_spool=MarkupResidueSpool(tmp_path / 'spool'),
+    )
 
     result = await built._tool_manager.call_tool('no_such_tool', {'anything': 1})
 
@@ -164,7 +175,7 @@ async def test_an_unknown_tool_fails_open_to_the_dispatcher():
 
 
 @pytest.mark.asyncio
-async def test_a_tool_with_no_usable_schema_fails_open():
+async def test_a_tool_with_no_usable_schema_fails_open(tmp_path):
     built = FastMCP('no-schema')
     calls: list[int] = []
 
@@ -176,7 +187,12 @@ async def test_a_tool_with_no_usable_schema_fails_open():
     tool = built._tool_manager.get_tool('echo')
     assert tool is not None
     tool.parameters = {'type': 'object'}
-    _install_tool_dispatch_guards(built)
+    _install_tool_dispatch_guards(
+        built,
+        known_projects=None,
+        prefix_resolver=None,
+        residue_spool=MarkupResidueSpool(tmp_path / 'spool'),
+    )
 
     result = await built._tool_manager.call_tool('echo', {'a': 1, 'extra': 2})
 

@@ -84,16 +84,15 @@ def _scripted_per_url(
 ) -> Callable[..., Awaitable[object]]:
     """Answer *tool_name* at *url* with ``outcome_for(url)`` (raised if an exception).
 
-    Each URL *tool_name* is dialed at is appended to *dialed*. Every other tool
-    gets ``{}``: the lifespan's background samplers dial the same patched seam,
-    so they are kept inert rather than sharing the route's outcome.
+    Each URL *tool_name* is dialed at is appended to *dialed*. Each write route
+    dials only its own tool (``dashboard/src/dashboard/app.py::_mcp_write_proxy``),
+    so a dial of any other tool fails the test.
     """
 
     async def _scripted_mcp_tool_call(
         client: object, url: str, called_tool: str, arguments: object, **kwargs: object
     ) -> object:
-        if called_tool != tool_name:
-            return {}
+        assert called_tool == tool_name, f'route dialed {called_tool!r}, expected only {tool_name!r}'
         dialed.append(url)
         outcome = outcome_for(url)
         if isinstance(outcome, BaseException):

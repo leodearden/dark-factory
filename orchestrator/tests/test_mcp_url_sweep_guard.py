@@ -12,7 +12,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from _mcp_url_scan import SweepFindings, sweep_parsed
+from _mcp_url_scan import (
+    ALLOW_MARKER_KEY,
+    SLASHED_TAIL,
+    SweepFindings,
+    may_hold_findings,
+    sweep_parsed,
+)
 from _tree_scan import (
     REPO_ROOT,
     TREE_PASS_XDIST_GROUP,
@@ -59,11 +65,48 @@ def _swept_files() -> tuple[Path, ...]:
 
 
 def _sweep(module: ParsedModule) -> SweepFindings:
+    if not may_hold_findings(module.source):
+        return SweepFindings()
     return sweep_parsed(module.tree, module.source)
 
 
 ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=_swept_files, extract=_sweep)
 TREE_ANALYSES = (ANALYSIS,)
+
+
+def _probe_findings(tmp_path: Path, source: str) -> SweepFindings:
+    path = tmp_path.resolve() / 'mcp_url_probe.py'
+    path.write_text(source, encoding='utf-8')
+    probe = TreeAnalysis('mcp_url_probe', files=lambda: [path], extract=_sweep)
+    return TreePass.run([probe]).facts(probe)[path]
+
+
+_SPLIT_LITERALS = {
+    f'split-after-{length}': f"'{SLASHED_TAIL[:length]}' \"{SLASHED_TAIL[length:]}\""
+    for length in range(1, len(SLASHED_TAIL))
+}
+
+
+@pytest.mark.parametrize('literal', [
+    "'/mcp\\x2f'",
+    *_SPLIT_LITERALS.values(),
+    "f'{base}/mc' 'p/'",
+], ids=['escaped', *_SPLIT_LITERALS, 'f-string-split'])
+def test_the_sweep_reports_a_slashed_literal_never_spelled_whole(tmp_path: Path, literal: str):
+    line = f'url = {literal}'
+
+    findings = _probe_findings(tmp_path, f'{line}\n')
+
+    assert SLASHED_TAIL not in literal
+    assert findings.offenders == ((1, line),)
+
+
+def test_the_sweep_reports_a_marker_in_a_file_with_no_slashed_literal(tmp_path: Path):
+    marker = f'# {ALLOW_MARKER_KEY} allow probe'
+
+    findings = _probe_findings(tmp_path, f'url = None  {marker}\n')
+
+    assert findings.stale_markers == ((1, marker),)
 
 
 def _sweep_findings(tree_pass: TreePass) -> dict[str, SweepFindings]:
@@ -72,7 +115,8 @@ def _sweep_findings(tree_pass: TreePass) -> dict[str, SweepFindings]:
     Shared by the guard and the allow-marker check below so both read the
     same pass — the markers and the sweep they exempt from must never be able
     to disagree about what the tree contains.  Refuses a vacuous sweep first.
-    An unparseable file fails the pass loudly, naming it.
+    An unparseable file fails the pass loudly, naming it, unless its text
+    alone proves it holds nothing to report (``_mcp_url_scan.py::may_hold_findings``).
     """
     swept = tree_pass.facts(ANALYSIS)
     assert len(swept) >= _MIN_SWEPT_FILES, (

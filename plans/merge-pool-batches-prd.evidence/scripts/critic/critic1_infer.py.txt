@@ -1,0 +1,90 @@
+"""Exact enumeration of the draft's 6.3 model, for hand-constructed cases.
+
+observation = (frozenset(keys), 'red'|'pass').  A pass clears its keys.
+"""
+from itertools import product
+
+
+def infer(obs, d, f, voided=()):
+    cleared = set()
+    for i, (keys, v) in enumerate(obs):
+        if v == 'pass':
+            cleared |= set(keys)
+    reds = [set(k) - cleared for i, (k, v) in enumerate(obs) if v == 'red' and i not in voided]
+    unexplained = sum(1 for r in reds if not r)
+    reds = [r for r in reds if r]
+    keys = sorted(set().union(*reds)) if reds else []
+    tot = 0.0
+    marg = {k: 0.0 for k in keys}
+    for bits in product([0, 1], repeat=len(keys)):
+        bad = {k for k, b in zip(keys, bits) if b}
+        p = 1.0
+        for k, b in zip(keys, bits):
+            p *= d if b else (1 - d)
+        for r in reds:
+            p *= 1.0 if (r & bad) else f
+        tot += p
+        for k in bad:
+            marg[k] += p
+    return {k: (marg[k] / tot if tot else float('nan')) for k in keys}, unexplained
+
+
+def show(title, obs, d=0.14, f=0.01, voided=()):
+    post, unx = infer(obs, d, f, voided)
+    print(f'{title}  [d={d} f={f}] unexplained={unx}')
+    for k, v in post.items():
+        flag = 'SUSPECT' if v > 1.2 * d else ''
+        conv = 'CONVICT' if v >= 0.9 else ''
+        print(f'   {k}: {v:.4f} {flag} {conv}')
+
+
+if __name__ == '__main__':
+    A = ['a1', 'a2', 'a3']
+    B = ['b1', 'b2', 'b3']
+    show('worked 1: batch of 3 red on main', [(A, 'red')])
+    show('worked 2: red built on unverified batch of 3', [(A + B, 'red')])
+    show('worked 3: base then passes', [(A + B, 'red'), (B, 'pass')])
+    show('worked 4: base goes red instead', [(A + B, 'red'), (B, 'red')])
+    show('worked 5: two of three pass alone', [(A, 'red'), (['a1'], 'pass'), (['a2'], 'pass')])
+    print()
+    # cold start
+    show('cold start: batch of 3 red on main', [(A, 'red')], d=0.5, f=0.5)
+    show('cold start: same batch red 3 times', [(A, 'red')] * 3, d=0.5, f=0.5)
+    show('cold-ish: d=1/7 (5 passes), f=1/7', [(A, 'red')], d=1 / 7, f=1 / 7)
+    show('d=0.14 f=0.5 (no sound-tree verdicts yet)', [(A, 'red')], d=0.14, f=0.5)
+    show('d=0.14 f=0.2', [(A, 'red')], d=0.14, f=0.2)
+    show('d=0.14 f=0.1', [(A, 'red')], d=0.14, f=0.1)
+    show('d=0.14 f=0.05', [(A, 'red')], d=0.14, f=0.05)
+    print()
+    # weak implication: solo suspect stacked on unverified work
+    show('single red stacked on unverified batch of 3', [(B + ['s'], 'red')])
+    show('single red stacked on unverified batch of 5', [(['b1', 'b2', 'b3', 'b4', 'b5', 's'], 'red')])
+    show('batch of 5 on unverified batch of 5', [([f'b{i}' for i in range(5)] + [f'a{i}' for i in range(5)], 'red')])
+    show('batch of 3 on 2 unverified entries of 5 each', [([f'b{i}' for i in range(10)] + A, 'red')])
+    print()
+    # D4: a member gone
+    show('D4: batch of 3 red, a3 gone (stays), a1 passes', [(A, 'red'), (['a1'], 'pass')])
+    # pair fails only together: a1,a2 each pass alone
+    show('pair only together: batch red, a1 pass alone, a2 pass alone', [(A, 'red'), (['a1'], 'pass'), (['a2'], 'pass')])
+    # two defective in a batch: a1 red alone (blocked) -> others
+    show('two defective: batch red; a1 red alone', [(A, 'red'), (['a1'], 'red')])
+    show('two defective: batch of 5 red; a1 red alone', [(['a1', 'a2', 'a3', 'a4', 'a5'], 'red'), (['a1'], 'red')])
+    # overlapping reds
+    show('overlap: {a1,a2,a3} red, {a3,b1,b2} red', [(A, 'red'), (['a3', 'b1', 'b2'], 'red')])
+    show('overlap then a3 passes', [(A, 'red'), (['a3', 'b1', 'b2'], 'red'), (['a3'], 'pass')])
+    # green tree containing key with solo red
+    show('solo red then green tree containing it', [(['a1'], 'red'), (['a1', 'x'], 'pass')])
+    # cleared on one main, later in a red tree
+    show('a1 passed alone earlier (gate re-verify), then red tree {a1,a2}', [(['a1'], 'pass'), (['a1', 'a2'], 'red')])
+    # threshold check by batch size
+    for n in (2, 3, 4, 5, 6, 8, 12):
+        post, _ = infer([([f'k{i}' for i in range(n)], 'red')], 0.14, 0.01)
+        print(f'batch {n} red on main: each {list(post.values())[0]:.3f}  suspect thr {1.2*0.14:.3f}')
+    for n in (2, 3, 4, 5, 6, 8, 12):
+        post, _ = infer([([f'k{i}' for i in range(n)], 'red')], 0.08, 0.01)
+        print(f'd=.08 batch {n} red on main: each {list(post.values())[0]:.3f}  suspect thr {1.2*0.08:.3f}')
+    # stacked: own n on unverified m
+    for n, m in ((1, 3), (1, 5), (3, 5), (5, 5), (3, 10), (5, 10), (1, 10), (4, 12), (1, 12)):
+        ks = [f'o{i}' for i in range(n)] + [f'u{i}' for i in range(m)]
+        post, _ = infer([(ks, 'red')], 0.14, 0.01)
+        print(f'own {n} on unverified {m}: each {post["o0"]:.3f} thr {1.2*0.14:.3f} -> {"suspect" if post["o0"] > 0.168 else "NOT suspect"}')

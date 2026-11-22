@@ -1043,6 +1043,10 @@ class TestComparativeBootstrapAndRefusals:
         low, high = comparative['harm_delta_bootstrap95']
         assert low <= comparative['harm_delta_vs_status_quo'] <= high
 
+    @pytest.mark.parametrize(('arm', 'expected'), [('A', [-7.0, 5.5]), ('B', [-8.0, 6.5])])
+    def test_the_bootstrap_interval_is_pinned(self, arm: str, expected: list[float]) -> None:
+        assert _comparative(arm)['harm_delta_bootstrap95'] == expected
+
     def test_the_bootstrap_settings_are_recorded(self) -> None:
         bootstrap = _comparative('A')['bootstrap']
         assert (bootstrap['resamples'], bootstrap['seed']) == (

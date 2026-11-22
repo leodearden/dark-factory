@@ -94,6 +94,13 @@ _ESC_506_1_CLAIM = (
 )
 
 
+# Verbatim from dark_factory esc-unverified-claim-6670-1: 6671 was folded INTO task 6670, pending when written.
+_ESC_6670_1_CLAIM = (
+    'The harness/workflow wiring, including on_host_readmitted → HostPool.note_readmitted, '
+    'is owned by pending task 6670 (6671 δ2 was merged into it 2026-11-01)'
+)
+
+
 def _extract(text: str, default_project_id: str = 'reify') -> list[CompletionClaim]:
     return extract_completion_claims(
         text,
@@ -635,6 +642,54 @@ class TestNonAssertiveScopes:
 
     def test_a_merge_into_main_is_still_a_claim(self):
         assert _triples('task 5422 was merged into main') == [('applied_work', 'task', '5422')]
+
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param(_ESC_6670_1_CLAIM, 'dark_factory', id='esc-unverified-claim-6670-1'),
+            pytest.param(
+                'branch task/5422 with main merged into it', 'reify',
+                id='main-merged-into-the-branch',
+            ),
+            pytest.param(
+                'task 5422 and task 5423 (5421 was merged into them)', 'reify',
+                id='merged-into-them',
+            ),
+        ],
+    )
+    def test_a_merge_into_a_pronoun_does_not_claim_its_antecedent(self, text, project):
+        assert _triples(text, project) == []
+
+    def test_a_merge_into_a_possessive_still_claims(self):
+        # Unlike 'it', 'its' can corefer with the marker's own subject.
+        assert _triples('task 5422 was merged into its target branch') == [
+            ('applied_work', 'task', '5422'),
+        ]
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('task 5422 was merged into it', id='task'),
+            pytest.param('commit abc1234 was merged into it', id='commit'),
+        ],
+    )
+    def test_a_merged_into_it_on_the_subject_ref_is_an_accepted_residual(self, text):
+        # Accepted residual (task 8600): 'it' cannot be the subject itself, so this is a real landing
+        # claim the gate gives up. Over 96,955 Mem0 records and 42,351 Episodic nodes (2026-11-22),
+        # each of the 13 'merged into it/them' hits names the destination.
+        assert _triples(text) == []
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('task 5422 merged into it as commit abc1234', id='as-complement'),
+            pytest.param('the fix was merged into it in commit abc1234', id='in-adjunct'),
+        ],
+    )
+    def test_a_commit_bound_forward_from_merged_into_it_is_an_accepted_residual(self, text):
+        # Blanking 'merged' also gives up the commit the merge produced, which the pronoun never
+        # names and a git probe would settle cheaply; the same corpus holds no such hit.
+        assert _triples(text) == []
 
     def test_a_possessive_merged_tree_is_an_accepted_residual(self):
         # Accepted residual (task 6824): over 93,986 Mem0 records (2026-11-16) about 39 of 42 possessive

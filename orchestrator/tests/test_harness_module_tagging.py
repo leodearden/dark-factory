@@ -10,6 +10,7 @@ import pytest
 from _orch_helpers import assert_update_wire_mode
 from _recording_event_store import _RecordingEventStore
 from shared.cli_invoke import AllAccountsCappedException
+from shared.config_models import UsageCapConfig
 
 import orchestrator.harness as harness_module
 from orchestrator.agents.invoke import AgentResult
@@ -21,9 +22,13 @@ from orchestrator.scheduler import Scheduler
 from orchestrator.task_status import ACTIVE_TASK_STATUSES
 
 
+def _config_without_usage_gate(tmp_path: Path, **overrides) -> OrchestratorConfig:
+    return OrchestratorConfig(project_root=tmp_path, usage_cap=UsageCapConfig(enabled=False), **overrides)
+
+
 @pytest.fixture
 def config(tmp_path: Path) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=tmp_path)
+    return _config_without_usage_gate(tmp_path)
 
 
 @pytest.fixture
@@ -376,7 +381,7 @@ async def test_tag_task_modules_does_not_cache_directory_wide_module(tmp_path):
     → ['crates/reify-eval'] (a subtree-wide prefix lock) is cached for task 1.
     Passes after step-6 adds strip_directory_locks at the cache-write site.
     """
-    config = OrchestratorConfig(project_root=tmp_path, lock_depth=2)
+    config = _config_without_usage_gate(tmp_path, lock_depth=2)
     h = Harness(config)
 
     tasks = [
@@ -451,7 +456,7 @@ async def test_tag_task_modules_strips_directories_in_writeback(tmp_path):
 
     A mixed file+directory list must persist only the file-level entries.
     """
-    config = OrchestratorConfig(project_root=tmp_path, lock_depth=2)
+    config = _config_without_usage_gate(tmp_path, lock_depth=2)
     h = Harness(config)
 
     tasks = [
@@ -513,7 +518,7 @@ async def test_tag_task_modules_routes_through_seed_modules(tmp_path):
     solely through seed_modules — so mocking seed_modules to a no-op must
     leave the cache untouched, proving there is no other writer left.
     """
-    config = OrchestratorConfig(project_root=tmp_path, lock_depth=2)
+    config = _config_without_usage_gate(tmp_path, lock_depth=2)
     h = Harness(config)
 
     tasks = [

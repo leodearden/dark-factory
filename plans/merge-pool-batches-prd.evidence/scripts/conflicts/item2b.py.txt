@@ -1,0 +1,25 @@
+import re,json,math
+DF={'2507122','2382379','234358','1188485','3122652','2245511','2531748','1538594','1218128'}
+rows=[]
+for l in open('/tmp/gate-10069/conflicts/bc_all.txt'):
+    m=re.search(r'uv\[(\d+)\].*depth=(\d+) built=(\d+).*truncated_at=(\S+) reason=(\S+)',l)
+    rows.append(dict(ts=l[:19],proj='df' if m.group(1) in DF else 'reify',depth=int(m.group(2)),built=int(m.group(3)),at=m.group(4),reason=m.group(5)))
+seen=set(); D=[]
+for r in rows:
+    if r['at']!='None':
+        if (r['proj'],r['at']) in seen: continue
+        seen.add((r['proj'],r['at']))
+    D.append(r)
+def wilson(k,n,z=1.96):
+    p=k/n; d=1+z*z/n; c=p+z*z/(2*n); h=z*math.sqrt(p*(1-p)/n+z*z/(4*n*n)); return ((c-h)/d,(c+h)/d)
+print('dedup builds',len(D),'truncations',sum(r['at']!='None' for r in D))
+tot_a=tot_f=0
+for k in range(1,6):
+    att=[r for r in D if r['depth']>=k and r['built']>=k-1]
+    fail=[r for r in att if r['built']==k-1 and r['at']!='None']
+    tot_a+=len(att); tot_f+=len(fail)
+    lo,hi=wilson(len(fail),len(att))
+    print(f' link {k} (n={k+1}): {len(fail)}/{len(att)} h={len(fail)/len(att):.3f} [{lo:.3f},{hi:.3f}]')
+lo,hi=wilson(tot_f,tot_a); print(' pooled',tot_f,tot_a,round(tot_f/tot_a,4),round(lo,4),round(hi,4))
+# logistic-ish trend: weighted slope of h vs k
+import statistics

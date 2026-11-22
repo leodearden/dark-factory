@@ -238,13 +238,17 @@ function unreadWireDatum(reason) {
 // A null `bucketMinutes` is a series that names no width; its labels are then
 // hourly. `outcomes` counts the window's untimed attempts by outcome. With
 // `unread`, the project's runs.db could not be read, so its depth and attempts
-// are unknown.
-export function mergeQueueBlock({ bucketMinutes = null, buckets = 3, outcomes = {}, unread = false } = {}) {
+// are unknown. With `noRunsDb`, the project has no runs.db file at all: it is
+// served runs_db_present false, its depth and attempts unknown saying so.
+export function mergeQueueBlock({ bucketMinutes = null, buckets = 3, outcomes = {}, unread = false, noRunsDb = false } = {}) {
   const labels = sampleLabels(buckets, bucketMinutes ?? 60);
   const outcomeLabels = Object.keys(outcomes);
   const outcomeValues = outcomeLabels.map(label => outcomes[label]);
   const attempts = outcomeValues.reduce((sum, n) => sum + n, 0);
-  const unreadReason = 'the merge_attempt events could not be read from runs.db';
+  const unreadReason = noRunsDb
+    ? 'no runs.db file exists for this project'
+    : 'the merge_attempt events could not be read from runs.db';
+  unread = unread || noRunsDb;
   return {
     depth: unread
       ? unreadWireDatum(unreadReason)
@@ -261,6 +265,7 @@ export function mergeQueueBlock({ bucketMinutes = null, buckets = 3, outcomes = 
     speculative: wireDatum({ hit_count: 0, discard_count: 0, total: 0, hit_rate: null }),
     in_queue: wireDatum(0),
     live_probe_configured: true,
+    runs_db_present: !noRunsDb,
     active_spark: { labels: [], values: [] },
     halt: { offline: true },
     train_events: [],

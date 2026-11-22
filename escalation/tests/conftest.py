@@ -33,6 +33,24 @@ import pytest
 if TYPE_CHECKING:
     import socket
 
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd escalation && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
+# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
+# at sys.path[0] it would make the subproject directories resolve as namespace
+# packages pointing at the project folder instead of src/<pkg>/, beating the
+# inserts below.  df_pytest_isolation is stdlib + pytest only, so it imports
+# cleanly ahead of the stubbing block in this venv, which deliberately excludes
+# aiosqlite.
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from df_pytest_isolation import (
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    reject_unsafe_basetemp,
+)
+
 _SRC = Path(__file__).parent.parent / 'src'
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -49,7 +67,7 @@ if str(_SRC) not in sys.path:
 # (`_SUBPROJECTS_WITH_CONFTEST`), which also fixes the spelling.
 #
 # Note this is `insert(0, ...)`, deliberately unlike the `REPO_ROOT` *append*
-# lower in this file: a tests dir contributes no package-shadowing directories,
+# higher in this file: a tests dir contributes no package-shadowing directories,
 # and `insert(0, ...)` is the spelling the enforcing test requires.
 _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
@@ -121,46 +139,21 @@ if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
         if _p not in sys.path:
             sys.path.insert(0, _p)
 
-# NOTE (task 3644, review finding #6): the `scripts/` + `scripts/legibility/`
-# path injection the census<->escalation E2E contract test needs is NOT done
-# here.  It lives in that one test module
-# (`test_legibility_census_escalation_e2e.py`), scoped to its only consumer and
-# APPENDING rather than inserting.  `scripts/legibility/` contributes very
-# generic flat top-level module names — `config.py`, `inventory.py`,
-# `sampling.py`, `digest.py`, `coder.py`, `codebook.py` — and putting those at
-# `sys.path[0]` for all ~1080 tests in this directory would shadow any
-# same-named module for every one of them, with a wrong-module import (not an
-# ImportError) as the failure mode.  The two-entry idiom in
-# `scripts/tests/conftest.py` is fine THERE because every test in that
+# NOTE (task 3644, review finding #6): the `scripts/` path injection the
+# census<->escalation E2E contract test needs is NOT done here.  It lives in
+# that one test module (`test_legibility_census_escalation_e2e.py`), scoped to
+# its only consumer and APPENDING rather than inserting.  `scripts/` contributes
+# ~130 flat top-level module names, and putting those at `sys.path[0]` for all
+# ~1080 tests in this directory would shadow any same-named module for every
+# one of them, with a wrong-module import (not an ImportError) as the failure
+# mode.  `scripts/tests/conftest.py` inserts it because every test in that
 # directory needs those modules; here exactly one does.
-
-# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
-# runs `cd escalation && uv run pytest tests/`, which makes rootdir the
-# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
-# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
-# at sys.path[0] it would make the subproject directories resolve as namespace
-# packages pointing at the project folder instead of src/<pkg>/, beating the
-# inserts above.  Placed after the stubbing block to keep that contiguous;
-# df_pytest_isolation is stdlib + pytest only, so it imports cleanly in this
-# venv, which deliberately excludes aiosqlite.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from df_pytest_isolation import (  # noqa: E402
-    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
-    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
-    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
-    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
-    _df_no_mock_derived_stray_dirs,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
-    arm_leaked_drain_process_guard,
-    reject_unsafe_basetemp,
-)
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the drain-leak guard."""
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the suite-wide defences."""
     reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
     arm_leaked_drain_process_guard(config)
 
 
@@ -364,7 +357,8 @@ def _serve_escalation_mcp_impl():
     Builds ``EscalationQueue(queue_dir)`` + ``create_server(queue,
     startup_sweep=False, dedupe_config=...)``, passing an optional
     ``store_identity=`` through (``None``, the default, keeps today's
-    identity-less server), and serves its ``http_app()``
+    identity-less server), as it does ``prefix_resolver=`` and
+    ``per_call_projects=``, and serves its ``http_app()``
     through ``uvicorn.Server`` -- production's shape -- on a localhost listener
     the fixture binds and holds from allocation onward
     (``_bind_escalation_listener``), inside a daemon thread running its own
@@ -423,13 +417,15 @@ def _serve_escalation_mcp_impl():
     def _start(
         queue_dir, *, dedupe_config=None, startup_sweep=False,
         store_identity: StoreIdentity | None = None,
+        prefix_resolver=None, per_call_projects=(),
     ):
         queue = EscalationQueue(queue_dir)
         if dedupe_config is None:
             dedupe_config = DedupeConfig(infra_dedupe_enabled=False)
         mcp = create_server(
             queue, startup_sweep=startup_sweep, dedupe_config=dedupe_config,
-            store_identity=store_identity,
+            store_identity=store_identity, prefix_resolver=prefix_resolver,
+            per_call_projects=per_call_projects,
         )
         listener = _bind_escalation_listener()
         port = listener.getsockname()[1]

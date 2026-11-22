@@ -28,8 +28,8 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.main_health_actions import MainHealthNextAction
 from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.main_health_probe import MAIN_HEALTH_RED_REASON_PREFIX
 from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
 )

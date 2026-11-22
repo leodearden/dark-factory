@@ -159,7 +159,7 @@ def newest_content_mtime(root: Path) -> float | None:
 
     Pure, heartbeat-immune liveness signal backing the merge-worktree
     no-progress budget in
-    :meth:`orchestrator.merge_lane.worker.SpeculativeMergeWorker._run_inflight_verify`.
+    :meth:`orchestrator.merge_lane.verify_dispatch.VerifyDispatcher.run_inflight_verify`.
     ``root`` itself is never stat'd, and any ``.git`` subtree is pruned from
     the walk entirely — so the #1728 alpha owner-heartbeat
     (``_touch_owned_merge_worktrees``), which calls ``os.utime`` on every
@@ -990,7 +990,7 @@ async def _acquire_warm_verify_worktree(
         deterministic reason string, hence an identical
         ``merge_outcome_signature`` on every attempt, which trips workflow.py's
         ``consecutive_merge_thrash`` ladder into a false-positive human
-        escalation.  ``merge_queue._run_inflight_verify`` implements that
+        escalation.  ``VerifyDispatcher.run_inflight_verify`` implements that
         defer in an ``except`` arm placed BEFORE its generic
         ``except Exception``.  This swap seam is the only place a reader can
         see that this call can raise at all, hence the note here.
@@ -1032,6 +1032,8 @@ async def acquire_chain_build_lane(
     git_ops: GitOps,
     config: OrchestratorConfig,
     base_commit: str,
+    *,
+    verify_is_local: bool = True,
 ) -> tuple[Path | None, bool]:
     """Acquire the ONE scratch worktree a deep merge-ahead chain builds in
     (task 3184, PRD β).
@@ -1042,17 +1044,24 @@ async def acquire_chain_build_lane(
     place and ``build_chain`` itself contains no worktree-provisioning
     branching.
 
-    Delegates to :meth:`~orchestrator.git_ops.GitOps.acquire_spec_lane` — the
-    single lane the whole chain build AND γ's tip verify run in.  γ (task
-    3185) has landed: ``SpeculativeMergeWorker._run_inflight_verify`` now
-    verifies ``ChainResult.tip`` inside THIS lane rather than acquiring a
+    For a local verify (*verify_is_local*) delegates to
+    :meth:`~orchestrator.git_ops.GitOps.acquire_spec_lane` — the single lane
+    the whole chain build AND γ's tip verify run in.  A remote verify never
+    reads the local lane's ``target/``, so it takes no ``_spec-`` lane and pays
+    no seed: it builds in
+    :meth:`~orchestrator.git_ops.GitOps.create_ephemeral_verify_worktree`
+    (``warm=False``), mirroring the ordinary remote path, which takes no local
+    lane at all (task 7721).
+
+    γ (task 3185) has landed: ``VerifyDispatcher.run_inflight_verify``
+    now verifies ``ChainResult.tip`` inside THIS lane rather than acquiring a
     verify worktree of its own, and releases it — once, in its ``finally``,
     on every exit — via :func:`release_chain_build_lane`.  That is why the
     serial-lane refusal below is load-bearing twice over: borrowing
     ``_merge-verify`` would make both the build and the subsequent verify
     contend with the serial head verify.
-    That method already handles knob-off (``spec_warm_lane_pool is None``) and
-    pool exhaustion by cold-falling-back to
+    ``acquire_spec_lane`` itself handles knob-off (``spec_warm_lane_pool is
+    None``) and pool exhaustion by cold-falling-back to
     :meth:`~orchestrator.git_ops.GitOps.create_ephemeral_verify_worktree` with
     ``warm=False``, so no knob branch is needed here.
 
@@ -1067,10 +1076,11 @@ async def acquire_chain_build_lane(
     contend with the serial head verify, and 3071's guard would then read the
     lane BUSY and defer the fleet.
 
-    **Never raises.**  Any exception degrades the round to "no chain this
-    round" (``(None, False)``, logged at WARNING with ``exc_info``) rather
-    than propagating into the dispatch loop — mirroring ``acquire_spec_lane``'s
-    own documented never-raise contract (inv.6).
+    **Never raises Exception.**  Any exception degrades the round to "no
+    chain this round" (``(None, False)``, logged at WARNING with
+    ``exc_info``) rather than propagating into the dispatch loop — mirroring
+    ``acquire_spec_lane``'s fail-open contract (inv.6).  A ``CancelledError``
+    propagates, and by then the acquirer has already given the lane back.
 
     Args:
         git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
@@ -1080,6 +1090,8 @@ async def acquire_chain_build_lane(
         base_commit: The SHA to check the lane out at — the frozen prefix tip
             (``SpeculativeMergeWorker.frozen_prefix_tip``), i.e. the chain's
             ``head_merge_commit``.
+        verify_is_local: Whether the chain tip will be verified on this host
+            (the dispatch's host-lease locality).
 
     Returns:
         ``(lane, warm)`` on success; ``(None, False)`` when no chain is
@@ -1088,7 +1100,10 @@ async def acquire_chain_build_lane(
     """
     del config  # accepted for seam symmetry; lane choice is git_ops-resident
     try:
-        lane, warm = await git_ops.acquire_spec_lane(base_commit)
+        if verify_is_local:
+            lane, warm = await git_ops.acquire_spec_lane(base_commit)
+        else:
+            lane, warm = await git_ops.create_ephemeral_verify_worktree(base_commit), False
     except Exception:
         logger.warning(
             'acquire_chain_build_lane: lane acquisition failed for %s — '

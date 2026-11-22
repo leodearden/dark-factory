@@ -2384,6 +2384,31 @@ class TestBeforeDoneCrossUnitDeploy:
 # the deploy script's exit code alone.
 # ---------------------------------------------------------------------------
 
+_TARGETLESS_RAN_AT = '2026-06-23T10:00:00+00:00'
+
+
+def _targetless_crash_before_done_write(queue: EscalationQueue) -> dict:
+    return _deploy_task(
+        task_id='2632', target_unit=None, before_done_ran_at=_TARGETLESS_RAN_AT,
+        before_done_verified_at='2026-06-23T10:01:00+00:00', before_done_verified_pid=0,
+    )
+
+
+def _targetless_human_resolution(queue: EscalationQueue) -> dict:
+    _seed_escalation(queue, '2632', 'orchestrator-deterministic', resolved=True)
+    return _deploy_task(
+        task_id='2632', target_unit=None, before_done_ran_at=_TARGETLESS_RAN_AT,
+        phase='escalated',
+    )
+
+
+def _targetless_gate_resolved(queue: EscalationQueue) -> dict:
+    task = _gate_task(task_id='2632', gate_escalated_at='2026-06-23T12:00:00+00:00')
+    task['metadata']['before_done'] = _deploy_task(target_unit=None)['metadata']['before_done']
+    task['metadata']['before_done_ran_at'] = _TARGETLESS_RAN_AT
+    return task
+
+
 @pytest.mark.asyncio
 class TestBeforeDoneTargetUnitlessDeploy:
     """DeterministicRunner — before_done cross-unit deploy with a falsy
@@ -2443,7 +2468,7 @@ class TestBeforeDoneTargetUnitlessDeploy:
         scheduler.set_task_status.assert_awaited_once()
         call = scheduler.set_task_status.call_args
         assert call.args[1] == 'done'
-        assert call.kwargs['done_provenance']['kind'] == 'deterministic-deploy'
+        assert call.kwargs['done_provenance']['kind'] == 'deterministic-deploy-unverified'
 
         verified_calls = [
             c for c in scheduler.update_task.call_args_list
@@ -2452,6 +2477,102 @@ class TestBeforeDoneTargetUnitlessDeploy:
         assert verified_calls, (
             'update_task must stamp before_done_verified_at (crash-safe verified stamp)'
         )
+
+    async def test_targetless_rc0_provenance_is_distinguishable_from_verified_empty_baseline(
+        self, tmp_path: Path,
+    ):
+        """Both record pid 0; only the kind says whether a unit was checked (task 5281)."""
+        from shared.task_metadata import DoneProvenance
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        queue = EscalationQueue(tmp_path)
+
+        async def _done_provenance(task: dict, unit_inspector: AsyncMock) -> dict:
+            scheduler = _mock_scheduler(task)
+            runner = DeterministicRunner(
+                scheduler=scheduler,
+                escalation_queue=queue,
+                unit_inspector=unit_inspector,
+                script_runner=AsyncMock(return_value=(0, 'ok')),
+            )
+            await runner.run(_make_assignment(task))
+            scheduler.set_task_status.assert_awaited_once()
+            return scheduler.set_task_status.call_args.kwargs['done_provenance']
+
+        targetless = await _done_provenance(
+            _deploy_task(task_id='2632', target_unit=None), AsyncMock(),
+        )
+        baseline_state = {
+            'MainPID': 0,
+            'ActiveState': 'inactive',
+            'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        }
+        fresh_state = {
+            'MainPID': 0,
+            'ActiveState': 'active',
+            'ActiveEnterTimestamp': 'Mon 2026-06-23 10:01:00 UTC',
+            'ActiveEnterTimestampMonotonic': 5_000_000,
+        }
+        verified = await _done_provenance(
+            _deploy_task(task_id='967', target_unit='legibility-trickle@dark-factory.timer'),
+            AsyncMock(side_effect=[baseline_state, fresh_state]),
+        )
+
+        assert targetless['kind'] == 'deterministic-deploy-unverified'
+        assert verified['kind'] == 'deterministic-deploy'
+        assert targetless != verified
+        assert 'unit' not in targetless
+        assert 'active_enter_timestamp' not in targetless
+        DoneProvenance.parse_for_write(targetless)
+
+    @pytest.mark.parametrize(
+        ('build_task', 'note'),
+        [
+            pytest.param(
+                _targetless_crash_before_done_write,
+                'resumed after deploy (crash before done write)',
+                id='crash-before-done-write',
+            ),
+            pytest.param(
+                _targetless_human_resolution,
+                'resumed after human resolution',
+                id='human-resolution',
+            ),
+            pytest.param(
+                _targetless_gate_resolved,
+                'resumed after gate resolution',
+                id='act-then-ask-gate-resolved',
+            ),
+        ],
+    )
+    async def test_targetless_resume_paths_record_unverified_kind(
+        self, tmp_path: Path, build_task, note,
+    ):
+        """A targetless deploy's kind must not depend on which path closed it (task 5281)."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        queue = EscalationQueue(tmp_path)
+        task = build_task(queue)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+
+        outcome = await runner.run(_make_assignment(task))
+
+        assert outcome == WorkflowOutcome.DONE
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert len(done_calls) == 1
+        provenance = done_calls[0].kwargs['done_provenance']
+        assert provenance['kind'] == 'deterministic-deploy-unverified'
+        assert provenance['note'] == note
+        assert 'pid' not in provenance
 
     async def test_targetless_deploy_rc_nonzero_escalates_and_blocks(self, tmp_path: Path):
         """rc != 0 with a falsy target_unit must escalate + block — NOT

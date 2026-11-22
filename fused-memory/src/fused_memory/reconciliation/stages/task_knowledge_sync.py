@@ -33,7 +33,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.models.scope import ProjectRoot, ProjectScope, resolve_main_checkout
+from fused_memory.models.scope import ProjectRoot, ProjectScope
 from fused_memory.reconciliation.blocked_gate_audit_section import (
     render_blocked_gate_audit_section,
 )
@@ -48,10 +48,9 @@ from fused_memory.reconciliation.cross_run_citation_scan import scan_cross_run_c
 from fused_memory.reconciliation.dangling_citation import build_dangling_citation_finding
 from fused_memory.reconciliation.flag_dedup import (
     acknowledge_resolved_flags,
-    filter_blocked_snapshot_findings,
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
-    filter_snapshot_stat_edge_findings,
+    filter_task_count_snapshot_findings,
 )
 from fused_memory.reconciliation.flag_identity import (
     compute_flag_signature,
@@ -69,7 +68,6 @@ from fused_memory.reconciliation.mem0_tombstone import (
     is_protected_mirror_record,
     record_mem0_deletion_tombstones,
 )
-from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
     _STAGE3_PROJECT_ID_GUIDELINE,
@@ -94,19 +92,9 @@ from fused_memory.reconciliation.summary_pool import (
     trailing_incomplete_agent_run_ids,
     write_cycle_summary,
 )
-from fused_memory.reconciliation.task_count_snapshot_cadence import (
-    SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY,
-    SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY,
-    SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY,
-    SNAPSHOT_PRUNED_STAT_KEY,
-    SNAPSHOT_WRITTEN_STAT_KEY,
-    TASK_COUNT_SNAPSHOT_CATEGORY,
-    TASK_COUNT_SNAPSHOT_KIND,
-    build_task_count_snapshot_content,
-    build_task_count_snapshot_unavailable_content,
-)
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
+    available_tree,
     detect_task_dump_contamination,
     filter_task_tree,
     format_task_list,
@@ -114,6 +102,7 @@ from fused_memory.reconciliation.task_filter import (
     render_active_section,
     render_retained_done_tasks,
     select_done_since_boundary,
+    tree_unavailable_notice,
 )
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.utils.async_utils import gather_collect
@@ -790,20 +779,6 @@ async def write_stage2_cycle_summary(
     )
 
 
-# Audit tag for _write_task_count_snapshot's deterministic write (task 2325)
-# — makes the Mem0 task_count_snapshot write structural (a plain Python
-# add_memory call at the end of run()) instead of depending on the Stage-2
-# LLM remembering the memory-stored Snapshot Discipline norm. Mirrors
-# write_cycle_summary's internal-service idiom (task 2229).
-_TASK_COUNT_SNAPSHOT_WRITE_SOURCE = 'stage2_task_count_snapshot_write'
-
-# Audit tag for _prune_task_count_snapshots's prune-before-write delete pass
-# (task 2429) — makes the recurring task_count_snapshot near-duplicate
-# accumulation self-correcting: every kind='task_count_snapshot' Mem0 record
-# is deleted immediately before _write_task_count_snapshot's add_memory call,
-# so at most one canonical snapshot survives per project per cycle.
-_TASK_COUNT_SNAPSHOT_PRUNE_SOURCE = 'stage2_task_count_snapshot_prune'
-
 # Age-based GC for the stage2_persistence_marker Channel-3 persistence-counter
 # family (task 2095), mirroring the stage1_flag_marker age-GC above (task 1944).
 # _track_flag_persistence writes one stage2_persistence_marker per surviving
@@ -995,15 +970,14 @@ ENTITY_STANDING_DECISION_GROWTH_EXPIRED_STAT_KEY = (
 )
 
 # Consecutive-failure streak (in full+completed cycles) at which the growth
-# sweep files a recon escalation (INV-4). Mirrors the task-count-snapshot
-# miss-streak threshold; recomputed from the journal each cycle (no stored
-# counter), so any successful sweep resets it.
+# sweep files a recon escalation (INV-4). Recomputed from the journal each
+# cycle (no stored counter), so any successful sweep resets it.
 GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD: int = 3
 
 # Escalation category for the growth-sweep failure streak (INV-4). Free-form str
 # on ``Escalation.category``; kept distinct from the Stage-1/Stage-2 recon
-# categories (reconciliation_stale_human_operator / reconciliation_stale_flag /
-# recon_stale_task_count_snapshot) so it can be filtered independently.
+# categories (reconciliation_stale_human_operator / reconciliation_stale_flag)
+# so it can be filtered independently.
 ENTITY_STANDING_DECISION_GROWTH_SWEEP_ESCALATION_CATEGORY = (
     'reconciliation_growth_sweep_failure'
 )
@@ -2538,11 +2512,11 @@ async def _sweep_entity_standing_decision_growth(
 
 
 # ── Growth-sweep failure-streak escalation (task 2899 ζ, INV-4) ──────────────
-# Pure helpers mirroring task_count_snapshot_cadence's streak-on-miss shape,
-# INVERTED to streak-on-failure: the counted flag is True=sweep-failed (a
-# Graphiti error left >=1 active row unverified this cycle), not False=miss. The
-# streak is recomputed from journalled prior-run stats each cycle (no persisted
-# counter), so any successful sweep resets it and it survives a restart.
+# Pure helpers for a streak-on-failure rule: the counted flag is
+# True=sweep-failed (a Graphiti error left >=1 active row unverified this
+# cycle). The streak is recomputed from journalled prior-run stats each cycle
+# (no persisted counter), so any successful sweep resets it and it survives a
+# restart.
 
 
 def _extract_growth_sweep_failed(stage_report: object) -> bool | None:
@@ -2625,9 +2599,8 @@ async def _maybe_escalate_growth_sweep_failures(
     """File a level-1 recon escalation on a sustained growth-sweep failure streak.
 
     Mirrors ``stage1_stall_detector.maybe_escalate_stalled_tasks`` (a Stage may
-    file a recon escalation directly via ``self._escalation_queue``) and the
-    harness's ``_maybe_escalate_stale_task_count_snapshot`` journal-recompute:
-    the consecutive-failure streak is recomputed each cycle from
+    file a recon escalation directly via ``self._escalation_queue``). The
+    consecutive-failure streak is recomputed each cycle from
     ``journal.get_recent_runs`` rather than a stored counter, so it resets on any
     successful sweep and survives a restart with no new schema.
 
@@ -2636,7 +2609,7 @@ async def _maybe_escalate_growth_sweep_failures(
       cycle returns ``False`` WITHOUT a journal read (cheap steady state).
     * Prior runs are filtered to full-cycle COMPLETED runs only, EXCLUDING the
       current *run_id* (a remediation/targeted or still-running run neither
-      counts toward nor resets the streak — matching the snapshot cadence).
+      counts toward nor resets the streak).
     * On reaching *threshold*, a single ``Escalation`` (level=1) is filed under
       a STABLE per-project synthetic key ``recon-esd-growth-sweep:<project_id>``
       and deduped via ``escalation_queue.has_open_l1`` so a persistent streak
@@ -2713,480 +2686,6 @@ async def _maybe_escalate_growth_sweep_failures(
             extra={'project_id': project_id, 'run_id': run_id, 'error': str(e)},
         )
         return False
-
-
-async def _verify_task_count_snapshot_written(
-    memory_service,
-    project_id: str,
-    run_window_start: datetime | None,
-    *,
-    scroll_limit: int = 1000,
-) -> bool | None:
-    """Best-effort freshness check: was a task_count_snapshot written this run window?
-
-    Enumerates existing ``kind='task_count_snapshot'`` Mem0 records via
-    ``get_memories_by_metadata`` (deterministic Qdrant scroll, NOT semantic
-    search) and checks whether any record's ``created_at`` falls within the
-    current run window via :func:`_marker_is_within_run_window`.
-
-    The existing snapshot write does not reliably carry ``metadata.run_id``,
-    so this checks the write's *timestamp* against the run window rather than
-    matching on run_id (which would read 0 forever).
-
-    Follows this module's never-raises, best-effort, WARNING-on-failure
-    contract, including the crucial distinction between a
-    CONFIRMED miss (``False``) and an inconclusive check (``None``).
-
-    Unlike that helper, this one passes an explicit ``limit`` (mirroring
-    :func:`_sweep_stale_persistence_markers`'s ``scroll_limit`` idiom —
-    task_count_snapshot has no GC or pool-cap, so its record count grows
-    unbounded over cycles) and treats a
-    saturated page as INCONCLUSIVE rather than a confirmed miss: Qdrant's
-    scroll orders by point id, not ``created_at``, so once matches exceed
-    *scroll_limit* the freshest record can fall outside the returned page —
-    misreading that as a confirmed miss would eventually fire a false
-    stale-snapshot escalation even though a fresh snapshot exists. A ``True``
-    result is unaffected by truncation: finding a match anywhere in a
-    (possibly partial) page is still real evidence of a fresh write.
-
-    Args:
-        memory_service: Service with ``get_memories_by_metadata``.
-        project_id: Project scope for the query.
-        run_window_start: Start of the current run window, or ``None`` when
-            unknown.
-        scroll_limit: Max records to enumerate in one scroll (default 1000,
-            matching the sibling GC helpers in this module).
-
-    Returns:
-        ``True`` when a record's ``created_at`` falls within the run window
-        (confirmed fresh). ``False`` when the query succeeded, the page was
-        NOT saturated (fewer than *scroll_limit* records), and no record
-        falls within the window (confirmed miss). ``None`` when
-        *run_window_start* is ``None`` (window unknown), the query itself
-        raised (transient failure), or no match was found in a saturated
-        (possibly-truncated) page — "unknown", never miscounted as a
-        confirmed miss.
-    """
-    if run_window_start is None:
-        return None
-    try:
-        members = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
-            filters={'kind': TASK_COUNT_SNAPSHOT_KIND},
-            limit=scroll_limit,
-        )
-    except Exception:
-        logger.warning(
-            'reconciliation._verify_task_count_snapshot_written: '
-            'get_memories_by_metadata failed for project_id=%s; absence NOT '
-            'confirmed (transient failure, not treated as a miss)',
-            project_id,
-            extra={'project_id': project_id},
-        )
-        return None
-    found = any(
-        _marker_is_within_run_window(member.get('created_at'), run_window_start)
-        for member in members
-    )
-    if found:
-        return True
-    if len(members) >= scroll_limit:
-        logger.warning(
-            'reconciliation._verify_task_count_snapshot_written: enumerated '
-            '%d of scroll_limit=%d task_count_snapshot records with none in '
-            'the current run window — Qdrant scroll is point-id ordered, NOT '
-            'created_at ordered, so a truncated page may exclude the '
-            'freshest record; treating as unknown rather than a confirmed '
-            'miss. Re-run with a higher scroll_limit.',
-            len(members), scroll_limit,
-            extra={'project_id': project_id},
-        )
-        return None
-    return False
-
-
-async def _prune_task_count_snapshots(
-    memory_service,
-    project_id: str,
-    run_id: str,
-    *,
-    scroll_limit: int = 1000,
-    stats: dict | None = None,
-) -> int:
-    """Delete every existing ``kind='task_count_snapshot'`` Mem0 record (task 2429).
-
-    Called by :func:`_write_task_count_snapshot` immediately before its
-    ``add_memory`` call, so the net effect of one cycle is exactly one
-    canonical snapshot surviving per project — self-correcting the
-    near-duplicate accumulation that manual/LLM-driven cleanups failed to
-    keep pruned.
-
-    Enumerates deterministically via ``memory_service.get_memories_by_metadata``
-    (Qdrant payload-filter scroll) — NEVER semantic search, which silently
-    drops low-similarity rows and is unsuitable for exhaustive GC. Unlike
-    :func:`_sweep_stale_persistence_markers`, this applies NO age cutoff:
-    every enumerated ``kind='task_count_snapshot'`` match is deleted —
-    including LLM-authored duplicates — so the caller's subsequent
-    ``add_memory`` leaves exactly one canonical snapshot.
-
-    Multi-cycle convergence on a large backlog (task 2429 review): when the
-    existing backlog exceeds *scroll_limit* records — precisely the
-    accumulation this change targets — only the first *scroll_limit*
-    matches are pruned in a given cycle (see the saturation WARNING
-    below); the remainder drains at up to *scroll_limit* per subsequent
-    cycle rather than being fully pruned in one run. This is an accepted
-    trade-off, not a bug: it is loudly logged (no silent truncation) and
-    strictly improves on the unbounded pre-2429 accumulation either way.
-
-    Best-effort and never raises: an enumeration failure or a per-item
-    delete failure degrades to a WARNING log and is excluded from the
-    returned count, rather than aborting the caller's write.
-
-    Args:
-        memory_service: Service with ``get_memories_by_metadata`` and
-            ``delete_memory``.
-        project_id: Project scope for enumeration and delete calls.
-        run_id: Current reconciliation run identifier used as ``causation_id``
-            in the audit journal.
-        scroll_limit: Max records to enumerate in one scroll (default 1000).
-        stats: Optional dict to populate with this cycle's runtime-observability
-            counts — see ``task_count_snapshot_cadence.SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY``
-            / ``SNAPSHOT_PRUNED_STAT_KEY`` / ``SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY``
-            / ``SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY`` (task 2646; the last one
-            added in the amendment round). Left untouched when ``None`` (the
-            default).
-
-    Returns:
-        Number of memories successfully deleted (0 if nothing matched, or
-        on enumeration failure).
-    """
-    enumeration_ok = True
-    try:
-        members = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
-            filters={'kind': TASK_COUNT_SNAPSHOT_KIND},
-            limit=scroll_limit,
-        )
-    except Exception:
-        logger.warning(
-            'reconciliation._prune_task_count_snapshots: '
-            'get_memories_by_metadata failed for project_id=%s; skipping prune',
-            project_id,
-            extra={'project_id': project_id, 'run_id': run_id},
-        )
-        enumeration_ok = False
-        members = []
-
-    # Silent-empty enumeration guard (task 2655, 5th recorded recurrence).
-    # Mem0Backend.scroll_by_metadata swallows TimeoutError and returns []
-    # (mem0_client.py:392-407), while its sibling count_by_metadata lets
-    # timeouts propagate (mem0_client.py:296-339) -- so an empty,
-    # NON-exceptional scroll page is ambiguous: it could be a genuine empty
-    # pool, or a swallowed Qdrant read timeout that would otherwise let the
-    # caller's canonical write proceed without ever pruning the prior
-    # snapshot(s), growing the byte-identical duplicate pile. Cross-check
-    # via count_memories_by_metadata, which propagates timeouts: a raised
-    # cross-check, or a confirmed count > 0, is the swallowed-timeout
-    # fingerprint. Only runs on an empty scroll -- a non-empty page skips
-    # the extra count call entirely. Best-effort: never raises.
-    #
-    # Benign false-positive note (reviewer finding, amendment round): the
-    # fingerprint assumes scroll and count agree for committed records. If a
-    # task_count_snapshot was authored earlier in this SAME cycle by the
-    # still-live Stage-2 LLM path (see the duplicate-write note in run()) and
-    # Qdrant's scroll vs. count views momentarily disagree under eventual
-    # consistency, this guard can flip enumeration_ok to 0 against an
-    # otherwise healthy pool. That is an accepted, self-correcting trigger --
-    # it costs one skipped write, recovered next cycle -- so not every
-    # enumeration_ok == 0 log below is a confirmed Qdrant timeout.
-    if enumeration_ok and not members:
-        try:
-            snapshot_count = await memory_service.count_memories_by_metadata(
-                project_id=project_id,
-                filters={'kind': TASK_COUNT_SNAPSHOT_KIND},
-            )
-            enumeration_confirmed_empty = snapshot_count <= 0
-        except Exception:
-            logger.warning(
-                'reconciliation._prune_task_count_snapshots: '
-                'count_memories_by_metadata cross-check failed for project_id=%s '
-                'after an empty scroll; treating enumeration as not-ok rather '
-                'than a confirmed empty pool (possible swallowed Qdrant read '
-                'timeout, task 2655)',
-                project_id,
-                extra={'project_id': project_id, 'run_id': run_id},
-            )
-            enumeration_ok = False
-        else:
-            if not enumeration_confirmed_empty:
-                logger.warning(
-                    'reconciliation._prune_task_count_snapshots: '
-                    'get_memories_by_metadata scroll returned 0 task_count_snapshot '
-                    'records for project_id=%s but count_memories_by_metadata '
-                    'reports %d existing -- swallowed Qdrant read timeout '
-                    'fingerprint (task 2655); treating enumeration as not-ok '
-                    'rather than a genuine empty pool',
-                    project_id, snapshot_count,
-                    extra={'project_id': project_id, 'run_id': run_id},
-                )
-                enumeration_ok = False
-
-    if len(members) >= scroll_limit:
-        logger.warning(
-            'reconciliation._prune_task_count_snapshots: enumerated %d of scroll_limit=%d '
-            'task_count_snapshot records — scroll cap reached; older stale snapshots may '
-            'remain unpruned this cycle; re-run with a higher scroll_limit.',
-            len(members), scroll_limit,
-            extra={'project_id': project_id, 'run_id': run_id},
-        )
-
-    ids = [member['id'] for member in members if member.get('id')]
-
-    success_count = 0
-    if ids:
-        # Two-tier check via gather_collect (fused_memory.utils.async_utils).
-        # Pass 1 (inside gather_collect): re-raises structured-cancellation
-        # signals — this preserves the structured-cancellation contract and
-        # prevents this delete pass from silently converting a shutdown
-        # signal into an under-counted deletion tally.
-        # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
-        results = await gather_collect(
-            memory_service.delete_memory(
-                memory_id=mid,
-                store='mem0',
-                project_id=project_id,
-                causation_id=run_id,
-                _source=_TASK_COUNT_SNAPSHOT_PRUNE_SOURCE,
-            )
-            for mid in ids
-        )
-
-        for mid, result in zip(ids, results, strict=True):
-            if isinstance(result, Exception):
-                logger.warning(
-                    'reconciliation._prune_task_count_snapshots: delete failed for memory_id=%s; not counted',
-                    mid,
-                    extra={'project_id': project_id, 'memory_id': mid, 'run_id': run_id},
-                )
-            else:
-                success_count += 1
-
-        if success_count:
-            logger.info(
-                'reconciliation._prune_task_count_snapshots: pruned %d stale task_count_snapshot '
-                'record(s) for project_id=%s prior to canonical write',
-                success_count, project_id,
-                extra={'project_id': project_id, 'run_id': run_id},
-            )
-
-    if stats is not None:
-        stats[SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY] = len(members)
-        stats[SNAPSHOT_PRUNED_STAT_KEY] = success_count
-        stats[SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY] = 1 if enumeration_ok else 0
-        stats[SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY] = 1 if len(members) >= scroll_limit else 0
-
-    return success_count
-
-
-async def _write_task_count_snapshot(
-    memory_service,
-    taskmaster,
-    project_root: str,
-    project_id: str,
-    run_id: str,
-    run_window_start: datetime | None,
-    *,
-    stats: dict | None = None,
-) -> bool | None:
-    """Deterministically write this cycle's task_count_snapshot Mem0 record.
-
-    Makes the Mem0 ``task_count_snapshot`` write structural (task 2325): a
-    plain Python ``add_memory`` call performed unconditionally at the end of
-    ``run()`` for non-blocked projects, rather than depending on the Stage-2
-    LLM remembering the memory-stored "Snapshot Discipline" norm.
-
-    Self-pruning (task 2429): immediately before ``add_memory``, calls
-    :func:`_prune_task_count_snapshots` to delete every existing
-    ``kind='task_count_snapshot'`` record for this project, so the net
-    effect of one cycle is at most ONE canonical snapshot surviving —
-    self-correcting the near-duplicate accumulation that manual/LLM-driven
-    cleanups repeatedly failed to keep pruned. The prune runs after the
-    ``taskmaster is None`` early-return and after ``content`` is derived, so
-    a skipped/failed fetch never deletes existing snapshots without a
-    replacement in hand; the prune helper is itself best-effort and never
-    raises, so a prune failure cannot abort this write.
-
-    Accepted zero-snapshot window (task 2429 review): if the prune
-    succeeds but the subsequent ``add_memory`` call itself then fails
-    (e.g. a transient mem0 outage), this cycle deletes the prior
-    snapshot(s) without landing a replacement, leaving zero
-    ``task_count_snapshot`` records until the next cycle's write
-    succeeds. This is an accepted, self-correcting trade-off rather than
-    an oversight: the alternative (write-then-prune-all-but-the-just-
-    written-id) avoids the window but must exclude the just-written id
-    under Qdrant scroll eventual-consistency, which is more complex and
-    race-prone for no material safety gain (see the task 2429 plan's
-    design decisions). The window is also no worse than today's
-    escalation path — a failed write already makes
-    ``_verify_task_count_snapshot_written`` return ``None``
-    (inconclusive) rather than a confirmed miss, so it cannot spuriously
-    grow the consecutive-miss streak that drives the stale-snapshot
-    escalation. Pinned by
-    ``test_add_memory_failure_after_successful_prune_returns_none``.
-
-    Enumeration-failure write-gate (task 2655; supersedes task 2646's note
-    that the write proceeds regardless of the prune's enumeration outcome):
-    if :func:`_prune_task_count_snapshots` reports
-    ``SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY == 0`` — including the silent-
-    empty-scroll case caught by its count cross-check — this function logs a
-    structured WARNING and returns ``None`` BEFORE calling ``add_memory``.
-    Writing a fresh snapshot when the prior one(s) could not be confirmed
-    enumerated/pruned is exactly what grows the byte-identical duplicate
-    pile (the recurring incident this task exists to fix); skipping is
-    self-correcting, since the next healthy cycle enumerates and prunes all
-    accumulated duplicates before writing one. Pinned by
-    ``TestWriteTaskCountSnapshotEnumerationGate``.
-
-    Counts are derived by self-fetching via ``taskmaster.get_tasks`` and
-    filtering with :func:`filter_task_tree` — mirroring
-    ``assemble_payload``'s own self-fetch fallback idiom — rather than
-    reusing any tree stashed by ``assemble_payload``, which can be
-    short-circuited or skipped and would then be stale.
-
-    Uses the internal ``memory_service.add_memory`` idiom directly, NOT the
-    MCP layer, so the ``ReconSnapshotWriteRejected`` temporal_facts guard
-    never applies here.
-
-    Best-effort: never raises. Returns ``True`` (wrote) or ``None``
-    (skipped — no taskmaster — or failed); NEVER ``False``, so a failed
-    best-effort write stays "inconclusive" for the caller rather than being
-    recorded as a confirmed miss (which would spuriously grow the
-    consecutive-miss streak that drives the stale-snapshot escalation).
-
-    Args:
-        memory_service: Service with ``add_memory``.
-        taskmaster: Service with ``get_tasks``, or ``None``.
-        project_root: Project root for the ``get_tasks`` call.
-        project_id: Project scope for the write.
-        run_id: Current reconciliation run identifier — both the write's
-            ``metadata.run_id`` and its ``causation_id``.
-        run_window_start: Start of the current run window, or ``None`` when
-            unknown — used only to derive the content's ``as_of`` date.
-        stats: Optional dict forwarded to ``_prune_task_count_snapshots`` to
-            populate with this cycle's prune runtime-observability counts
-            (task 2646). Populated only when the prune is actually reached —
-            left untouched if *taskmaster* is ``None`` or the fetch/filter
-            step fails before the prune call. Callers reading these keys
-            back out of ``report.stats`` MUST use ``.get(key, default)``
-            rather than direct indexing — see the "Conditional presence"
-            note on
-            ``task_count_snapshot_cadence.SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY``
-            (amendment round, task 2646 review). Also read back internally
-            (task 2655) immediately after the prune call to decide the
-            enumeration-failure write-gate below — a throwaway local dict is
-            used for this when the caller passes ``None``, so the gate reads
-            correctly even when the caller doesn't want the stats.
-
-    Returns:
-        ``True`` on a successful write; ``None`` when *taskmaster* is
-        ``None``, the prune could not confirm a clean enumeration (task
-        2655 write-gate), or any step of the fetch/filter/write fails.
-    """
-    if taskmaster is None:
-        return None
-    try:
-        tasks_data = await taskmaster.get_tasks(project_root=project_root)
-        tree = filter_task_tree(tasks_data)
-        as_of = (
-            run_window_start.date().isoformat()
-            if isinstance(run_window_start, datetime)
-            else None
-        )
-        # Task 2738: SqliteTaskBackend.get_tasks auto-creates an empty
-        # tasks.db and returns {'tasks': []} for ANY project_root (never
-        # raising), so a zero-count tree at a non-git project_root (e.g. a
-        # project whose repo was deleted) is a false census, not a
-        # genuinely empty project -- indistinguishable from one at the data
-        # layer. Gate ONLY on total_count == 0 so the common non-empty path
-        # stays byte-identical and never pays the git-subprocess cost.
-        # Note: resolve_main_checkout raises ValueError for two distinct
-        # causes -- project_root not inside any git working tree, OR the
-        # `git` executable being missing from the host entirely (it wraps
-        # FileNotFoundError) -- and does not distinguish between them. On a
-        # host with no git binary, EVERY zero-count project would take this
-        # branch, including a genuinely empty git-backed one that would
-        # otherwise get its legitimate numeric "0 total" record. This repo's
-        # hosts always have git installed, so it is not a live bug here, and
-        # "unavailable" is the fail-safe direction if it ever were (loud
-        # sentinel over a silently-wrong zero census) -- but be aware the two
-        # causes are conflated should resolve_main_checkout ever need to
-        # expose them separately.
-        snapshot_unavailable = False
-        if tree.total_count == 0:
-            try:
-                resolve_main_checkout(project_root)
-            except ValueError:
-                snapshot_unavailable = True
-        if snapshot_unavailable:
-            content = build_task_count_snapshot_unavailable_content(
-                project_id, project_root, as_of=as_of,
-            )
-        else:
-            content = build_task_count_snapshot_content(
-                project_id,
-                total=tree.total_count,
-                done=tree.done_count,
-                cancelled=tree.cancelled_count,
-                active=len(tree.active_tasks),
-                other=tree.other_count,
-                highest_task_id=tree.max_task_id,
-                as_of=as_of,
-            )
-        # prune_stats is ALWAYS a real dict (never None) so the write-gate
-        # below can read SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY back
-        # regardless of whether the caller wanted the observability stats
-        # (task 2655). When the caller passed a real `stats` dict (e.g.
-        # run()'s report.stats), prune_stats IS that same object, so the
-        # four prune stats still surface there unchanged.
-        prune_stats = stats if stats is not None else {}
-        await _prune_task_count_snapshots(
-            memory_service, project_id, run_id, stats=prune_stats,
-        )
-        if prune_stats.get(SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY) == 0:
-            logger.warning(
-                'reconciliation._write_task_count_snapshot: '
-                'prune enumeration failed for project_id=%s run_id=%s; '
-                'skipping this cycle\'s snapshot write to avoid growing the '
-                'duplicate pile (task 2655) -- the next healthy cycle will '
-                'prune and write normally',
-                project_id, run_id,
-                extra={'project_id': project_id, 'run_id': run_id},
-            )
-            return None
-        metadata = {
-            'kind': TASK_COUNT_SNAPSHOT_KIND,
-            'stage': 'task_knowledge_sync',
-            'run_id': run_id,
-        }
-        if snapshot_unavailable:
-            metadata['snapshot_status'] = 'unavailable'
-        await memory_service.add_memory(
-            content=content,
-            category=TASK_COUNT_SNAPSHOT_CATEGORY,
-            project_id=project_id,
-            metadata=metadata,
-            causation_id=run_id,
-            _source=_TASK_COUNT_SNAPSHOT_WRITE_SOURCE,
-        )
-    except Exception:
-        logger.warning(
-            'reconciliation._write_task_count_snapshot: '
-            'deterministic write failed for project_id=%s run_id=%s',
-            project_id, run_id,
-            extra={'project_id': project_id, 'run_id': run_id},
-        )
-        return None
-    return True
 
 
 async def _track_flag_persistence(
@@ -3449,14 +2948,6 @@ class TaskKnowledgeSync(BaseStage):
     # loudly in that case so test authors are reminded to set this attribute.
     _current_run_id: str | None = None
 
-    # Start of the current run's window (journal started_at) — stashed by
-    # assemble_payload() (task-2047 Gap 2) so run() can forward it, after
-    # super().run() returns, to _write_task_count_snapshot's freshness check.
-    # Mirrors the _current_run_id stash pattern. Reset to None at the top of
-    # run() so a prior run's value can never leak into a cycle whose
-    # assemble_payload call is skipped or short-circuited.
-    _run_window_start: datetime | None = None
-
     # Count of Stage 2 markers with absent/empty metadata.run_id that were routed
     # to the stale_missing_run_id bucket in the current assemble_payload() call
     # (task 1257).  Non-zero indicates Stage 1 producer drift from a PRIOR cycle —
@@ -3539,11 +3030,6 @@ class TaskKnowledgeSync(BaseStage):
         self._rescued_in_window_markers = 0
         self._markers_carried_forward = 0
         self._recon_report_systemic_polled = 0
-        # Reset BEFORE super().run() (task-2047 Gap 2) so a run whose
-        # assemble_payload call is skipped or short-circuited can never forward
-        # a PRIOR run's run_window_start into this cycle's sweep — falls back to
-        # the age-only sweep instead (backward compatible).
-        self._run_window_start = None
         # Amendment round 2 (reviewer finding: robustness): reset BEFORE
         # super().run() so a run whose assemble_payload call is skipped or
         # short-circuited can never leave a PRIOR run's combined_flags visible
@@ -3656,92 +3142,6 @@ class TaskKnowledgeSync(BaseStage):
         # mirror was in fact written — the "_ledger_" qualifier makes that
         # distinction explicit instead of implying "no summary at all".
         report.stats['stage2_cycle_summary_ledger_written'] = 1 if ledger_written else 0
-
-        # --- task_count_snapshot deterministic write + freshness stat (task 2325,
-        # follow-up to task 2278) ---
-        # Makes the Mem0 task_count_snapshot write structural rather than
-        # depending on the Stage-2 LLM remembering the memory-stored "Snapshot
-        # Discipline" norm: for a non-blocked project we WRITE the snapshot
-        # ourselves (deterministic Python, no LLM involved) and trust that
-        # write directly rather than re-querying Mem0 for it — Qdrant's scroll
-        # is point-id-ordered, so an immediate re-read can false-miss a write
-        # we just performed. Blocked projects (SNAPSHOT_WRITE_BLOCKED_PROJECTS
-        # — the per-project census is not in use there, so absence is
-        # correct-by-design) and any write failure fall back to the
-        # pre-existing best-effort freshness read below.
-        # run_window_start forwards whatever assemble_payload stashed on
-        # self._run_window_start this cycle.
-        # written is None when blocked+unverified, the run window is unknown,
-        # or the freshness query itself failed transiently, in which case the
-        # stat key is left absent entirely so the harness
-        # (_maybe_escalate_stale_task_count_snapshot) can distinguish a
-        # CONFIRMED miss (0) from "unknown" (never miscounted as a miss).
-        #
-        # Duplicate-write note (reviewer finding, amendment round): a
-        # memory-stored Stage-2 norm ("the corrected 2026-07-01 norm",
-        # dark_factory procedural_knowledge) separately tells the Stage-2 LLM
-        # to author this same kind='task_count_snapshot' observation as its
-        # own final action each cycle. This task does not retire that norm
-        # in-repo (it is runtime Mem0 content, not source under this task's
-        # locks), so for a non-blocked project the LLM path and this
-        # deterministic path can both fire in the same cycle. That is
-        # tolerated, not silently assumed away: (a) task_count_snapshot has
-        # no pool cap/GC (unlike e.g. stage1_flag_marker), so an extra record
-        # is inert rather than a leak; (b) neither this stat nor the
-        # harness's evaluate_snapshot_cadence()/build_stale_snapshot_finding()
-        # (task_count_snapshot_cadence.py) look at record *count* — only
-        # presence-within-window (verify path, skipped here on a successful
-        # write) or the directly-trusted True below — so a duplicate cannot
-        # change either outcome; (c) historically the LLM has fired only
-        # sporadically (a handful of snapshots recorded over several weeks of
-        # reify reconciliation cycles), so same-cycle collisions are expected
-        # to stay rare even though the norm itself has not been retired.
-        run_window_start = getattr(self, '_run_window_start', None)
-        task_count_snapshot_written: bool | None = None
-        if not is_snapshot_write_blocked(self.project_id):
-            task_count_snapshot_written = await _write_task_count_snapshot(
-                self.memory, self.taskmaster, self.project_root, self.project_id,
-                run_id, run_window_start, stats=report.stats,
-            )
-        # Task 2655 step-6: if the prune couldn't enumerate (enumeration_ok
-        # == 0 -- the swallowed-Qdrant-timeout fingerprint), _write_task_
-        # count_snapshot already skipped its write above (step-4) rather than
-        # risk another duplicate. Don't fall back to verify in that case
-        # either: _verify_task_count_snapshot_written's scroll swallows
-        # timeouts the same way and would mis-read the empty page as a
-        # CONFIRMED miss (False), spuriously growing the harness's
-        # consecutive-stale-snapshot streak. Leave the stat key absent
-        # (inconclusive) instead. When the key is absent entirely (taskmaster
-        # None, or write-blocked project -- the prune never ran) or
-        # enumeration_ok == 1, behavior is unchanged: verify still runs.
-        #
-        # Accepted trade-off (reviewer finding, amendment round): a
-        # SUSTAINED enumeration failure (e.g. a Qdrant read timeout that
-        # persists across cycles) is now invisible to the harness's
-        # consecutive-stale-snapshot escalation -- every affected cycle skips
-        # both the write and the verify fallback, so 'task_count_snapshot_
-        # written' stays absent (never a CONFIRMED miss) and the streak never
-        # advances. The only signal is the per-cycle WARNING logged in
-        # _prune_task_count_snapshots / _write_task_count_snapshot. Before
-        # this change a sustained timeout still produced a fresh (duplicated)
-        # snapshot each cycle, so freshness was maintained at the cost of the
-        # duplicate pile this task exists to stop. A bounded backstop --
-        # escalate once consecutive enumeration_ok == 0 cycles cross a
-        # threshold, mirroring the harness's existing consecutive-miss streak
-        # -- would close this blind spot; it needs a harness-side consumer of
-        # the prune stats and is left as a possible follow-up rather than
-        # folded into this task.
-        if (
-            task_count_snapshot_written is None
-            and report.stats.get(SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY) != 0
-        ):
-            task_count_snapshot_written = await _verify_task_count_snapshot_written(
-                self.memory, self.project_id, run_window_start,
-            )
-        if task_count_snapshot_written is not None:
-            report.stats[SNAPSHOT_WRITTEN_STAT_KEY] = (
-                1 if task_count_snapshot_written else 0
-            )
 
         # --- recon_ledger marker GC: single DELETE pass (task 2228 W5-κ) ---
         # Collapses what were two separate stage1_flag_marker sweeps —
@@ -3866,8 +3266,8 @@ class TaskKnowledgeSync(BaseStage):
 
         The consecutive-failure streak escalation is evaluated ONLY on a full,
         non-remediation cycle with a wired escalation queue: a remediation/targeted
-        pass must not inflate or reset the streak (mirroring the task-count-snapshot
-        cadence), and an unwired queue has nothing to file to. The filer itself is
+        pass must not inflate or reset the streak, and an unwired queue has
+        nothing to file to. The filer itself is
         journal-recompute + ``has_open_l1``-deduped and never raises.
         """
         result = await _sweep_entity_standing_decision_growth(
@@ -3956,15 +3356,12 @@ class TaskKnowledgeSync(BaseStage):
             if not mismatches:
                 return
             # Avoid a redundant get_tasks round-trip when the harness has
-            # already injected the full task tree into self.filtered_task_tree.
+            # already injected a FETCHED task tree into self.filtered_task_tree.
             existing_tasks: list[dict] | None = None
-            if self.filtered_task_tree is not None:
+            tree = available_tree(self.filtered_task_tree)
+            if tree is not None:
                 existing_tasks = list(
-                    itertools.chain(
-                        self.filtered_task_tree.active_tasks,
-                        self.filtered_task_tree.done_tasks,
-                        self.filtered_task_tree.cancelled_tasks,
-                    )
+                    itertools.chain(tree.active_tasks, tree.done_tasks, tree.cancelled_tasks)
                 )
             summary = await queue_briefing_refresh_tasks(
                 self.taskmaster,
@@ -4052,6 +3449,7 @@ class TaskKnowledgeSync(BaseStage):
         stage1_report = prior_reports[0] if prior_reports else None
 
         filtered, tree_read_at = await self._resolve_task_tree()
+        unavailable_notice = tree_unavailable_notice(filtered)
 
         # Defensive invariant check (task-782): see _check_filtered_tree_invariant.
         self._check_filtered_tree_invariant(filtered)
@@ -4077,17 +3475,23 @@ class TaskKnowledgeSync(BaseStage):
 
         proactive_sample_section = ''
         if not self.remediation_mode:
-            # Pool intentionally excludes unknown-status tasks (dropped by
-            # filter_task_tree) and caps done_tasks at MAX_DONE_TASKS_RETAINED.
-            sample = _select_proactive_sample(
-                itertools.chain(
-                    filtered.active_tasks, filtered.done_tasks, filtered.cancelled_tasks
-                ),
-                self.MIN_TASK_SAMPLE,
-            )
-            proactive_sample_section = (
-                f'\n### Proactive Task Sample ({len(sample)} tasks)\n{format_task_list(sample)}\n'
-            )
+            if unavailable_notice is not None:
+                proactive_sample_section = (
+                    f'\n### Proactive Task Sample\n{unavailable_notice}\n'
+                )
+            else:
+                # Pool intentionally excludes unknown-status tasks (dropped by
+                # filter_task_tree) and caps done_tasks at MAX_DONE_TASKS_RETAINED.
+                sample = _select_proactive_sample(
+                    itertools.chain(
+                        filtered.active_tasks, filtered.done_tasks, filtered.cancelled_tasks
+                    ),
+                    self.MIN_TASK_SAMPLE,
+                )
+                proactive_sample_section = (
+                    f'\n### Proactive Task Sample ({len(sample)} tasks)\n'
+                    f'{format_task_list(sample)}\n'
+                )
 
         # Done-Task Completion-Memory Audit — enumerate EVERY task that
         # transitioned to `done` inside the task-change window, which starts when
@@ -4101,36 +3505,41 @@ class TaskKnowledgeSync(BaseStage):
         # (remediation is a focused second pass, not general sync).
         done_audit_section = ''
         if not self.remediation_mode:
-            boundary = watermark.last_task_change_timestamp
-            audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
-            total_audit = len(audit_tasks)
-            boundary_label = (
-                boundary.isoformat()
-                if boundary is not None
-                else 'no prior full-run boundary (first cycle — all done tasks in scope)'
-            )
-            # select_done_since_boundary sorts most-recent-first (and parse-failures
-            # to the front), so a clip drops only the oldest tasks.
-            audit_body = render_capped_task_list(
-                audit_tasks,
-                cap=self.MAX_DONE_AUDIT_RENDERED,
-                cap_name='MAX_DONE_AUDIT_RENDERED',
-                omitted_noun='done task(s) since the boundary',
-                dropped_first='the oldest since-boundary tasks',
-                log_event='reconciliation.done_task_audit_render_capped',
-                log_extra={
-                    'project_id': self.project_id,
-                    'run_id': self._current_run_id,
-                    'total_since_boundary': total_audit,
-                    'boundary': boundary_label,
-                },
-            )
-            done_audit_section = (
-                f'\n### Done-Task Completion-Memory Audit '
-                f'({total_audit} since last cycle)\n'
-                f'Boundary (previous full run started): {boundary_label}\n'
-                f'{audit_body}'
-            )
+            if unavailable_notice is not None:
+                done_audit_section = (
+                    f'\n### Done-Task Completion-Memory Audit\n{unavailable_notice}\n'
+                )
+            else:
+                boundary = watermark.last_task_change_timestamp
+                audit_tasks = select_done_since_boundary(filtered.all_done_tasks, boundary)
+                total_audit = len(audit_tasks)
+                boundary_label = (
+                    boundary.isoformat()
+                    if boundary is not None
+                    else 'no prior full-run boundary (first cycle — all done tasks in scope)'
+                )
+                # select_done_since_boundary sorts most-recent-first (and parse-failures
+                # to the front), so a clip drops only the oldest tasks.
+                audit_body = render_capped_task_list(
+                    audit_tasks,
+                    cap=self.MAX_DONE_AUDIT_RENDERED,
+                    cap_name='MAX_DONE_AUDIT_RENDERED',
+                    omitted_noun='done task(s) since the boundary',
+                    dropped_first='the oldest since-boundary tasks',
+                    log_event='reconciliation.done_task_audit_render_capped',
+                    log_extra={
+                        'project_id': self.project_id,
+                        'run_id': self._current_run_id,
+                        'total_since_boundary': total_audit,
+                        'boundary': boundary_label,
+                    },
+                )
+                done_audit_section = (
+                    f'\n### Done-Task Completion-Memory Audit '
+                    f'({total_audit} since last cycle)\n'
+                    f'Boundary (previous full run started): {boundary_label}\n'
+                    f'{audit_body}'
+                )
 
         # Every blocked gate, not the MIN_TASK_SAMPLE survivors: in-progress tasks
         # sort ahead of blocked ones and evict them from the sample. Remediation-gated
@@ -4217,14 +3626,6 @@ class TaskKnowledgeSync(BaseStage):
                 'run-window sweep guard disabled this cycle',
                 extra={'project_id': self.project_id, 'run_id': self._current_run_id},
             )
-        # Stash on the instance (task-2047 Gap 2) so run() can forward this cycle's
-        # run_window_start into the task_count_snapshot write/verify helpers
-        # (_write_task_count_snapshot / _verify_task_count_snapshot_written) after
-        # super().run() returns — mirrors the _current_run_id stash pattern. Stays
-        # None (set at the top of run()) when the journal lookup above failed or
-        # returned a non-datetime started_at, which disables the run-window guard
-        # and falls those helpers back to their window-agnostic behaviour.
-        self._run_window_start = run_window_start
         carry_forward_run_ids = await trailing_incomplete_agent_run_ids(
             getattr(self.memory, 'recon_ledger', None),
             self.project_id,
@@ -4651,10 +4052,10 @@ class IntegrityCheck(BaseStage):
         """Execute Stage 3 and post-process with task-dump spot-check.
 
         Calls super().run() first (LLM agent + report extraction), then:
-        1. Applies filter_blocked_snapshot_findings() to suppress false-positive
-           task-count snapshot findings for projects with blocked-by-design write
-           paths (e.g. autopilot_video).  Records
-           report.stats['blocked_snapshot_findings_dropped'] = before - after.
+        1. Applies filter_task_count_snapshot_findings() to drop false-positive
+           findings that a task-count snapshot is missing or stale (no project
+           keeps one).  Records
+           report.stats['task_count_snapshot_findings_dropped'] = before - after.
         2. Applies filter_false_phantom_task_creation_flags() to drop
            phantom-tasks_created findings corroborated by a task that was
            legitimately created in a different known project via cross-project
@@ -4666,14 +4067,10 @@ class IntegrityCheck(BaseStage):
            missing or stale, for projects whose ceiling is retired-by-design
            (e.g. autopilot_video; task 2818/2826).  Records
            report.stats['contamination_ceiling_findings_dropped'] = before - after.
-        4. Applies filter_snapshot_stat_edge_findings() to drop findings that
-           read a Mem0-only task-count snapshot stat as evidence of a missing
-           Graphiti temporal_facts edge, for every project (task 3487).  Records
-           report.stats['snapshot_stat_edge_findings_dropped'] = before - after.
-        5. Calls scan_cross_run_citations() and appends one finding per
+        4. Calls scan_cross_run_citations() and appends one finding per
            confirmed-absent mem0 citation on a settled run's finding, recording
            the scan's stage3_cross_run_* stats (task 5749).
-        6. Calls record_task_dump_spot_check() to record a non-destructive
+        5. Calls record_task_dump_spot_check() to record a non-destructive
            observability stat when the cached task tree contains contamination
            signals.
 
@@ -4683,19 +4080,17 @@ class IntegrityCheck(BaseStage):
             events, watermark, prior_reports, run_id, model=model,
         )
 
-        # Layer 3 (finding-side) gate for blocked-snapshot false positives.
+        # Layer 3 (finding-side) gate for task-count snapshot false positives.
         # Mirrors the filter_stale_count_snapshot_corrections idiom in
-        # MemoryConsolidator.run() (stages/memory_consolidator.py:115-150).
+        # stages/memory_consolidator.py::MemoryConsolidator.run.
         if report.items_flagged:
             _before = len(report.items_flagged)
-            report.items_flagged = filter_blocked_snapshot_findings(
-                report.items_flagged, project_id=self.project_id
-            )
-            report.stats['blocked_snapshot_findings_dropped'] = (
+            report.items_flagged = filter_task_count_snapshot_findings(report.items_flagged)
+            report.stats['task_count_snapshot_findings_dropped'] = (
                 _before - len(report.items_flagged)
             )
         else:
-            report.stats['blocked_snapshot_findings_dropped'] = 0
+            report.stats['task_count_snapshot_findings_dropped'] = 0
 
         # Layer 3 (finding-side) gate for false phantom-tasks_created findings
         # (task-2525): drop a finding only when a cited task is positively
@@ -4730,15 +4125,6 @@ class IntegrityCheck(BaseStage):
         else:
             report.stats['contamination_ceiling_findings_dropped'] = 0
 
-        # Layer 3 (finding-side) gate for snapshot-stat/missing-edge false
-        # positives (task 3487): project-agnostic, since no project ever
-        # persists a task-count snapshot as a Graphiti edge.
-        _before = len(report.items_flagged)
-        report.items_flagged = filter_snapshot_stat_edge_findings(report.items_flagged)
-        report.stats['snapshot_stat_edge_findings_dropped'] = (
-            _before - len(report.items_flagged)
-        )
-
         scan = await scan_cross_run_citations(
             self.journal, self.memory, project_id=self.project_id
         )
@@ -4751,7 +4137,7 @@ class IntegrityCheck(BaseStage):
     def record_task_dump_spot_check(self, report: StageReport) -> None:
         """Spot-check the harness-injected filtered_task_tree for contamination signals.
 
-        If self.filtered_task_tree is set, builds a synthetic raw-dump dict from the
+        If self.filtered_task_tree is set and was really fetched, builds a synthetic raw-dump dict from the
         tree's task lists, runs detect_task_dump_contamination against it, and — when
         contamination is detected — records report.stats['task_dump_spot_check'] and
         emits a WARNING for operator triage.
@@ -4760,10 +4146,10 @@ class IntegrityCheck(BaseStage):
         Only records the stat key when contaminated=True (clean cycles leave stats
         untouched, matching the Stage 1 census-inconsistency pattern).
         """
-        if self.filtered_task_tree is None:
+        tree = available_tree(self.filtered_task_tree)
+        if tree is None:
             return
 
-        tree = self.filtered_task_tree
         # Build a synthetic dump from the tree's task lists, stamping self.project_id so
         # the dump mirrors what get_tasks now returns (task-1661 envelope stamp).
         #

@@ -1,0 +1,10 @@
+import sqlite3, json, collections
+db=sqlite3.connect('file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro', uri=True)
+c=collections.Counter(); cc=collections.Counter()
+for (data,) in db.execute("select data from events where event_type='merge_verify' and timestamp>='2026-11-10'"):
+    d=json.loads(data)
+    if d.get('attempt') not in (None,0): continue
+    k=(d.get('base_relation'), 'batch' if (d.get('chain_items') or 1)>1 else 'single')
+    c[k]+=1; cc[d.get('runner_reason')]+=1
+for k,v in sorted(c.items(), key=lambda x:-x[1]): print(v,k)
+print(cc.most_common(8))

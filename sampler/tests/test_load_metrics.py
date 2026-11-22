@@ -321,8 +321,7 @@ class TestCollectPsi:
 
 
 # ---------------------------------------------------------------------------
-# The process collector: classify once from proc.info, read memory only for
-# verify trees
+# The process collector: classify once from proc.info, never read memory
 # ---------------------------------------------------------------------------
 
 
@@ -370,10 +369,12 @@ class FakeProc:
         return result
 
 
-def _never_read_memory(pid: int) -> FakeProc:
-    """A non-verify process: reading its memory is the bug under test."""
+def _never_read_memory(pid: int, cmdline: list[str] | None = None) -> FakeProc:
+    """A process whose memory the collector must never read."""
     return FakeProc(
-        pid, ['python', 'app.py'], memory_error=AssertionError('memory read off a verify tree')
+        pid,
+        ['python', 'app.py'] if cmdline is None else cmdline,
+        memory_error=AssertionError('the process collector read memory'),
     )
 
 
@@ -389,35 +390,24 @@ class TestClassifyProcess:
     def test_an_occt_gated_command_line_is_occt(self, cmdline):
         from sampler.metrics import ProcessRecord, classify_process
 
-        assert classify_process({'pid': 7, 'cmdline': cmdline}) == ProcessRecord(7, True, False)
+        assert classify_process({'pid': 7, 'cmdline': cmdline}) == ProcessRecord(7, True)
 
-    @pytest.mark.parametrize('argv0', ['verify.sh', '/usr/local/bin/verify.sh'])
-    def test_an_argv0_basename_of_verify_sh_is_verify(self, argv0):
-        from sampler.metrics import ProcessRecord, classify_process
-
-        record = classify_process({'pid': 8, 'cmdline': [argv0, 'arg1']})
-
-        assert record == ProcessRecord(8, False, True)
-
-    def test_verify_sh_as_an_argument_is_not_verify(self):
-        from sampler.metrics import classify_process
-
-        assert not classify_process({'pid': 9, 'cmdline': ['bash', 'verify.sh']}).is_verify
-
-    @pytest.mark.parametrize('cmdline', [None, [], ['python', 'script.py']])
-    def test_an_unreadable_empty_or_unrelated_command_line_is_neither(self, cmdline):
+    @pytest.mark.parametrize(
+        'cmdline', [None, [], ['python', 'script.py'], ['verify.sh'], ['bash', 'verify.sh']]
+    )
+    def test_an_unreadable_empty_or_unrelated_command_line_is_not_occt(self, cmdline):
         """``None`` is what psutil puts in ``info`` for an AccessDenied attribute."""
         from sampler.metrics import ProcessRecord, classify_process
 
-        assert classify_process({'pid': 10, 'cmdline': cmdline}) == ProcessRecord(10, False, False)
+        assert classify_process({'pid': 10, 'cmdline': cmdline}) == ProcessRecord(10, False)
 
     def test_a_record_is_frozen(self):
         import dataclasses
 
         from sampler.metrics import classify_process
 
-        record = classify_process({'pid': 11, 'cmdline': ['verify.sh']})
-        field = 'is_verify'
+        record = classify_process({'pid': 11, 'cmdline': ['bash', 'cargo-test-occt-gated']})
+        field = 'is_occt'
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(record, field, False)
 
@@ -429,10 +419,10 @@ class TestCountOcctQueueDepth:
         from sampler.metrics import ProcessRecord, count_occt_queue_depth
 
         records = [
-            ProcessRecord(1, True, False),
-            ProcessRecord(2, True, False),
-            ProcessRecord(3, True, False),
-            ProcessRecord(4, False, False),
+            ProcessRecord(1, True),
+            ProcessRecord(2, True),
+            ProcessRecord(3, True),
+            ProcessRecord(4, False),
         ]
 
         assert count_occt_queue_depth(records, lambda pid: pid == 2) == 2
@@ -440,102 +430,23 @@ class TestCountOcctQueueDepth:
     def test_non_occt_records_are_ignored(self):
         from sampler.metrics import ProcessRecord, count_occt_queue_depth
 
-        records = [ProcessRecord(10, False, False), ProcessRecord(11, False, True)]
+        records = [ProcessRecord(10, False), ProcessRecord(11, False)]
 
         assert count_occt_queue_depth(records, lambda _pid: False) == 0
 
     def test_all_waiting(self):
         from sampler.metrics import ProcessRecord, count_occt_queue_depth
 
-        records = [ProcessRecord(i, True, False) for i in range(5)]
+        records = [ProcessRecord(i, True) for i in range(5)]
 
         assert count_occt_queue_depth(records, lambda _pid: False) == 5
 
     def test_all_holding_fd9_so_none_counted(self):
         from sampler.metrics import ProcessRecord, count_occt_queue_depth
 
-        records = [ProcessRecord(i, True, False) for i in range(3)]
+        records = [ProcessRecord(i, True) for i in range(3)]
 
         assert count_occt_queue_depth(records, lambda _pid: True) == 0
-
-
-class TestCountVerifyConcurrency:
-    def test_counts_verify_records(self):
-        from sampler.metrics import ProcessRecord, count_verify_concurrency
-
-        records = [
-            ProcessRecord(1, False, True),
-            ProcessRecord(2, False, True),
-            ProcessRecord(3, True, False),
-            ProcessRecord(4, False, False),
-        ]
-
-        assert count_verify_concurrency(records) == 2
-
-    def test_no_verify_records(self):
-        from sampler.metrics import ProcessRecord, count_verify_concurrency
-
-        assert count_verify_concurrency([ProcessRecord(1, False, False)]) == 0
-
-
-class TestSumVerifyRss:
-    """Takes only the verify roots, and is the only reader of their trees' memory."""
-
-    def test_sums_each_root_and_its_children(self):
-        from sampler.metrics import sum_verify_rss
-
-        parent = FakeProc(
-            100, ['verify.sh'], rss=1024,
-            children=[FakeProc(101, rss=512), FakeProc(102, rss=256)],
-        )
-
-        assert sum_verify_rss([parent]) == 1024 + 512 + 256
-
-    def test_a_pid_shared_between_trees_is_counted_once(self):
-        from sampler.metrics import sum_verify_rss
-
-        shared_child = FakeProc(999, rss=100)
-        parent1 = FakeProc(1, ['verify.sh'], rss=200, children=[shared_child])
-        parent2 = FakeProc(2, ['verify.sh'], rss=300, children=[shared_child])
-
-        assert sum_verify_rss([parent1, parent2]) == 200 + 300 + 100
-
-    def test_no_roots_sum_to_zero(self):
-        from sampler.metrics import sum_verify_rss
-
-        assert sum_verify_rss([]) == 0
-
-    def test_a_root_without_children(self):
-        from sampler.metrics import sum_verify_rss
-
-        assert sum_verify_rss([FakeProc(1, ['verify.sh'], rss=4096)]) == 4096
-
-    def test_a_child_that_vanished_is_skipped_and_the_rest_summed(self):
-        import psutil
-
-        from sampler.metrics import sum_verify_rss
-
-        gone = FakeProc(101, memory_error=psutil.NoSuchProcess(101))
-        parent = FakeProc(100, ['verify.sh'], rss=1024, children=[gone, FakeProc(102, rss=256)])
-
-        assert sum_verify_rss([parent]) == 1024 + 256
-
-    def test_a_root_whose_children_are_denied_counts_alone(self):
-        import psutil
-
-        from sampler.metrics import sum_verify_rss
-
-        root = FakeProc(100, ['verify.sh'], rss=1024, children_error=psutil.AccessDenied(100))
-
-        assert sum_verify_rss([root]) == 1024
-
-    def test_a_programming_error_propagates(self):
-        from sampler.metrics import sum_verify_rss
-
-        root = FakeProc(100, ['verify.sh'], memory_error=RuntimeError('not a psutil error'))
-
-        with pytest.raises(RuntimeError, match='not a psutil error'):
-            sum_verify_rss([root])
 
 
 class TestCollectProcessMetrics:
@@ -558,8 +469,8 @@ class TestCollectProcessMetrics:
         procs = [
             FakeProc(1, ['bash', 'cargo-test-occt-gated'], memory_error=AssertionError('occt')),
             FakeProc(2, ['bash', 'cargo-test-occt-gated'], memory_error=AssertionError('occt')),
-            FakeProc(3, ['verify.sh'], rss=1000, children=[FakeProc(30, rss=500)]),
-            FakeProc(4, ['/repo/verify.sh', '--fast'], rss=200),
+            _never_read_memory(3, ['verify.sh']),
+            _never_read_memory(4, ['/repo/verify.sh', '--fast']),
             _never_read_memory(5),
         ]
 
@@ -567,11 +478,7 @@ class TestCollectProcessMetrics:
             proc_iter=lambda _attrs: iter(procs), fd9_exists=lambda pid: pid == 2
         )
 
-        assert result == {
-            SampleKey('occt_queue_depth'): 1.0,
-            SampleKey('verify_concurrency'): 2.0,
-            SampleKey('verify_rss_total_bytes'): 1700.0,
-        }
+        assert result == {SampleKey('occt_queue_depth'): 1.0}
 
 
 # ---------------------------------------------------------------------------
@@ -1193,17 +1100,34 @@ class TestCollectLoadMetricsOwnPressure:
 # ---------------------------------------------------------------------------
 
 
+_CONSUMER_HOST = 'consumer-host'
+
+
+def _primed_consumer_collector(world):
+    """The world's consumer collector, fed a state one interval old so every name is emitted."""
+
+    def collect(now: int, _previous: str | None):
+        return world.collect_consumers(now, world.collect_consumers(now - 30, None).state)
+
+    return collect
+
+
 def _emitted_by_group(tmp_path):
     """What each live group's own collector emits over this module's fixtures."""
+    from _consumer_world import consumer_world
+
     from sampler.metrics import GroupName, collect_process_metrics, collect_psi
 
     pressure = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
+    world = consumer_world(tmp_path / _CONSUMER_HOST)
     return {
         GroupName.PSI: set(collect_psi(read=lambda name: pressure[name])),
         GroupName.PROCESS: set(collect_process_metrics(
             proc_iter=lambda _attrs: iter(()), fd9_exists=lambda _pid: False
         )),
         GroupName.LOAD: set(_collect(live_topology(tmp_path))),
+        GroupName.CONSUMERS: set(_primed_consumer_collector(world)(1_000_000, None).samples),
+        GroupName.VERIFY_SCOPES: set(world.collect_verify_scopes(1_000_000, None).samples),
     }
 
 
@@ -1219,33 +1143,29 @@ class TestArmMetricStemParity:
     The gate decides on arms; the sampler records metrics; the calibration
     gates (tasks 5219/5220) read one against the other. The metric side is the
     table's projection, sampler.metrics.ARM_METRICS. The arm side is read from
-    the live artifact, shared.psi._ARMS: a private name deliberately, because
-    it IS the saturation truth table and a copy of it here would be the drift
-    this test exists to catch.
+    shared.psi.ARM_FIELDS, the public projection of the saturation truth table.
     """
 
-    @staticmethod
-    def _arm_fields():
-        from shared.psi import _ARMS
-
-        return {arm.field for arm in _ARMS}
-
     def test_every_arm_is_recorded_by_a_table_metric(self):
+        from shared.psi import ARM_FIELDS
+
         from sampler.metrics import ARM_METRICS
 
-        missing = self._arm_fields() - set(ARM_METRICS)
+        missing = ARM_FIELDS - set(ARM_METRICS)
         assert not missing, (
-            f'shared.psi._ARMS has arms no MetricSpec records: {sorted(missing)}. '
+            f'shared.psi.ARM_FIELDS has arms no MetricSpec records: {sorted(missing)}. '
             'Give the recording spec in sampler.metrics.METRIC_GROUPS that arm, or '
             'the gate will hold on a signal the calibration corpus cannot see.'
         )
 
     def test_no_table_arm_is_orphaned(self):
+        from shared.psi import ARM_FIELDS
+
         from sampler.metrics import ARM_METRICS
 
-        orphans = set(ARM_METRICS) - self._arm_fields()
+        orphans = set(ARM_METRICS) - ARM_FIELDS
         assert not orphans, (
-            f'sampler.metrics.METRIC_GROUPS names arms that shared.psi._ARMS does not '
+            f'sampler.metrics.METRIC_GROUPS names arms that shared.psi.ARM_FIELDS does not '
             f'have: {sorted(orphans)}.'
         )
 
@@ -1294,6 +1214,7 @@ class TestEmittedNamesAreAdmittedByRunTick:
         """METRIC_GROUPS with each group's collector bound to this module's fixtures."""
         import dataclasses
 
+        from _consumer_world import consumer_world
         from shared.psi import RunqueueReading
 
         from sampler.metrics import (
@@ -1302,34 +1223,38 @@ class TestEmittedNamesAreAdmittedByRunTick:
             collect_load_metrics,
             collect_process_metrics,
             collect_psi,
+            every_tick,
         )
 
         pressure = {'cpu': PSI_CPU_TEXT, 'memory': PSI_MEM_TEXT, 'io': PSI_IO_TEXT}
+        world = consumer_world(tree.cgroup_root.parent / _CONSUMER_HOST)
         bound = {
-            GroupName.PSI: lambda: collect_psi(read=lambda name: pressure[name]),
-            GroupName.PROCESS: lambda: collect_process_metrics(
+            GroupName.PSI: every_tick(lambda: collect_psi(read=lambda name: pressure[name])),
+            GroupName.PROCESS: every_tick(lambda: collect_process_metrics(
                 proc_iter=lambda _attrs: iter(()), fd9_exists=lambda _pid: False
-            ),
-            GroupName.LOAD: lambda: collect_load_metrics(
+            )),
+            GroupName.LOAD: every_tick(lambda: collect_load_metrics(
                 read_runqueue=lambda **_kwargs: RunqueueReading(2.5, True),
                 own_cgroup_path=tree.own_cgroup_path,
                 cgroup_root=tree.cgroup_root,
-            ),
+            )),
+            GroupName.CONSUMERS: _primed_consumer_collector(world),
+            GroupName.VERIFY_SCOPES: world.collect_verify_scopes,
         }
         return tuple(
             dataclasses.replace(group, collect=bound[group.name]) for group in METRIC_GROUPS
         )
 
-    def _store_one_tick(self, tmp_path, tree) -> tuple[set[SampleKey], set[SampleKey]]:
-        """Collect every bound group, run one tick, and return (emitted, stored)."""
+    def _store_one_tick(self, tmp_path, tree) -> tuple[dict, set[SampleKey]]:
+        """Collect every bound group, run one tick, and return (emitted by group, stored)."""
         import sqlite3
 
         from sampler.sampler import run_tick
         from sampler.store import LoadSampleStore
 
-        collected = {group: group.collect() for group in self._bound_table(tree)}
-        for group, samples in collected.items():
-            unadmitted = sorted(key.label() for key in samples if not group.admits(key))
+        collected = {group: group.collect(1_000_000, None) for group in self._bound_table(tree)}
+        for group, outcome in collected.items():
+            unadmitted = sorted(key.label() for key in outcome.samples if not group.admits(key))
             assert not unadmitted, f'the {group.name} group does not admit {unadmitted}'
 
         db_path = tmp_path / 'db.sqlite'
@@ -1343,24 +1268,34 @@ class TestEmittedNamesAreAdmittedByRunTick:
             }
         finally:
             conn.close()
-        emitted = {key for samples in collected.values() for key in samples}
+        emitted = {group.name: set(outcome.samples) for group, outcome in collected.items()}
         return emitted, stored
 
     def test_every_name_the_collectors_emit_reaches_the_store(self, tmp_path):
-        from sampler.metrics import METRIC_GROUPS
+        from sampler.consumers import encode_consumer, parse_consumer
+        from sampler.metrics import METRIC_GROUPS, GroupName
 
         emitted, stored = self._store_one_tick(tmp_path, live_topology(tmp_path))
 
-        exact = [name for group in METRIC_GROUPS for name in group.exact]
-        per_leaf = [name for group in METRIC_GROUPS for name in group.per_leaf]
-        assert len(emitted) == len(exact) + len(per_leaf) * len(LIVE_ORCHESTRATOR_LEAVES), (
-            f'the fixture did not exercise every group; got {sorted(emitted)}'
-        )
-        assert stored == emitted
+        for group in METRIC_GROUPS:
+            names = {key.metric for key in emitted[group.name]}
+            assert names == group.exact | group.per_leaf, (
+                f'the fixture did not exercise every {group.name} name; got {sorted(names)}'
+            )
+        for name in (GroupName.PSI, GroupName.PROCESS, GroupName.LOAD):
+            (group,) = [g for g in METRIC_GROUPS if g.name is name]
+            expected = len(group.exact) + len(group.per_leaf) * len(LIVE_ORCHESTRATOR_LEAVES)
+            assert len(emitted[name]) == (expected if group.per_leaf else len(group.exact))
+        consumer_leaves = {key.leaf for key in emitted[GroupName.CONSUMERS] if key.leaf}
+        assert {encode_consumer(parse_consumer(leaf)) for leaf in consumer_leaves} == consumer_leaves
+        assert stored == set().union(*emitted.values())
 
     def test_the_df_topology_vocabulary_is_admitted_too(self, tmp_path):
         """Post-3394 the leaf names change shape; admission must still take them."""
+        from sampler.metrics import GroupName
+
         emitted, stored = self._store_one_tick(tmp_path, df_topology(tmp_path, 'dark-factory', 'reify'))
 
-        assert SampleKey('own_cpu_some10', 'df-dark-factory.slice') in emitted, sorted(emitted)
-        assert stored == emitted
+        load = emitted[GroupName.LOAD]
+        assert SampleKey('own_cpu_some10', 'df-dark-factory.slice') in load, sorted(load)
+        assert stored == set().union(*emitted.values())

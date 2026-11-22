@@ -32,7 +32,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_journal, plan_markup_stamp, plan_tools
+from orchestrator.mcp import markup_journal, plan_markup_repair, plan_markup_stamp, plan_tools
 
 #: pytest finds a fixture by its name in the requesting module's namespace.
 plan_artifacts = _plan_markup_fixtures.plan_artifacts
@@ -157,9 +157,9 @@ class TestTheWriteBoundaryStoresTheQuoteVerbatim:
 def _markup_fact_warnings(caplog) -> list[str]:
     return [
         record.getMessage() for record in caplog.records
-        if record.name == plan_tools.logger.name
+        if record.name == plan_markup_repair.logger.name
         and record.levelno == logging.WARNING
-        and plan_tools.MARKUP_FACT_EVENT in record.getMessage()
+        and plan_markup_repair.MARKUP_FACT_EVENT in record.getMessage()
     ]
 
 
@@ -169,7 +169,7 @@ class TestTheReadPathLeavesTheQuoteAlone:
     async def test_later_calls_carry_no_markup_repairs(self, harness: Harness, caplog):
         await harness.create_plan()
 
-        with caplog.at_level(logging.WARNING, logger=plan_tools.logger.name):
+        with caplog.at_level(logging.WARNING, logger=plan_markup_repair.logger.name):
             responses = [
                 await harness.add_step('step-1', STEP_DESCRIPTION),
                 await harness.add_step('step-2', 'A clean second step.'),

@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.branch_stack import (
@@ -736,16 +737,6 @@ class TestRestorePreStackTip:
 # ---------------------------------------------------------------------------
 
 
-def _seed_warm_base(root: Path) -> None:
-    """Copy of test_git_ops.py::_seed_default_warm_base: a non-empty warm base
-    and the ``.pool-root`` sentinel, so acquire_warm_lane's base-health gate
-    and create-once mount guard admit."""
-    base = root / '.worktrees' / '_merge-verify' / 'target'
-    base.mkdir(parents=True, exist_ok=True)
-    (base / '.keep').write_text('warm base sentinel\n')
-    (root / '.worktrees' / '.pool-root').touch()
-
-
 async def _commit_warm_lane_scripts(root: Path) -> None:
     """Commit the seed-warm-lane.sh stub test_git_ops.py::_add_warm_lane_scripts
     uses, plus a .gitignore that keeps the seeded target/ out of every commit."""
@@ -767,7 +758,7 @@ async def warm_repo(tmp_path: Path) -> Repo:
     await _init_repo(root)
     await _commit_files(root, {'shared.txt': 'v0\n', 'other.txt': 'v0\n'}, 'initial')
     await _commit_warm_lane_scripts(root)
-    _seed_warm_base(root)
+    seed_default_warm_base(root)
     cfg = GitConfig(
         main_branch='main',
         branch_prefix='task/',

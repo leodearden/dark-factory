@@ -142,6 +142,7 @@ __all__ = [
     'markup_override_requested',
     'only_inert_html_closers',
     'repair',
+    'scan_parameter_values',
     'strip_markup_override',
 ]
 
@@ -472,6 +473,18 @@ _CANONICAL_OPENER_RE = re.compile(r'\x3cparameter\s+name="([^"]+)"\s*"?>')
 # collide with a canonical opener (``parameter`` is followed by whitespace, not
 # by the closing bracket) nor with any closing tag (``/`` is not a name char).
 _ECHO_OPENER_RE = re.compile(r'\x3c(' + _TAG_NAME + r')"?>')
+
+# "An opener in EITHER dialect", for the one caller that does not care which:
+# scan_parameter_values, which routes a refused payload's preservation record
+# by the pseudo-parameters leaked into it. An ALTERNATION rather than two
+# searches, so the common no-opener case scans the value ONCE. Exactly
+# equivalent to searching each part in turn: neither part can match a prefix of
+# a match of the other (verified over 4054 generated fragments, 0 divergences).
+# The group numbering of the parts is deliberately not relied on; each hit is
+# re-read through _item_opener_at and the names are never read off this pattern.
+_ANY_OPENER_RE = re.compile(
+    _CANONICAL_OPENER_RE.pattern + '|' + _ECHO_OPENER_RE.pattern
+)
 
 # Structural bounds. repair() must be total for adversarial input WITHOUT a
 # blanket try/except (that is signature (b) of tests/repo_guards/silent_fallthrough_scan.py
@@ -1033,6 +1046,47 @@ def repair(
         )
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# The non-validating residue scan — ROUTING a refused payload, never a write.
+# ---------------------------------------------------------------------------
+
+#: A residue carrying more openers than this is refused whole: an uninspected
+#: remainder could contradict whatever the inspected part found. Far above the
+#: 15 openers the largest committed residue-loss specimen carries.
+_MAX_SCAN_OPENERS = 256
+
+
+def scan_parameter_values(value: object, names: Iterable[str]) -> dict[str, str]:
+    """Best-effort ``name -> value`` for pseudo-parameters leaked into *value*.
+
+    Every opener in either dialect whose name is in *names* contributes the
+    verbatim slice up to its own closer, or to end of string when none follows.
+    A name seen with two different values is dropped: ambiguity refuses. A
+    non-``str`` *value* yields ``{}``.
+
+    NON-VALIDATING, and for ROUTING a preservation record only: never believe
+    it for a write. It is independent of :func:`repair`, whose accept-time
+    validation and NO SILENT PARTIAL REPAIR contract it neither shares nor
+    loosens.
+    """
+    if not isinstance(value, str):
+        return {}
+    wanted = _as_name_set(names)
+    found: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for inspected, match in enumerate(_ANY_OPENER_RE.finditer(value)):
+        if inspected >= _MAX_SCAN_OPENERS:
+            return {}
+        opener = _item_opener_at(value, match.start())
+        if opener is None or opener.name not in wanted:
+            continue
+        closer = _closer_re(opener.closer_name).search(value, opener.end)
+        item_value = value[opener.end: closer.start() if closer else len(value)]
+        if found.setdefault(opener.name, item_value) != item_value:
+            ambiguous.add(opener.name)
+    return {name: item for name, item in found.items() if name not in ambiguous}
 
 
 # ---------------------------------------------------------------------------

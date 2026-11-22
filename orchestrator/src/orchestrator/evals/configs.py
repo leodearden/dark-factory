@@ -446,7 +446,11 @@ ALL_FINAL_CONFIG_NAMES = [c.name for c in FINAL_RUN_CONFIGS]
 # downstream role is FROZEN (decision 8: noise isolation + token savings). Per
 # the OFAT methodology, each candidate varies exactly one role — here, the
 # architect. These are the substrate the downstream μ OFAT/matrix driver
-# consumes to score the architect role.
+# consumes to score the architect role. Cost: ofat_candidates() takes this list
+# wholesale and cli.py::_run_matrix_driver crosses it with every implementer
+# incumbent (matrix_pairs), so EVERY entry adds one live architect invocation
+# per OFAT fixture/trial cell and one end-to-end pair per implementer incumbent
+# to every default matrix run, not only when named.
 ARCHITECT_EVAL_CONFIGS = [
     EvalConfig('architect-opus-high', 'claude', 'opus', 'high', role=RoleUnderTest.ARCHITECT),
     EvalConfig('architect-opus-max', 'claude', 'opus', 'max', role=RoleUnderTest.ARCHITECT),
@@ -466,12 +470,12 @@ ARCHITECT_EVAL_CONFIGS = [
     # eval-revival ρ: effort-matched to architect-opus-max above — only the
     # model axis varies. Config-only: run_ofat_stage's architect branch
     # (evals/runner.py, task 2478) already dispatches any role='architect'
-    # candidate, and get_config_by_name already searches this list. Cost note:
-    # ARCHITECT_EVAL_CONFIGS is consumed wholesale by ofat_candidates(), so
-    # this is a 5th architect candidate screened by EVERY OFAT run (not just
-    # fable-trial-v2 δ's stage-2 screen) — one extra live architect invocation
-    # per fixture/trial cell for any campaign that pulls the full candidate set.
+    # candidate, and get_config_by_name already searches this list.
     EvalConfig('architect-fable-max', 'claude', 'claude-fable-5', 'max', role=RoleUnderTest.ARCHITECT),
+    # Fable 5.2 arms (task 10488). Separate names from the claude-fable-5 arms
+    # above, whose stored results are keyed by name.
+    EvalConfig('architect-fable52-high', 'claude', 'claude-fable-5-2', 'high', role=RoleUnderTest.ARCHITECT),
+    EvalConfig('architect-fable52-max', 'claude', 'claude-fable-5-2', 'max', role=RoleUnderTest.ARCHITECT),
 ]
 
 

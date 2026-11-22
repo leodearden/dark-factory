@@ -10,29 +10,19 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, NonCallableMagicMock
 
 import pytest
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
-# docstring exists to prevent.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from nested_pytest_session import (  # noqa: E402  # debt: task 6997
-    binding_conftest,
+from nested_pytest_session import (
+    arming_conftest,
     run_nested_pytest,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-import df_pytest_isolation  # noqa: E402  # debt: task 6997
-from df_pytest_isolation import (  # noqa: E402  # debt: task 6997
+import df_pytest_isolation
+from df_pytest_isolation import (
     MOCK_FSPATH_ROOT_NAMES,
     STDLIB_MOCK_CLASSES,
     fixture_marker,
@@ -41,6 +31,7 @@ from df_pytest_isolation import (  # noqa: E402  # debt: task 6997
     mock_fspath_root_names,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Reached through the module, never imported: importing a fixture into a test
@@ -242,7 +233,7 @@ def _nested_run(
 ):
     source = f'import os\nfrom pathlib import Path\n{imports}\n\ndef test_leaks():\n{body}\n'
     return run_nested_pytest(root, {
-        'conftest.py': binding_conftest(_GUARD_NAME),
+        'conftest.py': arming_conftest(_GUARD_NAME),
         'test_x.py': source,
         **(extra_files or {}),
     })

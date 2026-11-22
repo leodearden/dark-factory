@@ -1,0 +1,28 @@
+import subprocess,sys,json,functools
+REPO='/home/leo/src/dark-factory'
+def git(*a):
+    p=subprocess.run(['git','-C',REPO,*a],capture_output=True,text=True,errors='replace'); return p.returncode,p.stdout.strip()
+@functools.lru_cache(None)
+def on_main(sha):
+    rc,_=git('merge-base','--is-ancestor',sha,'main'); return rc==0
+@functools.lru_cache(None)
+def info(sha):
+    rc,o=git('show','-s','--format=%H%x00%P%x00%aI%x00%cI%x00%s',sha)
+    if rc!=0: return None
+    h,p,a,c,s=o.split('\x00'); return {'sha':h,'parents':p.split(),'ad':a,'cd':c,'subj':s}
+def stack(sha,maxn=60):
+    """walk first-parent from sha until a commit on main. returns (layers top->bottom, base_main_sha)"""
+    out=[]; cur=sha
+    for _ in range(maxn):
+        i=info(cur)
+        if i is None: return out,None
+        if on_main(cur): return out,cur
+        out.append(i)
+        if not i['parents']: return out,None
+        cur=i['parents'][0]
+    return out,'TRUNC'
+if __name__=='__main__':
+    for s in sys.argv[1:]:
+        L,b=stack(s)
+        print('==',s[:10],'base on main:',b and b[:10], info(b)['cd'] if b and b!='TRUNC' else '', (info(b)['subj'][:60] if b and b!='TRUNC' else ''))
+        for i in L: print('   ',i['sha'][:10],'p2=',(i['parents'][1][:10] if len(i['parents'])>1 else '-'),i['cd'],i['subj'][:70])

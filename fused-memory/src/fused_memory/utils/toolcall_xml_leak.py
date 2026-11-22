@@ -24,8 +24,9 @@ storage gate runs at write time, where a false positive refuses a legitimate
 write that no caller is placed to resubmit.
 
 It is NOT the MCP write-boundary guard. That is
-``fused_memory/server/markup_guard.py::install_markup_guard`` (task 4458,
-which replaced task 3141's in-line ``markup_tripwire`` gate). It is
+``fused_memory/server/markup_guard.py::build_markup_guard`` (task 4458,
+which replaced task 3141's in-line ``markup_tripwire`` gate), installed by
+``fused_memory/server/boundary_guards.py::install_boundary_guards``. It is
 deliberately calibrated the other way: a recall-first predicate that accepts
 over-reporting at the MCP boundary, where a false positive costs the live
 caller only a resubmission. The two are complementary and must not be

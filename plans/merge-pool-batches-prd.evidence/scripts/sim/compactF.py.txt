@@ -1,0 +1,15 @@
+"""All rows of the unscannable-fallback run -> results2_F_compact.txt"""
+import sys
+sys.path.insert(0, '/tmp/gate-10069/sim')
+import fbrep as R
+D = R.load('ref', 'tog', 'coin_lo', 'coin_hi', 'sticky_lo', 'sticky_hi', 'w2', 'sens', 'f1u', 'x1', 'x2a', 'x2b', 'x2r', 'x3')
+out = ['cell | policy | n | land per verify-h ±95% | land/h | verifies/landing | rule k at prior | mean batch un-cleared / all | good wait p50/p95 h | defective arrival->block p50/p95 h | first dispatch->block p50/p95 h | '
+       'wrongly blocked/100 landings (own verify + conviction) | idle % | torn % | unscannable reds/run | fallbacks/run (void) | scans/run | scan util | scan queue wait p50/p95 h | members held p50/p95 h | defective landed']
+for (c, p), r in sorted(D.items(), key=lambda kv: kv[0]):
+    out.append('%s | %s | %d | %.3f ±%.3f | %.2f | %.3f | %s | %.1f / %.1f | %s/%s | %s/%s | %s/%s | %.3f (%.3f + %.3f) | %.1f | %.0f | %.1f | %.1f (%.1f) | %.1f | %s | %s/%s | %s/%s | %d' % (
+        c, p, r['n'], r['lvh'][0], r['lvh'][1], r['thr'][0], r['vpl'][0], r.get('kb'), r['batch_unc'], r['batch_all'], R.f(r['good_p50']), R.f(r['good_p95']),
+        R.f(r['bad_p50']), R.f(r['bad_p95']), R.f(r['b2b_p50']), R.f(r['b2b_p95']), r['wrong_per100'], r['false_block_per100'], r['conv_wrong_per100'],
+        100 * r['idle_share'], 100 * r['torn_share'], r['unscan_per_run'], r['fb_per_run'], r['fb_void_per_run'], r.get('scans_run', r['scans_per_run']),
+        R.f(r['scan_util'], '%.2f'), R.f(r['scan_wait_p50'], '%.2f'), R.f(r['scan_wait_p95'], '%.2f'), R.f(r['scan_hold_p50'], '%.2f'), R.f(r['scan_hold_p95'], '%.2f'), r['bad_landed']))
+open('/tmp/gate-10069/sim/results2_F_compact.txt', 'w').write('\n'.join(out) + '\n')
+print(len(out) - 1, 'rows; defective landed total', sum(r['bad_landed'] for r in D.values()))

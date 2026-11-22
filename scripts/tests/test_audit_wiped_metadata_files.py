@@ -20,6 +20,7 @@ synthetic temp databases built by conftest's `make_tasks_db` and
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import subprocess
@@ -37,6 +38,8 @@ from audit_wiped_metadata_files import (
     FIDELITY_LOCK_LEVEL,
     NO_MERGE_EVENT,
     NO_SUCCESSFUL_MERGE_SHA,
+    PLAN_EVENT_TYPES,
+    PLAN_EVENTS_SQL,
     AuditCoverage,
     PlanFilesRecord,
     ProjectAudit,
@@ -52,6 +55,12 @@ from audit_wiped_metadata_files import (
     load_plan_files_from_events,
     load_task_records,
     merge_plan_file_sources,
+)
+from shared.testing_sqlite_spill import (
+    SPILL_PAD,
+    SPILL_ROWS,
+    require_sort_to_spill,
+    run_unable_to_write_files,
 )
 
 from shared import project_layout
@@ -1479,6 +1488,35 @@ def test_main_audits_a_project_whose_runs_db_is_missing(tmp_path, make_tasks_db,
         " — wipe signatures unknown (event_log_unread)"
     ) in as_text.stdout.splitlines()
     assert "no_merge_event" not in as_text.stdout
+
+
+def test_main_audits_an_event_log_whose_sort_spills_when_no_file_can_be_written(
+    tmp_path, make_tasks_db, make_runs_db
+):
+    """A sandboxed run with no writable temp dir must audit a healthy event log,
+    not skip it as an unreadable project and exit 3 (task 7251)."""
+    root = _make_project(
+        tmp_path, make_tasks_db, make_runs_db,
+        tasks=[{"id": 1, "metadata": {"files": []}}],
+        events=[
+            {"event_type": "phase_skipped", "task_id": i, "data": {"plan_files": ["a.py"], "pad": SPILL_PAD}}
+            for i in range(SPILL_ROWS)
+        ],
+    )
+    runs_db = project_layout.runs_db(root)
+    # The live store carries this index (orchestrator/src/orchestrator/event_store.py); it makes the IN ... ORDER BY id query sort.
+    with contextlib.closing(sqlite3.connect(runs_db)) as c:
+        c.execute("CREATE INDEX idx_events_type ON events(event_type)")
+        c.commit()
+    require_sort_to_spill(runs_db, PLAN_EVENTS_SQL, PLAN_EVENT_TYPES)
+
+    result = run_unable_to_write_files([sys.executable, _SCRIPT, "--project-root", str(root), "--json"])
+
+    assert result.returncode == 1, result.stderr
+    assert "unreadable" not in result.stderr
+    [candidate] = json.loads(result.stdout)["projects"][0]["candidates"]
+    assert candidate["task_id"] == 1
+    assert candidate["plan_files_source"] == "phase_skipped_event"
 
 
 def test_main_min_fidelity_defaults_to_file_level(tmp_path, make_tasks_db, make_runs_db):

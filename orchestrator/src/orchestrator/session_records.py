@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
-# 3: session_registry.py::LeaseHolder.record_slug and decision_registry.py::DecisionRecord.record_slug (task 4237).
+# 3: session_leases.py::LeaseHolder.record_slug and decision_registry.py::DecisionRecord.record_slug (task 4237).
 # 4: SessionRecord.self_exit (task 7179).
 # 5: SessionRecord.exit_request and exit_requested_at (task 7193).
 # 6: SessionRecord.claude_launch_session_id (task 6069).
@@ -415,7 +415,8 @@ class SessionRecord:
         ``launcher_pid`` (see ``_coerce_identity``).
     start_ts: ISO-8601 timestamp of when this record was first written.
     status: current lifecycle status; see Status.
-    exit_code: claude's exit code, populated once status is terminal.
+    exit_code: claude's exit code, populated only while status is terminal
+        (see ``set_status``).
     result_file: path to this session's result.md (T5); allocated by
         `session_registry.py::_run_launching` at launch time (``<record_dir>/RESULT_FILENAME``)
         and preserved unchanged by every later read-modify-write.
@@ -452,7 +453,7 @@ class SessionRecord:
         alone cannot tell "the owner re-minted" from "a nested claude
         inherited the env var". The owning process keeps its pid across a
         re-mint; a nested ``claude`` never shares it. See
-        ``session_hooks._env_slug_is_owned``. A non-int, bool, or
+        ``session_hooks.py::_env_slug_ownership``. A non-int, bool, or
         non-positive value in a record body reads back as None instead of
         surviving unchanged (see ``_coerce_owner_pid``).
     claude_owner_identity: the ProcessIdentity of ``claude_owner_pid``,
@@ -677,6 +678,18 @@ def session_pointer_path_for_pid(pid: int, root: Path | str | None = None) -> Pa
     return session_pointers_dir(root) / str(pid)
 
 
+def is_session_pointer_pid(pid: int) -> bool:
+    """True iff *pid* can key a ``sessions-by-pid/`` entry, judged live from ``/proc``.
+
+    A shared ``claude agents`` host's pid is every hosted session's owning
+    claude, so a pointer keyed on it would name whichever hosted session
+    wrote last. Host-ness is read from ``/proc/<pid>/cmdline`` through
+    ``session_identity.is_shared_session_host`` on every call, so the answer
+    is an observation of the running process, not a property of the pid.
+    """
+    return pid > 0 and not session_identity.is_shared_session_host(pid)
+
+
 def is_record_key(slug: str) -> bool:
     """True iff *slug* can name a record dir directly inside ``sessions_dir``.
 
@@ -719,11 +732,12 @@ def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -
     ``$CLAUDE_PID`` carries), never the record's ``launcher_pid``.
 
     Returns True without rewriting when the pointer already holds *slug*.
-    Returns False without writing for a non-positive *pid* or a *slug* that
-    is not a record key, and False (after a WARNING) when the write itself
-    fails. Never raises: its callers are session hooks.
+    Returns False without writing for a *pid* that cannot key a pointer
+    (non-positive, or a shared ``claude agents`` host: ``is_session_pointer_pid``)
+    or a *slug* that is not a record key, and False (after a WARNING) when
+    the write itself fails. Never raises: its callers are session hooks.
     """
-    if pid <= 0 or not is_record_key(slug):
+    if not is_session_pointer_pid(pid) or not is_record_key(slug):
         return False
     return _write_pointer_file(session_pointer_path_for_pid(pid, root=root), slug)
 
@@ -738,11 +752,14 @@ def resolve_session_slug_for_pid(pid: int, root: Path | str | None = None) -> st
     caller-visible degradation signal; this function is read-only and never
     raises.
 
+    A *pid* that cannot key a pointer (``is_session_pointer_pid``) reads as
+    None, so a legacy host-keyed pointer still on disk is never followed.
+
     Contract limit: a new process that reuses a dead claude's pid can read
     that session's pointer until its own SessionStart hook overwrites it or
-    ``session_registry.py::reap_stale_session_pointers`` removes it.
+    ``session_reaper.py::reap_stale_session_pointers`` removes it.
     """
-    if pid <= 0:
+    if not is_session_pointer_pid(pid):
         return None
     slug = read_session_pointer(session_pointer_path_for_pid(pid, root=root))
     if slug is None or not is_record_key(slug):
@@ -830,7 +847,7 @@ T3_THREAD_POINTERS_DIRNAME = 'sessions-by-t3-thread'
 def t3_thread_pointers_dir(root: Path | str | None = None) -> Path:
     """The T3 thread pointer dir, ``<fleet_root>/sessions-by-t3-thread/``; a sibling of ``sessions_dir`` like ``session_pointers_dir``.
 
-    It is the index of live T3-hosted records that ``session_registry.py::mark_t3_sessions_exited`` iterates.
+    It is the index of live T3-hosted records that ``session_reaper.py::mark_t3_sessions_exited`` iterates.
     """
     return fleet_root(root) / T3_THREAD_POINTERS_DIRNAME
 
@@ -858,7 +875,7 @@ def resolve_session_slug_for_t3_thread(
     non-terminal and ``t3_thread_of`` it must be *thread_id*. That is the one
     definition of the index's invariant -- a terminal record has no pointer
     -- which the reap and every terminal write enforce through
-    ``session_registry.py::_is_stale_t3_thread_pointer``. Read-only; never raises.
+    ``session_reaper.py::_is_stale_t3_thread_pointer``. Read-only; never raises.
     """
     if not is_t3_thread_pointer_name(thread_id):
         return None
@@ -898,7 +915,7 @@ def index_t3_record_if_unheld(
     A held pointer is never moved: the T3 lane's bind
     (``orchestrator/src/orchestrator/spawn_t3_lane.py::_bind_to``) is the one
     writer that re-points one. A failed write is logged by the writer, and
-    ``session_registry.py::index_unpointed_t3_records`` retries it.
+    ``session_reaper.py::index_unpointed_t3_records`` retries it.
     """
     thread_id = t3_thread_of(record)
     if (
@@ -964,7 +981,7 @@ def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
     """Atomically write *record* (tmp file in the same dir, then os.replace).
 
     Every successful write bumps record.json's mtime, which
-    session_registry.py::reap_stale_records() reads as this record's heartbeat.
+    session_reaper.py::reap_stale_records() reads as this record's heartbeat.
     """
     path = record_path_for_slug(record.session_slug, root=root)
     atomic_write_text(path, record.to_json())
@@ -986,6 +1003,19 @@ def read_record(slug: str, root: Path | str | None = None) -> SessionRecord:
         raise CorruptSessionRecord(f'unparseable session record at {path}') from exc
 
 
+def set_status(record: SessionRecord, status: Status) -> None:
+    """Set *record*'s status in place, keeping ``exit_code`` terminal-only.
+
+    An exit code belongs to a terminal status, so a non-terminal *status*
+    clears it, whoever wrote it: the ``exit`` subcommand or an orphan sweep.
+    A terminal *status* keeps it. Every status write in this module goes
+    through here.
+    """
+    record.status = status
+    if status not in TERMINAL_STATUSES:
+        record.exit_code = None
+
+
 def update_status(
     slug: str,
     root: Path | str | None = None,
@@ -995,13 +1025,13 @@ def update_status(
 ) -> SessionRecord:
     """Strict read-modify-write of *status* (and optionally *exit_code*).
 
-    Raises if no record exists for *slug* -- used by the ``exit`` CLI
-    subcommand (spawn-claude.sh's ``finish()``), where a missing record
-    signals a genuine bug: the ``launching`` write should already have
-    created it moments earlier.
+    The status write goes through ``set_status``. Raises if no record exists
+    for *slug* -- used by the ``exit`` CLI subcommand (spawn-claude.sh's
+    ``finish()``), where a missing record signals a genuine bug: the
+    ``launching`` write should already have created it moments earlier.
     """
     record = read_record(slug, root=root)
-    record.status = status
+    set_status(record, status)
     if exit_code is not None:
         record.exit_code = exit_code
     write_record(record, root=root)
@@ -1099,7 +1129,9 @@ def apply_refresh(
 
     When *prior* is not None it is MUTATED AND RETURNED IN PLACE (the same
     read-modify contract ``refresh_record``/``update_status`` have always
-    had), so a caller holding the object sees the applied status. When
+    had), so a caller holding the object sees the applied status. The status
+    is applied by ``set_status``, so a non-terminal *status* also clears
+    *prior*'s ``exit_code`` and a terminal one keeps it. When
     *prior* is None a fresh, well-formed ``SessionRecord`` is synthesized
     under the same key: schema_version/session_slug/start_ts/status are
     populated and every other field is left at its documented default.
@@ -1130,5 +1162,5 @@ def apply_refresh(
             start_ts=datetime.now(UTC).isoformat(),
         )
     if status is not None:
-        prior.status = status
+        set_status(prior, status)
     return prior

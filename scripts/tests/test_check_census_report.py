@@ -17,10 +17,10 @@ import sys
 import time
 from pathlib import Path
 
-import check_census_report
 import pytest
 import yaml
 from cli_subprocess_timeout import cli_timeout_from_env
+from legibility import check_census_report
 
 SCRIPT = Path(__file__).parent.parent / "legibility" / "check_census_report.py"
 CLI_TIMEOUT = cli_timeout_from_env("CHECK_CENSUS_REPORT_TEST_TIMEOUT")

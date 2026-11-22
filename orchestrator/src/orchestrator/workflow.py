@@ -48,6 +48,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
+from shared.declared_checks import declared_checks
 from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 from shared.prompt_artifact import PromptArtifactStore, default_artifacts_root
 from shared.task_claimant import compose_claimant_run_id
@@ -323,12 +324,18 @@ VERDICT_TOOLS_MCP_SERVER = 'verdict-tools'
 PER_INVOCATION_MCP_SERVERS = frozenset({PLAN_TOOLS_MCP_SERVER, VERDICT_TOOLS_MCP_SERVER})
 
 
-def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Path) -> dict:
+def _inject_plan_tools_mcp(
+    mcp_config: dict | None, cwd: Path, role: AgentRole, *, task_root: Path,
+) -> dict:
     """Inject the plan-tools stdio MCP server entry into *mcp_config*.
 
     Creates a minimal ``{'mcpServers': {}}`` skeleton when *mcp_config* is
     ``None``; otherwise preserves all pre-existing server entries and adds
     (or replaces) the ``plan-tools`` key.
+
+    The server exposes only ``role.plan_tools_grants``: dispatches run under
+    ``bypassPermissions``, where ``allowed_tools`` neither hides nor denies a
+    tool, so the grant is enforced by the server registering only these names.
 
     The plan-tools server is launched via the direct-interpreter no-uv hot path
     (task 1776): ``sys.executable -m orchestrator.mcp.plan_tools --worktree <wt>``.
@@ -357,6 +364,7 @@ def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Pat
     mcp_config.setdefault('mcpServers', {})[PLAN_TOOLS_MCP_SERVER] = plan_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
         meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
+        granted_tools=role.plan_tools_grants,
     )
     return mcp_config
 
@@ -441,7 +449,7 @@ def compose_invocation_mcp_config(
     if 'orchestrator' in role.mcp_families and mcp is not None:
         mcp_config = mcp.mcp_config_json(escalation_url=escalation_url)
     if 'plan_tools' in role.mcp_families and cwd:
-        mcp_config = _inject_plan_tools_mcp(mcp_config, cwd, task_root=task_root)
+        mcp_config = _inject_plan_tools_mcp(mcp_config, cwd, role, task_root=task_root)
     if 'verdict_tools' in role.mcp_families and cwd:
         mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role, task_root=task_root)
     if strict_mcp_config and not mcp_config:
@@ -840,14 +848,6 @@ def _scope_basis(
         'undeclared': list(coverage.undeclared),
         'undelivered': list(coverage.undelivered),
     }
-
-
-def _declared_checks(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """The task's declared ``metadata.delivered_checks``, mapping entries only."""
-    return [
-        c for c in _declared_entries(metadata, 'delivered_checks')
-        if isinstance(c, dict)
-    ]
 
 
 def _compute_merge_outcome_signature(
@@ -7950,7 +7950,7 @@ class TaskWorkflow:
             self.git_ops, self.task_id, branch,
             reported_sha=commit,
             declared_files=_declared_files(metadata),
-            delivered_checks=_declared_checks(metadata),
+            delivered_checks=list(declared_checks(metadata).checks),
             delivered_checks_enabled=self.config.delivered_checks.enabled,
         )
         if not verdict.accepted or verdict.evidence_sha is None:
@@ -12951,12 +12951,14 @@ class TaskWorkflow:
         # case the gate exists for.  Steward mediation (e.g. mutating plan.json
         # to silence the gate) would undermine the safeguard, so skip the L0
         # steward path entirely and submit an L1 immediately.
-        from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane import (
+            MAIN_HEALTH_RED_REASON_PREFIX,
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            TRANSIENT_INFRA_REASON_PREFIX,
+        )
         from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
-            MAIN_HEALTH_RED_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-            TRANSIENT_INFRA_REASON_PREFIX,
         )
         if result.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX):
             self._write_merge_failure_review('dropped_plan_targets', result.reason)
@@ -14835,12 +14837,20 @@ class TaskWorkflow:
         # without the gate) never arises. compute_write_set is allowed to raise
         # on a malformed worktree (fail-loud; the fail-closed
         # backend-unavailable posture is a separate concern, not folded in here).
+        # A docs-only declared scope also grants the main checkout's .git and
+        # those paths: write_set.py::compute_write_set owns that gate.
         sandbox_modules = scope.sandbox_modules
         sandbox_extras = None
         if sandbox_modules is not None:
             write_set = compute_write_set(
                 cwd, task_id=self.task_id, task_root=self._artifact_roots(cwd)[1],
+                declared_files=self._task_files or task_metadata.get('files'),
             )
+            if write_set.docs_main_paths:
+                logger.info(
+                    'Task %s: %s granted the main checkout for its docs-only scope: %s',
+                    self.task_id, role.name, [str(p) for p in write_set.docs_main_paths],
+                )
             # Pre-create the load-bearing claude_fleet carve-out OUTSIDE the
             # sandbox at this single INV-5/D11 write-set consumption point, so it
             # exists before sandbox_extras (below) is built (task 2996) — see
@@ -16462,19 +16472,23 @@ class TaskWorkflow:
         A fallback arm's has-work heuristic says only that the branch reads as
         merged; main's tip, which those arms used to stamp, is whatever landed
         most recently from ANY task.  This runs ``validate_landing_evidence``
-        in DISCOVERY mode — the shape of the harness dispatch gate's ancestry
-        arm — and returns the task's own attributable, surviving citation.  A
+        in DISCOVERY mode — the legacy citation-plus-effect-present policy,
+        kept here deliberately
+        (``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md``
+        §7) — and returns the task's own attributable, surviving citation.  A
         reject, or a validation that raises, is logged and answers None, so
         every guard proceeds with its phase rather than stamping.
         """
+        metadata = self.task.get('metadata') or {}
         try:
             verdict = await validate_landing_evidence(
                 self.git_ops, self.task_id,
                 f'{self.config.git.branch_prefix}{self.task_id}',
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
-                delivered_checks=_declared_checks(self.task.get('metadata') or {}),
+                delivered_checks=list(declared_checks(metadata).checks),
                 checks_enabled=self.config.delivered_checks.enabled,
+                branch_base_sha=metadata.get('branch_base_sha'),
             )
         except Exception:
             logger.warning(
@@ -17061,12 +17075,15 @@ class TaskWorkflow:
         """
         if not self.event_store:
             return
+        data: dict[str, object] = {'backend': backend, 'digest': write_set.digest()}
+        if write_set.docs_main_paths:
+            data['docs_main_paths'] = [str(p) for p in write_set.docs_main_paths]
         self.event_store.emit(
             EventType.sandbox_applied,
             task_id=self.task_id,
             phase=self.state.value,
             role=role_name,
-            data={'backend': backend, 'digest': write_set.digest()},
+            data=data,
         )
 
     def _ensure_sandbox_dirs(self, write_set: WriteSet) -> None:

@@ -81,7 +81,13 @@ from shared.mcp_markup_middleware import (
 from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY, detect, repair
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp, plan_tools
+from orchestrator.mcp import (
+    markup_journal,
+    markup_sink,
+    plan_markup_repair,
+    plan_markup_stamp,
+    plan_tools,
+)
 from orchestrator.workflow import _is_gating_escalation
 
 # ---------------------------------------------------------------------------
@@ -138,14 +144,14 @@ QUOTED_DECISION = (
 
 @pytest.fixture(autouse=True)
 def _clear_reported_refusals():
-    """Clear ``_REPORTED_REFUSALS`` around every test in this module.
+    """Forget every reported refusal around each test in this module.
 
     It is PROCESS-global memo state owned by the read-time path, so a refusal
     reported by one test would otherwise be suppressed in the next.
     """
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair.forget_reported_refusals()
     yield
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair.forget_reported_refusals()
 
 
 @pytest.fixture(autouse=True)
@@ -1932,7 +1938,7 @@ class TestWhereTheRecordLands:
         this branch would silently file every record under the CWD.
         """
         monkeypatch.setattr(
-            plan_tools.subprocess, 'run',
+            subprocess, 'run',
             lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout='  \n', stderr=''),
         )
 

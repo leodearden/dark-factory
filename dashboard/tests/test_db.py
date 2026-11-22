@@ -113,6 +113,13 @@ class TestDbPool:
         conn = await pool.get(tmp_path / 'nonexistent' / 'nope.db')
         assert conn is None
 
+    async def test_get_missing_file_in_existing_dir_creates_nothing(self, tmp_path):
+        absent = tmp_path / 'absent.db'
+        pool = DbPool()
+        conn = await pool.get(absent)
+        assert conn is None
+        assert not absent.exists()
+
     async def test_get_reuses_connection(self, tmp_path):
         db_path = tmp_path / 'test.db'
         sqlite3.connect(str(db_path)).close()

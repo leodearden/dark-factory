@@ -11,6 +11,7 @@ contract intact across the cutover.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, ClassVar
 
 from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, StampViolation
@@ -394,6 +395,45 @@ class FollowupItemsRefusedError(TaskmasterError):
         }
 
 
+class DependencyCycle(TaskmasterError):
+    """Raised when a local dependency edge would close a cycle; nothing was written.
+
+    ``cycle`` is the path (task, depends_on, ..., task) the refused edge would close.
+    The rule's home is shared/src/shared/dependency_cycle.py. Call :meth:`to_error_dict`
+    for the wire shape; callers branch on ``error == ERROR`` and act on ``cycle``.
+    """
+
+    ERROR: ClassVar[str] = 'dependency_cycle'
+
+    def __init__(self, operation: str, cycle: Sequence[int]) -> None:
+        if len(cycle) < 2:
+            raise ValueError(f'a dependency cycle names at least two tasks, got {tuple(cycle)!r}')
+        if cycle[0] != cycle[-1]:
+            raise ValueError(
+                f'a dependency cycle must start and end on the same task, got {tuple(cycle)!r}'
+            )
+        self.operation = operation
+        self.cycle = tuple(cycle)
+        path = ' → '.join(str(task) for task in self.cycle)
+        super().__init__(
+            TASKMASTER_TOOL_ERROR,
+            f'{operation}: {self.cycle[0]} → {self.cycle[1]} would close a cycle {path}; '
+            'remove one of those edges first',
+        )
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': self.ERROR,
+            'error_type': type(self).__name__,
+            'operation': self.operation,
+            'task_id': self.cycle[0],
+            'depends_on': self.cycle[1],
+            'cycle': list(self.cycle),
+            'hint': self.message,
+        }
+
+
 _METADATA_NOT_AN_OBJECT_HINT = (
     'update_task metadata must be a JSON object: a dict, or a JSON string '
     'that encodes one. Nothing was written. Under merge/additive, send an '
@@ -595,6 +635,7 @@ __all__ = [
     'DeferralWriteAuthorityError',
     'DeclaredScopeWriteAuthorityError',
     'FollowupItemsRefusedError',
+    'DependencyCycle',
     'MetadataNotAnObjectError',
     'MetadataTooDeepError',
     'AppendUnsupportedFieldError',

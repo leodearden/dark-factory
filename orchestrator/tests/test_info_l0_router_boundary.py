@@ -832,7 +832,9 @@ class TestRow13BlockingOrphanIsPromotedAsItWasBeforeTheRouter:
         (off_l1,) = _l1s(disabled.queue, agent_role=ORPHAN_REAPER, task_id=task_id)
         assert _promotion_fields(on_l1) == _promotion_fields(off_l1)
         on, off = routed.current(on_orphan), disabled.current(off_orphan)
-        assert (on.status, on.resolved_by, on.resolution) == (off.status, off.resolved_by, off.resolution)
+        assert (on.status, on.resolved_by) == (off.status, off.resolved_by)
+        assert on.resolution is not None and off.resolution is not None
+        assert on.resolution.replace(on_l1.id, '<l1>') == off.resolution.replace(off_l1.id, '<l1>')
         assert on_l1.suggested_action == 'manual_intervention'
         assert f'branch=task/{task_id}' in on_l1.detail
 

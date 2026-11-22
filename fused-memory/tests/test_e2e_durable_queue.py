@@ -16,11 +16,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import mock_memory_backends
 from _fm_polling import poll_until
 from _queued_write_fixtures import insert_raw_row, queued
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-from fused_memory.backends.llm_token_usage import measure_llm_tokens
 from fused_memory.middleware import dead_letter_escalator
 from fused_memory.middleware.dead_letter_escalator import (
     _REPORTED_TO_CALLER,
@@ -35,35 +35,10 @@ from fused_memory.services.queued_writes import QueueOperation
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
-def _mock_backends(svc: MemoryService) -> MemoryService:
-    """Stub Graphiti/Mem0 on *svc* so tests never hit real FalkorDB/Qdrant.
-
-    THE single definition of what a mocked MemoryService looks like in this
-    module — every fixture below builds on it, so a backend that grows a new
-    method is taught about in exactly one place.
-    """
-    svc.graphiti = MagicMock()
-    svc.graphiti.initialize = AsyncMock()
-    svc.graphiti.add_episode = AsyncMock(return_value=None)
-    svc.graphiti.close = AsyncMock()
-    svc.graphiti._require_client = MagicMock()
-    # A bare MagicMock probe yields an AsyncMock usage that the real WriteJournal
-    # rejects, dropping the graphiti backend_ops row; this one measures nothing.
-    svc.graphiti.token_probe = lambda: measure_llm_tokens(None)
-
-    svc.mem0 = MagicMock()
-    svc.mem0.search = AsyncMock(return_value={'results': []})
-    svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
-    svc.mem0.get_all = AsyncMock(return_value={'results': []})
-    svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
-    svc.mem0.close = AsyncMock()
-    return svc
-
-
 @pytest_asyncio.fixture
 async def integrated_service(mock_config):
     """MemoryService with real DurableWriteQueue, mocked Graphiti/Mem0."""
-    svc = _mock_backends(MemoryService(mock_config))
+    svc = mock_memory_backends(MemoryService(mock_config))
 
     # Real initialize — creates DurableWriteQueue with real SQLite
     await svc.initialize()
@@ -390,7 +365,7 @@ class TestFailureRecovery:
     async def test_crash_recovery(self, mock_config):
         """Enqueue item, close before processing, new service recovers and processes it."""
         # Service 1: enqueue but close quickly
-        svc1 = _mock_backends(MemoryService(mock_config))
+        svc1 = mock_memory_backends(MemoryService(mock_config))
 
         await svc1.initialize()
 
@@ -404,7 +379,7 @@ class TestFailureRecovery:
         await svc1.close()
 
         # Service 2: same data_dir -> should recover the item
-        svc2 = _mock_backends(MemoryService(mock_config))
+        svc2 = mock_memory_backends(MemoryService(mock_config))
         svc2.graphiti.add_episode = AsyncMock(return_value={'ok': True})
 
         await svc2.initialize()
@@ -764,7 +739,7 @@ async def journaled_service(mock_config, tmp_path):
 
     # Same mocked-backend definition as integrated_service — deliberately not a
     # second copy of it.
-    svc = _mock_backends(MemoryService(mock_config))
+    svc = mock_memory_backends(MemoryService(mock_config))
 
     await svc.initialize()
 
@@ -1301,7 +1276,7 @@ class TestUndecodableRowIsRefusedNotExecuted:
 
         # The row is written by another build: it is already in the store
         # when this service starts, and startup recovery picks it up.
-        writer = _mock_backends(MemoryService(mock_config))
+        writer = mock_memory_backends(MemoryService(mock_config))
         await writer.initialize()
         await writer.close()
         await insert_raw_row(
@@ -1309,7 +1284,7 @@ class TestUndecodableRowIsRefusedNotExecuted:
             group_id='main', operation='typo_op', payload_text=body,
         )
 
-        svc = _mock_backends(MemoryService(mock_config))
+        svc = mock_memory_backends(MemoryService(mock_config))
         graphiti_add_episode = AsyncMock(return_value=None)
         svc.graphiti.add_episode = graphiti_add_episode
         svc.set_known_projects({'main': str(tmp_path)})

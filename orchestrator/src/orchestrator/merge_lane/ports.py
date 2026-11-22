@@ -187,7 +187,9 @@ class ProductionVerifier:
 
     Every method resolves its function and forwards the call exactly as
     received -- positional arguments positionally, keywords by keyword -- so
-    the function sees the same call it saw before the port existed.
+    the function sees the same call it saw before the port existed. The one
+    addition is ``cold_shadow``'s ``verifier=self``: the cold leg verifies
+    through the port it was asked through, whichever instance that is.
     """
 
     scoped: Resolver[Callable[..., Awaitable[VerifyResult]]]
@@ -214,7 +216,7 @@ class ProductionVerifier:
         return DiskGuardOutcome(reason=await self.disk_guard()(*args, **options))
 
     async def cold_shadow(self, *args: Any, **options: Any) -> dict[str, str]:
-        return await self.cold_shadow_verify()(*args, **options)
+        return await self.cold_shadow_verify()(*args, verifier=self, **options)
 
     def dry_run_unblock(self, **investigation: Any) -> Coroutine[Any, Any, None]:
         return self.dry_run()(**investigation)

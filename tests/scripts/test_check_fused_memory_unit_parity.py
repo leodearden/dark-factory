@@ -11,6 +11,7 @@ mirroring the pattern in tests/scripts/test_orchestrator_watchdog.py::_load_watc
 
 import ast
 import importlib.util
+import os
 import pathlib
 import subprocess
 import sys
@@ -21,11 +22,14 @@ import systemd_unit_parity
 import yaml
 from setup_host_sections import (
     enabled_units,
+    install_recording_systemctl,
     run_section,
     slice_section,
+    stub_bin_dir,
     systemctl_calls,
     usage_error_checker,
     write_checker,
+    write_stub,
 )
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -51,6 +55,22 @@ def _load_checker() -> types.ModuleType:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
+
+
+@pytest.fixture(autouse=True)
+def _systemctl_is_a_recording_stub(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolve every `systemctl` in this module to the recording stub.
+
+    main(--fix) shells out to `systemctl --user daemon-reload` through PATH;
+    this keeps every test in the module off the host's real user manager and
+    records each call for systemctl_calls(tmp_path).
+    """
+    monkeypatch.setenv(
+        "PATH",
+        f"{install_recording_systemctl(tmp_path)}{os.pathsep}{os.environ.get('PATH', '')}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -565,10 +585,8 @@ def test_main_names_the_flagged_compose_up_line_and_the_services_read_from_it(
 def test_fix_never_synthesizes_the_aof_gate_and_reports_it_as_residual_drift(
     tmp_path: pathlib.Path,
     capsys: pytest.CaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     mod = _load_checker()
-    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
     installed = _write_unit(tmp_path, _BARE_COMPOSE_UP_UNIT)
 
     rc = mod.main(["--installed", str(installed), "--fix"])
@@ -628,18 +646,64 @@ def test_main_fix_rewrites_file(tmp_path: pathlib.Path):
     assert rc == 0
 
 
-def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
-    """main(--fix) on a drifted unit invokes daemon_reload()."""
+def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path):
+    """main(--fix) on a drifted unit issues exactly one `systemctl --user daemon-reload`.
+
+    Observed at the process boundary through this module's recording
+    `systemctl` stub, not by patching the checker.
+    """
     mod = _load_checker()
     installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
-    reload_calls: list[None] = []
-
-    def _fake_reload() -> None:
-        reload_calls.append(None)
-
-    monkeypatch.setattr(mod, "daemon_reload", _fake_reload)
     mod.main(["--installed", str(installed), "--fix"])
-    assert len(reload_calls) == 1
+    assert systemctl_calls(tmp_path) == [["--user", "daemon-reload"]]
+
+
+def test_main_fix_survives_a_failing_daemon_reload_with_tagged_warning(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """A failing reload is reported, tagged line by line, and does not change the verdict.
+
+    The stub's multi-line stderr is foreign text the checker interpolates into
+    its warning, so every physical line of it must still carry the log tag.
+    """
+    mod = _load_checker()
+    write_stub(
+        stub_bin_dir(tmp_path),
+        "systemctl",
+        "printf 'first failure line\\nsecond failure line\\n' >&2\nexit 5\n",
+    )
+    installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    err_lines = [line for line in err.splitlines() if line.strip()]
+    assert all(line.startswith(f"[{mod.LOG_TAG}]") for line in err_lines), err
+    assert any(
+        "[warn] systemctl --user daemon-reload failed (exit 5)" in line
+        for line in err_lines
+    ), err
+    assert any(line.endswith("second failure line") for line in err_lines), err
+
+
+def test_main_fix_is_silent_when_systemctl_is_absent(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """With no `systemctl` on PATH, --fix still succeeds and says nothing about the reload."""
+    mod = _load_checker()
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+    installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "systemctl" not in captured.out + captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -1020,7 +1084,6 @@ def test_log_tags_every_physical_line_of_a_multi_line_message(
 def test_main_fix_returns_1_when_execstartpre_unsynthesizable(
     tmp_path: pathlib.Path,
     capsys: pytest.CaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     """main(--fix) returns 1 (not a false 0) when a host-specific prefix directive remains.
 
@@ -1031,7 +1094,6 @@ def test_main_fix_returns_1_when_execstartpre_unsynthesizable(
     return — instead of falsely signalling parity with exit 0.
     """
     mod = _load_checker()
-    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
     installed = _write_unit(tmp_path, _MISSING_MEM0_UNIT)
     rc = mod.main(["--installed", str(installed), "--fix"])
     assert rc == 1
@@ -1044,7 +1106,6 @@ def test_main_fix_returns_1_when_execstartpre_unsynthesizable(
 def test_main_fix_appended_count_excludes_unsynthesizable_prefix(
     tmp_path: pathlib.Path,
     capsys: pytest.CaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     """The '[fixed] Appended N' count reflects only the EXACT directives appended.
 
@@ -1054,7 +1115,6 @@ def test_main_fix_appended_count_excludes_unsynthesizable_prefix(
     therefore be the exact-directive count, never the inflated len(drift).
     """
     mod = _load_checker()
-    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
     full_drift = mod.find_drift(_MISSING_MEM0_UNIT)
     exact_only = mod.find_drift(_MISSING_MEM0_UNIT, required_prefixes=())
     assert len(full_drift) == len(exact_only) + len(mod.REQUIRED_SERVICE_DIRECTIVE_PREFIXES)

@@ -15,10 +15,9 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.agents.invoke import invoke_agent
+from orchestrator.evals.paths import main_checkout
 
 __all__ = ['propose_heuristics_edit']
-
-_DEFAULT_CWD = Path('/home/leo/src/dark-factory')
 
 _OPTIMIZER_SYSTEM_PROMPT = """\
 You are a frontier prompt optimizer running a SkillOpt-discipline reflection \
@@ -96,7 +95,7 @@ async def propose_heuristics_edit(
     max_edits: int,
     optimizer_model: str,
     invoke_fn: Callable[..., Awaitable[Any]] = invoke_agent,
-    cwd: Path = _DEFAULT_CWD,
+    cwd: Path | None = None,
 ) -> str:
     """Reflect over *scored_minibatch* + *rejected_buffer* and propose a bounded heuristics edit.
 
@@ -104,7 +103,8 @@ async def propose_heuristics_edit(
     CONTRACT is un-editable by construction (D-3). Calls *invoke_fn*
     (default :func:`orchestrator.agents.invoke.invoke_agent`, injectable for
     hermetic tests) with ``model=optimizer_model`` — the frontier optimizer,
-    distinct from the executor model that runs rollouts.
+    distinct from the executor model that runs rollouts. A *cwd* that is
+    not given means the main checkout.
 
     Returns the proposed heuristics block: prefers
     ``result.structured_output['heuristics']`` when present, else
@@ -116,7 +116,7 @@ async def propose_heuristics_edit(
     result = await invoke_fn(
         prompt=prompt,
         system_prompt=_OPTIMIZER_SYSTEM_PROMPT,
-        cwd=cwd,
+        cwd=cwd if cwd is not None else main_checkout(),
         model=optimizer_model,
     )
 

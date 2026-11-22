@@ -16,13 +16,16 @@ for these would be a circular import.
 
 A missing DB file is not an error here: ``DbPool.get`` yields ``None`` for
 it, so a consumer fans out over whatever exists and a project that has not
-produced a given DB yet simply contributes nothing.
+produced a given DB yet simply contributes nothing. ``DbPool.get`` yields the
+same ``None`` for a file it cannot open, so a consumer that must tell the two
+apart asks ``roots_without_file`` which roots have no file at all.
 
-These six names are this module's entire interface: ``TASKS_DB_REL_PATH``
-(read by ``api/invariants.py``) and five connection helpers. The helpers
-carry a leading underscore from when they were private to ``app.py``. Read
-their underscore as vestigial, not as a private-use signal — the move that
-created this module was a pure extraction, with renaming outside its scope.
+These seven names are this module's entire interface: ``TASKS_DB_REL_PATH``
+(read by ``api/invariants.py``), five connection helpers and
+``roots_without_file``. The connection helpers carry a leading underscore
+from when they were private to ``app.py``. Read their underscore as
+vestigial, not as a private-use signal — the move that created this module
+was a pure extraction, with renaming outside its scope.
 """
 
 from __future__ import annotations
@@ -55,6 +58,11 @@ async def _project_scoped_dbs_labeled(
 ) -> list[tuple[str, aiosqlite.Connection | None]]:
     """Return labeled (str(root), connection|None) pairs across all known project roots."""
     return [(str(root), await pool.get(root / rel_path)) for root in config.all_project_roots]
+
+
+def roots_without_file(config: DashboardConfig, rel_path: Path) -> frozenset[str]:
+    """The ``str(root)`` labels of every known project root with no file at *rel_path*."""
+    return frozenset(str(root) for root in config.all_project_roots if not (root / rel_path).exists())
 
 
 async def _cost_dbs(

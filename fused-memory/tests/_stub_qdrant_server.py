@@ -18,6 +18,11 @@ once, with a canned count per collection.  Every latency is waited out on :attr:
 rather than slept, so a test can end the wait early and no handler thread
 outlives the server.
 
+A collection's cluster info (``GET /collections/{name}/cluster``) reports one
+local shard, ``Initializing`` while an opted-in create is still running and
+``Active`` otherwise; a point upsert into an ``Initializing`` shard answers
+Qdrant's 500, as a real Qdrant does before the shard takes writes.
+
 Binds a loopback address on port 0, so ``-n auto`` xdist workers cannot collide.
 """
 
@@ -62,6 +67,13 @@ def _not_found(name: str) -> dict[str, Any]:
     return _error(f"Not found: Collection `{name}` doesn't exist!")
 
 
+#: Qdrant 1.17.1's 500 message for a point upsert into a shard that is not yet Active (measured 2026-11-20).
+_NO_ACTIVE_REPLICA = (
+    'Service internal error: Failed to apply operation to at least one `Active` replica. '
+    'Consistency of this update is not guaranteed. Please retry. '
+)
+
+
 class StubQdrantServer:
     """Handle yielded by :func:`stub_qdrant_server`."""
 
@@ -78,6 +90,7 @@ class StubQdrantServer:
         conflict_on_create: Iterable[str],
         create_status: Mapping[str, int],
         point_counts: Mapping[str, int],
+        initializing_during_create: Iterable[str],
     ) -> None:
         self.url = ''
         self.release_event = threading.Event()
@@ -91,6 +104,7 @@ class StubQdrantServer:
         self._conflict_on_create = frozenset(conflict_on_create)
         self._create_status = dict(create_status)
         self._point_counts = dict(point_counts)
+        self._initializing_during_create = frozenset(initializing_during_create)
         self._state_lock = threading.Lock()
         self._meta_op_lock = threading.Lock()
         self._create_requests: Counter[str] = Counter()
@@ -100,6 +114,7 @@ class StubQdrantServer:
         self._create_bodies: dict[str, list[dict[str, Any]]] = {}
         self._created: dict[str, threading.Event] = {}
         self._upserted: dict[str, threading.Event] = {}
+        self._initializing_shards: set[str] = set()
         self._open_connections = 0
         self._collection_lists_in_flight = 0
         self._index_creates_in_flight: Counter[str] = Counter()
@@ -175,6 +190,18 @@ class StubQdrantServer:
             event = self._created.get(name)
         return event is not None and event.is_set()
 
+    def _shard_initializing(self, name: str) -> bool:
+        with self._state_lock:
+            return name in self._initializing_shards
+
+    def _mark_shard_initializing(self, name: str) -> None:
+        with self._state_lock:
+            self._initializing_shards.add(name)
+
+    def _mark_shard_active(self, name: str) -> None:
+        with self._state_lock:
+            self._initializing_shards.discard(name)
+
     def _check_exists(self, name: str) -> tuple[int, dict[str, Any]]:
         with self._state_lock:
             self._exists_requests[name] += 1
@@ -207,7 +234,11 @@ class StubQdrantServer:
                 return 409, _already_exists(name)
             if name in self._create_status:
                 return self._create_status[name], _error(f'stub rejected the create of `{name}`')
+            if name in self._initializing_during_create:
+                self._mark_shard_initializing(name)
+                self._created_event(name).set()
             self.release_event.wait(self._create_delay_s.get(name, 0.0))
+            self._mark_shard_active(name)
             self._created_event(name).set()
             return 200, _ok(True)
 
@@ -219,6 +250,23 @@ class StubQdrantServer:
             existed = self._exists(name)
             self._created_event(name).clear()
             return 200, _ok(existed)
+
+    def _cluster_info(self, name: str) -> tuple[int, dict[str, Any]]:
+        """Qdrant's standalone-mode cluster info for one collection (shape measured 2026-11-20)."""
+        if not self._exists(name):
+            return 404, _not_found(name)
+        local_shard = {
+            'shard_id': 0,
+            'points_count': self._point_counts.get(name, 0),
+            'state': 'Initializing' if self._shard_initializing(name) else 'Active',
+        }
+        return 200, _ok({
+            'peer_id': 1,
+            'shard_count': 1,
+            'local_shards': [local_shard],
+            'remote_shards': [],
+            'shard_transfers': [],
+        })
 
     def _count(self, name: str) -> tuple[int, dict[str, Any]]:
         if not self._exists(name):
@@ -238,6 +286,8 @@ class StubQdrantServer:
     def _upsert(self, name: str) -> tuple[int, dict[str, Any]]:
         with self._state_lock:
             self._upsert_requests[name] += 1
+        if self._shard_initializing(name):
+            return 500, _error(_NO_ACTIVE_REPLICA)
         self.release_event.wait(self._upsert_delay_s.get(name, 0.0))
         self._upserted_event(name).set()
         return 200, _ok({'operation_id': 0, 'status': 'completed'})
@@ -256,6 +306,8 @@ class StubQdrantServer:
                 return self._list_collections()
             case 'GET', ['collections', name, 'exists']:
                 return self._check_exists(name)
+            case 'GET', ['collections', name, 'cluster']:
+                return self._cluster_info(name)
             case 'PUT', ['collections', name]:
                 return self._create(name, body)
             case 'DELETE', ['collections', name]:
@@ -328,6 +380,7 @@ def stub_qdrant_server(
     conflict_on_create: Iterable[str] = (),
     create_status: Mapping[str, int] | None = None,
     point_counts: Mapping[str, int] | None = None,
+    initializing_during_create: Iterable[str] = (),
 ) -> Iterator[StubQdrantServer]:
     """Serve the stub on an ephemeral port of loopback address *host*.
 
@@ -343,7 +396,11 @@ def stub_qdrant_server(
     present at once and the 409 follows its create delay.  A create of a
     collection in *create_status* answers that error status and leaves it
     absent.  *point_counts* is what a point count of each named collection
-    answers while it exists (0 for one not named).
+    answers while it exists (0 for one not named).  A create of a collection in
+    *initializing_during_create* makes it present at once with its shard
+    ``Initializing``, as Qdrant does, and turns the shard ``Active`` only when its
+    create delay ends, just before answering 200; every other collection that
+    exists reports an ``Active`` shard.
     """
     state = StubQdrantServer(
         create_delay_s=create_delay_s or {},
@@ -356,6 +413,7 @@ def stub_qdrant_server(
         conflict_on_create=conflict_on_create,
         create_status=create_status or {},
         point_counts=point_counts or {},
+        initializing_during_create=initializing_during_create,
     )
     httpd = _QuietServer((host, 0), _make_handler(state))
     bound_host, port = httpd.server_address[:2]

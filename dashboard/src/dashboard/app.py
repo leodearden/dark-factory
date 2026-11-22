@@ -43,6 +43,7 @@ from dashboard.api import task_prose as api_task_prose_routes
 from dashboard.api import tasks as api_tasks_routes
 from dashboard.api.clock import app_clock, install_clock, live_clock
 from dashboard.api.window import _parse_window, with_window
+from dashboard.background_loops import PRODUCTION_LOOPS, BackgroundLoops
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data import redux_api
@@ -105,15 +106,7 @@ from dashboard.data.task_snapshot import ROW_READ_FIELDS, ROW_READ_STATUSES
 from dashboard.data.tasks import fetch_task_page
 from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import MEMORY_OPS_FRESHNESS_BOUND_SECONDS, get_memory_ops
-from dashboard.http_pool import reaper_loop
-from dashboard.loops import (
-    _burndown_loop,
-    _BurndownStore,
-    _metrics_loop,
-    _MetricsStore,
-    _quality_loop,
-    _QualityStore,
-)
+from dashboard.loops import _BurndownStore, _MetricsStore, _QualityStore
 from dashboard.project_dbs import _cost_dbs, _cost_sources
 
 _pkg_dir = Path(__file__).parent
@@ -292,8 +285,11 @@ async def _close_each(*closers: Callable[[], Awaitable[object]]) -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI, *, loops: BackgroundLoops = PRODUCTION_LOOPS):
     """Manage shared resources: HTTP client, DB connection pool.
+
+    ``loops`` is the seam for a test to observe or replace the background
+    loops this starts; production takes ``PRODUCTION_LOOPS``.
 
     **Shutdown closes the objects THIS lifespan opened, held in locals — never
     whatever ``app.state`` happens to point at by then** (task 3466).
@@ -321,7 +317,8 @@ async def lifespan(app: FastAPI):
     this lifespan would wire its stores and loops to a config it never built.
     ``app.state`` assignment is retained purely for request handlers (which
     read ``request.app.state.config``) and for the tests that swap it.
-    ``_metrics_loop``'s docstring above states the resulting invariant in full;
+    ``dashboard/src/dashboard/loops.py::_metrics_loop``'s docstring states the
+    resulting invariant in full;
     ``dashboard/tests/test_lifespan_resource_binding.py`` pins it.
 
     **Shutdown also reaps detached cache refreshes**, which are the one thing
@@ -391,19 +388,20 @@ async def lifespan(app: FastAPI):
     # The reaper reclaims pool connections a cancelled request orphaned, which
     # httpcore itself cannot: dashboard/src/dashboard/http_pool.py states the
     # mechanism. It takes the LOCAL http_client — never app.state.http_client —
-    # for the reason _metrics_loop's docstring gives in full (task 3771).
+    # for the reason dashboard/src/dashboard/loops.py::_metrics_loop's docstring
+    # gives in full (task 3771).
     samplers = (
         (
-            asyncio.create_task(_burndown_loop(burndown_store, config, http_client)),
+            asyncio.create_task(loops.burndown(burndown_store, config, http_client)),
             asyncio.create_task(
-                _metrics_loop(metrics_store, app, pool=pool, http_client=http_client)
+                loops.metrics(metrics_store, app, pool=pool, http_client=http_client)
             ),
-            asyncio.create_task(_quality_loop(quality_store, config)),
+            asyncio.create_task(loops.quality(quality_store, config)),
         )
         if config.samplers_enabled
         else ()
     )
-    reaper_task = asyncio.create_task(reaper_loop(http_client))
+    reaper_task = asyncio.create_task(loops.reaper(http_client))
     background = (*samplers, reaper_task)
 
     yield

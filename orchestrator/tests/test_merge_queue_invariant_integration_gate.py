@@ -551,7 +551,7 @@ class TestScenario234VerifierLifecycleFaults:
         })
 
         async with _running_lane(git_ops, verifier=verifier) as (lane, queue):
-            lane.VERIFY_ABANDON_POLL_SECS = 0.02
+            lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
             req = await _submitted(git_ops, config, 'halt3', 'halt3.py', 'h = 1\n')
             await queue.put(req)
             await _until(lambda: 'halt3' in verifier.verified, what='the verify to enter')
@@ -599,7 +599,7 @@ class TestScenario234VerifierLifecycleFaults:
         })
 
         async with _running_lane(git_ops, verifier=verifier) as (lane, queue):
-            lane.VERIFY_ABANDON_POLL_SECS = 0.02
+            lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
             req = await _submitted(git_ops, config, 'drop4', 'drop4.py', 'd = 1\n')
             await queue.put(req)
             await _until(lambda: 'drop4' in verifier.verified, what='the verify to enter')

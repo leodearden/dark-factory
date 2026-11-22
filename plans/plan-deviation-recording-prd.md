@@ -337,8 +337,11 @@ not something pydantic gives for free. It does not touch `census.py`,
 **D9 — Corpus, cost and metric.** Two corpora, read into one flat list: (i) `plan.json`
 deviation records under every configured meta root (default
 `<project_root>/.worktrees/.task-meta`; `scripts/scan_plan_decision_pairing.py` is the
-bulk-reader precedent; task id from the directory name, which disagrees with the document's
-`task_id` on 4 of that script's 1,299-plan 2026-08-16 sample). The corpus is append-only and
+bulk-reader precedent). The task id is the plan document's own `task_id`, never the directory
+name: the two disagree on 4 of that script's 1,299-plan 2026-08-16 sample, and a lane directory
+(`N/`, `_lane-N/`) names no task at all. A plan without a usable `task_id` is skipped. One plan
+seen under both `N/` and `task-N/` counts once: identical records collapse, and a task's
+finalized plan is its latest `_finalized_at`. The corpus is append-only and
 230 MB today, so the reader **stats before it reads**: a `plan.json` is rewritten on every
 write, so a file whose mtime is older than the 28-day horizon cannot hold an in-window record
 and is skipped without being opened. (ii) Archived escalations from
@@ -347,14 +350,41 @@ and is skipped without being opened. (ii) Archived escalations from
 PRD's class for a pure observation — **or** the pre-router fallback (`severity == 'info'`,
 `category == 'design_concern'`, `agent_role` in the implementer/amendment set, resolved by
 any tier), which keeps counting records filed before the flag and the router exist. The
-archive is a rolling ~30 days; the metric needs 28. Metric: **records per day**, the unit
-the 2026-09-21 study used (4.2 → 9.0/day). Trigger A (rate rise): the trailing 7-day mean
-exceeds `rate_rise_factor` (default 2.0) × the mean of the preceding 21 days **and** the
-7-day count ≥ `min_records` (default 10). Trigger B (pattern): one `kind`'s share of the
-7-day records ≥ `pattern_share` (default 0.5) with count ≥ `min_records`, or `prose_only`
-records ≥ `prose_only_min` (default 3) in 7 days. Windows are measured backwards from `now`
-(UTC-aware); no day boundary. No denominator: a per-plan rate would need runs.db, which the
-nightly cannot reach; the human the escalation reaches has it. `Verdict(fire, reasons,
+archive is a rolling ~30 days; the metric needs 28. Metric: **records per finalized plan** in
+each window. The denominator is the number of distinct tasks whose latest `_finalized_at`
+falls in the window, read from the same `plan.json` corpus; the mtime pre-filter stays valid,
+because finalizing writes the file. A window without a finalized plan fires no rate arm.
+Plan-step records with no finalized plan anywhere in the corpus mean the plan read broke: the
+journal line names that break and is logged at WARNING. Per-day means stay in the evidence as context only: a per-day rate rises with planning volume
+alone. One rate-arm mechanism serves two kinds of arm. `rate-rise[<source>]`, one per record
+source, compares that source against its own baseline. It fires when the trailing 7-day
+per-plan rate exceeds `rate_rise_factor` (default 2.0) × the preceding 21 days' per-plan rate
+**and** the 7-day count ≥ `min_records` (default 10). `prose-only` applies the same relative
+rule to plan-step `prose_only` records, with `prose_only_min` (default 3) as its count floor.
+A source is **warming up** while it has no in-horizon record, or while its earliest in-horizon
+record is less than `horizon_days` − 7 days old. A warming-up source fires no rate arm (the
+prose-only arm is gated on the plan-step source), and the `sources` evidence lists it. Trigger B
+(pattern): one `kind`'s share of the 7-day *kinded* records ≥ `pattern_share` (default 0.5)
+with count ≥ `min_records`. Kindless escalation records are not in that denominator. Windows
+are measured backwards from `now` (UTC-aware); no day boundary.
+*Amended 2026-11-18 (task 7717; rulings on esc-plan-deviation-census-reify-9 and
+esc-plan-deviation-census-dark_factory-12).* The original metric was records per day with no
+denominator, on the belief that a per-plan rate needed runs.db; `_finalized_at` is in every
+plan the census already opens, so it does not. Trigger A also pooled both sources, so it fired
+on the plan-step channel's opening itself, against a baseline that was mostly the older
+escalation channel. The pre-11-04 reify lane-loss hole (before task 3157 made `plan.json`
+task-keyed, a reused lane overwrote the previous task's plan) is neutralised by per-plan
+normalisation: a lane overwrite deletes a plan's `_finalized_at` and its deviations in the same
+file, so the numerator and the denominator thin together. The escalation arm divides an
+archive-complete numerator by that thinned denominator, which inflates its baseline and can only
+suppress a fire. The 11-18 ruling's addendum (a) offered "per finalized plan, or per recording
+task" for the kind-pattern denominator too. Both were considered and declined: its denominator
+is the 7-day kinded records instead. A share is already invariant to planning volume, because
+doubling plans at a constant kind mix leaves every share unchanged, and that is the addendum's
+acceptance. On the 11-18 records, a share per recording task would fire (never_checked_fact in
+0.62 of 212 recording tasks, against a record share of 0.44). A per-plan figure would be a rate
+under a key named `pattern_share`. The share's real defect was pooling: kindless escalation
+records diluted it. `Verdict(fire, reasons,
 evidence)` is *modelled on* `census_trigger.Decision(fire, reasons)` — the `evidence` list
 is new, and is what carries the structured counts (INV-2 `structured-facts-at-failure`).
 
@@ -367,8 +397,9 @@ would become a task, not a human page. `blocking` L0s take the reaper's unchange
 promotion (router PRD D6) after `orphan_l0_timeout_secs` (600 s default — the "~10 min" the
 legibility trickle's comment records is that timeout, not a property of any category), the
 auto-watcher promotes a `design_concern` L1 to L2 with an explicit severity (never
-auto-closable), and the L2 watcher reads the structured `evidence` (window, 7-day and 21-day
-means, per-kind counts, prose-only count, top task ids). The synthetic task id pins nothing
+auto-closable), and the L2 watcher reads the structured `evidence` (window counts, finalized
+plans and per-plan rates, per-source rates and warm-up, per-kind counts, prose-only rates, top
+task ids). The synthetic task id pins nothing
 real — the `__recovery_veto_streak__` sentinel precedent in the auto-watcher skill. It files
 at most once per `cooldown_days` (default 7) and never while a record with that `task_id` is
 pending (`get_pending_escalations`). `escalate_info` accepts any `KNOWN_SEVERITIES` value;
@@ -425,7 +456,19 @@ a third would widen its problem). `_confirm_plan`'s comment and the `confirm_pla
 state that `_finalized_at` dates the *last* confirm. `record_step_deviation` is exposed
 through a **new** list `roles.py::_PLAN_DEVIATION_TOOLS`, added to IMPLEMENTER and DEBUGGER
 only — not through `_PLAN_STATUS_TOOLS`, which `SIMPLE_TASK` also holds and which would hand
-the tool to a role with no frozen plan and no doctrine.
+the tool to a role with no frozen plan and no doctrine. The plan-tools server enforces that
+allowlist by registering only the role's granted tools: `plan_tools.create_server(granted_tools=...)`,
+launched with `--grants-enforced` and one `--grant` per name in `AgentRole.plan_tools_grants`,
+so a role granted nothing gets nothing. Dispatches run under `bypassPermissions`, where
+`--allowed-tools` neither hides nor denies a tool (task 7717). 2026-11-18, task 7717 review: a
+launch carrying neither the marker nor any grant keeps the full surface and logs a WARNING,
+because it comes from a pre-7717 orchestrator, whose in-memory launcher emits no grant while
+the server child imports the new `plan_tools.py` through the editable install; task 10803
+removes that path once deploy task 10802 has restarted the fleet. The same skew can hand the
+server a `--grant` naming a tool it no longer registers, after a rename or removal, so the CLI
+drops such a grant with a WARNING rather than refusing to start (a server that fails at startup
+is dropped by the Claude CLI, taking every granted tool with it). In-process
+`create_server(granted_tools=...)` still raises on one.
 
 ---
 
@@ -437,7 +480,7 @@ the tool to a role with no frozen plan and no doctrine.
  step text wrong, rationale clear           escalate_info(note_to_file)     plan_deviation_census.py
    → apply rationale in full                  → chokepoint: stamp id,       reads .task-meta/*/plan.json
    → self-verify                                submit_resolved             (mtime-pruned) ∪ archive
-   → record_step_deviation(kind,…)  ──►  plan.json step.deviations[]        → records/day, 7d vs 21d
+   → record_step_deviation(kind,…)  ──►  plan.json step.deviations[]        → per plan, per source, 7d vs 21d
    → (not step-attributable)        ──►  archive/<date>/esc-*.json          → per-kind shares, prose_only
                                            resolution_class=note-to-file    → blocking escalate_info on
  ordinary info notes: router PRD chain                                        a synthetic task id, ≤1 per
@@ -485,17 +528,21 @@ record_step_deviation(step_id, kind, observed, expected, action_taken,
   `add_plan_step`; the allowlist `roles.py::_PLAN_DEVIATION_TOOLS =
   ['mcp__plan-tools__record_step_deviation']` is added to IMPLEMENTER and DEBUGGER by γ, the
   one leaf that edits `roles.py` — until γ lands the tool exists but no dispatched role holds
-  it. `STEP_TYPES` is a public constant in `plan_tools.py`.
+  it. A plan-tools server launched by a post-7717 dispatch registers only its role's granted
+  tools (D14), so a role without the grant can neither list nor call it. `STEP_TYPES` is a public constant in
+  `plan_tools.py`.
 
 ### 6.3 Census (δ)
 
-`plan_deviation_census.evaluate(records: list[DeviationRecord], *, now, config) -> Verdict`
-is pure (no I/O): `Verdict(fire: bool, reasons: list[str], evidence: list[dict])`. Readers
-(`read_plan_deviations(meta_roots, *, horizon)`, `read_archived_notes(escalations_dir)`)
-normalise both corpora to `DeviationRecord(task_id, recorded_at, kind | None, prose_only,
-source)` and return one flat list (a union). `run(cfg, *, now, filer, state_path)` wires
-readers → evaluate → cooldown / pending check → `escalate_info(severity='blocking')` → state
-write, never raises, returns the one journal line.
+`plan_deviation_census.evaluate(records: Sequence[CensusRecord], *, plans:
+Sequence[FinalizedPlan], now, config) -> Verdict` is pure (no I/O): `Verdict(fire: bool,
+reasons: tuple[str, ...], evidence: tuple[dict, ...])`. Readers (`read_plan_deviations(meta_roots,
+*, horizon)`, `read_archived_notes(escalations_dir, *, horizon)`) each return a
+`CorpusRead(records, opened, skipped, plans)`: records normalised to `CensusRecord(task_id,
+recorded_at, kind | None, prose_only, source)`, and `plans`, one `FinalizedPlan(task_id,
+finalized_at)` per task, from the plan reader only. `run(cfg, *, now, call_tool, state_path)`
+wires readers → evaluate → cooldown / pending check → `escalate_info(severity='blocking')` →
+state write, never raises, returns the one journal line.
 
 ### 6.4 Boundary-test sketch (the integration gate is δ's test module)
 

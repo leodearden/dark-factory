@@ -63,6 +63,9 @@ PURE_STDLIB_LEAVES = (
     'asyncio_tasks',
     'backends',
     'branch_names',
+    'cgroup_slice',
+    'cgroup_stats',
+    'claude_executable',
     'cli_boundary',
     'config_dir',
     'escalation_layout',
@@ -116,11 +119,13 @@ PURE_STDLIB_LEAVES = (
     'testing_reify_layout',
     'testing_repo_wide_tests',
     'testing_streams',
+    'testing_timeout_headroom',
     'testing_timeout_markers',
     'testing_virtual_clock',
     'timestamps',
     'transcript_archive',
     'verify_admission',
+    'verify_scope_tag',
     'whole_tree_guard_family',
 )
 

@@ -1,0 +1,39 @@
+"""Expected verifies per request under the mark rule, homogeneous vs sorted chains, using out-of-sample risk groups."""
+import json,collections,datetime as dt
+P='/tmp/gate-10069/predict/'
+rows=json.load(open(P+'rows_window.json')); CUT=json.load(open(P+'model_choice.json'))['cut']
+F={'prior_fail':lambda r:'pf1+' if r['prior_fail']>0 else 'pf0','decl12':lambda r:'decl>=12' if (r['n_decl_files'] or 0)>=12 else 'decl<12',
+   'files12':lambda r:'na' if r['n_task_files'] is None else ('tf>=12' if r['n_task_files']>=12 else 'tf<12'),
+   'simple':lambda r:'simple' if r['complexity']=='simple' else 'std','nverif':lambda r:'v>=3' if r['n_task_verifies']>=3 else 'v<3'}
+train=[r for r in rows if r['verdict_t']<CUT]; test=[r for r in rows if r['verdict_t']>=CUT]
+def fit(feats,m=8):
+    base=sum(r['y'] for r in train)/len(train); cell=collections.defaultdict(lambda:[0,0])
+    for r in train:
+        k=tuple(F[f](r) for f in feats); cell[k][0]+=1; cell[k][1]+=r['y']
+    return lambda r:((cell.get(tuple(F[f](r) for f in feats),(0,0))[1]+m*base)/(cell.get(tuple(F[f](r) for f in feats),(0,0))[0]+m))
+def cost(q,k,e=0.0):
+    if k==1: return 1.0
+    return 1/k+(1-(1-e)*(1-q)**k)      # verifies per request: the chain verify share + a solo each if red
+def best(q,e=0.0,ks=(1,2,3,4,5,6,8,12)):
+    return min((cost(q,k,e),k) for k in ks)
+def report(name,groups,e):
+    tot=sum(n for n,_ in groups); qbar=sum(n*q for n,q in groups)/tot
+    never=1.0
+    cb,kb=best(qbar,e)
+    line=f'  {name:34s} e={e:.2f} pooled q={qbar:.3f}: never=1.000 | one k for all: '+' '.join(f'k{k}={cost(qbar,k,e):.3f}' for k in(2,3,4,6))+f' best k={kb} {cb:.3f}'
+    sorted_cost=sum(n*best(q,e)[0] for n,q in groups)/tot
+    ks=[best(q,e)[1] for n,q in groups]
+    solo_risky=sum(n*(1.0 if i==len(groups)-1 else cost(q,kb,e)) for i,(n,q) in enumerate(groups))/tot
+    print(line+f' | chooser: risky group solo, rest k={kb}: {solo_risky:.3f} ({(solo_risky/cb-1)*100:+.1f}%) | per-group best k {ks}: {sorted_cost:.3f} ({(sorted_cost/cb-1)*100:+.1f}%) | per landing: x{1/(1-qbar):.3f}')
+for nm,feats,thr in(('A prior_fail+decl12',['prior_fail','decl12'],(0.13,0.20)),('B files12+simple+nverif (inner-selected)',['files12','simple','nverif'],(0.13,0.20))):
+    p=fit(feats)
+    g=collections.defaultdict(lambda:[0,0])
+    for r in test:
+        v=p(r); b=0 if v<thr[0] else (1 if v<thr[1] else 2); g[b][0]+=1; g[b][1]+=r['y']
+    groups=[(g[b][0],g[b][1]/g[b][0]) for b in sorted(g)]
+    print(nm,'holdout groups (n, observed fail rate) by predicted band <%.2f / <%.2f / >=:'%thr,[(n,round(q,3)) for n,q in groups])
+    for e in(0.0,0.10,0.20): report(nm[:30],groups,e)
+# hypothetical stronger discrimination, same pooled rate 0.136
+print('hypothetical groups (share,q) at pooled 0.136:')
+for nm,groups in(('2x  (80% @0.113, 20% @0.227)',[(80,0.1135),(20,0.227)]),('4x  (80% @0.085, 20% @0.34)',[(80,0.085),(20,0.34)]),('10x (80% @0.0486,20% @0.486)',[(80,0.0486),(20,0.486)]),('perfect (86.4% @0, 13.6% @1)',[(86.4,0.0),(13.6,1.0)])):
+    for e in(0.0,0.10): report(nm,groups,e)

@@ -1666,7 +1666,7 @@ class TestRegistryCoverageGauge:
         ])
         md = _mod.render_markdown(self._report(cells, registry))
         section = _md_section(
-            md, '### Registry coverage — the accountable target', stop='### ',
+            md, '### Registry coverage — the accountable target', stop='## ',
         )
         table_rows = {
             row[1]: row
@@ -2979,7 +2979,7 @@ class TestRenderMarkdownTopicCoverage:
     def test_registry_gauge_renders_with_its_actionable_worklist(self):
         md = _mod.render_markdown(_coverage_md_report())
         registry = _md_section(
-            md, '### Registry coverage — the accountable target', stop='### ',
+            md, '### Registry coverage — the accountable target', stop='## ',
         )
         # registry_topics_total, inside the registry section. Unanchored,
         # '**4**' matched any bolded 4 anywhere in the document.

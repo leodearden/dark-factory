@@ -14,7 +14,9 @@ Usage::
         -- <inner cmd> [args...]
 
 The ``/`` filesystem is made read-only (exec + read_file + read_dir). Each
-``--writable`` path is granted full v1 access. ``~/.claude`` is NOT granted
+``--writable`` directory is granted full v1 access. A ``--writable`` entry may
+also be a single regular file: that grant permits writing the file in place
+only, not creating, renaming or removing files beside it. ``~/.claude`` is NOT granted
 wholesale: only the subpaths passed in via ``--writable`` are writable (e.g.
 ``~/.claude/fleet/``, supplied as an extra computed by
 ``orchestrator.agents.write_set.compute_write_set``), so
@@ -98,6 +100,9 @@ FS_REFER = 1 << 13
 LANDLOCK_CREATE_RULESET_VERSION = 1
 
 FS_RO = FS_EXECUTE | FS_READ_FILE | FS_READ_DIR
+# A path-beneath rule on a regular file fails with EINVAL if its mask carries
+# directory-only rights, so a file grant is masked down to these.
+FS_FILE_ALL = FS_EXECUTE | FS_WRITE_FILE | FS_READ_FILE
 
 LANDLOCK_RULE_PATH_BENEATH = 1
 
@@ -135,7 +140,8 @@ def _add_path(
     *,
     warn_if_missing: bool = False,
 ) -> None:
-    """Add a path-beneath rule, skipping a path that is not an existing dir.
+    """Add a path-beneath rule: *allowed* for a directory, its file-only
+    subset for a regular file, and a skip for anything else.
 
     The skip is unavoidable — ``landlock_add_rule`` needs an O_PATH fd, so there
     is nothing to open for a path that does not exist — but it must not be
@@ -151,10 +157,12 @@ def _add_path(
     for them would be noise. Callers pass it for the ``--writable`` list, whose
     members come from outside this module.
     """
-    if not os.path.isdir(path):
+    if os.path.isfile(path):
+        allowed &= FS_FILE_ALL
+    elif not os.path.isdir(path):
         if warn_if_missing:
             print(
-                f'landlock_exec: --writable {path} is not an existing directory '
+                f'landlock_exec: --writable {path} is not an existing file or directory '
                 f'— NOT granting it. Whatever needed to write there will be '
                 f'denied by the kernel. (A grant issued before the directory is '
                 f'created is vacuous; create it first, then wrap.)',

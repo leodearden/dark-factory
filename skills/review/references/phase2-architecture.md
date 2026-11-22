@@ -59,9 +59,8 @@ A step below that mints a key already in the carry set merges into that entry ra
 Some projects ship an `/audit` slash command — an automated detector suite (reify's `reify-audit` covers P1 producer-orphan, P2 consumer-stub, P5 phantom-done). When present it runs first and takes the mechanical scanning off the later steps.
 
 1. **Detect.** `.claude/skills/audit/SKILL.md` at the project root. Absent → `f_infra.audit_skill_present: false`, skip.
-2. **Window.** `mode: since` → `--since` is the committer date of `since` (`git show -s --format=%cI <since>`). `mode: full` → now minus the briefing's `audit.window_days` (default 14).
-3. **Invoke.** `Skill(audit, args="--pattern P1,P2,P5 --since <iso>")`. It writes `data/audit-runs/<ts>.json`, escalates high, files medium, logs low, and keeps its own dedupe index.
-4. **Fold in.** Keep the raw counts in `f_infra` and convert each audit finding into a `findings` entry tagged `kind:audit` (lens first), disposition `filed:<filed_task_id>` for medium, `open` with the escalation id in the statement for high. Phase 3 never re-files or re-escalates them.
+2. **Invoke.** `Skill(audit, args="--pattern P1,P2,P5")`. It sweeps the whole task corpus in both modes: there is no window to pass. It writes `data/audit-runs/<ts>.json`, escalates high, files medium, logs low, and keeps its own dedupe index.
+3. **Fold in.** Keep the raw counts in `f_infra` and convert each audit finding into a `findings` entry tagged `kind:audit` (lens first), disposition `filed:<filed_task_id>` for medium, `open` with the escalation id in the statement for high. Phase 3 never re-files or re-escalates them.
 
 ## Step 1.5: Read the other instruments' reports (contract §9)
 

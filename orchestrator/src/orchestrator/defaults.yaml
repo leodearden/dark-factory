@@ -3,6 +3,11 @@
 
 # Concurrency
 max_concurrent_tasks: 24
+# Run slots beyond max_concurrent_tasks that only a main-health fix may take;
+# rationale in docs/main-health-fix-run-slot-reserve.md. The dashboard restates
+# this value (dashboard/src/dashboard/data/orchestrator.py, FORMAT COUPLING
+# item 2), so change both together.
+main_health_fix_reserved_slots: 1
 max_per_module: 1
 lock_depth: 4
 module_overrides: {}
@@ -429,15 +434,16 @@ effort:
   # Leo 2026-11-03: xhigh, as max is no longer a good choice since Opus 5.5
   # (reviewer moved to xhigh 2026-10-31, task 7972).
   architect: "xhigh"
-  implementer: "max"
-  debugger: "max"
+  # Leo 2026-11-16: xhigh, as max is no longer a good choice since Opus 5.5.
+  implementer: "xhigh"
+  debugger: "xhigh"
   # Leo 2026-10-31 (task 7972); evidence and revert: gate task 7973.
   reviewer: "xhigh"
-  merger: "max"
+  merger: "xhigh"
   steward: "high"
   triage: "medium"
   module_tagger: "medium"
-  deep_reviewer: "max"
+  deep_reviewer: "xhigh"
   judge: "medium"
   simple_task: "high"
 
@@ -675,14 +681,17 @@ git:
   # _lane- (warm-lane pool) or _spec- (merge-speculation pool).
   iact_prefix: "_iact-"
 
-# Deep merge-ahead chains (task 3183).  chain_cap is the single gate for the
-# whole feature: the maximum number of queued items one verify may cover as a
-# chain.  0 (shipped default) is the KILL SWITCH — byte-identical to pre-PRD
-# merge behaviour.  Green-tier hot-reloadable, so enable/retune/kill never needs
-# a restart; set it with scripts/merge-deep-set-cap.sh.  Dispatch contract and
-# cap-staging plan: plans/deep-merge-ahead-prd.md.
+# Deep merge-ahead chains (task 3183).  chain_cap is the KILL SWITCH only:
+# 0 (shipped default) is byte-identical to pre-PRD merge behaviour, and any
+# positive value turns chains on without bounding them.  depth_table sets the
+# depth: the first [min_pass_estimate, depth] row the rolling per-item pass
+# estimate meets, else 1 (task 8528).  Green-tier hot-reloadable, so
+# enable/retune/kill never needs a restart; set the switch with
+# scripts/merge-deep-set-cap.sh.  Policy: plans/merge-lane-policy-prd.md D6/D7.
 merge_deep:
   chain_cap: 0
+  depth_table: [[0.992, 12], [0.990, 11], [0.988, 10], [0.984, 9], [0.979, 8],
+                [0.972, 7], [0.959, 6], [0.934, 5], [0.876, 4], [0.75, 3]]
   # Chain-build deadline (s); above reify's measured whole-process build p99 (~1230 s).
   chain_build_timeout_secs: 1800
   # How long a built chain's links stay reserved for its tip verify (s).

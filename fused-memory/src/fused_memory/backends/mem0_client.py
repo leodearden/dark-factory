@@ -206,15 +206,14 @@ def split_managed_metadata(
     return managed, custom
 
 
-# mem0's own default embedding dimensionality, shared by its Qdrant vector
-# store (mem0/configs/vector_stores/qdrant.py) and its OpenAI embedder
-# (mem0/embeddings/openai.py). Emitting the embedder key at this value would
-# be a behaviour CHANGE, not a no-op — see _build_config_dict.
-_MEM0_DEFAULT_EMBEDDING_DIMS = 1536
-
 # mem0's MemoryConfig.history_db_path value for a private, per-instance SQLite
 # history DB (SQLiteManager's own default).
 _MEM0_IN_MEMORY_HISTORY_DB = ':memory:'
+
+
+def build_vector_store_client(qdrant_url: str, *, read_budget_s: float, write_budget_s: float) -> QdrantClient:
+    """The sync Qdrant client mem0's vector stores run on, its socket timeout outlasting both the read and the write budget."""
+    return QdrantClient(url=qdrant_url, timeout=socket_timeout_outlasting(read_budget_s, write_budget_s))
 
 
 class Mem0Backend:
@@ -242,8 +241,9 @@ class Mem0Backend:
     message format.  mem0's instance construction (its collection listing and
     payload-index creates) runs off the event loop under the write budget as
     ``create_instance``, and the Qdrant client mem0's vector store uses is this
-    backend's own, its socket timeout from ``socket_timeout_outlasting`` over
-    both budgets, so a slow mem0 leg fails on its named budget
+    backend's own, built by :func:`build_vector_store_client` from the very
+    budgets :meth:`_timed_read` / :meth:`_timed_write` apply, so a
+    slow mem0 leg fails on its named budget
     (tests/test_mem0_vector_store_client.py).  The one exception left: the
     direct async client's socket timeout is still the read budget, so its
     calls can still fail unattributed: its writes, and :meth:`list_projects`'
@@ -275,28 +275,20 @@ class Mem0Backend:
                 'config': {
                     'url': cfg.mem0.qdrant_url,
                     'collection_name': collection_name,
-                    # Note the deliberate asymmetry with the embedder's
-                    # 'embedding_dims' below: DIFFERENT key name, different
-                    # upstream semantics, different emission rule. mem0 would
-                    # CREATE the collection at this width, but never does:
-                    # _ensure_collection has already created it from the same
-                    # cfg.embedder.dimensions, so mem0's create_col always
-                    # finds it present and skips. mem0's own default is 1536
-                    # (mem0/configs/vector_stores/qdrant.py), so emitting it
-                    # unconditionally is a no-op at the shipped config.
+                    # The width the collection is created at. The embedder
+                    # below deliberately gets no width key, so mem0 never
+                    # sends `dimensions` (plans/local-embedder-cutover-prd.md
+                    # §6 C3). mem0 would CREATE the collection at this width,
+                    # but never does: _ensure_collection has already created
+                    # it from the same cfg.embedder.dimensions.
                     #
-                    # OPERATOR HAZARD at a NON-1536 embedder.dimensions on an
-                    # EXISTING deployment: neither key was plumbed before, so
-                    # such a config was inert — mem0 created the collection at
-                    # its own 1536 default and requested 1536-wide vectors.
-                    # Both now follow the config, but an existing collection
-                    # keeps its old width: _ensure_collection's exists-check
-                    # skips it, and so does mem0's QdrantDB.create_col
-                    # ('Collection ... already exists. Skipping creation.'),
-                    # leaving a 1536-wide collection that every N-wide upsert
-                    # then fails against at runtime. Changing
-                    # embedder.dimensions requires recreating and re-embedding
-                    # the Qdrant collection; it is not a live-migratable knob.
+                    # OPERATOR HAZARD on an EXISTING deployment: a collection
+                    # keeps the width it was created at. _ensure_collection's
+                    # exists-check skips it, and so does mem0's
+                    # QdrantDB.create_col, so every upsert at a new width
+                    # fails at runtime. Changing embedder.dimensions requires
+                    # recreating and re-embedding the Qdrant collection; it is
+                    # not a live-migratable knob.
                     'embedding_model_dims': cfg.embedder.dimensions,
                 },
             },
@@ -352,16 +344,6 @@ class Mem0Backend:
                 # the two endpoints stay independent.
                 'openai_base_url': cfg.embedder.providers.openai.api_url,
             }
-            # Emitted ONLY at a non-default dimensionality. This guard is
-            # mandatory, not stylistic: mem0/embeddings/openai.py does
-            #     self._pass_dimensions_to_api = self.config.embedding_dims is not None
-            # so emitting the key at all — even as 1536 — would start sending a
-            # `dimensions` field on EVERY embeddings request under the shipped
-            # config, which is not byte-identical. Do not "simplify" this away.
-            # (Note the key name: the embedder takes `embedding_dims`;
-            # `embedding_model_dims` is the vector store's, set above.)
-            if cfg.embedder.dimensions != _MEM0_DEFAULT_EMBEDDING_DIMS:
-                embedder_config['embedding_dims'] = cfg.embedder.dimensions
             config_dict['embedder'] = {
                 'provider': 'openai',
                 'config': embedder_config,
@@ -780,9 +762,10 @@ class Mem0Backend:
     def _get_vector_store_client(self) -> QdrantClient:
         """Get or create the sync Qdrant client every mem0 instance's vector store shares."""
         if self._vector_store_client is None:
-            self._vector_store_client = QdrantClient(
-                url=self.config.mem0.qdrant_url,
-                timeout=socket_timeout_outlasting(self._read_timeout, self._write_timeout),
+            self._vector_store_client = build_vector_store_client(
+                self.config.mem0.qdrant_url,
+                read_budget_s=self._read_timeout,
+                write_budget_s=self._write_timeout,
             )
         return self._vector_store_client
 

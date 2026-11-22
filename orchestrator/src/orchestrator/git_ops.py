@@ -2170,7 +2170,7 @@ class MergeVerifyLeaseContended(RuntimeError):
       unprotected.  It fires BEFORE any verify is dispatched at all.
 
     Both propagate to the merge worker's requeue seam
-    (``_run_inflight_verify``), which DEFERS the dispatch — re-queued to try
+    (``VerifyDispatcher.run_inflight_verify``), which DEFERS the dispatch — re-queued to try
     again later — instead of resolving a ``MergeOutcome('blocked')``.  That
     placement matters: a blocked resolution here would carry a DETERMINISTIC
     reason string, producing an identical ``merge_outcome_signature`` on every
@@ -6751,17 +6751,33 @@ class GitOps:
         and delta-touches sources against the base commit, so freshness never
         depends on lane history.
 
-        **Cold-fallback path** (inv.6: never raises, never blocks the scheduler):
-            Knob off or pool exhausted returns a cold worktree with warm=False,
-            logged at DEBUG.  A fault while holding a lane goes through
+        **Cold-fallback path** (inv.6: a fault never blocks the scheduler):
+            Knob off or pool exhausted returns a cold worktree with warm=False.
+            Knob off is the configured state and logs at DEBUG; an exhausted
+            pool degrades a verify that was meant to be warm, so it logs at
+            INFO.  A fault while holding a lane goes through
             :meth:`_spec_lane_cold_fallback`, which logs at WARNING.
+
+        **Vanished lane directory**: a lane still registered whose directory
+        is gone has its registration removed and takes the create-once path,
+        so a pool that hands out its first FREE lane does not re-draw a
+        broken one forever.
+
+        **Cancellation and errors**: any other exit between ``try_acquire``
+        and the warm return, such as a caller's deadline or shutdown cancel,
+        or a :class:`WorktreeMissing` from a lane whose directory vanished
+        mid-reset, gives the lane back and then propagates.  A seed killed
+        that way leaves ``target/`` half-cloned; the next acquire's
+        ``--fresh-checkout`` re-seed replaces it.
 
         Args:
             merge_commit: The merge commit SHA to check out in the spec lane.
 
         Returns:
             ``(lane_path, True)`` when the warm spec lane is ready;
-            ``(cold_path, False)`` on pool exhaustion or any failure (inv.6).
+            ``(cold_path, False)`` on knob-off, pool exhaustion or a detected
+            fault (inv.6).  Exceptions propagate after the lane is released
+            (see Cancellation and errors).
         """
         pool = self.spec_warm_lane_pool
         if pool is None:
@@ -6776,74 +6792,36 @@ class GitOps:
         lane = await pool.try_acquire()
         if lane is None:
             # Pool exhausted — inv.6: cold ephemeral fallback, never block.
-            logger.debug(
+            logger.info(
                 'acquire_spec_lane: pool exhausted — cold fallback for %s',
                 merge_commit[:8],
             )
             wt = await self.create_ephemeral_verify_worktree(merge_commit)
             return wt, False
 
+        try:
+            fault = await self._ready_spec_lane(lane, merge_commit)
+        except BaseException:
+            await complete_despite_cancellation(pool.release(lane))
+            raise
+        if fault is not None:
+            return await self._spec_lane_cold_fallback(pool, lane, merge_commit, fault)
+        return lane, True
+
+    async def _ready_spec_lane(self, lane: Path, merge_commit: str) -> str | None:
+        """Check the acquired *lane* out at *merge_commit* and re-seed it.
+
+        The create-once or reset-in-place and the inv.8 re-seed that
+        :meth:`acquire_spec_lane` describes.  Returns None when the lane is
+        warm and ready, else the fault reason for
+        :meth:`_spec_lane_cold_fallback`.  The lane stays ASSIGNED either way;
+        giving it back is the caller's.
+        """
         # ── Create-once or reset-in-place ────────────────────────────────────
-        if not await self._is_registered_worktree(lane):
-            # Create-once: serialized via _spec_wt_create_lock so that the K>1
-            # initial warm-up burst does not issue concurrent `git worktree add`
-            # calls against the same repo-level git lock (which would cause
-            # transient failures and a burst of cold fallbacks at warm-up time).
-            # Reset-in-place acquires (already-registered path below) are
-            # per-lane and don't contend, so no lock is needed there.
-            async with self._spec_wt_create_lock:
-                # Pool ownership is per-lane exclusive (try_acquire assigns a
-                # unique lane to exactly one caller), so no double-check is needed
-                # here — we're the only caller that can be creating this lane.
-                # The lock purely serializes the repo-level git worktree add
-                # against other lanes' concurrent first-time creates.
-                # Pool-storage-absent discriminator (task 2099). This is the
-                # PRIMARY guard for the spec pool — unlike acquire_warm_lane,
-                # acquire_spec_lane has no task-2061 base-health pre-gate, and
-                # without this check `git worktree add --detach` below would
-                # create a shadow lane on the rootfs skeleton during a
-                # mount-down window. Same missing-vs-empty distinction as
-                # acquire_warm_lane's create-once discriminator: base MISSING
-                # => genuinely fresh host => allow create; base EXISTS but
-                # `.pool-root` absent => suspected unmounted mountpoint =>
-                # refuse (release lane, cold fallback).
-                if self.worktree_base.exists() and not self.pool_storage_present():
-                    if self._pool_storage_bootstrap_ok():
-                        # First-seed bootstrap (task 2099 review-fix): the CoW
-                        # seed base is present & non-empty INSIDE worktree_base,
-                        # proving the mount is up — a missing sentinel here is a
-                        # fresh host, not an unmounted mountpoint. Mark it now so
-                        # subsequent acquisitions see storage present, then fall
-                        # through to the normal create (the seed re-marks it).
-                        logger.info(
-                            'acquire_spec_lane: create-once — .pool-root absent '
-                            'but warm base present under %s; first-seed bootstrap '
-                            '(marking sentinel, proceeding)', self.worktree_base,
-                        )
-                        self.mark_pool_storage_present()
-                    else:
-                        self._note_pool_storage_absent()
-                        return await self._spec_lane_cold_fallback(
-                            pool, lane, merge_commit,
-                            'create-once refused: pool storage absent/unmounted '
-                            f'at {self.worktree_base}',
-                        )
-                # Self-heal a stale unregistered directory first
-                # (mirrors reset_persistent_merge_worktree's self-heal pattern).
-                if lane.exists():
-                    await remove_tree(lane)
-                lane.parent.mkdir(parents=True, exist_ok=True)
-                rc, _, err = await _run(
-                    ['git', 'worktree', 'add', '--detach', str(lane), merge_commit],
-                    cwd=self.project_root,
-                )
-                if rc != 0:
-                    return await self._spec_lane_cold_fallback(
-                        pool, lane, merge_commit, f'worktree add failed (rc={rc}, err={err!r})',
-                    )
-                logger.info(
-                    'acquire_spec_lane: created %s (HEAD=%s)', lane, merge_commit[:8],
-                )
+        if not await self._spec_lane_registered(lane):
+            fault = await self._create_spec_lane(lane, merge_commit)
+            if fault is not None:
+                return fault
         else:
             # Reset-in-place: mirror reset_persistent_merge_worktree's exact sequence
             # (git reset --hard + ONE git clean with all -e flags in a single pass).
@@ -6852,16 +6830,12 @@ class GitOps:
                 cwd=lane,
             )
             if rc != 0:
-                return await self._spec_lane_cold_fallback(
-                    pool, lane, merge_commit, f'reset --hard failed (rc={rc}, err={err!r})',
-                )
+                return f'reset --hard failed (rc={rc}, err={err!r})'
             ok, err = await self._clean_lane_retaining_artifacts(
                 lane, caller='acquire_spec_lane',
             )
             if not ok:
-                return await self._spec_lane_cold_fallback(
-                    pool, lane, merge_commit, f'git clean failed (err={err!r})',
-                )
+                return f'git clean failed (err={err!r})'
             logger.info(
                 'acquire_spec_lane: reset %s to HEAD=%s', lane, merge_commit[:8],
             )
@@ -6869,10 +6843,92 @@ class GitOps:
         # ── inv.8: ALWAYS re-seed target/ from the current warm base ─────────
         rc = await self._seed_warm_lane(lane, '--fresh-checkout')
         if rc != 0:
-            return await self._spec_lane_cold_fallback(
-                pool, lane, merge_commit, f'seed failed (rc={rc})',
+            return f'seed failed (rc={rc})'
+        return None
+
+    async def _spec_lane_registered(self, lane: Path) -> bool:
+        """Whether *lane* is a registered worktree whose directory is in place.
+
+        A registration whose directory vanished is removed (scoped to *lane*,
+        never a repo-wide prune) so :meth:`_create_spec_lane` can add it
+        afresh; if that removal fails, the create's ``git worktree add``
+        fails too and the acquire falls back cold.
+        """
+        if not await self._is_registered_worktree(lane):
+            return False
+        if lane.is_dir():
+            return True
+        rc, _, err = await _run(
+            ['git', 'worktree', 'remove', '--force', str(lane)],
+            cwd=self.project_root,
+        )
+        logger.warning(
+            'acquire_spec_lane: %s is registered but its directory is gone — '
+            'removing the registration to re-create it (git worktree remove '
+            'rc=%d, err=%r)',
+            lane, rc, err,
+        )
+        return False
+
+    async def _create_spec_lane(self, lane: Path, merge_commit: str) -> str | None:
+        """Create-once: register *lane* at *merge_commit*; None, or the fault reason."""
+        # Create-once: serialized via _spec_wt_create_lock so that the K>1
+        # initial warm-up burst does not issue concurrent `git worktree add`
+        # calls against the same repo-level git lock (which would cause
+        # transient failures and a burst of cold fallbacks at warm-up time).
+        # Reset-in-place acquires (_ready_spec_lane's already-registered path)
+        # are per-lane and don't contend, so no lock is needed there.
+        async with self._spec_wt_create_lock:
+            # Pool ownership is per-lane exclusive (try_acquire assigns a
+            # unique lane to exactly one caller), so no double-check is needed
+            # here — we're the only caller that can be creating this lane.
+            # The lock purely serializes the repo-level git worktree add
+            # against other lanes' concurrent first-time creates.
+            # Pool-storage-absent discriminator (task 2099). This is the
+            # PRIMARY guard for the spec pool — unlike acquire_warm_lane,
+            # acquire_spec_lane has no task-2061 base-health pre-gate, and
+            # without this check `git worktree add --detach` below would
+            # create a shadow lane on the rootfs skeleton during a
+            # mount-down window. Same missing-vs-empty distinction as
+            # acquire_warm_lane's create-once discriminator: base MISSING
+            # => genuinely fresh host => allow create; base EXISTS but
+            # `.pool-root` absent => suspected unmounted mountpoint =>
+            # refuse (release lane, cold fallback).
+            if self.worktree_base.exists() and not self.pool_storage_present():
+                if self._pool_storage_bootstrap_ok():
+                    # First-seed bootstrap (task 2099 review-fix): the CoW
+                    # seed base is present & non-empty INSIDE worktree_base,
+                    # proving the mount is up — a missing sentinel here is a
+                    # fresh host, not an unmounted mountpoint. Mark it now so
+                    # subsequent acquisitions see storage present, then fall
+                    # through to the normal create (the seed re-marks it).
+                    logger.info(
+                        'acquire_spec_lane: create-once — .pool-root absent '
+                        'but warm base present under %s; first-seed bootstrap '
+                        '(marking sentinel, proceeding)', self.worktree_base,
+                    )
+                    self.mark_pool_storage_present()
+                else:
+                    self._note_pool_storage_absent()
+                    return (
+                        'create-once refused: pool storage absent/unmounted '
+                        f'at {self.worktree_base}'
+                    )
+            # Self-heal a stale unregistered directory first
+            # (mirrors reset_persistent_merge_worktree's self-heal pattern).
+            if lane.exists():
+                await remove_tree(lane)
+            lane.parent.mkdir(parents=True, exist_ok=True)
+            rc, _, err = await _run(
+                ['git', 'worktree', 'add', '--detach', str(lane), merge_commit],
+                cwd=self.project_root,
             )
-        return lane, True
+            if rc != 0:
+                return f'worktree add failed (rc={rc}, err={err!r})'
+            logger.info(
+                'acquire_spec_lane: created %s (HEAD=%s)', lane, merge_commit[:8],
+            )
+        return None
 
     async def _spec_lane_cold_fallback(
         self, pool: WarmLanePool, lane: Path, merge_commit: str, reason: str,
@@ -6882,7 +6938,7 @@ class GitOps:
             'acquire_spec_lane: %s for %s — releasing lane; speculative verify '
             'of %s runs COLD', reason, lane, merge_commit[:8],
         )
-        await pool.release(lane)
+        await complete_despite_cancellation(pool.release(lane))
         return await self.create_ephemeral_verify_worktree(merge_commit), False
 
     async def release_spec_lane(self, lane: Path, *, warm: bool) -> None:
@@ -11029,13 +11085,8 @@ class GitOps:
     async def merge_base_with_main(self, ref: str) -> str | None:
         """Return *ref*'s FORK POINT from ``config.main_branch``, or None.
 
-        "Where did this branch leave main?", which is the only honest
-        pre-branch baseline for a BRANCH TIP.  ``<tip>^1`` is not that: it is
-        the branch's own previous work commit, so a differential anchored on
-        it asks whether the branch's LAST commit delivered a capability rather
-        than whether the BRANCH did.  See
-        :func:`~orchestrator.merge_lane.landing_evidence._delivered_checks_differential`,
-        the caller this exists for (amendment pass, review finding).
+        "Where did this branch leave main?" while *ref* is still outside
+        main's history.  For a ref already on main the answer is *ref* itself.
 
         None on any git failure or an unresolvable ref — callers must treat it
         as "no baseline available" and degrade, never substitute a guess.
@@ -11286,11 +11337,17 @@ class GitOps:
         - **Merge commit** (2+ parents; task 2675 FIX 1′) — the old plain
           ``diff-tree`` touched-set is empty by git's own default
           behavior for merge commits, which used to make this primitive
-          return True *unconditionally* for every merge (the task-1175
-          "reverted merge" blind spot: a ``Merge task/1175 into main``
-          marker exists and the merge commit is an ancestor of main
-          forever, but a later commit on main removed the deliverable —
-          effect NOT present, yet the old code said True).  Instead this
+          return True *unconditionally* for every merge.  Task 1175's
+          ``Merge task/1175 into main`` marker was read that way, but it
+          was not a revert: its branch had an empty net diff, so nothing
+          was ever on main to remove, and the old code still said True.
+          This probe catches that shape through its empty-touched-set
+          fail-safe, the ``'empty_branch_merge'`` failure on
+          :class:`CommitEffectProbe`.
+          ``docs/prds/landed-not-done-recovery.md`` §"The revert
+          measurement" has the measurement, and
+          ``plans/found-on-main-provenance-integrity-prd.md`` calls the
+          event a re-derivation clobber.  Instead this
           diffs EVERY non-first parent's (each merged branch's) content
           against current main, requiring ALL of them to still be present
           (task 2675 amendment — octopus-merge safety, so a later revert
@@ -11594,7 +11651,7 @@ class GitOps:
         # .patch fixtures all hit it.  Worse, the loss was ASYMMETRIC — a
         # revert of exactly those lines went unseen, so a half-reverted
         # deliverable measured 1.0 survival and read as a clean landing.
-        # That is a false ACCEPT on the task-1175 revert class this check
+        # That is a false ACCEPT on the post-hoc revert class this check
         # exists to catch, the one direction it must never take.
         #
         # Everything before the first '@@' is header; after it, a leading
@@ -12058,11 +12115,17 @@ class GitOps:
         - **Merge commit** (2+ parents; task 2675 FIX 1′) — the old plain
           ``diff-tree`` touched-set is empty by git's own default
           behavior for merge commits, which used to make this primitive
-          return True *unconditionally* for every merge (the task-1175
-          "reverted merge" blind spot: a ``Merge task/1175 into main``
-          marker exists and the merge commit is an ancestor of main
-          forever, but a later commit on main removed the deliverable —
-          effect NOT present, yet the old code said True).  Instead this
+          return True *unconditionally* for every merge.  Task 1175's
+          ``Merge task/1175 into main`` marker was read that way, but it
+          was not a revert: its branch had an empty net diff, so nothing
+          was ever on main to remove, and the old code still said True.
+          This probe catches that shape through its empty-touched-set
+          fail-safe, the ``'empty_branch_merge'`` failure on
+          :class:`CommitEffectProbe`.
+          ``docs/prds/landed-not-done-recovery.md`` §"The revert
+          measurement" has the measurement, and
+          ``plans/found-on-main-provenance-integrity-prd.md`` calls the
+          event a re-derivation clobber.  Instead this
           diffs EVERY non-first parent's (each merged branch's) content
           against current main, requiring ALL of them to still be present
           (task 2675 amendment — octopus-merge safety, so a later revert
@@ -13192,6 +13255,10 @@ class GitOps:
         not defensive: five archived occurrences under ``data/verify-logs``
         (tasks 3692, 3420, 3869, 4215, 4545) blocked a merge outright on a
         single non-zero rc here.
+
+        An add interrupted by a cancel or an exception is torn down through
+        :meth:`cleanup_merge_worktree` before propagating, since no caller
+        can clean a path this call never returned.
         """
         import uuid
         merge_id = uuid.uuid4().hex[:8]
@@ -13215,9 +13282,13 @@ class GitOps:
             checkout_ref = base_sha.strip()
 
         # Detached worktree avoids "branch already checked out" error
-        rc, out, err, attempts = await self._worktree_add_with_retry(
-            merge_wt, checkout_ref, label='_create_merge_worktree',
-        )
+        try:
+            rc, out, err, attempts = await self._worktree_add_with_retry(
+                merge_wt, checkout_ref, label='_create_merge_worktree',
+            )
+        except BaseException:
+            await complete_despite_cancellation(self.cleanup_merge_worktree(merge_wt))
+            raise
         if rc != 0:
             # The `Failed to create merge worktree: ` PREFIX is load-bearing
             # beyond this module: other test modules construct it verbatim to

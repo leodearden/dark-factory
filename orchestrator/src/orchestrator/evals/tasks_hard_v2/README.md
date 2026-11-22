@@ -65,7 +65,7 @@ that is what makes the artifact regenerable rather than hand-transcribed.
 
 ## Why this directory can never leak into a default eval run
 
-`cli._load_fixture_dir` (`orchestrator/src/orchestrator/cli.py`) globs
+`_load_fixture_dir` (`orchestrator/src/orchestrator/evals/cli.py`) globs
 `*.json` **non-recursively** against a single `tasks_dir`:
 
 ```python

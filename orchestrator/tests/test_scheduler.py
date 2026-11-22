@@ -2176,7 +2176,8 @@ class TestRequeueCooldown:
     async def test_requeue_cooldown_expires(self, monkeypatch, task_response):
         """After cooldown expires, task should be acquirable again."""
         config = OrchestratorConfig(max_per_module=1, requeue_cooldown_secs=30.0)
-        scheduler = Scheduler(config)
+        clock = {'t': 1000.0}
+        scheduler = Scheduler(config, time_source=lambda: clock['t'])
         scheduler.finish_startup()
 
         mock = AsyncMock(return_value=task_response)
@@ -2188,11 +2189,7 @@ class TestRequeueCooldown:
 
         scheduler.release('99', requeued=True)
 
-        # Fast-forward time past cooldown
-        import time
-        original_monotonic = time.monotonic
-        offset = 31.0  # past the 30s cooldown
-        monkeypatch.setattr(time, 'monotonic', lambda: original_monotonic() + offset)
+        clock['t'] += 31.0  # past the 30s cooldown
 
         a2 = await scheduler.acquire_next()
         assert a2 is not None and a2.task_id == '99'

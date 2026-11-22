@@ -2302,9 +2302,9 @@ async def fetch_production_rankings(
     qdrant_url = config.mem0.qdrant_url
     # Resolved HERE, before the first acquisition below — never in the `with`
     # header further down, where it would sit after `mkdtemp` but before the
-    # `try` that releases it.  `load_cleanup_script()` can raise
-    # (`_load_sibling_script` raises `FixtureError` when the spec cannot be
-    # built), and a raise in that one window leaks the queue directory.
+    # `try` that releases it.  `load_cleanup_script()` can raise (a sibling
+    # whose body raises on first load propagates out of `load_script`), and a
+    # raise in that one window leaks the queue directory.
     # `run_bake_off` carries the same hoist for the same reason.
     reaper = bake.load_cleanup_script()
 

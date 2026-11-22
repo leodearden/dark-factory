@@ -196,3 +196,20 @@ async def test_probe_refuses_an_ok_outcome_without_a_replay_uuid_rather_than_mat
         await probe_retrieval_utility(graph, llm_spec(), [no_uuid], items=[_item('ep-0')])
 
     assert graph.search_calls == []
+
+
+@pytest.mark.asyncio
+async def test_probe_propagates_a_search_timeout_rather_than_ranking_a_miss():
+    def search_results(query: str) -> list:
+        if query == 'body of ep-1':
+            raise TimeoutError('graphiti search timed out after 30.0s')
+        return [_edge('replay-ep-0')]
+
+    graph = FakeArmGraph(search_results=search_results)
+    outcomes = [_outcome(f'ep-{i}') for i in range(3)]
+    items = [_item(f'ep-{i}') for i in range(3)]
+
+    with pytest.raises(TimeoutError, match='timed out after'):
+        await probe_retrieval_utility(graph, llm_spec(), outcomes, items=items)
+
+    assert [call['query'] for call in graph.search_calls] == ['body of ep-0', 'body of ep-1']

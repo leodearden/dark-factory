@@ -36,6 +36,7 @@ from fused_memory.backends.sqlite_task_backend import (
 )
 from fused_memory.backends.task_backend_errors import (
     AppendUnsupportedFieldError,
+    DependencyCycle,
     DoneProvenanceWriteAuthorityError,
     MetadataNotAnObjectError,
     MetadataTooDeepError,
@@ -1202,8 +1203,19 @@ async def test_update_task_replace_admits_identical_done_provenance_passthrough(
             {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']},
             {**_STORED_DONE_PROVENANCE, 'note': 'drift'},
         ),
+        (
+            {'done_provenance': {**_STORED_DONE_PROVENANCE, 'attempt': 1}, 'files': ['src']},
+            {**_STORED_DONE_PROVENANCE, 'attempt': 1.0},
+        ),
+        (
+            {'done_provenance': {**_STORED_DONE_PROVENANCE, 'attempt': 1}, 'files': ['src']},
+            {**_STORED_DONE_PROVENANCE, 'attempt': True},
+        ),
     ],
-    ids=['add', 'change-commit', 'change-kind', 'change-nested-shape'],
+    ids=[
+        'add', 'change-commit', 'change-kind', 'change-nested-shape',
+        'change-json-type-float', 'change-json-type-bool',
+    ],
 )
 async def test_update_task_replace_still_rejects_added_and_changed_done_provenance(
     backend, project_root, stored, payload_done_provenance,
@@ -2738,6 +2750,67 @@ async def test_add_dependency_self_loop_raises(backend, project_root):
     await backend.add_task(project_root=project_root, title='a')
     with pytest.raises(TaskmasterError):
         await backend.add_dependency('1', '1', project_root=project_root)
+
+
+async def _add_tasks(backend: SqliteTaskBackend, project_root: str, count: int) -> None:
+    for n in range(1, count + 1):
+        await backend.add_task(project_root=project_root, title=f'task {n}')
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_refuses_a_three_cycle_naming_the_path(backend, project_root):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('1', '2', project_root=project_root)
+    await backend.add_dependency('2', '3', project_root=project_root)
+
+    with pytest.raises(DependencyCycle) as caught:
+        await backend.add_dependency('3', '1', project_root=project_root)
+
+    assert caught.value.cycle == (3, 1, 2, 3)
+    assert '3 → 1 → 2 → 3' in caught.value.message
+    assert await backend.get_dependency_edges(project_root) == {1: [2], 2: [3]}
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_refuses_a_cycle_through_a_done_task(backend, project_root):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('1', '2', project_root=project_root)
+    await backend.add_dependency('2', '3', project_root=project_root)
+    await backend.set_task_status('2', 'done', project_root=project_root)
+
+    with pytest.raises(DependencyCycle) as caught:
+        await backend.add_dependency('3', '1', project_root=project_root)
+
+    assert caught.value.cycle == (3, 1, 2, 3)
+    assert await backend.get_dependency_edges(project_root) == {1: [2], 2: [3]}
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_accepts_a_diamond(backend, project_root):
+    await _add_tasks(backend, project_root, 4)
+    for task, depends_on in (('1', '2'), ('1', '3'), ('2', '4'), ('3', '4')):
+        await backend.add_dependency(task, depends_on, project_root=project_root)
+
+    assert await backend.get_dependency_edges(project_root) == {1: [2, 3], 2: [4], 3: [4]}
+
+
+@pytest.mark.asyncio
+async def test_add_dependency_refuses_a_cycle_closed_from_a_second_backend_instance(
+    backend, project_root, tmp_path,
+):
+    await _add_tasks(backend, project_root, 2)
+    await backend.add_dependency('1', '2', project_root=project_root)
+
+    second = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await second.start()
+    try:
+        with pytest.raises(DependencyCycle) as caught:
+            await second.add_dependency('2', '1', project_root=project_root)
+    finally:
+        await second.close()
+
+    assert caught.value.cycle == (2, 1, 2)
+    assert await backend.get_dependency_edges(project_root) == {1: [2]}
 
 
 # ── add_dependency — qualified (cross-project) happy path ──────────
@@ -7879,6 +7952,105 @@ async def test_update_task_empty_dependencies_list_is_a_real_write(
     await backend.update_task('2', project_root=project_root, dependencies=[])
 
     assert (await backend.get_task('2', project_root=project_root))['dependencies'] == []
+
+
+@pytest.mark.asyncio
+async def test_update_task_dependency_replacement_closing_a_cycle_is_refused(
+    backend, project_root,
+):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('2', '1', project_root=project_root)
+    await backend.add_dependency('3', '2', project_root=project_root)
+
+    with pytest.raises(DependencyCycle) as caught:
+        await backend.update_task(
+            '1', project_root=project_root, title='renamed', dependencies=['3'],
+        )
+
+    assert caught.value.cycle == (1, 3, 2, 1)
+    assert caught.value.operation == 'update_task'
+    task = await backend.get_task('1', project_root=project_root)
+    assert (task['title'], task['dependencies']) == ('task 1', [])
+    assert await backend.get_dependency_edges(project_root) == {2: [1], 3: [2]}
+
+
+@pytest.mark.asyncio
+async def test_update_task_refuses_a_cycle_through_a_cancelled_task(backend, project_root):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('2', '1', project_root=project_root)
+    await backend.add_dependency('3', '2', project_root=project_root)
+    await backend.set_task_status('2', 'cancelled', project_root=project_root)
+
+    with pytest.raises(DependencyCycle) as caught:
+        await backend.update_task('1', project_root=project_root, dependencies=['3'])
+
+    assert caught.value.cycle == (1, 3, 2, 1)
+    assert await backend.get_dependency_edges(project_root) == {2: [1], 3: [2]}
+
+
+@pytest.mark.asyncio
+async def test_update_task_dependency_self_loop_is_refused(backend, project_root):
+    await _add_tasks(backend, project_root, 1)
+
+    with pytest.raises(TaskmasterError, match='cannot depend on itself'):
+        await backend.update_task('1', project_root=project_root, dependencies=['1'])
+
+    assert await backend.get_dependency_edges(project_root) == {}
+
+
+@pytest.mark.asyncio
+async def test_update_task_dependency_on_a_missing_task_is_refused(backend, project_root):
+    await _add_tasks(backend, project_root, 2)
+    await backend.add_dependency('1', '2', project_root=project_root)
+
+    with pytest.raises(TaskmasterError) as caught:
+        await backend.update_task('1', project_root=project_root, dependencies=['99'])
+
+    assert caught.value.message == 'No tasks found for ID(s): 99'
+    assert (await backend.get_task('1', project_root=project_root))['dependencies'] == [2]
+
+
+@pytest.mark.asyncio
+async def test_update_task_writing_back_a_stored_edge_to_a_removed_task_is_accepted(
+    backend, project_root,
+):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('1', '3', project_root=project_root)
+    await backend.remove_tasks(['3'], project_root=project_root)
+
+    await backend.update_task('1', project_root=project_root, dependencies=['3', '2'])
+
+    assert (await backend.get_task('1', project_root=project_root))['dependencies'] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_update_task_resaving_or_rewiring_an_acyclic_list_is_accepted(
+    backend, project_root,
+):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('1', '2', project_root=project_root)
+
+    await backend.update_task('1', project_root=project_root, dependencies=['2'])
+    await backend.update_task('1', project_root=project_root, dependencies=['3'])
+
+    assert (await backend.get_task('1', project_root=project_root))['dependencies'] == [3]
+
+
+@pytest.mark.asyncio
+async def test_add_task_cannot_close_a_cycle(backend, project_root):
+    await _add_tasks(backend, project_root, 3)
+    await backend.add_dependency('1', '3', project_root=project_root)
+    await backend.remove_tasks(['3'], project_root=project_root)
+    assert (await backend.get_dependency_edges(project_root))[1] == [3]
+
+    created = await backend.add_task(
+        project_root=project_root, title='new', dependencies='1',
+    )
+
+    new_id = int(created['id'])
+    edges = await backend.get_dependency_edges(project_root)
+    assert edges[new_id] == [1]
+    assert [task for task, deps in edges.items() if new_id in deps] == []
 
 
 @pytest.mark.asyncio

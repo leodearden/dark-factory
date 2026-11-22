@@ -1,0 +1,83 @@
+"""Item 3: false-failure rate of single-request verifies, three content-change proxies; bound per sound-tree verify."""
+import sys
+sys.path.insert(0, '/tmp/gate-10069/measure')
+from collections import Counter, defaultdict
+from datetime import datetime
+from common import verifies, TE, GIT, by_type, cp_upper, wilson, ts, fmt
+
+V = sorted(verifies('2026-11-05'), key=lambda r: r['id'])
+# task activity
+act = defaultdict(list)
+for t in TE:
+    act[t['task']].append(t)
+# branch commits (landed tasks only): author timestamps
+auth = {}
+for task, merges in GIT.items():
+    auth[task] = [(datetime.fromisoformat(c['aI']).timestamp(), m['merge_ci']) for m in merges for c in m['commits']]
+# merge_queued head_sha
+HQ = defaultdict(list)
+for q in by_type('merge_queued', '2026-11-05'):
+    if q['d'].get('head_sha'):
+        HQ[q['task']].append((ts(q['ts']), q['d']['head_sha']))
+
+
+def next_verify(v):
+    for w in V:
+        if w['id'] <= v['id']:
+            continue
+        if w['task'] == v['task'] or (w['members'] and v['task'] in w['members']):
+            return w
+    return None
+
+
+out = defaultdict(Counter)
+detail = []
+for w_ in ('a', 'b'):
+    pass
+for v in V:
+    if v['k'] != 1 or v['passed'] or v['gate']:
+        continue
+    win = v['win']
+    c = out[win]
+    c['failed_singles'] += 1
+    nx = next_verify(v)
+    if nx is None:
+        c['no_later_verify'] += 1
+        continue
+    if not nx['passed']:
+        c['next_failed'] += 1
+        continue
+    c['next_passed'] += 1
+    c['next_passed_chain'] += nx['k'] > 1
+    lo, hi = v['end_ts'], nx['start_ts']
+    evs = [t for t in act.get(v['task'], []) if lo < ts(t['ts']) < hi]
+    r1 = not any(t['type'] in ('task_started', 'phase_enter') for t in evs)
+    r2 = r1 and not any(t['type'] == 'invocation_end' and t['role'] != 'unblock_auto' for t in evs)
+    c['R1_no_task_started_or_phase_enter'] += r1
+    c['R2_R1_and_no_agent_invocation'] += r2
+    # git proxy: only if the task landed via a 'Merge task/<id>' commit
+    if v['task'] in auth:
+        c['git_known'] += 1
+        new_commit = any(lo < a < hi for a, _ in auth[v['task']])
+        c['git_no_commit_authored_between'] += not new_commit
+        c['git_and_R2'] += (not new_commit) and r2
+        detail.append((v['ts'][:16], v['task'], v['runner'], nx['ts'][:16], nx['k'], r1, r2, not new_commit))
+    # head_sha proxy
+    hq = HQ.get(v['task'], [])
+    before = [h for t_, h in hq if t_ < v['start_ts']]
+    after = [h for t_, h in hq if lo < t_ < hi]
+    if before and after:
+        c['headsha_known'] += 1
+        c['headsha_same'] += before[-1] == after[-1]
+
+for win in ('a', 'b'):
+    print(win, dict(out[win]))
+print()
+for d in detail:
+    print(d)
+
+# sound-tree bound from gate re-verifies (tree already verified green, rebased onto moved main)
+for win in ('a', 'b'):
+    G = [v for v in V if v['gate'] and v['win'] == win]
+    x = sum(not v['passed'] for v in G)
+    print(f'gate re-verifies window {win}: fails {x}/{len(G)} ; 95% one-sided upper bound on fail rate {fmt(cp_upper(x, len(G)) if G else None)}')

@@ -169,9 +169,9 @@ If a single bulk call is rejected (e.g. payload-size cap), split into the smalle
 
 ### Step 5.5 — Stamp + commit the sidecar
 
-`commit_planning` is also the mechanical Greek-label → real-task-id mapping point: for every task in the batch carrying `metadata.prd_path` + `metadata.prd_task_label`, it locates the YAML sidecar from Step 2.5, stamps the matching label's `task_id`, writes the file back, and copies that label's `delivered_check`s of every kind except `manual` into the producer task's `metadata.delivered_checks` (`manual` checks are never copied — they stay sidecar-only, excluded from the dispatch gate). The write-back rewrites only `task_id` values, so comments, quoting and key order survive; a stamp it cannot verify, or one that would leave the sidecar invalid, is refused, named in `errors`, and nothing is written. No sidecar on disk is a no-op — every non-manifest batch is byte-identical to today.
+`commit_planning` is also the mechanical Greek-label → real-task-id mapping point: for every task in the batch carrying `metadata.prd_path` + `metadata.prd_task_label`, it locates the YAML sidecar from Step 2.5, stamps the matching label's `task_id`, writes the file back, and copies that label's `delivered_check`s of every kind except `manual` into the producer task's `metadata.delivered_checks` (`manual` checks are never copied — they stay sidecar-only, excluded from the dispatch gate). The write-back rewrites only `task_id` values, so comments, quoting and key order survive; a stamp it cannot verify, or one that would leave the sidecar invalid, is refused, named in `errors`, and nothing is written. A batch with no `prd_path` is byte-identical to today. A batch task whose `prd_path` derives a sidecar absent from the tree searched is named under the report's `sidecar_not_found` (`{root, paths}`) and never blocks the flip — check its `root` before concluding the PRD has no manifest.
 
-The response carries a structured `manifest_stamping` report: always `{path, stamped, missing_labels, errors}`, plus `external_labels`, `near_miss_labels`, `near_miss_keys`, `unlabeled_tasks` and `polarity_warnings` when non-empty. Every batch task carrying `prd_path` whose sidecar exists lands in exactly one bucket:
+The response carries a structured `manifest_stamping` report: always `{path, stamped, missing_labels, errors}`, plus `sidecar_not_found`, `external_labels`, `near_miss_labels`, `near_miss_keys`, `unlabeled_tasks` and `polarity_warnings` when non-empty. Every batch task carrying `prd_path` whose sidecar exists lands in exactly one bucket:
 
 - `stamped` — its label was found and stamped;
 - `missing_labels` — its `prd_task_label` names no block in the sidecar;
@@ -213,6 +213,7 @@ State:
 
 - **Curator gate closed / planning_mode batch rejected.** Do **not** switch to non-planning_mode to paper over it. Wait or escalate — PRD-decomp batches are the precise case where planning_mode is correct.
 - **`add_dependency` fails** because a referenced task doesn't exist. Likely the out-of-batch prereq is `deferred` or `cancelled`; check via `get_task` and resolve with the user.
+- **`add_dependency` returns `error_type` `DependencyCycle`** while wiring. The plan's dependency graph is wrong: remove one of the edges its `cycle` names (fix the PRD ordering). Do not retry the same call.
 - **`commit_planning` rejects with "metadata.files missing".** Decompose mode shouldn't hit this (fresh tasks); if it does, a stale entry was probably combined into one of the new tasks — investigate before retrying.
 
 ## Anti-patterns
