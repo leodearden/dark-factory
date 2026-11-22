@@ -34,7 +34,9 @@ STALE_STRAND_CLASS: Final = 'stale-strand'
 ARCHIVE_SUBDIR: Final = 'archive'
 ARCHIVE_DAY_FORMAT: Final = '%Y-%m-%d'
 LIVE_RECORD_GLOB: Final = 'esc-*.json'
+# escalation/src/escalation/models.py::Escalation.status
 PENDING_STATUS: Final = 'pending'
+DISMISSED_STATUS: Final = 'dismissed'
 
 COUNTED_LEVEL: Final = 0
 COUNTED_SEVERITY: Final = 'blocking'
@@ -69,13 +71,19 @@ class NothingFiled(CannotJudge):
 
 class Closure(enum.StrEnum):
     OPEN = 'open'
-    STEWARD_OR_OTHER = 'steward_or_other'
+    RESOLVED = 'resolved'
     REAPER_PROMOTION = 'reaper_promotion'
     OTHER_PROMOTION = 'other_promotion'
     REAPER_DISMISSAL = 'reaper_dismissal'
     STARTUP_STRAND = 'startup_strand'
     STARTUP_DISMISSAL = 'startup_dismissal'
     WORKFLOW_AUTO_DISMISSAL = 'workflow_auto_dismissal'
+    OTHER_DISMISSAL = 'other_dismissal'
+
+
+NON_STARTUP_DISMISSALS: Final = frozenset(
+    {Closure.REAPER_DISMISSAL, Closure.WORKFLOW_AUTO_DISMISSAL, Closure.OTHER_DISMISSAL}
+)
 
 
 def classify_closure(
@@ -92,7 +100,7 @@ def classify_closure(
         return Closure.STARTUP_DISMISSAL if text.startswith(RESTART_PREFIX) else Closure.WORKFLOW_AUTO_DISMISSAL
     if text.startswith(PROMOTION_PREFIX):
         return Closure.OTHER_PROMOTION
-    return Closure.STEWARD_OR_OTHER
+    return Closure.OTHER_DISMISSAL if status == DISMISSED_STATUS else Closure.RESOLVED
 
 
 @dataclass(frozen=True)
@@ -273,6 +281,14 @@ def wrongly_dismissed(record: Record, followers_by_task_category: FollowerIndex)
     )
 
 
+def _per_100(count: int, filed: int) -> float | None:
+    return 100 * count / filed if filed else None
+
+
+def _rounded(rate: float | None) -> float | None:
+    return None if rate is None else round(rate, RATE_DIGITS)
+
+
 @dataclass(frozen=True)
 class WindowCounts:
     filed: int
@@ -285,6 +301,8 @@ class WindowCounts:
     startup_wrong: int
     workflow_auto_dismissals: int
     workflow_auto_wrong: int
+    non_startup_dismissals: int
+    non_startup_wrong: int
 
     @property
     def stranded(self) -> int:
@@ -292,14 +310,18 @@ class WindowCounts:
 
     @property
     def stranded_per_100(self) -> float | None:
-        return 100 * self.stranded / self.filed if self.filed else None
+        return _per_100(self.stranded, self.filed)
+
+    @property
+    def non_startup_wrong_per_100(self) -> float | None:
+        return _per_100(self.non_startup_wrong, self.filed)
 
     def as_json(self) -> dict[str, int | float | None]:
-        rate = self.stranded_per_100
         return {
             **asdict(self),
             'stranded': self.stranded,
-            'stranded_per_100': None if rate is None else round(rate, RATE_DIGITS),
+            'stranded_per_100': _rounded(self.stranded_per_100),
+            'non_startup_wrong_per_100': _rounded(self.non_startup_wrong_per_100),
         }
 
 
@@ -316,6 +338,7 @@ def count_window(records: Sequence[Record], followers: FollowerIndex, *, start: 
     reaper_dismissals = closed_as(Closure.REAPER_DISMISSAL)
     startup_dismissals = closed_as(Closure.STARTUP_STRAND, Closure.STARTUP_DISMISSAL)
     workflow_auto_dismissals = closed_as(Closure.WORKFLOW_AUTO_DISMISSAL)
+    non_startup = closed_as(*NON_STARTUP_DISMISSALS)
     return WindowCounts(
         filed=len(counted),
         reaper_promotions=len(closed_as(Closure.REAPER_PROMOTION)),
@@ -327,6 +350,8 @@ def count_window(records: Sequence[Record], followers: FollowerIndex, *, start: 
         startup_wrong=wrong(startup_dismissals),
         workflow_auto_dismissals=len(workflow_auto_dismissals),
         workflow_auto_wrong=wrong(workflow_auto_dismissals),
+        non_startup_dismissals=len(non_startup),
+        non_startup_wrong=wrong(non_startup),
     )
 
 
