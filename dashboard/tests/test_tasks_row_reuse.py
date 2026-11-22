@@ -4,19 +4,24 @@ Two renders inside one ``SNAPSHOT_TTL_SECONDS`` are served the SAME cached
 unit. Whatever the collector reuses between them, each render's rows must
 still carry that render's own runtime probe, clock and external-dep read, and
 serialise exactly as a freshly shaped row would.
+
+What may be reused is the unit-derived half of each row, memoised per unit by
+``UnitRowMemo``; its own contract is pinned on a test-owned instance below.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from _canned_mcp import ByRoot, CannedMCP, _raw_row
+from _task_units import measured_unit
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from dashboard.config import DashboardConfig
-from dashboard.data.active_tasks import collect_tasks_with_counts
+from dashboard.data.active_tasks import UnitRowMemo, collect_tasks_with_counts
 
 pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
 
@@ -190,3 +195,72 @@ async def test_a_reused_render_serialises_byte_identically(
         return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
 
     assert wire(served) == wire(EVERY_FIELD_GROUP_WIRE)
+
+
+# ---------------------------------------------------------------------------
+# UnitRowMemo: the unit-derived half of a unit's rows, shaped once per unit.
+# ---------------------------------------------------------------------------
+
+RUNTIME_PLACEHOLDERS = {
+    'agent': None, 'loops': None, 'attempts': None, 'lane': None, 'phase': None,
+    'lane_state': None, 'started': None, 'runtime_offline': False, 'runtime_status': 'ok',
+}
+
+
+def _unit(*task_ids: int, external_deps: tuple[str, ...] = ()):
+    return measured_unit(rows=[
+        {
+            'id': task_id, 'title': f'task {task_id}', 'status': 'pending',
+            'dependencies': [], 'metadata': {'external_deps': list(external_deps)},
+        }
+        for task_id in task_ids
+    ])
+
+
+def test_the_same_unit_is_shaped_once():
+    memo, unit = UnitRowMemo(), _unit(1, 2)
+
+    assert memo.rows_for('alpha', unit) is memo.rows_for('alpha', unit)
+
+
+def test_a_new_unit_is_reshaped_even_with_equal_content():
+    memo, unit = UnitRowMemo(), _unit(1, 2)
+    first = memo.rows_for('alpha', unit)
+
+    refreshed = memo.rows_for('alpha', dataclasses.replace(unit))
+
+    assert refreshed is not first, (
+        'a refreshed unit is a new object, so it must be reshaped: equal content '
+        'is not evidence it is the same generation'
+    )
+    assert refreshed == first
+
+
+def test_labels_are_memoised_independently():
+    memo, alpha, beta = UnitRowMemo(), _unit(1), _unit(2)
+    alpha_rows, beta_rows = memo.rows_for('alpha', alpha), memo.rows_for('beta', beta)
+
+    assert memo.rows_for('alpha', alpha) is alpha_rows
+    assert memo.rows_for('beta', beta) is beta_rows
+
+
+def test_clear_forgets_every_unit():
+    memo, unit = UnitRowMemo(), _unit(1)
+    first = memo.rows_for('alpha', unit)
+
+    memo.clear()
+
+    assert memo.rows_for('alpha', unit) is not first
+
+
+def test_unit_rows_carry_no_per_render_fact():
+    rows = UnitRowMemo().rows_for('alpha', _unit(1, 2, external_deps=('beta:5',)))
+
+    assert [row.task_id for row in rows] == [1, 2]
+    for row in rows:
+        runtime = {key: row.fields[key] for key in RUNTIME_PLACEHOLDERS}
+        assert runtime == RUNTIME_PLACEHOLDERS, (
+            f'task {row.task_id} holds runtime facts {runtime}: a memo shared '
+            'across renders must hold only placeholders for them'
+        )
+        assert row.fields['external_deps'] == [{'id': 'beta:5', 'status': 'unknown'}]
