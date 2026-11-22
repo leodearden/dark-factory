@@ -8,14 +8,18 @@ scratch server only, over two graphs it creates; run it with
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
+import uuid
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 
 import pytest
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
 from _fm_helpers import load_script_module
+from falkordb import FalkorDB
 
 CLEANUP = load_script_module(
     Path(__file__).resolve().parents[1] / 'scripts' / 'cleanup_litter_graphs.py'
@@ -438,3 +442,42 @@ def test_a_clean_run_sees_one_run_id_throughout():
 
     assert record.run_id_before == record.run_id_after == 'run-a'
     assert record.outcome == CLEANUP.Exit.OK
+
+
+
+# --- the adapter, live on the scratch server --------------------------------------------
+
+
+@pytest.mark.integration
+@falkor_skipif()
+class TestFalkorGraphServerOnScratch:
+    """Only the two graphs this test creates are planned: scratch holds other tests' litter."""
+
+    def test_it_counts_lists_and_deletes_only_the_reviewed_litter(self):
+        litter = f'evalmem_test_{uuid.uuid4().hex[:8]}'
+        kept = f'_test_7793_kept_{uuid.uuid4().hex[:8]}'
+        client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+        try:
+            client.select_graph(litter).query('CREATE (:Litter), (:Litter)')
+            client.select_graph(kept).query('CREATE (:Kept)')
+            server = CLEANUP.FalkorGraphServer(client)
+
+            assert (server.node_count(litter), server.node_count(kept)) == (2, 1)
+            assert server.run_id()
+            assert server.run_id() == server.run_id()
+            assert {litter, kept} <= set(server.graph_names())
+
+            plan = CLEANUP.plan_cleanup([litter, kept])
+            record = CLEANUP.execute(server, plan, _reviewed((litter,), (kept,)), pace_s=0)
+
+            names = server.graph_names()
+            assert litter not in names
+            assert kept in names
+            assert server.node_count(kept) == 1
+            assert record.deleted == (litter,)
+            assert record.outcome == CLEANUP.Exit.OK
+        finally:
+            for name in (litter, kept):
+                with contextlib.suppress(Exception):
+                    client.select_graph(name).delete()
+            client.close()
