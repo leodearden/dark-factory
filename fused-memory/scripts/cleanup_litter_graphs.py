@@ -343,7 +343,7 @@ def execute(
     targets = select_targets(names, plan, reviewed)
     started = CleanupRecord.started(reviewed.target, before, targets)
     on_progress(started)
-    deleted = _delete_paced(
+    run = _delete_paced(
         server,
         targets.delete,
         run_id=before.run_id,
@@ -351,7 +351,17 @@ def execute(
         sleep=sleep,
         on_deleted=lambda done: on_progress(replace(started, deleted=done)),
     )
-    return _finished(server, plan, replace(started, deleted=deleted))
+    record = replace(started, deleted=run.deleted)
+    if run.run_id_after != before.run_id:
+        return _restarted(server, plan, record, run.run_id_after)
+    return _finished(server, plan, record)
+
+
+class DeleteRun(NamedTuple):
+    """The graphs deleted, and the run_id that stopped the run or was read after its last delete."""
+
+    deleted: tuple[str, ...]
+    run_id_after: str
 
 
 def _delete_paced(
@@ -362,22 +372,43 @@ def _delete_paced(
     pace_s: float,
     sleep: Callable[[float], None],
     on_deleted: Callable[[tuple[str, ...]], None],
-) -> tuple[str, ...]:
+) -> DeleteRun:
     deleted: list[str] = []
     for index, name in enumerate(names):
         if index:
             sleep(pace_s)
-        if server.run_id() != run_id:
-            break
+        seen = server.run_id()
+        if seen != run_id:
+            return DeleteRun(tuple(deleted), seen)
         server.delete(require_litter(name))
         deleted.append(name)
         on_deleted(tuple(deleted))
-    return tuple(deleted)
+    return DeleteRun(tuple(deleted), server.run_id())
+
+
+def _kept_census(server: GraphServer, plan: CleanupPlan) -> Census:
+    present = frozenset(server.graph_names())
+    return take_census(server, [name for name in plan.keep if name in present])
+
+
+def _restarted(
+    server: GraphServer, plan: CleanupPlan, record: CleanupRecord, run_id_after: str
+) -> CleanupRecord:
+    """The record of a run a restart stopped; ``after`` stays empty if the restarted server cannot be counted."""
+    restarted = replace(record, run_id_after=run_id_after, outcome=Exit.SERVER_RESTARTED)
+    try:
+        census = _kept_census(server, plan)
+    except (RedisError, OSError):
+        return restarted
+    return replace(
+        restarted,
+        after=census.counts,
+        shrank=shrunk_graphs(record.before, census.counts, plan.keep),
+    )
 
 
 def _finished(server: GraphServer, plan: CleanupPlan, record: CleanupRecord) -> CleanupRecord:
-    present = frozenset(server.graph_names())
-    after = take_census(server, [name for name in plan.keep if name in present])
+    after = _kept_census(server, plan)
     shrank = shrunk_graphs(record.before, after.counts, plan.keep)
     return replace(
         record,
