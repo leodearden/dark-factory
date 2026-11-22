@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import functools
 import json
+import re
 import types
 from pathlib import Path
 from typing import Any
@@ -152,6 +153,39 @@ class TestTheCli:
         assert _mod().main(['--check', str(path)]) == 1
         assert str(path) in capsys.readouterr().err
         assert path.read_bytes() == before
+
+    @staticmethod
+    def _mixed_key_file(tmp_path: Path) -> Path:
+        mixed = _legacy_key()
+        mixed['shards']['primary_00']['items'].append('attach_primary_00-000')
+        path = tmp_path / 'mixed' / 'key.json'
+        path.parent.mkdir()
+        path.write_text(json.dumps(mixed))
+        return path
+
+    @pytest.mark.parametrize('check', [True, False])
+    def test_a_refused_key_is_named_with_its_refusal_and_every_other_key_still_handled(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], check: bool,
+    ) -> None:
+        mixed, legacy = self._mixed_key_file(tmp_path), self._key_file(tmp_path)
+        mixed_before, legacy_before = mixed.read_bytes(), legacy.read_bytes()
+        assert _mod().main([*(['--check'] if check else []), str(mixed), str(legacy)]) == 1
+        err = capsys.readouterr().err
+        assert re.search(rf"{re.escape(str(mixed))}: shard primary_00: .*\['attach_time', 'current'\]",
+                         err)
+        assert mixed.read_bytes() == mixed_before
+        assert (str(legacy) in err) is check
+        assert (legacy.read_bytes() == legacy_before) is check
+
+    def test_a_path_that_is_not_a_key_is_refused_before_any_key_is_written(
+        self, tmp_path: Path,
+    ) -> None:
+        legacy = self._key_file(tmp_path)
+        before = legacy.read_bytes()
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([str(legacy), str(tmp_path / 'missing' / 'key.json')])
+        assert exited.value.code == 2
+        assert legacy.read_bytes() == before
 
     def test_check_passes_a_backfilled_key(self, tmp_path: Path) -> None:
         path = self._key_file(tmp_path)

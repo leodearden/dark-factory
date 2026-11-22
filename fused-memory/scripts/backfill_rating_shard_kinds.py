@@ -22,6 +22,8 @@ Usage, from ``fused-memory/``::
     python scripts/backfill_rating_shard_kinds.py --check calibration/*_rounds/key.json
 
 ``--check`` writes nothing, names each key needing a change on stderr, and exits 1 if any does.
+A key whose derivation is refused is named on stderr with the refusal and left
+as it is; every other key is still handled, and the run exits 1.
 """
 from __future__ import annotations
 
@@ -91,13 +93,19 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    needing_change = 0
+    not_keys = [str(path) for path in args.keys if path.name != 'key.json' or not path.is_file()]
+    if not_keys:
+        parser.error(f'not a rating-rounds key.json: {", ".join(not_keys)}')
+    needing_change = refused = 0
     for path in args.keys:
-        if path.name != 'key.json' or not path.is_file():
-            parser.error(f'{path}: not a rating-rounds key.json')
         scratch = _rounds.RatingScratch(path.parent)
         key = scratch.load_key()
-        result = backfilled(key)
+        try:
+            result = backfilled(key)
+        except ValueError as refusal:
+            print(f'{path}: {refusal}', file=sys.stderr)
+            refused += 1
+            continue
         if result == key:
             continue
         needing_change += 1
@@ -108,7 +116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         counts = Counter((spec['kind'], spec['basis']) for spec in result['shards'].values())
         print(f'{path}: {len(result["shards"])} shards: '
               + ', '.join(f'{count} {kind}/{basis}' for (kind, basis), count in sorted(counts.items())))
-    return 1 if args.check and needing_change else 0
+    return 1 if refused or (args.check and needing_change) else 0
 
 
 if __name__ == '__main__':
