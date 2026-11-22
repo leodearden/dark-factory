@@ -218,6 +218,30 @@ class TestTheBrief:
         assert exited.value.code == 2
         assert '--brief-sha256' in capsys.readouterr().err
 
+    def test_a_corpus_record_with_a_sha256_is_refused_naming_the_flag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        record = tmp_path / 'summary.json'
+        record.write_text(json.dumps({'rerates': [
+            {'version': 'v2.2', 'round': 1, 'pairs': 1, 'brief_sha256': 'c' * 64},
+        ]}))
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--corpus-record', str(record),
+                         '--brief-sha256', 'c' * 64])
+        assert exited.value.code == 2
+        assert '--brief-sha256' in capsys.readouterr().err
+
+    @pytest.mark.parametrize(('label', 'sha', 'named'), [
+        ('v2.1', 'xyz', "'xyz'"), ('2.1', 'a' * 64, "'2.1'"),
+    ])
+    def test_a_malformed_label_or_sha256_is_refused_naming_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], label: str, sha: str, named: str,
+    ) -> None:
+        with pytest.raises(SystemExit) as exited:
+            _mod().main([*self._inputs(tmp_path), '--rubric', label, '--brief-sha256', sha])
+        assert exited.value.code == 2
+        assert named in capsys.readouterr().err
+
     def test_a_corpus_record_names_the_brief_of_its_latest_rerate(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
     ) -> None:

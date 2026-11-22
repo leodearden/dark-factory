@@ -38,6 +38,13 @@ def _rubric() -> types.ModuleType:
     )
 
 
+@functools.cache
+def _backfill() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'backfill_rating_shard_kinds.py', mod_name='backfill_rating_shard_kinds',
+    )
+
+
 def _rated(entry: str, *, role: str = 'primary', basis: str = 'current', **answers: str) -> dict[str, Any]:
     row: dict[str, Any] = {
         'entry_id': entry, 'target_id': 'p1', 'basis': basis, 'rater': f'opus-{role}',
@@ -782,6 +789,23 @@ class TestRatingScratch:
         assert rounds.scratch.add_shards(key, [*_scratch_entries(), extra], seed=7) == [
             'primary_01', 'second_01',
         ]
+
+    def test_every_shard_the_rounds_key_records_the_kind_and_basis_the_backfill_derives(
+        self, rounds: _Rounds,
+    ) -> None:
+        rounds.rate({('primary', ('e0', 'p1', 'current')): _lacks_loss,
+                     ('primary', ('e0', 'p1', 'attach_time')): _lacks_loss})
+        _mod().reask_round(rounds.scratch, rounds.key(), rounds.entries())
+        rounds.rate()
+        _mod().third_round(rounds.scratch, rounds.key(), rounds.entries(), {('e1', 'p1')})
+        rounds.rate()
+        _mod().rerate_round(rounds.scratch, rounds.key(), rounds.entries(), [('e2', 'p1')],
+                            version='v2.2')
+        key = rounds.key()
+        assert {(spec['kind'], spec['basis']) for spec in key['shards'].values()} == {
+            (kind, basis) for kind in ('initial', 'reask') for basis in ('current', 'attach_time')
+        } | {('third', 'current'), ('rerate', 'current')}
+        assert _backfill().backfilled(key) == key
 
 
 def _sha(path: Path) -> str:

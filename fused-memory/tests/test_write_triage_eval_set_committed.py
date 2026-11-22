@@ -220,6 +220,9 @@ class TestTheCommittedRerates:
             for rerate in _key().get('rerates', ())
         ]
 
+    def test_a_scorer_takes_from_the_summary_the_brief_of_the_keys_latest_rerate(self) -> None:
+        assert _rounds().latest_rerate_brief(_summary()) == _rounds().latest_rerate_brief(_key())
+
     def test_the_summary_names_the_brief_of_every_keyed_shard(self) -> None:
         assert {name: spec['brief_sha256'] for name, spec in _summary()['shards'].items()} == {
             name: spec['brief_sha256'] for name, spec in _key()['shards'].items()}
