@@ -11987,7 +11987,7 @@ class TestGetMemoryById:
     @pytest.mark.asyncio
     async def test_content_fallback_to_content_key(self, service):
         """With neither 'data' nor 'memory', content falls back to the third and
-        last key in the canonical _MEM0_CONTENT_KEYS order ('content')."""
+        last key in the canonical ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` order ('content')."""
         payload = {'content': 'c', 'category': 'observations_and_summaries'}
         service.mem0.get_point_by_id = AsyncMock(return_value=payload)
 
@@ -11999,7 +11999,7 @@ class TestGetMemoryById:
 
     @pytest.mark.asyncio
     async def test_no_recognized_content_key_returns_found_with_empty_content(self, service):
-        """A present point whose payload carries NONE of _MEM0_CONTENT_KEYS is still
+        """A present point whose payload carries NONE of ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` is still
         a hit (found), with content=='' and the full raw payload as metadata — the
         documented ('data'→'memory'→'content'→'') precedence's fall-through arm.
 

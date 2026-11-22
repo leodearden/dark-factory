@@ -529,7 +529,8 @@ def unkeyable_successor_refs(refs: list[PointerRef]) -> list[PointerRef]:
     """The ``supersedes`` refs whose source carries no content to key on.
 
     ``fetch_pointer_records`` normalises ``content`` to ``''`` when none of
-    ``_CONTENT_KEYS`` yields a string, and :func:`content_key` of an empty
+    ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` yields a
+    string, and :func:`content_key` of an empty
     string is a CONSTANT. Every content-less source therefore hashes to the
     same value, so two DIFFERENT sources citing one target would share an
     item_key — which :func:`successor_pointer_items` would then fold with
@@ -1367,17 +1368,6 @@ and that the Graphiti-primary ones were not — rather than leaving a near-zero
 count to be misread as an empty graph.
 """
 
-_CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
-"""Payload keys tried in order for a scrolled record's text.
-
-``data`` is the canonical scroll-payload key and is tried first; ``memory``
-is a search-layer key that can appear stale on a scroll payload; ``content``
-is a defensive third. Same order and same reasoning as δ's ``fetch_memories``
-— the two runners read the same payloads and must agree about which string is
-the memory.
-"""
-
-
 STORE_READ_CONCURRENCY = 8
 """How many store reads either fetch band keeps in flight at once.
 
@@ -1462,6 +1452,7 @@ async def fetch_pointer_records(
             itself adopted.
     """
     from fused_memory.models.scope import Scope
+    from fused_memory.utils.mem0_content_keys import mem0_payload_text
 
     scope = Scope(project_id=project_id)
     records: list[dict[str, Any]] = []
@@ -1483,15 +1474,9 @@ async def fetch_pointer_records(
         }
         for raw in raw_records:
             payload = raw.get('metadata') or {}
-            content = ''
-            for key in _CONTENT_KEYS:
-                value = payload.get(key)
-                if isinstance(value, str) and value:
-                    content = value
-                    break
             records.append({
                 'id': str(raw.get('id') or ''),
-                'content': content,
+                'content': mem0_payload_text(payload),
                 'metadata': payload,
             })
     return records, scan_stats

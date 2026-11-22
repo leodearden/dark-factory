@@ -74,7 +74,8 @@ def _child(
     """A scrolled child row, shaped exactly as ``get_memories_by_metadata`` returns.
 
     ``metadata`` is the FULL raw Qdrant payload — so the body lives under the
-    mem0 content key ``data`` (the first of ``_MEM0_CONTENT_KEYS``), not under
+    mem0 content key ``data`` (the first of
+    ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS``), not under
     a separate 'content' field.
     """
     return {

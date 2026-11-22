@@ -2782,7 +2782,7 @@ class TestMem0BackendScanPayloadText:
     @pytest.mark.asyncio
     async def test_data_wins_over_memory_and_content(self, backend):
         """`data` is the canonical Qdrant payload key for memory text
-        (memory_service._MEM0_CONTENT_KEYS)."""
+        (``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS``)."""
         point = _scan_point('p1', {'data': 'clean text', 'memory': _SCAN_LEAK_TEXT})
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(return_value=([point], None))

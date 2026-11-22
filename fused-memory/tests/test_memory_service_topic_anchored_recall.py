@@ -90,7 +90,7 @@ def _canonical_payload(
 
     NOTE the body sits under the raw payload key ``'data'``, NOT ``'memory'``:
     a scroll payload is a FULL raw Qdrant payload, not a Mem0 *search item*, so
-    the ``_MEM0_CONTENT_KEYS`` fallback order ('data' -> 'memory' -> 'content')
+    the ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` fallback order ('data' -> 'memory' -> 'content')
     is what turns it into text. Crucially it carries NO ``store_score`` — see
     TestTopicPinScoreContract for why that absence is load-bearing.
     """
@@ -143,7 +143,7 @@ class TestPromotingTopicPin:
         """A scroll payload is not a search item — item.get('memory') does not apply.
 
         The body is under ``'data'``; reading it requires the
-        ``_MEM0_CONTENT_KEYS`` fallback order, so this pins that the pin uses
+        ``fused_memory/utils/mem0_content_keys.py::MEM0_CONTENT_KEYS`` fallback order, so this pins that the pin uses
         the shared helper rather than guessing a key.
         """
         _seed(service)

@@ -161,12 +161,10 @@ import logging
 import sys
 from typing import Any
 
-from fused_memory.backends.mem0_client import (
-    _MEM0_TEXT_KEYS,
-    MEM0_MANAGED_METADATA_KEYS,
-)
+from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
 from fused_memory.memory_metadata import validate_memory_metadata
 from fused_memory.models import MEM0_PRIMARY, MemoryCategory
+from fused_memory.utils.mem0_content_keys import MEM0_CONTENT_KEYS, mem0_payload_text
 from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 from fused_memory.utils.toolcall_xml_leak import LEAK_TAIL
 
@@ -214,17 +212,6 @@ HUMAN_ADJUDICATION_FLAGS: tuple[str, ...] = (
 # Pure core
 # ---------------------------------------------------------------------------
 
-# Payload keys tried in order when extracting a Mem0 memory's text content from
-# its raw Qdrant payload dict. BOUND to mem0_client's tuple rather than
-# re-spelled, so "what counts as a memory's content" is judged by the same
-# object the backend judges it by ('data' is the canonical Qdrant
-# scroll-payload content key for infer=False writes). Two further mirrors of
-# this tuple survive -- ``memory_service._MEM0_CONTENT_KEYS`` and
-# ``clear_malformed_empty_memory._CONTENT_KEYS`` -- and consolidating those is
-# outside this task's lock scope; this script at least does not add a fifth.
-_CONTENT_KEYS: tuple[str, ...] = _MEM0_TEXT_KEYS
-
-
 # Payload keys that mem0/Qdrant OWN or re-derive on write, and which must
 # therefore never be forged back into an ``add_memory(metadata=...)`` call.
 #
@@ -237,16 +224,16 @@ _CONTENT_KEYS: tuple[str, ...] = _MEM0_TEXT_KEYS
 # copy would silently fail to grow when mem0's payload shape does, and the
 # repair would start forging a newly-owned key back into metadata.
 #
-# The four additions are owned by this repair's own mechanics rather than by
+# The additions are owned by this repair's own mechanics rather than by
 # mem0's payload contract, which is why they are not in the shared set:
+#   MEM0_CONTENT_KEYS    every spelling of the memory text, which goes back in
+#                        as ``content=``;
 #   'id'                 the Qdrant point id, assigned by the new write;
-#   'memory'/'content'   historical spellings of the memory text, which goes
-#                        back in as ``content=``;
 #   'category'           overwritten by the service anyway
-#                        (memory_service.py:2193 ``meta['category'] = ...``)
+#                        (``MemoryService.add_memory`` sets ``meta['category']``)
 #                        and passed back as ``category=``.
 _MEM0_OWNED_KEYS: frozenset[str] = MEM0_MANAGED_METADATA_KEYS | {
-    'id', 'memory', 'content', 'category',
+    *MEM0_CONTENT_KEYS, 'id', 'category',
 }
 
 # The subset of the owned keys that the repair DOES carry, just not as metadata:
@@ -257,7 +244,7 @@ _MEM0_OWNED_KEYS: frozenset[str] = MEM0_MANAGED_METADATA_KEYS | {
 # ``project_id=args.project_id``. Reporting any of these as "dropped" would be a
 # false alarm that buries the genuinely-lost ones.
 _ARGUMENT_CARRIED_KEYS: frozenset[str] = frozenset({
-    'data', 'memory', 'content', 'category', 'agent_id', 'run_id', 'user_id',
+    *MEM0_CONTENT_KEYS, 'category', 'agent_id', 'run_id', 'user_id',
 })
 
 
@@ -304,20 +291,6 @@ def carried_metadata(payload: dict, memory_id: Any) -> tuple[dict, list[str]]:
     return metadata, dropped
 
 
-def extract_content(payload: dict) -> str:
-    """Return the first non-empty string among payload['data'], ['memory'],
-    ['content'], trying _CONTENT_KEYS in order.
-
-    Returns '' when no key is present or every present value is empty/not a
-    string -- identical to clear_malformed_empty_memory.extract_content.
-    """
-    for key in _CONTENT_KEYS:
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ''
-
-
 def _split_at_leak(text: str) -> tuple[str, str] | None:
     """Split *text* into (before, remainder) around the leak marker.
 
@@ -360,7 +333,7 @@ def classify_record(payload: dict) -> str:
         'manual_review' for every other leak -- including a leak at offset 0,
         where no repair could preserve content because there is none to keep.
     """
-    content = extract_content(payload)
+    content = mem0_payload_text(payload)
     split = _split_at_leak(content)
     if split is None:
         return CLEAN
@@ -779,8 +752,8 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
     # READ from the scan result, never re-derived here. The alternative --
     # spelling ``Scope(project_id=...).mem0_collection_name(prefix)`` a second
     # time inside this script -- would be a second copy of the
-    # scope-to-collection rule, the same duplication the ``_CONTENT_KEYS`` /
-    # ``_MEM0_OWNED_KEYS`` bindings above exist to avoid, and it would go
+    # scope-to-collection rule, the same duplication the ``_MEM0_OWNED_KEYS``
+    # binding above exists to avoid, and it would go
     # silently wrong the day that mapping changes. The value the scan actually
     # swept is the only value worth printing.
     collection = scan.get('collection') or ''
@@ -807,7 +780,7 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
 
     for match in matches:
         payload = match.get('metadata') or {}
-        content = extract_content(payload)
+        content = mem0_payload_text(payload)
         classification = classify_record(payload)
         record: dict = {
             'id': match.get('id'),

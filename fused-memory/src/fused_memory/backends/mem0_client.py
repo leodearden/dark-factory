@@ -13,6 +13,7 @@ from fused_memory.backends.timeout_budget import await_within, socket_timeout_ou
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
+from fused_memory.utils.mem0_content_keys import MEM0_TEXT_KEY, mem0_payload_text
 from fused_memory.utils.toolcall_xml_leak import PREFILTER_NEEDLES, find_toolcall_xml_leak
 
 logger = logging.getLogger(__name__)
@@ -20,24 +21,8 @@ logger = logging.getLogger(__name__)
 #: Return type of whatever a timed call is awaiting — see Mem0Backend._timed_read.
 _T = TypeVar('_T')
 
-# The canonical Qdrant payload key for a memory's text, with the historical
-# fallbacks. Mirrors memory_service._MEM0_CONTENT_KEYS and
-# scripts/clear_malformed_empty_memory._CONTENT_KEYS so "what counts as a
-# memory's content" is judged identically everywhere.
-_MEM0_TEXT_KEY = 'data'
-_MEM0_TEXT_KEYS = (_MEM0_TEXT_KEY, 'memory', 'content')
-
 # How much of a matching record's text to echo back in a scan hit.
 _EXCERPT_LEN = 240
-
-
-def extract_payload_text(payload: dict[str, Any]) -> str | None:
-    """Return a Qdrant payload's memory text, in canonical key order."""
-    for key in _MEM0_TEXT_KEYS:
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
 
 
 #: A scan verdict: the fragments of *text* that make it a match (empty: no match).
@@ -892,7 +877,7 @@ class Mem0Backend:
             for k, v in (filters or {}).items()
         ]
         should: list[qmodels.Condition] = [
-            qmodels.FieldCondition(key=_MEM0_TEXT_KEY, match=qmodels.MatchText(text=needle))
+            qmodels.FieldCondition(key=MEM0_TEXT_KEY, match=qmodels.MatchText(text=needle))
             for needle in (text_needles or ())
         ]
         # `or None` on BOTH arms — the omit-an-unused-arm rule, stated once.
@@ -1282,7 +1267,7 @@ class Mem0Backend:
                 async for point in pages:
                     scanned += 1
                     payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-                    text = extract_payload_text(payload) or ''
+                    text = mem0_payload_text(payload)
                     fragments = verdict(text)
                     if not fragments:
                         continue

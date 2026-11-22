@@ -241,6 +241,7 @@ from fused_memory.reconciliation.task_filter import (
     WIDE_CLAUSE_BOUNDARY_RE,
 )
 from fused_memory.utils.created_at import parse_created_at
+from fused_memory.utils.mem0_content_keys import mem0_payload_text
 from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('audit_duplicate_memories')
@@ -2583,15 +2584,6 @@ def build_metric_series(
 # I/O layer: fetch (thin, mock-tested)
 # ---------------------------------------------------------------------------
 
-# Payload keys tried in order when extracting a Mem0 memory's text content
-# from its scroll_by_metadata() 'metadata' payload dict. 'data' is the
-# canonical scroll-payload key (mirrors prune_recon_cycle_summaries.py, which
-# reads only metadata.get('data')) so it is tried first; 'memory' is a
-# search-result-layer key (memory_service.py's MemoryResult.content, built
-# from Mem0's search API, not scroll) that can appear stale on a scroll
-# payload, so it is only a fallback; 'content' is a defensive third fallback.
-_CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
-
 
 async def fetch_memories(
     memory: Any,
@@ -2612,9 +2604,10 @@ async def fetch_memories(
     (plus ``'vector'`` when *with_vectors*). The top-level ``'category'`` is
     lifted out of the payload because ``build_sweep_plan`` filters on it —
     without the lift every record would read as category ``None`` and the
-    sweep would be a silent no-op. Content is extracted by trying
-    ``_CONTENT_KEYS`` in order, falling back to ``''``; a record with no
-    extractable content never clusters and is never deleted.
+    sweep would be a silent no-op. Content is extracted by
+    ``fused_memory/utils/mem0_content_keys.py::mem0_payload_text``, falling
+    back to ``''``; a record with no extractable content never clusters and is
+    never deleted.
 
     Args:
         memory: Live (or mock) MemoryService instance.
@@ -2659,15 +2652,9 @@ async def fetch_memories(
         }
         for record in raw_records:
             payload = record.get('metadata') or {}
-            content = ''
-            for key in _CONTENT_KEYS:
-                value = payload.get(key)
-                if isinstance(value, str) and value:
-                    content = value
-                    break
             normalized: dict[str, Any] = {
                 'id': record.get('id'),
-                'content': content,
+                'content': mem0_payload_text(payload),
                 'category': payload.get('category'),
                 'created_at': record.get('created_at'),
                 'metadata': payload,
