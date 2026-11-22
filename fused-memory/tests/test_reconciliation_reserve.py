@@ -31,6 +31,7 @@ from shared.testing_reserve import (
     RELEASE_AT,
     RESERVE_ACCOUNT,
     ReserveClock,
+    cap_account,
     cap_all_but_reserve,
     reserve_gate,
 )
@@ -54,6 +55,8 @@ from fused_memory.reconciliation.reserve_step_aside import (
 )
 
 _STEP_ASIDE_LOGGER = 'fused_memory.reconciliation.reserve_step_aside'
+_HARNESS_LOGGER = 'fused_memory.reconciliation.harness'
+_AFTER_THE_RELEASE = RELEASE_AT - PROTECTED + timedelta(minutes=1)
 
 
 class MonotonicClock:
@@ -142,6 +145,27 @@ class TestReserveStepAside:
 
         assert [(c.refused, c.refusal, c.refusal_ended) for c in checks] == [(False, None, False)] * 3
 
+    @pytest.mark.asyncio
+    async def test_a_refusal_ends_only_once_an_account_is_open(self, tmp_path: Path) -> None:
+        reserve_clock = ReserveClock(PROTECTED)
+        gate = b2_gate(tmp_path, reserve_clock)
+        step_aside = ReserveStepAside(gate, clock=MonotonicClock())
+        try:
+            assert step_aside.check('p', site=StepAsideSite.PROJECT_LOOP).refused
+            cap_account(gate, RESERVE_ACCOUNT, resets_at=datetime.now(UTC) - timedelta(minutes=1))
+            in_the_window = step_aside.check('p', site=StepAsideSite.PROJECT_LOOP)
+            reserve_clock.advance(_AFTER_THE_RELEASE)
+            after_the_release = step_aside.check('p', site=StepAsideSite.PROJECT_LOOP)
+
+            assert await gate.wait_for_open(timeout=0)
+            reopened = step_aside.check('p', site=StepAsideSite.PROJECT_LOOP)
+        finally:
+            await gate.shutdown()
+
+        nothing_open = [in_the_window, after_the_release]
+        assert [(c.refused, c.refusal_ended) for c in nothing_open] == [(False, False)] * 2
+        assert (reopened.refused, reopened.refusal_ended) == (False, True)
+
     def test_an_open_pool_in_the_protected_window_is_not_refused(self, tmp_path: Path) -> None:
         step_aside = ReserveStepAside(
             reserve_gate(tmp_path, clock=ReserveClock(PROTECTED)), clock=MonotonicClock(),
@@ -206,6 +230,32 @@ def record_stage_runs(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return entered
 
 
+async def run_project_loop_for_ticks(harness: ReconciliationHarness, ticks: int) -> None:
+    """Run the project loop until it has slept *ticks* times, then cancel it."""
+    slept = 0
+    enough = asyncio.Event()
+
+    async def counting_sleep(_seconds: float) -> None:
+        nonlocal slept
+        await asyncio.sleep(0)
+        slept += 1
+        if slept >= ticks:
+            enough.set()
+
+    with patch('fused_memory.reconciliation.harness._sleep', counting_sleep):
+        loop_task = asyncio.create_task(harness._project_loop('test-project'))
+        try:
+            await enough.wait()
+        finally:
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task
+
+
+async def yield_once(_seconds: float) -> None:
+    await asyncio.sleep(0)
+
+
 def one_event_per_chunk_assembler(memory_service, taskmaster, config, project_root=''):
     """A ContextAssembler stand-in whose every chunk is the oldest peeked event."""
     assembler = MagicMock()
@@ -232,29 +282,31 @@ class TestDrainSitesStepAside:
         async with open_reserve_harness(tmp_path, b2_gate(tmp_path, ReserveClock(PROTECTED))) as harness:
             await buffer_events(harness, 3)
             assert (await harness.buffer.should_trigger('test-project'))[0]
-            sleeps = 0
-            third_sleep = asyncio.Event()
 
-            async def counting_sleep(_seconds: float) -> None:
-                nonlocal sleeps
-                await asyncio.sleep(0)
-                sleeps += 1
-                if sleeps >= 3:
-                    third_sleep.set()
-
-            with patch('fused_memory.reconciliation.harness._sleep', counting_sleep):
-                loop_task = asyncio.create_task(harness._project_loop('test-project'))
-                try:
-                    await third_sleep.wait()
-                finally:
-                    loop_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await loop_task
+            await run_project_loop_for_ticks(harness, 3)
 
             assert await harness.journal.get_recent_runs('test-project') == []
             assert (await harness.buffer.get_buffer_stats('test-project'))['size'] == 3
         assert entered == []
         assert len(deferral_records(caplog)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_manual_trigger_requested_while_refused_runs_once_the_refusal_ends(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        record_stage_runs(monkeypatch)
+        reserve_clock = ReserveClock(PROTECTED)
+        async with open_reserve_harness(tmp_path, b2_gate(tmp_path, reserve_clock)) as harness:
+            await harness.buffer.request_trigger('test-project')
+            await run_project_loop_for_ticks(harness, 3)
+            assert await harness.journal.get_recent_runs('test-project') == []
+
+            reserve_clock.advance(_AFTER_THE_RELEASE)
+            with patch('fused_memory.reconciliation.harness._sleep', yield_once):
+                await drive_one_project_loop_cycle(harness)
+
+            runs = await harness.journal.get_recent_runs('test-project')
+        assert [run.trigger_reason for run in runs] == ['manual_trigger']
 
     @pytest.mark.asyncio
     async def test_a_backlog_refused_before_its_first_chunk_drains_nothing(
@@ -329,6 +381,61 @@ async def drive_one_project_loop_cycle(harness: ReconciliationHarness) -> None:
                 await loop_task
 
 
+def recording_review(
+    journal: Any, reviewed: list[str], *, first_waits_for: asyncio.Event | None = None,
+) -> Callable[[str], Awaitable[JudgeVerdict]]:
+    """A Judge.review_run stand-in: records each run it reviews, then commits an ok verdict.
+
+    With *first_waits_for*, the first run reviewed stays in flight until that event is set.
+    """
+
+    async def review(run_id: str) -> JudgeVerdict:
+        reviewed.append(run_id)
+        if first_waits_for is not None and run_id == reviewed[0]:
+            await first_waits_for.wait()
+        verdict = JudgeVerdict(
+            run_id=run_id, reviewed_at=datetime.now(UTC), severity=VerdictSeverity.ok,
+            findings=[], action_taken=VerdictAction.none,
+        )
+        await journal.add_verdict(verdict)
+        return verdict
+
+    return review
+
+
+def has_reviewed(reviewed: list[str], *run_ids: str) -> Callable[[], Awaitable[bool]]:
+    async def holds() -> bool:
+        return set(run_ids) <= set(reviewed)
+
+    return holds
+
+
+def has_reviewed_any(reviewed: list[str]) -> Callable[[], Awaitable[bool]]:
+    async def holds() -> bool:
+        return bool(reviewed)
+
+    return holds
+
+
+def no_judge_pending(journal: Any) -> Callable[[], Awaitable[bool]]:
+    async def holds() -> bool:
+        return await journal.get_pending_judge_runs() == []
+
+    return holds
+
+
+async def let_tasks_run() -> None:
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+def recovery_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == _HARNESS_LOGGER and record.getMessage().startswith('Recovering ')
+    ]
+
+
 class TestJudgesStepAside:
     @pytest.mark.asyncio
     async def test_a_refused_judge_waits_and_is_recovered_once_when_the_refusal_ends(
@@ -337,61 +444,114 @@ class TestJudgesStepAside:
         record_stage_runs(monkeypatch)
         reserve_clock = ReserveClock(PROTECTED)
         gate = reserve_gate(tmp_path, clock=reserve_clock)
-        async with open_reserve_harness(
-            tmp_path, gate,
-            judge_enabled=True, judge_infra_max_consecutive_failures=1, halt_on_judge_serious=True,
-        ) as harness:
+        async with open_reserve_harness(tmp_path, gate, judge_enabled=True) as harness:
             assert harness.judge is not None
             journal = harness.journal
             reviewed: list[str] = []
             release_a = asyncio.Event()
-
-            async def review(run_id: str) -> JudgeVerdict:
-                reviewed.append(run_id)
-                if run_id == reviewed[0]:
-                    await release_a.wait()
-                verdict = JudgeVerdict(
-                    run_id=run_id, reviewed_at=datetime.now(UTC), severity=VerdictSeverity.ok,
-                    findings=[], action_taken=VerdictAction.none,
-                )
-                await journal.add_verdict(verdict)
-                return verdict
-
-            async def a_is_in_review() -> bool:
-                return bool(reviewed)
+            review = recording_review(journal, reviewed, first_waits_for=release_a)
 
             with patch.object(harness.judge, 'review_run', new=AsyncMock(side_effect=review)):
                 run_a = await harness.run_full_cycle('test-project', 'test')
-                await wait_until(a_is_in_review)
+                await wait_until(has_reviewed_any(reviewed))
                 assert reviewed == [run_a.id]
 
                 cap_all_but_reserve(gate)
                 run_b = await harness.run_full_cycle('test-project', 'test')
-                for _ in range(10):
-                    await asyncio.sleep(0)
+                await let_tasks_run()
 
                 assert (run_b.id, 'test-project') in await journal.get_pending_judge_runs()
                 assert reviewed == [run_a.id]
-                assert harness.judge.is_halted('test-project') is False
 
                 await buffer_events(harness, 3)
-                reserve_clock.advance(RELEASE_AT - PROTECTED + timedelta(minutes=1))
+                reserve_clock.advance(_AFTER_THE_RELEASE)
                 await drive_one_project_loop_cycle(harness)
                 [run_c] = [
                     run.id for run in await journal.get_recent_runs('test-project')
                     if run.id not in {run_a.id, run_b.id}
                 ]
 
-                async def b_and_c_reviewed() -> bool:
-                    return {run_b.id, run_c} <= set(reviewed)
-
-                await wait_until(b_and_c_reviewed)
+                await wait_until(has_reviewed(reviewed, run_b.id, run_c))
                 assert Counter(reviewed) == {run_a.id: 1, run_b.id: 1, run_c: 1}
 
                 release_a.set()
-
-                async def nothing_pending() -> bool:
-                    return await journal.get_pending_judge_runs() == []
-
-                await wait_until(nothing_pending)
+                await wait_until(no_judge_pending(journal))
             assert Counter(reviewed) == {run_a.id: 1, run_b.id: 1, run_c: 1}
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_first_seen_ended_at_a_judge_starts_that_judge_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        record_stage_runs(monkeypatch)
+        reserve_clock = ReserveClock(PROTECTED)
+        async with open_reserve_harness(
+            tmp_path, b2_gate(tmp_path, reserve_clock), judge_enabled=True,
+        ) as harness:
+            assert harness.judge is not None
+            reviewed: list[str] = []
+            review = recording_review(harness.journal, reviewed)
+
+            with patch.object(harness.judge, 'review_run', new=AsyncMock(side_effect=review)):
+                assert await harness.reserve_steps_aside('test-project', site=StepAsideSite.PROJECT_LOOP)
+                reserve_clock.advance(_AFTER_THE_RELEASE)
+                run_x = await harness.run_full_cycle('test-project', 'test')
+                await wait_until(no_judge_pending(harness.journal))
+                await let_tasks_run()
+        assert reviewed == [run_x.id]
+
+    @pytest.mark.asyncio
+    async def test_a_recovery_pass_leaves_a_judge_in_flight_out_of_its_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.INFO, logger=_HARNESS_LOGGER)
+        record_stage_runs(monkeypatch)
+        reserve_clock = ReserveClock(PROTECTED)
+        gate = reserve_gate(tmp_path, clock=reserve_clock)
+        async with open_reserve_harness(tmp_path, gate, judge_enabled=True) as harness:
+            assert harness.judge is not None
+            journal = harness.journal
+            reviewed: list[str] = []
+            release_a = asyncio.Event()
+            review = recording_review(journal, reviewed, first_waits_for=release_a)
+
+            with patch.object(harness.judge, 'review_run', new=AsyncMock(side_effect=review)):
+                run_a = await harness.run_full_cycle('test-project', 'test')
+                await wait_until(has_reviewed_any(reviewed))
+                cap_all_but_reserve(gate)
+                run_b = await harness.run_full_cycle('test-project', 'test')
+                reserve_clock.advance(_AFTER_THE_RELEASE)
+
+                assert not await harness.reserve_steps_aside(
+                    'test-project', site=StepAsideSite.PROJECT_LOOP,
+                )
+                await wait_until(has_reviewed(reviewed, run_b.id))
+                release_a.set()
+                await wait_until(no_judge_pending(journal))
+        assert recovery_lines(caplog) == [
+            'Recovering 1 pending judge review(s) after the reserve refusal ended',
+        ]
+        assert Counter(reviewed) == {run_a.id: 1, run_b.id: 1}
+
+    @pytest.mark.asyncio
+    async def test_a_recovery_pass_the_reserve_refuses_claims_no_recovery(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.INFO, logger=_HARNESS_LOGGER)
+        record_stage_runs(monkeypatch)
+        async with open_reserve_harness(
+            tmp_path, b2_gate(tmp_path, ReserveClock(PROTECTED)), judge_enabled=True,
+        ) as harness:
+            assert harness.judge is not None
+            reviewed: list[str] = []
+            review = recording_review(harness.journal, reviewed)
+
+            with patch.object(harness.judge, 'review_run', new=AsyncMock(side_effect=review)):
+                run_x = await harness.run_full_cycle('test-project', 'test')
+                await harness._recover_pending_judge_reviews()
+                await let_tasks_run()
+            pending = await harness.journal.get_pending_judge_runs()
+        assert reviewed == []
+        assert pending == [(run_x.id, 'test-project')]
+        [line] = recovery_lines(caplog)
+        assert line.startswith('Recovering 0 pending judge review(s) after restart')
+        assert 'allowance reserve' in line

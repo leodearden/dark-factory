@@ -4,6 +4,10 @@ Reconciliation is background work (plans/allowance-reserve-by-account-prd.md D13
 reserve is the only open account in its protected window, a drain site asks first (§6.4) and
 defers instead of spending a cycle waiting in the gate. This module holds that policy: the
 question, the edge on which a refusal ends, and a deferral log quiet enough to run every tick.
+
+A refusal ends only once an account is open again. A reserve that caps inside its own window
+leaves nothing open, so the reserve no longer refuses, but the judges the refusal held back
+still have no account to run on; the edge waits for one.
 """
 
 from __future__ import annotations
@@ -60,11 +64,14 @@ class ReserveStepAside:
             self._refused = True
             self._log_deferral(project_id, site, refusal)
             return ReserveCheck(refusal=refusal, refusal_ended=False)
-        ended = self._refused
-        self._refused = False
+        ended = self._refused and self._an_account_is_open()
         if ended:
+            self._refused = False
             self._last_logged.clear()
         return ReserveCheck(refusal=None, refusal_ended=ended)
+
+    def _an_account_is_open(self) -> bool:
+        return self._gate is not None and self._gate.active_account_name is not None
 
     def _log_deferral(self, project_id: str, site: StepAsideSite, refusal: ReserveRefusal) -> None:
         now = self._clock()

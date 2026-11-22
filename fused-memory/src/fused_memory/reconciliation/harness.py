@@ -935,6 +935,7 @@ class ReconciliationHarness:
         self._remediation_deferrals: dict[str, int] = {}
 
         # Usage gate (multi-account cap failover): the injected one, else one from config.
+        # Either way the harness owns it and shuts it down with itself.
         self.usage_gate: UsageGate | None = usage_gate
         if self.usage_gate is None and hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
             self.usage_gate = UsageGate(self.config.usage_cap)
@@ -2585,7 +2586,7 @@ class ReconciliationHarness:
             logger.info('Reconciliation escalation server stopped')
 
     async def _shutdown_usage_gate(self) -> None:
-        """Tear down the usage gate built in ``__init__``, best-effort."""
+        """Tear down the usage gate, best-effort: the one built from config or the one injected."""
         if self.usage_gate is None:
             return
         try:
@@ -3135,6 +3136,10 @@ class ReconciliationHarness:
                 logger.info('reconciliation.drain_ack', extra={'project_id': project_id})
                 return
             try:
+                # Asked before should_trigger, which consumes a manual trigger.
+                if await self.reserve_steps_aside(project_id, site=StepAsideSite.PROJECT_LOOP):
+                    await _sleep(5)
+                    continue
                 should, reason = await self.buffer.should_trigger(project_id)
                 if not should:
                     idle_ticks += 1
@@ -3145,9 +3150,6 @@ class ReconciliationHarness:
                     continue
 
                 idle_ticks = 0
-                if await self.reserve_steps_aside(project_id, site=StepAsideSite.PROJECT_LOOP):
-                    await _sleep(5)
-                    continue
                 acquired = await self.buffer.mark_run_active(project_id)
                 if not acquired:
                     await _sleep(5)
@@ -3342,8 +3344,8 @@ class ReconciliationHarness:
                 logger.warning(f'_recover_pending_judge_reviews after a reserve refusal failed: {e}')
         return check.refused
 
-    async def _spawn_judge(self, run_id: str, project_id: str) -> None:
-        """Durably mark a judge review pending, then fire a tracked judge task.
+    async def _spawn_judge(self, run_id: str, project_id: str) -> bool:
+        """Durably mark a judge review pending, then fire a tracked judge task; whether one started.
 
         The single seam for both fresh cycle-end launches (run_full_cycle,
         _run_remediation_pass) and startup recovery (task 2708). Awaiting the
@@ -3359,12 +3361,13 @@ class ReconciliationHarness:
         """
         await self.journal.mark_judge_pending(run_id, project_id)
         if await self.reserve_steps_aside(project_id, site=StepAsideSite.JUDGE):
-            return
+            return False
         if self._judge_in_flight(run_id):
-            return
+            return False
         task = asyncio.create_task(self._run_judge(run_id), name=_judge_task_name(run_id))
         self._judge_tasks.add(task)
         task.add_done_callback(self._judge_tasks.discard)
+        return True
 
     def _judge_in_flight(self, run_id: str) -> bool:
         name = _judge_task_name(run_id)
@@ -3442,10 +3445,14 @@ class ReconciliationHarness:
                 f'remaining {total - len(to_spawn)} will be recovered on '
                 'later passes.'
             )
-        else:
-            logger.info(f'Recovering {total} pending judge review(s) {why}')
-        for run_id, project_id in to_spawn:
-            await self._spawn_judge(run_id, project_id)
+        started = [
+            run_id for run_id, project_id in to_spawn if await self._spawn_judge(run_id, project_id)
+        ]
+        held = len(to_spawn) - len(started)
+        logger.info(
+            f'Recovering {len(started)} pending judge review(s) {why}'
+            + (f'; {held} stay pending while the allowance reserve refuses reconciliation' if held else '')
+        )
 
     async def _run_judge(self, run_id: str) -> None:
         """Fire-and-forget judge wrapper with error logging."""
