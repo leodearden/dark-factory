@@ -3,10 +3,10 @@
 
 A graph is deleted only when its name fully matches one of ``LITTER_PATTERNS``;
 that allowlist is the script's whole blast radius, and every other graph is
-kept and reported. ``list`` writes a listing for review; ``delete`` removes only
-the graphs that listing reviewed and that are still litter, one at a time, and
-stops if the server restarts. Runbook: OPERATIONS.md "Deleting test litter from
-production".
+kept and reported. ``list`` writes a listing for review; ``delete`` refuses a
+listing whose ``delete`` section names anything but litter, removes the
+reviewed graphs still present one at a time, and stops if the server restarts.
+Runbook: OPERATIONS.md "Deleting test litter from production".
 
 It does not call the store-mutation preflight, which guards the mem0/Qdrant
 store this script never touches: its one write is GRAPH.DELETE of an allowlisted
@@ -443,8 +443,32 @@ def require_same_target(listing: Listing, target: str) -> Listing:
     return listing
 
 
+class ListingDeletesKeptGraphs(ValueError):
+    """A reviewed listing whose delete section names graphs the allowlist does not."""
+
+    def __init__(self, names: tuple[str, ...]) -> None:
+        super().__init__(
+            f'the reviewed listing names {", ".join(map(repr, names))} under delete, but only '
+            'graphs on LITTER_PATTERNS are ever deleted; list again and review that listing'
+        )
+        self.names = names
+
+
+def require_deletable(listing: Listing, target: str) -> Listing:
+    """A listing taken on *target* whose delete section names only litter."""
+    require_same_target(listing, target)
+    kept = tuple(name for name in listing.delete if not is_litter(name))
+    if kept:
+        raise ListingDeletesKeptGraphs(kept)
+    return listing
+
+
 class _RecordFile:
-    """The delete run's record on disk, rewritten whole at each step of the run."""
+    """The delete run's record on disk, rewritten whole at each step of the run.
+
+    ``latest`` is set before each write, so it names every delete even when
+    writing it failed.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -459,6 +483,9 @@ class _RecordFile:
             with contextlib.suppress(OSError):
                 self.write(replace(self.latest, outcome=Exit.FAILED))
 
+    def deleted(self) -> tuple[str, ...]:
+        return () if self.latest is None else self.latest.deleted
+
 
 def run_delete(
     server: GraphServer,
@@ -470,8 +497,8 @@ def run_delete(
     sleep: Callable[[float], None],
 ) -> Exit:
     try:
-        require_same_target(reviewed, target)
-    except WrongTarget as error:
+        require_deletable(reviewed, target)
+    except (WrongTarget, ListingDeletesKeptGraphs) as error:
         return _report(Exit.REFUSED, error)
     record_file = _RecordFile(record_path)
     try:
@@ -485,13 +512,24 @@ def run_delete(
         )
         record_file.write(record)
     except (RedisError, OSError) as error:
-        record_file.write_failed()
-        return _report(Exit.FAILED, f'{type(error).__name__}: {error}; record at {record_path}')
+        return _report_failed(record_file, target, f'{type(error).__name__}: {error}')
+    except KeyboardInterrupt:
+        return _report_failed(record_file, target, 'interrupted')
     return _report_outcome(record, record_path)
 
 
+def _run_summary(deleted: tuple[str, ...], target: str, record_path: Path) -> str:
+    return f'deleted {len(deleted)} graphs on {target}; record at {record_path}'
+
+
+def _report_failed(record_file: _RecordFile, target: str, cause: str) -> Exit:
+    record_file.write_failed()
+    summary = _run_summary(record_file.deleted(), target, record_file.path)
+    return _report(Exit.FAILED, f'{cause}; {summary}')
+
+
 def _report_outcome(record: CleanupRecord, record_path: Path) -> Exit:
-    summary = f'deleted {len(record.deleted)} graphs on {record.target}; record at {record_path}'
+    summary = _run_summary(record.deleted, record.target, record_path)
     if record.outcome is Exit.OK:
         print(f'ok: {summary}')
         return Exit.OK
@@ -585,8 +623,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == 'list':
         return _against(endpoint, password, lambda server: _list(server, endpoint.uri, args.out))
     try:
-        reviewed = require_same_target(read_listing(args.reviewed), endpoint.uri)
-    except (UnreadableListing, WrongTarget) as error:
+        reviewed = require_deletable(read_listing(args.reviewed), endpoint.uri)
+    except (UnreadableListing, WrongTarget, ListingDeletesKeptGraphs) as error:
         return _report(Exit.REFUSED, error)
     return _against(
         endpoint,

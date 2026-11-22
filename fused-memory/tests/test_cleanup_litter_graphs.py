@@ -531,12 +531,12 @@ def refused_target(monkeypatch) -> Iterator[str]:
         yield uri
 
 
-def _write_reviewed(path: Path, target: str) -> Path:
+def _write_reviewed(path: Path, target: str, delete: tuple[str, ...] = ('_probe',)) -> Path:
     listing = CLEANUP.Listing(
         target=target,
         run_id='run-a',
         taken_at='2026-11-21T00:00:00+00:00',
-        delete={'_probe': 0},
+        delete={name: 0 for name in delete},
         keep={'dark_factory': 41},
     )
     CLEANUP.write_listing(path, listing)
@@ -579,6 +579,24 @@ def test_delete_with_a_listing_for_another_target_is_refused_naming_both(
     assert code == CLEANUP.Exit.REFUSED
     assert 'redis://localhost:6379' in err
     assert refused_target in err
+    assert not record.exists()
+
+
+def test_delete_with_a_listing_naming_kept_graphs_under_delete_is_refused_before_connecting(
+    refused_target, tmp_path, capsys
+):
+    reviewed = _write_reviewed(
+        tmp_path / 'listing.json', refused_target, ('_probe', 'default_db', 'dark_factory')
+    )
+    record = tmp_path / 'record.json'
+
+    code = CLEANUP.main(['delete', '--reviewed', str(reviewed), '--record', str(record)])
+
+    err = capsys.readouterr().err
+    assert code == CLEANUP.Exit.REFUSED
+    assert err.startswith('refused:')
+    assert "'default_db'" in err
+    assert "'dark_factory'" in err
     assert not record.exists()
 
 
@@ -726,6 +744,61 @@ def test_run_delete_keeps_the_record_of_a_run_a_redis_error_interrupted(tmp_path
     assert 'GRAPH.DELETE probe_e1_gw0 failed' in capsys.readouterr().err
 
 
+def _interrupt(seconds: float) -> None:
+    raise KeyboardInterrupt
+
+
+def test_run_delete_records_an_interrupted_run_as_failed_naming_what_it_deleted(tmp_path, capsys):
+    server = FakeGraphServer({'_probe': 0, 'probe_e1_gw0': 1, 'dark_factory': 41})
+    record_path = tmp_path / 'record.json'
+
+    code = CLEANUP.run_delete(
+        server, _reviewed(('_probe', 'probe_e1_gw0')), record_path,
+        target=TARGET, pace_s=10.0, sleep=_interrupt,
+    )
+
+    record = _record_json(record_path)
+    err = capsys.readouterr().err
+    assert code == CLEANUP.Exit.FAILED
+    assert server.deleted == ['_probe']
+    assert record['deleted'] == ['_probe']
+    assert record['outcome'] == 'failed'
+    assert err.startswith('failed: interrupted')
+    assert 'deleted 1 graphs' in err
+
+
+def test_run_delete_with_an_unwritable_record_deletes_nothing(tmp_path, capsys):
+    server = FakeGraphServer({'_probe': 0, 'dark_factory': 41})
+    record_path = tmp_path / 'missing' / 'record.json'
+
+    code = CLEANUP.run_delete(
+        server, _reviewed(('_probe',)), record_path,
+        target=TARGET, pace_s=0.0, sleep=RecordingSleep(server),
+    )
+
+    assert code == CLEANUP.Exit.FAILED
+    assert server.deleted == []
+    assert not record_path.exists()
+    assert 'deleted 0 graphs' in capsys.readouterr().err
+
+
+def test_run_delete_refuses_a_listing_naming_a_kept_graph_under_delete(tmp_path, capsys):
+    server = FakeGraphServer({'_probe': 0, 'dark_factory': 41})
+    record_path = tmp_path / 'record.json'
+
+    code = CLEANUP.run_delete(
+        server, _reviewed(('_probe', 'dark_factory')), record_path,
+        target=TARGET, pace_s=0.0, sleep=RecordingSleep(server),
+    )
+
+    err = capsys.readouterr().err
+    assert code == CLEANUP.Exit.REFUSED
+    assert server.deleted == []
+    assert not record_path.exists()
+    assert err.startswith('refused:')
+    assert "'dark_factory'" in err
+
+
 def test_run_delete_refuses_a_listing_for_another_target(tmp_path):
     server = FakeGraphServer({'_probe': 0})
     record_path = tmp_path / 'record.json'
@@ -749,6 +822,16 @@ def test_a_server_that_reports_no_run_id_fails_closed(reply):
 
     with pytest.raises(RedisError, match='no run_id'):
         CLEANUP.FalkorGraphServer(client).run_id()
+
+
+def test_the_adapter_refuses_a_kept_graph_before_selecting_it():
+    selected: list[str] = []
+    client = SimpleNamespace(select_graph=selected.append)
+
+    with pytest.raises(CLEANUP.NotLitter, match="'dark_factory'"):
+        CLEANUP.FalkorGraphServer(client).delete('dark_factory')
+
+    assert selected == []
 
 
 # --- the adapter, live on the scratch server --------------------------------------------
