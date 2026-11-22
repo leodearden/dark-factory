@@ -124,7 +124,9 @@ def _rules(settings: Settings) -> dict[Check, str]:
         'number no more than the (pass, test) entries they list in threshold_reached',
         Check.LEDGER_ROWS_PER_PASS: 'every test a windowed confirmed outcome lists as reproduced has a '
         'fails_in_isolation row, and every cleared test a passes_in_isolation row, at call site offline_lane '
-        "observed at the pass's start (PRD 5.8); the unconfirmable pseudo-test and the unknown id are exempt",
+        "observed at the pass's start (PRD 5.8); the unconfirmable pseudo-test and the unknown id are exempt; "
+        'a pass started before the ledger cut-over, the earliest stored pass whose effect block records its debts '
+        '(ε2, when the lane began writing rows), is not judged and is noted',
         Check.DEFLAKE_TASKS_CARRY_EVIDENCE: 'every owner task of a debt a windowed effect block offered, whose '
         'metadata says flake_debt_call_site offline_lane, carries a flake_debt_trigger and, in its description '
         "or details, the kind and first line of one of that test's failures in the command's pass records; "
@@ -231,20 +233,30 @@ def _owed_rows(record: PassRecord, outcome: Confirmed) -> list[tuple[str, FlakeV
     return [(node, verdict) for node, verdict in owed if node not in exempt]
 
 
+def _before_ledger(inputs: SoakInputs, window_pass: WindowPass) -> bool:
+    """Whether *window_pass* started before the ledger cut-over, or no stored pass records one."""
+    return inputs.ledger_cut_over is None or window_pass.started_at < inputs.ledger_cut_over
+
+
 def _ledger_rows_per_pass(inputs: SoakInputs, rule: str, settings: Settings) -> CheckResult:
     rows = _lane_rows(inputs)
+    cut_over = 'none recorded' if inputs.ledger_cut_over is None else inputs.ledger_cut_over.isoformat()
     examined = 0
     failures: list[str] = []
+    notes: list[str] = []
     for window_pass in inputs.passes:
         record = window_pass.stored.record
         if record is None or not isinstance(window_pass.outcome, Confirmed):
             continue
         owed = _owed_rows(record, window_pass.outcome)
+        if owed and _before_ledger(inputs, window_pass):
+            notes.append(f'not judged, before the ledger cut-over {cut_over}: {_label(window_pass)}')
+            continue
         examined += len(owed)
         missing = [f'{node} ({verdict})' for node, verdict in owed if (node, record.started_at, verdict) not in rows]
         if missing:
             failures.append(f'{_label(window_pass)}: no offline_lane row for ' + ', '.join(missing))
-    return _judged(Check.LEDGER_ROWS_PER_PASS, rule, examined, failures)
+    return _judged(Check.LEDGER_ROWS_PER_PASS, rule, examined, failures, notes)
 
 
 def _live_episodes(inputs: SoakInputs) -> Iterator[Episode]:
