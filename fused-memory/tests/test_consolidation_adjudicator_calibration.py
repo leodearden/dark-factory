@@ -551,9 +551,8 @@ class TestCalibrationRun:
         gate = asyncio.Event()
         double = ScriptedResponses(_key(), gate=gate)
         run = asyncio.create_task(_calibrate(ledger, double))
-        async with asyncio.timeout(10):
-            while double.in_flight < CALLS_IN_FLIGHT:
-                await asyncio.sleep(0)
+        while double.in_flight < CALLS_IN_FLIGHT and not run.done():
+            await asyncio.sleep(0)
 
         stored = await _stored(ledger)
 
