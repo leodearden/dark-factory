@@ -77,7 +77,7 @@ import enum
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple, NoReturn, get_args
 
@@ -593,6 +593,24 @@ def _ambiguity_record(planned: _Planned) -> dict[str, Any]:
     }
 
 
+def _declared_paths(
+    exempt_paths: Mapping[str, Iterable[tuple[str | int, ...]]],
+) -> Mapping[str, frozenset[tuple[str | int, ...]]]:
+    """*exempt_paths* frozen read-only, refusing an empty path (heuristic 10).
+
+    An empty path would exempt the whole tool, and that already has one
+    mechanism: ``exempt_tools``.
+    """
+    declared = {tool: frozenset(paths) for tool, paths in exempt_paths.items()}
+    for tool, paths in declared.items():
+        if () in paths:
+            raise ValueError(
+                f'exempt_paths[{tool!r}] declares an empty path, which would exempt the '
+                f'whole tool; declare {tool!r} in exempt_tools instead.'
+            )
+    return MappingProxyType(declared)
+
+
 class UuidPrefixGuardMiddleware(Middleware):
     """Resolve and police truncated-uuid prefixes at the FastMCP boundary.
 
@@ -607,6 +625,12 @@ class UuidPrefixGuardMiddleware(Middleware):
     so a declaration written with the prefixed spelling would silently never
     match — and a machine-checked declaration that fails open is worse than
     none (INV-1).
+
+    *exempt_paths* is the third declaration: per tool, argument-path prefixes
+    the guard never repairs, matched segment by segment. It names values the
+    tool accepts only as a verbatim echo of what it stored, so a repair there
+    could only turn an accepted call into a refused one (PRD §4-C3, erratum
+    2026-11-22). Like an exempt tool, it is not a detection.
 
     *escalation_sink* and *fact_sink* are injected for the same reason the
     resolver is, and both are invoked DEFENSIVELY: the call's outcome is
@@ -629,6 +653,7 @@ class UuidPrefixGuardMiddleware(Middleware):
         # exempt the tools meant to forward and vice versa.
         exempt_tools: frozenset[str] | set[str] = frozenset(),
         forward_on_ambiguity_tools: frozenset[str] | set[str] = frozenset(),
+        exempt_paths: Mapping[str, Iterable[tuple[str | int, ...]]] = MappingProxyType({}),
         escalation_sink: Sink | None = None,
         fact_sink: Sink | None = None,
         storm_threshold: int = 3,
@@ -639,6 +664,7 @@ class UuidPrefixGuardMiddleware(Middleware):
         self._project_for = project_for
         self.exempt_tools = frozenset(exempt_tools)
         self.forward_on_ambiguity_tools = frozenset(forward_on_ambiguity_tools)
+        self.exempt_paths = _declared_paths(exempt_paths)
         self._fact_sink = fact_sink
         # The burst escape is a COLLABORATOR, not a set of members on this
         # class: the counting, the dormant sweep and the summary shape are the
@@ -702,7 +728,7 @@ class UuidPrefixGuardMiddleware(Middleware):
             await self._apply_override(context, name, arguments)
             return await call_next(context)
 
-        tokens = find_prefix_tokens(arguments)
+        tokens = self._repairable(name, find_prefix_tokens(arguments))
         if not tokens:
             return await call_next(context)
 
@@ -926,6 +952,21 @@ class UuidPrefixGuardMiddleware(Middleware):
         return resolutions
 
     # -- policy -----------------------------------------------------------
+
+    def _repairable(self, name: str, tokens: tuple[PrefixToken, ...]) -> tuple[PrefixToken, ...]:
+        """*tokens* minus those at or under a path declared exempt for *name*.
+
+        Dropped before resolution, so an exempt token costs no walk, emits no
+        fact and does not count toward :data:`MAX_DISTINCT_PREFIXES_PER_CALL`.
+        """
+        exempt = self.exempt_paths.get(name)
+        if not exempt:
+            return tokens
+        return tuple(
+            token
+            for token in tokens
+            if not any(token.path[: len(path)] == path for path in exempt)
+        )
 
     def _tool_class(self, name: str) -> ToolClass:
         """Which policy column *name* sits in, per this registration's declaration.
