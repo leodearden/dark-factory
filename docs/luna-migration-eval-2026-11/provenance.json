@@ -376,7 +376,9 @@
    "Extraction: near-duplicate facts sat side by side within an episode, so an adjudicator could infer that the two copies come from different arms. Edges also differed in surface style (e.g. 'Task 166 (solar_challenge_platform)' against 'Task 166'; 'Liveness-snapshot memory' against 'liveness-snapshot memory'). No style-to-arm mapping was checked, and near-duplicates were labelled alike.",
    "Extraction: the running label tally over the UNION of arms was printed once, after all 54 episodes were labelled; it was never printed per arm.",
    "resolve_edge: before labelling, the adjudicator saw the worksheet's 200 rows, their field names (fact, fixture_id, invalidation_candidates, related) and the totals of related facts (566, 1 to 10 per fixture) and invalidation candidates (1844, 0 to 10 per fixture). No arm output was opened while labelling. Some related and candidate facts were near-duplicates in different wording; they carry no arm attribution, since they were drawn from the stored graph before either arm ran.",
-   "routing: the worksheet's line count (230 discordant classifier and router items, of 503 fixtures) was seen in the step-25 session before any routing labelling. Each row shows both arms' labels in sha256(fixture_id:label) order, so the adjudicator saw which two labels were in dispute but not which arm gave which. The classifier inputs are the write journal's stored content, at most 200 characters, the same text both arms classified."
+   "routing: the worksheet's line count (230 discordant classifier and router items, of 503 fixtures) was seen in the step-25 session before any routing labelling. Each row shows both arms' labels in sha256(fixture_id:label) order, so the adjudicator saw which two labels were in dispute but not which arm gave which. The classifier inputs are the write journal's stored content, at most 200 characters, the same text both arms classified.",
+   "summaries: before rating, the adjudicator saw the worksheet's 80 items over 45 fixtures, the total input sizes, and that no A or B summary was None, so nothing would be rated dropped. No run output beyond the worksheet was opened while rating.",
+   "summaries: the A/B summaries showed two recognisable styles. One condensed the episode and its facts, often with typographic apostrophes; the other restated previous-summary sentences, often with generic connectives. Letters are assigned per item by sha256(fixture_id:arm), so a style is not tied to a letter. Which style belongs to which arm was not known while rating, but the styles themselves were visible."
   ],
   "extraction": {
    "adjudicator": "claude-task-9945-implementer, the role that ran the arms, in a later session of the same task; single, self-blinded, no sub-agents",
@@ -477,6 +479,40 @@
     "router": 13
    },
    "validated": "luna_eval_score.py::load_routing_verdicts over the worksheet rows: 230 accepted. Only the counts above, over the union of arms, were printed."
+  },
+  "summaries": {
+   "adjudicator": "claude-task-9945-implementer, the role that ran the arms, in a later session of the same task; single, self-blinded, no sub-agents",
+   "procedure": "one sitting in one session on 2026-11-22, after the routing-gold commit c4f74bc61c. The worksheet /tmp/9945-summaries.jsonl and the key /tmp/9945-ratings-summaries-key.json had been written in the step-25 session by `luna_migration_eval.py worksheet --kind summaries --dir $EVAL --runs $EVAL/runs.jsonl --summary-inputs /tmp/9945-summary-inputs.jsonl --out /tmp/9945-summaries.jsonl --key-out /tmp/9945-ratings-summaries-key.json` (rc 0); /tmp/9945-summary-inputs.jsonl still had the design.md sha256 9176413a.... Items were rated in worksheet order 000..079, in batches of 3 to 6. Each item was shown as its node name, the episode body (first 900 to 1500 characters), up to 4 incident facts, and A and B split into sentences, each sentence beside its best-matching input sentence by content-token overlap and the tokens absent from every input. Claims were then checked by regex search over the full inputs: previous summary, episode body, previous episodes and incident facts. Every batch was written to disk before the next was shown. The key was moved into $EVAL only after all 160 ratings were on disk.",
+   "rubric": "design.md §2.6 summaries: faithful, unsupported (asserts or contradicts beyond its inputs) or dropped (no summary for the node)",
+   "conventions": [
+    "faithful: every claim in the summary is stated in, or follows directly from, the inputs. Condensing, omitting, re-ordering and paraphrasing are not judged; which facts were kept is not judged. A summary cut off mid-sentence is judged on what it does say.",
+    "unsupported: at least one claim asserts beyond the inputs (a name, number, status, relation or event no input states), or contradicts them (a negation flipped, a number changed, a plan stated as done, or a state that a later input explicitly supersedes stated as current), or binds an input fact to the wrong entity (a fact about W stated of this node, or two inputs' entities conflated).",
+    "dropped: no summary for the node (None or empty).",
+    "a generalisation is unsupported only when it changes what can be checked (a scope, a quantifier, a condition); a neutral umbrella word for listed items ('several tests', 'multiple fixes') is not.",
+    "meta-text ('the context does not say ...') is judged as a claim: unsupported only if false of the inputs.",
+    "the rationale quotes the summary span the rating rests on; for unsupported it also names the input it lacks or the input span it contradicts.",
+    "(added at item 012, before its B was written) an added generic purpose phrase ('for efficiency', 'ensuring consistency', 'is crucial for') is not judged unsupported unless it contradicts a rationale the inputs state.",
+    "(applied at item 050; 040 A re-rated under it before moving on) a superseded state is unsupported only when the superseding input is in view: the summary itself, the episode or a previous episode states the later state.",
+    "(fixed at item 056; 030 A re-rated under it) episode order is not a reliable clock (a 'previous' episode can record the later state), so supersession is read from the inputs' own words: an input that says the thing was retired, removed, deleted, superseded or 'no longer' exists supersedes a statement that it is pending, open or present. A task's cancellation does not supersede a statement of what its branch does."
+   ],
+   "rating_file": "ratings-summaries.json",
+   "key_file": {
+    "name": "ratings-summaries-key.json",
+    "sha256": "2f6666fa1f345e484d6335eebd29cea10548e6bdedb16e47bf0c0206fab90a13",
+    "opened": "never before all 160 ratings were written; moved from /tmp/9945-ratings-summaries-key.json, then read only by load_summary_ratings"
+   },
+   "ratings": 160,
+   "label_counts": {
+    "faithful": 143,
+    "unsupported": 17,
+    "dropped": 0
+   },
+   "re_ratings_before_unblinding": [
+    "040 A, faithful to unsupported, at item 050, when the supersession convention was first applied.",
+    "030 A, faithful to unsupported, at item 056, when supersession was fixed to be read from the inputs' own words rather than episode order.",
+    "After item 079, every summary rated faithful in items 000-049 was re-scanned for pending, planned or hedged claims against an explicit later state in its inputs; none changed."
+   ],
+   "validated": "luna_eval_score.py::load_summary_ratings over luna_migration_eval.py::_offered_summary_items of runs.jsonl and the key: 80 items, each rated under both arms, 160 entries accepted. Only the counts above, over the union of arms, were printed."
   }
  }
 }

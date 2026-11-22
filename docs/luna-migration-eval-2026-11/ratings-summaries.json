@@ -1,0 +1,1124 @@
+{
+ "ratings": [
+  {
+   "fixture_id": "dark_factory/066b7e64-769f-4682-a264-3ae57594040c",
+   "node_uuid": "10af8a54-3975-497a-97f4-adf1d6f8fd13",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "Every claim is in the previous summary: \"A filing is the event that the census counts, and it deduplicates records\", \"returns ok=False at attempt 2 under any transient lock\", \"owns the status for lifecycle transitions\", \"skips fully dynamic values\", \"sole writer for the codebook\", \"no test was lost or duplicated during the move\"."
+  },
+  {
+   "fixture_id": "dark_factory/066b7e64-769f-4682-a264-3ae57594040c",
+   "node_uuid": "10af8a54-3975-497a-97f4-adf1d6f8fd13",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"found 11 dispatched sessions ... recorded as a success\" is the episode verbatim; \"sole writer of the codebook YAML\" rests on the previous summary's \"The census is the sole writer for the codebook\"."
+  },
+  {
+   "fixture_id": "dark_factory/066b7e64-769f-4682-a264-3ae57594040c",
+   "node_uuid": "9940c909-a830-4ff0-97a9-78406af23864",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "All three claims are in the previous summary: \"logs timestamped lines ... from its first 'Graphiti LLM' line to 'Wrote metrics artifact'\", \"downgrades success to failure for headless sessions that exited with the wait abandoned\", \"predicate, evidence, confirmation policy, and alarm as a self-contained unit\"."
+  },
+  {
+   "fixture_id": "dark_factory/066b7e64-769f-4682-a264-3ae57594040c",
+   "node_uuid": "9940c909-a830-4ff0-97a9-78406af23864",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"downgrades success to failure for headless sessions that exit after arming Monitor\" contradicts the episode: the Monitor-arm sessions \"exited with the wait abandoned, and [were] recorded as a success\", and recognising a Monitor arm is the filed follow-up."
+  },
+  {
+   "fixture_id": "dark_factory/0fea6914-f42e-492c-ba8e-93959f2c0561",
+   "node_uuid": "2f62cd08-47d2-43df-bfe2-8974fdaca1de",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"its changes are limited to task-authoring documentation and tests, with neither vci file touched\" restates the episode's \"touches only docs/task-authoring.md, tests/scripts/task_authoring_marker_span.py, ... Neither vci file is touched, so there is no ordering constraint\"."
+  },
+  {
+   "fixture_id": "dark_factory/0fea6914-f42e-492c-ba8e-93959f2c0561",
+   "node_uuid": "2f62cd08-47d2-43df-bfe2-8974fdaca1de",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "Each claim is in the previous summary: \"now listed in the plan's files\", \"describes the Tier-C key as ad-hoc keys\", \"names execution_class=operational as the route for running a script\", \"blessing is preferred when validation depends on context\", \"The addition of invalid_value ... is documented\"."
+  },
+  {
+   "fixture_id": "dark_factory/135d44f1-f93b-4ad4-8a38-f981e631fe26",
+   "node_uuid": "4f5e772f-fa55-4688-a8c7-ff9d2e182ec9",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"The sweep's existing contract and behavior are load-bearing and must not be widened\" restates the previous summary's \"The sweep's contract, which must not be widened, is load-bearing\"; the second sentence is the episode's \"answered audit leaves the draw and is swept to done on the next render\"."
+  },
+  {
+   "fixture_id": "dark_factory/135d44f1-f93b-4ad4-8a38-f981e631fe26",
+   "node_uuid": "4f5e772f-fa55-4688-a8c7-ff9d2e182ec9",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "Each claim is in the previous summary: \"measures the WORKING TREE of --root, not HEAD\", \"INFO log line indicating a skip\", \"would emit up to 10 escalations for a false alarm\", \"runs right after _recover_predecessor_runs\", \"nightly sweep is designed but waits on task 3169\", \"keeps the journal-row orphans with their own pass\"."
+  },
+  {
+   "fixture_id": "dark_factory/135d44f1-f93b-4ad4-8a38-f981e631fe26",
+   "node_uuid": "4fd51257-a18c-49b3-9d3b-c9d0839b3d2e",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"stores audit items under key kind ('audit', decision_id)\", \"scoped by kind\", \"one numbering high-water mark\", \"Done footer and sitting_summary count only question kinds\" are the episode's own; \"answer_rounds persist only on runs that apply\" is the previous summary's."
+  },
+  {
+   "fixture_id": "dark_factory/135d44f1-f93b-4ad4-8a38-f981e631fe26",
+   "node_uuid": "4fd51257-a18c-49b3-9d3b-c9d0839b3d2e",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "Each claim is in the previous summary: \"the single home of actions, results, and scans\", \"shaped like its sibling silent_fallthrough_allowlist\", \"grows from approximately 696 lines to about 1,000 lines\", \"now one JSON file per entry\", \"Ledger writes occur only after the coding is durably merged\", \"considered test data\"."
+  },
+  {
+   "fixture_id": "dark_factory/19adad1f-13ba-4b5b-8b8f-e2c0a3e3929b",
+   "node_uuid": "23fe6ad8-5c47-4200-b5b7-084a0855487a",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"misleading names and comments as a severe defect\" rests on \"a name or comment that lies is the worst defect class\"; the factory move and \"_mock_verify_result to real_verify_result because it returns a real VerifyResult\" are in the previous episodes; \"TestCuratorPoolCaps\" is the episode's."
+  },
+  {
+   "fixture_id": "dark_factory/19adad1f-13ba-4b5b-8b8f-e2c0a3e3929b",
+   "node_uuid": "23fe6ad8-5c47-4200-b5b7-084a0855487a",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"misleading names are the worst defect class\" and its application to code, docstrings and outputs (\"Heuristic 1 forbids misleading outputs\", \"the module docstring\") are all in the previous summary; nothing checkable is added."
+  },
+  {
+   "fixture_id": "dark_factory/1abf3795-e500-4920-a938-6c1ebdc1aee1",
+   "node_uuid": "a3b994f8-d7f0-48c5-9b5b-b1dc36aa889b",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"VerifyDispatcher ... top\", \"puts items onto host slots\", the eight-module downward stack, \"does not import worker.py\" and \"verify_attempt_exits only if inflight_verify exceeds 1,500 lines\" are all stated in the episode or facts."
+  },
+  {
+   "fixture_id": "dark_factory/1abf3795-e500-4920-a938-6c1ebdc1aee1",
+   "node_uuid": "a3b994f8-d7f0-48c5-9b5b-b1dc36aa889b",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"includes ... post_merge_verify and main_health_probe\" and \"contains the VerifyDispatcher class\" are the facts; \"performs a merge-role verify\" and the PRD D11 ownership are in the previous summary; \"spans eight modules\" is the episode's."
+  },
+  {
+   "fixture_id": "dark_factory/1abf3795-e500-4920-a938-6c1ebdc1aee1",
+   "node_uuid": "d9639d74-440b-4785-86bf-0395ad2ec7ca",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"spans about 6,000 lines across eight modules\" and \"verify_dispatch.py is the top seam\" are the episode's (\"The moved code is ~6,000 lines\", \"κ's code spans eight modules in one downward stack\"); \"composition root and wiring\" is the previous summary's (\"worker.py, which is the composition root\", \"worker.py retains only the wiring\")."
+  },
+  {
+   "fixture_id": "dark_factory/1abf3795-e500-4920-a938-6c1ebdc1aee1",
+   "node_uuid": "d9639d74-440b-4785-86bf-0395ad2ec7ca",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"handle worktree add failures\", \"SpeculativeMergeWorker\", \"_drain_queue_into_lanes\", \"reads the state held in worker.py\", \"performs a merge-role verify of a real merge tree\" and the authorised growth (\"PRD Correction 8 authorizes the raise for the growth of worker.py\") are all in the previous summary."
+  },
+  {
+   "fixture_id": "dark_factory/522879ba-f80c-4bc3-ab5d-78a8fb36b59e",
+   "node_uuid": "8029f00e-865d-48cd-8849-b8346a5dcb47",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"measures the leakage of later restatements on a write's slate\", the winner rank, \"accepts only π2's write-time population artifact\" and \"refuses inputs that have drifted from what π published\" are in the previous summary; \"select Sol as the frontier arm\" is backed by the measured \"the winner (sol:low@5)\"."
+  },
+  {
+   "fixture_id": "dark_factory/522879ba-f80c-4bc3-ab5d-78a8fb36b59e",
+   "node_uuid": "8029f00e-865d-48cd-8849-b8346a5dcb47",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"producer of the gate artifact\", \"rate the pairs\", \"inputs pin the digest of π2's committed artifact\", \"maps n_judge_band_write_time to the C2 key population.n_judge_band\" are in the previous summary; the winner rank and \"pins Γ3's seven key PATHS as numbers but never their thresholds\" are the episode's."
+  },
+  {
+   "fixture_id": "dark_factory/522879ba-f80c-4bc3-ab5d-78a8fb36b59e",
+   "node_uuid": "e3dda896-112a-4d41-8f3d-195007465c94",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "Every claim is in the previous summary: \"window read remains as `metric = ? AND leaf IS ? ORDER BY ts DESC`\", \"confirmed_since method ... for task 4031\", \"overlays the reproducing test files ... onto the merge-base\", \"derived from the observed distribution of legitimate task in-flight duration\", \"requires a reset only when a task leaves the active population\"."
+  },
+  {
+   "fixture_id": "dark_factory/522879ba-f80c-4bc3-ab5d-78a8fb36b59e",
+   "node_uuid": "e3dda896-112a-4d41-8f3d-195007465c94",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"thresholds are defined in PRD D3 and before_done.args; tests should not duplicate them\" restates the episode's \"The thresholds' home is task 5808's before_done.args (PRD D3). A test copy would be a second home\"; the five aliases and the window query are in the previous summary (\"The Tier-B row lists the five D3 aliases\")."
+  },
+  {
+   "fixture_id": "dark_factory/73d19d05-a901-41f3-a9ae-b93645e0ee5a",
+   "node_uuid": "580102e3-d621-46c9-a9bc-a8b627bd392f",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"shared 120-second cap via NESTED_SESSION_TIMEOUT_SECS\", \"pytest_timeout.get_env_settings(pytestconfig)\" and \"If the per-test timeout drops below 120 seconds, the guard fails\" restate the episode's \"One cap, NESTED_SESSION_TIMEOUT_SECS = 120\" and \"an axe dropping below 120 goes red\"."
+  },
+  {
+   "fixture_id": "dark_factory/73d19d05-a901-41f3-a9ae-b93645e0ee5a",
+   "node_uuid": "580102e3-d621-46c9-a9bc-a8b627bd392f",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"pytest-timeout enforces a 120-second timeout for nested sessions\" binds the cap to the wrong entity: in the episode the 120 cap is NESTED_SESSION_TIMEOUT_SECS, surfacing \"as TimeoutExpired\", pinned against pytest-timeout's own per-test \"--timeout=300 axe\"."
+  },
+  {
+   "fixture_id": "dark_factory/8010efd0-baa5-404c-91cf-4abb7c6968bf",
+   "node_uuid": "1d3f9423-0e32-4a51-af2f-7dfa6d565c5b",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "Each claim is in the previous summary or previous episodes: \"backs both the orchestrator queue and the reconciliation queue\", \"binds the identity to a plain local\", \"create_server is synchronous\", \"Uvicorn runs create_server(...).http_app()\", \"a dozen injected collaborators\", \"a two-line import-and-pass\"; the NAME-equality test is the episode's."
+  },
+  {
+   "fixture_id": "dark_factory/8010efd0-baa5-404c-91cf-4abb7c6968bf",
+   "node_uuid": "1d3f9423-0e32-4a51-af2f-7dfa6d565c5b",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"captures it in a local for tool closures and renders it into tool descriptions\" is in the previous episodes (\"binds the identity to a plain local (`_store_identity`) for closure capture\", \"γ3 renders descriptions\"); \"no identity block is rendered\" restates \"no store identity results in no block being present\"; the test claim is the episode's."
+  },
+  {
+   "fixture_id": "dark_factory/9f35c5ed-19b8-47e1-acc4-cd05f4655077",
+   "node_uuid": "1ad5dd1a-2798-4a04-b891-056ad5d7577e",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"single source for ... parameter binding and disposition operand shapes\", \"inspect.signature(governed_exceptions)\", \"malformed dispositions as exit 1; non-literals and other invalid forms are exit 2\" and \"Runtime collection retains key-set and count checks\" restate the episode and its facts."
+  },
+  {
+   "fixture_id": "dark_factory/9f35c5ed-19b8-47e1-acc4-cd05f4655077",
+   "node_uuid": "1ad5dd1a-2798-4a04-b891-056ad5d7577e",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"Entity γ depends on entity β\", \"assigns substrate to γ to ensure separate editing of models.py\", \"confines new logic to the new module middleware/cancel_children_gate.py\" and \"must reuse the stranded reaper's enqueue_merge_request\" are in the previous summary; \"for efficiency\" is a generic purpose phrase."
+  },
+  {
+   "fixture_id": "dark_factory/9f35c5ed-19b8-47e1-acc4-cd05f4655077",
+   "node_uuid": "f8795f93-dff5-4b63-8b27-6050571f42c8",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "Every claim restates the episode: \"inspect.signature(governed_exceptions).bind over the AST nodes\", \"constructed through β's own classes (... matched by __name__)\", \"A MalformedDisposition is an exit-1 violation\", the exit-2 list, \"does NOT re-run governed_exceptions' count rules\"."
+  },
+  {
+   "fixture_id": "dark_factory/9f35c5ed-19b8-47e1-acc4-cd05f4655077",
+   "node_uuid": "f8795f93-dff5-4b63-8b27-6050571f42c8",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"single-sourced as indicated by heuristic 11\", \"kept uniform\", \"owns the policy for task-path RU\", the retention policy (previous episode), \"added to delivered_check_scope.py\", \"value_events.py imports ... policy\" and \"needed for task 5405's migration\" are all in the inputs."
+  },
+  {
+   "fixture_id": "dark_factory/a4e66cb0-2f8d-428b-90b0-32da2581e8b5",
+   "node_uuid": "4466eb10-bb10-4c9f-9e81-06bff4fbc56a",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"Each project has its own config with different merge-verify timeouts\", \"the project_id, which lives only in the config\", \"The 6-char uuid suffix prevents sub-second collisions\" and \"sets low/polish thresholds to 9999, effectively meaning tasks are never parked\" are in the previous summary."
+  },
+  {
+   "fixture_id": "dark_factory/a4e66cb0-2f8d-428b-90b0-32da2581e8b5",
+   "node_uuid": "4466eb10-bb10-4c9f-9e81-06bff4fbc56a",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"_utils builds a config only for the maintenance modules\", \"every script passes config=\" and \"maintenance_service looks MemoryService up through its home module at call time\" restate the episode."
+  },
+  {
+   "fixture_id": "dark_factory/a4e66cb0-2f8d-428b-90b0-32da2581e8b5",
+   "node_uuid": "b996c117-b9ed-400a-a2d6-7010483de46e",
+   "summary": "A",
+   "rating": "unsupported",
+   "rationale": "\"It supports task management and enforces transitions\" contradicts the previous summary's \"task_status.enforce_transitions defaults to False, allowing illegal transitions to proceed without rejection\"."
+  },
+  {
+   "fixture_id": "dark_factory/a4e66cb0-2f8d-428b-90b0-32da2581e8b5",
+   "node_uuid": "b996c117-b9ed-400a-a2d6-7010483de46e",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "Both sentences restate the episode: \"looks MemoryService up through its home module at call time\", \"FusedMemoryConfig keeps its import-time binding\", \"every script passes config=\", \"_utils builds a config only for the maintenance modules, whose tests replace maintenance_service\"."
+  },
+  {
+   "fixture_id": "dark_factory/bca9e311-a171-43f5-ad1e-34f2bdbe482e",
+   "node_uuid": "d36d3248-c42d-4cd4-9676-c68ab387f948",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"serves all projects\", \"inherits from llm.providers.openai when set to None\", \"Auto-recharge was enabled on the account behind OPENAI_API_KEY\", \"With the key unset, it would send OPENAI_API_KEY to the proxy\", \"a fixed non-secret api_key placeholder\", the live tests and the judge-accuracy arbiter are all in the previous summary."
+  },
+  {
+   "fixture_id": "dark_factory/bca9e311-a171-43f5-ad1e-34f2bdbe482e",
+   "node_uuid": "d36d3248-c42d-4cd4-9676-c68ab387f948",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "The two leaves and per-leaf None inheritance \"at use in routing/openai_client.py\" are the episode's; \"the SDK may fall back to the OPENAI_API_KEY environment variable\" restates the previous summary's \"get() passes api_key=None, so the SDK's OPENAI_API_KEY fallback still applies\"."
+  },
+  {
+   "fixture_id": "reify/29c4f1a3-12ff-4dc5-84aa-e3b13d7327dd",
+   "node_uuid": "6817a451-dba0-414e-bafb-72d908648745",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"single source of truth to prevent drift\" and its application to metadata rules and test assertions rest on the previous summary (\"Heuristic 11 wants one definition of the metadata rule\", \"the test as the enforced truth\", \"one source for two renderings\"); nothing checkable is added."
+  },
+  {
+   "fixture_id": "reify/29c4f1a3-12ff-4dc5-84aa-e3b13d7327dd",
+   "node_uuid": "6817a451-dba0-414e-bafb-72d908648745",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"one authoritative definition ... to prevent drift\" rests on \"Heuristic 11 wants one definition\"; \"The DOF-kind verdict is centralized in the declared_kinds classifier\" restates the episode's \"invariant then lives in one place, the classifier sum (heuristic 11)\"."
+  },
+  {
+   "fixture_id": "reify/29c4f1a3-12ff-4dc5-84aa-e3b13d7327dd",
+   "node_uuid": "a7695839-c545-429c-afe4-76604956bca7",
+   "summary": "A",
+   "rating": "unsupported",
+   "rationale": "\"It is excluded from the E_ARG_TYPE_MISMATCH filter/map\" binds the exclusion to ArgTypeMismatch itself; the input says \"Type::Error is excluded from the E_ARG_TYPE_MISMATCH filter/map\"."
+  },
+  {
+   "fixture_id": "reify/29c4f1a3-12ff-4dc5-84aa-e3b13d7327dd",
+   "node_uuid": "a7695839-c545-429c-afe4-76604956bca7",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"Non-kind DOF fields receive E_ARG_TYPE_MISMATCH\", \"Type::Error is excluded to avoid cascade diagnostics\" (the episode's \"anti-cascade rule that a Type::Error draws no second diagnostic\") and \"returns None if any declared DOF lacks a kind\" restate the episode."
+  },
+  {
+   "fixture_id": "reify/42f8a90a-bc7a-45b8-b036-29b9992c6520",
+   "node_uuid": "57e7c5f1-ad41-4c5f-950a-ce7dd12d64d8",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"do not depend on each other\", \"forbids language → engine and engine → frontend edges\", \"Only normal and build edges count, so reify-eval's deliberate dev-dep cycle ... is not flagged\" are the episode's; \"348 tests\" \"at HEAD dde0380ffc\" is the previous summary's."
+  },
+  {
+   "fixture_id": "reify/42f8a90a-bc7a-45b8-b036-29b9992c6520",
+   "node_uuid": "57e7c5f1-ad41-4c5f-950a-ce7dd12d64d8",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"reify-expr is already a dev-dependency of reify-compiler\", \"The test addition was made to crates/reify-expr/src/calculus.rs\", \"a single settle point that converts a Rejection into Undef\", the sanitize.rs/complex.rs split and the passing rustfmt/clippy checks are all in the previous summary."
+  },
+  {
+   "fixture_id": "reify/4e70da61-47d4-48c0-b47f-542c537e5fee",
+   "node_uuid": "35ddc3cb-2805-4b74-b812-6a239f030bf1",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "The exclusion of the fixture corpora as \"point-in-time evidence records\" with \"a different charter\", the residual \"including the regressed stdlib materials_fea.ri cite, is filed as a follow-up\" and \"Symbol cites are used to avoid minting PLINECITE debt in tests/prd-gate/fixtures/\" are all in the inputs."
+  },
+  {
+   "fixture_id": "reify/4e70da61-47d4-48c0-b47f-542c537e5fee",
+   "node_uuid": "35ddc3cb-2805-4b74-b812-6a239f030bf1",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"The fixtures are crate-local\" is said of tests/prd-gate/fixtures/, contradicting the previous summary's \"The fixtures are crate-local rather than being part of tests/prd-gate/fixtures/\"."
+  },
+  {
+   "fixture_id": "reify/ea2a4400-9469-4784-84e8-8fc16892e9b8",
+   "node_uuid": "661ececa-32ab-440f-a29f-0f832826b807",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "Every sentence is a previous-summary sentence restated (\"Defect 5 is the only divergence in the bash corpus comparison\", \"The defect was caused by folding correct short entries into the long canonical\", \"A defect destroyed 100% of remote verify capacity\", ...); nothing is added."
+  },
+  {
+   "fixture_id": "reify/ea2a4400-9469-4784-84e8-8fc16892e9b8",
+   "node_uuid": "661ececa-32ab-440f-a29f-0f832826b807",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"Defect 5 diverges in the bash corpus comparison. It results from folding correct short entries into the long canonical\" binds the consolidation defect (\"The defect was caused by folding correct short entries...\") to Defect 5, a different defect in the previous summary."
+  },
+  {
+   "fixture_id": "scoping_intake/17b586fb-0241-43db-a5d5-39d79b355416",
+   "node_uuid": "98e2a0f0-ab48-495f-99c7-d61026ab8b16",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"measured the task's results across the nine test modules\", \"documentation meta-test according to architect rule 5\", \"measured the fix in a throwaway copy\" and \"invoices-only mutant passed 673 tests\" are in the previous summary; \"ensuring clarity\" is a generic purpose phrase."
+  },
+  {
+   "fixture_id": "scoping_intake/17b586fb-0241-43db-a5d5-39d79b355416",
+   "node_uuid": "98e2a0f0-ab48-495f-99c7-d61026ab8b16",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"no implementation change was needed: the task only adds a test for existing precedence behavior\" restates the episode's \"No impl step ... The precedence already holds on main ... asks only to pin it\"; \"six cases pass ... and fail under a throwaway mutant using `uv run pytest`\" is its \"6 failed under the reviewer's mutant and 6 passed unmutated\"."
+  },
+  {
+   "fixture_id": "scoping_intake/2e47930d-2fc4-4abd-85ce-9ba87aad4624",
+   "node_uuid": "d041fb1e-e4af-409b-b174-f9d1c4061594",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"accepts printed output as str or bytes and keyword-only stderr bytes\", \"writes exact bytes through sys.stdout.buffer and sys.stderr.buffer\", \"__call__ gains no stderr keyword\" and \"Existing text callers remain compatible\" restate the episode."
+  },
+  {
+   "fixture_id": "scoping_intake/2e47930d-2fc4-4abd-85ce-9ba87aad4624",
+   "node_uuid": "d041fb1e-e4af-409b-b174-f9d1c4061594",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"raises ModelUnavailable when the classification is run\", \"creates 'sessions' under its own directory\", \"records the value of HOME ... PATH\", \"uses monkeypatch to plant credentials\", \"default result includes the stop printed by the StructuredOutput tool\" and \"now model the real FakeClaude\" are in the previous summary."
+  },
+  {
+   "fixture_id": "scoping_intake/75a860ad-c03c-4be9-8b75-8cbe3ff16284",
+   "node_uuid": "25f9dd3c-ec97-4914-893e-ecc279aa421f",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"reportPrivateUsage\" set to error, \"configuration ... includes tests as well as src\", \"pyright infers the return type as list of ParameterSet from pytest.param\" and \"removes the pyright friction noted for task 338\" are all in the inputs."
+  },
+  {
+   "fixture_id": "scoping_intake/75a860ad-c03c-4be9-8b75-8cbe3ff16284",
+   "node_uuid": "25f9dd3c-ec97-4914-893e-ecc279aa421f",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"Pyright checks the annotated files in tests and src\", \"Pyright reports 0 errors on tests\", \"forbids importing a private name by dotted path\" and \"connected to heuristic 1, which emphasizes clarity in field naming\" are in the previous summary."
+  },
+  {
+   "fixture_id": "scoping_intake/75a860ad-c03c-4be9-8b75-8cbe3ff16284",
+   "node_uuid": "f8624c49-4286-4d82-8d46-80c8041b287f",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"consumes DAMAGED_COUNT_BYTES via .items(), wrapping each damage's bytes in methodcaller under its own test id\" and the one derivation serving \"both consumers: test_store.py ... and test_clients.py\" restate the episode."
+  },
+  {
+   "fixture_id": "scoping_intake/75a860ad-c03c-4be9-8b75-8cbe3ff16284",
+   "node_uuid": "f8624c49-4286-4d82-8d46-80c8041b287f",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"goes from 1409 to about 1436 lines\", \"Three models ... use the record parameter\", \"catches a ValidationError\", \"a project directory's entries\", \"uses ClientStore\" are in the previous summary; \"maintains various damage checks\" is an umbrella for DAMAGED_COUNT_BYTES."
+  },
+  {
+   "fixture_id": "scoping_intake/c549c393-5587-4bb6-b07f-cbcd9fe3e103",
+   "node_uuid": "5e903e68-6437-4b19-bb76-e4a61371210e",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"the only maker of rows for CalibrationRecord\", \"checks against operator_view to ensure stability\", \"appends the row first and saves the operator placement second\", \"reads from the draft.json file\" and \"relying on the project's lock held by Intake.place\" are in the previous summary; \"only against unguided drafts\" is the episode's."
+  },
+  {
+   "fixture_id": "scoping_intake/c549c393-5587-4bb6-b07f-cbcd9fe3e103",
+   "node_uuid": "5e903e68-6437-4b19-bb76-e4a61371210e",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"the only maker of rows for CalibrationRecord\" (previous summary) backs \"sole placement-row maker\"; \"only ever made against an unguided draft\", \"compute the digest from analyst_prompt(None) and Intake.place read it\" and \"takes no arguments\" restate the episode."
+  },
+  {
+   "fixture_id": "scoping_intake/c549c393-5587-4bb6-b07f-cbcd9fe3e103",
+   "node_uuid": "6ea3f846-39ca-4aeb-981b-a9403b1b06bb",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"leave the last_updated date unchanged\", \"reserves prospect-facing wording for himself\", \"A damaged operator placement hides the whole session from Leo's page\" and the unreadable-record ruling are in the previous summary; \"emphasizing the importance of clarity and consistency\" is a generic purpose phrase."
+  },
+  {
+   "fixture_id": "scoping_intake/c549c393-5587-4bb6-b07f-cbcd9fe3e103",
+   "node_uuid": "6ea3f846-39ca-4aeb-981b-a9403b1b06bb",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"He also ruled that the admin side should be split into four modules\" attributes to Leo a plan decision: the previous episode says \"This is the plan's split ... the admin side is four new modules\" and names no ruling by Leo."
+  },
+  {
+   "fixture_id": "scoping_intake/e7f4f814-7891-43d6-8600-74072fd4253b",
+   "node_uuid": "65499792-18a1-4ee3-96fb-c7193bf5eb67",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"A ValueError is raised when the model lacks a required field\", \"through done() or acquire()\", \"does not declare any model_validator\" / \"any field_validator\", \"An input for any field ... is refused\" and the project's lock are all in the inputs."
+  },
+  {
+   "fixture_id": "scoping_intake/e7f4f814-7891-43d6-8600-74072fd4253b",
+   "node_uuid": "65499792-18a1-4ee3-96fb-c7193bf5eb67",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"forms.require_blank_as_on_the_field_itself\" (previous episode), \"naming the model and every buried field\", \"render via required_attribute, and the package-wide test\" and \"tick_box is not made an enforcement point but its models are still held to the rule\" restate the episode and facts."
+  },
+  {
+   "fixture_id": "scoping_intake/e7f4f814-7891-43d6-8600-74072fd4253b",
+   "node_uuid": "ae83cf05-a651-40a5-9270-693f43f887ee",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"emphasizes uniform enforcement\", \"the violation must specify its location\" and \"every accepted scheme has a default port in DEFAULT_PORTS\" are in the previous summary."
+  },
+  {
+   "fixture_id": "scoping_intake/e7f4f814-7891-43d6-8600-74072fd4253b",
+   "node_uuid": "ae83cf05-a651-40a5-9270-693f43f887ee",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"the invariant's definition and its violation message have one home, and both enforcement points call it\", \"render via required_attribute, and the package-wide test\" and \"tick_box is not made an enforcement point\" restate the episode and fact."
+  },
+  {
+   "fixture_id": "solar_challenge/12e2b213-c085-459e-b810-71a64a6e691d",
+   "node_uuid": "22cb3ade-3a9d-4f91-b914-74ef81bd5319",
+   "summary": "A",
+   "rating": "unsupported",
+   "rationale": "\"Task 132 may delete the module's hook, impacting shutdown_all_managers()\" states as open what a previous episode records as done: \"132 removed jobs.py's module-level atexit hook\", \"that hook no longer exists\". (Re-rated at item 056 under the supersession convention, before any key was opened.)"
+  },
+  {
+   "fixture_id": "solar_challenge/12e2b213-c085-459e-b810-71a64a6e691d",
+   "node_uuid": "22cb3ade-3a9d-4f91-b914-74ef81bd5319",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"a dropped app's manager with a blocked job ... stays in live_managers() until the job e[nds]\", \"shutdown_all_managers is literally `for manager in live_managers()`\", the removed hook and \"cli/web.py::start's explicit `finally: shutdown_all_managers()`\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/12e2b213-c085-459e-b810-71a64a6e691d",
+   "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"called directly instead of through web/api.py\", the shutdown docstring on queued jobs, \"not freed while jobs are queued or running\" and \"test_dropping_the_app_frees_its_job_manager\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/12e2b213-c085-459e-b810-71a64a6e691d",
+   "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "app.extensions[\"job_manager\"] is the episode's; the executor work item retaining the manager is the previous episode's; \"Managers freed before teardown are no longer seen\" follows from \"live_managers() reports the JobManagers that are currently active\"; the broader-scoped fixture reason is the previous summary's."
+  },
+  {
+   "fixture_id": "solar_challenge/24068d28-8531-4bc1-aa62-895085dfc03f",
+   "node_uuid": "02496b13-01c6-466a-8222-d9b1b790b565",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"The plan remains unchanged\", \"the same app.py auto-merge and the same test_web_app.py conflict\", \"1 failed, 12 passed\", \"60 targeted tests and 517 web unit tests pass, and mypy is clean\", esc-121-3 and \"would orphan the step commits recorded in e702d9e and fc3aa25\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/24068d28-8531-4bc1-aa62-895085dfc03f",
+   "node_uuid": "02496b13-01c6-466a-8222-d9b1b790b565",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"No commit in the range from b487803 to 18a3394 has modified app.py\" (previous summary) and the episode's jobs.py/tests/conftest.py list back the first sentence; \"applies verbatim\" and \"RED holds with main's app.py (1 failed, 12 passed)\" are the episode's."
+  },
+  {
+   "fixture_id": "solar_challenge/24068d28-8531-4bc1-aa62-895085dfc03f",
+   "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"gates MERGE entry on any escalation at level 2 or above\", \"only a human can dismiss it\", \"esc-121-2 is an orphan reaper's L1 that leads to the auto-watcher's L2 esc-121-3\", the esc-121-1 chain and \"already on the task record, in five dry-run proposals, and in recon memory 19a21a4a\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/24068d28-8531-4bc1-aa62-895085dfc03f",
+   "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"prevents the merge\" through \"_is_gating_escalation\", \"follows the chain from info L0 escalation esc-121-1\" via esc-121-2 and \"already on the task record\" are in the episode and previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/34774da0-bce7-4c08-aa93-63c3c906c683",
+   "node_uuid": "32c11f24-9b9b-41f0-a231-f0b2c3f512b2",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"SPOT uses the existing source of the timezone from config.py\", \"household_occupant_count shares the same range as SPOT\", \"Heuristic 11 keeps one derivation\", \"SPOT applies to the tests in tests/integration/test_tou_pv_aware_grid_charge.py\" and the load-path fact are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/34774da0-bce7-4c08-aa93-63c3c906c683",
+   "node_uuid": "32c11f24-9b9b-41f0-a231-f0b2c3f512b2",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"one definition ... instead of duplicate literals\" rests on the previous summary's heuristic-11 \"second home of a fact\"; \"The home is timebase.MINUTES_PER_DAY\" and the downward imports from \"tariff.py ..., ev.py ..., and load.py\" are the previous episodes'."
+  },
+  {
+   "fixture_id": "solar_challenge/34774da0-bce7-4c08-aa93-63c3c906c683",
+   "node_uuid": "7b994a94-ad0e-4cf6-9ea9-4834aba8cce9",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"load.py imports HOURS_PER_MINUTE from src/solar_challenge/timebase.py\", \"defines ten_minute_steps_per_day as 144\", the 563-to-650-line growth, the LoadConfig comments and the SPOT/load-path fact are all in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/34774da0-bce7-4c08-aa93-63c3c906c683",
+   "node_uuid": "7b994a94-ad0e-4cf6-9ea9-4834aba8cce9",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"Its np.arange(MINUTES_PER_DAY) / 60.0 calculation remains unchanged to preserve floating-point behavior\" adds a change status and a rationale no input states; the previous summary says only \"load.py uses np.arange(MINUTES_PER_DAY) divided by 60.0\"."
+  },
+  {
+   "fixture_id": "solar_challenge/39f0a92c-9dbd-42b0-98d9-0b81eaf84d4c",
+   "node_uuid": "814e6734-83e5-4a46-9ed3-03136acbc2e4",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"main was bb2bfb1 ... The branch is still e000976\", \"app.py auto-merges to 9a32716, which has no atexit line\", the test_web_app.py tail conflict, the 075f234 resolution, task 5222 and the pending esc-121-2/esc-121-3 are all in the episode or previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/39f0a92c-9dbd-42b0-98d9-0b81eaf84d4c",
+   "node_uuid": "814e6734-83e5-4a46-9ed3-03136acbc2e4",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"These blobs are byte-identical at 743a0e7 and bb2bfb1: web/app.py ..., tests/unit/test_web_app.py ..., tests/conftest.py ... and cli/web.py\", \"task 5222 already covers it\" and \"a known tail conflict that remains unresolved\" are in the episode and previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/39f0a92c-9dbd-42b0-98d9-0b81eaf84d4c",
+   "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"esc-121-2 is an orphan reaper's L1 that leads to the auto-watcher's L2 esc-121-3, blocking the merge\", \"task 5222 will stop the gating of MERGE for info L2 escalations ... once implemented\" and \"a human dismisses esc-121-3\" are in the inputs; \"Do not file anything new\" backs \"no new escalation was filed\"."
+  },
+  {
+   "fixture_id": "solar_challenge/39f0a92c-9dbd-42b0-98d9-0b81eaf84d4c",
+   "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"The pending L2 esc-121-3 prevents the merge, as it requires human dismissal\", \"follows from the earlier info L0 escalation, esc-121-1\" and task 5222's purpose (\"will stop the gating of MERGE for info L2 escalations\") are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/3ca2029c-f4f3-4c66-ae48-80ef9121436a",
+   "node_uuid": "8d6fed17-fabf-4921-ba31-efe661ddcf0c",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"'deployed-server teardown' clause, written in dd081a2 alongside the per-app hook\", \"task 132 ... owns its exit-time docstrings\" and \"Delete the per-app registration ... Leave src/solar_challenge/web/jobs.py untouched\" are in the episode and previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/3ca2029c-f4f3-4c66-ae48-80ef9121436a",
+   "node_uuid": "8d6fed17-fabf-4921-ba31-efe661ddcf0c",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"task 132 owns exit-time docstrings that include JobManager.shutdown's clause, written in dd081a2\" is in the previous summary; \"Task 132 includes exit-time docstrings\" is a paraphrase of that ownership."
+  },
+  {
+   "fixture_id": "solar_challenge/3ca2029c-f4f3-4c66-ae48-80ef9121436a",
+   "node_uuid": "e92507e1-d7da-4bc8-9db9-ec7c7d90b865",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"live_managers() over the _active_managers WeakSet\", the module-level hook removed by task 132, \"JobManager.shutdown now documents that atexit hooks run after concurrent.futures has run every queued job\" and \"deleted with no replacement, and jobs.py remains untouched\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/3ca2029c-f4f3-4c66-ae48-80ef9121436a",
+   "node_uuid": "e92507e1-d7da-4bc8-9db9-ec7c7d90b865",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "JobManager's home, the module-level atexit hook removed in task 132 and \"JobManager.shutdown now documents that atexit hooks run after concurrent.futures has run every queued job\" restate the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/624a196a-f366-46da-b05a-2bc6e12eb8e9",
+   "node_uuid": "0170553c-2932-4d4c-a83e-372363f47ce7",
+   "summary": "A",
+   "rating": "unsupported",
+   "rationale": "\"Both new tests build through _build_app, which supplies the SECRET_KEY\" states as current a plan the later inputs supersede (\"call `build_test_app(tmp_path)` where e702d9e calls `_build_app(tmp_path)`\", \"Do not restore _build_app ... Tasks 146 and 205 deleted them\"), which the summary's own last sentence then states. (Re-rated at item 050 under the supersession convention, before any key was opened.)"
+  },
+  {
+   "fixture_id": "solar_challenge/624a196a-f366-46da-b05a-2bc6e12eb8e9",
+   "node_uuid": "0170553c-2932-4d4c-a83e-372363f47ce7",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "The episode is the original plan (\"reuse its _build_app helper\"); \"tasks 146 and 205 deleted it\" and \"call `build_test_app(tmp_path)` where e702d9e calls `_build_app(tmp_path)`\" are in the previous summary and episodes."
+  },
+  {
+   "fixture_id": "solar_challenge/624a196a-f366-46da-b05a-2bc6e12eb8e9",
+   "node_uuid": "03032bd9-ca84-4e57-b5d5-a4016d12911a",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"create_app initializes JobManager\", \"typed as Flask in web/api.py\" and \"the app is its manager's only owner and the manager is registered while the app lives\" are in the previous summary; the test-file placement is the episode's."
+  },
+  {
+   "fixture_id": "solar_challenge/624a196a-f366-46da-b05a-2bc6e12eb8e9",
+   "node_uuid": "03032bd9-ca84-4e57-b5d5-a4016d12911a",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"The membership of app.extensions[\"job_manager\"] in live_managers()\" and \"the manager is registered while the app lives\" are in the previous summary; the test-file placement is the episode's."
+  },
+  {
+   "fixture_id": "solar_challenge/9175793b-0e7e-4a10-a748-cfe36c9845b2",
+   "node_uuid": "02496b13-01c6-466a-8222-d9b1b790b565",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"applying the merge resolution from Main b487803 verbatim\", \"Main already imports ... build_test_app\", \"1 failed, 12 passed\", \"60 targeted tests and 517 web unit tests pass, and mypy is clean\", esc-121-3 and \"This session does not: rebase ..., file ... escalations; edit the task record\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/9175793b-0e7e-4a10-a748-cfe36c9845b2",
+   "node_uuid": "02496b13-01c6-466a-8222-d9b1b790b565",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"No commit in the range from b487803 to 18a3394 has modified app.py / ... jobs.py / touches test_web_app.py\", \"applies verbatim\" and the RED/GREEN counts are in the previous summary and episode."
+  },
+  {
+   "fixture_id": "solar_challenge/9175793b-0e7e-4a10-a748-cfe36c9845b2",
+   "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "The level-2 gate, \"only a human can dismiss it\", \"The chain was esc-121-1, then the orphan reaper's L1 esc-121-2, then the auto-watcher's L2 esc-121-3\" and task 5222's \"Severity-aware gating\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/9175793b-0e7e-4a10-a748-cfe36c9845b2",
+   "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"prevents the merge\", the esc-121-1 chain and \"already on the task record, in five dry-run proposals, and in recon memory 19a21a4a\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/94bb011d-ff7b-4828-bc1b-ee9c3c621651",
+   "node_uuid": "5032c626-089c-48d4-ba5c-bea889c73a5e",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"FROZEN_SURFACE pins only the top-level package's names, including PVConfig's signature\", the removed module_efficiency/temperature_coefficient fields, \"Step 10 edits FROZEN_SURFACE's PVConfig entry and adds an ... Unreleased ... line ... in ONE commit\" and \"records its break under task 341's convention instead of bumping the version\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/94bb011d-ff7b-4828-bc1b-ee9c3c621651",
+   "node_uuid": "5032c626-089c-48d4-ba5c-bea889c73a5e",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"FROZEN_SURFACE remains unchanged despite modifications to create_simple_module_params\", \"The task-195 Unreleased line remains unchanged\", the step-10 PVConfig edit and the FROZEN_SURFACE/FROZEN_MEMBERS rule are in the previous summary and episodes."
+  },
+  {
+   "fixture_id": "solar_challenge/94bb011d-ff7b-4828-bc1b-ee9c3c621651",
+   "node_uuid": "bfb4489f-8e05-46d0-8178-2781c51d29c6",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"removes module_efficiency and temperature_coefficient from PVConfig, from the YAML parsers\", \"dropped the leading efficiency parameter\", the \"keyword-only\" amendment, \"instead of bumping the version\", \"No third integration of main\" and \"follow-up ticket tkt_0RVEYSRQNBDS7J5C2GCWF8H7YP, which depends on task 195\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/94bb011d-ff7b-4828-bc1b-ee9c3c621651",
+   "node_uuid": "bfb4489f-8e05-46d0-8178-2781c51d29c6",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"removing two fields\", \"integrates main a second time with git merge, keeping both Unreleased paragraphs in merge order\" and \"Task 195 is cancelled and superseded by task 825\" are in the previous summary; \"not with a rebase\" is the episode's."
+  },
+  {
+   "fixture_id": "solar_challenge/ad5a977a-77f8-4b5f-b7da-6e565ab7a909",
+   "node_uuid": "25c9872d-539e-4319-83a9-86f4bc7be42d",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"A freshly built app is freed by refcounting alone. An app that has served a template-rendering request sits in a reference cycle and needs the cyclic collector (measured on 3.12 at a08...)\" and the blocked-job survival are in the previous episode and episode."
+  },
+  {
+   "fixture_id": "solar_challenge/ad5a977a-77f8-4b5f-b7da-6e565ab7a909",
+   "node_uuid": "25c9872d-539e-4319-83a9-86f4bc7be42d",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"Measured on a08eacc: a dropped app's manager with a blocked job survives gc.collect() and stays in live_managers() until the job ends\" is the episode's; the other two sentences restate it."
+  },
+  {
+   "fixture_id": "solar_challenge/ad5a977a-77f8-4b5f-b7da-6e565ab7a909",
+   "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"installed in app.extensions[\"job_manager\"]\", live_managers(), the blocked-job retention, \"The per-app hook was removed\" and \"The only production shutdown path for managers is now through cli/web.py to shutdown_all_managers\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/ad5a977a-77f8-4b5f-b7da-6e565ab7a909",
+   "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"called directly instead of through web/api.py\", \"updates the status during job execution\", \"get_job_manager returns an instance of JobManager\", \"tested in test_web_app.py\", the live_managers() retention and the shutdown docstring are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/b3d064fe-d3e5-4674-bd8b-69823acc11b8",
+   "node_uuid": "4395502d-4d1c-483d-bdab-291a1a74ac45",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"The test_shutdown_all_managers_shuts_down_every_live_manager in tests/unit/test_web_jobs.py pins the jobs-level aspect of the shutdown process\" is the previous summary's; \"ensuring ... behaves as expected\" is a generic purpose phrase."
+  },
+  {
+   "fixture_id": "solar_challenge/b3d064fe-d3e5-4674-bd8b-69823acc11b8",
+   "node_uuid": "4395502d-4d1c-483d-bdab-291a1a74ac45",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"tests/unit/test_web_jobs.py already pins the jobs-level half: test_shutdown_all_managers_shuts_down_every_live_manager\" and \"shutdown_all_managers() would still shut down every live manager\" are the episode's."
+  },
+  {
+   "fixture_id": "solar_challenge/b3d064fe-d3e5-4674-bd8b-69823acc11b8",
+   "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"create_app initializes JobManager\", \"updates the status during job execution\", shutdown_all_managers() over every live manager, the shutdown docstring and \"test_dropping_the_app_frees_its_job_manager\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/b3d064fe-d3e5-4674-bd8b-69823acc11b8",
+   "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"Each Flask instance creates its own JobManager\", app.extensions[\"job_manager\"], \"While the app lives, live_managers() reports its job manager\", the queued-job retention, \"dropping the app frees its job manager\" and the broader-scoped fixture reason are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/c5fa0c76-a3f0-4fdc-82b5-8380820dc2c3",
+   "node_uuid": "9ae19f97-b061-43ef-a512-c8d1e1d5c205",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"Task 1148 retired test_surface_form.py\", \"fails if test_surface_form.py is recreated\" and the episode's mapping of \"test_surface_form.py ... to the family modules ... test_surface_form_grammar.py\" back each claim."
+  },
+  {
+   "fixture_id": "solar_challenge/c5fa0c76-a3f0-4fdc-82b5-8380820dc2c3",
+   "node_uuid": "9ae19f97-b061-43ef-a512-c8d1e1d5c205",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"test_surface_form.py has 1,759 lines\" and \"it is proposed for a future split into family-specific modules\" state as current what the inputs supersede: the episode says \"The test files were split by task 670 and later family splits\", and the module was retired by task 1148."
+  },
+  {
+   "fixture_id": "solar_challenge/c5fa0c76-a3f0-4fdc-82b5-8380820dc2c3",
+   "node_uuid": "9fdae2a4-b5eb-4017-861e-f926877c7ca1",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"Task 1079 retired test_named_classes.py\", the family modules, \"fails if test_named_classes.py is recreated\", and the previous episode's \"(the JSON alias) stays for ε\" and forward-reference test \"deleted with the NewType rule\" back every claim."
+  },
+  {
+   "fixture_id": "solar_challenge/c5fa0c76-a3f0-4fdc-82b5-8380820dc2c3",
+   "node_uuid": "9fdae2a4-b5eb-4017-861e-f926877c7ca1",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"test_named_classes.py contains 30 tests\" and \"has a size of 2,191 lines\" state the module as present, while the summary's own last sentence and the previous summary say \"Task 1079 retired this module\"; the 2,191 figure is \"at base 4815e43\"."
+  },
+  {
+   "fixture_id": "solar_challenge/d44cd744-319e-41e1-992f-f12a6a8ef27e",
+   "node_uuid": "ce0815f2-178f-4fc7-b38f-f0a71914a46e",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"Take src/solar_challenge/web/app.py exactly as git auto-merges it\", \"Delete the per-app registration\", \"cli/web.py to shutdown_all_managers to live_managers\" and the tail-conflict placement \"before the `home` fixture\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/d44cd744-319e-41e1-992f-f12a6a8ef27e",
+   "node_uuid": "ce0815f2-178f-4fc7-b38f-f0a71914a46e",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"main's app.py includes the job-manager tests and maintains the order of imports and tests\", \"referenced in the context of the merge conflict resolution\" and \"The tests in tests/unit/test_web_app.py interact with app.py\" are the previous summary's."
+  },
+  {
+   "fixture_id": "solar_challenge/d44cd744-319e-41e1-992f-f12a6a8ef27e",
+   "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"Each Flask instance creates its own JobManager\", app.extensions[\"job_manager\"], live_managers() retaining a manager blocked by a job, \"cli/web.py::start's `finally`\" and \"Called from a unit test, shutdown_all_managers() would still shut down every live manager\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/d44cd744-319e-41e1-992f-f12a6a8ef27e",
+   "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"The shutdown method ensures all live JobManagers are shut down\" binds to JobManager's shutdown method what the inputs say of shutdown_all_managers(): \"shutdown_all_managers() shuts down every live JobManager in the pytest process\"."
+  },
+  {
+   "fixture_id": "solar_challenge/e5d2ac5a-7ce4-455a-950e-b25d609b6209",
+   "node_uuid": "814e6734-83e5-4a46-9ed3-03136acbc2e4",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"These blobs are byte-identical at 743a0e7 and bb2bfb1: web/app.py ..., tests/unit/test_web_app.py ..., tests/conftest.py\", \"task 5222 already covers it\" and \"confirm the plan unchanged\" are the episode's."
+  },
+  {
+   "fixture_id": "solar_challenge/e5d2ac5a-7ce4-455a-950e-b25d609b6209",
+   "node_uuid": "814e6734-83e5-4a46-9ed3-03136acbc2e4",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"re-checked ... on 2026-10-01 ... confirm the plan unchanged\", \"app.py auto-merges to 9a32716, which has no atexit line\", the known tail conflict with the 075f234 resolution, the pending esc-121-2/esc-121-3 and task 5222 are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/e5d2ac5a-7ce4-455a-950e-b25d609b6209",
+   "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"The pending L2 esc-121-3 prevents the merge, as it requires human dismissal\", \"follows the chain from info L0 escalation esc-121-1\" and task 5222's aim \"to prevent the info L2 escalation ... from gating the merge\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/e5d2ac5a-7ce4-455a-950e-b25d609b6209",
+   "node_uuid": "dbeca320-725d-48de-92a1-e7c634d594dc",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"esc-121-2 leads to the auto-watcher's L2 esc-121-3, which blocks the merge\", task 5222's aim, \"only a human can dismiss an L2 escalation\" and \"prevents the merge, not the plan\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/ef305c16-c852-4cdc-b2ea-52be1bcf4d7a",
+   "node_uuid": "22cb3ade-3a9d-4f91-b914-74ef81bd5319",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"app.extensions[\"job_manager\"] in live_managers()\", \"shutdown_all_managers is literally `for manager in live_managers()`\", the session-scoped manager reason, \"132 removed jobs.py's module-level atexit hook\" and \"cli/web.py::start's explicit `finally: shutdown_all_managers()`\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/ef305c16-c852-4cdc-b2ea-52be1bcf4d7a",
+   "node_uuid": "22cb3ade-3a9d-4f91-b914-74ef81bd5319",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"Task 132 may delete its module-level hook\" states as open what a previous episode records as done: \"132 removed jobs.py's module-level atexit hook\", \"that hook no longer exists\"."
+  },
+  {
+   "fixture_id": "solar_challenge/ef305c16-c852-4cdc-b2ea-52be1bcf4d7a",
+   "node_uuid": "ec6c91bf-9f9c-4593-9238-2c976a847a72",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"Delete the per-app registration and add no replacement of any form\", \"Leave src/solar_challenge/web/jobs.py untouched\", \"132 removed jobs.py's module-level atexit hook\" and \"atexit callbacks run only after concurrent.futures' own exit handler has run every queued job, so neither hook cancels anything\" are in the episodes."
+  },
+  {
+   "fixture_id": "solar_challenge/ef305c16-c852-4cdc-b2ea-52be1bcf4d7a",
+   "node_uuid": "ec6c91bf-9f9c-4593-9238-2c976a847a72",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"task 132 owns exit-time docstrings that include the atexit callbacks\" / \"include the clause for JobManager.shutdown\" and \"No atexit hook is added to jobs.py as a replacement for the per-app registration\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/f96613dc-463e-4d6b-9b76-29223f5498c9",
+   "node_uuid": "25c9872d-539e-4319-83a9-86f4bc7be42d",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"Measured on a08eacc: a dropped app's manager with a blocked job survives gc.collect() and stays in live_managers() until the job ends\" is the episode's; the second sentence restates it."
+  },
+  {
+   "fixture_id": "solar_challenge/f96613dc-463e-4d6b-9b76-29223f5498c9",
+   "node_uuid": "25c9872d-539e-4319-83a9-86f4bc7be42d",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"A freshly built app is freed by refcounting alone. An app that has served a template-rendering request sits in a reference cycle and needs the cyclic collector (measured on 3.12 at a08eacc ...)\" is the previous episode's; the blocked-job sentence is the episode's."
+  },
+  {
+   "fixture_id": "solar_challenge/f96613dc-463e-4d6b-9b76-29223f5498c9",
+   "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"called directly instead of through web/api.py\", \"updates the status during job execution\", the shutdown docstring on queued jobs, \"listed in live_managers() until the job ends, even if they are dropped\" and the test_web_app.py tests are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/f96613dc-463e-4d6b-9b76-29223f5498c9",
+   "node_uuid": "d64f7f5d-bdc1-473e-9943-f32489c662b5",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"installed in app.extensions[\"job_manager\"]\", the weakref and gc.collect() test (a), the queued-job retention, \"shutdown_all_managers() shuts down every live manager\", cli/web.py's finally and \"The per-app hook was removed ... jobs.py ... still needs no edit\" are all in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge/fc1b42be-137d-4ff7-a1ad-96d0ef6e21c5",
+   "node_uuid": "8da2bd38-f4bc-41fa-837b-0dc372c0cf4a",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"ε starts reading T_NOCT and A_c\", the refusal domain (\"T_NOCT not a finite temperature above NOCT's 20 C test air, or A_c not a finite positive area giving an efficiency below the transmittance-absorptance\") and \"a pv.py constant (0.9) and pass it to pvlib\" restate the episode."
+  },
+  {
+   "fixture_id": "solar_challenge/fc1b42be-137d-4ff7-a1ad-96d0ef6e21c5",
+   "node_uuid": "8da2bd38-f4bc-41fa-837b-0dc372c0cf4a",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"The PRD assigns the retired names' tests and prose to ε\", \"keeps its listed files, including review/briefing.yaml ... weather.py\", \"NOCT-SAM is bypassed because the cell temperature is given\", \"ε is editing tests/unit/test_pv.py\" and the FROZEN_SURFACE entries are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge/fc1b42be-137d-4ff7-a1ad-96d0ef6e21c5",
+   "node_uuid": "a0034a3b-b3ac-4ecd-9cfc-52d849f5e247",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "The three refusal conditions, \"Own that transmittance-absorptance as a pv.py constant (0.9) and pass it to pvlib\" and \"where the thermal parameters are built\" are the episode's; the name TRANSMITTANCE_ABSORPTANCE is the previous summary's."
+  },
+  {
+   "fixture_id": "solar_challenge/fc1b42be-137d-4ff7-a1ad-96d0ef6e21c5",
+   "node_uuid": "a0034a3b-b3ac-4ecd-9cfc-52d849f5e247",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"constructs PVConfig only with capacity_kw, azimuth, tilt, system_age_years, and degradation_rate_per_year\", \"refuses non-finite inputs\", \"raises ConfigurationError\", \"PVConfig.module_efficiency becomes Optional[float] = None, where None means the template module's own value\", \"part of solar_challenge.__all__\" and \"single source of truth for system_losses\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/4bb349b6-2220-459d-ac0e-e2d7e27735f8",
+   "node_uuid": "450a55db-cdf6-4034-8019-5a428536eced",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"RegisterSpan is unit tested in tests/test_hermetic_billing_service_home.py\", \"has a new row for class-on-a-call-result\" and \"The RegisterSpan guard's removal prevents the shared module from offering a second way to read its callee\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/4bb349b6-2220-459d-ac0e-e2d7e27735f8",
+   "node_uuid": "450a55db-cdf6-4034-8019-5a428536eced",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"The builders import the types they construct at module level\" including RegisterSpan, because \"These builders call their types' constructors at run time\", and \"Dry run of the full edit: mypy is clean, the 35 collected ids are identical, and all 35 pass\" are the episode's."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/4bb349b6-2220-459d-ac0e-e2d7e27735f8",
+   "node_uuid": "5209b2d5-7461-4f0e-9df9-948fc19abcab",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"The mypy check is clean on 304 files\", \"pyproject configures mypy to run with strict = true\", \"Strict mypy requires a type ignore on the shutdown() call because pymodbus leaves it unannotated\", \"mypy configuration is located in pyproject.toml\" and \"mypy was clean for task 761\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/4bb349b6-2220-459d-ac0e-e2d7e27735f8",
+   "node_uuid": "5209b2d5-7461-4f0e-9df9-948fc19abcab",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"Dry run of the full edit: mypy is clean, the 35 collected ids are identical, and all 35 pass\" and \"Only SegmentResult ... goes under TYPE_CHECKING, beside FinanceConfig\" are the episode's; the test file belongs to the solar_challenge_platform graph."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/8519a1d7-d3e0-4d79-a0c6-9b6544557f75",
+   "node_uuid": "198aed85-3e64-45aa-ab9d-5c00dce67d60",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"Heuristic 10 enforces informative, redundant, and uniform enforcement of the invariant\" and \"asks that a violation name the offending values\" are in the previous summary; ConsentGate and the battery config are in the episode's heuristic-10 rationale."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/8519a1d7-d3e0-4d79-a0c6-9b6544557f75",
+   "node_uuid": "198aed85-3e64-45aa-ab9d-5c00dce67d60",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"the log names the instant\" (\"no governed HomeBatteryConfig in force at %s\"), \"a REQUIRED positional `at`\" and \"`at` is validated once at the service boundary ... none of the sibling instant readers re-validate\" back each claim; \"identity readers\" garbles \"instant readers\" without adding a fact."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/8519a1d7-d3e0-4d79-a0c6-9b6544557f75",
+   "node_uuid": "9665acf3-e81d-4643-a3b2-4259db689f60",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"exposes three surfaces through the core function ConsentGate.check\", the runner's window 'at', \"maps SQLAlchemyError to a CHECK_FAILED ConsentDecision\", \"governing the PLANNED-with-command state\" and \"ConsentDecide is wired to ConsentGate.decide in the API\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/8519a1d7-d3e0-4d79-a0c6-9b6544557f75",
+   "node_uuid": "9665acf3-e81d-4643-a3b2-4259db689f60",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"The instant is the runner's window `at`, the value _run_home already passes to ConsentGate.check\" and \"It is neither `issued_at` (the issuance clock) nor the wall clock\" are the previous episode's; the battery-config read taking the same `at` is the episode's resolve()."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/87a2f26c-79e3-42e8-987e-d6126358247b",
+   "node_uuid": "1ff539c2-2f81-4242-a2ed-cceabce2686c",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"defines how long a Docker Engine API call may go unanswered\", \"The probe pings at DOCKER_API_TIMEOUT_S\", \"the slow ping-answering daemon is available under option 1\" and option 2's \"silent coverage loss on a merely slow daemon\" are in the inputs."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/87a2f26c-79e3-42e8-987e-d6126358247b",
+   "node_uuid": "1ff539c2-2f81-4242-a2ed-cceabce2686c",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"DOCKER_API_TIMEOUT_S is defined as an integer 300 in docker_api.py\", \"greater than docker.constants.DEFAULT_TIMEOUT_SECONDS\" and \"Every container client already waits for DOCKER_API_TIMEOUT_S\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/87a2f26c-79e3-42e8-987e-d6126358247b",
+   "node_uuid": "43dc911d-40ee-4e3f-93b4-2e3db8d6e71f",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"Every container client already waits for DOCKER_API_TIMEOUT_S\" and \"The constant is imported by tests/_timescale_container.py from the new module src/solar_challenge_platform/validation/docker_api.py\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/87a2f26c-79e3-42e8-987e-d6126358247b",
+   "node_uuid": "43dc911d-40ee-4e3f-93b4-2e3db8d6e71f",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"ensuring clients wait for DOCKER_API_TIMEOUT_S, set to 300 seconds\" asserts a value no input of this item states: neither the previous summary, the episode nor the previous episodes give the constant's value."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/951ebb36-dd9e-4263-a5aa-5f65cee6243d",
+   "node_uuid": "6b3cb188-5234-4932-bac0-7f7bcb0d71be",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "The three-module split by store method, \"Heuristic 14 measurement at 73e9443. The file is 1,832 lines\", \"moving it down into tests/_sql_executions.py before any move\" and \"about 970, 275 and 640 lines, at about +29 s per verify run\" restate the episode."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/951ebb36-dd9e-4263-a5aa-5f65cee6243d",
+   "node_uuid": "6b3cb188-5234-4932-bac0-7f7bcb0d71be",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"split into three modules\" follows the facts' \"is split into\"; \"resolves a SQLAlchemy URL for TimescaleDB\", \"london_session_engine\", \"ensuring no retention or compression job can touch the rows mid-test\", \"pins production's values\" and the PostgreSQL device upserts are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/951ebb36-dd9e-4263-a5aa-5f65cee6243d",
+   "node_uuid": "830353d1-a37c-4acd-b927-434f307f27c6",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "Moving _statements_sent \"down into tests/_sql_executions.py\" and \"That module imports only sqlalchemy and the stdlib, so every split file imports it downward and nothing imports back\" are the episode's."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/951ebb36-dd9e-4263-a5aa-5f65cee6243d",
+   "node_uuid": "830353d1-a37c-4acd-b927-434f307f27c6",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"compatible with Postgres 16\", \"AUTOCOMMIT isolation level\", \"compiled SQLite interval arithmetic correctly\", \"public before_cursor_execute event guards against an N+1 regression\", \"checks a dialect uniformly\" and \"saves and restores the connection's transaction isolation level\" are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/c2265dc1-7776-4d40-94ca-5edb73e74ba1",
+   "node_uuid": "388148dd-1cfa-41a1-826f-33b15b9cdb92",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"Settings reads .env from the working directory\" and \"The log_level tests already use _env_file=None\" are in the previous summary; \"should call Settings() directly\" and \"uncached_settings is for a test whose code under test reads through get_settings\" are the episode's."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/c2265dc1-7776-4d40-94ca-5edb73e74ba1",
+   "node_uuid": "388148dd-1cfa-41a1-826f-33b15b9cdb92",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"built inside alembic's migrations/env.py\" and \"inside uvicorn's import of runtime/asgi.py\", \"mqtt_tls set to False\", \"database_url set to sqlite\" and the MODBUS_FLEET_CONFIG_PATH source order are in the previous summary."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/c2265dc1-7776-4d40-94ca-5edb73e74ba1",
+   "node_uuid": "bca61fd1-8256-4a21-a921-47036629e153",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"They describe the cache's semantics: clearing it does not repoint db.session's engine, so call init_db for that. They do not describe the suite's reset policy\" and \"Leave the src docstrings ... alone\" are the episode's."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/c2265dc1-7776-4d40-94ca-5edb73e74ba1",
+   "node_uuid": "bca61fd1-8256-4a21-a921-47036629e153",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"settings.py is 758 lines\", \"hide_input_in_errors is modified to False in settings.py for testing purposes\", \"imports the ingestion.wire entity\", \"DEFAULT_INGEST_CLOCK_SKEW_ALLOWANCE_SECONDS = 300.0\", the ingest tuning defaults and the ingestion_store_backend check are in the previous summary."
+  },
+  {
+   "fixture_id": "stream_touch/6b3dcbaf-ae6f-447c-b1c0-fe90f1325ef9",
+   "node_uuid": "33db6a81-99e5-4df3-8455-b1f1b9720142",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"pinned in touch-trace\", \"Validation is limited to what the PRD lists, including INV-H1 ..., INV-H2 ..., INV-F3\", \"all arithmetic is in i128\", the capture directory and amendment markers, \"reserves owner decisions for brief §9\" and \"the order of operations for record::run\" are in the previous summary."
+  },
+  {
+   "fixture_id": "stream_touch/6b3dcbaf-ae6f-447c-b1c0-fe90f1325ef9",
+   "node_uuid": "33db6a81-99e5-4df3-8455-b1f1b9720142",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"makes the decision itself, as an in-place PRD amendment\", the idle-hold durations, step timings and fixture classes, \"G6's six-minute hold, which is kept\", \"No PRD row reserves them to a human\" and \"reversible before gate ζ ... the owner approves in person\" restate the episode."
+  },
+  {
+   "fixture_id": "stream_touch/6b3dcbaf-ae6f-447c-b1c0-fe90f1325ef9",
+   "node_uuid": "38e740f1-a735-4214-a10b-917990a18965",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"Leo is busy\", the planned spawn of Gates π and G6, \"Leo chose option C for task 224\", \"pause task 113\", the Ploopy Trackpad and Raspberry Pi Pico 2 orders, \"prioritizes Linux\" and the planned firmware are all in the previous summary."
+  },
+  {
+   "fixture_id": "stream_touch/6b3dcbaf-ae6f-447c-b1c0-fe90f1325ef9",
+   "node_uuid": "38e740f1-a735-4214-a10b-917990a18965",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"the brief asks for autonomy (\"Leo is busy\")\", \"The spawn brief's owner answer here is G6's six-minute hold\" and \"an in-place PRD amendment, and does not escalate it to the owner\" restate the episode."
+  },
+  {
+   "fixture_id": "stream_touch/ad0907b9-772a-46e5-a591-41bb1981c74e",
+   "node_uuid": "71f7b858-c98a-4eeb-b9c0-b782b48e08c5",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"data_files includes session.toml as part of the durable copy\" is the previous summary's; CopyName and the Recording seam test's \"each file is put and re-read by one name ... with the ledger last\" are the episode's."
+  },
+  {
+   "fixture_id": "stream_touch/ad0907b9-772a-46e5-a591-41bb1981c74e",
+   "node_uuid": "71f7b858-c98a-4eeb-b9c0-b782b48e08c5",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"It validates committed data\" inverts the input: the previous summary says \"η validates every committed session.toml\", not that session.toml validates anything."
+  },
+  {
+   "fixture_id": "stream_touch/ad0907b9-772a-46e5-a591-41bb1981c74e",
+   "node_uuid": "d26eb564-c9b7-48bc-92d7-4dd9d5c5b90f",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"put takes `contents: &mut dyn Read` and writes exactly what it reads, replacing an earlier copy\", File::create, the copy-directory sync, \"creates only the session directory, never the root\" and \"The existing FsStore tests cover content and naming on disk\" are all in the inputs."
+  },
+  {
+   "fixture_id": "stream_touch/ad0907b9-772a-46e5-a591-41bb1981c74e",
+   "node_uuid": "d26eb564-c9b7-48bc-92d7-4dd9d5c5b90f",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"FsStore writes using File::create\", \"FsStore::put syncs the durable root on every put, including data\", \"creates only the session directory, never the root\", \"The CLI uses FsStore for writing the ledger\", \"drives FsStore through its public seam\" and \"FsStore::put returns a bare io::Error\" are in the previous summary."
+  },
+  {
+   "fixture_id": "stream_touch/b8f82dfd-e3fd-4b27-a538-0bc4b8169398",
+   "node_uuid": "33db6a81-99e5-4df3-8455-b1f1b9720142",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"the PRD ... defines the single point of truth for terminology\", \"Validation is limited to what the PRD lists\", the record::run order of operations and \"header-declared units\" are in the previous summary; \"ensuring consistency\" is a generic purpose phrase."
+  },
+  {
+   "fixture_id": "stream_touch/b8f82dfd-e3fd-4b27-a538-0bc4b8169398",
+   "node_uuid": "33db6a81-99e5-4df3-8455-b1f1b9720142",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"Sensel ε reads the PRD contract\", \"the PRD's gate script\", \"names all three\" LibSensel functions for \"MorphInfo's supported_content, led_count and max_led_bright[ness]\", \"Write the range as ASCII \"T1-T10\"\", \"Change only the μ leaf binding\" and \"T10 is task 145's row\" are all in the inputs."
+  },
+  {
+   "fixture_id": "stream_touch/b8f82dfd-e3fd-4b27-a538-0bc4b8169398",
+   "node_uuid": "dfe64d65-1619-44d9-939b-ee841f2c5aa8",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"Heuristic 11 (SPOT) requires that each fact has a single home\" and \"follows heuristic 11, which emphasizes avoiding duplication\" are in the previous summary; the rest is a neutral umbrella over its listed applications."
+  },
+  {
+   "fixture_id": "stream_touch/b8f82dfd-e3fd-4b27-a538-0bc4b8169398",
+   "node_uuid": "dfe64d65-1619-44d9-939b-ee841f2c5aa8",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "\"Heuristic 11 (SPOT) requires that each fact has a single home\", \"read_info takes its reads from LISTED ... INFO_READS and OPTIONAL_INFO_READS\", \"the_command_list_renders_the_gate_list ... pins the rendered list\" to the PRD, the ASCII \"T1-T10\" range and \"Change only the μ leaf binding\" are all in the inputs."
+  },
+  {
+   "fixture_id": "stream_touch/e6422203-8fdb-4665-a247-550bdda19c74",
+   "node_uuid": "7a6f56be-56b8-4658-81e3-7fc3644a98f1",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"tests/durable.rs uses hex_sha256 as part of its Display check\" is the fact; \"sha2's `{:x}` is the independent oracle, as in tests/durable.rs lines 880-889 and tests/ledger.rs's hex_sha256\" is the episode's."
+  },
+  {
+   "fixture_id": "stream_touch/e6422203-8fdb-4665-a247-550bdda19c74",
+   "node_uuid": "7a6f56be-56b8-4658-81e3-7fc3644a98f1",
+   "summary": "B",
+   "rating": "faithful",
+   "rationale": "The 1338-to-1360-line growth, \"includes the copy_durable_again test\", \"an FsStore durable-root test\", \"shares a function named scratch with tests/ledger.rs\", \"imports the dir_names/mod.rs module\" and \"filed as follow-up ticket tkt_0RWCNYEFYHZA8RAZJT08VTB33M\" are in the previous summary."
+  },
+  {
+   "fixture_id": "stream_touch/e6422203-8fdb-4665-a247-550bdda19c74",
+   "node_uuid": "9c95b74a-c004-4e44-85a5-df1794f1f2fe",
+   "summary": "A",
+   "rating": "faithful",
+   "rationale": "\"keeps `use sha2::{Digest, Sha256};` only for the Display test's `{:x}` oracle\" and \"a Display check whose expected text came from Sha256Digest's own Display would be circular\" are the episode's; the `Sha256Digest(<64 hex>)` print is the previous summary's."
+  },
+  {
+   "fixture_id": "stream_touch/e6422203-8fdb-4665-a247-550bdda19c74",
+   "node_uuid": "9c95b74a-c004-4e44-85a5-df1794f1f2fe",
+   "summary": "B",
+   "rating": "unsupported",
+   "rationale": "\"Display implementations derive expected text from sha2's Display\" binds to the implementations what the previous summary says of the tests: \"Tests take expected text from sha2's Display\"."
+  }
+ ]
+}
