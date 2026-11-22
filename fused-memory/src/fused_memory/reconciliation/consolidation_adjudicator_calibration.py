@@ -4,8 +4,10 @@ Owns the eval set, the six bounds, the scoring and the calibration row: its
 states, its payload and the one-step state machine :func:`run_calibration`
 moves it through. The eval set is resolved from the package and pinned by
 sha256; the bounds are module constants, changed by code review and never by
-reload. It files nothing itself: a result names the finding for its caller to
-file. Imports no executor code.
+reload. A row carries the fingerprint of the bounds and eval set it was scored
+under, and a settled row carrying another is scored again rather than read
+under rules it was not scored by. It files nothing itself: a result names the
+finding for its caller to file. Imports no executor code.
 """
 
 from __future__ import annotations
@@ -357,7 +359,35 @@ BOUNDS: tuple[Bound, ...] = (
 )
 """PRD E7's six bounds, compared as rationals by integer cross-multiplication."""
 
+
+def _bound_rule(bound: Bound) -> dict[str, Any]:
+    return {
+        'name': bound.name.value,
+        'split': None if bound.split is None else bound.split.value,
+        'kinds': sorted(kind.value for kind in bound.kinds),
+        'direction': bound.direction.value,
+        'numerator': bound.numerator,
+        'denominator': bound.denominator,
+        'basis': bound.basis.value,
+        'counts': bound.counts.value,
+    }
+
+
+def scoring_fingerprint(bounds: Iterable[Bound], eval_sha256: str) -> str:
+    """The sha256 of the rules a run is scored under: *bounds* in name order, and the eval set."""
+    rules = {
+        'eval_sha256': eval_sha256,
+        'bounds': sorted((_bound_rule(bound) for bound in bounds), key=lambda rule: rule['name']),
+    }
+    canonical = json.dumps(rules, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+#: What a row's figures were scored under.
+SCORING_FINGERPRINT = scoring_fingerprint(BOUNDS, EVAL_SET_SHA256)
+
 _BOUNDS_BY_NAME: Mapping[BoundName, Bound] = {bound.name: bound for bound in BOUNDS}
+_BOUND_NAMES = tuple(bound.name for bound in BOUNDS)
 
 
 @dataclass(frozen=True)
@@ -374,6 +404,13 @@ class RunFigures:
 
     figures: tuple[BoundFigure, ...]
 
+    def __post_init__(self) -> None:
+        names = tuple(figure.name for figure in self.figures)
+        if names != _BOUND_NAMES:
+            raise ValueError(
+                f'run figures must name every bound once, in BOUNDS order; got {", ".join(names)}',
+            )
+
     def to_payload(self) -> list[dict[str, Any]]:
         return [
             {'name': f.name.value, 'numerator': f.numerator, 'denominator': f.denominator,
@@ -383,13 +420,21 @@ class RunFigures:
 
     @classmethod
     def from_payload(cls, payload: object) -> RunFigures:
-        """Decode :meth:`to_payload`'s shape: one figure per bound, in :data:`BOUNDS` order."""
+        """Decode :meth:`to_payload`'s shape, stored in any order: one figure per bound."""
         if not isinstance(payload, list):
             raise ValueError(f'figures are not a list: {payload!r:.200}')
-        figures = tuple(_figure_from_payload(item) for item in payload)
-        if tuple(f.name for f in figures) != tuple(b.name for b in BOUNDS):
-            raise ValueError(f'figures do not name the bounds in order: {payload!r:.200}')
-        return cls(figures)
+        by_name: dict[BoundName, BoundFigure] = {}
+        for figure in map(_figure_from_payload, payload):
+            if figure.name in by_name:
+                raise ValueError(f'figures name {figure.name} twice')
+            by_name[figure.name] = figure
+        missing = [name for name in _BOUND_NAMES if name not in by_name]
+        extra = [name for name in by_name if name not in _BOUNDS_BY_NAME]
+        if missing or extra:
+            raise ValueError(
+                f'figures are missing [{", ".join(missing)}] and carry extra [{", ".join(extra)}]',
+            )
+        return cls(tuple(by_name[name] for name in _BOUND_NAMES))
 
 
 _FIGURE_KEYS = frozenset({'name', 'numerator', 'denominator', 'holds'})
@@ -554,7 +599,7 @@ class CalibrationRecord:
     #: The sum over the priced calls; None when no call was priced.
     cost_usd: float | None = None
     wall_time_s: float | None = None
-    eval_sha256: str = EVAL_SET_SHA256
+    scoring_fingerprint: str = SCORING_FINGERPRINT
 
     def __post_init__(self) -> None:
         checks = (
@@ -578,13 +623,20 @@ class CalibrationRecord:
              and all(_is_text(m) for m in self.resolved_models), 'a tuple of model names'),
             ('cost_usd', _is_measure(self.cost_usd), 'a non-negative number or None'),
             ('wall_time_s', _is_measure(self.wall_time_s), 'a non-negative number or None'),
-            ('eval_sha256', _is_text(self.eval_sha256), 'a non-empty string'),
+            ('scoring_fingerprint', _is_text(self.scoring_fingerprint) and (
+                self.scored_under_current_rules
+                or (self.figures is None and self.first_run is None)
+            ), 'a non-empty string, and SCORING_FINGERPRINT whenever figures are carried'),
         )
         for field, ok, wanted in checks:
             if not ok:
                 raise ValueError(
                     f'calibration record {field} must be {wanted}, got {getattr(self, field)!r}',
                 )
+
+    @property
+    def scored_under_current_rules(self) -> bool:
+        return self.scoring_fingerprint == SCORING_FINGERPRINT
 
     @property
     def failed_bounds(self) -> tuple[BoundName, ...]:
@@ -604,19 +656,24 @@ class CalibrationRecord:
             'resolved_models': list(self.resolved_models),
             'cost_usd': self.cost_usd,
             'wall_time_s': self.wall_time_s,
-            'eval_sha256': self.eval_sha256,
+            'scoring_fingerprint': self.scoring_fingerprint,
         }
 
     @classmethod
     def from_payload(
         cls, payload: object, *, identity: str, state: CalibrationState,
     ) -> CalibrationRecord:
-        """Decode :meth:`to_payload`'s shape; every key is required. A bad field is named."""
+        """Decode :meth:`to_payload`'s shape; every key is required. A bad field is named.
+
+        Figures scored under another fingerprint are not read: they decode as None.
+        """
         if not isinstance(payload, dict):
             raise ValueError(f'calibration payload is not an object: {payload!r:.200}')
         missing = [key for key in _PAYLOAD_KEYS if key not in payload]
         if missing:
             raise ValueError(f'calibration payload is missing {", ".join(missing)}')
+        fingerprint = payload['scoring_fingerprint']
+        current = fingerprint == SCORING_FINGERPRINT
         resolved_models = payload['resolved_models']
         if not isinstance(resolved_models, list):
             raise ValueError(f'calibration payload resolved_models is not a list: {resolved_models!r}')
@@ -629,13 +686,13 @@ class CalibrationRecord:
             endpoint_host=payload['endpoint_host'],
             stall_count=payload['stall_count'],
             stalled_at=None if payload['stalled_at'] is None else _timestamp(payload, 'stalled_at'),
-            first_run=_optional_figures(payload, 'first_run'),
-            figures=_optional_figures(payload, 'figures'),
+            first_run=_optional_figures(payload, 'first_run') if current else None,
+            figures=_optional_figures(payload, 'figures') if current else None,
             unanswered=payload['unanswered'],
             resolved_models=tuple(resolved_models),
             cost_usd=payload['cost_usd'],
             wall_time_s=payload['wall_time_s'],
-            eval_sha256=payload['eval_sha256'],
+            scoring_fingerprint=fingerprint,
         )
 
     def to_ledger_record(self, *, now: datetime) -> ReconLedgerRecord:
@@ -715,7 +772,11 @@ class CalibrationResult:
 
     @property
     def may_adjudicate(self) -> bool:
-        return self.state is CalibrationState.PASS
+        return (
+            self.record is not None
+            and self.record.state is CalibrationState.PASS
+            and self.record.scored_under_current_rules
+        )
 
 
 @dataclass(frozen=True)
@@ -745,12 +806,13 @@ async def run_calibration(
 ) -> CalibrationResult:
     """Take the identity's calibration row one step: read it, and score a run when one is due.
 
-    A ``pass`` or ``fail`` row is final, a fresh ``running`` row or a stall
-    still backing off is waited for, and an old ``running`` row is only marked
-    crashed (see :func:`_step_without_run`). Otherwise the eval set is verified
-    before any write, the run is claimed by compare-and-set so one caller runs
-    it, the cases are scored through :func:`adjudicate`, and the row is
-    rewritten with the run's end state.
+    A ``pass`` or ``fail`` row scored under the current rules is final, a fresh
+    ``running`` row or a stall still backing off is waited for, and an old
+    ``running`` row is only marked crashed (see :func:`_step_without_run`).
+    A settled row scored under other rules is scored afresh. Otherwise the eval
+    set is verified before any write, the run is claimed by compare-and-set so
+    one caller runs it, the cases are scored through :func:`adjudicate`, and
+    the row is rewritten with the run's end state.
     """
     _require_aware('now', now)
     identity = adjudicator_identity(settings)
@@ -803,7 +865,13 @@ async def _step_without_run(
     old row apart, so the next run starts from ``crashed`` on a later call.
     """
     if stored.state in _SETTLED:
-        return CalibrationResult(record=stored, ran=False)
+        if stored.scored_under_current_rules:
+            return CalibrationResult(record=stored, ran=False)
+        logger.info(
+            'calibration %s: %s row was scored under other rules; re-scoring',
+            stored.identity[:12], stored.state,
+        )
+        return None
     if stored.state is CalibrationState.RUNNING:
         if _age(stored, now) < CRASH_AGE:
             return CalibrationResult(record=stored, ran=False)
