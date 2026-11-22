@@ -23,10 +23,12 @@ from shared.uuid_prefix import (
     UUID_PREFIX_OVERRIDE_KEY,
     PrefixToken,
     find_prefix_tokens,
+    in_sent_shape,
     strip_uuid_prefix_override,
     substitute,
     substitute_all,
     uuid_prefix_override_requested,
+    walkable_arguments,
 )
 
 # A 31-hex run: the INCLUSIVE upper bound of the grammar.
@@ -853,3 +855,90 @@ def test_strip_leaves_other_keys_in_place() -> None:
 )
 def test_strip_passes_unaffected_input_straight_through(metadata: object) -> None:
     assert strip_uuid_prefix_override(metadata) == metadata
+
+
+# --- the metadata walk: a JSON-object-string metadata is walked as structure ---
+
+
+class TestAJsonStringMetadataIsWalkedAsStructure:
+    """submit_task/update_task take metadata as an object OR a JSON string.
+
+    The walk sees both shapes as the same structure, and the write-back hands
+    the caller's shape back: the original string when nothing under metadata
+    changed, a re-encoding when something did.
+    """
+
+    def test_its_values_get_structured_paths(self) -> None:
+        arguments = {'metadata': json.dumps({'note': 'see bff81530', 'ids': ['8bec9cd6']})}
+        found = find_prefix_tokens(walkable_arguments(arguments))
+        assert [(t.path, t.token) for t in found] == [
+            (('metadata', 'note'), 'bff81530'),
+            (('metadata', 'ids', 0), '8bec9cd6'),
+        ]
+
+    def test_a_prefix_shaped_key_is_not_a_token(self) -> None:
+        arguments = {'metadata': json.dumps({'bff81530': 'x'})}
+        assert find_prefix_tokens(walkable_arguments(arguments)) == ()
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            pytest.param('not json bff81530', id='not-json'),
+            pytest.param('["bff81530", 2]', id='json-list'),
+            pytest.param('"bff81530"', id='json-string'),
+        ],
+    )
+    def test_a_string_that_is_not_a_json_object_stays_a_raw_site(self, metadata: str) -> None:
+        walked = walkable_arguments({'metadata': metadata})
+        assert walked['metadata'] is metadata
+        assert [t.path for t in find_prefix_tokens(walked)] == [('metadata',)]
+
+    @pytest.mark.parametrize(
+        'arguments',
+        [
+            pytest.param({'metadata': {'note': 'see bff81530'}}, id='dict-metadata'),
+            pytest.param({'content': 'see bff81530'}, id='no-metadata'),
+        ],
+    )
+    def test_a_dict_or_absent_metadata_walks_unchanged(self, arguments: dict[str, Any]) -> None:
+        walked = walkable_arguments(arguments)
+        assert walked == arguments
+        assert walked.get('metadata') is arguments.get('metadata')
+
+    def test_a_touched_metadata_is_re_encoded_as_a_string(self) -> None:
+        sent = {
+            'content': 'unrelated',
+            'metadata': json.dumps({'note': 'see bff81530', 'kind': 'merged'}),
+        }
+        before = copy.deepcopy(sent)
+        walked = walkable_arguments(sent)
+        repaired = substitute_all(walked, replacements_for(walked))
+        shaped = in_sent_shape(sent, walked, repaired)
+        assert isinstance(shaped['metadata'], str)
+        assert json.loads(shaped['metadata']) == {'note': f'see {FULL_BFF}', 'kind': 'merged'}
+        assert shaped['content'] == 'unrelated'
+        assert sent == before
+
+    def test_an_untouched_metadata_string_is_returned_byte_identical(self) -> None:
+        original = json.dumps({'note': 'no identifiers', 'n': [1, 2]}, indent=2)
+        sent = {'content': 'see bff81530', 'metadata': original}
+        before = copy.deepcopy(sent)
+        walked = walkable_arguments(sent)
+        repaired = substitute_all(walked, replacements_for(walked))
+        shaped = in_sent_shape(sent, walked, repaired)
+        assert shaped['metadata'] is original
+        assert shaped['content'] == f'see {FULL_BFF}'
+        assert sent == before
+
+    def test_a_dict_metadata_is_returned_as_repaired(self) -> None:
+        sent = {'metadata': {'note': 'see bff81530'}}
+        walked = walkable_arguments(sent)
+        repaired = substitute_all(walked, replacements_for(walked))
+        assert in_sent_shape(sent, walked, repaired) == {'metadata': {'note': f'see {FULL_BFF}'}}
+
+    def test_a_json_escape_before_hex_is_not_part_of_the_token(self) -> None:
+        """The raw text holds the run 'b18e5b292'; the decoded value holds '\\x08' + '18e5b292'."""
+        raw = '{"note": "\\b18e5b292"}'
+        assert [t.token for t in find_prefix_tokens({'metadata': raw})] == ['b18e5b292']
+        found = find_prefix_tokens(walkable_arguments({'metadata': raw}))
+        assert [(t.path, t.token) for t in found] == [(('metadata', 'note'), '18e5b292')]
