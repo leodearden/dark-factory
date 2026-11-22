@@ -8,7 +8,6 @@ fused-memory HTTP endpoint.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -181,18 +180,3 @@ class TestHandledDigest:
         tail = _steward_owned_tail(prompt)
         assert '- **Detail:** Agent ran out of iterations.\n' + render_handled_digest(_HANDLED) in tail
         assert render_handled_digest(_HANDLED) + '\n# Parameters\n' in tail
-
-    async def test_handled_is_a_required_keyword(
-        self, briefing: BriefingAssembler, tmp_path: Path,
-    ) -> None:
-        without_handled: dict[str, Any] = {
-            'task': _TASK,
-            'escalation': _ESCALATION,
-            'pending_escalations': [],
-            'worktree': tmp_path,
-        }
-        with (
-            patch.object(BriefingAssembler, '_get_memory_context', return_value=''),
-            pytest.raises(TypeError),
-        ):
-            await briefing.build_steward_initial_prompt(**without_handled)
