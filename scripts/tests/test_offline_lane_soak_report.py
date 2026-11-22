@@ -31,7 +31,7 @@ from offline_lane_soak_fixtures import (
     episode,
     failure,
 )
-from offline_lane_soak_inputs import FusedMemoryTaskReader
+from offline_lane_soak_inputs import FusedMemoryTaskReader, MetadataMatches
 from orchestrator.flake_ledger import (
     UNKNOWN_TEST_ID,
     DebtTrigger,
@@ -1160,18 +1160,32 @@ def test_debt_cycle_owners_list_every_cycles_owner_of_an_offered_test(tmp_path: 
 
     _, report, _ = _report(project, capsys)
 
-    assert _figure(report, 'debt_cycle_owners')[NODE_A] == [
+    cycle_owners = _figure(report, 'debt_cycle_owners')
+    assert cycle_owners['owners'][NODE_A] == [
         {'task_id': first_owner, 'cycle': 1, 'call_site': 'offline_lane', 'trigger': 'cleared', 'status': 'done'},
         {
             'task_id': second_owner, 'cycle': 2, 'call_site': 'offline_lane', 'trigger': 'cleared',
             'status': project.tasks.tasks[second_owner]['status'],
         },
     ]
+    assert cycle_owners['unreadable_metadata'] == []
     assert [debt['owner'] for debt in _figure(report, 'lane_debts') if debt['test'] == NODE_A] == [
         second_owner, second_owner,
     ]
     rule = next(figure['rule'] for figure in report['figures'] if figure['name'] == 'debt_cycle_owners')
     assert rule
+
+
+def test_debt_cycle_owners_name_the_tasks_whose_metadata_the_lookup_could_not_read(tmp_path: Path, capsys):
+    project, _, owners = _debt_project(tmp_path, owned=(NODE_A,))
+    project.tasks.tasks['8999'] = {'id': '8999', 'status': 'done', 'metadata': '{"flake_debt_test": truncated'}
+
+    _, report, _ = _report(project, capsys)
+
+    assert report['unjudgeable'] is None
+    cycle_owners = _figure(report, 'debt_cycle_owners')
+    assert [owner['task_id'] for owner in cycle_owners['owners'][NODE_A]] == [owners[NODE_A]]
+    assert cycle_owners['unreadable_metadata'] == ['8999']
 
 
 def test_a_failed_owner_lookup_is_nothing_to_judge(tmp_path: Path, capsys):
@@ -1393,30 +1407,42 @@ def test_the_task_reader_answers_a_transport_failure_with_that_exception():
     assert _read(_ToolStub(raises=failure)) == (None, failure)
 
 
-def _lookup_page(*task_ids: int, has_more: bool) -> dict[str, Any]:
-    """One find_tasks_by_metadata page as the tool answers it."""
-    return {
+def _lookup_page(*task_ids: int, has_more: bool, malformed: Sequence[int] = ()) -> dict[str, Any]:
+    """One find_tasks_by_metadata page as the tool answers it, naming *malformed* only when there are any."""
+    page: dict[str, Any] = {
         'results': [{'task_id': task_id, 'title': f'De-flake {NODE_A}', 'status': 'done'} for task_id in task_ids],
         'tasks_with_key': 2,
         'pagination': {'has_more': has_more, 'returned': len(task_ids)},
     }
+    if malformed:
+        page['malformed_metadata_ids'] = list(malformed)
+    return page
 
 
-def _lookup(stub: _ToolStub) -> tuple[list[str] | None, Exception | None]:
+def _lookup(stub: _ToolStub) -> tuple[MetadataMatches | None, Exception | None]:
     reader = FusedMemoryTaskReader(stub, '/srv/project')
-    return asyncio.run(reader.task_ids_with_metadata('flake_debt_test', NODE_A))
+    return asyncio.run(reader.metadata_matches('flake_debt_test', NODE_A))
 
 
 def test_the_task_reader_lists_every_task_carrying_a_metadata_value_across_pages():
     stub = _ToolStub(replies=[_lookup_page(8089, has_more=True), _lookup_page(8231, has_more=False)])
 
-    assert _lookup(stub) == (['8089', '8231'], None)
+    assert _lookup(stub) == (MetadataMatches(('8089', '8231'), ()), None)
     assert [name for name, _ in stub.calls] == ['find_tasks_by_metadata', 'find_tasks_by_metadata']
     for (_, arguments), offset in zip(stub.calls, (0, 1), strict=True):
         assert {key: value for key, value in arguments.items() if key != 'limit'} == {
             'project_root': '/srv/project', 'key': 'flake_debt_test', 'value': NODE_A, 'offset': offset,
         }
         assert isinstance(arguments['limit'], int) and arguments['limit'] > 0
+
+
+def test_the_task_reader_carries_the_tasks_whose_metadata_the_store_could_not_read():
+    stub = _ToolStub(replies=[
+        _lookup_page(8089, has_more=True, malformed=(7001, 7002)),
+        _lookup_page(8231, has_more=False, malformed=(7001, 7002)),
+    ])
+
+    assert _lookup(stub) == (MetadataMatches(('8089', '8231'), ('7001', '7002')), None)
 
 
 @pytest.mark.parametrize('reply', [
@@ -1426,6 +1452,8 @@ def test_the_task_reader_lists_every_task_carrying_a_metadata_value_across_pages
     {'tasks_with_key': 1, 'pagination': {'has_more': False}},
     {'results': [8089], 'pagination': {'has_more': False}},
     {'results': [{'task_id': 8089}], 'pagination': {}},
+    {**_lookup_page(8089, has_more=False), 'malformed_metadata_ids': 7001},
+    {**_lookup_page(8089, has_more=False), 'malformed_metadata_ids': [{'id': 7001}]},
 ])
 def test_the_task_reader_answers_a_failed_lookup_as_an_error(reply: Any):
     task_ids, error = _lookup(_ToolStub(reply))

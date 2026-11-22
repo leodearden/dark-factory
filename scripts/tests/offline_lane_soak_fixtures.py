@@ -19,6 +19,7 @@ from typing import Any
 import _checkout as _checkout
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from offline_lane_soak_inputs import MetadataMatches
 from orchestrator.config import LaneCommand
 from orchestrator.flake_debt_drain import REGRESSED_AFTER_RESOLUTION, call_site_evidence
 from orchestrator.flake_ledger import (
@@ -156,8 +157,9 @@ class FakeTaskStore:
 
     An id told :meth:`answer_absent` reads as a corroborated absence, and one told
     :meth:`fail` as a failed read, by the ``(task, error)`` convention.  A metadata lookup
-    answers the ids of :attr:`tasks` carrying the value, but not those told
-    :meth:`answer_absent`; after :meth:`fail_lookups` every lookup is a failed read.
+    answers the ids of :attr:`tasks` carrying the value, and as unreadable those whose metadata
+    is not a dict, but neither kind told :meth:`answer_absent`; after :meth:`fail_lookups`
+    every lookup is a failed read.
     """
 
     def __init__(self) -> None:
@@ -200,14 +202,13 @@ class FakeTaskStore:
             return None, None
         return copy.deepcopy(self.tasks[task_id]), None
 
-    async def task_ids_with_metadata(self, key: str, value: str) -> tuple[list[str] | None, Exception | None]:
+    async def metadata_matches(self, key: str, value: str) -> tuple[MetadataMatches | None, Exception | None]:
         if self.lookups_fail:
             return None, ConnectionError(f'task store unreachable looking up {key}={value}')
-        found = [
-            task_id for task_id, task in self.tasks.items()
-            if task_id not in self.absent and task.get('metadata', {}).get(key) == value
-        ]
-        return sorted(found, key=int), None
+        stored = {task_id: task.get('metadata', {}) for task_id, task in self.tasks.items() if task_id not in self.absent}
+        found = [task_id for task_id, metadata in stored.items() if isinstance(metadata, dict) and metadata.get(key) == value]
+        unreadable = [task_id for task_id, metadata in stored.items() if not isinstance(metadata, dict)]
+        return MetadataMatches(tuple(sorted(found, key=int)), tuple(sorted(unreadable, key=int))), None
 
     async def commit_planning(self, task_ids: list[str]) -> None:
         for task_id in task_ids:

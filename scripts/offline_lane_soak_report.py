@@ -557,11 +557,16 @@ def _cycle_order(owner: Mapping[str, Any]) -> tuple[bool, int]:
 def _debt_cycle_owners(inputs: SoakInputs) -> Figure:
     return Figure(
         'debt_cycle_owners',
-        f'per test a windowed effect block offered, every de-flake task whose metadata.{DEBT_TEST_KEY} names it, '
-        f'any status, by cycle (metadata.{DEBT_CYCLE_KEY}), with its call site, trigger and status now',
+        f'owners: per test a windowed effect block offered, every de-flake task whose metadata.{DEBT_TEST_KEY} '
+        f'names it, any status, by cycle (metadata.{DEBT_CYCLE_KEY}), with its call site, trigger and status now; '
+        'unreadable_metadata: the tasks whose metadata is not an object, so the lookup cannot say whether one owns '
+        'a cycle missing from owners',
         {
-            test: sorted((_cycle_owner(inputs, task_id) for task_id in task_ids), key=_cycle_order)
-            for test, task_ids in inputs.cycle_owners.items()
+            'owners': {
+                test: sorted((_cycle_owner(inputs, task_id) for task_id in task_ids), key=_cycle_order)
+                for test, task_ids in inputs.cycle_owners.by_test.items()
+            },
+            'unreadable_metadata': list(inputs.cycle_owners.unreadable),
         },
     )
 

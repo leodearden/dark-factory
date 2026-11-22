@@ -73,16 +73,25 @@ class Unjudgeable:
     reason: str
 
 
+@dataclass(frozen=True)
+class MetadataMatches:
+    """The id of every task, any status, whose top-level ``metadata[key]`` equals a value, in id order;
+    *unreadable_ids* the tasks whose metadata is not an object, so the store cannot say whether they match."""
+
+    task_ids: tuple[str, ...]
+    unreadable_ids: tuple[str, ...]
+
+
 class TaskReader(Protocol):
     """``flake_ledger.FlakeLedgerTaskClient.get_task``'s convention: ``(task, None)`` read,
     ``(None, None)`` a corroborated absence, ``(None, error)`` a failed read.
 
-    :meth:`task_ids_with_metadata` answers the id of every task, any status, whose top-level
-    ``metadata[key]`` equals *value*, in id order, or ``(None, error)`` for a failed read."""
+    :meth:`metadata_matches` answers the :class:`MetadataMatches` of *key* and *value*, or
+    ``(None, error)`` for a failed read."""
 
     async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]: ...
 
-    async def task_ids_with_metadata(self, key: str, value: str) -> tuple[list[str] | None, Exception | None]: ...
+    async def metadata_matches(self, key: str, value: str) -> tuple[MetadataMatches | None, Exception | None]: ...
 
 
 class ToolClient(Protocol):
@@ -97,19 +106,30 @@ _FAILED_CALL_ERRORS = (httpx.HTTPError, RuntimeError, ValueError, AttributeError
 _LOOKUP_PAGE = 100
 
 
-def _lookup_page(reply: Any) -> tuple[list[str], bool] | str:
-    """One ``find_tasks_by_metadata`` page as (its task ids, has_more), or why the reply is not one."""
+@dataclass(frozen=True)
+class _LookupPage:
+    task_ids: tuple[str, ...]
+    unreadable_ids: tuple[str, ...]
+    has_more: bool
+
+
+def _lookup_page(reply: Any) -> _LookupPage | str:
+    """One ``find_tasks_by_metadata`` page, or why the reply is not one.  The tool sends
+    ``malformed_metadata_ids`` only when some task's metadata is not an object."""
     problem = write_failure_reason(reply)
     if problem is not None:
         return problem
     rows = reply.get('results')
     pagination = reply.get('pagination')
     has_more = pagination.get('has_more') if isinstance(pagination, Mapping) else None
+    unreadable = reply.get('malformed_metadata_ids', [])
     if not isinstance(rows, list) or not all(isinstance(row, Mapping) and 'task_id' in row for row in rows):
         return 'the reply carries no list of task rows'
     if not isinstance(has_more, bool):
         return 'the reply carries no boolean pagination.has_more'
-    return [str(row['task_id']) for row in rows], has_more
+    if not isinstance(unreadable, list) or not all(isinstance(task_id, int | str) for task_id in unreadable):
+        return 'the reply carries a malformed_metadata_ids that is not a list of task ids'
+    return _LookupPage(tuple(str(row['task_id']) for row in rows), tuple(map(str, unreadable)), has_more)
 
 
 class FusedMemoryTaskReader:
@@ -122,8 +142,8 @@ class FusedMemoryTaskReader:
     that is not a JSON-RPC object (AttributeError, KeyError or TypeError, from reading it as
     one).  Any other exception propagates.
 
-    :meth:`task_ids_with_metadata` reads ``find_tasks_by_metadata`` page by page, and answers
-    a failed reply, a reply that is not a page of task rows, or such a raise as a failed read.
+    :meth:`metadata_matches` reads ``find_tasks_by_metadata`` page by page, and answers a
+    failed reply, a reply that is not a page of task rows, or such a raise as a failed read.
     """
 
     def __init__(self, client: ToolClient, project_root: str) -> None:
@@ -142,19 +162,20 @@ class FusedMemoryTaskReader:
             return None, RuntimeError(f'get_task {task_id}: {problem}')
         return reply, None
 
-    async def task_ids_with_metadata(self, key: str, value: str) -> tuple[list[str] | None, Exception | None]:
+    async def metadata_matches(self, key: str, value: str) -> tuple[MetadataMatches | None, Exception | None]:
         task_ids: list[str] = []
+        unreadable_ids: dict[str, None] = {}
         has_more = True
         while has_more:
             page = await self._lookup(key, value, offset=len(task_ids))
             if isinstance(page, Exception):
                 return None, page
-            found, has_more = page
-            task_ids.extend(found)
-            has_more = has_more and bool(found)
-        return task_ids, None
+            task_ids.extend(page.task_ids)
+            unreadable_ids.update(dict.fromkeys(page.unreadable_ids))
+            has_more = page.has_more and bool(page.task_ids)
+        return MetadataMatches(tuple(task_ids), tuple(unreadable_ids)), None
 
-    async def _lookup(self, key: str, value: str, *, offset: int) -> tuple[list[str], bool] | Exception:
+    async def _lookup(self, key: str, value: str, *, offset: int) -> _LookupPage | Exception:
         arguments = {
             'project_root': self._project_root, 'key': key, 'value': value, 'limit': _LOOKUP_PAGE, 'offset': offset,
         }
@@ -237,12 +258,20 @@ class EscalationReads:
 
 
 @dataclass(frozen=True)
+class CycleOwners:
+    """*by_test* maps each offered test to every de-flake task naming it, one per debt cycle;
+    *unreadable* the tasks whose metadata is not an object, any of which may be an owner missing there."""
+
+    by_test: Mapping[str, tuple[str, ...]]
+    unreadable: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class SoakInputs:
     """*tasks* maps each task read to its body, or None for a corroborated absence; *failures* maps
     (command, test) to that test's failure records over every stored pass of the selected commands;
     *record_bytes* is the size of every file under the run-record root.  *ledger_cut_over* is
-    :func:`_ledger_cut_over` over every stored pass, whatever the window and commands.
-    *cycle_owners* maps each offered test to every de-flake task naming it, one per debt cycle."""
+    :func:`_ledger_cut_over` over every stored pass, whatever the window and commands."""
 
     since: datetime
     ledger_cut_over: datetime | None
@@ -252,7 +281,7 @@ class SoakInputs:
     episodes: Mapping[str, CommandRecord]
     tasks: Mapping[str, Mapping[str, Any] | None]
     ledger: LedgerReads
-    cycle_owners: Mapping[str, tuple[str, ...]]
+    cycle_owners: CycleOwners
     failures: Mapping[tuple[str, str], tuple[FailureRecord, ...]]
     escalations: EscalationReads
     record_bytes: int
@@ -383,26 +412,28 @@ def _task_ids(
     window: Sequence[WindowPass],
     episodes: Mapping[str, CommandRecord],
     ledger: LedgerReads,
-    cycle_owners: Mapping[str, Sequence[str]],
+    cycle_owners: CycleOwners,
 ) -> list[str]:
     """The ids the windowed effect blocks filed, the tasks the stored episodes are bound to now,
     the owners of the offered tests' debts, and every cycle's owner of each offered test."""
     filed = [task_id for p in window if p.effect is not None for task_id in p.effect.tasks_filed]
     bound = episode_bindings(episodes).values()
     owners = [row.owner_task_id for row in ledger.debts.values() if row.owner_task_id is not None]
-    every_cycle = [task_id for task_ids in cycle_owners.values() for task_id in task_ids]
+    every_cycle = [task_id for task_ids in cycle_owners.by_test.values() for task_id in task_ids]
     return list(dict.fromkeys((*filed, *bound, *owners, *every_cycle)))
 
 
-async def _cycle_owners(tests: Sequence[str], task_reader: TaskReader) -> dict[str, tuple[str, ...]] | Unjudgeable:
-    """Each test to every de-flake task naming it; a failed lookup leaves nothing to judge."""
+async def _cycle_owners(tests: Sequence[str], task_reader: TaskReader) -> CycleOwners | Unjudgeable:
+    """Every de-flake task naming each test; a failed lookup leaves nothing to judge."""
     owners: dict[str, tuple[str, ...]] = {}
+    unreadable: dict[str, None] = {}
     for test in tests:
-        task_ids, error = await task_reader.task_ids_with_metadata(DEBT_TEST_KEY, test)
-        if error is not None or task_ids is None:
+        matches, error = await task_reader.metadata_matches(DEBT_TEST_KEY, test)
+        if error is not None or matches is None:
             return Unjudgeable(f'task store unreadable: {DEBT_TEST_KEY}={test}: {error}')
-        owners[test] = tuple(task_ids)
-    return owners
+        owners[test] = matches.task_ids
+        unreadable.update(dict.fromkeys(matches.unreadable_ids))
+    return CycleOwners(owners, tuple(unreadable))
 
 
 def _is_lane_regression(escalation: Escalation, since: datetime) -> bool:
