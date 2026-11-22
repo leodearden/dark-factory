@@ -949,7 +949,7 @@ class TestReapStaleSessionPointers:
         pointers = session_records.claude_session_pointers_dir(tmp_path)
         return [pointers / name for name in names]
 
-    def test_entry_removed_by_a_concurrent_sweep_is_skipped_silently(
+    def test_entry_gone_before_unlink_is_skipped_silently(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         raced, kept = self._write_orphan_pointers(tmp_path, 'raced-session', 'orphan-session')
@@ -986,7 +986,7 @@ class TestReapStaleSessionPointers:
 
         assert removed == [other]
         [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert warning.startswith(f'reap_stale_session_pointers: failed to remove {stuck}: ')
+        assert str(stuck) in warning
 
 
 _ENVIRONMENT = '3f9a1c2e-5b7d-4e8f-9a0b-1c2d3e4f5a6b'

@@ -348,9 +348,9 @@ def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
     This is a separate sweep from ``reap_stale_records`` because that one
     derives identity from each record's PATH and never reads the body, so it
     cannot know which pointers name the records it removes. Returns the
-    paths this sweep removed; an entry a concurrent sweep already removed is
-    skipped silently, and any other entry that cannot be removed is logged
-    and skipped.
+    paths this sweep removed; an entry already gone when this sweep unlinks
+    it is skipped silently, and any other entry that cannot be removed is
+    logged and skipped.
     """
     return [
         *_reap_pointer_dir(session_records.session_pointers_dir(root), _is_stale_session_pointer, root),
