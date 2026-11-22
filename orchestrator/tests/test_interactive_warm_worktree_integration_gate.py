@@ -51,6 +51,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _git_fixtures import seed_repo
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
@@ -65,16 +66,6 @@ from orchestrator.warm_lane_pool import LaneState, WarmLanePool
 # escalation/tests/test_warm_worktree_verbs.py,
 # test_harness_interactive_reaper.py, test_warm_lane_integration_gate.py).
 # ---------------------------------------------------------------------------
-
-
-async def _init_repo(repo: Path) -> None:
-    """git init -b main + one initial commit."""
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 async def _add_seed_script(repo: Path, *, exit_code: int = 0) -> None:
@@ -229,9 +220,7 @@ def warm_gate(tmp_path: Path) -> WarmGate:
     — this fixture itself runs synchronously, before pytest-asyncio's own
     event loop for the (async) test function is created.
     """
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     asyncio.run(_add_seed_script(repo))
     config = _make_config(repo, max_concurrent_tasks=3)
     harness, server = _build_harness_and_server(config, tmp_path)
@@ -448,9 +437,7 @@ class TestSeedInvocationFreshCheckout:
         )
 
     async def test_absent_seed_script_is_fail_soft_cold(self, tmp_path: Path) -> None:
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
         # Deliberately do NOT commit scripts/seed-warm-lane.sh — models the
         # absent-script fail-soft path (_seed_warm_lane returns rc=127).
         # Separate repo + its own harness/server, per the plan's isolation

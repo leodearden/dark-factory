@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -52,15 +53,6 @@ def _make_harness(tmp_path: Path) -> tuple[Harness, MagicMock]:
 # ---------------------------------------------------------------------------
 # Real-repo fixtures + helpers (mirrors test_interactive_worktree_reaper.py)
 # ---------------------------------------------------------------------------
-
-
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 async def _commit_file(repo: Path, name: str, content: str, message: str) -> str:
@@ -330,9 +322,7 @@ class TestInteractiveReaperEndToEndSummarySignal:
         """Over a real repo: a TTL-expired idle worktree is reaped and gone
         from `git worktree list`; a within-TTL live worktree remains; a
         summary INFO line reports the count of worktrees reaped."""
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
 
         harness, _rs = _make_harness(repo)
         git_ops = harness.git_ops
