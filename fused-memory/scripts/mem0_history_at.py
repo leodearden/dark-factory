@@ -18,7 +18,11 @@ from pathlib import Path
 
 
 def read_only(database: Path) -> closing[sqlite3.Connection]:
-    """A read-only connection to *database*, with temp storage kept in memory."""
+    """A read-only connection to *database*, with temp storage kept in memory.
+
+    Any sqlite file opens this way, not only mem0's history.db; the soak
+    builder opens the write journal with it too.
+    """
     connection = sqlite3.connect(f'{Path(database).resolve().as_uri()}?mode=ro', uri=True)
     connection.execute('PRAGMA temp_store=MEMORY')
     return closing(connection)
