@@ -211,6 +211,7 @@ def build_settle_queue(queue_dir: Path) -> SettleQueue:
     pre += [build.closed(str(40 + n), build.ago(days=15 + n), STEWARD) for n in range(7)]
     pre += [build.closed('50', build.ago(days=25), PROMOTION)]
     pre += [build.closed('51', build.ago(days=20), WORKFLOW_DISMISSAL, late=True)]
+    pre += [build.closed('52', build.ago(days=21), REAPER_DISMISSAL, late=True)]
     return SettleQueue(queue_dir, tuple(post), tuple(pre), tuple(excluded))
 
 
@@ -236,8 +237,8 @@ def trailing_json(lines: Sequence[str]) -> dict[str, Any]:
     return json.loads(lines[-1])
 
 
-def rate(stranded: int, filed: int) -> float:
-    return round(100 * stranded / filed, 2)
+def rate(count: int, filed: int) -> float:
+    return round(100 * count / filed, 2)
 
 
 def test_trailing_json_equals_fixture_counts(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
@@ -271,15 +272,15 @@ def test_trailing_json_equals_fixture_counts(settle_queue: SettleQueue, capsys: 
         'other_promotions': 0,
         'stranded': 1,
         'stranded_per_100': rate(1, pre_filed),
-        'reaper_dismissals': 0,
-        'reaper_wrong': 0,
+        'reaper_dismissals': 1,
+        'reaper_wrong': 1,
         'startup_dismissals': 0,
         'startup_wrong': 0,
         'workflow_auto_dismissals': 1,
         'workflow_auto_wrong': 1,
-        'non_startup_dismissals': 1,
-        'non_startup_wrong': 1,
-        'non_startup_wrong_per_100': rate(1, pre_filed),
+        'non_startup_dismissals': 2,
+        'non_startup_wrong': 2,
+        'non_startup_wrong_per_100': rate(2, pre_filed),
     }
     assert payload['pending_over_h'] == 0
 
@@ -423,7 +424,7 @@ def test_non_startup_wrong_rate_bar_scales_the_pre_window_rate(
     unrounded_pre_rate = 100 * pre['non_startup_wrong'] / pre['filed']
     ratio = float(NON_STARTUP_WRONG_UNDER_PRE_BAR['ratio'])
     floor = float(NON_STARTUP_WRONG_UNDER_PRE_BAR['baseline_non_startup_wrong_per_100'])
-    assert ratio * floor < post_rate < ratio * unrounded_pre_rate
+    assert ratio * max(floor, pre['stranded_per_100']) < post_rate < ratio * unrounded_pre_rate
 
     code, lines = run_main(capsys, settle_queue.queue_dir, **NON_STARTUP_WRONG_UNDER_PRE_BAR)
 
