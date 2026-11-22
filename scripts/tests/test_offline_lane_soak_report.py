@@ -509,13 +509,14 @@ def test_a_window_with_no_filing_and_no_crossing_has_no_data_to_bound(tmp_path: 
 
 def _reproduced_and_cleared(
     project: SoakProject, at: datetime, *, cleared_row: FlakeCallSite | None, debt_fields: bool = True,
+    command: str = UNIT,
 ) -> LanePass:
     """A confirmed pass reproducing NODE_A and clearing NODE_B, with NODE_A's row and, at *cleared_row*, NODE_B's.
 
     *debt_fields* False writes its effect block as the lane did before ε2, and, as the lane did then, no row.
     """
     lane_pass = project.add_pass(
-        UNIT, at=at, detect=[failure(NODE_A), failure(NODE_B)], confirm=[failure(NODE_A)],
+        command, at=at, detect=[failure(NODE_A), failure(NODE_B)], confirm=[failure(NODE_A)],
         outcome=Confirmed(ConfirmMode.NARROWED, (NODE_A,), (NODE_B,), ()), effect=effect(tests_counted=(NODE_A,)),
         debt_fields=debt_fields,
     )
@@ -666,6 +667,27 @@ def test_a_window_with_only_passes_before_the_ledger_cut_over_has_no_ledger_data
     for note, lane_pass in zip(check['notes'], earlier, strict=True):
         assert f'{UNIT}/{lane_pass.pass_id}' in note
         assert 'not judged' in note
+
+
+def test_the_ledger_cut_over_is_read_over_every_command_not_only_the_judged_ones(tmp_path: Path, capsys):
+    project = SoakProject(tmp_path)
+    project.provision(UNIT, LINT)
+    project.add_pass(UNIT, at=T0, effect=effect())
+    lint_pass = _reproduced_and_cleared(
+        project, T0 - timedelta(hours=1), cleared_row=None, debt_fields=False, command=LINT,
+    )
+
+    code, report, _ = _report(project, capsys, '--command', LINT, '--since', (T0 - timedelta(hours=2)).isoformat())
+
+    assert code == 0
+    assert report['commands'] == [LINT]
+    assert report['ledger_cut_over'] == T0.isoformat()
+    check = _check(report, 'ledger_rows_per_pass')
+    assert (check['verdict'], check['examined']) == ('no_data', 0)
+    (note,) = check['notes']
+    assert f'{LINT}/{lint_pass.pass_id}' in note
+    assert 'not judged' in note
+    assert T0.isoformat() in note
 
 
 # --- (e) deflake_tasks_carry_evidence and (g) offered_debts_owned_or_due ---------------

@@ -14,9 +14,10 @@ Usage:
     python scripts/offline_lane_soak_report.py [--project-root ROOT] [--since ISO]
         [--command NAME ...] [--json] [--server-url URL] [--recheck-secs N]
 
---since defaults to the ledger cut-over: the start of the first pass whose effect block
-records its debts, which is when ε2 (task 6865) went live and the lane began writing
-ledger rows.  The report names it as ``ledger_cut_over``.
+--since defaults to the ledger cut-over: the start of the earliest stored pass whose
+effect block records its debts.  That is ε2's go-live (task 6865, when the lane began
+writing ledger rows) while a pre-ε2 record survives retention, otherwise the oldest
+surviving ε2-era pass.  The report names it as ``ledger_cut_over``.
 
 Verdict lines go to stderr; stdout carries the figures, or with --json the full report.
 Run it directly, never via `python -m`: it imports flat siblings in scripts/.
@@ -125,7 +126,7 @@ def _rules(settings: Settings) -> dict[Check, str]:
         'fails_in_isolation row, and every cleared test a passes_in_isolation row, at call site offline_lane '
         "observed at the pass's start (PRD 5.8); the unconfirmable pseudo-test and the unknown id are exempt; "
         'a pass started before the ledger cut-over, the earliest stored pass whose effect block records its debts '
-        '(ε2, when the lane began writing rows), is not judged and is noted',
+        "(ε2's go-live while a pre-ε2 record survives retention), is not judged and is noted",
         Check.DEFLAKE_TASKS_CARRY_EVIDENCE: 'every owner task of a debt a windowed effect block offered, whose '
         'metadata says flake_debt_call_site offline_lane, carries a flake_debt_trigger and, in its description '
         "or details, the kind and first line of one of that test's failures in the command's pass records; "
@@ -776,8 +777,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--project-root', type=Path, default=None,
                         help='project whose lane to judge (default: the main checkout)')
     parser.add_argument('--since', type=_instant, default=None,
-                        help='window start, ISO-8601 with an offset (default: the ledger cut-over, the first '
-                        'pass whose effect block records its debts)')
+                        help='window start, ISO-8601 with an offset (default: the ledger cut-over, the earliest '
+                        'stored pass whose effect block records its debts)')
     parser.add_argument('--command', action='append', default=[], dest='commands',
                         help='a lane command name to judge; repeatable (default: every command with records)')
     parser.add_argument('--json', action='store_true', help='print the full report as JSON on stdout')

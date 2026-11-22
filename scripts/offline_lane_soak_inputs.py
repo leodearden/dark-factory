@@ -316,8 +316,9 @@ def _missing_store(stores: StoreLocations) -> Unjudgeable | None:
 
 
 def _ledger_cut_over(every_pass: Sequence[StoredPass]) -> datetime | None:
-    """ε2's go-live, the first pass that wrote ledger rows: the earliest pass-id start, over every
-    command, of a stored pass whose effect block records its debts."""
+    """The earliest pass-id start, over every command, of a STORED pass whose effect block records
+    its debts: ε2's go-live while a pre-ε2 record survives retention, otherwise the oldest surviving
+    ε2-era pass.  Either way no stored pass before it wrote ledger rows."""
     return min(
         (p.started_at for p in every_pass if p.record is not None and effect_records_debts(p.record.effect)),
         default=None,
