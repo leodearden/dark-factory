@@ -329,7 +329,7 @@ _DISALLOWED_TOOLS: list[str] = [
 
 _GRANTED_TOOLS_LINE: str = (
     f'**Granted tools:** {", ".join(_ALLOWED_TOOLS)}. '
-    'Every other tool call and Bash command is denied permanently: a retry is denied again.'
+    'Every Bash command no rule above admits is denied permanently: a retry is denied again.'
 )
 
 _INVESTIGATION_ENV_OVERRIDES: Mapping[str, str] = MappingProxyType({

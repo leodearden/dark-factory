@@ -68,7 +68,7 @@ Read <worktree>/.task/iterations.jsonl  # execution log: what each agent attempt
 Also scan the `**Reviews directory:**` path from your prompt for reviewer verdict files (`*.json`).
 
 ### 1b. Git state (read-only commands only)
-You run with the task worktree as your working directory. The `**Granted tools:**` line of your prompt is your entire allowlist: any call outside it is denied without a prompt.
+You run with the task worktree as your working directory. The `**Granted tools:**` line lists every Bash command rule you hold: any shell command outside it is denied without a prompt.
 ```bash
 git log --oneline -15
 git diff main...HEAD --stat
