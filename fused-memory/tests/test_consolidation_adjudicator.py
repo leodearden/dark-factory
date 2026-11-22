@@ -44,8 +44,6 @@ from fused_memory.reconciliation.consolidation_adjudicator import (
     INPUT_TEMPLATE,
     INSTRUCTIONS,
     MAX_OUTPUT_TOKENS,
-    OUTPUT_SCHEMA,
-    TEXT_FORMAT,
     Adjudication,
     AdjudicationFailure,
     AdjudicationRequest,
@@ -62,8 +60,10 @@ from fused_memory.reconciliation.consolidation_adjudicator import (
     adjudicator_identity,
     keep_rule_holds,
     openai_model_call,
+    output_schema,
     parse_verdict,
     render_request,
+    text_format,
 )
 from fused_memory.reconciliation.consolidation_auto import (
     REASON_CODE_CLASSES,
@@ -390,36 +390,67 @@ class TestParseVerdict:
 
 class TestOutputSchema:
     def test_text_format_is_strict_json_schema(self) -> None:
-        assert set(TEXT_FORMAT) == {'type', 'name', 'strict', 'schema'}
-        assert TEXT_FORMAT['type'] == 'json_schema'
-        assert TEXT_FORMAT.get('strict') is True
-        assert isinstance(TEXT_FORMAT['name'], str) and TEXT_FORMAT['name']
-        assert TEXT_FORMAT['schema'] == OUTPUT_SCHEMA
+        sent = text_format()
+        assert set(sent) == {'type', 'name', 'strict', 'schema'}
+        assert sent['type'] == 'json_schema'
+        assert sent.get('strict') is True
+        assert isinstance(sent['name'], str) and sent['name']
+        assert sent['schema'] == output_schema()
 
     def test_strict_mode_requires_every_property_and_no_others(self) -> None:
-        assert OUTPUT_SCHEMA['type'] == 'object'
-        assert OUTPUT_SCHEMA['additionalProperties'] is False
-        assert set(OUTPUT_SCHEMA['required']) == set(OUTPUT_SCHEMA['properties'])
-        assert set(OUTPUT_SCHEMA['properties']) == {
+        schema = output_schema()
+        assert schema['type'] == 'object'
+        assert schema['additionalProperties'] is False
+        assert set(schema['required']) == set(schema['properties'])
+        assert set(schema['properties']) == {
             'decision', 'keep_member_ids', 'claim', 'reason_code', 'reason',
         }
 
     def test_the_enums_come_from_the_vocabularies(self) -> None:
-        properties = OUTPUT_SCHEMA['properties']
+        properties = output_schema()['properties']
         assert properties['decision']['enum'] == [d.value for d in Decision]
         assert properties['reason_code']['enum'] == [c.value for c in VerdictReasonCode]
 
     def test_the_schema_is_json_serialisable(self) -> None:
-        assert json.loads(json.dumps(TEXT_FORMAT)) == TEXT_FORMAT
+        sent = text_format()
+        assert json.loads(json.dumps(sent)) == sent
+
+    def test_mutating_a_returned_format_reaches_neither_the_identity_nor_the_next_call(
+        self,
+    ) -> None:
+        identity = adjudicator_identity(_settings())
+        pristine = text_format()
+        held = text_format()
+        held['strict'] = False
+        held['schema'].clear()
+        output_schema()['required'].clear()
+        assert text_format() == pristine
+        assert adjudicator_identity(_settings()) == identity
+
+
+def _words(text: str) -> set[str]:
+    return set(re.findall(r'[a-z]+(?:_[a-z]+)*', text))
+
+
+def _snake_case_words(text: str) -> set[str]:
+    return {word for word in _words(text) if '_' in word}
 
 
 class TestInstructions:
     def test_the_mixed_category_rule_is_gone(self) -> None:
         assert 'cross_category' not in INSTRUCTIONS
 
-    def test_the_k3_statements_are_present(self) -> None:
-        for phrase in ('same_referent_as_existing_topic', 'keep_member_ids', 'same_lesson'):
-            assert phrase in INSTRUCTIONS
+    def test_every_output_field_decision_and_reason_code_is_named(self) -> None:
+        vocabulary = {
+            *output_schema()['properties'],
+            *(d.value for d in Decision),
+            *(c.value for c in VerdictReasonCode),
+        }
+        assert vocabulary - _words(INSTRUCTIONS) == set()
+
+    def test_every_snake_case_name_is_an_output_field_or_a_reason_code(self) -> None:
+        known = {*output_schema()['properties'], *(c.value for c in VerdictReasonCode)}
+        assert _snake_case_words(INSTRUCTIONS) - known == set()
 
 
 def _probe(body: str) -> subprocess.CompletedProcess[str]:
@@ -477,7 +508,7 @@ class TestTheCall:
             'reasoning_effort': 'high',
             'instructions': INSTRUCTIONS,
             'user_content': render_request(request, field_chars=10),
-            'text_format': TEXT_FORMAT,
+            'text_format': text_format(),
             'max_output_tokens': MAX_OUTPUT_TOKENS,
             'timeout': 60.0,
         }]
@@ -576,6 +607,28 @@ class TestFailures:
         with pytest.raises(asyncio.CancelledError):
             await _adjudicate(ScriptedResponses(asyncio.CancelledError()))
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'fault', [KeyError('model'), TypeError('unexpected keyword'), RuntimeError('wrapper bug')],
+        ids=['KeyError', 'TypeError', 'RuntimeError'],
+    )
+    async def test_a_fault_in_the_model_call_propagates_rather_than_scoring(
+        self, fault: Exception,
+    ) -> None:
+        with pytest.raises(type(fault)):
+            await _adjudicate(ScriptedResponses(fault))
+
+    @pytest.mark.asyncio
+    async def test_a_fault_in_the_claim_check_propagates(self) -> None:
+        def check(claim: str, topic: str | None) -> list[str]:
+            raise LookupError('claim rules unavailable')
+
+        with pytest.raises(LookupError):
+            await _adjudicate(
+                ScriptedResponses(reply_json(_body(claim='Replacement claim.'))),
+                claim_check=check,
+            )
+
 
 def _config(monkeypatch, tmp_path, *, openai_section, **auto) -> FusedMemoryConfig:
     monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
@@ -627,14 +680,14 @@ class TestOpenAIModelCall:
         with patch('openai.AsyncOpenAI', return_value=client) as ctor:
             reply = await openai_model_call(config)(
                 model='gpt-6.1-sol', instructions='i', user_content='u',
-                text_format=TEXT_FORMAT, max_output_tokens=MAX_OUTPUT_TOKENS,
+                text_format=text_format(), max_output_tokens=MAX_OUTPUT_TOKENS,
                 timeout=5.0, reasoning_effort='low',
             )
         ctor.assert_called_once_with(
             api_key='sk-x', base_url='https://h.example/v1', max_retries=0,
         )
         assert reply.text == '{}'
-        assert client.responses.create.call_args.kwargs['text'] == {'format': TEXT_FORMAT}
+        assert client.responses.create.call_args.kwargs['text'] == {'format': text_format()}
 
     @pytest.mark.asyncio
     async def test_a_blank_key_is_not_forwarded(self, monkeypatch, tmp_path) -> None:
@@ -646,7 +699,23 @@ class TestOpenAIModelCall:
         client.responses.create = AsyncMock(return_value=_sdk_response())
         with patch('openai.AsyncOpenAI', return_value=client) as ctor:
             await openai_model_call(config)(
-                model='m', instructions='i', user_content='u', text_format=TEXT_FORMAT,
+                model='m', instructions='i', user_content='u', text_format=text_format(),
                 max_output_tokens=10, timeout=5.0, reasoning_effort=None,
             )
         ctor.assert_called_once_with(base_url='https://h.example/v1', max_retries=0)
+
+    def test_an_overridden_ambient_base_url_is_reported(
+        self, monkeypatch, tmp_path, caplog,
+    ) -> None:
+        config = _config(
+            monkeypatch, tmp_path,
+            openai_section=OpenAIProviderConfig(api_key='sk-x', api_url='https://h.example/v1'),
+        )
+        monkeypatch.setenv('OPENAI_BASE_URL', f'https://ambient-{tmp_path.name}.example/v1')
+        with caplog.at_level('WARNING'):
+            openai_model_call(config)
+        assert any(
+            'consolidation adjudicator' in record.getMessage()
+            and 'OPENAI_BASE_URL' in record.getMessage()
+            for record in caplog.records
+        )

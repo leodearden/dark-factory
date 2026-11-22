@@ -1,8 +1,9 @@
 """The consolidation adjudicator: one LLM ruling on one proposal (plans/consolidation-adjudicator-prd.md K3).
 
-A function of its typed request. The instructions, the input template and the
-strict output schema are module constants; :func:`adjudicator_identity` hashes
-them with every setting that can change a verdict or what code does with it.
+A function of its typed request. The instructions and the input template are
+module constants and the strict output schema is built afresh per use;
+:func:`adjudicator_identity` hashes them with every setting that can change a
+verdict or what code does with it.
 K1's keep rule lives here too, because the executor and the calibration both
 apply it to a kept list. Imports no executor code.
 """
@@ -19,6 +20,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.llm.list_prices import list_price
 from fused_memory.llm.openai_responses import (
     ResponsesCall,
@@ -33,9 +35,10 @@ from fused_memory.reconciliation.consolidation_auto import (
 )
 
 if TYPE_CHECKING:
+    import openai
     from openai.types.responses import ResponseFormatTextJSONSchemaConfigParam
 
-    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.config.schema import FusedMemoryConfig, ReasoningEffort
 
 
 INSTRUCTIONS = """\
@@ -125,26 +128,34 @@ class VerdictReasonCode(StrEnum):
     insufficient_information = 'insufficient_information'
 
 
-#: Strict structured output: every property required, no others (OpenAI strict mode).
-OUTPUT_SCHEMA: dict[str, Any] = {
-    'type': 'object',
-    'properties': {
-        'decision': {'type': 'string', 'enum': [d.value for d in Decision]},
-        'keep_member_ids': {'type': 'array', 'items': {'type': 'string'}},
-        'claim': {'type': ['string', 'null']},
-        'reason_code': {'type': 'string', 'enum': [c.value for c in VerdictReasonCode]},
-        'reason': {'type': 'string'},
-    },
-    'required': ['decision', 'keep_member_ids', 'claim', 'reason_code', 'reason'],
-    'additionalProperties': False,
-}
+def output_schema() -> dict[str, Any]:
+    """Strict structured output: every property required, no others (OpenAI strict mode).
 
-TEXT_FORMAT: ResponseFormatTextJSONSchemaConfigParam = {
-    'type': 'json_schema',
-    'name': 'consolidation_adjudication',
-    'strict': True,
-    'schema': OUTPUT_SCHEMA,
-}
+    Built afresh on each call, so no holder's mutation can reach the identity
+    or a later request.
+    """
+    return {
+        'type': 'object',
+        'properties': {
+            'decision': {'type': 'string', 'enum': [d.value for d in Decision]},
+            'keep_member_ids': {'type': 'array', 'items': {'type': 'string'}},
+            'claim': {'type': ['string', 'null']},
+            'reason_code': {'type': 'string', 'enum': [c.value for c in VerdictReasonCode]},
+            'reason': {'type': 'string'},
+        },
+        'required': ['decision', 'keep_member_ids', 'claim', 'reason_code', 'reason'],
+        'additionalProperties': False,
+    }
+
+
+def text_format() -> ResponseFormatTextJSONSchemaConfigParam:
+    """The ``text.format`` every adjudicator call sends, carrying :func:`output_schema`; fresh per call."""
+    return {
+        'type': 'json_schema',
+        'name': 'consolidation_adjudication',
+        'strict': True,
+        'schema': output_schema(),
+    }
 
 MAX_OUTPUT_TOKENS = 4000
 
@@ -287,7 +298,7 @@ class AdjudicatorSettings:
     """The configuration one adjudication runs under."""
 
     model: str
-    reasoning_effort: str | None
+    reasoning_effort: ReasoningEffort | None
     #: ``host[:port]`` the call goes to, or None for the SDK's default endpoint.
     endpoint_host: str | None
     timeout_seconds: float
@@ -334,7 +345,7 @@ def adjudicator_identity(settings: AdjudicatorSettings) -> str:
         'endpoint_host': settings.endpoint_host,
         'instructions': INSTRUCTIONS,
         'input_template': dataclasses.asdict(INPUT_TEMPLATE),
-        'output_schema': OUTPUT_SCHEMA,
+        'output_schema': output_schema(),
         'max_output_tokens': MAX_OUTPUT_TOKENS,
         'field_chars': settings.field_chars,
         'member_max': settings.member_max,
@@ -367,7 +378,7 @@ class VerdictInvalid(ValueError):
     """A reply that is not a verdict; the message says why."""
 
 
-_VERDICT_KEYS = frozenset(OUTPUT_SCHEMA['properties'])
+_VERDICT_KEYS = frozenset(output_schema()['properties'])
 
 
 _E = TypeVar('_E', bound=StrEnum)
@@ -434,7 +445,11 @@ def parse_verdict(text: str, request: AdjudicationRequest, claim_check: ClaimChe
 
 def openai_model_call(config: FusedMemoryConfig) -> ResponsesCall:
     """The production model call: the endpoint :meth:`AdjudicatorSettings.from_config` names, one attempt."""
-    return functools.partial(call_openai_responses, _openai_client_kwargs(config), max_retries=0)
+    client_kwargs = _openai_client_kwargs(config)
+    warn_if_ambient_base_url_is_overridden(
+        client_kwargs.get('base_url'), context='consolidation adjudicator',
+    )
+    return functools.partial(call_openai_responses, client_kwargs, max_retries=0)
 
 
 class FailureKind(StrEnum):
@@ -475,14 +490,17 @@ class AdjudicationFailure:
 AdjudicationResult = Adjudication | AdjudicationFailure
 
 
-def classify_failure(exc: BaseException) -> FailureKind:
-    """Transport when no reply arrived; content otherwise.
+def classify_failure(exc: TimeoutError | openai.OpenAIError) -> FailureKind:
+    """Which side of K3's partition a failed call falls on.
 
-    K3's transport list (a timeout, a connection failure, a 429, a 5xx) plus the
-    failures that refuse the call before any model answers: a rejected key (401),
-    a denied permission (403), and an SDK client that could not be built (a bare
-    ``OpenAIError``, e.g. no key). Scoring those as content would let an account
-    outage retire the identity, which K5 says a provider outage never does.
+    Transport: the provider or the network did not answer. That is K3's list (a
+    timeout, a connection failure, a 429, a 5xx) plus the refusals that come
+    before any model answers: a rejected key (401), a denied permission (403),
+    and an SDK client that could not be built (a bare ``OpenAIError``, e.g. no
+    key). Scoring those as content would let an account outage retire the
+    identity, which K5 says a provider outage never does.
+
+    Content: the request or the reply is at fault, e.g. a 400.
     """
     import openai
 
@@ -529,8 +547,12 @@ async def adjudicate(
 ) -> AdjudicationResult:
     """One model call on *request*, its reply parsed into a verdict or a typed failure.
 
-    Exactly one attempt: retrying is the caller's choice. A cancellation propagates.
+    Exactly one attempt: retrying is the caller's choice. Only a timeout or an
+    SDK error becomes a failure; any other exception is a fault in the code,
+    not in the model, and propagates, as a cancellation does.
     """
+    import openai
+
     user_content = render_request(request, field_chars=settings.field_chars)
     started = time.monotonic()
     try:
@@ -538,12 +560,12 @@ async def adjudicate(
             model=settings.model,
             instructions=INSTRUCTIONS,
             user_content=user_content,
-            text_format=TEXT_FORMAT,
+            text_format=text_format(),
             max_output_tokens=MAX_OUTPUT_TOKENS,
             timeout=settings.timeout_seconds,
             reasoning_effort=settings.reasoning_effort,
         )
-    except Exception as exc:
+    except (TimeoutError, openai.OpenAIError) as exc:
         return AdjudicationFailure(
             kind=classify_failure(exc), detail=f'{type(exc).__name__}: {exc}', meta=None,
         )

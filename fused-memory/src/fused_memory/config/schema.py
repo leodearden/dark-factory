@@ -2812,10 +2812,12 @@ def _default_curator_usage_cap() -> UsageCapConfig:
     )
 
 
-#: The reasoning efforts the write-triage judge may send on the Responses API.
-#: The single home of that vocabulary: the judge's resolver reads it with
-#: ``typing.get_args`` rather than restating the words.
-JudgeReasoningEffort = Literal['none', 'low', 'medium', 'high']
+#: The reasoning efforts a caller may send on the OpenAI Responses API.
+#: The single home of that vocabulary: the write-triage judge's resolver reads
+#: it with ``typing.get_args`` rather than restating the words.
+ReasoningEffort = Literal['none', 'low', 'medium', 'high']
+#: The write-triage judge's name for :data:`ReasoningEffort`.
+JudgeReasoningEffort = ReasoningEffort
 
 
 def _require_cutoffs_in_unit_range(
@@ -3754,7 +3756,7 @@ class ConsolidationAutoConfig(BaseModel):
             'hot-reloadable. plans/consolidation-adjudicator-prd.md K3, K7.'
         ),
     )
-    adjudicator_reasoning_effort: JudgeReasoningEffort | None = Field(
+    adjudicator_reasoning_effort: ReasoningEffort | None = Field(
         default='low',
         description=(
             "The adjudicator model's reasoning effort, or null for a "
