@@ -1626,15 +1626,16 @@ def test_gates_family_row_does_not_restate_the_invariant_family() -> None:
     text = GATES_DOC.read_text(encoding="utf-8")
     source = _repo_relative(GATES_DOC)
     row = dark_factory_family_row(text)
-    canonical = set(canonical_slugs())
-    restated = sorted(set(slugs_in_span(row)) & canonical)
+    restated = sorted(slug for slug in canonical_slugs() if slug in row)
     normative = _repo_relative(NORMATIVE_DOC)
 
     assert not restated, (
         f"{source}: the `| dark-factory |` family-inventory row names invariant "
         f"slug(s) {restated} (task 7136). {normative} is the single normative "
         f"copy, so a list here is one more site to update by hand on every new "
-        f"invariant. Replace the copy with a pointer to {normative}."
+        f"invariant. Replace the copy with a pointer to the normative doc that "
+        f"*Application* names, not with its filename on the row (see this "
+        f"test's docstring)."
     )
 
 
