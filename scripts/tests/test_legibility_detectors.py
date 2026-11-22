@@ -17,6 +17,7 @@ from legibility_carrier_fixtures import (
     PROSE_QUOTING_THE_SCHEMA,
     SDK_GUI_CLIENT_HUMAN_TURNS,
     TRICKLE_CODER_PREAMBLE,
+    UNMARKED_HEADLESS_SDK_PROMPT_TEXTS,
     UNMARKED_HEADLESS_SDK_PROMPTS,
     assistant_record,
     briefing_text,
@@ -631,6 +632,13 @@ def _coder_prompt(digest_line):
     return coder.build_prompt(digest_text=digest_line, codebook_index='', invariant_slugs=())
 
 
+_MARKERLESS_HEADLESS_PROMPTS = [
+    pytest.param(UNMARKED_HEADLESS_SDK_PROMPT_TEXTS[name], id=name)
+    for name in ('link_adjudicator', 'path_scope_adjudicator', 'task_curator_candidate')
+]
+"""The headless prompts no marker names: dry_run_unblock's 'Task ID:' /
+'Worktree:' preamble is an orchestrated-task marker."""
+
 _READ_OF_MARKER_SOURCE = (
     user_record('why did the sampler restratify my session?'),
     assistant_record(tool_use_block(
@@ -648,13 +656,13 @@ class TestAgentClassVocabulary:
     def test_agent_classes_are_the_strata_plus_unknown(self):
         assert [c.value for c in AgentClass] == [
             'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
-            'legibility-instrument', 'unknown',
+            'unattended', 'legibility-instrument', 'unknown',
         ]
 
     def test_the_sampler_strata_are_every_class_but_unknown(self):
         assert sampling.STRATA == (
             'recon', 'curator-classifier', 'watcher', 'orchestrated-task', 'interactive',
-            'legibility-instrument',
+            'unattended', 'legibility-instrument',
         )
 
 
@@ -755,6 +763,28 @@ class TestClassifyAgentClass:
             AgentClass.INTERACTIVE
         )
 
+    @pytest.mark.parametrize('text', _MARKERLESS_HEADLESS_PROMPTS)
+    def test_a_markerless_headless_session_is_unattended(self, text):
+        assert _classify(sdk_prompt(text), assistant_record(text_block('done'))) is AgentClass.UNATTENDED
+
+    def test_a_session_whose_only_turn_is_harness_injected_is_unattended(self):
+        assert _classify(user_record(briefing_text())) is AgentClass.UNATTENDED
+
+    def test_records_without_any_user_turn_are_unattended(self):
+        assert _classify(tool_result_record('tu-1', 'ok')) is AgentClass.UNATTENDED
+
+    def test_a_dialogue_turn_after_an_injected_first_turn_is_interactive(self):
+        records = [sdk_prompt('link the two memories'), user_record('actually, stop and explain')]
+
+        assert _classify(*records) is AgentClass.INTERACTIVE
+
+    @pytest.mark.parametrize(('text', 'entrypoint'), SDK_GUI_CLIENT_HUMAN_TURNS)
+    def test_a_gui_client_human_turn_is_interactive(self, text, entrypoint):
+        assert _classify(sdk_prompt(text, entrypoint=entrypoint)) is AgentClass.INTERACTIVE
+
+    def test_a_marker_still_precedes_the_dialogue_fallback(self):
+        assert _classify(sdk_prompt('## Reconciliation Run\nStage 1: sync\n')) is AgentClass.RECON
+
     def test_a_lone_worktree_mention_stays_interactive(self):
         # Both task-preamble lines must co-occur: 'Worktree:' alone is
         # ordinary prose in this project.
@@ -819,6 +849,19 @@ class TestAgentClassEvidence:
         )
 
         assert evidence.first_turn_text == ''
+
+    def test_a_dialogue_turn_is_recorded_whichever_class_wins(self):
+        records = [
+            user_record('<command-name>recon-escalation-watcher</command-name>'),
+            user_record('please check the queue'),
+        ]
+        evidence = detectors.AgentClassEvidence.for_path(_MAIN_DIR_PATH)
+
+        for record in records:
+            evidence = evidence.observe(record)
+
+        assert evidence.agent_class is AgentClass.WATCHER
+        assert evidence.has_dialogue_turn is True
 
     def test_observing_returns_new_evidence_and_leaves_the_old_unchanged(self):
         before = detectors.AgentClassEvidence.for_path(_MAIN_DIR_PATH)
@@ -927,6 +970,11 @@ _SHAPES = [
         '-home-leo-src-dark-factory', [user_record('please fix the parser')], 'interactive',
         id='no_marker',
     ),
+    pytest.param(
+        '-home-leo-src-dark-factory',
+        [sdk_prompt('please fix the parser'), assistant_record(text_block('done'))],
+        'unattended', id='headless_no_marker',
+    ),
     pytest.param('-home-leo-src-dark-factory', [], 'unknown', id='empty'),
     pytest.param(
         '-home-leo-src-dark-factory',
@@ -955,18 +1003,34 @@ _SHAPES = [
 ]
 
 
-@pytest.mark.parametrize(('encoded', 'records', 'expected'), _SHAPES)
-def test_sampler_stratum_and_digest_agent_class_agree(tmp_path, encoded, records, expected):
+def _write_session(tmp_path, encoded, records):
     directory = tmp_path / encoded
     directory.mkdir()
     path = directory / 'sess.jsonl'
     path.write_text(''.join(json.dumps(record) + '\n' for record in records))
-    session = inventory.SessionRecord(
+    return inventory.SessionRecord(
         path=path, encoded_dir=encoded, cwd='/home/leo/src/dark-factory',
         date=date(2026, 10, 11), size_bytes=path.stat().st_size,
     )
 
+
+@pytest.mark.parametrize(('encoded', 'records', 'expected'), _SHAPES)
+def test_sampler_stratum_and_digest_agent_class_agree(tmp_path, encoded, records, expected):
+    session = _write_session(tmp_path, encoded, records)
+
     stratum = sampling.score_session(session).stratum
-    rendered = coder.parse_frontmatter(digest.build_digest(path))['agent_class']
+    rendered = coder.parse_frontmatter(digest.build_digest(session.path))['agent_class']
 
     assert stratum == rendered == expected
+
+
+@pytest.mark.parametrize(('encoded', 'records', 'expected'), _SHAPES)
+def test_an_interactive_digest_has_user_turns_and_an_unattended_one_none(
+    tmp_path, encoded, records, expected,
+):
+    front = coder.parse_frontmatter(digest.build_digest(_write_session(tmp_path, encoded, records).path))
+
+    if front['agent_class'] == 'interactive':
+        assert front['n_user_turns'] > 0
+    if front['agent_class'] == 'unattended':
+        assert front['n_user_turns'] == 0
