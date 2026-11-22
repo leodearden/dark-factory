@@ -992,7 +992,7 @@ def _load_replay_inputs(args: argparse.Namespace) -> list[dict[str, Any]]:
     return rows
 
 
-def _arm_clients(arms: Sequence[ReplayArm], llm_factory: LlmFactory) -> ArmClients | None:
+def build_arm_clients(arms: Sequence[ReplayArm], llm_factory: LlmFactory) -> ArmClients | None:
     """One client per distinct arm ExtractionLlm, in first-seen order; None if any has none.
     The factory raises ArmClientMismatch for a client it cannot build."""
     clients: dict[ExtractionLlm, LLMClient] = {}
@@ -1060,7 +1060,7 @@ async def _replay_command(args: argparse.Namespace, llm_factory: LlmFactory, rea
         logger.error('invalid inputs, nothing is written: %s', exc)
         return EXIT_INVALID
     try:
-        arm_clients = _arm_clients([ARMS[name] for name in dict.fromkeys(args.arm)], llm_factory)
+        arm_clients = build_arm_clients([ARMS[name] for name in dict.fromkeys(args.arm)], llm_factory)
         for arm, llm in arm_clients or ():
             await check_arm_client(llm, arm)
     except (ArmClientMismatch, UnmeasurableClient) as exc:

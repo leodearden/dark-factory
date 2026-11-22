@@ -326,9 +326,12 @@ async def run_site_fixtures(
     """Run every (arm, fixture) *out* does not already hold, appending one line each; returns the failures.
 
     *out* is resumed as replay_overreach_extraction's replay file is: its run
-    lines are kept and its failure lines dropped, so a rerun retries exactly them.
+    lines are kept and *site*'s failure lines dropped, so a rerun retries exactly
+    them. Every site shares one *out*, so another site's failure lines are kept.
     """
-    kept = [r for r in read_jsonl(out) if r.get('kind') == RecordKind.replayed] if out.exists() else []
+    kept = [
+        r for r in read_jsonl(out) if r.get('kind') == RecordKind.replayed or r.get('site') != site
+    ] if out.exists() else []
     write_files_atomically({out: jsonl_text(kept)})
     done = {record_key(record) for record in kept}
     failures = 0

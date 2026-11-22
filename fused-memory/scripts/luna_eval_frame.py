@@ -6,7 +6,8 @@ category, with the 4716 audit's own hash rule and window semantics, so
 replay_overreach_extraction.py replays and scores it unchanged. Graphs are read
 over GRAPH.RO_QUERY only, through fused_memory/backends/falkor_read_only.py's
 ReadOnlyGraphReader; episode bodies are read only for sampled episodes, and only
-the worksheet carries them, never the frame. The classifier and router
+the extraction worksheet and the summary inputs carry them, never the frame or a
+fixture manifest. The classifier and router
 fixtures come from the write journal, opened read-only, and keep only inputs
 the production WriteClassifier and ReadRouter send to their LLM.
 """
@@ -19,7 +20,7 @@ import os
 import sqlite3
 import sys
 from collections import defaultdict
-from collections.abc import Awaitable, Iterable, Mapping
+from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,6 +46,7 @@ from audit_ruling_overreach import (
     sample_key,
     stored_instant,
 )
+from replay_overreach_extraction import EpisodeContextReader
 
 # --------------------------------------------------------------------------- #
 # The extraction frame
@@ -399,6 +401,105 @@ async def summary_fixtures(
             if item['graph'] == graph:
                 item['episode_content_sha256'] = _sha256(contents[item['episode_uuid']])
     return items
+
+
+ENTITY_SUMMARY_CYPHER = 'MATCH (n:Entity) WHERE n.uuid IN $uuids RETURN n.uuid, n.summary'
+EDGE_FACT_CYPHER = (
+    'MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity) WHERE r.uuid IN $uuids RETURN r.uuid, a.uuid, b.uuid, r.fact'
+)
+
+
+class SummaryInputsMismatch(ValueError):
+    """Summary inputs whose text is not what the summary_fixtures manifest hashed."""
+
+
+SummaryIdentity = tuple[str, str, str, str, str, tuple[str, ...]]
+"""``(graph, episode, node, summary sha256, episode content sha256, sorted edge uuids)``."""
+
+
+def _manifest_identity(item: Mapping[str, Any]) -> SummaryIdentity:
+    return (item['graph'], item['episode_uuid'], item['node_uuid'], item['summary_sha256'],
+            item['episode_content_sha256'], tuple(sorted(item['edge_uuids'])))
+
+
+def _restored_identities(fixture: Mapping[str, Any]) -> list[SummaryIdentity]:
+    content = _sha256(fixture['episode_content'])
+    return [
+        (fixture['graph'], fixture['episode_uuid'], node['node_uuid'], _sha256(node['summary']), content,
+         tuple(sorted(edge['uuid'] for edge in fixture['edges']
+                      if node['node_uuid'] in (edge['source_node_uuid'], edge['target_node_uuid']))))
+        for node in fixture['nodes']
+    ]
+
+
+def check_summary_inputs(items: Sequence[Mapping[str, Any]], inputs: Sequence[Mapping[str, Any]]) -> None:
+    """Raise SummaryInputsMismatch unless *inputs* restore exactly the manifest *items*, in order, to
+    the episode bodies and summaries the manifest hashed."""
+    restored = [identity for fixture in inputs for identity in _restored_identities(fixture)]
+    expected = [_manifest_identity(item) for item in items]
+    if restored != expected:
+        differing = sorted({'/'.join(identity[:3]) for identity in set(restored) ^ set(expected)})
+        raise SummaryInputsMismatch(
+            f'the summary inputs do not restore the manifest: {differing or "the items are out of order"}',
+        )
+
+
+async def _text_by_uuid(
+    graph: str, reader: ReadOnlyGraphReader, cypher: str, uuids: Sequence[str],
+) -> dict[str, list[Any]]:
+    """uuid -> the rest of its row; a uuid the graph no longer holds refuses the frame."""
+    rows = {str(row[0]): list(row[1:]) for row in await reader.read_unpaged(cypher, {'uuids': list(uuids)})}
+    if missing := sorted(set(uuids) - rows.keys()):
+        raise FrameReadIncomplete(f'{graph}: sampled records vanished before their text was read: {missing}')
+    return rows
+
+
+async def _summary_input(
+    graph: str, reader: ReadOnlyGraphReader, episode: str, items: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    content = (await _contents(graph, reader, [episode]))[episode]
+    summaries = await _text_by_uuid(graph, reader, ENTITY_SUMMARY_CYPHER, [item['node_uuid'] for item in items])
+    edge_uuids = list(dict.fromkeys(uuid for item in items for uuid in item['edge_uuids']))
+    edges = await _text_by_uuid(graph, reader, EDGE_FACT_CYPHER, edge_uuids)
+    context = await EpisodeContextReader(reader).read(
+        {'graph': graph, 'uuid': episode, 'stratum': 'summaries', 'content': content},
+    )
+    return {
+        'graph': graph, 'episode_uuid': episode, 'episode_valid_at': items[0]['episode_valid_at'],
+        'episode_content': content,
+        'nodes': [
+            {'node_uuid': item['node_uuid'], 'node_name': item['node_name'],
+             'summary': _text(summaries[item['node_uuid']][0]) or ''}
+            for item in items
+        ],
+        'edges': [
+            {'uuid': uuid, 'source_node_uuid': str(edges[uuid][0]), 'target_node_uuid': str(edges[uuid][1]),
+             'fact': _text(edges[uuid][2]) or ''}
+            for uuid in edge_uuids
+        ],
+        'previous': list(context.previous),
+    }
+
+
+async def summary_inputs(
+    readers: Mapping[str, ReadOnlyGraphReader], items: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """luna_eval_sites.run_summaries' fixture for each episode of the summary_fixtures *items*: their
+    episode body, node summaries, edge facts and previous-episode contents, read once, when the frame is
+    drawn. These carry bodies, so they are kept apart from the committed manifest, which hashes them.
+    A graph that changed between the draw and this read refuses the frame."""
+    by_episode: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for item in items:
+        by_episode.setdefault((item['graph'], item['episode_uuid']), []).append(item)
+    restored = [
+        await _summary_input(graph, readers[graph], episode, episode_items)
+        for (graph, episode), episode_items in by_episode.items()
+    ]
+    try:
+        check_summary_inputs(items, restored)
+    except SummaryInputsMismatch as exc:
+        raise FrameReadIncomplete(f'the graph changed while the frame was drawn: {exc}') from exc
+    return restored
 
 
 # --------------------------------------------------------------------------- #

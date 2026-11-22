@@ -401,7 +401,9 @@ class TestFrame:
 
             def _by_uuid(self, cypher: str, wanted: Sequence[str]) -> list[list[Any]]:
                 rows = super()._by_uuid(cypher, wanted)
-                return [[row[0], row[1] + ' since edited'] for row in rows] if ':Entity' in cypher else rows
+                if ':RELATES_TO' in cypher or ':Entity' not in cypher:
+                    return rows
+                return [[row[0], row[1] + ' since edited'] for row in rows]
 
         ev = _Eval(tmp_path)
         assert _frame(ev, _Drifting()) == 1
