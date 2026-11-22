@@ -587,6 +587,21 @@ def is_primary_user_turn(record: Mapping[str, Any], *, subagent_transcript: bool
     )
 
 
+def dialogue_turn_text(record: Mapping[str, Any]) -> str | None:
+    """The text of a turn a human addressed to this session, None for any
+    other record: the single rule behind the digest's gold user turns and
+    n_user_turns, and the classifier's INTERACTIVE.
+
+    Main chain only, since no human types on a sub-agent's chain.
+    """
+    if not is_primary_user_turn(record):
+        return None
+    text = user_turn_text(record)
+    if text is None or is_non_dialogue_carrier(record, text):
+        return None
+    return text
+
+
 def _sighted(text: str, literals: AbstractSet[str]) -> frozenset[str]:
     lowered = text.lower()
     return frozenset(literal for literal in literals if literal in lowered)
