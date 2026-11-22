@@ -7076,10 +7076,6 @@ class GitOps:
         # (which is still checked out at this lane) before resetting it.
         # 1912 branch-retention preserves the committed WIP so the resumed
         # victim recovers it via the reattach path.
-        # ``victim_branch`` is the pool key (the task id), not a git branch. It
-        # is rendered as ``[lane <id>]`` because ``(<id>)`` / ``task/<id>``
-        # match DEFAULT_COMMIT_CITATION_PATTERN and would make this WIP commit
-        # read as a landing of the victim task.
         try:
             await self.commit(
                 lane,
