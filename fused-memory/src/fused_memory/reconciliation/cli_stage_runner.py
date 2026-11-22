@@ -24,6 +24,7 @@ from fused_memory.reconciliation import (
     _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
     RECONCILIATION_CLI_ENV_OVERRIDES,
     RECONCILIATION_CLI_SETTING_SOURCES,
+    RECONCILIATION_WORK_CLASS,
 )
 from fused_memory.reconciliation.sandbox_guard import (
     RemediationSandboxUnavailable,
@@ -965,6 +966,7 @@ async def run_stage_via_cli(
             strict_mcp_config=True,
             setting_sources=list(RECONCILIATION_CLI_SETTING_SOURCES),
             env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
+            work_class=RECONCILIATION_WORK_CLASS,
             output_schema=output_schema,  # PRD γ: pass None straight through when caller opts out
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
