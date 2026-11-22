@@ -292,7 +292,7 @@ class TestBriefingArms:
             ReviewBriefing.DIFF_ONLY, ReviewBriefing.CONTEXT_COMPLETE,
         ] * 2
 
-    def test_a_d2_trial_role_is_the_production_d2_role_plus_jcodemunch(self) -> None:
+    def test_a_d2_trial_role_is_the_production_d2_role(self) -> None:
         spec = VARIANT_A.reviewers[0]
         role = build_trial_reviewer_role(spec, ReviewBriefing.CONTEXT_COMPLETE)
         production = build_reviewer_role(
@@ -301,14 +301,14 @@ class TestBriefingArms:
 
         assert role.prompt_harness_version == 'reviewer-d2-v2'
         assert role.system_prompt == production.system_prompt
-        assert role.allowed_tools == [*production.allowed_tools, 'mcp__jcodemunch__*']
+        assert role.allowed_tools == production.allowed_tools
         assert (role.default_model, role.default_budget) == (spec.model, spec.budget)
 
-    def test_a_diff_only_trial_role_is_the_production_incumbent_plus_jcodemunch(self) -> None:
+    def test_a_diff_only_trial_role_is_the_production_incumbent(self) -> None:
         spec = VARIANT_A.reviewers[0]
         role = build_trial_reviewer_role(spec)
         production = build_reviewer_role(spec.name, spec.specialization)
 
         assert role.prompt_harness_version == production.prompt_harness_version
         assert role.system_prompt == production.system_prompt
-        assert role.allowed_tools == [*production.allowed_tools, 'mcp__jcodemunch__*']
+        assert role.allowed_tools == production.allowed_tools
