@@ -34,6 +34,15 @@ non-empty — and a report with anything to repair renders
 :func:`stamping_action_required` lines, which ``commit_planning`` attaches as
 ``manifest_stamping_action_required`` and this module logs once at WARNING.
 
+Sidecar root: when ``commit_planning`` is given a ``manifest_root`` (a linked
+worktree of the project's repository that holds a PRD family not yet on main),
+the sidecar is selected, read, containment-checked and stamped under that
+root instead of ``project_root``. Paths stay relative to it, and the stamped
+file is left uncommitted there exactly as it would be in the main checkout.
+The task store, the polarity lint and corpus indexing stay on
+``project_root``. Which worktrees are accepted is
+:mod:`fused_memory.server.manifest_root`'s contract.
+
 I/O contract: every filesystem and YAML step runs in one ``asyncio.to_thread``
 hop, and a process-wide lock serializes each sidecar read-modify-write.
 
@@ -154,6 +163,7 @@ async def stamp_capability_manifests(
     tasks_data: list[Any],
     task_interceptor: Any,
     agent_id: str | None = None,
+    manifest_root: Path | None = None,
 ) -> dict[str, Any] | None:
     """Stamp task_ids and copy mechanical delivered_checks for a commit_planning batch.
 
@@ -174,6 +184,9 @@ async def stamp_capability_manifests(
             call earlier in the same handler is likewise un-attributed — so
             that call site intentionally passes ``None`` here; that is
             parity with the existing handler, not a missed wiring.
+        manifest_root: An already-accepted worktree root of
+            ``project_root``'s repository to select, read and stamp the
+            sidecar under; ``None`` searches ``project_root``.
 
     Returns:
         ``None`` when no batch task carries a non-empty ``prd_path``, or
@@ -201,6 +214,7 @@ async def stamp_capability_manifests(
             tasks_data=tasks_data,
             task_interceptor=task_interceptor,
             agent_id=agent_id,
+            manifest_root=manifest_root,
         )
     except Exception as exc:  # pragma: no cover - structural backstop, see docstring above
         logger.error(
@@ -224,6 +238,7 @@ async def _stamp_capability_manifests_impl(
     tasks_data: list[Any],
     task_interceptor: Any,
     agent_id: str | None = None,
+    manifest_root: Path | None = None,
 ) -> dict[str, Any] | None:
     """Implementation for :func:`stamp_capability_manifests` — see there for the contract.
 
@@ -257,7 +272,9 @@ async def _stamp_capability_manifests_impl(
 
     # 2-4 touch the filesystem and parse YAML, so they run off the event
     # loop in one hop — see _stamp_sidecar_on_disk.
-    outcome = await asyncio.to_thread(_stamp_sidecar_on_disk, project_root, prd_bound)
+    outcome = await asyncio.to_thread(
+        _stamp_sidecar_on_disk, manifest_root or Path(project_root), prd_bound,
+    )
     if outcome is None:
         return None
     sidecar_rel = outcome.sidecar_rel
@@ -361,7 +378,7 @@ async def _stamp_capability_manifests_impl(
                 lint_delivered_checks,
                 [{**check_meta, 'manifest_path': sidecar_rel} for check_meta in mechanical],
                 files=files_by_task_id.get(tid, []),
-                repo_root=str(outcome.root),
+                repo_root=project_root,
                 ref=GATE_REF,
             )
             refused = {f.check_name: f for f in findings if f.severity == 'reject'}
@@ -616,15 +633,15 @@ def _labels_bound_to(prd_bound: Sequence[_PrdBoundTask], sidecar_rel: str) -> di
 
 
 def _stamp_sidecar_on_disk(
-    project_root: str, prd_bound: Sequence[_PrdBoundTask]
+    sidecar_root: Path, prd_bound: Sequence[_PrdBoundTask]
 ) -> _SidecarOutcome | None:
     """Steps 2-4, synchronous: select the batch's sidecar, load it, stamp it.
 
     Returns None when no derived sidecar is both contained under
-    *project_root* and present on disk — the coroutine's complete no-op.
+    *sidecar_root* and present on disk — the coroutine's complete no-op.
     Run via ``asyncio.to_thread``; never call it on the event loop.
     """
-    root = Path(project_root).resolve()
+    root = sidecar_root.resolve()
     sidecar_rel, selection_errors = _select_sidecar(root, prd_bound)
     if sidecar_rel is None:
         return None
@@ -640,12 +657,12 @@ def _select_sidecar(
 ) -> tuple[str | None, tuple[str, ...]]:
     """Step 2: choose the one sidecar this batch stamps, plus the errors naming the rest."""
     # Keep only distinct rel paths (insertion order) that stay CONTAINED
-    # under project_root and whose file actually exists on disk. prd_path is
-    # author-controlled task metadata (set by the /prd decompose skill, read
-    # here without re-validation) — an absolute path or one containing '../'
-    # would otherwise let both the read and the step-4 write-back escape
-    # project_root, so every candidate is resolved and containment-checked
-    # before it is ever stat-ed.
+    # under the sidecar root and whose file actually exists on disk. prd_path
+    # is author-controlled task metadata (set by the /prd decompose skill,
+    # read here without re-validation) — an absolute path or one containing
+    # '../' would otherwise let both the read and the step-4 write-back
+    # escape the sidecar root, so every candidate is resolved and
+    # containment-checked before it is ever stat-ed.
     seen_rel_paths = list(dict.fromkeys(task.sidecar_rel for task in prd_bound))
     unsafe_rel_paths: list[str] = []
     existing_rel_paths: list[str] = []

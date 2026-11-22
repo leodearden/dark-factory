@@ -10211,6 +10211,7 @@ def create_mcp_server(
         target_status: str = 'pending',
         deferral: dict | None = None,
         agent_id: str | None = None,
+        manifest_root: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Commit a batch of tasks created via ``submit_task(planning_mode=True)``.
@@ -10239,6 +10240,11 @@ def create_mcp_server(
                 is echoed per id as ``deferral``.
             agent_id: Which agent is committing (optional, auto-derived from
                 MCP context); a re-stamp records it as ``stamped_by``.
+            manifest_root: Absolute path of a git worktree of
+                *project_root*'s repository that holds the batch's PRD family
+                (a PRD not yet on main). Its capability-manifest sidecar is
+                the one stamped. Omitted, the sidecar is searched for in
+                *project_root*.
 
         RELEASE RULE (``pending``/``cancelled``): only a ``planning`` hold, or a
         row with no record, is released. Any other hold is refused per id with
@@ -10461,6 +10467,7 @@ def create_mcp_server(
                 tasks_data=list(tasks_data),
                 task_interceptor=task_interceptor,
                 agent_id=agent_id,
+                manifest_root=Path(manifest_root) if manifest_root is not None else None,
             )
             if manifest_report is not None and isinstance(result, dict):
                 result['manifest_stamping'] = manifest_report
