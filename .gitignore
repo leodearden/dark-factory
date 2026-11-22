@@ -64,20 +64,29 @@ mutants/
 /orchestrator/df_pytest_isolation.py
 
 # ── Test SQLite artifacts — MagicMock path side-effects ──────────────
-# OverrideStore creates an SQLite DB at config.overrides_db_path; when
-# tests pass an unpatched MagicMock as config the stringified mock name
-# becomes the path, producing files like "<MagicMock name='...' id='...'>".
-# That is the str(mock)/repr shape, which always carries a leading "<".
-# A MagicMock is ALSO a valid os.PathLike[str]: os.fspath(mock) returns a
-# repr-derived string whose first component is a plain "MagicMock", with
-# no angle bracket, so code that coerces one with Path() and then calls
-# mkdir() materialises a real directory tree named MagicMock/ under the
-# CWD.  The pattern below cannot match that second shape, so it needs its
-# own entry.  Both are containment only — the real fix is to give the
-# test a genuine path (see orchestrator/tests/conftest.py's autouse
-# stray-artifact guard, which fails loudly on the directory shape).
+# A mock passed where code wants a path leaves one of two shapes, each led
+# by the mock's OWN CLASS NAME, not always "MagicMock". The str(mock)/repr
+# FILE "<ClassName name=... id=...>" (e.g. OverrideStore's SQLite DB) comes
+# from every stdlib mock, df_pytest_isolation.py::STDLIB_MOCK_CLASSES. The
+# os.fspath() DIRECTORY tree "<ClassName>/..." comes only from the
+# MagicMixin-based, PathLike ones, df_pytest_isolation.py::MOCK_FSPATH_ROOT_NAMES.
+# AsyncMock is not a MagicMock subclass but shares MagicMixin; it reached a
+# commit in task 4592 because only MagicMock was listed.
+# tests/scripts/test_mock_fspath_dir_isolation.py fails if a name is missing.
+# These entries are containment only. The DIRECTORY shape's fence is
+# df_pytest_isolation.py::_df_no_mock_derived_stray_dirs; in the orchestrator
+# suite the FILE shape's is orchestrator/tests/conftest.py::_no_mock_repr_stray_entries.
+<AsyncMock*
 <MagicMock*
+<Mock*
+<NonCallableMagicMock*
+<NonCallableMock*
+<PropertyMock*
+<ThreadingMock*
 MagicMock/
+AsyncMock/
+NonCallableMagicMock/
+ThreadingMock/
 
 # ── pytest scratch debris — `--basetemp` inside a checkout ───────────
 # An agent passing `pytest --basetemp=.pytest-tmp` (legal and expected —

@@ -118,8 +118,6 @@ async def spawn(
     """Run the real stage to its CLI spawn and return what the child received."""
     journal = AsyncMock()
     journal.data_dir = tmp_path
-    journal.record_run_session = AsyncMock()
-    journal.clear_run_session = AsyncMock()
     memory = AsyncMock()
     memory.graphiti.enumerate_all_valid_edges = AsyncMock(
         return_value=({}, complete_paged_read()),

@@ -281,7 +281,9 @@ class TestRoutingClientsClose:
         mock_config.routing.llm_fallback = True
         owner = owner_cls(mock_config)
         with mock_openai_server() as server:
-            monkeypatch.setenv('OPENAI_BASE_URL', server.base_url)
+            monkeypatch.delenv('OPENAI_BASE_URL', raising=False)
+            monkeypatch.delenv('OPENAI_API_BASE', raising=False)
+            mock_config.routing.openai_api_url = server.base_url
             server.chat_content = answer
             await _start_census()
             await ask(owner)

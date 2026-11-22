@@ -1,0 +1,44 @@
+import sys
+from common import *
+import chain_detail as CD
+MARK='2026-11-17T20:49:02'; D8528='2026-11-19T04:25:50'
+def era(ts): return 'A' if ts<MARK else ('B' if ts<D8528 else 'C')
+BAD={('7736','1b28101f'):'HIST',('8826','009377e5'):'FILING',('5281','b53d4cf7'):'DETRUN',('5281','253f7c15'):'DETRUN',('5281','ec33d80e'):'DETRUN',
+     ('5715','ef6ce5ba'):'CACHEB',('6701','675725bb'):'SUPP',('10242','0dad9938'):'UVRUN',('10137','1e140efe'):'CACHEB'}
+PROB={('10137','1e140efe')}
+MAINRED={'LOOP':('2026-11-15T10:09','2026-11-15T22:55'),'RETIRED':('2026-11-17T14:07','2026-11-17T18:50')}
+def start_iso(v): return dt.datetime.fromtimestamp(v['start'],dt.timezone.utc).isoformat()
+rows=[]
+for v in V:
+    if v['k']<=1 or v['passed'] or v['ts']<'2026-11-15T11:19': continue
+    k=v['k']; L=v['layers']; mem=L[:k]; pred=L[k:]
+    unl=[l for l in pred if not l.get('on_main_now')]
+    lnd=[l for l in pred if l.get('on_main_now')]
+    fs=fset(v) or set(['<nolog>'])
+    attr={}
+    for g in fs:
+        a=None
+        if g in MAINRED and MAINRED[g][0]<=start_iso(v)[:16] and v['ts'][:16]<=MAINRED[g][1]: a=('MAIN',None)
+        else:
+            for l in mem:
+                if l.get('tip') and BAD.get((l['task'],l['tip'][:8]))==g: a=('MEM',l['task'])
+            if a is None:
+                for l in unl:
+                    if l.get('tip') and BAD.get((l['task'],l['tip'][:8]))==g: a=('PRED',l['task'])
+        attr[g]=a
+    kinds=set(a[0] if a else 'UNK' for a in attr.values())
+    if 'MEM' in kinds: cls='MEMBER_DEFECT'
+    elif kinds<={'PRED'}: cls='INHERITED_BASE'
+    elif kinds<={'MAIN'}: cls='MAIN_RED'
+    elif kinds<={'PRED','MAIN'}: cls='INHERITED+MAIN'
+    else: cls='UNKNOWN'
+    rows.append((v,cls,attr,unl,lnd))
+import collections
+cnt=collections.Counter()
+for v,cls,attr,unl,lnd in rows:
+    cnt[(era(v['ts']),cls)]+=1; cnt[(era(v['ts']),'n')]+=1
+    cnt[(era(v['ts']),'base_never_landed' if unl else ('base_landed_later_as_built' if lnd else 'base_was_main'))]+=1
+    a=' '.join('%s<-%s'%(g,(x[0]+(':'+x[1] if x[1] else '')) if x else '?') for g,x in sorted(attr.items()))
+    print(v['vid'],v['ts'][5:16],era(v['ts']),'own',v['task'],'k%d'%v['k'],v['runner'][:3],v['base_relation'][:5],'unl-pred',len(unl),'L-pred',len(lnd),'|',cls,'|',a)
+for k_,c in sorted(cnt.items()): print(c,k_)
+json.dump([{'vid':v['vid'],'cls':cls,'attr':{g:x for g,x in attr.items()},'n_unl':len(unl),'n_lnd':len(lnd)} for v,cls,attr,unl,lnd in rows],open('/tmp/gate-10069/forensics/classes.json','w'))

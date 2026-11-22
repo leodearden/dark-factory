@@ -32,6 +32,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import (
@@ -68,22 +69,7 @@ def ig_git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / 'repo'
     repo.mkdir()
     asyncio.run(_init_repo(repo))
-    # Task 2061: pre-create the DEFAULT derived warm-lane base
-    # (<repo>/.worktrees/_merge-verify/target, non-empty) so the
-    # acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK
-    # for this file's tests, which exercise OTHER acquire_warm_lane/
-    # create_worktree behavior (recycle/exhausted/fault/disk-pressure/omega)
-    # via stub scripts that ignore the base path entirely — mirrors the same
-    # fix in test_warm_lane_pool.py's wl_git_repo fixture.
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    # Task 2099: mark pool storage present so the NEW mount-presence guard on
-    # prune_worktrees/_run_warm_lane_gc_reclaim/acquire create-once does not
-    # false-trip in this file's tests, which simulate an already-running
-    # warm-lane host (disk pressure / recycle / exhaustion presuppose prior
-    # lane usage) — an orthogonal concern to whether the mount is present.
-    (repo / '.worktrees' / '.pool-root').touch()
+    seed_default_warm_base(repo)
     return repo
 
 

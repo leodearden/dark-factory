@@ -2,7 +2,7 @@
 
 FocusArrangeBackend is the single interface wm/X11 and tmux backends
 implement; DisplayTarget is a local, concrete stand-in for orchestrator's
-session_registry.Display (C1) so cockpit never imports orchestrator (PRD
+session_records.Display (C1) so cockpit never imports orchestrator (PRD
 §5.1/§5.7) — mirrors priority.py's ScoringItem pattern. Backends read
 DisplayTarget's attributes structurally, never isinstance it.
 """
@@ -24,7 +24,7 @@ _COMMAND_TIMEOUT_SECONDS = 5.0
 class DisplayTarget:
     """Where to find/focus a session's terminal.
 
-    Mirrors orchestrator.session_registry.Display's field shape (kind,
+    Mirrors orchestrator.session_records.Display's field shape (kind,
     wm_title, wm_window_id, tmux_target). Any object exposing these four
     attributes works — backends read attributes, not isinstance — so a real
     orchestrator Display satisfies this structurally with zero import

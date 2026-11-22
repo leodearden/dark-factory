@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, derive_declared_scope
+from shared.followup_hold_records import FOLLOWUP_HOLDER_METADATA_KEY
 from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, observed_item
 from shared.task_statuses import TaskStatus
 
@@ -27,7 +28,6 @@ from fused_memory.middleware.curator_types import (
     item_count_of,
     render_declared_scope,
 )
-from fused_memory.middleware.followup_hold import FOLLOWUP_HOLDER_METADATA_KEY
 
 _NARROW = derive_declared_scope(['pkg/a.py', 'pkg/b.py'], 'd' * 50, 'e' * 7, basis='submit')
 _TWO_ITEMS = [

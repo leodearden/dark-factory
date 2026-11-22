@@ -37,6 +37,7 @@ from legibility import (
     landing_gate,
     prescreen,
     session_ledger,
+    sighting_fit,
     similarity,
     synthesis,
     task_store,
@@ -721,6 +722,7 @@ class CensusEffects:
     selection_of: Callable[[], census_window.SessionSelection | None]
     invoke: Callable[[str, str], str]
     verify_fn: Callable[..., Mapping[str, Any] | None]
+    fit_fn: sighting_fit.FitFn
     synthesize_fn: Callable[..., str]
     embedder: embeddings.Embedder
     submit_fn: Callable[..., Any]
@@ -997,16 +999,22 @@ class _VerifiedPlacements:
     re_observed: tuple[prescreen.ReObserved, ...]
 
 
+def _entry_sighting_count(cb: dict, entry_id: str, *, kind: str) -> int:
+    entry = codebook.record_by_id(cb["entries"], entry_id, kind=kind)
+    return len(sighting_fit.counted_sessions(cb, entry))
+
+
 def _place_verified(
     cb: dict, clusters: Sequence[dict], *, run_id: str, instrument_findings: prescreen.InstrumentFindings,
 ) -> tuple[dict, _VerifiedPlacements]:
     """Promote, key-attach or drop each verified cluster, gating its filing at
-    the distinct sessions of the record it lands on."""
-    # Each verified cluster's filing is gated at the distinct sessions of the
-    # record it lands on: its candidate, counted BEFORE promotion so a withheld
-    # entry is marked as it is created; its entry, after a key attach; or the
-    # standing record a dropped verdict met. A structural cluster (contract
-    # §6, D6) is promoted but never filed.
+    the sessions the record it lands on counts."""
+    # Each verified cluster's filing is gated at the sessions of the record it
+    # lands on: its candidate's distinct sessions, counted BEFORE promotion so
+    # a withheld entry is marked as it is created; its entry's
+    # sighting_fit.counted_sessions, after a key attach; or the standing
+    # record a dropped verdict met. A structural cluster (contract §6, D6) is
+    # promoted but never filed.
     placed: list[tuple[dict, str | None]] = []
     fileable: list[tuple[dict, str | None]] = []
     held_back: list[tuple[filing_policy.WithheldCluster, str]] = []
@@ -1024,11 +1032,11 @@ def _place_verified(
                 verdict="verified", cluster=cluster, standing=candidate, contradicting_disposition="rejected",
             ))
             standing_entry_id = _promoted_entry_id(cb, candidate)
-            holder = (
-                candidate if standing_entry_id is None
-                else codebook.record_by_id(cb["entries"], standing_entry_id, kind="standing entry")
+            sighting_count = (
+                census_filing.distinct_sessions(candidate) if standing_entry_id is None
+                else _entry_sighting_count(cb, standing_entry_id, kind="standing entry")
             )
-            files, _ = census_filing.filing_gate(cluster, census_filing.distinct_sessions(holder))
+            files, _ = census_filing.filing_gate(cluster, sighting_count)
             if files:
                 fileable.append((cluster, standing_entry_id))
             continue
@@ -1047,8 +1055,9 @@ def _place_verified(
             )
             key_attaches.append(key_attach)
             entry_id = key_attach.entry_id
-            attached_entry = codebook.record_by_id(cb["entries"], entry_id, kind="key-attached entry")
-            files, held = census_filing.filing_gate(cluster, census_filing.distinct_sessions(attached_entry))
+            files, held = census_filing.filing_gate(
+                cluster, _entry_sighting_count(cb, entry_id, kind="key-attached entry"),
+            )
             if entry_id not in {adjudication.record_id for adjudication in promoted}:
                 promoted.append(census_findings.Adjudication(entry_id, found, cluster.get("cause")))
         else:
@@ -1233,13 +1242,14 @@ class FilingPlan:
     synthesized: Synthesized
     codebook: dict
     filings: tuple[disposition.Filing, ...]
-    withheld_entry_ids: frozenset[str]
+    reoffered_entry_ids: frozenset[str]
     outcomes: disposition.Outcomes
     reverified: Mapping[str, disposition.Reverification]
     status_changes: tuple[disposition.StatusChange, ...]
     refiled: tuple[disposition.Refiling, ...]
     backfilled: disposition.Backfill
     reverify_probes: int
+    fit_outcomes: tuple[sighting_fit.FitOutcome, ...]
 
 
 def plan_filing(
@@ -1276,6 +1286,20 @@ def plan_filing(
         remaining=merged.reverify_budget,
     )
     cb, status_changes = disposition.project(cb, outcomes, reverified.reverifications, as_of_sha=run.as_of_sha)
+    # A withheld entry whose release turns on sightings a judgment attached
+    # gets their fit checked before the release loop counts it
+    # (plans/census-incremental-prd.md C1, L7).
+    cb, fit_outcomes = sighting_fit.check(
+        cb,
+        sighting_fit.at_stake(
+            cb,
+            census_filing.withheld_awaiting_count(list(placed.fileable), cb),
+            releases=functools.partial(census_filing.entry_releases, cb),
+        ),
+        fit_fn=effects.fit_fn,
+        model=run.config.models.census_verify,
+        run_id=run.run_id,
+    )
     refiled = disposition.refilings(outcomes, reverified.reverifications, sighted=placed.sighted)
     queue = census_filing.with_refilings(census_filing.filing_queue(list(placed.fileable), cb), refiled, cb)
     payloads = census_filing.build_task_payloads(
@@ -1292,8 +1316,8 @@ def plan_filing(
         synthesized=synthesized,
         codebook=cb,
         filings=tuple(pending.filing(payload) for pending, payload in zip(queue, payloads, strict=True)),
-        withheld_entry_ids=frozenset(
-            pending.withheld_entry_id for pending in queue if pending.withheld_entry_id is not None
+        reoffered_entry_ids=frozenset(
+            pending.reoffered_entry_id for pending in queue if pending.reoffered_entry_id is not None
         ),
         outcomes=outcomes,
         reverified=reverified.reverifications,
@@ -1301,25 +1325,28 @@ def plan_filing(
         refiled=refiled,
         backfilled=backfilled,
         reverify_probes=reverified.probes,
+        fit_outcomes=fit_outcomes,
     )
 
 
 def _after_filing(plan: FilingPlan, disposal: disposition.Disposal) -> tuple[dict, tuple[str, ...]]:
-    """The plan's codebook with every withheld entry this run routed marked
-    filed, each routed decision's back-link and the run's follow-ups; and the
-    ids of those released entries."""
+    """The plan's codebook with every re-offered (withheld or owed) entry this
+    run routed marked filed, each routed decision's back-link, the run's
+    follow-ups, and every entry whose filing reached no work marked owed
+    (``census_filing.with_owed_after_filing``); and the ids of those released
+    entries."""
     run = plan.run
     released_entry_ids = tuple(dict.fromkeys(
         decision.filing.entry_id
         for decision in disposal.decisions
-        if decision.routed and decision.filing.entry_id in plan.withheld_entry_ids
+        if decision.routed and decision.filing.entry_id in plan.reoffered_entry_ids
     ))
     cb = plan.codebook
     for entry_id in released_entry_ids:
         cb = codebook_lifecycle.mark_entry_filed(cb, entry_id)
     if released_entry_ids:
         logger.info(
-            "census: %d withheld codebook entr(ies) recurred and were routed: %s",
+            "census: %d re-offered codebook entr(ies) (withheld or owed) were routed: %s",
             len(released_entry_ids), list(released_entry_ids),
         )
     cb = disposition.with_back_links(
@@ -1329,6 +1356,7 @@ def _after_filing(plan: FilingPlan, disposal: disposition.Disposal) -> tuple[dic
         cb, reverified=plan.reverified, refiled=plan.refiled, decisions=disposal.decisions,
         run_id=run.run_id, as_of_sha=run.as_of_sha,
     )
+    cb = census_filing.with_owed_after_filing(cb, disposal, dry_run=run.dry_run_payloads_path is not None)
     return cb, released_entry_ids
 
 
@@ -1379,6 +1407,8 @@ def _census_record(
         f"{config.models.census_synthesis} synthesis={synthesis_report.calls}, "
         f"{config.models.trickle} headroom-probe={probe_calls}"
     )
+    if plan.fit_outcomes:
+        cost_note += f", {config.models.census_verify} sighting-fit={len(plan.fit_outcomes)}"
     if storm_batch_indices:
         cost_note += (
             f"; WARNING: {len(storm_batch_indices)} storm batch(es) at indices "
@@ -1427,6 +1457,7 @@ def _census_record(
         dropped_verdicts=tuple(placed.dropped_verdicts),
         mass_rejection=verdicts.mass_rejection,
         withheld=placed.withheld,
+        fit_outcomes=plan.fit_outcomes,
         findings=[
             row.to_record()
             for row in census_findings.finding_rows(
@@ -1490,11 +1521,12 @@ def persist(plan: FilingPlan, effects: CensusEffects) -> Done | Unlanded:
         dry_run = census_filing.write_dry_run_payloads(
             Path(run.dry_run_payloads_path),
             [dict(filing.payload) for filing in disposal.unfiled],
-            withheld_offered=sum(1 for filing in disposal.unfiled if filing.entry_id in plan.withheld_entry_ids),
+            reoffered=sum(1 for filing in disposal.unfiled if filing.entry_id in plan.reoffered_entry_ids),
             write_text=effects.write_text,
         )
     cb, released_entry_ids = _after_filing(plan, disposal)
     cb, resolutions = disposition.resolve_tickets(cb, store=effects.task_store, run_id=run.run_id)
+    cb = census_filing.with_owed_after_resolving(cb, resolutions)
     # Synthesis corrections land after filing, so this run's filing pairing
     # and sighting counts read the codebook the run verified.
     cb, synthesis_report = _apply_synthesis_corrections(

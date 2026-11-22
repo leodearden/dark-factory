@@ -224,14 +224,14 @@ class TestCrashOutsideAnyStep:
             with pytest.raises(RuntimeError, match='fm down'):
                 await h.run(prd_path=None)
 
-        assert _runs(h) == [(None, 'startup_crash:after-1c1h')] * CRASH_LOOP_THRESHOLD
+        assert _runs(h) == [(None, 'startup_crash:after-1c1i')] * CRASH_LOOP_THRESHOLD
 
         healthy = make_harness()
-        leftover_reaper = AsyncMock()
-        healthy._run_leftover_verify_scope_reaper_pass = leftover_reaper
+        slice_weight = AsyncMock()
+        healthy._ensure_project_slice_weight = slice_weight
         await healthy.run(prd_path=None, dry_run=True)
 
-        leftover_reaper.assert_awaited_once()
+        slice_weight.assert_awaited_once()
 
 
 @pytest.mark.asyncio

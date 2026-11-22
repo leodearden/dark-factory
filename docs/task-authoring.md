@@ -152,6 +152,7 @@ marked `done` on the strength of an unverified claim.
 | `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required; `stamped_at` written server-side (see below) |
 | `deterministic-deploy` | `DeterministicRunner` cross-unit deploy completed | — |
 | `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run`; dependents wait until the restart is verified (see `docs/deterministic-runner.md` §2) | — |
+| `deterministic-deploy-unverified` | `DeterministicRunner` cross-unit deploy with no `before_done.target_unit`: the script exited 0 (or a human resolved its gate or failure); no unit was inspected or verified | — |
 | `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | `escalation_id` **required on write** — cites the resolving gate escalation, recorded verbatim (no cross-service lookup) |
 | `deterministic-milestone` | A `kind='predicate'` milestone check exited `0` | — |
 | `operational-verified` | A `normal`-task no-code operational ask closed via a resolved escalation, not a merge | `escalation_id` **and** `note` required |
@@ -186,7 +187,7 @@ callers, on both the fresh `done` transition and the same-status
 `done`→`done` repair path — a recon stage may never self-authorize an
 operational close.
 
-The four `deterministic-*` kinds carry a caller bar of the same shape, with
+The five `deterministic-*` kinds carry a caller bar of the same shape, with
 two factors (PRD `plans/memory-auto-consolidation-prd.md` C5/D11, where the
 rationale lives). They are accepted only from a caller whose resolved
 identity matches a prefix in
@@ -780,6 +781,24 @@ consequence it does not spell out: a missing, non-executable, or malformed
 and no escalation. That is a SILENT, indefinite hold on the dependent. Pin the
 script's existence and executability with a test.
 
+Every orchestrator, escalation and shared reader takes
+`metadata.delivered_checks` through
+`shared/src/shared/declared_checks.py::declared_checks`, so all of them read a
+malformed declaration the same way. Three tooling readers still read the key
+raw, by their own rules, and are not migrated yet:
+`scripts/audit_manifest_descriptor_drift.py::_delivered_check_entries`,
+`skills/review-all/scripts/program/clerk_batch.py::_checks` and
+`skills/review-all/scripts/program/seam_scan.py::_anchored`.
+
+An entry that is not a dict (a JSON object), or a value that is neither a list
+nor empty (a bare dict, a string, a number), is never a check and never
+"nothing declared". Both gates count it as ERRORED, but they degrade
+differently. The dependency gate holds the dependent: the same silent
+fail-safe hold as above. The mark-done gate withholds done and logs a WARNING,
+and its caller takes its own no-landing-evidence path, which degrades toward
+re-delivery. Landing evidence ignores the entry, and the briefing shows it as
+a malformed entry. Repair the record rather than wait it out.
+
 See `plans/write-triage-attach-target-contradiction.md` for the worked example
 (tasks 4762 / 4810 / 3169).
 
@@ -825,6 +844,113 @@ capability actually lands on `main` (or the check itself is fixed), an
 operator must manually set the dependent back to `pending` to reopen it —
 resolving the escalation records the human decision but does not by itself
 unblock the task.
+
+### 3.4 The follow-up holder (`metadata.followup_holder`)
+
+Each project has at most one **follow-up holder**: a task that never
+dispatches. Low-priority follow-ups wait behind it, parked by an ordinary
+local dependency edge, until a promotion removes that edge. The contract is
+`plans/follow-up-filing-shape-prd.md` §3 decisions 9–15 and §4.3. The one
+implementation is `fused-memory/src/fused_memory/middleware/followup_hold.py`.
+
+**The hold rule** (`followup_hold.py::hold_scope`). A task is held if all of
+these are true:
+
+- it was filed as a follow-up: `metadata.source == 'agent-followup'` or
+  `metadata.spawn_context == 'review_suggestions'`;
+- its priority is `low` or `polish`;
+- its `task_kind` is `normal` or absent;
+- it carries none of `execution_class`, `prd_path`, `x_finding_key` or
+  `human_decomposed`.
+
+Every planning-mode birth carries `human_decomposed`, so a PRD decompose is
+never held. Neither is a task that a finding cites. To keep a follow-up out
+of the hold, file it at a higher priority, or attach the finding key or PRD
+that makes it wanted.
+
+**Held means a dependency edge on the holder.** The edge decides whether a
+task is held now. `metadata.followup_hold`
+(`{holder, held_at, promoted?}`) is the record of the hold, and it stays on
+the task after a promotion as history. A held task can also carry other
+dependencies; the edges compose by AND.
+
+**Hold at filing.** A ticket-path `submit_task` that the rule matches is
+created already held. The holder id is appended to its `dependencies`, and
+its `followup_hold` record is written in the same `add_task`, so the
+scheduler never sees it ready. A `followup_held {task_id, holder_id}` event
+is journaled beside `task_created`, and the ticket's stored outcome
+(`result_json`) carries `held_by`, the holder's id; `resolve_ticket` does
+not return it. The holder is minted the first time a project needs one, and
+its mint journals a `task_created` event with `source:
+'followup-holder-mint'`, whether a filing or the backfill minted it.
+
+**The backfill.** Each fused-memory start runs the hold over every known
+project before the server serves
+(`fused-memory/src/fused_memory/server/main.py::backfill_followup_holds_at_startup`,
+walking the primary root plus `DASHBOARD_KNOWN_PROJECT_ROOTS`). It holds
+every `pending` task the rule matches unless the task already depends on the
+holder or already carries a `followup_hold` record, so a promoted or released
+task is never re-held and a second start holds nothing. It also leaves unheld
+any pending follow-up that an active, non-deferred task waits on, directly or
+through other stock follow-ups, whether that task is in the same project or in
+another known project that cites it in `metadata.external_deps`
+(`fused-memory/src/fused_memory/middleware/followup_hold.py::backfill`). Such
+a wait existed before the hold, and none of promotion's triggers
+(`plans/follow-up-filing-shape-prd.md` §3 decision 14) fires for it, so
+holding the follow-up would jam its dependent silently. An edge between two
+follow-ups the backfill holds stays held, since promotion's closure releases
+them together. If the backfill cannot read a known project's store, that
+project's backfill fails rather than holding blind. Each task's edge and
+record land in one backend write, with no `task_modified` event. Each
+project emits exactly one `followup_hold_backfilled {project_id, count}`
+event, even when `count` is 0. One project's failure is logged at ERROR and
+does not block startup or the other projects. The config key
+`followup_hold.backfill_enabled` (default `true`) is restart-only.
+
+**The holder's shape.** It is a deterministic pure gate:
+`task_kind='deterministic'`, `always_escalates=true`,
+`execution_class='decision'`, priority `low`, no dependencies, a
+`deferred_watch` text, and the marker `metadata.followup_holder`
+(`{project_id, minted_at}`). The store's marker is the only record of which
+task is the holder. If a lookup finds two live markers in one project, it
+raises `DuplicateFollowupHolderError` naming both ids. Then every filing in
+that project that the hold rule matches fails and creates no task, and so
+does the project's backfill, until all but one holder is released with
+`release_holder=True`. The holder is never a curator pool entry or a combine
+target.
+
+**Protection.** A `cancelled` or `done` dependency counts as satisfied, so one
+status write on the holder would release the whole held backlog at once.
+A `deferred` holder still holds, but it releases every held follow-up when
+it lands back on `pending`, because promotion (task 8418) fires on that
+landing (decision 14).
+
+- `set_task_status` refuses `done`, `cancelled` and `deferred` on the holder
+  unless `release_holder` is the literal `true`. Releasing is a human act.
+- `update_task` refuses a write that strips `followup_holder`, strips
+  `deferred_watch` or sets `trigger_met` on the holder. That covers a
+  `replace` that leaves either key out; an unchanged echo passes.
+
+Both refusals return error `followup_holder_protected`
+(`followup_hold.py::FollowupHolderProtectedError`). The error carries the
+holder's `held_count`, the number of active tasks that depend on it, and a
+`protection` field naming the rule that refused. Each refusal journals a
+`followup_holder_protected` event. `release_holder` is ignored on any task
+other than the holder.
+
+Until promotion lands (task 8418), a cancel-release has a side effect. Every
+held follow-up depends on the holder, so targeted reconciliation's
+cancelled-dependency sweep
+(`fused-memory/src/fused_memory/reconciliation/targeted.py::TargetedReconciler._sweep_cancelled_descendants`)
+reads each one as an ambiguous dependent. It files one L1 escalation per
+held follow-up while the project's orchestrator is live, and sets each one
+`blocked` when it is stopped.
+
+**Promotion** removes a held task's holder edge and stamps
+`followup_hold.promoted {by, at, ref}`, where `by` is one of `dependent`,
+`citation`, `combine`, `pack`, `rider` or `human`. It belongs to task 8418;
+see `plans/follow-up-filing-shape-prd.md` §3 decision 14 and §4.3. Held does
+not expire: there is no age-out (decision 15).
 
 ---
 
@@ -1005,14 +1131,22 @@ open (quiescence guard — no re-dispatch, no churn).
   existence and the executable bit before the unit is registered; an
   unrunnable script blocks the task instead of marking it `scheduled`
   (`docs/deterministic-runner.md` §2).
-- `before_done.target_unit` differs from own unit (or is `None`) →
-  blocking subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify
-  against a pre-run baseline (done = `deployed-and-verified`).
+- `before_done.target_unit` names a unit other than own → blocking
+  subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify against a
+  pre-run baseline (done = deployed-and-verified, kind
+  `deterministic-deploy`).
+- `before_done.target_unit` is `None` or omitted → blocking subprocess
+  driven on the script's exit code ALONE, with no baseline inspect and no
+  fresh-PID verify, because there is no unit to inspect (task 2632 /
+  esc-2585-1). Done means the script exited 0. Every done write for such a
+  deploy, the crash, human-resolution and gate resumes included, records
+  kind `deterministic-deploy-unverified`; the rule's home is
+  `orchestrator/src/orchestrator/deterministic_runner.py::_deploy_done_kind`.
 
 **Runner stamps** (written by `DeterministicRunner`, never
 author-supplied): `before_done_ran_at`, `before_done_verified_at`,
 `gate_escalated_at`, `gate_escalated_preconditions` (pure gates only), and
-`done_provenance` (stamped for all four
+`done_provenance` (stamped for all five
 `deterministic-*` kinds — see the requirement table in §2 for
 per-kind semantics; `deterministic-milestone` is stamped on both the
 first-pass check and the post-escalation re-check described in §6).
@@ -1569,7 +1703,7 @@ flows) — is exempted from the `unknown_key` scan even though these are not
 (yet) typed `TaskMetadata` fields. This is `_BLESSED_METADATA_KEYS` in
 `shared/src/shared/task_metadata.py`:
 
-<!-- tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:begin -->
 ```
 source, modules, spawn_context, complexity, force_full_path,
 branch_base_sha, _causation_id, dry_run_proposals, reblock_guard,
@@ -1583,14 +1717,14 @@ before_done_verified_pid, files_tagged_at, files_tagged_empty,
 source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
-human_curator_adjudicated_at, last_blocked_at, recurrence,
-execution_class, pure_gate_from, merge_lane, pending_since,
+human_curator_adjudicated_at, last_blocked_at, merge_first_enqueued_at,
+merge_phase_liveness, recurrence, execution_class, pure_gate_from, merge_lane, pending_since,
 pending_since_backfilled, claimant_exception, audit_trail_rotation,
 plan_text_fp, plan_authored_at,
 main_health_signature, superseded_by, cancel_dispositions, trigger_chain,
 predicate_recheck, predicate_verdict
 ```
-<!-- /tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:end -->
 
 This listing is **machine-checked** against the live frozenset by
 `tests/scripts/test_task_authoring_blessed_keys_drift.py` (task 3780), which
@@ -1708,6 +1842,19 @@ architect and implementer filers bundle (`plans/follow-up-filing-shape-prd.md`
 §4.1 and §3 decisions 1 and 3–5). As for `shared.defects`, the registration is
 an import side effect of `shared.followup_items`, so a process that never
 imports it would census the key as `unknown_key`.
+
+`followup_holder` and `followup_hold` are the follow-up holder's marker and a
+held task's record (§3.4). Both are registered submodels
+(`shared/src/shared/followup_hold_records.py::FollowupHolder` and
+`::FollowupHold`, cardinality dict), registered in
+`shared/src/shared/task_metadata.py` itself, so every process that parses
+task metadata knows them. Both are machine-written only and deliberately not
+Tier-A blessed. Only `fused-memory/src/fused_memory/middleware/followup_hold.py`
+writes them: the mint writes the marker, and the hold at filing and the
+startup backfill write the record. A held task's `followup_hold.promoted`
+(`by` one of `dependent`, `citation`, `combine`, `pack`, `rider`, `human`) is
+the history of its release. The dependency edge on the holder, not this
+record, decides whether the task is held now.
 
 `claimant_exception` is the machine ledger entry
 `{claimant_run_id, target_status, agent_id, tag, stamped_at}`. The
@@ -1954,7 +2101,7 @@ new row whose canonical is unblessed fails the suite rather than silently
 re-creating that task's defect, where authors were told to migrate to
 `related_tasks` and still minted a census line.
 
-<!-- tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:begin -->
 
 | Canonical | Aliases to avoid |
 |---|---|
@@ -1964,7 +2111,7 @@ re-creating that task's defect, where authors were told to migrate to
 | `source_finding_id` | `origin_finding_id`, `origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id` |
 | `superseded_by` | `x_superseded_by`, `x_subsumed_by`, `subsumed_by`, `x_coalesced_into`, `x_replacement` |
 
-<!-- /tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:end -->
 
 **The finding-provenance row splits into two classes** (ruling:
 `esc-3796-1`, 2026-08-17). `origin_finding_id` is the **retired** alias and
@@ -2131,6 +2278,23 @@ oblige every future task write quoting this section to set the override,
 which is precisely the loop this section exists to break. For the full
 picture see `docs/mcp-toolcall-xml-leak.md` §4, "The boundary rejection".
 
+### `allow_uuid_prefix`: a write-time flag, not a metadata key
+
+`metadata={'allow_uuid_prefix': True}` (a literal `True` only) is the
+sanctioned move for a write that **deliberately quotes a bare truncated
+uuid**, such as a correction record citing a bad citation verbatim: the
+uuid-prefix boundary guard then forwards the call without resolving or
+expanding the prefix. It is honoured only on tools that declare
+`metadata`, and it is stripped before persistence exactly as
+`allow_mcp_markup` is, so it never lands in stored metadata. It is
+**never** the remedy for an `ambiguous_uuid_prefix` rejection: that
+rejection means the prefix names more than one record, so put the full
+uuid you meant into the rejection's `original_call` and resubmit that. The
+guard's policy is stated once, in `plans/uuid-prefix-resolution-prd.md`
+§4 C3 (**Override.**), and the strip lives in
+`shared/src/shared/uuid_prefix.py::strip_uuid_prefix_override`; neither is
+restated here.
+
 ### Promoting a convention
 
 A key only stops warning once it's added to the `_BLESSED_METADATA_KEYS`
@@ -2161,15 +2325,30 @@ it. Generalising: prefer blessing when validation is context-dependent, when
 the live corpus already contains values a type would reject, or when the
 apparent enum is not the thing writers are actually held to.
 
-### Known gaps (re-measured 2026-10-02 — none open)
+### Known gaps (re-measured 2026-11-15 — one tracked by a follow-up ticket)
 
-No tracked `unknown_key` source is open. All counts are a snapshot of a
-**growing** corpus, not an invariant: 4748 tasks carried dict metadata at
-the latest corpus-wide measurement
-(2026-08-31), up from 4204 on 2026-08-18 and 3553 when this section was
-first written. Across that corpus 1516 tasks emit at least one
-`unknown_key` line, 3130 lines over 1028 distinct spellings; those are
-untracked Tier-C keys, not gaps this section owns.
+All counts are a snapshot of a **growing** corpus, not an invariant: 9950
+tasks carried dict metadata at the latest corpus-wide measurement
+(2026-11-15, submodel registrations imported), up from 4748 on 2026-08-31
+and 3553 when this section was first written. Across that corpus 1614 tasks
+emit at least one `unknown_key` line, 3416 lines over 1055 distinct
+spellings; most are untracked Tier-C keys, not gaps this section owns.
+
+The largest remaining machine-written `unknown_key` source is the flake
+ledger's `flake_debt_*` keys
+(`orchestrator/src/orchestrator/flake_ledger.py::_deflake_metadata`, 128
+carriers each for `test`, `open_count` and `opened_at`), filed as follow-up
+ticket `tkt_0RX0D4E9Y4DDHGVS4J3MSYFDQP`.
+
+**The merge-lane stamps `merge_first_enqueued_at` and
+`merge_phase_liveness` are CLOSED** — task 5281 blessed both into Tier-A.
+Recorded in the same shape as the rows below so a reader arriving from an
+older revision does not re-open them: the fork was **decided, not
+deferred**. Typing was rejected because `merge_phase_liveness` has no
+reader left, and `x_`-renaming because one key has a live writer and the
+other a live reader. See the frozenset entry in
+`shared/src/shared/task_metadata.py` for the census and the writer/reader
+trail; the figures are not restated here.
 
 **The two rows this table last carried are CLOSED**, recorded in the same
 shape as the `execution_class` row below so a reader arriving from an older

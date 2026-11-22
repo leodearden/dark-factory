@@ -6,7 +6,10 @@ exists, so a stale one is refused before a graph phase is spent on the arm. The 
 half (embedding_graph_phase.py) raises ``EmbeddingRunCheckFailed`` on a failed
 instrument check, so such a run writes nothing. A query the arm cannot embed is
 a measurement, not an error: it reads as a miss and is counted in the manifest.
-``run.json`` is written last and is the run's commit marker.
+A search that overruns its read budget stops the run with its ``TimeoutError``
+and is never read as a miss; why is in the "Known limitations" of
+fused-memory/scripts/local_memory_models_eval/README.md. ``run.json`` is written
+last and is the run's commit marker.
 """
 
 import asyncio

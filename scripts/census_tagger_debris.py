@@ -9,21 +9,22 @@ read-only SQLite URI: the task store goes through
 through :func:`_connect_readonly`
 (``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
 structurally incapable of writing to the live WAL databases the six running
-orchestrators hold open. REMEDIATION IS A SEPARATE, REVIEWED
-FOLLOW-UP — nothing here repairs, backfills or clears a stamp.
+orchestrators hold open. Nothing here repairs, backfills or clears a stamp;
+whether repair is needed is decided in the PRD's "Debris repair disposition".
 
 WHAT THIS IS FOR. PRD task epsilon of ``plans/module-tagger-retirement-prd.md``
 (decision 3). The retired module tagger stamped ``metadata.files_tagged_at``
 onto task records alongside a GUESSED file scope. This census enumerates every
 surviving stamp across all six project corpora and classifies each on three
-axes, so its two consumers can join a machine-readable candidate set instead of
-re-deriving one from prose:
+axes. Its consumer, DF 7271, used it to decide no dedicated tagger-debris repair
+is needed: DF 3113's heal
+(``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._heal_metadata_files_if_diverged``)
+restores metadata.files from plan.files at the plan boundary. The measured
+basis, and the simple-task residual, is the PRD's "Debris repair disposition".
 
-  * DF 3113 P4a — the forward fix for the DONE-path ``metadata.files`` wipe.
-  * DF 3427 — the debris repair pipeline.
-
-Both already speak the audit's ``merge_finalized`` wipe-signature vocabulary,
-so every census row carries that verdict too, keyed to the same task ids.
+Every census row also carries the audit's ``merge_finalized`` wipe-signature
+verdict, keyed to the same task ids, so a consumer can join it to the audit's
+candidate sets.
 
 CORPUS ACCESS — WHY tasks.db, READ-ONLY (task 4525, esc-4525-1).
 Task 4525's text asks for "the fused-memory read path or each project's own
@@ -74,13 +75,15 @@ from typing import NamedTuple
 
 import _checkout as _checkout
 
-# Tier 1 — the ONE tasks.db and runs.db locators. Tier 3 — the warn-and-continue per-root
+# Tier 1 — the ONE tasks.db and runs.db locators, and the guard that turns an
+# underivable default root into the no-root exit. Tier 3 — the warn-and-continue per-root
 # loop and the shared no-root message. run_audit_cli is deliberately NOT
 # adopted; the exit-ladder block near main() records why.
 # discover_project_roots comes second-hand through the audit's documented
 # re-export, the same route repair_wiped_metadata_files.py takes.
 from _task_db_scan import (
     NO_PROJECT_ROOT_RESOLVED_MESSAGE,
+    discover_or_report_no_default_root,
     runs_db_path,
     sweep_project_roots,
     tasks_db_path,
@@ -119,7 +122,7 @@ from shared.tasks_db_readonly import connect_ro
 # ---------------------------------------------------------------------------
 # The classification vocabulary.
 #
-# These six strings are the artifact's PUBLIC contract: DF 3113 P4a and DF 3427
+# These six strings are the artifact's PUBLIC contract: the artifact's consumers
 # read them out of the committed JSON, where they cannot see this module's
 # constants. tests/scripts/test_census_tagger_debris.py pins each literal so a
 # rename fails CI rather than silently producing an unjoinable artifact.
@@ -310,9 +313,9 @@ class CensusRecord(NamedTuple):
 
     ``merge_signature`` is the audit's OWN ``classify_wipe_signature`` verdict
     over this task's ``merge_finalized`` history — a second, independently
-    derived piece of evidence in a vocabulary DF 3113 P4a and DF 3427 already
-    consume, so they can join this artifact to their existing candidate sets
-    without a translation layer. When the event log could not be read it is
+    derived piece of evidence in a vocabulary audit_wiped_metadata_files.py and
+    repair_wiped_metadata_files.py already speak, so a consumer can join this
+    artifact to the audit's candidate sets without a translation layer. When the event log could not be read it is
     the audit's ``EVENT_LOG_UNREAD``, never a verdict over a log nobody read.
     It is deliberately NOT the same field as ``wipe_signature``, which is this
     census's own axis-3 label.
@@ -912,6 +915,9 @@ def census_project(project_root: str) -> ProjectCensus:
 
 SCHEMA_VERSION = 3
 
+# Why 7271 and no repair owner: plans/module-tagger-retirement-prd.md "Debris repair disposition".
+ARTIFACT_CONSUMERS: tuple[str, ...] = ("dark_factory 7271",)
+
 # The vocabulary, ordered. Iterating THIS rather than the observed data is what
 # makes a zero-valued cell present rather than absent — a missing key must
 # never be readable as a zero.
@@ -1035,7 +1041,7 @@ def build_report(
                     "true is evidence, false proves nothing either way."
                 ),
             },
-            "consumers": ["dark_factory 3113 P4a", "dark_factory 3427"],
+            "consumers": list(ARTIFACT_CONSUMERS),
             "regen_command": " ".join(
                 [_REGEN_COMMAND_HEAD, *(f"--project-root {root}" for root in roots)]
             ),
@@ -1128,7 +1134,8 @@ def render_markdown(report: dict) -> str:
         f"  the `{NEVER_RECONCILED}` caveat below.",
         "- **merge_signature** — the audit's own `merge_finalized` verdict",
         "  (`audit_wiped_metadata_files.classify_wipe_signature`), carried as correlating",
-        "  evidence in the vocabulary both consumers already speak.",
+        "  evidence in the vocabulary `audit_wiped_metadata_files.py` and",
+        "  `repair_wiped_metadata_files.py` already speak.",
         "",
         f"### Why `{LOCK_RECONCILED}` is a weaker signal than `{RECONCILED}`",
         "",
@@ -1430,7 +1437,7 @@ def main(argv: list[str] | None = None) -> int:
     """Sweep the roots, classify every stamp, and publish the artifact pair."""
     args = _build_parser().parse_args(argv)
 
-    roots = discover_project_roots(args.project_roots)
+    roots = discover_or_report_no_default_root(lambda: discover_project_roots(args.project_roots))
     if not roots:
         print(NO_PROJECT_ROOT_RESOLVED_MESSAGE, file=sys.stderr)
         return EXIT_NO_ROOT

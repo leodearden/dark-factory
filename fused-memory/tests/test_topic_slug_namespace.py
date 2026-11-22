@@ -307,7 +307,7 @@ class TestOneNamespaceOneConstant:
 
         memory_codes = {
             v.code
-            for v in validate_memory_metadata({'topic': value}, enforce_kind_registry=False)
+            for v in validate_memory_metadata({'topic': value})
         }
         memory_accepts = 'invalid_topic_slug' not in memory_codes
 

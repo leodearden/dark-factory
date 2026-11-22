@@ -158,8 +158,9 @@ skipped.
 ### Frontier labeling
 
 Ground truth for a mined diff is **proposed by a frontier model** (opus, via
-`mining.propose_labels_frontier()` — reuses the `scorer.match_issues`
-`invoke_agent` pattern with `effort="high"`), never fabricated by the mining
+`mining.propose_labels_frontier()` — runs through
+`evals/measurement.py::measured_call` (stage `label_proposer`), like
+`scorer.match_issues`, with `effort="high"`), never fabricated by the mining
 script itself. The model is prompted with the diff text (truncated to the
 first 10K characters — see "Known limitation" below) and the FN context (task
 title + `signal_reason`), and asked to list concrete issues.
@@ -168,6 +169,12 @@ A candidate is only added to the corpus if the frontier model proposes at
 least one issue; candidates with an empty proposal are skipped (not added,
 but eligible to be retried by a future `mine` run since they were never
 recorded as "in the corpus").
+
+A proposal that did not measure (a refused or capped call, an answer with no
+usable issues list, or a raised call) is not an empty proposal: `mine`
+reports it on its own progress line and counts it in the run summary's
+"Unmeasured proposals". Like an empty proposal, it is not added, and the
+next `mine` run retries it.
 
 **Known limitation:** many mined merge-commit diffs are far larger than the
 10K-character prompt window (they bundle a task's full implementation, not

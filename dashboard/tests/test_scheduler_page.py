@@ -21,10 +21,10 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from _task_units import measured_unit, units_by_label
 from shared.scheduler_state import SchedulerStateSnapshot
 
 from dashboard.data.scheduler import clear_scheduler_state
-from dashboard.data.task_snapshot import SnapshotFailure, unmeasured_snapshot
 
 
 @pytest.fixture(autouse=True)
@@ -36,21 +36,8 @@ def _forget_scheduler_state():
 
 
 def _tasks_read(active=(), *, offline=(), degraded=()):
-    """A ``collect_tasks_with_counts`` result: ``(active_rows, snapshots_by_label)``.
-
-    Only the offline and degraded roots get a unit; the scheduler reads the
-    snapshots solely through ``task_snapshot.classify``, so a healthy root
-    needs none.
-    """
-    now = datetime(2026, 1, 1, tzinfo=UTC)
-
-    def unit(label, failure):
-        return unmeasured_snapshot(label, now=now, reason='test', failure=failure)
-
-    return list(active), {
-        **{label: unit(label, SnapshotFailure.UNREACHABLE) for label in offline},
-        **{label: unit(label, SnapshotFailure.BUDGET) for label in degraded},
-    }
+    """A ``collect_tasks_with_counts`` result: ``{label: unit}``, each carrying its root's rows."""
+    return units_by_label(active, offline=offline, degraded=degraded)
 
 
 # ---------------------------------------------------------------------------
@@ -106,9 +93,9 @@ def test_module_contention_counts_sorted_desc():
         {'task_id': 'T2', 'lock_set': ['b', 'c']},
         {'task_id': 'T3', 'lock_set': ['b', 'd']},
     ]
-    current_holders = {'b': 'T1'}  # T1 holds 'b'
+    snapshot = SchedulerStateSnapshot(current_holders={'b': 'T1'})  # T1 holds 'b'
 
-    result = _module_contention_counts(rows, current_holders)
+    result = _module_contention_counts(rows, snapshot)
 
     assert isinstance(result, list)
     assert len(result) == 4
@@ -117,11 +104,15 @@ def test_module_contention_counts_sorted_desc():
     assert result[0]['path'] == 'b'
     assert result[0]['contention'] == 3
     assert result[0]['holder'] == 'T1'
+    assert result[0]['holders'] == ['T1']
+    assert result[0]['at_holder_limit'] is True
 
     # a, c, d follow with contention 1 (alphabetical for ties), no holder
     assert [r['path'] for r in result[1:]] == ['a', 'c', 'd']
     assert all(r['contention'] == 1 for r in result[1:])
     assert all(r['holder'] is None for r in result[1:])
+    assert all(r['holders'] == [] for r in result[1:])
+    assert all(r['at_holder_limit'] is False for r in result[1:])
 
 
 # ---------------------------------------------------------------------------
@@ -2147,7 +2138,7 @@ def test_module_contention_counts_tags_project_and_holder_project():
 
     rows = [{'task_id': '1', 'lock_set': ['src/a.py']}]
     result = _module_contention_counts(
-        rows, {'src/a.py': '1'}, project='proj-a',
+        rows, SchedulerStateSnapshot(current_holders={'src/a.py': '1'}), project='proj-a',
     )
 
     assert len(result) == 1
@@ -2157,7 +2148,7 @@ def test_module_contention_counts_tags_project_and_holder_project():
 
     # When no holder is present, holder_project must be None
     result2 = _module_contention_counts(
-        rows, {}, project='proj-a',
+        rows, SchedulerStateSnapshot(), project='proj-a',
     )
     assert result2[0]['project'] == 'proj-a'
     assert result2[0]['holder_project'] is None
@@ -2176,8 +2167,10 @@ def test_holder_project_set_iff_holder_set_jsx_contract():
     from dashboard.data.scheduler import _module_contention_counts
 
     rows = [{'task_id': '1', 'lock_set': ['src/a.py']}]
-    with_holder = _module_contention_counts(rows, {'src/a.py': '1'}, project='proj-a')
-    without_holder = _module_contention_counts(rows, {}, project='proj-a')
+    with_holder = _module_contention_counts(
+        rows, SchedulerStateSnapshot(current_holders={'src/a.py': '1'}), project='proj-a',
+    )
+    without_holder = _module_contention_counts(rows, SchedulerStateSnapshot(), project='proj-a')
 
     # Bi-conditional: set together or not at all
     assert (with_holder[0]['holder'] is not None) == (with_holder[0]['holder_project'] is not None), (
@@ -2404,8 +2397,43 @@ async def test_collect_scheduler_state_refuses_a_malformed_reply_at_the_parse_bo
     assert pin_queue == []
     assert any(
         r.levelno == logging.WARNING and r.name == 'dashboard.data.scheduler'
+        and 'is not a scheduler snapshot' in r.getMessage()
         for r in caplog.records
     ), [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.parametrize('has_unit', [False, True], ids=['missing', 'present'])
+async def test_collect_scheduler_state_names_a_root_the_collector_gave_no_unit(
+    dummy_client, dummy_config, caplog, has_unit,
+):
+    """A configured root with no unit is a broken collector, said by name.
+
+    ``collect_tasks_with_counts`` promises a unit for every configured root.
+    The root still shows no active tasks either way, but only a MISSING unit
+    is logged, so a broken promise does not pass for a quiet project.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    label = dummy_config.project_root.name
+    units = {label: measured_unit()} if has_unit else {}
+    mock_mcp = AsyncMock(side_effect=[_scheduler_snapshot(), [], []])
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
+        patch(
+            'dashboard.data.scheduler.collect_tasks_with_counts',
+            AsyncMock(return_value=units),
+        ),
+        caplog.at_level(logging.WARNING, logger='dashboard.data.scheduler'),
+    ):
+        rows, *_ = await collect_scheduler_state(dummy_client, dummy_config)
+
+    messages = [r.getMessage() for r in caplog.records]
+    named = [m for m in messages if 'no unit for' in m and label in m]
+    assert rows == []
+    assert len(named) == (0 if has_unit else 1), messages
 
 
 async def test_collect_scheduler_state_ignores_an_unknown_key_from_a_newer_producer(
@@ -2595,8 +2623,9 @@ def test_compose_rows_deep_path_holder_resolves_in_module_contention():
     ]
     snapshot = _scheduler_snapshot(current_holders={'orchestrator/src': '7'})
 
-    rows = _compose_rows(active_tasks, SchedulerStateSnapshot.from_json(snapshot), depth=2)
-    modules = _module_contention_counts(rows, snapshot['current_holders'], project='orch')
+    parsed = SchedulerStateSnapshot.from_json(snapshot)
+    rows = _compose_rows(active_tasks, parsed, depth=2)
+    modules = _module_contention_counts(rows, parsed, project='orch')
 
     assert len(modules) == 1
     assert modules[0]['path'] == 'orchestrator/src'
@@ -2616,7 +2645,9 @@ def test_module_contention_counts_resolves_sub_lock_depth_parent_holder():
 
     rows = [{'task_id': '1', 'lock_set': ['foo/bar']}]
     # Holder is keyed at the parent 'foo' (fewer than lock_depth components).
-    result = _module_contention_counts(rows, {'foo': 'T-9'}, project='p')
+    result = _module_contention_counts(
+        rows, SchedulerStateSnapshot(current_holders={'foo': 'T-9'}), project='p',
+    )
 
     assert len(result) == 1
     assert result[0]['path'] == 'foo/bar'
@@ -2714,7 +2745,7 @@ def test_module_contention_counts_attaches_parked_by_and_stack():
     live_task_ids = {'low', 'high'}
 
     result = _module_contention_counts(
-        rows, {}, project='p',
+        rows, SchedulerStateSnapshot(), project='p',
         park_stacks=park_stacks,
         live_task_ids=live_task_ids,
     )
@@ -2809,7 +2840,7 @@ def test_module_contention_counts_mixed_liveness_stack():
     rows = [{'task_id': 'alive', 'lock_set': ['m']}]
 
     result = _module_contention_counts(
-        rows, {}, project='p',
+        rows, SchedulerStateSnapshot(), project='p',
         park_stacks=park_stacks,
         live_task_ids=live_task_ids,
     )

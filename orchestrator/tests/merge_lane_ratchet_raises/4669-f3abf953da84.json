@@ -1,0 +1,18 @@
+{
+  "task_id": "4669",
+  "reason": "Net-additive invariant guard (review suggestion 4, heuristic 10): PlanFilesTouchedResult.__post_init__ refuses a dropped_by_rebase that is not a subset of not_touched or overlaps missing_from_tree, naming the offending keys, instead of letting plan_files_not_touched_reason silently render it without its dropped clause.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 378,
+      "current": 380
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5247,
+      "current": 5249
+    }
+  ]
+}

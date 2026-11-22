@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Awaitable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
 from shared.config_dir import TaskConfigDir
+from shared.escalation_project_scope import escalation_project_headers
 from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.safe_io import load_json_or_warn
 from shared.transcript_archive import archive_task_transcripts
@@ -36,7 +36,6 @@ from fused_memory.reconciliation.cli_stage_runner import (
     recon_transcript_archive_key,
     run_stage_via_cli,
 )
-from fused_memory.reconciliation.sqlite_failures import await_best_effort
 from fused_memory.utils.validation import require_project_id, require_run_id
 
 if TYPE_CHECKING:
@@ -264,26 +263,14 @@ class BaseStage:
             else self.get_report_schema()
         )
 
-        # Session-capture substrate (task 2744): mint a CLI session and a per-run
-        # isolated config dir, persist the (session_id, stage) snapshot on the run
-        # row BEFORE launching the stage subprocess (mint-before-spawn, mirroring
-        # the orchestrator), then clear the snapshot once the subprocess exits —
-        # on every exit, cancellation included — so the row carries a session_id
-        # only while a stage is actually in flight. The config dir is derived
-        # deterministically from (data_dir, run_id) so all three stages of a run
-        # share it and the harness GCs the same path. Both snapshot writes are
-        # best-effort (task 5561).
+        # A CLI session id and the per-run config dir are minted before the spawn
+        # and forwarded to the runner. The dir is derived from (data_dir, run_id),
+        # so every stage of a run shares it and the harness GCs the same path.
+        # Nothing is written to the run row.
         session_id = str(uuid4())
         config_dir = TaskConfigDir(
             task_id=run_id,
             base_dir=recon_config_base_dir(self.journal.data_dir),
-        )
-        await self._write_session_snapshot_best_effort(
-            'record_run_session',
-            run_id,
-            self.journal.record_run_session(
-                run_id, session_id=session_id, stage_cursor=self.stage_id.value
-            ),
         )
 
         try:
@@ -302,9 +289,6 @@ class BaseStage:
             )
         finally:
             self._archive_stage_transcripts(config_dir, run_id)
-            await self._write_session_snapshot_best_effort(
-                'clear_run_session', run_id, self.journal.clear_run_session(run_id),
-            )
 
         completed = datetime.now(UTC)
 
@@ -498,31 +482,29 @@ class BaseStage:
 
         return stage_report
 
-    async def _write_session_snapshot_best_effort(
-        self, op: str, run_id: str, write: Awaitable[None],
-    ) -> None:
-        """Await one session-snapshot journal write, logging rather than raising on failure.
-
-        The snapshot is advisory — it records which stage is in flight, and no
-        control path reads it back — so a failed write must not stop the stage.
-        Cancellation propagates.
-        """
-        await await_best_effort(
-            write,
-            what=f'Stage {self.stage_id.value} session-snapshot write {op}',
-            run_id=run_id, logger=logger, level=logging.WARNING,
-        )
-
     def _archive_stage_transcripts(self, config_dir: TaskConfigDir, run_id: str) -> None:
         """Producer half of recon transcript archival (task 3972).
 
-        COPIES: deleting the source is the teardown half's job
-        (``cli_stage_runner.py::gc_run_config_dir``, which archives before it
-        deletes). Runs on every exit, cancellation included, so each stage's
-        transcript is durable before the run's teardown reaches the dir.
-        ``session_id=None`` archives the whole per-run dir, so subagent
-        transcripts are covered; ``_archive_one``'s mtime-equality skip makes
-        repeats nearly free. Synchronous and total by contract.
+        Copies every transcript in the run's config dir into the archive as
+        each stage exits, cancellation included, so the archive already holds
+        them all by the time the harness writes the run row terminal.
+
+        The case only this copy covers: a kill that runs no ``finally``
+        (SIGKILL, watchdog SIGABRT, OOM) after the row went terminal and before
+        the teardown ``cli_stage_runner.py::gc_run_config_dir`` ran.
+        ``harness.py::ReconciliationHarness.run_full_cycle`` and
+        ``::_run_remediation_pass`` write the row terminal (``complete_run``,
+        ``_record_*_run``) before their finally-GC, and every recovery pass selects only 'running' rows
+        (``journal.py::ReconciliationJournal.get_stale_runs`` /
+        ``get_running_runs``). Nothing revisits such a dir, so this copy is the
+        only archival its transcripts get. A boot-time orphan sweep over recon
+        config dirs (task 4906) would retire this hook.
+
+        COPIES: deleting the source is the teardown's job, and
+        ``gc_run_config_dir`` archives before it deletes. ``session_id=None``
+        archives the whole per-run dir, so subagent transcripts are covered;
+        ``_archive_one``'s mtime-equality skip makes repeats nearly free.
+        Synchronous and total by contract.
         """
         archive_root = recon_archive_root(self.config)
         if archive_root is None:
@@ -540,7 +522,9 @@ class BaseStage:
         Always includes the fused-memory server (HTTP or stdio), the
         jcodemunch stdio server, and the in-process recon-report HTTP server
         on ``self._recon_report_port``.  The escalation HTTP server is added
-        only if an escalation URL is configured.
+        only if an escalation URL is configured; its entry carries the stage's
+        project as the ``X-Escalation-Project`` header, which scopes the
+        reconciliation escalation server's uuid-prefix guard.
         """
         fm_config = _find_fused_memory_server()
 
@@ -579,6 +563,7 @@ class BaseStage:
             servers['escalation'] = {
                 'type': 'http',
                 'url': self._escalation_url,
+                'headers': escalation_project_headers(self.project_id),
             }
 
         return {'mcpServers': servers}

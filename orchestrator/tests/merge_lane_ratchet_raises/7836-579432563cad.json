@@ -1,0 +1,30 @@
+{
+  "task_id": "7836",
+  "reason": "Review fix: the recorded-branch-base rung now requires every own commit since the record to cite the task, and a merge-commit tip on main gets no baseline instead of tip^1 \u2014 two added fail-safe guards on the delivered-checks accept path",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+      "baseline": 178,
+      "current": 185
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py::_delivered_checks_differential",
+      "baseline": 15,
+      "current": 16
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py::_differential_parent_ref",
+      "baseline": 5,
+      "current": 6
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5344,
+      "current": 5351
+    }
+  ]
+}

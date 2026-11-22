@@ -1202,8 +1202,19 @@ async def test_update_task_replace_admits_identical_done_provenance_passthrough(
             {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']},
             {**_STORED_DONE_PROVENANCE, 'note': 'drift'},
         ),
+        (
+            {'done_provenance': {**_STORED_DONE_PROVENANCE, 'attempt': 1}, 'files': ['src']},
+            {**_STORED_DONE_PROVENANCE, 'attempt': 1.0},
+        ),
+        (
+            {'done_provenance': {**_STORED_DONE_PROVENANCE, 'attempt': 1}, 'files': ['src']},
+            {**_STORED_DONE_PROVENANCE, 'attempt': True},
+        ),
     ],
-    ids=['add', 'change-commit', 'change-kind', 'change-nested-shape'],
+    ids=[
+        'add', 'change-commit', 'change-kind', 'change-nested-shape',
+        'change-json-type-float', 'change-json-type-bool',
+    ],
 )
 async def test_update_task_replace_still_rejects_added_and_changed_done_provenance(
     backend, project_root, stored, payload_done_provenance,

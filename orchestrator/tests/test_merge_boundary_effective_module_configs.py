@@ -1,5 +1,5 @@
 """The γ user-observable signal: a red in an UNTOUCHED module is suppressible
-at the real merge boundary (``merge_queue._run_post_merge_verify``).
+at the real merge boundary (``merge_queue.run_post_merge_verify``).
 
 Flake-ledger PRD §8.2 / task 3787 (γ). This module drives the production
 chokepoint every merge verify flows through, not a helper in isolation.
@@ -61,14 +61,13 @@ from orchestrator import flake_recorder, verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.merge_lane.post_merge_verify import (
+    merge_boundary_module_configs,
+    run_post_merge_verify,
+)
 from orchestrator.merge_lane.queue_store import MergeQueueStore, reconstruct_merge_request
 from orchestrator.merge_lane.types import QueuedBranch
-from orchestrator.merge_lane.worker import (
-    MergeOutcome,
-    MergeRequest,
-    _merge_boundary_module_configs,
-    _run_post_merge_verify,
-)
+from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
 from orchestrator.verify import VerifyResult
 
 _MERGE_SHA = 'd' * 40
@@ -144,7 +143,7 @@ async def _drive_merge_boundary(
     event_store=None,
     escalation_queue=None,
 ) -> MergeOutcome | None:
-    """Drive the REAL ``_run_post_merge_verify`` — the single funnel every
+    """Drive the REAL ``run_post_merge_verify`` — the single funnel every
     production merge verify flows through.
 
     The scoped verify and the post-scoped pyright gate both come from the
@@ -178,7 +177,7 @@ async def _drive_merge_boundary(
     rerun = _passing_result() if isolated_rerun_passes else _failing_rerun_result()
 
     with patch.object(verify, 'run_verification', new=AsyncMock(return_value=rerun)):
-        return await _run_post_merge_verify(
+        return await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={},
             enospc_retries={},
@@ -473,7 +472,7 @@ async def _capture_boundary_consumers(
     touched: list[ModuleConfig],
     global_commands: bool = False,
 ) -> dict:
-    """Drive ``_run_post_merge_verify`` and capture what each consumer of the
+    """Drive ``run_post_merge_verify`` and capture what each consumer of the
     module set actually RECEIVED.
 
     The LOCAL set comes off the injected verify port and the WIRE set off a
@@ -488,7 +487,7 @@ async def _capture_boundary_consumers(
 
     Returns ``{'spec_arg', 'spec', 'verified', 'config', 'merge_wt'}``.
     """
-    from orchestrator.merge_lane import worker as merge_queue_module
+    from orchestrator.merge_lane import post_merge_verify as post_merge_verify_module
 
     config = _make_config(tmp_path, merge_verify_breadth=breadth)
     config._module_configs = dict(registry)
@@ -519,7 +518,7 @@ async def _capture_boundary_consumers(
     verifier = FakeVerifier()
     captured: dict = {'config': config, 'merge_wt': merge_wt}
 
-    real_build = merge_queue_module.build_merge_verify_spec
+    real_build = post_merge_verify_module.build_merge_verify_spec
 
     def _spy_build(cfg, module_configs, task_files):
         captured['spec_arg'] = list(module_configs)
@@ -527,8 +526,8 @@ async def _capture_boundary_consumers(
         captured['spec'] = spec
         return spec
 
-    with patch('orchestrator.merge_lane.worker.build_merge_verify_spec', new=_spy_build):
-        await _run_post_merge_verify(
+    with patch('orchestrator.merge_lane.post_merge_verify.build_merge_verify_spec', new=_spy_build):
+        await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=3, max_enospc=1,
@@ -799,7 +798,7 @@ class TestMergeBoundaryLeavesTheZeroModuleTaskAlone:
 
 
 class TestMergeBoundaryModuleConfigsWrapper:
-    """``merge_queue._merge_boundary_module_configs`` — the guard, and nothing
+    """``merge_queue.merge_boundary_module_configs`` — the guard, and nothing
     but the guard.
 
     INV-5: the wrapper must DELEGATE the expansion to the one shared
@@ -818,7 +817,7 @@ class TestMergeBoundaryModuleConfigsWrapper:
     def test_non_empty_passed_set_delegates_to_the_shared_helper(
         self, tmp_path: Path, monkeypatch,
     ):
-        from orchestrator.merge_lane import worker as merge_queue_module
+        from orchestrator.merge_lane import post_merge_verify as post_merge_verify_module
 
         config = self._config(tmp_path)
         passed = [_module_config('beta')]
@@ -830,10 +829,10 @@ class TestMergeBoundaryModuleConfigsWrapper:
             return list(sentinel)
 
         monkeypatch.setattr(
-            merge_queue_module, 'effective_merge_module_configs', _spy,
+            post_merge_verify_module, 'effective_merge_module_configs', _spy,
         )
 
-        result = merge_queue_module._merge_boundary_module_configs(config, passed)
+        result = post_merge_verify_module.merge_boundary_module_configs(config, passed)
 
         assert _prefixes(result) == ['sentinel']
         assert len(calls) == 1
@@ -847,7 +846,7 @@ class TestMergeBoundaryModuleConfigsWrapper:
         policy, so the breadth helper's contract stays untouched (its other
         caller, verify.py's force_workspace branch, still widens an empty
         passed set exactly as it did before γ)."""
-        from orchestrator.merge_lane import worker as merge_queue_module
+        from orchestrator.merge_lane import post_merge_verify as post_merge_verify_module
 
         config = self._config(tmp_path)
         calls: list[tuple] = []
@@ -857,11 +856,11 @@ class TestMergeBoundaryModuleConfigsWrapper:
             return [_module_config('sentinel')]
 
         monkeypatch.setattr(
-            merge_queue_module, 'effective_merge_module_configs', _spy,
+            post_merge_verify_module, 'effective_merge_module_configs', _spy,
         )
 
         passed: list[ModuleConfig] = []
-        result = merge_queue_module._merge_boundary_module_configs(config, passed)
+        result = post_merge_verify_module.merge_boundary_module_configs(config, passed)
 
         assert result is passed
         assert calls == []
@@ -875,7 +874,7 @@ class TestMergeBoundaryModuleConfigsWrapper:
 # belief (stated in its docstring) that "[] means all configured modules" and
 # that this "errs on the side of verifying more than the original, never
 # less".  Both claims were FALSE: the class directly above pins that
-# ``_merge_boundary_module_configs`` deliberately NEVER widens an empty set,
+# ``merge_boundary_module_configs`` deliberately NEVER widens an empty set,
 # so the empty set routes to ``verify_plan._derive_fallback_runs`` and the
 # recovered merge is verified FILE-SCOPED — narrower than its original, and
 # silently so (a file-scoped verify runs, and passes fast).
@@ -902,7 +901,7 @@ def _merge_plan_full_suite_prefixes(
     ``worktree_reader`` can be a constant ``None``: the FULL_SUITE branch
     (``_derive_full_suite_runs``) never consults file contents.
     """
-    effective = _merge_boundary_module_configs(config, module_configs)
+    effective = merge_boundary_module_configs(config, module_configs)
     plan = verify_plan.derive_verify_plan(
         files, effective, config, lambda _f: None, role='merge',
     )
@@ -1034,10 +1033,10 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
         rehydrated = self._rehydrate(tmp_path, config, original)
 
         original_effective = _prefixes(
-            _merge_boundary_module_configs(config, original.module_configs)
+            merge_boundary_module_configs(config, original.module_configs)
         )
         rehydrated_effective = _prefixes(
-            _merge_boundary_module_configs(config, rehydrated.module_configs)
+            merge_boundary_module_configs(config, rehydrated.module_configs)
         )
 
         assert rehydrated_effective == original_effective, (
@@ -1056,8 +1055,11 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
         GREEN today and must STAY green.  A task that genuinely has no
         assigned modules reconstructs to ``[]``, the boundary leaves it ``[]``
         (task 3787 γ's deliberate no-widen guard), and the plan takes
-        ``_derive_fallback_runs`` — no FULL_SUITE run at all — even though the
-        SAME nine-module registry is configured and breadth is 'full'.
+        ``_derive_fallback_runs`` — no registered module's FULL_SUITE run —
+        even though the SAME nine-module registry is configured and breadth is
+        'full'. The one FULL_SUITE run is the global fallback's own test floor
+        (tasks 8714/7041): a source-only diff at merge role runs the configured
+        test_command whole.
         """
         config = self._config(tmp_path, 'full')
         original = self._original(
@@ -1069,7 +1071,7 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
             f'a genuinely zero-module task must NOT be widened by the fix; '
             f'got {_prefixes(rehydrated.module_configs)!r}'
         )
-        assert _merge_boundary_module_configs(config, rehydrated.module_configs) == []
+        assert merge_boundary_module_configs(config, rehydrated.module_configs) == []
         assert _merge_plan_full_suite_prefixes(
             config, rehydrated.module_configs, self._TASK_FILES,
-        ) == [], 'the zero-module task must still take the global-fallback path'
+        ) == ['__fallback__'], 'the zero-module task must still take the global-fallback path'

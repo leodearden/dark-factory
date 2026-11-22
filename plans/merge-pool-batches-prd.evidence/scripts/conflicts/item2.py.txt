@@ -1,0 +1,21 @@
+import json,collections,math
+rows=json.load(open('/tmp/gate-10069/conflicts/bc_rows.json'))
+def wilson(k,n,z=1.96):
+    if n==0: return (float('nan'),)*2
+    p=k/n; d=1+z*z/n; c=p+z*z/(2*n); h=z*math.sqrt(p*(1-p)/n+z*z/(4*n*n)); return ((c-h)/d,(c+h)/d)
+for proj in ('df','all'):
+  R=[r for r in rows if proj=='all' or r['proj']==proj]
+  print('==',proj)
+  for cls,reasons in (('any',None),('conflict+merge_error',{'conflict','merge_error'}),('already_merged',{'already_merged'})):
+    print(' class',cls)
+    for k in range(1,6):
+        att=[r for r in R if r['depth']>=k and r['built']>=k-1]
+        fail=[r for r in att if r['built']==k-1 and r['reason']!='None' and (reasons is None or r['reason'] in reasons)]
+        # for class-specific hazard, treat other-reason truncations at k as censored (remove from att)
+        if reasons is not None:
+            att=[r for r in att if not (r['built']==k-1 and r['reason']!='None' and r['reason'] not in reasons)]
+        lo,hi=wilson(len(fail),len(att))
+        print(f'  link {k} (item n={k+1}): attempts {len(att)} fails {len(fail)} h={len(fail)/max(1,len(att)):.3f} [{lo:.3f},{hi:.3f}]')
+# timeline of truncations
+for r in rows:
+    if r['reason']!='None': print(r['proj'],r['ts'],r['depth'],r['built'],r['reason'])

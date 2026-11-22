@@ -17,7 +17,6 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, assert_never, cast
 
 from graphiti_core.nodes import EpisodeType
-from shared.storm_counter import KeyedStormCounters
 from shared.streak import KeyedStreaks
 
 from fused_memory.backends.graphiti_client import (
@@ -87,7 +86,6 @@ from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
-    StageAgentOutcome,
 )
 from fused_memory.models.scope import (
     Scope,
@@ -113,9 +111,15 @@ from fused_memory.reconciliation.standing_decision_constants import (
 from fused_memory.reconciliation.standing_decision_writer import (
     expire_entity_standing_decision,
 )
+from fused_memory.reconciliation.summary_pool import decode_cycle_summary_agent_outcome
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services import mem0_retry_backlog_alarm, mem0_write_retry, overreach_guard
+from fused_memory.services.agent_project_storm_counters import AgentProjectStormCounters
+from fused_memory.services.billing_exhaustion_alarm import (
+    BillingExhaustionAlarm,
+    BillingParkPolicy,
+)
 from fused_memory.services.classification_fallback_alarm import (
     ClassificationFallbackAlarm,
     journal_params,
@@ -133,6 +137,7 @@ from fused_memory.services.mem0_write_retry import (
     Mem0RetryPassSummary,
     Mem0RetryPolicy,
     OnMem0Landed,
+    TransientProviderFailure,
     classify_transient_provider_failure,
     mem0_write_op_landed,
     retry_reason,
@@ -146,6 +151,10 @@ from fused_memory.services.overreach_shadow import (
     OverreachShadow,
     open_overreach_shadow,
     shadow_job_from_write,
+)
+from fused_memory.services.provider_billing import (
+    billing_source_of,
+    classify_billing_exhaustion,
 )
 from fused_memory.services.queued_writes import (
     DecodedReferents,
@@ -879,9 +888,7 @@ async def _apply_memory_metadata_validation(
     dropped by task GC; it yields the loop, which is the property that
     matters.
     """
-    violations = validate_memory_metadata(
-        meta, enforce_kind_registry=config.enforce_kind_registry
-    )
+    violations = validate_memory_metadata(meta)
 
     # parent_id LIVENESS (leaf δ). Gated on the SHAPE check having passed —
     # `validate_memory_metadata` emits `invalid_parent_id_shape` under the
@@ -985,9 +992,7 @@ async def _apply_memory_metadata_validation(
         before = dict(baseline)
         already = {
             (v.key, v.code)
-            for v in validate_memory_metadata(
-                before, enforce_kind_registry=config.enforce_kind_registry
-            )
+            for v in validate_memory_metadata(before)
         }
         violations = [
             v for v in violations
@@ -1606,30 +1611,17 @@ except Exception:
 def _is_rate_limit_or_quota_error(exc: BaseException) -> bool:
     """Return True if *exc* represents an embedding-provider rate-limit or quota error.
 
-    Matches ANY ``openai.RateLimitError`` — this covers both hard quota
-    exhaustion (``insufficient_quota``, non-retryable) and transient
-    too-many-requests rate limiting (retryable); the two are not
-    distinguished. Also matches duck-typed equivalents — a
-    ``status_code == 429`` attribute (regardless of code/message), or
-    ``'insufficient_quota'`` appearing in the error's ``code`` attribute —
-    so callers (get_entity's degraded fallback) can classify this condition
-    without a hard dependency on the openai SDK's exact exception hierarchy
-    (e.g. if Graphiti wraps/re-raises the error, or a different embedding
-    provider is configured). As a last resort, ``'insufficient_quota'``
-    appearing in the exception's string message also matches, but ONLY when
-    the exception carries neither a ``status_code`` nor a ``code`` attribute
-    — a concrete (even if non-matching, e.g. ``status_code=500``) status or
-    code classification is trusted over the fuzzy message-substring guess,
-    so a wrapped/log-echo error that merely quotes an upstream
-    'insufficient_quota' message inside an otherwise-unrelated, already-
-    classified error does not get swallowed into the degraded fallback
-    (task 2448 review).
+    Matches ANY ``openai.RateLimitError`` and any duck-typed
+    ``status_code == 429``, so a transient too-many-requests rate limit and
+    exhausted credits are deliberately ONE condition here. get_entity's
+    degraded fallback is fine with that because it has no retry loop of its
+    own: on a match it degrades immediately rather than retrying, for either
+    cause. Callers that must tell the two apart ask
+    ``provider_billing.py::classify_billing_exhaustion`` directly.
 
-    Callers that need to tell hard quota exhaustion apart from a
-    retryable transient rate limit must not rely on this predicate alone —
-    it deliberately treats both as one condition. get_entity's degraded
-    fallback is fine with that because it has no retry loop of its own: on
-    a match it degrades immediately rather than retrying, for either cause.
+    The quota half is that classifier's verdict, so the rules for reading
+    ``insufficient_quota`` (through a wrapper's ``__cause__``, structured
+    fields over a message substring, task 2448) have one home.
 
     Never matches a bare BaseException (e.g. ``asyncio.CancelledError``,
     ``KeyboardInterrupt``, ``SystemExit``) — those are structured-concurrency
@@ -1640,15 +1632,9 @@ def _is_rate_limit_or_quota_error(exc: BaseException) -> bool:
         return False
     if _OpenAIRateLimitError is not None and isinstance(exc, _OpenAIRateLimitError):
         return True
-    status_code = getattr(exc, 'status_code', None)
-    if status_code == 429:
+    if getattr(exc, 'status_code', None) == 429:
         return True
-    code = str(getattr(exc, 'code', '') or '')
-    if 'insufficient_quota' in code.lower():
-        return True
-    if status_code is None and not code:
-        return 'insufficient_quota' in str(exc).lower()
-    return False
+    return classify_billing_exhaustion(exc) is not None
 
 
 def _graphiti_degraded_entity_result() -> dict:
@@ -1758,6 +1744,7 @@ def _store_failure_diagnostics(
 
     Returns:
         dict with keys: store, reason, error_type, error, rate_limit_or_quota,
+        billing_exhausted (the exhausted ``BillingSource`` value, or None),
         query_len, project_id.
     """
     return {
@@ -1766,6 +1753,7 @@ def _store_failure_diagnostics(
         'error_type': type(exc).__name__ if exc is not None else 'TimeoutError',
         'error': (str(exc)[:500] if exc is not None else 'search_timeout'),
         'rate_limit_or_quota': _is_rate_limit_or_quota_error(exc) if exc is not None else False,
+        'billing_exhausted': billing_source_of(exc),
         'query_len': len(query),
         # Intentionally repeated per-entry (not deduped onto SearchResults) so
         # each diagnostic stays self-contained for independent log consumption —
@@ -2185,6 +2173,9 @@ class MemoryService:
         self.classifier = WriteClassifier(config)
         self.router = ReadRouter(config)
         self.durable_queue: DurableWriteQueue | None = None
+        self._billing_alarm = BillingExhaustionAlarm(
+            resolve_project_root=lambda: configured_primary_root(self.config.taskmaster) or None,
+        )
         self._event_buffer: EventBuffer | None = None
         self._write_journal: WriteJournal | None = None
         self.taskmaster: TaskBackendProtocol | None = None
@@ -2206,18 +2197,17 @@ class MemoryService:
         # service). An alarm bound to either would vanish in exactly the
         # degraded configuration where an unattended rewrite loop is least
         # likely to be noticed any other way.
-        self._mem0_update_storm_counters: KeyedStormCounters[tuple[str, str]] = (
-            KeyedStormCounters()
-        )
+        self._mem0_update_storm_counters = AgentProjectStormCounters()
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
         self.set_known_projects(build_known_projects_map(primary_root=''))
         # INV-4 storm escape for the ensure_entity_node MCP tool (task 4932),
-        # keyed per `agent_id` for the same attribution reason as the registry
-        # above.
+        # keyed per `(agent_id, project_id)` for the same attribution reason as
+        # the update_memory registry above: one agent's mints in another
+        # project cannot inflate the count filed into this project's queue.
         # No escalator OBJECT beside it: `middleware/entity_mint_storm_escalator`
         # is a module FUNCTION taking project_root explicitly, so there is no
         # queue cache to own and no set_known_projects lifecycle to keep in sync.
-        self._entity_mint_storm_counters: KeyedStormCounters[str] = KeyedStormCounters()
+        self._entity_mint_storm_counters = AgentProjectStormCounters()
         # Warn-ONCE latch for a corrupt/absent `entity_mint.storm_*` leaf. The
         # corrupt-leaf branch of `_record_entity_mint` is reached on EVERY mint
         # (unlike the `_known_projects` miss beside it, which only fires at a
@@ -2353,16 +2343,16 @@ class MemoryService:
         agents is a real memory bound on a long-lived server and belongs in the
         interface, as ``UnknownKeyStormDetector.tracked_writers`` argues.
         """
-        return frozenset(agent for agent, _ in self._mem0_update_storm_counters.tracked_keys)
+        return self._mem0_update_storm_counters.tracked_agents
 
     @property
     def entity_mint_storm_tracked_agents(self) -> frozenset[str]:
-        """The ``agent_id`` labels holding an ``ensure_entity_node`` storm window.
+        """The ``agent_id`` labels holding an ``ensure_entity_node`` storm window in any project.
 
         The same bound as :attr:`mem0_update_storm_tracked_agents`, for the
         entity-mint burst alarm.
         """
-        return self._entity_mint_storm_counters.tracked_keys
+        return self._entity_mint_storm_counters.tracked_agents
 
     def set_planned_registry(self, registry: PlannedEpisodeRegistry) -> None:
         """Wire the planned episode registry into the service."""
@@ -2462,6 +2452,7 @@ class MemoryService:
         except Exception:
             logger.warning('overreach shadow failed to open; running without it', exc_info=True)
 
+        await self._billing_alarm.restore()
         self.durable_queue = DurableWriteQueue(
             data_dir=qcfg.data_dir,
             execute_write=self._execute_durable_write,
@@ -2475,6 +2466,7 @@ class MemoryService:
             transient_error_names=qcfg.transient_error_names,
             on_terminal=self._record_queue_terminal_outcome,
             on_dead_letter=self._report_queue_dead_letter,
+            park_policy=BillingParkPolicy(self._billing_alarm),
         )
         self.durable_queue.register_callback(
             QueueCallback.DUAL_WRITE_EPISODE, self._dual_write_callback
@@ -6999,6 +6991,10 @@ class MemoryService:
             write_op_id,
             failure.value,
         )
+        if failure is TransientProviderFailure.BILLING_EXHAUSTED:
+            exhaustion = classify_billing_exhaustion(error)
+            if exhaustion is not None:
+                await self._billing_alarm.record_exhausted(exhaustion, site='mem0_write')
         return reason
 
     async def reissue_mem0_intent(self, intent: Mapping[str, Any]) -> Mem0AddOutcome:
@@ -7032,7 +7028,9 @@ class MemoryService:
 
         The one dispatch from method to backend call, shared by the original
         write and its re-issue so the two cannot diverge. The backend_op label
-        is ``add`` for both methods: the mem0 primitive each one calls.
+        is ``add`` for both methods: the mem0 primitive each one calls. A write
+        that lands proves OpenAI credits are back, so it resolves an open
+        billing page.
         """
         match write_method:
             case Mem0WriteMethod.ADD:
@@ -7054,9 +7052,12 @@ class MemoryService:
             payload={'content': content[:200]},
             coro=coro,
         )
-        return read_mem0_add_result(
+        outcome = read_mem0_add_result(
             raw, operation=write_method.value, zero_ids_anomalous=zero_ids_anomalous
         )
+        if outcome.landed:
+            await self._billing_alarm.record_recovered(site='mem0_write')
+        return outcome
 
     @property
     def mem0_retry_policy(self) -> Mem0RetryPolicy:
@@ -7088,6 +7089,7 @@ class MemoryService:
             now=now or datetime.now(UTC),
             max_age=timedelta(seconds=self._mem0_retry_policy.backlog_alarm_age_seconds),
             project_roots=self._known_projects,
+            billing=self._billing_alarm.state(),
         )
 
     # ------------------------------------------------------------------
@@ -8929,11 +8931,8 @@ class MemoryService:
             # be trusted as a suppression signal for Stage 3 (task 2652
             # amendment).
             remediation = raw_remediation if isinstance(raw_remediation, bool) else None
-            raw_outcome = payload.get('agent_outcome') if isinstance(payload, dict) else None
-            try:
-                agent_outcome = StageAgentOutcome(raw_outcome).value
-            except ValueError:
-                agent_outcome = None
+            decoded = decode_cycle_summary_agent_outcome(record)
+            agent_outcome = decoded.value if decoded is not None else None
 
         reason, expected, run_status = await self._classify_summary_absence(
             journal,
@@ -9560,10 +9559,10 @@ class MemoryService:
         # agent_id is caller-supplied and unbounded; KeyedStormCounters sweeps
         # the dormant ones on every record.
         storm = self._mem0_update_storm_counters.record(
-            (label, project_id),
+            label,
+            project_id,
             threshold=threshold,
             window_seconds=float(window_seconds),
-            label=label,
             now=self._mem0_update_storm_time_provider(),
         )
         if storm is None:
@@ -10448,10 +10447,15 @@ class MemoryService:
         exactly the hold time the bounded acquire in ``ensure_entity_node``
         exists to bound, and would stall the event loop besides.
 
-        One counter per ``agent_id``, so two independently-busy agents cannot
-        sum into a false alarm. The threshold and window are read LIVE off the
-        shared config and passed INTO ``record()`` per call — captured once,
-        they would make both green-tier leaves restart-only in disguise.
+        One counter per ``(agent_id, project_id)``. Two independently-busy
+        agents cannot sum into a false alarm, and one agent's mints in another
+        project cannot inflate the count filed into this project's queue, so
+        the number is reproducible from this project's own
+        ``ensure_entity_node`` journal rows. Recon stage ids
+        (``recon-stage-<stage>``) are project-independent, which is why the
+        project is part of the key. The threshold and window are read LIVE off
+        the shared config and passed INTO ``record()`` per call — captured
+        once, they would make both green-tier leaves restart-only in disguise.
         """
         label = agent_id or '<unattributed>'
         cfg = getattr(self.config, 'entity_mint', None)
@@ -10490,9 +10494,9 @@ class MemoryService:
         # the dormant ones on every record.
         storm = self._entity_mint_storm_counters.record(
             label,
+            project_id,
             threshold=threshold,
             window_seconds=float(window_seconds),
-            label=label,
             now=self._entity_mint_storm_time_provider(),
         )
         if storm is None:

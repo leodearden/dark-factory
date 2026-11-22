@@ -1,0 +1,29 @@
+from common import *
+MARK='2026-11-17T20:49:02'; D8528='2026-11-19T04:25:50'
+def era(ts): return 'A' if ts<MARK else ('B' if ts<D8528 else 'C')
+W=[v for v in V if v['ts']>='2026-11-15T11:19']
+print('verifies in window',len(W),'pass',sum(v['passed'] for v in W),'red',sum(not v['passed'] for v in W))
+print('by era/k/pass:',sorted(collections.Counter((era(v['ts']),'chain' if v['k']>1 else 'solo','P' if v['passed'] else 'F') for v in W).items()))
+# identical tree re-verified
+bysha=collections.defaultdict(list)
+for v in W: bysha[v['merge_sha']].append(v)
+print('merge_sha verified >1 time:',sum(1 for s,l in bysha.items() if len(l)>1))
+for s,l in bysha.items():
+    if len(l)>1: print('   ',s[:8],[(v['vid'],v['ts'][5:16],v['task'],'k%d'%v['k'],v['runner'][:3],'P' if v['passed'] else 'F',sorted(fset(v) or [])) for v in l])
+# identical content trees (same main base + same ordered tips)
+def key(v): return (v['base'],tuple((l.get('task'),l.get('tip') or l['sha']) for l in v['layers']))
+byk=collections.defaultdict(list)
+for v in W: byk[key(v)].append(v)
+print('identical (base,tips) verified >1 time:',sum(1 for s,l in byk.items() if len(l)>1))
+for s,l in byk.items():
+    if len(l)>1 and len(set(v['merge_sha'] for v in l))>1: print('   ',[(v['vid'],v['ts'][5:16],v['task'],'k%d'%v['k'],v['runner'][:3],'P' if v['passed'] else 'F',sorted(fset(v) or [])) for v in l])
+KNOWN={'HIST','FILING','DETRUN','LOOP','RETIRED','SUPP','UVRUN','CACHEB'}
+print('red verifies with failing groups outside the attributed set, or no log:')
+for v in W:
+    if v['passed']: continue
+    fs=fset(v)
+    if fs is None or (fs-KNOWN):
+        print('   ',v['vid'],v['ts'][5:16],era(v['ts']),v['task'],'k%d'%v['k'],v['runner'][:3],v['base_relation'],'red_units',v['red_units'],'fails',sorted(fs) if fs else 'NOLOG','layers',[(l.get('task'),(l.get('tip') or '')[:8]) for l in v['layers']][:4])
+EV=events()
+print('flake-suppressed (gate retried and passed):',[(e['id'],e['ts'][5:16],e['task'],len(e['d'].get('node_ids') or [])) for e in EV if e['et']=='merge_flake_suppressed' and e['ts']>='2026-11-15T11:19'])
+print('gate_retry attempts:',sum(1 for e in EV if e['et']=='merge_attempt' and e['d'].get('outcome')=='gate_retry' and e['ts']>='2026-11-15T11:19'))

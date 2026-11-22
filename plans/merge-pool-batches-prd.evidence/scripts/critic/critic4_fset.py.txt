@@ -1,0 +1,49 @@
+import sqlite3, json, collections
+REPO='/home/leo/src/dark-factory'
+db=sqlite3.connect(f'file:{REPO}/data/orchestrator/runs.db?mode=ro', uri=True)
+# red chain tips since 2026-10-21
+tips={}
+for id_,ts,task,data in db.execute("""select id,timestamp,task_id,data from events where event_type='merge_verify'
+  and timestamp>='2026-10-21' and json_extract(data,'$.chain_items')>1 and json_extract(data,'$.passed')=0"""):
+    d=json.loads(data); tips[d['merge_sha']]=(ts,d.get('runner'),d.get('chain_items'),d.get('units'))
+occ=collections.defaultdict(list)
+for test_id,verdict,sha,detail,runner in db.execute("select test_id,verdict,merge_sha,detail,runner from flake_occurrence where call_site='merge_gate' and observed_at>='2026-10-21'"):
+    if sha in tips: occ[sha].append((test_id,verdict,detail,runner))
+print('red chain tips',len(tips),'with flake rows',len(occ))
+v=collections.Counter(); nomod=0; multi_file=0; sizes=[]; files=collections.Counter(); multi_module=0; reasons=collections.Counter()
+big=[]
+for sha,rows in occ.items():
+    verdicts={r[1] for r in rows}
+    vv='fails_in_isolation' if 'fails_in_isolation' in verdicts else sorted(verdicts)[0]
+    v[vv]+=1
+    if vv=='unconfirmable':
+        for r in rows:
+            try: reasons[json.loads(r[2]).get('unconfirmable_reason')]+=1
+            except Exception: reasons['?']+=1
+        continue
+    if vv!='fails_in_isolation': continue
+    ids=[r[0] for r in rows if r[1]=='fails_in_isolation']
+    sizes.append(len(ids))
+    if any('::' not in i for i in ids): nomod+=1
+    fs={i.split('::')[0] for i in ids}
+    for f in fs: files[f]+=1
+    if len(fs)>1: multi_file+=1
+    if len(ids)>=5: big.append((len(ids),sorted(fs)[:3]))
+print(v); print('unconfirmable reasons (rows)',reasons)
+print('fails sets:',len(sizes),'mean',sum(sizes)/max(1,len(sizes)),'max',max(sizes),'size dist',sorted(collections.Counter(sizes).items()))
+print('sets with a module-level id (no ::):',nomod,' sets spanning >1 file:',multi_file)
+print('top files:'); [print('  ',n,f) for f,n in files.most_common(14)]
+print('big sets',big[:8])
+# detail sample
+r=db.execute("select detail from flake_occurrence where call_site='merge_gate' and verdict='fails_in_isolation' order by id desc limit 1").fetchone()
+print('detail sample',r[0][:600])
+# tips without flake rows: what units red
+nof=[s for s in tips if s not in occ]
+print('tips with no flake row',len(nof))
+uc=collections.Counter()
+for s in nof:
+    u=tips[s][3]
+    if not u: uc['no-units']+=1; continue
+    red=[x['unit'] if isinstance(x,dict) else str(x) for x in u if (x.get('outcome') if isinstance(x,dict) else '')=='ran_red']
+    uc[tuple(sorted(r.split(':')[-1] for r in red))]+=1
+print(uc)

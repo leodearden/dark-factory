@@ -3,7 +3,7 @@
 
 Walks ``~/.claude/projects/<enc>`` (or an injected ``projects_root``, so
 tests never touch the real ``~/.claude`` tree — mirrors
-``session_registry.fleet_root(root=)``) for a project whose agents span
+``fleet_files.fleet_root(root=)``) for a project whose agents span
 many encoded cwd directories: a project's config lists **cwd prefixes**
 (``docs/legibility/legibility.yaml``'s ``cwd_prefixes``), and membership is
 resolved from each session's REAL ``cwd`` (read from a transcript line) via
@@ -11,6 +11,12 @@ path-component semantics, never a raw string-prefix match on the encoded
 dir name — the ``~/.claude/projects`` encoding is lossy (``/``, ``.`` and
 ``_`` all map to ``-``), so a sibling project sharing the same literal
 prefix (e.g. ``dark-factory-cockpit``) would otherwise be over-included.
+
+Each encoded dir holds session transcripts ``<sid>.jsonl`` and, per session,
+Claude Code sub-agent transcripts ``<sid>/subagents/agent-<id>.jsonl`` and
+``<sid>/subagents/workflows/wf_<id>/agent-<id>.jsonl``; all are enumerated, as
+the archive's recursive walk already does, and each is its own session
+(:class:`TranscriptIdentity`).
 
 Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 §5.2, contract §7.4). Self-contained — does not import task α's
@@ -22,7 +28,7 @@ import argparse
 import json
 import logging
 import sys
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -32,7 +38,7 @@ logger = logging.getLogger('legibility.inventory')
 
 
 def encode_cwd(cwd: str) -> str:
-    """Mirror ``session_registry.encode_cwd``'s encoding of Claude Code's dir naming.
+    """Mirror ``session_records.encode_cwd``'s encoding of Claude Code's dir naming.
 
     ``/``, ``.`` AND ``_`` all map to ``-``; ``-`` passes through and CASE
     IS PRESERVED (the encoder does not lowercase). Validated against 738
@@ -42,7 +48,7 @@ def encode_cwd(cwd: str) -> str:
     complete over the observed domain, and unverified outside it.
 
     This is a hand-written mirror of the canonical implementation,
-    ``orchestrator.session_registry.encode_cwd`` (named, not line-cited, so
+    ``orchestrator.session_records.encode_cwd`` (named, not line-cited, so
     this docstring doesn't drift as that file evolves). It is duplicated
     rather than imported because this module is deliberately self-contained
     — its ``__main__`` bootstrap puts only ``scripts/`` on ``sys.path``, so
@@ -219,46 +225,125 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
             raise as_unreadable_file_error(exc) from exc
 
 
-def _session_cwd_and_date(path: Path) -> tuple[str | None, date | None]:
-    """Single-pass read of *path*, returning ``(cwd, date)`` together.
+SUBAGENTS_DIR = 'subagents'
+"""The per-session directory Claude Code files sub-agent transcripts under."""
 
-    :func:`session_cwd` and :func:`_first_timestamp_date` each scan *path*
-    independently for their own first-occurrence value, so
-    :func:`enumerate_sessions` calling both on every candidate session read
-    the same transcript twice (reviewer_comprehensive/performance, task
-    2573 amendment pass #2). This helper collects both facts in ONE pass —
-    each still only takes its own first occurrence, so the values returned
-    are identical to calling ``session_cwd(path)`` and
-    ``_first_timestamp_date(path)`` separately — stopping as soon as both
-    have been found. Degrades to ``(None, None)`` on an unreadable path,
-    matching both functions' individual degrade-to-None contracts.
+
+@dataclass(frozen=True)
+class TranscriptIdentity:
+    """Which session a transcript IS, as ledger rows, digests and coding records name it.
+
+    A session transcript is keyed on its ``sessionId``. A Claude Code
+    sub-agent transcript carries its PARENT's ``sessionId`` plus its own
+    ``agentId``, so it is keyed ``<parent sid>/subagents/agent-<agentId>`` and
+    names the parent in :attr:`parent_session` rather than inside a string a
+    consumer would parse. That key is an Agent-tool sub-agent's path under the
+    encoded dir; a Workflow-tool sub-agent, filed deeper under
+    ``subagents/workflows/wf_<id>/``, gets the same key shape, because none of
+    its records names the workflow and an ``agentId`` is unique within its
+    session.
+    """
+
+    session_id: str
+    agent_id: str | None = None
+
+    @property
+    def key(self) -> str:
+        if self.agent_id is None:
+            return self.session_id
+        return f'{self.session_id}/{SUBAGENTS_DIR}/agent-{self.agent_id}'
+
+    @property
+    def parent_session(self) -> str | None:
+        return self.session_id if self.agent_id is not None else None
+
+
+def transcript_identity(record: Mapping[str, Any]) -> TranscriptIdentity | None:
+    """The identity *record* declares, or ``None`` when it carries no non-empty ``sessionId``."""
+    session_id = record.get('sessionId')
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    agent_id = record.get('agentId')
+    return TranscriptIdentity(
+        session_id=session_id,
+        agent_id=agent_id if isinstance(agent_id, str) and agent_id else None,
+    )
+
+
+def first_transcript_identity(records: Iterable[Mapping[str, Any]]) -> TranscriptIdentity | None:
+    """A transcript's identity: that of its first ``sessionId``-bearing record.
+
+    An ``agentId`` on that record marks a sub-agent transcript, whose
+    ``sessionId`` is its parent's.
+    """
+    for record in records:
+        identity = transcript_identity(record)
+        if identity is not None:
+            return identity
+    return None
+
+
+def transcript_encoded_dir(path: Path) -> str:
+    """The encoded cwd dir a transcript is filed under.
+
+    ``<enc>/<sid>.jsonl`` is filed under its parent dir. A sub-agent
+    transcript sits somewhere beneath ``<enc>/<sid>/subagents/`` (directly,
+    or under ``workflows/wf_<id>/``) and is filed under the dir two above its
+    nearest ``subagents`` ancestor. The same holds beneath the archive's
+    ``<key>/<enc>/...``.
+    """
+    for ancestor in path.parents:
+        if ancestor.name == SUBAGENTS_DIR and len(ancestor.parents) >= 2:
+            return ancestor.parents[1].name
+    return path.parent.name
+
+
+@dataclass(frozen=True)
+class _TranscriptHeader:
+    cwd: str | None = None
+    date: date | None = None
+    identity: TranscriptIdentity | None = None
+
+
+def _record_date(record: Mapping[str, Any]) -> date | None:
+    ts = record.get('timestamp')
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).date()
+
+
+def _read_header(path: Path) -> _TranscriptHeader:
+    """Single-pass read of *path*'s cwd, first-timestamp date and identity.
+
+    Each value is its first occurrence, so the answers equal those of three
+    separate scans; the pass stops once all three are found, which for a
+    live transcript is its first record. An unreadable path degrades to an
+    all-``None`` header.
     """
     cwd: str | None = None
     session_date: date | None = None
+    identity: TranscriptIdentity | None = None
     try:
         for record in iter_json_lines(path):
             if cwd is None:
                 candidate_cwd = record.get('cwd')
                 if isinstance(candidate_cwd, str) and candidate_cwd:
                     cwd = candidate_cwd
-
             if session_date is None:
-                ts = record.get('timestamp')
-                if isinstance(ts, str) and ts:
-                    try:
-                        parsed = datetime.fromisoformat(ts)
-                    except ValueError:
-                        parsed = None
-                    if parsed is not None:
-                        if parsed.tzinfo is None:
-                            parsed = parsed.replace(tzinfo=UTC)
-                        session_date = parsed.astimezone(UTC).date()
-
-            if cwd is not None and session_date is not None:
+                session_date = _record_date(record)
+            if identity is None:
+                identity = transcript_identity(record)
+            if cwd is not None and session_date is not None and identity is not None:
                 break
     except OSError:
-        return None, None
-    return cwd, session_date
+        return _TranscriptHeader()
+    return _TranscriptHeader(cwd=cwd, date=session_date, identity=identity)
 
 
 def session_cwd(path: Path) -> str | None:
@@ -268,24 +353,24 @@ def session_cwd(path: Path) -> str | None:
     ``agent-name``, ``queue-operation``) carry no ``cwd`` at all, and a few
     metadata-only stub sessions carry no ``cwd`` anywhere in the file. Both
     an unreadable path and a cwd-less file degrade to ``None`` rather than
-    raising. Delegates to :func:`_session_cwd_and_date` — a standalone
-    caller wanting only the cwd also pays for that helper's timestamp scan,
-    but this function is no longer on :func:`enumerate_sessions`'s hot path
-    (it calls :func:`_session_cwd_and_date` directly), so that trade only
-    affects callers wanting the cwd in isolation.
+    raising. A thin wrapper over :func:`_read_header`, which
+    :func:`enumerate_sessions` calls directly.
     """
-    cwd, _ = _session_cwd_and_date(path)
-    return cwd
+    return _read_header(path).cwd
 
 
 @dataclass(frozen=True)
 class SessionRecord:
     """One enumerated session transcript.
 
-    ``encoded_dir`` is the containing directory's basename (a
-    ``~/.claude/projects/<enc>`` entry); ``cwd`` is the REAL decoded cwd
+    ``encoded_dir`` is the ``~/.claude/projects/<enc>`` entry the transcript
+    is filed under, which for a sub-agent transcript is not its containing
+    directory (:func:`transcript_encoded_dir`; an archive transcript's is the
+    ``<enc>`` below its archive key, :func:`_archive_enc`); ``cwd`` is the REAL decoded cwd
     read from the transcript (the value :func:`is_member` was checked
-    against), not a re-derivation from ``encoded_dir``.
+    against), not a re-derivation from ``encoded_dir``. ``identity`` is the
+    transcript's :class:`TranscriptIdentity`, ``None`` when no record carries
+    a ``sessionId``.
     """
 
     path: Path
@@ -293,17 +378,7 @@ class SessionRecord:
     cwd: str
     date: date
     size_bytes: int
-
-
-def _first_timestamp_date(path: Path) -> date | None:
-    """Return the UTC date of the first valid ISO-8601 ``timestamp`` line in *path*.
-
-    Returns None when the file is unreadable, has no timestamp line, or
-    every timestamp line is unparseable — callers fall back to file mtime.
-    Delegates to :func:`_session_cwd_and_date`; see its docstring for why.
-    """
-    _, session_date = _session_cwd_and_date(path)
-    return session_date
+    identity: TranscriptIdentity | None = None
 
 
 def resolve_agent_transcript_roots(
@@ -332,15 +407,15 @@ def _build_session_record(
 
     Skips (returns ``None``) a non-existent/unreadable/empty file, a session
     whose real ``cwd`` is not a project member (:func:`is_member`), and a
-    session whose date — first-timestamp (:func:`_session_cwd_and_date`),
+    session whose date — first-timestamp (:func:`_read_header`),
     falling back to file mtime — is rejected by *date_ok* (``date_ok(d)`` is
     ``False``). The *date_ok* predicate is what lets one shared record-builder
     back both the single-date enumerator (``date_ok = d == target_date``) and
     the range enumerator (``date_ok = start <= d <= end``) with no duplicated
     walk. Shared by the ``~/.claude/projects`` loop and the archive-roots loop
     in :func:`_enumerate`: the projects path is behaviorally unchanged (guarded
-    by ``TestEnumerateSessions``), while the archive path passes the encoded
-    worktree dir (``session_path.parent.name``) as *encoded_dir*.
+    by ``TestEnumerateSessions``), while the archive path passes the
+    archive transcript's ``<enc>`` (:func:`_archive_enc`) as *encoded_dir*.
     """
     try:
         st = session_path.stat()
@@ -349,7 +424,8 @@ def _build_session_record(
     if st.st_size == 0:
         return None
 
-    cwd, session_date = _session_cwd_and_date(session_path)
+    header = _read_header(session_path)
+    cwd, session_date = header.cwd, header.date
     if cwd is None or not is_member(cwd, cwd_prefixes):
         return None
 
@@ -372,6 +448,7 @@ def _build_session_record(
         cwd=cwd,
         date=session_date,
         size_bytes=st.st_size,
+        identity=header.identity,
     )
 
 
@@ -468,6 +545,17 @@ def _archive_enc(session_path: Path, archive_root: Path) -> str | None:
     return parts[1] if len(parts) >= 2 else None
 
 
+def _iter_project_transcripts(project_dir: Path) -> Iterator[Path]:
+    """Yield a projects-root encoded dir's session transcripts, then its sub-agents'.
+
+    The ``*/subagents/**/agent-*.jsonl`` glob admits Claude Code's Agent-tool
+    and Workflow-tool sub-agent layouts and never a ``.meta.json`` sibling or
+    a workflow's ``journal.jsonl``.
+    """
+    yield from sorted(project_dir.glob('*.jsonl'))
+    yield from sorted(project_dir.glob(f'*/{SUBAGENTS_DIR}/**/agent-*.jsonl'))
+
+
 def _enumerate(
     projects_root: Path | str,
     cwd_prefixes: Sequence[str],
@@ -478,9 +566,10 @@ def _enumerate(
 
     Aggregates across every directory :func:`iter_project_dirs` yields
     (never assumes one dir per project — a project's agents span many
-    encodings). For each ``*.jsonl`` file: skip non-existent/unreadable/
-    empty files, read the session's real ``cwd`` and first-timestamp date
-    together in one pass (:func:`_session_cwd_and_date`) and confirm
+    encodings). For each session transcript and sub-agent transcript
+    (:func:`_iter_project_transcripts`): skip non-existent/unreadable/
+    empty files, read the session's real ``cwd``, first-timestamp date and
+    identity together in one pass (:func:`_read_header`) and confirm
     membership via :func:`is_member`, falling back to file mtime for the
     date when no timestamp is present, and keep only sessions whose date
     satisfies *date_ok* (all via :func:`_build_session_record`).
@@ -510,7 +599,7 @@ def _enumerate(
     root = Path(projects_root)
     records: list[SessionRecord] = []
     for project_dir in iter_project_dirs(root, cwd_prefixes):
-        for session_path in sorted(project_dir.glob('*.jsonl')):
+        for session_path in _iter_project_transcripts(project_dir):
             record = _build_session_record(
                 session_path, project_dir.name, cwd_prefixes, date_ok
             )
@@ -600,7 +689,11 @@ def main(argv: Sequence[str]) -> int:
 
     A debug/inspection entry point for inventory.py alone — the full
     inventory->score->sample pipeline's CLI acceptance surface is
-    ``sampling.main`` (task 2573 step-18).
+    ``sampling.main`` (task 2573 step-18). Each ``--agent-transcript-root``
+    adds an archive tree to the walk, so an archived run, a reconciliation
+    run's ``recon-<run_id>`` included, is listable. Each line is
+    tab-separated: path, encoded dir, cwd, date, size, then the
+    :class:`TranscriptIdentity` key and parent session ('' when absent).
     """
     parser = argparse.ArgumentParser(
         description="List legibility sessions matching cwd_prefixes for a given UTC date."
@@ -622,6 +715,16 @@ def main(argv: Sequence[str]) -> int:
         default=None,
         help='UTC date to filter sessions to, YYYY-MM-DD (default: yesterday UTC).',
     )
+    parser.add_argument(
+        '--agent-transcript-root',
+        dest='agent_transcript_roots',
+        action='append',
+        default=[],
+        help=(
+            'An archive root walked recursively alongside the projects root, '
+            'e.g. data/orchestrator/agent-transcripts (repeatable).'
+        ),
+    )
     args = parser.parse_args(argv)
 
     target_date = (
@@ -629,11 +732,19 @@ def main(argv: Sequence[str]) -> int:
         if args.date
         else (datetime.now(UTC) - timedelta(days=1)).date()
     )
-    records = enumerate_sessions(args.projects_root, args.cwd_prefixes, target_date)
+    records = enumerate_sessions(
+        args.projects_root,
+        args.cwd_prefixes,
+        target_date,
+        agent_transcript_roots=args.agent_transcript_roots,
+    )
     for record in records:
+        identity = record.identity
+        key = identity.key if identity is not None else ''
+        parent = (identity.parent_session or '') if identity is not None else ''
         print(
             f'{record.path}\t{record.encoded_dir}\t{record.cwd}\t'
-            f'{record.date}\t{record.size_bytes}'
+            f'{record.date}\t{record.size_bytes}\t{key}\t{parent}'
         )
     return 0
 

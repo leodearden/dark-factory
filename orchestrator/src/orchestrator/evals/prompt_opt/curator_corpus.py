@@ -641,13 +641,10 @@ async def propose_curator_label_frontier(
     """Propose a GOLD curator label for *candidate* via a frontier model.
 
     Its production callers are build-time only; corpus-building tests inject a
-    fake ``FrontierProposerFn`` instead. Mirrors
-    ``reviewer_trial.mining.propose_labels_frontier``'s ``invoke_agent``
-    pattern: no tools, structured JSON output, cost always reported --
-    unlike the reviewer_trial version (which returns a ``(issues, cost_usd)``
-    tuple), ``FrontierProposerFn`` is a plain ``Callable[[dict],
-    Awaitable[FrontierLabel]]``, so the cost is instead stamped onto the
-    returned label's ``FrontierLabel.cost_usd`` field. ``__main__.py``'s
+    fake ``FrontierProposerFn`` instead. Calls ``invoke_agent`` with no tools and
+    structured JSON output, and always reports cost: ``FrontierProposerFn``
+    is a plain ``Callable[[dict], Awaitable[FrontierLabel]]``, so the cost
+    is stamped onto the returned label's ``FrontierLabel.cost_usd`` field. ``__main__.py``'s
     ``build-curator-corpus`` command wraps this proposer to accumulate
     ``cost_usd`` across every sampled candidate and prints the total.
 

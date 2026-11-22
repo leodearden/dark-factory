@@ -33,17 +33,7 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 # hand-copy of the section parse; task 3913 retired it.
 from systemd_unit_invariants import parse_sections
 
-REPO_ROOT = pathlib.Path(__file__).parents[2]
-WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"
-
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
-# docstring exists to prevent. Mirrors test_deploy_clock_isolation.py.
-if str(REPO_ROOT.resolve()) not in sys.path:
-    sys.path.append(str(REPO_ROOT.resolve()))
-
-from df_pytest_isolation import (  # noqa: E402
+from df_pytest_isolation import (
     CLOCK_PROVENANCE_SESSION_KEY,
     CLOCK_PROVENANCE_SOURCE_KEY,
     PIPE_CLOSING_LEAKER_SRC,
@@ -60,6 +50,9 @@ from df_pytest_isolation import (  # noqa: E402
     wait_pid_gone,
     wait_proof_grace_secs,
 )
+
+REPO_ROOT = pathlib.Path(__file__).parents[2]
+WATCHDOG_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.py"
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 

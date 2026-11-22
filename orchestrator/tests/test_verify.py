@@ -2996,7 +2996,7 @@ class TestRunVerificationJunitxmlInjection:
         assert result.failing_test_ids is None
 
     async def test_scoped_breadth_does_not_inject_or_collect(self, tmp_path: Path):
-        """merge_verify_breadth='scoped' (the default) — merge role but no injection."""
+        """merge_verify_breadth='scoped' (the per-project opt-down) — merge role but no injection."""
         config = self._make_config(tmp_path, breadth='scoped')
         module_config = self._module_config()
         fake_run_cmd, captured = self._fake_run_cmd_writing_junit()
@@ -10712,7 +10712,10 @@ class TestRunVerificationGovernRouting:
     equivalent to be covered by.
     """
 
-    def _make_govern_config(self, tmp_path, enabled=True, create_exec=True):
+    def _make_govern_config(
+        self, tmp_path, enabled=True, create_exec=True, *,
+        breadth: Literal['scoped', 'full'] = 'full',
+    ):
         """Build an OrchestratorConfig with cpu_governance wired to a tmp executable."""
         from orchestrator.config import CpuGovernConfig
         scripts = tmp_path / 'scripts'
@@ -10721,7 +10724,7 @@ class TestRunVerificationGovernRouting:
         if create_exec:
             exec_file.write_text('#!/bin/sh\nexec "$@"\n')
             exec_file.chmod(0o755)
-        config = OrchestratorConfig()
+        config = OrchestratorConfig(merge_verify_breadth=breadth)
         config.cpu_governance = CpuGovernConfig(
             enabled=enabled,
             exec_path='scripts/cpu-governed-exec.sh',
@@ -10898,7 +10901,9 @@ class TestRunVerificationGovernRouting:
         import shlex
 
         from orchestrator.config import ModuleConfig
-        config, exec_file = self._make_govern_config(tmp_path)
+        # Under 'full', role='merge' injects --junitxml into the test leg,
+        # which would change the exact inner command this test pins.
+        config, exec_file = self._make_govern_config(tmp_path, breadth='scoped')
         module_config = ModuleConfig(
             prefix='pkg',
             test_command='pytest tests/x.py -v',

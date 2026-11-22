@@ -8,8 +8,10 @@ invocation_end event tagging, sha-stamping, and keep-last-N trim.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json as _json
 import logging
+import os
 import re
 import subprocess
 from datetime import datetime
@@ -17,6 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _agent_result_fakes import make_agent_result as _make_agent_result
 from _orch_helpers import (
     pydantic_spec,
     skip_role_config_layer,
@@ -27,6 +30,7 @@ from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
     AllAccountsCappedException,
+    SubprocessResult,
     classify_agent_failure,
 )
 from shared.config_dir import TaskConfigDir
@@ -34,6 +38,7 @@ from shared.process_cost import ProcessCostBasis
 from shared.testing import make_gate_mock
 
 from orchestrator.agents import sandbox_dispatch
+from orchestrator.agents.invoke import invoke_agent
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.dry_run_unblock import _TASK_EMPTY_STATE, _TASK_UNAVAILABLE_STATE
@@ -174,51 +179,6 @@ def _init_git_repo(path) -> str:
     subprocess.run(['git', '-C', p, 'commit', '-m', 'initial commit'], check=True, capture_output=True)
     result = subprocess.run(['git', '-C', p, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True)
     return result.stdout.strip()
-
-
-def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
-                       subtype='', output='', duration_ms=1000,
-                       timed_out=False, transcript_turns=None, session_id='',
-                       stderr='', turns=0, api_error_status=None,
-                       schema_salvaged=False, output_tokens=None,
-                       ended_awaiting_background=False):
-    # NOTE: duplicated verbatim in test_b3_gate.py (task 2020 review:
-    # code_duplication). Both copies must be extended together whenever
-    # shared.cli_invoke.AgentResult gains/renames a field consumed by
-    # classify_agent_failure(). Out of this task's locked scope: hoisting
-    # both into the existing orchestrator/tests/_orch_helpers.py shared-helper
-    # module (the established convention for cross-suite test helpers in this
-    # package) is a follow-up.
-    r = MagicMock()
-    r.success = success
-    r.cost_usd = cost_usd
-    r.structured_output = structured_output
-    r.subtype = subtype
-    r.output = output
-    r.duration_ms = duration_ms
-    # Faithful diagnostic-field defaults (mirrors shared.cli_invoke.AgentResult).
-    # A bare MagicMock auto-vivifies every unset attribute as a truthy
-    # MagicMock, which would silently corrupt classify_agent_failure()'s
-    # decision rules: .timed_out truthy -> misclassifies every failure as
-    # TIMED_OUT -> infra; .schema_salvaged truthy -> misclassifies a generic
-    # failure as STRUCTURAL instead of UNKNOWN. Setting explicit defaults for
-    # every field classify_agent_failure() consults (including
-    # .output_tokens, read when formatting the MAX_TURNS summary) keeps
-    # these mocks faithful stand-ins for its decision rules.
-    r.timed_out = timed_out
-    r.transcript_turns = transcript_turns
-    r.session_id = session_id
-    r.stderr = stderr
-    r.turns = turns
-    r.api_error_status = api_error_status
-    r.schema_salvaged = schema_salvaged
-    r.output_tokens = output_tokens
-    # task 2761: classify_agent_failure now reads .ended_awaiting_background
-    # (rule 2, above the timed_out rule). A bare MagicMock auto-vivifies it as
-    # a truthy stand-in, which would misclassify every failure as
-    # ENDED_AWAITING_BACKGROUND -> investigation_failed. Default it False.
-    r.ended_awaiting_background = ended_awaiting_background
-    return r
 
 
 def _assert_one_proposal_persist(scheduler) -> None:
@@ -2799,20 +2759,19 @@ class _TaskDocScheduler:
         return dict(self._task_doc)
 
 
-async def _capture_investigation_call(tmp_path, scheduler, config=None, **overrides) -> dict:
-    """Run one investigation and return the kwargs handed to the agent.
+_LOW_RISK_PROPOSAL = {
+    'proposal_text': 'Rebase on main and rerun verify',
+    'risk_label': 'low',
+    'files_referenced': [],
+}
 
-    *overrides* replace or add ``run_dry_run_unblock`` keyword arguments.
+
+def _investigation_kwargs(tmp_path, scheduler, config=None, **overrides) -> dict:
+    """The ``run_dry_run_unblock`` arguments of one investigation of task 42.
+
+    *overrides* replace or add keyword arguments.
     """
-    from orchestrator.dry_run_unblock import run_dry_run_unblock
-
-    agent_result = _make_agent_result(structured_output={
-        'proposal_text': 'Rebase on main and rerun verify',
-        'risk_label': 'low',
-        'files_referenced': [],
-    })
-    mock_invoke = AsyncMock(return_value=agent_result)
-    investigation = {
+    return {
         'task_id': '42',
         'worktree': str(tmp_path),
         'reason': 'verify exhausted',
@@ -2822,6 +2781,18 @@ async def _capture_investigation_call(tmp_path, scheduler, config=None, **overri
         'config': config if config is not None else _make_config(),
         **overrides,
     }
+
+
+async def _capture_investigation_call(tmp_path, scheduler, config=None, **overrides) -> dict:
+    """Run one investigation and return the kwargs handed to the agent.
+
+    *overrides* replace or add ``run_dry_run_unblock`` keyword arguments.
+    """
+    from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+    agent_result = _make_agent_result(structured_output=dict(_LOW_RISK_PROPOSAL))
+    mock_invoke = AsyncMock(return_value=agent_result)
+    investigation = _investigation_kwargs(tmp_path, scheduler, config, **overrides)
     with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
         await run_dry_run_unblock(**investigation)
     assert mock_invoke.call_args is not None, 'the investigation never reached the agent'
@@ -3258,27 +3229,59 @@ _FILE_WRITING_GIT_FLAGS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _rendered_argv(kwargs: dict) -> list[str]:
-    """The CLI argv the captured investigation call becomes."""
-    from shared.cli_invoke import build_claude_argv
+# The behaviours the host's user settings file supplied before the
+# investigation stopped reading it, and that it still relies on.
+_PINNED_INVESTIGATION_ENV = {
+    'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE': '1',
+    'DISABLE_AUTO_COMPACT': '1',
+}
 
-    argv, temp_files = build_claude_argv(
-        model=kwargs['model'],
-        max_budget_usd=kwargs['max_budget_usd'],
-        system_prompt=kwargs['system_prompt'],
-        max_turns=kwargs['max_turns'],
-        permission_mode=kwargs['permission_mode'],
-        allowed_tools=kwargs['allowed_tools'],
-        disallowed_tools=kwargs['disallowed_tools'],
-        mcp_config=None,
-        output_schema=kwargs['output_schema'],
-        effort=kwargs['effort'],
-        resume_session_id=None,
-        session_id=kwargs['session_id'],
-    )
-    for path in temp_files:
-        Path(path).unlink(missing_ok=True)
-    return argv
+
+async def _capture_investigation_spawn(tmp_path, config=None) -> tuple[list[str], dict[str, str]]:
+    """Run one investigation through the real ``invoke_agent`` and return the
+    argv and env its CLI would be spawned with.
+
+    The pinned env vars are removed from this process's environment first, so
+    the captured env shows what the investigation supplies, not what the
+    test's own shell happened to inherit.
+    """
+    from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+    spawns: list[tuple[list[str], dict[str, str]]] = []
+
+    async def recording_runner(cmd, cwd, env, **kwargs) -> SubprocessResult:
+        spawns.append((list(cmd), dict(env)))
+        return SubprocessResult(
+            stdout=_json.dumps({
+                'result': 'ok',
+                'is_error': False,
+                'subtype': 'success',
+                'total_cost_usd': 0.01,
+                'num_turns': 1,
+                'session_id': 'spawn-capture',
+                'structured_output': _LOW_RISK_PROPOSAL,
+            }),
+            stderr='',
+            returncode=0,
+            duration_ms=1,
+        )
+
+    mcp = MagicMock()
+    mcp.mcp_config_json.return_value = {'mcpServers': {}}
+    with (
+        patch.dict(os.environ),
+        patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=functools.partial(invoke_agent, runner=recording_runner),
+        ),
+    ):
+        for name in _PINNED_INVESTIGATION_ENV:
+            os.environ.pop(name, None)
+        await run_dry_run_unblock(
+            **_investigation_kwargs(tmp_path, _TaskDocScheduler(), config, mcp=mcp),
+        )
+    assert len(spawns) == 1, f'expected exactly one CLI spawn; got {len(spawns)}'
+    return spawns[0]
 
 
 def _bash_rule_matches(rule: str, command: str) -> bool:
@@ -3324,17 +3327,15 @@ class TestInvestigationPermissionEnvelope:
 
     @pytest.mark.asyncio
     async def test_investigation_runs_under_dont_ask_not_bypass(self, tmp_path):
-        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+        argv, _ = await _capture_investigation_spawn(tmp_path)
 
-        assert kwargs.get('permission_mode') == 'dontAsk', kwargs.get('permission_mode')
-        argv = _rendered_argv(kwargs)
         assert argv[argv.index('--permission-mode') + 1] == 'dontAsk', argv
 
     @pytest.mark.asyncio
     async def test_every_builtin_file_writing_tool_is_denied(self, tmp_path):
-        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+        argv, _ = await _capture_investigation_spawn(tmp_path)
 
-        denied = set(_flag_values(_rendered_argv(kwargs), '--disallowed-tools'))
+        denied = set(_flag_values(argv, '--disallowed-tools'))
         missing = sorted({'Edit', 'Write', 'NotebookEdit'} - denied)
         assert not missing, f'file-writing tools not denied: {missing}'
 
@@ -3483,6 +3484,42 @@ class TestInvestigationIsConfined:
 
         assert kwargs['sandbox_modules'] is None
         assert any('UNSANDBOXED' in record.getMessage() for record in caplog.records)
+
+
+class TestInvestigationReadsNoAmbientSettings:
+    """The per-investigation config dir symlinks the host's settings files, and
+    the cwd is the blocked task's own worktree, whose ``.claude/`` settings the
+    task under investigation may have written: any settings source would merge
+    its allow rules into the dontAsk envelope."""
+
+    @pytest.mark.asyncio
+    async def test_the_unsandboxed_spawn_reads_no_settings_file(self, tmp_path):
+        argv, _ = await _capture_investigation_spawn(
+            tmp_path, config=_make_config(sandbox_enabled=False),
+        )
+
+        assert '--setting-sources' in argv, argv
+        assert argv[argv.index('--setting-sources') + 1] == '', argv
+
+    @pytest.mark.asyncio
+    async def test_the_sandboxed_spawn_reads_no_settings_file(self, tmp_path, landlock_backend):
+        """The sandboxed path builds its own argv, so it is pinned separately."""
+        with patch('orchestrator.agents.landlock.is_landlock_available', return_value=True):
+            argv, _ = await _capture_investigation_spawn(
+                tmp_path, config=_make_config(sandbox_enabled=True),
+            )
+
+        assert '--setting-sources' in argv, argv
+        assert argv[argv.index('--setting-sources') + 1] == '', argv
+
+    @pytest.mark.asyncio
+    async def test_the_spawn_keeps_what_the_settings_file_used_to_supply(self, tmp_path):
+        """The watchdog and the zero-output retry read the transcript, and
+        compaction stays off as before."""
+        _, env = await _capture_investigation_spawn(tmp_path)
+
+        pinned = {name: env.get(name) for name in _PINNED_INVESTIGATION_ENV}
+        assert pinned == _PINNED_INVESTIGATION_ENV
 
 
 _FENCE = re.compile(r'^```(\w*)\n(.*?)^```', re.MULTILINE | re.DOTALL)

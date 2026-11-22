@@ -20,17 +20,19 @@ members = [
 include = ["conftest.py", "df_pytest_isolation.py"]
 extraPaths = [
     # scripts/ is a flat script directory rather than a package src root, so
-    # both it and scripts/legibility/ are listed explicitly. scripts/tests/
-    # conftest.py performs the same two sys.path insertions at runtime, and the
-    # `scripts` module's declared type gate
+    # it is listed explicitly. scripts/tests/conftest.py performs the same
+    # sys.path insertion at runtime, and the `scripts` module's declared type gate
     # (`uv run --project shared pyright scripts/`, task 4358; `npx pyright
     # scripts/` before that) runs from this directory — it carries no
     # --directory, and --project selects only the environment pyright resolves
     # from — so it resolves against this table. Pinned by
     # tests/scripts/test_scripts_module_config.py::
     # test_root_pyright_extrapaths_resolves_scripts_imports (task 3456).
+    # scripts/legibility/ is deliberately absent (task 6645): its modules are
+    # reached only as `legibility.<mod>`, so a bare sibling import is
+    # reportMissingImports. Guarded by
+    # scripts/tests/test_legibility_import_spelling.py.
     "scripts",
-    "scripts/legibility",
     "scripts/local-model-serving",
     "client-feed/src",
     "cockpit/src",

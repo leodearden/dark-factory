@@ -7,7 +7,6 @@ live container, so a container that grows an entry fails this suite at
 collection until the new entry has a disposition.
 """
 
-import re
 from collections import Counter
 from collections.abc import Iterable
 
@@ -17,7 +16,14 @@ import loop_blocking_allowlist
 import pytest
 import silent_fallthrough_allowlist
 import test_design_invariants_consistency as design_invariants_consistency
-from shared.governed_exceptions import Debt, Policy, TaskRef, TicketRef, governed_exceptions
+from shared.governed_exceptions import (
+    Debt,
+    Disposition,
+    Policy,
+    TaskRef,
+    TicketRef,
+    governed_exceptions,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -100,53 +106,41 @@ LOOP_BLOCKING_LEDGER = governed_exceptions(
         'fused-memory/src/fused_memory/server/main.py::run_server::8a884f86a26c': Debt(TaskRef(7572)),
         'fused-memory/src/fused_memory/server/main.py::run_server::f6a7ff40db1f': Debt(TaskRef(7572)),
         'fused-memory/src/fused_memory/server/main.py::run_server::43c97372205c': Debt(TaskRef(7572)),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_tasks::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_statuses::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_external_statuses::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_task::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.set_task_status::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.set_task_claimant::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.submit_task::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.resolve_ticket::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.list_tickets::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.search_tasks::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.commit_planning::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.update_task::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.remove_task::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.add_dependency::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.remove_dependency::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.set_task_priority_override::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.clear_task_priority_override::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.reorder_pin_queue::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_pin_queue::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_scheduler_state::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_scheduler_events::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.request_park_eviction::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_tasks::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_statuses::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_external_statuses::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_task::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.set_task_status::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.set_task_claimant::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.submit_task::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.resolve_ticket::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.list_tickets::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.search_tasks::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.commit_planning::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.update_task::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.remove_task::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.add_dependency::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.remove_dependency::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.set_task_priority_override::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.clear_task_priority_override::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.reorder_pin_queue::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_pin_queue::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_scheduler_state::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.get_scheduler_events::81d0d2709341': Debt(TaskRef(9822)),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.request_park_eviction::81d0d2709341': Debt(TaskRef(9822)),
         'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.request_park_eviction::a0b1b5c60eed': Debt(TaskRef(7572)),
-        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.find_tasks_by_metadata::81d0d2709341': Debt(TicketRef('tkt_0RT7QWVY61QYCHFCBE6KDTX7TQ')),
+        'fused-memory/src/fused_memory/server/tools.py::create_mcp_server.find_tasks_by_metadata::81d0d2709341': Debt(TaskRef(9822)),
         'fused-memory/src/fused_memory/services/overreach_shadow.py::OverreachShadowStore.open_read_only::fa698adde643': Debt(TaskRef(7572)),
     },
 )
 
-_OWNER_TYPE_BY_LEDGER_DISPOSITION = {'accepted': None, 'filed': TaskRef, 'to_file': TicketRef}
-
-
-def _override_follows_row(
-    owner_type: type[TaskRef] | type[TicketRef] | None, override: object, justification: str
-) -> bool:
-    if owner_type is None:
-        return override is None
-    if not isinstance(override, Debt) or not isinstance(override.owner, owner_type):
-        return False
-    return re.search(rf'\b{re.escape(str(override.owner.id))}\b', justification) is not None
-
-
-def _loop_blocking_mismatch(row: tuple[str, str, str, str, str], key: str) -> str | None:
-    disposition, justification = row[3], row[4]
-    override = LOOP_BLOCKING_LEDGER.overrides.get(key)
-    if _override_follows_row(_OWNER_TYPE_BY_LEDGER_DISPOSITION[disposition], override, justification):
+def _loop_blocking_mismatch(
+    key: str, owner: TaskRef | TicketRef | None, override: Disposition | None
+) -> str | None:
+    expected = None if owner is None else Debt(owner)
+    if override == expected:
         return None
-    return f'{key}: ledger disposition {disposition!r}, override found {override!r}'
+    return f'{key}: ledger owner {owner!r}, expected override {expected!r}, found {override!r}'
 
 
 _OVERRIDE_TYPE_BY_ARCHIVAL_DISPOSITION = {
@@ -173,18 +167,37 @@ def test_repeated_sites_keep_distinct_keys() -> None:
     ]
 
 
-def test_loop_blocking_overrides_follow_the_ledger_vocabulary() -> None:
-    assert set(_OWNER_TYPE_BY_LEDGER_DISPOSITION) == loop_blocking_allowlist.DISPOSITIONS, (
-        'loop_blocking_allowlist.DISPOSITIONS changed: decide which INV-12 disposition '
-        'each ledger disposition maps to in _OWNER_TYPE_BY_LEDGER_DISPOSITION.'
-    )
+def test_an_override_must_equal_its_row_owner() -> None:
+    key = 'pkg/mod.py::f::aaaaaaaaaaaa'
+    agreeing = [
+        (TaskRef(5270), Debt(TaskRef(5270))),
+        (TicketRef('tkt_A'), Debt(TicketRef('tkt_A'))),
+        (None, None),
+    ]
+    disagreeing = [
+        (TaskRef(5270), Debt(TaskRef(4484))),
+        (TaskRef(5270), None),
+        (None, Debt(TaskRef(5270))),
+        (TicketRef('tkt_A'), Debt(TaskRef(1))),
+    ]
+    for owner, override in agreeing:
+        assert _loop_blocking_mismatch(key, owner, override) is None, (owner, override)
+    for owner, override in disagreeing:
+        assert _loop_blocking_mismatch(key, owner, override) is not None, (owner, override)
+
+
+def test_loop_blocking_overrides_equal_the_ledger_owners() -> None:
     rows = zip(loop_blocking_allowlist.AUDITED_SITES, LOOP_BLOCKING_LEDGER.keys, strict=True)
-    mismatches = [mismatch for row, key in rows if (mismatch := _loop_blocking_mismatch(row, key))]
+    mismatches = [
+        mismatch
+        for (_relpath, _qualname, _hash, _disposition, owner, _why), key in rows
+        if (mismatch := _loop_blocking_mismatch(key, owner, LOOP_BLOCKING_LEDGER.overrides.get(key)))
+    ]
     assert not mismatches, (
-        'Each loop-blocking override must match its ledger row: none for accepted, '
-        'Debt(TaskRef(<task>)) for filed, Debt(TicketRef(<ticket>)) for to_file, and the '
-        "owner id must appear in the row's justification. Correct the override in this "
-        'module, or the ledger row in loop_blocking_allowlist.py:\n  ' + '\n  '.join(mismatches)
+        "Each owned loop-blocking row's override must equal Debt(<that row's owner>), and "
+        'an owner-less (accepted) row must have no override, because it borrows the '
+        'default. Correct whichever side is wrong: the override in this module, or the '
+        'owner column in loop_blocking_allowlist.py:\n  ' + '\n  '.join(mismatches)
     )
 
 

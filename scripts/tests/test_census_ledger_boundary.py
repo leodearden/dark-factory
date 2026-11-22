@@ -180,6 +180,7 @@ class _Census:
             selection_of=lambda: source.selection,
             invoke=_Invoke(),
             verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
+            fit_fn=lambda check, *, model: (),
             synthesize_fn=lambda brief, *, model: _EMPTY_SYNTHESIS,
             embedder=embeddings.Embedder(
                 embed_fn=_distinct_one_hot_embed, cache_path=embeddings.cache_path("p"),

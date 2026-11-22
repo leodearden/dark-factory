@@ -1,0 +1,32 @@
+import json,collections
+C=json.load(open('/tmp/gate-10069/forensics/cond.json'))
+ALL=C['verifies']; W=[x for x in ALL if x['in_window']]; CT=C['contents']; BV={x['vid']:x for x in ALL}
+SIG={}
+for k,c in CT.items():
+    if c['truth']=='D':
+        s=set()
+        for vid,fs in c['solofail']: s|=set(fs)
+        SIG[k]=s
+    elif c['truth']=='Di': SIG[k]={'HIST'} if k.startswith('7736@') else {'CACHEB'}
+EARLY_STOP=3  # n_units==3: one global && command; a later leg is masked once an earlier leg fails
+LEG={'FILING':2,'DETRUN':2,'merge_queue_request_li':2,'seed_scratch_reference':3,'link_heal_config':3,'CACHEB':4,'api_prds':4,'HIST':8,'UVRUN':8,'SUPP':8,'check_run_completion':8,'restart_all_orchestrat':8,'LOOP':9,'RETIRED':9,'merge_lane_ratchet':2,'store_mutation_preflig':3}
+print('signature per defective content, and its record across every window tree holding that content')
+for k,s in sorted(SIG.items()):
+    hold=[x for x in W if k in [r['cid'] for r in x['own']+x['base_reqs']]]
+    f=nf=mask=0; ex=[]
+    for x in hold:
+        fs=set(x['fails'] or [])
+        if s & fs: f+=1
+        elif x['passed']: nf+=1; ex.append((x['vid'],'PASS'))
+        elif x['n_units']==3 and fs and min(LEG.get(g,99) for g in fs)<min(LEG.get(g,99) for g in s): mask+=1
+        else: nf+=1; ex.append((x['vid'],'red without it: '+','.join(sorted(fs))))
+    print('  ',k,CT[k]['truth'],'sig',sorted(s),'| trees holding it',len(hold),'signature failed',f,'masked by an earlier failing leg (global command)',mask,'NOT failed',nf,ex)
+print('red trees whose failing tests are not all explained by defective contents in the tree or main red:')
+for x in W:
+    if x['passed']: continue
+    fs=set(x['fails'] or [])-set(x['main_red'])
+    exp=set()
+    for r in x['own']+x['base_reqs']:
+        if r['cid'] in SIG: exp|=SIG[r['cid']]
+    extra=fs-exp
+    if extra: print('  ',x['vid'],x['ts'][5:16],'own',x['task'],'k%d'%x['k'],'units',x['n_units'],'unexplained',sorted(extra),'| explained',sorted(fs&exp),'| tree', ' '.join('%s:%s'%(r['task'],CT[r['cid']]['truth'] if r['cid'] else 'U') for r in x['own']+x['base_reqs']))

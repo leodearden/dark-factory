@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 import pytest
+from _synthetic_proc import synthetic_stat_line
 
 import shared.proc_group as proc_group_module
 from shared.proc_group import (
@@ -27,6 +28,7 @@ from shared.proc_group import (
     SigkillDispatch,
     StatFields,
     cpu_ticks_under_path,
+    parse_start_ticks,
     pid_running,
     process_group_members,
     process_group_terminated,
@@ -274,32 +276,6 @@ def unreaped_zombie_pgid():
         yield p.pid
     finally:
         p.wait()
-
-
-def _synthetic_stat_line(
-    pid: int,
-    pgrp: int,
-    *,
-    state: str = 'S',
-    comm: str = 'weird (name) proc',
-    cpu: tuple[int, int, int, int] = (0, 0, 0, 0),
-    session: int | None = None,
-) -> str:
-    """A real-format ``/proc/<pid>/stat`` for a fabricated /proc: ``pid (comm) state 1 pgrp session ...``.
-
-    The default *comm* deliberately contains spaces AND a ``)`` so the parser's
-    ``rfind(')')`` idiom stays pinned — a ``split()``-based parser would
-    mis-read this line, and the kernel really does allow it (a process can
-    set an arbitrary 15-char comm).  *cpu* is utime, stime, cutime and cstime,
-    stat fields 14-17.  *session* is stat field 6, and defaults to *pgrp*.
-    """
-    counters = ['0'] * 4 + [str(ticks) for ticks in cpu] + ['0'] * 12
-    sid = pgrp if session is None else session
-    return (
-        f'{pid} ({comm}) {state} 1 {pgrp} {sid} 0 -1 4194304 '
-        + ' '.join(counters)
-        + '\n'
-    )
 
 
 #: ``python -c`` source that renames its own process to the undecodable comm
@@ -930,7 +906,7 @@ class TestTerminateProcessGroup:
         for offset, state in states_by_pid_offset.items():
             entry = proc_root / str(pgid + offset)
             entry.mkdir(parents=True)
-            (entry / 'stat').write_text(_synthetic_stat_line(pgid + offset, pgid, state=state))
+            (entry / 'stat').write_text(synthetic_stat_line(pgid + offset, pgid, state=state))
         monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
         calls: list[tuple[int, int]] = []
         monkeypatch.setattr(
@@ -1354,7 +1330,7 @@ class TestSnapshotProcessGroup:
         entry = proc_root / str(fake_pid)
         entry.mkdir(parents=True)
         (entry / 'stat').write_text(
-            _synthetic_stat_line(fake_pid, target_pgid, comm=comm_name)
+            synthetic_stat_line(fake_pid, target_pgid, comm=comm_name)
         )
         (entry / 'wchan').write_text('do_wait\n')
         (proc_root / 'version').write_text('Linux 5.x')  # non-numeric, must be skipped
@@ -1374,7 +1350,7 @@ class TestSnapshotProcessGroup:
         entry = proc_root / str(fake_pid)
         entry.mkdir(parents=True)
         (entry / 'stat').write_text(
-            _synthetic_stat_line(fake_pid, target_pgid, comm='plain')
+            synthetic_stat_line(fake_pid, target_pgid, comm='plain')
         )
         (entry / 'wchan').write_bytes(b'\xff\xfe\n')
         monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
@@ -1398,7 +1374,7 @@ class TestSnapshotProcessGroup:
         entry = proc_root / str(fake_pid)
         entry.mkdir(parents=True)
         (entry / 'stat').write_text(
-            _synthetic_stat_line(fake_pid, target_pgid, state='R', comm='sleep')
+            synthetic_stat_line(fake_pid, target_pgid, state='R', comm='sleep')
         )
         (entry / 'wchan').write_text('0\n')
         (entry / 'cmdline').write_bytes(b'')
@@ -1700,7 +1676,7 @@ class TestScanProcessGroupsAgainstASyntheticProc:
         def _pid(pid: int, pgrp: int, cwd) -> None:
             entry = proc_root / str(pid)
             entry.mkdir()
-            (entry / 'stat').write_text(_synthetic_stat_line(pid, pgrp))
+            (entry / 'stat').write_text(synthetic_stat_line(pid, pgrp))
             (entry / 'cwd').symlink_to(cwd)
 
         _pid(100, 100, root)
@@ -1829,7 +1805,7 @@ class TestScanProcessGroupsAgainstASyntheticProc:
         proc_root = tmp_path / 'proc'
         entry = proc_root / '900'
         entry.mkdir(parents=True)
-        (entry / 'stat').write_text(_synthetic_stat_line(900, 900))
+        (entry / 'stat').write_text(synthetic_stat_line(900, 900))
         root_bytes = os.fsencode(tmp_path) + b'/_merge-verify-' + odd_bytes
         (entry / 'maps').write_bytes(
             b'55d4c7e1a000-55d4c7e3b000 rw-p 00000000 00:00 0          [heap]\n'
@@ -1892,7 +1868,7 @@ class TestReadStatFields:
     ):
         entry = tmp_path / '4242'
         entry.mkdir()
-        (entry / 'stat').write_text(_synthetic_stat_line(4242, 4242, state='S'))
+        (entry / 'stat').write_text(synthetic_stat_line(4242, 4242, state='S'))
 
         assert read_stat_fields(entry, skip_malformed=skip_malformed) == StatFields(
             comm='weird (name) proc', state='S', ppid=1, pgrp=4242
@@ -2245,7 +2221,7 @@ class TestReapProcessGroups:
         planted = [(pgid + 1, pgid, 'Z') for pgid in zombie_groups] + [(5_000_401, 5_000_400, 'S')]
         for pid, pgrp, state in planted:
             (proc_root / str(pid)).mkdir(parents=True)
-            (proc_root / str(pid) / 'stat').write_text(_synthetic_stat_line(pid, pgrp, state=state))
+            (proc_root / str(pid) / 'stat').write_text(synthetic_stat_line(pid, pgrp, state=state))
         monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
 
         def killpg(pgid: int, sig: int) -> None:
@@ -2332,7 +2308,7 @@ class TestCpuTicksUnderPathAgainstASyntheticProc:
         def _pid(pid: int, pgrp: int, cwd, cpu: tuple[int, int, int, int]) -> Path:
             entry = proc_root / str(pid)
             entry.mkdir()
-            (entry / 'stat').write_text(_synthetic_stat_line(pid, pgrp, cpu=cpu))
+            (entry / 'stat').write_text(synthetic_stat_line(pid, pgrp, cpu=cpu))
             (entry / 'cwd').symlink_to(cwd)
             return entry
 
@@ -2405,7 +2381,7 @@ class TestCpuTicksUnderPathAgainstASyntheticProc:
             d.mkdir()
         entry = proc_root / '100'
         entry.mkdir(parents=True)
-        (entry / 'stat').write_text(_synthetic_stat_line(100, 100))
+        (entry / 'stat').write_text(synthetic_stat_line(100, 100))
         (entry / 'cwd').symlink_to(idle_root)
         monkeypatch.setattr('shared.proc_group._PROC_ROOT', proc_root)
 
@@ -2423,7 +2399,7 @@ class TestReadCpuTicks:
     def test_a_well_formed_line_sums_the_four_cpu_fields(self, tmp_path):
         entry = tmp_path / '4242'
         entry.mkdir()
-        (entry / 'stat').write_text(_synthetic_stat_line(4242, 4242, cpu=(5, 6, 7, 8)))
+        (entry / 'stat').write_text(synthetic_stat_line(4242, 4242, cpu=(5, 6, 7, 8)))
 
         assert read_cpu_ticks(entry) == 26
         assert read_stat_fields(entry, skip_malformed=False) == StatFields(
@@ -2461,7 +2437,7 @@ class TestReadSessionId:
     def test_a_well_formed_line_reads_field_six_not_the_pgrp(self, tmp_path):
         entry = tmp_path / '4242'
         entry.mkdir()
-        (entry / 'stat').write_text(_synthetic_stat_line(4242, 4242, session=777))
+        (entry / 'stat').write_text(synthetic_stat_line(4242, 4242, session=777))
 
         assert read_session_id(entry) == 777
 
@@ -2491,6 +2467,42 @@ class TestReadSessionId:
 
     def test_on_the_real_proc_it_is_our_own_session(self):
         assert read_session_id(Path('/proc') / str(os.getpid())) == os.getsid(0)
+
+
+def _with_start_ticks_token(token: str) -> str:
+    return synthetic_stat_line(810, 810, start_ticks=424242).replace(' 424242 ', f' {token} ')
+
+
+class TestParseStartTicks:
+    """Start time (stat field 22) of a ``/proc/<pid>/stat`` text, on the split read_stat_fields uses."""
+
+    def test_a_well_formed_line_reads_field_22_after_the_last_paren(self):
+        text = synthetic_stat_line(4242, 4242, cpu=(5, 6, 7, 8), session=777, start_ticks=31337)
+
+        assert parse_start_ticks(Path('/proc/4242/stat'), text) == 31337
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            *_MALFORMED_STAT_LINES,
+            pytest.param(
+                '7 (x) S 1 7 7 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0\n', id='start-ticks-truncated'
+            ),
+            pytest.param(_with_start_ticks_token('soon'), id='start-ticks-not-a-number'),
+            pytest.param(_with_start_ticks_token('-1'), id='start-ticks-negative'),
+            pytest.param(_with_start_ticks_token('+5'), id='start-ticks-signed'),
+            pytest.param(_with_start_ticks_token('1_0'), id='start-ticks-underscored'),
+        ],
+    )
+    def test_a_malformed_line_raises_naming_its_path_and_text(self, text):
+        path = Path('/proc/810/stat')
+
+        with pytest.raises(MalformedStatLine) as excinfo:
+            parse_start_ticks(path, text)
+
+        exc = excinfo.value
+        assert isinstance(exc, ValueError)
+        assert (exc.path, exc.text) == (path, text)
 
 
 class TestUnifiedCgroupPath:

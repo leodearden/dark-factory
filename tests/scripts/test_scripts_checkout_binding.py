@@ -82,10 +82,10 @@ def _python(
     )
 
 
-def _run_probe(checkout: Path, source: str) -> subprocess.CompletedProcess[str]:
+def _run_probe(checkout: Path, source: str, *argv: str) -> subprocess.CompletedProcess[str]:
     probe = checkout / 'scripts' / 'probe.py'
     probe.write_text(source, encoding='utf-8')
-    return _python([str(probe)], decoy=checkout.parent / _DECOY)
+    return _python([str(probe), *argv], decoy=checkout.parent / _DECOY)
 
 
 def _lies_under(path: str, directory: Path) -> bool:
@@ -182,6 +182,64 @@ def test_an_unbindable_checkout_refuses_to_import(tmp_path: Path, pyproject: str
     assert reported['runtime_error'] is True
     assert reported['path'] == pyproject_path
     assert pyproject_path in reported['message']
+
+
+_REPORT_WORKSPACE_MEMBERS = (
+    'import json, sys\n'
+    'from pathlib import Path\n'
+    + _BIND
+    + 'try:\n'
+    '    members = _checkout.workspace_members(Path(sys.argv[1]))\n'
+    'except _checkout.CheckoutBindingError as exc:\n'
+    "    print(json.dumps({'refused': type(exc).__name__, 'path': exc.path,"
+    " 'message': str(exc)}))\n"
+    'else:\n'
+    "    print(json.dumps({'members': list(members), 'is_tuple': type(members) is tuple}))\n"
+)
+
+
+def _read_members(tmp_path: Path, pyproject: str | None) -> tuple[Path, dict[str, object]]:
+    checkout = _layout(tmp_path)
+    other = tmp_path / 'other'
+    other.mkdir()
+    if pyproject is not None:
+        (other / 'pyproject.toml').write_text(pyproject, encoding='utf-8')
+    proc = _run_probe(checkout, _REPORT_WORKSPACE_MEMBERS, str(other))
+
+    assert proc.returncode == 0, proc.stderr
+    return other, json.loads(proc.stdout)
+
+
+def test_workspace_members_reads_any_roots_declared_members_in_declared_order(
+    tmp_path: Path,
+) -> None:
+    _, reported = _read_members(
+        tmp_path, '[tool.uv.workspace]\nmembers = ["sampler", "no-src", "shared"]\n'
+    )
+
+    assert reported == {'members': ['sampler', 'no-src', 'shared'], 'is_tuple': True}
+
+
+@pytest.mark.parametrize(
+    'pyproject', _UNBINDABLE_PYPROJECTS.values(), ids=_UNBINDABLE_PYPROJECTS.keys()
+)
+def test_workspace_members_refuses_each_unbindable_member_list_naming_its_pyproject(
+    tmp_path: Path, pyproject: str | None
+) -> None:
+    other, reported = _read_members(tmp_path, pyproject)
+
+    pyproject_path = str(other / 'pyproject.toml')
+    assert reported['refused'] == 'CheckoutBindingError'
+    assert reported['path'] == pyproject_path
+    assert pyproject_path in str(reported['message'])
+
+
+def test_a_glob_refusal_names_only_the_glob_entries(tmp_path: Path) -> None:
+    _, reported = _read_members(
+        tmp_path, '[tool.uv.workspace]\nmembers = ["pkgs/*", "shared", "a?b"]\n'
+    )
+
+    assert "['pkgs/*', 'a?b']" in str(reported['message'])
 
 
 _BOUND_SCRIPTS = (

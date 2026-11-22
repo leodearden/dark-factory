@@ -15,6 +15,7 @@ from dashboard.data.datum import (
     unknown_datum,
 )
 from dashboard.data.escalation_corpus import EscalationView
+from dashboard.data.label_spans import labels_from_spans
 from dashboard.data.memory import WRITE_QUEUE_FRESHNESS_BOUND_SECONDS, write_queue_datum
 from dashboard.data.merge_queue import MergeAttempts, TrainThroughput
 from dashboard.data.performance import PerformanceCards, PerformanceListing
@@ -689,6 +690,7 @@ _MQ_ZERO_THROUGHPUT: TrainThroughput = {
 _MQ_MEASURED_QUEUE = {
     'in_queue': Datum(0, MQ_SERVED_AT, DatumState.FRESH, None, 30),
     'live_probe_configured': True,
+    'runs_db_present': True,
     'speculative': _mq_read({'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None}),
     'recent_total': _mq_read(0),
     'depth_timeseries': _mq_read({'labels': [], 'values': [], 'bucket_minutes': 15}),
@@ -1190,26 +1192,35 @@ _DIVERGENT_SERIES = {
 _BURNDOWN_SERIES_KEYS = ('done', 'in_progress', 'blocked', 'pending')
 
 
+def _own_labels(body, pid):
+    return labels_from_spans(
+        body['BURNDOWN_BY_PROJECT'][pid]['label_spans'], body['BURNDOWN']['labels'],
+    )
+
+
 def test_shape_burndown_per_project_labels_are_that_projects_own_row():
     """Each per-project block keeps its OWN snapshot row, not the union.
 
-    Passes against current server code — this is a regression pin, not a RED
-    step.  It fires if a future change densifies per-project rows onto the
-    union row, which would silently re-break the tabs.jsx consumer.
+    The row is sent as label_spans over the aggregate union rather than as a
+    repeated label array, and decodes back to exactly the project's input row.
+    It fires if a future change densifies per-project rows onto the union row,
+    which would silently re-break the tabs.jsx consumer.
     """
     body = redux_api.shape_burndown(_DIVERGENT_SERIES, labels=_BASENAME_LABELS)
+    p1 = body['BURNDOWN_BY_PROJECT']['p1']
+    p2 = body['BURNDOWN_BY_PROJECT']['p2']
 
-    assert body['BURNDOWN_BY_PROJECT']['p1']['labels'] == [
-        '2026-05-20T00:00:00', '2026-05-22T00:00:00',
-    ]
-    assert body['BURNDOWN_BY_PROJECT']['p2']['labels'] == [
-        '2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00',
-    ]
+    assert p1['label_spans'] == [[0, 1], [2, 3]]
+    assert p2['label_spans'] == [[0, 3]]
+    assert 'labels' not in p1
+    assert 'labels' not in p2
+    for pid, series in _DIVERGENT_SERIES.items():
+        assert _own_labels(body, pid) == series['labels'], pid
     # The aggregate carries the sorted union — strictly longer than p1's row.
     assert body['BURNDOWN']['labels'] == [
         '2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00',
     ]
-    assert len(body['BURNDOWN']['labels']) > len(body['BURNDOWN_BY_PROJECT']['p1']['labels'])
+    assert len(body['BURNDOWN']['labels']) > len(_own_labels(body, 'p1'))
 
 
 def test_shape_burndown_per_project_series_are_co_length_with_own_labels():
@@ -1225,18 +1236,20 @@ def test_shape_burndown_per_project_series_are_co_length_with_own_labels():
     contract on that.
 
     Given a co-length input, this is the invariant that makes `labels={pb.labels}`
-    sound at the tabs.jsx consumer: a per-project block is internally co-indexed,
-    so it needs no hole semantics.  Densifying these onto the union row would
+    sound at the tabs.jsx consumer, where pb is the block decoded by
+    burndown_bands.js::projectBurndownBlock: a per-project block is internally
+    co-indexed with its own decoded row, so it needs no hole semantics.  Densifying these onto the union row would
     require making deriveVelocitySeries, the summary-table last-value reads, and
     compute_window_completion hole-aware first.
     """
     body = redux_api.shape_burndown(_DIVERGENT_SERIES, labels=_BASENAME_LABELS)
 
     for pid, block in body['BURNDOWN_BY_PROJECT'].items():
+        own_labels = _own_labels(body, pid)
         for key in _BURNDOWN_SERIES_KEYS:
-            assert len(block[key]) == len(block['labels']), (
+            assert len(block[key]) == len(own_labels), (
                 f'{pid}.{key} has {len(block[key])} values for '
-                f'{len(block["labels"])} labels'
+                f'{len(own_labels)} labels'
             )
 
 
@@ -1275,8 +1288,9 @@ def test_shape_burndown_ragged_input_is_passed_through_unnormalized():
     happens today rather than leaving it to be rediscovered:
 
       * the per-project block stays ragged (labels 3, done 2), so the co-length
-        property the tabs.jsx `labels={pb.labels}` pairing relies on comes from
-        get_burndown_series upstream, NOT from this function;
+        property the tabs.jsx `labels={pb.labels}` pairing relies on (pb being
+        the block decoded by burndown_bands.js::projectBurndownBlock) comes
+        from get_burndown_series upstream, NOT from this function;
       * completed / velocity / window_days are zeroed and the forecast is None,
         because both helpers bail out on the mismatch;
       * the aggregate reads the missing tail as a HOLE (None), never 0: a
@@ -1297,7 +1311,7 @@ def test_shape_burndown_ragged_input_is_passed_through_unnormalized():
     }, labels=_BASENAME_LABELS)
 
     block = body['BURNDOWN_BY_PROJECT']['p1']
-    assert len(block['labels']) == 3
+    assert len(_own_labels(body, 'p1')) == 3
     assert block['done'] == [3, 7]          # verbatim — not padded, not truncated
     assert block['in_progress'] == [1, 2, 3]
     completion = block['latest']['value']
@@ -2223,6 +2237,10 @@ class TestShapeMergeQueueServedDatums:
     @pytest.mark.parametrize('configured', [True, False])
     def test_live_probe_configured_is_carried_verbatim(self, configured):
         assert _shaped(live_probe_configured=configured)['live_probe_configured'] is configured
+
+    @pytest.mark.parametrize('present', [True, False])
+    def test_runs_db_present_is_carried_verbatim(self, present):
+        assert _shaped(runs_db_present=present)['runs_db_present'] is present
 
     def test_there_is_no_active_approximate_key(self):
         assert 'active_approximate' not in _shaped(active_approximate=True)

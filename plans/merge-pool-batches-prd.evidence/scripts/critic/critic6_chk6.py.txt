@@ -1,0 +1,26 @@
+import sys
+sys.path.insert(0,'/tmp/gate-10069/critic6')
+from rule7 import fallback_cost, batch_cost, going_costs, plan_batch
+U=0.15
+def true_cost(q,r,u,f,c):
+    # verifies per new-request landing when batches are forced to f new / c cleared, at the true rates
+    a_new,a_cl=1.0,1.0
+    for i in range(2000):
+        nc=batch_cost(0,c,q,r,u,True,a_new,a_cl)/c
+        nf=batch_cost(f,0,q,r,u,True,a_new,nc)/f
+        if abs(nc-a_cl)<1e-10 and abs(nf-a_new)<1e-10: break
+        a_new,a_cl=nf,nc
+    return nf,nc
+q,r=0.14,0.01
+base=true_cost(q,r,U,12,24)
+print('true rates q=0.14 r=0.01: sizes (12,24) ->', [round(x,3) for x in base])
+for rh in (0.03,0.05,0.08,0.1,0.15,0.2,0.25):
+    a,c,_=going_costs(q,rh,U,True)
+    f=plan_batch('new',['new']*30,q,rh,U,True)[0]
+    cc=min(range(1,25),key=lambda x:(round(batch_cost(0,x,q,rh,U,True,a,c)/x,12),-x))
+    t=true_cost(q,r,U,f,cc)
+    print(f'r_hat={rh}: rule picks new {f}, cleared {cc}; at the true rates A_new {t[0]:.3f} (+{100*(t[0]/base[0]-1):.0f}%)')
+# r_hat steady state under 'landed always NEW': events e in a 600-row window
+for share_cleared_outcomes,rt in ((0.6,0.01),(0.6,0.02)):
+    e=600*share_cleared_outcomes*rt
+    print('window events',round(e,1),'-> r_hat',round((e+20*0.01)/(e+20),3))

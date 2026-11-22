@@ -306,7 +306,7 @@ population.
 | Code | Meaning |
 |---|---|
 | 0 | ok |
-| 1 | the run could not complete (store unreachable, index build failed, the index probe could not remove its seeded node — the error names it — or a traceback) |
+| 1 | the run could not complete (store unreachable, a store read overran its timeout budget, index build failed, the index probe could not remove its seeded node — the error names it — or a traceback) |
 | 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete, an embedding arm's scratch graph or replica is stale, a control pair yields no valid pre-registration |
 | 3 | an instrument check failed (post-run, smoke, index-check, integrity, control-check, embed-run's mid-run checks, probe-set's frozen-reference check) |
 | 4 | INV-4 abort: consecutive episode failures stopped the run |
@@ -364,9 +364,13 @@ the same for an embedding arm's copy, re-embed and index transitions.
 
 ## Known limitations
 
-- `GraphitiBackend.search` raises a `TimeoutError` naming its read budget when
-  it times out. A timed-out retrieval probe therefore stops the run; it is not
-  recorded as a miss.
+- A search that overruns its read budget stops `embed-run` and `run`: they exit
+  1 with its `TimeoutError` and write no `run.json`. The timeout is never
+  counted in `query_failures` or read as a miss, because the budget spans the
+  query embedding and FalkorDB's search legs, so it is not the arm's. The arm's
+  own query latency is measured by `query-embed-latency-p95` against the
+  envelope. Before re-running, remove the scratch graph it left with
+  `teardown --arm-spec S`, adding `--collection` for an embedding arm's replica.
 - The harness never sets graphiti's `SEMAPHORE_LIMIT`, whose env name collides
   with the queue knob. `run.json` records the effective value, and the
   symmetry check requires it to be equal across arms.

@@ -481,9 +481,10 @@ async def _fake_create_wt(*_a, **_k):
     return Path('/fake/wt'), 'run-b1'
 
 
-async def _fake_collect(_wf, _wt, _task, *, role, replay_frame=None):
+async def _fake_collect(_wf, _wt, _task, *, role, replay_frame=None, sandbox_backend=None):
     return EvalMetrics(
         composite_score=0.9, tests_pass=True, role_under_test=role, replay_frame=replay_frame,
+        sandbox_backend=sandbox_backend,
     )
 
 

@@ -52,8 +52,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'orchestrator' / 's
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 
 from _task_db_scan import discover_project_roots
+from orchestrator.decision_registry import decisions_dir
 from orchestrator.digest import ModelRoleRow
-from orchestrator.session_registry import decisions_dir, fleet_root, sessions_dir
+from orchestrator.fleet_files import fleet_root
+from orchestrator.session_records import sessions_dir
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots
 from shared.safe_io import atomic_write_text
 from sitting import audits, brief, fleet_state, prepare_sitting, trigger_state
@@ -593,7 +595,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--project-root', action='append', dest='project_roots',
                         help='repeatable; default: _task_db_scan.discover_project_roots()')
     parser.add_argument('--decisions-root', type=Path, help='fleet root holding decisions/ (default: fleet_root())')
-    parser.add_argument('--sessions-root', type=Path, help='default: session_registry.sessions_dir()')
+    parser.add_argument('--sessions-root', type=Path, help='default: session_records.sessions_dir()')
     parser.add_argument('--handover', type=prepare_sitting.parse_handover_override, metavar='PROJECT=PATH',
                         help="read PATH as PROJECT's handover (default: each project root's own)")
     parser.add_argument('--preparation', type=Path, default=DEFAULT_PREPARATION)

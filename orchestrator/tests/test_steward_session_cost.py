@@ -100,6 +100,7 @@ def _max_budget(argv: list[str]) -> str:
     return argv[argv.index('--max-budget-usd') + 1]
 
 
+@pytest.mark.spawns_agent_cli
 @pytest.mark.asyncio
 class TestStewardSessionCost:
     async def test_each_continuation_is_charged_its_own_spend(

@@ -448,7 +448,7 @@ def test_detector_flags_an_alternative_session_id_spelling() -> None:
 
 def test_detector_ignores_a_glob_with_no_session_id() -> None:
     """Interpolating something else — an escalation id, a task id — is not a
-    session-id-keyed lookup. session_registry.py's escalation-id glob is the
+    session-id-keyed lookup. decision_registry.py's escalation-id glob is the
     live in-repo witness for this arm."""
     source = (
         'def by_escalation(root, escalation_id):\n'

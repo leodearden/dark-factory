@@ -1,0 +1,199 @@
+# Machine-readable twin of task-verify-lanes-prd.capability-manifest.md
+prd: plans/task-verify-lanes-prd.md
+schema_version: 1
+signal_leaves:
+- ε
+tasks:
+- label: α
+  task_id: 10736
+  title: Task-verify lanes on the executing host
+  capabilities:
+  - name: verify-task-worktree-acquisition-seam
+    binding: '`grep:orchestrator/src/orchestrator/cli.py::_verify_task_body` wired: the one place verify-task obtains its worktree today'
+    verdict: PASS
+  - name: clean-retaining-build-artifact-dirs
+    binding: '`grep:orchestrator/src/orchestrator/git_ops.py::GitOps.reset_persistent_offline_deep_worktree` wired: an existing persistent lane already resets through GitOps._clean_lane_retaining_artifacts with git.reap_build_artifact_dirs'
+    verdict: PASS
+  - name: lane-lock-helper
+    binding: '`grep:orchestrator/src/orchestrator/verify_cancel.py::acquire_merge_verify_flock` `grep:orchestrator/src/orchestrator/verify_cancel.py::lane_lock_path` wired: non-blocking with timeout 0; descriptor not inherited'
+    verdict: PASS
+  - name: live-reference-scan
+    binding: '`grep:shared/src/shared/proc_group.py::scan_process_groups_under_path` exists; used read-only (nothing is reaped)'
+    verdict: PASS
+  - name: cancel-leaves-non-merge-band-alone
+    binding: '`grep:orchestrator/src/orchestrator/cli.py::cancel_verify` wired: _recorded_merge_worktree_remover refuses anything but a _merge- entry under the worktree base'
+    verdict: PASS
+  - name: cold-classification-after-reset
+    binding: '`grep:orchestrator/src/orchestrator/task_verify_run.py::run_task_verify_on_worktree` wired: prepare_task_verify_worktree creates .task/ fresh and verify.py::_is_verify_cold then reports cold'
+    verdict: PASS
+  - name: wire-fingerprint-pin
+    binding: '`grep:orchestrator/tests/test_remote_gate.py` exists: its pinned wire vector must be re-pinned when VerifyResult gains fields'
+    verdict: PASS
+  - name: real-git-fixture-for-verify-task
+    binding: '`grep:orchestrator/tests/_task_verify_fixtures.py::seed_verify_repo` exists'
+    verdict: PASS
+  - name: lane-config-keys
+    binding: 'built here: GitConfig.task_verify_lanes, task_verify_lane_root, task_verify_lane_min_free_gib (C1)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: task_verify_lane_root
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: lane-claim-prepare-fallback
+    binding: 'built here: the lane module with the note enum (C2-C6)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: lane_root_unavailable
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: lane-facts-on-result
+    binding: 'built here: three optional fields on VerifyResult (C7)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: host_lane_kept
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: verify-lanes-status-and-reset
+    binding: 'built here: the verify-lanes command group (C10)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verify-lanes
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: lane-boundary-rows-1-17
+    binding: 'built here: orchestrator/tests/test_task_verify_lane.py (PRD section 6 rows 1-17)'
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/tests/test_task_verify_lane.py
+      expect: present
+- label: β
+  task_id: 10737
+  title: Dispatcher record of lane facts and the degraded-lane alarm
+  capabilities:
+  - name: lane-facts-on-result
+    binding: 'producer:task-α upstream: VerifyResult carries host_lane, host_lane_kept, host_lane_note'
+    verdict: PASS
+  - name: remote-result-received-here
+    binding: '`grep:orchestrator/src/orchestrator/task_verify_dispatch.py::TaskVerifyDispatcher._remote_verdict` wired: every remote result passes through it before _settle_remote discards it on cross-check and red-confirm'
+    verdict: PASS
+  - name: dispatch-record-writer
+    binding: '`grep:orchestrator/src/orchestrator/task_verify_dispatch.py::_write_sidecar` wired: writes DispatchDecision to data/verify-logs/<task>/attempt-N.dispatch-*.json'
+    verdict: PASS
+  - name: dispatcher-construction-site
+    binding: '`grep:orchestrator/src/orchestrator/harness.py::Harness.__init__` wired: the only place TaskVerifyDispatcher is constructed; the escalation queue is None there'
+    verdict: PASS
+  - name: escalation-queue-late-binding
+    binding: '`grep:orchestrator/src/orchestrator/harness.py::Harness._start_escalation_server` wired: creates the queue and late-binds the sinks that need it'
+    verdict: PASS
+  - name: l1-dedup-and-resolve-precedent
+    binding: '`grep:escalation/src/escalation/queue.py::EscalationQueue.has_open_l1` `grep:orchestrator/src/orchestrator/merge_lane/liveness.py::_alarm_verify_host_skew` wired: sentinel dedup and resolve-on-recovery'
+    verdict: PASS
+  - name: born-at-l2-filing-precedent
+    binding: '`grep:orchestrator/src/orchestrator/deterministic_runner.py` (its born-at-L2 escalation helpers: level 2 with a sentinel role and severity the server keeps at level 2)'
+    verdict: PASS
+  - name: registered-category-infra-issue
+    binding: '`grep:escalation/src/escalation/categories.py` (INFRA_ISSUE = ''infra_issue'')'
+    verdict: PASS
+  - name: lane-facts-on-dispatch-record
+    binding: 'built here: DispatchDecision carries the three facts, remote_runner and recorded_at for every dispatch that obtained a remote result (C8)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: remote_runner
+      paths:
+      - orchestrator/src/orchestrator/task_verify_dispatch.py
+      expect: present
+  - name: degraded-lane-alarm
+    binding: 'built here: the alarm module and its sentinel (C9)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: __task_verify_lane_degraded__
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: integration-row-21
+    binding: 'built here: real verify-task behind the ssh seam, two dispatches, second record kept true'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: host_lane
+      paths:
+      - orchestrator/tests/test_task_verify_integration.py
+      expect: present
+- label: γ
+  task_id: 10738
+  title: Host provisioning script, in-service check and operations notes
+  capabilities:
+  - name: lane-config-keys
+    binding: 'producer:task-α upstream: the three keys the installer writes'
+    verdict: PASS
+  - name: verify-lanes-status-and-reset
+    binding: 'producer:task-α upstream: the command OPERATIONS.md documents'
+    verdict: PASS
+  - name: lane-facts-on-dispatch-record
+    binding: 'producer:task-β upstream: the lane facts, remote_runner and recorded_at the in-service check reads'
+    verdict: PASS
+  - name: ssh-shim-test-pattern
+    binding: '`grep:scripts/tests/test_enable_laptop_persistent_worktree.py` `grep:scripts/deploy/enable_laptop_persistent_worktree.sh` exist: fake ssh shims and yaml edit with backup'
+    verdict: PASS
+  - name: installer
+    binding: 'built here: scripts/deploy/install_laptop_task_verify_lanes.sh with --check'
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/deploy/install_laptop_task_verify_lanes.sh
+      expect: present
+  - name: in-service-check
+    binding: 'built here: scripts/deploy/check_task_verify_lanes_in_service.py, exits 0 / 75 / 2 / 1'
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/deploy/check_task_verify_lanes_in_service.py
+      expect: present
+  - name: operations-section
+    binding: 'built here: OPERATIONS.md section on task-verify lanes'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verify-lanes reset
+      paths:
+      - OPERATIONS.md
+      expect: present
+- label: ε
+  task_id: 10739
+  title: Enable task-verify lanes for reify on leo-laptop (operator gate)
+  capabilities:
+  - name: installer
+    binding: producer:task-γ upstream
+    verdict: PASS
+  - name: in-service-check
+    binding: producer:task-γ upstream
+    verdict: PASS
+  - name: degraded-lane-alarm
+    binding: 'producer:task-β upstream: fallbacks after enabling are visible'
+    verdict: PASS
+  - name: lane-claim-prepare-fallback
+    binding: producer:task-α upstream
+    verdict: PASS
+  - name: dispatcher-code-commit-readable
+    binding: '`grep:scripts/orchestrator-watchdog.py` (--report prints each orchestrator''s CODE-SHA)'
+    verdict: PASS
+  - name: lanes-in-service-for-reify
+    binding: 'built here (by the operator): the in-service check exits 0 against /home/leo/src/reify/data/verify-logs'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: host state on leo-laptop and reify dispatch records; not expressible as a check on the dark-factory tree

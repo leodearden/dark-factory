@@ -1,0 +1,582 @@
+# Machine-readable twin of early-start-on-predecessor-branch-prd.capability-manifest.md
+# Anchors verified against main 783d0ba683 (2026-11-16). Cited by symbol.
+# Delivered-check patterns are names each task's description lists as required names.
+prd: plans/early-start-on-predecessor-branch-prd.md
+schema_version: 1
+signal_leaves:
+- T8
+- T9
+tasks:
+- label: T1
+  task_id: 10472
+  title: The successor relation in the lock table and the early-start dependency answer
+  note: Intermediate; unlocks T4 and T5a (shared scheduler.py). No prerequisites.
+  capabilities:
+  - name: lock-table-acquires-and-blocker-views
+    binding: '`grep:orchestrator/src/orchestrator/lock_table.py::ModuleLockTable.try_acquire` `grep:orchestrator/src/orchestrator/lock_table.py::ModuleLockTable.try_acquire_additional` `grep:orchestrator/src/orchestrator/lock_table.py::ModuleLockTable.blockers` `grep:orchestrator/src/orchestrator/lock_table.py::ModuleLockTable.blocking_holders` `grep:orchestrator/src/orchestrator/lock_table.py::ModuleLockTable._count_conflicts` the two acquires, the two blocker views and the holder count the one helper replaces'
+    verdict: PASS
+  - name: deps-verdict-and-its-callers
+    binding: '`grep:orchestrator/src/orchestrator/dependency_verdict.py::deps_verdict` `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._deps_satisfied` `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal` `grep:orchestrator/src/orchestrator/pure_gate_resolution.py::_dependencies_satisfied` wired: the three callers that must keep today''s answers bit for bit'
+    verdict: PASS
+  - name: lock-event-and-release
+    binding: '`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._emit_lock_event` `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler.release` wired: the lock event writer and the release that drops the relation'
+    verdict: PASS
+  - name: scheduler-state-snapshot
+    binding: '`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler.get_state_snapshot` `grep:shared/src/shared/scheduler_state.py::SchedulerStateSnapshot` the snapshot that lists the dependent as a co-holder'
+    verdict: PASS
+  - name: hot-reloadable-config-groups
+    binding: '`grep:orchestrator/src/orchestrator/config.py::OrchestratorConfig` `grep:orchestrator/src/orchestrator/config.py::RELOADABLE_FIELDS` a submodel group is made hot-reloadable by adding it to RELOADABLE_FIELDS'
+    verdict: PASS
+  - name: successor-relation-in-lock-table
+    binding: built here; ModuleLockTable declares and removes the successor relation, and its one holder-count helper skips the partner on a single-holder key
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[Ss]uccessor'
+      paths:
+      - orchestrator/src/orchestrator/lock_table.py
+      expect: present
+  - name: successor-of-on-lock-event
+    binding: built here; lock_acquired for the dependent carries successor_of (contract, Events)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: successor_of
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+  - name: early-start-config-group
+    binding: built here; the early_start group with its seven keys, enabled off in the code until T7 (contract, Config)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: stop_streak_pause
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: early-start-group-hot-reloadable
+    binding: 'built here; early_start added to RELOADABLE_FIELDS (contract, Config: hot-reloadable)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '["'']early_start["'']'
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: early-start-dependency-answer
+    binding: built here; deps_verdict's opt-in input of waiting predecessors and its not-satisfied answer naming the predecessor (contract, Dependency test)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: waiting_predecessor|WAITING_PREDECESSOR|early_start|EARLY_START
+      paths:
+      - orchestrator/src/orchestrator/dependency_verdict.py
+      expect: present
+  - name: callers-without-the-input-unchanged
+    binding: built here; ordinary starts, pinned starts and the reservation clean-up get today's answers (invariant 9; the dependency half of test 32)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: A behavioural equality over recorded inputs; no text marks it.
+- label: T2a
+  task_id: 10473
+  title: Stacked worktree, the re-stack, and own work
+  note: Intermediate; unlocks T2b, T5b. After task 7736 (in progress, same worktree-reuse path). Supersedes task 7660.
+  capabilities:
+  - name: stack-base-ledger
+    binding: '`grep:orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._record_stack_base` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps.own_delta_upstream` wired: the train path''s record writer and a reader. StackBaseLedger.record never raises and returns nothing; StackBaseLedger.base_of answers None both for no record and for a git error'
+    verdict: PASS
+  - name: create-worktree-stacking-input
+    binding: '`grep:orchestrator/src/orchestrator/git_ops.py::GitOps.create_worktree` its train argument branches an order > 0 member from the prior member''s tip and writes no record (task 7660)'
+    verdict: PASS
+  - name: own-delta-rule
+    binding: '`grep:orchestrator/src/orchestrator/git_ops.py::GitOps.own_delta_upstream` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._solo_upstream` wired: the merge queue''s use of the one rule that knows stack bases'
+    verdict: PASS
+  - name: own-work-readers
+    binding: '`grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._own_work_base` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._review` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._context_complete_review_subject` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._detect_committed_branch_work` `grep:orchestrator/src/orchestrator/branch_base.py::own_work_base` wired: review and the scope readers all take their range from _own_work_base'
+    verdict: PASS
+  - name: replay-that-aborts
+    binding: '`grep:orchestrator/src/orchestrator/branch_stack.py::rebase_own_delta` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._rebase_off_base` wired: replays the commits after cut onto a named commit and aborts on a conflict'
+    verdict: PASS
+  - name: worktree-reuse-routes
+    binding: '`grep:orchestrator/src/orchestrator/git_ops.py::GitOps._reattach_cold_worktree` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._reuse_warm_lane` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._rebase_requeued_onto_main` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps.acquire_warm_lane` `grep:orchestrator/src/orchestrator/rebase_recovery.py::guarded_abort` the reuse routes that rebase an existing branch onto main today, the warm-worktree acquire a stacked worktree goes through, and the abort whose failure is only logged'
+    verdict: PASS
+  - name: re-stack-in-reuse-routes
+    binding: built here; given the stack input on an existing branch each reuse route commits work in progress, cuts the own commits with the own_delta_upstream rule, replays them onto the named commit and re-records the base; a conflict, a refused start and a failed abort are told apart; a trial that touches nothing (section 5.3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[Rr]estack|RESTACK|[^p]re_stack'
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: stacked-create-worktree-writes-and-reads-back-record
+    binding: built here; create_worktree takes a stack-on-commit input, writes the ledger record before returning and returns the base; the train path uses it (closes task 7660)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: The input's name is the architect's; the T2 signal (the ledger answers the base of a branch create_worktree stacked) proves it.
+  - name: ledger-read-tells-no-record-from-unreadable
+    binding: built here; a read of the record that answers no record, a base, or cannot read, for the guarding readers (section 5.3)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Needed because StackBaseLedger.base_of folds a git error into None today; the name is the architect's.
+  - name: own-work-through-stack-rule
+    binding: built here; _own_work_base answers through own_delta_upstream when the branch has a ledger record (test 28)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: own_delta_upstream already appears in workflow.py, so a grep would be green before T2 lands.
+  - name: stacked-worktree-through-warm-pool
+    binding: built here; a stacked worktree comes from the warm-worktree pool where the project has one, with the record written and read back on that route; declared-train successors stay out (section 5.3)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Behavioural; tests 50 and 47 (iii) prove it.
+  - name: reuse-routes-un-stack-without-stack-input
+    binding: built here; without a stack input all three reuse routes un-stack before a rebase onto main, the registered cold worktree included
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Behavioural; proved on a real repository.
+- label: T2b
+  task_id: 10474
+  title: The landed question and the replay that pauses
+  note: Intermediate; unlocks T6a, T6b, T6c. After T2a (same files).
+  capabilities:
+  - name: containment-classifier
+    binding: '`grep:orchestrator/src/orchestrator/merge_lane/landing_evidence.py::classify_containment` `grep:orchestrator/src/orchestrator/merge_lane/landing_evidence.py::patch_content_contained` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps.is_ancestor_checked` classify_containment is public and tested (task 10215) but has no production caller yet; T2 is its first consumer. Its git cherry core is wired through patch_content_contained'
+    verdict: PASS
+  - name: ledger-and-own-commits
+    binding: 'producer:T2a upstream: the three-valued ledger read and the cut of own commits'
+    verdict: PASS
+  - name: landed-question
+    binding: built here; one function answering landed as built on / landed, changed / not landed / unknown, taking the predecessor's recorded landings and main's tip at the early start as inputs (section 5.6)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[Ll]anded_?[Cc]hanged|LANDED_CHANGED'
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: replay-that-pauses
+    binding: built here; replay a branch's own commits onto main, pause at a conflict, let the caller resolve and continue, drop the record only when complete and checked (contract, Worktree and git)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: The entry point name is the architect's; the T2b signal (a paused replay is continued and only then drops the record) proves it.
+- label: T3
+  task_id: 10475
+  title: The borrowed slot
+  note: Intermediate; unlocks T5b. No prerequisites. Keep the slot-ended signal in slot_lease.py so T3 stays off scheduler.py.
+  capabilities:
+  - name: slot-lease-and-its-exits
+    binding: '`grep:orchestrator/src/orchestrator/slot_lease.py::SlotLease.release` `grep:orchestrator/src/orchestrator/harness.py::Harness._run_slot` wired: _run_slot builds the lease and releases it on every exit'
+    verdict: PASS
+  - name: harness-waits-for-a-permit
+    binding: '`grep:orchestrator/src/orchestrator/harness.py::Harness.run` `grep:orchestrator/src/orchestrator/harness.py::Harness._launch_slot` wired: run takes acquire_next''s task, then waits on the semaphore, then launches'
+    verdict: PASS
+  - name: borrowing-lease
+    binding: built here; a lease that takes no permit and names its lender; the lender's release hands its permit to a still-running borrower (contract, SlotLease)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[Ll]ender'
+      paths:
+      - orchestrator/src/orchestrator/slot_lease.py
+      expect: present
+  - name: slot-ended-signal
+    binding: built here; a per-task signal set at the release of a lease (open question 3)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Where it lives and its name are decided in T3 (section 13, question 3).
+  - name: permits-conserved
+    binding: built here; every permit released once on every exit in either order (invariant 4)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Proved by the harness-loop tests over the five exits, not by a name.
+- label: T4
+  task_id: 10476
+  title: The task picture and the claim-time check
+  note: Intermediate; unlocks T5a. Serialized after T1 by scheduler.py.
+  capabilities:
+  - name: five-writing-steps
+    binding: '`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_backfill_dep_status` `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._apply_external_dep_policy` `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._compute_delivered_check_cache` `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_override_snapshot_gc` `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._compute_effective_priorities` the steps whose read parts are split out (section 5.4)'
+    verdict: PASS
+  - name: ready-list-and-claims
+    binding: '`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._eligible_for_dispatch` `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_select_scored` `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._dispatch_pin` wired: the started-set is checked at the ready list and added to at the ranked and pinned claims'
+    verdict: PASS
+  - name: task-picture
+    binding: built here; a picture built only by read parts and kept for picture_max_age_secs (section 5.4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[Pp]icture'
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+  - name: claim-refuses-a-started-task
+    binding: built here; the ranked and pinned claims refuse a task already started (invariant 11)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: The started-set test already exists at the ready list, so a grep cannot tell the new claim-time check from it.
+  - name: picture-writes-nothing
+    binding: built here; test 35 and an unchanged ordinary pass on a recorded pass
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: A behavioural property (invariant 12).
+  - name: picture-event-loop-time-reported
+    binding: built here; the measured event-loop time of one picture in the task's result
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: A figure in the task's result, not code.
+- label: T5a
+  task_id: 10477
+  title: The early-start selection in the scheduler
+  note: Intermediate; unlocks T5b. After T1 and T4 (scheduler.py).
+  capabilities:
+  - name: delivered-checks-at-a-commit
+    binding: '`grep:orchestrator/src/orchestrator/delivered_checks.py::run_delivered_check` `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._compute_delivered_check_cache` wired: run_delivered_check takes a ref, read by the grep and path kinds'
+    verdict: PASS
+  - name: system-holds
+    binding: '`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_psi_gate` `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler.is_paused` `grep:orchestrator/src/orchestrator/harness.py::Harness._run_review_checkpoint` `grep:orchestrator/src/orchestrator/harness.py::Harness._probe_warm_base_health` `grep:orchestrator/src/orchestrator/harness.py::Harness.get_merge_halt_status` the host-load gate, pause, review checkpoint, warm-base health and merge halt the selection must honour'
+    verdict: PASS
+  - name: fairness-bookkeeping
+    binding: '`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._settle_fairness_on_dispatch` `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._bump_skip_and_maybe_park` the counter an early start must not bump'
+    verdict: PASS
+  - name: eligibility-predicate
+    binding: '`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._eligible_for_dispatch` `grep:orchestrator/src/orchestrator/harness.py::Harness._enforce_cost_ceilings` the one predicate ranked and pinned starts use, and the cost-ceiling check the main loop runs before each dispatch'
+    verdict: PASS
+  - name: lock-rule-and-picture
+    binding: 'producer:T1 producer:T4 upstream: the successor relation, the early-start dependency answer, the picture and the claim-time check'
+    verdict: PASS
+  - name: tier-condition-refusal
+    binding: built here; the higher_tier_waiting refusal naming the task (ruling 3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: higher_tier_waiting
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: one-dependent-per-predecessor
+    binding: built here; a second dependent of one predecessor is refused predecessor_has_dependent (test 46)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: predecessor_has_dependent
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: claim-in-one-step
+    binding: built here; request still live, file rule, tier condition, keys, relation and started mark in one uninterrupted step, with a release for a failed launch
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Behavioural (tests 33, 34); no name marks it.
+- label: T5b
+  task_id: 10478
+  title: The early-start coroutine and launch in the harness
+  note: Intermediate; unlocks T6a. After T5a, T2a and T3.
+  capabilities:
+  - name: live-merge-requests
+    binding: '`grep:orchestrator/src/orchestrator/merge_lane/types.py::InFlightMergeRegistry` `grep:orchestrator/src/orchestrator/harness.py::Harness.__init__` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._submit_to_merge_queue` wired: the harness owns the registry of live requests; the workflow awaits its request inside the slot'
+    verdict: PASS
+  - name: event-vocabulary
+    binding: '`grep:orchestrator/src/orchestrator/event_store.py::EventType` new members join this enum'
+    verdict: PASS
+  - name: selection-stacking-borrowing
+    binding: 'producer:T5a producer:T2a producer:T3 upstream: the selection entry, the stack input and re-stack of create_worktree, the borrowing lease'
+    verdict: PASS
+  - name: selection-and-dispatched-events-declared
+    binding: built here; early_start_selection and early_start_dispatched join EventType
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: early_start_dispatched
+      paths:
+      - orchestrator/src/orchestrator/event_store.py
+      expect: present
+  - name: early-start-dispatched-emitted
+    binding: built here; the launch emits early_start_dispatched naming dependent, predecessor, stacked base, co-held keys
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: EventType\.early_start_dispatched
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: early-start-selection-emitted
+    binding: built here; one selection event per change of outcome, at most once per waiting predecessor per interval
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: EventType\.early_start_selection
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: trial-replay-refusal
+    binding: built here; step (b) runs the trial replay for a dependent with a stacked branch, refuses restack_conflict and remembers it per pair of tips
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: restack_conflict
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: selection-coroutine-timer
+    binding: built here; the harness coroutine runs on submit and every pass_interval_secs while a predecessor has no dependent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \.pass_interval_secs
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: early-start-mark
+    binding: built here; the mark on the dependent naming its predecessor
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: The metadata key is the architect's; tests 42 and 43 build and read it.
+- label: T6a
+  task_id: 10479
+  title: Stop when the predecessor's work does not land
+  note: Intermediate; unlocks T6b. After T5b and T2b.
+  capabilities:
+  - name: re-pend-and-cancel-paths
+    binding: '`grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._repend_for_requeue` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._exit_requeued` `grep:orchestrator/src/orchestrator/harness.py::Harness.cancel_workflow` `grep:orchestrator/src/orchestrator/harness.py::Harness.hard_cancel_workflow` wired: _exit_requeued writes pending through _repend_for_requeue'
+    verdict: PASS
+  - name: requeue-cooldown-and-history
+    binding: '`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler.release` the requeued release arms the cooldown and records the requeue the stop must not count'
+    verdict: PASS
+  - name: landed-question-and-slot-ended
+    binding: 'producer:T2b producer:T3 producer:T5b upstream: the answer at slot end, the signal to await, a live early start'
+    verdict: PASS
+  - name: early-start-stopped-emitted
+    binding: built here; early_start_stopped with dependent, predecessor, cause, time worked
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: EventType\.early_start_stopped
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: self-pause
+    binding: built here; early_start_paused and one escalation after stop_streak_pause stops in a row
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: EventType\.early_start_paused
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: stop-streak-read
+    binding: built here; the stop streak compared with early_start.stop_streak_pause
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \.stop_streak_pause
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: hard-cancel-after-timeout
+    binding: built here; hard cancel after early_start.stop_hard_cancel_secs, pending written before the owner stamp is cleared
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \.stop_hard_cancel_secs
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: stop-not-counted-and-shutdown-excluded
+    binding: built here; the stop is a requeue that does not count; a shutdown emits and counts nothing
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Behavioural (tests 22, 31); no name marks it.
+  - name: work-in-progress-committed-at-stop
+    binding: built here; the stop commits the dependent's uncommitted work before the workflow exits, and a warm worktree is released only after that commit (test 48)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Behavioural; test 48 proves it.
+  - name: unknown-at-slot-end-re-asked
+    binding: built here; an unknown answer at slot end is asked again on the timer, with one escalation after unknown_streak_alert in a row (test 18 (i))
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Behavioural; the alert key is checked at T6c.
+- label: T6b
+  task_id: 10480
+  title: Settle when it lands
+  note: Intermediate; unlocks T6c. After T6a.
+  capabilities:
+  - name: merge-phase-order
+    binding: '`grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._run_merge_phase` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_merge_phase_entered` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._handle_merge_gate_escalations` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._rebase_before_enqueue` wired: _run_merge_phase stamps, then handles gating escalations, then rebases and submits; the settle goes between the stamp and the gating step'
+    verdict: PASS
+  - name: merge-conflict-agent
+    binding: '`grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._resolve_and_resubmit` `grep:orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_merger_prompt` wired: the workflow invokes MERGER with this brief'
+    verdict: PASS
+  - name: landing-events
+    binding: '`grep:orchestrator/src/orchestrator/merge_lane/intake.py::enqueue_merge_request` `grep:orchestrator/src/orchestrator/event_store.py::EventType` merge_finalized carries state (done, already_merged and others), emitted from enqueue_merge_request''s _on_finalized'
+    verdict: PASS
+  - name: landed-question-replay-slot-ended-stop
+    binding: producer:T2b producer:T3 producer:T6a upstream
+    verdict: PASS
+  - name: early-start-settled-emitted
+    binding: built here; early_start_settled with the answer, replayed, conflict resolved, verify re-run
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: EventType\.early_start_settled
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: merge-entry-wait-alert
+    binding: built here; the wait at merge entry and one escalation after early_start.merge_entry_alert_secs
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \.merge_entry_alert_secs
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: paused-replay-brief
+    binding: 'built here; the merge-conflict agent''s brief for a paused replay: never merge main in, never rebase the whole branch'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Brief wording is the architect's; test 17 proves it.
+  - name: verify-rule-after-landing
+    binding: built here; one more task verify unless the landing is a merge commit whose second parent is the stacked base (choice 5)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Behavioural (tests 13 to 16).
+- label: T6c
+  task_id: 10481
+  title: The landed question at every later start
+  note: Intermediate; unlocks T7. Depends on T6b.
+  capabilities:
+  - name: re-cut-gate-in-run-slot
+    binding: '`grep:orchestrator/src/orchestrator/harness.py::Harness._run_slot` `grep:orchestrator/src/orchestrator/harness.py::Harness._run_recut_ruling_gate` wired: _run_slot runs the re-cut gate before the worktree is touched'
+    verdict: PASS
+  - name: issuing-a-ruling
+    binding: '`grep:orchestrator/src/orchestrator/recut_ruling.py::issue_ruling` `grep:orchestrator/src/orchestrator/harness.py::Harness._issue_restart_recut_ruling` wired: the restart resolution already issues a ruling from code through issue_ruling; the automatic issuer follows that shape'
+    verdict: PASS
+  - name: requeue-replay-path
+    binding: '`grep:orchestrator/src/orchestrator/git_ops.py::GitOps._reuse_warm_lane` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps._rebase_requeued_onto_main` `grep:orchestrator/src/orchestrator/git_ops.py::GitOps.unstack_from_unlanded_base` wired: the existing requeue path that replays onto main on landed'
+    verdict: PASS
+  - name: recorded-landings-after-restart
+    binding: '`grep:orchestrator/src/orchestrator/event_store.py::_MERGE_FINALIZED_ROWS` the event-store selector for merge_finalized rows'
+    verdict: PASS
+  - name: landed-question-and-settle
+    binding: producer:T2b producer:T6b upstream
+    verdict: PASS
+  - name: early-start-recut-emitted
+    binding: built here; early_start_recut with dependent, predecessor, ruling
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: EventType\.early_start_recut
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: unknown-streak-alert
+    binding: built here; one escalation after early_start.unknown_streak_alert unknown answers in a row
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: T6a already reads this key at slot end, so a use-site grep would be green before T6c lands; test 38 proves the start-time alert.
+  - name: automatic-issuer-named
+    binding: 'built here; recut_ruling.py names the automatic issuer (early start: predecessor''s work never landed)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: early.start|[Pp]redecessor
+      paths:
+      - orchestrator/src/orchestrator/recut_ruling.py
+      expect: present
+  - name: re-cut-drops-record-and-mark-once
+    binding: built here; the re-cut drops the ledger record and the mark; never issued twice for the same predecessor and base
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: Behavioural (tests 25, 37).
+- label: T7
+  task_id: 10482
+  title: Operator views, and the default turned on
+  note: 'Intermediate; unlocks T8, T9. Depends on T6c. Soft pre-condition: task 10211.'
+  capabilities:
+  - name: slot-count-alarm
+    binding: '`grep:dashboard/src/dashboard/data/burndown.py::compute_parity_alarm` `grep:dashboard/src/dashboard/data/burndown.py::_row_for_root` `grep:dashboard/src/dashboard/data/redux_api.py::_project_block` wired: _project_block serves compute_parity_alarm over the persisted in_progress_live column; _row_for_root logs the same comparison'
+    verdict: PASS
+  - name: runtime-state
+    binding: '`grep:orchestrator/src/orchestrator/harness.py::Harness.task_runtime_snapshot` `grep:orchestrator/src/orchestrator/task_runtime.py::TaskRuntimeState` `grep:shared/src/shared/task_runtime_state.py::TaskRuntimeEntry` `grep:escalation/src/escalation/server.py` get_task_runtime_state projects the harness snapshot onto TaskRuntimeEntry'
+    verdict: PASS
+  - name: operations-doc
+    binding: '`grep:OPERATIONS.md` a section on early starts'
+    verdict: PASS
+  - name: borrowed-slot-lender
+    binding: producer:T3 producer:T5b upstream
+    verdict: PASS
+  - name: alarm-allows-borrowed-slots
+    binding: built here; each burndown snapshot row records the number of live early starts and the slot-count alarm adds it to the cap
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: early_start|[Bb]orrowed|[Ll]ender
+      paths:
+      - dashboard/src/dashboard/data/
+      expect: present
+  - name: runtime-state-names-lender
+    binding: built here; the runtime entry of an early-started dependent names the task whose slot it borrows
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[Ll]ender|early_start|[Bb]orrow'
+      paths:
+      - orchestrator/src/orchestrator/task_runtime.py
+      - shared/src/shared/task_runtime_state.py
+      expect: present
+  - name: enabled-by-default
+    binding: built here; early_start.enabled defaults to on (choice 7, test 41)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: A default value; a grep for its literal text is too brittle to gate T8 and T9 on.
+- label: T8
+  task_id: 10483
+  title: 'Gate: read the first real pairs'
+  note: Signal leaf. Pure gate, delayed two days after T7 is done.
+  capabilities:
+  - name: events-to-read
+    binding: '`grep:orchestrator/src/orchestrator/event_store.py::EventType` producer:T1 producer:T5b producer:T6b upstream: lock_acquired with successor_of, early_start_dispatched, early_start_settled, and the existing merge_queued and merge_finalized'
+    verdict: PASS
+  - name: end-to-end-sequence-for-one-real-pair
+    binding: built here; the ordered sequence of section 9, T8, read from the event store for one real pair
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: A reading of production events after two days; nothing in the tree changes.
+- label: T9
+  task_id: 10484
+  title: 'Gate: read two weeks of early starts'
+  note: Signal leaf. Pure gate, delayed fourteen days after T7 is done; carries the end-to-end proof if T8 closed without a completed pair.
+  capabilities:
+  - name: counts-to-read
+    binding: 'producer:T5b producer:T6a producer:T6b producer:T6c upstream: refusals, stops by cause, settles, re-cuts'
+    verdict: PASS
+  - name: two-week-report-and-stage-2-recommendation
+    binding: built here; counts per week against section 2, and a recommendation on stage 2
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: A report for the operator.

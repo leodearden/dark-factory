@@ -11,12 +11,19 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
 
 from shared.task_store_schema import TASK_STORE_DDL
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
+from shared.testing_sqlite_spill import (
+    SPILL_PAD,
+    SPILL_ROWS,
+    require_sort_to_spill,
+    run_unable_to_write_files,
+)
 
 
 def _make_store(directory: Path, rows: list[dict]) -> Path:
@@ -403,3 +410,27 @@ def test_connect_ro_returns_a_plain_connection_not_a_wrapper(tmp_path):
         assert type(conn) is sqlite3.Connection
     finally:
         conn.close()
+
+
+def test_connect_ro_sorts_without_a_temp_file(tmp_path):
+    """A sandboxed reader with no writable temp dir must still sort a large
+    result, rather than fail mid-query and be reported as an unreadable store
+    (task 7251)."""
+    db = _make_store(
+        tmp_path,
+        [{"id": i, "title": f"t{i}", "details": SPILL_PAD} for i in range(SPILL_ROWS)],
+    )
+    sort_on_an_unindexed_column = "SELECT details FROM tasks ORDER BY title"
+    require_sort_to_spill(db, sort_on_an_unindexed_column)
+
+    result = run_unable_to_write_files([
+        sys.executable,
+        "-c",
+        "import sys; from shared.tasks_db_readonly import connect_ro; "
+        "print(len(connect_ro(sys.argv[1]).execute(sys.argv[2]).fetchall()))",
+        str(db),
+        sort_on_an_unindexed_column,
+    ])
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(SPILL_ROWS)

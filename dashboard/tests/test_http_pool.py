@@ -33,7 +33,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -41,7 +41,7 @@ from unittest.mock import AsyncMock, patch
 import httpcore
 import httpx
 import pytest
-from _dashboard_helpers import apply_isolated_env
+from _dashboard_helpers import IDLE_BACKGROUND_LOOPS, apply_isolated_env
 from fastapi import FastAPI
 from starlette.datastructures import State
 
@@ -1232,12 +1232,11 @@ async def _run_lifespan_with_a_recording_reaper(
 
     with (
         patch('dashboard.app.httpx.AsyncClient', _recording_async_client),
-        patch('dashboard.app.reaper_loop', _recording_reaper_loop),
         patch('dashboard.app.reap_detached_refreshes', _observing_reap_detached),
-        patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
-        patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock(return_value=None)),
     ):
-        async with lifespan(run.app):
+        async with lifespan(
+            run.app, loops=replace(IDLE_BACKGROUND_LOOPS, reaper=_recording_reaper_loop)
+        ):
             await _step_until(
                 lambda: run.reaper_task is not None, what='the reaper task starting'
             )
@@ -1353,14 +1352,9 @@ class TestWiringTheReaperKeepsTheExitPathGuarantee:
                 'dashboard.app.reap_detached_refreshes',
                 new=AsyncMock(side_effect=RuntimeError(self._BOOM)),
             ),
-            patch('dashboard.loops.collect_snapshot', new=AsyncMock(return_value=None)),
-            patch(
-                'dashboard.loops.collect_metrics_snapshot',
-                new=AsyncMock(return_value=None),
-            ),
             pytest.raises(RuntimeError, match=self._BOOM),
         ):
-            async with lifespan(app):
+            async with lifespan(app, loops=IDLE_BACKGROUND_LOOPS):
                 pass
 
         assert app.state.http_client.is_closed, (

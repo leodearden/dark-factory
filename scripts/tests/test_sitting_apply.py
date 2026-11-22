@@ -18,7 +18,7 @@ import pytest
 from escalation.authority import COORDINATOR_IDENTITY, EXECUTOR_IDENTITY, ClassSwitch
 from escalation.classify import classify_resolver_tier
 from escalation.models import Escalation
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     AuditOutcome,
     AuditVerdict,
     DecisionRecord,

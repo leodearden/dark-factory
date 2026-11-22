@@ -1,0 +1,15 @@
+import sqlite3, json, collections
+c=sqlite3.connect('file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro',uri=True,timeout=60)
+LO=595475
+SKIP=('external_dep_gate_held','scheduler_tick','verify_admission_heartbeat','verify_admission_plan','lock_acquired','lock_released','routing_decision','sandbox_applied','dispatch_deferred','pin_blocked','phase_exit','recovery_vetoed','set_to_plan','task_skipped','escalation_rulings_briefed','age_anchor_reset','starvation_detected','drift_check_deferred','delivered_check_gate_held','plan_revalidated','reservation_installed','reservation_expired','reservation_shadowed','reservation_used','phase_skipped')
+q="select id,timestamp,run_id,task_id,event_type,phase,role,data,duration_ms from events where id>=? and event_type not in (%s) order by id"%','.join('?'*len(SKIP))
+n=0
+with open('/tmp/gate-10069/forensics/ev.jsonl','w') as f:
+    for r in c.execute(q,(LO,)+SKIP):
+        try: d=json.loads(r[7] or '{}')
+        except Exception: d={'_raw':r[7]}
+        f.write(json.dumps({'id':r[0],'ts':r[1],'run':r[2],'task':r[3],'et':r[4],'phase':r[5],'role':r[6],'d':d,'dur':r[8]})+'\n'); n+=1
+print(n)
+# runs
+with open('/tmp/gate-10069/forensics/runs.json','w') as f:
+    json.dump([dict(zip(('run_id','project_id','started_at','completed_at','code_sha','exit_reason'),r)) for r in c.execute("select run_id,project_id,started_at,completed_at,code_sha,exit_reason from runs where started_at>='2026-11-13' order by started_at")],f)

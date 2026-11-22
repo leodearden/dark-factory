@@ -4,13 +4,15 @@
 :class:`TaskDbUnreadable` whose :class:`TaskDbProblem` says which mistake the
 reader made. What to do with a refusal (surface it, skip that store, degrade
 and log) is each caller's policy, not this module's. It imports only the
-standard library.
+standard library and shared.sqlite_readonly.
 """
 from __future__ import annotations
 
 import sqlite3
 from enum import Enum
 from pathlib import Path
+
+from shared.sqlite_readonly import connect_readonly
 
 
 class TaskDbProblem(Enum):
@@ -105,11 +107,8 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
     :class:`sqlite3.DatabaseError`, so branching on the exception class would
     report every unreadable store as "not a database".
 
-    The URI is built from the RESOLVED absolute path, so a relative one cannot
-    be re-resolved against a different cwd by a subprocess or a later chdir —
-    the ``unable to open database file`` shape of the same confusion. It is
-    percent-encoded, so a ``#``, ``?`` or ``%`` in the path cannot end the
-    path early and drop ``mode=ro``.
+    It opens through shared/src/shared/sqlite_readonly.py::connect_readonly,
+    which owns the URI and the in-memory temp storage.
     """
     resolved = Path(path).resolve()
     if not resolved.exists():
@@ -119,7 +118,7 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
     if resolved.stat().st_size == 0:
         raise TaskDbUnreadable(resolved, TaskDbProblem.EMPTY_STUB)
 
-    conn = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
+    conn = connect_readonly(resolved)
     try:
         first_table = conn.execute(f"{TABLE_NAMES_SQL} LIMIT 1").fetchone()
     except sqlite3.DatabaseError as exc:

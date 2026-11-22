@@ -28,4 +28,4 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 # shellcheck disable=SC2086  # CHECK_DASHBOARD_PAYLOAD_PY is a command word list.
-exec ${CHECK_DASHBOARD_PAYLOAD_PY:-uv run --frozen --project "$REPO_ROOT/dashboard" python -m dashboard.payload_check} "$@"
+exec ${CHECK_DASHBOARD_PAYLOAD_PY:-uv run --no-sync --project "$REPO_ROOT/dashboard" python -m dashboard.payload_check} "$@"

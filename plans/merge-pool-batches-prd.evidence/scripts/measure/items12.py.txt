@@ -1,0 +1,99 @@
+"""Items 1-2: single-request pass rate and chain pass rate by size; implied per-request rate."""
+import sys
+sys.path.insert(0, '/tmp/gate-10069/measure')
+from collections import Counter, defaultdict
+from common import verifies, wilson, binom_cdf, fmt, T8528
+
+V = verifies()
+print('rows', len(V), 'by window', Counter(v['win'] for v in V))
+print('gate (sha join) rows', sum(v['gate'] for v in V), 'same-task', sum(v['gate_same_task'] for v in V),
+      'proxy runner_reason=gate_on_head_host', sum(v['runner_reason'] == 'gate_on_head_host' for v in V),
+      'proxy&join', sum(v['gate'] and v['runner_reason'] == 'gate_on_head_host' for v in V))
+print('gate rows by k', Counter(v['k'] for v in V if v['gate']))
+print('8528 key check: rows in b without cdr key', [ (v['ts'], v['k']) for v in V if v['win']=='b' and v['cdr']=='ABSENT'],
+      'rows in a with key', [(v['ts']) for v in V if v['win']=='a' and v['cdr']!='ABSENT'])
+
+# isolation tag: first single verify of a task after it sat in a red chain (chain_task_ids era only)
+last_red_chain = {}
+iso_ids = set()
+for v in sorted(V, key=lambda r: r['id']):
+    if v['k'] >= 2 and v['members']:
+        for m in v['members']:
+            if not v['passed']:
+                last_red_chain[m] = v['id']
+            else:
+                last_red_chain.pop(m, None)
+    elif v['k'] == 1:
+        if v['task'] in last_red_chain:
+            iso_ids.add(v['id'])
+            last_red_chain.pop(v['task'])
+print('isolation-tagged singles', len(iso_ids))
+
+
+def rate(rows):
+    x = sum(r['passed'] for r in rows); n = len(rows)
+    lo, hi = wilson(x, n)
+    return x, n, (x / n if n else None), lo, hi
+
+
+print('\n## Item 1 single-request')
+for w in ('a', 'b'):
+    S = [v for v in V if v['win'] == w and v['k'] == 1]
+    rows = [
+        ('all singles', S),
+        ('excl gate re-verify (sha join)', [v for v in S if not v['gate']]),
+        ('excl gate AND excl post-red-chain isolation solos', [v for v in S if not v['gate'] and v['id'] not in iso_ids]),
+        ('gate re-verifies only', [v for v in S if v['gate']]),
+        ('isolation solos only (non-gate)', [v for v in S if v['id'] in iso_ids and not v['gate']]),
+        ('excl gate, runner=laptop', [v for v in S if not v['gate'] and v['runner'] == 'laptop']),
+        ('excl gate, runner=local', [v for v in S if not v['gate'] and v['runner'] == 'local']),
+    ]
+    for name, r in rows:
+        x, n, p, lo, hi = rate(r)
+        print(f'| {w} | {name} | {x}/{n} | {fmt(p)} | [{fmt(lo)}, {fmt(hi)}] |')
+
+print('\n## Item 1 chains by size (gate excluded)')
+size_bucket = lambda k: '5+' if k >= 5 else str(k)
+for w in ('a', 'b'):
+    C = [v for v in V if v['win'] == w and v['k'] >= 2 and not v['gate']]
+    S = [v for v in V if v['win'] == w and v['k'] == 1 and not v['gate'] and v['id'] not in iso_ids]
+    s = sum(v['passed'] for v in S) / len(S)
+    by = defaultdict(list)
+    for v in C:
+        by[size_bucket(v['k'])].append(v)
+    by['all chains'] = C
+    for b in ['2', '3', '4', '5+', 'all chains']:
+        r = by.get(b, [])
+        x, n, p, lo, hi = rate(r)
+        if not n:
+            print(f'| {w} | {b} | 0 | - |'); continue
+        mk = sum(v['k'] for v in r) / n
+        ks = Counter(v['k'] for v in r)
+        implied = p ** (1 / mk) if p else 0.0
+        implied_lo = lo ** (1 / mk) if lo else 0.0
+        implied_hi = hi ** (1 / mk)
+        # expected passes under independence at single rate s: sum over rows s^k
+        exp = sum(s ** v['k'] for v in r)
+        # one-sided test P(X <= x) under Poisson-binomial approx via normal
+        var = sum(s ** v['k'] * (1 - s ** v['k']) for v in r)
+        z = (x - exp) / var ** 0.5 if var else 0
+        print(f'| {w} | {b} | ks={dict(ks)} | {x}/{n} | {fmt(p)} | [{fmt(lo)},{fmt(hi)}] | mean k {mk:.2f} | implied {fmt(implied)} [{fmt(implied_lo)},{fmt(implied_hi)}] | expected passes at single rate {s:.3f}: {exp:.1f} | z={z:.2f} |')
+    print(f'   window {w}: single (excl gate & iso) rate used = {s:.3f} n={len(S)}')
+    # gated chains
+    print('   gate chains in window', sum(1 for v in V if v['win']==w and v['k']>=2 and v['gate']))
+
+# per day singles, for drift
+print('\n## singles excl gate & iso, by day')
+d = defaultdict(list)
+for v in V:
+    if v['k'] == 1 and not v['gate'] and v['id'] not in iso_ids:
+        d[v['day'] + ('b' if v['win'] == 'b' else '')].append(v['passed'])
+for k in sorted(d):
+    print(k, sum(d[k]), len(d[k]), round(sum(d[k]) / len(d[k]), 3))
+print('\n## chains by day (non-gate)')
+d = defaultdict(list)
+for v in V:
+    if v['k'] >= 2 and not v['gate']:
+        d[v['day'] + ('b' if v['win'] == 'b' else '')].append((v['k'], v['passed']))
+for k in sorted(d):
+    print(k, d[k])

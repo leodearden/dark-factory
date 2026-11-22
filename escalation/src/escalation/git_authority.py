@@ -28,6 +28,13 @@ the orchestrator process.  Hoisting either to module level would convert that
 degradation into an import-time crash.  ``shared.*`` imports are intra-workspace
 and unconstrained.
 
+**Which producer decides.**  Both live-ref arms (:attr:`GitAuthorityArm.ancestor`
+and :attr:`GitAuthorityArm.patch_id`) are decided by the non-decaying
+``branch_work_landed``; the deleted-ref :attr:`GitAuthorityArm.marker` arm keeps
+``validate_landing_evidence``'s effect-present CANDIDATE policy (task 4648).
+``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md`` §7
+records why each landing-detection site keeps the policy it has.
+
 **On the three non-landing outcomes.**  This module reports WHAT git
 established — :attr:`GitAuthorityOutcome.landed_unconfirmed`,
 :attr:`GitAuthorityOutcome.no_signal` or
@@ -44,6 +51,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from shared.branch_names import bare_queued_branch_id, canonical_queued_branch_name
+from shared.declared_checks import declared_checks
 from shared.merge_state import MergeState
 from shared.task_read import TaskAbsent, TaskFound
 
@@ -87,17 +95,27 @@ class GitAuthorityArm(enum.StrEnum):
 
     A ``StrEnum`` for the same reason :class:`GitAuthorityOutcome` is one
     (heuristic 12, structured data instead of meaningful strings): ``arm`` is
-    a closed three-member set a consumer switches on, not free text.
-    ``ancestor`` — the branch ref still exists and its tip is an ancestor of
-    main; ``marker`` — the ref is gone and a merge marker for it was found on
-    main; ``patch_id`` — the ref still exists, its tip is NOT an ancestor of
-    main, and
+    a closed three-member set a consumer switches on, not free text.  Each
+    member names the git SHAPE that was observed, not the producer that
+    decided it:
+
+    - ``ancestor`` — the branch ref still exists and its tip is an ancestor
+      of main;
+    - ``patch_id`` — the ref still exists and its tip is NOT an ancestor of
+      main, the shape a worker-rebased solo landing leaves
+      (``GitOps.advance_main``'s rebased path retains the ref at its
+      pre-rebase tip);
+    - ``marker`` — the ref is gone and a merge marker for it was found on
+      main.
+
+    Both live-ref shapes are decided by
     ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed``
-    decided the verdict (patch-id containment, behind its degeneracy and
-    empty-net-diff guards).  That last is the shape a worker-rebased solo
-    landing leaves: ``GitOps.advance_main``'s rebased path retains the ref at
-    its pre-rebase tip.  The arms carry different evidence and different
-    guards, which is why the verdict names the one it came from.
+    (patch-id containment plus attribution, behind its degeneracy and
+    empty-net-diff guards; task 4648).  ``marker`` is decided by
+    ``validate_landing_evidence`` CANDIDATE mode, the effect-present policy,
+    because a deleted ref has no tip to judge.  The arms carry different
+    evidence and different guards, which is why the verdict names the one it
+    came from.
     """
 
     ancestor = 'ancestor'
@@ -112,9 +130,9 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
     explicit exception — Exception 1 below (task 3103); Exception 2
     weakens a different guarantee and leaves this one intact:
 
-    - **Live-branch path** (``is_ancestor`` hit): the citation commit
-      discovered by ``validate_landing_evidence`` — a commit on main
-      whose subject cites the task.
+    - **Live-branch path** (``is_ancestor`` hit): ``branch_work_landed``'s
+      ``evidence_sha``, the most recent commit on main whose subject cites
+      the task by the project's ``git.commit_citation_pattern``.
     - **Deleted-branch path** (``find_merge_marker`` hit): the
       merge-commit SHA found on main via ``git log``.
     - **Patch-id path** (a live branch that is NOT an ancestor of main,
@@ -124,29 +142,29 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
       ``git.commit_citation_pattern`` (none on a ``''`` opt-out), else the
       branch tip's patch-id twin on main.
 
-    The first two are effect-present-checked against current main HEAD
-    before being returned.  The patch-id path is NOT, by
-    ``docs/prds/landed-not-done-recovery.md`` D1's non-decay contract: it
-    is checked by containment instead, and a later revert does not unland
-    it.  So ``merge_sha`` is safe to record as provenance as-is on every
-    path — EXCEPT in the two cases below, which
-    :attr:`GitAuthorityVerdict.merge_sha_fully_guarded` answers as one
-    question.  Neither exception applies to the patch-id path: it never
-    consults the delivered checks, and on a ``''`` opt-out its sha is still
-    a commit on main carrying the tip's diff.  (Before task 3103 the
-    live-branch path returned the *branch tip*, which for a ``--no-ff``
-    merge is a distinct commit that is not
-    on main's first-parent chain — callers were told to prefer the
-    deleted-branch path's value.  That caveat no longer applies.)
+    Only the deleted-branch path is effect-present-checked against current
+    main HEAD before being returned.  Both live-branch paths are checked by
+    patch-id containment plus attribution instead, by
+    ``docs/prds/landed-not-done-recovery.md`` D1's non-decay contract (task
+    4648), so later churn on main does not unland them.  So ``merge_sha`` is
+    safe to record as provenance as-is on every path — EXCEPT in the two
+    cases below, which :attr:`GitAuthorityVerdict.merge_sha_fully_guarded`
+    answers as one question.  Neither exception applies to the patch-id
+    path: it never consults the delivered checks, and on a ``''`` opt-out its
+    sha is still a commit on main carrying the tip's diff.  (Before task 3103
+    the live-branch path returned the *branch tip*, which for a ``--no-ff``
+    merge is a distinct commit that is not on main's first-parent chain —
+    callers were told to prefer the deleted-branch path's value.  That caveat
+    no longer applies.)
 
     **Exception 1 — ``git.commit_citation_pattern == ''``.**  That
     is the documented per-project opt-out for projects with no citation
     convention (config.py; ``find_task_citation_commit`` honours it by
-    returning None for everything, so running the gate would reject
-    unconditionally and turn this tier into dead code).  On that setting
-    the live-branch path skips the citation gate entirely and
-    ``merge_sha`` is the raw BRANCH TIP, neither citation-discovered nor
-    effect-present-checked — i.e. exactly the pre-3103 ``--no-ff`` wart,
+    returning None for everything, and an ancestor tip has no patch-id twin
+    on main, so deciding the live-branch path would find every landing
+    unattributed).  On that setting the live-branch path skips the producer
+    entirely and ``merge_sha`` is the raw BRANCH TIP, neither
+    citation-discovered nor containment-checked — i.e. exactly the pre-3103 ``--no-ff`` wart,
     deliberately retained as the price of the opt-out (the degeneracy
     guard still applies).  Do not read the paragraphs above as
     unconditional: on such a project a caller stamping ``merge_sha`` as
@@ -157,17 +175,18 @@ def found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, 
     "use the built-in default pattern" and keeps the full guarantee.
     Both SKILL.md runbooks carry the same exception.
 
-    **Exception 2 — a delivered-checks rescue.**  ``merge_sha`` is still a
-    commit ON MAIN here (this exception does NOT reach the where-the-sha-
-    came-from paragraphs above), but the EFFECT-PRESENT guarantee is gone:
-    ``validate_landing_evidence``'s second accept path
-    (``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::validate_landing_evidence``,
-    both modes)
+    **Exception 2 — a delivered-checks rescue, deleted-branch path only.**
+    ``merge_sha`` is still a commit ON MAIN here (this exception does NOT
+    reach the where-the-sha-came-from paragraphs above), but the
+    EFFECT-PRESENT guarantee is gone: ``validate_landing_evidence``'s second
+    accept path
+    (``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::validate_landing_evidence``)
     sits INSIDE the ``commit_effect_present_in_main(...) is False`` branch
     and accepts anyway when the three-leg delivered-checks differential
-    confirms.  So ``merge_sha`` may name a landing that was later REVERTED
-    — the exact task-1175 shape FIX 1' exists to catch.  It is NARROW: it
-    requires (i) the task to declare a non-empty
+    confirms.  So ``merge_sha`` may name a landing whose effect main no
+    longer carries — the shape FIX 1' exists to catch.  Only the
+    deleted-branch path calls ``validate_landing_evidence``, so only it can
+    be rescued.  It is NARROW: it requires (i) the task to declare a non-empty
     ``metadata.delivered_checks``, (ii) the fleet-wide
     ``delivered_checks.enabled`` config to be on, and (iii) the
     differential to actually confirm.  A task declaring no checks passes
@@ -315,13 +334,13 @@ class GitAuthorityVerdict:
 
     - ``citation_gate_skipped`` — the project opted out of citation checking
       (``git.commit_citation_pattern == ''``) and ``merge_sha`` is the raw
-      BRANCH TIP: not a commit discovered on main, and not
-      effect-present-checked.
+      BRANCH TIP of an ``ancestor``-arm landing: not a commit discovered on
+      main, and not checked by the landing producer.
     - ``rescued_by_delivered_checks`` — ``merge_sha`` IS a genuine commit on
       main, but its EFFECT is absent at main HEAD and the accept came from
-      the delivered-checks differential instead; i.e. the task-1175
-      reverted-landing shape the FIX 1' effect-present guard exists to
-      catch.
+      the delivered-checks differential instead; i.e. the shape the FIX 1'
+      effect-present guard exists to catch.  Only the ``marker`` arm can set
+      it: the live-ref arms never consult the delivered checks.
 
     A provenance writer should ask :attr:`merge_sha_fully_guarded` rather
     than enumerate these flags, so a third weakening does not silently
@@ -362,8 +381,9 @@ class GitAuthorityVerdict:
         because there is no sha to stamp at all; that is NOT a claim that the
         branch did not land.
 
-        A ``patch_id``-arm ``found_on_main`` is fully guarded: that path is
-        checked by containment rather than effect survival, which is
+        An ``ancestor``- or ``patch_id``-arm ``found_on_main`` decided by
+        ``branch_work_landed`` is fully guarded: those paths are checked by
+        containment rather than effect survival, which is
         ``docs/prds/landed-not-done-recovery.md`` D1's contract and not a
         weakening.
         """
@@ -378,44 +398,35 @@ async def _evidence_verdict(
     git_ops: Any,
     tid: str,
     full_branch: str,
-    arm: GitAuthorityArm,
     fetch: TaskMetadataResult,
     *,
-    branch_tip_sha: str | None,
+    candidate_sha: str,
     checks_enabled: bool,
-    candidate_sha: str | None = None,
-    pattern_template: str | None = None,
 ) -> GitAuthorityVerdict:
-    """Run the landing-evidence gate for one arm and render its verdict.
+    """Judge a merge marker through ``validate_landing_evidence`` and render its verdict.
 
-    :func:`_ancestor_arm` and :func:`_marker_arm` end identically once their
-    own guard has passed — validate, then accept or report the landing as
-    unconfirmed — so that sequence lives here ONCE (heuristic 11) and the arms differ
-    only in the ``arm`` they label and the evidence keywords they pass.
-    ``candidate_sha=None`` selects ``validate_landing_evidence``'s DISCOVERY
-    mode, where a commit on main must positively cite the task (FIX 2) AND
-    its effect must still be present at main HEAD (FIX 1', the task-1175
-    reverted-landing guard); passing a marker selects CANDIDATE mode, where
-    the marker's subject match already establishes attribution so only the
-    effect-present guard remains.  Neither arm escalates on reject — this
-    mirrors the harness ancestor arm's silent-False, and ``merge_status`` is
-    a read-only probe with no write side.
+    The marker arm's CANDIDATE call: the marker's subject match already
+    establishes attribution, so only the FIX 1' effect-present guard remains.
+    The marker arm is the one arm this tier still decides by that legacy
+    policy, because a deleted ref has no live tip for ``branch_work_landed``
+    to judge; ``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md``
+    §7 records which policy each landing-detection site keeps.  It never
+    escalates on reject: ``merge_status`` is a read-only probe with no write
+    side.
 
     ``delivered_checks`` is THREE-STATE (task 4498): ``None`` means "this
     call site is unwired", ``[]`` means "wired, and this task declares no
-    checks".  Both arms ARE wired, so ``or []`` never degrades to ``None`` —
+    checks".  This site IS wired, so ``or []`` never degrades to ``None`` —
     the capstone (task 4500) reads ``probe['delivered_checks_state']`` to
     find sites that regressed to the default.  ``[]`` is also the fail-safe
     direction: the checks are consulted ONLY on the ``effect_absent`` reject
     path and can only ever UPGRADE a rejection to an acceptance, so an empty
-    list simply leaves that second accept path unreachable — exactly today's
-    behaviour, and a failed metadata fetch (which yields ``{}``, hence
-    ``[]``) cannot fabricate a confident ``done``.  For a task that DOES
-    declare checks the wiring is a real change: this is the first production
-    call site ever to pass them, so that second accept path is LIVE here,
-    and an accept may now carry an effect that is ABSENT at main HEAD.
-    :attr:`GitAuthorityVerdict.rescued_by_delivered_checks` is what reports
-    it.  The awkward cell — a
+    list simply leaves that second accept path unreachable, and a failed
+    metadata fetch (which yields ``{}``, hence ``[]``) cannot fabricate a
+    confident ``done``.  For a task that DOES declare checks that second
+    accept path is LIVE here, and an accept may carry an effect that is
+    ABSENT at main HEAD; :attr:`GitAuthorityVerdict.rescued_by_delivered_checks`
+    is what reports it.  The awkward cell — a
     FAILED fetch reported as 'none_declared' rather than as genuinely-empty
     — is resolved OUT OF BAND by :attr:`TaskMetadataResult.unavailable`, not
     by abusing the third state: the parameter has no fourth value, and
@@ -430,7 +441,7 @@ async def _evidence_verdict(
     from :func:`probe_landing`'s ``orch_config``, because a real
     ``GitOps.config`` is the ``git`` sub-config and cannot supply it.
 
-    The runtime-only reverse import is repeated here rather than threaded in
+    The runtime-only reverse import is made here rather than threaded in
     from :func:`probe_landing` — see the module docstring for why it must
     stay inside a function body.  Resolving it per call is also what lets
     ``escalation/tests/test_merge_status_git_authority.py`` observe the call
@@ -442,10 +453,9 @@ async def _evidence_verdict(
     )
     verdict = await validate_landing_evidence(
         git_ops, tid, full_branch,
-        branch_tip_sha=branch_tip_sha,
+        branch_tip_sha=None,
         candidate_sha=candidate_sha,
-        pattern_template=pattern_template,
-        delivered_checks=fetch.metadata.get('delivered_checks') or [],
+        delivered_checks=list(declared_checks(fetch.metadata).checks),
         checks_enabled=checks_enabled,
     )
     # Plain `str`, never LandingReason — see GitAuthorityVerdict.reason.
@@ -464,7 +474,7 @@ async def _evidence_verdict(
         # orchestrator/src/orchestrator/landing_evidence.py::_delivered_checks_differential.
         return GitAuthorityVerdict(
             outcome=GitAuthorityOutcome.found_on_main,
-            merge_sha=verdict.evidence_sha, arm=arm, reason=reason,
+            merge_sha=verdict.evidence_sha, arm=GitAuthorityArm.marker, reason=reason,
             evidence_sha=verdict.evidence_sha,
             metadata_unavailable=fetch.unavailable,
             rescued_by_delivered_checks=(
@@ -472,15 +482,14 @@ async def _evidence_verdict(
             ),
         )
     # NOT no_signal.  git POSITIVELY established this branch's work is on
-    # main — its tip is an ancestor of main, or a marker survived the
-    # predates-this-incarnation veto — and only attribution or
+    # main — a marker survived the predates-this-incarnation veto — and only
     # effect-survival failed.  evidence_sha comes from probe['citation']
     # because a REJECTED verdict carries evidence_sha is None STRUCTURALLY
     # — landing_evidence.py::_reject_verdict, "a rejected verdict carrying
     # a sha is an invalid state".
     return GitAuthorityVerdict(
-        outcome=GitAuthorityOutcome.landed_unconfirmed, arm=arm, reason=reason,
-        evidence_sha=(verdict.probe or {}).get('citation'),
+        outcome=GitAuthorityOutcome.landed_unconfirmed, arm=GitAuthorityArm.marker,
+        reason=reason, evidence_sha=(verdict.probe or {}).get('citation'),
         metadata_unavailable=fetch.unavailable,
     )
 
@@ -513,8 +522,8 @@ async def _marker_arm(
             outcome=GitAuthorityOutcome.no_signal, metadata_unavailable=fetch.unavailable,
         )
     return await _evidence_verdict(
-        git_ops, tid, full_branch, GitAuthorityArm.marker, fetch,
-        branch_tip_sha=None, candidate_sha=marker, checks_enabled=checks_enabled,
+        git_ops, tid, full_branch, fetch,
+        candidate_sha=marker, checks_enabled=checks_enabled,
     )
 
 
@@ -526,7 +535,7 @@ async def _ancestor_arm(
     *,
     branch_tip_sha: str,
     pattern: str | None,
-    checks_enabled: bool,
+    site: str,
 ) -> GitAuthorityVerdict:
     """Judge a live branch whose tip is an ancestor of main but not main's tip.
 
@@ -540,12 +549,15 @@ async def _ancestor_arm(
     warm-lane reseed cannot split the two observations.
 
     *pattern* is ``git.commit_citation_pattern``.  ``''`` is the documented
-    per-project opt-out: ``find_task_citation_commit`` then returns None for
-    everything, so running the gate would reject unconditionally and turn
-    this arm into dead code.  The opt-out instead returns the raw BRANCH TIP
-    with ``citation_gate_skipped`` set (see :func:`found_on_main_response`,
-    Exception 1).  ``None`` means "use the built-in default pattern" and is
-    NOT the opt-out.
+    per-project opt-out: the producer's citation tier then finds nothing, and
+    an ancestor tip has no patch-id twin on main to fall back on, so every
+    landing here would read as unattributed.  The opt-out instead returns the
+    raw BRANCH TIP with ``citation_gate_skipped`` set (see
+    :func:`found_on_main_response`, Exception 1).  ``None`` means "use the
+    built-in default pattern" and is NOT the opt-out.
+
+    Past both, the decision is :func:`_branch_work_landed_arm`'s, the same one
+    the patch-id arm makes (task 4648).
     """
     from orchestrator.merge_lane.landing_evidence import branch_is_degenerate
     if await branch_is_degenerate(
@@ -560,14 +572,14 @@ async def _ancestor_arm(
             arm=GitAuthorityArm.ancestor, citation_gate_skipped=True,
             metadata_unavailable=fetch.unavailable,
         )
-    return await _evidence_verdict(
-        git_ops, tid, full_branch, GitAuthorityArm.ancestor, fetch,
-        branch_tip_sha=branch_tip_sha, pattern_template=pattern,
-        checks_enabled=checks_enabled,
+    return await _branch_work_landed_arm(
+        git_ops, tid, full_branch, fetch,
+        branch_tip_sha=branch_tip_sha, pattern=pattern, site=site,
+        arm=GitAuthorityArm.ancestor,
     )
 
 
-async def _patch_id_arm(
+async def _branch_work_landed_arm(
     git_ops: Any,
     tid: str,
     full_branch: str,
@@ -576,10 +588,12 @@ async def _patch_id_arm(
     branch_tip_sha: str,
     pattern: str | None,
     site: str,
+    arm: GitAuthorityArm,
 ) -> GitAuthorityVerdict:
-    """Decide the patch-id arm through ``branch_work_landed`` and render its verdict.
+    """Decide a live branch through ``branch_work_landed`` and render its verdict.
 
-    The producer owns the whole decision and its normative guard order
+    Both live-branch arms end here, and *arm* labels which git shape was
+    observed.  The producer owns the whole decision and its normative guard order
     (``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed``);
     this only maps its ``LandingReason`` onto a :class:`GitAuthorityOutcome`:
     ``no_attribution`` (containment proven, nothing attributable) is
@@ -589,8 +603,7 @@ async def _patch_id_arm(
     table keyed by ``LandingReason`` would hoist the reverse import, which is
     runtime-only for the same reason as :func:`_evidence_verdict`'s.  No
     escalation queue is passed: ``None`` is the producer's documented
-    supported shape, and this tier is a read-only probe.  *pattern* is
-    forwarded so this arm and :func:`_ancestor_arm` apply one citation policy.
+    supported shape, and this tier is a read-only probe.
     """
     from orchestrator.merge_lane.landing_evidence import LandingReason, branch_work_landed
     verdict = await branch_work_landed(
@@ -601,23 +614,22 @@ async def _patch_id_arm(
     if verdict.accepted and verdict.evidence_sha is not None:
         return GitAuthorityVerdict(
             outcome=GitAuthorityOutcome.found_on_main,
-            merge_sha=verdict.evidence_sha, arm=GitAuthorityArm.patch_id, reason=reason,
+            merge_sha=verdict.evidence_sha, arm=arm, reason=reason,
             evidence_sha=verdict.evidence_sha, metadata_unavailable=fetch.unavailable,
         )
     if verdict.reason == LandingReason.no_attribution:
         outcome = GitAuthorityOutcome.landed_unconfirmed
     elif verdict.reason == LandingReason.git_error:
         logger.warning(
-            '%s: patch-id arm could not answer for %s (git_error at stage %s) '
+            '%s: %s arm could not answer for %s (git_error at stage %s) '
             '— returning probe_failed',
-            site, full_branch, verdict.probe.get('git_error_stage'),
+            site, arm, full_branch, verdict.probe.get('git_error_stage'),
         )
         outcome = GitAuthorityOutcome.probe_failed
     else:
         outcome = GitAuthorityOutcome.no_signal
     return GitAuthorityVerdict(
-        outcome=outcome, arm=GitAuthorityArm.patch_id,
-        reason=reason, metadata_unavailable=fetch.unavailable,
+        outcome=outcome, arm=arm, reason=reason, metadata_unavailable=fetch.unavailable,
     )
 
 
@@ -643,9 +655,10 @@ async def probe_landing(
     Three arms, one per :class:`GitAuthorityArm`: a gone ref goes to the
     marker search (:func:`_marker_arm`); a live ref not at main's tip goes to
     :func:`_ancestor_arm` when its tip is an ancestor of main, and otherwise
-    to :func:`_patch_id_arm`, whose guards (degeneracy, empty net diff) and
-    containment check all belong to
-    ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed``.
+    straight to :func:`_branch_work_landed_arm`.  Both live-ref arms are
+    decided by
+    ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed``,
+    which owns their guards (degeneracy, empty net diff) and containment check.
     A ref sitting at exactly main's tip is ``no_signal``.  Every arm that
     reads task metadata is handed it already fetched, so the fetch's
     ``unavailable`` flag reaches the verdict even when the arm then raises.
@@ -705,12 +718,12 @@ async def probe_landing(
         if tip_is_ancestor:
             return await _ancestor_arm(
                 git_ops, tid, full_branch, fetch,
-                branch_tip_sha=tip, pattern=git_config.commit_citation_pattern,
-                checks_enabled=checks_enabled,
+                branch_tip_sha=tip, pattern=git_config.commit_citation_pattern, site=site,
             )
-        return await _patch_id_arm(
+        return await _branch_work_landed_arm(
             git_ops, tid, full_branch, fetch, branch_tip_sha=tip,
             pattern=git_config.commit_citation_pattern, site=site,
+            arm=GitAuthorityArm.patch_id,
         )
     except Exception:
         logger.warning(

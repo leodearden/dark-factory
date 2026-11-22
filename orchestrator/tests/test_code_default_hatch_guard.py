@@ -41,6 +41,7 @@ from pathlib import Path
 import pytest
 from _code_default_hatch import require_code_default_config
 from _config_default_scan import (
+    CONFIG_CLASS_NAME,
     DEFAULT_CONFIG,
     ConfigPathWrite,
     config_path_blanking_sites_in,
@@ -1090,19 +1091,60 @@ class _HatchFacts:
     blanking_sites: tuple[tuple[str, int, ConfigPathWrite], ...]
 
 
+def _default_assertion_facts(module: ParsedModule) -> tuple[tuple[str | None, str, int, str, str], ...]:
+    if not module.may_name(CONFIG_CLASS_NAME):
+        return ()
+    return tuple(
+        (cls, test, lineno, attr, repr(value))
+        for cls, test, lineno, attr, value in default_asserting_tests_in(module.tree)
+    )
+
+
 def _hatch_facts(module: ParsedModule) -> _HatchFacts:
-    tree = module.tree
     return _HatchFacts(
-        default_assertions=tuple(
-            (cls, test, lineno, attr, repr(value))
-            for cls, test, lineno, attr, value in default_asserting_tests_in(tree)
-        ),
-        blanking_sites=tuple(config_path_blanking_sites_in(tree)),
+        default_assertions=_default_assertion_facts(module),
+        blanking_sites=tuple(config_path_blanking_sites_in(module.tree)),
     )
 
 
 ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=orchestrator_test_modules, extract=_hatch_facts)
 TREE_ANALYSES = (ANALYSIS,)
+
+
+def _ratchet_facts(path: Path) -> _HatchFacts:
+    probe = TreeAnalysis('hatch_probe', files=lambda: [path], extract=_hatch_facts)
+    return TreePass.run([probe]).facts(probe)[path]
+
+
+@pytest.mark.parametrize('binding, asserted_root', [
+    ('', 'ＯrchestratorConfig()'),
+    (f'cfg = {CONFIG_CLASS_NAME}()', 'cfg'),
+], ids=['nfkc-spelled-direct-call', 'bound-name'])
+def test_the_ratchet_extract_reports_each_spelling_of_a_bare_config(tmp_path, binding, asserted_root):
+    leaf = f'{_PROBE_SECTION}.{_PROBE_LEAF}'
+    source = _write(tmp_path.resolve(), 'test_synth_ratchet_probe.py', (
+        'def test_default():\n'
+        f'    {binding}\n'
+        f'    assert {asserted_root}.{leaf} == {_probe_default()!r}\n'
+    ))
+
+    found = [(cls, test, attr) for cls, test, _lineno, attr, _value in _ratchet_facts(source).default_assertions]
+
+    assert found == [(None, 'test_default', leaf)]
+
+
+def test_the_ratchet_extract_reports_a_blanking_site_in_a_module_naming_no_config(tmp_path):
+    source = _write(tmp_path.resolve(), 'test_synth_blanking_probe.py', (
+        'def test_isolated(monkeypatch):\n'
+        "    monkeypatch.delenv('ORCH_CONFIG_PATH')\n"
+    ))
+
+    facts = _ratchet_facts(source)
+
+    assert facts.default_assertions == ()
+    assert [(qualname, kind) for qualname, _lineno, kind in facts.blanking_sites] == [
+        ('test_isolated', ConfigPathWrite.DELETE),
+    ]
 
 #: One param per FILE, not one per suite, so a regression names the offending
 #: file directly and each repair turns a specific subset green.  Listed at
@@ -1156,6 +1198,10 @@ _ABSENT_CONFIG_PATH_IS_THE_PRECONDITION = frozenset({
      'TestEvalListFixturesCLI.test_needs_no_orchestrator_config'),
     ('test_code_default_hatch_guard.py',
      'TestRequireCodeDefaultConfig.test_fails_when_the_variable_is_unset'),
+    ('test_cli_config.py',
+     'test_missing_config_exits_1_with_the_error_and_never_runs_the_body'),
+    ('test_cli_config.py',
+     'test_every_config_loading_command_fails_the_same_way_without_a_config'),
 })
 
 

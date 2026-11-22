@@ -88,8 +88,8 @@ if str(_ORCH_SRC) not in sys.path:
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import codebook as codebook_mod  # noqa: E402
 import yaml  # noqa: E402
+from legibility import codebook as codebook_mod  # noqa: E402  # debt: task 6760
 from legibility import invariants, session_runner  # noqa: E402
 from orchestrator.agents import code_quality  # noqa: E402
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
@@ -241,7 +241,7 @@ def _prescribed_reply() -> dict[str, list[dict[str, str | None]]]:
     return {
         _MATCHES_KEY: [{
             "entry_id": "...", "origin_phase": "...", "manifested_phase": "...",
-            "invariant_violated": None, "note": "...",
+            "invariant_violated": None, "note": "...", "evidence_quote": "...",
         }],
         _CANDIDATES_KEY: [{
             "title": "...", "cause": "...", "area": "...", "origin_phase": "...",
@@ -252,6 +252,24 @@ def _prescribed_reply() -> dict[str, list[dict[str, str | None]]]:
 
 _REPLY_KEYS = tuple(_prescribed_reply())
 """The reply schema code_digest reads: exactly the keys build_prompt prescribes."""
+
+_RULE_STAMP_FIELD = "attached_by"
+"""The finding field only a census rule writes: how an attach placed a
+sighting, which ``sighting_fit`` counts without a fit check."""
+
+
+def _without_rule_stamps(findings: object) -> object:
+    """*findings* with any rule stamp a reply claims removed. Every other field
+    passes through: the schema gate refuses a malformed one, and the merger's
+    never-delete guard names a removal action rather than letting it land as
+    a plain match."""
+    if not isinstance(findings, list):
+        return findings
+    return [
+        {field: value for field, value in finding.items() if field != _RULE_STAMP_FIELD}
+        if isinstance(finding, dict) else finding
+        for finding in findings
+    ]
 
 
 def build_prompt(
@@ -278,6 +296,9 @@ def build_prompt(
         "causes not yet in the codebook (candidates).\n\n"
         "Never guess a phase you can't support from the evidence — use "
         '"unknown" instead. Legal phase values: ' + phases + ".\n\n"
+        "Match an entry only when the digest shows the mechanism that "
+        "entry's title names, not merely a related theme, and copy the "
+        "digest text that shows it into the match's evidence_quote.\n\n"
         "Respond with STRICT JSON ONLY (no prose, no markdown fences), "
         "exactly this shape:\n"
         + json.dumps(_prescribed_reply()) + "\n"
@@ -390,8 +411,9 @@ def code_digest(
     parse its strict-JSON judgment ->
     assemble a §7.3 coding record with a DETERMINISTIC header
     (session/date/agent_class from the digest's own frontmatter; project
-    from *project* — the LLM never supplies the header) -> schema-gate it
-    via codebook.validate_coding_record.
+    from *project* — the LLM never supplies the header; nor a rule stamp,
+    which is removed from every finding) -> schema-gate it via
+    codebook.validate_coding_record.
 
     Never-fabricate contract: unparseable/malformed digest frontmatter, an
     invocation error, a usage/auth CAP, unparseable LLM output, a reply
@@ -487,7 +509,7 @@ def code_digest(
         "date": meta.get("date"),
         "project": project,
         "agent_class": meta.get("agent_class"),
-        **{key: judgment[key] for key in _REPLY_KEYS},
+        **{key: _without_rule_stamps(judgment[key]) for key in _REPLY_KEYS},
     }
 
     errors = codebook_mod.validate_coding_record(record)

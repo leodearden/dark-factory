@@ -14,12 +14,15 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.falkor_read_only import PagedQuery
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.reconciliation import task_filter
 from fused_memory.services import completion_claim_gate, overreach_guard
 from fused_memory.services.overreach_guard import is_guarded_category
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_ruling_overreach.py'
 
@@ -689,6 +692,29 @@ class TestWilsonInterval:
     def test_an_empty_denominator_is_not_computed(self) -> None:
         assert mod.wilson_interval(0, 0) is None
 
+    def test_every_committed_report_interval_is_the_wilson_interval_of_its_counts(self) -> None:
+        reports = sorted((Path(__file__).resolve().parents[2] / 'docs').glob('ruling-overreach-*/*.json'))
+        cells = [
+            (report.name, cell) for report in reports
+            for cell in _count_cells(json.loads(report.read_text()))
+        ]
+
+        assert cells
+        for name, cell in cells:
+            assert cell['ci'] == list(mod.wilson_interval(cell['k'], cell['n'])), (name, cell)
+
+
+def _count_cells(node):
+    """Every dict at any depth carrying ``k``, a positive ``n`` and a computed ``ci``."""
+    if isinstance(node, dict):
+        if {'k', 'n', 'ci'} <= node.keys() and node['ci'] is not None and node['n'] > 0:
+            yield node
+        for value in node.values():
+            yield from _count_cells(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _count_cells(value)
+
 
 def _minted(uuid: str, *, served: bool = True, live_strict: bool = True) -> dict:
     return {'edge_uuid': uuid, 'fact': f'fact of {uuid}', 'source_name': 'S',
@@ -797,6 +823,7 @@ class TestWeightedRate:
         weighted = mod.weighted_rate([(10.0, 2, 4), (30.0, 0, 4)])
         assert weighted['rate'] == 0.125
         assert weighted['effective_n'] == 6.4
+        assert weighted['ci'] == [0.0191, 0.5123]
 
     @pytest.mark.parametrize('strata', [[], [(5.0, 0, 0)], [(0.0, 1, 4)]])
     def test_no_weighted_denominator_is_not_computed(self, strata) -> None:

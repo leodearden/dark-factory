@@ -6,7 +6,6 @@ PRD ``plans/instruments-honesty-prd.md`` task α; the source vocabulary is
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -23,13 +22,6 @@ pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
 
 ROOT = 'dark-factory'
 TASKS = '/api/v2/dashboard/tasks'
-
-
-@pytest.fixture(scope='module', autouse=True)
-def _module_samplers_off() -> Iterator[None]:
-    with pytest.MonkeyPatch.context() as patched:
-        patched.setenv('DASHBOARD_SAMPLERS', 'off')
-        yield
 
 
 IN_PROGRESS, PENDING, UNBACKFILLED, DONE = 9101, 9102, 9103, 9111

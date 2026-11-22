@@ -118,6 +118,7 @@ async def _what_the_tools_see(
 
 
 @pytest.mark.asyncio
+@pytest.mark.spawns_agent_cli
 async def test_the_checkout_env_file_never_reaches_a_sandboxed_zcode_agent_s_tools(
     tmp_path, refusing_endpoint, env_dump_server,
 ):

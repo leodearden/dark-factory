@@ -7,7 +7,7 @@ run over a frozen population of writes. For every write the arm attached, the
 pair (write, the record its judge named) is looked up in a blind verdict
 corpus, and the arm is scored on what the raters said about that pair.
 
-It is not ``eval_write_triage_judge.py::score_attachments``. That function
+It is not ``eval_write_triage_scoring.py::score_attachments``. That function
 asks whether the attach target is the fixture's canonical record, a
 fixture-strict hit rate that feeds the judge-accuracy report. This module asks
 whether raters agree the write belongs under the record the judge chose. They
@@ -67,7 +67,7 @@ from itertools import chain
 from numbers import Real
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.maintenance.verdict_majority import Pair, Resolution, resolve_verdicts
 from fused_memory.server.write_triage import (
@@ -77,6 +77,14 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
 )
+from fused_memory.utils.script_loader import load_script
+
+_SCRIPTS = Path(__file__).resolve().parent
+
+if TYPE_CHECKING:
+    import write_triage_stats as _stats
+else:
+    _stats = load_script(_SCRIPTS / 'write_triage_stats.py', 'write_triage_stats')
 
 _REQUIRED_CASE_KEYS = ('arm', 'memory_id', 'band', 'outcome')
 _ATTACH_OUTCOMES = TRIAGE_OUTCOMES - {OUTCOME_STORED}
@@ -84,7 +92,6 @@ _BANDS = frozenset({OUTCOME_RESTATED, OUTCOME_JUDGE, OUTCOME_STORED})
 """Every band ``write_triage.py::decide_band`` routes a write to."""
 _WRITE_FLAGS = ('recon_marker', 'declares_attach_keys')
 """Case-row flags that take a write out of production's judge path (PRD §12 D19)."""
-_WILSON_Z = 1.96
 
 
 @dataclass(frozen=True, order=True)
@@ -791,18 +798,18 @@ def _quality(scored: Sequence[ScoredCase]) -> dict[str, Any]:
         'attaches': len(attached),
         'unclear_attaches': sum(s.resolution is Resolution.UNCLEAR for s in attached),
         'misfiles': misfiles,
-        'misfile_rate_of_attaches': _rate(misfiles, decided),
-        'misfile_rate_wilson95': _wilson95(misfiles, decided),
+        'misfile_rate_of_attaches': _stats.rate(misfiles, decided),
+        'misfile_rate_wilson95': _stats.wilson95(misfiles, decided),
         'duplicates_placed': contradictions + agreeing,
         'contradictions_attached': contradictions,
         'contradictions_contested': contradictions_contested,
-        'contradiction_recall': _rate(contradictions_contested, contradictions),
+        'contradiction_recall': _stats.rate(contradictions_contested, contradictions),
         'agreeing_attaches': agreeing,
         'agreeing_contested': agreeing_contested,
-        'false_contested_rate': _rate(agreeing_contested, agreeing),
+        'false_contested_rate': _stats.rate(agreeing_contested, agreeing),
         'true_links': true_links,
         'true_links_answered_distinct': answered_distinct,
-        'true_links_answered_distinct_rate': _rate(answered_distinct, true_links),
+        'true_links_answered_distinct_rate': _stats.rate(answered_distinct, true_links),
         'contested_decision_errors': sum(s.contested_decision_error for s in scored),
         'parse_failures': sum(s.case.parse_failure for s in scored),
         'unrated_pairs': 0,
@@ -856,7 +863,7 @@ def _paired_bootstrap95(delta_by_write: Mapping[str, float]) -> list[float] | No
     sums = sorted(
         sum(draws.choices(deltas, k=len(deltas))) for _ in range(BOOTSTRAP_RESAMPLES)
     )
-    return [round(_nearest_rank(sums, 2.5), 4), round(_nearest_rank(sums, 97.5), 4)]
+    return _stats.nearest_rank95(sums)
 
 
 def _harm_figures(
@@ -883,8 +890,8 @@ def _attach_figures(attaches: Sequence[ComparedWrite]) -> dict[str, Any]:
     return {
         'placeable_attaches': decided,
         'wrong_sibling_misfiles': misfiles,
-        'wrong_sibling_rate_placeable': _rate(misfiles, decided),
-        'wrong_sibling_rate_wilson95': _wilson95(misfiles, decided),
+        'wrong_sibling_rate_placeable': _stats.rate(misfiles, decided),
+        'wrong_sibling_rate_wilson95': _stats.wilson95(misfiles, decided),
         'no_known_home_attaches': sum(
             write.scored.decided for write in attaches if not write.placeable
         ),
@@ -892,21 +899,6 @@ def _attach_figures(attaches: Sequence[ComparedWrite]) -> dict[str, Any]:
             write.scored.resolution is Resolution.UNCLEAR for write in attaches
         ),
     }
-
-
-def _rate(hits: int, total: int) -> float | None:
-    """*hits*/*total*, or None when nothing was measured; never 0.0 for an empty denominator."""
-    return round(hits / total, 4) if total else None
-
-
-def _wilson95(hits: int, total: int) -> list[float] | None:
-    if not total:
-        return None
-    share = hits / total
-    spread = _WILSON_Z * _WILSON_Z / total
-    centre = (share + spread / 2) / (1 + spread)
-    half = _WILSON_Z * math.sqrt(share * (1 - share) / total + spread / (4 * total)) / (1 + spread)
-    return [round(max(0.0, centre - half), 4), round(min(1.0, centre + half), 4)]
 
 
 def _runtime(calls: Sequence[JudgedCase]) -> dict[str, Any]:
@@ -917,18 +909,12 @@ def _runtime(calls: Sequence[JudgedCase]) -> dict[str, Any]:
     return {
         'judge_calls': len(calls),
         'untimed_calls': len(calls) - len(seconds),
-        'p50_judge_seconds': round(_nearest_rank(seconds, 50), 3) if timed else None,
-        'p95_judge_seconds': round(_nearest_rank(seconds, 95), 3) if timed else None,
+        'p50_judge_seconds': round(_stats.nearest_rank(seconds, 50), 3) if timed else None,
+        'p95_judge_seconds': round(_stats.nearest_rank(seconds, 95), 3) if timed else None,
         'judge_models': sorted({call.judge_model for call in calls if call.judge_model}),
         'unpriced_calls': len(calls) - len(costs),
         'cost_per_write_usd': round(sum(costs) / len(costs), 6) if priced else None,
     }
-
-
-def _nearest_rank(sorted_values: Sequence[float], percent: float) -> float:
-    """The smallest observed value with at least *percent*% of values at or below it."""
-    rank = math.ceil(percent * len(sorted_values) / 100)
-    return sorted_values[rank - 1]
 
 
 def _call_cost(call: JudgedCase) -> float | None:
