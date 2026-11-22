@@ -3434,8 +3434,9 @@ So:
    covers hand-run access. It does not cover this section's own remedy and
    recovery procedures, or committed tooling, whose access to production is
    settled when it is reviewed. The eval harness and
-   `seed_scratch_reference_graph.py` in "The scratch FalkorDB" below are
-   committed tooling of that kind.
+   `seed_scratch_reference_graph.py` in "The scratch FalkorDB" below, and
+   `fused-memory/scripts/cleanup_litter_graphs.py` in "Deleting test litter
+   from production" below, are committed tooling of that kind.
 3. **Never clone a graph on production.** That means no `RESTORE` onto it and
    no `EVAL`. The one sanctioned `DUMP` is
    `fused-memory/scripts/seed_scratch_reference_graph.py`, and its `RESTORE`
@@ -3501,6 +3502,87 @@ for g in $(docker exec $C redis-cli GRAPH.LIST); do
   printf '%s %s\n' "$g" "$(docker exec $C redis-cli GRAPH.RO_QUERY "$g" 'MATCH (n) RETURN count(n)' | sed -n 2p)"
 done > /tmp/falkordb-graph-counts-$(date +%s).txt
 ```
+
+#### Deleting test litter from production
+
+`fused-memory/scripts/cleanup_litter_graphs.py` deletes test and probe graphs
+from the FalkorDB the config names, which is production. An operator runs it,
+never an agent. Its `LITTER_PATTERNS` allowlist is its whole blast radius: a
+graph is deleted only if its name fully matches a pattern and the reviewed
+listing names it. Registered project graphs, `evalmem_lme_ref_incumbent_a`
+(the graph `seed_scratch_reference_graph.py` copies to scratch), `default_db`
+and every other name stay, and the listing shows them under `keep`.
+
+1. **Halt the merge queue** (`mcp__escalation__halt_merge_queue`) and wait for
+   it to be idle.
+2. **Confirm no offline-lane pass is running**: the newest
+   `data/orchestrator/offline-lane/qdrant-integration/*/record.json` has a
+   non-null `effect` (see "The offline lane's red path"):
+
+   ```bash
+   R=$(ls -td /home/leo/src/dark-factory/data/orchestrator/offline-lane/qdrant-integration/*/ | head -1)
+   python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["effect"] is not None)' "${R}record.json"
+   ```
+
+3. **Set aside a copy.** Once `docker exec docker-falkordb-1 redis-cli INFO
+   persistence` reads `aof_rewrite_in_progress:0`, run step 1 of "Deciding
+   which FalkorDB copy is newest" above with the suffix `.pre-litter-cleanup`
+   in place of `.pre-bootstrap`.
+4. **List**, from `fused-memory/` in the main checkout, with `FALKORDB_URI`
+   unset. This deletes nothing:
+
+   ```bash
+   uv run python scripts/cleanup_litter_graphs.py list --out ~/litter-listing.json
+   ```
+
+   Check that the printed `target` is production (port 6379), then review the
+   listing's `delete` and `keep` sections.
+5. **Delete** what was reviewed:
+
+   ```bash
+   uv run python scripts/cleanup_litter_graphs.py delete \
+     --reviewed ~/litter-listing.json --record ~/litter-record.json
+   ```
+
+   It refuses a listing whose `delete` section names a graph that is not on
+   `LITTER_PATTERNS`. Otherwise it deletes one graph at a time,
+   `--pace-seconds` apart (default 10), and only graphs in that section that
+   are still present. Litter that appeared after the listing is reported in the
+   record's `unreviewed`, not deleted, and reviewed graphs already gone in its
+   `already_absent`. The record also holds every graph's node count before the
+   run and each kept graph's count after it.
+6. **Read the exit code**:
+
+   | Exit | Meaning | Next |
+   |---|---|---|
+   | 0 `ok` | Every reviewed graph still present was deleted, and no kept graph shrank. | Step 7. |
+   | 1 `failed` | No connection, a Redis or file error, or an interrupt (Ctrl-C). A record written before the error has `outcome: failed` and names what was deleted. The `deleted N graphs` count on stderr is right even when the last record write failed. | If the record exists, first compare the server's current `run_id` (`docker exec docker-falkordb-1 redis-cli INFO server \| grep run_id`) with the record's `run_id_before`. If they differ, or the server does not answer, treat the run as row 4 (a crash), not as a cause to fix and list again. Otherwise fix the cause, then list again. If no record was written, nothing was deleted. |
+   | 2 | A usage error. | Fix the arguments. |
+   | 3 `refused` | The listing is unreadable, was taken on another target, or names under `delete` a graph that is not on `LITTER_PATTERNS` (stderr names it). Nothing was deleted. | List again against this target. A graph off the allowlist, such as `default_db`, is deleted only after a reviewed change adds it to `LITTER_PATTERNS`. |
+   | 4 `server_restarted` | The server's `run_id` changed during the run, so the run stopped. The record's `run_id_after` is the new id, and its `after` is empty when the restarted server could not yet be counted. | Treat it as a crash: read `docker logs --tail 50 docker-falkordb-1`, then, once `docker exec docker-falkordb-1 redis-cli INFO persistence` reads `loading:0`, take the counts with `list` and compare them with the record's `before`. Do not run `delete` again until the crash is understood. |
+   | 5 `kept_graph_shrank` | A kept graph's node count fell during the run; the record's `shrank` names it. With no restart, `GRAPH.DELETE` of a litter graph cannot touch another graph, so the likely cause is live fused-memory work: entity merges and deletes remove nodes. | Count the nodes fused-memory removed since `delete` started (below). If they cover the drop, the shrink is that work. Otherwise treat it as damage. Either way, investigate before unhalting. |
+
+   Each entity merge or delete logs one `delete_entity_node: deleted node=`
+   line, which does not name the graph. To count them for row 5:
+
+   ```bash
+   journalctl --user -u fused-memory --since '<when delete started>' --no-pager -o cat -q \
+     --grep 'delete_entity_node: deleted node=' | wc -l
+   ```
+
+   A record whose `outcome` is `null` comes from a run that was killed before
+   it finished, for example by a closed terminal. Its `deleted` names what was
+   removed, but may miss the last delete. Treat it as row 1.
+
+7. **Unhalt the merge queue** (`mcp__escalation__unhalt_merge_queue`).
+8. **Remove the set-aside copy** once a `list` run after two lane passes shows
+   no delete candidates, with `D` and `IMG` from step 1 of "Deciding which
+   FalkorDB copy is newest":
+
+   ```bash
+   docker run --rm --entrypoint sh -v "$D":/d "$IMG" -c \
+     'rm -rf /d/appendonlydir.pre-litter-cleanup /d/dump.rdb.pre-litter-cleanup'
+   ```
 
 #### Bootstrapping FalkorDB's AOF from dump.rdb
 
