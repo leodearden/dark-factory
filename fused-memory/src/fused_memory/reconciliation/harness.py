@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -235,6 +236,17 @@ logger = logging.getLogger(__name__)
 # commits). Exceeding the cap is WARN-logged so a wedged judge is visible rather
 # than silently re-run each restart.
 _JUDGE_RECOVERY_MAX_SPAWN = 20
+
+
+class _JudgeRecoveryOccasion(StrEnum):
+    """Why a judge-recovery pass runs; the value completes its log lines."""
+
+    STARTUP = 'after restart'
+    RESERVE_REFUSAL_ENDED = 'after the reserve refusal ended'
+
+
+def _judge_task_name(run_id: str) -> str:
+    return f'judge-{run_id}'
 
 # Task 1755 / PRD β: stable finding identity for the dead_owner_shielded storm alarm.
 # The fingerprint is keyed on finding['category'] / affected_ids / description
@@ -2993,7 +3005,7 @@ class ReconciliationHarness:
         # guarded (self.judge is not None) inside the method. Fail-safe wrapped like
         # the sibling one-shot passes so a recovery hiccup never crashes the loop.
         try:
-            await self._recover_pending_judge_reviews()
+            await self._recover_pending_judge_reviews(why=_JudgeRecoveryOccasion.STARTUP)
         except Exception as e:
             logger.warning(f'_recover_pending_judge_reviews at startup failed: {e}')
 
@@ -3323,7 +3335,9 @@ class ReconciliationHarness:
         check = self._reserve_step_aside.check(project_id, site=site)
         if check.refusal_ended:
             try:
-                await self._recover_pending_judge_reviews()
+                await self._recover_pending_judge_reviews(
+                    why=_JudgeRecoveryOccasion.RESERVE_REFUSAL_ENDED,
+                )
             except Exception as e:
                 logger.warning(f'_recover_pending_judge_reviews after a reserve refusal failed: {e}')
         return check.refused
@@ -3338,11 +3352,23 @@ class ReconciliationHarness:
         marker is cleared atomically inside ``add_verdict``. The task is tracked
         in ``_judge_tasks`` (with a done-callback that discards it) so shutdown
         can drain it deterministically.
+
+        While the allowance reserve refuses reconciliation, no task starts and the
+        marker waits for the recovery pass the refusal's end runs. That check comes
+        before the in-flight one because the pass it runs may start this run's judge.
         """
         await self.journal.mark_judge_pending(run_id, project_id)
-        task = asyncio.create_task(self._run_judge(run_id), name=f'judge-{run_id}')
+        if await self.reserve_steps_aside(project_id, site=StepAsideSite.JUDGE):
+            return
+        if self._judge_in_flight(run_id):
+            return
+        task = asyncio.create_task(self._run_judge(run_id), name=_judge_task_name(run_id))
         self._judge_tasks.add(task)
         task.add_done_callback(self._judge_tasks.discard)
+
+    def _judge_in_flight(self, run_id: str) -> bool:
+        name = _judge_task_name(run_id)
+        return any(task.get_name() == name and not task.done() for task in self._judge_tasks)
 
     async def _drain_judge_tasks(self) -> None:
         """Cancel and await every in-flight judge task on shutdown (task 2708).
@@ -3360,12 +3386,17 @@ class ReconciliationHarness:
             await asyncio.gather(*pending, return_exceptions=True)
         self._judge_tasks.clear()
 
-    async def _recover_pending_judge_reviews(self) -> None:
+    async def _recover_pending_judge_reviews(
+        self, *, why: _JudgeRecoveryOccasion = _JudgeRecoveryOccasion.STARTUP,
+    ) -> None:
         """Re-fire the judge for every run left with a judge_pending marker (task 2708).
 
-        One-shot startup pass: a restart landing in the cycle-end→verdict-commit
+        It runs at startup: a restart landing in the cycle-end→verdict-commit
         window cancels the fire-and-forget judge before add_verdict's atomic
-        marker-clear, so the marker survives. Re-running the judge is safe — the
+        marker-clear, so the marker survives. It runs again when an allowance
+        reserve refusal ends, for the judges _spawn_judge left pending meanwhile.
+        Runs whose judge is still in flight are skipped: their markers clear only
+        when their verdicts commit. Re-running the judge is safe — the
         review is read-only over the run record, and the invariant 'marker present
         ⟹ no committed verdict' (add_verdict clears atomically) means the re-run's
         judge_verdicts INSERT never collides on the run_id PK. Routes through the
@@ -3373,7 +3404,11 @@ class ReconciliationHarness:
         """
         if self.judge is None:
             return
-        pending = await self.journal.get_pending_judge_runs()
+        pending = [
+            (run_id, project_id)
+            for run_id, project_id in await self.journal.get_pending_judge_runs()
+            if not self._judge_in_flight(run_id)
+        ]
         if not pending:
             return
         # Account-availability gate (task 2947 ask c): if a usage gate is wired
@@ -3400,17 +3435,15 @@ class ReconciliationHarness:
         to_spawn = pending[:_JUDGE_RECOVERY_MAX_SPAWN]
         if total > _JUDGE_RECOVERY_MAX_SPAWN:
             logger.warning(
-                f'{total} pending judge review(s) at startup exceeds the '
-                f'{_JUDGE_RECOVERY_MAX_SPAWN}-per-restart recovery cap — a judge may '
+                f'{total} pending judge review(s) {why} exceed the '
+                f'{_JUDGE_RECOVERY_MAX_SPAWN}-per-pass recovery cap — a judge may '
                 'be persistently failing (a judge_pending marker clears only on a '
                 f'committed verdict). Re-firing the {len(to_spawn)} oldest; the '
                 f'remaining {total - len(to_spawn)} will be recovered on '
-                'subsequent restarts.'
+                'later passes.'
             )
         else:
-            logger.info(
-                f'Recovering {total} pending judge review(s) after restart'
-            )
+            logger.info(f'Recovering {total} pending judge review(s) {why}')
         for run_id, project_id in to_spawn:
             await self._spawn_judge(run_id, project_id)
 
