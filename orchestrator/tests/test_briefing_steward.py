@@ -8,13 +8,16 @@ fused-memory HTTP endpoint.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.landed_sha_searches import LandedShaSearches, already_merged_step
+from orchestrator.agents.steward_digest import HandledL0, render_handled_digest
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.workflow_types import StewardResolved
 
 _TASK = {
     'id': 'df_task_42',
@@ -47,7 +50,12 @@ def _assembler(tmp_path: Path, git: GitConfig) -> BriefingAssembler:
     return BriefingAssembler(OrchestratorConfig(project_root=tmp_path, git=git))
 
 
-async def _initial_prompt(briefing: BriefingAssembler, worktree: Path) -> str:
+async def _initial_prompt(
+    briefing: BriefingAssembler,
+    worktree: Path,
+    handled: tuple[HandledL0, ...] = (),
+    pending_escalations: list[dict] | None = None,
+) -> str:
     with patch.object(
         BriefingAssembler,
         '_get_memory_context',
@@ -56,9 +64,14 @@ async def _initial_prompt(briefing: BriefingAssembler, worktree: Path) -> str:
         return await briefing.build_steward_initial_prompt(
             task=_TASK,
             escalation=_ESCALATION,
-            pending_escalations=[],
+            pending_escalations=pending_escalations or [],
             worktree=worktree,
+            handled=handled,
         )
+
+
+def _steward_owned_tail(prompt: str) -> str:
+    return prompt[prompt.index('\n# Escalation\n\n') + 1:]
 
 
 @pytest.fixture
@@ -102,3 +115,84 @@ class TestBuildStewardInitialPrompt:
 
         expected = already_merged_step(LandedShaSearches.for_task(str(_TASK['id']), git))
         assert f'\n2. {expected}\n3. ' in prompt
+
+
+_DIGEST_HEADING = '## Escalations This Steward Already Handled'
+_HANDLED = (HandledL0('esc-42-0', 'task_failure', StewardResolved(resolution_text='fixed the import')),)
+_OTHER_PENDING = {'id': 'esc-42-2', 'category': 'review_suggestion', 'summary': 'Rename the helper'}
+
+
+@pytest.mark.asyncio
+class TestHandledDigest:
+    async def test_an_empty_digest_leaves_the_steward_owned_tail_byte_identical(
+        self, briefing: BriefingAssembler, tmp_path: Path,
+    ) -> None:
+        prompt = await _initial_prompt(briefing, tmp_path)
+
+        already_merged = already_merged_step(
+            LandedShaSearches.for_task(str(_TASK['id']), _fixture_git()),
+        )
+        expected = (
+            '# Escalation\n'
+            '\n'
+            '- **ID:** `esc-42-1`\n'
+            '- **Category:** task_failure\n'
+            '- **Severity:** blocking\n'
+            '- **Summary:** Execution iterations exhausted\n'
+            '- **Detail:** Agent ran out of iterations.\n'
+            '\n'
+            '# Parameters\n'
+            '\n'
+            f'- **project_id:** `{briefing.project_id}`\n'
+            f'- **project_root:** `{tmp_path}`\n'
+            f'- **worktree:** `{tmp_path}`\n'
+            '\n'
+            '# Action\n'
+            '\n'
+            '1. Understand the escalation and the task context.\n'
+            f'2. {already_merged}\n'
+            '3. Read the relevant code.\n'
+            '4. Handle the escalation — fix the issue, or triage suggestions.\n'
+            '5. Run tests to verify any code changes.\n'
+            '6. Call `resolve_issue` with a summary of what you did.\n'
+        )
+        assert _steward_owned_tail(prompt) == expected
+        assert _DIGEST_HEADING not in prompt
+
+    async def test_the_digest_sits_after_the_pending_block_and_before_parameters(
+        self, briefing: BriefingAssembler, tmp_path: Path,
+    ) -> None:
+        prompt = await _initial_prompt(
+            briefing, tmp_path, handled=_HANDLED, pending_escalations=[_OTHER_PENDING],
+        )
+
+        digest = render_handled_digest(_HANDLED)
+        assert digest in prompt
+        at = prompt.index(digest)
+        assert prompt.index('\n# Escalation\n\n') < at
+        assert prompt.index('## Other Pending Escalations') < at
+        assert at + len(digest) <= prompt.index('# Parameters')
+
+    async def test_the_digest_follows_the_escalation_block_with_no_pending(
+        self, briefing: BriefingAssembler, tmp_path: Path,
+    ) -> None:
+        prompt = await _initial_prompt(briefing, tmp_path, handled=_HANDLED)
+
+        tail = _steward_owned_tail(prompt)
+        assert '- **Detail:** Agent ran out of iterations.\n' + render_handled_digest(_HANDLED) in tail
+        assert render_handled_digest(_HANDLED) + '\n# Parameters\n' in tail
+
+    async def test_handled_is_a_required_keyword(
+        self, briefing: BriefingAssembler, tmp_path: Path,
+    ) -> None:
+        without_handled: dict[str, Any] = {
+            'task': _TASK,
+            'escalation': _ESCALATION,
+            'pending_escalations': [],
+            'worktree': tmp_path,
+        }
+        with (
+            patch.object(BriefingAssembler, '_get_memory_context', return_value=''),
+            pytest.raises(TypeError),
+        ):
+            await briefing.build_steward_initial_prompt(**without_handled)
