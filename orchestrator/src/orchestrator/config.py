@@ -1067,6 +1067,20 @@ class DeliveredChecksConfig(BaseModel):
             'budget remain uncached and are retried next tick (fail-safe wait).'
         ),
     )
+    max_record_fetches_per_tick: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            'Maximum number of terminal dep records '
+            'Scheduler._phase_backfill_terminal_dep_records fetches per '
+            'scheduler tick; the delivered-check gate and the scheduled '
+            'self-deploy hold both read those records. Must be >= 1. A '
+            'never-cached dep it defers makes its dependents wait for a later '
+            'tick, so after a restart it sets how fast the cold record cache '
+            'warms; one slot per tick is kept for never-cached deps while any '
+            'wait.'
+        ),
+    )
     grace_cycles: int = Field(
         default=3,
         ge=1,
@@ -7155,9 +7169,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # lowers the merge fan-out without a restart.
         'merge_verify_max_concurrent_modules',
         # Delivered-check dep-gate sweep budget (task 2580, capability-
-        # delivered-checks PRD delta) — scheduler tuning, same tier as
+        # delivered-checks PRD delta) and the terminal-dep record-fetch budget
+        # (task 9029, S16 D13) — scheduler tuning, same tier as
         # fairness.skip_threshold / starvation_watchdog.*.
         'delivered_checks.max_checks_per_tick',
+        'delivered_checks.max_record_fetches_per_tick',
         # Delivered-check grace-streak escalation knobs (task 2583, epsilon
         # of the same PRD) — same green tier: an operator may flip the kill
         # switch, retune the grace window, or adjust the per-check timeout
