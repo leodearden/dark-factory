@@ -723,6 +723,11 @@ class ModuleLockTable:
         stack = self._parked.get(module)
         return stack[-1][0] if stack else None
 
+    def top_park_rank(self, owner: str) -> int | None:
+        """The strongest rank among the stack tops *owner* holds: the rank its parks gate a requester at (only an active top blocks, INV-2); None when it tops none.  A READ."""
+        ranks = [stack[-1][1] for stack in self._parked.values() if stack and stack[-1][0] == owner]
+        return min(ranks, default=None)
+
     def force_clear(
         self, owner: str
     ) -> tuple[list[str], list[tuple[str, list[str]]]]:
