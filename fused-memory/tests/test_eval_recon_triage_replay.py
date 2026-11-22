@@ -12,6 +12,7 @@ import functools
 import hashlib
 import json
 import types
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -552,7 +553,9 @@ class _CredentialedStage:
 
 
 class TestTheStageCliAsker:
-    def _asker(self, tmp_path: Path, stage: Any, **extra: Any) -> Any:
+    def _asker(
+        self, tmp_path: Path, stage: Callable[..., Awaitable[StageResult]], **extra: Any,
+    ) -> Any:
         return _mod().StageCliAsker(
             run_stage=stage, config=ReconciliationConfig(), model='sonnet',
             cwd=Path('/srv/explore'), config_base=tmp_path / 'configs',
