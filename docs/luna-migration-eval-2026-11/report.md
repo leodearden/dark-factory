@@ -173,3 +173,17 @@ amendment to esc-9522-1: there is no API fallback.
     gpt-4o-mini.
   * It reuses task 9943's per-prompt plan route, or reports a blocking
     dependency on 9943 if that has not landed.
+
+### 6.2 The routing layer: classifier and router, jointly
+
+* **The routing layer FAILS** (`r.routing_layer.passes` false). The
+  classifier passes C1, but the router fails Q1 at −0.2667 [−0.3322,
+  −0.2011], so both sites stay on gpt-4o-mini on `OPENAI_API_KEY`, as today.
+* **No config changes.** `fused-memory/config/config.yaml`'s `routing` block
+  keeps `model`, `reasoning_effort`, `openai_api_url` and `openai_api_key`
+  null, which inherits `llm.providers.openai`'s gpt-4o-mini endpoint
+  (`routing/openai_client.py::routing_chat_params`, `routing_endpoint`).
+  Nothing is flipped, so no operational restart follow-up is filed.
+* **What the user sees is unchanged.** After the next fused-memory restart,
+  the 'Routing LLM: ...' line still names gpt-4o-mini on
+  `https://api.openai.com/v1`.
