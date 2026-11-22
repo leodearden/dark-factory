@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -218,8 +219,8 @@ class _Store:
     """A whole graph served by population: RELATES_TO, Episodic, MENTIONS and Entity pages, each
     with its census, plus episode bodies by uuid. Records every body read."""
 
-    def __init__(self, *, edges: list[list[Any]] = (), episodes: list[list[Any]] = (),
-                 mentions: list[list[Any]] = (), entities: list[list[Any]] = (),
+    def __init__(self, *, edges: Sequence[list[Any]] = (), episodes: Sequence[list[Any]] = (),
+                 mentions: Sequence[list[Any]] = (), entities: Sequence[list[Any]] = (),
                  bodies: dict[str, str] | None = None) -> None:
         self.populations = {
             ':MENTIONS': sorted(mentions), ':RELATES_TO': sorted(edges),

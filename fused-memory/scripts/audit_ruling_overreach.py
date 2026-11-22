@@ -352,22 +352,28 @@ def sample_key(graph: str, uuid: str) -> str:
     return hashlib.sha256(f'{graph}:{uuid}'.encode()).hexdigest()
 
 
-def _instant(iso: str) -> datetime:
+def parse_instant(iso: str) -> datetime:
     """Parse an ISO timestamp; a naive one is UTC, which is how graphiti writes them."""
     parsed = datetime.fromisoformat(iso)
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def _created_instant(episode: Episode) -> datetime | None:
+def stored_instant(value: object) -> datetime | None:
+    """A stored timestamp parsed by parse_instant; None when it is missing or unparseable."""
     try:
-        return _instant(episode.created_at)
-    except (TypeError, ValueError):
+        return parse_instant(str(value)) if value is not None else None
+    except ValueError:
         return None
 
 
+def instant_in_window(value: object, window_start: str, window_end: str) -> bool:
+    """Whether a stored timestamp falls in the half-open window [window_start, window_end)."""
+    at = stored_instant(value)
+    return at is not None and parse_instant(window_start) <= at < parse_instant(window_end)
+
+
 def in_window(episode: Episode, window_start: str, window_end: str) -> bool:
-    at = _created_instant(episode)
-    return at is not None and _instant(window_start) <= at < _instant(window_end)
+    return instant_in_window(episode.created_at, window_start, window_end)
 
 
 @dataclass(frozen=True)
@@ -422,7 +428,7 @@ class SampleDefinition:
     @property
     def window_days(self) -> float:
         """The window's length in days."""
-        return (_instant(self.window_end) - _instant(self.window_start)).total_seconds() / 86400
+        return (parse_instant(self.window_end) - parse_instant(self.window_start)).total_seconds() / 86400
 
     def select(self, episodes: Iterable[Episode]) -> tuple[SampledEpisode, ...]:
         return select_sample(
