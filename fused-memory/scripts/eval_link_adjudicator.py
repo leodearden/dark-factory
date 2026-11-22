@@ -62,7 +62,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from shared.safe_io import atomic_write_text
 
@@ -99,8 +99,14 @@ from fused_memory.maintenance.link_heal_store import (
 )
 from fused_memory.maintenance.verdict_majority import Pair, Resolution, resolve_verdicts
 from fused_memory.server.grouped_read import AMENDMENT_KIND
+from fused_memory.utils.script_loader import load_script
 
 _SCRIPTS = Path(__file__).resolve().parent
+
+if TYPE_CHECKING:
+    import write_triage_stats as _stats
+else:
+    _stats = load_script(_SCRIPTS / 'write_triage_stats.py', 'write_triage_stats')
 
 
 class TruthClass(StrEnum):
@@ -185,27 +191,12 @@ class Population:
         }
 
 
-_WILSON_Z = 1.96
-
-
-def wilson95(k: int, n: int) -> list[float] | None:
-    """The Wilson score 95% interval of *k* successes in *n* trials; ``None`` for none."""
-    if n == 0:
-        return None
-    p = k / n
-    z2 = _WILSON_Z * _WILSON_Z
-    denominator = 1 + z2 / n
-    centre = (p + z2 / (2 * n)) / denominator
-    half = _WILSON_Z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n)) / denominator
-    return [max(0.0, centre - half), min(1.0, centre + half)]
-
-
 def _figure(name: str, num: int, den: int) -> dict[str, Any]:
     return {
         name: None if den == 0 else num / den,
         f'{name}_num': num,
         f'{name}_den': den,
-        f'{name}_ci95': wilson95(num, den),
+        f'{name}_ci95': None if den == 0 else list(_stats.wilson_bounds(num / den, den)),
     }
 
 
