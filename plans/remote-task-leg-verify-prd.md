@@ -165,7 +165,9 @@ async def run_merge_verify(...)   # unchanged signature; main-mirror push + _dis
 async def run_task_verify(self, spec: TaskVerifySpec, *, task_id: str, archive_root: Path | None, event_store=None) -> VerifyResult
     # _dispatch('verify-task') + archive: red → attempt-{spec.attempt_id}.remote-<name>.{test,lint,type}-<stamp>.log
     # + .summary-<stamp>.json; green → .pass-summary-<stamp>.json; sets result.archive_log_paths to those files.
-class RunnerUnavailable(Exception): kind: Literal['transport', 'unparseable', 'no_verdict', 'wire_shape']
+class RunnerUnavailable(Exception): kind: RunnerUnavailableKind
+    # vocabulary: remote_gate.py::RunnerUnavailableKind; rc rule: remote_gate.py::classify_remote_exit
+    # (ssh rc 255 or a spawn failure is 'transport'; any other rc is 'gate')
 ```
 
 `probe_clean` matches `verify-(merge|task)`. `cancel_verify` is unchanged.
@@ -259,7 +261,7 @@ Both sides of each seam are faced; the integration gate ι executes every row. F
 |---|---|---|---|
 | 1 | Spec round trip | a `TaskVerifySpec` with two modules, env, `task_files=()` | `task_spec_from_json(task_spec_to_json(s)) == s`; an extra key raises `TypeError` |
 | 2 | Laptop body on a fixture repo | fixture repo at SHA, spec with `true`/`false` test commands, `--request-id` | exit 0 both ways; parsed result equals a direct in-process `run_scoped_verification(role='task')`; `.task/verify_warmed` absent before → the SPEC's preprovision command observed when non-empty, the host's when the spec's is `''`; worktree removed; pgid and worktree-path files removed; log path lists empty |
-| 3 | Infra on the laptop | the fixture's test command raises `VerifyInfraError` via a killed leg | CLI exits 1; `RemoteRunner.run_task_verify` raises `RunnerUnavailable(kind='transport')` |
+| 3 | Infra on the laptop | the fixture's test command raises `VerifyInfraError` via a killed leg | CLI exits 1; `RemoteRunner.run_task_verify` raises `RunnerUnavailable(kind='gate')`, because `remote_gate.py::classify_remote_exit` classes every ssh rc other than 255 as `gate` (6565 Q1 ruling); the host is benched in the `skew` class (`merge_lane/types.py::quarantine_class`), re-admitted by a passing `ensure_gate`, not by `ssh true`; a second skew bench on the same deployed sha is sticky (decision 7) |
 | 4 | No-verdict kill | fake stdout is a parseable result whose summary carries `killed by signal 9` | `_dispatch` raises `RunnerUnavailable(kind='no_verdict')` for BOTH `run_merge_verify` and `run_task_verify`; nothing red is returned |
 | 5 | Eligible, free turn | policy `remote_modules: [orchestrator]`, executed module set includes `orchestrator`, fake remote free | remote result returned; the local call never started; sidecar `attempt-N.dispatch-*.json` has `decision=remote, runner=laptop`; turn left; `archive_log_paths` name workstation files; no per-module summary was modified |
 | 6 | Merge running on the same host | as 5, with the merge allocator's laptop slot BUSY | task runs remote all the same; the merge slot and the merge runner are untouched |
