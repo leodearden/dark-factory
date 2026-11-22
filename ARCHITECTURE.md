@@ -477,11 +477,16 @@ For a normal task, `TaskWorkflow._drive()`
 ### 3.6 Escalation on failure
 
 An unresolved failure at any stage moves the workflow to `ESCALATED` and
-starts a persistent per-task `TaskSteward`
-(`orchestrator/src/orchestrator/steward.py`) — a single Claude session,
-opus-backed, with a lifetime budget, that owns every escalation for that
-task. `steward` is the **only** role permitted to call `set_task_status`
-(enforced by an `AgentRole` capability assertion at import time — §4). The
+starts a per-task `TaskSteward`
+(`orchestrator/src/orchestrator/steward.py::TaskSteward`) — opus-backed, with
+a lifetime budget, and owning every escalation for that task. Under the
+default `steward_session_mode: fresh_per_l0` it handles each L0 in a fresh
+Claude session, briefed in full plus a digest of the L0s it already concluded
+(`orchestrator/src/orchestrator/agents/steward_digest.py::render_handled_digest`);
+`resume` keeps one resumed session across L0s, the comparison arm of the
+steward shadow eval (task 5820). `steward` is the **only** role permitted to
+call `set_task_status` (enforced by an `AgentRole` capability assertion at
+import time — §4). The
 steward tries to resolve the issue itself; if it can't (budget exhaustion,
 retry/timeout/empty-output cap, a missing worktree at preflight), it
 auto-escalates to a human, starting the L1→L2 promotion path in §6.
@@ -962,9 +967,15 @@ flowchart LR
     L2 --> HUMAN["Human via resolve_issue<br/>(resume/restart/park/abandon/close_only)"]
 ```
 
-- **L0.** A per-task `TaskSteward` — a single, persistent Claude session
-  across every escalation that task ever raises, with a lifetime budget (§4)
-  — the first responder for any workflow failure. An info L0 is consumed by
+- **L0.** A per-task `TaskSteward`
+  (`orchestrator/src/orchestrator/steward.py::TaskSteward`), with a lifetime
+  budget (§4), is the first responder for any workflow failure. Under the
+  default `steward_session_mode: fresh_per_l0` it handles each L0 in a fresh
+  Claude session with a full briefing plus a digest of the L0s it already
+  concluded
+  (`orchestrator/src/orchestrator/agents/steward_digest.py::render_handled_digest`);
+  `resume` keeps one resumed session across L0s, the comparison arm of the
+  steward shadow eval (task 5820). An info L0 is consumed by
   the chain in §3.6, not by the steward ladder.
 - **L0 → L1.** Two routes for a blocking record, and a third for info.
   Automatically,
