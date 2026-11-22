@@ -30,7 +30,7 @@ from _session_hook_fixtures import (
 )
 
 from orchestrator import session_hooks as sh
-from orchestrator import session_records
+from orchestrator import session_reaper, session_records
 from orchestrator import session_registry as sr
 
 
@@ -333,6 +333,32 @@ def test_run_session_start_refreshes_existing_record_preserving_fields(tmp_path:
     assert record.prompt == '/unblock 2085'
     # mtime heartbeat bumped by the refresh write.
     assert record_path.stat().st_mtime > old_ts
+
+
+def test_run_session_start_clears_orphan_exit_code_when_live_session_resumes(
+    tmp_path: Path,
+) -> None:
+    hook_input = {
+        'session_id': 'sess-b',
+        'cwd': '/home/leo/src/dark-factory',
+        'source': 'compact',
+    }
+    env: dict[str, str] = {}
+    slug = sh.hook_session_slug(hook_input, env)
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug,
+            status=session_records.Status.EXITED,
+            exit_code=session_reaper.ORPHAN_EXIT_CODE,
+            cwd='/home/leo/src/dark-factory',
+        ),
+        root=tmp_path,
+    )
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    record = session_records.read_record(slug, root=tmp_path)
+    assert (record.status, record.exit_code) == (session_records.Status.RUNNING, None)
 
 
 def test_run_session_start_hand_launched_uses_session_leader_as_liveness_pid(
