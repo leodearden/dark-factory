@@ -23,7 +23,7 @@ from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
 from _fm_helpers import load_script_module
 from _fm_sockets import refused_port
 from falkordb import FalkorDB
-from redis.exceptions import RedisError
+from redis.exceptions import BusyLoadingError, RedisError
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -40,7 +40,10 @@ class FakeGraphServer:
 
     *on_run_id* runs at the start of each ``run_id()`` call, so a test can
     restart the server or shrink a graph mid-run. The *fail_delete_at*-th
-    delete call raises RedisError and deletes nothing.
+    delete call raises RedisError and deletes nothing. While ``loading`` is
+    True, ``graph_names()`` and ``node_count()`` raise BusyLoadingError, as a
+    real Redis does while it loads its dataset after a restart; ``run_id()``
+    keeps answering, since INFO is served while loading.
     """
 
     def __init__(
@@ -55,14 +58,21 @@ class FakeGraphServer:
         self.current_run_id = run_id
         self.on_run_id = on_run_id
         self.fail_delete_at = fail_delete_at
+        self.loading = False
         self.delete_calls = 0
         self.counted: list[str] = []
         self.deleted: list[str] = []
 
+    def _refuse_while_loading(self) -> None:
+        if self.loading:
+            raise BusyLoadingError('LOADING Redis is loading the dataset in memory')
+
     def graph_names(self) -> tuple[str, ...]:
+        self._refuse_while_loading()
         return tuple(self.counts)
 
     def node_count(self, name: str) -> int:
+        self._refuse_while_loading()
         self.counted.append(name)
         return self.counts[name]
 
@@ -313,6 +323,11 @@ def _restart(server: FakeGraphServer) -> None:
     server.current_run_id = 'run-b'
 
 
+def _restart_loading(server: FakeGraphServer) -> None:
+    server.current_run_id = 'run-b'
+    server.loading = True
+
+
 def test_it_deletes_the_reviewed_litter_one_at_a_time_in_plan_order_pacing_between():
     server = FakeGraphServer(
         {'probe_e1_gw0': 1, 'dark_factory': 41, '_probe': 0, 'sweep_e4_gw2': 3}
@@ -445,6 +460,53 @@ def test_a_server_restart_after_the_last_delete_is_still_reported():
     assert record.deleted == ('_probe',)
     assert record.outcome == CLEANUP.Exit.SERVER_RESTARTED
     assert (record.run_id_before, record.run_id_after) == ('run-a', 'run-b')
+
+
+def _assert_restarted_uncounted(server: FakeGraphServer, record: Any) -> None:
+    assert server.deleted == ['_probe']
+    assert record.deleted == ('_probe',)
+    assert record.outcome == CLEANUP.Exit.SERVER_RESTARTED
+    assert (record.run_id_before, record.run_id_after) == ('run-a', 'run-b')
+    assert dict(record.after) == {}
+    assert record.shrank == ()
+
+
+def test_a_restart_into_loading_mid_run_stays_a_restart_with_no_after_counts():
+    server = FakeGraphServer(
+        {'_probe': 0, 'probe_e1_gw0': 1, 'dark_factory': 41},
+        on_run_id=_after_deletes(1, _restart_loading),
+    )
+
+    record = _execute(server, _reviewed(('_probe', 'probe_e1_gw0')))
+
+    _assert_restarted_uncounted(server, record)
+
+
+def test_a_restart_into_loading_after_the_last_delete_stays_a_restart_with_no_after_counts():
+    server = FakeGraphServer(
+        {'_probe': 0, 'dark_factory': 41}, on_run_id=_after_deletes(1, _restart_loading)
+    )
+
+    record = _execute(server, _reviewed(('_probe',)))
+
+    _assert_restarted_uncounted(server, record)
+
+
+def test_a_restarted_server_that_can_be_counted_is_still_counted():
+    def restart_and_shrink(server: FakeGraphServer) -> None:
+        server.current_run_id = 'run-b'
+        server.counts['dark_factory'] = 30
+
+    server = FakeGraphServer(
+        {'_probe': 0, 'probe_e1_gw0': 1, 'dark_factory': 41},
+        on_run_id=_after_deletes(1, restart_and_shrink),
+    )
+
+    record = _execute(server, _reviewed(('_probe', 'probe_e1_gw0')))
+
+    assert record.outcome == CLEANUP.Exit.SERVER_RESTARTED
+    assert dict(record.after) == {'dark_factory': 30}
+    assert record.shrank == (('dark_factory', 41, 30),)
 
 
 def test_a_clean_run_sees_one_run_id_throughout():
@@ -619,6 +681,30 @@ def test_run_delete_returns_the_runs_outcome(tmp_path):
 
     assert code == CLEANUP.Exit.SERVER_RESTARTED
     assert _record_json(record_path)['outcome'] == 'server_restarted'
+
+
+def test_run_delete_reports_a_restart_into_loading_as_a_restart(tmp_path, capsys):
+    server = FakeGraphServer(
+        {'_probe': 0, 'probe_e1_gw0': 1, 'dark_factory': 41},
+        on_run_id=_after_deletes(1, _restart_loading),
+    )
+    record_path = tmp_path / 'record.json'
+
+    code = CLEANUP.run_delete(
+        server, _reviewed(('_probe', 'probe_e1_gw0')), record_path,
+        target=TARGET, pace_s=0.0, sleep=RecordingSleep(server),
+    )
+
+    record = _record_json(record_path)
+    err = capsys.readouterr().err
+    assert code == CLEANUP.Exit.SERVER_RESTARTED
+    assert record['outcome'] == 'server_restarted'
+    assert record['run_id_after'] == 'run-b'
+    assert record['after'] == {}
+    assert record['deleted'] == ['_probe']
+    assert err.startswith('server_restarted:')
+    assert 'run-a' in err
+    assert 'run-b' in err
 
 
 def test_run_delete_keeps_the_record_of_a_run_a_redis_error_interrupted(tmp_path, capsys):
