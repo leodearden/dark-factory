@@ -112,7 +112,12 @@ def steward(make_steward):
     set it explicitly, and the rest either resolve successfully, start at
     ``retry_count=0`` (``0 >= 1`` is False), or hit the budget guard first.
     """
-    steward = make_steward(config_overrides={'steward_max_attempts': 1})
+    steward = make_steward(config_overrides={
+        'steward_max_attempts': 1,
+        # This module characterises the resume arm's session bookkeeping; the
+        # default arm is covered in test_steward_session_mode.py.
+        'steward_session_mode': 'resume',
+    })
     # Deliberately distinct from _make_escalation's default id 'esc-42-1' —
     # which is exactly conftest's make_id default.  A steward-minted escalation
     # must stay distinguishable from the escalation under test, or the two

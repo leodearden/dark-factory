@@ -35,7 +35,12 @@ def queue(tmp_path):
 
 @pytest.fixture
 def steward(make_steward, queue):
-    return make_steward(escalation_queue=queue)
+    return make_steward(
+        escalation_queue=queue,
+        # This module characterises the resume arm's session bookkeeping; the
+        # default arm is covered in test_steward_session_mode.py.
+        config_overrides={'steward_session_mode': 'resume'},
+    )
 
 
 async def _captured_builder(steward, escalation):
