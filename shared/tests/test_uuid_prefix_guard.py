@@ -2451,3 +2451,97 @@ class TestTheApplyPhaseIsOneDoorCallPerGuardedCall:
         assert door.calls == 0
         assert h.recorder.args['content'] == submitted
         assert repair_of(result) == {'resolver': 'unavailable', 'store': OUTAGE, 'reason': 'unreachable'}
+
+
+# ---------------------------------------------------------------------------
+# A declared exempt PATH is never repaired.
+# ---------------------------------------------------------------------------
+#
+# A value the tool accepts only as a verbatim echo of what it stored: a repair
+# there could only turn an accepted call into a refused one. Like an exempt
+# tool, a declaration is not a detection, so it costs no walk, no fact and no
+# meta, and it does not count toward the ceiling.
+
+DONE_PROVENANCE = ('metadata', 'done_provenance')
+
+
+def path_exempt_harness(*paths: tuple[str | int, ...]) -> Harness:
+    """A harness that KNOWS BFF, so only the exemption can keep it unexpanded."""
+    return build_harness(
+        answers={BFF: unique(BFF_FULL)},
+        exempt_paths={'update_task': frozenset(paths or (DONE_PROVENANCE,))},
+    )
+
+
+def provenance_call(**extra: Any) -> dict[str, Any]:
+    return {
+        'task_id': '7',
+        'project_root': PROJECT,
+        'metadata': {'done_provenance': {'kind': 'merged', 'note': f'per observation {BFF}'}},
+        **extra,
+    }
+
+
+class TestADeclaredExemptPathIsNeverRepaired:
+    async def test_the_exempt_value_reaches_the_tool_verbatim(self) -> None:
+        h = path_exempt_harness()
+        result = await h.call('update_task', provenance_call())
+        assert h.recorder.args['metadata']['done_provenance']['note'] == f'per observation {BFF}'
+        assert h.resolver.prefixes == []
+        assert repair_of(result) is None
+        assert h.facts == []
+
+    async def test_a_sibling_argument_is_still_repaired(self) -> None:
+        h = path_exempt_harness()
+        result = await h.call('update_task', provenance_call(description=f'see {BFF}'))
+        assert h.recorder.args['description'] == f'see {BFF_FULL}'
+        assert h.recorder.args['metadata']['done_provenance']['note'] == f'per observation {BFF}'
+        repair = repair_of(result)
+        assert repair is not None
+        assert [record['path'] for record in repair['substitutions']] == [['description']]
+
+    async def test_the_exemption_is_scoped_to_the_named_tool(self) -> None:
+        h = path_exempt_harness()
+        call = provenance_call()
+        del call['task_id']
+        await h.call('submit_task', {**call, 'title': 't', 'description': 'd'})
+        assert h.recorder.args['metadata']['done_provenance']['note'] == f'per observation {BFF_FULL}'
+
+    async def test_a_path_is_matched_per_segment_not_as_a_string_prefix(self) -> None:
+        h = path_exempt_harness(('metadata', 'done'))
+        await h.call('update_task', provenance_call())
+        assert h.recorder.args['metadata']['done_provenance']['note'] == f'per observation {BFF_FULL}'
+
+    async def test_a_deeper_path_exempts_only_that_leaf(self) -> None:
+        h = path_exempt_harness(('metadata', 'done_provenance', 'note'))
+        call = provenance_call()
+        call['metadata']['done_provenance']['x'] = f'see {BFF}'
+        await h.call('update_task', call)
+        provenance = h.recorder.args['metadata']['done_provenance']
+        assert provenance['note'] == f'per observation {BFF}'
+        assert provenance['x'] == f'see {BFF_FULL}'
+
+    async def test_an_exempt_token_does_not_count_toward_the_ceiling(self) -> None:
+        h = path_exempt_harness()
+        call = provenance_call(description=f'see {BFF}')
+        call['metadata']['done_provenance']['notes'] = hex_tokens(
+            guard.MAX_DISTINCT_PREFIXES_PER_CALL + 1
+        )
+        result = await h.call('update_task', call)
+        assert h.resolver.prefixes == [BFF]
+        assert h.recorder.args['description'] == f'see {BFF_FULL}'
+        repair = repair_of(result)
+        assert repair is not None
+        assert 'resolver' not in repair
+
+    async def test_the_declared_paths_are_empty_by_default(self) -> None:
+        middleware = guard.UuidPrefixGuardMiddleware(_FakeResolver({}), lambda arguments: PROJECT)
+        assert middleware.exempt_paths == {}
+
+    async def test_an_empty_path_is_refused_at_construction(self) -> None:
+        with pytest.raises(ValueError, match='update_task'):
+            guard.UuidPrefixGuardMiddleware(
+                _FakeResolver({}),
+                lambda arguments: PROJECT,
+                exempt_paths={'update_task': frozenset({()})},
+            )
