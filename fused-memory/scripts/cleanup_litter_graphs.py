@@ -18,13 +18,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 import json
 import re
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+import time
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from enum import IntEnum
 from types import MappingProxyType
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 from shared.safe_io import atomic_write_text
+
+
+class Exit(IntEnum):
+    OK = 0
+    FAILED = 1
+    REFUSED = 3
+    SERVER_RESTARTED = 4
+    KEPT_GRAPH_SHRANK = 5
+
 
 LITTER_PATTERNS = tuple(
     re.compile(pattern)
@@ -187,3 +198,160 @@ def _counts(raw: dict[str, object], key: str) -> dict[str, int]:
 
 def _is_count(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+@dataclass(frozen=True)
+class Targets:
+    delete: tuple[str, ...]
+    unreviewed: tuple[str, ...]
+    already_absent: tuple[str, ...]
+
+
+def select_targets(present: Iterable[str], plan: CleanupPlan, reviewed: Listing) -> Targets:
+    """Litter both planned and reviewed is deleted; planned-only is unreviewed; reviewed-but-gone is absent."""
+    on_server = frozenset(present)
+    return Targets(
+        delete=tuple(n for n in plan.delete if n in reviewed.delete and n in on_server),
+        unreviewed=tuple(n for n in plan.delete if n not in reviewed.delete),
+        already_absent=tuple(n for n in reviewed.delete if n not in on_server),
+    )
+
+
+class Shrinkage(NamedTuple):
+    graph: str
+    before: int
+    after: int
+
+
+def shrunk_graphs(
+    before: Mapping[str, int], after: Mapping[str, int], kept: Iterable[str]
+) -> tuple[Shrinkage, ...]:
+    """Each kept graph whose count fell; one absent from *after* counts as zero."""
+    return tuple(
+        Shrinkage(name, before[name], after.get(name, 0))
+        for name in kept
+        if name in before and after.get(name, 0) < before[name]
+    )
+
+
+@dataclass(frozen=True)
+class CleanupRecord:
+    """A delete run; ``outcome`` is None while the run is in progress."""
+
+    target: str
+    run_id_before: str
+    run_id_after: str | None
+    before: Mapping[str, int]
+    after: Mapping[str, int]
+    deleted: tuple[str, ...]
+    unreviewed: tuple[str, ...]
+    already_absent: tuple[str, ...]
+    shrank: tuple[Shrinkage, ...]
+    outcome: Exit | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'before', _frozen(self.before))
+        object.__setattr__(self, 'after', _frozen(self.after))
+
+    @classmethod
+    def started(cls, target: str, before: Census, targets: Targets) -> CleanupRecord:
+        return cls(
+            target=target,
+            run_id_before=before.run_id,
+            run_id_after=None,
+            before=before.counts,
+            after={},
+            deleted=(),
+            unreviewed=targets.unreviewed,
+            already_absent=targets.already_absent,
+            shrank=(),
+            outcome=None,
+        )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            'target': self.target,
+            'run_id_before': self.run_id_before,
+            'run_id_after': self.run_id_after,
+            'before': dict(self.before),
+            'after': dict(self.after),
+            'deleted': list(self.deleted),
+            'unreviewed': list(self.unreviewed),
+            'already_absent': list(self.already_absent),
+            'shrank': [shrinkage._asdict() for shrinkage in self.shrank],
+            'outcome': None if self.outcome is None else self.outcome.name.lower(),
+        }
+
+
+def _ignore_progress(record: CleanupRecord) -> None:
+    pass
+
+
+def execute(
+    server: GraphServer,
+    plan: CleanupPlan,
+    reviewed: Listing,
+    *,
+    pace_s: float,
+    sleep: Callable[[float], None] = time.sleep,
+    on_progress: Callable[[CleanupRecord], None] = _ignore_progress,
+) -> CleanupRecord:
+    """Delete the reviewed litter one graph at a time, stopping if the server restarts.
+
+    *on_progress* receives the record before the first delete and after each one.
+    """
+    before = take_census(server, server.graph_names())
+    targets = select_targets(before.counts, plan, reviewed)
+    started = CleanupRecord.started(reviewed.target, before, targets)
+    on_progress(started)
+    deleted = _delete_paced(
+        server,
+        targets.delete,
+        run_id=before.run_id,
+        pace_s=pace_s,
+        sleep=sleep,
+        on_deleted=lambda done: on_progress(replace(started, deleted=done)),
+    )
+    return _finished(server, plan, replace(started, deleted=deleted))
+
+
+def _delete_paced(
+    server: GraphServer,
+    names: tuple[str, ...],
+    *,
+    run_id: str,
+    pace_s: float,
+    sleep: Callable[[float], None],
+    on_deleted: Callable[[tuple[str, ...]], None],
+) -> tuple[str, ...]:
+    deleted: list[str] = []
+    for index, name in enumerate(names):
+        if index:
+            sleep(pace_s)
+        if server.run_id() != run_id:
+            break
+        server.delete(require_litter(name))
+        deleted.append(name)
+        on_deleted(tuple(deleted))
+    return tuple(deleted)
+
+
+def _finished(server: GraphServer, plan: CleanupPlan, record: CleanupRecord) -> CleanupRecord:
+    present = frozenset(server.graph_names())
+    after = take_census(server, [name for name in plan.keep if name in present])
+    shrank = shrunk_graphs(record.before, after.counts, plan.keep)
+    return replace(
+        record,
+        run_id_after=after.run_id,
+        after=after.counts,
+        shrank=shrank,
+        outcome=_outcome(record.run_id_before, after.run_id, shrank),
+    )
+
+
+def _outcome(run_id_before: str, run_id_after: str, shrank: tuple[Shrinkage, ...]) -> Exit:
+    if run_id_after != run_id_before:
+        return Exit.SERVER_RESTARTED
+    if shrank:
+        return Exit.KEPT_GRAPH_SHRANK
+    return Exit.OK
