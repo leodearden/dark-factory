@@ -332,10 +332,24 @@ There was simply no way to ask "which memories contain this substring."
 
 That is now `scan_memory_content` (WORK b): a **literal** substring scan over
 Qdrant payload text. It uses a server-side `MatchText` prefilter for speed and
-then re-verifies **every** returned record in Python with the shared detector,
-which is the authoritative verdict. `exhaustive=True` skips the prefilter
-entirely and paginates the whole collection — that is the mode for an
-incidence-rate claim, so the number rests on nothing but the detector.
+then judges **every** walked record in Python, which is the authoritative
+verdict. With the default sentinels that verdict is the shared detector. With
+caller-supplied `needles` it is the needles themselves: a literal,
+case-sensitive substring match over the record text (task 4857; before that,
+a record containing a custom needle was never reported). `exhaustive=True`
+skips the prefilter, and nothing else, and paginates the whole collection —
+that is the mode for an incidence-rate claim, so the number rests on nothing
+but the Python verdict. The prefilter reads only the `data` key, so a complete
+literal enumeration, one that also sees text under the `memory`/`content`
+fallbacks, passes `needles` with `exhaustive=True, limit=None`. `scanned` is
+the number of records walked: the prefilter population, or the whole
+collection when exhaustive.
+
+The MCP tool defaults to `limit=1000` and returns each match's `metadata`
+without its text keys; the text is in `excerpt`, and `get_memory_by_id` gives
+the full body. `MemoryService.scan_memory_content` and
+`Mem0Backend.scan_payload_text` keep no default limit and return the full raw
+payload, because the in-process sweep (§5) repairs from it.
 
 Pagination is mandatory in both modes. A silently-capped scan would answer
 "what is the true incidence rate" *wrongly*, which is the same silent-wrong-value
