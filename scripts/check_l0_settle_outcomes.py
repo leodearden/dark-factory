@@ -35,11 +35,6 @@ STALE_STRAND_CLASS: Final = 'stale-strand'
 ARCHIVE_SUBDIR: Final = 'archive'
 ARCHIVE_DAY_FORMAT: Final = '%Y-%m-%d'
 LIVE_RECORD_GLOB: Final = 'esc-*.json'
-# escalation/src/escalation/models.py::Escalation.status
-PENDING_STATUS: Final = 'pending'
-RESOLVED_STATUS: Final = 'resolved'
-DISMISSED_STATUS: Final = 'dismissed'
-KNOWN_STATUSES: Final = frozenset({PENDING_STATUS, RESOLVED_STATUS, DISMISSED_STATUS})
 
 COUNTED_LEVEL: Final = 0
 COUNTED_SEVERITY: Final = 'blocking'
@@ -72,6 +67,14 @@ class NothingFiled(CannotJudge):
     headline = 'nothing to judge'
 
 
+class Status(enum.StrEnum):
+    """escalation/src/escalation/models.py::Escalation.status"""
+
+    PENDING = 'pending'
+    RESOLVED = 'resolved'
+    DISMISSED = 'dismissed'
+
+
 class Closure(enum.StrEnum):
     OPEN = 'open'
     RESOLVED = 'resolved'
@@ -90,9 +93,9 @@ NON_STARTUP_DISMISSALS: Final = frozenset(
 
 
 def classify_closure(
-    status: str, resolved_by: str | None, resolution: str | None, resolution_class: str | None,
+    status: Status, resolved_by: str | None, resolution: str | None, resolution_class: str | None,
 ) -> Closure:
-    if status == PENDING_STATUS:
+    if status is Status.PENDING:
         return Closure.OPEN
     if resolution_class == STALE_STRAND_CLASS:
         return Closure.STARTUP_STRAND
@@ -103,7 +106,7 @@ def classify_closure(
         return Closure.STARTUP_DISMISSAL if text.startswith(RESTART_PREFIX) else Closure.WORKFLOW_AUTO_DISMISSAL
     if text.startswith(PROMOTION_PREFIX):
         return Closure.OTHER_PROMOTION
-    return Closure.OTHER_DISMISSAL if status == DISMISSED_STATUS else Closure.RESOLVED
+    return Closure.OTHER_DISMISSAL if status is Status.DISMISSED else Closure.RESOLVED
 
 
 @dataclass(frozen=True)
@@ -163,11 +166,12 @@ def _moment(raw: Mapping[str, Any], key: str, path: Path) -> datetime:
         raise UnreadableQueue(path, f'{key} {value!r} is not a usable ISO timestamp') from exc
 
 
-def _status(raw: Mapping[str, Any], path: Path) -> str:
+def _status(raw: Mapping[str, Any], path: Path) -> Status:
     value = _text(raw, 'status', path)
-    if value not in KNOWN_STATUSES:
-        raise UnreadableQueue(path, f'status {value!r} is not one of pending, resolved, dismissed')
-    return value
+    try:
+        return Status(value)
+    except ValueError:
+        raise UnreadableQueue(path, f'status {value!r} is not one of {", ".join(Status)}') from None
 
 
 def _late_resolved(raw: Mapping[str, Any], path: Path) -> bool:
@@ -180,7 +184,7 @@ def _late_resolved(raw: Mapping[str, Any], path: Path) -> bool:
 def parse_record(raw: Mapping[str, Any], path: Path) -> Record:
     """The one boundary where an escalation file's persisted fields become a typed Record."""
     status = _status(raw, path)
-    is_open = status == PENDING_STATUS
+    is_open = status is Status.PENDING
     return Record(
         id=_text(raw, 'id', path),
         task_id=_text_or_null(_required(raw, 'task_id', path), 'task_id', path),
