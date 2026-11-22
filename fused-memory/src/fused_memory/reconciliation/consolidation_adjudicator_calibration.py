@@ -566,8 +566,9 @@ class CalibrationRecord:
             ('endpoint_host', self.endpoint_host is None or _is_text(self.endpoint_host),
              'a host or None'),
             ('stall_count', _is_count(self.stall_count), 'a non-negative int'),
-            ('stalled_at', self.stalled_at is None or _is_aware(self.stalled_at),
-             'a timezone-aware datetime or None'),
+            ('stalled_at', (self.stalled_at is None) != (self.state is CalibrationState.STALLED)
+             and (self.stalled_at is None or _is_aware(self.stalled_at)),
+             'a timezone-aware datetime exactly when the state is stalled'),
             ('first_run', self.first_run is None or isinstance(self.first_run, RunFigures),
              'RunFigures or None'),
             ('figures', self.figures is None or isinstance(self.figures, RunFigures),
@@ -744,7 +745,9 @@ async def run_calibration(
 ) -> CalibrationResult:
     """Take the identity's calibration row one step: read it, and score a run when one is due.
 
-    A ``pass`` or ``fail`` row is final. Otherwise the eval set is verified
+    A ``pass`` or ``fail`` row is final, a fresh ``running`` row or a stall
+    still backing off is waited for, and an old ``running`` row is only marked
+    crashed (see :func:`_step_without_run`). Otherwise the eval set is verified
     before any write, the run is claimed by compare-and-set so one caller runs
     it, the cases are scored through :func:`adjudicate`, and the row is
     rewritten with the run's end state.
@@ -752,8 +755,8 @@ async def run_calibration(
     _require_aware('now', now)
     identity = adjudicator_identity(settings)
     stored = await _read(ledger, identity)
-    if stored is not None and stored.state in _SETTLED:
-        return CalibrationResult(record=stored, ran=False)
+    if stored is not None and (step := await _step_without_run(ledger, stored, now)) is not None:
+        return step
     try:
         cases = load_eval_set(eval_set_path)
     except EvalSetInvalid as exc:
@@ -773,7 +776,8 @@ async def run_calibration(
         settings=settings, model_call=model_call, claim_check=claim_check,
         wall_time_limit_s=wall_time_limit_s, retry_delay_s=retry_delay_s,
     )
-    return await _write_end(ledger, _ended(running, tally, member_min=settings.member_min), now)
+    ended = _ended(running, tally, member_min=settings.member_min, now=now)
+    return await _write_end(ledger, ended, now)
 
 
 async def _read(ledger: ReconLedgerStore, identity: str) -> CalibrationRecord | None:
@@ -781,19 +785,91 @@ async def _read(ledger: ReconLedgerStore, identity: str) -> CalibrationRecord | 
     return None if row is None else CalibrationRecord.from_ledger_record(row)
 
 
+def _age(record: CalibrationRecord, now: datetime) -> timedelta:
+    """Time in *record*'s state: since its stall when stalled, else since its run started."""
+    since = record.stalled_at if record.state is CalibrationState.STALLED else record.started_at
+    if since is None:
+        raise ValueError(f'calibration {record.identity[:12]} is stalled with no stalled_at')
+    return now - since
+
+
+async def _step_without_run(
+    ledger: ReconLedgerStore, stored: CalibrationRecord, now: datetime,
+) -> CalibrationResult | None:
+    """This call's whole step when *stored* starts no run now; None when a run is due.
+
+    An old ``running`` row is moved to ``crashed`` and nothing starts: the
+    state-only compare-and-set cannot tell two callers that both read the same
+    old row apart, so the next run starts from ``crashed`` on a later call.
+    """
+    if stored.state in _SETTLED:
+        return CalibrationResult(record=stored, ran=False)
+    if stored.state is CalibrationState.RUNNING:
+        if _age(stored, now) < CRASH_AGE:
+            return CalibrationResult(record=stored, ran=False)
+        return await _mark_crashed(ledger, stored, now)
+    if stored.state is CalibrationState.STALLED and _age(stored, now) < STALL_BACKOFF:
+        return CalibrationResult(record=stored, ran=False)
+    return None
+
+
+async def _mark_crashed(
+    ledger: ReconLedgerStore, stored: CalibrationRecord, now: datetime,
+) -> CalibrationResult:
+    marked = _counted_toward_stall(
+        dataclasses.replace(stored, state=CalibrationState.CRASHED), now,
+    )
+    if not await ledger.upsert_if_state(
+        marked.to_ledger_record(now=now), existing_state=CalibrationState.RUNNING.value,
+    ):
+        return CalibrationResult(record=await _read(ledger, stored.identity), ran=False)
+    logger.warning(
+        'calibration %s: attempt %d started %s never ended; marked %s',
+        stored.identity[:12], stored.attempt, stored.started_at.isoformat(), marked.state,
+    )
+    return CalibrationResult(record=marked, ran=False, finding=_finding(marked))
+
+
+def _counted_toward_stall(record: CalibrationRecord, now: datetime) -> CalibrationRecord:
+    """*record* with one more run ended without a verdict; at :data:`STALL_RUN_CAP` it stalls."""
+    stall_count = record.stall_count + 1
+    if stall_count < STALL_RUN_CAP:
+        return dataclasses.replace(record, stall_count=stall_count)
+    return dataclasses.replace(
+        record, state=CalibrationState.STALLED, stall_count=stall_count, stalled_at=now,
+    )
+
+
+def _finding(record: CalibrationRecord) -> CalibrationFinding | None:
+    if record.state is CalibrationState.FAIL:
+        return CalibrationFinding.adjudicator_calibration_failed
+    if record.state is CalibrationState.STALLED:
+        return CalibrationFinding.adjudicator_calibration_stalled
+    return None
+
+
 def _running_record(
     identity: str, settings: AdjudicatorSettings, stored: CalibrationRecord | None, now: datetime,
 ) -> CalibrationRecord:
-    """The next run's ``running`` row: one attempt on, a stored first run kept for pooling."""
+    """The next run's ``running`` row: one attempt on, a stored first run kept for pooling.
+
+    A start from ``stalled`` resets the stall count; a start from ``stale``
+    drops the first run, so the drifted model is scored afresh.
+    """
+    if stored is None:
+        return CalibrationRecord(
+            identity=identity, state=CalibrationState.RUNNING, attempt=1, started_at=now,
+            model=settings.model, endpoint_host=settings.endpoint_host,
+        )
     return CalibrationRecord(
         identity=identity,
         state=CalibrationState.RUNNING,
-        attempt=1 if stored is None else stored.attempt + 1,
+        attempt=stored.attempt + 1,
         started_at=now,
         model=settings.model,
         endpoint_host=settings.endpoint_host,
-        stall_count=0 if stored is None else stored.stall_count,
-        first_run=None if stored is None else stored.first_run,
+        stall_count=0 if stored.state is CalibrationState.STALLED else stored.stall_count,
+        first_run=None if stored.state is CalibrationState.STALE else stored.first_run,
     )
 
 
@@ -856,8 +932,13 @@ async def _score_case(
     return CaseOutcome(case=case, kind=OutcomeKind.unanswered, verdict=None)
 
 
-def _ended(running: CalibrationRecord, tally: _Tally, *, member_min: int) -> CalibrationRecord:
-    """*running* rewritten with the run's measures and the state K5 assigns them."""
+def _ended(
+    running: CalibrationRecord, tally: _Tally, *, member_min: int, now: datetime,
+) -> CalibrationRecord:
+    """*running* rewritten with the run's measures and the state K5 assigns them.
+
+    An inconclusive run counts toward a stall; a scored one clears the count.
+    """
     costs = [meta.cost_usd for meta in tally.metas if meta.cost_usd is not None]
     measured = dataclasses.replace(
         running,
@@ -867,7 +948,10 @@ def _ended(running: CalibrationRecord, tally: _Tally, *, member_min: int) -> Cal
         wall_time_s=tally.wall_time_s,
     )
     if tally.timed_out or tally.unanswered > MAX_UNANSWERED:
-        return dataclasses.replace(measured, state=CalibrationState.INCONCLUSIVE)
+        return _counted_toward_stall(
+            dataclasses.replace(measured, state=CalibrationState.INCONCLUSIVE), now,
+        )
+    measured = dataclasses.replace(measured, stall_count=0)
     figures = score_run(tally.outcomes, member_min=member_min)
     if running.first_run is None:
         if evaluate(figures):
@@ -898,8 +982,35 @@ async def _write_end(
         ended.identity[:12], ended.attempt, ended.state,
         ', '.join(ended.failed_bounds) or 'none',
     )
-    finding = (
-        CalibrationFinding.adjudicator_calibration_failed
-        if ended.state is CalibrationState.FAIL else None
+    return CalibrationResult(record=ended, ran=True, finding=_finding(ended))
+
+
+async def mark_stale_if_drifted(
+    ledger: ReconLedgerStore,
+    record: CalibrationRecord,
+    resolved_model: str | None,
+    *,
+    now: datetime,
+) -> bool:
+    """Move *record*'s ``pass`` row to ``stale`` when a reply came from a model it was not scored on.
+
+    K5's drift rule; the next :func:`run_calibration` then scores a fresh first
+    run. A matching or absent model, or a record that is not a pass, writes
+    nothing. True only when the row moved.
+    """
+    if (
+        record.state is not CalibrationState.PASS
+        or resolved_model is None
+        or resolved_model in record.resolved_models
+    ):
+        return False
+    stale = dataclasses.replace(record, state=CalibrationState.STALE)
+    moved = await ledger.upsert_if_state(
+        stale.to_ledger_record(now=now), existing_state=CalibrationState.PASS.value,
     )
-    return CalibrationResult(record=ended, ran=True, finding=finding)
+    if moved:
+        logger.info(
+            'calibration %s: a reply came from %s, not %s; marked stale',
+            record.identity[:12], resolved_model, ', '.join(record.resolved_models) or 'none',
+        )
+    return moved

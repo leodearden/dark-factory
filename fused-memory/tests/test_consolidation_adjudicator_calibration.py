@@ -788,7 +788,7 @@ class TestCalibrationLifecycle:
     async def test_an_old_running_row_is_marked_crashed_and_the_next_call_runs(
         self, ledger,
     ) -> None:
-        first_run = _run(SEVEN_FALSE_KEEPS(_seven()))
+        first_run = _run(_false_keeps(7))
         seeded = _seeded(
             CalibrationState.RUNNING, started_at=NOW - CRASH_AGE - MINUTE, attempt=2,
             first_run=first_run, figures=first_run,
