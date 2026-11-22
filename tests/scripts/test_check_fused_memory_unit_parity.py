@@ -25,9 +25,11 @@ from setup_host_sections import (
     install_recording_systemctl,
     run_section,
     slice_section,
+    stub_bin_dir,
     systemctl_calls,
     usage_error_checker,
     write_checker,
+    write_stub,
 )
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -62,9 +64,8 @@ def _systemctl_is_a_recording_stub(
     """Resolve every `systemctl` in this module to the recording stub.
 
     main(--fix) shells out to `systemctl --user daemon-reload` through PATH;
-    without this fixture three --fix tests reloaded the host's real user
-    manager on every verify (measured, task 7803). The stub records each call
-    for systemctl_calls(tmp_path).
+    this keeps every test in the module off the host's real user manager and
+    records each call for systemctl_calls(tmp_path).
     """
     monkeypatch.setenv(
         "PATH",
@@ -655,6 +656,54 @@ def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path):
     installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
     mod.main(["--installed", str(installed), "--fix"])
     assert systemctl_calls(tmp_path) == [["--user", "daemon-reload"]]
+
+
+def test_main_fix_survives_a_failing_daemon_reload_with_tagged_warning(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture
+):
+    """A failing reload is reported, tagged line by line, and does not change the verdict.
+
+    The stub's multi-line stderr is foreign text the checker interpolates into
+    its warning, so every physical line of it must still carry the log tag.
+    """
+    mod = _load_checker()
+    write_stub(
+        stub_bin_dir(tmp_path),
+        "systemctl",
+        "printf 'first failure line\\nsecond failure line\\n' >&2\nexit 5\n",
+    )
+    installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    err_lines = [line for line in err.splitlines() if line.strip()]
+    assert all(line.startswith(f"[{mod.LOG_TAG}]") for line in err_lines), err
+    assert any(
+        "[warn] systemctl --user daemon-reload failed (exit 5)" in line
+        for line in err_lines
+    ), err
+    assert any(line.endswith("second failure line") for line in err_lines), err
+
+
+def test_main_fix_is_silent_when_systemctl_is_absent(
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """With no `systemctl` on PATH, --fix still succeeds and says nothing about the reload."""
+    mod = _load_checker()
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+    installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
+
+    rc = mod.main(["--installed", str(installed), "--fix"])
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert "systemctl" not in captured.out + captured.err
 
 
 # ---------------------------------------------------------------------------
