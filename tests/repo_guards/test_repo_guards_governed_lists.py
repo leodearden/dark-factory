@@ -46,7 +46,7 @@ DESIGN_INVARIANT_PINNED_SITES_LIST = governed_exceptions(
     'module instead of being flagged as an unregistered enumeration site.',
     sorted(design_invariants_consistency.PINNED_SITES),
     default=Debt(TaskRef(7136)),
-    default_covers=5,
+    default_covers=4,
 )
 
 
