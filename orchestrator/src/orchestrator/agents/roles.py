@@ -40,9 +40,7 @@ from orchestrator.review_issue_contract import IssueSeverity
 # referenced fused-memory/escalation/plan-tools tools, but the _invoke()-level
 # gate tuples forgot to list it, so its sessions were told to call tools that
 # did not exist and the Lever-C fast-path silently always fell through to the
-# architect).  jcodemunch tools intentionally have no prefix entry here — they
-# ride inside the 'orchestrator' MCP config but are not themselves a trigger
-# for requiring a family.
+# architect).
 _FAMILY_TOOL_PREFIXES: dict[str, tuple[str, ...]] = {
     'orchestrator': ('mcp__fused-memory__', 'mcp__escalation__'),
     'plan_tools': ('mcp__plan-tools__',),
@@ -116,10 +114,7 @@ class AgentRole:
         family, that family MUST be declared in mcp_families, or the role's
         sessions would be instructed (via system_prompt/allowed_tools) to
         call tools that are never actually wired in by _invoke(). The
-        reverse is fine — a role may declare a family with no matching tool
-        (e.g. judge declares 'orchestrator' purely to get an MCP config for
-        its jcodemunch tools, with no fused-memory/escalation tool in its
-        allowed_tools).
+        reverse is fine — a role may declare a family with no matching tool.
 
         Also guards the mcp_families Literal against drifting out of sync
         with _FAMILY_TOOL_PREFIXES: a family with no prefix-mapping entry
@@ -157,9 +152,6 @@ class AgentRole:
 
 # --- Tools offered to analysis roles (advisory under bypassPermissions; not read-only) ---
 _ANALYSIS_TOOLS = ['Read', 'Glob', 'Grep', 'Bash(git:*)']
-
-# --- jCodeMunch tools for structured code retrieval ---
-_JCODEMUNCH_TOOLS = ['mcp__jcodemunch__*']
 
 # --- Escalation tools available to roles that can escalate ---
 ESCALATE_INFO_TOOL = 'mcp__escalation__escalate_info'
@@ -359,8 +351,7 @@ _NO_TASK_STATUS_WRITE = ['mcp__fused-memory__set_task_status']
 # The server registers exactly one submit_* tool per --verdict-role
 # invocation (judge -> submit_completion_verdict, merger ->
 # submit_merge_disposition, else -> submit_review_verdict), so the
-# full-server wildcard grants precisely that one tool — same idiom as
-# _JCODEMUNCH_TOOLS above.
+# full-server wildcard grants precisely that one tool.
 _VERDICT_TOOLS = ['mcp__verdict-tools__*']
 
 _PLAN_CREATOR_TOOLS = [
@@ -937,7 +928,7 @@ You are a TDD architect. Your job is to analyze a task and produce a detailed, s
 1. **Read before planning.** Thoroughly explore the codebase to understand existing patterns, utilities, and conventions before writing your plan.
 2. **Verify premises before planning.** For any file or symbol the task description claims already exists (files to MODIFY, functions to extend, types to reuse), confirm it is actually present on the base branch:
    - Files: `Read` them or run `git ls-files -- <path>` in the worktree.
-   - Symbols/functions: use `mcp__jcodemunch__search_symbols` or grep.
+   - Symbols/functions: use `Grep`, or `git grep` through `Bash`.
    - Load-bearing symbols: for every existing symbol a step routes through, calls or extends — not only those the task names — read its signature and confirm the step's other requirements are expressible through it. A step that must pass something through a function with no parameter for it rests on a false premise, however present the function is.
 
    Based on what you find, choose ONE of the following exits. Do NOT call `create_plan` if any of the rejection paths apply.
@@ -1013,7 +1004,7 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
 - If the task requires touching files beyond what was originally specified, list ALL needed files in the `files` parameter.
 """ + CODE_QUALITY_GUIDANCE + ARCHITECT_CODE_QUALITY_ADDENDUM + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
+    allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_PLAN_CREATOR_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
@@ -1066,7 +1057,7 @@ The workflow for each step is:
 - Run tests frequently to verify your work.
 - Prefer minimal, targeted changes. Don't refactor surrounding code.
 """ + IMPLEMENTER_DEVIATION_DOCTRINE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=10.0,
@@ -1109,7 +1100,7 @@ git add -- .
 - Read the failing test/code carefully before making changes.
 - If the failure reveals a fundamental design issue, note it and stop rather than applying band-aids.
 """ + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_JCODEMUNCH_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, *_PLAN_STATUS_TOOLS, *_PLAN_DEVIATION_TOOLS, *_SCOPE_REQUEST_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
@@ -1418,17 +1409,14 @@ Submit your verdict by calling submit_completion_verdict(complete,
 reasoning, uncovered_plan_steps, substantive_work). Do not print the
 verdict as prose or JSON — the tool call is how your verdict is recorded.
 """,
-    allowed_tools=[*_ANALYSIS_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
+    allowed_tools=[*_ANALYSIS_TOOLS, *_VERDICT_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='sonnet',
     default_budget=0.50,
     default_max_turns=15,
-    # No fused-memory/escalation tool in allowed_tools — 'orchestrator' is
-    # declared purely so _invoke() attaches an MCP config for the
-    # jcodemunch tools above (one-way lower bound, see __post_init__).
     # 'verdict_tools' is declared because of the submit_completion_verdict
     # grant above (PRD task β, task 2482).
-    mcp_families=frozenset({'orchestrator', 'verdict_tools'}),
+    mcp_families=frozenset({'verdict_tools'}),
 )
 
 
@@ -1504,7 +1492,7 @@ git add -- .
 - Read both sides of every conflict carefully.
 - If the conflict involves architectural changes where both sides restructured the same code differently, call `submit_merge_disposition(blocked=true, reason="<why>")` — don't attempt a creative merge.
 """ + _ESCALATION_INSTRUCTIONS,
-    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_JCODEMUNCH_TOOLS, *_VERDICT_TOOLS],
+    allowed_tools=['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', *_ESCALATION_TOOLS, *_VERDICT_TOOLS],
     disallowed_tools=[*_NO_TASK_STATUS_WRITE],
     default_model='opus',
     default_budget=5.0,
@@ -2034,7 +2022,6 @@ convert it into a task candidate and then close it:
         # permission denial, with the fetch fallback already forbidden.
         'mcp__escalation__merge_status',
         *_STEWARD_MEMORY_TOOLS,
-        *_JCODEMUNCH_TOOLS,
     ],
     default_model='opus',
     default_budget=5.0,
@@ -2154,7 +2141,6 @@ or expired tickets as a follow-up escalation):
         'Read', 'Glob', 'Grep', 'Bash',
         *_DEEP_REVIEW_TOOLS,
         ESCALATE_INFO_TOOL,
-        *_JCODEMUNCH_TOOLS,
     ],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -2251,7 +2237,6 @@ git add -- .
         'Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash',
         *_ESCALATION_TOOLS,
         *_MEMORY_TOOLS,
-        *_JCODEMUNCH_TOOLS,
         *_PLAN_CREATOR_TOOLS,
         *_PLAN_STATUS_TOOLS,
     ],
