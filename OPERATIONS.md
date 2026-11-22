@@ -3478,9 +3478,10 @@ and every other name stay, and the listing shows them under `keep`.
      --reviewed ~/litter-listing.json --record ~/litter-record.json
    ```
 
-   It deletes one graph at a time, `--pace-seconds` apart (default 10), and
-   only graphs in the listing's `delete` section that are still litter and
-   still present. Litter that appeared after the listing is reported in the
+   It refuses a listing whose `delete` section names a graph that is not on
+   `LITTER_PATTERNS`. Otherwise it deletes one graph at a time,
+   `--pace-seconds` apart (default 10), and only graphs in that section that
+   are still present. Litter that appeared after the listing is reported in the
    record's `unreviewed`, not deleted, and reviewed graphs already gone in its
    `already_absent`. The record also holds every graph's node count before the
    run and each kept graph's count after it.
@@ -3489,11 +3490,23 @@ and every other name stay, and the listing shows them under `keep`.
    | Exit | Meaning | Next |
    |---|---|---|
    | 0 `ok` | Every reviewed graph still present was deleted, and no kept graph shrank. | Step 7. |
-   | 1 `failed` | No connection, or a Redis or file error. A record written before the error has `outcome: failed` and names what was deleted. | If the record exists, first compare the server's current `run_id` (`docker exec docker-falkordb-1 redis-cli INFO server \| grep run_id`) with the record's `run_id_before`. If they differ, or the server does not answer, treat the run as row 4 (a crash), not as a cause to fix and list again. Otherwise fix the cause, then list again. If no record was written, nothing was deleted. |
+   | 1 `failed` | No connection, a Redis or file error, or an interrupt (Ctrl-C). A record written before the error has `outcome: failed` and names what was deleted. The `deleted N graphs` count on stderr is right even when the last record write failed. | If the record exists, first compare the server's current `run_id` (`docker exec docker-falkordb-1 redis-cli INFO server \| grep run_id`) with the record's `run_id_before`. If they differ, or the server does not answer, treat the run as row 4 (a crash), not as a cause to fix and list again. Otherwise fix the cause, then list again. If no record was written, nothing was deleted. |
    | 2 | A usage error. | Fix the arguments. |
-   | 3 `refused` | The listing is unreadable, or was taken on another target. Nothing was deleted. | List again against this target. |
+   | 3 `refused` | The listing is unreadable, was taken on another target, or names under `delete` a graph that is not on `LITTER_PATTERNS` (stderr names it). Nothing was deleted. | List again against this target. A graph off the allowlist, such as `default_db`, is deleted only after a reviewed change adds it to `LITTER_PATTERNS`. |
    | 4 `server_restarted` | The server's `run_id` changed during the run, so the run stopped. The record's `run_id_after` is the new id, and its `after` is empty when the restarted server could not yet be counted. | Treat it as a crash: read `docker logs --tail 50 docker-falkordb-1`, then, once `docker exec docker-falkordb-1 redis-cli INFO persistence` reads `loading:0`, take the counts with `list` and compare them with the record's `before`. Do not run `delete` again until the crash is understood. |
-   | 5 `kept_graph_shrank` | A kept graph's node count fell during the run; the record's `shrank` names it. | Investigate before unhalting. |
+   | 5 `kept_graph_shrank` | A kept graph's node count fell during the run; the record's `shrank` names it. With no restart, `GRAPH.DELETE` of a litter graph cannot touch another graph, so the likely cause is live fused-memory work: entity merges and deletes remove nodes. | Count the nodes fused-memory removed since `delete` started (below). If they cover the drop, the shrink is that work. Otherwise treat it as damage. Either way, investigate before unhalting. |
+
+   Each entity merge or delete logs one `delete_entity_node: deleted node=`
+   line, which does not name the graph. To count them for row 5:
+
+   ```bash
+   journalctl --user -u fused-memory --since '<when delete started>' --no-pager -o cat -q \
+     --grep 'delete_entity_node: deleted node=' | wc -l
+   ```
+
+   A record whose `outcome` is `null` comes from a run that was killed before
+   it finished, for example by a closed terminal. Its `deleted` names what was
+   removed, but may miss the last delete. Treat it as row 1.
 
 7. **Unhalt the merge queue** (`mcp__escalation__unhalt_merge_queue`).
 8. **Remove the set-aside copy** once a `list` run after two lane passes shows
