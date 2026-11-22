@@ -116,6 +116,7 @@ class TestBuilderRendersTheLiveRecord:
                 e.to_dict() for e in queue.get_by_task(steward.task_id, status='pending')
             ],
             worktree=steward.worktree,
+            handled=(),
         )
         assert prompt == steward.briefing.build_steward_initial_prompt.return_value
 

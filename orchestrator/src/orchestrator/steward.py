@@ -648,6 +648,7 @@ class TaskSteward:
                 escalation=escalation.to_dict(),
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
+                handled=(),
             )
         else:
             prompt = await self.briefing.build_steward_continuation_prompt(
@@ -872,6 +873,7 @@ class TaskSteward:
                 ).to_dict(),
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
+                handled=(),
             )
 
         # Route resolution (task η): resolve model/effort/max_turns through the

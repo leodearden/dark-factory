@@ -510,6 +510,7 @@ class TestStewardInvokeWithCapRetryWiring:
             escalation={**live.to_dict(), 'detail': esc.detail, 'summary': esc.summary},
             pending_escalations=[e.to_dict() for e in fresh_pending],
             worktree=steward.worktree,
+            handled=(),
         )
         assert result == mock_briefing.build_steward_initial_prompt.return_value
 
