@@ -2,8 +2,9 @@
 
 Three populations are pinned. Task 6036 re-anchored descriptors on BOTH sides: the
 producer task's ``metadata.delivered_checks`` entry in tasks.db AND the sidecar
-the stamper copies it from. Tasks 5256 and 6209 resynced sidecars, sidecar-only, to task
-records that had already been repaired. CI can never see the tasks.db half, so
+the stamper copies it from; task 9538 did the same for task 8461's file-existence
+gate, which a docstring had been satisfying as a grep. Tasks 5256 and 6209
+resynced sidecars, sidecar-only, to task records that had already been repaired. CI can never see the tasks.db half, so
 either way these pins guard the SIDECAR half: a stale sidecar would be
 re-stamped over the repaired record by the next re-decompose. Every resynced
 producer is done, so the resynced rows are also evaluated at HEAD through the
@@ -37,7 +38,15 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
-# Task 6036: re-anchored on both sides.
+# Task 9538: task 8461's path gate, pinned below and behind the fixture-tree tests.
+_QUALITY_BOUNDARY = (
+    "plans/quality-dashboard-prd.capability-manifest.yaml",
+    8461, "ε", "boundary-test-for-quality-payload",
+    {"kind": "path", "pattern": None, "expect": "present",
+     "paths": ["dashboard/tests/js/boundary_quality.test.mjs"]},
+)
+
+# Tasks 6036 and 9538: re-anchored on both sides.
 _REANCHORED = [
     (
         "docs/prds/recurring-deterministic-tasks.capability-manifest.yaml",
@@ -63,6 +72,7 @@ _REANCHORED = [
         {"kind": "path", "pattern": None, "expect": "present",
          "paths": ["scripts/eval_bootstrap_smoke.sh"]},
     ),
+    _QUALITY_BOUNDARY,
 ]
 
 # Tasks 5256 and 6209: sidecar resynced to the already-repaired task record.
@@ -169,6 +179,20 @@ def _kappa_check():
         f"{relpath} label {label} capability {capability} is kind={check.kind!r} "
         f"expect={check.expect!r}, not path/absent: either the vacuous "
         f"scripts/verify-pipeline-paths.txt grep is back or the check changed kind."
+    )
+    return check
+
+
+def _quality_boundary_check():
+    relpath, _task_id, label, capability, _expected = _QUALITY_BOUNDARY
+    check = _the_one_capability(
+        checkout_root_or_skip(), relpath, label, capability).delivered_check
+
+    assert check is not None
+    assert check.kind == "path" and check.expect == "present", (
+        f"{relpath} label {label} capability {capability} is kind={check.kind!r} "
+        f"expect={check.expect!r}, not path/present: either the content grep for "
+        f"the test file's name is back or the check changed kind."
     )
     return check
 
@@ -288,4 +312,53 @@ def test_kappa_gate_opens_once_only_the_contract_primitives_remain(tmp_path):
     assert outcome is CheckOutcome.PASS, (
         f"κ's delivered_check evaluates {outcome.value} on a tree holding only "
         f"{_CONTRACT_PRIMITIVES}; a retained primitive must not be in the gate."
+    )
+
+
+@pytest.mark.parametrize(
+    "files,expected",
+    [
+        pytest.param(
+            {"dashboard/tests/test_boundary_js.py":
+                '"""``js/boundary_quality.test.mjs`` holds their client half."""\n'},
+            CheckOutcome.FAIL, id="prose-only",
+        ),
+        pytest.param(
+            {"dashboard/tests/js/boundary_quality.test.mjs":
+                "import test from 'node:test';\n"},
+            CheckOutcome.PASS, id="file-only",
+        ),
+    ],
+)
+def test_quality_boundary_gate_follows_the_test_file_not_the_prose(tmp_path, files, expected):
+    """esc-8461-1's two failure modes, inverted: prose naming the file must not
+    deliver, and the file must deliver whatever it says."""
+    check = _quality_boundary_check()
+    repo = committed_repo(tmp_path / "dashboard", files)
+
+    outcome = evaluate_path_at_tree(
+        list(check.paths), expect=check.expect, repo_root=repo, ref="HEAD",
+    )
+    assert outcome is expected, (
+        f"task 8461's delivered_check evaluates {outcome.value} on a tree holding "
+        f"only {sorted(files)}; it must follow the test file's existence, not any "
+        f"mention of its name."
+    )
+
+
+def test_quality_boundary_gate_delivers_at_head():
+    """Producer 8461 is done, so its sidecar path gate must deliver at HEAD."""
+    relpath, task_id, label, capability, _expected = _QUALITY_BOUNDARY
+    check = _quality_boundary_check()
+
+    outcome = evaluate_path_at_tree(
+        list(check.paths), expect=check.expect, repo_root=checkout_root_or_skip(),
+        ref="HEAD",
+    )
+    assert outcome is CheckOutcome.PASS, (
+        f"{relpath} label {label} capability {capability} (task {task_id}) evaluates "
+        f"{outcome.value} at HEAD, but its producer is done, so its sidecar "
+        f"delivered_check must deliver. If the test file moved, repath BOTH halves "
+        f"(the task record via update_task, the sidecar here) and update "
+        f"_QUALITY_BOUNDARY per the MAINTENANCE CONTRACT."
     )
