@@ -11,8 +11,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, NamedTuple, Protocol, TypeGuard
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeGuard
 from urllib.parse import urlsplit
+
+if TYPE_CHECKING:
+    from openai.types.responses import ResponseFormatTextConfigParam
 
 
 class TokenUsage(NamedTuple):
@@ -48,7 +51,7 @@ class ResponsesCall(Protocol):
         model: str,
         instructions: str,
         user_content: str,
-        text_format: Mapping[str, Any],
+        text_format: ResponseFormatTextConfigParam,
         max_output_tokens: int,
         timeout: float,
         reasoning_effort: str | None,
@@ -96,7 +99,7 @@ async def call_openai_responses(
     model: str,
     instructions: str,
     user_content: str,
-    text_format: Mapping[str, Any],
+    text_format: ResponseFormatTextConfigParam,
     max_output_tokens: int,
     timeout: float,
     reasoning_effort: str | None,

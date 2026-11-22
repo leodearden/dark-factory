@@ -310,7 +310,7 @@ class TestParseVerdict:
             ('[1, 2]', 'object'),
             (json.dumps({'decision': 'proceed', 'keep_member_ids': ['a', 'b'], 'claim': None,
                          'reason_code': 'same_lesson'}), 'reason'),
-            (_reply(extra='x'), 'extra'),
+            (_reply(confidence=0.9), 'confidence'),
             (_reply(decision='merge'), 'merge'),
             (_reply(reason_code='cross_category'), 'cross_category'),
             (_reply(keep_member_ids=['a', 'zz']), 'zz'),
@@ -358,7 +358,7 @@ class TestOutputSchema:
     def test_text_format_is_strict_json_schema(self) -> None:
         assert set(TEXT_FORMAT) == {'type', 'name', 'strict', 'schema'}
         assert TEXT_FORMAT['type'] == 'json_schema'
-        assert TEXT_FORMAT['strict'] is True
+        assert TEXT_FORMAT.get('strict') is True
         assert isinstance(TEXT_FORMAT['name'], str) and TEXT_FORMAT['name']
         assert TEXT_FORMAT['schema'] == OUTPUT_SCHEMA
 
