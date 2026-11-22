@@ -5390,7 +5390,10 @@ below tells the two apart. A record the session reaper marked orphaned
 (exit_code 200, `orchestrator/src/orchestrator/session_reaper.py::ORPHAN_EXIT_CODE`)
 that no session hook ever bound (no `claude_session_id` or
 `claude_launch_session_id`) is not checked, because nothing shows its
-session started.
+session started. The unit's output line counts such records ("N unbound
+orphan record(s) not checked") without changing the exit code. A sudden rise
+in that count means hooks stopped binding session ids, which would also hide
+lost transcripts from sibling-mode spawns.
 
 **Why no `--check-preventer`.** With the flag, the detector also exits 1 when `skills/spawn/spawn-claude.sh` stops
 exporting `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`. Task 5859 decided to

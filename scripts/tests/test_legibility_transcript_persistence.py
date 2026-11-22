@@ -245,6 +245,56 @@ def test_run_check_does_not_alarm_on_unbound_orphan(tmp_path):
     assert poster.calls == []
 
 
+def test_run_check_reports_count_of_skipped_unbound_orphans(tmp_path):
+    fleet = tmp_path / "fleet"
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    orphan = session_reaper.ORPHAN_EXIT_CODE
+    in_window = FIXED_NOW - timedelta(hours=1)
+    prompt = "Investigate the flaky merge on task 2500 and report back."
+    member_cwd = "/home/leo/src/dark-factory"
+
+    # (COUNT) two in-window unbound orphans in this project.
+    for slug in ("member-orphan-1", "member-orphan-2"):
+        _write_session_record(
+            fleet, slug, status=session_records.Status.EXITED,
+            prompt=prompt, cwd=member_cwd, start_ts=in_window, exit_code=orphan,
+        )
+    # (NOT COUNTED) another project's unbound orphan.
+    _write_session_record(
+        fleet, "foreign-orphan", status=session_records.Status.EXITED,
+        prompt=prompt, cwd="/home/leo/src/reify", start_ts=in_window, exit_code=orphan,
+    )
+    # (NOT COUNTED) an unbound orphan outside the lookback window.
+    _write_session_record(
+        fleet, "old-orphan", status=session_records.Status.EXITED,
+        prompt=prompt, cwd=member_cwd, start_ts=FIXED_NOW - timedelta(hours=72),
+        exit_code=orphan,
+    )
+    config_path = _write_config(tmp_path, cwd_prefixes=[member_cwd])
+
+    result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=_RecordingPoster(),
+    )
+
+    assert result.exit_code == 0
+    assert result.skipped_unbound_orphans == 2
+    assert "2 unbound orphan record(s) not checked" in result.reason
+
+
+def test_run_check_reason_omits_orphan_clause_when_none_skipped(tmp_path):
+    fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=False)
+
+    result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=_RecordingPoster(),
+    )
+
+    assert result.skipped_unbound_orphans == 0
+    assert "unbound orphan" not in result.reason
+
+
 # ---------------------------------------------------------------------------
 # step-3/4: STRONG prompt-prefix matching (find_matching_transcript)
 # ---------------------------------------------------------------------------
