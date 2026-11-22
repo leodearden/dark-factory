@@ -62,6 +62,7 @@ Status = Literal['ok', 'source_missing', 'unreadable']
 STATUSES: tuple[Status, ...] = ('ok', 'source_missing', 'unreadable')
 
 NO_OPEN_ESCALATION = 'blocked with no open escalation'
+INACTIVE_REASON = 'unit inactive, no activity'
 UNKNOWN_OPEN_ESCALATIONS = 'open escalations unknown: no queue of this project was read'
 
 SHADOW_ONLY = (
@@ -254,6 +255,8 @@ class PreparerTrial:
 
 @dataclass(frozen=True)
 class ProjectState:
+    """One project's measurements; whether it is active is derived from three of them, never stored."""
+
     project: str
     root: str
     landed: Measurement[int]
@@ -261,6 +264,22 @@ class ProjectState:
     spend: Measurement[tuple[ModelRoleRow, ...]]
     standing_policy: Measurement[StandingPolicyRulings]
     trial: Measurement[PreparerTrial]
+    unit_active: Measurement[bool]
+    pause_reason: Measurement[str | None]
+    new_escalations: Measurement[int]
+
+    @property
+    def inactive_reason(self) -> str | None:
+        """INACTIVE_REASON only when all three activity signals were read and show none; an unread one keeps it active."""
+        signals = (self.unit_active, self.landed, self.new_escalations)
+        if not all(signal.ok for signal in signals):
+            return None
+        idle = not self.unit_active.value and self.landed.value + self.new_escalations.value == 0
+        return INACTIVE_REASON if idle else None
+
+    @property
+    def active(self) -> bool:
+        return self.inactive_reason is None
 
 
 def project_queue_dirs(project_root: Path | str) -> tuple[str, ...]:
@@ -459,6 +478,7 @@ def measure_projects(
     *,
     window: Window,
     now: datetime,
+    units: OrchestratorUnits,
 ) -> Mapping[str, ProjectState]:
     """Every per-project measurement, keyed by canonical project token; a root with no stores is flagged, never dropped.
 
@@ -471,7 +491,7 @@ def measure_projects(
     for root in project_roots:
         by_project[fold_project_token(Path(root).name)].append(root)
     return MappingProxyType({
-        project: _measure_project(project, roots[0], _fold_collisions(project, roots), pending, window, now)
+        project: _measure_project(project, roots[0], _fold_collisions(project, roots), pending, window, now, units)
         for project, roots in by_project.items()
     })
 
@@ -571,6 +591,7 @@ def _measure_project(
     pending: Mapping[str, PendingRecords],
     window: Window,
     now: datetime,
+    units: OrchestratorUnits,
 ) -> ProjectState:
     """Each measurement guarded by ``unreadable_if_raises`` and carrying *noted*, the root-level shortfalls."""
     queues = _measured_queues(root)
@@ -591,6 +612,10 @@ def _measure_project(
         standing_policy=guarded('escalation_queue', queue_source, StandingPolicyRulings(_fold_reports((), window)),
                                 lambda: standing_policy_rulings(queues, window, now=now)),
         trial=guarded('escalation_queue', queue_source, _trial(()), lambda: preparer_trial(queues, window, now=now)),
+        unit_active=guarded('orchestrator_units', str(root), False, lambda: unit_active(root, units, now=now)),
+        pause_reason=guarded('runs_db', str(runs_db), None, lambda: scheduler_pause(runs_db, now=now)),
+        new_escalations=guarded('escalation_queue', queue_source, 0,
+                                lambda: new_escalations(queues, window, now=now)),
     )
 
 

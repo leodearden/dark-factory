@@ -52,6 +52,7 @@ from typing import Any, Literal
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'orchestrator' / 'src'))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 
+import orchestrator_projects
 from _task_db_scan import discover_project_roots
 from orchestrator.decision_registry import decisions_dir
 from orchestrator.digest import ModelRoleRow
@@ -168,6 +169,7 @@ def build(
     trigger_state_path: Path,
     window: Window,
     now: datetime,
+    units: fleet_state.OrchestratorUnits,
 ) -> ReturnBriefDocument:
     """Read every store once, number the open items as a recommend-only sitting seeded from *previous_ledger*, and measure the fleet."""
     sources = prepare_sitting.read_sources(
@@ -195,7 +197,8 @@ def build(
         host_alarms=fleet_state.host_alarms(sources.inventory.pending, now=now),
         sitting=sitting,
         preparation=_freshness(sources, sitting),
-        projects=fleet_state.measure_projects(project_roots, sources.inventory.pending, window=window, now=now),
+        projects=fleet_state.measure_projects(project_roots, sources.inventory.pending, window=window, now=now,
+                                              units=units),
         closes=fleet_state.unreadable_if_raises(
             'decision_registry', str(decisions_dir(decisions_root)), AutonomousCloses((), (), 0),
             lambda: fleet_state.autonomous_closes(decisions_root, window, now=now), now=now,
@@ -244,6 +247,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             trigger_state_path=args.trigger_state,
             window=Window.trailing(now, days=args.window_days),
             now=now,
+            units=fleet_state.OrchestratorUnits(
+                orchestrator_projects.scan_units(args.units_dir), fleet_state.systemctl_active_state),
         )
     except ValueError as exc:
         print(f'return brief not written: {exc}', file=sys.stderr)
@@ -604,6 +609,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--trigger-state', type=Path, default=DEFAULT_TRIGGER_STATE,
                         help="the sitting trigger evaluator's last-run file (default: trigger_state.DEFAULT_PATH)")
     parser.add_argument('--window-days', type=_positive_days, default=1.0)
+    parser.add_argument('--units-dir', type=Path, default=orchestrator_projects.DEFAULT_UNITS_DIR,
+                        help='where the orchestrator units are read from, to say whether each root is running '
+                             f'(default: {orchestrator_projects.DEFAULT_UNITS_DIR})')
     parser.add_argument('--now', type=prepare_sitting.parse_instant, help='ISO-8601 instant to run at (default: now)')
     return parser
 
