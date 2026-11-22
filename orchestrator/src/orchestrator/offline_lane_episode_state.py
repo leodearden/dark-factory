@@ -537,7 +537,10 @@ class PassEffect:
 
     @classmethod
     def from_json(cls, payload: object) -> PassEffect:
-        """Strict on every key but the two debt fields, which an effect written before task 6865 lacks."""
+        """Strict on every key but the two debt fields, which an effect written before task 6865 lacks.
+
+        Both eras read with () for the debts; :func:`effect_records_debts` tells them apart.
+        """
         fields = _Fields(payload, 'pass effect')
         return cls(
             tests_counted=fields.strings('tests_counted'),
@@ -552,6 +555,11 @@ class PassEffect:
             debts_offered=tuple(_offered_from_json(item) for item in fields.objects('debts_offered', absent=[])),
             debts_undecided=fields.strings('debts_undecided', absent=[]),
         )
+
+
+def effect_records_debts(block: object) -> bool:
+    """Every effect block the lane wrote from task 6865 (epsilon2) on carries both debt fields, and none before it did."""
+    return isinstance(block, Mapping) and 'debts_offered' in block and 'debts_undecided' in block
 
 
 def _ended_from_json(payload: object) -> EndedEpisode:
