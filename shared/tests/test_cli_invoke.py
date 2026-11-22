@@ -19,6 +19,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _transcript_fixtures import assistant_record, bash_launch, bg_launch_result
 
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 from shared.cli_invoke import (
@@ -5913,31 +5914,16 @@ def _sigkill_proc() -> MagicMock:
 
 
 # Two assistant turns served by a real model, the second of which launches a
-# background Bash command that is never reaped — so ONE transcript yields all
-# three normal-exit signals at once: transcript_turns == 2,
+# background Bash command the CLI confirms and nothing reaps — so ONE transcript
+# yields all three normal-exit signals at once: transcript_turns == 2,
 # ended_awaiting_background is True, model_id == 'claude-opus-5'.
 _MODEL_AND_ABANDONED_LAUNCH_RECORDS = [
     {'type': 'user', 'message': {'role': 'user', 'content': 'go'}},
-    {
-        'type': 'assistant',
-        'message': {
-            'model': 'claude-opus-5',
-            'role': 'assistant',
-            'content': [{'type': 'text', 'text': 'kick off the long build'}],
-        },
-    },
-    {
-        'type': 'assistant',
-        'message': {
-            'model': 'claude-opus-5',
-            'role': 'assistant',
-            'content': [{
-                'type': 'tool_use',
-                'name': 'Bash',
-                'input': {'command': './long-build.sh', 'run_in_background': True},
-            }],
-        },
-    },
+    assistant_record(
+        [{'type': 'text', 'text': 'kick off the long build'}], model='claude-opus-5'
+    ),
+    assistant_record([bash_launch(command='./long-build.sh')], model='claude-opus-5'),
+    bg_launch_result(),
 ]
 
 
