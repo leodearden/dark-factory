@@ -933,12 +933,11 @@ target.
 
 **Protection.** A `cancelled` or `done` dependency counts as satisfied, so one
 status write on the holder would release the whole held backlog at once.
-A `deferred` holder still holds, but it releases every held follow-up when
-it lands back on `pending`, because promotion (task 8418) fires on that
-landing (decision 14).
 
 - `set_task_status` refuses `done`, `cancelled` and `deferred` on the holder
-  unless `release_holder` is the literal `true`. Releasing is a human act.
+  unless `release_holder` is the literal `true`. Releasing is a human act,
+  and it promotes every held follow-up at once (below), whichever of the
+  three statuses the holder takes.
 - `update_task` refuses a write that strips `followup_holder`, strips
   `deferred_watch` or sets `trigger_met` on the holder. That covers a
   `replace` that leaves either key out; an unchanged echo passes.
@@ -950,19 +949,57 @@ holder's `held_count`, the number of active tasks that depend on it, and a
 `followup_holder_protected` event. `release_holder` is ignored on any task
 other than the holder.
 
-Until promotion lands (task 8418), a cancel-release has a side effect. Every
-held follow-up depends on the holder, so targeted reconciliation's
-cancelled-dependency sweep
-(`fused-memory/src/fused_memory/reconciliation/targeted.py::TargetedReconciler._sweep_cancelled_descendants`)
-reads each one as an ambiguous dependent. It files one L1 escalation per
-held follow-up while the project's orchestrator is live, and sets each one
-`blocked` when it is stopped.
-
 **Promotion** removes a held task's holder edge and stamps
-`followup_hold.promoted {by, at, ref}`, where `by` is one of `dependent`,
-`citation`, `combine`, `pack`, `rider` or `human`. It belongs to task 8418;
-see `plans/follow-up-filing-shape-prd.md` §3 decision 14 and §4.3. Held does
-not expire: there is no age-out (decision 15).
+`followup_hold.promoted {by, at, ref}` in one backend write
+(`followup_hold.py::promote`), then journals one
+`followup_promoted {task_id, by, ref}` event. It never writes
+`metadata.pending_since`, so a promoted task keeps its wait age. The
+contract is `plans/follow-up-filing-shape-prd.md` §3 decision 14 and §4.3.
+Every trigger runs under the project's write lock:
+
+- **An edge from a pending, unheld task** (`by: dependent`, `ref`: the
+  dependent's id): `add_dependency`, a task born with the edge through
+  `submit_task`, or an `update_task` `dependencies` replacement. An edge
+  between two held tasks promotes neither.
+- **A landing on `pending` from `deferred`** promotes the held tasks the
+  landing task depends on, the same way: `commit_planning` of a batch task,
+  a plain `set_task_status`, or the deferral-expiry sweep, which flips
+  through the same chokepoint. A held task landing back on `pending` stays
+  held.
+- **A citation** (`by: citation`, `ref`: the first finding key, else the PRD
+  path): an `update_task` on a held task whose metadata payload carries
+  `x_finding_key` or `prd_path`, the keys that keep a filing out of the hold.
+- **A combine** (`by: combine`, `ref`: the candidate's ticket id): the
+  curator combining a candidate the hold rule does not match into a held
+  target. A candidate the rule matches leaves its held target held.
+- **A human removal of the holder edge** (`by: human`):
+  `remove_dependency(task, holder)` (`ref: remove_dependency`), or an
+  `update_task` `dependencies` replacement that drops the holder id
+  (`ref: update_task`). The replacement is refused for every machine actor
+  class (orchestrator, harness, steward, reconciliation, escalation,
+  deterministic) with error `followup_holder_edge_strip_refused`, and
+  nothing is written: keep the holder id in the list. Removing any other
+  edge of a held task leaves it held.
+- **The explicit release** (`by: human`, `ref: release_holder`):
+  `set_task_status(holder, done|cancelled|deferred, release_holder=True)`
+  promotes every active held follow-up before targeted reconciliation runs,
+  so the cancelled-dependency sweep finds no held dependents.
+
+**The closure.** Promoting a task also promotes every held task it depends
+on, transitively and each task once, with `by: dependent` and `ref` the id
+of the promoted task that depends on it.
+
+**Guards.** `followup_hold.py::register_promotion_guard` adds a function
+that every promotion consults with the live row, the cause and the ref. A
+`PromotionDeferral {guard, reason}` answer leaves that task held, journals
+`followup_promotion_deferred {task_id, by, ref, guard, reason}` and promotes
+none of its dependencies. A human removal that a guard defers returns error
+`followup_promotion_deferred` with the guard and reason, and writes nothing.
+None is registered by default.
+
+`by` is one of `dependent`, `citation`, `combine`, `pack`, `rider` or
+`human`; the packer and riders call `followup_hold.py::promote` themselves.
+Held does not expire: there is no age-out (decision 15).
 
 ---
 

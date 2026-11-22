@@ -17,6 +17,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### Held follow-ups are promoted (task 8418)
+
+A held follow-up now leaves the hold by promotion: one write drops its holder
+edge and stamps `followup_hold.promoted {by, at, ref}`, and every held task it
+depends on is promoted with it. `pending_since` is left as it is. See
+`docs/task-authoring.md` §3.4.
+
+- Triggers: an edge from a pending, unheld task (`add_dependency`, a
+  born-with dependency, an `update_task` replacement); a landing on `pending`
+  from `deferred` (`commit_planning`, `set_task_status`, the deferral sweep);
+  a citation (`x_finding_key` or `prd_path` written by `update_task`); a
+  combine of a candidate outside the hold rule; a human
+  `remove_dependency(task, holder)` or replacement dropping the holder id; and
+  `release_holder=True`, which promotes every active held follow-up before
+  targeted reconciliation runs, so a cancel-release no longer files one L1
+  per held follow-up.
+- Two new event types: `followup_promoted {task_id, by, ref}` and
+  `followup_promotion_deferred {task_id, by, ref, guard, reason}`.
+- Two new refusals: `followup_holder_edge_strip_refused`, for a machine-role
+  `update_task` replacement that drops the holder edge, and
+  `followup_promotion_deferred`, for a human removal a guard defers.
+- A promotion guard hook, `followup_hold.py::register_promotion_guard`; none
+  is registered by default.
+
 #### Low follow-ups are held behind a per-project follow-up holder (task 8417)
 
 `submit_task` now files a low or polish agent follow-up or reviewer suggestion

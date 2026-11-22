@@ -475,6 +475,8 @@ allowlist test greps real imports.
 2. **`update_task` replacement lists.** Decision 14 records a stripped holder edge as
    `by=human, ref='update_task'`; ζ decides whether the replacement list that strips it must also
    be rejected when the caller is an agent role (it is a release by side effect).
+   *Resolved in ζ (task 8418):* refused for every non-human actor class with
+   `followup_holder_edge_strip_refused`; a human replacement promotes `by=human, ref='update_task'`.
 3. **6000-character text term in `narrow`.** The data supports text length at the large end only
    (PRD1-G §2.3). Keep v1 as specified; θ's confusion table decides whether v2 drops it.
 4. **`undeclared` as its own band** (0 files lands median 40 non-test lines but 22% over 300). Kept in

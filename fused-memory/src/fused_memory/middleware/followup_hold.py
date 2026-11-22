@@ -312,9 +312,9 @@ def protected_status(
 ) -> HolderProtection | None:
     """Decision 13: a holder goes ``done``, ``cancelled`` or ``deferred`` only on release.
 
-    Done or cancelled settles every held follow-up's holder edge at once; deferred releases them all
-    when the holder lands back on ``pending`` (decision 14). Only a literal ``True`` releases: a
-    whole-backlog release is a human act, never a truthy accident.
+    Each of the three releases every held follow-up at once: the release promotes them all at the
+    act (:func:`releases_holder`, decision 14). Only a literal ``True`` releases: a whole-backlog
+    release is a human act, never a truthy accident.
     """
     if release_holder is True or status not in PROTECTED_STATUSES or not is_holder(task):
         return None
@@ -387,11 +387,10 @@ def protected_update(
 
 
 _HOLDER_PROTECTED_HINT = (
-    'This task is its project\'s follow-up holder: every held low follow-up depends on it. Done or '
-    'cancelled releases every held follow-up at once, and deferred releases them all when the '
-    'holder lands back on pending. That release is a human act: pass release_holder=True to '
-    'set_task_status. update_task may not strip followup_holder or deferred_watch, nor set '
-    'trigger_met. See docs/task-authoring.md §3.4.'
+    'This task is its project\'s follow-up holder: every held low follow-up depends on it. Done, '
+    'cancelled or deferred releases every held follow-up at once, promoting each by human. That '
+    'release is a human act: pass release_holder=True to set_task_status. update_task may not '
+    'strip followup_holder or deferred_watch, nor set trigger_met. See docs/task-authoring.md §3.4.'
 )
 
 
