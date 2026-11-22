@@ -18,8 +18,9 @@ import yaml
 from _fastmcp_tool_result import tool_result_dict
 from _fm_git_repos import _init_git_repo, git_stdout
 from _hermetic_task_stack import hermetic_task_stack
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)]
 
 _PRD_PATH = 'plans/foo-prd.md'
 _SIDECAR_REL = 'plans/foo-prd.capability-manifest.yaml'
