@@ -47,6 +47,11 @@ class VerifyPort(Protocol):
     ``run_dry_run_unblock``), so the wiring is a rename, not a translation.
     """
 
+    @property
+    def verify_cache(self) -> CacheAccess | None:
+        """The dispatcher's verify-result cache that a LOCAL merge gate through this port joins; None keeps every verify outside it."""
+        ...
+
     async def run_scoped(
         self,
         worktree: Path,
@@ -193,6 +198,8 @@ class ProductionVerifier:
     the function sees the same call it saw before the port existed. The one
     addition is ``cold_shadow``'s ``verifier=self``: the cold leg verifies
     through the port it was asked through, whichever instance that is.
+    ``verify_cache`` is held for the callers that opt into it and is never
+    injected into a forwarded call.
     """
 
     scoped: Resolver[Callable[..., Awaitable[VerifyResult]]]
@@ -202,6 +209,10 @@ class ProductionVerifier:
     disk_guard: Resolver[Callable[..., Awaitable[str | None]]]
     cold_shadow_verify: Resolver[Callable[..., Awaitable[dict[str, str]]]]
     dry_run: Resolver[Callable[..., Coroutine[Any, Any, None]]]
+    verify_cache: CacheAccess | None = None
+
+    def joined_to(self, access: CacheAccess | None) -> ProductionVerifier:
+        return dataclasses.replace(self, verify_cache=access)
 
     async def run_scoped(self, *args: Any, **options: Any) -> VerifyResult:
         return await self.scoped()(*args, **options)

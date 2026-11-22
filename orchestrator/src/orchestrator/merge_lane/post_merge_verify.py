@@ -436,8 +436,8 @@ class _PostMergeVerify:
         job).  Both archive under data/verify-logs/<task_id>/ beside the
         task-verify logs for operator triage (task 1920).
 
-        Only the local pool joins the verify-result cache, through the
-        dispatcher's own registry; the remote arm waits for gamma2 (task 9123).
+        Only the local pool joins the verify-result cache, through the access
+        the verifier holds; the remote arm waits for gamma2 (task 9123).
         """
         if self.runner is not None:
             return VerifyRunnerPool(
@@ -446,16 +446,16 @@ class _PostMergeVerify:
                 task_id=self.task_id,
                 archive_root=self.archive_root,
             )
-        access = CacheAccess.on_dispatcher(self.req.config.project_root)
+        access = self.verifier.verify_cache
         return VerifyRunnerPool(
             [self._local_merge_verify_runner(task_files, access)],
             event_store=self.event_store,
             task_id=self.task_id,
-            verify_cache_registry=access.registry,
+            verify_cache_registry=None if access is None else access.registry,
         )
 
     def _local_merge_verify_runner(
-        self, task_files: tuple[str, ...] | None, access: CacheAccess,
+        self, task_files: tuple[str, ...] | None, access: CacheAccess | None,
     ) -> VerifyRunner:
         """The full gate's scoped + unscoped bundle, or only the declared history leg (task 7248)."""
         if self.history_leg_command is not None:

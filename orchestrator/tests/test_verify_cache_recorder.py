@@ -629,10 +629,14 @@ class TestWorkflowRecordsTaskGreens:
         assert (entry.run_id, entry.sha) == ('r', row['data']['tip_sha'])
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('given_access', [True, False], ids=['given-an-access', 'given-none'])
     async def test_the_pre_merge_site_records_its_green_and_verifies_through_the_access_it_was_given(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, given_access,
     ):
-        access = CacheAccess(registry=Registry(tmp_path / 'verify_cache.db'), orchestrator_code=TEST_CODE)
+        access = (
+            CacheAccess(registry=Registry(tmp_path / 'verify_cache.db'), orchestrator_code=TEST_CODE)
+            if given_access else None
+        )
         config, store, workflow = await self._scene(tmp_path, monkeypatch, forked=True, verify_cache=access)
         result, key = _task_green()
         verify = self._verifies(monkeypatch, result)
@@ -645,16 +649,6 @@ class TestWorkflowRecordsTaskGreens:
         assert (entry.run_id, entry.sha) == ('r', row['data']['tip_sha'])
         assert verify.await_args is not None
         assert verify.await_args.kwargs['verify_cache'] is access
-
-    @pytest.mark.asyncio
-    async def test_a_pre_merge_scene_given_no_access_verifies_outside_the_cache(self, tmp_path, monkeypatch):
-        _config, _store, workflow = await self._scene(tmp_path, monkeypatch, forked=True)
-        verify = self._verifies(monkeypatch, _task_green()[0])
-
-        assert await workflow._rebase_before_enqueue() is True
-
-        assert verify.await_args is not None
-        assert verify.await_args.kwargs['verify_cache'] is None
 
     @pytest.mark.asyncio
     async def test_a_verdict_without_a_cache_record_records_nothing(self, tmp_path, monkeypatch):

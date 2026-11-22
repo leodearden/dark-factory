@@ -1412,6 +1412,7 @@ class TaskWorkflow:
         resume_outcome_sink: ResumeOutcomeSink | None = None,
         task_verify: TaskVerifyPort | None = None,
         task_priority: TaskPriorityLookup | None = None,
+        verify_cache: CacheAccess | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -1441,6 +1442,8 @@ class TaskWorkflow:
         # TaskVerifyDispatcher); None keeps the module-level
         # run_scoped_verification, resolved at call time.
         self._task_verify = task_verify
+        # The dispatcher's verify-result cache, which the pre-merge re-verify joins; None keeps it outside.
+        self._verify_cache = verify_cache
         # Task 9908: the scheduler's tier/pin lookup, recorded on merge_queued;
         # None leaves those keys null.
         self._task_priority = task_priority
@@ -4218,8 +4221,8 @@ class TaskWorkflow:
                 role='task',
                 task_id=self.task_id,
                 event_store=self.event_store,
-                # It does not go through TaskVerifyDispatcher, so it joins the cache itself.
-                verify_cache=CacheAccess.on_dispatcher(self.config.project_root),
+                # It does not go through TaskVerifyDispatcher, so it joins the harness's cache directly.
+                verify_cache=self._verify_cache,
             )
         if self.event_store is not None:
             tip = await self._verified_tip('the post-rebase re-verify')
@@ -19780,6 +19783,7 @@ def build_workflow(
     resume_outcome_sink: ResumeOutcomeSink | None = None,
     task_verify: TaskVerifyPort | None = None,
     task_priority: TaskPriorityLookup | None = None,
+    verify_cache: CacheAccess | None = None,
 ) -> TaskWorkflow:
     """Single construction point for :class:`TaskWorkflow` (PRD C2 / Invariant P2).
 
@@ -19817,4 +19821,5 @@ def build_workflow(
         resume_outcome_sink=resume_outcome_sink,
         task_verify=task_verify,
         task_priority=task_priority,
+        verify_cache=verify_cache,
     )

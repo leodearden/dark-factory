@@ -289,13 +289,14 @@ class _VerifyCall:
     force_workspace: bool
     role: Literal['task']
     event_store: EventStore | None
+    verify_cache: CacheAccess | None
 
     async def run(
         self, port: LocalVerifyPort, *, admission_plan: AdmissionPlan | None = None,
     ) -> VerifyResult:
-        """Call *port* joined to this host's task-role verify cache (A3); the plan
+        """Call *port* joined to the dispatcher's task-role verify cache (A3); the plan
         keyword is passed only when a plan is carried."""
-        return await self._call(port, admission_plan, CacheAccess.on_dispatcher(self.config.project_root))
+        return await self._call(port, admission_plan, self.verify_cache)
 
     async def run_outside_cache(self, port: LocalVerifyPort) -> VerifyResult:
         """Call *port* with no verify cache, so its verdict is one it ran."""
@@ -484,11 +485,13 @@ class TaskVerifyDispatcher(DispatchRecords):
         *,
         policy_of: Callable[[OrchestratorConfig], TaskVerifyPolicy],
         run_local: LocalVerifyPort = run_scoped_verification,
+        verify_cache: CacheAccess | None = None,
     ) -> None:
         self._pool = pool
         self._git_ops = git_ops
         self._policy_of = policy_of
         self._run_local = run_local
+        self._verify_cache = verify_cache
         self._decisions: dict[tuple[str, int], DispatchDecision] = {}
         self._warned_overrides: set[CollapsedOverride] = set()
         self._remote_verdicts = 0
@@ -509,7 +512,7 @@ class TaskVerifyDispatcher(DispatchRecords):
     ) -> VerifyResult:
         call = _VerifyCall(
             worktree, config, module_configs, task_files, attempt_id, task_id,
-            archive_root, force_workspace, role, event_store,
+            archive_root, force_workspace, role, event_store, self._verify_cache,
         )
         policy = self._policy_of(config)
         if policy.host_policy == 'local':
