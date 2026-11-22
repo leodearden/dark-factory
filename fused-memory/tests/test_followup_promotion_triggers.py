@@ -1,7 +1,7 @@
 """What promotes a held follow-up, through the public tools (plans/follow-up-filing-shape-prd.md §4.3).
 
 Boundary rows 8-13 and 15: an edge from a pending unheld task, every landing on pending, a
-citation, a combine, a human removal of the holder edge and the explicit release. Every scenario
+citation, a combine, a human removal or replacement of the holder edge and the explicit release. Every scenario
 files through ``submit_task`` / ``resolve_ticket`` on the real submit stack and reads back through
 ``get_task`` and the journaled events.
 """
@@ -13,13 +13,14 @@ from collections.abc import Iterator, Mapping
 from typing import Any
 
 import pytest
-from _submit_stack import Stack
+from _submit_stack import CuratorScript, Stack
 from _submit_stack import curator_creates as curator_creates
+from _submit_stack import curator_script as curator_script
 from _submit_stack import passthrough_main_checkout as passthrough_main_checkout
 from _submit_stack import stack as stack
 from shared.followup_hold_records import FOLLOWUP_HOLD_METADATA_KEY
 
-from fused_memory.middleware.curator_types import PreparedCandidate
+from fused_memory.middleware.curator_types import CuratorDecision, PreparedCandidate, RewrittenTask
 from fused_memory.middleware.followup_hold import (
     PromotionDeferral,
     register_promotion_guard,
@@ -247,3 +248,150 @@ async def test_releasing_the_holder_promotes_every_active_held_task_by_human(
     assert sorted(event['task_id'] for event in events) == sorted(held)
     assert {event['by'] for event in events} == {'human'}
     assert await _promotion(stack, dropped) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('citation', 'ref'), [
+    ({'x_finding_key': ['fk-1']}, 'fk-1'),
+    ({'prd_path': 'plans/x-prd.md'}, 'plans/x-prd.md'),
+], ids=['finding-key', 'prd-path'])
+async def test_citing_a_held_task_promotes_it(
+    stack: Stack, curator_creates: list[PreparedCandidate], citation: dict[str, Any], ref: str,
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+
+    _ok(await stack.call('update_task', id=held, metadata=citation, metadata_mode='additive'))
+
+    await _assert_promoted(stack, held, by='citation', ref=ref)
+    assert await _promoted_events(stack) == [{'task_id': held, 'by': 'citation', 'ref': ref}]
+
+
+@pytest.mark.asyncio
+async def test_citing_a_held_task_promotes_the_held_task_it_depends_on(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    upstream = await _file_held(stack, 'The cache key ignores the tenant')
+    cited = await _file_held(stack, 'The tenant leaks into the log')
+    _ok(await stack.call('add_dependency', id=cited, depends_on=upstream))
+
+    _ok(await stack.call('update_task', id=cited, metadata={'x_finding_key': ['fk-1']}, metadata_mode='additive'))
+
+    await _assert_promoted(stack, cited, by='citation', ref='fk-1')
+    await _assert_promoted(stack, upstream, by='dependent', ref=cited)
+
+
+@pytest.mark.asyncio
+async def test_citing_a_task_that_is_not_held_promotes_nothing(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    await _file_held(stack, 'The retry loop swallows the timeout')
+    unheld = await _file_followup(stack, 'Ship the retry budget', priority='medium')
+
+    _ok(await stack.call('update_task', id=unheld, metadata={'x_finding_key': ['fk-1']}, metadata_mode='additive'))
+
+    assert await _promoted_events(stack) == []
+
+
+@pytest.mark.asyncio
+async def test_a_dependency_replacement_onto_a_held_task_promotes_it(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    dependent = await _file_followup(stack, 'Ship the retry budget', priority='medium')
+
+    _ok(await stack.call('update_task', id=dependent, dependencies=[held]))
+
+    await _assert_promoted(stack, held, by='dependent', ref=dependent)
+
+
+@pytest.mark.asyncio
+async def test_a_human_replacement_dropping_the_holder_edge_promotes_the_task(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+
+    _ok(await stack.call('update_task', id=held, dependencies=[], title='Renamed'))
+
+    assert (await stack.row(held))['title'] == 'Renamed'
+    await _assert_promoted(stack, held, by='human', ref='update_task')
+    assert await _promoted_events(stack) == [{'task_id': held, 'by': 'human', 'ref': 'update_task'}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('agent_id', ['orchestrator', 'steward-1'])
+async def test_a_machine_replacement_dropping_the_holder_edge_is_refused(
+    stack: Stack, curator_creates: list[PreparedCandidate], agent_id: str,
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    holder = await _holder(stack)
+    before = await stack.row(held)
+
+    answer = await stack.call('update_task', id=held, dependencies=[], title='Renamed', agent_id=agent_id)
+
+    assert answer.get('error') == 'followup_holder_edge_strip_refused', answer
+    assert answer['task_id'] == held
+    assert answer['holder_id'] == holder
+    after = await stack.row(held)
+    assert after['title'] == before['title']
+    assert await stack.dependencies(held) == [holder]
+    assert await _promoted_events(stack) == []
+
+
+@pytest.mark.asyncio
+async def test_a_machine_replacement_keeping_the_holder_edge_leaves_the_task_held(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    holder = await _holder(stack)
+    upstream = await _file_followup(stack, 'Ship the retry budget', priority='medium')
+
+    _ok(await stack.call('update_task', id=held, dependencies=[holder, upstream], agent_id='orchestrator'))
+
+    assert sorted(await stack.dependencies(held)) == sorted([holder, upstream])
+    await _assert_held(stack, held)
+    assert await _promoted_events(stack) == []
+
+
+_REWRITE = RewrittenTask(
+    title='Harden the retry path',
+    description='Fold the retry follow-ups into one task.',
+    details='- retry timeout\n- retry budget',
+    files_to_modify=[_FILE],
+    priority='low',
+)
+
+
+async def _combine_candidate_into(stack: Stack, script: CuratorScript, *, priority: str) -> tuple[str, str, dict[str, Any]]:
+    """A held target and the ticket of a candidate the curator combines into it."""
+    target_title = 'The retry loop swallows the timeout'
+    target = await _file_held(stack, target_title)
+    script.decisions.append(CuratorDecision(
+        action='combine', target_id=target, target_fingerprint=target_title,
+        rewritten_task=_REWRITE, justification='the same retry path',
+    ))
+    ticket, resolved = await stack.submit(
+        title='The retry budget is unnamed', description='One more observation.', priority=priority,
+        metadata=_followup(spawned_from='202'),
+    )
+    return target, ticket, resolved
+
+
+@pytest.mark.asyncio
+async def test_combining_an_unheld_candidate_into_a_held_task_promotes_it(
+    stack: Stack, curator_script: CuratorScript,
+) -> None:
+    target, ticket, resolved = await _combine_candidate_into(stack, curator_script, priority='medium')
+
+    assert {key: resolved.get(key) for key in ('status', 'task_id')} == {'status': 'combined', 'task_id': target}
+    await _assert_promoted(stack, target, by='combine', ref=ticket)
+
+
+@pytest.mark.asyncio
+async def test_combining_a_held_candidate_into_a_held_task_leaves_it_held(
+    stack: Stack, curator_script: CuratorScript,
+) -> None:
+    target, _ticket, resolved = await _combine_candidate_into(stack, curator_script, priority='low')
+
+    assert {key: resolved.get(key) for key in ('status', 'task_id')} == {'status': 'combined', 'task_id': target}
+    await _assert_held(stack, target)
+    assert await _promoted_events(stack) == []
