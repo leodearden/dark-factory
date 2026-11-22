@@ -86,9 +86,6 @@ _NOT_YET_MIGRATED = frozenset({
     'test_merge_verify_survivor_barrier.py',
     'test_merge_worktree_lifecycle_integration_gate.py',
     'test_multihost_verify_integration.py',
-    'test_protected_prefixes.py',
-    'test_provenance_gate_integration.py',
-    'test_rebase_branch_reset_guard.py',
     'test_rebase_verify_cost.py',
     'test_reconcile_done_step_commits.py',
     'test_reopen_sticks_e2e.py',  # debt: task 11025
@@ -97,13 +94,11 @@ _NOT_YET_MIGRATED = frozenset({
     'test_scheduler_park_owner_state.py',  # debt: task 11026
     'test_session_hooks_install.py',
     'test_session_resume_integration_gate.py',
-    'test_substrate_gate.py',
     'test_suffix_conflict_tracker.py',
     'test_task_runtime.py',
     'test_train_integration.py',
     'test_verify_events_units.py',  # debt: task 11025
     'test_verify_phase_rebase.py',
-    'test_verify_plan_integration.py',
     'test_verify_scope_inversion_boundary.py',
     'test_warm_base_coherence.py',
     'test_warm_lane_abort_teardown.py',

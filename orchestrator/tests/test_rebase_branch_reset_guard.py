@@ -26,11 +26,11 @@ below fails collection until step-2 implements them.
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 from _seed_script_stubs import seed_default_warm_base
 
@@ -50,19 +50,7 @@ from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
-
-
-async def _setup_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+    return seed_repo(tmp_path / 'repo')
 
 
 @pytest.fixture
