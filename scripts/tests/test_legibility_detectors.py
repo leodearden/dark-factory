@@ -15,6 +15,9 @@ from legibility import coder, detectors, digest, inventory, sampling
 from legibility.detectors import AgentClass, CarrierKind, SignalClass
 from legibility_carrier_fixtures import (
     PROSE_QUOTING_THE_SCHEMA,
+    SLASH_COMMAND_ARGLESS_TURN,
+    SLASH_COMMAND_EMPTY_ARGS_TURN,
+    SLASH_COMMAND_WITH_ARGS_TURN,
     TRICKLE_CODER_PREAMBLE,
     assistant_record,
     briefing_text,
@@ -522,6 +525,53 @@ class TestUserTurnText:
 
     def test_a_tool_result_only_record_has_no_turn_text(self):
         assert detectors.user_turn_text(tool_result_record('tu-1', 'output')) is None
+
+
+class TestParseSlashCommandExpansion:
+    def test_message_first_expansion_with_typed_args(self):
+        assert detectors.parse_slash_command_expansion(SLASH_COMMAND_WITH_ARGS_TURN) == (
+            detectors.SlashCommandExpansion(
+                name='/team',
+                args='Should dark-factory split its very large test files?',
+                trailing='',
+            )
+        )
+
+    def test_name_first_expansion_with_empty_args(self):
+        assert detectors.parse_slash_command_expansion(SLASH_COMMAND_EMPTY_ARGS_TURN) == (
+            detectors.SlashCommandExpansion(name='/login', args='', trailing='')
+        )
+
+    def test_expansion_without_an_args_tag_has_no_args(self):
+        assert detectors.parse_slash_command_expansion(SLASH_COMMAND_ARGLESS_TURN) == (
+            detectors.SlashCommandExpansion(name='/reflect', args=None, trailing='')
+        )
+
+    def test_text_after_the_expansion_is_trailing(self):
+        expansion = detectors.parse_slash_command_expansion(
+            SLASH_COMMAND_WITH_ARGS_TURN + '\nand then redo it'
+        )
+
+        assert expansion is not None
+        assert expansion.trailing.strip() == 'and then redo it'
+
+    def test_args_not_adjacent_to_the_name_are_not_its_args(self):
+        expansion = detectors.parse_slash_command_expansion(
+            '<command-name>/unblock</command-name>\nAn unrelated aside.\n'
+            '<command-args>4743</command-args>'
+        )
+
+        assert expansion is not None
+        assert expansion.args is None
+        assert 'An unrelated aside.' in expansion.trailing
+
+    def test_a_turn_quoting_an_expansion_after_prose_is_not_one(self):
+        text = 'Read the digest below.\n\n' + SLASH_COMMAND_WITH_ARGS_TURN
+
+        assert detectors.parse_slash_command_expansion(text) is None
+
+    def test_plain_prose_is_not_an_expansion(self):
+        assert detectors.parse_slash_command_expansion('status?') is None
 
 
 # ---------------------------------------------------------------------------
