@@ -3489,10 +3489,10 @@ and every other name stay, and the listing shows them under `keep`.
    | Exit | Meaning | Next |
    |---|---|---|
    | 0 `ok` | Every reviewed graph still present was deleted, and no kept graph shrank. | Step 7. |
-   | 1 `failed` | No connection, or a Redis or file error. A record written before the error has `outcome: failed` and names what was deleted. | Fix the cause, then list again. |
+   | 1 `failed` | No connection, or a Redis or file error. A record written before the error has `outcome: failed` and names what was deleted. | If the record exists, first compare the server's current `run_id` (`docker exec docker-falkordb-1 redis-cli INFO server \| grep run_id`) with the record's `run_id_before`. If they differ, or the server does not answer, treat the run as row 4 (a crash), not as a cause to fix and list again. Otherwise fix the cause, then list again. If no record was written, nothing was deleted. |
    | 2 | A usage error. | Fix the arguments. |
    | 3 `refused` | The listing is unreadable, or was taken on another target. Nothing was deleted. | List again against this target. |
-   | 4 `server_restarted` | The server's `run_id` changed, so the run stopped. | Treat it as a crash: read `docker logs --tail 50 docker-falkordb-1` and compare graph counts with the record's `before`. |
+   | 4 `server_restarted` | The server's `run_id` changed during the run, so the run stopped. The record's `run_id_after` is the new id, and its `after` is empty when the restarted server could not yet be counted. | Treat it as a crash: read `docker logs --tail 50 docker-falkordb-1`, then, once `docker exec docker-falkordb-1 redis-cli INFO persistence` reads `loading:0`, take the counts with `list` and compare them with the record's `before`. Do not run `delete` again until the crash is understood. |
    | 5 `kept_graph_shrank` | A kept graph's node count fell during the run; the record's `shrank` names it. | Investigate before unhalting. |
 
 7. **Unhalt the merge queue** (`mcp__escalation__unhalt_merge_queue`).
