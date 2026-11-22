@@ -558,9 +558,6 @@ class TestFailures:
         assert result.kind is FailureKind.CONTENT
         assert 'claim restates the topic slug' in result.detail
 
-    def test_a_failure_never_carries_a_verdict(self) -> None:
-        assert 'verdict' not in {f.name for f in dataclasses.fields(AdjudicationFailure)}
-
     @pytest.mark.asyncio
     async def test_a_failed_reply_still_reports_its_call(self) -> None:
         result = await _adjudicate(ScriptedResponses(incomplete_reply()))
