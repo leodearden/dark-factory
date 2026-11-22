@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
 from fused_memory.reconciliation.cli_stage_runner import (
@@ -34,6 +35,8 @@ from fused_memory.server.grouped_read import (
     SIGHTING_KIND,
 )
 from fused_memory.server.write_triage import OUTCOME_AMENDED, OUTCOME_CONTESTED, OUTCOME_RESTATED
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 
