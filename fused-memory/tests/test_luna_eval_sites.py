@@ -339,6 +339,24 @@ class TestRunClassifierAndRouter:
         assert (record['label'], record['stores'], record['primary_store']) == ('procedural', ['mem0'], 'mem0')
         assert record['tokens'] == {'router': {'input_tokens': 11, 'output_tokens': 7, 'llm_calls': 1}}
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('run', 'fixture'), [
+        ('run_classifier', {'id': 'w-1', 'input': 'Hello world'}),
+        ('run_router', {'id': 's-1', 'query': 'foo bar baz'}),
+    ])
+    async def test_a_call_no_completion_answers_raises_rather_than_score_the_fallback(
+        self, routing_cfg: Any, plan_proxy_env: dict[str, str], run: str, fixture: dict[str, str],
+    ) -> None:
+        import httpx
+
+        def refused(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={'error': {'message': 'Unsupported parameter', 'type': 'invalid_request'}})
+
+        arm = sites.SITE_ARMS['luna-low']
+        arm_cfg, client = sites.routing_arm(routing_cfg, arm, plan_proxy_env, transport=httpx.MockTransport(refused))
+        with pytest.raises(sites.RoutingCallUnanswered, match=fixture['id']):
+            await getattr(sites, run)(arm_cfg, client, fixture, arm)
+
 
 class TestResumableRuns:
     FIXTURES = [{'id': 'f-1'}, {'id': 'f-2'}, {'id': 'f-3'}]
