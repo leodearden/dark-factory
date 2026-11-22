@@ -95,9 +95,11 @@ from shared.mcp_tool_schema import live_tool_parameters
 from shared.uuid_prefix import (
     PrefixToken,
     find_prefix_tokens,
+    in_sent_shape,
     strip_uuid_prefix_override,
     substitute_all,
     uuid_prefix_override_requested,
+    walkable_arguments,
 )
 
 __all__ = [
@@ -728,7 +730,8 @@ class UuidPrefixGuardMiddleware(Middleware):
             await self._apply_override(context, name, arguments)
             return await call_next(context)
 
-        tokens = self._repairable(name, find_prefix_tokens(arguments))
+        walked = walkable_arguments(arguments)
+        tokens = self._repairable(name, find_prefix_tokens(walked))
         if not tokens:
             return await call_next(context)
 
@@ -763,7 +766,7 @@ class UuidPrefixGuardMiddleware(Middleware):
         if not plan:
             return await call_next(context)
 
-        return await self._deliver(context, call_next, name, arguments, project, plan)
+        return await self._deliver(context, call_next, name, arguments, walked, project, plan)
 
     # -- the call whose resolution is not attempted ------------------------
 
@@ -1011,7 +1014,7 @@ class UuidPrefixGuardMiddleware(Middleware):
 
     # -- delivery ---------------------------------------------------------
 
-    async def _deliver(self, context, call_next, name, arguments, project, plan):
+    async def _deliver(self, context, call_next, name, arguments, walked, project, plan):
         """Perform the actions the matrix chose. It decides; this executes.
 
         Facts are emitted BEFORE the outcome is delivered, so a tool body that
@@ -1039,7 +1042,7 @@ class UuidPrefixGuardMiddleware(Middleware):
 
         await self._record_storms(plan, project, report)
 
-        self._expand(arguments, expansions)
+        self._expand(arguments, walked, expansions)
         return await self._forward(context, call_next, report)
 
     def _reject(self, name: str, arguments: Mapping[str, Any], planned: _Planned) -> NoReturn:
@@ -1098,8 +1101,15 @@ class UuidPrefixGuardMiddleware(Middleware):
         )
 
     @staticmethod
-    def _expand(arguments: dict[str, Any], expansions: tuple[_Planned, ...]) -> None:
+    def _expand(
+        arguments: dict[str, Any],
+        walked: Mapping[str, Any],
+        expansions: tuple[_Planned, ...],
+    ) -> None:
         """Apply every substitution in ONE batch, then write the result back IN PLACE.
+
+        The batch runs on *walked*, the view the tokens were found in, and the
+        result is put back in the wire shape *arguments* sent ``metadata`` in.
 
         Ordering is the batch door's own concern — ``substitute_all`` sorts the
         spans it is given per path — so this hands it every planned expansion
@@ -1127,11 +1137,12 @@ class UuidPrefixGuardMiddleware(Middleware):
         if not expansions:
             return
         repaired = substitute_all(
-            arguments,
+            walked,
             ((p.token, p.resolution.candidates[0].id) for p in expansions),
         )
+        shaped = in_sent_shape(arguments, walked, repaired)
         arguments.clear()
-        arguments.update(repaired)
+        arguments.update(shaped)
 
     @staticmethod
     async def _forward(context, call_next, report: dict[str, Any]):
