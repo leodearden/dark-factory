@@ -6,8 +6,8 @@ Cross-checks fleet session-registry records
 (``~/.claude/fleet/sessions/<slug>/record.json``) against
 ``~/.claude/projects`` transcripts and alarms loudly when a COMPLETED
 spawn-launched interactive session — a record WITH a substantive prompt, a
-terminal status, a ``start_ts`` inside a lookback window, and evidence its
-session started — produced no
+terminal status, a ``start_ts`` inside a lookback window, and is not an
+unbound orphan record — produced no
 plausibly-matching transcript. This is the detector for the transcript-loss
 regression (a suppressed session-persistence path), NOT the preventer: that
 is ``skills/spawn/spawn-claude.sh``'s unconditional
@@ -131,11 +131,11 @@ def _parse_start_ts(value: str | None) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _shows_session_started(record: session_records.SessionRecord) -> bool:
-    """Whether *record* carries evidence claude ran: a hook-bound session id, or a real (non-orphan) exit code."""
-    if record.claude_session_id or record.claude_launch_session_id:
-        return True
-    return record.exit_code != session_reaper.ORPHAN_EXIT_CODE
+def _is_unbound_orphan(record: session_records.SessionRecord) -> bool:
+    """Whether *record* is the unbound-orphan shape: the reaper stamped ORPHAN_EXIT_CODE and no session hook ever bound a session id."""
+    return record.exit_code == session_reaper.ORPHAN_EXIT_CODE and not (
+        record.claude_session_id or record.claude_launch_session_id
+    )
 
 
 def find_completed_spawn_records(
@@ -154,15 +154,15 @@ def find_completed_spawn_records(
           in-flight session's transcript may still be flushing, so alarming
           on it would false-positive;
       (c) its ``start_ts`` parses and lies within ``[now - lookback, now]``;
-      (d) it shows its session started (:func:`_shows_session_started`) — a
-          record the reaper stamped ``session_reaper.ORPHAN_EXIT_CODE`` that
-          no hook ever bound carries no evidence its session started (the
+      (d) it is not an unbound orphan (:func:`_is_unbound_orphan`) — the
+          reaper stamped ``session_reaper.ORPHAN_EXIT_CODE`` and no session
+          id was ever bound, so nothing shows its session started (the
           launcher died before claude ran, e.g. a caller's ``timeout``
-          killing a t3-lane launcher inside its started-grace), so it cannot
-          be a lost transcript.
+          killing a t3-lane launcher inside its started-grace), and such a
+          record cannot be a lost transcript.
 
     Records failing any condition (in-flight, promptless, out-of-window,
-    unparseable ``start_ts``, never started) are skipped defensively.
+    unparseable ``start_ts``, unbound orphan) are skipped defensively.
     """
     window_start = now - lookback
     kept: list[session_records.SessionRecord] = []
@@ -176,7 +176,7 @@ def find_completed_spawn_records(
             continue
         if not (window_start <= start <= now):
             continue
-        if not _shows_session_started(record):
+        if _is_unbound_orphan(record):
             continue
         kept.append(record)
     return kept
