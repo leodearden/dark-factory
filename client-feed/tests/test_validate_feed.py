@@ -1,9 +1,9 @@
 """validate-feed on the committed boundary fixtures (PRD B4, B5) and on altered copies of them.
 
 The fixtures are what the portal repo vendors. feed-v1/state.json is the fold of feed-v1/feed.jsonl at
-seq 27; feed-v1-foreign-project/state.json is the fold of that feed's lines 1 and 3. Regenerate feed-v1's
+seq 28; feed-v1-foreign-project/state.json is the fold of that feed's lines 1 and 3. Regenerate feed-v1's
 only after a deliberate feed change, from client-feed/:
-uv run python -c "from pathlib import Path; from client_feed.contract import parse_feed_line as p, split_jsonl; from client_feed.fold import fold; d = Path('tests/fixtures/feed-v1'); d.joinpath('state.json').write_text(fold([p(t, line_no=i) for i, t in enumerate(split_jsonl(d.joinpath('feed.jsonl').read_text()), 1)], project_id='demo-client', upto_seq=27).model_dump_json(indent=2) + '\\n')"
+uv run python -c "from pathlib import Path; from client_feed.contract import parse_feed_line as p, split_jsonl; from client_feed.fold import fold; d = Path('tests/fixtures/feed-v1'); d.joinpath('state.json').write_text(fold([p(t, line_no=i) for i, t in enumerate(split_jsonl(d.joinpath('feed.jsonl').read_text()), 1)], project_id='demo-client', upto_seq=28).model_dump_json(indent=2) + '\\n')"
 """
 
 import json
@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -74,7 +74,7 @@ def only_problem(report: ValidationReport) -> Problem:
 
 
 def test_every_fixture_line_parses() -> None:
-    assert len(feed_lines(FEED_V1)) == len(feed_texts(FEED_V1)) == 29
+    assert len(feed_lines(FEED_V1)) == len(feed_texts(FEED_V1)) == 31
 
 
 def test_the_fixture_carries_every_known_type_and_one_unknown() -> None:
@@ -136,7 +136,7 @@ def test_the_committed_state_holds_the_facts_the_feed_was_written_to_show() -> N
 def test_the_fixture_validates(capsys: pytest.CaptureFixture[str]) -> None:
     report = validate_out_dir(FEED_V1)
     assert report.ok, report.problems
-    assert (report.lines_checked, report.watermark_seq) == (29, 27)
+    assert (report.lines_checked, report.watermark_seq) == (31, 28)
     assert main(['validate-feed', '--out-dir', str(FEED_V1)]) == 0
     printed = json.loads(capsys.readouterr().out)
     assert printed['ok'] is True
@@ -156,12 +156,14 @@ def test_a_line_separator_inside_a_string_is_not_a_line_break(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     out_dir = altered_copy(tmp_path)
-    revealed = next(ln for ln in feed_lines(out_dir) if isinstance(ln, FileRevealed))
+    lines = feed_lines(out_dir)
+    revealed = next(ln for ln in lines if isinstance(ln, FileRevealed))
     assert revealed.seq == 22
+    last = lines[-1]
     line = revealed.model_copy(
         update={
-            'seq': 30,
-            'at': datetime(2026, 10, 14, 9, 30, tzinfo=UTC),
+            'seq': last.seq + 1,
+            'at': last.at + timedelta(minutes=1),
             'content': 'first\u2028second\x85third\u2029',
         }
     ).model_dump_json()
@@ -170,7 +172,7 @@ def test_a_line_separator_inside_a_string_is_not_a_line_break(
         feed.write(line + '\n')
     report = validate_out_dir(out_dir)
     assert report.ok, report.problems
-    assert report.lines_checked == 30
+    assert report.lines_checked == len(feed_lines(FEED_V1)) + 1
     assert main(['validate-feed', '--out-dir', str(out_dir)]) == 0
 
 
@@ -269,14 +271,15 @@ def test_a_file_without_read_permission_is_unreadable(tmp_path: Path) -> None:
 
 def test_swapped_lines_past_the_watermark_are_a_corrupt_feed(tmp_path: Path) -> None:
     out_dir = altered_copy(tmp_path)
+    second_last = feed_lines(out_dir)[-2].seq
 
     def swap_the_last_two(objects: list[dict[str, Any]]) -> None:
         objects[-2], objects[-1] = objects[-1], objects[-2]
 
     rewrite_feed(out_dir, swap_the_last_two)
     problem = only_problem(validate_out_dir(out_dir))
-    assert committed_state(out_dir).watermark_seq < 28
-    assert (problem.kind, problem.seq) == (ProblemKind.CORRUPT_FEED, 28)
+    assert committed_state(out_dir).watermark_seq < second_last
+    assert (problem.kind, problem.seq) == (ProblemKind.CORRUPT_FEED, second_last)
 
 
 @pytest.mark.parametrize('text', ['{', '[]', '{"project_id": "demo-client"}'])

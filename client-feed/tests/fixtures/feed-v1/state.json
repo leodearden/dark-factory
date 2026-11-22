@@ -1,7 +1,7 @@
 {
   "project_id": "demo-client",
   "feed_version": "1.0",
-  "watermark_seq": 27,
+  "watermark_seq": 28,
   "as_of": "2026-10-14T09:27:00Z",
   "head": "3f2a9c1e7b4d5a60812c9e0f4b7a1d2c3e5f6a7b",
   "engagement_version": 2,
@@ -24,8 +24,8 @@
   },
   "prds": {
     "plans/ledger-prd.md": {
-      "seq": 3,
-      "at": "2026-10-14T09:03:00Z",
+      "seq": 27,
+      "at": "2026-10-14T09:27:00Z",
       "project_id": "demo-client",
       "feed_version": "1.0",
       "type": "prd_upserted",
@@ -33,10 +33,10 @@
       "title": "Ledger",
       "excerpt": "Record every entry and show the running balance.",
       "task_counts": {
-        "pending": 1,
-        "in-progress": 1,
         "blocked": 1,
-        "review": 1
+        "done": 1,
+        "in-progress": 1,
+        "pending": 1
       }
     },
     "plans/reports-prd.md": {
@@ -269,22 +269,6 @@
     }
   },
   "recent": [
-    {
-      "seq": 3,
-      "at": "2026-10-14T09:03:00Z",
-      "project_id": "demo-client",
-      "feed_version": "1.0",
-      "type": "prd_upserted",
-      "prd_path": "plans/ledger-prd.md",
-      "title": "Ledger",
-      "excerpt": "Record every entry and show the running balance.",
-      "task_counts": {
-        "pending": 1,
-        "in-progress": 1,
-        "blocked": 1,
-        "review": 1
-      }
-    },
     {
       "seq": 4,
       "at": "2026-10-14T09:04:00Z",
@@ -580,6 +564,22 @@
           "tests": []
         }
       ]
+    },
+    {
+      "seq": 27,
+      "at": "2026-10-14T09:27:00Z",
+      "project_id": "demo-client",
+      "feed_version": "1.0",
+      "type": "prd_upserted",
+      "prd_path": "plans/ledger-prd.md",
+      "title": "Ledger",
+      "excerpt": "Record every entry and show the running balance.",
+      "task_counts": {
+        "blocked": 1,
+        "done": 1,
+        "in-progress": 1,
+        "pending": 1
+      }
     }
   ]
 }
