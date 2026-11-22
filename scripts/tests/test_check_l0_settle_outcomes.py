@@ -477,6 +477,13 @@ def test_record_missing_required_key_exits_2(settle_queue: SettleQueue, capsys: 
     assert_cannot_judge(*run_main(capsys, settle_queue.queue_dir), UNREADABLE, keyless)
 
 
+def test_record_with_unknown_status_exits_2(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    build = FixtureQueue(settle_queue.queue_dir, datetime.now(UTC))
+    unknown = build.closed('62', build.ago(days=2), ('archived', 'steward', 'moved', None))
+
+    assert_cannot_judge(*run_main(capsys, settle_queue.queue_dir), UNREADABLE, unknown)
+
+
 def test_empty_post_window_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     build = FixtureQueue(tmp_path / 'escalations', datetime.now(UTC))
     for n in range(3):
