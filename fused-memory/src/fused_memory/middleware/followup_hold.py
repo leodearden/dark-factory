@@ -534,6 +534,58 @@ async def remove_holder_edge(
     return walk.promoted
 
 
+def drops_holder_edge(task: Mapping[str, object], dependencies: Sequence[object]) -> bool:
+    """Whether a replacement dependencies list leaves out the edge *task* is held behind."""
+    holder = held_by(task)
+    return holder is not None and str(holder) not in {str(dependency).strip() for dependency in dependencies}
+
+
+async def human_promotion_refusal(
+    task: Mapping[str, object], *, ref: str, emit: HoldEmit,
+) -> PromotionDeferredError | None:
+    """A guard's deferral of a human promotion of *task*, judged before the caller writes anything.
+
+    A deferral emits ``followup_promotion_deferred``. Returns None when *task* is not held now.
+    """
+    record = _current_hold(task)
+    if record is None:
+        return None
+    deferral = _first_deferral(task, PromotionCause.HUMAN, ref)
+    if deferral is None:
+        return None
+    await emit(
+        EventType.followup_promotion_deferred,
+        {'task_id': str(task['id']), 'by': PromotionCause.HUMAN.value, 'ref': ref, **deferral.model_dump()},
+    )
+    return PromotionDeferredError(
+        task_id=str(task['id']), holder_id=str(record.holder), cause=PromotionCause.HUMAN, deferral=deferral,
+    )
+
+
+async def record_human_promotion(
+    tm: TaskBackendProtocol, project_root: str, before: Mapping[str, object], *, ref: str, emit: HoldEmit,
+) -> tuple[int, ...]:
+    """Stamp a human promotion whose holder edge the caller's committed write already dropped.
+
+    *before* is the row as it stood before that write; its hold record is the one stamped. Then
+    every held task the promoted task now depends on is promoted by ``dependent``, as
+    :func:`promote` would. Returns the promoted ids. Same precondition as :func:`promote`.
+    """
+    record = _current_hold(before)
+    if record is None:
+        return ()
+    task_id = int(str(before['id']))
+    await tm.update_task(
+        str(task_id), project_root,
+        metadata=_promoted_metadata(record, PromotionCause.HUMAN, ref), metadata_mode='merge',
+    )
+    await emit(EventType.followup_promoted, {'task_id': str(task_id), 'by': PromotionCause.HUMAN.value, 'ref': ref})
+    row = await _live_row(tm, project_root, task_id)
+    dependencies = [] if row is None else _local_dependencies(row)
+    seeds = [(int(dependency), PromotionCause.DEPENDENT, str(task_id)) for dependency in dependencies]
+    return (task_id, *(await _promote_frontier(tm, project_root, seeds, emit)).promoted)
+
+
 async def promote_dependencies_of(
     tm: TaskBackendProtocol, project_root: str, task_id: int, *, emit: HoldEmit,
 ) -> tuple[int, ...]:
@@ -623,15 +675,18 @@ async def _write_promotion(
 ) -> list[int]:
     """ONE write: the holder edge dropped and the promotion stamped. Returns the dependencies left."""
     remaining = [dependency for dependency in _local_dependencies(row) if dependency != str(record.holder)]
+    await tm.update_task(
+        str(row['id']), project_root,
+        metadata=_promoted_metadata(record, cause, ref), metadata_mode='merge', dependencies=remaining,
+    )
+    return [int(dependency) for dependency in remaining]
+
+
+def _promoted_metadata(record: FollowupHold, cause: PromotionCause, ref: str | None) -> str:
     stamped = record.model_copy(
         update={'promoted': PromotionRecord(by=cause, at=datetime.now(UTC).isoformat(), ref=ref)},
     )
-    await tm.update_task(
-        str(row['id']), project_root,
-        metadata=json.dumps({FOLLOWUP_HOLD_METADATA_KEY: stamped.model_dump(mode='json', exclude_none=True)}),
-        metadata_mode='merge', dependencies=remaining,
-    )
-    return [int(dependency) for dependency in remaining]
+    return json.dumps({FOLLOWUP_HOLD_METADATA_KEY: stamped.model_dump(mode='json', exclude_none=True)})
 
 
 _PROMOTION_DEFERRED_HINT = (

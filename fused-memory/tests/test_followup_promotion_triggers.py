@@ -318,6 +318,39 @@ async def test_a_human_replacement_dropping_the_holder_edge_promotes_the_task(
 
 
 @pytest.mark.asyncio
+async def test_a_human_replacement_the_backend_refuses_leaves_the_task_held(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    holder = await _holder(stack)
+
+    answer = await stack.call('update_task', id=held, dependencies=['99999'], title='Renamed')
+
+    assert answer.get('error'), answer
+    assert (await stack.row(held))['title'] == 'The retry loop swallows the timeout'
+    assert await stack.dependencies(held) == [holder]
+    await _assert_held(stack, held)
+    assert await _promoted_events(stack) == []
+
+
+@pytest.mark.asyncio
+async def test_a_guard_deferral_refuses_the_human_replacement_with_nothing_written(
+    stack: Stack, curator_creates: list[PreparedCandidate], deferring_guard: None,
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    holder = await _holder(stack)
+
+    answer = await stack.call('update_task', id=held, dependencies=[], title='Renamed')
+
+    assert answer.get('error') == 'followup_promotion_deferred', answer
+    assert answer['guard'] == 'stub-guard'
+    assert (await stack.row(held))['title'] == 'The retry loop swallows the timeout'
+    assert await stack.dependencies(held) == [holder]
+    await _assert_held(stack, held)
+    assert [event['guard'] for event in await stack.events(EventType.followup_promotion_deferred)] == ['stub-guard']
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('agent_id', ['orchestrator', 'steward-1'])
 async def test_a_machine_replacement_dropping_the_holder_edge_is_refused(
     stack: Stack, curator_creates: list[PreparedCandidate], agent_id: str,
