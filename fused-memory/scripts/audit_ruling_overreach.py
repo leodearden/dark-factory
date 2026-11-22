@@ -419,6 +419,11 @@ class SampleDefinition:
             cap=int(obj['cap']), strata=tuple(obj['strata']), hash_rule=str(obj['hash_rule']),
         )
 
+    @property
+    def window_days(self) -> float:
+        """The window's length in days."""
+        return (_instant(self.window_end) - _instant(self.window_start)).total_seconds() / 86400
+
     def select(self, episodes: Iterable[Episode]) -> tuple[SampledEpisode, ...]:
         return select_sample(
             episodes, window_start=self.window_start, window_end=self.window_end, cap=self.cap,
@@ -952,13 +957,8 @@ class Measurement:
         return {g: {s: len(episodes) for s, episodes in by_s.items()} for g, by_s in window.items()}
 
 
-def _window_days(definition: SampleDefinition) -> float:
-    span = _instant(definition.window_end) - _instant(definition.window_start)
-    return span.total_seconds() / 86400
-
-
 def _classifier_block(m: Measurement) -> dict[str, Any]:
-    window, days = m.window_episodes(), _window_days(m.definition)
+    window, days = m.window_episodes(), m.definition.window_days
     block: dict[str, Any] = {}
     for name, holds in CLASSIFIERS.items():
         block[name] = {}
@@ -1045,7 +1045,7 @@ def _sample_block(m: Measurement) -> dict[str, Any]:
         cell['corroborated'] += row['corroborated_count']
     return {
         'definition': m.definition.to_dict(), 'sizes': sizes,
-        'window_days': _window_days(m.definition),
+        'window_days': m.definition.window_days,
         'unattributed_edges': m.attribution.unattributed,
     }
 
@@ -1054,7 +1054,7 @@ def _adjudicated_block(m: Measurement, verdicts: VerdictSet) -> dict[str, Any]:
     return {
         'rates': adjudicated_rates(m.rows, verdicts),
         'population_weighted': population_weighted_rates(
-            m.rows, verdicts, m.window_population(), _window_days(m.definition),
+            m.rows, verdicts, m.window_population(), m.definition.window_days,
         ),
         'per_classifier': per_classifier_rates(m.rows, verdicts),
         'detector_catch': detector_catch(m.rows, verdicts, m.hits),
