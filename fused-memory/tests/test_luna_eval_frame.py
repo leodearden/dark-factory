@@ -524,6 +524,34 @@ class TestRouterFixtures:
         assert kept == sorted(sorted(first_per_query.values(), key=lambda row_id: hashlib.sha256(row_id.encode()).hexdigest())[:3])
 
 
+class TestJournalRowsThatAreNotWrites:
+    @pytest.mark.asyncio
+    async def test_a_row_whose_params_are_not_a_json_object_is_skipped_and_counted(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+        import sqlite3
+
+        journal = _journal(tmp_path, [_write('w-1', 'Hello world', TEMPORAL)])
+        with sqlite3.connect(journal) as db:
+            db.executemany(
+                'INSERT INTO write_ops (id, operation, kind, params, created_at) VALUES (?, ?, ?, ?, ?)',
+                [('w-garbled', 'add_memory', 'write', '{not json', J_IN), ('w-list', 'add_memory', 'write', '[1]', J_IN)],
+            )
+        with caplog.at_level(logging.WARNING):
+            fixtures = await frame_mod.classifier_fixtures(journal, JOURNAL_WINDOW, per_category=10)
+        assert [fixture['id'] for fixture in fixtures] == ['w-1']
+        assert '2 add_memory row(s)' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_journal_of_readable_rows_warns_nothing(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            await frame_mod.router_fixtures(_journal(tmp_path, [_search('q-1', 'foo bar baz')]), JOURNAL_WINDOW, n=3)
+        assert 'row(s)' not in caplog.text
+
+
 class TestTheJournalIsReadOnly:
     def test_a_write_through_the_journal_connection_fails(self, tmp_path: Path) -> None:
         import sqlite3

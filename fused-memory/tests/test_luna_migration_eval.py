@@ -396,6 +396,18 @@ class TestFrame:
         assert _frame(ev) == 2
         assert not ev.dir.exists() and not ev.journal.exists()
 
+    @pytest.mark.parametrize('journal', [
+        pytest.param(lambda path: sqlite3.connect(path).executescript('CREATE TABLE other (id TEXT);').close(),
+                     id='another-schema'),
+        pytest.param(lambda path: path.write_bytes(b'not a sqlite database, only bytes ' * 64), id='corrupt'),
+    ])
+    def test_an_unreadable_journal_exits_2_and_writes_nothing(self, tmp_path: Path, journal: Any) -> None:
+        ev = _Eval(tmp_path)
+        ev.journal.unlink()
+        journal(ev.journal)
+        assert _frame(ev) == 2
+        assert not ev.dir.exists() and not ev.private.exists()
+
     def test_summaries_the_live_graph_rewrites_during_the_draw_still_restore_the_manifest(
         self, tmp_path: Path, routing_cfg: Any,
     ) -> None:

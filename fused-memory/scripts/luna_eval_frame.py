@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -47,6 +48,8 @@ from audit_ruling_overreach import (
     stored_instant,
 )
 from replay_overreach_extraction import EpisodeContextReader
+
+logger = logging.getLogger('luna_eval_frame')
 
 # --------------------------------------------------------------------------- #
 # The extraction frame
@@ -531,18 +534,33 @@ def _row_key(row_id: str) -> str:
     return hashlib.sha256(row_id.encode()).hexdigest()
 
 
+def _params(raw: str | None) -> dict[str, Any] | None:
+    try:
+        params = json.loads(raw or '{}')
+    except json.JSONDecodeError:
+        return None
+    return params if isinstance(params, dict) else None
+
+
 def _journal_rows(path: str | Path, operation: str, window: Window) -> list[tuple[str, str, dict[str, Any]]]:
-    """``(id, created_at, params)`` of *operation*'s rows created in *window*, in sha256(id) order."""
+    """``(id, created_at, params)`` of *operation*'s rows created in *window*, in sha256(id) order.
+
+    A window row whose params are not a JSON object leaves the population, and is counted in one
+    WARNING line.
+    """
     with contextlib.closing(open_journal(path)) as db:
         rows = db.execute(JOURNAL_ROWS_SQL, (operation,)).fetchall()
-    kept = []
+    kept, unreadable = [], 0
     for row_id, created_at, raw in rows:
-        try:
-            params = json.loads(raw or '{}')
-        except json.JSONDecodeError:
+        if not instant_in_window(created_at, *window):
             continue
-        if isinstance(params, dict) and instant_in_window(created_at, *window):
+        if (params := _params(raw)) is None:
+            unreadable += 1
+        else:
             kept.append((str(row_id), str(created_at), params))
+    if unreadable:
+        logger.warning('journal: %d %s row(s) in the window skipped, their params not a JSON object',
+                       unreadable, operation)
     return sorted(kept, key=lambda row: _row_key(row[0]))
 
 

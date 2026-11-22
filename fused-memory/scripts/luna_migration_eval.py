@@ -71,6 +71,7 @@ import contextlib
 import json
 import logging
 import os
+import sqlite3
 import sys
 from collections.abc import Awaitable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -266,7 +267,7 @@ async def _frame_command(args: argparse.Namespace, reader_factory: ReaderFactory
     try:
         worksheet, inputs_path = _private(args.worksheet, eval_dir), _private(args.summary_inputs, eval_dir)
         journal = await _journal_fixtures(args)
-    except (PrivateFileInDir, FileNotFoundError) as exc:
+    except (PrivateFileInDir, FileNotFoundError, sqlite3.DatabaseError) as exc:
         logger.error('invalid inputs, nothing is written: %s', exc)
         return EXIT_INVALID
     try:
