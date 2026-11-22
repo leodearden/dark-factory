@@ -487,7 +487,7 @@ async def test_external_producer_label_is_reported_and_its_siblings_still_stamp(
 
 
 @pytest.mark.asyncio
-async def test_sidecar_missing_on_disk_returns_none(tmp_path):
+async def test_sidecar_missing_on_disk_is_reported_not_found(tmp_path):
     """prd_path/prd_task_label are present but the derived sidecar file doesn't exist."""
     task_interceptor = AsyncMock()
     ids = ['1']
@@ -508,7 +508,16 @@ async def test_sidecar_missing_on_disk_returns_none(tmp_path):
         task_interceptor=task_interceptor,
     )
 
-    assert result is None
+    assert result == {
+        'path': None,
+        'stamped': [],
+        'missing_labels': [],
+        'errors': [],
+        'sidecar_not_found': {
+            'root': str(tmp_path.resolve()),
+            'paths': ['plans/foo-prd.capability-manifest.yaml'],
+        },
+    }
     task_interceptor.update_task.assert_not_called()
 
 

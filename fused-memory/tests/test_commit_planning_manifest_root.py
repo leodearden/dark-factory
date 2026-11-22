@@ -195,3 +195,54 @@ async def test_manifest_root_that_is_not_a_worktree_of_the_repo_is_refused(
         assert 'delivered_checks' not in task['metadata']
 
     assert {sidecar: sidecar.read_bytes() for sidecar in sidecars} == snapshot
+
+
+@pytest.mark.parametrize('searched', ['main', 'wt'], ids=['manifest-root-omitted', 'worktree'])
+async def test_absent_sidecar_is_reported_with_the_root_searched(
+    repo_layout: tuple[Path, Path], searched: str,
+) -> None:
+    main, wt = repo_layout
+    root = {'main': main, 'wt': wt}[searched]
+    args = {'project_root': str(main)}
+    if searched == 'wt':
+        args['manifest_root'] = str(wt)
+
+    async with task_stack(main) as server:
+        task_id = await submit_planned(server, main, _producer_metadata())
+
+        result = await call(server, 'commit_planning', {**args, 'task_ids': task_id})
+
+        assert result['manifest_stamping'] == {
+            'path': None,
+            'stamped': [],
+            'missing_labels': [],
+            'errors': [],
+            'sidecar_not_found': {'root': str(root.resolve()), 'paths': [_SIDECAR_REL]},
+        }, result
+        assert 'manifest_stamping_action_required' not in result
+        task = await call(server, 'get_task', {'id': task_id, 'project_root': str(main)})
+        assert task['status'] == 'pending'
+
+
+async def test_absent_sidecar_beside_a_found_one_is_reported(
+    repo_layout: tuple[Path, Path],
+) -> None:
+    main, wt = repo_layout
+    write_prd_family(wt, 'foo', 'alpha')
+
+    async with task_stack(main) as server:
+        alpha = await submit_planned(server, main, _producer_metadata(label='alpha'))
+        beta = await submit_planned(
+            server, main, _producer_metadata(prd_path='plans/bar-prd.md', label='beta'),
+        )
+
+        result = await call(server, 'commit_planning', {
+            'project_root': str(main), 'task_ids': f'{alpha},{beta}', 'manifest_root': str(wt),
+        })
+
+        report = result['manifest_stamping']
+        assert report['path'] == _SIDECAR_REL, result
+        assert report['stamped'] == ['alpha']
+        assert report['sidecar_not_found'] == {
+            'root': str(wt.resolve()), 'paths': ['plans/bar-prd.capability-manifest.yaml'],
+        }
