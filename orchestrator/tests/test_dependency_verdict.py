@@ -372,3 +372,235 @@ class TestTaskExternalDeps:
     def test_returned_elements_stay_string_wire_form(self):
         task = {'id': '6', 'metadata': {'external_deps': ['dark_factory:42', 'p:9']}}
         assert all(isinstance(dep, str) for dep in task_external_deps(task))
+
+
+# --- The early-start dependency answer (PRD plans/early-start-on-predecessor-branch-prd.md section 7) ---
+
+
+def _train_member(train_id: str, *local_deps: str) -> dict:
+    return {'id': 'T', 'dependencies': list(local_deps), 'metadata': {'train': {'id': train_id}}}
+
+
+def _merge_deferred(dep_id: str, train_id: str) -> dict:
+    return {'id': dep_id, 'status': 'merge-deferred', 'metadata': {'train': {'id': train_id}}}
+
+
+#: Answers recorded from deps_verdict before the waiting_predecessors input existed.
+_RECORDED = [
+    pytest.param(_dependent(), {}, {}, SATISFIED, id='no-deps'),
+    pytest.param(_dependent('D', 'E'), {'D': 'done', 'E': 'done'}, {}, SATISFIED, id='all-done'),
+    pytest.param(_dependent('D'), {'D': 'cancelled'}, {}, SATISFIED, id='cancelled-dep'),
+    pytest.param(
+        _dependent('P'), {'P': 'pending'}, {}, DepsVerdict.unsatisfied(DepKind.LOCAL),
+        id='pending-dep',
+    ),
+    pytest.param(
+        _dependent('P'), {}, {}, DepsVerdict.unsatisfied(DepKind.LOCAL), id='dep-without-status',
+    ),
+    pytest.param(
+        _train_member('t1', 'P'),
+        {'P': 'merge-deferred'},
+        {'tasks_by_id': {'P': _merge_deferred('P', 't1')}},
+        SATISFIED,
+        id='merge-deferred-same-train',
+    ),
+    pytest.param(
+        _train_member('t1', 'P'),
+        {'P': 'merge-deferred'},
+        {'tasks_by_id': {'P': _merge_deferred('P', 't2')}},
+        DepsVerdict.unsatisfied(DepKind.LOCAL),
+        id='merge-deferred-other-train',
+    ),
+    pytest.param(
+        _dependent('D'),
+        {'D': 'done'},
+        {'terminal_dep_records': {'D': _scheduled_dep('scheduled')}},
+        DepsVerdict.unsatisfied(DepKind.SCHEDULED_DEPLOY),
+        id='held-scheduled-self-deploy',
+    ),
+    pytest.param(
+        _dependent('D'),
+        {'D': 'done'},
+        {'terminal_dep_records': {}, 'deferred_terminal_deps': {'D'}},
+        DepsVerdict.unknown(DepKind.SCHEDULED_DEPLOY),
+        id='self-deploy-deferred-by-the-fetch-budget',
+    ),
+    pytest.param(
+        _dependent(external_deps=(EXTERNAL_DEP,)),
+        {},
+        {'external_status_cache': {EXTERNAL_DEP: 'done'}},
+        SATISFIED,
+        id='external-done',
+    ),
+    pytest.param(
+        _dependent(external_deps=(EXTERNAL_DEP,)),
+        {},
+        {'external_status_cache': {}},
+        DepsVerdict.unknown(DepKind.EXTERNAL),
+        id='external-missing-from-the-cache',
+    ),
+    pytest.param(
+        _dependent(external_deps=(EXTERNAL_DEP,)),
+        {},
+        {'external_status_cache': {EXTERNAL_DEP: 'in-progress'}, 'external_resolver_failed': True},
+        DepsVerdict.unknown(DepKind.EXTERNAL),
+        id='external-resolver-failed',
+    ),
+    pytest.param(
+        _dependent('D'),
+        {'D': 'done'},
+        {'tasks_by_id': {}, 'delivered_check_cache': {'D': True}, 'terminal_dep_records': {'D': CHECKED_DEP}},
+        SATISFIED,
+        id='delivered-check-true',
+    ),
+    pytest.param(
+        _dependent('D'),
+        {'D': 'done'},
+        {'tasks_by_id': {}, 'delivered_check_cache': {'D': False}, 'terminal_dep_records': {'D': CHECKED_DEP}},
+        DepsVerdict.unsatisfied(DepKind.DELIVERED_CHECK),
+        id='delivered-check-false',
+    ),
+    pytest.param(
+        _dependent('D'),
+        {'D': 'done'},
+        {'tasks_by_id': {}, 'delivered_check_cache': {}, 'terminal_dep_records': {'D': CHECKED_DEP}},
+        DepsVerdict.unknown(DepKind.DELIVERED_CHECK),
+        id='delivered-check-absent-from-the-cache',
+    ),
+    pytest.param(
+        _dependent('P', 'Q'),
+        {'P': 'pending', 'Q': 'pending'},
+        {},
+        DepsVerdict.unsatisfied(DepKind.LOCAL),
+        id='two-pending-deps',
+    ),
+    pytest.param(
+        _dependent('P', external_deps=(EXTERNAL_DEP,)),
+        {'P': 'pending'},
+        {'tasks_by_id': {}, 'external_status_cache': {}},
+        DepsVerdict.unsatisfied(DepKind.LOCAL),
+        id='pending-dep-and-unknown-external-dep',
+    ),
+]
+
+
+@pytest.mark.parametrize(('task', 'status_map', 'kwargs', 'recorded'), _RECORDED)
+class TestCallersWithoutTheInputGetTodaysAnswers:
+    """Invariant 9: the input is opt-in, and it never turns an unfinished dependency satisfied."""
+
+    def test_no_input_answers_as_recorded(self, task, status_map, kwargs, recorded):
+        assert deps_verdict(task, status_map, **kwargs) == recorded
+
+    def test_an_empty_input_answers_as_recorded(self, task, status_map, kwargs, recorded):
+        verdict = deps_verdict(task, status_map, **kwargs, waiting_predecessors=frozenset())
+        assert verdict == recorded
+
+    def test_every_dep_waiting_keeps_the_recorded_state_and_kind(
+        self, task, status_map, kwargs, recorded
+    ):
+        every_dep = frozenset(task['dependencies'])
+        verdict = deps_verdict(task, status_map, **kwargs, waiting_predecessors=every_dep)
+        assert (verdict.satisfied, verdict.state, verdict.kind) == (
+            recorded.satisfied, recorded.state, recorded.kind,
+        )
+
+
+PLAIN_LOCAL = DepsVerdict.unsatisfied(DepKind.LOCAL)
+
+
+def _checked(dep_id: str) -> dict:
+    return {'id': dep_id, 'status': 'done', 'metadata': {'delivered_checks': ['check']}}
+
+
+class TestTheEarlyStartAnswer:
+    def test_the_only_unfinished_dep_waiting_names_its_predecessor(self):
+        verdict = deps_verdict(_dependent('P'), {'P': 'in-progress'}, waiting_predecessors={'P'})
+
+        assert verdict == DepsVerdict.waiting_on('P')
+        assert not verdict.satisfied
+        assert (verdict.state, verdict.kind) == (DepState.UNSATISFIED, DepKind.LOCAL)
+        assert verdict.waiting_predecessor == 'P'
+
+    def test_a_dep_outside_the_set_gets_the_plain_answer(self):
+        verdict = deps_verdict(_dependent('P'), {'P': 'in-progress'}, waiting_predecessors={'Z'})
+
+        assert verdict == PLAIN_LOCAL
+        assert verdict.waiting_predecessor is None
+
+    @pytest.mark.parametrize('waiting', [{'P'}, {'P', 'Q'}], ids=['one-waiting', 'both-waiting'])
+    def test_two_unfinished_deps_get_the_plain_answer(self, waiting):
+        verdict = deps_verdict(
+            _dependent('P', 'Q'),
+            {'P': 'in-progress', 'Q': 'in-progress'},
+            waiting_predecessors=waiting,
+        )
+
+        assert verdict == PLAIN_LOCAL
+
+    @pytest.mark.parametrize(
+        ('task', 'kwargs'),
+        [
+            pytest.param(
+                _dependent('P', 'D'),
+                {'tasks_by_id': {}, 'delivered_check_cache': {'D': False},
+                 'terminal_dep_records': {'D': _checked('D')}},
+                id='done-dep-check-failed',
+            ),
+            pytest.param(
+                _dependent('P', 'D'),
+                {'tasks_by_id': {}, 'delivered_check_cache': {},
+                 'terminal_dep_records': {'D': _checked('D')}},
+                id='done-dep-check-absent-from-the-cache',
+            ),
+            pytest.param(
+                _dependent('P', 'D', external_deps=(EXTERNAL_DEP,)),
+                {'tasks_by_id': {}, 'external_status_cache': {}},
+                id='external-dep-unknown',
+            ),
+            pytest.param(
+                _dependent('P', 'D'),
+                {'terminal_dep_records': {'D': _scheduled_dep('scheduled')}},
+                id='done-dep-a-held-scheduled-self-deploy',
+            ),
+        ],
+    )
+    def test_another_arm_that_does_not_pass_gives_the_plain_answer(self, task, kwargs):
+        verdict = deps_verdict(
+            task, {'P': 'in-progress', 'D': 'done'}, **kwargs, waiting_predecessors={'P'},
+        )
+
+        assert verdict == PLAIN_LOCAL
+
+    def test_every_other_arm_passing_names_the_predecessor(self):
+        verdict = deps_verdict(
+            _dependent('P', 'D', 'E', external_deps=(EXTERNAL_DEP,)),
+            {'P': 'in-progress', 'D': 'done', 'E': 'done'},
+            {},
+            external_status_cache={EXTERNAL_DEP: 'done'},
+            delivered_check_cache={'D': True, 'E': True},
+            terminal_dep_records={'D': _checked('D'), 'E': _checked('E')},
+            waiting_predecessors={'P'},
+        )
+
+        assert verdict == DepsVerdict.waiting_on('P')
+
+
+class TestTheWaitingPredecessorInvariant:
+    @pytest.mark.parametrize(
+        ('state', 'kind'),
+        [
+            (DepState.SATISFIED, None),
+            (DepState.UNKNOWN, DepKind.LOCAL),
+            (DepState.UNSATISFIED, DepKind.EXTERNAL),
+            (DepState.UNSATISFIED, DepKind.DELIVERED_CHECK),
+        ],
+    )
+    def test_only_an_unsatisfied_local_verdict_names_a_predecessor(self, state, kind):
+        with pytest.raises(ValueError) as excinfo:
+            DepsVerdict(state, kind, waiting_predecessor='P')
+        assert str(state) in str(excinfo.value)
+        assert "'P'" in str(excinfo.value)
+
+    def test_an_empty_predecessor_id_is_refused(self):
+        with pytest.raises(ValueError):
+            DepsVerdict.waiting_on('')
