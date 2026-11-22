@@ -204,3 +204,180 @@ class TestAWrongClientIsRefusedBeforeAnyCall:
         with pytest.raises(replay.ArmClientMismatch):
             await sites.run_summaries(llm, SUMMARY_FIXTURE, PREVIOUS, sites.SITE_ARMS['luna-low'])
         assert llm.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# The routing sites: the production classifier and router per arm (step 15)
+# --------------------------------------------------------------------------- #
+
+PROXY_URL, PROXY_KEY = 'http://127.0.0.1:8317/v1', 'proxy-test-key'
+CLASSIFIER_ANSWER = '{"primary": "temporal_facts", "secondary": "decisions_and_rationale", "confidence": 0.8}'
+ROUTER_ANSWER = '{"query_type": "procedural", "stores": ["mem0"], "primary_store": "mem0"}'
+
+
+@pytest.fixture
+def plan_proxy_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    monkeypatch.setenv('OPENAI_PLAN_PROXY_URL', PROXY_URL)
+    monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', PROXY_KEY)
+    return {'OPENAI_PLAN_PROXY_URL': PROXY_URL, 'OPENAI_PLAN_PROXY_KEY': PROXY_KEY}
+
+
+@pytest.fixture
+def routing_cfg(mock_config: Any) -> Any:
+    mock_config.routing.llm_fallback = True
+    return mock_config
+
+
+class _Chat:
+    """An httpx MockTransport handler answering every chat completion with *content* and usage 11/7."""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.bodies: list[dict[str, Any]] = []
+
+    def __call__(self, request: Any) -> Any:
+        import json
+
+        import httpx
+
+        self.bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            'id': 'c', 'object': 'chat.completion', 'created': 0, 'model': 'm',
+            'choices': [{'index': 0, 'finish_reason': 'stop', 'message': {'role': 'assistant', 'content': self.content}}],
+            'usage': {'prompt_tokens': 11, 'completion_tokens': 7, 'total_tokens': 18},
+        })
+
+
+def _transport(chat: _Chat) -> Any:
+    import httpx
+
+    return httpx.MockTransport(chat)
+
+
+class TestRoutingArm:
+    def test_the_control_routes_on_the_production_endpoint_unchanged(self, routing_cfg: Any, plan_proxy_env: dict[str, str]) -> None:
+        from fused_memory.routing.openai_client import routing_endpoint
+
+        arm_cfg, client = sites.routing_arm(routing_cfg, sites.SITE_ARMS['control'], plan_proxy_env)
+        assert arm_cfg.routing == routing_cfg.routing
+        assert (client.api_key, str(client.base_url).rstrip('/')) == routing_endpoint(routing_cfg)
+        assert replay.client_endpoint(client) == 'configured'
+
+    def test_the_luna_arm_is_the_flip_the_routing_layer_would_ship(
+        self, routing_cfg: Any, plan_proxy_env: dict[str, str],
+    ) -> None:
+        before = routing_cfg.model_dump()
+        arm_cfg, client = sites.routing_arm(routing_cfg, sites.SITE_ARMS['luna-low'], plan_proxy_env)
+        assert arm_cfg.routing == routing_cfg.routing.model_copy(update={
+            'model': LUNA, 'reasoning_effort': 'low', 'openai_api_url': PROXY_URL, 'openai_api_key': PROXY_KEY,
+        })
+        assert (client.api_key, str(client.base_url).rstrip('/')) == (PROXY_KEY, PROXY_URL)
+        assert replay.client_endpoint(client) == 'plan_proxy'
+        assert routing_cfg.model_dump() == before
+
+    @pytest.mark.parametrize('missing', ['OPENAI_PLAN_PROXY_URL', 'OPENAI_PLAN_PROXY_KEY'])
+    def test_an_unset_proxy_variable_is_refused_by_name(self, routing_cfg: Any, plan_proxy_env: dict[str, str], missing: str) -> None:
+        environ = {name: value for name, value in plan_proxy_env.items() if name != missing}
+        with pytest.raises(replay.ArmClientMismatch, match=missing):
+            sites.routing_arm(routing_cfg, sites.SITE_ARMS['luna-low'], environ)
+
+
+class TestTheRoutingRequests:
+    @pytest.mark.asyncio
+    async def test_the_luna_request_sends_the_effort_and_no_temperature(self, routing_cfg: Any, plan_proxy_env: dict[str, str]) -> None:
+        chat = _Chat(CLASSIFIER_ANSWER)
+        arm = sites.SITE_ARMS['luna-low']
+        arm_cfg, client = sites.routing_arm(routing_cfg, arm, plan_proxy_env, transport=_transport(chat))
+        await sites.run_classifier(arm_cfg, client, {'id': 'w-1', 'input': 'Hello world'}, arm)
+        (body,) = chat.bodies
+        assert (body['model'], body['reasoning_effort'], body['max_completion_tokens']) == (LUNA, 'low', 256)
+        assert 'temperature' not in body and 'max_tokens' not in body
+
+    @pytest.mark.asyncio
+    async def test_the_control_request_is_todays(self, routing_cfg: Any, plan_proxy_env: dict[str, str]) -> None:
+        chat = _Chat(ROUTER_ANSWER)
+        arm = sites.SITE_ARMS['control']
+        arm_cfg, client = sites.routing_arm(routing_cfg, arm, plan_proxy_env, transport=_transport(chat))
+        await sites.run_router(arm_cfg, client, {'id': 's-1', 'query': 'foo bar baz'}, arm)
+        (body,) = chat.bodies
+        assert (body['model'], body['temperature'], body['max_tokens']) == ('gpt-4o-mini', 0.0, 256)
+        assert 'reasoning_effort' not in body
+
+
+class TestRunClassifierAndRouter:
+    @pytest.mark.asyncio
+    async def test_a_classifier_record_carries_its_label_secondary_fallback_and_tokens(
+        self, routing_cfg: Any, plan_proxy_env: dict[str, str],
+    ) -> None:
+        arm = sites.SITE_ARMS['luna-low']
+        arm_cfg, client = sites.routing_arm(routing_cfg, arm, plan_proxy_env, transport=_transport(_Chat(CLASSIFIER_ANSWER)))
+        record = await sites.run_classifier(arm_cfg, client, {'id': 'w-1', 'input': 'Hello world'}, arm)
+        assert {k: record[k] for k in ('site', 'arm', 'model', 'reasoning_effort', 'endpoint', 'fixture_id')} == {
+            'site': 'classifier', 'arm': 'luna-low', 'model': LUNA, 'reasoning_effort': 'low',
+            'endpoint': 'plan_proxy', 'fixture_id': 'w-1',
+        }
+        assert (record['label'], record['secondary'], record['fallback']) == (
+            'temporal_facts', 'decisions_and_rationale', None,
+        )
+        assert record['tokens'] == {'classifier': {'input_tokens': 11, 'output_tokens': 7, 'llm_calls': 1}}
+
+    @pytest.mark.asyncio
+    async def test_a_classifier_fallback_is_recorded(self, routing_cfg: Any, plan_proxy_env: dict[str, str]) -> None:
+        arm = sites.SITE_ARMS['control']
+        arm_cfg, client = sites.routing_arm(routing_cfg, arm, plan_proxy_env, transport=_transport(_Chat('no json here')))
+        record = await sites.run_classifier(arm_cfg, client, {'id': 'w-1', 'input': 'Hello world'}, arm)
+        assert (record['label'], record['fallback']) == ('observations_and_summaries', 'llm_no_json')
+
+    @pytest.mark.asyncio
+    async def test_a_router_record_carries_its_query_type_stores_and_tokens(
+        self, routing_cfg: Any, plan_proxy_env: dict[str, str],
+    ) -> None:
+        arm = sites.SITE_ARMS['control']
+        arm_cfg, client = sites.routing_arm(routing_cfg, arm, plan_proxy_env, transport=_transport(_Chat(ROUTER_ANSWER)))
+        record = await sites.run_router(arm_cfg, client, {'id': 's-1', 'query': 'foo bar baz'}, arm)
+        assert (record['site'], record['fixture_id'], record['endpoint']) == ('router', 's-1', 'configured')
+        assert (record['label'], record['stores'], record['primary_store']) == ('procedural', ['mem0'], 'mem0')
+        assert record['tokens'] == {'router': {'input_tokens': 11, 'output_tokens': 7, 'llm_calls': 1}}
+
+
+class TestResumableRuns:
+    FIXTURES = [{'id': 'f-1'}, {'id': 'f-2'}, {'id': 'f-3'}]
+
+    def _runner(self, calls: list[tuple[str, str]], failing: frozenset[str] = frozenset()) -> Any:
+        async def runner(arm: Any, fixture: dict[str, Any]) -> dict[str, Any]:
+            calls.append((arm.name, fixture['id']))
+            if fixture['id'] in failing:
+                raise RuntimeError('proxy down')
+            return {'kind': 'replayed', 'site': 'router', 'arm': arm.name, 'fixture_id': fixture['id']}
+        return runner
+
+    async def _run(self, out: Path, calls: list[tuple[str, str]], failing: frozenset[str] = frozenset()) -> int:
+        return await sites.run_site_fixtures(
+            sites.Site.router, self.FIXTURES, list(sites.SITE_ARMS.values()), self._runner(calls, failing), out,
+        )
+
+    @staticmethod
+    def _lines(out: Path) -> list[dict[str, Any]]:
+        import json
+
+        return [json.loads(line) for line in out.read_text().splitlines()]
+
+    @pytest.mark.asyncio
+    async def test_a_failure_is_a_line_and_a_rerun_retries_only_it(self, tmp_path: Path) -> None:
+        out, first, second = tmp_path / 'runs.jsonl', [], []
+        assert await self._run(out, first, frozenset({'f-2'})) == 2
+        failed = [line for line in self._lines(out) if line['kind'] == 'failed']
+        assert {(line['arm'], line['fixture_id'], line['error_type']) for line in failed} == {
+            ('control', 'f-2', 'RuntimeError'), ('luna-low', 'f-2', 'RuntimeError'),
+        }
+        assert await self._run(out, second) == 0
+        assert sorted(second) == [('control', 'f-2'), ('luna-low', 'f-2')]
+        lines = self._lines(out)
+        assert len(lines) == 6 and all(line['kind'] == 'replayed' for line in lines)
+
+    @pytest.mark.asyncio
+    async def test_recorded_keys_are_skipped(self, tmp_path: Path) -> None:
+        out, first, second = tmp_path / 'runs.jsonl', [], []
+        assert await self._run(out, first) == 0
+        assert await self._run(out, second) == 0
+        assert second == [] and len(self._lines(out)) == 6
