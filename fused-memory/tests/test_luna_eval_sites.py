@@ -346,6 +346,18 @@ class TestRunClassifierAndRouter:
         assert record['tokens'] == {'router': {'input_tokens': 11, 'output_tokens': 7, 'llm_calls': 1}}
 
     @pytest.mark.asyncio
+    async def test_a_router_record_claims_no_fallback_it_cannot_observe(
+        self, routing_cfg: Any, plan_proxy_env: dict[str, str],
+    ) -> None:
+        """ReadRouter serves the broad route on an unparsed answer and says nothing, so a router
+        record carries no fallback field rather than a None that reads as 'not a fallback'."""
+        arm = sites.SITE_ARMS['control']
+        arm_cfg, client = sites.routing_arm(routing_cfg, arm, plan_proxy_env, transport=_transport(_Chat('no json here')))
+        record = await sites.run_router(arm_cfg, client, {'id': 's-1', 'query': 'foo bar baz'}, arm)
+        assert record['label'] == 'broad'
+        assert 'fallback' not in record
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(('run', 'fixture'), [
         ('run_classifier', {'id': 'w-1', 'input': 'Hello world'}),
         ('run_router', {'id': 's-1', 'query': 'foo bar baz'}),

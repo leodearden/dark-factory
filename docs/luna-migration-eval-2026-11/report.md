@@ -146,6 +146,10 @@ Each is read in full in `design.md` §7.
     store that is not a `SourceStore` ('mem1', 'error_pages'). All 10 were
     served as broad. Counting luna's 6 as luna-correct still gives
     −0.2267 [−0.2941, −0.1592], a FAIL.
+  * `runs.jsonl`'s router lines carry `"fallback": null`. The runner that
+    wrote them could not observe a router fallback, so that null does not
+    mean the route was an LLM answer. The runner now omits the field
+    (`luna_eval_sites.py::run_router`).
   * Classifier: 14 luna answers and 1 control answer sent
     `"secondary": "null"`. The production parser rejects that string, so
     each was served as `observations_and_summaries`, the `llm_error`

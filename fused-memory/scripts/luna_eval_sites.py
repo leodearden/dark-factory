@@ -321,13 +321,17 @@ async def run_classifier(
 async def run_router(
     arm_cfg: FusedMemoryConfig, client: UsageRecordingOpenAI, fixture: Mapping[str, Any], arm: ReplayArm,
 ) -> dict[str, Any]:
-    """The production ReadRouter.route over one journal query. *client* stays the caller's to close."""
+    """The production ReadRouter.route over one journal query. *client* stays the caller's to close.
+
+    The record has no ``fallback``: ReadRouteResult carries no fallback marker, so an unparsed
+    answer served as the broad route cannot be told from an answer of broad.
+    """
     mark = len(client.usages)
     result = await ReadRouter(arm_cfg, openai_client=client).route(fixture['query'])
     return _record(
         Site.router, arm, _routing_client(arm_cfg, client), fixture,
         _answered_usage(Site.router, client, mark, fixture, arm),
-        label=result.query_type.value, secondary=None, fallback=None,
+        label=result.query_type.value, secondary=None,
         stores=[store.value for store in result.stores], primary_store=result.primary_store.value,
     )
 
