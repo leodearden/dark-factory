@@ -4,31 +4,61 @@ Public names of ``fused_memory.reconciliation.consolidation_adjudicator`` only.
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import re
 import subprocess
 import sys
+import types
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from _adjudicator_doubles import (
+    RESOLVED_MODEL,
+    USAGE,
+    ScriptedResponses,
+    bad_request,
+    connection_error,
+    incomplete_reply,
+    rate_limited,
+    reply_json,
+    reply_text,
+    sdk_timeout,
+    server_error,
+)
+from _sdk_client_stubs import sdk_client_double
 
-from fused_memory.config.schema import ConsolidationAutoConfig, FusedMemoryConfig
+from fused_memory.config.schema import (
+    ConsolidationAutoConfig,
+    FusedMemoryConfig,
+    LLMConfig,
+    LLMProvidersConfig,
+    OpenAIProviderConfig,
+)
+from fused_memory.llm.list_prices import list_price
 from fused_memory.reconciliation.consolidation_adjudicator import (
     INPUT_TEMPLATE,
     INSTRUCTIONS,
+    MAX_OUTPUT_TOKENS,
     OUTPUT_SCHEMA,
     TEXT_FORMAT,
+    Adjudication,
+    AdjudicationFailure,
     AdjudicationRequest,
     AdjudicatorSettings,
     Decision,
     ExcludedMember,
+    FailureKind,
     Hazard,
     MemberInput,
     Verdict,
     VerdictInvalid,
     VerdictReasonCode,
+    adjudicate,
     adjudicator_identity,
     keep_rule_holds,
+    openai_model_call,
     parse_verdict,
     render_request,
 )
@@ -414,3 +444,206 @@ class TestImportsNoExecutorCode:
             f'assert {_EXECUTOR!r} not in sys.modules\n',
         )
         assert result.returncode == 0, result.stderr
+
+
+def _body(**overrides) -> dict:
+    return json.loads(_reply(**overrides))
+
+
+async def _adjudicate(double: ScriptedResponses, **overrides):
+    kwargs = {
+        'settings': _settings(),
+        'model_call': double,
+        'claim_check': _no_claim_problems,
+    }
+    kwargs.update(overrides)
+    request = kwargs.pop('request', _request())
+    return await adjudicate(request, **kwargs)
+
+
+class TestTheCall:
+    @pytest.mark.asyncio
+    async def test_one_call_with_the_settings_and_the_constants(self) -> None:
+        double = ScriptedResponses(reply_json(_body()))
+        settings = _settings(model='gpt-6-luna', reasoning_effort='high', field_chars=10)
+        request = _request(members=(_member('a', 'y' * 40), _member('b')))
+        await _adjudicate(double, settings=settings, request=request)
+        assert double.requests == [{
+            'model': 'gpt-6-luna',
+            'reasoning_effort': 'high',
+            'instructions': INSTRUCTIONS,
+            'user_content': render_request(request, field_chars=10),
+            'text_format': TEXT_FORMAT,
+            'max_output_tokens': MAX_OUTPUT_TOKENS,
+            'timeout': 60.0,
+        }]
+
+    @pytest.mark.asyncio
+    async def test_a_valid_reply_is_an_adjudication_with_its_call_meta(self) -> None:
+        double = ScriptedResponses(reply_json(_body()))
+        result = await _adjudicate(double)
+        assert isinstance(result, Adjudication)
+        assert result.verdict.decision is Decision.proceed
+        assert result.verdict.keep_member_ids == ('a', 'b')
+        meta = result.meta
+        assert meta.identity == adjudicator_identity(_settings())
+        assert meta.resolved_model == RESOLVED_MODEL
+        assert (meta.input_tokens, meta.output_tokens) == (USAGE.input_tokens, USAGE.output_tokens)
+        price = list_price('gpt-6.1-sol')
+        assert price is not None
+        assert meta.cost_usd == pytest.approx(price.usd(USAGE.input_tokens, USAGE.output_tokens))
+        assert meta.latency_s >= 0
+
+    @pytest.mark.asyncio
+    async def test_an_unpriced_model_costs_none(self) -> None:
+        double = ScriptedResponses(reply_json(_body()))
+        result = await _adjudicate(double, settings=_settings(model='no-such-model'))
+        assert isinstance(result, Adjudication)
+        assert result.meta.cost_usd is None
+
+    @pytest.mark.asyncio
+    async def test_missing_usage_costs_none(self) -> None:
+        double = ScriptedResponses(reply_json(_body(), usage=None))
+        result = await _adjudicate(double)
+        assert isinstance(result, Adjudication)
+        assert result.meta.cost_usd is None
+        assert (result.meta.input_tokens, result.meta.output_tokens) == (None, None)
+
+
+class TestFailures:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [TimeoutError(), sdk_timeout(), connection_error(), rate_limited(),
+         server_error(500), server_error(502), server_error(503)],
+        ids=['timeout', 'sdk-timeout', 'connection', '429', '500', '502', '503'],
+    )
+    async def test_a_transport_failure(self, error: BaseException) -> None:
+        double = ScriptedResponses(error)
+        result = await _adjudicate(double)
+        assert isinstance(result, AdjudicationFailure)
+        assert result.kind is FailureKind.TRANSPORT
+        assert len(double.requests) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('answer', 'why'),
+        [
+            (bad_request(), 'BadRequestError'),
+            (incomplete_reply('max_output_tokens'), 'max_output_tokens'),
+            (reply_text('not json'), 'JSON'),
+            (reply_text(None), 'JSON'),
+            (reply_json({**_body(), 'confidence': 0.9}), 'confidence'),
+            (reply_json(_body(keep_member_ids=['a', 'zz'])), 'zz'),
+        ],
+        ids=['400', 'incomplete', 'malformed', 'no-text', 'unknown-key', 'unshown-kept-id'],
+    )
+    async def test_a_content_failure_names_why(self, answer, why: str) -> None:
+        double = ScriptedResponses(answer)
+        result = await _adjudicate(double)
+        assert isinstance(result, AdjudicationFailure)
+        assert result.kind is FailureKind.CONTENT
+        assert why in result.detail
+        assert len(double.requests) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_replacement_claim_the_check_rejects(self) -> None:
+        def check(claim: str, topic: str | None) -> list[str]:
+            return ['claim restates the topic slug']
+
+        double = ScriptedResponses(reply_json(_body(claim='Replacement claim.')))
+        result = await _adjudicate(double, claim_check=check)
+        assert isinstance(result, AdjudicationFailure)
+        assert result.kind is FailureKind.CONTENT
+        assert 'claim restates the topic slug' in result.detail
+
+    def test_a_failure_never_carries_a_verdict(self) -> None:
+        assert 'verdict' not in {f.name for f in dataclasses.fields(AdjudicationFailure)}
+
+    @pytest.mark.asyncio
+    async def test_a_failed_reply_still_reports_its_call(self) -> None:
+        result = await _adjudicate(ScriptedResponses(incomplete_reply()))
+        assert isinstance(result, AdjudicationFailure)
+        assert result.meta is not None
+        assert result.meta.identity == adjudicator_identity(_settings())
+        assert result.meta.input_tokens == USAGE.input_tokens
+
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates(self) -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await _adjudicate(ScriptedResponses(asyncio.CancelledError()))
+
+
+def _config(monkeypatch, tmp_path, *, openai_section, **auto) -> FusedMemoryConfig:
+    monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
+    return FusedMemoryConfig(
+        llm=LLMConfig(providers=LLMProvidersConfig(openai=openai_section)),
+        consolidation_auto=ConsolidationAutoConfig(**auto),
+    )
+
+
+class TestFromConfig:
+    def test_the_k7_leaves_member_min_and_the_endpoint_host(self, monkeypatch, tmp_path) -> None:
+        config = _config(
+            monkeypatch, tmp_path,
+            openai_section=OpenAIProviderConfig(
+                api_key='sk-x', api_url='https://proxy.example:8443/v1',
+            ),
+            adjudicator_model='gpt-6-luna', adjudicator_reasoning_effort=None,
+            adjudicator_timeout_seconds=12.5, adjudicator_field_chars=1500,
+            adjudicator_member_max=7, member_min=3,
+        )
+        assert AdjudicatorSettings.from_config(config) == AdjudicatorSettings(
+            model='gpt-6-luna', reasoning_effort=None, endpoint_host='proxy.example:8443',
+            timeout_seconds=12.5, field_chars=1500, member_max=7, member_min=3,
+        )
+
+    def test_no_provider_section_is_the_sdk_default_endpoint(self, monkeypatch, tmp_path) -> None:
+        config = _config(monkeypatch, tmp_path, openai_section=None)
+        assert AdjudicatorSettings.from_config(config).endpoint_host is None
+
+
+def _sdk_response() -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        output_text='{}', status='completed', incomplete_details=None,
+        model='gpt-6.1-sol', usage=None,
+    )
+
+
+class TestOpenAIModelCall:
+    @pytest.mark.asyncio
+    async def test_the_client_uses_the_provider_section_and_one_attempt(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        config = _config(
+            monkeypatch, tmp_path,
+            openai_section=OpenAIProviderConfig(api_key='sk-x', api_url='https://h.example/v1'),
+        )
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(return_value=_sdk_response())
+        with patch('openai.AsyncOpenAI', return_value=client) as ctor:
+            reply = await openai_model_call(config)(
+                model='gpt-6.1-sol', instructions='i', user_content='u',
+                text_format=TEXT_FORMAT, max_output_tokens=MAX_OUTPUT_TOKENS,
+                timeout=5.0, reasoning_effort='low',
+            )
+        ctor.assert_called_once_with(
+            api_key='sk-x', base_url='https://h.example/v1', max_retries=0,
+        )
+        assert reply.text == '{}'
+        assert client.responses.create.call_args.kwargs['text'] == {'format': TEXT_FORMAT}
+
+    @pytest.mark.asyncio
+    async def test_a_blank_key_is_not_forwarded(self, monkeypatch, tmp_path) -> None:
+        config = _config(
+            monkeypatch, tmp_path,
+            openai_section=OpenAIProviderConfig(api_key='', api_url='https://h.example/v1'),
+        )
+        client = sdk_client_double()
+        client.responses.create = AsyncMock(return_value=_sdk_response())
+        with patch('openai.AsyncOpenAI', return_value=client) as ctor:
+            await openai_model_call(config)(
+                model='m', instructions='i', user_content='u', text_format=TEXT_FORMAT,
+                max_output_tokens=10, timeout=5.0, reasoning_effort=None,
+            )
+        ctor.assert_called_once_with(base_url='https://h.example/v1', max_retries=0)
