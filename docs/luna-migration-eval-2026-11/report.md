@@ -143,3 +143,33 @@ Each is read in full in `design.md` §7.
 * **luna's extraction mints 1.91× the control's edges** (437 against 229,
   `r.extraction.arms.<arm>.minted`). So a luna extraction would raise
   per-episode resolve_edge calls above the figure in §3.
+
+## 6. Decision
+
+The pre-registered rule is `design.md` §2.5, under Leo's 2026-11-19
+amendment to esc-9522-1: there is no API fallback.
+
+### 6.1 The graphiti sites: extraction, resolve_edge, summaries
+
+* **resolve_edge FAILS**, on R2 (§1). It stays on gpt-4o-mini on
+  `OPENAI_API_KEY`, as today. Nothing is filed for it.
+* **extraction and summaries PASS. Neither flip ships in this task.** Task
+  9944 owns the plan-cap classifier, latch, park and L2 escalation, and it
+  was pending when this report was written. So
+  `fused-memory/src/fused_memory/backends/graphiti_client.py` and
+  `config.yaml`'s `llm` block are unchanged.
+* **One flip follow-up was filed**, ticket `tkt_0RX9K2525CQR6J5QPN3EH7WM4B`,
+  on 2026-11-22. It has `dependencies='9944'` and `spawned_from` 9945, and
+  the curator assigns the task id asynchronously.
+  * It moves only the measured prompts, for every category except
+    `decisions_and_rationale`, to gpt-6-luna at effort low on
+    `OPENAI_PLAN_PROXY_URL`/`OPENAI_PLAN_PROXY_KEY`. The extraction prompts
+    are `extract_nodes.extract_text` and `extract_edges.edge`; the summaries
+    prompt is `extract_nodes.extract_summaries_batch`.
+  * It keeps exactly the measured configuration of `design.md` §2.2, and
+    keeps no gpt-4o-mini cap fallback.
+  * It routes per `prompt_name`, so `dedupe_nodes.nodes`,
+    `dedupe_edges.resolve_edge` and every unmeasured prompt stay on
+    gpt-4o-mini.
+  * It reuses task 9943's per-prompt plan route, or reports a blocking
+    dependency on 9943 if that has not landed.
