@@ -1,0 +1,192 @@
+"""Reusing one unit's shaped rows across renders, at the collector's public seam.
+
+Two renders inside one ``SNAPSHOT_TTL_SECONDS`` are served the SAME cached
+unit. Whatever the collector reuses between them, each render's rows must
+still carry that render's own runtime probe, clock and external-dep read, and
+serialise exactly as a freshly shaped row would.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from _canned_mcp import ByRoot, CannedMCP, _raw_row
+from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
+
+from dashboard.config import DashboardConfig
+from dashboard.data.active_tasks import collect_tasks_with_counts
+
+pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
+
+NOW = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)
+LATER = NOW + timedelta(minutes=3)
+STARTED = (NOW - timedelta(minutes=10)).isoformat()
+OFFLINE = TaskRuntimeSnapshot(offline=True, offline_reason='unreachable')
+
+
+class _RuntimeProbe:
+    """A stand-in for ``fetch_task_runtime`` whose answer a test changes between renders."""
+
+    def __init__(self) -> None:
+        self.answer: dict[str, TaskRuntimeSnapshot] = {}
+
+    async def __call__(self, client, escalation_urls):
+        return dict(self.answer)
+
+
+def _entry(task_id: int, *, loops: int, phase, started: str | None = STARTED) -> TaskRuntimeEntry:
+    return TaskRuntimeEntry(
+        task_id=task_id, has_worktree=True, loops=loops, attempts=1,
+        started=started, lane='_lane-1', phase=phase, lane_state='assigned',
+    )
+
+
+@pytest.fixture()
+def probe(monkeypatch) -> _RuntimeProbe:
+    fake = _RuntimeProbe()
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_task_runtime', fake)
+    return fake
+
+
+@pytest.fixture()
+def alpha_config(tmp_path) -> DashboardConfig:
+    root = tmp_path / 'alpha'
+    root.mkdir()
+    return DashboardConfig(project_root=root)
+
+
+def _serve(monkeypatch, by_label: dict[str, CannedMCP]) -> None:
+    monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', ByRoot(by_label))
+
+
+def _assert_one_unit(alpha: CannedMCP) -> None:
+    """Every render of the test was served the one unit the first render read."""
+    reads = alpha.calls_to('get_tasks')
+    assert len(reads) == 1, (
+        f'{len(reads)} row reads: a later render missed the unit cache, so it '
+        'reshaped a new unit and reuse was never exercised'
+    )
+
+
+async def _alpha_row(client, config, *, now: datetime) -> dict:
+    snapshots = await collect_tasks_with_counts(client, config, resolve_external=True, now=now)
+    (row,) = snapshots['alpha'].rows.value or []
+    return row
+
+
+async def test_each_render_carries_its_own_runtime_fields_and_started(
+    dummy_client, alpha_config, probe, monkeypatch,
+):
+    alpha = CannedMCP(rows=[_raw_row(1, 'in-progress')], status_map={1: 'in-progress'})
+    _serve(monkeypatch, {'alpha': alpha})
+
+    probe.answer = {'alpha': TaskRuntimeSnapshot(tasks=[_entry(1, loops=1, phase='PLAN')])}
+    first = await _alpha_row(dummy_client, alpha_config, now=NOW)
+    probe.answer = {'alpha': TaskRuntimeSnapshot(tasks=[_entry(1, loops=2, phase='EXECUTE')])}
+    second = await _alpha_row(dummy_client, alpha_config, now=LATER)
+    probe.answer = {'alpha': OFFLINE}
+    offline = await _alpha_row(dummy_client, alpha_config, now=LATER)
+
+    _assert_one_unit(alpha)
+    assert (first['loops'], first['phase'], first['started']) == (1, 'PLAN', 10)
+    assert (second['loops'], second['phase'], second['started']) == (2, 'EXECUTE', 13), (
+        f'the second render carried {second}: a runtime fact or the clock was reused '
+        'from the first render of the same unit'
+    )
+    assert (offline['runtime_offline'], offline['runtime_status'], offline['loops']) == (
+        True, 'unreachable', None,
+    ), f'an offline probe after an online render of the same unit must read offline: {offline}'
+    assert (first['loops'], first['phase']) == (1, 'PLAN'), (
+        'a later render changed a row an earlier render already returned'
+    )
+
+
+async def test_an_external_dep_status_never_leaks_into_a_later_render(
+    dummy_client, alpha_config, probe, monkeypatch,
+):
+    alpha = CannedMCP(
+        rows=[_raw_row(1, 'pending', metadata={'external_deps': ['beta:5']})],
+        status_map={1: 'pending'},
+    )
+    beta = CannedMCP(status_map={5: 'done'})
+    _serve(monkeypatch, {'alpha': alpha, 'beta': beta})
+    probe.answer = {'alpha': TaskRuntimeSnapshot()}
+
+    first = await _alpha_row(dummy_client, alpha_config, now=NOW)
+    beta.status_map[5] = 'in-progress'
+    second = await _alpha_row(dummy_client, alpha_config, now=LATER)
+
+    _assert_one_unit(alpha)
+    assert second['external_deps'] == [{'id': 'beta:5', 'status': 'in-progress'}]
+    assert first['external_deps'] == [{'id': 'beta:5', 'status': 'done'}], (
+        f'the first render\'s row now says {first["external_deps"]}: the two renders '
+        'share one external_deps entry, so the second read overwrote the first'
+    )
+
+
+EVERY_FIELD_GROUP_WIRE = {
+    'id': 'alpha/T-1',
+    'project': 'alpha',
+    'title': 'task 1',
+    'status': 'in-progress',
+    'agent': 'claude-task-1',
+    'loops': 2,
+    'attempts': 1,
+    'lane': '_lane-1',
+    'phase': 'EXECUTE',
+    'lane_state': 'assigned',
+    'runtime_offline': False,
+    'runtime_status': 'ok',
+    'claimant_run_id': 'run-1/sess-1/pid=42',
+    'heartbeat_at': '2026-11-22T11:59:00+00:00',
+    'stranded': False,
+    'created_at': '2026-11-12T09:10:17.253Z',
+    'created_at_source': 'stamped',
+    'meta_files': ['a.py', 'b.py'],
+    'train': {'id': 'train-1', 'order': 2},
+    'external_deps': [{'id': 'beta:5', 'status': 'done'}],
+    'prd': None,
+    'started': 13,
+    'deps': [
+        {'id': 'alpha/T-2', 'title': 'task 2', 'done': False},
+        {'id': 'alpha/T-3', 'title': '', 'done': True},
+    ],
+}
+
+
+async def test_a_reused_render_serialises_byte_identically(
+    dummy_client, alpha_config, probe, monkeypatch,
+):
+    row = _raw_row(
+        1, 'in-progress',
+        dependencies=['2', '3'],
+        claimant_run_id='run-1/sess-1/pid=42',
+        heartbeat_at='2026-11-22T11:59:00+00:00',
+        created_at='2026-11-12T09:10:17.253Z',
+        created_at_source='stamped',
+        metadata={
+            'files': ['a.py', 'b.py'],
+            'train': {'id': 'train-1', 'order': 2},
+            'external_deps': ['beta:5'],
+        },
+    )
+    alpha = CannedMCP(
+        rows=[row, _raw_row(2, 'pending')],
+        status_map={1: 'in-progress', 2: 'pending', 3: 'done'},
+    )
+    _serve(monkeypatch, {'alpha': alpha, 'beta': CannedMCP(status_map={5: 'done'})})
+    probe.answer = {'alpha': TaskRuntimeSnapshot(tasks=[_entry(1, loops=2, phase='EXECUTE')])}
+
+    await collect_tasks_with_counts(dummy_client, alpha_config, resolve_external=True, now=NOW)
+    snapshots = await collect_tasks_with_counts(
+        dummy_client, alpha_config, resolve_external=True, now=LATER,
+    )
+    served = (snapshots['alpha'].rows.value or [])[0]
+    _assert_one_unit(alpha)
+
+    def wire(value) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+
+    assert wire(served) == wire(EVERY_FIELD_GROUP_WIRE)
