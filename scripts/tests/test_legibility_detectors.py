@@ -608,6 +608,12 @@ class TestSamplerAndDigestAgreeOnTheCorpus:
 
         assert sampled == digested == (signal in EXPECTED_PRESENT[name])
 
+    @pytest.mark.parametrize('name', sorted(EXPECTED_PRESENT))
+    def test_an_interactive_digest_has_user_turns_and_an_unattended_one_none(self, name):
+        front = coder.parse_frontmatter(digest.build_digest(_CORPUS / name))
+
+        _assert_the_class_and_the_user_turns_agree(front['agent_class'], front['n_user_turns'])
+
 
 # ---------------------------------------------------------------------------
 # Boundary row 2: one agent-class classifier, read by the sampler's stratum
@@ -920,6 +926,14 @@ class TestLegibilityInstrumentSessions:
 
         assert _classify(*records) is AgentClass.INTERACTIVE
 
+    def test_a_lone_question_pasting_an_instrument_prompt_is_unattended_with_no_user_turns(self, tmp_path):
+        records = [user_record(f'why is this prompt restratified?\n\n{TRICKLE_CODER_PREAMBLE}')]
+        session = _write_session(tmp_path, '-home-leo-src-dark-factory', records)
+
+        front = coder.parse_frontmatter(digest.build_digest(session.path))
+
+        assert (front['agent_class'], front['n_user_turns']) == (AgentClass.UNATTENDED, 0)
+
     def test_the_opener_in_a_tool_result_is_foreign(self):
         records = [
             user_record('please read reingestion.py'),
@@ -1027,13 +1041,15 @@ def test_sampler_stratum_and_digest_agent_class_agree(tmp_path, encoded, records
     assert stratum == rendered == expected
 
 
+def _assert_the_class_and_the_user_turns_agree(agent_class, n_user_turns):
+    ruled_out = AgentClass.UNATTENDED if n_user_turns > 0 else AgentClass.INTERACTIVE
+    assert agent_class != ruled_out
+
+
 @pytest.mark.parametrize(('encoded', 'records', 'expected'), _SHAPES)
 def test_an_interactive_digest_has_user_turns_and_an_unattended_one_none(
     tmp_path, encoded, records, expected,
 ):
     front = coder.parse_frontmatter(digest.build_digest(_write_session(tmp_path, encoded, records).path))
 
-    if front['agent_class'] == 'interactive':
-        assert front['n_user_turns'] > 0
-    if front['agent_class'] == 'unattended':
-        assert front['n_user_turns'] == 0
+    _assert_the_class_and_the_user_turns_agree(expected, front['n_user_turns'])

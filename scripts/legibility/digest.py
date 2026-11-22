@@ -497,8 +497,8 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     INTERACTIVE also asks.
 
     This function is the SINGLE source for both the gold user_corrections
-    section and render_digest's n_user_turns score component, so this one
-    filter excludes such a turn from the body AND the score together --
+    section and render_digest's n_user_turns score component, so a turn
+    dialogue_turn_text drops leaves the body AND the score together --
     which is exactly what confusion-census-2026-07-31 §3.1 asks for, its
     clusters 1.1(b) and 1.2 being one event observed from two surfaces.
     User corrections are gold (PRD Sec 5) -- this is the highest-priority
