@@ -3269,12 +3269,17 @@ and a revive rate cap — described below.
 `scripts/orchestrator-watchdog.py::_fused_memory_liveness_verdict`, which
 classifies fm three ways: `port-down` (the port probe fails), `healthy`
 (the zero-I/O `/alive` route answers within 15s), or `wedged` (the port is
-up but `/alive` does not answer — the asyncio loop is hung). Under socket
-activation `port-down` does **not** mean the process is gone: the probe sees
+up but `/alive` does not answer — the asyncio loop is hung). Under
+[socket activation](#socket-activation-mcp-ports-survive-restarts)
+`port-down` does **not** mean the process is gone: the probe sees
 `fused-memory.socket`, which stays bound through a restart or a crash awaiting
-auto-restart and closes only on a deliberate stop or disable. A dead process
-behind a live socket is restarted by the next connection, and one that does
-not answer in time reads as `wedged`. `/health` is deliberately not
+auto-restart. It closes only on a deliberate stop or disable, or when a crash
+loop exhausts the service's `StartLimitBurst`
+(`scripts/fused-memory.service.template`): systemd then fails the socket with
+result `service-start-limit-hit`. That second case is the
+permanently-unstartable unit the revive cap below exists to bound. A dead process behind a live socket is
+restarted by the next connection, and one that does not answer in time reads
+as `wedged`. `/health` is deliberately not
 consulted for the verdict: it awaits two sequential backing-store
 round-trips, which would make a slow FalkorDB/Qdrant read as a wedge and
 get the shared MCP server restarted for nothing. `/health` is still the
@@ -3288,10 +3293,12 @@ persisted to `data/fused-memory/fm_liveness_streak.json` rather than held
 in memory because `orchestrator-watchdog.service` is `Type=oneshot` — the
 process exits between probes, so an in-memory counter could never
 accumulate. The streak is **shared across both non-healthy classes** on
-purpose: an fm instance dying mid-probe can legitimately alternate
-`port-down`/`wedged` from tick to tick, and per-class counters would each
-keep resetting, so a genuinely broken process would reach neither
-threshold.
+purpose: on a host without `fused-memory.socket`, an fm instance dying
+mid-probe can legitimately alternate `port-down`/`wedged` from tick to
+tick, and per-class counters would each keep resetting, so a genuinely
+broken process would reach neither threshold. Socket activation changes
+what each class means (see **The verdict** above), not the case for one
+shared streak.
 
 **Layer 2 — a revive cap**, on its own clock file
 `data/fused-memory/last_liveness_restart_fused_memory.json`. That is
@@ -3324,12 +3331,59 @@ which defeats systemd's own `StartLimitBurst` backstop, so an uncapped
 lane would re-restart a permanently-unstartable unit (bad config, missing
 dependency, corrupt venv) every ~180s forever.
 
-A shorter, port-down-specific lane was designed under task 4131 and
-DELIBERATELY NOT SHIPPED — see esc-4131-9 (Leo's 2026-09-21 ruling) and
-task 5739, which revisits it once task 5550 has removed the wedge cause.
-Measured 2026-08-23..2026-09-21: 57 `wedged` threshold-crossings against
-exactly 1 `port-down` crossing, and that one was a race with an external
-restart already in flight.
+**No port-down fast lane — closed (task 5739).** A shorter, 600s
+port-down-specific lane was designed under task 4131 and dropped by Leo's
+2026-09-21 ruling on esc-4131-9. Task 5739 re-measured after task 5550 and
+closed it: the single shared `FM_LIVENESS_RESTART_MIN_INTERVAL_SECS` window
+is the permanent answer. The pre-5550 baseline, syslog 2026-08-23..09-21,
+had 57 `wedged` threshold-crossings against 1 `port-down` crossing, and
+that one was a race with an external restart already in flight. The
+post-5550 window, the whole syslog rotation set from 2026-10-18 to
+2026-11-15 (28 days, starting 23 days after the 2026-09-25 merge), had 0
+crossings of either class, 0 capped ticks, 0 `restart issued` lines and 0
+`port-down` verdicts at any streak; its 21 sub-threshold `wedged` ticks (20
+at 1/3, 1 at 2/3) never reached threshold. So the cap was never armed in the
+window and hid nothing, and `port-down` did not occur even below threshold.
+The lane's target class is also gone. The lane was built to revive a
+crashed process sooner, and since `fused-memory.socket` (2026-09-29) a crash
+no longer reads `port-down`. Both of the causes **The verdict** above gives
+for a socket-era `port-down` argue against a lane. A deliberate stop needs
+no revive. A crash loop that exhausted `StartLimitBurst` is the
+permanently-unstartable unit the cap exists to bound, and a faster lane
+would only make it worse. Reopen only if either holds:
+
+- fm runs on a host without its socket unit, so `port-down` again means
+  "process gone";
+- a syslog re-measure over >=4 weeks finds more than ~1 `port-down`
+  crossing per week that is not a crash loop. A crossing that coincides with
+  `fused-memory.socket` failing with result `service-start-limit-hit` in
+  `journalctl --user -u fused-memory.socket` is one: it calls for fixing the
+  crash, not for a lane. Count each episode once, at its threshold tick,
+  whether it revived or was capped:
+  `for f in /var/log/syslog*; do echo "$f $(zgrep -cE "verdict 'port-down' \(streak ([0-9]+)/\1\)(; restarting| but a liveness restart is capped)" "$f")"; done`
+  The backreference matches only a streak equal to its threshold, so a
+  capped episode's later revive is not counted twice and a non-default
+  `FM_LIVENESS_STREAK_THRESHOLD` still works. zgrep reads plain and `.gz`
+  files alike. Unlike the literal `(streak 3/3); restarting` form used to
+  compare against the esc-4131-9 baseline, it also counts a capped episode
+  that recovered before its window expired.
+
+A reopened lane must also meet task 5739's constraints:
+
+- Detection stays class-blind: the shared streak above, pinned by
+  `tests/scripts/test_orchestrator_watchdog.py::test_liveness_pass_mixed_non_healthy_verdicts_reach_threshold`.
+- The lane is resolved from the WHOLE streak, via a sticky "saw a wedge"
+  bit in the streak file (the esc-4131-7 shape), so a mixed streak always
+  arms the 3600s window and no class's cap is ever left un-armed.
+- The true aggregate revive bound is stated here and on the constant's
+  comment. Separate clocks ADD: the 4131 design silently moved <=24/day to
+  <=168/day.
+- It is justified on probe semantics, not on the 3180s figure (READ THAT
+  FIGURE CORRECTLY, above).
+- `--report` shows a revive COUNT, not just an age.
+- `NRestarts` is not evidence of quiet: watchdog revives are manual
+  restarts, which it never counts (the crash-loop paragraph in
+  [§8](#8-fleet-redeploy--watchdog)).
 
 **A failed — or raising — restart still arms the cap.** `restart_unit`
 passes `check=False`, so a non-zero `systemctl` exit has always armed it;
@@ -4267,7 +4321,7 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | A fused-memory offline-lane pass is recorded as an outage on a line starting `falkordb: ` (with the container stopped, measured: `falkordb: connect: ConnectionError`), or a fused-memory test session under the lane exits 4 at start with `the scratch FalkorDB at redis://localhost:6380 is not reachable` | The scratch FalkorDB (compose service `falkordb-scratch`, `127.0.0.1:6380`) is not running. Docker restarts it on its own unless someone stopped it, and nothing else starts it; see [§8 The scratch FalkorDB](#the-scratch-falkordb) | `docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d --no-deps falkordb-scratch`, then `docker exec docker-falkordb-scratch-1 redis-cli ping`. If `GRAPH.LIST` there lacks `evalmem_lme_ref_incumbent_a`, seed it with `scripts/seed_scratch_reference_graph.py`. The next lane pass runs normally |
 | All work across the fleet stalls; every account shows capped | The multi-account usage gate is **all-or-nothing per scope**: capacity in a scope only frees up once at least one account is uncapped for it | Check account-level cap/reset times; this self-heals once any single account resets — it is not a per-request failure to retry individually |
 | A burst of zero-output invocations across many tasks at once | Usually a transient upstream 5xx (529 overloaded), not a real failure. Since task 3316 an execute-phase zero-output result carrying a 5xx requeues through the scheduler's transient lane instead of blocking | Read the task's `zero_output_evidence-iter<N>.json` under its TASK root, `<worktree base>/.task-meta/task-<id>/` (for this repo `.worktrees/.task-meta/task-<id>/`; path owner `orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.zero_output_evidence_path`). A `ZERO_OUTPUT_HANG_REASON` block's detail names the exact glob. `api_error_status` in 500-599, with the provider's error in `output_tail`, is a provider outage: wait it out, and do not switch accounts or treat it as a code regression. `api_error_status: null` with `transcript_turns: 0` is a local wedge: read `proc_tree` and `stderr_tail`. Check host health via PSI (`full` pressure), not load average |
-| Every open Claude session's fused-memory MCP calls fail at once, each within a second, with the harness's `Unable to connect. Is the computer able to access the url?`; on Claude Code ≥2.1.280 the server's tools can then be withdrawn from the session until a manual `/mcp` | Port 8002 is **closed**: the request never reaches the server, so no backing store is involved, and nothing is worktree-specific (8002 is host-global). Under socket activation a `restart`, a watchdog revive (`scripts/orchestrator-watchdog.py::restart_unit`) or a crash keeps 8002 bound, and a client waits rather than being refused. The port closes only on a deliberate `systemctl --user stop`/`disable` of `fused-memory.service` (its `ExecStopPost` stops the socket), on the port-change stop-then-start, or on a host where `fused-memory.socket` is not installed — see [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts) and [§8 fused-memory liveness revive](#fused-memory-liveness-revive). Before 2026-09-29 every restart closed it for the whole restart; the 2026-09-19 sighting (codebook `entry-cand-20260919-3`) was two calls refused during a watchdog revive's 40s start | Check that `systemctl --user show fused-memory.service -p TriggeredBy` prints `TriggeredBy=fused-memory.socket`; if it does not, install the socket per [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts). Prefer `restart` over `stop` then `start`. Run `/mcp` in any session whose fused-memory tools were withdrawn, then retry the failed call: its payload never left the client. A **manual** stop or restart of fused-memory still needs explicit operator sign-off, because it is one shared process and affects the whole fleet, not one project |
+| Every open Claude session's fused-memory MCP calls fail at once, each within a second, with the harness's `Unable to connect. Is the computer able to access the url?`; on Claude Code ≥2.1.280 the server's tools can then be withdrawn from the session until a manual `/mcp` | Port 8002 is **closed**: the request never reaches the server, so no backing store is involved, and nothing is worktree-specific (8002 is host-global). Under socket activation a `restart`, a watchdog revive (`scripts/orchestrator-watchdog.py::restart_unit`) or a crash keeps 8002 bound, and a client waits rather than being refused. The port closes only on a deliberate `systemctl --user stop`/`disable` of `fused-memory.service` (its `ExecStopPost` stops the socket), on the port-change stop-then-start, when a crash loop exhausts the service's `StartLimitBurst` (systemd fails the socket with result `service-start-limit-hit`; the crash is in `journalctl --user -u fused-memory.service`), or on a host where `fused-memory.socket` is not installed — see [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts) and [§8 fused-memory liveness revive](#fused-memory-liveness-revive). Before 2026-09-29 every restart closed it for the whole restart; the 2026-09-19 sighting (codebook `entry-cand-20260919-3`) was two calls refused during a watchdog revive's 40s start | Check that `systemctl --user show fused-memory.service -p TriggeredBy` prints `TriggeredBy=fused-memory.socket`; if it does not, install the socket per [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts). Prefer `restart` over `stop` then `start`. Run `/mcp` in any session whose fused-memory tools were withdrawn, then retry the failed call: its payload never left the client. A **manual** stop or restart of fused-memory still needs explicit operator sign-off, because it is one shared process and affects the whole fleet, not one project |
 | `Permission denied` reading `/proc/<pid>/environ` while diagnosing a systemd --user unit's `PATH` or environment, or a unit failing `ENOENT` on a binary that `which` finds | That pid is the user manager, whose environ is readable or not depending on its capabilities, and is the wrong layer anyway. Or the unit is `DRIFTED`: it still has the environment of its last start | [§3 Inspecting a unit's live environment](#inspecting-a-units-live-environment) |
 | `escalation-watcher-auto` rotations respawn continuously while the L1 queue shows only `esc-task-path-guard*` records, and each rotation resolves nothing | The path-scope guard files its rejection / advisory audit records at `level=1` under a **synthetic anchor** `task_id` — no such task exists. Until the record reaches a terminal state it stays `pending`, and the supervisor's pre-boot precheck (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) counts any pending un-promoted L1 as actionable, so it keeps spawning rotations. A `stamp_triage` does **not** clear it: that precheck reads `status`/`level` only, never `triaged_at` | Expected, and clears on the first rotation that actually reaches the record — the watcher's `scope_violation` recipe has an audit-only branch that closes these `close_only`/`benign` (see `skills/escalation-watcher-auto/SKILL.md`). **Do not `stamp_triage` these records**: a stamp reaches no terminal state, so it cannot clear the precheck, but its fresh `triaged_at` makes the next rotation drop the record at the drain filter before the auto-close branch is consulted — the loop then persists for as long as the stamp stays fresh (~6h). The recipe carves these out of that skip; a rotation running an older copy will not. If they persist beyond that, check the drain-filter carve-out is present, then compare the branch's tokens against `_ANCHOR_TASK_ID` / `_AGENT_ROLE` in `fused-memory/src/fused_memory/middleware/scope_violation_escalator.py` for producer drift. Do **not** "fix" this by re-gating the producer — the guard is the census, and the one deliberate bypass (`routing_override_reason`) already returns before any verdict or escalation fires (`fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._path_guard_or_skip`), so there is nothing left to gate |
 | Two branches that each moved `orchestrator/tests/merge_lane_ratchet_baseline.json` conflict on it (a probe bounce or a stopped merge), although they moved different code | The structured merge driver `.gitattributes` names (`merge=ratchet-baseline`) is not installed in this host's `.git/config`, so git falls back to its line merge, which conflicts whenever two branches touch one baseline row; or the driver REFUSED this pair (it says why on stderr: two different changes to one scalar, a row deleted on one side and changed on the other, two insertions at one place in a path list) and wrote git's own text merge with markers. The probe (`git merge-tree` at `project_root`) reads attributes from `project_root`'s working tree, so it composes only once `.gitattributes` is on main and `project_root` has re-synced | `git config --get merge.ratchet-baseline.driver` on the host: empty means run `python3 scripts/merge_lane_ratchet_merge.py install` from the main checkout (it writes the shared `.git/config`, so it covers every linked worktree; `scripts/setup-host.sh` step 9 does the same on a new host). A merge or probe that instead DIES with `fatal: custom merge driver ratchet-baseline lacks command line` (exit 128) means a `merge.ratchet-baseline` section without its `driver` key: `git config --remove-section merge.ratchet-baseline`, then install. A refusal is an ordinary conflict: resolve the code, then regenerate the baseline with `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json`. While a driver merge runs under the probe, git leaves transient `.merge_file_*` files in `project_root`; they are untracked and gone when the probe returns. A raise is never authorized in the baseline file itself: it is one new file under `orchestrator/tests/merge_lane_ratchet_raises/`, which never conflicts |
