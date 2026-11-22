@@ -710,7 +710,9 @@ class TestTheShardsCommand:
             roles = sorted(key['shards'][name]['role'] for name in _shards_holding(key, keyed))
             assert roles == ['primary', 'second'], keyed
         for spec in key['shards'].values():
+            [basis] = {key['items'][item]['basis'] for item in spec['items']}
             assert spec == {'role': spec['role'], 'rater': f'opus-{spec["role"]}', 'round': 0,
+                            'kind': 'initial', 'basis': basis,
                             'items': spec['items'], 'brief_sha256': BRIEF_SHA256}
 
     def test_attach_time_pairs_sit_only_in_attach_shards(self, bundle: _Bundle) -> None:
@@ -994,7 +996,7 @@ class TestTheRatingRounds:
             name = f'third_{index:02d}'
             assert {**key['shards'][name], 'items': len(key['shards'][name]['items'])} == {
                 'role': 'third', 'rater': f'opus-third-{index:02d}', 'round': 0, 'items': 1,
-                'brief_sha256': BRIEF_SHA256,
+                'kind': 'third', 'basis': 'current', 'brief_sha256': BRIEF_SHA256,
             }
             assert _shard_keyed(key, name) == {tied}
             _rate(bundle, overrides)
@@ -1022,7 +1024,7 @@ class TestTheRatingRounds:
         key = bundle.key()
         assert {**key['shards']['third_00'], 'items': len(key['shards']['third_00']['items'])} == {
             'role': 'third', 'rater': 'opus-third-00', 'round': 0, 'items': 1,
-            'brief_sha256': BRIEF_SHA256,
+            'kind': 'third', 'basis': 'current', 'brief_sha256': BRIEF_SHA256,
         }
         assert _shard_keyed(key, 'third_00') == {open_pair}
 

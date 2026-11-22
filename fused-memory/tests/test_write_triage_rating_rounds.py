@@ -5,6 +5,7 @@ Synthetic rows and a tmp scratch only. The module is loaded by path
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import functools
 import hashlib
@@ -577,8 +578,11 @@ class TestRatingScratch:
             attach = [name.startswith('attach_') for name in rounds.holding(triple)]
             assert attach == [triple[2] == 'attach_time'] * 2, triple
         for name, spec in key['shards'].items():
+            basis = 'attach_time' if name.startswith('attach_') else 'current'
             assert spec == {'role': spec['role'], 'rater': f'opus-{spec["role"]}', 'round': 0,
+                            'kind': 'initial', 'basis': basis,
                             'items': spec['items'], 'brief_sha256': _sha(_mod().BRIEF_PATH)}
+            assert {key['items'][item]['basis'] for item in spec['items']} == {basis}
             assert (rounds.root / 'shards' / f'{name}.txt').exists()
         assert sorted(rounds.added) == sorted(key['shards'])
 
@@ -716,7 +720,7 @@ class TestRatingScratch:
         key = rounds.key()
         assert {**key['shards']['third_00'], 'items': len(key['shards']['third_00']['items'])} == {
             'role': 'third', 'rater': 'opus-third-00', 'round': 0, 'items': 1,
-            'brief_sha256': _sha(_mod().BRIEF_PATH),
+            'kind': 'third', 'basis': 'current', 'brief_sha256': _sha(_mod().BRIEF_PATH),
         }
         assert rounds.holding(('e0', 'p1', 'current'))[-1] == 'third_00'
         assert 'third_00' not in rounds.holding(('e0', 'p1', 'attach_time'))
@@ -731,6 +735,66 @@ class TestRatingScratch:
             'pairs': 0, 'shards': [],
         }
         assert (rounds.root / 'key.json').read_bytes() == key_bytes
+
+    def test_every_reask_shard_records_its_kind(self, rounds: _Rounds) -> None:
+        rounds.rate({('primary', ('e1', 'p1', 'current')): _lacks_loss,
+                     ('second', ('e2', 'p1', 'current')): _unfound_quote})
+        _mod().reask_round(rounds.scratch, rounds.key(), rounds.entries())
+        reasks = {name: spec for name, spec in rounds.key()['shards'].items() if 'reask_' in name}
+        assert {name: (spec['kind'], spec['basis']) for name, spec in reasks.items()} == {
+            'reask_01_primary': ('reask', 'current'), 'reask_02_second': ('reask', 'current'),
+        }
+
+    def test_a_reask_round_deals_each_basis_of_a_rater_into_its_own_shard(
+        self, rounds: _Rounds,
+    ) -> None:
+        rounds.rate({('primary', ('e0', 'p1', 'current')): _lacks_loss,
+                     ('primary', ('e0', 'p1', 'attach_time')): _lacks_loss})
+        assert _mod().reask_round(rounds.scratch, rounds.key(), rounds.entries()) == {
+            'lines': 2, 'shards': {'reask_01_primary': 1, 'attach_reask_01_primary': 1},
+        }
+        key = rounds.key()
+        assert {name: (spec['round'], spec['rater'], spec['kind'], spec['basis'])
+                for name, spec in key['shards'].items() if 'reask_' in name} == {
+            'reask_01_primary': (1, 'opus-primary', 'reask', 'current'),
+            'attach_reask_01_primary': (1, 'opus-primary', 'reask', 'attach_time'),
+        }
+
+    def test_a_shard_of_more_than_one_basis_is_refused_before_writing(self, rounds: _Rounds) -> None:
+        mod = _mod()
+        key = rounds.key()
+        before = copy.deepcopy(key)
+        entries = [mod.ShardEntry('e0', 'p1', 'current', 'df', 'child of e0', 'parent of e0'),
+                   mod.ShardEntry('e0', 'p1', 'attach_time', 'df', 'child of e0',
+                                  'parent of e0 as it read then')]
+        with pytest.raises(ValueError, match=r"reask_01_primary.*\['attach_time', 'current'\]"):
+            rounds.scratch.write_shard(key, 'reask_01_primary', entries, kind=mod.ShardKind.REASK,
+                                       role='primary', rater='opus-primary', round=1)
+        assert not (rounds.root / 'shards' / 'reask_01_primary.txt').exists()
+        assert key == before
+
+    def test_add_shards_refuses_a_key_with_a_spec_lacking_its_kind_or_basis(
+        self, rounds: _Rounds,
+    ) -> None:
+        key = rounds.key()
+        del key['shards']['primary_00']['kind']
+        extra = _mod().ShardEntry('e9', 'p1', 'current', 'df', 'child of e9', 'parent of e9')
+        with pytest.raises(ValueError, match=r"primary_00.*backfill_rating_shard_kinds\.py"):
+            rounds.scratch.add_shards(key, [*_scratch_entries(), extra], seed=7)
+
+    def test_add_shards_numbers_new_shards_past_the_initial_ones_alone(self, rounds: _Rounds) -> None:
+        rounds.rate({('primary', ('e1', 'p1', 'current')): _lacks_loss})
+        _mod().reask_round(rounds.scratch, rounds.key(), rounds.entries())
+        rounds.rate()
+        _mod().third_round(rounds.scratch, rounds.key(), rounds.entries(), {('e0', 'p1')})
+        rounds.rate()
+        _mod().rerate_round(rounds.scratch, rounds.key(), rounds.entries(), [('e2', 'p1')],
+                            version='v2.2')
+        key = rounds.key()
+        extra = _mod().ShardEntry('e9', 'p1', 'current', 'df', 'child of e9', 'parent of e9')
+        assert rounds.scratch.add_shards(key, [*_scratch_entries(), extra], seed=7) == [
+            'primary_01', 'second_01',
+        ]
 
 
 def _sha(path: Path) -> str:
@@ -1038,6 +1102,9 @@ class TestEnsureRerate:
         }
         [rerate] = scratch.load_key()['rerates']
         assert rerate == key['rerates'][0]
+        assert {name: (key['shards'][name]['kind'], key['shards'][name]['basis'])
+                for name in rerate['shards']} == {
+            name: ('rerate', 'current') for name in rerate['shards']}
         assert (rerate['version'], rerate['round'], rerate['pairs']) == ('v2.2', 1, [['w', 'p1']])
         assert rerate['brief_sha256'] == _sha(new_brief)
         assert rerate['retires_third_raters'] == ['opus-third-00']
@@ -1079,6 +1146,11 @@ class TestEnsureRerate:
         assert summary['rendered_again'] == ['rerate_01_primary_00']
         assert scratch.key_path.read_bytes() == key_bytes
         assert deleted.read_bytes() == shard_bytes
+
+
+class TestShardKind:
+    def test_names_the_four_ways_a_shard_is_keyed(self) -> None:
+        assert {str(kind) for kind in _mod().ShardKind} == {'initial', 'reask', 'third', 'rerate'}
 
 
 class TestTheRaterContract:
