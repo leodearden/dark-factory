@@ -246,8 +246,8 @@ class TestDeclarationGuards:
         self._assert_raises_naming(table, 'D', ['a.py'], 'P', 'D')
 
 
-GRID_KEYS = ('a.py', 'c.py', 'two.py', 'b.py', 'u.py')
-GRID_KEY_SETS = [
+GRID_KEYS: tuple[str, ...] = ('a.py', 'c.py', 'two.py', 'b.py', 'u.py')
+GRID_KEY_SETS: list[list[str]] = [
     list(keys)
     for size in range(1, len(GRID_KEYS) + 1)
     for keys in itertools.combinations(GRID_KEYS, size)
