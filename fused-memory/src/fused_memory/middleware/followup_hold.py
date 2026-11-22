@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar, Final
 
+from pydantic import BaseModel, ConfigDict, ValidationError
 from shared.followup_hold_records import (
     FOLLOWUP_HOLD_METADATA_KEY,
     FOLLOWUP_HOLDER_METADATA_KEY,
@@ -23,6 +24,7 @@ from shared.project_id import normalize_project_id
 from shared.task_metadata import ExternalDep
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import ACTIVE, TaskStatus
+from shared.task_transitions import ActorClass, derive_actor_class
 
 from fused_memory.backends.task_backend_errors import (
     TASKMASTER_TOOL_ERROR,
@@ -49,14 +51,22 @@ __all__ = [
     'FollowupHolders',
     'HolderMinted',
     'HolderProtection',
+    'PromotionDeferral',
+    'PromotionGuard',
     'backfill',
+    'citation_ref',
+    'held_by',
     'held_count',
     'hold_at_create',
     'hold_scope',
     'is_holder',
+    'may_strip_holder_edge',
     'protected_status',
     'protected_update',
     'protection_refusal',
+    'register_promotion_guard',
+    'releases_holder',
+    'unregister_promotion_guard',
 ]
 
 HELD_PRIORITIES: Final = frozenset({'low', 'polish'})
@@ -68,7 +78,10 @@ _WAITING_STATUSES: Final = frozenset(ACTIVE - {TaskStatus.DEFERRED})
 
 _FOLLOWUP_SOURCE: Final = 'agent-followup'
 _REVIEW_SUGGESTIONS_CONTEXT: Final = 'review_suggestions'
-_HOLD_EXCLUDING_KEYS: Final = ('execution_class', 'prd_path', 'x_finding_key', 'human_decomposed')
+_FINDING_KEY: Final = 'x_finding_key'
+_PRD_PATH_KEY: Final = 'prd_path'
+_CITATION_KEYS: Final = (_FINDING_KEY, _PRD_PATH_KEY)
+_HOLD_EXCLUDING_KEYS: Final = ('execution_class', *_CITATION_KEYS, 'human_decomposed')
 _HOLD_SCOPE_KEYS: Final = ('source', 'spawn_context', 'task_kind', *_HOLD_EXCLUDING_KEYS)
 _BACKFILL_FIELDS: Final = (
     'priority',
@@ -115,6 +128,41 @@ def hold_at_create(
     }
     held_kwargs = {**kwargs, 'dependencies': _with_holder_edge(kwargs.get('dependencies'), holder_id)}
     return held_kwargs, held_metadata
+
+
+def held_by(task: Mapping[str, object]) -> int | None:
+    """The holder an active row waits behind now: its record names the edge, and the edge is the authority.
+
+    A promoted row keeps its record but has lost the edge, so it is not held. A record that does
+    not parse holds nothing and logs one WARNING naming the task.
+    """
+    if task.get('status') not in ACTIVE:
+        return None
+    raw = raw_metadata_dict(task.get('metadata'), source=_METADATA_SOURCE).get(FOLLOWUP_HOLD_METADATA_KEY)
+    if raw is None:
+        return None
+    try:
+        record = FollowupHold.model_validate(raw)
+    except ValidationError as exc:
+        logger.warning('followup_hold: task %s carries a malformed followup_hold record: %s', task.get('id'), exc)
+        return None
+    dependencies = task.get('dependencies') or ()
+    if not isinstance(dependencies, Iterable):
+        return None
+    named = {str(dependency) for dependency in dependencies}
+    return record.holder if str(record.holder) in named else None
+
+
+def citation_ref(metadata: object) -> str | None:
+    """The citation a metadata payload carries: the first finding key, else the PRD path.
+
+    The same keys exclude a filing from the hold, so a citation that would have kept a task unheld
+    is the one that promotes it.
+    """
+    fields = raw_metadata_dict(metadata, source=_METADATA_SOURCE)
+    finding_keys = fields.get(_FINDING_KEY)
+    candidates = [*(finding_keys if isinstance(finding_keys, list) else [finding_keys]), fields.get(_PRD_PATH_KEY)]
+    return next((value for value in candidates if isinstance(value, str) and value), None)
 
 
 def _with_holder_edge(dependencies: object, holder_id: int) -> str:
@@ -256,6 +304,16 @@ def protected_status(
     return HolderProtection.STATUS
 
 
+def releases_holder(task: Mapping[str, object], status: str, *, release_holder: bool) -> bool:
+    """The explicit release :func:`protected_status` lets through: every held follow-up is promoted."""
+    return release_holder is True and status in PROTECTED_STATUSES and is_holder(task)
+
+
+def may_strip_holder_edge(agent_id: str | None) -> bool:
+    """Open question 2: only a human may drop a held task's holder edge through a dependency replacement."""
+    return derive_actor_class(agent_id) is ActorClass.HUMAN
+
+
 def protected_update(
     stored_metadata: object, payload: object, *, replace: bool,
 ) -> HolderProtection | None:
@@ -354,6 +412,31 @@ async def protection_refusal(
         attempted_status=attempted_status,
         held_count=await held_count(tm, project_root, holder_id),
     )
+
+
+class PromotionDeferral(BaseModel):
+    """A registered guard's answer that a held task must not be promoted yet, and why."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    guard: str
+    reason: str
+
+
+PromotionGuard = Callable[[Mapping[str, object], str, str | None], PromotionDeferral | None]
+"""Called with the held task's live row, the promotion cause and its ref; a deferral blocks the promotion."""
+
+_PROMOTION_GUARDS: list[PromotionGuard] = []
+
+
+def register_promotion_guard(guard: PromotionGuard) -> None:
+    """Consult *guard* before every promotion, after the guards registered before it; idempotent."""
+    if not any(registered is guard for registered in _PROMOTION_GUARDS):
+        _PROMOTION_GUARDS.append(guard)
+
+
+def unregister_promotion_guard(guard: PromotionGuard) -> None:
+    _PROMOTION_GUARDS[:] = [registered for registered in _PROMOTION_GUARDS if registered is not guard]
 
 
 BackfillEmit = Callable[[EventType, Mapping[str, object]], Awaitable[None]]
