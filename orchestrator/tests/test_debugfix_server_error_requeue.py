@@ -35,6 +35,7 @@ from orchestrator.scheduler import (
     TerminalExitRejection,
     is_transient_api_requeue,
 )
+from orchestrator.task_status import TERMINAL_STATUSES
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
@@ -120,23 +121,30 @@ class ScriptedDebuggerStub(AgentStub):
 
 
 class TerminalRowScheduler(FakeScheduler):
-    """A row moved to *terminal_status* out-of-band: 'pending' writes are refused.
+    """A row a racing writer makes *terminal_status* just before the first re-pend.
 
-    The refusal records the out-of-band transition in the row's history, so
-    ``get_status`` reports the terminal row the way the real store would.
+    While the row is terminal, every non-terminal write without a
+    ``reopen_reason`` meets the server's terminal-exit gate and raises
+    ``TerminalExitRejection``, as scheduler.py::Scheduler.set_task_status does.
+    A ``reopen_reason`` is the gate's sanctioned override, so that write lands.
     """
 
     def __init__(self, terminal_status: str):
         super().__init__()
         self.terminal_status = terminal_status
-        self.refused_pending_writes: list[str] = []
+        self.refused_writes: list[str] = []
 
     async def set_task_status(self, task_id: str, status: str, **kwargs) -> None:
-        if status == 'pending':
-            self.refused_pending_writes.append(task_id)
-            history = self.statuses.setdefault(task_id, [])
-            if history[-1:] != [self.terminal_status]:
-                history.append(self.terminal_status)
+        history = self.statuses.setdefault(task_id, [])
+        if status == 'pending' and self.terminal_status not in history:
+            history.append(self.terminal_status)
+        row_is_terminal = history[-1:] == [self.terminal_status]
+        if (
+            row_is_terminal
+            and status not in TERMINAL_STATUSES
+            and kwargs.get('reopen_reason') is None
+        ):
+            self.refused_writes.append(status)
             raise TerminalExitRejection(
                 task_id=task_id,
                 old_status=self.terminal_status,
@@ -229,10 +237,17 @@ class TestTerminalRowDuringRepend:
             scheduler=scheduler,
         )
 
-        assert len(scheduler.refused_pending_writes) == config.max_verify_attempts - 1
-        assert stub.calls.count('debugger') == config.max_verify_attempts - 1
+        dropped_requeues = config.max_verify_attempts - 1
+        assert scheduler.refused_writes == ['pending'] * dropped_requeues + ['blocked']
+        assert stub.calls.count('debugger') == dropped_requeues
         assert _reviewer_calls(stub) == []
-        assert report.outcome is not WorkflowOutcome.REQUEUED
+        # The terminal-exit gate adjudicates the exhaustion block: a done row
+        # with no on-main done_provenance is reopened as a bypass.
+        assert report.outcome is WorkflowOutcome.BLOCKED
+        assert scheduler.reopen_reasons[TASK_ID] == (
+            'bypass detected: Verification attempts exhausted'
+        )
+        assert scheduler.statuses[TASK_ID][-2:] == ['done', 'blocked']
 
 
 @pytest.mark.asyncio
