@@ -9,7 +9,11 @@ disagree with what it summarises. The summary's contract with gate θ is
 non-number under one, is returned. The summary counts the series and the UTC
 days they were stamped on, gives each per-run metric's 7-day sum under its id
 with the ``_7d`` suffix, and gives the failure rate as the failed sum over the
-asked sum, 0.0 when nothing was asked.
+asked sum, 0.0 when nothing was asked. It also carries ``expires_at``,
+:data:`SUMMARY_TTL` after its window ends, and
+``scripts/check_write_triage_readiness_gate.py`` fails closed on a report past
+its ``expires_at``, so a summary no later run replaced (a refused or crashed
+run, or a stopped timer) stops being evidence for gate θ.
 
 A per-run metric added later needs no reset of the window: a series that
 predates it adds nothing to its sum. Only the metrics in
@@ -28,7 +32,7 @@ import logging
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +66,8 @@ EVAL_ID = 'link-heal'
 SUMMARY_FILENAME = 'summary.json'
 SUMMARY_FORMAT = 'link-heal-summary/1'
 SUMMARY_WINDOW = timedelta(days=7)
+#: One nightly interval (scripts/fused-memory-link-heal.timer) plus jitter and run time; a missed night expires it.
+SUMMARY_TTL = timedelta(hours=26)
 SUMMARY_SUFFIX = '_7d'
 #: plans/write-triage-link-healing-prd.capability-manifest.md, "Summary key contract (ε → θ)".
 THETA_SUMMARY_KEYS: tuple[str, ...] = (
@@ -173,6 +179,7 @@ def summarize_series(root: Path, *, now: datetime) -> dict[str, Any]:
         'format': SUMMARY_FORMAT,
         'eval_id': EVAL_ID,
         'window': {'since': since, 'until': until},
+        'expires_at': (now + SUMMARY_TTL).astimezone(UTC).isoformat(timespec='seconds'),
         f'runs{SUMMARY_SUFFIX}': len(series),
         f'run_days{SUMMARY_SUFFIX}': len({stamp_datetime(run.run_stamp).date() for run in series}),
         **{f'{metric_id}{SUMMARY_SUFFIX}': total for metric_id, total in sums.items()},
@@ -247,8 +254,9 @@ class SweepMetricsTarget:
 
         A series that cannot be built raises. A failure to write, or to re-read an
         earlier artifact, is logged and returned as ``unwritten``, and the summary an
-        earlier run left is removed: it no longer counts tonight, and gate θ fails
-        closed on a missing summary rather than reading a stale one.
+        earlier run left is removed, because it does not count tonight. A summary no
+        run replaces at all is not removed; it stops being evidence at its own
+        ``expires_at``.
         """
         stamp = format_stamp(now)
         series = sweep_metric_series(view, project_id=self.project_id, stamp=stamp)
