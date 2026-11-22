@@ -5,8 +5,15 @@ the record's native carriers count as this session's own dialogue, which
 pattern of which signal class each one holds, and what every structured
 error in it means. Both readers reduce these hits, and both take a
 session's agent class from :func:`classify_agent_class`, so neither can
-disagree with the other (plans/confusion-reduction-prd.md §7.2.4). Imports
-only :mod:`legibility.reingestion` and :mod:`legibility.inventory`.
+disagree with the other (plans/confusion-reduction-prd.md §7.2.4).
+
+It also holds the parses of what a user turn carries: its text
+(:func:`user_turn_text`), the one grammar for Claude Code's slash-command
+markup (:func:`parse_slash_command_expansion`, which
+check_transcript_persistence also uses), and the gold-only rule for a turn
+the client composed (:func:`is_client_rendered_turn`), which
+:func:`record_hits` never asks. Imports only :mod:`legibility.reingestion`
+and :mod:`legibility.inventory`.
 """
 from __future__ import annotations
 
