@@ -44,6 +44,13 @@ REPORT = {
 }
 
 
+def expiry(hours: float) -> str:
+    return (datetime.now(UTC) + timedelta(hours=hours)).isoformat()
+
+
+HOLDING = ('--require', 'j', 'production_shape.duplicate_attach.strict_rate', '>=', '0.1')
+
+
 def test_every_requirement_holding_exits_zero_with_on_pass_actions(tmp_path):
     p = write(tmp_path, 'r.json', REPORT)
     rc, v, c = run(tmp_path, '--gate', 'G', '--report', 'j', p,
@@ -120,22 +127,14 @@ def test_a_subcheck_is_argv_and_its_exit_code_is_a_requirement(tmp_path):
 
 
 def test_the_compact_line_stays_under_the_note_cap_however_many_checks_fail(tmp_path):
-    p = write(tmp_path, 'r.json', REPORT)
+    p = write(tmp_path, 'r.json', {**REPORT, 'expires_at': expiry(-1)})
     args = ['--gate', 'Gamma-3', '--report', 'j', p, '--on-fail', 'y' * 500]
     for i in range(8):
         args += ['--require', 'j', f'production_shape.some_very_long_metric_name_number_{i}.rate_of_attaches', '<=', '0.25']
     args += ['--subcheck', f'{sys.executable} -c "raise SystemExit(1)"']
     rc, v, c = run(tmp_path, *args)
-    assert rc == 1 and len(v['checks']) == 9 and len(c['actions']) == 160
-    assert c['failed'][-1] == '…' and c['gate'] == 'Gamma-3'
-
-
-
-def expiry(hours: float) -> str:
-    return (datetime.now(UTC) + timedelta(hours=hours)).isoformat()
-
-
-HOLDING = ('--require', 'j', 'production_shape.duplicate_attach.strict_rate', '>=', '0.1')
+    assert rc == 1 and len(v['checks']) == 10 and len(c['actions']) == 160
+    assert c['failed'][0] == 'j:expires_at' and c['failed'][-1] == '…' and c['gate'] == 'Gamma-3'
 
 
 def test_an_unexpired_report_passes_and_shows_its_expiry(tmp_path):
@@ -152,17 +151,21 @@ def test_an_expired_report_fails_closed_and_still_reports_its_values(tmp_path):
     rc, v, c = run(tmp_path, '--gate', 'G', '--report', 'j', p, *HOLDING)
     assert rc == 1 and v['verdict'] == 'fail' and c['failed'][0] == 'j:expires_at'
     first, requested = v['checks']
-    assert first['check'] == 'j:expires_at' and first['ok'] is False and first['note']
+    assert first['check'] == 'j:expires_at' and first['ok'] is False and first['note'] == 'expired'
     assert requested['ok'] is True and requested['actual'] == 0.16
 
 
-@pytest.mark.parametrize('expires_at', [123, 'tomorrow', '2099-01-01T00:00:00'])
-def test_a_malformed_expiry_fails_closed(tmp_path, expires_at):
+@pytest.mark.parametrize(('expires_at', 'reason'), [
+    (123, 'not an ISO-8601 string'),
+    ('tomorrow', 'not an ISO-8601 timestamp'),
+    ('2099-01-01T00:00:00', 'no UTC offset'),
+])
+def test_a_malformed_expiry_fails_closed_and_names_why(tmp_path, expires_at, reason):
     p = write(tmp_path, 'r.json', {**REPORT, 'expires_at': expires_at})
     rc, v, c = run(tmp_path, '--gate', 'G', '--report', 'j', p, *HOLDING)
     assert rc == 1 and c['failed'] == ['j:expires_at']
     first = v['checks'][0]
-    assert first['check'] == 'j:expires_at' and first['ok'] is False and first['note']
+    assert first['check'] == 'j:expires_at' and first['ok'] is False and first['note'] == reason
 
 
 def test_an_expiry_alone_is_not_a_check_given(tmp_path):

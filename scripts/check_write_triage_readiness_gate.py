@@ -18,8 +18,9 @@ Every input is structured argv, never a mini-language:
 A PATH is dotted; a segment may select a list element by index (`per_k[3]`)
 or by key match (`per_k[k=20]`). Every malformed or missing input fails closed.
 A report whose top level carries `expires_at` (ISO-8601 with a UTC offset) is
-evidence only until then: its expiry is a leading check, and a passed,
-malformed or offset-less expiry fails closed.
+evidence only until then: its expiry is a leading check, and a past,
+malformed or offset-less expiry fails closed. A report without `expires_at`
+never expires.
 """
 from __future__ import annotations
 
