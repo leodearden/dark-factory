@@ -136,6 +136,13 @@ def effect(**fields: Any) -> PassEffect:
     return PassEffect(**{**empty, **fields})
 
 
+def _effect_block(pass_effect: PassEffect, *, debt_fields: bool) -> dict[str, Any]:
+    block = pass_effect.to_json()
+    if not debt_fields:
+        del block['debts_offered'], block['debts_undecided']
+    return block
+
+
 class Clock:
     def __init__(self, start: datetime = T0) -> None:
         self.current = start
@@ -248,11 +255,13 @@ class SoakProject:
         effect: PassEffect | None = None,
         blocks: bool = True,
         probe: ProbeResult | None = None,
+        debt_fields: bool = True,
     ) -> LanePass:
         """One pass: *detect* None writes no sub-run (a header only), ``()`` a green one.
 
         *blocks* False leaves the outcome and effect blocks as the header wrote them,
         which is how an interrupted pass, and a pass written before δ2, look.
+        *debt_fields* is :meth:`set_blocks`'.
         """
         self.clock.current = at
         lane_pass = self.records.allocate_pass(command, Leg.GENERIC, head)
@@ -261,15 +270,21 @@ class SoakProject:
         if confirm is not None:
             self._run(lane_pass, Phase.CONFIRM, confirm, None)
         if blocks:
-            self.set_blocks(lane_pass, outcome=outcome, effect=effect)
+            self.set_blocks(lane_pass, outcome=outcome, effect=effect, debt_fields=debt_fields)
         return lane_pass
 
-    def set_blocks(self, lane_pass: LanePass, *, outcome: PassOutcome | None, effect: PassEffect | None) -> None:
-        """The outcome and effect blocks, as ``offline_lane_pass.run_pass`` writes them at the end of a pass."""
+    def set_blocks(
+        self, lane_pass: LanePass, *, outcome: PassOutcome | None, effect: PassEffect | None, debt_fields: bool = True,
+    ) -> None:
+        """The outcome and effect blocks, as ``offline_lane_pass.run_pass`` writes them at the end of a pass.
+
+        *debt_fields* False writes the effect block without ``debts_offered`` and
+        ``debts_undecided``, as the lane wrote it before task 6865 (ε2).
+        """
         self.records.set_pass_blocks(
             lane_pass,
             outcome=None if outcome is None else outcome_to_json(outcome),
-            effect=None if effect is None else effect.to_json(),
+            effect=None if effect is None else _effect_block(effect, debt_fields=debt_fields),
         )
 
     def pass_record(self, lane_pass: LanePass) -> PassRecord:

@@ -202,6 +202,20 @@ def test_records_none_of_which_carries_an_effect_block_are_nothing_to_judge(tmp_
     _assert_nothing_to_judge(code, report, err, 'effect block')
 
 
+def test_records_none_of_which_records_its_debts_are_nothing_to_judge(tmp_path: Path, capsys):
+    project = SoakProject(tmp_path)
+    project.add_pass(
+        UNIT, at=T0, detect=(failure('tests/test_a.py::test_a'),), effect=effect(tests_counted=()), debt_fields=False,
+    )
+    project.provision(UNIT)
+
+    code, report, err = _report(project, capsys)
+
+    _assert_nothing_to_judge(code, report, err, 'debts')
+    assert 'effect block' in report['unjudgeable']
+    assert '--since' in report['unjudgeable']
+
+
 def test_no_pass_since_the_cut_is_nothing_to_judge(tmp_path: Path, capsys):
     project = SoakProject(tmp_path)
     _red_pass(project)
@@ -311,6 +325,21 @@ def test_a_pass_from_before_the_cut_over_is_outside_the_default_window(tmp_path:
     check = _check(report, 'records_well_formed')
     assert (check['examined'], check['notes']) == (4, [])
     assert report['since'] == T0.isoformat()
+
+
+def test_a_pass_from_before_the_ledger_cut_over_is_outside_the_default_window(tmp_path: Path, capsys):
+    project, _ = _green_project(tmp_path)
+    project.add_pass(
+        UNIT, at=T0 - timedelta(hours=1), detect=[failure(NODE_A)], confirm=[failure(NODE_A)],
+        outcome=_reproduced(NODE_A), effect=effect(tests_counted=(NODE_A,)), debt_fields=False,
+    )
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    assert report['since'] == T0.isoformat()
+    assert report['ledger_cut_over'] == T0.isoformat()
+    assert _check(report, 'records_well_formed')['examined'] == 4
 
 
 def test_command_restricts_the_examined_passes(tmp_path: Path, capsys):
