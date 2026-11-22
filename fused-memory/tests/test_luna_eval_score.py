@@ -7,6 +7,9 @@ them to its ``decide``.
 """
 from __future__ import annotations
 
+import hashlib
+import inspect
+import json
 import math
 from collections.abc import Sequence
 from pathlib import Path
@@ -427,3 +430,330 @@ class TestTheRunsFailClosed:
     def test_no_runs_are_refused(self) -> None:
         with pytest.raises(score.RunFileError):
             score.routing_label_decision([], {})
+
+
+# --------------------------------------------------------------------------- #
+# Blind worksheets
+# --------------------------------------------------------------------------- #
+
+ARM_WORDS = ('control', 'luna', 'gpt', 'arm', 'model', 'plan_proxy', 'configured')
+
+
+def _blind(rows: Any) -> bool:
+    text = json.dumps(rows).lower()
+    return not any(word in text for word in ARM_WORDS)
+
+
+def _edge(uuid: str, fact: str) -> dict[str, Any]:
+    return {'uuid': uuid, 'fact': fact, 'source_node_uuid': 'A', 'target_node_uuid': 'B',
+            'created_at': '2026-10-01T00:00:00+00:00', 'valid_at': None, 'invalid_at': None, 'expired_at': None}
+
+
+RESOLVE_FIXTURES = {
+    'dark_factory/new': {
+        'graph': 'dark_factory', 'edge_uuid': 'new', 'fact': 'Alpha adopts Beta for the queue',
+        'source_node_uuid': 'A', 'target_node_uuid': 'B', 'created_at': '2026-10-06T00:00:00+00:00',
+        'valid_at': None, 'invalid_at': None, 'expired_at': None,
+        'episode_uuid': 'ep-1', 'episode_valid_at': '2026-10-06T00:00:00+00:00',
+        'related': [_edge('sib', 'Alpha uses Beta for the queue')],
+        'invalidation_candidates': [_edge('old', 'Alpha uses Xi for the queue')],
+    },
+}
+
+
+class TestTheResolveGoldWorksheet:
+    def test_it_carries_only_the_fixtures_facts(self) -> None:
+        assert score.resolve_gold_worksheet(RESOLVE_FIXTURES) == [{
+            'fixture_id': 'dark_factory/new', 'fact': 'Alpha adopts Beta for the queue',
+            'related': [{'uuid': 'sib', 'fact': 'Alpha uses Beta for the queue'}],
+            'invalidation_candidates': [{'uuid': 'old', 'fact': 'Alpha uses Xi for the queue'}],
+        }]
+
+    def test_it_reads_no_run(self) -> None:
+        assert list(inspect.signature(score.resolve_gold_worksheet).parameters) == ['fixtures']
+
+    def test_it_names_no_arm_model_or_label(self) -> None:
+        assert _blind(score.resolve_gold_worksheet(RESOLVE_FIXTURES))
+
+
+EPISODE = 'dark_factory/ep-1'
+SUMMARY_FIXTURES = {
+    EPISODE: {
+        'graph': 'dark_factory', 'episode_uuid': 'ep-1', 'episode_valid_at': '2026-10-06T00:00:00+00:00',
+        'episode_content': 'Alpha now routes the queue through Beta.', 'previous': ['Alpha ran the queue alone.'],
+        'nodes': [{'node_uuid': 'A', 'node_name': 'Alpha', 'summary': 'Alpha runs the queue.'},
+                  {'node_uuid': 'B', 'node_name': 'Beta', 'summary': 'Beta is a broker.'}],
+        'edges': [{'uuid': 'e1', 'source_node_uuid': 'A', 'target_node_uuid': 'B', 'fact': 'Alpha routes via Beta'},
+                  {'uuid': 'e2', 'source_node_uuid': 'B', 'target_node_uuid': 'B', 'fact': 'Beta restarts nightly'}],
+    },
+}
+
+
+def _summary_run(arm: str, summaries: dict[str, str]) -> dict[str, Any]:
+    return _run(SUMMARIES, arm, EPISODE, summaries=summaries)
+
+
+SUMMARY_RUNS = [
+    _summary_run(CONTROL, {'A': 'Alpha routes the queue via Beta.', 'B': 'Beta brokers the queue.'}),
+    _summary_run(LUNA, {'A': 'Alpha sends queue work to Beta.', 'B': ''}),
+]
+
+
+def _letters(fixture_id: str) -> dict[str, str]:
+    """The pre-registered blinding: the arm whose sha256(fixture_id:arm) sorts first is A."""
+    first, second = sorted((CONTROL, LUNA), key=lambda arm: hashlib.sha256(f'{fixture_id}:{arm}'.encode()).hexdigest())
+    return {'A': first, 'B': second}
+
+
+class TestTheSummaryRatingWorksheet:
+    def test_each_node_is_one_item_with_its_inputs_and_both_summaries(self) -> None:
+        rows, _ = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
+        letters = _letters(EPISODE)
+        by_arm = {record['arm']: record['summaries'] for record in SUMMARY_RUNS}
+        assert rows[0] == {
+            'fixture_id': EPISODE, 'node_uuid': 'A', 'node_name': 'Alpha', 'previous_summary': 'Alpha runs the queue.',
+            'episode_content': 'Alpha now routes the queue through Beta.',
+            'previous_episodes': ['Alpha ran the queue alone.'], 'facts': ['Alpha routes via Beta'],
+            'summaries': {letter: by_arm[arm]['A'] for letter, arm in letters.items()},
+        }
+        assert [row['node_uuid'] for row in rows] == ['A', 'B']
+        assert rows[1]['facts'] == ['Alpha routes via Beta', 'Beta restarts nightly']
+
+    def test_an_empty_summary_is_shown_as_none(self) -> None:
+        rows, _ = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
+        luna_letter = next(letter for letter, arm in _letters(EPISODE).items() if arm == LUNA)
+        assert rows[1]['summaries'][luna_letter] is None
+
+    def test_the_key_maps_each_letter_to_its_arm_by_sha256(self) -> None:
+        _, key = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
+        assert key == [{'fixture_id': EPISODE, 'node_uuid': node, **_letters(EPISODE)} for node in ('A', 'B')]
+
+    def test_the_worksheet_never_names_an_arm_or_model(self) -> None:
+        rows, _ = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
+        assert _blind(rows)
+
+    def test_a_fixture_one_arm_failed_is_not_offered(self) -> None:
+        runs = [SUMMARY_RUNS[0], _failed(SUMMARIES, LUNA, EPISODE)]
+        assert score.summary_rating_worksheet(SUMMARY_FIXTURES, runs) == ([], [])
+
+
+CATEGORIES = ('temporal_facts', 'entities_and_relations', 'procedural_knowledge')
+
+
+def _routing_runs(site: str, labels: dict[str, tuple[str, str]]) -> list[dict[str, Any]]:
+    return _labelled(site, labels)
+
+
+class TestTheRoutingDiscordantWorksheet:
+    def _rows(self) -> list[dict[str, Any]]:
+        runs = _routing_runs(CLASSIFIER, {'1': ('temporal_facts', 'temporal_facts'),
+                                          '2': ('temporal_facts', 'procedural_knowledge')})
+        return score.routing_discordant_worksheet({'1': 'first text', '2': 'second text'}, runs, CATEGORIES)
+
+    def test_only_discordant_items_are_offered(self) -> None:
+        assert [row['fixture_id'] for row in self._rows()] == ['2']
+
+    def test_the_labels_are_unattributed_in_sha256_order(self) -> None:
+        (row,) = self._rows()
+        assert row['labels'] == sorted(
+            ['temporal_facts', 'procedural_knowledge'],
+            key=lambda label: hashlib.sha256(f'2:{label}'.encode()).hexdigest(),
+        )
+        assert row == {'site': CLASSIFIER, 'fixture_id': '2', 'text': 'second text', 'labels': row['labels'],
+                       'vocabulary': list(CATEGORIES)}
+
+    def test_it_never_names_an_arm_or_model(self) -> None:
+        assert _blind(self._rows())
+
+
+# --------------------------------------------------------------------------- #
+# Verdict files fail closed, naming the offender
+# --------------------------------------------------------------------------- #
+
+
+def _gold_file(**overrides: Any) -> dict[str, Any]:
+    verdict = {'fixture_id': 'dark_factory/new', 'duplicates': ['sib'], 'contradicted': ['old'], 'judgeable': True,
+               'rationale': '"uses Beta for the queue" restates "adopts Beta for the queue"'}
+    return {'gold': [verdict | overrides]}
+
+
+class TestTheResolveGoldLoader:
+    def test_a_complete_file_loads(self) -> None:
+        worksheet = score.resolve_gold_worksheet(RESOLVE_FIXTURES)
+        assert score.load_resolve_gold(_gold_file(), worksheet) == {
+            'dark_factory/new': score.ResolveGold(duplicates=frozenset({'sib'}), contradicted=frozenset({'old'})),
+        }
+
+    def test_an_unjudgeable_fixture_loads_as_such(self) -> None:
+        worksheet = score.resolve_gold_worksheet(RESOLVE_FIXTURES)
+        gold = score.load_resolve_gold(_gold_file(duplicates=[], contradicted=[], judgeable=False), worksheet)
+        assert gold['dark_factory/new'].judgeable is False
+
+    @pytest.mark.parametrize(('obj', 'error', 'offender'), [
+        ({'gold': []}, 'MissingVerdicts', 'dark_factory/new'),
+        ({'gold': _gold_file()['gold'] * 2}, 'DuplicateVerdict', 'dark_factory/new'),
+        (_gold_file(duplicates=['old']), 'UnknownLabel', 'dark_factory/new'),
+        (_gold_file(contradicted=['elsewhere']), 'UnknownLabel', 'dark_factory/new'),
+        (_gold_file(rationale='  '), 'MissingRationale', 'dark_factory/new'),
+        ({'gold': _gold_file()['gold'] + _gold_file(fixture_id='reify/other')['gold']}, 'OutOfSampleVerdict',
+         'reify/other'),
+        ({'gold': [{'fixture_id': 'dark_factory/new'}]}, 'MalformedVerdicts', 'dark_factory/new'),
+        ({'verdicts': []}, 'MalformedVerdicts', ''),
+    ])
+    def test_a_bad_file_is_refused_naming_the_offender(self, obj: Any, error: str, offender: str) -> None:
+        with pytest.raises(getattr(score, error)) as caught:
+            score.load_resolve_gold(obj, score.resolve_gold_worksheet(RESOLVE_FIXTURES))
+        assert offender in str(caught.value)
+        assert isinstance(caught.value, score.VerdictError)
+
+
+def _ratings_file(rows: list[dict[str, Any]], **overrides: Any) -> dict[str, Any]:
+    return {'ratings': [
+        {'fixture_id': row['fixture_id'], 'node_uuid': row['node_uuid'], 'summary': letter,
+         'rating': 'dropped' if row['summaries'][letter] is None else 'faithful',
+         'rationale': 'quotes "routes the queue through Beta"'} | overrides
+        for row in rows for letter in ('A', 'B')
+    ]}
+
+
+class TestTheSummaryRatingLoader:
+    def test_ratings_are_unblinded_through_the_key(self) -> None:
+        rows, key = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
+        ratings = score.load_summary_ratings(_ratings_file(rows), rows, key)
+        assert ratings[(EPISODE, 'A')] == {CONTROL: 'faithful', LUNA: 'faithful'}
+        assert ratings[(EPISODE, 'B')] == {CONTROL: 'faithful', LUNA: 'dropped'}
+
+    def test_the_loaded_ratings_drive_the_decision(self) -> None:
+        rows, key = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
+        decision = score.summary_decision(SUMMARY_RUNS, score.load_summary_ratings(_ratings_file(rows), rows, key))
+        assert decision['statistics']['faithful_rate']['control_only'] == 1
+
+    @pytest.mark.parametrize(('mutate', 'error', 'offender'), [
+        (lambda ratings: ratings[1:], 'MissingVerdicts', 'ep-1/A'),
+        (lambda ratings: ratings + ratings[:1], 'DuplicateVerdict', 'ep-1/A'),
+        (lambda ratings: [ratings[0] | {'rating': 'great'}, *ratings[1:]], 'UnknownLabel', 'ep-1/A'),
+        (lambda ratings: [ratings[0] | {'rationale': ''}, *ratings[1:]], 'MissingRationale', 'ep-1/A'),
+        (lambda ratings: [*ratings, ratings[0] | {'node_uuid': 'Z'}], 'OutOfSampleVerdict', 'ep-1/Z'),
+        (lambda ratings: [*ratings, ratings[0] | {'summary': 'C'}], 'OutOfSampleVerdict', 'ep-1/A'),
+    ])
+    def test_a_bad_file_is_refused_naming_the_offender(self, mutate: Any, error: str, offender: str) -> None:
+        rows, key = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
+        obj = {'ratings': mutate(_ratings_file(rows)['ratings'])}
+        with pytest.raises(getattr(score, error)) as caught:
+            score.load_summary_ratings(obj, rows, key)
+        assert offender in str(caught.value)
+
+    def test_a_key_that_does_not_cover_the_worksheet_is_refused(self) -> None:
+        rows, key = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
+        with pytest.raises(score.MalformedVerdicts) as caught:
+            score.load_summary_ratings(_ratings_file(rows), rows, key[:1])
+        assert 'ep-1/B' in str(caught.value)
+
+
+class TestTheRoutingVerdictLoader:
+    def _worksheet(self) -> list[dict[str, Any]]:
+        classifier = score.routing_discordant_worksheet(
+            {'2': 'second text'}, _routing_runs(CLASSIFIER, {'2': ('temporal_facts', 'procedural_knowledge')}),
+            CATEGORIES)
+        router = score.routing_discordant_worksheet(
+            {'9': 'a query'}, _routing_runs(ROUTER, {'9': ('temporal', 'entity')}), ('temporal', 'entity', 'procedural'))
+        return classifier + router
+
+    def _file(self, **overrides: Any) -> dict[str, Any]:
+        return {'verdicts': [
+            {'site': CLASSIFIER, 'fixture_id': '2', 'label': 'entities_and_relations', 'rationale': 'names two teams'},
+            {'site': ROUTER, 'fixture_id': '9', 'label': 'entity', 'rationale': 'asks what Alpha is'} | overrides,
+        ]}
+
+    def test_gold_is_keyed_by_site_then_fixture(self) -> None:
+        assert score.load_routing_verdicts(self._file(), self._worksheet()) == {
+            CLASSIFIER: {'2': 'entities_and_relations'}, ROUTER: {'9': 'entity'},
+        }
+
+    def test_a_label_neither_arm_gave_is_accepted_from_the_vocabulary(self) -> None:
+        gold = score.load_routing_verdicts(self._file(label='procedural'), self._worksheet())
+        assert gold[ROUTER] == {'9': 'procedural'}
+
+    @pytest.mark.parametrize(('overrides', 'error', 'offender'), [
+        ({'label': 'entities_and_relations'}, 'UnknownLabel', 'router/9'),
+        ({'rationale': ''}, 'MissingRationale', 'router/9'),
+        ({'fixture_id': '10'}, 'OutOfSampleVerdict', 'router/10'),
+    ])
+    def test_a_bad_verdict_is_refused_naming_the_offender(
+        self, overrides: dict[str, Any], error: str, offender: str,
+    ) -> None:
+        with pytest.raises(getattr(score, error)) as caught:
+            score.load_routing_verdicts(self._file(**overrides), self._worksheet())
+        assert offender in str(caught.value)
+
+    def test_a_missing_verdict_is_refused(self) -> None:
+        obj = {'verdicts': self._file()['verdicts'][:1]}
+        with pytest.raises(score.MissingVerdicts) as caught:
+            score.load_routing_verdicts(obj, self._worksheet())
+        assert 'router/9' in str(caught.value)
+
+    def test_a_duplicate_verdict_is_refused(self) -> None:
+        verdicts = self._file()['verdicts']
+        with pytest.raises(score.DuplicateVerdict) as caught:
+            score.load_routing_verdicts({'verdicts': [*verdicts, verdicts[1]]}, self._worksheet())
+        assert 'router/9' in str(caught.value)
+
+
+# --------------------------------------------------------------------------- #
+# Cost
+# --------------------------------------------------------------------------- #
+
+pricing = load_script_module(SCRIPTS / 'score_write_triage_pairs.py', mod_name='score_write_triage_pairs')
+
+
+def _costed(site: str, arm: str, fixture_id: str, input_tokens: int, output_tokens: int) -> dict[str, Any]:
+    return _run(site, arm, fixture_id, label='x') | {
+        'tokens': {site: {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'llm_calls': 1}},
+    }
+
+
+COST_RUNS = [
+    _costed(ROUTER, CONTROL, '1', 100, 10), _costed(ROUTER, CONTROL, '2', 300, 30),
+    _costed(ROUTER, LUNA, '1', 100, 10), _costed(ROUTER, LUNA, '2', 300, 30),
+    _costed(CLASSIFIER, CONTROL, '1', 1000, 0), _costed(CLASSIFIER, LUNA, '1', 2000, 0),
+    _failed(ROUTER, LUNA, '3'),
+]
+
+
+class TestTheCostBlock:
+    def test_the_prices_are_the_write_triage_scorers(self) -> None:
+        assert score.LIST_PRICES is pricing.LIST_PRICES
+        assert score.LIST_PRICES_AS_OF is pricing.LIST_PRICES_AS_OF
+
+    def test_tokens_per_call_per_site_per_arm(self) -> None:
+        cost = score.cost_block(COST_RUNS, {ROUTER: 1000.0}, (280.0, 470.0))
+        router = cost['sites'][ROUTER]
+        assert {arm: (block['calls'], block['input_tokens_per_call'], block['output_tokens_per_call'])
+                for arm, block in router.items()} == {CONTROL: (2, 200.0, 20.0), LUNA: (2, 200.0, 20.0)}
+        assert (router[CONTROL]['model'], router[LUNA]['model']) == ('gpt-4o-mini', 'gpt-6-luna')
+
+    def test_each_arm_is_priced_at_its_models_list_price(self) -> None:
+        router = score.cost_block(COST_RUNS, {ROUTER: 1000.0}, (280.0, 470.0))['sites'][ROUTER]
+        assert router[CONTROL]['usd_per_call'] == pytest.approx((200 * 0.15 + 20 * 0.60) / 1e6)
+        assert router[LUNA]['usd_per_call'] == pytest.approx((200 * 0.10 + 20 * 0.50) / 1e6)
+
+    def test_daily_usd_is_per_call_usd_times_the_sites_calls_per_day(self) -> None:
+        cost = score.cost_block(COST_RUNS, {ROUTER: 1000.0}, (280.0, 470.0))
+        assert cost['sites'][ROUTER][LUNA]['daily_usd'] == pytest.approx(0.03)
+        assert cost['sites'][ROUTER][CONTROL]['daily_usd'] == pytest.approx(0.042)
+        assert cost['sites'][CLASSIFIER][LUNA]['daily_usd'] is None
+
+    def test_a_model_without_a_list_price_prices_as_none(self) -> None:
+        runs = [_costed(ROUTER, CONTROL, '1', 100, 10), _costed(ROUTER, LUNA, '1', 100, 10) | {'model': 'unpriced'}]
+        block = score.cost_block(runs, {ROUTER: 10.0}, (280.0, 470.0))['sites'][ROUTER][LUNA]
+        assert (block['usd_per_call'], block['daily_usd']) == (None, None)
+
+    def test_the_plan_window_share_is_inferred_at_each_end_of_the_window(self) -> None:
+        cost = score.cost_block(COST_RUNS, {ROUTER: 1000.0, CLASSIFIER: 500.0}, (280.0, 470.0))
+        weekly = 7 * (0.03 + 500.0 * 2000 * 0.10 / 1e6)
+        window = cost['plan_window']
+        assert window['weekly_candidate_usd'] == pytest.approx(weekly)
+        assert window['window_usd_per_week'] == [280.0, 470.0]
+        assert window['share'] == [pytest.approx(weekly / 280.0), pytest.approx(weekly / 470.0)]
+        assert window['tag'] == 'inferred'
+        assert cost['prices']['as_of'] == pricing.LIST_PRICES_AS_OF
