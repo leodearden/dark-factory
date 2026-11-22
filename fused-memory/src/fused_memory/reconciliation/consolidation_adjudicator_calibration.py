@@ -93,13 +93,6 @@ class CaseKind(StrEnum):
 
 
 @dataclass(frozen=True)
-class EvalMember:
-    id: str
-    category: str
-    text: str
-
-
-@dataclass(frozen=True)
 class EvalHazard:
     code: AutoReasonCode
     #: None for a case-level hazard (``mixed_category``).
@@ -119,7 +112,7 @@ class EvalCase:
     case_id: str
     split: CaseSplit
     kind: CaseKind
-    members: tuple[EvalMember, ...]
+    members: tuple[MemberInput, ...]
     claim: str
     hazards: tuple[EvalHazard, ...]
     expected: Expectation
@@ -155,9 +148,9 @@ def _str(value: object, case_id: object, what: str) -> str:
     return value
 
 
-def _member(raw: object, case_id: object) -> EvalMember:
+def _member(raw: object, case_id: object) -> MemberInput:
     member = _object(raw, case_id, required=_MEMBER_KEYS, allowed=_MEMBER_KEYS)
-    return EvalMember(
+    return MemberInput(
         id=_str(member['id'], case_id, 'member id'),
         category=_str(member['category'], case_id, 'member category'),
         text=_str(member['text'], case_id, 'member text'),
@@ -267,7 +260,7 @@ def case_request(case: EvalCase) -> AdjudicationRequest:
         topic=case.topic,
         claim=case.claim,
         category=categories.pop(),
-        members=tuple(MemberInput(id=m.id, category=m.category, text=m.text) for m in case.members),
+        members=case.members,
         hazards=tuple(
             Hazard(code=h.code, subject_id=h.member_id)
             for h in case.hazards

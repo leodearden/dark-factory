@@ -31,26 +31,25 @@ USAGE = TokenUsage(input_tokens=1_000, output_tokens=100, reasoning_tokens=50)
 
 
 class ScriptedResponses:
-    """Records every request's kwargs and answers from *answers*.
+    """Records every request's kwargs and answers every call from *answer*.
 
-    The answers are consumed one per call and the last one repeats, so a
-    single answer serves every call. With *gate*, every call waits on that event first,
-    so a test can hold calls in flight (or hang them). ``peak_in_flight`` is the
-    most calls ever awaiting at once.
+    A per-call sequence is scripted through a function of the request, as
+    ``EvalAnswerKey`` does per eval case. With *gate*, every call waits on that
+    event first, so a test can hold calls in flight (or hang them).
+    ``peak_in_flight`` is the most calls ever awaiting at once.
     """
 
-    def __init__(self, first: Answer, *rest: Answer, gate: asyncio.Event | None = None):
-        self._script: Sequence[Answer] = (first, *rest)
+    def __init__(self, answer: Answer, *, gate: asyncio.Event | None = None):
+        self._answer = answer
         self._gate = gate
         self.requests: list[dict[str, Any]] = []
         self.in_flight = 0
         self.peak_in_flight = 0
 
     def _answer_for(self, request: Mapping[str, Any]) -> ResponsesReply | BaseException:
-        answer = self._script[min(len(self.requests) - 1, len(self._script) - 1)]
-        if isinstance(answer, (ResponsesReply, BaseException)):
-            return answer
-        return answer(request)
+        if isinstance(self._answer, (ResponsesReply, BaseException)):
+            return self._answer
+        return self._answer(request)
 
     async def __call__(
         self,
@@ -158,8 +157,8 @@ def bad_request() -> openai.BadRequestError:
 class UnidentifiedCase(BaseException):
     """A request that matches no eval case, or several: a fault in the test, never an answer.
 
-    A ``BaseException``, so the adjudicator's ``except Exception`` cannot turn it
-    into a content failure and the run fails loudly instead.
+    A ``BaseException``, so no ``except Exception`` on the call path can absorb
+    it, and the run fails loudly instead.
     """
 
 
