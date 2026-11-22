@@ -153,7 +153,7 @@ cmd_inner() {  # INSIDE the namespace: cmd_inner <id> <mode>
     log "$id: head $(git rev-parse --short=10 HEAD) toplevel $(git rev-parse --show-toplevel) PWD=$PWD sock=$SOCK"
     printf '{"run":"%s","host":"%s","mode":"%s","head":"%s","target_existed_fingerprints":%s}\n' "$id" "$HOST" "$mode" \
         "$(git rev-parse HEAD)" "$(find target -maxdepth 3 -name .fingerprint -type d 2>/dev/null | grep -q . && echo true || echo false)" >"$out/meta.json"
-    env | grep -E '^(CARGO_|RUSTC|SCCACHE_|PWD=|PATH=)' | sort >"$out/env.observed"
+    env | grep -E '^(CARGO_|RUSTC|SCCACHE_|PWD=|PATH=)' | sort >"$out/env.observed.txt"
     ( . "$out/env.sh" && bash -e "$out/preflight.sh" ) >"$out/preflight.log" 2>&1 || die "$id preflight failed"
     while IFS=$'\t' read -r name cmd; do
         cmd="$(printf '%s' "$cmd" | sed -E 's/timeout --kill-after=60 [0-9]+m //')"
@@ -313,7 +313,7 @@ PY
             --writable "$lane/.task" --writable "$lane" --writable "$d" -- \
         claude -p --model claude-sonnet-5-5 --dangerously-skip-permissions --output-format json --max-turns 8 "$prompt"
     ) >"$d/session.json" 2>"$d/session.err"
-    echo "agent rc=$?" | tee -a "$d/rc"
+    echo "agent rc=$?" | tee -a "$d/rc.txt"
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("result","")[:2000]); print("is_error", d.get("is_error"), "turns", d.get("num_turns"), "cost", d.get("total_cost_usd"))' "$d/session.json" 2>&1 | tee "$d/result.txt"
     cat "$d/journal.jsonl" 2>/dev/null
 }
