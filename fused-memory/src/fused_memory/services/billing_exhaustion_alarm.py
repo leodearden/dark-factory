@@ -55,8 +55,10 @@ _LOG_LABEL = 'provider_billing_exhausted'
 _SOURCE = BillingSource.API_KEY_CREDITS
 _UNKNOWN = 'unknown'
 
-#: Right after a top-up, writes that land can interleave with probes that
-#: still meet the old balance while it propagates.
+#: Sets two cadences. An exhaustion this soon after a recovery waits it out,
+#: because right after a top-up, writes that land can interleave with probes
+#: that still meet the old balance while it propagates. A filed page is also
+#: re-checked against the queue no more often than this.
 REPAGE_COOLDOWN = timedelta(minutes=10)
 
 
@@ -156,9 +158,9 @@ class BillingExhaustionAlarm:
             return
         if latched.escalation_id is not None and latched.escalation_id != escalation_id:
             logger.warning(
-                '%s: %s was closed while credits are still exhausted (since %s); '
-                're-paged as %s', _LOG_LABEL, latched.escalation_id,
-                latched.first_seen.isoformat(), escalation_id,
+                '%s: %s did not come back as the pending page for credits '
+                'exhausted since %s; latched onto %s', _LOG_LABEL,
+                latched.escalation_id, latched.first_seen.isoformat(), escalation_id,
             )
         if self._state is latched:
             self._state = replace(latched, escalation_id=escalation_id, page_confirmed_at=now)
