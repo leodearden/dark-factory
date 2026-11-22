@@ -93,8 +93,11 @@ def _commits(*present: str) -> Callable[[str], bool]:
     return lambda sha: sha in present
 
 
+_TIP_AND_BASE_EXIST = _commits(_TIP, _BASE)
+
+
 def _read(
-    root: Path, *, min_seconds: float = 1.0, commit_exists: Callable[[str], bool] = _commits(_TIP, _BASE)
+    root: Path, *, min_seconds: float = 1.0, commit_exists: Callable[[str], bool] = _TIP_AND_BASE_EXIST
 ) -> vlj.JunitCorpus:
     return vlj.read_runs(root, min_seconds=min_seconds, commit_exists=commit_exists, head_sha=_HEAD)
 
