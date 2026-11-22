@@ -217,6 +217,9 @@ def _scope() -> list[tuple[Path, bool]]:
     others = [
         REPO_ROOT / 'dashboard' / 'src' / 'dashboard' / 'data' / 'load.py',
         REPO_ROOT / 'scripts' / 'load-threshold-calibration.py',
+        REPO_ROOT / 'scripts' / 'resource_report.py',
+        REPO_ROOT / 'scripts' / 'resource_report_holds.py',
+        REPO_ROOT / 'scripts' / 'resource_report_holds_render.py',
     ]
     return [(path, path == _SPEC_HOME) for path in sampler_modules] + [
         (path, False) for path in others
@@ -251,3 +254,11 @@ class TestTheLiveTree:
         scanned = {path.name for path, _declares_specs in _scope()}
 
         assert {'consumers.py', 'host_memory.py'} <= scanned
+
+    def test_the_resource_report_is_scanned(self):
+        """It queries the consumer metrics, so it must take every name from the table."""
+        scanned = {path.name for path, _declares_specs in _scope()}
+
+        assert {
+            'resource_report.py', 'resource_report_holds.py', 'resource_report_holds_render.py'
+        } <= scanned
