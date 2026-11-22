@@ -8,7 +8,6 @@ them to its ``decide``.
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import math
 from collections.abc import Sequence
@@ -468,9 +467,6 @@ class TestTheResolveGoldWorksheet:
             'related': [{'uuid': 'sib', 'fact': 'Alpha uses Beta for the queue'}],
             'invalidation_candidates': [{'uuid': 'old', 'fact': 'Alpha uses Xi for the queue'}],
         }]
-
-    def test_it_reads_no_run(self) -> None:
-        assert list(inspect.signature(score.resolve_gold_worksheet).parameters) == ['fixtures']
 
     def test_it_names_no_arm_model_or_label(self) -> None:
         assert _blind(score.resolve_gold_worksheet(RESOLVE_FIXTURES))

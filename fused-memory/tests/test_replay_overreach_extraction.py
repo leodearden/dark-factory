@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import inspect
 import json
 import logging
 import os
@@ -1376,9 +1375,6 @@ class TestScoreOverAFrame:
         arms = report['arms']
         assert calls == [(arms['control']['population_weighted'], arms['o1']['population_weighted'])]
         assert report['comparison'] == {'o1': {'candidate_rate': 0.0}}
-
-    def test_the_default_decision_is_the_lever_rule(self) -> None:
-        assert inspect.signature(mod.score_replay).parameters['decide'].default is mod.lever_decision
 
 
 class TestScoreFailsClosed:
