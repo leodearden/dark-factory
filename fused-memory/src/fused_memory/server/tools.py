@@ -262,6 +262,7 @@ from fused_memory.services.read_telemetry import (
 )
 from fused_memory.services.supersession_mark import mark_superseded
 from fused_memory.utils.clip_disclosure import truncation_fields
+from fused_memory.utils.mem0_content_keys import payload_without_text
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     canonicalize_project_id,
@@ -4903,7 +4904,7 @@ def create_mcp_server(
         needles: list[str] | None = None,
         filters: dict | None = None,
         exhaustive: bool = False,
-        limit: int | None = None,
+        limit: int | None = 1000,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Scan memory TEXT for literal substrings (deterministic substring match, not semantic).
@@ -4928,15 +4929,17 @@ def create_mcp_server(
         preferences_and_norms, procedural_knowledge). It does NOT scan Graphiti
         episodes or edges; a leaked episode must be found and remediated separately.
 
-        **No silent caps:** the walk paginates to the end of the collection. When an
-        explicit *limit* stops it early, the response self-discloses this via
-        ``truncated`` (bool) alongside ``scanned`` (the number of records actually
-        examined, and the correct denominator for an incidence rate).
+        **No silent caps:** the walk stops after *limit* records (default 1000,
+        matching ``get_memories_by_metadata``); pass ``limit=null`` to walk to the end
+        of the collection. When the limit stops it early, the response self-discloses
+        this via ``truncated`` (bool) alongside ``scanned`` (the number of records
+        actually examined, and the correct denominator for an incidence rate).
 
-        Example call:
+        Example call (a whole-collection incidence walk):
             scan_memory_content(
                 project_id="dark_factory",
                 exhaustive=True,
+                limit=None,
             )
 
         This tool is intentionally read-only and is NOT included in any DISALLOW_*
@@ -4954,14 +4957,17 @@ def create_mcp_server(
                 answer then depends on nothing but the Python verdict, and it also
                 sees text under the ``memory``/``content`` fallback keys — use this
                 when establishing a true incidence rate or a complete literal hunt.
-            limit: Maximum records to WALK (default: no limit).
+            limit: Maximum records to WALK (default 1000). ``null`` walks to the end;
+                an early stop is disclosed by ``truncated``.
 
         Returns:
             {'matches': [{'id', 'created_at', 'matched_fragments', 'excerpt',
             'metadata'}, ...], 'scanned': int, 'truncated': bool, 'exhaustive': ...,
             'limit': ..., 'project_id': ...} on success, or {'error': ...,
             'error_type': ...} on failure. An empty ``matches`` list is a SUCCESSFUL
-            scan of a clean corpus, not an error.
+            scan of a clean corpus, not an error. A match's ``metadata`` omits the
+            text keys (``data``/``memory``/``content``): the text is in ``excerpt``,
+            and ``get_memory_by_id`` returns the full body.
         """
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:
@@ -4976,7 +4982,10 @@ def create_mcp_server(
             limit=limit,
         )
         return {
-            'matches': result.get('matches', []),
+            'matches': [
+                {**match, 'metadata': payload_without_text(match.get('metadata') or {})}
+                for match in result.get('matches', [])
+            ],
             'scanned': result.get('scanned', 0),
             'truncated': result.get('truncated', False),
             'exhaustive': exhaustive,

@@ -1,4 +1,4 @@
-"""Which raw Qdrant payload keys hold a Mem0 memory's text, and how to read it.
+"""Which raw Qdrant payload keys hold a Mem0 memory's text, and how to read or drop it.
 
 mem0 writes a memory's text under ``data``; older or alternately written
 points carry it under ``memory`` or ``content``. The first non-empty string,
@@ -23,3 +23,8 @@ def mem0_payload_text(payload: Mapping[str, Any]) -> str:
         if isinstance(value, str) and value:
             return value
     return ''
+
+
+def payload_without_text(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """A new dict of *payload*'s keys other than :data:`MEM0_CONTENT_KEYS`."""
+    return {key: value for key, value in payload.items() if key not in MEM0_CONTENT_KEYS}
