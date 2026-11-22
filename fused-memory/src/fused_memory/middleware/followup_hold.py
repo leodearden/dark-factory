@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -19,6 +20,8 @@ from shared.followup_hold_records import (
     FOLLOWUP_HOLDER_METADATA_KEY,
     FollowupHold,
     FollowupHolder,
+    PromotionCause,
+    PromotionRecord,
 )
 from shared.project_id import normalize_project_id
 from shared.task_metadata import ExternalDep
@@ -45,10 +48,10 @@ __all__ = [
     'HOLDER_GATE_KEYS',
     'HOLDER_MINT_SOURCE',
     'PROTECTED_STATUSES',
-    'BackfillEmit',
     'DuplicateFollowupHolderError',
     'FollowupHolderProtectedError',
     'FollowupHolders',
+    'HoldEmit',
     'HolderMinted',
     'HolderProtection',
     'PromotionDeferral',
@@ -63,8 +66,11 @@ __all__ = [
     'may_strip_holder_edge',
     'protected_status',
     'protected_update',
+    'promote',
+    'promote_dependencies_of',
     'protection_refusal',
     'register_promotion_guard',
+    'release_held',
     'releases_holder',
     'unregister_promotion_guard',
 ]
@@ -90,6 +96,7 @@ _BACKFILL_FIELDS: Final = (
 )
 _EXTERNAL_DEPS_FIELDS: Final = ('id', 'metadata.external_deps')
 _METADATA_SOURCE: Final = 'followup_hold'
+_RELEASE_REF: Final = 'release_holder'
 
 
 def is_holder(task: Mapping[str, object]) -> bool:
@@ -136,6 +143,11 @@ def held_by(task: Mapping[str, object]) -> int | None:
     A promoted row keeps its record but has lost the edge, so it is not held. A record that does
     not parse holds nothing and logs one WARNING naming the task.
     """
+    record = _current_hold(task)
+    return None if record is None else record.holder
+
+
+def _current_hold(task: Mapping[str, object]) -> FollowupHold | None:
     if task.get('status') not in ACTIVE:
         return None
     raw = raw_metadata_dict(task.get('metadata'), source=_METADATA_SOURCE).get(FOLLOWUP_HOLD_METADATA_KEY)
@@ -146,11 +158,12 @@ def held_by(task: Mapping[str, object]) -> int | None:
     except ValidationError as exc:
         logger.warning('followup_hold: task %s carries a malformed followup_hold record: %s', task.get('id'), exc)
         return None
+    return record if str(record.holder) in _local_dependencies(task) else None
+
+
+def _local_dependencies(task: Mapping[str, object]) -> list[str]:
     dependencies = task.get('dependencies') or ()
-    if not isinstance(dependencies, Iterable):
-        return None
-    named = {str(dependency) for dependency in dependencies}
-    return record.holder if str(record.holder) in named else None
+    return [str(dependency) for dependency in dependencies] if isinstance(dependencies, Iterable) else []
 
 
 def citation_ref(metadata: object) -> str | None:
@@ -439,7 +452,127 @@ def unregister_promotion_guard(guard: PromotionGuard) -> None:
     _PROMOTION_GUARDS[:] = [registered for registered in _PROMOTION_GUARDS if registered is not guard]
 
 
-BackfillEmit = Callable[[EventType, Mapping[str, object]], Awaitable[None]]
+HoldEmit = Callable[[EventType, Mapping[str, object]], Awaitable[None]]
+"""Journals one hold event for the project; the backfill and every promotion emit through it."""
+
+_Seed = tuple[int, PromotionCause, str | None]
+
+
+async def promote(
+    tm: TaskBackendProtocol,
+    project_root: str,
+    held_id: int,
+    *,
+    by: PromotionCause | str,
+    ref: str | None = None,
+    emit: HoldEmit,
+) -> tuple[int, ...]:
+    """Promote a held task and, by closure, every held task it depends on (decision 14).
+
+    The caller holds the project's interceptor write lock, so each task is read and promoted with
+    no write in between. Each promotion is ONE backend write that drops the holder edge and stamps
+    ``followup_hold.promoted``, then one ``followup_promoted`` event; ``pending_since`` is never
+    written. A registered guard's deferral leaves its task held, emits
+    ``followup_promotion_deferred`` and promotes none of that task's dependencies. A task that is
+    not held now promotes nothing. Returns the promoted ids in promotion order; an unknown *by*
+    raises ``ValueError``.
+    """
+    return await _promote_frontier(tm, project_root, [(held_id, PromotionCause(by), ref)], emit)
+
+
+async def promote_dependencies_of(
+    tm: TaskBackendProtocol, project_root: str, task_id: int, *, emit: HoldEmit,
+) -> tuple[int, ...]:
+    """An edge onto a held task promotes it once its dependent is pending and not itself held.
+
+    So an edge between two held tasks keeps both held. Same precondition as :func:`promote`.
+    """
+    try:
+        row = await tm.get_task(str(task_id), project_root)
+    except TaskNotFoundError:
+        return ()
+    if row.get('status') != TaskStatus.PENDING or held_by(row) is not None:
+        return ()
+    seeds = [(int(dependency), PromotionCause.DEPENDENT, str(task_id)) for dependency in _local_dependencies(row)]
+    return await _promote_frontier(tm, project_root, seeds, emit)
+
+
+async def release_held(
+    tm: TaskBackendProtocol, project_root: str, holder_id: int, *, emit: HoldEmit,
+) -> tuple[int, ...]:
+    """The explicit release: every task held behind the holder is promoted by a human.
+
+    Every dependent is seeded before any closure step, so each is attributed to the release. Same
+    precondition as :func:`promote`.
+    """
+    edges = await tm.get_dependency_edges(project_root)
+    dependents = sorted(task_id for task_id, dependencies in edges.items() if holder_id in dependencies)
+    return await _promote_frontier(
+        tm, project_root, [(dependent, PromotionCause.HUMAN, _RELEASE_REF) for dependent in dependents], emit,
+    )
+
+
+async def _promote_frontier(
+    tm: TaskBackendProtocol, project_root: str, seeds: Sequence[_Seed], emit: HoldEmit,
+) -> tuple[int, ...]:
+    """Breadth-first over the seeds, then over each promoted task's other dependencies; each task once."""
+    frontier = deque(seeds)
+    seen: set[int] = set()
+    promoted: list[int] = []
+    while frontier:
+        task_id, cause, ref = frontier.popleft()
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        dependencies = await _promote_one(tm, project_root, task_id, cause, ref, emit)
+        if dependencies is not None:
+            promoted.append(task_id)
+            frontier.extend((dependency, PromotionCause.DEPENDENT, str(task_id)) for dependency in dependencies)
+    return tuple(promoted)
+
+
+async def _promote_one(
+    tm: TaskBackendProtocol,
+    project_root: str,
+    task_id: int,
+    cause: PromotionCause,
+    ref: str | None,
+    emit: HoldEmit,
+) -> list[int] | None:
+    """The live row's promotion: its remaining dependencies once promoted, None when it stays as it is."""
+    try:
+        row = await tm.get_task(str(task_id), project_root)
+    except TaskNotFoundError:
+        return None
+    record = _current_hold(row)
+    if record is None:
+        return None
+    deferral = _first_deferral(row, cause, ref)
+    if deferral is not None:
+        await emit(
+            EventType.followup_promotion_deferred,
+            {'task_id': str(task_id), 'by': cause.value, 'ref': ref, **deferral.model_dump()},
+        )
+        return None
+    remaining = [dependency for dependency in _local_dependencies(row) if dependency != str(record.holder)]
+    stamped = record.model_copy(
+        update={'promoted': PromotionRecord(by=cause, at=datetime.now(UTC).isoformat(), ref=ref)},
+    )
+    await tm.update_task(
+        str(task_id), project_root,
+        metadata=json.dumps({FOLLOWUP_HOLD_METADATA_KEY: stamped.model_dump(mode='json', exclude_none=True)}),
+        metadata_mode='merge', dependencies=remaining,
+    )
+    await emit(EventType.followup_promoted, {'task_id': str(task_id), 'by': cause.value, 'ref': ref})
+    return [int(dependency) for dependency in remaining]
+
+
+def _first_deferral(row: Mapping[str, object], cause: PromotionCause, ref: str | None) -> PromotionDeferral | None:
+    for guard in tuple(_PROMOTION_GUARDS):
+        deferral = guard(row, cause.value, ref)
+        if deferral is not None:
+            return deferral
+    return None
 
 
 async def backfill(
@@ -448,7 +581,7 @@ async def backfill(
     *,
     holders: FollowupHolders,
     write_lock: asyncio.Lock,
-    emit: BackfillEmit,
+    emit: HoldEmit,
     known_roots: Sequence[str],
 ) -> int:
     """Decision 12: hold every pending task the hold rule matches that was never held, and report once.
