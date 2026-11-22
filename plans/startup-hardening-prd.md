@@ -251,7 +251,7 @@ dispatched agent shell (task 8274's worktree) on host leo-MS-7C35. The journal w
 | item | rule | figure | verdict |
 |---|---|---|---|
 | 1. `runs` rows started in the window | every row has `startup_completed_at` or `exit_reason` non-NULL; a both-NULL row is a γ defect | dark-factory: 6 rows, 4 `cancelled`, 2 both-NULL. reify: 6 rows, 4 `cancelled`, 2 both-NULL. All 4 both-NULL rows had completed startup: 2 are live, 2 were SIGKILLed after startup. 0 `startup_crash:*` | **FAIL**: γ (task 8269) persists `startup_completed_at` only at exit. Follow-up: _pending in this commit_ |
-| 2. watchdog restart-rate sampling, `--report RESTARTS` | _pending in this commit_ | _pending in this commit_ | _pending in this commit_ |
+| 2. watchdog restart-rate sampling, `--report RESTARTS` | every WATCHED unit has an entry with `sampling_since` ≤ window start and a last sample ≤ ~3 min old; the watchdog timer ran across the whole window with no gap far above its 60 s tick; `--report` prints `RESTARTS` for every running unit. (δ keeps only the last 1800 s of samples by design, so §6's "≥ 7 days of samples" is read as `sampling_since` plus timer continuity.) | 7/7 WATCHED units present, each with `sampling_since` 2026-11-11T17:55:04Z and a last sample 2 s old (30 samples, all NRestarts 0). 10 095 timer ticks in the window, median gap 60.2 s, largest 120.4 s (one missed tick). `RESTARTS` printed for 9/9 running units, all `0/success`. Not sampled: scoping-intake and stream-touch, which are not in WATCHED | **PASS**. The WATCHED gap is owned by pending tasks 9321 and 9815 |
 | 3. crash-loop pages | _pending in this commit_ | _pending in this commit_ | _pending in this commit_ |
 | 4. startup-step L1s | _pending in this commit_ | _pending in this commit_ | _pending in this commit_ |
 | 5. merge-lane cost per restart | _pending in this commit_ | _pending in this commit_ | _pending in this commit_ |
@@ -294,3 +294,33 @@ started_at`, run on each project's `data/orchestrator/runs.db`.
   exits through its `finally`, the column cannot tell §3.6's crashed start from a healthy one.
 - The two class (ii) kills are systemd's 90 s stop-sigterm bound: `Stopping` came 90 s before `Killing` both
   times. So the shutdown drain overran, which is task 7247 and out of scope under §4.
+
+**Item 2 evidence** (measured 2026-11-22T11:27–11:28Z, main checkout at `8436bb9b60`).
+
+- `data/orchestrator/watchdog-restart-rate.json`. Its key set equals the 7 units in
+  `scripts/orchestrator-watchdog.py::WATCHED`, as read from the main checkout's file. The watchdog unit sets no
+  `ORCH_RESTART_RATE_*` override, so `scripts/_watchdog_crash_loop.py`'s defaults apply:
+  `RESTART_RATE_ALARM_COUNT` 5 and `RESTART_RATE_ALARM_WINDOW_SECS` 1800.
+
+  | unit | `sampling_since` | samples | first / last sample | NRestarts | `last_escalation_epoch` | `start_limit_paged` |
+  |---|---|---|---|---|---|---|
+  | each of the 7 WATCHED units (dark-factory, reify, my-solar-challenge, know-live, autopilot-video, solar-challenge-platform, pump-web-ui) | 2026-11-11T17:55:04Z | 30 | 2026-11-22T10:58:23Z / 11:27:30Z | 0 in every sample | none | false |
+
+- Why the samples span only 29 min. `scripts/_watchdog_crash_loop.py` keeps a sample only while `now - epoch <=
+  window_secs`, so `samples` is pruned to the alarm window, while `sampling_since` "is never pruned". So δ
+  cannot persist seven days of samples; that is a restatement of the rule, not a defect. The value of
+  `sampling_since` (four days before the window opened) together with the timer's continuity is what shows
+  the whole window was sampled.
+- Timer continuity. `journalctl --user USER_UNIT=orchestrator-watchdog.service --since '2026-11-15 10:24'`
+  shows 10 095 `Starting` and 10 096 `Finished` lines, from 2026-11-15T10:24:21Z to 2026-11-22T11:27:30Z, and
+  no failed run (the only other lines are 33 `Consumed … CPU time`). The timer is
+  `OnUnitActiveSec=60` with `AccuracySec=5s`. The median gap between starts is 60.2 s, the largest are 120.4 s
+  (2026-11-19T05:48:23Z) and 120.2 s (2026-11-21T02:58:10Z), and only 3 gaps exceed 90 s.
+- `python3 /home/leo/src/dark-factory/scripts/orchestrator-watchdog.py --report` exited 1. Per its docstring,
+  `report()` "return[s] 1 iff any unit is stale": all 9 units were `stale` against a main commit from
+  2026-11-22T08:17Z, inside the 72 h deploy cadence, so the exit is not a failure. The `RESTARTS` column sits
+  beside `VERDICT` and reads `0/success` for all 9 running units: autopilot-video, dark-factory, know-live,
+  my-solar-challenge, pump-web-ui, reify, scoping-intake, solar-challenge-platform, stream-touch.
+- orchestrator-scoping-intake.service and orchestrator-stream-touch.service appear in `--report` but not in
+  WATCHED, so they get no crash-loop sampling. Pending tasks 9321 (add both to WATCHED) and 9815 (S24 δ2a:
+  derive the liveness set from installed sockets) already own that gap, so nothing new is filed for it.
