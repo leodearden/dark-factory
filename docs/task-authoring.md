@@ -883,8 +883,11 @@ that makes it wanted.
 **Held means a dependency edge on the holder.** The edge decides whether a
 task is held now. `metadata.followup_hold`
 (`{holder, held_at, promoted?}`) is the record of the hold, and it stays on
-the task after a promotion as history. A held task can also carry other
-dependencies; the edges compose by AND.
+the task after a promotion as history. Every promotion trigger finds a held
+task through that record, so only `followup_hold.py` writes it: an
+`update_task` that would drop or rewrite it, a `replace` included, writes
+the stored record back unchanged (`followup_hold.py::carry_hold_record`). A
+held task can also carry other dependencies; the edges compose by AND.
 
 **Hold at filing.** A ticket-path `submit_task` that the rule matches is
 created already held. The holder id is appended to its `dependencies`, and
@@ -952,7 +955,10 @@ other than the holder.
 **Promotion** removes a held task's holder edge and stamps
 `followup_hold.promoted {by, at, ref}` in one backend write
 (`followup_hold.py::promote`), then journals one
-`followup_promoted {task_id, by, ref}` event. It never writes
+`followup_promoted {task_id, by, ref}` event. The exception is a human
+`update_task` replacement. There, the caller's own write drops the edge, and
+the stamp follows as a second write under the same lock, only once that
+write has landed (`followup_hold.py::promote_after_update`). It never writes
 `metadata.pending_since`, so a promoted task keeps its wait age. The
 contract is `plans/follow-up-filing-shape-prd.md` §3 decision 14 and §4.3.
 Every trigger runs under the project's write lock:
@@ -983,7 +989,24 @@ Every trigger runs under the project's write lock:
 - **The explicit release** (`by: human`, `ref: release_holder`):
   `set_task_status(holder, done|cancelled|deferred, release_holder=True)`
   promotes every active held follow-up before targeted reconciliation runs,
-  so the cancelled-dependency sweep finds no held dependents.
+  so the cancelled-dependency sweep finds no held dependents. The same call
+  on a holder already at that status releases whatever is still held, so a
+  release that stopped partway, or that a guard deferred in part, can be
+  finished. Measured on 2026-11-22, df's holder had 2,903 held follow-ups;
+  releasing that many on a test SQLite store held the project's write lock
+  for 22.6 s. It also journals one `followup_promoted` per task, which is
+  more than the default reconciliation backlog limit of 500
+  (`reconciliation.backlog_hard_limit`). Until reconciliation drains those
+  events, the project's backlog gate escalates writes while an orchestrator
+  is live, and refuses them otherwise.
+
+**When a promotion fails.** A promotion that another write set off runs
+after that write has landed, and its failure never fails the write: the
+error appears in the result's `post_write_warnings` (`post_create_warnings`
+on a filing), and the write's event and reconciliation still run. Every
+trigger is safe to repeat, because a promoted task is skipped. A
+`remove_dependency` of the holder edge is different: the promotion is that
+call's own write, so its failure is the call's failure.
 
 **The closure.** Promoting a task also promotes every held task it depends
 on, transitively and each task once, with `by: dependent` and `ref` the id
@@ -993,9 +1016,14 @@ of the promoted task that depends on it.
 that every promotion consults with the live row, the cause and the ref. A
 `PromotionDeferral {guard, reason}` answer leaves that task held, journals
 `followup_promotion_deferred {task_id, by, ref, guard, reason}` and promotes
-none of its dependencies. A human removal that a guard defers returns error
-`followup_promotion_deferred` with the guard and reason, and writes nothing.
-None is registered by default.
+none of its dependencies. A guard that raises counts as a deferral, with
+`guard` its name and `reason` naming the exception, so a faulty guard keeps
+its task held instead of failing the trigger. A human removal that a guard
+defers returns error `followup_promotion_deferred` with the guard and
+reason, and writes nothing. None is registered by default. A caller outside
+the interceptor passes `TaskInterceptor.hold_emit(project_root)` as the
+`emit` every promotion function takes, so its events are journaled like the
+interceptor's own.
 
 `by` is one of `dependent`, `citation`, `combine`, `pack`, `rider` or
 `human`; the packer and riders call `followup_hold.py::promote` themselves.

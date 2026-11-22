@@ -39,7 +39,16 @@ depends on is promoted with it. `pending_since` is left as it is. See
   `update_task` replacement that drops the holder edge, and
   `followup_promotion_deferred`, for a human removal a guard defers.
 - A promotion guard hook, `followup_hold.py::register_promotion_guard`; none
-  is registered by default.
+  is registered by default. A guard that raises counts as a deferral.
+- A promotion that another write set off never fails that write: its error
+  is reported in `post_write_warnings` (`post_create_warnings` on a filing),
+  and the write's event and reconciliation still run. `release_holder=True`
+  on a holder already at the release status releases whatever is still
+  held, so a release that stopped partway can be finished.
+- `update_task` keeps a held task's `followup_hold` record: a write that
+  would drop or rewrite it, a `replace` included, carries the stored record.
+- `TaskInterceptor.hold_emit(project_root)` gives a caller outside the
+  interceptor the journaling `emit` every promotion function takes.
 
 #### Low follow-ups are held behind a per-project follow-up holder (task 8417)
 
