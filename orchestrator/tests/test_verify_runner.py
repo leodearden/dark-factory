@@ -23,15 +23,15 @@ from _gate_fixtures import (
 )
 from _git_fixtures import seed_repo
 from _orch_helpers import pydantic_spec, wait_responsive
-from test_verify_cache_decision import (
-    _LOG,
-    _MARKERS_ENV,
-    _SEED,
-    _clean_unscoped_gate,
-    _config,
-    _module,
+from _verify_cache_fixtures import (
+    LOG_MODES,
+    MARKERS_ENV,
+    WORKSPACE_SEED,
+    cache_config,
+    cache_module,
+    clean_unscoped_gate,
+    put_pytest_on_path,
 )
-from test_verify_cache_recorder import put_pytest_on_path
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
@@ -3373,14 +3373,14 @@ class TestRunnerVerifyConsultsNoRegistry:
 
         put_pytest_on_path(tmp_path, monkeypatch)
         markers = tmp_path / 'markers.txt'
-        monkeypatch.setenv(_MARKERS_ENV, str(markers))
-        repo = seed_repo(tmp_path / 'repo', _SEED)
-        config = _config(repo, _LOG)
-        modules = [_module('alpha', markers), _module('beta', markers)]
+        monkeypatch.setenv(MARKERS_ENV, str(markers))
+        repo = seed_repo(tmp_path / 'repo', WORKSPACE_SEED)
+        config = cache_config(repo, LOG_MODES)
+        modules = [cache_module('alpha', markers), cache_module('beta', markers)]
 
         result = await run_merge_verify_on_worktree(
             repo, config, build_merge_verify_spec(config, modules, None),
-            run_scoped=run_scoped_verification, run_unscoped=_clean_unscoped_gate,
+            run_scoped=run_scoped_verification, run_unscoped=clean_unscoped_gate,
         )
 
         assert result.passed, result.summary

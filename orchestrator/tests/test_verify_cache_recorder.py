@@ -4,22 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import shlex
-import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
-from test_verify_events_units import (
-    _TASK_ID,
-    _forked_task_workflow,
-    _git,
-    _task_workflow,
+from _task_workflow_scene import (
+    SCENE_TASK_ID,
+    forked_task_workflow,
+    scene_git,
     task_scene_config,
+    task_workflow,
 )
+from _verify_cache_fixtures import put_pytest_on_path
 
 from orchestrator.artifacts import ReviewAggregation
 from orchestrator.config import ModuleConfig, OrchestratorConfig, VerifyCacheConfig
@@ -59,17 +57,6 @@ _PROGRESS_COLUMN = 73
 
 def _progress(statuses: str, percent: int) -> str:
     return f'{statuses.ljust(_PROGRESS_COLUMN)}[{percent:3d}%]'
-
-
-def put_pytest_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A bare ``pytest`` on PATH running this interpreter's pytest: the launcher
-    the verify path injects ``--junitxml`` into (``python -m pytest`` gets none)."""
-    bin_dir = tmp_path / 'pytest-bin'
-    bin_dir.mkdir()
-    shim = bin_dir / 'pytest'
-    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -m pytest "$@"\n')
-    shim.chmod(0o755)
-    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
 
 
 @pytest.fixture
@@ -608,7 +595,7 @@ class TestWorkflowRecordsTaskGreens:
         config = task_scene_config(tmp_path)
         config.pre_merge_reverify = forked
         store = EventStore(tmp_path / 'events.db', run_id='r')
-        scene = _forked_task_workflow if forked else _task_workflow
+        scene = forked_task_workflow if forked else task_workflow
         workflow = await scene(config, GitOps(config.git, config.project_root), store, monkeypatch)
         monkeypatch.setattr(workflow, '_review', AsyncMock(return_value=ReviewAggregation(
             has_blocking_issues=False, blocking_issues=[], suggestions=[], reviews={'analyst': {}},
@@ -684,9 +671,9 @@ class TestWorkflowRecordsTaskGreens:
     async def test_a_checkpoint_hit_records_nothing(self, tmp_path, monkeypatch):
         config, store, workflow = await self._scene(tmp_path, monkeypatch)
         assert workflow.worktree is not None
-        head = _git(workflow.worktree, 'rev-parse', 'HEAD')
+        head = scene_git(workflow.worktree, 'rev-parse', 'HEAD')
         EventStore(tmp_path / 'events.db', run_id='prior').emit(
-            EventType.workflow_verify, task_id=_TASK_ID, data={'passed': True, 'tip_sha': head},
+            EventType.workflow_verify, task_id=SCENE_TASK_ID, data={'passed': True, 'tip_sha': head},
         )
         verify = self._verifies(monkeypatch, _task_green()[0])
 

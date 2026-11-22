@@ -8,19 +8,27 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import pytest
-from _git_fixtures import RepoSeed, seed_repo
+from _git_fixtures import seed_repo
 from _orch_helpers import git_env_with_ceiling
-from test_verify_cache_recorder import put_pytest_on_path
+from _verify_cache_fixtures import (
+    LOG_MODES,
+    MARKERS_ENV,
+    ON_MODES,
+    TEST_CODE,
+    WORKSPACE_SEED,
+    cache_config,
+    cache_module,
+    clean_unscoped_gate,
+    put_pytest_on_path,
+)
 
 from orchestrator import verify_plan
 from orchestrator.config import (
     ModuleConfig,
-    ModuleVerifyCache,
     OrchestratorConfig,
     VerifyCacheConfig,
 )
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.verify import VerifyResult, is_no_verdict_summary, run_scoped_verification
 from orchestrator.verify_cache.keys import TREE_UNIT_ID, UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
@@ -43,49 +51,9 @@ from orchestrator.verify_runner import (
     build_merge_verify_spec,
 )
 
-#: Every leg of the fixture appends ``<module>:<leg>`` to the file this names.
-_MARKERS_ENV = 'DF_VERIFY_CACHE_TEST_MARKERS'
-
-
-def _marking_test(prefix: str) -> str:
-    return (
-        f'import os\n\n\ndef test_{prefix}():\n'
-        f"    with open(os.environ['{_MARKERS_ENV}'], 'a') as markers:\n"
-        f"        markers.write('{prefix}:test\\n')\n"
-    )
-
-
-_SEED = RepoSeed(
-    files=(
-        ('.gitignore', '.df-verify-junit/\n.task/\n.pytest_cache/\n__pycache__/\n'),
-        ('pyproject.toml', '[tool.uv.workspace]\nmembers = ["alpha", "beta"]\n'),
-        ('alpha/pyproject.toml', '[project]\nname = "alpha"\nversion = "0"\n'),
-        ('alpha/src/alpha/__init__.py', 'A = 1\n'),
-        ('alpha/tests/test_alpha.py', _marking_test('alpha')),
-        ('beta/pyproject.toml', '[project]\nname = "beta"\nversion = "0"\ndependencies = ["alpha>=0"]\n'),
-        ('beta/src/beta/__init__.py', 'B = 1\n'),
-        ('beta/tests/test_beta.py', _marking_test('beta')),
-    ),
-    message='verify cache decision fixture',
-)
-
-_ON = VerifyCacheConfig(task_mode=CacheMode.ON, merge_mode=CacheMode.ON)
-_LOG = VerifyCacheConfig(task_mode=CacheMode.LOG, merge_mode=CacheMode.LOG)
-_CODE = 'c' * 40
-
 
 def _units(prefix: str) -> set[str]:
     return {module_leg_name(prefix, leg) for leg in Leg}
-
-
-def _module(prefix: str, markers: Path, *, verify_cache: ModuleVerifyCache = 'default') -> ModuleConfig:
-    return ModuleConfig(
-        prefix=prefix,
-        test_command=f'pytest {prefix}/tests -q',
-        lint_command=f'echo {prefix}:lint >> {markers}',
-        type_check_command=f'echo {prefix}:type >> {markers}',
-        verify_cache=verify_cache,
-    )
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -103,21 +71,6 @@ def _commit_edit(repo: Path, path: str, text: str) -> None:
     _git(repo, 'commit', '-q', '-m', f'edit {path}')
 
 
-def _config(
-    repo: Path,
-    modes: VerifyCacheConfig = _ON,
-    *,
-    test_command: str = 'pytest',
-    lint_command: str = 'ruff check',
-    type_check_command: str = 'pyright',
-) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        project_root=repo, merge_verify_workspace=True, merge_verify_breadth='full',
-        verify_cold_preprovision_command='', verify_cache=modes,
-        test_command=test_command, lint_command=lint_command, type_check_command=type_check_command,
-    )
-
-
 def _full_suite_plan(modules: Sequence[ModuleConfig], role: VerifyRole = 'merge') -> VerifyPlan:
     plan_role: Literal['merge', 'task'] = 'task' if role == 'task' else 'merge'
     return VerifyPlan(runs=tuple(
@@ -131,7 +84,7 @@ def _no_env(_mc: ModuleConfig | None) -> Mapping[str, str]:
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    return seed_repo(tmp_path / 'repo', _SEED)
+    return seed_repo(tmp_path / 'repo', WORKSPACE_SEED)
 
 
 @pytest.fixture
@@ -146,12 +99,12 @@ def registry(tmp_path: Path) -> Registry:
 
 @pytest.fixture
 def access(registry: Registry) -> CacheAccess:
-    return CacheAccess(registry=registry, orchestrator_code=_CODE)
+    return CacheAccess(registry=registry, orchestrator_code=TEST_CODE)
 
 
 @pytest.fixture
 def modules(markers: Path) -> list[ModuleConfig]:
-    return [_module('alpha', markers), _module('beta', markers)]
+    return [cache_module('alpha', markers), cache_module('beta', markers)]
 
 
 async def _replay(
@@ -159,7 +112,7 @@ async def _replay(
     modules: Sequence[ModuleConfig | None],
     access: CacheAccess,
     *,
-    modes: VerifyCacheConfig = _ON,
+    modes: VerifyCacheConfig = ON_MODES,
     role: VerifyRole = 'merge',
     plan: VerifyPlan | None = None,
     config: OrchestratorConfig | None = None,
@@ -167,7 +120,7 @@ async def _replay(
     if plan is None and all(mc is not None for mc in modules):
         plan = _full_suite_plan([mc for mc in modules if mc is not None], role)
     replay = await plan_replay(
-        repo, plan, modules, config=config or _config(repo, modes), role=role, access=access,
+        repo, plan, modules, config=config or cache_config(repo, modes), role=role, access=access,
         leg_env=_no_env,
     )
     assert replay is not None
@@ -238,7 +191,7 @@ class TestPlanReplay:
     ):
         alpha = modules[0]
         task_plan = verify_plan.derive_verify_plan(
-            ['alpha/src/alpha/__init__.py'], [alpha], _config(repo),
+            ['alpha/src/alpha/__init__.py'], [alpha], cache_config(repo),
             lambda path: (repo / path).read_text(), role='task',
         )
         task_replay = await _replay(repo, [alpha], access, role='task', plan=task_plan)
@@ -254,7 +207,7 @@ class TestPlanReplay:
     async def test_row_9_log_mode_would_hit_with_the_entry(self, repo, modules, access, registry):
         recorded = await _record(registry, await _replay(repo, modules, access), _units('alpha'))
 
-        replay = await _replay(repo, modules, access, modes=_LOG)
+        replay = await _replay(repo, modules, access, modes=LOG_MODES)
 
         for unit_id in _units('alpha'):
             assert replay.modules[unit_id].decision.decision is Decision.WOULD_HIT
@@ -265,7 +218,7 @@ class TestPlanReplay:
     async def test_row_10_an_unreadable_registry_is_unavailable_naming_it(self, repo, modules, tmp_path):
         db_path = tmp_path / 'garbage.db'
         db_path.write_bytes(b'garbage, not sqlite' * 64)
-        access = CacheAccess(registry=Registry(db_path), orchestrator_code=_CODE)
+        access = CacheAccess(registry=Registry(db_path), orchestrator_code=TEST_CODE)
 
         replay = await _replay(repo, modules, access)
 
@@ -295,10 +248,10 @@ class TestPlanReplay:
     @pytest.mark.asyncio
     async def test_mode_off_decides_nothing_and_touches_no_registry(self, repo, modules, tmp_path):
         db_path = tmp_path / 'never_created.db'
-        access = CacheAccess(registry=Registry(db_path), orchestrator_code=_CODE)
+        access = CacheAccess(registry=Registry(db_path), orchestrator_code=TEST_CODE)
 
         replay = await plan_replay(
-            repo, _full_suite_plan(modules), modules, config=_config(repo, VerifyCacheConfig()),
+            repo, _full_suite_plan(modules), modules, config=cache_config(repo, VerifyCacheConfig()),
             role='merge', access=access, leg_env=_no_env,
         )
 
@@ -321,7 +274,7 @@ class TestPlanReplay:
     async def test_a_never_cache_module_misses_and_keeps_the_tree_from_hitting(
         self, repo, markers, access, registry,
     ):
-        never = [_module('alpha', markers, verify_cache='never'), _module('beta', markers)]
+        never = [cache_module('alpha', markers, verify_cache='never'), cache_module('beta', markers)]
         first = await _replay(repo, never, access)
         await _record(registry, first, _units('alpha') | _units('beta'))
         await _record_tree(registry, first)
@@ -336,8 +289,8 @@ class TestPlanReplay:
 
     @pytest.mark.asyncio
     async def test_a_plan_less_run_keys_its_tree_on_the_executed_commands(self, repo, access, markers):
-        config = _config(repo, test_command='pytest -q', lint_command=f'echo lint >> {markers}')
-        other = _config(repo, test_command='pytest -q -x', lint_command=f'echo lint >> {markers}')
+        config = cache_config(repo, test_command='pytest -q', lint_command=f'echo lint >> {markers}')
+        other = cache_config(repo, test_command='pytest -q -x', lint_command=f'echo lint >> {markers}')
 
         replay = await _replay(repo, [None], access, config=config)
         changed = await _replay(repo, [None], access, config=other)
@@ -373,7 +326,7 @@ _TASK_ON_MERGE_OFF = VerifyCacheConfig(task_mode=CacheMode.ON, merge_mode=CacheM
 def seam(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, markers: Path) -> None:
     """Real legs: a bare ``pytest`` whose junit the verify reads, and every leg leaves a marker."""
     put_pytest_on_path(tmp_path, monkeypatch)
-    monkeypatch.setenv(_MARKERS_ENV, str(markers))
+    monkeypatch.setenv(MARKERS_ENV, str(markers))
 
 
 def _legs(prefix: str) -> set[str]:
@@ -448,7 +401,7 @@ class TestFanOutSeam:
     async def test_an_edit_outside_alpha_replays_alpha_and_runs_beta(
         self, repo, modules, access, registry, markers,
     ):
-        config = _config(repo)
+        config = cache_config(repo)
         first = await _gate(repo, config, modules, access)
         recorded = await _record_run(registry, first)
         assert _units('alpha') <= set(recorded)
@@ -472,7 +425,7 @@ class TestFanOutSeam:
     async def test_a_wholly_replayed_module_reads_as_a_cache_hit_not_a_run(
         self, repo, modules, access, registry, markers,
     ):
-        config = _config(repo)
+        config = cache_config(repo)
         recorded = await _record_run(registry, await _gate(repo, config, modules, access))
         _commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
         _clear(markers)
@@ -490,7 +443,7 @@ class TestFanOutSeam:
 
     @pytest.mark.asyncio
     async def test_a_recorded_tree_green_runs_no_leg_at_all(self, repo, modules, access, registry, markers):
-        config = _config(repo)
+        config = cache_config(repo)
         first = await _gate(repo, config, modules, access)
         assert TREE_UNIT_ID in await _record_run(registry, first)
         tree_entry = await registry.record_green(_tree_key(first), evidence_event_id=99, run_id='r', sha='sha-tree')
@@ -508,7 +461,7 @@ class TestFanOutSeam:
 
     @pytest.mark.asyncio
     async def test_log_mode_runs_every_leg_and_reads_would_hit(self, repo, modules, access, registry, markers):
-        config = _config(repo, _LOG)
+        config = cache_config(repo, LOG_MODES)
         await _record_run(registry, await _gate(repo, config, modules, access))
         _clear(markers)
 
@@ -521,7 +474,7 @@ class TestFanOutSeam:
 
     @pytest.mark.asyncio
     async def test_outside_the_cache_the_verify_is_as_before(self, repo, modules, tmp_path, markers):
-        result = await _gate(repo, _config(repo, _LOG), modules, None)
+        result = await _gate(repo, cache_config(repo, LOG_MODES), modules, None)
 
         assert _ran_legs(markers) == _legs('alpha') | _legs('beta')
         assert result.passed, result.summary
@@ -538,7 +491,7 @@ class TestFanOutSeam:
     @pytest.mark.asyncio
     async def test_each_role_reads_its_own_mode(self, repo, modules, access, registry, markers):
         (repo / '.task').mkdir()
-        config = _config(repo, _TASK_ON_MERGE_OFF)
+        config = cache_config(repo, _TASK_ON_MERGE_OFF)
         task_files = ['alpha/src/alpha/__init__.py', 'beta/src/beta/__init__.py']
         recorded = await _record_run(registry, await _task_verify(repo, config, modules, access, task_files))
         alpha_units = {unit_id for unit_id in recorded if unit_id.startswith('module:alpha:')}
@@ -563,7 +516,7 @@ class TestFanOutSeam:
 
     @pytest.mark.asyncio
     async def test_a_plan_less_gate_replays_its_recorded_tree_green(self, repo, access, registry, markers):
-        config = _config(
+        config = cache_config(
             repo, test_command='pytest alpha/tests beta/tests -q',
             lint_command=f'echo global:lint >> {markers}', type_check_command=f'echo global:type >> {markers}',
         )
@@ -587,10 +540,6 @@ class TestFanOutSeam:
 # replayed before the merge_verify row, then records its greens citing that row.
 
 
-async def _clean_unscoped_gate(*_args: Any, **_kwargs: Any) -> PostMergePyrightResult:
-    return PostMergePyrightResult()
-
-
 def _merge_pool(
     repo: Path,
     config: OrchestratorConfig,
@@ -602,8 +551,8 @@ def _merge_pool(
 ) -> VerifyRunnerPool:
     local = LocalRunner(
         repo, config, list(modules), None,
-        run_scoped=run_scoped, run_unscoped=_clean_unscoped_gate,
-        verify_cache=CacheAccess(registry, _CODE),
+        run_scoped=run_scoped, run_unscoped=clean_unscoped_gate,
+        verify_cache=CacheAccess(registry, TEST_CODE),
     )
     return VerifyRunnerPool([local], event_store=store, task_id='5653', verify_cache_registry=registry)
 
@@ -662,7 +611,7 @@ class TestMergeGateRecordsAndConsumes:
     async def test_row_1_the_first_gate_records_every_admitted_unit_citing_its_row(
         self, repo, modules, registry, store,
     ):
-        config = _config(repo)
+        config = cache_config(repo)
         merge_sha = _head(repo)
 
         result = await _merge_pool(repo, config, modules, registry, store).dispatch(merge_sha, _spec(config, modules))
@@ -683,7 +632,7 @@ class TestMergeGateRecordsAndConsumes:
     async def test_row_2_the_second_gate_replays_alpha_and_consumes_it_before_returning(
         self, repo, modules, registry, store,
     ):
-        config = _config(repo)
+        config = cache_config(repo)
         pool = _merge_pool(repo, config, modules, registry, store)
         first = await pool.dispatch(_head(repo), _spec(config, modules))
         first_entries = await _entries_for(registry, first)
@@ -705,7 +654,7 @@ class TestMergeGateRecordsAndConsumes:
 
     @pytest.mark.asyncio
     async def test_row_9_log_mode_reads_would_hit_and_consumes_nothing(self, repo, modules, registry, store):
-        config = _config(repo, _LOG)
+        config = cache_config(repo, LOG_MODES)
         pool = _merge_pool(repo, config, modules, registry, store)
         await pool.dispatch(_head(repo), _spec(config, modules))
         _commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
@@ -722,7 +671,7 @@ class TestMergeGateRecordsAndConsumes:
     async def test_a_replay_the_registry_cannot_consume_is_no_verdict(
         self, repo, modules, registry, store, tmp_path,
     ):
-        config = _config(repo)
+        config = cache_config(repo)
         await _merge_pool(repo, config, modules, registry, store).dispatch(_head(repo), _spec(config, modules))
         _commit_edit(repo, 'beta/src/beta/__init__.py', 'B = 2\n')
 
@@ -741,7 +690,7 @@ class TestMergeGateRecordsAndConsumes:
 
     @pytest.mark.asyncio
     async def test_a_non_local_runner_records_nothing(self, repo, modules, access, registry, store):
-        config = _config(repo)
+        config = cache_config(repo)
         remote_result = await _gate(repo, config, modules, access)
         assert remote_result.passed, remote_result.summary
         assert remote_result.cache_record is not None
