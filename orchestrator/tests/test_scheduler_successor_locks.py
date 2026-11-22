@@ -205,6 +205,9 @@ class TestRow12ThePredecessorWidensOntoItsSuccessorsKey:
         assert rig.scheduler.lock_table.held_modules('P') == {'a.py', 'c.py'}
         rig.status.assert_not_awaited()
         assert _released_rows(rig.store, 'P') == []
+        assert _acquired_rows(rig.store, 'P') == [
+            {'modules': ['c.py'], 'reason': 'plan_refinement'},
+        ]
 
     async def test_control_an_unrelated_holder_still_sends_the_widener_back(
         self, tmp_path, monkeypatch
