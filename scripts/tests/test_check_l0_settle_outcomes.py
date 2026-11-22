@@ -61,6 +61,8 @@ WORKFLOW_DISMISSAL = (
     'Auto-dismissed: steward interrupted (timeout) with WIP present — task blocked for review',
     None,
 )
+STEWARD_DISMISSAL = ('dismissed', 'steward', 'Duplicate of esc-{task_id}-1: the same red test', None)
+SETTLE_DISMISSAL = ('dismissed', 'orchestrator-workflow', 'Settled own L0: abandoned on timeout', None)
 CLOSE_DELAY = timedelta(hours=1)
 PERMISSIVE: dict[str, str] = {
     'window_days': '14',
@@ -176,6 +178,7 @@ def build_settle_queue(queue_dir: Path) -> SettleQueue:
     dismissed_then_refiled = build.ago(days=5)
     dismissed_then_refiled_late = build.ago(days=8)
     dismissed_then_l2 = build.ago(days=12)
+    resolved_then_refiled = build.ago(days=1)
     post += [
         build.closed('11', build.ago(days=2), STEWARD),
         build.closed('12', build.ago(days=3), PROMOTION),
@@ -192,6 +195,10 @@ def build_settle_queue(queue_dir: Path) -> SettleQueue:
         build.pending('21', build.ago(hours=30)),
         build.closed('22', dismissed_then_l2, REAPER_DISMISSAL),
         build.closed('24', build.ago(days=13), ARCHITECT_PROMOTION),
+        build.closed('25', build.ago(days=1, hours=6), STEWARD_DISMISSAL, late=True),
+        build.closed('26', resolved_then_refiled, STEWARD),
+        build.closed('26', resolved_then_refiled + CLOSE_DELAY + timedelta(hours=2), STEWARD),
+        build.closed('27', build.ago(days=1, hours=12), SETTLE_DISMISSAL, late=True),
     ]
     excluded += [
         build.closed('30', build.ago(days=3), PROMOTION, severity='info'),
@@ -201,6 +208,7 @@ def build_settle_queue(queue_dir: Path) -> SettleQueue:
     ]
     pre += [build.closed(str(40 + n), build.ago(days=15 + n), STEWARD) for n in range(7)]
     pre += [build.closed('50', build.ago(days=25), PROMOTION)]
+    pre += [build.closed('51', build.ago(days=20), WORKFLOW_DISMISSAL, late=True)]
     return SettleQueue(queue_dir, tuple(post), tuple(pre), tuple(excluded))
 
 
@@ -250,6 +258,9 @@ def test_trailing_json_equals_fixture_counts(settle_queue: SettleQueue, capsys: 
         'startup_wrong': 1,
         'workflow_auto_dismissals': 1,
         'workflow_auto_wrong': 1,
+        'non_startup_dismissals': 8,
+        'non_startup_wrong': 5,
+        'non_startup_wrong_per_100': rate(5, post_filed),
     }
     assert payload['pre'] == {
         'filed': pre_filed,
@@ -262,8 +273,11 @@ def test_trailing_json_equals_fixture_counts(settle_queue: SettleQueue, capsys: 
         'reaper_wrong': 0,
         'startup_dismissals': 0,
         'startup_wrong': 0,
-        'workflow_auto_dismissals': 0,
-        'workflow_auto_wrong': 0,
+        'workflow_auto_dismissals': 1,
+        'workflow_auto_wrong': 1,
+        'non_startup_dismissals': 1,
+        'non_startup_wrong': 1,
+        'non_startup_wrong_per_100': rate(1, pre_filed),
     }
     assert payload['pending_over_h'] == 0
 
@@ -630,6 +644,9 @@ def test_counts_records_written_by_the_real_queue(tmp_path: Path, capsys: pytest
     resolved_id = file_escalation(queue, '103', 'ordinary steward work', filed_at=now - timedelta(minutes=2))
     queue.resolve(resolved_id, 'steward fixed it', resolved_by='steward')
 
+    duplicate_id = file_escalation(queue, '106', 'a duplicate the steward dismisses', filed_at=now - timedelta(minutes=1))
+    queue.resolve(duplicate_id, 'Duplicate of an earlier L0', dismiss=True, resolved_by='steward')
+
     code, lines = run_main(capsys, queue_dir)
 
     post = trailing_json(lines)['post']
@@ -637,4 +654,5 @@ def test_counts_records_written_by_the_real_queue(tmp_path: Path, capsys: pytest
     assert (post['stale_strands'], post['stranded']) == (1, 1)
     assert (post['reaper_dismissals'], post['reaper_wrong']) == (1, 1)
     assert post['startup_dismissals'] == 1
-    assert post['filed'] == 3
+    assert (post['non_startup_dismissals'], post['non_startup_wrong']) == (2, 1)
+    assert post['filed'] == 4
