@@ -6252,9 +6252,11 @@ class TaskInterceptor:
           unchanged from the original behavior. An edge that would close a cycle
           comes back as the :class:`DependencyCycle` refusal dict, nothing written.
 
-        The interceptor does not inspect or transform ``depends_on``; routing is
-        handled entirely by the backend.  The journal and ``task_modified`` event
-        are emitted regardless of which branch the backend takes.
+        Once the edge lands, a pending, non-held dependent promotes every held
+        follow-up it depends on (``by='dependent'``,
+        :func:`followup_hold.promote_dependencies_of`; docs/task-authoring.md
+        §3.4).  The journal and ``task_modified`` event are emitted regardless of
+        which branch the backend takes.
 
         ``client_op_id`` is an optional client idempotency key (task 2712): a
         retry with a recorded key replays the prior outcome and skips the write
@@ -6307,18 +6309,20 @@ class TaskInterceptor:
     ) -> dict:
         """Remove a dependency from a task.
 
-        ``depends_on`` is forwarded verbatim to the backend.
-
         - **Qualified form** (``"project_id:task_id"``, contains ``':'``): the
           backend removes the canonical entry from the dependent task's
           ``metadata.external_deps`` list.  Idempotent — no error if the entry
           is absent.
-        - **Bare integer form**: issues an unconditional ``DELETE`` from the
-          integer ``dependencies`` table, unchanged from the original behavior.
+        - **Bare integer form**: the backend deletes the edge from the integer
+          ``dependencies`` table — except a held follow-up's holder edge, which
+          the interceptor removes as a human promotion
+          (:func:`followup_hold.remove_holder_edge`, ``ref='remove_dependency'``):
+          the result carries ``promoted``, and a registered promotion guard can
+          refuse it with ``followup_promotion_deferred``, nothing written
+          (docs/task-authoring.md §3.4).
 
-        The interceptor does not inspect or transform ``depends_on``; routing is
-        handled entirely by the backend.  The journal and ``task_modified`` event
-        are emitted regardless of which branch the backend takes.
+        The journal and ``task_modified`` event are emitted for every removal
+        that lands.
 
         ``client_op_id`` is an optional client idempotency key (task 2712): a
         retry with a recorded key replays the prior outcome and skips the write

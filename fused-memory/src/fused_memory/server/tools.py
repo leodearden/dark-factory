@@ -10872,8 +10872,14 @@ def create_mcp_server(
 
         ``depends_on`` accepts two forms:
 
-        - **Bare integer** (e.g. ``"5"``): issues an unconditional ``DELETE``
-          from the integer ``dependencies`` table — the original behavior.
+        - **Bare integer** (e.g. ``"5"``): deletes the edge from the integer
+          ``dependencies`` table. One exception: removing a held follow-up's
+          holder edge is a human promotion (``by='human'``,
+          ``ref='remove_dependency'``) that also promotes the task's held
+          dependencies; the result then carries ``promoted`` (the promoted ids),
+          and a registered promotion guard can refuse it with error
+          ``followup_promotion_deferred``, nothing written. See
+          docs/task-authoring.md §3.4.
         - **Qualified** (e.g. ``"dark_factory:13"``): removes the canonical
           entry from the dependent task's ``metadata.external_deps`` list.
           ``'-'`` in the project_id is normalised to ``'_'``.  Idempotent —
