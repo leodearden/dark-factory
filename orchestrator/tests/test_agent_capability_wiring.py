@@ -56,8 +56,9 @@ class TestAgentRoleCapabilityFields:
 class TestImportTimeCapabilityAssertion:
     """__post_init__ enforces: tool-in-allowed_tools ⟹ matching family declared.
 
-    One-way only — declaring a family with no matching tool is a lower
-    bound, never the reverse: it is allowed.
+    One-way only: mcp_families is a lower bound on the families
+    allowed_tools needs, so declaring a family with no matching tool is
+    allowed.
     """
 
     def test_plan_tools_tool_without_plan_tools_family_raises(self):
@@ -107,8 +108,8 @@ class TestImportTimeCapabilityAssertion:
         assert role.mcp_families == frozenset({'orchestrator'})
 
     def test_declaring_family_with_no_matching_tool_is_allowed(self):
-        """Declaring a family with no matching tool is a lower bound, never
-        the reverse."""
+        """mcp_families is a lower bound on the families allowed_tools needs,
+        so a declared family need not have a matching tool."""
 
         role = AgentRole(
             name='family_only',
@@ -187,8 +188,8 @@ class TestShippedRoleCapabilityDeclarations:
         )
 
     def test_judge_mcp_surface_is_its_verdict_server(self):
-        """The judge declares only verdict_tools and grants nothing else, so
-        it runs strictly scoped to its verdict server."""
+        """The judge declares only verdict_tools and has no other MCP grant,
+        so it runs strictly scoped to its verdict server."""
 
         assert ROLES['judge'].strict_mcp_scope is True
 
@@ -264,11 +265,14 @@ class TestInverseCapabilityInvariant:
                     f"'verdict_tools' in mcp_families (reify esc-4943-54 class)"
                 )
 
-    _FAMILY_PREFIXES = {
-        'orchestrator': ('mcp__fused-memory__', 'mcp__escalation__'),
-        'plan_tools': ('mcp__plan-tools__',),
-        'verdict_tools': ('mcp__verdict-tools__',),
-    }
+    def test_a_grant_no_declared_family_serves_is_reported(self):
+        role = AgentRole(
+            name='probe_ambient', system_prompt='x',
+            allowed_tools=['Read', 'mcp__verdict-tools__*', 'mcp__ambient-probe__*'],
+            mcp_families=frozenset({'verdict_tools'}),
+        )
+
+        assert role.mcp_grants_outside_families == ('mcp__ambient-probe__*',)
 
     @pytest.mark.parametrize('role_name', sorted(ROLES))
     def test_every_mcp_grant_is_served_by_a_declared_family(self, role_name):
@@ -276,18 +280,10 @@ class TestInverseCapabilityInvariant:
         family it declares, so no grant names a server _invoke never wires."""
 
         role = ROLES[role_name]
-        served = tuple(
-            prefix
-            for family in role.mcp_families
-            for prefix in self._FAMILY_PREFIXES[family]
-        )
-        stray = [
-            t for t in role.allowed_tools
-            if t.startswith('mcp__') and not t.startswith(served)
-        ]
-        assert not stray, (
-            f'{role_name!r} grants {stray!r}, which no family in its '
-            f'mcp_families={sorted(role.mcp_families)!r} serves.'
+        assert role.mcp_grants_outside_families == (), (
+            f'{role_name!r} grants {list(role.mcp_grants_outside_families)!r}, '
+            f'which no family in its mcp_families={sorted(role.mcp_families)!r} '
+            'serves.'
         )
 
 

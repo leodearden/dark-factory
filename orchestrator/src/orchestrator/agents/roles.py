@@ -81,22 +81,28 @@ class AgentRole:
     prompt_harness_version: str | None = None
 
     @property
-    def strict_mcp_scope(self) -> bool:
-        """Whether this role's whole MCP surface is its declared families.
-
-        True when it declares a family, none is 'orchestrator', and every
-        mcp__ grant falls under a declared family's prefix.
-        """
-        if not self.mcp_families or 'orchestrator' in self.mcp_families:
-            return False
+    def mcp_grants_outside_families(self) -> tuple[str, ...]:
+        """The mcp__ grants in allowed_tools that no declared family's prefix
+        covers, in allowed_tools order: tools only an ambient server can serve."""
         declared_prefixes = tuple(
             prefix for family in self.mcp_families for prefix in _FAMILY_TOOL_PREFIXES[family]
         )
-        return all(
-            tool.startswith(declared_prefixes)
+        return tuple(
+            tool
             for tool in self.allowed_tools
-            if tool.startswith('mcp__')
+            if tool.startswith('mcp__') and not tool.startswith(declared_prefixes)
         )
+
+    @property
+    def strict_mcp_scope(self) -> bool:
+        """Whether this role's whole MCP surface is its declared families.
+
+        True when it declares a family, none is 'orchestrator', and it has no
+        mcp__ grant outside its declared families.
+        """
+        if not self.mcp_families or 'orchestrator' in self.mcp_families:
+            return False
+        return not self.mcp_grants_outside_families
 
     @property
     def plan_tools_grants(self) -> frozenset[str]:
