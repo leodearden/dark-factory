@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import gzip
 import json
+import subprocess
+import textwrap
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -307,3 +312,208 @@ def test_the_slot_changes_when_the_bound_changes() -> None:
 
     assert before.slot() != after_report.finding.slot()
     assert before.slot().startswith('timeout-headroom:per_test_headroom:big_family:')
+
+
+# ---------------------------------------------------------------------------
+# run -- over a tmp project: a git repo holding its own verify archive.
+# ---------------------------------------------------------------------------
+
+_NOW = datetime(2026, 11, 22, 1, 30, tzinfo=UTC)
+_FAMILY_MODULE = """
+    import pytest
+    from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+    pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+    def test_scan() -> None:
+        pass
+    """
+
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', '-C', str(root), '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _project(tmp_path: Path, *, scan_seconds: float) -> Path:
+    root = tmp_path / 'project'
+    (root / 'pkg' / 'tests').mkdir(parents=True)
+    (root / 'pkg' / 'tests' / 'test_m.py').write_text(textwrap.dedent(_FAMILY_MODULE), encoding='utf-8')
+    (root / 'pkg' / 'orchestrator.yaml').write_text(
+        'test_command: "pytest pkg/tests"\nverify_command_timeout_secs: 900\n', encoding='utf-8'
+    )
+    (root / 'dark-factory-orchestrator.yaml').write_text('project_root: .\n', encoding='utf-8')
+    _git(root, 'init', '-q')
+    _git(root, 'add', '-A')
+    _git(root, 'commit', '-q', '--no-verify', '-m', 'family member')
+    tip = _git(root, 'rev-parse', 'HEAD')
+    task_dir = root / 'data' / 'verify-logs' / '7011'
+    task_dir.mkdir(parents=True)
+    xml = (
+        '<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest">'
+        f'<testcase classname="tests.test_m" name="test_scan" time="{scan_seconds}" />'
+        '</testsuite></testsuites>'
+    )
+    with gzip.open(task_dir / 'attempt-1.pkg.junit-20261120T145849_000001Z.xml.gz', 'wt', encoding='utf-8') as handle:
+        handle.write(xml)
+    (task_dir / 'attempt-1.dispatch-20261120T150000Z.json').write_text(
+        json.dumps({'base_sha': tip, 'tip_sha': tip}), encoding='utf-8'
+    )
+    return root
+
+
+@dataclass
+class _Escalations:
+    """A plain recording escalation port: (tool, args) -> canned answer."""
+
+    history: Mapping[str, list[dict]] = field(default_factory=dict)
+    fail_on: str | None = None
+    answer_error: bool = False
+    calls: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+
+    def __call__(self, tool: str, args: dict[str, object]) -> Mapping[str, object]:
+        self.calls.append((tool, args))
+        if tool == self.fail_on:
+            raise ConnectionError('escalation server unreachable')
+        if self.answer_error:
+            return {'error': 'boom'}
+        if tool == 'get_task_escalations':
+            return {'result': list(self.history.get(str(args['task_id']), []))}
+        return {'id': 'esc-new-1'}
+
+    def tools(self) -> list[str]:
+        return [tool for tool, _ in self.calls]
+
+
+_NO_LEGS = selfcheck.LegFacts(budgets={}, family=frozenset())
+
+
+def _config(root: Path, *, dry_run: bool = False) -> selfcheck.RunConfig:
+    return selfcheck.RunConfig(
+        project_root=root,
+        archive_root=root / 'data' / 'verify-logs',
+        stamp_path=root / 'data' / 'timeout-headroom-selfcheck' / 'state.json',
+        dry_run=dry_run,
+    )
+
+
+def _run(root: Path, escalations: _Escalations, *, dry_run: bool = False) -> selfcheck.RunResult:
+    return selfcheck.run(_config(root, dry_run=dry_run), selfcheck.Ports(escalation=escalations), _NOW, legs=_NO_LEGS)
+
+
+def test_a_breach_with_no_history_files_exactly_one_escalate_info_in_its_slot(tmp_path: Path) -> None:
+    root = _project(tmp_path, scan_seconds=200.0)
+    escalations = _Escalations()
+
+    result = _run(root, escalations)
+
+    assert result.ok
+    (finding,) = result.findings
+    assert finding.subject == 'whole_tree_family'
+    filed = [args for tool, args in escalations.calls if tool == 'escalate_info']
+    assert len(filed) == 1
+    (args,) = filed
+    assert args['task_id'] == finding.slot()
+    assert args['agent_role'] == 'timeout-headroom-selfcheck'
+    assert args['category'] == 'risk_identified'
+    evidence = args['evidence']
+    assert isinstance(evidence, list) and evidence
+    assert all(set(entry) == {'observation', 'measured_at', 'ref'} for entry in evidence)
+    assert result.filed == (finding.slot(),)
+
+
+def test_a_breach_whose_slot_has_history_is_skipped_and_reported(tmp_path: Path) -> None:
+    root = _project(tmp_path, scan_seconds=200.0)
+    slot = _run(root, _Escalations(), dry_run=True).findings[0].slot()
+    escalations = _Escalations(history={slot: [{'id': 'esc-7011-1', 'status': 'resolved'}]})
+
+    result = _run(root, escalations)
+
+    assert result.ok
+    assert 'escalate_info' not in escalations.tools()
+    assert (result.filed, result.skipped) == ((), (slot,))
+
+
+def test_a_dry_run_calls_no_write_tool_and_writes_no_stamp(tmp_path: Path) -> None:
+    root = _project(tmp_path, scan_seconds=200.0)
+    escalations = _Escalations()
+
+    result = _run(root, escalations, dry_run=True)
+
+    assert result.ok
+    assert len(result.findings) == 1
+    assert 'escalate_info' not in escalations.tools()
+    assert not _config(root).stamp_path.exists()
+
+
+def test_a_completed_run_writes_the_stamp(tmp_path: Path) -> None:
+    root = _project(tmp_path, scan_seconds=200.0)
+
+    result = _run(root, _Escalations())
+
+    stamp = json.loads(_config(root).stamp_path.read_text(encoding='utf-8'))
+    assert stamp['ok'] is True
+    assert stamp['measured_at'] == _NOW.isoformat()
+    assert {entry['anchor_id'] for entry in stamp['report']['anchors']} == {
+        'whole_tree_family',
+        'bare_magicmock_repo_scan',
+        'ini_default',
+    }
+    assert stamp['report']['legs'] == []
+    assert stamp['filed'] == list(result.filed)
+    assert stamp['skipped'] == []
+
+
+def test_a_quiet_night_files_nothing_and_still_stamps(tmp_path: Path) -> None:
+    root = _project(tmp_path, scan_seconds=20.0)
+    escalations = _Escalations()
+
+    result = _run(root, escalations)
+
+    assert result.ok
+    assert result.findings == ()
+    assert escalations.calls == []
+    assert json.loads(_config(root).stamp_path.read_text(encoding='utf-8'))['ok'] is True
+
+
+@pytest.mark.parametrize('escalations', [_Escalations(fail_on='get_task_escalations'), _Escalations(answer_error=True)])
+def test_an_escalation_fault_fails_the_run_at_its_stage_and_stamps_it(tmp_path: Path, escalations: _Escalations) -> None:
+    root = _project(tmp_path, scan_seconds=200.0)
+
+    result = _run(root, escalations)
+
+    assert not result.ok
+    assert result.failure is not None
+    assert result.failure.stage is selfcheck.FailureStage.ESCALATION
+    stamp = json.loads(_config(root).stamp_path.read_text(encoding='utf-8'))
+    assert stamp['ok'] is False
+    assert stamp['failure']['stage'] == 'escalation'
+
+
+def test_main_dry_run_prints_the_structured_report(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    root = _project(tmp_path, scan_seconds=200.0)
+
+    code = selfcheck.main(['--project-root', str(root), '--dry-run', '--json'])
+
+    assert code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed['ok'] is True
+    assert printed['dry_run'] is True
+    assert [finding['subject'] for finding in printed['findings']] == ['whole_tree_family']
+    assert [leg['prefix'] for leg in printed['report']['legs']] == ['pkg']
+    assert not _config(root).stamp_path.exists()
+
+
+def test_the_legs_adapters_read_this_checkouts_registered_legs() -> None:
+    repo_root = Path(_git(Path(__file__).resolve().parent, 'rev-parse', '--show-toplevel'))
+
+    budgets = selfcheck.registered_leg_budgets(repo_root)
+    family = selfcheck.family_legs(repo_root, budgets)
+
+    assert isinstance(budgets['shared'], int)
+    assert isinstance(budgets['orchestrator'], int)
+    assert 'shared' in family
