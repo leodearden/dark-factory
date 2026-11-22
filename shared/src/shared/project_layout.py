@@ -23,6 +23,7 @@ __all__ = [
     'offline_lane_dir',
     'orchestrator_data_dir',
     'park_eviction_requests_db',
+    'reconciliation_tickets_db',
     'runs_db',
     'scheduler_eligibility_db',
     'scheduler_overrides_db',
@@ -84,6 +85,11 @@ def scheduler_eligibility_db(root: StrPath) -> Path:
 
 def tasks_db(root: StrPath) -> Path:
     return Path(root) / '.taskmaster' / 'tasks' / 'tasks.db'
+
+
+def reconciliation_tickets_db(root: StrPath) -> Path:
+    """fused-memory's tickets.db at its DEFAULT reconciliation.data_dir; a configured data_dir moves it."""
+    return Path(root) / 'data' / 'reconciliation' / 'tickets.db'
 
 
 def known_project_roots(environ: Mapping[str, str] = os.environ) -> tuple[Path, ...]:

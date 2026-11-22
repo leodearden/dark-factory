@@ -20,6 +20,9 @@ class EventType(StrEnum):
     task_deleted = 'task_deleted'
     deferral_restamped = 'deferral_restamped'
     task_text_amended = 'task_text_amended'
+    followup_held = 'followup_held'
+    followup_hold_backfilled = 'followup_hold_backfilled'
+    followup_holder_protected = 'followup_holder_protected'
 
 
 class EventSource(StrEnum):

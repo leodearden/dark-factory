@@ -19,8 +19,15 @@ from typing import Any
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
-from _merge_lane_fakes import FakeVerifier, fails, lane_scene_config, make_lane, merge_through_lane
-from _merge_lane_verifier_doubles import ScriptedVerifier
+from _merge_lane_fakes import (
+    FakeVerifier,
+    delegates_to,
+    fails,
+    lane_scene_config,
+    make_lane,
+    merge_through_lane,
+    passes,
+)
 from _orch_helpers import git_env_with_ceiling
 from df_pytest_isolation import git_redirect_env
 
@@ -990,30 +997,18 @@ class TestTheReverifyArmCanBeHandedBackAsADispatch:
 # ─── Both production call sites hand the worker's store to the gate ─────────
 
 
-class _MovesMainOnItsFirstVerify:
-    """A merge verify that passes, moving main under itself on its first call."""
-
-    def __init__(self, repo: Path, drift: Drift) -> None:
-        self._repo = repo
-        self._drift = drift
-        self.calls = 0
-
-    async def __call__(self, *args: Any, **kwargs: Any) -> VerifyResult:
-        self.calls += 1
-        if self.calls == 1:
-            self._drift(self._repo)
-        return VerifyResult(
-            passed=True, test_output='ok', lint_output='', type_output='', summary='ok',
-        )
-
-
 async def _through_the_lane(
-    scene: _Scene, request: MergeRequest, verify: _MovesMainOnItsFirstVerify,
+    scene: _Scene, request: MergeRequest, drift: Drift,
 ) -> MergeOutcome:
+    """Merge *request* through the lane; every verify passes, the first moving main by *drift*."""
+
+    async def moves_main_then_passes(*args: Any, **kwargs: Any) -> VerifyResult:
+        drift(scene.repo)
+        return passes().result
+
     queue: asyncio.Queue[Any] = asyncio.Queue()
-    lane = make_lane(
-        scene.git_ops, queue, verifier=ScriptedVerifier(verify), event_store=scene.store,
-    )
+    verifier = FakeVerifier(sequence=[delegates_to(moves_main_then_passes)])
+    lane = make_lane(scene.git_ops, queue, verifier=verifier, event_store=scene.store)
     return await merge_through_lane(lane, queue, request)
 
 
@@ -1026,10 +1021,8 @@ class TestSingleBranchGateIsRecorded:
         config = scene.config(merge_verify_breadth='scoped', merge_verify_min_free_disk_bytes=0)
         branch_wt = (await scene.git_ops.create_worktree('lane-5064')).path
         _edit_shared_line(branch_wt, 2, 'shared line 2, edited by the branch')
-        verify = _MovesMainOnItsFirstVerify(scene.repo, _drift_on_the_branchs_file)
-
         outcome = await _through_the_lane(
-            scene, _request(config, 'lane-5064', branch_wt), verify,
+            scene, _request(config, 'lane-5064', branch_wt), _drift_on_the_branchs_file,
         )
 
         assert outcome.status == 'done', outcome
@@ -1059,8 +1052,7 @@ class TestSingleBranchGateIsRecorded:
             return _git(repo, 'rev-parse', 'HEAD')
 
         outcome = await _through_the_lane(
-            scene, _request(config, 'follower', follower_wt),
-            _MovesMainOnItsFirstVerify(scene.repo, lands_the_heads_patch),
+            scene, _request(config, 'follower', follower_wt), lands_the_heads_patch,
         )
 
         assert outcome.status == 'done', outcome

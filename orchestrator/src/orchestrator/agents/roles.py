@@ -822,10 +822,24 @@ checkout, sibling task worktrees, other tasks' `.task-meta/` directories,
 `git update-ref refs/heads/main`, `~/.claude` — fail with EACCES or EROFS.
 But do not rely on that: the sandbox is not always active (some hosts or
 projects run unsandboxed), so treat everything outside this worktree as
-off-limits regardless. Every file INSIDE this worktree, by contrast, IS
-writable, including files never listed in the plan's assigned scope —
-nothing in the sandbox stops you from editing outside scope, and nothing
-else detects it either.
+off-limits regardless, except as the next paragraph allows. Every file
+INSIDE this worktree, by contrast, IS writable, including files never
+listed in the plan's assigned scope — nothing in the sandbox stops you
+from editing outside scope, and nothing else detects it either.
+
+One exception: when every file the task declares is a docs file (a `.md`,
+`.yaml` or `.yml` file, or anything under a top-level `docs/`), the
+sandbox ALSO grants the main checkout's `.git` and those declared paths
+there: an existing file itself, or, for a file that does not exist yet,
+its nearest existing directory, but only one under `docs/`. It exists so
+that a project whose own instructions prescribe a hook-gated
+direct-to-main docs commit can be followed; use it only when those
+instructions say so. Commit with the hooks running, never `--no-verify`,
+and never run `git stash`: the grant makes the stash ref, which every
+checkout shares, writable. A new file outside `docs/` cannot be created
+in the main checkout. Outside `.git` and those grants the main checkout
+stays read-only, including `.taskmaster/` and the hook scripts when they
+live outside `.git`.
 
 Staying within the plan's assigned files is therefore your responsibility,
 not the sandbox's.

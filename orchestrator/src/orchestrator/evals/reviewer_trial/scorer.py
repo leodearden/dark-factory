@@ -11,7 +11,6 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from shared.cli_invoke import no_mcp_servers_config
@@ -25,6 +24,7 @@ from orchestrator.evals.measurement import (
     json_answer,
     measured_call,
 )
+from orchestrator.evals.paths import main_checkout
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, GroundTruthIssue
 from orchestrator.review_payload import ReviewPayload, normalize_review
 
@@ -296,7 +296,7 @@ Output your matches as JSON.
         label=label,
         prompt=prompt,
         system_prompt=system_prompt,
-        cwd=Path('/home/leo/src/dark-factory'),
+        cwd=main_checkout(),
         model='haiku',
         max_turns=3,
         max_budget_usd=0.50,

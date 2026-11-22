@@ -80,7 +80,7 @@ async def test_reset_forgets_every_unit_the_last_good_and_the_rotation(
     reset_task_snapshot_state()
     canned.calls.clear()
     canned.fail_when = lambda call: True
-    _rows, snapshots = await collect_tasks_with_counts(
+    snapshots = await collect_tasks_with_counts(
         dummy_client, config, now=NOW, budget=width_one,
     )
 

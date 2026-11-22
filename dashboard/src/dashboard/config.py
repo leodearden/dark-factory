@@ -26,17 +26,8 @@ DEFAULT_FUSED_MEMORY_URLS: Final = ('http://localhost:8002',)
 # The canonical top-level orchestrator config name (task 2698 / commit
 # 97f0bd9f85). Every onboarded project's top-level orchestrator config MUST
 # live at ``<project_root>/dark-factory-orchestrator.yaml`` — this is the
-# name dashboard discovery keys on first.
+# name dashboard discovery reads.
 _CANONICAL_CONFIG_NAME: Final = 'dark-factory-orchestrator.yaml'
-
-# Legacy spellings tolerated as a fallback (transitional symlinks left behind
-# by the migration to the canonical name). Resolution order matters: each is
-# tried in turn only after the canonical name is absent.
-_LEGACY_CONFIG_NAMES: Final = (
-    'orchestrator.yaml',
-    'orchestrator-config.yaml',
-    'orchestrator/config.yaml',
-)
 
 _ON_OFF: Final = {'on': True, 'off': False}
 
@@ -119,53 +110,28 @@ def _read_escalation_url(yaml_path: Path) -> str | None:
 
 
 def discover_root_escalation_url(root: Path) -> str | None:
-    """Resolve *root*'s escalation MCP URL, preferring the canonical config name.
+    """Resolve *root*'s escalation MCP URL from ``<root>/dark-factory-orchestrator.yaml``.
 
-    If ``_CANONICAL_CONFIG_NAME`` exists on disk, it is authoritative: its
-    resolved URL (or None, if it exists but has no ``escalation.port``) is
-    returned without ever consulting legacy spellings. A present-but-
-    misconfigured canonical config must not be silently masked by a stale
-    legacy file's port — that would report a "please migrate" nudge instead
-    of the real problem (a broken canonical config). Only when the canonical
-    file is absent entirely does resolution fall back to each of
-    ``_LEGACY_CONFIG_NAMES`` in order, logging a WARNING naming the project
-    (``root.name``) when a legacy spelling is what resolved it — a nudge to
-    migrate. Returns None if no candidate yields a URL.
+    That is the only file read. Returns None when it is absent, malformed or
+    has no ``escalation.port`` (see ``_read_escalation_url``).
     """
-    canonical_path = root / _CANONICAL_CONFIG_NAME
-    if canonical_path.is_file():
-        return _read_escalation_url(canonical_path)
-    for legacy_name in _LEGACY_CONFIG_NAMES:
-        legacy_url = _read_escalation_url(root / legacy_name)
-        if legacy_url is not None:
-            logger.warning(
-                'Project %s: found orchestrator config at legacy path %s '
-                '(expected %s) — please migrate.',
-                root.name,
-                root / legacy_name,
-                _CANONICAL_CONFIG_NAME,
-            )
-            return legacy_url
-    return None
+    return _read_escalation_url(root / _CANONICAL_CONFIG_NAME)
 
 
 def _discover_escalation_urls(roots: Iterable[Path]) -> dict[str, str]:
     """Derive each root's escalation MCP URL from its orchestrator config.
 
     Keyed by each root's project label, unique across *roots* (see
-    ``dashboard/project_labels.py::ProjectLabels``). Prefers the
-    canonical ``dark-factory-orchestrator.yaml`` name, falling back to legacy
-    spellings (see ``discover_root_escalation_url``). A root that yields no
-    URL at all — no config found under any spelling, or a config found with
-    no ``escalation.port`` — logs a WARNING naming the root, rather than
-    degrading silently.
+    ``dashboard/project_labels.py::ProjectLabels``). Only
+    ``dark-factory-orchestrator.yaml`` is read (see
+    ``discover_root_escalation_url``). A root that yields no URL at all — no
+    such file, or one with no ``escalation.port`` — logs a WARNING naming the
+    root, rather than degrading silently.
 
-    The per-root WARNINGs (both the legacy-fallback nudge and this no-URL
-    one) are an intentional, persistent migration nudge — not transient
-    errors. Discovery runs once per process at startup (via
+    Discovery runs once per process at startup (via
     ``DashboardConfig.__post_init__`` / ``from_env``), never per request, so
-    a legitimately non-orchestrator or still-legacy root re-emits its WARNING
-    only once per process lifetime — a bounded reminder, not log spam.
+    a legitimately non-orchestrator root re-emits that WARNING only once per
+    process lifetime — a bounded reminder, not log spam.
     """
     roots = tuple(roots)
     labels = ProjectLabels.of_roots(roots)
@@ -174,11 +140,9 @@ def _discover_escalation_urls(roots: Iterable[Path]) -> dict[str, str]:
         url = discover_root_escalation_url(root)
         if url is None:
             logger.warning(
-                'No escalation URL discovered for project root %s '
-                '(checked %s and legacy spellings %s)',
+                'No escalation URL discovered for project root %s (checked %s)',
                 root,
                 _CANONICAL_CONFIG_NAME,
-                _LEGACY_CONFIG_NAMES,
             )
             continue
         out[labels.of(root)] = url

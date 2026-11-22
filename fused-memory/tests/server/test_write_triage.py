@@ -22,6 +22,7 @@ import types
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from _fm_helpers import make_insufficient_quota_error
 
 from fused_memory.models.enums import MEM0_PRIMARY, MemoryCategory, SourceStore
 from fused_memory.models.memory import AddMemoryResponse, MemoryResult
@@ -1946,6 +1947,96 @@ class TestEmitTriageFailOpenStormEscalation:
         assert payload['category'] == 'write_triage_fail_open_storm'
         assert payload['task_id'] == write_triage._ANCHOR_TASK_ID
         assert payload['level'] == 1
+
+
+class TestAFailOpenOnExhaustedCreditsSaysSo:
+    """A fail-open storm behind an empty OpenAI balance names the credits (task 10922).
+
+    On 2026-11-19 the triage fail-open alarm read like a transient outage while
+    the real cause was exhausted credits, which only a human paying clears.
+    """
+
+    _service = staticmethod(TestTriageWriteFailsOpen._service)
+    _fail_open_logs = staticmethod(TestTriageWriteFailsOpen._fail_open_logs)
+
+    @pytest.mark.asyncio
+    async def test_the_fail_open_line_names_the_billing_cause(self, caplog) -> None:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(
+            search=AsyncMock(side_effect=make_insufficient_quota_error()),
+        )
+
+        with caplog.at_level(logging.DEBUG, logger=write_triage.logger.name):
+            decision = await triage_write(
+                service, content='c', project_id='p', counter=counter,
+            )
+
+        assert decision.outcome == OUTCOME_STORED, 'the write is never blocked'
+        assert decision.fail_open_stage is not None
+        (logged,) = self._fail_open_logs(caplog)
+        assert logged.levelno == logging.WARNING
+        assert 'cause=billing_exhausted:api_key_credits' in logged.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_fail_open_names_its_exception_type(self, caplog) -> None:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        service = self._service(search=AsyncMock(side_effect=RuntimeError('mem0 down')))
+
+        with caplog.at_level(logging.DEBUG, logger=write_triage.logger.name):
+            await triage_write(service, content='c', project_id='p', counter=counter)
+
+        (logged,) = self._fail_open_logs(caplog)
+        assert 'cause=RuntimeError' in logged.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_the_storm_counts_the_billing_fail_opens_in_its_window(self) -> None:
+        counter = TriageFailOpenCounter(time_provider=_Clock())
+        outage = self._service(search=AsyncMock(side_effect=RuntimeError('mem0 down')))
+        empty_balance = self._service(
+            search=AsyncMock(side_effect=make_insufficient_quota_error()),
+        )
+        plain = 2
+        billing = _FAIL_OPEN_STORM_THRESHOLD - plain
+
+        for _ in range(plain):
+            await triage_write(outage, content='c', project_id='p', counter=counter)
+        for _ in range(billing):
+            await triage_write(empty_balance, content='c', project_id='p', counter=counter)
+
+        storm = counter.drain_storm()
+        assert storm is not None, 'crossing the threshold must fire'
+        assert storm['count'] == _FAIL_OPEN_STORM_THRESHOLD
+        assert storm['billing_exhausted_in_window'] == billing
+
+    def test_a_billing_storm_leads_with_the_credits(self, tmp_path) -> None:
+        pytest.importorskip('escalation')
+
+        emit_triage_fail_open_storm_escalation(
+            str(tmp_path), {**_STORM, 'billing_exhausted_in_window': 9},
+        )
+
+        payload = _only_escalation(tmp_path)
+        assert 'credits exhausted' in payload['summary'].lower()
+        assert 'provider_billing_exhausted' in f"{payload['summary']}\n{payload['detail']}"
+        assert 'billing_exhausted_in_window=9' in payload['detail']
+
+    @pytest.mark.parametrize(
+        'storm',
+        [_STORM, {**_STORM, 'billing_exhausted_in_window': 0}],
+        ids=['key-absent', 'zero'],
+    )
+    def test_without_billing_fail_opens_the_summary_is_unchanged(
+        self, tmp_path, storm,
+    ) -> None:
+        pytest.importorskip('escalation')
+
+        emit_triage_fail_open_storm_escalation(str(tmp_path), storm)
+
+        assert _only_escalation(tmp_path)['summary'] == (
+            f'12 add_memory write(s) triaged WITHOUT triage in '
+            f'{_FAIL_OPEN_STORM_WINDOW_SECONDS}s — write triage is failing open '
+            '(see docs/prds/memory-write-path-convergence.md)'
+        )
 
 
 def _only_escalation(project_root) -> dict:

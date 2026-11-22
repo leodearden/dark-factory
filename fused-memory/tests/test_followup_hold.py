@@ -12,8 +12,17 @@ import sys
 from typing import Any
 
 import pytest
+from shared.followup_hold_records import FOLLOWUP_HOLD_METADATA_KEY, FOLLOWUP_HOLDER_METADATA_KEY
 
-from fused_memory.middleware.followup_hold import FOLLOWUP_HOLDER_METADATA_KEY, is_holder
+from fused_memory.middleware.followup_hold import (
+    FollowupHolderProtectedError,
+    HolderProtection,
+    hold_at_create,
+    hold_scope,
+    is_holder,
+    protected_status,
+    protected_update,
+)
 
 _MARKER = {'project_id': 'dark_factory', 'minted_at': '2026-11-08T00:00:00+00:00'}
 
@@ -70,3 +79,185 @@ def test_importing_followup_hold_loads_neither_the_interceptor_nor_the_curator()
         f'importing followup_hold loaded {result.stdout.strip()}; it must import only the stdlib '
         'and lower layers.'
     )
+
+
+_FOLLOWUP = {'source': 'agent-followup', 'spawn_context': 'agent_followup', 'spawned_from': '101'}
+_REVIEW = {'spawn_context': 'review_suggestions'}
+
+
+@pytest.mark.parametrize(('metadata', 'priority'), [
+    (_FOLLOWUP, 'low'),
+    (_FOLLOWUP, 'polish'),
+    (_REVIEW, 'low'),
+    ({**_FOLLOWUP, 'complexity': 'simple'}, 'low'),
+    ({**_FOLLOWUP, 'task_kind': 'normal'}, 'low'),
+    (json.dumps(_FOLLOWUP), 'low'),
+], ids=['followup-low', 'followup-polish', 'review-low', 'simple', 'task-kind-normal', 'json-string'])
+def test_a_low_followup_is_in_hold_scope(metadata: Any, priority: str) -> None:
+    assert hold_scope(metadata, priority)
+
+
+@pytest.mark.parametrize(('metadata', 'priority'), [
+    (_FOLLOWUP, 'medium'),
+    (_FOLLOWUP, 'high'),
+    (_FOLLOWUP, None),
+    ({'source': 'reconciliation'}, 'low'),
+    ({'spawn_context': 'agent_followup'}, 'low'),
+    ({**_FOLLOWUP, 'task_kind': 'deterministic'}, 'low'),
+    ({**_FOLLOWUP, 'execution_class': 'operational'}, 'low'),
+    ({**_FOLLOWUP, 'prd_path': 'plans/x-prd.md'}, 'low'),
+    ({**_FOLLOWUP, 'x_finding_key': 'fk-x'}, 'low'),
+    ({**_FOLLOWUP, 'x_finding_key': ['fk-x']}, 'low'),
+    ({**_FOLLOWUP, 'human_decomposed': True}, 'low'),
+    (json.dumps({**_FOLLOWUP, 'human_decomposed': True}), 'low'),
+    (None, 'low'),
+    ('', 'low'),
+], ids=[
+    'medium', 'high', 'no-priority', 'other-source', 'followup-context-without-source',
+    'deterministic', 'execution-class', 'prd-path', 'finding-key', 'finding-key-list',
+    'planning-birth', 'planning-birth-json', 'metadata-none', 'metadata-empty',
+])
+def test_a_task_outside_the_hold_rule_is_not_held(metadata: Any, priority: str | None) -> None:
+    assert not hold_scope(metadata, priority)
+
+
+_HELD_AT = '2026-11-19T04:30:00+00:00'
+
+
+@pytest.mark.parametrize(('dependencies', 'expected'), [
+    (None, '9'),
+    ('', '9'),
+    ('3,4', '3,4,9'),
+    ('3,9', '3,9'),
+    ('9', '9'),
+], ids=['none', 'empty', 'two-others', 'already-names-holder', 'only-holder'])
+def test_hold_at_create_appends_the_holder_edge(dependencies: str | None, expected: str) -> None:
+    kwargs = {'title': 't', 'priority': 'low', 'dependencies': dependencies}
+
+    held_kwargs, _ = hold_at_create(kwargs, dict(_FOLLOWUP), 9, held_at=_HELD_AT)
+
+    assert held_kwargs['dependencies'] == expected
+    assert held_kwargs['title'] == 't'
+    assert held_kwargs['priority'] == 'low'
+
+
+def test_hold_at_create_appends_the_edge_when_dependencies_are_absent() -> None:
+    held_kwargs, _ = hold_at_create({'title': 't'}, dict(_FOLLOWUP), 9, held_at=_HELD_AT)
+
+    assert held_kwargs == {'title': 't', 'dependencies': '9'}
+
+
+@pytest.mark.parametrize('metadata', [dict(_FOLLOWUP), json.dumps(_FOLLOWUP)], ids=['dict', 'json-string'])
+def test_hold_at_create_stamps_the_record_beside_every_other_key(metadata: Any) -> None:
+    _, held_metadata = hold_at_create({'title': 't'}, metadata, 9, held_at=_HELD_AT)
+
+    assert held_metadata == {**_FOLLOWUP, FOLLOWUP_HOLD_METADATA_KEY: {'holder': 9, 'held_at': _HELD_AT}}
+
+
+def test_hold_at_create_leaves_its_inputs_unmutated() -> None:
+    kwargs = {'title': 't', 'dependencies': '3'}
+    metadata = dict(_FOLLOWUP)
+
+    hold_at_create(kwargs, metadata, 9, held_at=_HELD_AT)
+
+    assert kwargs == {'title': 't', 'dependencies': '3'}
+    assert metadata == _FOLLOWUP
+
+
+_HOLDER_ROW = {'id': 9, 'status': 'pending', 'metadata': {FOLLOWUP_HOLDER_METADATA_KEY: _MARKER}}
+_PLAIN_ROW = {'id': 10, 'status': 'pending', 'metadata': dict(_FOLLOWUP)}
+
+
+@pytest.mark.parametrize('status', ['done', 'cancelled', 'deferred'])
+def test_leaving_pending_for_a_protected_status_is_refused(status: str) -> None:
+    assert protected_status(_HOLDER_ROW, status, release_holder=False) is HolderProtection.STATUS
+
+
+@pytest.mark.parametrize('status', ['done', 'cancelled', 'deferred'])
+def test_an_explicit_release_lifts_the_status_protection(status: str) -> None:
+    assert protected_status(_HOLDER_ROW, status, release_holder=True) is None
+
+
+@pytest.mark.parametrize('release_holder', ['yes', 'true', 1], ids=['yes', 'true', 'one'])
+def test_only_a_literal_true_releases(release_holder: Any) -> None:
+    assert protected_status(_HOLDER_ROW, 'cancelled', release_holder=release_holder) is HolderProtection.STATUS
+
+
+@pytest.mark.parametrize('status', ['pending', 'in-progress', 'blocked'])
+def test_an_unprotected_status_is_not_judged(status: str) -> None:
+    assert protected_status(_HOLDER_ROW, status, release_holder=False) is None
+
+
+@pytest.mark.parametrize('status', ['done', 'cancelled', 'deferred', 'pending'])
+def test_a_non_holder_row_is_never_protected(status: str) -> None:
+    assert protected_status(_PLAIN_ROW, status, release_holder=False) is None
+
+
+_WATCH = 'The follow-up holder never dispatches.'
+_STORED_HOLDER = {
+    'task_kind': 'deterministic', 'always_escalates': True, 'execution_class': 'decision',
+    'deferred_watch': _WATCH, FOLLOWUP_HOLDER_METADATA_KEY: _MARKER,
+}
+
+
+@pytest.mark.parametrize(('payload', 'replace', 'expected'), [
+    ({FOLLOWUP_HOLDER_METADATA_KEY: None}, False, 'MARKER'),
+    ({FOLLOWUP_HOLDER_METADATA_KEY: {**_MARKER, 'project_id': 'other'}}, False, 'MARKER'),
+    ({'deferred_watch': None}, False, 'DEFERRED_WATCH'),
+    ({'deferred_watch': ''}, False, 'DEFERRED_WATCH'),
+    ({'trigger_met': True}, False, 'TRIGGER_MET'),
+    ({key: value for key, value in _STORED_HOLDER.items() if key != FOLLOWUP_HOLDER_METADATA_KEY}, True, 'MARKER'),
+    ({key: value for key, value in _STORED_HOLDER.items() if key != 'deferred_watch'}, True, 'DEFERRED_WATCH'),
+    ({**_STORED_HOLDER, 'trigger_met': True}, True, 'TRIGGER_MET'),
+    (json.dumps({'trigger_met': True}), False, 'TRIGGER_MET'),
+], ids=[
+    'merge-strips-marker', 'merge-alters-marker', 'merge-strips-watch', 'merge-blanks-watch',
+    'merge-sets-trigger-met', 'replace-drops-marker', 'replace-drops-watch',
+    'replace-sets-trigger-met', 'json-payload',
+])
+def test_an_update_that_would_ungate_the_holder_is_refused(payload: Any, replace: bool, expected: str) -> None:
+    assert protected_update(_STORED_HOLDER, payload, replace=replace) is HolderProtection[expected]
+
+
+@pytest.mark.parametrize(('payload', 'replace'), [
+    ({**_STORED_HOLDER, 'x_note': 'kept'}, True),
+    ({'x_note': 'kept', 'files': ['a.py']}, False),
+    ({FOLLOWUP_HOLDER_METADATA_KEY: _MARKER, 'deferred_watch': 'reworded'}, False),
+    ({'trigger_met': False}, False),
+], ids=['replace-echo-plus-x-key', 'merge-unrelated', 'merge-echo-marker-reword-watch', 'trigger-met-false'])
+def test_an_update_that_keeps_the_holder_gated_is_allowed(payload: Any, replace: bool) -> None:
+    assert protected_update(_STORED_HOLDER, payload, replace=replace) is None
+
+
+@pytest.mark.parametrize(('payload', 'replace'), [
+    ({'trigger_met': True}, False),
+    ({'deferred_watch': None}, False),
+    ({FOLLOWUP_HOLDER_METADATA_KEY: None}, False),
+    ({}, True),
+], ids=['trigger-met', 'strip-watch', 'marker-none', 'replace-empty'])
+def test_an_update_to_a_non_holder_is_never_judged(payload: Any, replace: bool) -> None:
+    stored = {**_FOLLOWUP, 'deferred_watch': _WATCH}
+
+    assert protected_update(stored, payload, replace=replace) is None
+
+
+def test_the_refusal_carries_the_holder_and_its_held_count() -> None:
+    error = FollowupHolderProtectedError(
+        holder_id='9', protection=HolderProtection.STATUS, attempted_status='cancelled', held_count=2,
+    )
+
+    wire = error.to_error_dict()
+
+    assert {key: wire[key] for key in wire if key != 'hint'} == {
+        'success': False,
+        'error': 'followup_holder_protected',
+        'error_type': 'FollowupHolderProtectedError',
+        'holder_id': '9',
+        'protection': 'protected_status',
+        'attempted_status': 'cancelled',
+        'held_count': 2,
+    }
+    assert 'release_holder=True' in wire['hint']
+    assert error.event_payload() == {
+        'holder_id': '9', 'attempted_status': 'cancelled', 'protection': 'protected_status', 'held_count': 2,
+    }

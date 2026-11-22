@@ -1016,6 +1016,17 @@ def _schedule_cursor(
     )
 
 
+def schedule_reached(prior: TrickleState | None, *, target_date: date) -> bool:
+    """Whether the schedule cursor *prior* recorded has already reached
+    *target_date*: a scheduled pass over it re-targets a date an earlier
+    scheduled pass covered or jumped over."""
+    return (
+        prior is not None
+        and prior.last_scheduled_target_date is not None
+        and target_date <= prior.last_scheduled_target_date
+    )
+
+
 # ---------------------------------------------------------------------------
 # Escalation re-arm policies — decided on a night's fold, before it is written
 # ---------------------------------------------------------------------------

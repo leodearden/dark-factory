@@ -275,7 +275,7 @@
       ],
       [
         "--reify-root PATH",
-        "reify checkout to discover merges in"
+        "reify checkout to discover merges in (default: the reify root registered in $DASHBOARD_KNOWN_PROJECT_ROOTS)"
       ],
       [
         "--sampled-at TEXT",

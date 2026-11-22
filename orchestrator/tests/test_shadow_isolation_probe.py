@@ -19,7 +19,7 @@ from shared.eval_lane import is_eval_fixture_task_id
 
 from orchestrator.agents.roles import IMPLEMENTER, ROLES
 from orchestrator.agents.sandbox_dispatch import Backend
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, SandboxConfig
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.live_fixture import build_live_fixture
 from orchestrator.evals.profile import apply_eval_profile
@@ -74,12 +74,22 @@ def _shadow_fixture(project_root: Path) -> dict:
     )
 
 
+def _sandboxed_base(project_root: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project_root=project_root, sandbox=SandboxConfig(enabled=True, backend='landlock'),
+    )
+
+
+def _sandbox_disabled_base(project_root: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(project_root=project_root, sandbox=SandboxConfig(enabled=False))
+
+
 def _eval_cwd(project_root: Path) -> Path:
     return eval_worktree_root(project_root) / _SHADOW_ID
 
 
 def _production_implementer_leg(tmp_path: Path) -> LegInvocation:
-    production = OrchestratorConfig(project_root=tmp_path)
+    production = _sandboxed_base(tmp_path)
     return workflow_leg(
         production, IMPLEMENTER, task_id=_SHADOW_ID, cwd=_eval_cwd(tmp_path),
         mcp=McpLifecycle(production), resolve_backend=_landlock,
@@ -96,7 +106,7 @@ def _workflow_leg_for(legs: tuple[LegInvocation, ...], role: str) -> LegInvocati
 
 
 def test_the_built_shadow_implementer_leg_is_isolated(tmp_path: Path) -> None:
-    legs = shadow_leg_invocations(OrchestratorConfig(project_root=tmp_path), resolve_backend=_landlock)
+    legs = shadow_leg_invocations(_sandboxed_base(tmp_path), resolve_backend=_landlock)
 
     leg = _workflow_leg_for(legs, 'implementer')
     assert leg.strict_mcp_config is True
@@ -108,7 +118,7 @@ def test_the_built_shadow_implementer_leg_is_isolated(tmp_path: Path) -> None:
 
 
 def test_the_built_legs_cover_every_role_plus_the_architect_eval(tmp_path: Path) -> None:
-    legs = shadow_leg_invocations(OrchestratorConfig(project_root=tmp_path), resolve_backend=_landlock)
+    legs = shadow_leg_invocations(_sandboxed_base(tmp_path), resolve_backend=_landlock)
 
     workflow_roles = sorted(leg.role for leg in legs if leg.dispatch is LegDispatch.WORKFLOW)
     assert workflow_roles == sorted(role.name for role in ROLES.values())
@@ -119,7 +129,7 @@ def test_the_built_legs_cover_every_role_plus_the_architect_eval(tmp_path: Path)
 
 
 def test_the_built_legs_carry_only_per_invocation_mcp_servers(tmp_path: Path) -> None:
-    legs = shadow_leg_invocations(OrchestratorConfig(project_root=tmp_path), resolve_backend=_landlock)
+    legs = shadow_leg_invocations(_sandboxed_base(tmp_path), resolve_backend=_landlock)
 
     assert all(leg.mcp_servers <= PER_INVOCATION_MCP_SERVERS for leg in legs)
     assert _workflow_leg_for(legs, 'implementer').mcp_servers == {PLAN_TOOLS_MCP_SERVER}
@@ -131,7 +141,7 @@ def test_a_shadow_leg_handed_the_production_mcp_lifecycle_is_live_mcp_server(
     tmp_path: Path,
 ) -> None:
     shadow = build_shadow_orch_config(
-        _IMPL, _shadow_fixture(tmp_path), OrchestratorConfig(project_root=tmp_path),
+        _IMPL, _shadow_fixture(tmp_path), _sandboxed_base(tmp_path),
     )
     leg = workflow_leg(
         shadow, IMPLEMENTER, task_id=_SHADOW_ID, cwd=_eval_cwd(tmp_path),
@@ -147,7 +157,7 @@ def test_a_shadow_leg_handed_the_production_mcp_lifecycle_is_live_mcp_server(
 
 
 def test_the_built_shadow_profile_has_no_isolation_gap(tmp_path: Path) -> None:
-    base = OrchestratorConfig(project_root=tmp_path)
+    base = _sandboxed_base(tmp_path)
 
     verdict = probe_isolation(shadow_leg_invocations(base, resolve_backend=_landlock))
 
@@ -166,7 +176,7 @@ def test_a_production_profile_leg_is_ambient_mcp_and_live_memory(tmp_path: Path)
 
 
 def test_dropping_strict_mcp_alone_is_exactly_strict_mcp_off(tmp_path: Path) -> None:
-    config = apply_eval_profile(OrchestratorConfig(project_root=tmp_path)).model_copy(
+    config = apply_eval_profile(_sandboxed_base(tmp_path)).model_copy(
         update={'strict_mcp_config': False},
     )
 
@@ -180,7 +190,7 @@ def test_dropping_strict_mcp_alone_is_exactly_strict_mcp_off(tmp_path: Path) -> 
 
 def test_a_production_task_id_and_lane_is_escalation_uncontained(tmp_path: Path) -> None:
     cwd = tmp_path / '.worktrees' / '4242'
-    config = apply_eval_profile(OrchestratorConfig(project_root=tmp_path))
+    config = apply_eval_profile(_sandboxed_base(tmp_path))
     leg = workflow_leg(
         config, IMPLEMENTER, task_id='4242', cwd=cwd,
         mcp=eval_mcp_lifecycle(config), resolve_backend=_landlock,
@@ -193,9 +203,9 @@ def test_a_production_task_id_and_lane_is_escalation_uncontained(tmp_path: Path)
     assert str(cwd) in finding.observed
 
 
-def test_a_corpus_profile_sandboxed_leg_is_sandbox_off(tmp_path: Path) -> None:
+def test_a_sandbox_disabled_base_leaves_sandboxed_legs_sandbox_off(tmp_path: Path) -> None:
     corpus = build_eval_orch_config(
-        _IMPL, _shadow_fixture(tmp_path), OrchestratorConfig(project_root=tmp_path),
+        _IMPL, _shadow_fixture(tmp_path), _sandbox_disabled_base(tmp_path),
     )
 
     legs = [
@@ -209,9 +219,18 @@ def test_a_corpus_profile_sandboxed_leg_is_sandbox_off(tmp_path: Path) -> None:
     assert {finding.role for finding in findings} == _SANDBOXED_ROLES
 
 
+def test_a_sandbox_disabled_base_closes_the_shadow_probe(tmp_path: Path) -> None:
+    legs = shadow_leg_invocations(_sandbox_disabled_base(tmp_path), resolve_backend=_landlock)
+
+    findings = probe_isolation(legs).findings
+
+    assert {finding.gap for finding in findings} == {IsolationGap.SANDBOX_OFF}
+    assert {finding.role for finding in findings} == _SANDBOXED_ROLES
+
+
 def test_a_shadow_profile_leg_under_no_backend_is_sandbox_unwrapped(tmp_path: Path) -> None:
     shadow = build_shadow_orch_config(
-        _IMPL, _shadow_fixture(tmp_path), OrchestratorConfig(project_root=tmp_path),
+        _IMPL, _shadow_fixture(tmp_path), _sandboxed_base(tmp_path),
     )
 
     leg = workflow_leg(
@@ -223,7 +242,7 @@ def test_a_shadow_profile_leg_under_no_backend_is_sandbox_unwrapped(tmp_path: Pa
 
 
 def test_no_backend_leaves_the_unsandboxed_legs_without_a_sandbox_gap(tmp_path: Path) -> None:
-    legs = shadow_leg_invocations(OrchestratorConfig(project_root=tmp_path), resolve_backend=_no_backend)
+    legs = shadow_leg_invocations(_sandboxed_base(tmp_path), resolve_backend=_no_backend)
 
     findings = probe_isolation(legs).findings
 
@@ -240,7 +259,7 @@ def test_an_empty_probe_refuses_to_claim_isolation() -> None:
 def test_shadow_isolation_available_refuses_and_logs_every_finding(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    base = OrchestratorConfig(project_root=tmp_path)
+    base = _sandboxed_base(tmp_path)
     findings = probe_isolation(shadow_leg_invocations(base, resolve_backend=_no_backend)).findings
 
     with caplog.at_level(logging.WARNING, logger='orchestrator.evals.shadow_isolation'):
@@ -257,7 +276,7 @@ def test_shadow_isolation_available_refuses_and_logs_every_finding(
 def test_a_probe_that_cannot_build_its_legs_fails_closed(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    base = OrchestratorConfig(project_root=tmp_path)
+    base = _sandboxed_base(tmp_path)
 
     with caplog.at_level(logging.ERROR, logger='orchestrator.evals.shadow_isolation'):
         available = shadow_isolation_available(base, resolve_backend=_failing_backend)
@@ -281,7 +300,7 @@ async def costs(tmp_path):
 async def test_the_coordinator_skips_a_cell_whose_profile_does_not_isolate(
     tmp_path: Path, costs: CostStore, resolve_backend,
 ) -> None:
-    base = OrchestratorConfig(project_root=tmp_path)
+    base = _sandboxed_base(tmp_path)
     rig = build_coordinator(
         tmp_path, costs,
         isolation_probe=lambda: shadow_isolation_available(base, resolve_backend=resolve_backend),
@@ -300,7 +319,7 @@ async def test_the_coordinator_skips_a_cell_whose_profile_does_not_isolate(
 async def test_the_coordinator_opens_a_cell_behind_the_shadow_isolation_probe(
     tmp_path: Path, costs: CostStore,
 ) -> None:
-    base = OrchestratorConfig(project_root=tmp_path)
+    base = _sandboxed_base(tmp_path)
     rig = build_coordinator(
         tmp_path, costs,
         isolation_probe=lambda: shadow_isolation_available(base, resolve_backend=_landlock),

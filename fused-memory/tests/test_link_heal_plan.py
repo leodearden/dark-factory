@@ -346,6 +346,7 @@ class TestRunCounts:
             {'failed': 1},
             {'skipped_cap': 1},
             {'not_attempted': 1},
+            {'adjudication_capped': 1},
             {'stopped_by': 'write_failure_streak'},
         ],
         ids=lambda partial: next(iter(partial)),

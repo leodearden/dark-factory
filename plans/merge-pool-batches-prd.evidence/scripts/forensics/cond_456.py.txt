@@ -1,0 +1,107 @@
+import json,collections,statistics,datetime as dt
+from common import events,T
+C=json.load(open('/tmp/gate-10069/forensics/cond.json'))
+ALL=C['verifies']; W=[x for x in ALL if x['in_window']]; CT=C['contents']; BV={x['vid']:x for x in ALL}
+def tr(c): return CT[c]['truth'] if c else 'U'
+def f(t): return dt.datetime.fromtimestamp(t,dt.timezone.utc).strftime('%m-%dT%H:%M')
+def conts(x,which='all'):
+    rs=x['own'] if which=='own' else (x['base_reqs'] if which=='base' else x['own']+x['base_reqs'])
+    return [r['cid'] for r in rs if r['cid']]
+RED=[x for x in W if not x['passed']]; GRN=[x for x in W if x['passed']]
+print('=== 4a. literal: PASS whose first-parent tree holds an entry with a RED verify row (before or after)')
+k=0
+for x in GRN:
+    bad=[e for e in x['entries'] if e['vid'] is not None and not e['passed']]
+    if bad: k+=1; print('   ',x['vid'],x['ts'][5:16],x['task'],[(e['owner'],e['vid'],e['st']) for e in bad])
+print('   count',k,'of',len(GRN),'passes;  passes on a speculative base:',sum(1 for x in GRN if x['state']!='MAIN'))
+print('  passes on a base that never landed as built (no red row):')
+for x in GRN:
+    if x['state']!='MAIN' and x['fate']!='landed_as_built':
+        print('   ',x['vid'],x['ts'][5:16],'own',x['task'],'k%d'%x['k'],x['state'],'| own',' '.join('%s:%s%s'%(r['task'],tr(r['cid']),'(L)' if r['on_main'] else '') for r in x['own']),'| entries',' '.join('%s/%s/vid%s/%s'%(e['owner'],e['st'],e['vid'],'L' if e['on_main'] else 'notL') for e in x['entries']),'| base',' '.join('%s:%s'%(r['task'],tr(r['cid'])) for r in x['base_reqs']))
+print('=== censoring: verifies cancelled by cascade, by whether their base (last speculative_merge base_sha) had a red row')
+EV=events(); MS={x['merge_sha']:x for x in ALL}
+SM=collections.defaultdict(list)
+for e in EV:
+    if e['et']=='speculative_merge': SM[e['task']].append((T(e['ts']),e['d'].get('base_sha')))
+cc=collections.Counter(); ex=[]
+for e in EV:
+    if e['et']=='merge_verify_cancelled' and e['ts']>='2026-11-15T11:19':
+        t=T(e['ts']); sm=[s for s in SM.get(e['task'],[]) if s[0]<=t]
+        b=sm[-1][1] if sm else None
+        r=MS.get(b)
+        if r is None: cc[(e['d']['cause'],'base has no verify row / is main')]+=1
+        elif r['passed']: cc[(e['d']['cause'],'base row PASS')]+=1
+        else:
+            near=abs(r['end']-t)<300
+            cc[(e['d']['cause'],'base row RED'+(' (cancel within 5 min of it)' if near else ' (not adjacent)'))]+=1
+            if near: ex.append((e['ts'][5:16],e['task'],'base owner',r['task'],r['vid'],'frac %.2f'%(e['d'].get('fraction') or 0)))
+for k_,v in sorted(cc.items(),key=str): print('   ',v,k_)
+print('    cancelled successors of a red base:',len(ex),' median fraction done',statistics.median([float(x[5][5:]) for x in ex]) if ex else None)
+print('=== 4b. content-level: red R whose OWN contents all appear (same content) in a later-or-earlier PASS tree')
+for R in RED:
+    oc=set(conts(R,'own'))
+    if not oc or len(oc)<len(R['own']): continue
+    hits=[P for P in GRN if oc<=set(conts(P))]
+    if not hits: continue
+    P=sorted(hits,key=lambda p:abs(p['end']-R['end']))[0]
+    rc=set(conts(R)); full=rc<=set(conts(P)) 
+    miss=[c for c in conts(R,'base') if c not in set(conts(P))]
+    print('   R',R['vid'],R['ts'][5:16],'own',R['task'],'k%d'%R['k'],R['state'],R['fate'],'mr',R['main_red'],'fails',','.join(R['fails'] or []),'| own',' '.join(c.split('@')[0]+':'+tr(c) for c in conts(R,'own')),'| P',P['vid'],P['ts'][5:16],'own',P['task'],'k%d'%P['k'],'units',P['n_units'],'| R-base contents absent from P:',' '.join(c.split('@')[0]+':'+tr(c) for c in miss) or '-','| n_pass_trees',len(hits))
+print('=== green on red MAIN (pass whose main base is inside a main-red episode, incl. the heal)')
+for x in ALL:
+    if x['passed'] and ('2026-11-15T10:09'<=x['ts']<='2026-11-15T23:30' or '2026-11-17T14:07'<=x['ts']<='2026-11-17T19:00'):
+        print('   ',x['vid'],x['ts'][5:16],'own',x['task'],'k%d'%x['k'],x['runner'],'units',x['n_units'],'base',(x['base'] or '?')[:8],'main_red flag',x['main_red'],'in_window',x['in_window'],'tree',[r['task'] for r in x['own']+x['base_reqs']])
+print('=== 5. delay from a RED verdict on an UNVERIFIED base until the base resolves')
+rows=[]
+for x in RED:
+    if x['state']!='UNVERIFIED': continue
+    un=[e for e in x['entries'] if e['st'] in('later_pass','later_red','norow')]
+    reds=[e['delay'] for e in un if e['st']=='later_red']
+    if reds: d=min(reds); how='red'
+    else:
+        ds=[]
+        for e in un:
+            if e['delay'] is not None: ds.append(e['delay'])
+            elif e['on_main'] and e['landed_ts']: ds.append(T(e['landed_ts'])-x['end'])
+            else: ds.append(None)
+        d=None if any(v is None for v in ds) else max(ds); how='green' if d is not None else 'no verdict ever'
+    rows.append((x['vid'],x['ts'][5:16],x['task'],how,None if d is None else round(d/60,1),x['fate']))
+for r in rows: print('   ',r)
+ds=sorted(r[4] for r in rows if r[4] is not None)
+def pct(a,p): 
+    i=(len(a)-1)*p; lo=int(i); hi=min(lo+1,len(a)-1); return a[lo]+(a[hi]-a[lo])*(i-lo)
+print('   n with a base verdict',len(ds),'of',len(rows),'p50 %.1f p90 %.1f max %.1f min %.1f (minutes)'%(pct(ds,.5),pct(ds,.9),ds[-1],ds[0]))
+for how in ('red','green'):
+    a=sorted(r[4] for r in rows if r[3]==how and r[4] is not None)
+    if a: print('   resolved',how,'n',len(a),'p50 %.1f p90 %.1f max %.1f'%(pct(a,.5),pct(a,.9),a[-1]))
+# same for green verdicts on unverified base
+a=[]
+for x in GRN:
+    if x['state']=='UNVERIFIED':
+        d=[e['delay'] for e in x['entries'] if e['delay'] is not None]
+        if d: a.append(max(d)/60)
+a.sort(); print('   (green verdicts on an unverified base: n with base row',len(a),'p50 %.1f p90 %.1f max %.1f)'%(pct(a,.5),pct(a,.9),a[-1]) if a else '')
+print('=== 6. joint-model check over all window trees')
+cnt=collections.Counter(); lists=collections.defaultdict(list)
+for x in W:
+    cs=conts(x); ts=[tr(c) for c in cs]; nreq=len(x['own'])+len(x['base_reqs'])
+    hasD=any(t=='D' for t in ts); hasDi=any(t=='Di' for t in ts)
+    if x['passed']:
+        if hasD: key='GREEN with proved-defective content (CONTRADICTION A)'
+        elif hasDi: key='GREEN with inferred-defective content (contradiction A, inferred)'
+        elif x['main_red']: key='GREEN on red main (heal absent)'
+        else: key='green, no defective content: consistent'
+    else:
+        fs=set(x['fails'] or [])
+        if hasD: key='red, holds proved-defective content: consistent'
+        elif hasDi: key='red, holds inferred-defective content: consistent'
+        elif x['main_red'] and fs<=set(x['main_red']): key='red, main red only: outside model'
+        elif all(t=='S' for t in ts) and len(cs)==nreq: key='RED with every unlanded request proved sound, main not red (CONTRADICTION B)'
+        elif all(t in('S','Sm') for t in ts) and len(cs)==nreq: key='RED with every unlanded request sound or sound-modulo-main-red (contradiction B, ext)'
+        else: key='red, undetermined (holds unknown-truth content, no defective)'
+    cnt[key]+=1; lists[key].append(x)
+for k_,v in sorted(cnt.items()): print('   ',v,k_)
+for k_ in lists:
+    if 'CONTRAD' in k_ or 'contradiction' in k_ or 'undetermined' in k_ or 'GREEN on red' in k_:
+        for x in lists[k_]:
+            print('      [%s]'%k_[:28],x['vid'],x['ts'][5:16],'own',x['task'],'k%d'%x['k'],x['runner'][:3],'units',x['n_units'],x['state'],x['fate'],'fails',','.join(x['fails'] or []),'mr',x['main_red'],'| own',' '.join('%s:%s'%(r['task'],tr(r['cid'])) for r in x['own']),'| base',' '.join('%s:%s'%(r['task'],tr(r['cid'])) for r in x['base_reqs']) or '-')

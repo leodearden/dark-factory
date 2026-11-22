@@ -213,6 +213,7 @@ State:
 
 - **Curator gate closed / planning_mode batch rejected.** Do **not** switch to non-planning_mode to paper over it. Wait or escalate — PRD-decomp batches are the precise case where planning_mode is correct.
 - **`add_dependency` fails** because a referenced task doesn't exist. Likely the out-of-batch prereq is `deferred` or `cancelled`; check via `get_task` and resolve with the user.
+- **`add_dependency` returns `error_type` `DependencyCycle`** while wiring. The plan's dependency graph is wrong: remove one of the edges its `cycle` names (fix the PRD ordering). Do not retry the same call.
 - **`commit_planning` rejects with "metadata.files missing".** Decompose mode shouldn't hit this (fresh tasks); if it does, a stale entry was probably combined into one of the new tasks — investigate before retrying.
 
 ## Anti-patterns

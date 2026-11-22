@@ -4809,14 +4809,17 @@ class SpeculativeMergeWorker:
         # consecutive tip-advance equivalence failure; popped on a clean
         # 'done' landing or bound-exceeded escalation.
         self._generation_chain_counts: dict[str, int] = {}
-        # Tasks whose NEXT dispatch verifies un-chained (tasks 3185, 10617): a
-        # chain-arm error marks its owner, a red tip marks its owner and every
-        # link, because neither verdict is attributable to any one member.  A
-        # marked task is neither a chain owner (`_deep_chain_placement` guard
-        # 2b) nor a link (`chain_snapshot`), so its own subset tree gets a
-        # verdict that IS attributable to it.  The mark lasts until a verdict
-        # for the task is applied, which is when its request is retired
-        # (`_retire_item`): a verify the cascade cancels or voids keeps it.
+        # Tasks whose NEXT dispatch verifies un-chained (tasks 3185, 10617,
+        # 10721).  A chain-arm error marks its owner, and a red tip marks its
+        # owner and every link, because neither verdict is attributable to any
+        # one member.  A gate-rebased head marks its own task at dispatch, so
+        # its re-verify covers its own rebased tree alone
+        # (plans/merge-lane-policy-prd.md D3).  A marked task is neither a chain
+        # owner (`_deep_chain_placement` guard 2b) nor a link (`chain_snapshot`),
+        # so its own subset tree gets a verdict that IS attributable to it.  The
+        # mark lasts until a verdict for the task is applied, which is when its
+        # request is retired (`_retire_item`): a verify the cascade cancels or
+        # voids keeps it.
         self._next_dispatch_unchained: set[str] = set()
         # task 2828 amend (reviewer_comprehensive, robustness): per-task
         # consecutive contended-lease requeue counter.  Incremented each time
@@ -5479,7 +5482,7 @@ class SpeculativeMergeWorker:
         test_merge_queue_lifecycle_registry.py's
         ``TestRequeueRecipeHasASingleChokepoint``, which fails if any
         ``_queue.put_nowait`` or ``on_requeued`` call site appears outside this
-        method. Its nine callers are the head-failure cascade's downstream
+        method. Its nine requeue sites are the head-failure cascade's downstream
         self-requeue, the operator-halt mid-verify abort, the dead-verify
         no-progress abort, the ``MergeVerifyLeaseContended`` defer, the
         pre-dispatch operator/admission halt in :meth:`VerifyDispatcher.dispatch`, the
@@ -5496,6 +5499,10 @@ class SpeculativeMergeWorker:
         tree, never any individual member's own subset tree — so a red tip
         names no culprit to blame (the fail arm) and an infra error is not a
         verdict about anyone at all (the error arm).
+
+        Every site but the train and the rebased head requeues a built item,
+        so it arrives through :meth:`_requeue_built_item`, which records that
+        item's merge commit dead first (task 8933); those two call here directly.
 
         The tip-PASS exit used to be a third such caller and is NOT one any
         more: δ adopts there, because the cumulative tree that went green is a
@@ -5592,19 +5599,21 @@ class SpeculativeMergeWorker:
     async def _requeue_from_verify(
         self, item: RealMergeItem, entry_slot: InflightEntrySlot | None,
     ) -> None:
-        """Vacate the entry as REQUEUED, then :meth:`_requeue_request`.
+        """Vacate the entry as REQUEUED, then :meth:`_requeue_built_item`.
 
         No await separates the two, so a cancel landing during the release
         skips the requeue and leaves the request to the canceller.
         """
         await self._vacate_inflight_entry(entry_slot, InflightStatus.REQUEUED)
-        self._requeue_request(item.request)
+        self._requeue_built_item(item)
 
     async def _drop_from_verify(
         self, item: RealMergeItem, entry_slot: InflightEntrySlot | None,
     ) -> None:
-        """Vacate the entry as DROPPED, then retire *item*'s request_id."""
+        """Vacate the entry as DROPPED, record its commit abandoned, then
+        retire *item*'s request_id."""
         await self._vacate_inflight_entry(entry_slot, InflightStatus.DROPPED)
+        self._record_abandoned_item(item)
         self._retire_item(item.request.request_id)
 
     async def _bench_from_verify(
@@ -6071,9 +6080,9 @@ class SpeculativeMergeWorker:
                 bench_unavailable_runner=lambda name, exc: self.bench_unavailable_runner(name, exc),
                 adopt_head_on_tip_authority=lambda item: self._adopt_head_on_tip_authority(item),
                 admission_halted=lambda: self.is_admission_halted,
-                requeue_request=lambda req: self._requeue_request(req),
+                requeue_built_item=lambda item: self._requeue_built_item(item),
                 retire_item=lambda rid: self._retire_item(rid),
-                record_unlanded_rebased_head=lambda item: self._record_unlanded_rebased_head(item),
+                record_abandoned_item=lambda item: self._record_abandoned_item(item),
                 note_transition=lambda rid, before, after, live: self._note_transition(
                     rid, before, after, live_obj=live,
                 ),
@@ -6650,7 +6659,9 @@ class SpeculativeMergeWorker:
         speculative item whose ``base_sha`` points at it has a BROKEN chain
         (see :meth:`_chain_dead_link`).  Called at every invalidation site
         (head-failure cascade, dispatch chain-invalidation discard, adoption-time
-        void, RUNNER_UNAVAILABLE re-merge, rebased landing) so a built-awaiting-host
+        void, RUNNER_UNAVAILABLE re-merge, rebased landing, requeue of a built
+        item via :meth:`_requeue_built_item`, abandon of one via
+        :meth:`_record_abandoned_item`) so a built-awaiting-host
         straggler that the cascade missed is still caught at its next dispatch.
         *killer* names that site; the ledger keeps a commit's first killer.
         Each commit is then handed to the merger's re-anchor hook,
@@ -6710,6 +6721,27 @@ class SpeculativeMergeWorker:
                 doomed=doomed,
                 notify_merger=notify_merger,
             )
+
+    def _requeue_built_item(self, item: SpeculativeItem) -> None:
+        """Requeue *item*'s request to merge afresh; the commit it built will never land.
+
+        Recorded dead first, so a successor stacked on it is re-merged at its
+        dispatch (INV-3) and a merger holding it re-anchors (D2).  Synchronous,
+        like :meth:`_requeue_request`, so no await separates the two.
+        """
+        self._record_item_commit_dead(item, DeadBaseSite.REQUEUED)
+        self._requeue_request(item.request)
+
+    def _give_back_built_item(self, item: SpeculativeItem) -> None:
+        """Requeue *item*'s request, or record its build abandoned if that request already resolved.
+
+        Either way the commit it built is recorded dead: no exit of a built
+        item from the lane leaves that commit live.
+        """
+        if item.request.result.done():
+            self._record_abandoned_item(item)
+        else:
+            self._requeue_built_item(item)
 
     def _reanchor_merger_on(self, dead: RealMergeItem, replacement: SpeculativeItem) -> None:
         """Point a merger holding *dead*'s commit at *replacement*'s (D2).
@@ -7204,17 +7236,16 @@ class SpeculativeMergeWorker:
              green-tier ``reload_config`` — which mutates the held
              :class:`~orchestrator.config.MergeDeepConfig` in place — takes
              effect on the very next dispatch, in both directions.
-          2b. ``task_id in self._next_dispatch_unchained`` -> the same.  The
-             LOOP GUARD (tasks 3185, 10617).  A chain-arm error or a red tip
-             was not attributed to this item (the tree was cumulative), so the
-             request was DEFERRED rather than blocked — and a defer that
-             re-chained into the same tree would ping-pong forever.  Declining
-             sends the re-dispatch down the ordinary path, where it verifies the
-             item's OWN subset tree and gets a verdict that IS attributable to
-             it.  Sits AFTER the kill switch so the stock path still pays
-             nothing, and BEFORE the queue scan so a marked task pays no
-             O(n) walk either.  The mark lasts until the task's verdict is
-             applied (see ``_next_dispatch_unchained`` in ``__init__``).
+          2b. ``task_id in self._next_dispatch_unchained`` -> the same.
+             Declining sends the dispatch down the ordinary path, where it
+             verifies the item's OWN subset tree and gets a verdict that IS
+             attributable to it.  What marks a task, and until when, is
+             ``_next_dispatch_unchained`` in ``__init__``.  It is also the
+             LOOP GUARD (tasks 3185, 10617): an unattributable chain verdict
+             DEFERS its request rather than blocking it, and a defer that
+             re-chained into the same tree would ping-pong forever.  Sits
+             AFTER the kill switch so the stock path still pays nothing, and
+             BEFORE the queue scan so a marked task pays no O(n) walk either.
           3. ``(d, reason) = choose_depth(...)``
              (:mod:`~orchestrator.merge_lane.chain_policy`): the depth table
              over the rolling pass estimate, bounded by the queue.
@@ -12164,9 +12195,7 @@ class SpeculativeMergeWorker:
                                 and _entry.verify_task.cancelled()
                             ):
                                 self._free_entry_permit(_entry)
-                                _entry_req = _entry.item.request
-                                if not _entry_req.result.done():
-                                    self._requeue_request(_entry_req)
+                                self._give_back_built_item(_entry.item)
                                 continue
                             # MQ-reliability kappa follow-up (task 2441): the
                             # registry follows the item through MERGING to
@@ -14604,7 +14633,7 @@ class SpeculativeMergeWorker:
             # gate re-verify is this verify (task 8525).
             if self._request_abandoned(req):
                 await self._release_or_cleanup(merge_wt, spec_warm=_vr_spec_warm)
-                self._record_unlanded_rebased_head(item)
+                self._record_abandoned_item(item)
                 self._retire_item(req.request_id)
                 return False
 
@@ -15076,6 +15105,8 @@ class SpeculativeMergeWorker:
         redispatch park, with every in-flight successor torn down and parked
         behind it to re-anchor at its own dispatch (plans/merge-lane-policy-prd.md
         D3).  ``_inflight`` is empty on return, so no head-failure cascade runs.
+        The head's task is marked un-chained, so its re-verify covers its own
+        rebased tree alone, a dispatch-time re-merge included (D3).
 
         False when the head did not dispatch: :meth:`_admit_gate_attempt`
         ended the request, or :meth:`_rebased_head_worktree` re-queued it.
@@ -15095,6 +15126,7 @@ class SpeculativeMergeWorker:
             candidate, rebased_sha=gate.rebased_sha, rebased_onto=gate.rebased_onto,
             merge_wt=merge_wt, cap_permit=self._merge_ahead_ledger.try_acquire(),
         )
+        self._next_dispatch_unchained.add(req.task_id)
         self._note_transition(
             req.request_id, ItemLifecycleState.GATE_REVERIFY,
             ItemLifecycleState.REDISPATCH_PARKED, live_obj=head,
@@ -15140,10 +15172,23 @@ class SpeculativeMergeWorker:
             killer=DeadBaseKiller(DeadBaseSite.GATE_UNLANDED, gate.candidate.item.request.task_id),
         )
 
-    def _record_unlanded_rebased_head(self, item: SpeculativeItem) -> None:
-        """A dispatched rebased head leaves without landing: its commit, the merger's tip (D2), is dead."""
+    @staticmethod
+    def _abandoned_build_site(item: SpeculativeItem) -> DeadBaseSite:
+        """The killer an abandoned build's commit is recorded under: GATE_UNLANDED
+        for a dispatched rebased head, whose commit is the merger's tip (D2),
+        ABANDONED for any other build."""
         if isinstance(item, RealMergeItem) and item.gate_rebase_of is not None:
-            self._record_item_commit_dead(item, DeadBaseSite.GATE_UNLANDED)
+            return DeadBaseSite.GATE_UNLANDED
+        return DeadBaseSite.ABANDONED
+
+    def _record_abandoned_item(self, item: SpeculativeItem) -> None:
+        """*item*'s request was abandoned, so the commit it built will never land.
+
+        Recorded dead under :meth:`_abandoned_build_site`'s killer, so a
+        successor stacked on it is re-merged at its dispatch (INV-3) and a
+        merger holding it re-anchors (D2).
+        """
+        self._record_item_commit_dead(item, self._abandoned_build_site(item))
 
     async def _repark_gate_successors(self, gate: PendingGate) -> list[SpeculativeItem]:
         """Tear down every in-flight successor of a head re-verified as a dispatch.

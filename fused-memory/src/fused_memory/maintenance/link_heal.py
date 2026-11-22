@@ -659,12 +659,16 @@ class RunCounts:
     ``unexamined`` counts the examined links that reached the verdict rows with no basis.
     ``adjudications_reused`` counts the adjudicator verdicts already ledgered at the
     texts a link shows; ``adjudication_failed`` the links the adjudicator was asked
-    about and gave no verdict. ``withheld_uncalibrated`` counts the heals a writing
-    sweep's plan run or an apply run withheld because the adjudicator behind their
-    verdict has no passing calibration: a policy refusal, not a failure, so it
-    leaves a run complete. ``superseded`` counts the pending heals a plan run
-    retired because its own ruling on their link, at the texts they rest on, no
-    longer plans them.
+    about and gave no verdict. ``adjudications_asked`` counts the pairs put to the
+    adjudicator this run, failed ones included; ``adjudication_capped`` the
+    candidates the run did not ask because it reached its adjudication cap.
+    Capped candidates are also counted in ``unexamined`` and leave the run partial,
+    so a sweep holds its window until they have been asked.
+    ``withheld_uncalibrated`` counts the heals a writing sweep's plan run or an
+    apply run withheld because the adjudicator behind their verdict has no passing
+    calibration: a policy refusal, not a failure, so it leaves a run complete.
+    ``superseded`` counts the pending heals a plan run retired because its own
+    ruling on their link, at the texts they rest on, no longer plans them.
     """
 
     links_total: int = 0
@@ -673,6 +677,8 @@ class RunCounts:
     unexamined: int = 0
     adjudications_reused: int = 0
     adjudication_failed: int = 0
+    adjudications_asked: int = 0
+    adjudication_capped: int = 0
     planned: int = 0
     planned_by_action: Mapping[str, int] = field(default_factory=dict)
     already_pending: int = 0
@@ -719,6 +725,7 @@ class RunCounts:
             self.skipped_cap,
             self.not_attempted,
             self.adjudication_failed,
+            self.adjudication_capped,
         )
         return not any(partial) and self.stopped_by is None
 

@@ -1,0 +1,12 @@
+import json,collections,datetime as dt
+P='/tmp/gate-10069/predict/'
+R=json.load(open(P+'requests.json')); TR=json.load(open(P+'trials.json'))
+day=lambda t: dt.datetime.fromtimestamp(t,dt.timezone.utc).strftime('%m-%d') if t else None
+print('done_no_solo by day:',sorted(collections.Counter(day(r['final_t']) for r in R if r['label_src']=='done_no_solo').items()))
+print('done_no_solo landed_via_chain:',collections.Counter(r['landed_via_chain'] for r in R if r['label_src']=='done_no_solo'))
+print('none/blocked reasons:',collections.Counter(r['final_reason'][:40] for r in R if r['label_src'] is None and r['final_state']=='blocked').most_common(10))
+print('none/blocked w red chain:',collections.Counter((r['red_chain_before']>0,r['void_fails']>0) for r in R if r['label_src'] is None and r['final_state']=='blocked'))
+print('solo_pass/blocked reasons:',collections.Counter(r['final_reason'][:40] for r in R if r['label_src']=='solo_pass' and r['final_state']=='blocked').most_common(10))
+na=[t for t in TR if t['k']==1 and not t['passed'] and not t['applied'] and not t['train_union']]
+print('non-applied failed solo by day',sorted(collections.Counter(t['ts'][5:10] for t in na).items()))
+print(collections.Counter((t['last_attempt'],t.get('attempt_outcome'),t['base_relation'],t['speculative']) for t in na))

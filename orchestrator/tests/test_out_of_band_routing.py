@@ -32,7 +32,7 @@ from _orch_helpers import (
 from _recording_event_store import _RecordingEventStore
 from escalation.models import Escalation
 
-from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
+from orchestrator.config import EffortConfig, OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.routing import RoleDefaults, RoutingDecision
@@ -352,6 +352,8 @@ class TestDeepReviewerAdoptsResolveRoute:
         mock_helper.assert_awaited_once()
         hk = mock_helper.call_args.kwargs
         assert hk['role_name'] == 'deep_reviewer'
+        # The layer-4 effort base is kept in lockstep with the config field default.
+        assert hk['role_defaults'].effort == EffortConfig().deep_reviewer
         # Project-level: no task identity flows into resolution / no mirror sink.
         assert hk.get('task_id') is None
         assert hk.get('task_metadata') is None

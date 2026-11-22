@@ -27,12 +27,12 @@ This module builds up the guard from the bottom:
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _seed_script_stubs import seed_default_warm_base
 from escalation.queue import EscalationQueue
 
@@ -527,15 +527,6 @@ class TestWarmLaneGcReclaimGuard:
 # ---------------------------------------------------------------------------
 
 
-async def _init_acquire_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 async def _add_warm_lane_scripts(repo: Path) -> None:
     """Commit a stub seed-warm-lane.sh into repo/scripts/ (mirrors test_git_ops.py)."""
     scripts_dir = repo / 'scripts'
@@ -565,9 +556,7 @@ def acquire_git_repo(tmp_path: Path) -> Path:
     Contrast ``empty_mountpoint_git_repo`` below, where the base is ABSENT —
     the genuine unmounted-mountpoint case that must still refuse.
     """
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_acquire_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     seed_default_warm_base(repo, pool_root=False)
     return repo
 
@@ -580,9 +569,7 @@ def empty_mountpoint_git_repo(tmp_path: Path) -> Path:
     create-once discriminator must refuse (cold fallback), never bootstrap a
     shadow lane on the underlying root fs.
     """
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_acquire_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     (repo / '.worktrees').mkdir()  # empty mountpoint dir, no base target
     return repo
 

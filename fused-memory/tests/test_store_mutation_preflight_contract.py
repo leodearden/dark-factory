@@ -165,8 +165,10 @@ class TestNeutraliseFixture:
 
         The fixture's real directory is shared by the whole session, and a
         subprocess that imports mem0 under the redirected MEM0_DIR writes mem0's
-        import-time ``config.json`` there. Emptiness is only this test's to
-        assert on a directory no other test can reach.
+        import-time ``config.json`` there
+        (``fused-memory/tests/test_normalize_topic_slugs.py::TestNoLiveCorpusCountIsPinned``
+        does, task 4809). Emptiness is only this test's to assert on a directory
+        no other test can reach.
         """
         mod = _stub_script_module()
         fx = neutralise_fixture(mod, note='a note')

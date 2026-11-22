@@ -9,11 +9,11 @@ nested run, remain the main regression detectors for it.
 
 from __future__ import annotations
 
-import getpass
 import subprocess
 from pathlib import Path
 
 import pytest
+from host_pytest_temp_root import listing, seed_dead_session_dirs
 from nested_pytest_session import (
     NESTED_SESSION_TIMEOUT_SECS,
     arming_conftest,
@@ -70,10 +70,6 @@ def _output(result: subprocess.CompletedProcess[str]) -> str:
     return result.stdout + result.stderr
 
 
-def _listing(root: Path) -> list[str]:
-    return sorted(str(p.relative_to(root)) for p in root.rglob('*'))
-
-
 def test_an_armed_session_runs_against_its_own_copy_in_its_own_tree(tmp_path: Path) -> None:
     result = run_nested_pytest(
         tmp_path / 'armed',
@@ -124,8 +120,8 @@ def test_a_nested_session_leaves_the_hosts_default_temp_root_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     host = tmp_path / 'host-temp'
-    (host / f'pytest-of-{getpass.getuser()}' / 'garbage-seeded' / 'leftover').mkdir(parents=True)
-    before = _listing(host)
+    seed_dead_session_dirs(host)
+    before = listing(host)
     monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
     root = tmp_path / 'temproot-probe'
 
@@ -136,7 +132,7 @@ def test_a_nested_session_leaves_the_hosts_default_temp_root_untouched(
     assert (root / 'inherited-temproot').read_text() == str(host), (
         'nested session did not inherit PYTEST_DEBUG_TEMPROOT'
     )
-    after = _listing(host)
+    after = listing(host)
     assert after == before, (
         "nested session touched the host's default temp root\n"
         f'before: {before}\nafter:  {after}'

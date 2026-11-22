@@ -1,0 +1,22 @@
+import json
+from collections import Counter
+E = json.load(open('/tmp/gate-10069/measure/events.json'))
+V = [e for e in E if e['type'] == 'merge_verify' and e['ts'] >= '2026-11-05']
+first_cr = next(e for e in V if 'chain_request_ids' in e['d'])
+print('first chain_request_ids', first_cr['ts'], first_cr['id'])
+print('rows after that without it', sum(1 for e in V if e['id'] > first_cr['id'] and 'chain_request_ids' not in e['d']))
+first_br = next(e for e in V if 'base_relation' in e['d'])
+print('first base_relation', first_br['ts'])
+for e in V:
+    if e['ts'] >= '2026-11-18T12':
+        d = e['d']
+        print(e['id'], e['ts'][:19], e['task'], d['runner'], d['passed'], round(d['duration_ms']/60000), 'k=', d['chain_items'], d.get('chain_task_ids'), d.get('chain_depth_reason', 'ABSENT'), d.get('runner_reason'), d.get('base_relation'), d.get('speculative'), d.get('depth'))
+# other event types payload examples
+for t in ['merge_attempt', 'merge_finalized', 'merge_dequeued', 'merge_queued', 'merge_reverify_gate', 'merge_verify_cancelled', 'merge_flake_suppressed', 'merge_coalesced', 'merge_blocked', 'merge_heartbeat']:
+    rows = [e for e in E if e['type'] == t and e['ts'] >= '2026-11-17']
+    ks = Counter()
+    for e in rows:
+        ks.update(e['d'].keys())
+    print('=====', t, len(rows), dict(ks))
+    if rows:
+        print(json.dumps(rows[-1]['d'])[:1500])

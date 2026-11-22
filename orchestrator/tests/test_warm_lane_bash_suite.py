@@ -213,7 +213,7 @@ ASSERT_FLOORS = {
     'test_warm_lane_gc.sh': 226,  # 234 measured − 8 (S-discard3, root-guarded)
     'test_warm_lane_gc_native.sh': 217,  # 215 moved from test_warm_lane_gc.sh + 2 (its own TRASH pair)
     'test_warm_lane_gc_sweep.sh': 130,  # 99 + 3 (G6g, task 5940) + 28 (Z, task 7859)
-    'test_warm_lane_audit.sh': 229,  # 232 measured − 3 (L9, root-guarded)
+    'test_warm_lane_audit.sh': 232,  # 235 measured − 3 (L9, root-guarded); incl. Block R's 3 (task 10896)
     'test_warm_lane_sizing_lifecycle.sh': 65,
     'test_provision_warm_lane_fs.sh': 110,  # 115 measured − 5 (Block I, xfsprogs)
 }

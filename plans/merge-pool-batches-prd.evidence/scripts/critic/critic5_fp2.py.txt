@@ -1,0 +1,20 @@
+import sys
+sys.path.insert(0,'/tmp/gate-10069/critic5')
+from rule6 import fb_release, cost, going, plan
+def trace(q,r,t,u,mf=12,mt=24,scan='auto',n=60):
+    a_f,a_c=1.0,1/mt; h=[]
+    for i in range(n):
+        na_c=min(cost(0,c,q,r,t,u,a_f,a_c,fb_release,scan)/c for c in range(1,mt+1))
+        na_f=min(cost(f,0,q,r,t,u,a_f,na_c,fb_release,scan)/f for f in range(1,mf+1))
+        h.append((round(na_f,4),round(na_c,4)))
+        if abs(na_c-a_c)<1e-9 and abs(na_f-a_f)<1e-9: return h,True
+        a_f,a_c=na_f,na_c
+    return h,False
+print('scan=auto, r=0.01: converge? (last 3 iterates)')
+for u in (0.07,0.16):
+  for q in (0.05,0.08,0.14,0.20):
+    row=[]
+    for t in (0.05,0.2,0.3,0.35,0.38,0.40,0.42,0.45,0.48,0.5,0.55,0.6,0.7,0.8):
+        h,ok=trace(q,0.01,t,u)
+        row.append(f't={t}:' + ('ok %.3f'%h[-1][0] if ok else 'CYCLE '+'/'.join('%.3f'%x[0] for x in h[-2:])))
+    print(f'u={u} q={q}: ' + ' | '.join(row))

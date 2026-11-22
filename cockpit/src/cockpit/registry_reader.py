@@ -203,10 +203,10 @@ class SessionScanner:
     that -- it is an invariant upheld by the caller. CockpitApp's own
     SessionScanner is only ever scanned from on_mount's synchronous initial
     refresh_registry() (which completes before self.set_interval starts
-    polling) or from the single poll-triggered worker _poll_registry
+    polling) or from the single poll-triggered worker start_poll_tick
     launches, itself guarded by the app's _scan_in_flight flag so at most
     one poll-triggered scan() call is ever in flight (see app.py's
-    _poll_registry/_scan_registry_worker docstrings). A caller that adds a
+    start_poll_tick/_scan_registry_worker docstrings). A caller that adds a
     second concurrent path to scan() -- e.g. a hypothetical "force refresh"
     keybinding that could race an in-flight poll worker -- must provide its
     own mutual exclusion (or a lock added to this class) first.

@@ -9,7 +9,12 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_helpers import _make_rate_limit_error
+from _fm_helpers import (
+    _make_rate_limit_error,
+    make_insufficient_quota_error,
+    make_transient_rate_limit_error,
+    wrap_like_graphiti,
+)
 from _mem0_record_shapes import mem0_record
 from _qdrant_responses import missing_collection_404
 from _queued_write_fixtures import (
@@ -4029,6 +4034,13 @@ class TestIsRateLimitOrQuotaError:
 
         exc = WrappedError('upstream said: insufficient_quota, but this is unrelated')
         assert _is_rate_limit_or_quota_error(exc) is False
+
+    def test_graphiti_wrapped_insufficient_quota_matches(self):
+        """graphiti_core re-raises the provider 429 as its own unstructured
+        RateLimitError, so the quota code is reachable only on __cause__
+        (task 10922)."""
+        exc = wrap_like_graphiti(make_insufficient_quota_error())
+        assert _is_rate_limit_or_quota_error(exc) is True
 
 
 class TestGetEntity:
@@ -11612,6 +11624,30 @@ class TestStoreFailureDiagnosticsHelper:
             f"Expected rate_limit_or_quota=True, got {graphiti_diag!r}. "
             "RED: _store_failure_diagnostics does not yet emit rate_limit_or_quota."
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('make_error', 'billing_exhausted'),
+        [
+            (make_insufficient_quota_error, 'api_key_credits'),
+            (make_transient_rate_limit_error, None),
+        ],
+        ids=['credits-exhausted', 'transient-429'],
+    )
+    async def test_search_diagnostics_tell_exhausted_credits_from_a_transient_429(
+        self, service, make_error, billing_exhausted,
+    ):
+        """Both are rate_limit_or_quota, but only exhausted credits name a
+        billing source: it needs a human to pay, a 429 clears by itself
+        (task 10922)."""
+        service.graphiti.search = AsyncMock(side_effect=make_error())
+
+        res = await service.search(query='q', project_id='reify')
+
+        graphiti_diag = next(d for d in res.failure_diagnostics if d['store'] == 'graphiti')
+        assert graphiti_diag['rate_limit_or_quota'] is True
+        assert 'billing_exhausted' in graphiti_diag
+        assert graphiti_diag['billing_exhausted'] == billing_exhausted
 
     @pytest.mark.asyncio
     async def test_search_outer_timeout_populates_failure_diagnostics(self, service):

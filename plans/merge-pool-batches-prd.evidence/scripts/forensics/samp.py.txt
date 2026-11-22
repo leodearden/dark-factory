@@ -1,0 +1,23 @@
+import json,collections
+E=[json.loads(l) for l in open('/tmp/gate-10069/forensics/ev.jsonl')]
+seen=collections.Counter()
+keys=collections.defaultdict(collections.Counter)
+for e in E:
+    for k in e['d']: keys[e['et']][k]+=1
+for et in ('merge_verify','merge_finalized','merge_attempt','merge_verify_cancelled','speculative_merge','speculative_discard','merge_queued','merge_blocked','merge_reverify_gate','merge_flake_suppressed','verdict_voided','rebase_verify_cost','workflow_verify','merge_dequeued','merge_heartbeat','landed_scope_diff','service_restart'):
+    print('==',et,dict(keys[et]))
+def show(et,pred=lambda e:True,n=1,cut=1500):
+    k=0
+    for e in E:
+        if e['et']==et and pred(e):
+            s=json.dumps(e); print(s[:cut]); k+=1
+            if k>=n: break
+print()
+show('merge_verify',lambda e:(e['d'].get('chain_items') or 1)>1 and not e['d']['passed'] and e['ts']>'2026-11-16',1,3000)
+show('merge_attempt',lambda e:e['ts']>'2026-11-16',3,600)
+show('merge_verify_cancelled',lambda e:e['ts']>'2026-11-16',3,600)
+show('speculative_merge',lambda e:e['ts']>'2026-11-16',2,600)
+show('speculative_discard',lambda e:e['ts']>'2026-11-16',2,600)
+show('verdict_voided',lambda e:e['ts']>'2026-11-16',2,800)
+show('merge_queued',lambda e:e['ts']>'2026-11-16',2,600)
+show('merge_finalized',lambda e:e['ts']>'2026-11-16',2,900)

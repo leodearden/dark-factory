@@ -26,10 +26,10 @@
 - attaches on a `distinct`/`pseudo_contradiction`/`distractor` case: 9/9 = `1.0`
 - the case's canonical was ON the slate: 28/84 = `0.3333`
 - cases whose canonical is no longer in the corpus: `21`
-- judge accuracy restricted to the MIDDLE band: 34/73 = `0.4658`
+- judge accuracy restricted to the cosine MIDDLE band [t_low, t_high): 34/73 = `0.4658`
 - LLM calls made: `73`, tokens: `200162`
 
-### Band split — expected class by the band that answered
+### Band split — expected class by the cosine band (`decide_band`) it fell in
 
 | class | restated | judge | stored |
 |---|---|---|---|
@@ -37,6 +37,10 @@
 | distinct | 1 | 2 | 0 |
 | pseudo_contradiction | 1 | 5 | 0 |
 | distractor | 0 | 0 | 0 |
+
+## Routing — what `route_band` sent the judge
+
+- not measured by this run.
 
 ## Duplicate attach split (a distribution, not an error term)
 

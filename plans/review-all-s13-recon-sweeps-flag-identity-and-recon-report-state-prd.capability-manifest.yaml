@@ -261,7 +261,7 @@ tasks:
   - label: "η"
     task_id: 9739
     title: "Give both stale-edge sweeps one Graphiti edge-sweep primitive, take the agent id from StageId, and stop recon writing task status into memory (the sweep's replacement sentence and the Stage-1 prompt's status facts)"
-    note: "Closes fk-917fdf32a542, fk-cdb8c20a3d0f. OQ-1 (b) and OQ-8 (b′) ruled by Leo: nothing writes task status into memory; the sweep invalidates and writes nothing, and the Stage-1 prompt's two status sections tell the agent to invalidate and write nothing for a task's status (D19). The detector stays as a backstop. Deps κ2, δ2; out of batch 9203 (S26 μ, C7 read surface), 6721 (S14 μ), 6718 (S14 θ, same sweep module and test), 7941, 5272 (6598 done)."
+    note: "Closes fk-917fdf32a542, fk-cdb8c20a3d0f. OQ-1 (b) and OQ-8 (b′) ruled by Leo: nothing writes task status into memory; the sweep invalidates and writes nothing, and the Stage-1 prompt's two status sections tell the agent to invalidate and write nothing for a task's status (D19). The detector stays as a backstop. Deps κ2, δ2; out of batch 9203 (S26 μ, C7 read surface), 6721 (S14 μ), 6718 (S14 θ, same sweep module and test), 7941, 5272 (6598 done). AMENDED 2026-11-14/18 (fused-recall plan 1, R93): task 9739 now depends on task 10087 (plan 1 κ), which deletes the status sweep, the detector and the Stage-1 prompt's status sections; η shrinks to the priority-override sweep. Its check sweep-writes-no-replacement-guidance is dropped, and stage1-status-flip-two-step-gone and stage1-task-count-example-gone moved to task 10087 (plans/live-task-facts-at-recall-prd.capability-manifest.yaml, block κ). The dependency on 7941 was removed (7941 cancelled as superseded by 10087)."
     capabilities:
       - name: "edge-sweep-primitive"
         binding: "built here — reconciliation/graph_edge_sweep.py::invalidate_edges (C6)"
@@ -295,22 +295,6 @@ tasks:
           pattern: "_SUPERSEDE_FACT_TEMPLATE"
           paths: ["fused-memory/src/"]
           expect: absent
-      - name: "sweep-writes-no-replacement-guidance"
-        binding: "built here — prompts/stage1.py tells the agent the sweep writes no replacement status fact"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "do not write a replacement status fact"
-          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/stage1.py"]
-          expect: present
-      - name: "stage1-status-flip-two-step-gone"
-        binding: "anti-inversion (OQ-8 b′) — the Stage-1 prompt no longer scopes the invalidate-and-write two-step to status flips"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "status flips"
-          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/stage1.py"]
-          expect: absent
       - name: "supersede-stats-gone"
         binding: "anti-inversion (OQ-1 b) — the consolidator reports no superseding-write stats"
         verdict: PASS
@@ -318,14 +302,6 @@ tasks:
           kind: grep
           pattern: "stale_blocked_edges_supersede"
           paths: ["fused-memory/src/"]
-          expect: absent
-      - name: "stage1-task-count-example-gone"
-        binding: "anti-inversion (OQ-8 b′) — the Stage-1 prompt's effective-date example is no longer a task-status count (the recon-stage count-snapshot gate refuses that write anyway)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "3 blocked, 18 done"
-          paths: ["fused-memory/src/fused_memory/reconciliation/prompts/stage1.py"]
           expect: absent
       - name: "checked-read-surface-upstream"
         binding: "producer:task-9203 upstream (S26 μ, C7 MemoryService.enumerate_valid_edges); its own delivered checks gate it"

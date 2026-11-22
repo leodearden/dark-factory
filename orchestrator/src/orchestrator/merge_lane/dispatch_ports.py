@@ -58,9 +58,9 @@ class DispatchCustody:
     bench_unavailable_runner: Callable[[str, RunnerUnavailable], None]
     adopt_head_on_tip_authority: Callable[[RealMergeItem], Awaitable[object]]
     admission_halted: Callable[[], bool]
-    requeue_request: Callable[[MergeRequest], None]
+    requeue_built_item: Callable[[SpeculativeItem], None]
     retire_item: Callable[[str], None]
-    record_unlanded_rebased_head: Callable[[SpeculativeItem], None]
+    record_abandoned_item: Callable[[SpeculativeItem], None]
     note_transition: Callable[
         [str, ItemLifecycleState, ItemLifecycleState, SpeculativeItem | MergeRequest], None,
     ]

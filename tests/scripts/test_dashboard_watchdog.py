@@ -958,8 +958,8 @@ DASHBOARD_SERVICE_PATH = REPO_ROOT / "dashboard" / "dark-factory-dashboard.servi
 #: The orchestrator config — the only other place in the repo that names the
 #: escalation queue directory the watchdog writes its born-at-L2 into.
 #: ``dark-factory-orchestrator.yaml`` is the canonical required basename (the
-#: dashboard's escalation-URL discovery keys on it); the legacy spellings are a
-#: discovery fallback for unmigrated projects, not a name to accept here.
+#: dashboard's escalation-URL discovery keys on it); discovery reads no legacy
+#: spelling (retired, task 7138), and none is a name to accept here.
 ORCH_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
 
 #: The deep, DB-touching endpoint the retired inline shell probed. Used to

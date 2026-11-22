@@ -1,9 +1,10 @@
 """File an orchestrator-detected condition as one deduped born-at-L2 escalation.
 
 A born-at-L2 escalation goes straight to a human: it is filed at level 2 with
-severity ``urgent`` under an ``orchestrator-`` role, so the agent-role
-downgrade gate exempts it. One pending L2 per root cause is the dedup policy,
-and a filing failure never reaches the caller.
+severity ``urgent`` under a role in the harness sentinel namespace
+(``harness-`` or ``orchestrator-``, which BornAtL2Alarm enforces), so the
+agent-role downgrade gate exempts it. One pending L2 per root cause is the
+dedup policy, and a filing failure never reaches the caller.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from escalation.categories import EscalationCategory, require_registered_category
-from escalation.models import Escalation
+from escalation.models import HARNESS_SENTINEL_ROLE_PREFIXES, Escalation
 
 from orchestrator.event_store import EventType
 
@@ -32,7 +33,7 @@ class BornAtL2Alarm:
     """What stays the same each time one kind of alarm is filed."""
 
     root_cause: str
-    sentinel_task: str
+    task_id: str
     role: str
     category: EscalationCategory
     suggested_action: str
@@ -40,6 +41,13 @@ class BornAtL2Alarm:
 
     def __post_init__(self) -> None:
         require_registered_category(self.category)
+        if not self.role.startswith(HARNESS_SENTINEL_ROLE_PREFIXES):
+            raise ValueError(
+                f'BornAtL2Alarm {self.root_cause!r} has role={self.role!r}; it needs a role '
+                f'starting with one of {HARNESS_SENTINEL_ROLE_PREFIXES}. The record is written '
+                'at level 2 straight through EscalationQueue.submit, skipping the agent-role '
+                'downgrade gate, and escalation/submit.py refuses the same combination.'
+            )
 
 
 def file_deduped_born_at_l2(
@@ -67,7 +75,9 @@ def file_deduped_born_at_l2(
         logger.warning('%s: failed to file the born-at-L2', alarm.root_cause, exc_info=True)
         return None
     _emit_created(event_store, alarm, escalation)
-    logger.warning('%s: born-at-L2 %s filed', alarm.root_cause, escalation.id)
+    logger.warning(
+        '%s: born-at-L2 %s filed: %s', alarm.root_cause, escalation.id, escalation.summary,
+    )
     return escalation
 
 
@@ -79,8 +89,8 @@ def _escalation(
     filing_claimant_run_id: str | None,
 ) -> Escalation:
     return Escalation(
-        id=queue.make_id(alarm.sentinel_task),
-        task_id=alarm.sentinel_task,
+        id=queue.make_id(alarm.task_id),
+        task_id=alarm.task_id,
         agent_role=alarm.role,
         severity='urgent',
         category=alarm.category,
@@ -101,7 +111,7 @@ def _emit_created(
     try:
         event_store.emit(
             EventType.escalation_created,
-            task_id=alarm.sentinel_task,
+            task_id=alarm.task_id,
             data={
                 'escalation_id': escalation.id,
                 'category': escalation.category,

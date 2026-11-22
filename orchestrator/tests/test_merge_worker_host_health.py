@@ -27,7 +27,6 @@ from _host_health_helpers import transport_down, until
 from _merge_lane_fakes import (
     FakeClock,
     FakeVerifier,
-    healthy_verify_clock,
     lane_scene_config,
     make_lane,
     passes,
@@ -234,7 +233,7 @@ class TestSymmetricHost:
         config = _config(repo, verify_host_policy='prefer_remote')
         queue: asyncio.Queue[Any] = asyncio.Queue()
         lane = make_lane(
-            git_ops, queue, clock=healthy_verify_clock(), remote_runners=[laptop],
+            git_ops, queue, remote_runners=[laptop],
             deployed_sha=TEST_DEPLOYED_SHA, host_holder_reader=lambda: {_HOST: 'task:42'},
         )
         request = await _request(git_ops, config, 'row7')

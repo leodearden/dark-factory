@@ -1,0 +1,21 @@
+import sqlite3, re, json
+con = sqlite3.connect("file:/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db?mode=ro", uri=True)
+print(con.execute("select status, count(*) from tasks group by status").fetchall())
+terms = ["run_node_ids","confirm_isolated_rerun_verdict","apply_merge_flake_suppression","flake gate","_settle_chain","_deep_chain_placement","chain_snapshot","_next_dispatch_unchained","mark_next_dispatch_unchained","un-chained","unchained","chain_policy","choose_depth","depth_table","_take_verdict","take_buffered","ephemeral_worktree","WorktreeKind","fetch_recent_events_by_type","build_chain","ChainResult","InflightEntry","chain_cap","_land_chain_prefix","note_tip_result"]
+draft = open("/tmp/gate-10069/draft/merge-pool-batches-prd.md").read()
+hits = {}
+for t in terms:
+    pat = "%" + t.replace("\\","\\\\").replace("%","\\%").replace("_","\\_") + "%"
+    rows = con.execute("select id, status, title from tasks where status not in ('done','cancelled') and (title like ? escape '\\' or description like ? escape '\\' or details like ? escape '\\')", (pat,pat,pat)).fetchall()
+    print(t, len(rows))
+    for i, s, title in rows:
+        hits.setdefault(i, {"status": s, "title": title, "terms": []})["terms"].append(t)
+out = []
+for i in sorted(hits):
+    h = hits[i]
+    indraft = bool(re.search(r'(?<!\d)%d(?!\d)' % i, draft))
+    out.append((i, h["status"], h["title"][:100], h["terms"], indraft))
+json.dump(out, open("hits.json","w"))
+print(len(out), "tasks;", sum(1 for o in out if not o[4]), "not in draft")
+for o in out:
+    print(("  " if o[4] else "* ") + f"{o[0]} | {o[1]} | {o[2]} | {','.join(o[3])}")

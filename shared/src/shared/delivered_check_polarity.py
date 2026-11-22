@@ -140,6 +140,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
+from shared.declared_checks import declared_checks
 from shared.delivered_check_scope import (
     GIT_PROBE_FAILURES,
     GIT_TIMEOUT_SECS,
@@ -1234,10 +1235,10 @@ def extract_delivered_checks(metadata: object) -> list[dict[str, Any]]:
     * ``''`` → ``[]`` (benign-absent, not a discard)
     * ``str`` → ``json.loads``; on failure, or a non-object result → ``[]``
     * anything else (list, int, ...) → ``[]``
-    * no ``delivered_checks`` key, or a non-list value → ``[]``
-    * non-dict entries inside the list are filtered out
+    * the decoded mapping → the ``checks`` of
+      ``shared/src/shared/declared_checks.py::declared_checks``
 
-    That function is the SPEC this is kept in sync with, and it is
+    ``extract_files`` is the SPEC this is kept in sync with, and it is
     DUPLICATED rather than imported for one structural reason: it lives in
     ``fused_memory``, and ``shared`` must not import ``fused_memory`` (the
     dependency runs the other way — this module exists in ``shared``
@@ -1264,10 +1265,7 @@ def extract_delivered_checks(metadata: object) -> list[dict[str, Any]]:
     if parsed is None:
         return []
 
-    checks = parsed.get('delivered_checks')
-    if not isinstance(checks, list):
-        return []
-    return [c for c in checks if isinstance(c, dict)]
+    return list(declared_checks(parsed).checks)
 
 
 #: The remedy every measured repair actually used. Stated POSITIVELY on

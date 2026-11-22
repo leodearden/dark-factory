@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import aiosqlite
 from mcp.server.fastmcp import Context, FastMCP
+from pydantic import StrictBool
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
 from shared.defects import DeclareEvent, MalformedDefectRef, OutcomeEvent
 from shared.delivered_check_polarity import (
@@ -277,6 +278,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.backlog_policy import BacklogPolicy
     from fused_memory.reconciliation.event_queue import EventQueue
     from fused_memory.reconciliation.harness import ReconciliationHarness
+    from fused_memory.server.markup_residue_spool import MarkupResidueSpool
     from fused_memory.services.write_journal import WriteJournal
 
 logger = logging.getLogger(__name__)
@@ -1434,6 +1436,7 @@ def create_mcp_server(
     known_projects: dict[str, str] | None = None,
     topic_cluster_store: TopicClusterStore | None = None,
     id_resolver: IdResolver | None = None,
+    markup_residue_spool: MarkupResidueSpool | None = None,
     embedder_probe: EmbedderEndpointProbe | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
@@ -7817,6 +7820,12 @@ def create_mcp_server(
         recipes probe it (skills/_shared/filing-the-trigger-chain.md §2)
         because it comes from the running process, not from main.
 
+        A top-level ``markup_residue`` field is present when the markup guard's
+        residue floor is wired (task 4809). A non-zero
+        ``preservation_failures`` counts refused payloads this process could
+        not preserve anywhere; ``spooled_files`` counts the payloads waiting in
+        ``spool_dir`` for an operator.
+
         When the server runs the startup embedder probe, the top-level
         ``embedder`` block reports the probed endpoint, and ``config_overlay``
         the active config overlay's provenance.
@@ -7896,6 +7905,16 @@ def create_mcp_server(
 
         if isinstance(result, dict) and 'error' not in result:
             result['task_metadata_capabilities'] = sorted(TASK_METADATA_CAPABILITIES)
+
+        # task 4809 (INV-4): refused payloads the markup guard lost. Top-level
+        # and present-when-wired for the same reasons as `journal_drops`. The
+        # status lists the spool dir, so it runs off the loop like event_dead.
+        if (
+            markup_residue_spool is not None
+            and isinstance(result, dict)
+            and 'error' not in result
+        ):
+            result['markup_residue'] = await asyncio.to_thread(markup_residue_spool.status)
 
         if embedder_probe is not None and isinstance(result, dict) and 'error' not in result:
             result.update(embedder_identity_status(memory_service.config, embedder_probe))
@@ -9135,6 +9154,7 @@ def create_mcp_server(
         deferral: dict | None = None,
         expected_stamped_at: str | None = None,
         restamp_only: bool = False,
+        release_holder: StrictBool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update task status. Triggers targeted reconciliation for
@@ -9226,6 +9246,13 @@ def create_mcp_server(
                 and a ``deferral`` required: refused ``deferral_changed`` unless
                 the row is ``deferred`` now with the record named by
                 ``expected_stamped_at`` (omitted = no record).
+            release_holder: Must be the literal ``true`` for a follow-up holder to go
+                ``done``, ``cancelled`` or ``deferred``; without it that write is refused
+                ``followup_holder_protected`` with the holder's ``held_count``. Releasing the
+                holder releases every held follow-up at once, so it is a human act. Until
+                promotion lands (task 8418), a cancel-release also files one L1 escalation
+                per held follow-up while the orchestrator is live, or blocks each one when
+                it is stopped. Ignored on any other task. See docs/task-authoring.md §3.4.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -9257,6 +9284,7 @@ def create_mcp_server(
             deferral=deferral,
             expected_stamped_at=expected_stamped_at,
             restamp_only=restamp_only,
+            release_holder=release_holder,
             **claimant_kwargs,
         )
 
@@ -10595,7 +10623,10 @@ def create_mcp_server(
                 Passing it together with ``append=True`` is REJECTED — see
                 ``append`` above.
             status: New status (e.g. "pending"/"in-progress"/"done")
-            dependencies: Replacement list of dependency task ids (top-level only)
+            dependencies: Replacement list of dependency task ids (top-level only).
+                Each entry must exist (one already stored is exempt), must
+                not be the task itself, and must not close a local cycle (the
+                same ``DependencyCycle`` refusal as ``add_dependency``).
             agent_id: Which agent is writing (optional, auto-derived from MCP
                 context). Resolved here for uniform caller-identity attribution
                 across the task write path (task 2175/rho1b); status= writes
@@ -10772,6 +10803,13 @@ def create_mcp_server(
         Self-loops (same project + same task id) and malformed qualified strings
         raise ``TaskmasterError`` and surface as
         ``{'error': 'TASKMASTER_TOOL_ERROR: …', 'error_type': 'TaskmasterError'}``.
+
+        A bare-integer edge that would close a dependency cycle is refused, with
+        nothing written. The walk runs over the local ``dependencies`` table at
+        every status, and the reply carries ``{'error': 'dependency_cycle',
+        'error_type': 'DependencyCycle', 'cycle': [A, B, …, A], 'hint': …}``:
+        remove one of the named edges. Qualified ``project:id`` deps are not
+        walked.
 
         Args:
             id: Task ID that will depend on another

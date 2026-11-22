@@ -211,6 +211,11 @@ def split_managed_metadata(
 _MEM0_IN_MEMORY_HISTORY_DB = ':memory:'
 
 
+def build_vector_store_client(qdrant_url: str, *, read_budget_s: float, write_budget_s: float) -> QdrantClient:
+    """The sync Qdrant client mem0's vector stores run on, its socket timeout outlasting both the read and the write budget."""
+    return QdrantClient(url=qdrant_url, timeout=socket_timeout_outlasting(read_budget_s, write_budget_s))
+
+
 class Mem0Backend:
     """Lazily creates AsyncMemory instances keyed by project_id.
 
@@ -236,8 +241,9 @@ class Mem0Backend:
     message format.  mem0's instance construction (its collection listing and
     payload-index creates) runs off the event loop under the write budget as
     ``create_instance``, and the Qdrant client mem0's vector store uses is this
-    backend's own, its socket timeout from ``socket_timeout_outlasting`` over
-    both budgets, so a slow mem0 leg fails on its named budget
+    backend's own, built by :func:`build_vector_store_client` from the very
+    budgets :meth:`_timed_read` / :meth:`_timed_write` apply, so a
+    slow mem0 leg fails on its named budget
     (tests/test_mem0_vector_store_client.py).  The one exception left: the
     direct async client's socket timeout is still the read budget, so its
     calls can still fail unattributed: its writes, and :meth:`list_projects`'
@@ -756,9 +762,10 @@ class Mem0Backend:
     def _get_vector_store_client(self) -> QdrantClient:
         """Get or create the sync Qdrant client every mem0 instance's vector store shares."""
         if self._vector_store_client is None:
-            self._vector_store_client = QdrantClient(
-                url=self.config.mem0.qdrant_url,
-                timeout=socket_timeout_outlasting(self._read_timeout, self._write_timeout),
+            self._vector_store_client = build_vector_store_client(
+                self.config.mem0.qdrant_url,
+                read_budget_s=self._read_timeout,
+                write_budget_s=self._write_timeout,
             )
         return self._vector_store_client
 

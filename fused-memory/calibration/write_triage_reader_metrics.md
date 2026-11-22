@@ -102,7 +102,7 @@ left out.
 | **M1** hidden information in the high-cosine band | the write's dispute or needed detail is not visible to a reader of the parent: CONFLICT, or HOME with LOSS for a restated write, or HOME with LOSS and DIGEST=NO for an amended one (`derive`, `Decided.m1_hidden`); contested and stored writes are visible. DIGEST is YES only when every LOSS-YES rater's spans all lie in the amendment text a reader sees (`digest_visible`, via `amendment_text`, resolved all-visible) | every write whose band-winner cosine was >= t_high when it was written (about 105 a week), whatever its outcome; unit = write | census | **gate: point estimate <= 0.15**, Wilson reported. Soak baseline 0.3736 under rubric v2.1 (§8); the v1 proxy was 0.50 |
 | **M1 as amended** (counterfactual) | M1's rule with every band attach read as if it were amended: CONFLICT, or HOME with LOSS and DIGEST=NO (`Decided.m1_hidden_as_amended`) | M1's band writes that were attached; unit = write | shared with M1 | report-only |
 | **M2** ack truth per outcome | the outcome triage gave is correct, meaning no triage cell | attach and stored acks; unit = write, per outcome | 100 per outcome, stratified outcome × project | report-only |
-| **M3** hidden corrections | of the writes that dispute their parent or an earlier record (CONFLICT), the share that ended restated, amended, or stored with no mark on the record they dispute | every CONFLICT write; unit = write | >= 60 CONFLICT writes, drawn from the contested census, the M2 samples, and 150 stored writes rated against their nearest earlier records | **gate: bound unset — Leo sets it.** The critic's soak-equivalent after F3/F4 is >= ~0.06–0.07 |
+| **M3** hidden corrections | of the writes that dispute their parent or an earlier record (CONFLICT), the share that ended restated, amended, or stored with no mark on the record they dispute | every CONFLICT write; unit = write | >= 60 CONFLICT writes, drawn from the contested census, the M2 samples, and 150 stored writes rated against their nearest earlier records | **gate: population point estimate <= 0.35** (Leo 2026-10-26, esc-7301-1; no interval condition; the sample rate is not gated because it depends on the sampling design). Long-term target 0.10, work owned by task 7519 |
 | **M4** wrong home | wrong_home over decided attaches, split direct vs via-sibling and same vs cross category | attaches; unit = write | shared with M2 | reported against 0.20 |
 | **M5** conflict-flag precision | contested writes with CONFLICT, split by SCOPE (central, secondary, unknown) and by action_changing (yes, no, unknown) | contested writes; unit = write | census or 100 | report-only |
 | **M6** read-time drift | children whose triage cells differ when re-rated against the parent's text at attach time | children whose parent was edited after they attached; unit = write | census | report-only until the edit guard of ruling 5d lands |
@@ -261,7 +261,7 @@ record marked). The window opens when the last of them is live, runs at least
 **Release condition** (memo §6, decision 8a). All of the following must hold:
 
 - M1 at or below 0.15 (point estimate; Wilson reported).
-- M3 within the bound Leo sets.
+- M3 population point estimate at or below 0.35 (bootstrap interval reported).
 - Zero cross-task completion attaches: no completion record attached under
   another task's completion record.
 - The fail-open rate and judge latency are no worse than the soak's: 0.37%
@@ -270,6 +270,11 @@ record marked). The window opens when the last of them is live, runs at least
 
 **Report-only:** M2 per outcome, M4 against 0.20, M5, M6, and harm per write
 under the provisional weights.
+
+M1 is scored under the grouped-read render deployed when the window is scored.
+Leo's ruling of 2026-10-26 on esc-7301-1 (gate task 7301), decision 2, adopted
+memo 2c (amendment bodies rendered past 240 chars) as task 7518, not a
+precondition of the window.
 
 **Which brief: v2.2 (Leo, 2026-10-30).** The post-fix measurement rates under
 rater brief v2.2, the file's default, and is scored with `--rubric v2.2`. This
@@ -429,7 +434,7 @@ stratified bootstrap 95% interval.
 | M2 amended correct | 31 / 100 = 0.31 [0.2278, 0.4063] | 0.31 [0.22, 0.4] | |
 | M2 contested correct | 322 / 472 = 0.6822 [0.6389, 0.7226] | 0.6822 [0.6385, 0.7246] | |
 | M2 stored correct | n 0 | — | |
-| M3 hidden corrections | 39 / 371 = 0.1051 [0.0779, 0.1405] | 0.379 [0.2686, 0.4673] | bound unset |
+| M3 hidden corrections | 39 / 371 = 0.1051 [0.0779, 0.1405] | 0.379 [0.2686, 0.4673] | gate 0.35 (population) |
 | M4 wrong home | 233 / 671 = 0.3472 [0.3122, 0.384] | 0.5416 [0.4761, 0.6043] | 0.20 |
 | M4 direct | 127 / 503 = 0.2525 [0.2165, 0.2922] | 0.4658 [0.3882, 0.5418] | 0.20 |
 | M4 via sibling | 104 / 164 = 0.6341 [0.5581, 0.704] | 0.7749 [0.6694, 0.8603] | 0.20 |

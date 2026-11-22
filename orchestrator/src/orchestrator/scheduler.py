@@ -29,6 +29,7 @@ from typing import (
 from shared import safe_io
 from shared.capability_manifest import CHECK_SUBJECT_FIELD
 from shared.cli_invoke import is_server_error_status
+from shared.declared_checks import declared_checks
 from shared.locking import (
     files_to_modules,
     normalize_lock,
@@ -128,6 +129,7 @@ from orchestrator.recovery_emission import (
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.run_slots import DispatchScope
+from orchestrator.scheduler_priority_lookup import LookupPins, last_written_tiers
 from orchestrator.sentinel_l1 import file_sentinel_l1, resolve_sentinel_l1
 from orchestrator.starvation_cap import CapReport, cap_report, sync_cap_l1
 from orchestrator.starvation_state import WatchdogState
@@ -940,7 +942,7 @@ def _terminal_record_is_immutable(record: dict) -> bool:
     advances after it goes done; both must be re-fetched.
     """
     metadata = record.get('metadata') or {}
-    return not metadata.get('delivered_checks') and not awaits_scheduled_restart(metadata)
+    return declared_checks(metadata).is_empty and not awaits_scheduled_restart(metadata)
 
 
 class McpSessionLike(Protocol):
@@ -1662,12 +1664,26 @@ class Scheduler:
         self._dispatched_priority: dict[str, str] = {}
         # The legacy score's age anchors (age_anchors.py).
         self.age_anchors = AgeAnchors(self._project_root)
-        # Effective-priority cache: populated at the end of each acquire_next tick
-        # so get_state_snapshot() can include it without re-fetching tasks.
-        # Empty dict before the first tick.
-        self._last_effective_priorities: dict[str, str] = {}
+        # Test-injectable override for the _write_snapshot_best_effort write
+        # target (task 2418), and so for the construction-time read of the
+        # last-written tiers just below.  None (default) preserves current behavior: the
+        # path is derived from _project_root and the no-project-root guard
+        # applies.  When set, the write goes to this exact path instead —
+        # bypassing both the derivation and the guard, since an explicit path
+        # is always honored — decoupling the on-disk write target from
+        # _project_root, which some tests must also use as an OverrideStore
+        # lookup key.  Mirrors the _read_psi_sample-style constructor-vs-
+        # instance-attr seam pattern used elsewhere in this class.
+        self._state_snapshot_path: Path | None = state_snapshot_path
+        # Effective-priority cache: seeded from the last-written snapshot, then
+        # replaced at the end of each acquire_next tick so get_state_snapshot()
+        # can include it without re-fetching tasks.
+        self._last_effective_priorities: dict[str, str] = last_written_tiers(self._snapshot_path())
         # --- Priority-override state ---
         self._override_store: OverrideStore | None = override_store
+        self._lookup_pins = LookupPins(
+            lambda: self._override_store, self._project_root, clock=self._time_source,
+        )
         # Public alias for shutdown-path callers (harness checkpoint) — read-only.
         self.override_store: OverrideStore | None = override_store
         # Snapshot from the previous tick, used to diff-detect override changes
@@ -1954,16 +1970,6 @@ class Scheduler:
         # tick. Default None so bare-Scheduler unit tests are unaffected.
         self._already_landed_gate: AlreadyLandedGate | None = None
         # --- Snapshot write throttle (task 1332) ---
-        # Test-injectable override for the _write_snapshot_best_effort write
-        # target (task 2418).  None (default) preserves current behavior: the
-        # path is derived from _project_root and the no-project-root guard
-        # applies.  When set, the write goes to this exact path instead —
-        # bypassing both the derivation and the guard, since an explicit path
-        # is always honored — decoupling the on-disk write target from
-        # _project_root, which some tests must also use as an OverrideStore
-        # lookup key.  Mirrors the _read_psi_sample-style constructor-vs-
-        # instance-attr seam pattern used elsewhere in this class.
-        self._state_snapshot_path: Path | None = state_snapshot_path
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
         # proceeds regardless of the throttle interval.
@@ -3374,8 +3380,7 @@ class Scheduler:
                     # WARNING on every such fetch failure so the bypass is
                     # operator-visible rather than silent.
                     continue
-                checks = (dep_task.get('metadata') or {}).get('delivered_checks')
-                if not checks:
+                if declared_checks(dep_task.get('metadata')).is_empty:
                     continue
                 checked_deps[dep_id] = dep_task
                 deps_by_dependent.setdefault(task_id, set()).add(dep_id)
@@ -3431,8 +3436,9 @@ class Scheduler:
             # DIFFERENT key than the one a prior sweep cached against, so
             # the edit is a cache MISS (re-evaluate) rather than continuing
             # to serve a verdict computed against the old descriptor.
-            checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
-            descriptor_digest = _delivered_checks_descriptor_digest(checks)
+            declared = declared_checks(dep_task.get('metadata'))
+            checks = declared.checks
+            descriptor_digest = _delivered_checks_descriptor_digest(list(checks))
             cache_key = (dep_id, main_sha, descriptor_digest)
             # Prune any stale digest variant(s) left behind by an earlier
             # descriptor for this SAME (dep, sha) (task 2975): bounds cache
@@ -3450,11 +3456,13 @@ class Scheduler:
             ]
             for stale_key in stale_variant_keys:
                 del self._delivered_check_cache[stale_key]
-            if cache_key in self._delivered_check_cache:
+            if not declared.unreadable and cache_key in self._delivered_check_cache:
                 # Only the monotone-safe DELIVERED=True result is ever
                 # cached (see the FAILED branch below) — a cache hit is
                 # therefore always True, served straight from cache with no
-                # checks re-run this sweep.
+                # checks re-run this sweep. The digest covers ``checks``
+                # alone, so a declaration with unreadable entries is never
+                # served from it.
                 cached = self._delivered_check_cache[cache_key]
                 projection[dep_id] = cached
                 # A dep resolved definitively (cached True) on a prior sweep
@@ -3466,11 +3474,13 @@ class Scheduler:
 
             results: list[tuple[dict, DeliveredCheckResult]] = []
             over_budget = False
-            # Only the first dep this sweep actually evaluates gets the
+            # Only the first dep this sweep that runs a check gets the
             # forward-progress guarantee; every later dep still respects
-            # the budget exactly as before.
-            guaranteed_dep = first_dep_this_sweep
-            first_dep_this_sweep = False
+            # the budget exactly as before. A wholly unreadable declaration
+            # runs none, so it leaves the guarantee for the next dep.
+            guaranteed_dep = first_dep_this_sweep and bool(checks)
+            if guaranteed_dep:
+                first_dep_this_sweep = False
             for check in checks:
                 if used >= budget and not guaranteed_dep:
                     over_budget = True
@@ -3517,7 +3527,9 @@ class Scheduler:
                     dep_id, len(checks), budget,
                 )
 
-            if all(r is DeliveredCheckResult.DELIVERED for _c, r in results):
+            if not declared.unreadable and all(
+                r is DeliveredCheckResult.DELIVERED for _c, r in results
+            ):
                 self._delivered_check_cache[cache_key] = True
                 projection[dep_id] = True
                 self._delivered_check_error_streak.pop(dep_id, None)
@@ -3573,11 +3585,12 @@ class Scheduler:
             )
             error_log(
                 'Delivered-check dep %s: at least one check has ERRORED for '
-                '%d consecutive sweep(s) (checks=%r) — left uncached '
-                '(fail-safe wait; no dispatch-gate event/streak per row 7). '
-                'This may indicate a misconfigured check (bad regex/path, '
-                'or a missing/non-executable script).',
-                dep_id, error_streak, errored_names,
+                '%d consecutive sweep(s) (checks=%r, not check descriptors=%r) '
+                '— left uncached (fail-safe wait; no dispatch-gate event/streak '
+                'per row 7). This may indicate a misconfigured check (bad '
+                'regex/path, or a missing/non-executable script) or a '
+                'malformed metadata.delivered_checks.',
+                dep_id, error_streak, errored_names, declared.unreadable,
             )
 
         # Hold-visibility + grace-streak escalation: per dependent, decided
@@ -3665,7 +3678,7 @@ class Scheduler:
         detail = fail_detail_by_dep.get(dep_id) or {}
         check_name = detail.get('name')
         dep_task = checked_deps.get(dep_id) or {}
-        checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
+        checks = declared_checks(dep_task.get('metadata')).checks
         check = next((c for c in checks if c.get('name') == check_name), None)
         if check is None:
             check = {'name': check_name, 'kind': detail.get('kind')}
@@ -6761,6 +6774,7 @@ class Scheduler:
             override_boosts=override_boosts or None,
         )
         self._last_effective_priorities = dict(effective_priorities)
+        self._lookup_pins.adopt(ctx.overrides)
         transitive_counts = self._compute_transitive_counts(
             ctx.tasks_by_id, reverse_index, ctx.status_map
         )
@@ -7454,8 +7468,9 @@ class Scheduler:
         reserved run slot is free).
 
         Returns ``None`` immediately when the scheduler is paused (park-stop).
-        No MCP round-trips, no GC, no override snapshots are performed while
-        paused — all resume cleanly on the first unpaused tick.
+        The only work while paused is the priority lookup's pin re-read, at
+        most once a minute, into a map of its own (not the tick's override
+        snapshot); everything else resumes on the first unpaused tick.
         """
         assert self._started, (
             'acquire_next() called before finish_startup() — startup '
@@ -7467,6 +7482,7 @@ class Scheduler:
                 'acquire_next() short-circuit: scheduler is paused (reason=%r)',
                 self._pause_reason,
             )
+            await self._lookup_pins.refresh_if_due()
             return None
 
         try:
@@ -7631,19 +7647,14 @@ class Scheduler:
             logger.warning('scheduler_tick telemetry emit failed', exc_info=True)
 
     def task_priority(self, task_id: str) -> TaskPriority:
-        """*task_id*'s live effective tier and pin, read from this scheduler's memory.
+        """*task_id*'s effective tier, base tier and pin, read from this scheduler's memory.
 
-        The tier is the one :meth:`get_state_snapshot` exports as
-        ``effective_priorities``; the pin is the override row the last tick
-        loaded. Both are unknown (None) before the first tick, the tier also
-        for a task that tick did not rank, and the pin when no override store
-        is wired. A pure dict read: never touches the override store.
+        The base tier is the one :meth:`get_state_snapshot` exports as
+        ``effective_priorities`` (unknown for a task no tick ranked); the pin
+        comes from the lookup's own pin map (unknown when no override store is
+        wired). A pure dict read: never touches the override store.
         """
-        pinned = None
-        if self._override_store is not None and self._overrides_initialized:
-            row = self._prev_overrides_snapshot.get(task_id)
-            pinned = row is not None and row.pinned
-        return TaskPriority(tier=self._last_effective_priorities.get(task_id), pinned=pinned)
+        return self._lookup_pins.priority(task_id, self._last_effective_priorities.get(task_id))
 
     def get_state_snapshot(self) -> SchedulerStateSnapshot:
         """Return a frozen copy of the scheduler's current state.
@@ -7762,6 +7773,14 @@ class Scheduler:
             payload = json.dumps(self.get_state_snapshot().to_json())
         safe_io.atomic_write_text(path, payload, encoding='utf-8', mkdir=True)
 
+    def _snapshot_path(self) -> Path | None:
+        """The state snapshot's file: the injected path, else under the project root; ``None`` for an unset root."""
+        if self._state_snapshot_path is not None:
+            return Path(self._state_snapshot_path)
+        if not self._project_root or self._project_root == 'None':
+            return None
+        return scheduler_state_json(self._project_root)
+
     async def _write_snapshot_best_effort(self, force: bool = False) -> None:
         """Write the scheduler state snapshot to the default path off the event loop.
 
@@ -7828,9 +7847,8 @@ class Scheduler:
         # 2418): an explicit injected path is always honored regardless of
         # ``_project_root``, which some callers must independently set to a
         # non-writable value for use as an OverrideStore lookup key.
-        if self._state_snapshot_path is None and (
-            not self._project_root or self._project_root == 'None'
-        ):
+        path = self._snapshot_path()
+        if path is None:
             if not self._snapshot_guard_warned:
                 self._snapshot_guard_warned = True
                 logger.warning(
@@ -7881,11 +7899,6 @@ class Scheduler:
                 # applies.  Passed directly to _write_state_snapshot_raw to avoid a
                 # second get_state_snapshot() call on the actual write path.
                 disk_payload = json.dumps(state.to_json())
-                path = (
-                    Path(self._state_snapshot_path)
-                    if self._state_snapshot_path is not None
-                    else scheduler_state_json(self._project_root)
-                )
                 await asyncio.to_thread(self._write_state_snapshot_raw, path, disk_payload)
                 # Bookkeeping advanced only after a confirmed successful write.
                 # _write_state_snapshot_raw propagates exceptions so these lines are

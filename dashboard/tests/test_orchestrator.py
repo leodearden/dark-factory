@@ -833,7 +833,7 @@ class TestRunSlotCapacityConfigRules:
     # ---- happy paths -------------------------------------------------
 
     def test_canonical_config_yields_cap(self, tmp_path):
-        """The canonical CLAUDE.md filename is what discovery keys on first."""
+        """The canonical CLAUDE.md filename is the one config discovery reads."""
         from dashboard.data.orchestrator import read_run_slot_capacity
 
         self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks: 24\n' + self.NO_RESERVE)
@@ -898,72 +898,22 @@ class TestRunSlotCapacityConfigRules:
 
         assert read_run_slot_capacity(tmp_path) == 0
 
-    # ---- legacy-spelling precedence ----------------------------------
+    # ---- only the canonical name is read ------------------------------
 
     @pytest.mark.parametrize(
         'legacy_name',
         ['orchestrator.yaml', 'orchestrator-config.yaml', 'orchestrator/config.yaml'],
     )
-    def test_legacy_spellings_honoured_as_fallback(self, tmp_path, legacy_name):
-        """Each legacy spelling from config._LEGACY_CONFIG_NAMES still resolves."""
+    def test_legacy_spelling_alone_is_unknown(self, tmp_path, legacy_name):
+        """A retired legacy spelling with no canonical file beside it is never read."""
         from dashboard.data.orchestrator import read_run_slot_capacity
 
         self._write(tmp_path / legacy_name, 'max_concurrent_tasks: 12\n' + self.NO_RESERVE)
 
-        assert read_run_slot_capacity(tmp_path) == 12
+        assert read_run_slot_capacity(tmp_path) is None
 
-    def test_legacy_precedence_order_is_first_match_wins(self, tmp_path):
-        """The documented order is orchestrator.yaml, then -config, then subdir."""
-        from dashboard.data.orchestrator import read_run_slot_capacity
-
-        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 11\n' + self.NO_RESERVE)
-        self._write(
-            tmp_path / 'orchestrator-config.yaml', 'max_concurrent_tasks: 22\n' + self.NO_RESERVE
-        )
-        self._write(
-            tmp_path / 'orchestrator/config.yaml', 'max_concurrent_tasks: 33\n' + self.NO_RESERVE
-        )
-
-        assert read_run_slot_capacity(tmp_path) == 11
-
-    def test_first_readable_legacy_config_is_authoritative(self, tmp_path, caplog):
-        """A readable legacy file's answer is final, exactly as the canonical file's is.
-
-        Its malformed reserve makes the capacity unknown.  A later legacy
-        spelling never supplies a number in its place: that would follow a
-        WARNING calling the capacity unknown with a capacity read from a file
-        the orchestrator is not running from.
-        """
-        import logging
-
-        from dashboard.data.orchestrator import read_run_slot_capacity
-
-        self._write(
-            tmp_path / 'orchestrator.yaml',
-            'max_concurrent_tasks: 10\nmain_health_fix_reserved_slots: lots\n',
-        )
-        self._write(
-            tmp_path / 'orchestrator-config.yaml', 'max_concurrent_tasks: 40\n' + self.NO_RESERVE
-        )
-
-        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
-            result = read_run_slot_capacity(tmp_path)
-
-        assert result is None, f'a later legacy file must not stand in (got {result!r})'
-        assert [r for r in caplog.records if r.levelno == logging.WARNING]
-
-    def test_unreadable_legacy_config_falls_through_to_the_next(self, tmp_path):
-        """Only a legacy file that does not parse to a mapping is passed over."""
-        from dashboard.data.orchestrator import read_run_slot_capacity
-
-        self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: [unclosed\n')
-        self._write(
-            tmp_path / 'orchestrator-config.yaml', 'max_concurrent_tasks: 12\n' + self.NO_RESERVE
-        )
-
-        assert read_run_slot_capacity(tmp_path) == 12
-
-    def test_canonical_beats_legacy(self, tmp_path):
+    def test_stray_legacy_file_beside_canonical_is_ignored(self, tmp_path):
+        """A stray legacy file beside the canonical one is never read."""
         from dashboard.data.orchestrator import read_run_slot_capacity
 
         self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks: 24\n' + self.NO_RESERVE)
@@ -971,14 +921,13 @@ class TestRunSlotCapacityConfigRules:
 
         assert read_run_slot_capacity(tmp_path) == 24
 
-    def test_present_canonical_is_authoritative_even_without_the_key(self, tmp_path):
-        """A canonical config that omits the key must NOT be masked by a legacy file.
+    def test_canonical_omitting_the_key_ignores_stray_legacy_value(self, tmp_path):
+        """A canonical config that omits the key never takes it from a stray legacy file.
 
-        Same rule config.discover_root_escalation_url documents: once the
-        canonical file exists on disk it is authoritative, so a stale legacy
-        spelling can never silently supply a cap the live config dropped.  The
-        omitted key resolves to the orchestrator's own default of 24 — never
-        to the legacy file's 99.
+        Only the canonical file is read, so a stale legacy spelling beside it
+        can never supply a cap the live config dropped.
+        The omitted key resolves to the orchestrator's own default of 24 —
+        never to the legacy file's 99.
         """
         from dashboard.data.orchestrator import read_run_slot_capacity
 
@@ -1006,14 +955,6 @@ class TestRunSlotCapacityConfigRules:
             tmp_path / self.CANONICAL,
             'project_root: /somewhere\nescalation:\n  port: 9101\n' + self.NO_RESERVE,
         )
-
-        assert read_run_slot_capacity(tmp_path) == 24
-
-    def test_omitted_key_in_a_legacy_config_also_yields_the_default(self, tmp_path):
-        """Defaults layering is a property of the orchestrator, not of a filename."""
-        from dashboard.data.orchestrator import read_run_slot_capacity
-
-        self._write(tmp_path / 'orchestrator.yaml', 'project_root: /somewhere\n' + self.NO_RESERVE)
 
         assert read_run_slot_capacity(tmp_path) == 24
 
@@ -1235,9 +1176,9 @@ class TestRunSlotCapacityConfigRules:
         (tmp_path / self.CANONICAL).mkdir()
         self._write(tmp_path / 'orchestrator.yaml', 'max_concurrent_tasks: 7\n' + self.NO_RESERVE)
 
-        # The canonical name is not a readable FILE, so resolution falls through
-        # to the legacy spelling rather than exploding on IsADirectoryError.
-        assert read_run_slot_capacity(tmp_path) == 7
+        # The canonical name is not a readable FILE and no other name is
+        # consulted, so the capacity is unknown rather than an IsADirectoryError.
+        assert read_run_slot_capacity(tmp_path) is None
 
 
 class TestReadRunSlotCapacity:
@@ -1352,23 +1293,13 @@ class TestReadRunSlotCapacity:
         assert read_run_slot_capacity(tmp_path) == 38
 
     def test_both_keys_come_from_the_one_authoritative_file(self, tmp_path):
-        """A legacy reserve is never mixed with the canonical general slots."""
+        """A stray legacy file's reserve is never read beside the canonical general slots."""
         from dashboard.data.orchestrator import read_run_slot_capacity
 
         self._write(tmp_path / self.CANONICAL, 'max_concurrent_tasks: 36\n')
         self._write(tmp_path / 'orchestrator.yaml', 'main_health_fix_reserved_slots: 5\n')
 
         assert read_run_slot_capacity(tmp_path) == 37
-
-    def test_legacy_only_config_supplies_both_keys(self, tmp_path):
-        from dashboard.data.orchestrator import read_run_slot_capacity
-
-        self._write(
-            tmp_path / 'orchestrator.yaml',
-            'max_concurrent_tasks: 10\nmain_health_fix_reserved_slots: 2\n',
-        )
-
-        assert read_run_slot_capacity(tmp_path) == 12
 
     def test_missing_config_is_none(self, tmp_path):
         from dashboard.data.orchestrator import read_run_slot_capacity
