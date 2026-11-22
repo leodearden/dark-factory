@@ -346,7 +346,7 @@ def _project(tmp_path: Path, *, scan_seconds: float) -> Path:
     (root / 'pkg' / 'orchestrator.yaml').write_text(
         'test_command: "pytest pkg/tests"\nverify_command_timeout_secs: 900\n', encoding='utf-8'
     )
-    (root / 'dark-factory-orchestrator.yaml').write_text('project_root: .\n', encoding='utf-8')
+    (root / 'dark-factory-orchestrator.yaml').write_text(f'project_root: {root}\n', encoding='utf-8')
     _git(root, 'init', '-q')
     _git(root, 'add', '-A')
     _git(root, 'commit', '-q', '--no-verify', '-m', 'family member')
@@ -401,7 +401,7 @@ def _config(root: Path, *, dry_run: bool = False) -> selfcheck.RunConfig:
     )
 
 
-def _run(root: Path, escalations: _Escalations, *, dry_run: bool = False) -> selfcheck.RunResult:
+def _selfcheck_run(root: Path, escalations: _Escalations, *, dry_run: bool = False) -> selfcheck.RunResult:
     return selfcheck.run(_config(root, dry_run=dry_run), selfcheck.Ports(escalation=escalations), _NOW, legs=_NO_LEGS)
 
 
@@ -409,7 +409,7 @@ def test_a_breach_with_no_history_files_exactly_one_escalate_info_in_its_slot(tm
     root = _project(tmp_path, scan_seconds=200.0)
     escalations = _Escalations()
 
-    result = _run(root, escalations)
+    result = _selfcheck_run(root, escalations)
 
     assert result.ok
     (finding,) = result.findings
@@ -428,10 +428,10 @@ def test_a_breach_with_no_history_files_exactly_one_escalate_info_in_its_slot(tm
 
 def test_a_breach_whose_slot_has_history_is_skipped_and_reported(tmp_path: Path) -> None:
     root = _project(tmp_path, scan_seconds=200.0)
-    slot = _run(root, _Escalations(), dry_run=True).findings[0].slot()
+    slot = _selfcheck_run(root, _Escalations(), dry_run=True).findings[0].slot()
     escalations = _Escalations(history={slot: [{'id': 'esc-7011-1', 'status': 'resolved'}]})
 
-    result = _run(root, escalations)
+    result = _selfcheck_run(root, escalations)
 
     assert result.ok
     assert 'escalate_info' not in escalations.tools()
@@ -442,7 +442,7 @@ def test_a_dry_run_calls_no_write_tool_and_writes_no_stamp(tmp_path: Path) -> No
     root = _project(tmp_path, scan_seconds=200.0)
     escalations = _Escalations()
 
-    result = _run(root, escalations, dry_run=True)
+    result = _selfcheck_run(root, escalations, dry_run=True)
 
     assert result.ok
     assert len(result.findings) == 1
@@ -453,7 +453,7 @@ def test_a_dry_run_calls_no_write_tool_and_writes_no_stamp(tmp_path: Path) -> No
 def test_a_completed_run_writes_the_stamp(tmp_path: Path) -> None:
     root = _project(tmp_path, scan_seconds=200.0)
 
-    result = _run(root, _Escalations())
+    result = _selfcheck_run(root, _Escalations())
 
     stamp = json.loads(_config(root).stamp_path.read_text(encoding='utf-8'))
     assert stamp['ok'] is True
@@ -472,7 +472,7 @@ def test_a_quiet_night_files_nothing_and_still_stamps(tmp_path: Path) -> None:
     root = _project(tmp_path, scan_seconds=20.0)
     escalations = _Escalations()
 
-    result = _run(root, escalations)
+    result = _selfcheck_run(root, escalations)
 
     assert result.ok
     assert result.findings == ()
@@ -484,7 +484,7 @@ def test_a_quiet_night_files_nothing_and_still_stamps(tmp_path: Path) -> None:
 def test_an_escalation_fault_fails_the_run_at_its_stage_and_stamps_it(tmp_path: Path, escalations: _Escalations) -> None:
     root = _project(tmp_path, scan_seconds=200.0)
 
-    result = _run(root, escalations)
+    result = _selfcheck_run(root, escalations)
 
     assert not result.ok
     assert result.failure is not None
