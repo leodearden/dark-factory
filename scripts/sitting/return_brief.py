@@ -19,6 +19,13 @@ block and the header's figures are ``fleet_state`` measurements, each printed
 with its own stamp. A store that cannot be read is a stated shortfall in its
 section; no section is ever omitted.
 
+Sections 2-5 list the active projects. A project is inactive only when its
+orchestrator unit is not running and nothing landed or was escalated in the
+window, all three read (``fleet_state.ProjectState.inactive_reason``), so an
+unmeasured signal keeps a project listed. A paused project keeps its blocks,
+each flagged with its scheduler pause, and one line closing the page names
+every inactive project with its reason.
+
 Sections 2 and 6 stay apart on purpose. Section 2 is the standing-policy
 adjudicator's shadow agreement; section 6 is this preparer's own carve-out
 closes, read back from ``closing_evidence``. Leo audits the two mechanisms
@@ -36,8 +43,9 @@ the number it had. A watcher seeds its session ledger from it
 the numbers his session applies. That holds for a session launched on an
 earlier night too, for every item a render had already numbered by then.
 
-The one subprocess is a ``git rev-list`` per measured root, for its landings;
-no network. Exit codes: 0 whenever the page is written, degraded or not; 2 on
+The subprocesses are one ``git rev-list`` per measured root, for its landings,
+and one ``systemctl --user show`` per orchestrator unit naming a measured
+root; no network. Exit codes: 0 whenever the page is written, degraded or not; 2 on
 a configuration error.
 """
 from __future__ import annotations
@@ -58,7 +66,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 import orchestrator_projects
 from _task_db_scan import discover_project_roots
 from orchestrator.decision_registry import decisions_dir
-from orchestrator.digest import ModelRoleRow
+from orchestrator.digest import PER_DONE_RUN_LABEL, ModelRoleRow
 from orchestrator.fleet_files import fleet_root
 from orchestrator.session_records import sessions_dir
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots
@@ -113,6 +121,11 @@ NO_EXECUTOR_CLOSE = f'no executor close in window (the trailing {audits.AUDIT_WI
 ALL_AUDITED = 'every executor close in the window is audited'
 AGED_OUT = ('{count} close(s) in the window name an escalation that has aged out of the archive; '
             'their class cannot be read')
+INACTIVE_LINE = 'Inactive projects (not in sections 2–5):'
+NO_ACTIVE_PROJECT = 'No active project was measured.'
+
+Figure = tuple[Measurement[Any], Callable[[Any], list[str]]]
+"""A measurement and the renderer of its value, printed under the measurement's stamp line."""
 
 
 @dataclass(frozen=True)
@@ -213,19 +226,22 @@ def build(
 
 def render(document: ReturnBriefDocument) -> str:
     heading = {slug: f'{number}. {title}' for number, (slug, title) in enumerate(SECTIONS, start=1)}
-    measured = _measurements(document)
-    projects = list(document.projects)
+    active = _active(document)
+
+    def per_project(slug: str, preface: Iterable[str] = ()) -> str:
+        return _per_project_section(heading[slug], slug, active, preface=preface)
+
     return '\n'.join([
         _header(document),
         _host_section(document.host_alarms),
         _decisions_section(document.sitting, heading['decisions']),
-        _per_project_section(heading['standing_policy'], projects, measured['standing_policy'], _agreement_lines,
-                             preface=_standing_policy_preface(document)),
-        _per_project_section(heading['landed'], projects, measured['landed'], _landed_lines),
-        _per_project_section(heading['stuck'], projects, measured['stuck'], _stuck_lines),
-        _per_project_section(heading['spend'], projects, measured['spend'], _spend_lines),
+        per_project('standing_policy', _standing_policy_preface(document)),
+        per_project('landed'),
+        per_project('stuck'),
+        per_project('spend'),
         _closes_section(document.closes, heading['closes']),
         _audit_draw_section(document.audits, document.sitting.ledger),
+        _inactive_line(document.projects.values()),
     ])
 
 
@@ -345,14 +361,38 @@ def _freshness(sources: prepare_sitting.Sources, sitting: Sitting) -> Preparatio
     return PreparationFreshness(newest, awaiting, len(sitting.numbered))
 
 
-def _measurements(document: ReturnBriefDocument) -> dict[str, tuple[Measurement[Any], ...]]:
-    """Every measurement behind each measured section; the single map both render and the statuses read."""
-    states = list(document.projects.values())
+def _active(document: ReturnBriefDocument) -> tuple[ProjectState, ...]:
+    return tuple(state for state in document.projects.values() if state.active)
+
+
+def _section_figures(state: ProjectState) -> dict[str, tuple[Figure, ...]]:
+    """Each per-project section's figures for *state* in print order; the one map render and the statuses read."""
     return {
-        'standing_policy': tuple(state.standing_policy for state in states),
-        'landed': tuple(state.landed for state in states),
-        'stuck': tuple(state.stuck for state in states),
-        'spend': tuple(state.spend for state in states),
+        'standing_policy': ((state.standing_policy, _agreement_lines),),
+        'landed': ((state.landed, _landed_lines), (state.unit_active, _unit_lines),
+                   (state.new_escalations, _new_escalation_lines)),
+        'stuck': ((state.stuck, _stuck_lines),),
+        'spend': ((state.spend, _spend_lines),),
+    }
+
+
+def _measurements(document: ReturnBriefDocument) -> dict[str, tuple[Measurement[Any], ...]]:
+    """Every measurement behind each measured section.
+
+    A section counts the figures it prints for the active projects. Section 3
+    counts every project's activity signals and pause too, since they decide
+    which projects sections 2-5 list.
+    """
+    states, active = tuple(document.projects.values()), _active(document)
+
+    def printed(slug: str, listed: Iterable[ProjectState]) -> tuple[Measurement[Any], ...]:
+        return tuple(measurement for state in listed for measurement, _ in _section_figures(state)[slug])
+
+    return {
+        'standing_policy': printed('standing_policy', active),
+        'landed': (*printed('landed', states), *(state.pause_reason for state in states)),
+        'stuck': printed('stuck', active),
+        'spend': printed('spend', active),
         'closes': (document.closes, document.audits),
     }
 
@@ -467,22 +507,41 @@ def _standing_policy_preface(document: ReturnBriefDocument) -> list[str]:
 
 
 def _per_project_section(
-    heading: str,
-    projects: Sequence[str],
-    measurements: Sequence[Measurement[Any]],
-    body: Callable[[Any], list[str]],
-    *,
-    preface: Iterable[str] = (),
+    heading: str, slug: str, states: Sequence[ProjectState], *, preface: Iterable[str] = (),
 ) -> str:
     lines = [f'## {heading}', '', *preface]
-    for project, measurement in zip(projects, measurements, strict=True):
-        lines += [f'### {project}', '', _stamp_line(measurement)]
-        if measurement.ok:
-            lines += ['', *body(measurement.value)]
-        lines += ['', *_shortfall_lines(measurement.shortfalls)]
-    if not projects:
-        lines.append('No project root was measured.')
+    for state in states:
+        flags = _activity_flags(state)
+        lines += [f'### {state.project}', '', *flags, *(flags and [''])]
+        for measurement, body in _section_figures(state)[slug]:
+            lines += _figure_lines(measurement, body)
+    if not states:
+        lines.append(NO_ACTIVE_PROJECT)
     return _text(lines)
+
+
+def _figure_lines(measurement: Measurement[Any], body: Callable[[Any], list[str]]) -> list[str]:
+    lines = [_stamp_line(measurement), '']
+    if measurement.ok:
+        lines += [*body(measurement.value), '']
+    shortfalls = _shortfall_lines(measurement.shortfalls)
+    return [*lines, *shortfalls, *(shortfalls and [''])]
+
+
+def _activity_flags(state: ProjectState) -> list[str]:
+    """The flag printed under each of *state*'s headings: its scheduler pause, or why it could not be read."""
+    pause = state.pause_reason
+    if not pause.ok:
+        return [f'scheduler pause not read — {_flag_text(pause)}']
+    return [f'scheduler paused: {pause.value}'] if pause.value else []
+
+
+def _inactive_line(states: Iterable[ProjectState]) -> str:
+    inactive = [
+        '; '.join([f'{state.project} ({state.root}): {state.inactive_reason}', *_activity_flags(state)])
+        for state in states if not state.active
+    ]
+    return f'{INACTIVE_LINE} {", ".join(inactive) or "none"}.\n'
 
 
 def _agreement_lines(rulings: StandingPolicyRulings) -> list[str]:
@@ -503,6 +562,14 @@ def _landed_lines(count: int) -> list[str]:
             '(merge commits and fast-forwards; each train member counted).']
 
 
+def _unit_lines(running: bool) -> list[str]:
+    return [f'orchestrator unit: {"active" if running else "inactive"}']
+
+
+def _new_escalation_lines(count: int) -> list[str]:
+    return [f'{count} new escalation{"" if count == 1 else "s"} filed in the window']
+
+
 def _stuck_lines(rows: tuple[StuckRow, ...]) -> list[str]:
     return [f'- task {row.task_id} — {row.title}: {row.reason}' for row in rows] or ['No blocked task.']
 
@@ -510,7 +577,8 @@ def _stuck_lines(rows: tuple[StuckRow, ...]) -> list[str]:
 def _spend_lines(rows: tuple[ModelRoleRow, ...]) -> list[str]:
     if not rows:
         return ['No invocation completed in the window.']
-    table = ['| model | role | invocations | cost | cap-hit rate | $/done |', '|---|---|---|---|---|---|']
+    table = [f'| model | role | invocations | cost | cap-hit rate | {PER_DONE_RUN_LABEL} |',
+             '|---|---|---|---|---|---|']
     table += [f'| {r.model} | {r.role} | {r.invocation_count} | {_money(r.total_cost_usd)} | '
               f'{_percent(r.cap_hit_rate)} | {_money(r.cost_per_done)} |' for r in rows]
     total = sum(r.total_cost_usd for r in rows)

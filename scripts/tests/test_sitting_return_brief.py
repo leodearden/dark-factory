@@ -1123,10 +1123,9 @@ class TestActivityRendering:
         assert not document.projects['reify'].active
         sections = _sections(text)
         for title in TITLES[1:5]:
-            assert '### reify' not in sections[title].splitlines(), title
+            assert 'reify' not in sections[title], title
             assert '### dark_factory' in sections[title].splitlines(), title
-        body = text[len(_header(text)):]
-        (naming,) = [line for line in body.splitlines() if 'reify' in line]
+        (naming,) = [line for line in sections[TITLES[5]].splitlines() if 'reify' in line]
         assert naming.startswith(INACTIVE_FOOTER)
         assert f'reify ({reify}): {fleet_state.INACTIVE_REASON}' in naming
         assert 'dark_factory' not in naming
