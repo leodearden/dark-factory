@@ -73,21 +73,37 @@ async def _git(repo: Path, *args: str) -> tuple[int, str]:
     return proc.returncode, stdout.decode()
 
 
-def _task_files(listing: str) -> Tree:
-    return frozenset(name for name in listing.split() if name.endswith('.txt'))
+async def _task_files(repo: Path, *listing: str) -> tuple[int, Tree]:
+    """``git *listing`` in *repo*: its exit code and the task files (``*.txt``) it printed."""
+    rc, out = await _git(repo, *listing)
+    return rc, frozenset(name for name in out.split() if name.endswith('.txt'))
+
+
+def _tree_listing(rev: str) -> tuple[str, ...]:
+    """The ``git`` arguments printing the paths in *rev*'s tree."""
+    return ('ls-tree', '--name-only', rev)
+
+
+def _change_listing(rev: str) -> tuple[str, ...]:
+    """The ``git`` arguments printing the paths *rev* changes over its first parent."""
+    return ('diff', '--name-only', f'{rev}^1', rev)
+
+
+async def _listed(repo: Path, listing: tuple[str, ...]) -> Tree:
+    """The task files ``git *listing`` prints in *repo*, which must succeed."""
+    rc, files = await _task_files(repo, *listing)
+    assert rc == 0, f'git {" ".join(listing)} exited {rc} in {repo}'
+    return files
 
 
 async def _tree_of(repo: Path, rev: str) -> Tree:
     """The task files (``*.txt``) in *rev*'s tree."""
-    _, listing = await _git(repo, 'ls-tree', '--name-only', rev)
-    return _task_files(listing)
+    return await _listed(repo, _tree_listing(rev))
 
 
 async def _change_of(repo: Path, rev: str) -> Tree:
     """The task files (``*.txt``) *rev* changes over its first parent."""
-    rc, listing = await _git(repo, 'diff', '--name-only', f'{rev}^1', rev)
-    assert rc == 0, f'git diff {rev}^1 {rev} failed in {repo}'
-    return _task_files(listing)
+    return await _listed(repo, _change_listing(rev))
 
 
 class _TreeRecordingVerifier(FakeVerifier):
@@ -126,10 +142,11 @@ class _RemoteVerify:
 
 class _TreeRecordingRemote(FakeRemoteRunner):
     """A remote host that records each commit it is asked to verify as a
-    ``_RemoteVerify``, alongside the ``calls`` ledger. A verify is recorded on
-    entry, so one handed and then cancelled still counts, and with nothing
-    awaited between recording it and starting it: once ``release`` is set, a
-    recorded verify with the host not ``live`` has returned."""
+    ``_RemoteVerify``, alongside the ``calls`` ledger, with nothing awaited
+    between recording it and starting it: once ``release`` is set, a recorded
+    verify with the host not ``live`` has returned. A commit git cannot read
+    goes to ``unreadable`` instead of raising, since an exception here would
+    reach the lane as a failed verify rather than the test as an error."""
 
     def __init__(
         self, name: str, repo: Path, *, release: asyncio.Event, entered: asyncio.Event,
@@ -137,11 +154,15 @@ class _TreeRecordingRemote(FakeRemoteRunner):
         super().__init__(name, release=release, entered=entered)
         self.repo = repo
         self.verifies: list[_RemoteVerify] = []
+        self.unreadable: list[str] = []
 
     async def run_merge_verify(self, merge_sha: str, spec: Any) -> VerifyResult:
-        change = await _change_of(self.repo, merge_sha)
-        tree = await _tree_of(self.repo, merge_sha)
-        self.verifies.append(_RemoteVerify(change=change, tree=tree))
+        change_rc, change = await _task_files(self.repo, *_change_listing(merge_sha))
+        tree_rc, tree = await _task_files(self.repo, *_tree_listing(merge_sha))
+        if change_rc == tree_rc == 0:
+            self.verifies.append(_RemoteVerify(change=change, tree=tree))
+        else:
+            self.unreadable.append(merge_sha)
         return await super().run_merge_verify(merge_sha, spec)
 
 
@@ -236,6 +257,9 @@ class _Run:
 
     def remote_trees_of(self, task_id: str) -> list[Tree]:
         """The trees 'head-host' verified for commits bringing in *task_id*'s branch."""
+        assert not self.head_host.unreadable, (
+            f'git could not read commits head-host was handed: {self.head_host.unreadable}'
+        )
         return [v.tree for v in self.head_host.verifies if v.change == self.changes[task_id]]
 
     def first_merge_base(self, task_id: str) -> str:
