@@ -102,6 +102,7 @@ from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.park_refusal import ParkRefusalEpisodes, is_park_refusal
 from orchestrator.pause_policy import PauseClass, PausePolicy, policy_for
 from orchestrator.pending_age import AnchorReading, read_pending_age
 from orchestrator.pin_reservation import (
@@ -113,6 +114,7 @@ from orchestrator.pin_reservation import (
     park_rank,
     pin_release_reason,
     priority_payload,
+    rank_payload,
 )
 from orchestrator.recovery_emission import (
     LeaveReason,
@@ -1658,6 +1660,9 @@ class Scheduler:
         # Per-pin pin_blocked cadence (task 6040): a pin's blocked episode
         # ends when it dispatches or leaves the pin queue.
         self._pin_blocked = PinBlockedLimiter()
+        # Per-candidate park_refused cadence (task 6328): an episode ends on a
+        # dispatch, a refusal by anything else, or leaving candidacy.
+        self._park_refusals = ParkRefusalEpisodes()
         # Per-tier cap bookkeeping: remember the effective priority of every
         # currently-dispatched task so acquire_next can count slots at-or-below
         # a candidate's tier without re-walking the full task graph.
@@ -4823,8 +4828,8 @@ class Scheduler:
 
         THE single place a dispatch settles fairness state, called for EVERY
         dispatch — pin loop and scored loop, top or not: the skip count,
-        blocked-install streak and ``pin_blocked`` episode (task 6040) are
-        dropped, and the task's own parks are
+        blocked-install streak, ``pin_blocked`` episode (task 6040) and
+        ``park_refused`` episode (task 6328) are dropped, and the task's own parks are
         consumed (``reservation_used``, plus ``reservation_restored`` for each
         shadow the clear exposes).  A running task's park would otherwise
         block the installs of every owner it outranks (INV-3) until release,
@@ -4835,6 +4840,7 @@ class Scheduler:
         self._skip_count.pop(task_id, None)
         self._streak_park_install_blocked.clear(task_id)
         self._pin_blocked.forget(task_id)
+        self._park_refusals.end(task_id)
         if not self.lock_table.has_parks(task_id):
             return
         source = self.lock_table.reservation_source(task_id)
@@ -7343,6 +7349,10 @@ class Scheduler:
         numeric one, in string order.
         """
         self._poll_work_product()
+        # A scoped tick's candidates are filtered (task 8480), so only an ANY
+        # tick can tell that a task has left candidacy.
+        if ctx.scope is DispatchScope.ANY:
+            self._park_refusals.retain(str(t.get('id', '')) for t in ctx.candidates)
         scored = self._score_candidates(ctx)
 
         # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
@@ -7409,6 +7419,7 @@ class Scheduler:
                             grant = None
                 if not acquired:
                     refused.append(task_id)
+                    self._note_park_refusal(ctx, task_id, modules, pri)
                 if acquired:
                     self._dispatched.add(task_id)
                     self._watchdog_state.note_scan(refused)
@@ -7455,6 +7466,67 @@ class Scheduler:
         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
         await self._write_snapshot_best_effort()
         return TickOutcome(None)
+
+    def _note_park_refusal(
+        self, ctx: TickContext, task_id: str, modules: list[str], tier: str
+    ) -> None:
+        """Track *task_id*'s refusal by parks alone, and emit ``park_refused`` when due (task 6328).
+
+        Called at refusal time, before a winner changes the lock table, so the
+        blockers are exactly what refused this acquire (INV-5).  A refusal
+        outside the class (:func:`orchestrator.park_refusal.is_park_refusal`)
+        ends the episode.
+        """
+        blockers = self.lock_table.blockers(task_id, modules)
+        if not is_park_refusal(tier, blockers, self.lock_table.top_park_rank):
+            self._park_refusals.end(task_id)
+            return
+        episode_secs = self._park_refusals.observe(
+            task_id,
+            now=self._time_source(),
+            interval=self.config.park_refused_emit_interval_secs,
+        )
+        if episode_secs is None or not self.event_store:
+            return
+        ranks = {
+            blocker.owner: self.lock_table.top_park_rank(blocker.owner)
+            for blocker in blockers
+        }
+        self.event_store.emit(
+            EventType.park_refused,
+            task_id=task_id,
+            data={
+                'task_id': task_id,
+                'priority': tier,
+                'episode_secs': episode_secs,
+                'blockers': [blocker.as_payload() for blocker in blockers],
+                'park_owners': [
+                    self._park_owner_entry(ctx, owner, rank)
+                    for owner, rank in sorted(ranks.items())
+                    if rank is not None
+                ],
+            },
+        )
+
+    def _park_owner_entry(self, ctx: TickContext, owner: str, rank: int) -> dict:
+        """One ``park_refused`` park owner: the priority behind its *rank*, its park age, and its own wait.
+
+        ``waiting_on`` is None, meaning unknown, when *owner* is not in this
+        tick's task list.  That is a fail-safe, not an expected case:
+        ``_phase_park_gc`` runs earlier in the tick and expires the parks of
+        every owner missing from it.
+        """
+        owner_task = ctx.tasks_by_id.get(owner)
+        waiting_on = None if owner_task is None else [
+            blocker.as_payload()
+            for blocker in self.lock_table.blockers(owner, self._get_modules(owner_task))
+        ]
+        return {
+            'owner': owner,
+            **rank_payload(rank),
+            'park_age_secs': self.lock_table.park_age_secs(owner, now=self._wall_now()),
+            'waiting_on': waiting_on,
+        }
 
     async def acquire_next(self, scope: DispatchScope = DispatchScope.ANY) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.

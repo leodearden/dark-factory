@@ -5363,6 +5363,17 @@ class OrchestratorConfig(BaseSettings):
             'or the task leaving the pin queue, resets it.'
         ),
     )
+    park_refused_emit_interval_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description=(
+            'park_refused is emitted once a dispatch candidate has been refused '
+            'its locks by parks alone, none of which outranks it, for this many '
+            'seconds, then at most once per this many seconds while that lasts. '
+            'A dispatch, a refusal by anything else, or the task leaving the '
+            'dispatch candidates ends the episode.'
+        ),
+    )
 
     # Escalation-watcher subprocess supervisor (AFK hardening, task 1326).
     # Keeps a fresh escalation-watcher-auto agent alive across multi-day AFK
@@ -6983,6 +6994,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'pin_reservations_enabled',
         'pin_reservation_max_active',
         'pin_blocked_emit_interval_secs',
+        # park_refused cadence (task 6328): the same flat, tick-time read.
+        'park_refused_emit_interval_secs',
         # Digest + EWA breaker knobs (task 4559).  Explicit literals for the
         # same reason as the backfill_* group above: these are FLAT top-level
         # fields, not a submodel, so _submodel_leaf_paths does not apply.
