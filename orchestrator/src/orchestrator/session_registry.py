@@ -689,8 +689,8 @@ def main(argv: list[str] | None = None) -> int:
     from argparse's parse_args() below, before the try/except.
 
     A decision verb goes to decision_cli.run_verb, which owns the decision
-    half of this policy, including why close-decision and reopen-decision
-    exit non-zero on a refusal. The filer's record slug it needs is session
+    half of this policy, including why the refusing verbs exit non-zero on
+    a refusal. The filer's record slug it needs is session
     identity, so this module hands it _resolve_filing_record_slug.
     """
     parser = _build_parser()
