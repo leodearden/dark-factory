@@ -638,7 +638,10 @@ def _resolve_deps(
 
 @dataclass(frozen=True, slots=True)
 class UnitRow:
-    """One active row's unit-derived wire fields, shared read-only across renders."""
+    """One active row's unit-derived wire fields, held by :class:`UnitRowMemo`.
+
+    Never handed to a consumer: every render copies it (:func:`_with_render_facts`).
+    """
 
     task_id: int
     fields: dict
@@ -679,13 +682,21 @@ def _with_render_facts(unit_row: UnitRow, rt: dict) -> dict:
     """A new wire row: *unit_row*'s fields under one render's runtime fields *rt*.
 
     Every key of *rt* is already on the row, so each keeps its wire position.
-    ``external_deps`` entries are copied because the external-dep tail of
-    :func:`collect_tasks_with_counts` overwrites their ``status`` in place.
+    Every container on the row is copied too, so a render owns its row as
+    wholly as when it shaped its own. The external-dep tail of
+    :func:`collect_tasks_with_counts` overwrites ``external_deps`` statuses in
+    place, and a consumer that mutated a shared ``deps`` or ``meta_files``
+    would otherwise corrupt every later render of the unit.
     """
     row = dict(unit_row.fields)
     row.update(rt)
-    if row['external_deps']:
-        row['external_deps'] = [dict(entry) for entry in row['external_deps']]
+    row['meta_files'] = list(row['meta_files'])
+    row['deps'] = [dict(dep) for dep in row['deps']]
+    row['external_deps'] = [dict(entry) for entry in row['external_deps']]
+    if row['train'] is not None:
+        row['train'] = dict(row['train'])
+    if row.get('deferral') is not None:
+        row['deferral'] = dict(row['deferral'])
     return row
 
 
@@ -734,9 +745,9 @@ def _shape_one_project(
     PURE given its arguments: it reads no clock and issues no MCP call. The
     unit-derived half of each row is memoised per unit identity
     (:class:`UnitRowMemo`), which is transparent because a unit is never
-    mutated; every returned row is new. Acquiring the unit is I/O and lives in
-    ``task_snapshot.acquire_snapshot``; turning it into rows is arithmetic and
-    lives here. The split is what lets the shaping be exercised against a
+    mutated; every returned row, and every container in it, is new. Acquiring
+    the unit is I/O and lives in ``task_snapshot.acquire_snapshot``; turning
+    it into rows is arithmetic and lives here. The split is what lets the shaping be exercised against a
     canned unit and the reads be exercised against a canned substrate, with
     neither test having to stand in for the other.
 
@@ -1064,8 +1075,10 @@ async def collect_tasks_with_counts(
     root's shaped row list: the very dicts the external-dep tail then
     overwrites in place, so that overwrite reaches the wire through the
     units. ``dataclasses.replace`` on the frozen records gives the wire its
-    own unit and leaves the cached one's raw rows for the next render to
-    shape; ``TaskSnapshot.rows`` records why the two cannot be one list. A
+    own unit and leaves the cached one's raw rows untouched: the next render
+    of a new unit shapes them, and :class:`UnitRowMemo` reuses the
+    unit-derived half of an unchanged one. ``TaskSnapshot.rows`` records why
+    the shaped and raw rows cannot be one list. A
     unit whose rows were never measured keeps
     ``value is None``, because ``[]`` would claim a measured zero.
 

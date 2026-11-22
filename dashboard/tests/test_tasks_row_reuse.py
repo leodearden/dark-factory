@@ -11,6 +11,7 @@ What may be reused is the unit-derived half of each row, memoised per unit by
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 from datetime import UTC, datetime, timedelta
@@ -18,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from _canned_mcp import ByRoot, CannedMCP, _raw_row
 from _task_units import measured_unit
+from shared.task_deferral import LegacyUnknownDeferral, record_to_json
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from dashboard.config import DashboardConfig
@@ -161,10 +163,9 @@ EVERY_FIELD_GROUP_WIRE = {
 }
 
 
-async def test_a_reused_render_serialises_byte_identically(
-    dummy_client, alpha_config, probe, monkeypatch,
-):
-    row = _raw_row(
+def _every_field_group_row() -> dict:
+    """The raw row :data:`EVERY_FIELD_GROUP_WIRE` is shaped from."""
+    return _raw_row(
         1, 'in-progress',
         dependencies=['2', '3'],
         claimant_run_id='run-1/sess-1/pid=42',
@@ -177,8 +178,13 @@ async def test_a_reused_render_serialises_byte_identically(
             'external_deps': ['beta:5'],
         },
     )
+
+
+async def test_a_reused_render_serialises_byte_identically(
+    dummy_client, alpha_config, probe, monkeypatch,
+):
     alpha = CannedMCP(
-        rows=[row, _raw_row(2, 'pending')],
+        rows=[_every_field_group_row(), _raw_row(2, 'pending')],
         status_map={1: 'in-progress', 2: 'pending', 3: 'done'},
     )
     _serve(monkeypatch, {'alpha': alpha, 'beta': CannedMCP(status_map={5: 'done'})})
@@ -195,6 +201,87 @@ async def test_a_reused_render_serialises_byte_identically(
         return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
 
     assert wire(served) == wire(EVERY_FIELD_GROUP_WIRE)
+
+
+def _vandalise(value) -> None:
+    """Mutate every container nested in *value*, as a careless consumer of a row might."""
+    if isinstance(value, list):
+        for item in value:
+            _vandalise(item)
+        value.append('vandalised')
+    elif isinstance(value, dict):
+        for item in list(value.values()):
+            _vandalise(item)
+        value['vandalised'] = True
+
+
+async def test_a_consumer_mutating_a_row_never_reaches_a_later_render(
+    dummy_client, alpha_config, probe, monkeypatch,
+):
+    legacy_hold = LegacyUnknownDeferral(
+        deferred_at=None, stamped_at=NOW - timedelta(days=5), stamped_by='deferral-migration',
+    )
+    deferred = _raw_row(4, 'deferred', metadata={'deferral': record_to_json(legacy_hold)})
+    alpha = CannedMCP(
+        rows=[_every_field_group_row(), _raw_row(2, 'pending'), deferred],
+        status_map={1: 'in-progress', 2: 'pending', 3: 'done', 4: 'deferred'},
+    )
+    _serve(monkeypatch, {'alpha': alpha, 'beta': CannedMCP(status_map={5: 'done'})})
+    probe.answer = {'alpha': TaskRuntimeSnapshot(tasks=[_entry(1, loops=2, phase='EXECUTE')])}
+
+    async def render() -> list[dict]:
+        snapshots = await collect_tasks_with_counts(
+            dummy_client, alpha_config, resolve_external=True, now=NOW,
+        )
+        return snapshots['alpha'].rows.value or []
+
+    first = await render()
+    assert first[2]['deferral'] is not None, 'the fixture must exercise a deferral dict'
+    as_first_served = copy.deepcopy(first)
+    _vandalise(first)
+    second = await render()
+
+    _assert_one_unit(alpha)
+    assert second == as_first_served, (
+        'a consumer that mutated a row of one render changed a later render of the '
+        'same unit: some container in the row is shared across renders'
+    )
+
+
+async def test_an_unmemoisable_unit_is_judged_at_each_render_clock(
+    dummy_client, alpha_config, probe, monkeypatch,
+):
+    heartbeat = NOW - timedelta(minutes=5)
+    measured = measured_unit(rows=[{
+        'id': 1, 'title': 'task 1', 'status': 'in-progress', 'dependencies': [],
+        'metadata': {}, 'claimant_run_id': 'run-1/sess-1/pid=42',
+        'heartbeat_at': heartbeat.isoformat(),
+    }])
+    out_of_contract = dataclasses.replace(
+        measured, rows=dataclasses.replace(measured.rows, as_of=None),
+    )
+
+    async def acquire(client, config, project_root, *, now):
+        return out_of_contract
+
+    monkeypatch.setattr('dashboard.data.active_tasks.acquire_snapshot', acquire)
+    probe.answer = {'alpha': TaskRuntimeSnapshot()}
+
+    verdicts = []
+    for now in (NOW, NOW + timedelta(minutes=15)):
+        snapshots = await collect_tasks_with_counts(dummy_client, alpha_config, now=now)
+        rows = snapshots['alpha'].rows.value
+        assert rows is not None, (
+            'a unit whose rows carry no as_of was marked unmeasured: it reached '
+            'UnitRowMemo, which refuses it, instead of being shaped at the render clock'
+        )
+        verdicts.append(rows[0]['stranded'])
+
+    assert verdicts == [False, True], (
+        f'strand verdicts {verdicts}: a heartbeat live at the first render and past '
+        "the TTL at the second must change verdict, or the first render's clock "
+        'was frozen into the rows'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +329,14 @@ def test_labels_are_memoised_independently():
 
     assert memo.rows_for('alpha', alpha) is alpha_rows
     assert memo.rows_for('beta', beta) is beta_rows
+
+
+def test_a_unit_whose_rows_carry_no_as_of_is_refused():
+    unit = _unit(1)
+    out_of_contract = dataclasses.replace(unit, rows=dataclasses.replace(unit.rows, as_of=None))
+
+    with pytest.raises(ValueError, match='alpha'):
+        UnitRowMemo().rows_for('alpha', out_of_contract)
 
 
 def test_clear_forgets_every_unit():
