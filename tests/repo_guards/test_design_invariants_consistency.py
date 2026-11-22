@@ -21,8 +21,9 @@ THE FOUR PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
   * ``docs/legibility/design-invariants-fixtures.md`` — one fixture section per
     invariant, plus a rehearsal verdict table pinned for COVERAGE (never for its
     rationale prose, which the doc itself declares a point-in-time snapshot).
-  * ``skills/prd/references/gates.md`` — TWO independent enumerations: the
-    family-inventory row (ordered) and the G7 trigger-shape fallback list (set).
+  * ``skills/prd/references/gates.md`` — the G7 trigger-shape fallback list
+    (set), with the family-inventory row pinned as an ABSENCE: it points at the
+    normative doc instead of listing slugs.
   * ``orchestrator/src/orchestrator/agents/code_quality.md``
     (``docs/code-quality.md`` is a symlink to it) — a PARTIAL
     `INV-N`-to-heuristic mapping, pinned pair-wise against the normative doc,
@@ -43,7 +44,7 @@ instead, so they cannot go stale and need no guard.
 
 The ONE surviving marked span, ``inv-trigger-shapes`` in gates.md, is a pure
 DELIMITER rather than a wording pin: that file carries decoy backticked slugs
-outside both of its enumerations (`no-lockstep-duplication` discussed in prose,
+outside that list (`no-lockstep-duplication` discussed in prose,
 a `G7 waiver: <slug>` template), so the trigger-shape SET check needs an
 explicit boundary that a content heuristic could not supply. In the doc it is
 BARE — ``<!-- inv-trigger-shapes:begin -->``, no explanatory body — because /prd
@@ -259,13 +260,12 @@ def slugs_in_span(span_text: str) -> list[str]:
 
     Duplicates are deliberately NOT collapsed here. The live trigger-shape
     paragraph names one invariant twice because two distinct trigger shapes map
-    to it, while the family-inventory row must not repeat a slug at all — so
-    multiplicity is the CALLER's decision, and an extractor that de-duplicated
-    would quietly take it away from both.
+    to it, so multiplicity is the CALLER's decision, and an extractor that
+    de-duplicated would quietly take it away.
 
     Takes a span, not a whole document, precisely because slug-shaped tokens
     appear in ordinary prose too (gates.md discusses `no-lockstep-duplication` by
-    name outside both enumerations). Delimiting the span is the caller's job.
+    name outside the trigger-shape list). Delimiting the span is the caller's job.
     """
     return _SLUG_TOKEN_RE.findall(span_text)
 
@@ -276,9 +276,8 @@ def dark_factory_family_row(md_text: str) -> str:
     Loud when the row is absent or duplicated, never a ``''`` return. The row is
     matched by its LINE PREFIX rather than by content: the adjacent ``| reify |``
     row lists INV-SF slugs of exactly the same lexical shape, so any "table row
-    containing backticked slugs" heuristic would merge two projects' families
-    into a set that equals neither — and would then blame the wrong rows in its
-    diff.
+    containing backticked slugs" heuristic would read reify's family as
+    dark-factory's and blame the wrong row.
     """
     rows = [line for line in md_text.splitlines() if line.startswith(_FAMILY_ROW_PREFIX)]
     assert len(rows) == 1, (
@@ -435,8 +434,8 @@ PINNED_SITES = {
         "pinned for COVERAGE (never for its snapshot rationale prose)"
     ),
     "skills/prd/references/gates.md": (
-        "two independent enumerations — the family-inventory row (ordered) and "
-        "the `inv-trigger-shapes` G7 fallback span (set)"
+        "the `inv-trigger-shapes` G7 fallback span (set), with the "
+        "family-inventory row pinned as an absence"
     ),
     "orchestrator/src/orchestrator/agents/code_quality.md": (
         "a partial `INV-N`-to-heuristic mapping, pinned pair-wise against the "
@@ -1473,14 +1472,13 @@ def test_marked_span_fails_loudly_on_a_broken_marker(
 
 
 # ---------------------------------------------------------------------------
-# gates.md — TWO independent enumerations, pinned differently on purpose
+# gates.md — the family row pinned as an ABSENCE, the trigger-shape list as a SET
 #
-# Task 3811 (commit f29da1855b) deliberately preserved the two-site shape:
-# gates.md:181 records that collapsing them was considered and REJECTED. The
-# family-inventory row is read generically off each project's own normative doc
-# by projects that HAVE adopted one; the trigger-shape list exists precisely for
-# projects that have NOT, and is a hand-distilled illustrative set. So both are
-# pinned, but not in the same way — see the two live tests below.
+# The family-inventory row is read generically off each project's own normative
+# doc by projects that HAVE adopted one, so it is a pointer and names no slug
+# (task 7136). The trigger-shape list exists precisely for projects that have
+# NOT, and is a hand-distilled illustrative set that no pointer can replace.
+# See the two live tests below.
 # ---------------------------------------------------------------------------
 
 _GATES_TRIGGER_SPAN = "inv-trigger-shapes"
@@ -1508,8 +1506,7 @@ _SLUGS_DUPLICATED = (
 
 # A fixture table carrying BOTH project rows. The reify row's INV-SF slugs are
 # the same lexical shape as dark-factory's, so an extractor keyed on "a table row
-# with backticked slugs" would silently merge two projects' families — and the
-# merged set would then never equal either one.
+# with backticked slugs" would read reify's family as dark-factory's.
 _FAMILY_ROW_TABLE = """\
 | Project | Family |
 |---|---|
@@ -1549,8 +1546,8 @@ def test_slugs_in_span_preserves_duplicates_in_order() -> None:
 
     The live trigger-shape paragraph names `contracts-machine-checked` twice
     because two distinct trigger shapes map to that one invariant. Silently
-    de-duplicating inside the extractor would hide that from the ordered
-    family-row check, which legitimately must not tolerate a repeat.
+    de-duplicating inside the extractor would take that decision away from
+    every caller.
     """
     assert slugs_in_span(_SLUGS_DUPLICATED) == [
         "contracts-machine-checked",
@@ -1562,9 +1559,8 @@ def test_slugs_in_span_preserves_duplicates_in_order() -> None:
 def test_dark_factory_family_row_ignores_the_reify_row() -> None:
     """DECOY IMMUNITY: the sibling project's row has the same lexical shape.
 
-    Merging the two families is the failure that would not announce itself — the
-    combined set simply never equals dark-factory's, and the diff would blame the
-    wrong rows.
+    An extractor that took reify's row for dark-factory's would make the
+    absence pin report another project's family as a restatement here.
     """
     row = dark_factory_family_row(_FAMILY_ROW_TABLE)
 
@@ -1592,10 +1588,9 @@ def test_dark_factory_family_row_fails_loudly(
 ) -> None:
     """A missing or duplicated row RAISES — never returns ''.
 
-    Absent is the vacuity hazard (an empty row yields an empty slug list, and
-    empty-vs-a-real-family at least fails loudly — but empty-vs-empty would not,
-    if the family ever failed to parse too). Duplicated means one of the two rows
-    is unpinned and free to drift.
+    Absent is the vacuity hazard: an empty row names no slug, so the absence pin
+    would read green over a row that is not there. Duplicated means one of the
+    two rows is unpinned and free to drift.
 
     Both cases pin the REPR OF WHAT MATCHED rather than the rendered count. That
     repr is what makes a duplicate report actionable — it names both offending
@@ -1620,6 +1615,12 @@ def test_gates_family_row_points_at_the_normative_doc() -> None:
 
     An absence pin, like CONTRIBUTING.md's. It cannot go stale when an invariant
     is added, which is why it replaced the ordered pin over a copied slug list.
+
+    Like CONTRIBUTING.md's, it pins no pointer wording. The row names the doc
+    through *Application* above rather than by filename: a filename on the row
+    would put the adjacent reify row's slugs in the window of
+    ``test_every_doc_anchored_slug_citation_is_canonical``, which reads them as
+    phantom dark-factory citations.
     """
     text = GATES_DOC.read_text(encoding="utf-8")
     source = _repo_relative(GATES_DOC)
@@ -1633,11 +1634,6 @@ def test_gates_family_row_points_at_the_normative_doc() -> None:
         f"slug(s) {restated} (task 7136). {normative} is the single normative "
         f"copy, so a list here is one more site to update by hand on every new "
         f"invariant. Replace the copy with a pointer to {normative}."
-    )
-    assert normative in row, (
-        f"{source}: the `| dark-factory |` family-inventory row does not point at "
-        f"{normative} (task 7136): {row!r}. The row replaced its slug list with "
-        f"that pointer, so without it the row no longer says where the family is."
     )
 
 
@@ -1658,7 +1654,7 @@ def test_gates_trigger_shape_list_covers_every_invariant() -> None:
     agent executing the screening list would read "pinned as a SET ... one
     invariant deliberately appears twice" as part of the gate. The marker there
     is now bare; the delimiter is still needed, because gates.md carries decoy
-    backticked slugs outside both enumerations.
+    backticked slugs outside the list.
 
     A set still catches the defect this site has actually exhibited twice: an
     invariant added to the normative doc with no trigger shape appended here, so
