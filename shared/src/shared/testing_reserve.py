@@ -22,7 +22,6 @@ import yaml
 
 from shared.account_reserve import WorkClass, WorkKind
 from shared.config_models import UsageCapConfig
-from shared.cost_store import CostStore
 from shared.invocation_outcome import CapHit
 from shared.usage_gate import InvokeSlot, UsageGate
 
@@ -98,13 +97,13 @@ def reserve_gate(
     clock: ReserveClock,
     account_names: Sequence[str] = POOL,
     block: Mapping[str, object] | None = DEFAULT_RESERVE_BLOCK,
-    cost_store: CostStore | None = None,
     **usage_cap: object,
 ) -> UsageGate:
     """A gate over *account_names*, every one open, its reserve calendar read from *clock*.
 
     The fake tokens are in the environment only while the gate is built, so no real
-    credential is ever adopted.
+    credential is ever adopted. A cost store belongs on ``gate.attach_cost_store``,
+    the one path that records the reserve_config row; it needs a running loop.
     """
     config = UsageCapConfig.model_validate(
         {
@@ -115,16 +114,20 @@ def reserve_gate(
         }
     )
     with patch.dict(os.environ, fake_tokens(account_names)):
-        return UsageGate(config, cost_store=cost_store, reserve_clock=clock)
+        return UsageGate(config, reserve_clock=clock)
 
 
-def cap_account(gate: UsageGate, name: str) -> None:
-    """Cap *name* with no reset time, as a real CLI cap hit on it would."""
+def cap_account(gate: UsageGate, name: str, *, resets_at: datetime | None = None) -> None:
+    """Cap *name* until *resets_at* (None: unknown), as a real CLI cap hit on it would.
+
+    The gate reopens an account whose wall-clock *resets_at* has passed the next time
+    it is asked, for instance by ``await gate.wait_for_open(timeout=0)``.
+    """
     others = [acct for acct in gate.account_names if acct != name]
     lease = gate.try_lease(exclude=others, work_class=_ESSENTIAL)
     if lease is None or lease.name != name:
         raise AssertionError(f'{name} is not open: {lease!r}')
-    InvokeSlot(gate, lease).report(CapHit(reason='test cap', resets_at=None))
+    InvokeSlot(gate, lease).report(CapHit(reason='test cap', resets_at=resets_at))
 
 
 def cap_all_but_reserve(gate: UsageGate, reserve: str = RESERVE_ACCOUNT) -> None:
