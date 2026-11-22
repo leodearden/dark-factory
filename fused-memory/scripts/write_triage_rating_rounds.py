@@ -606,6 +606,39 @@ def brief_version(label: str) -> str:
     return label
 
 
+_SHA256 = re.compile(r'[0-9a-f]{64}')
+
+
+@dataclass(frozen=True)
+class RaterBrief:
+    """A rater brief: its version label (:func:`brief_version`) and the sha256 of its text."""
+
+    version: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        brief_version(self.version)
+        if _SHA256.fullmatch(self.sha256) is None:
+            raise ValueError(f'brief sha256 {self.sha256!r} is not 64 lowercase hex digits')
+
+
+BRIEF_V2_1 = RaterBrief('v2.1', BRIEF_V2_1_SHA256)
+
+
+def latest_rerate_brief(record: Mapping[str, Any]) -> RaterBrief:
+    """The brief of *record*'s latest re-rate: a scratch key's, or a corpus summary's or derivation's.
+
+    That brief is the corpus's own: assemble refuses any pair reading LOSS
+    outside the latest re-rate (:func:`refuse_loss_outside_the_latest_rerate`).
+    A corpus with no re-rate names its brief explicitly, e.g. :data:`BRIEF_V2_1`.
+    """
+    rerates = record.get('rerates') or ()
+    if not rerates:
+        raise ValueError('the record holds no re-rate, so it names no brief; a corpus without'
+                         ' one names its brief explicitly (e.g. BRIEF_V2_1)')
+    return RaterBrief(rerates[-1]['version'], rerates[-1]['brief_sha256'])
+
+
 def keyed_rerate(key: Mapping[str, Any], version: str, brief: Path = BRIEF_PATH) -> Mapping[str, Any] | None:
     """The re-rate *key* records under brief *version*; None if none.
 
