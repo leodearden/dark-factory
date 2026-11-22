@@ -12,9 +12,13 @@ own summary and detail.  :func:`pending_folded_escalations` and
 :func:`resolve_folded_escalations` read and close what a caller filed, for an
 alarm that clears itself, under the same guard.
 
-EVERY FILER'S ANCHOR MUST BE UNIQUE.  A filer that dedupes against an anchor
-somebody else keeps open never files again, and that silence is
-indistinguishable from health.  Measured: the L1 escalation watcher squatted
+EVERY FILER'S ANCHOR MUST BE UNIQUE.  Role scoping stops another ROLE's
+record under the anchor from silencing a filer, but a second filer under the
+same anchor and role would fold into the first one's open record and never
+file again, and that silence is indistinguishable from health.  Queue
+consumers outside this module also match on ``task_id`` without the role, e.g.
+``escalation/src/escalation/queue.py::EscalationQueue.dismiss_if_covered``.
+Measured before the fold was role-scoped: the L1 escalation watcher squatted
 the ``markup-tripwire`` anchor, and the tripwire filed nothing from 2026-08-16
 to 2026-08-19 while 41 rejections occurred.  So ``anchor_task_id`` is required
 and keyword-only with no default, which makes a shared anchor impossible to
@@ -147,9 +151,12 @@ def file_folded_escalation(
             Any other L0 is promoted to L1 after a delay.
         dedupe: Fold into an already-open escalation *agent_role* filed under
             *anchor_task_id* instead of filing a duplicate.  Another role's
-            pending record under the anchor is not folded into.  Pass false
-            when each record holds a distinct payload that a fold would
-            discard.
+            pending record under the anchor is not folded into.  That
+            includes the L1 the orphan reaper re-files under its own role when
+            it promotes an L0, so after a promotion each recurrence files a
+            fresh L0, which the reaper then dismisses as covered by that L1.
+            That churn is bounded and accepted.  Pass false when each record
+            holds a distinct payload that a fold would discard.
         context: The caller's description of the subject, appended to every
             emitted message, including the no-op arms.
         on_fold: Called with the existing escalation in place of the default

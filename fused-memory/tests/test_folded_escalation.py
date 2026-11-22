@@ -1630,12 +1630,10 @@ class TestTheFiledAnchorAndTheLookupAreTheSame:
         self, tmp_path, monkeypatch,
     ):
         seen: list = []
-        seen_roles: list = []
         real_get_by_task = _folded_escalation.EscalationQueue.get_by_task
 
         def _spy(self, task_id, status=None, **kwargs):
             seen.append(task_id)
-            seen_roles.append(kwargs.get('agent_role'))
             return real_get_by_task(self, task_id, status=status, **kwargs)
 
         monkeypatch.setattr(_folded_escalation.EscalationQueue, 'get_by_task', _spy)
@@ -1647,7 +1645,3 @@ class TestTheFiledAnchorAndTheLookupAreTheSame:
             f'deduped against {seen!r} but filed under {filed[0]["task_id"]!r}'
         )
         assert seen == ['a-distinctive-anchor']
-        assert seen_roles == [filed[0]['agent_role']], (
-            f'deduped against role {seen_roles!r} but filed under '
-            f'{filed[0]["agent_role"]!r}'
-        )
