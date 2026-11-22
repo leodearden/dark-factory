@@ -9578,6 +9578,8 @@ async def _run_scoped_verification_body(
             # Task 5296: a touched behavioural artifact (a skills/ script, an
             # agent-prompt SKILL.md, the root yaml) runs the registered
             # modules whose tests consume it, even when the task owns none.
+            # Idempotent: the remote task leg already receives the widened
+            # set from task_verify_dispatch.py::TaskVerifyDispatcher._scope_of.
             widened_modules = verify_plan.with_artifact_consumer_modules(
                 config, module_configs, task_files, role,
             )

@@ -1124,7 +1124,9 @@ def with_artifact_consumer_modules(
     An empty set with ``.py``/``.rs`` source in *files* stays empty: the
     fallback's configured chain already runs every suite, and widening would
     drop the source file no module owns. Merge role returns the set unchanged
-    (see :func:`_artifact_consumer_demand`).
+    (see :func:`_artifact_consumer_demand`). Idempotent, so a boundary may
+    resolve it once (``task_verify_dispatch.py::TaskVerifyDispatcher._scope_of``
+    does, for the remote spec) and the executor's own call is then a no-op.
     """
     if not module_configs and _has_source_files(files):
         return list(module_configs)

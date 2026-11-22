@@ -45,7 +45,11 @@ from orchestrator.verify import VerifyResult, run_scoped_verification
 from orchestrator.verify_admission_gate import AdmissionPlan
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 from orchestrator.verify_hosts import HostPool
-from orchestrator.verify_plan import derive_verify_plan, executed_module_prefixes
+from orchestrator.verify_plan import (
+    derive_verify_plan,
+    executed_module_prefixes,
+    with_artifact_consumer_modules,
+)
 from orchestrator.verify_runner import RunnerUnavailable
 
 if TYPE_CHECKING:
@@ -303,9 +307,13 @@ class _VerifyCall:
 
 @dataclass(frozen=True)
 class _TaskScope:
+    """*module_configs* is the task's set widened by its behavioural-artifact
+    consumers: the one set eligibility and the remote spec both use."""
+
     tip_sha: str
     base_sha: str | None
     task_files: tuple[str, ...]
+    module_configs: tuple[ModuleConfig, ...]
     executed_prefixes: frozenset[str]
 
 
@@ -648,7 +656,7 @@ class TaskVerifyDispatcher(DispatchRecords):
             if await self._git_ops.has_uncommitted_work(call.worktree):
                 return 'dirty_tree'
             spec = build_task_verify_spec(
-                call.config, call.module_configs, scope.task_files,
+                call.config, scope.module_configs, scope.task_files,
                 force_workspace=False, attempt_id=call.attempt_id,
                 task_id=call.task_id, tip_sha=scope.tip_sha,
             )
@@ -702,11 +710,14 @@ class TaskVerifyDispatcher(DispatchRecords):
         base_sha = await self._git_ops.merge_base_with_main(tip_sha)
         files = await self._task_files(call, tip_sha, base_sha)
         existing = [f for f in files if (call.worktree / f).is_file()]
+        modules = tuple(with_artifact_consumer_modules(
+            call.config, call.module_configs, files, 'task',
+        ))
         plan = derive_verify_plan(
-            existing, list(call.module_configs), call.config,
+            existing, list(modules), call.config,
             _worktree_reader(call.worktree), role='task',
         )
-        return _TaskScope(tip_sha, base_sha, files, executed_module_prefixes(plan))
+        return _TaskScope(tip_sha, base_sha, files, modules, executed_module_prefixes(plan))
 
     async def _task_files(
         self, call: _VerifyCall, tip_sha: str, base_sha: str | None,
@@ -718,7 +729,7 @@ class TaskVerifyDispatcher(DispatchRecords):
         return tuple(await self._git_ops.get_changed_files(base_sha, tip_sha))
 
     def _eligible(self, call: _VerifyCall, policy: TaskVerifyPolicy, scope: _TaskScope) -> bool:
-        collapsed = collapsed_module_overrides(call.module_configs)
+        collapsed = collapsed_module_overrides(scope.module_configs)
         for override in collapsed:
             self._warn_once(override)
         files_derivable = call.task_files is not None or scope.base_sha is not None
