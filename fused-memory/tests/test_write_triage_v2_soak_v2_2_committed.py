@@ -42,6 +42,12 @@ def _rounds() -> types.ModuleType:
 
 
 @functools.cache
+def _backfill() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'backfill_rating_shard_kinds.py',
+                              mod_name='backfill_rating_shard_kinds')
+
+
+@functools.cache
 def _score() -> types.ModuleType:
     return load_script_module(SCRIPTS / 'score_write_triage_reader.py',
                               mod_name='score_write_triage_reader')
@@ -139,6 +145,9 @@ class TestTheCommittedV22SoakReport:
 
 @pytest.mark.xdist_group('committed_v2_soak_v2_2')
 class TestTheCommittedV22Rerate:
+
+    def test_every_shard_records_the_kind_and_basis_its_fields_derive(self) -> None:
+        assert _backfill().backfilled(_key()) == _key()
 
     def test_every_round_0_double_shard_records_brief_v2_1(self) -> None:
         briefs = {spec['brief_sha256'] for spec in _key()['shards'].values()

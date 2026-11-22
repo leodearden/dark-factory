@@ -45,6 +45,12 @@ def _rounds() -> types.ModuleType:
 
 
 @functools.cache
+def _backfill() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'backfill_rating_shard_kinds.py',
+                              mod_name='backfill_rating_shard_kinds')
+
+
+@functools.cache
 def _score() -> types.ModuleType:
     return load_script_module(SCRIPTS / 'score_write_triage_reader.py',
                               mod_name='score_write_triage_reader')
@@ -203,6 +209,9 @@ class TestTheCommittedEvalSet:
 @pytest.mark.xdist_group('committed_write_triage_eval_set')
 class TestTheCommittedRerates:
     """Every re-rate the rounds key records is the one the summary reports and the verdicts rest on."""
+
+    def test_every_shard_records_the_kind_and_basis_its_fields_derive(self) -> None:
+        assert _backfill().backfilled(_key()) == _key()
 
     def test_the_summary_reports_each_keyed_rerate(self) -> None:
         assert _summary()['rerates'] == [

@@ -934,6 +934,9 @@ class TestTheV2ScriptsImportOnlyDownward:
             'write_triage_rating_rounds', 'write_triage_reader_rubric',
         }),
         ('mem0_history_at', {'mem0_history_at'}),
+        ('backfill_rating_shard_kinds', {
+            'backfill_rating_shard_kinds', 'write_triage_rating_rounds', 'write_triage_reader_rubric',
+        }),
         ('build_write_triage_v2_soak_baseline', {
             'build_write_triage_v2_soak_baseline', 'write_triage_rating_rounds',
             'write_triage_reader_rubric', 'mem0_history_at',
