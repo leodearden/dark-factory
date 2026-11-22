@@ -10,19 +10,6 @@ from __future__ import annotations
 # Canonical project identifier — single source of truth for stage2 prompt injection.
 AUTOPILOT_VIDEO_PROJECT_ID: str = 'autopilot_video'
 
-# Snapshot write paths blocked-by-design for autopilot_video.
-#
-# Two paths are blocked:
-#   1. Direct add_memory(category='temporal_facts') from recon-stage-* agents:
-#      rejected by the Layer-2 ReconSnapshotWriteRejected guard in server/tools.py.
-#   2. Graphiti async queue path: silently no-ops (memory_ids=[]) so no edge lands.
-#
-# As a result the ABSENCE of a task-count snapshot temporal_fact edge is the
-# CORRECT state for this project.  Stage 3 findings asserting that the edge is
-# missing or stale are therefore false positives and must be suppressed.
-# (evidence: memory fccfa232-16fe-404a-880a-8eca32eb974e)
-AUTOPILOT_VIDEO_SNAPSHOT_WRITES_BLOCKED: bool = True
-
 # Stage-1 task-ID "contamination ceiling" retired-by-design for autopilot_video.
 #
 # The old Stage-1 task-ID contamination ceiling (the 606 -> 610 -> 612 -> 613 ->

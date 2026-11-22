@@ -2063,8 +2063,6 @@ class TestEnumerationStatKeyValues:
     still green, silently renaming the wire format the ledger, the journal
     and the judge read. So the literal is pinned in exactly one place: here.
 
-    Mirrors test_task_count_snapshot_cadence.py's
-    ``test_prune_enumeration_ok_stat_key_value`` for the sibling stat family.
     (amendment, reviewer_comprehensive pattern-consistency finding)
     """
 
