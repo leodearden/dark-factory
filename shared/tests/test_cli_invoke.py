@@ -4161,8 +4161,9 @@ class TestRunSubprocessWatchdog:
         """Startup wedge (0 turns) is killed at startup_grace_secs, not the 12s ceiling.
 
         With startup_grace_secs=0.05 and timeout_seconds=12.0, the watchdog
-        should detect 0 turns after ~0.05s and kill fast.  Wall-clock must be
-        well under the 12s ceiling, proving the kill happened at the grace bound.
+        should detect 0 turns after ~0.05s and kill fast.  The kill decision
+        time must be well under the 12s ceiling, proving the kill happened at
+        the grace bound.
         """
         import time as _time
 
@@ -4172,6 +4173,7 @@ class TestRunSubprocessWatchdog:
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
+        snapshot_side_effect, decided_at = _kill_decision_clock()
 
         async def fake_exec(*args, **kwargs):
             return proc
@@ -4179,6 +4181,7 @@ class TestRunSubprocessWatchdog:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
+            patch('shared.cli_invoke.snapshot_process_group', side_effect=snapshot_side_effect),
             patch('shared.cli_invoke.count_transcript_turns', return_value=0),
         ):
             t0 = _time.monotonic()
@@ -4187,22 +4190,15 @@ class TestRunSubprocessWatchdog:
                 backend='claude', model='opus', timeout_seconds=12.0,
                 transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
-            wall = _time.monotonic() - t0
 
         assert result.timed_out is True, 'Expected timed_out=True for startup wedge kill'
         terminate_pg_mock.assert_called_once()
-        # Discriminates the correct ~0.05s-grace kill from the WRONG 12.0s ceiling
-        # (widened from 5.0s — task 2723). The wedge kill itself fires near the grace
-        # bound (see the "Startup wedge detected" log); wall additionally captures
-        # real post-kill teardown — an UNMOCKED snapshot_process_group /proc walk,
-        # comm_task cancellation/await, the second (SIGTERM-window) communicate()
-        # call, and event-loop scheduling — which under parallel verify/host load has
-        # been observed to drift to ~3.3s. 7.0s keeps full discriminating power
-        # against the 12.0s wrong ceiling while comfortably tolerating that teardown
-        # latency — same load-drift de-flake shape as the sibling absolute-cap-vs-
-        # idle-bound and UNREADABLE-DEGRADE tests in this class (commits
-        # f1aae9678e, fda97df621af).
-        assert wall < 7.0, f'Expected fast kill (<7s), got {wall:.3f}s — wedge not killed at grace bound'
+        assert len(decided_at) == 1, f'Expected exactly one kill decision, got {len(decided_at)}'
+        # The bounds time the kill decision, not the teardown after it, so 6.0s
+        # separates the ~0.05s grace kill from the wrong 12.0s ceiling under any load.
+        decision = decided_at[0] - t0
+        assert decision >= 0.05, f'Expected wedge kill at the 0.05s grace bound, killed too early at {decision:.3f}s'
+        assert decision < 6.0, f'Expected wedge kill at the ~0.05s grace bound, not the 12.0s ceiling ({decision:.3f}s)'
 
     async def test_none_transcript_degrades_to_ceiling_not_grace(self, tmp_path):
         """B7 conservative degrade: unreadable/absent transcript (None) must NOT trigger
