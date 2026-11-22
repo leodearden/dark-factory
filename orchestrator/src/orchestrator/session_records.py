@@ -415,7 +415,8 @@ class SessionRecord:
         ``launcher_pid`` (see ``_coerce_identity``).
     start_ts: ISO-8601 timestamp of when this record was first written.
     status: current lifecycle status; see Status.
-    exit_code: claude's exit code, populated once status is terminal.
+    exit_code: claude's exit code, populated only while status is terminal
+        (see ``set_status``).
     result_file: path to this session's result.md (T5); allocated by
         `session_registry.py::_run_launching` at launch time (``<record_dir>/RESULT_FILENAME``)
         and preserved unchanged by every later read-modify-write.
@@ -1002,6 +1003,19 @@ def read_record(slug: str, root: Path | str | None = None) -> SessionRecord:
         raise CorruptSessionRecord(f'unparseable session record at {path}') from exc
 
 
+def set_status(record: SessionRecord, status: Status) -> None:
+    """Set *record*'s status in place, keeping ``exit_code`` terminal-only.
+
+    An exit code belongs to a terminal status, so a non-terminal *status*
+    clears it, whoever wrote it: the ``exit`` subcommand or an orphan sweep.
+    A terminal *status* keeps it. Every status write in this module goes
+    through here.
+    """
+    record.status = status
+    if status not in TERMINAL_STATUSES:
+        record.exit_code = None
+
+
 def update_status(
     slug: str,
     root: Path | str | None = None,
@@ -1011,13 +1025,13 @@ def update_status(
 ) -> SessionRecord:
     """Strict read-modify-write of *status* (and optionally *exit_code*).
 
-    Raises if no record exists for *slug* -- used by the ``exit`` CLI
-    subcommand (spawn-claude.sh's ``finish()``), where a missing record
-    signals a genuine bug: the ``launching`` write should already have
-    created it moments earlier.
+    The status write goes through ``set_status``. Raises if no record exists
+    for *slug* -- used by the ``exit`` CLI subcommand (spawn-claude.sh's
+    ``finish()``), where a missing record signals a genuine bug: the
+    ``launching`` write should already have created it moments earlier.
     """
     record = read_record(slug, root=root)
-    record.status = status
+    set_status(record, status)
     if exit_code is not None:
         record.exit_code = exit_code
     write_record(record, root=root)
@@ -1115,7 +1129,9 @@ def apply_refresh(
 
     When *prior* is not None it is MUTATED AND RETURNED IN PLACE (the same
     read-modify contract ``refresh_record``/``update_status`` have always
-    had), so a caller holding the object sees the applied status. When
+    had), so a caller holding the object sees the applied status. The status
+    is applied by ``set_status``, so a non-terminal *status* also clears
+    *prior*'s ``exit_code`` and a terminal one keeps it. When
     *prior* is None a fresh, well-formed ``SessionRecord`` is synthesized
     under the same key: schema_version/session_slug/start_ts/status are
     populated and every other field is left at its documented default.
@@ -1146,9 +1162,5 @@ def apply_refresh(
             start_ts=datetime.now(UTC).isoformat(),
         )
     if status is not None:
-        if prior.status in TERMINAL_STATUSES and status not in TERMINAL_STATUSES:
-            # A live session an orphan sweep falsely stamped EXITED: leaving
-            # the terminal status voids the sweep's exit_code.
-            prior.exit_code = None
-        prior.status = status
+        set_status(prior, status)
     return prior
