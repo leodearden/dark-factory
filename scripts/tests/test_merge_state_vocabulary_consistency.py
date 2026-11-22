@@ -14,7 +14,7 @@ this guard existed:
 
   * ``skills/escalation-watcher/SKILL.md`` documented the POLL terminal set as
     ``done | conflict | blocked | already_merged`` — three defects in one line.
-    ``already_merged`` is SUBMIT-only (``_map_terminal_state`` collapses it to
+    ``already_merged`` is SUBMIT-only (``map_terminal_state`` collapses it to
     ``done``, as that same file says forty lines further down), and ``abandoned``
     and ``superseded`` were both missing even though the same file documents
     ``merge_status`` returning ``state: 'abandoned'``. The file contradicted
@@ -59,7 +59,7 @@ WHAT THIS GUARD DELIBERATELY DOES NOT PIN.
     PRD delta rewrites it, and pinning wording would go red on an editorial
     edit while a genuinely stale VALUE list stayed green.
   * The mapping between the two vocabularies. That belongs to
-    ``escalation/src/escalation/server.py::_map_terminal_state``; a copy here
+    ``escalation/src/escalation/merge_status_answer.py::map_terminal_state``; a copy here
     would be exactly the second home the normative module exists to remove.
 
 PLACEMENT IS LOAD-BEARING. ``scripts/tests/`` modules must import no first-party
@@ -214,16 +214,26 @@ def vocabulary_values(partitions: dict[str, frozenset[str]]) -> frozenset[str]:
         f"{_MINIMUM_VOCABULARY_SIZE} (task 4829). All three vocabularies are "
         f"expected; a union this small means the module was parsed but not read."
     )
+    promoted = sorted(values & _KNOWN_PHANTOM_VALUES)
+    assert not promoted, (
+        f"{promoted!r} are now real merge-state values but are still listed in "
+        f"`_KNOWN_PHANTOM_VALUES` (task 5178). Drop them from that set: a phantom "
+        f"that became a member would otherwise be reported as EXTRA in every "
+        f"correct span that names it."
+    )
     return values
 
 
-# `failed` is NOT a member of any vocabulary — it is a value
-# `skills/merge-queue/SKILL.md` and `skills/unblock-low-risk/SKILL.md` invented
-# (the real value is `error`). It is listed here anyway so that correcting those
-# files cannot accidentally start counting it.
 _AMBIGUOUS_TOKENS = frozenset(
-    {"done", "blocked", "queued", "conflict", "unknown", "error", "gate", "failed"}
+    {"done", "blocked", "queued", "conflict", "unknown", "error", "gate"}
 )
+
+# Values runbooks have invented: `failed` (the real value is `error`) and
+# `needs_rebase` (a bounce surfaces as `blocked` with a needs-rebase `reason`, see
+# orchestrator/src/orchestrator/merge_lane/worker.py::NEEDS_REBASE_REASON_PREFIX).
+# They are in neither vocabulary, so membership filtering would otherwise drop
+# them from a span silently.
+_KNOWN_PHANTOM_VALUES = frozenset({"failed", "needs_rebase"})
 
 
 def discriminating_tokens(partitions: dict[str, frozenset[str]]) -> frozenset[str]:
@@ -312,7 +322,7 @@ def _opens_inside_html_comment(lines: list[str], index: int, marker_column: int)
 
     So the question asked is "is this marker inside an unclosed ``<!--``?",
     answered over everything preceding it: the last opener wins unless a closer
-    came after it. Cheap enough to do per marker: the registry holds a handful of files.
+    came after it. Cheap enough to do per marker.
     """
     before = "\n".join([*lines[:index], lines[index][:marker_column]])
     return before.rfind("<!--") > before.rfind("-->")
@@ -330,8 +340,9 @@ def extract_spans(
     (``<!-- merge-state-vocab:begin partition=X ... -->`` … ``<!-- …:end -->``); in
     a Python docstring they are bare lines, because an HTML comment there is
     nonsense that renders literally in `--help` output and in every agent's
-    context. Four pinned sites use the first carrier and one uses the second, so a
-    scanner that handled only one would leave the other silently unpinned.
+    context. The markdown sites use the first carrier and the Python docstring
+    uses the second, so a scanner that handled only one would leave the other
+    silently unpinned.
 
     Which carrier a marker uses is decided STRUCTURALLY, by
     ``_opens_inside_html_comment`` — an opener on an earlier line counts — rather
@@ -452,14 +463,17 @@ def extract_values(body: str, vocabulary_values: frozenset[str], *, source: str 
 
     Membership filtering is what lets a span carry ordinary English (``— stop
     polling here``) without every noun becoming a phantom member. *vocabulary_values*
-    must be the union of every vocabulary — see ``vocabulary_values()``.
+    must be the union of every vocabulary — see ``vocabulary_values()``. The
+    ``_KNOWN_PHANTOM_VALUES`` survive the filter too, so a span naming one is
+    reported as EXTRA rather than silently passing.
 
     Raises rather than returning an empty set: an empty set does compare unequal to
     every partition, so the drift would be caught — but reported as "the list lost
     all five members", sending the reader to fix a list that is fine when the real
     defect is a misplaced `:end` marker.
     """
-    found = frozenset(token for token in _TOKEN_RE.findall(body) if token in vocabulary_values)
+    kept = vocabulary_values | _KNOWN_PHANTOM_VALUES
+    found = frozenset(token for token in _TOKEN_RE.findall(body) if token in kept)
     assert found, (
         f"{source}: a `merge-state-vocab` span body carries no vocabulary member at "
         f"all (task 4829). Body was {body!r}. Almost always a misplaced marker — the "
@@ -499,6 +513,15 @@ def assert_span_matches(
 
     missing = sorted(partition - values)
     extra = sorted(values - partition)
+    phantoms = sorted(set(extra) & _KNOWN_PHANTOM_VALUES)
+    phantom_clause = (
+        f" {phantoms!r} are known phantoms that no server ever returns (`failed` is "
+        f"really `error`; a bounce surfaces as `blocked` with a needs-rebase "
+        f"`reason`) — if the word is prose rather than a list entry, move it outside "
+        f"the span."
+        if phantoms
+        else ""
+    )
     assert not missing and not extra, (
         f"{source}: the `merge-state-vocab` span pinned to `{partition_name}` has "
         f"drifted from {_repo_relative(_VOCABULARY_MODULE)}::{partition_name} (task "
@@ -506,7 +529,7 @@ def assert_span_matches(
         f"partition is {sorted(partition)!r}. A MISSING value means this list did not "
         f"follow a member that landed in the enum; an EXTRA one is usually a value "
         f"from a sibling vocabulary (a submit status in a poll list, a state in the "
-        f"reason list) or one that never existed. Fix the list — the "
+        f"reason list) or one that never existed.{phantom_clause} Fix the list — the "
         f"partition is the source of truth."
     )
 
@@ -540,6 +563,16 @@ def assert_span_matches(
 # threshold is the wrong instrument here; a reviewer reading the diff is the
 # right one.
 PINNED_SITES: dict[str, tuple[tuple[str, ...], str]] = {
+    "ARCHITECTURE.md": (
+        ("LIVE_STATES", "TERMINAL_STATES", "EPISTEMIC_STATES"),
+        "§5.1 Submit/poll protocol — merge_status's live, terminal and epistemic "
+        "state lists",
+    ),
+    "OPERATIONS.md": (
+        ("SUBMIT_TERMINAL", "SUBMIT_NON_TERMINAL"),
+        "the merge-queue section's step 3 — merge_request's terminal and "
+        "non-terminal status lists",
+    ),
     "escalation/src/escalation/server.py": (
         ("CANCEL_STATES",),
         "the `merge_cancel` docstring's CANCEL_STATES span (bare markers — an HTML "
@@ -595,14 +628,12 @@ _UNPINNED_RULE_SITES = {
 # there. `test_registry_is_complete` reports each offender's count when it fires.
 _ENUMERATION_THRESHOLD = 4
 
-# BOUNDARY, deliberate and worth stating so a reader does not read it as an
-# oversight: this scan covers `skills/**` only — the domain of the registered
-# skill sites. `ARCHITECTURE.md` (~lines 700-702) and `OPERATIONS.md` (~lines 517-523)
-# each carry a further enumeration interleaving BOTH vocabularies, and
-# `skills/merge-queue/SKILL.md` documents a `needs_rebase` outcome that
-# `merge_request` never returns (it is a `suffix_graph.py` internal). Those are out
-# of task 4829's declared scope and are filed as follow-up work.
-_SKILL_MARKDOWN_PATHSPEC = "skills/*.md"
+# The scan domain: markdown under `skills/` at any depth (git's default `*` crosses
+# `/`), plus the ROOT-LEVEL operating docs (`ARCHITECTURE.md`, `OPERATIONS.md`, …;
+# `:(glob)` stops `*` at `/`). Agents and operators execute or consult these.
+# `docs/**` and `plans/**` are excluded: they hold PRDs and design records whose
+# historical value lists must not be forced into pins.
+_SCAN_PATHSPECS = ("skills/*.md", ":(glob)*.md")
 
 
 def _repo_relative(path: Path) -> str:
@@ -627,8 +658,10 @@ def _scrubbed_git_env() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
 
 
-def tracked_skill_markdown(*, root: Path = REPO_ROOT) -> list[Path]:
-    """Every TRACKED markdown file under ``skills/`` in *root*.
+def tracked_scan_markdown(*, root: Path = REPO_ROOT) -> list[Path]:
+    """Every TRACKED markdown file in *root* matching ``_SCAN_PATHSPECS``.
+
+    That is ``skills/*.md`` at any depth plus ``:(glob)*.md`` at the root only.
 
     Sourced from ``git ls-files``, never a filesystem walk: an untracked file — a
     scratch draft, a gitignored digest — must not be able to flip the registry
@@ -649,7 +682,7 @@ def tracked_skill_markdown(*, root: Path = REPO_ROOT) -> list[Path]:
     """
     try:
         completed = subprocess.run(
-            ["git", "ls-files", "-z", "--", _SKILL_MARKDOWN_PATHSPEC],
+            ["git", "ls-files", "-z", "--", *_SCAN_PATHSPECS],
             cwd=root,
             capture_output=True,
             text=True,
@@ -664,7 +697,7 @@ def tracked_skill_markdown(*, root: Path = REPO_ROOT) -> list[Path]:
         outcome = f"exited {returncode}" if returncode is not None else "could not be run"
         raise RuntimeError(
             f"the tracked-file scan of {root} failed (task 4829): `git ls-files -z -- "
-            f"{_SKILL_MARKDOWN_PATHSPEC}` {outcome} — {detail}. This scan sources its "
+            f"{' '.join(_SCAN_PATHSPECS)}` {outcome} — {detail}. This scan sources its "
             f"file list from TRACKED files only, by design, so {root} must be a git "
             f"repository (or a subdirectory of one) with `git` on PATH — there is no "
             f"filesystem-walk fallback."
@@ -697,7 +730,8 @@ def find_unregistered_sites(
     A drift guard whose site list is hand-maintained reproduces the exact defect it
     exists to prevent: it reads green while a newly written runbook restates the
     vocabulary and rots on the next member. So ``PINNED_SITES`` is not trusted — it
-    is checked against a scan of every tracked markdown file under ``skills/``.
+    is checked against a scan of every tracked markdown file under ``skills/`` and
+    at the repo root.
 
     DISTINCT tokens, not occurrences: a file discussing one state six times is
     discussing it, not enumerating the vocabulary.
@@ -708,7 +742,7 @@ def find_unregistered_sites(
     possible verdict ("every site is registered") and an over-broad pathspec would
     report it having read nothing.
     """
-    files = tracked_skill_markdown() if files is None else files
+    files = tracked_scan_markdown() if files is None else files
     registry = PINNED_SITES if registry is None else registry
     rule_sites = _UNPINNED_RULE_SITES if rule_sites is None else rule_sites
     if discriminating is None:
@@ -864,6 +898,19 @@ Terminal: `done`, `conflict`, `blocked`, `abandoned`, `superseded`, `already_mer
 _SPAN_WRONG_VOCABULARY = """\
 <!-- merge-state-vocab:begin partition=TERMINAL_STATES -->
 Terminal: `done`, `conflict`, `blocked`, `abandoned`, `superseded`, `wip_halted`
+<!-- merge-state-vocab:end -->
+"""
+
+# Values in NEITHER vocabulary that runbooks have actually named.
+_SPAN_PHANTOM_FAILED = """\
+<!-- merge-state-vocab:begin partition=TERMINAL_STATES -->
+Terminal: `done`, `conflict`, `blocked`, `abandoned`, `superseded`, `failed`
+<!-- merge-state-vocab:end -->
+"""
+
+_SPAN_PHANTOM_NEEDS_REBASE = """\
+<!-- merge-state-vocab:begin partition=TERMINAL_STATES -->
+Terminal: `done`, `conflict`, `blocked`, `abandoned`, `superseded`, `needs_rebase`
 <!-- merge-state-vocab:end -->
 """
 
@@ -1099,9 +1146,9 @@ def test_extract_spans_reads_the_markdown_comment_carrier() -> None:
 def test_extract_spans_reads_the_bare_marker_carrier_in_a_docstring() -> None:
     """Bare marker lines inside a Python docstring, where `<!-- -->` is nonsense.
 
-    Both carriers matter: four pinned sites are markdown and one is a docstring
-    in `escalation/src/escalation/server.py`, and a guard that handled only one
-    carrier would leave the other unpinned.
+    Both carriers matter: the markdown sites use HTML comments and the docstring
+    in `escalation/src/escalation/server.py` uses bare lines, and a guard that
+    handled only one carrier would leave the other unpinned.
     """
     spans = extract_spans(_DOCSTRING_SPAN, source="server.py")
 
@@ -1350,6 +1397,18 @@ def test_assert_span_matches_accepts_an_exact_match() -> None:
             id="wrong-vocabulary",
         ),
         pytest.param(
+            _SPAN_PHANTOM_FAILED,
+            "a value that never existed — the submit status the runbooks invented",
+            repr(["failed"]),
+            id="phantom-failed",
+        ),
+        pytest.param(
+            _SPAN_PHANTOM_NEEDS_REBASE,
+            "a bounce reason mistaken for a status",
+            repr(["needs_rebase"]),
+            id="phantom-needs-rebase",
+        ),
+        pytest.param(
             _SPAN_REASON_MISSING_MEMBER,
             "a reason the list forgot",
             repr(["probe_failed"]),
@@ -1556,7 +1615,7 @@ def test_find_unregistered_sites_raises_on_an_empty_scan() -> None:
         find_unregistered_sites(files=[], registry={}, threshold=4)
 
 
-def test_tracked_skill_markdown_fails_loudly_without_the_git_oracle(tmp_path: Path) -> None:
+def test_tracked_scan_markdown_fails_loudly_without_the_git_oracle(tmp_path: Path) -> None:
     """The tracked-file oracle raises when it cannot run, with no filesystem fallback.
 
     The scan's verdict must come from TRACKED files only, so that an untracked
@@ -1567,9 +1626,47 @@ def test_tracked_skill_markdown_fails_loudly_without_the_git_oracle(tmp_path: Pa
     `orchestrator/src/orchestrator/verify.py::_target_subprocess_env`.
     """
     with pytest.raises(RuntimeError) as excinfo:
-        tracked_skill_markdown(root=tmp_path)
+        tracked_scan_markdown(root=tmp_path)
 
     assert str(tmp_path) in str(excinfo.value)
+
+
+def test_tracked_scan_markdown_reads_skills_and_root_docs_only(tmp_path: Path) -> None:
+    """The scan domain is tracked markdown under `skills/` and at the repo root.
+
+    Checked against a real git index, so the domain is pinned as behaviour of git,
+    not as a pathspec string.
+    """
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            timeout=60,
+            env=_scrubbed_git_env(),
+        )
+
+    git("init", "-q")
+    tracked = [
+        "skills/a/SKILL.md",
+        "skills/a/references/ref.md",
+        "ROOT.md",
+        "docs/d.md",
+        "plans/p.md",
+        "skills/notes.txt",
+    ]
+    for relative in [*tracked, "UNTRACKED.md"]:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# fixture\n", encoding="utf-8")
+    git("add", "--", *tracked)
+
+    assert [p.relative_to(tmp_path).as_posix() for p in tracked_scan_markdown(root=tmp_path)] == [
+        "ROOT.md",
+        "skills/a/SKILL.md",
+        "skills/a/references/ref.md",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1696,7 +1793,7 @@ def test_registry_declares_only_known_partitions() -> None:
 
 
 def test_registry_is_complete() -> None:
-    """No tracked `skills/` markdown enumerates the vocabulary without being pinned.
+    """No tracked markdown in the scan domain enumerates the vocabulary unpinned.
 
     The registry is not trusted — it is checked against a scan. This is what stops
     this guard from developing the very defect it exists to prevent: a new runbook
@@ -1712,7 +1809,7 @@ def test_registry_is_complete() -> None:
             found = sorted({t for t in _TOKEN_RE.findall(text) if t in discriminating})
             detail.append(f"{label}: {len(found)} distinct — {found!r}")
         raise AssertionError(
-            "tracked `skills/` markdown enumerating >= "
+            "tracked markdown in the scan domain (`_SCAN_PATHSPECS`) enumerating >= "
             f"{_ENUMERATION_THRESHOLD} distinct discriminating merge-state values "
             f"without being registered (task 4829):\n  " + "\n  ".join(detail) + "\n"
             "Either wrap each list in a `merge-state-vocab` span and add the file to "
@@ -1720,6 +1817,25 @@ def test_registry_is_complete() -> None:
             "rather than a copy of a vocabulary — add it to _UNPINNED_RULE_SITES "
             "with the reason, as `skills/orchestrate/SKILL.md` is."
         )
+
+
+def test_every_registered_markdown_site_is_inside_the_scan_domain() -> None:
+    """If the scan cannot see a registered markdown site, the completeness check is vacuous for it.
+
+    It means the registry and the scan disagree about the domain. ARCHITECTURE.md
+    and OPERATIONS.md were in exactly that state.
+    """
+    scanned = {_scan_label(path) for path in tracked_scan_markdown()}
+    registered = [
+        label for label in (*PINNED_SITES, *_UNPINNED_RULE_SITES) if label.endswith(".md")
+    ]
+    outside = sorted(label for label in registered if label not in scanned)
+
+    assert not outside, (
+        f"{outside!r} are registered markdown sites outside the registry scan's domain "
+        f"(task 5178). Widen `_SCAN_PATHSPECS` to cover them, or the completeness check "
+        f"never looks at their directory."
+    )
 
 
 @pytest.mark.parametrize("relative_path", sorted(_UNPINNED_RULE_SITES))

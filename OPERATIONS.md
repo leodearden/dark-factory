@@ -1415,11 +1415,25 @@ worker for the same ref. Always go through `/merge-queue`:
    ```
    `wait_secs=100` is always passed explicitly — it's the server's maximum
    bounded wait, so a fast or idle-queue merge often resolves terminally in
-   this same call. A **terminal** result (`done`, `already_merged`,
-   `conflict`, `blocked`, `unknown_branch`, `failed`, `superseded`) needs no
-   further polling (except `superseded` — see below). A **non-terminal**
-   result (`queued`, `attached`) means the request was accepted as durable
-   intent; poll for it.
+   this same call. The result is one of two kinds:
+
+   <!-- merge-state-vocab:begin partition=SUBMIT_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py. -->
+   - A **terminal** result (`done`, `already_merged`, `done_wip_recovery`,
+     `conflict`, `blocked`, `unknown_branch`, `unmerged_state`,
+     `stash_failed`, `wip_halted`, `wip_recovery_no_advance`, `error`,
+     `superseded`) needs no further polling (except `superseded` — see below).
+   <!-- merge-state-vocab:end -->
+     The worker-internal outcomes among them are rare; handle all of them
+     but `done_wip_recovery` (which landed — treat it as `done`) as
+     `blocked`, per `/merge-queue` step 3.
+   <!-- merge-state-vocab:begin partition=SUBMIT_NON_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py. -->
+   - A **non-terminal** result (`queued`, `attached`) means the request was
+     accepted as durable intent; poll for it.
+   <!-- merge-state-vocab:end -->
 4. Poll `merge_status(request_id)` on a 15s→60s backoff (or the server's
    `eta_seconds` if given) until terminal. `state: "superseded"` means your
    request was absorbed into an in-flight coalesced train — poll
