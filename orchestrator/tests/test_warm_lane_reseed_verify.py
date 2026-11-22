@@ -12,9 +12,10 @@ relied on the collapse guard to catch late.
 
 Self-contained, mirroring ``test_lane_lifecycle_gitops.py`` /
 ``test_warm_lane_abort_teardown.py``: ``conftest.py`` provides no shared
-``git_repo`` fixture, so this module owns its own real-git-repo fixture +
-stub warm-lane scripts (copied verbatim from ``test_lane_lifecycle_gitops.py``)
-rather than depending on another test module's module-level helpers.
+``git_repo`` fixture, so this module owns its own real-git-repo fixture
+(seeded through ``_git_fixtures.seed_repo``) + stub warm-lane scripts (copied
+verbatim from ``test_lane_lifecycle_gitops.py``) rather than depending on
+another test module's module-level helpers.
 """
 from __future__ import annotations
 
@@ -43,7 +44,7 @@ from orchestrator.lane_lifecycle import LaneState as RecordLaneState
 from orchestrator.warm_lane_pool import LaneState as PoolLaneState
 
 # ---------------------------------------------------------------------------
-# Repo fixture (copied from test_lane_lifecycle_gitops.py — self-contained)
+# Repo fixture (seeded through _git_fixtures.seed_repo)
 # ---------------------------------------------------------------------------
 
 

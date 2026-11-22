@@ -5,8 +5,8 @@ DF consumer side of the reify activation-seam R1:
       and holds flock -s on .gen.N.lock during the cp.
 - D10: refresh_warm_base passes --landed-commit <sha> to satisfy reify's inv.9 guard.
 
-This file is self-contained (no shared conftest fixtures beyond tmp_path).
-Scaffolding patterns mirror test_warm_lane_pool.py.
+Repos come from _git_fixtures.seed_repo; scaffolding patterns mirror
+test_warm_lane_pool.py.
 """
 
 from pathlib import Path
