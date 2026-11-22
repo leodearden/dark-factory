@@ -57,9 +57,11 @@ OPENAI_PLAN_PROXY_KEY, and refused when either is unset. ``worksheet`` interleav
 every arm's edges by sha256(edge_uuid) and names no arm, for blind
 adjudication; it carries episode bodies, so it is not committed. ``score``
 validates one verdict file over every arm's edges with the audit's own
-load_verdicts, rates each arm at the 4716 cell weights with the audit's own
-estimators, and judges each lever arm against the control by the
-pre-registered rule beside OVERREACH_RATIO_MAX.
+load_verdicts, under the frame's sample.definition, rates each arm at the
+frame's cell weights (the 4716 report's, or a luna-eval frame.json's) with the
+audit's own estimators, and judges each lever arm against the control by the
+pre-registered rule beside OVERREACH_RATIO_MAX; score_replay takes another rule
+as ``decide``.
 
 Exit codes: 0 ran; 1 the LLM or graph is unavailable, or an episode failed
 (re-run to resume); 2 an input is invalid, or an arm's client cannot be built
@@ -644,29 +646,37 @@ EpisodeKey = tuple[str, str]
 
 @dataclass(frozen=True)
 class Baseline:
-    """What the score takes from the 4716 report.json: its sample, cell populations and own result."""
+    """What the score takes from the sample frame's report: its sample, cell populations and own result.
 
+    The frame is the 4716 report.json or a luna-eval frame.json (task 9945).
+    """
+
+    definition: SampleDefinition
+    """The frame's sample.definition, which its verdict file must carry."""
     sample_cells: Mapping[str, int]
     """baseline_cells of the report."""
     window_population: Mapping[str, Mapping[str, int]]
     window_days: float
-    overreach_rate_minted: Mapping[str, Any]
+    overreach_rate_minted: Mapping[str, Any] | None
+    """The report's own adjudicated rate; None for a frame no one adjudicated in production."""
 
     @classmethod
     def from_report(cls, report: Mapping[str, Any]) -> Baseline:
         sample_cells = baseline_cells(report)
         try:
+            weighted = (report.get('adjudicated') or {}).get('population_weighted')
             return cls(
+                definition=SampleDefinition.from_dict(report['sample']['definition']),
                 sample_cells=sample_cells,
                 window_population={
                     graph: {stratum: int(cell['window_population']) for stratum, cell in by_stratum.items()}
                     for graph, by_stratum in report['strata'].items()
                 },
                 window_days=float(report['sample']['window_days']),
-                overreach_rate_minted=report['adjudicated']['population_weighted']['overreach_rate_minted'],
+                overreach_rate_minted=None if weighted is None else weighted['overreach_rate_minted'],
             )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ReplayFileError(f'the baseline report lacks {exc}') from exc
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise ReplayFileError(f'the baseline report lacks {exc!r}') from exc
 
 
 def _audit_row(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -694,12 +704,14 @@ def _minted_edges(by_arm: ReplayByArm) -> dict[tuple[str, str], str]:
     return edges
 
 
-def validate_verdicts(obj: Any, by_arm: ReplayByArm, episodes: Iterable[EpisodeKey]) -> VerdictSet:
-    """load_verdicts once over every arm's edges. A replayed edge was never in a graph, so the
-    verdict load_verdicts would call stale names an edge no arm minted."""
+def validate_verdicts(
+    obj: Any, by_arm: ReplayByArm, episodes: Iterable[EpisodeKey], definition: SampleDefinition,
+) -> VerdictSet:
+    """load_verdicts once over every arm's edges, under the frame's *definition*. A replayed edge
+    was never in a graph, so the verdict load_verdicts would call stale names an edge no arm minted."""
     verdicts = load_verdicts(
         obj, expected_edges=_minted_edges(by_arm), sampled_episodes=episodes,
-        existing_edges=(), definition=SampleDefinition(),
+        existing_edges=(), definition=definition,
     )
     if verdicts.stale:
         raise OutOfSampleVerdict(
@@ -800,7 +812,7 @@ def arm_score(
         'minted': sum(len(row['minted']) for row in rows),
         'rates': {
             scope: {key: measured[key] for key in REPORTED_RATES}
-            for scope, measured in adjudicated_rates(rows, verdicts).items()
+            for scope, measured in adjudicated_rates(rows, verdicts, baseline.definition.strata).items()
         },
         'population_weighted': weighted | window_measures(
             rows, verdicts, weighted['weights'], baseline.window_days,
@@ -866,17 +878,23 @@ def fidelity(baseline: Mapping[str, Any], control: Mapping[str, Any]) -> dict[st
     }
 
 
+ArmDecision = Callable[[Mapping[str, Any], Mapping[str, Any]], dict[str, Any]]
+"""``decide(control, candidate)`` over two arms' ``population_weighted`` blocks."""
+
+
 def score_replay(
     records: Sequence[Mapping[str, Any]], verdict_obj: Any, baseline_report: Mapping[str, Any],
+    decide: ArmDecision = lever_decision,
 ) -> dict[str, Any]:
-    """Every arm scored against one verdict file, then each lever arm judged against the control."""
+    """Every arm scored against one verdict file over the frame *baseline_report* names, then
+    each other arm judged against the control by *decide*."""
     baseline = Baseline.from_report(baseline_report)
     episodes = list(dict.fromkeys((record['graph'], record['uuid']) for record in records))
     by_arm = complete_replay(records, episodes)
     if CONTROL not in by_arm:
         raise ReplayFileError(f'every arm is judged against {CONTROL!r}, which this replay lacks')
     check_worksheet(by_arm[CONTROL].values(), baseline.sample_cells)
-    verdicts = validate_verdicts(verdict_obj, by_arm, episodes)
+    verdicts = validate_verdicts(verdict_obj, by_arm, episodes, baseline.definition)
     arms = {arm: arm_score(replayed, by_arm[CONTROL], verdicts, baseline) for arm, replayed in sorted(by_arm.items())}
     control = arms[CONTROL]['population_weighted']
     return {
@@ -884,10 +902,13 @@ def score_replay(
         'verdicts': len(verdicts.verdicts),
         'arms': arms,
         'comparison': {
-            arm: lever_decision(control, scored['population_weighted'])
+            arm: decide(control, scored['population_weighted'])
             for arm, scored in arms.items() if arm != CONTROL
         },
-        'fidelity': fidelity(baseline.overreach_rate_minted, control['overreach_rate_minted']),
+        'fidelity': (
+            None if baseline.overreach_rate_minted is None
+            else fidelity(baseline.overreach_rate_minted, control['overreach_rate_minted'])
+        ),
     }
 
 
@@ -902,6 +923,12 @@ ArmClients = tuple[tuple[ReplayArm, LLMClient], ...]
 """Each selected arm with the client its ExtractionLlm names."""
 
 
+_BASELINE_REPORT_HELP = (
+    "The sample frame's report: the 4716 report.json, or a frame.json carrying sample.definition, "
+    'sample.sizes, sample.window_days and strata.<graph>.<stratum>.window_population.'
+)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='replay_overreach_extraction',
@@ -911,8 +938,8 @@ def _build_parser() -> argparse.ArgumentParser:
     replay = commands.add_parser('replay', help='Re-extract each worksheet episode under each arm.')
     replay.add_argument('--worksheet', required=True,
                         help='audit_ruling_overreach.py --emit-worksheet output (JSONL).')
-    replay.add_argument('--baseline-report', required=True,
-                        help="The 4716 report.json; the worksheet must match its sample.sizes.")
+    replay.add_argument('--baseline-report', required=True, help=_BASELINE_REPORT_HELP
+                        + ' The worksheet must match its sample.sizes.')
     replay.add_argument('--arm', action='append', required=True, choices=sorted(ARMS))
     add_graph_arguments(replay)
     replay.add_argument('--out', required=True, help='Replay JSONL; an existing file is resumed.')
@@ -924,8 +951,8 @@ def _build_parser() -> argparse.ArgumentParser:
     score.add_argument('--replay', required=True)
     score.add_argument('--verdicts', required=True,
                        help='Verdicts on every replayed edge, in audit_ruling_overreach.py format.')
-    score.add_argument('--baseline-report', required=True,
-                       help='The 4716 report.json, for its cell populations and its own rate.')
+    score.add_argument('--baseline-report', required=True, help=_BASELINE_REPORT_HELP
+                       + ' Its sample.definition, cell populations and any own rate are scored against.')
     score.add_argument('--out', required=True, help='report.json to write.')
     return parser
 

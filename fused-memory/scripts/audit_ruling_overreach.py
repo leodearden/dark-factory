@@ -696,10 +696,12 @@ def _rates_over(rows: list[Row], labels: Mapping[EdgeKey, str]) -> dict[str, Any
     }
 
 
-def adjudicated_rates(rows: Iterable[Row], verdicts: VerdictSet) -> dict[str, Any]:
-    """The esc-4639-1 measures, per stratum and rolled up under ``'all'``."""
+def adjudicated_rates(
+    rows: Iterable[Row], verdicts: VerdictSet, strata: Sequence[str] = STRATA,
+) -> dict[str, Any]:
+    """The esc-4639-1 measures, per stratum of *strata* and rolled up under ``'all'``."""
     rows, labels = list(rows), verdicts.by_edge
-    rates = {s: _rates_over([r for r in rows if r['stratum'] == s], labels) for s in STRATA}
+    rates = {s: _rates_over([r for r in rows if r['stratum'] == s], labels) for s in strata}
     rates['all'] = _rates_over(rows, labels)
     return rates
 
