@@ -53,6 +53,7 @@ from fused_memory.config.schema import (
     blank_means_inherit,
 )
 from fused_memory.llm.openai_responses import (
+    TokenUsage,
     call_openai_responses,
     endpoint_host,
     read_token_usage,
@@ -991,11 +992,15 @@ def _usage_from(
     unpriced) rather than turning a good verdict into a fail-open; the
     never-coercing rule is :func:`fused_memory.llm.openai_responses.read_token_usage`'s.
     """
-    read = read_token_usage(
+    return _judge_usage(read_token_usage(
         usage, input_field=input_field, output_field=output_field,
         details_field=details_field,
-    )
-    return JudgeUsage(*read) if read is not None else None
+    ))
+
+
+def _judge_usage(usage: TokenUsage | None) -> JudgeUsage | None:
+    """*usage* as a :class:`JudgeUsage`, field by field, so a renamed or added field raises."""
+    return JudgeUsage(**usage._asdict()) if usage is not None else None
 
 
 async def _call_llm(
@@ -1098,7 +1103,7 @@ async def _call_openai_responses(
         raise _reject(f'response incomplete ({reply.incomplete_reason})', reply.text)
     return _JudgeReply(
         reply.text or '',
-        JudgeUsage(*reply.usage) if reply.usage is not None else None,
+        _judge_usage(reply.usage),
     )
 
 
