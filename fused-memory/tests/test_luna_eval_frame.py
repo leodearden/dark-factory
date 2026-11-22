@@ -201,3 +201,229 @@ class TestTheFrame:
         assert sorted(graph.content_reads) == sorted(row['uuid'] for row in drawn.worksheet)
         paged = [cypher for cypher in graph.queries if 'SKIP' in cypher or 'count(' in cypher]
         assert paged and not any('e.content' in cypher for cypher in paged)
+
+
+# --------------------------------------------------------------------------- #
+# Graph-derived fixtures: resolve_edge and summaries (step 9)
+# --------------------------------------------------------------------------- #
+
+WINDOW = ('2026-10-01T00:00:00+00:00', '2026-11-18T00:00:00+00:00')
+BEFORE, IN_1, IN_2, IN_3 = (
+    '2026-09-20T00:00:00+00:00', '2026-10-05T00:00:00+00:00',
+    '2026-10-06T00:00:00+00:00', '2026-10-07T00:00:00+00:00',
+)
+
+
+class _Store:
+    """A whole graph served by population: RELATES_TO, Episodic, MENTIONS and Entity pages, each
+    with its census, plus episode bodies by uuid. Records every body read."""
+
+    def __init__(self, *, edges: list[list[Any]] = (), episodes: list[list[Any]] = (),
+                 mentions: list[list[Any]] = (), entities: list[list[Any]] = (),
+                 bodies: dict[str, str] | None = None) -> None:
+        self.populations = {
+            ':MENTIONS': sorted(mentions), ':RELATES_TO': sorted(edges),
+            ':Episodic': sorted(episodes), ':Entity': sorted(entities),
+        }
+        self.bodies = bodies or {}
+        self.body_reads: list[str] = []
+
+    def _population(self, cypher: str) -> list[list[Any]]:
+        match = cypher.split('RETURN')[0]
+        return next(rows for marker, rows in self.populations.items() if marker in match)
+
+    async def ro_query(self, cypher: str, params: dict[str, Any] | None = None) -> _Result:
+        if 'e.content' in cypher:
+            wanted = list(params['uuids']) if params else []
+            self.body_reads.extend(wanted)
+            return _Result([[uuid, self.bodies[uuid]] for uuid in wanted if uuid in self.bodies])
+        rows = self._population(cypher)
+        if _CENSUS_RE.search(cypher.strip()):
+            return _Result([[len(rows)]])
+        match = _SKIP_LIMIT_RE.search(cypher)
+        assert match, cypher
+        skip, limit = int(match.group(1)), int(match.group(2))
+        return _Result(rows[skip: skip + limit])
+
+    async def query(self, cypher: str, params: dict[str, Any] | None = None) -> Any:
+        raise AssertionError('the fixtures are read-only: they may never issue query()')
+
+
+def _edge(uuid: str, source: str, target: str, fact: str, created_at: str, episodes: tuple[str, ...] = ('ep-1',),
+          *, invalid_at: str | None = None) -> list[Any]:
+    """A RELATES_TO row in the order the frame projects it."""
+    return [uuid, source, target, fact, created_at, created_at, invalid_at, None, list(episodes)]
+
+
+def _store_readers(store: _Store, graph: str = DF) -> dict[str, ReadOnlyGraphReader]:
+    return {graph: ReadOnlyGraphReader(graph_name=graph, graph=store, page_size=2, resultset_size=5)}
+
+
+EPISODES = [['ep-1', IN_1, 'add_memory:temporal_facts', '2026-10-05T01:00:00+00:00']]
+
+
+def _resolve_store(*edges: list[Any]) -> _Store:
+    return _Store(edges=list(edges), episodes=EPISODES, bodies={'ep-1': 'the body of ep-1'})
+
+
+async def _resolve(store: _Store, n: int = 10, **caps: int) -> list[dict[str, Any]]:
+    return await frame_mod.resolve_edge_fixtures(_store_readers(store), WINDOW, n, **caps)
+
+
+class TestResolveEdgeFixtures:
+    @pytest.mark.asyncio
+    async def test_a_candidate_is_resolved_against_the_older_edges_between_its_pair_newest_first(self) -> None:
+        store = _resolve_store(
+            _edge('c', 'A', 'B', 'Alpha adopts Beta for the queue', IN_2),
+            _edge('s-old', 'A', 'B', 'Alpha weighs Beta', BEFORE),
+            _edge('s-new', 'A', 'B', 'Alpha trials Beta', IN_1),
+            _edge('s-later', 'A', 'B', 'Alpha drops Beta', IN_3),
+            _edge('reverse', 'B', 'A', 'Beta serves Alpha', BEFORE),
+        )
+        fixtures = await _resolve(store)
+        (fixture,) = [f for f in fixtures if f['edge_uuid'] == 'c']
+        assert [edge['uuid'] for edge in fixture['related']] == ['s-new', 's-old']
+
+    @pytest.mark.asyncio
+    async def test_siblings_are_capped(self) -> None:
+        siblings = [_edge(f's-{index}', 'A', 'B', f'fact {index}', BEFORE) for index in range(4)]
+        fixtures = await _resolve(_resolve_store(_edge('c', 'A', 'B', 'new fact', IN_2), *siblings), sibling_cap=2)
+        (fixture,) = [f for f in fixtures if f['edge_uuid'] == 'c']
+        assert len(fixture['related']) == 2
+
+    @pytest.mark.asyncio
+    async def test_an_edge_with_no_older_sibling_or_a_verbatim_one_is_skipped(self) -> None:
+        store = _resolve_store(
+            _edge('lonely', 'C', 'D', 'Gamma feeds Delta', IN_2),
+            _edge('verbatim', 'A', 'B', '  ALPHA adopts   beta ', IN_2),
+            _edge('s', 'A', 'B', 'Alpha adopts Beta', BEFORE),
+        )
+        assert [f['edge_uuid'] for f in await _resolve(store)] == []
+
+    @pytest.mark.asyncio
+    async def test_candidates_are_the_windows_edges_in_hash_order_up_to_n(self) -> None:
+        candidates = [_edge(f'c-{index}', 'A', 'B', f'new fact {index}', IN_2) for index in range(5)]
+        store = _resolve_store(*candidates, _edge('s', 'A', 'B', 'old fact', BEFORE),
+                               _edge('outside', 'A', 'B', 'too old', '2026-09-25T00:00:00+00:00'))
+        fixtures = await _resolve(store, n=3)
+        expected = sorted((f'c-{index}' for index in range(5)), key=lambda uuid: _key(DF, uuid))[:3]
+        assert [f['edge_uuid'] for f in fixtures] == expected
+
+    @pytest.mark.asyncio
+    async def test_invalidation_candidates_are_older_edges_on_either_endpoint_off_the_pair(self) -> None:
+        store = _resolve_store(
+            _edge('c', 'A', 'B', 'Alpha adopts Beta', IN_2),
+            _edge('s', 'A', 'B', 'Alpha weighs Beta', BEFORE),
+            _edge('on-a', 'A', 'X', 'Alpha uses Xi', BEFORE),
+            _edge('on-b', 'Y', 'B', 'Psi feeds Beta', BEFORE),
+            _edge('reverse', 'B', 'A', 'Beta serves Alpha', BEFORE),
+            _edge('newer', 'A', 'Z', 'Alpha needs Zeta', IN_3),
+            _edge('elsewhere', 'P', 'Q', 'Pi meets Qi', BEFORE),
+        )
+        (fixture, *_) = [f for f in await _resolve(store) if f['edge_uuid'] == 'c']
+        expected = sorted(['on-a', 'on-b', 'reverse'], key=lambda uuid: _key(DF, uuid))
+        assert [edge['uuid'] for edge in fixture['invalidation_candidates']] == expected
+
+    @pytest.mark.asyncio
+    async def test_invalidation_candidates_are_capped(self) -> None:
+        incident = [_edge(f'i-{index}', 'A', f'X{index}', f'fact {index}', BEFORE) for index in range(4)]
+        store = _resolve_store(_edge('c', 'A', 'B', 'new', IN_2), _edge('s', 'A', 'B', 'old', BEFORE), *incident)
+        (fixture, *_) = [f for f in await _resolve(store, candidate_cap=2) if f['edge_uuid'] == 'c']
+        assert len(fixture['invalidation_candidates']) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_fixture_carries_ids_facts_times_and_its_episode_but_no_body(self) -> None:
+        store = _resolve_store(_edge('c', 'A', 'B', 'Alpha adopts Beta', IN_2, ('ep-1', 'ep-2')),
+                               _edge('s', 'A', 'B', 'Alpha weighs Beta', BEFORE, invalid_at=IN_1))
+        (fixture,) = await _resolve(store)
+        assert {k: fixture[k] for k in ('graph', 'edge_uuid', 'fact', 'source_node_uuid', 'target_node_uuid')} == {
+            'graph': DF, 'edge_uuid': 'c', 'fact': 'Alpha adopts Beta', 'source_node_uuid': 'A', 'target_node_uuid': 'B',
+        }
+        assert (fixture['created_at'], fixture['valid_at'], fixture['invalid_at'], fixture['expired_at']) == (
+            IN_2, IN_2, None, None,
+        )
+        assert (fixture['episode_uuid'], fixture['episode_valid_at']) == ('ep-1', '2026-10-05T01:00:00+00:00')
+        assert fixture['related'] == [{
+            'uuid': 's', 'fact': 'Alpha weighs Beta', 'source_node_uuid': 'A', 'target_node_uuid': 'B',
+            'created_at': BEFORE, 'valid_at': BEFORE, 'invalid_at': IN_1, 'expired_at': None,
+        }]
+        assert 'the body of' not in repr(fixture) and store.body_reads == []
+
+
+def _long(prefix: str, length: int) -> str:
+    return (prefix + ' ') * (length // (len(prefix) + 1)) + 'x' * (length % (len(prefix) + 1))
+
+
+LIMIT = 4 * 500
+"""4 * graphiti_core.utils.text_utils.MAX_SUMMARY_CHARS in graphiti_core 0.28.2."""
+
+
+def _summary_store(summaries: dict[str, str], *, minted: tuple[tuple[str, str, str], ...] = (),
+                   episodes: tuple[str, ...] = ('ep-1',)) -> _Store:
+    """Each episode mentions every node in *summaries*; *minted* edges are (uuid, node, fact) of ep-1."""
+    return _Store(
+        episodes=[[uuid, IN_1, 'add_memory:temporal_facts', IN_1] for uuid in episodes],
+        mentions=[[f'm-{ep}-{node}', ep, node] for ep in episodes for node in summaries],
+        entities=[[node, f'name of {node}', summary] for node, summary in summaries.items()],
+        edges=[_edge(uuid, node, 'OTHER', fact, IN_1, ('ep-1',)) for uuid, node, fact in minted],
+        bodies={uuid: f'the body of {uuid}' for uuid in episodes},
+    )
+
+
+async def _summaries(store: _Store, n: int = 10, **kwargs: int) -> list[dict[str, Any]]:
+    return await frame_mod.summary_fixtures(_store_readers(store), WINDOW, n, **kwargs)
+
+
+class TestSummaryFixtures:
+    def test_the_threshold_is_graphitis_own_constant(self) -> None:
+        from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
+        assert frame_mod.MAX_SUMMARY_CHARS is MAX_SUMMARY_CHARS and 4 * MAX_SUMMARY_CHARS == LIMIT
+
+    @pytest.mark.asyncio
+    async def test_a_node_is_an_item_only_past_four_times_max_summary_chars(self) -> None:
+        store = _summary_store({'at-limit': _long('kept', LIMIT), 'past-limit': _long('long', LIMIT + 1)})
+        assert [item['node_uuid'] for item in await _summaries(store)] == ['past-limit']
+
+    @pytest.mark.asyncio
+    async def test_the_episodes_minted_incident_facts_count_toward_the_length(self) -> None:
+        summary = _long('base', LIMIT - 10)
+        store = _summary_store({'N': summary}, minted=(('r1', 'N', 'a fact that tips it over'),))
+        (item,) = await _summaries(store)
+        assert item['edge_uuids'] == ['r1']
+        assert item['summary_with_edges_chars'] == len(f'{summary}\na fact that tips it over'.strip())
+
+    @pytest.mark.asyncio
+    async def test_an_edge_the_episode_only_corroborates_does_not_count(self) -> None:
+        store = _summary_store({'N': _long('base', LIMIT - 10)})
+        store.populations[':RELATES_TO'] = [_edge('r1', 'N', 'OTHER', 'a long corroborated fact', IN_1, ('ep-0', 'ep-1'))]
+        assert await _summaries(store) == []
+
+    @pytest.mark.asyncio
+    async def test_at_most_nodes_per_episode_by_hash_and_at_most_n(self) -> None:
+        nodes = {f'N{index}': _long('long', LIMIT + 50) for index in range(4)}
+        store = _summary_store(nodes, episodes=('ep-1', 'ep-2', 'ep-3'))
+        items = await _summaries(store, n=5, nodes_per_episode=2)
+        assert len(items) == 5
+        by_episode: dict[str, list[str]] = {}
+        for item in items:
+            by_episode.setdefault(item['episode_uuid'], []).append(item['node_uuid'])
+        episode_order = sorted(('ep-1', 'ep-2', 'ep-3'), key=lambda uuid: _key(DF, uuid))
+        assert list(by_episode) == episode_order
+        node_order = sorted(nodes, key=lambda uuid: _key(DF, uuid))[:2]
+        assert all(chosen == node_order[: len(chosen)] for chosen in by_episode.values())
+
+    @pytest.mark.asyncio
+    async def test_an_episode_outside_the_window_offers_no_item(self) -> None:
+        store = _summary_store({'N': _long('long', LIMIT + 1)})
+        store.populations[':Episodic'] = [['ep-1', BEFORE, 'add_memory:temporal_facts', BEFORE]]
+        assert await _summaries(store) == []
+
+    @pytest.mark.asyncio
+    async def test_the_manifest_carries_ids_and_hashes_not_bodies(self) -> None:
+        summary = _long('long', LIMIT + 1)
+        (item,) = await _summaries(_summary_store({'N': summary}))
+        assert item['graph'] == DF and (item['episode_uuid'], item['node_uuid']) == ('ep-1', 'N')
+        assert item['node_name'] == 'name of N' and item['episode_valid_at'] == IN_1
+        assert item['episode_content_sha256'] == hashlib.sha256(b'the body of ep-1').hexdigest()
+        assert item['summary_sha256'] == hashlib.sha256(summary.encode()).hexdigest()
+        assert summary not in repr(item) and 'the body of' not in repr(item)
