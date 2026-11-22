@@ -5,12 +5,16 @@ import dataclasses
 import json
 import logging
 import sqlite3
+import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import orchestrator_projects
 import pytest
 from escalation.models import Escalation
 from escalation.shadow_ruling import ShadowRuling, agreement_report
+from fake_systemctl import install_fake_systemctl, systemctl_calls
 from landing_history import LandingRepo, record_merge_done, record_train
 from orchestrator.decision_registry import DecisionRecord, normalize_escalations_dir
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -26,6 +30,7 @@ NOW = datetime(2026, 9, 26, 5, 30, tzinfo=UTC)
 WINDOW = mod.Window(NOW - timedelta(days=1), NOW)
 IN_WINDOW = '2026-09-25T18:00:00+00:00'
 BEFORE_WINDOW = '2026-09-20T18:00:00+00:00'
+UNIT = 'orchestrator-dark-factory.service'
 
 _RUNS_SCHEMA = """
 CREATE TABLE events (
@@ -41,6 +46,10 @@ CREATE TABLE invocations (
 CREATE TABLE task_results (
     run_id TEXT NOT NULL, task_id TEXT NOT NULL, project_id TEXT NOT NULL, title TEXT,
     outcome TEXT NOT NULL, completed_at TEXT, PRIMARY KEY (run_id, task_id)
+);
+CREATE TABLE scheduler_state (
+    project_id TEXT PRIMARY KEY, pause_reason TEXT NOT NULL, pause_at TEXT NOT NULL, set_by_run_id TEXT NOT NULL,
+    ewa_value REAL, pause_class TEXT, hold_owner TEXT, expires_at TEXT
 );
 """
 
@@ -631,6 +640,130 @@ class TestCrossProject:
     def test_a_naive_now_is_still_a_configuration_error(self, df, tmp_path):
         with pytest.raises(ValueError, match='aware'):
             mod.measure_projects([df], _pending(tmp_path=tmp_path), window=WINDOW, now=NOW.replace(tzinfo=None))
+
+
+def _units(root: Path, probe: Callable[[str], str], *, problems: tuple[str, ...] = ()) -> mod.OrchestratorUnits:
+    scan = orchestrator_projects.UnitScan(roots={root.resolve(): (UNIT,)}, problems=problems)
+    return mod.OrchestratorUnits(scan=scan, active_state=probe)
+
+
+def _pause(runs_db: Path, reason: str) -> None:
+    conn = sqlite3.connect(runs_db)
+    try:
+        conn.execute("INSERT INTO scheduler_state (project_id, pause_reason, pause_at, set_by_run_id) "
+                     "VALUES ('dark_factory', ?, ?, 'r1')", (reason, IN_WINDOW))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestSystemctlActiveState:
+    def test_returns_the_printed_state_of_the_user_unit(self, tmp_path, monkeypatch):
+        calls = install_fake_systemctl(tmp_path / 'bin', monkeypatch, {UNIT: 'active'})
+
+        assert mod.systemctl_active_state(UNIT) == 'active'
+        assert systemctl_calls(calls) == [['--user', 'show', '--property=ActiveState', '--value', UNIT]]
+
+    def test_a_failing_systemctl_raises(self, tmp_path, monkeypatch):
+        install_fake_systemctl(tmp_path / 'bin', monkeypatch, {UNIT: 'active'}, exit_code=1)
+
+        with pytest.raises(subprocess.CalledProcessError):
+            mod.systemctl_active_state(UNIT)
+
+    def test_a_missing_binary_raises(self, tmp_path, monkeypatch):
+        empty = tmp_path / 'empty-path'
+        empty.mkdir()
+        monkeypatch.setenv('PATH', str(empty))
+
+        with pytest.raises(OSError):
+            mod.systemctl_active_state(UNIT)
+
+
+class TestUnitActive:
+    @pytest.mark.parametrize(('state', 'active'), [('active', True), ('reloading', True), ('inactive', False),
+                                                   ('failed', False)])
+    def test_the_units_state_decides(self, df, state, active):
+        measurement = mod.unit_active(df, _units(df, {UNIT: state}.__getitem__), now=NOW)
+
+        assert (measurement.value, measurement.status) == (active, 'ok')
+        assert UNIT in measurement.source
+        assert measurement.measured_at == NOW.isoformat()
+
+    def test_a_root_no_unit_names_is_not_active_and_carries_the_scan_problems(self, df, tmp_path):
+        other = tmp_path / 'src' / 'reify'
+        other.mkdir(parents=True)
+        problems = ('/units/orchestrator-x.service: no ExecStart',)
+
+        measurement = mod.unit_active(other, _units(df, {UNIT: 'active'}.__getitem__, problems=problems), now=NOW)
+
+        assert (measurement.value, measurement.status) == (False, 'ok')
+        assert 'no orchestrator unit' in measurement.source
+        assert [gap.reason for gap in measurement.shortfalls] == list(problems)
+
+    def test_a_probe_that_raises_is_unreadable_naming_the_unit_and_exception(self, df):
+        def probe(_unit: str) -> str:
+            raise subprocess.CalledProcessError(1, ['systemctl'])
+
+        measurement = mod.unit_active(df, _units(df, probe), now=NOW)
+
+        assert measurement.status == 'unreadable'
+        (gap,) = measurement.shortfalls
+        assert gap.path == UNIT
+        assert 'CalledProcessError' in gap.reason
+
+
+class TestSchedulerPause:
+    def test_a_pause_row_is_its_reason(self, df):
+        _pause(mod.runs_db_path(df), 'cost ceiling reached')
+
+        measurement = mod.scheduler_pause(mod.runs_db_path(df), now=NOW)
+
+        assert (measurement.value, measurement.status) == ('cost ceiling reached', 'ok')
+
+    def test_no_row_is_none(self, df):
+        measurement = mod.scheduler_pause(mod.runs_db_path(df), now=NOW)
+
+        assert (measurement.value, measurement.status) == (None, 'ok')
+
+    def test_a_runs_db_without_the_table_is_unreadable(self, tmp_path):
+        runs_db = tmp_path / 'runs.db'
+        conn = sqlite3.connect(runs_db)
+        conn.execute('CREATE TABLE events (id INTEGER)')
+        conn.close()
+
+        assert mod.scheduler_pause(runs_db, now=NOW).status == 'unreadable'
+
+    def test_a_missing_runs_db_is_source_missing(self, tmp_path):
+        runs_db = tmp_path / 'absent' / 'runs.db'
+
+        assert mod.scheduler_pause(runs_db, now=NOW).status == 'source_missing'
+        assert not runs_db.parent.exists()
+
+
+class TestNewEscalations:
+    def test_counts_records_filed_in_the_window_in_either_tier_at_any_level_and_status(self, df):
+        queue = df / 'data' / 'escalations'
+        _write_escalation(queue, id='esc-20-1', level=0, timestamp=IN_WINDOW)
+        _resolved(queue, 'esc-21-1', subdir='archive', timestamp=IN_WINDOW)
+        _write_escalation(queue, id='esc-22-1', level=2, timestamp=BEFORE_WINDOW)
+
+        measurement = mod.new_escalations([str(queue)], WINDOW, now=NOW)
+
+        assert (measurement.value, measurement.status, measurement.shortfalls) == (2, 'ok', ())
+
+    def test_an_unparsable_record_is_a_shortfall_on_an_ok_measurement(self, df):
+        queue = df / 'data' / 'escalations'
+        (queue / 'esc-99-1.json').write_text('{not json')
+
+        measurement = mod.new_escalations([str(queue)], WINDOW, now=NOW)
+
+        assert (measurement.value, measurement.status) == (0, 'ok')
+        assert [gap.path for gap in measurement.shortfalls] == [str(queue / 'esc-99-1.json')]
+
+    def test_no_existing_queue_is_source_missing(self, tmp_path):
+        measurement = mod.new_escalations([str(tmp_path / 'nowhere')], WINDOW, now=NOW)
+
+        assert (measurement.value, measurement.status) == (0, 'source_missing')
 
 
 class TestReadOnly:
