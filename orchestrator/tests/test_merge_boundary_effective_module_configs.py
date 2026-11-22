@@ -48,6 +48,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, VerifyScript
+from _verify_cache_fixtures import TEST_CODE
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
 from test_merge_queue_store import NINE_PREFIXES
 from test_verify_merge_flake_suppression import (
@@ -70,7 +71,7 @@ from orchestrator.merge_lane.queue_store import MergeQueueStore, reconstruct_mer
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
 from orchestrator.verify import VerifyResult
-from orchestrator.verify_cache.registry import registry_db_path
+from orchestrator.verify_cache.registry import Registry
 from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_cmd import parse_config_command
 from orchestrator.verify_evidence import UnitOutcome, UnitTier, VerifyUnit, module_leg_name
@@ -1092,8 +1093,8 @@ class TestRehydratedRequestVerifiesAsWideAsItsOriginal:
 class _CapturingVerifier(FakeVerifier):
     """A ``FakeVerifier`` whose scoped verify passes and also keeps every call's options."""
 
-    def __init__(self) -> None:
-        super().__init__(VerifyScript(result=_passing_result()))
+    def __init__(self, verify_cache: CacheAccess | None = None) -> None:
+        super().__init__(VerifyScript(result=_passing_result()), verify_cache=verify_cache)
         self.scoped_options: list[dict[str, Any]] = []
 
     async def run_scoped(
@@ -1130,24 +1131,35 @@ class TestMergeBoundaryJoinsTheVerifyCache:
             merge_sha=_MERGE_SHA, verifier=verifier, history_leg_command=history_leg_command,
         )
 
+    @staticmethod
+    def _access(tmp_path: Path) -> CacheAccess:
+        return CacheAccess(registry=Registry(tmp_path / 'verify_cache.db'), orchestrator_code=TEST_CODE)
+
     @pytest.mark.asyncio
-    async def test_the_local_gate_verifies_through_the_dispatchers_registry(self, tmp_path: Path):
+    async def test_the_local_gate_verifies_through_the_access_its_verifier_holds(self, tmp_path: Path):
+        req, merge_wt = self._req(tmp_path)
+        access = self._access(tmp_path)
+        verifier = _CapturingVerifier(verify_cache=access)
+
+        assert await self._drive(tmp_path, req, merge_wt, verifier) is None
+
+        (options,) = verifier.scoped_options
+        assert options['verify_cache'] is access
+
+    @pytest.mark.asyncio
+    async def test_a_verifier_holding_no_access_keeps_the_local_gate_outside_the_cache(self, tmp_path: Path):
         req, merge_wt = self._req(tmp_path)
         verifier = _CapturingVerifier()
 
         assert await self._drive(tmp_path, req, merge_wt, verifier) is None
 
-        (options,) = verifier.scoped_options
-        access = options['verify_cache']
-        assert isinstance(access, CacheAccess)
-        assert access.registry is not None
-        assert (await access.registry.summary()).path == registry_db_path(req.config.project_root)
-        assert access.orchestrator_code is None
+        assert verifier.scoped_options
+        assert [options for options in verifier.scoped_options if options.get('verify_cache') is not None] == []
 
     @pytest.mark.asyncio
     async def test_the_history_leg_stays_outside_the_cache(self, tmp_path: Path):
         req, merge_wt = self._req(tmp_path)
-        verifier = _CapturingVerifier()
+        verifier = _CapturingVerifier(verify_cache=self._access(tmp_path))
 
         assert await self._drive(tmp_path, req, merge_wt, verifier, history_leg_command='true') is None
 
@@ -1156,7 +1168,7 @@ class TestMergeBoundaryJoinsTheVerifyCache:
     @pytest.mark.asyncio
     async def test_the_placeholder_runner_stays_outside_the_cache(self, tmp_path: Path):
         req, merge_wt = self._req(tmp_path)
-        verifier = _CapturingVerifier()
+        verifier = _CapturingVerifier(verify_cache=self._access(tmp_path))
         runner = placeholder_local_runner(merge_wt, req, verifier)
 
         await runner.run_merge_verify(_MERGE_SHA, build_merge_verify_spec(req.config, req.module_configs, None))

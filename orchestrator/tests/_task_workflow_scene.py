@@ -14,6 +14,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.workflow import TaskWorkflow
 
 SCENE_TASK_ID = '42'
@@ -51,6 +52,7 @@ def task_scene_config(tmp_path: Path) -> OrchestratorConfig:
 
 async def task_workflow(
     config: OrchestratorConfig, git_ops: GitOps, store: EventStore, monkeypatch: pytest.MonkeyPatch,
+    *, verify_cache: CacheAccess | None = None,
 ) -> TaskWorkflow:
     worktree = await git_ops.create_worktree(SCENE_TASK_ID)
     workflow = TaskWorkflow(
@@ -64,7 +66,7 @@ async def task_workflow(
         ),
         config=config, git_ops=git_ops,
         scheduler=MagicMock(), briefing=MagicMock(), mcp=MagicMock(),
-        event_store=store,
+        event_store=store, verify_cache=verify_cache,
     )
     workflow.worktree = worktree.path
     workflow._base_commit = worktree.base_commit
@@ -79,9 +81,10 @@ async def task_workflow(
 
 async def forked_task_workflow(
     config: OrchestratorConfig, git_ops: GitOps, store: EventStore, monkeypatch: pytest.MonkeyPatch,
+    *, verify_cache: CacheAccess | None = None,
 ) -> TaskWorkflow:
     """A task branch with one commit of its own, forked one commit behind main's tip."""
-    workflow = await task_workflow(config, git_ops, store, monkeypatch)
+    workflow = await task_workflow(config, git_ops, store, monkeypatch, verify_cache=verify_cache)
     assert workflow.worktree is not None
     scene_commit(workflow.worktree, 'task_change.py')
     scene_commit(config.project_root, 'main_change.py')
