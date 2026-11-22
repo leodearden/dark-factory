@@ -8,6 +8,7 @@ from fused_memory.utils.mem0_content_keys import (
     MEM0_CONTENT_KEYS,
     MEM0_TEXT_KEY,
     mem0_payload_text,
+    payload_without_text,
 )
 
 
@@ -53,3 +54,23 @@ class TestMem0PayloadText:
         payload = types.MappingProxyType({'memory': 'hello from memory'})
 
         assert mem0_payload_text(payload) == 'hello from memory'
+
+
+class TestPayloadWithoutText:
+    def test_drops_exactly_the_content_keys(self):
+        payload = {'data': 'd', 'memory': 'm', 'content': 'c', 'category': 'x', 'agent_id': 'a'}
+
+        assert payload_without_text(payload) == {'category': 'x', 'agent_id': 'a'}
+
+    def test_returns_a_new_dict_and_leaves_the_input_unmutated(self):
+        payload = {'data': 'd', 'category': 'x'}
+
+        stripped = payload_without_text(payload)
+        stripped['extra'] = 1
+
+        assert payload == {'data': 'd', 'category': 'x'}
+
+    def test_a_payload_without_text_keys_is_copied_whole(self):
+        payload = types.MappingProxyType({'category': 'x'})
+
+        assert payload_without_text(payload) == {'category': 'x'}

@@ -69,7 +69,7 @@ class TestScanMemoryContentTool:
             needles=None,
             filters=None,
             exhaustive=False,
-            limit=None,
+            limit=1000,
         )
 
     @pytest.mark.asyncio
@@ -144,6 +144,72 @@ class TestScanMemoryContentTool:
         await server._tool_manager.call_tool('scan_memory_content', {'project_id': _PROJECT_ID})
 
         assert mock_service.scan_memory_content.call_args.kwargs['needles'] is None
+
+    @pytest.mark.asyncio
+    async def test_an_omitted_limit_walks_at_most_1000_records(self):
+        """The same default as get_memories_by_metadata: it bounds the walk,
+        and so the number of matches, since matches <= walked <= limit."""
+        mock_service = AsyncMock()
+        mock_service.scan_memory_content = AsyncMock(return_value=_EMPTY_RESULT)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'scan_memory_content', {'project_id': _PROJECT_ID}
+        )
+
+        assert mock_service.scan_memory_content.call_args.kwargs['limit'] == 1000
+        assert result['limit'] == 1000
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_null_limit_walks_to_the_end(self):
+        mock_service = AsyncMock()
+        mock_service.scan_memory_content = AsyncMock(return_value=_EMPTY_RESULT)
+        server = create_mcp_server(mock_service)
+
+        await server._tool_manager.call_tool(
+            'scan_memory_content', {'project_id': _PROJECT_ID, 'limit': None}
+        )
+
+        assert mock_service.scan_memory_content.call_args.kwargs['limit'] is None
+
+    @pytest.mark.asyncio
+    async def test_a_match_echoes_its_metadata_without_the_text_keys(self):
+        """The text is already in ``excerpt``, and get_memory_by_id returns
+        the full body, so echoing it again in ``metadata`` is pure bulk."""
+        service_match = {
+            'id': 'mem-1',
+            'created_at': '2026-07-27T00:00:00Z',
+            'matched_fragments': ['needle'],
+            'excerpt': 'a needle in prose',
+            'metadata': {
+                'data': 'a needle in prose ' * 500,
+                'memory': 'm',
+                'content': 'c',
+                'category': 'procedural_knowledge',
+                'agent_id': 'a',
+                'created_at': '2026-07-27T00:00:00Z',
+            },
+        }
+        service_result = {'matches': [service_match], 'scanned': 1, 'truncated': False}
+        mock_service = AsyncMock()
+        mock_service.scan_memory_content = AsyncMock(return_value=service_result)
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool(
+            'scan_memory_content', {'project_id': _PROJECT_ID, 'needles': ['needle']}
+        )
+
+        [match] = result['matches']
+        assert match['metadata'] == {
+            'category': 'procedural_knowledge',
+            'agent_id': 'a',
+            'created_at': '2026-07-27T00:00:00Z',
+        }
+        for key in ('id', 'created_at', 'matched_fragments', 'excerpt'):
+            assert match[key] == service_match[key], key
+        assert set(service_match['metadata']) == {
+            'data', 'memory', 'content', 'category', 'agent_id', 'created_at',
+        }, 'the service result must not be mutated'
 
     @pytest.mark.asyncio
     async def test_invalid_project_id_returns_validation_error_without_calling_service(self):
