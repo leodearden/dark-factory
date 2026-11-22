@@ -18,10 +18,10 @@ import dataclasses
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _steward_helpers import _make_escalation, _make_result, _sole_invocation_end_data
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
 from shared.testing import make_gate_mock
-from test_steward import _make_escalation, _make_result, _sole_invocation_end_data
 
 from orchestrator.agents.steward_digest import EarlierAttempts
 from orchestrator.workflow_types import PublishedStewardOutcome, StewardResolved

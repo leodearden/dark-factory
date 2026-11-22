@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
+from _steward_helpers import _make_escalation, _make_result, _sole_invocation_end_data
 from escalation import archive
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -35,24 +36,6 @@ from orchestrator.workflow_types import (
     StewardReescalatedL1,
     StewardResolved,
 )
-
-
-def _sole_invocation_end_data(emit_mock) -> dict:
-    """Return the ``data`` payload of the single ``invocation_end`` emit.
-
-    task η: ``_invoke_with_session`` now emits a ``routing_decision`` event
-    before the ``invocation_end`` event, so a bare ``emit.assert_called_once()``
-    no longer holds. Filter to the ``invocation_end`` call (asserting it fired
-    exactly once) rather than relaxing to the last-call heuristic.
-    """
-    calls = [
-        c for c in emit_mock.call_args_list
-        if c.args and c.args[0] == EventType.invocation_end
-    ]
-    assert len(calls) == 1, (
-        f'expected exactly one invocation_end emit; got {emit_mock.call_args_list!r}'
-    )
-    return calls[0].kwargs['data']
 
 
 def _attach_invoke_slot(gate: MagicMock) -> MagicMock:
@@ -156,26 +139,6 @@ def mock_briefing(steward):
     return steward.briefing
 
 
-def _make_result(
-    cost=1.0, turns=5, session_id='sess-abc', success=True,
-    duration_ms=5000, stderr='', timed_out=False, subtype='',
-    ended_awaiting_background=False,
-):
-    from shared.cli_invoke import AgentResult
-    return AgentResult(
-        success=success,
-        output='done',
-        stderr=stderr,
-        cost_usd=cost,
-        duration_ms=duration_ms,
-        turns=turns,
-        session_id=session_id,
-        timed_out=timed_out,
-        subtype=subtype,
-        ended_awaiting_background=ended_awaiting_background,
-    )
-
-
 def _make_capped_result(session_id='sess-capped', cost=1.0):
     from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
     from shared.cli_invoke import AgentResult
@@ -188,19 +151,6 @@ def _make_capped_result(session_id='sess-capped', cost=1.0):
         turns=1,
         session_id=session_id,
     )
-
-
-def _make_escalation(**overrides):  # type: ignore[no-untyped-def]
-    defaults: dict = dict(
-        id='esc-42-1',
-        task_id='42',
-        agent_role='orchestrator',
-        severity='blocking',
-        category='limit_exhausted',
-        summary='execute limit exhausted',
-    )
-    defaults.update(overrides)
-    return Escalation(**defaults)  # type: ignore[arg-type]
 
 
 def _assert_cap_fire_pops_counters(steward, esc_id, mock_invoke):  # type: ignore[no-untyped-def]
