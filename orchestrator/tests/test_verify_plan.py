@@ -28,6 +28,20 @@ from _serial_recovery_helpers import (
     ROOT_SHAPED_PYPROJECT,
     pyproject_with_addopts,
 )
+from _verify_artifact_fixtures import (
+    ARTIFACT_MODULES,
+    ARTIFACT_ORCH_MC,
+    ARTIFACT_SCRIPTS_MC,
+    ARTIFACT_TESTS_SCRIPTS_MC,
+    HOOK_SH,
+    ROOT_YAML,
+    SKILL_PROMPT_CONSUMERS,
+    SPAWN_CONSUMERS,
+    SPAWN_SH,
+    UNBLOCK_SKILL,
+    WATCHER_SKILL,
+    registry_config,
+)
 from _verify_config_corpus import (
     DASHBOARD_LINT_COMMAND,
     FM_LINT_COMMAND,
@@ -2176,65 +2190,6 @@ class TestDeriveVerifyPlanFallbackPath:
         assert 'verbatim' in run.reason
 
 
-# ---------------------------------------------------------------------------
-# Behavioural-artifact fixtures (task 5296)
-# ---------------------------------------------------------------------------
-
-# Shaped like the registered modules that own every behavioural-artifact
-# consumer test in orchestrator/src/orchestrator/verify_artifact_consumers.py.
-_ARTIFACT_ORCH_MC = ModuleConfig(
-    prefix='orchestrator',
-    test_command='uv run --directory orchestrator pytest tests/',
-    lint_command='uv run --directory orchestrator ruff check src/ tests/',
-    type_check_command='uv run --directory orchestrator pyright src/ tests/',
-)
-_ARTIFACT_SCRIPTS_MC = ModuleConfig(
-    prefix='scripts',
-    test_command='uv run --project shared pytest tests/scripts/ scripts/tests/',
-    lint_command='uv run --project shared ruff check scripts/',
-    type_check_command='uv run --project shared pyright scripts/',
-)
-_ARTIFACT_TESTS_SCRIPTS_MC = ModuleConfig(
-    prefix='tests/scripts',
-    test_command='uv run --project shared pytest tests/scripts/',
-    lint_command='uv run --project shared ruff check tests/scripts/',
-    type_check_command='uv run --project shared pyright tests/scripts/',
-)
-_ARTIFACT_MODULES = [_ARTIFACT_ORCH_MC, _ARTIFACT_SCRIPTS_MC, _ARTIFACT_TESTS_SCRIPTS_MC]
-
-_SPAWN_SH = 'skills/spawn/spawn-claude.sh'
-_HOOK_SH = 'skills/spawn/hooks/stop.sh'
-_UNBLOCK_SKILL = 'skills/unblock-auto/SKILL.md'
-_WATCHER_SKILL = 'skills/escalation-watcher-auto/SKILL.md'
-_ROOT_YAML = 'dark-factory-orchestrator.yaml'
-
-_SPAWN_CONSUMERS: dict[str, tuple[str, ...]] = {
-    'orchestrator': (
-        'orchestrator/tests/test_session_hooks.py',
-        'orchestrator/tests/test_session_hooks_bash.py',
-    ),
-    'scripts': ('scripts/tests/test_legibility_inventory.py',),
-    'tests/scripts': ('tests/scripts/test_spawn_claude.py',),
-}
-_SKILL_PROMPT_CONSUMERS = (
-    'orchestrator/tests/test_harness_watcher_supervisor.py',
-    'orchestrator/tests/test_skill_prompt.py',
-)
-
-
-def _artifact_registry_config(
-    tmp_path: Path,
-    registry: list[ModuleConfig],
-    *,
-    breadth: Literal['scoped', 'full'] = 'full',
-) -> OrchestratorConfig:
-    """A config whose module registry is *registry*, none of it passed as the
-    task's own module set: the shape of a skills-only or root-yaml task."""
-    config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth=breadth)
-    config._module_configs = {mc.prefix: mc for mc in registry}
-    return config
-
-
 def _is_trivial_plan(plan: VerifyPlan) -> bool:
     return len(plan.runs) == 1 and plan.runs[0].scope_kind is ScopeKind.TRIVIAL
 
@@ -2296,14 +2251,14 @@ class TestPlanFlags:
 
     def test_behavioural_artifact_diff_is_not_trivial_at_task_role_when_a_module_owns_its_consumers(self):
         plan = derive_verify_plan(
-            [_UNBLOCK_SKILL], [_ARTIFACT_ORCH_MC], None, fake_worktree_reader, role='task',
+            [UNBLOCK_SKILL], [ARTIFACT_ORCH_MC], None, fake_worktree_reader, role='task',
         )
         assert not _is_trivial_plan(plan)
         assert plan.needs_pipeline_guard_check is False
 
     def test_behavioural_artifact_diff_stays_trivial_at_merge_role(self):
         plan = derive_verify_plan(
-            [_UNBLOCK_SKILL], [_ARTIFACT_ORCH_MC], None, fake_worktree_reader, role='merge',
+            [UNBLOCK_SKILL], [ARTIFACT_ORCH_MC], None, fake_worktree_reader, role='merge',
         )
         assert _is_trivial_plan(plan)
         assert plan.needs_pipeline_guard_check is True
@@ -2347,7 +2302,7 @@ class TestDeriveVerifyPlanBehaviouralArtifacts:
         list_pkg_tests=None,
     ) -> VerifyPlan:
         return derive_verify_plan(
-            files, _ARTIFACT_MODULES if modules is None else modules, None, reader,
+            files, ARTIFACT_MODULES if modules is None else modules, None, reader,
             role=role, list_pkg_tests=list_pkg_tests,
         )
 
@@ -2363,45 +2318,45 @@ class TestDeriveVerifyPlanBehaviouralArtifacts:
         assert artifact in pytest_run.reason
         return pytest_run
 
-    @pytest.mark.parametrize('artifact', [_SPAWN_SH, _HOOK_SH])
+    @pytest.mark.parametrize('artifact', [SPAWN_SH, HOOK_SH])
     def test_spawn_script_runs_each_owning_modules_consumer_tests(self, artifact: str):
         plan = self._plan([artifact])
 
         assert not any(run.scope_kind is ScopeKind.TRIVIAL for run in plan.runs)
         assert executed_module_prefixes(plan) == {'orchestrator', 'scripts', 'tests/scripts'}
-        for mc in _ARTIFACT_MODULES:
+        for mc in ARTIFACT_MODULES:
             run = self._assert_consumer_only_module(plan, mc, artifact)
-            targets = _SPAWN_CONSUMERS[mc.prefix]
+            targets = SPAWN_CONSUMERS[mc.prefix]
             assert run.scope_kind is ScopeKind.FILE_SCOPED
             assert run.scoped_targets == targets
             assert mc.test_command is not None
             assert run.cmd == scope_prefix_to_keyword(mc.test_command, 'pytest', list(targets))
 
-    @pytest.mark.parametrize('artifact', [_UNBLOCK_SKILL, _WATCHER_SKILL])
+    @pytest.mark.parametrize('artifact', [UNBLOCK_SKILL, WATCHER_SKILL])
     def test_auto_skill_prompt_runs_only_the_orchestrator_prompt_loader_tests(self, artifact: str):
         plan = self._plan([artifact])
 
         assert executed_module_prefixes(plan) == {'orchestrator'}
-        run = self._assert_consumer_only_module(plan, _ARTIFACT_ORCH_MC, artifact)
+        run = self._assert_consumer_only_module(plan, ARTIFACT_ORCH_MC, artifact)
         assert run.scope_kind is ScopeKind.FILE_SCOPED
-        assert run.scoped_targets == _SKILL_PROMPT_CONSUMERS
+        assert run.scoped_targets == SKILL_PROMPT_CONSUMERS
 
     def test_root_yaml_runs_the_tests_scripts_full_suite_only(self):
-        plan = self._plan([_ROOT_YAML])
+        plan = self._plan([ROOT_YAML])
 
         assert not any(run.scope_kind is ScopeKind.TRIVIAL for run in plan.runs)
         assert executed_module_prefixes(plan) == {'tests/scripts'}
-        run = self._assert_consumer_only_module(plan, _ARTIFACT_TESTS_SCRIPTS_MC, _ROOT_YAML)
+        run = self._assert_consumer_only_module(plan, ARTIFACT_TESTS_SCRIPTS_MC, ROOT_YAML)
         assert run.scope_kind is ScopeKind.FULL_SUITE
-        assert _ARTIFACT_TESTS_SCRIPTS_MC.test_command is not None
-        assert run.cmd == parse_config_command(_ARTIFACT_TESTS_SCRIPTS_MC.test_command)
+        assert ARTIFACT_TESTS_SCRIPTS_MC.test_command is not None
+        assert run.cmd == parse_config_command(ARTIFACT_TESTS_SCRIPTS_MC.test_command)
         assert run.scoped_targets == ()
 
     def test_prose_stays_trivial(self):
         assert _is_trivial_plan(self._plan(['README.md']))
 
     def test_merge_role_is_unchanged(self):
-        plan = self._plan([_SPAWN_SH], role='merge')
+        plan = self._plan([SPAWN_SH], role='merge')
 
         assert _is_trivial_plan(plan)
         assert plan.needs_pipeline_guard_check is True
@@ -2409,27 +2364,27 @@ class TestDeriveVerifyPlanBehaviouralArtifacts:
     def test_artifact_whose_consumers_no_passed_module_owns_stays_trivial(self):
         moda = ModuleConfig(prefix='moda', test_command='uv run --project moda pytest tests/')
 
-        assert _is_trivial_plan(self._plan([_UNBLOCK_SKILL], [moda]))
+        assert _is_trivial_plan(self._plan([UNBLOCK_SKILL], [moda]))
 
     def test_consumer_tests_join_the_task_role_floor_selection(self):
         reader, list_pkg_tests = _guard_family_seams()
         plan = self._plan(
-            [*SOURCE_ONLY_DIFF, _UNBLOCK_SKILL], reader=reader, list_pkg_tests=list_pkg_tests,
+            [*SOURCE_ONLY_DIFF, UNBLOCK_SKILL], reader=reader, list_pkg_tests=list_pkg_tests,
         )
 
         run = _run_for(plan, 'orchestrator', 'pytest:')
         assert run is not None
         assert run.scope_kind is ScopeKind.FILE_SCOPED
-        assert run.scoped_targets == (*_GUARD_FAMILY, *_SKILL_PROMPT_CONSUMERS)
+        assert run.scoped_targets == (*_GUARD_FAMILY, *SKILL_PROMPT_CONSUMERS)
         assert run.reason.startswith('pytest: production module touched')
-        assert _UNBLOCK_SKILL in run.reason
+        assert UNBLOCK_SKILL in run.reason
         lint = _run_for(plan, 'orchestrator', 'lint:')
         assert lint is not None
         assert lint.scope_kind is ScopeKind.FILE_SCOPED
         assert lint.scoped_targets == tuple(SOURCE_ONLY_DIFF)
 
     def test_an_existing_full_suite_absorbs_the_demand(self):
-        plan = self._plan(['orchestrator/tests/conftest.py', _UNBLOCK_SKILL])
+        plan = self._plan(['orchestrator/tests/conftest.py', UNBLOCK_SKILL])
 
         run = _run_for(plan, 'orchestrator', 'pytest:')
         assert run is not None
@@ -2440,9 +2395,9 @@ class TestDeriveVerifyPlanBehaviouralArtifacts:
         deselected = 'import pytest\npytestmark = pytest.mark.warm_lane_bash\n\ndef test_x():\n    pass\n'
         contents = {
             'orchestrator/pyproject.toml': ORCH_SHAPED_PYPROJECT,
-            **dict.fromkeys(_SKILL_PROMPT_CONSUMERS, deselected),
+            **dict.fromkeys(SKILL_PROMPT_CONSUMERS, deselected),
         }
-        plan = self._plan([_UNBLOCK_SKILL], reader=contents.get)
+        plan = self._plan([UNBLOCK_SKILL], reader=contents.get)
 
         run = _run_for(plan, 'orchestrator', 'pytest:')
         assert run is not None
@@ -2454,22 +2409,22 @@ class TestDeriveVerifyPlanBehaviouralArtifacts:
     @pytest.mark.parametrize(
         ('files', 'modules'),
         [
-            pytest.param([_SPAWN_SH], None, id='spawn-sh'),
-            pytest.param([_HOOK_SH], None, id='hook-sh'),
-            pytest.param([_UNBLOCK_SKILL], None, id='unblock-skill'),
-            pytest.param([_WATCHER_SKILL], None, id='watcher-skill'),
-            pytest.param([_ROOT_YAML], None, id='root-yaml'),
+            pytest.param([SPAWN_SH], None, id='spawn-sh'),
+            pytest.param([HOOK_SH], None, id='hook-sh'),
+            pytest.param([UNBLOCK_SKILL], None, id='unblock-skill'),
+            pytest.param([WATCHER_SKILL], None, id='watcher-skill'),
+            pytest.param([ROOT_YAML], None, id='root-yaml'),
             pytest.param(['README.md'], None, id='prose'),
             pytest.param(
-                [_UNBLOCK_SKILL], [ModuleConfig(prefix='moda', test_command='pytest tests/')],
+                [UNBLOCK_SKILL], [ModuleConfig(prefix='moda', test_command='pytest tests/')],
                 id='unowned-consumers',
             ),
-            pytest.param([*SOURCE_ONLY_DIFF, _UNBLOCK_SKILL], None, id='source-plus-skill'),
-            pytest.param(['orchestrator/tests/conftest.py', _UNBLOCK_SKILL], None, id='conftest-plus-skill'),
+            pytest.param([*SOURCE_ONLY_DIFF, UNBLOCK_SKILL], None, id='source-plus-skill'),
+            pytest.param(['orchestrator/tests/conftest.py', UNBLOCK_SKILL], None, id='conftest-plus-skill'),
         ],
     )
     def test_is_trivial_diff_agrees_with_the_plan(self, files, modules, role):
-        mcs = _ARTIFACT_MODULES if modules is None else modules
+        mcs = ARTIFACT_MODULES if modules is None else modules
 
         assert is_trivial_diff(files, mcs, role) is _is_trivial_plan(self._plan(files, mcs, role=role))
 
@@ -2482,42 +2437,42 @@ class TestWithArtifactConsumerModules:
 
     @classmethod
     def _config(cls, tmp_path: Path, registry: list[ModuleConfig] | None = None) -> OrchestratorConfig:
-        modules = [*_ARTIFACT_MODULES, cls._DOCSMOD] if registry is None else registry
-        return _artifact_registry_config(tmp_path, modules)
+        modules = [*ARTIFACT_MODULES, cls._DOCSMOD] if registry is None else registry
+        return registry_config(modules, project_root=tmp_path)
 
     def test_a_skill_prompt_adds_the_module_owning_its_consumers(self, tmp_path):
         config = self._config(tmp_path)
 
-        assert with_artifact_consumer_modules(config, [], [_UNBLOCK_SKILL], 'task') == [_ARTIFACT_ORCH_MC]
+        assert with_artifact_consumer_modules(config, [], [UNBLOCK_SKILL], 'task') == [ARTIFACT_ORCH_MC]
 
     def test_a_spawn_script_adds_every_consumer_module_in_registry_order(self, tmp_path):
         config = self._config(tmp_path)
 
-        assert with_artifact_consumer_modules(config, [], [_SPAWN_SH], 'task') == _ARTIFACT_MODULES
+        assert with_artifact_consumer_modules(config, [], [SPAWN_SH], 'task') == ARTIFACT_MODULES
 
     def test_the_task_set_leads_and_is_never_duplicated(self, tmp_path):
         config = self._config(tmp_path)
-        own = dataclasses.replace(_ARTIFACT_ORCH_MC)
+        own = dataclasses.replace(ARTIFACT_ORCH_MC)
 
         widened = with_artifact_consumer_modules(
-            config, [own], ['orchestrator/src/x.py', _HOOK_SH], 'task',
+            config, [own], ['orchestrator/src/x.py', HOOK_SH], 'task',
         )
 
         assert widened[0] is own
-        assert widened[1:] == [_ARTIFACT_SCRIPTS_MC, _ARTIFACT_TESTS_SCRIPTS_MC]
+        assert widened[1:] == [ARTIFACT_SCRIPTS_MC, ARTIFACT_TESTS_SCRIPTS_MC]
 
     def test_unclaimed_source_keeps_the_empty_set_on_the_fallback(self, tmp_path):
         config = self._config(tmp_path)
 
-        assert with_artifact_consumer_modules(config, [], ['skills/x.py', _SPAWN_SH], 'task') == []
+        assert with_artifact_consumer_modules(config, [], ['skills/x.py', SPAWN_SH], 'task') == []
 
     def test_merge_role_is_the_identity(self, tmp_path):
         config = self._config(tmp_path)
 
-        assert with_artifact_consumer_modules(config, [], [_SPAWN_SH], 'merge') == []
+        assert with_artifact_consumer_modules(config, [], [SPAWN_SH], 'merge') == []
         assert with_artifact_consumer_modules(
-            config, [_ARTIFACT_ORCH_MC], [_SPAWN_SH], 'merge',
-        ) == [_ARTIFACT_ORCH_MC]
+            config, [ARTIFACT_ORCH_MC], [SPAWN_SH], 'merge',
+        ) == [ARTIFACT_ORCH_MC]
 
     def test_prose_adds_nothing(self, tmp_path):
         config = self._config(tmp_path)
@@ -2525,19 +2480,19 @@ class TestWithArtifactConsumerModules:
         assert with_artifact_consumer_modules(config, [], ['README.md'], 'task') == []
 
     def test_a_module_without_a_test_command_is_never_added(self, tmp_path):
-        no_tests = dataclasses.replace(_ARTIFACT_TESTS_SCRIPTS_MC, test_command=None)
-        config = self._config(tmp_path, [_ARTIFACT_ORCH_MC, no_tests, self._DOCSMOD])
+        no_tests = dataclasses.replace(ARTIFACT_TESTS_SCRIPTS_MC, test_command=None)
+        config = self._config(tmp_path, [ARTIFACT_ORCH_MC, no_tests, self._DOCSMOD])
 
-        assert with_artifact_consumer_modules(config, [], [_ROOT_YAML], 'task') == []
+        assert with_artifact_consumer_modules(config, [], [ROOT_YAML], 'task') == []
 
     def test_returns_a_new_list_without_mutating_the_argument(self, tmp_path):
         config = self._config(tmp_path)
-        passed = [_ARTIFACT_ORCH_MC]
+        passed = [ARTIFACT_ORCH_MC]
 
-        widened = with_artifact_consumer_modules(config, passed, [_SPAWN_SH], 'task')
+        widened = with_artifact_consumer_modules(config, passed, [SPAWN_SH], 'task')
 
         assert widened is not passed
-        assert passed == [_ARTIFACT_ORCH_MC]
+        assert passed == [ARTIFACT_ORCH_MC]
         unchanged = with_artifact_consumer_modules(config, passed, ['README.md'], 'task')
         assert unchanged is not passed
         assert unchanged == passed

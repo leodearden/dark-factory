@@ -106,18 +106,18 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _merge_lane_fakes import lane_scene_config, merge_through_lane
+from _verify_artifact_fixtures import (
+    ARTIFACT_MODULES,
+    ROOT_YAML,
+    SKILL_PROMPT_CONSUMERS,
+    SPAWN_CONSUMERS,
+    SPAWN_SH,
+    UNBLOCK_SKILL,
+    registry_config,
+)
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
 from test_train_integration import _SpyEventStore, build_group_merge_request, make_stacked_member
 from test_verify import _real_worktree_reader
-from test_verify_plan import (
-    _ARTIFACT_MODULES,
-    _ROOT_YAML,
-    _SKILL_PROMPT_CONSUMERS,
-    _SPAWN_CONSUMERS,
-    _SPAWN_SH,
-    _UNBLOCK_SKILL,
-    _artifact_registry_config,
-)
 from test_verify_scope_kappa import (
     _FLEET_LINT_COMMAND,
     _FLEET_TEST_COMMAND,
@@ -629,15 +629,15 @@ class TestRow3ProseOnlyTrivialBothRoles:
     @pytest.mark.parametrize(
         ('artifact', 'consumers'),
         [
-            pytest.param(_SPAWN_SH, _SPAWN_CONSUMERS, id='spawn-sh'),
-            pytest.param(_UNBLOCK_SKILL, {'orchestrator': _SKILL_PROMPT_CONSUMERS}, id='unblock-skill'),
-            pytest.param(_ROOT_YAML, {'tests/scripts': None}, id='root-yaml-full-suite'),
+            pytest.param(SPAWN_SH, SPAWN_CONSUMERS, id='spawn-sh'),
+            pytest.param(UNBLOCK_SKILL, {'orchestrator': SKILL_PROMPT_CONSUMERS}, id='unblock-skill'),
+            pytest.param(ROOT_YAML, {'tests/scripts': None}, id='root-yaml-full-suite'),
         ],
     )
     async def test_behavioural_artifact_runs_its_consumers_at_task_role(
         self, tmp_path: Path, artifact: str, consumers: dict[str, tuple[str, ...] | None],
     ) -> None:
-        config = _artifact_registry_config(tmp_path, _ARTIFACT_MODULES, breadth='scoped')
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
         files = self._write_artifact(tmp_path, artifact)
 
         result, executed, _fake = await _drive_producer(
@@ -659,7 +659,7 @@ class TestRow3ProseOnlyTrivialBothRoles:
 
     @pytest.mark.asyncio
     async def test_prose_stays_trivial_beside_a_consumer_registry(self, tmp_path: Path) -> None:
-        config = _artifact_registry_config(tmp_path, _ARTIFACT_MODULES, breadth='scoped')
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
         files = self._write_artifact(tmp_path, 'README.md')
 
         result, executed, fake = await _drive_producer(
@@ -672,8 +672,8 @@ class TestRow3ProseOnlyTrivialBothRoles:
 
     @pytest.mark.asyncio
     async def test_behavioural_artifact_stays_trivial_at_merge_role(self, tmp_path: Path) -> None:
-        config = _artifact_registry_config(tmp_path, _ARTIFACT_MODULES, breadth='scoped')
-        files = self._write_artifact(tmp_path, _SPAWN_SH)
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
+        files = self._write_artifact(tmp_path, SPAWN_SH)
 
         result, _executed, fake = await _drive_producer(
             tmp_path, config, [], task_files=files, role='merge', is_merge_verify=False,
@@ -684,11 +684,11 @@ class TestRow3ProseOnlyTrivialBothRoles:
         assert fake.await_count == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('path', [_SPAWN_SH, _UNBLOCK_SKILL, _ROOT_YAML, 'README.md'])
+    @pytest.mark.parametrize('path', [SPAWN_SH, UNBLOCK_SKILL, ROOT_YAML, 'README.md'])
     async def test_run_scoped_verification_and_verify_plan_agree_on_trivial(
         self, tmp_path: Path, path: str,
     ) -> None:
-        config = _artifact_registry_config(tmp_path, _ARTIFACT_MODULES, breadth='scoped')
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
         files = self._write_artifact(tmp_path, path)
 
         result, _executed, _fake = await _drive_producer(
