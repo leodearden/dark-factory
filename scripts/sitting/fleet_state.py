@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import sqlite3
 import statistics
+import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
@@ -33,6 +34,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Generic, Literal, TypeVar
 
+import orchestrator_projects
 from _task_db_scan import (
     runs_db_path,
     tasks_db_path,
@@ -68,9 +70,11 @@ SHADOW_ONLY = (
 )
 
 _LANDINGS_UNREADABLE = (GitUnavailable, GitTimeout, GitObjectMissing, UnrecognisedTrainEvent)
+ACTIVE_UNIT_STATES = frozenset({'active', 'reloading', 'activating'})
 
 T = TypeVar('T')
 Refusal = tuple[Status, Shortfall]
+ActiveStateProbe = Callable[[str], str]
 TrialOutcome = Literal['agreed', 'disagreed', 'no_lean', 'unanswered', 'rejected']
 
 
@@ -270,6 +274,70 @@ def landed(runs_db: Path | str, window: Window, *, now: datetime, repo: Path | s
     except _LANDINGS_UNREADABLE as exc:
         gap = Shortfall('landings', str(repo), f'{type(exc).__name__}: {exc}')
         return Measurement(0, _stamp(now), str(runs_db), 'unreadable', (gap,))
+
+
+def systemctl_active_state(unit: str) -> str:
+    """*unit*'s ActiveState as the user systemd prints it; a failed or missing ``systemctl`` raises."""
+    return subprocess.run(
+        ['systemctl', '--user', 'show', '--property=ActiveState', '--value', unit],
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout.strip()
+
+
+@dataclass(frozen=True)
+class OrchestratorUnits:
+    """The installed orchestrator units by the root their ``--config`` names, and the probe reading a unit's state."""
+
+    scan: orchestrator_projects.UnitScan
+    active_state: ActiveStateProbe
+
+
+def unit_active(root: Path | str, units: OrchestratorUnits, *, now: datetime) -> Measurement[bool]:
+    """Whether an orchestrator unit running *root* is in ``ACTIVE_UNIT_STATES``; a unit that cannot be read is named."""
+    stamp = _stamp(now)
+    resolved = Path(root).resolve()
+    names = units.scan.roots.get(resolved, ())
+    if not names:
+        problems = tuple(Shortfall('orchestrator_units', '', problem) for problem in units.scan.problems)
+        return Measurement(False, stamp, f'no orchestrator unit names {resolved}', 'ok', problems)
+    states: list[str] = []
+    failures: list[Shortfall] = []
+    for name in names:
+        try:
+            states.append(units.active_state(name))
+        except (subprocess.SubprocessError, OSError) as exc:
+            failures.append(Shortfall('orchestrator_unit', name, f'{type(exc).__name__}: {exc}'))
+    source = f'systemctl --user show {", ".join(names)}'
+    if any(state in ACTIVE_UNIT_STATES for state in states):
+        return Measurement(True, stamp, source, 'ok', tuple(failures))
+    return Measurement(False, stamp, source, 'unreadable' if failures else 'ok', tuple(failures))
+
+
+def scheduler_pause(runs_db: Path | str, *, now: datetime) -> Measurement[str | None]:
+    """The held pause reason(s) in *runs_db*'s ``scheduler_state``, or None when its scheduler is not paused."""
+    def read(conn: sqlite3.Connection) -> str | None:
+        rows = conn.execute('SELECT pause_reason FROM scheduler_state ORDER BY pause_at').fetchall()
+        return '; '.join(dict.fromkeys(reason for (reason,) in rows)) or None
+
+    unpaused: str | None = None
+    return _from_runs_db(Path(runs_db), unpaused, read, now)
+
+
+def new_escalations(queue_dirs: Iterable[str], window: Window, *, now: datetime) -> Measurement[int]:
+    """Records filed (by ``timestamp``) in *window*, root tier and archive, at any level and status."""
+    def measure(queues: Sequence[str]) -> tuple[int, tuple[Shortfall, ...]]:
+        filed = 0
+        shortfalls: list[Shortfall] = []
+        for queue in queues:
+            for path in iter_all_escalation_paths(Path(queue)):
+                esc, problem = inventory.read_escalation(path)
+                if problem is not None:
+                    shortfalls.append(problem)
+                if esc is not None and window.holds(inventory.parse_stamp(esc.timestamp)):
+                    filed += 1
+        return filed, tuple(shortfalls)
+
+    return _over_queues(queue_dirs, 0, measure, now)
 
 
 def spend_and_cap_hits(runs_db: Path | str, window: Window, *, now: datetime) -> Measurement[tuple[ModelRoleRow, ...]]:
