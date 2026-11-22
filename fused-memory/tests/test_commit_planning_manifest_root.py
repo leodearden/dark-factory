@@ -128,3 +128,70 @@ async def test_prd_family_only_in_a_worktree_is_stamped_there(
     assert reloaded['tasks'][0]['task_id'] == int(task_id)
     assert git_stdout(wt, 'status', '--porcelain') == f'M {_SIDECAR_REL}'
     assert not (main / 'plans').exists()
+
+
+def _other_repository(tmp_path: Path, main: Path, wt: Path) -> tuple[str, list[Path]]:
+    other = tmp_path / 'other'
+    other.mkdir()
+    _init_git_repo(other)
+    return str(other), [write_prd_family(other, 'foo', 'alpha')]
+
+
+def _plain_directory(tmp_path: Path, main: Path, wt: Path) -> tuple[str, list[Path]]:
+    plain = tmp_path / 'plain'
+    return str(plain), [write_prd_family(plain, 'foo', 'alpha')]
+
+
+def _missing_directory(tmp_path: Path, main: Path, wt: Path) -> tuple[str, list[Path]]:
+    return str(tmp_path / 'missing'), []
+
+
+def _relative_path(tmp_path: Path, main: Path, wt: Path) -> tuple[str, list[Path]]:
+    return 'wt', [write_prd_family(wt, 'foo', 'alpha')]
+
+
+def _worktree_subdirectory(tmp_path: Path, main: Path, wt: Path) -> tuple[str, list[Path]]:
+    sidecar = write_prd_family(wt, 'foo', 'alpha')
+    return str(wt / 'plans'), [sidecar]
+
+
+def _main_checkout_alias(tmp_path: Path, main: Path, wt: Path) -> tuple[str, list[Path]]:
+    alias = tmp_path / 'alias'
+    alias.symlink_to(main, target_is_directory=True)
+    return str(alias), [write_prd_family(main, 'foo', 'alpha')]
+
+
+@pytest.mark.parametrize(
+    ('build_case', 'reason_code'),
+    [
+        pytest.param(_other_repository, 'other_repository', id='other-repository'),
+        pytest.param(_plain_directory, 'not_a_worktree', id='plain-directory'),
+        pytest.param(_missing_directory, 'not_a_worktree', id='missing-directory'),
+        pytest.param(_relative_path, 'not_a_worktree', id='relative-path'),
+        pytest.param(_worktree_subdirectory, 'not_a_worktree', id='worktree-subdirectory'),
+        pytest.param(_main_checkout_alias, 'main_checkout', id='main-checkout-alias'),
+    ],
+)
+async def test_manifest_root_that_is_not_a_worktree_of_the_repo_is_refused(
+    tmp_path: Path, repo_layout: tuple[Path, Path], build_case: Any, reason_code: str,
+) -> None:
+    main, wt = repo_layout
+    manifest_root, sidecars = build_case(tmp_path, main, wt)
+    snapshot = {sidecar: sidecar.read_bytes() for sidecar in sidecars}
+
+    async with task_stack(main) as server:
+        task_id = await submit_planned(server, main, _producer_metadata())
+
+        result = await call(server, 'commit_planning', {
+            'project_root': str(main), 'task_ids': task_id, 'manifest_root': manifest_root,
+        })
+
+        assert result.get('error_type') == 'ManifestRootRefused', result
+        assert result['reason_code'] == reason_code, result
+        assert manifest_root in result['error']
+        assert 'manifest_stamping' not in result
+        task = await call(server, 'get_task', {'id': task_id, 'project_root': str(main)})
+        assert task['status'] == 'deferred'
+        assert 'delivered_checks' not in task['metadata']
+
+    assert {sidecar: sidecar.read_bytes() for sidecar in sidecars} == snapshot
