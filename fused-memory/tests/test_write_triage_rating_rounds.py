@@ -760,19 +760,6 @@ class TestRatingScratch:
             'attach_reask_01_primary': (1, 'opus-primary', 'reask', 'attach_time'),
         }
 
-    def test_a_shard_of_more_than_one_basis_is_refused_before_writing(self, rounds: _Rounds) -> None:
-        mod = _mod()
-        key = rounds.key()
-        before = copy.deepcopy(key)
-        entries = [mod.ShardEntry('e0', 'p1', 'current', 'df', 'child of e0', 'parent of e0'),
-                   mod.ShardEntry('e0', 'p1', 'attach_time', 'df', 'child of e0',
-                                  'parent of e0 as it read then')]
-        with pytest.raises(ValueError, match=r"reask_01_primary.*\['attach_time', 'current'\]"):
-            rounds.scratch.write_shard(key, 'reask_01_primary', entries, kind=mod.ShardKind.REASK,
-                                       role='primary', rater='opus-primary', round=1)
-        assert not (rounds.root / 'shards' / 'reask_01_primary.txt').exists()
-        assert key == before
-
     def test_add_shards_refuses_a_key_with_a_spec_lacking_its_kind_or_basis(
         self, rounds: _Rounds,
     ) -> None:
@@ -1146,6 +1133,88 @@ class TestEnsureRerate:
         assert summary['rendered_again'] == ['rerate_01_primary_00']
         assert scratch.key_path.read_bytes() == key_bytes
         assert deleted.read_bytes() == shard_bytes
+
+
+def _planned(name: str, *entries: Any, kind: str = 'initial', role: str = 'primary',
+             round_: int = 0) -> Any:
+    rounds = _mod()
+    return rounds.PlannedShard(name=name, entries=entries, kind=rounds.ShardKind(kind), role=role,
+                               rater=f'opus-{role}', round=round_)
+
+
+def _e9(basis: str = 'current') -> Any:
+    return _mod().ShardEntry('e9', 'p1', basis, 'df', 'child of e9', f'parent of e9 {basis}')
+
+
+class TestARoundChecksEveryShardBeforeWritingAny:
+    """A round's shards are checked together before any is written, and never keyed over stale ratings."""
+
+    COUNT = 45
+
+    def test_a_later_barred_shard_leaves_no_earlier_shard_written(
+        self, tmp_path: Path, old_brief: Path,
+    ) -> None:
+        rounds = _mod()
+        entries = {(f'e{index:02d}', 'p1', 'current'): rounds.ShardEntry(
+            f'e{index:02d}', 'p1', 'current', 'df', f'child {index}', f'parent {index}')
+            for index in range(self.COUNT)}
+        first = rounds.RatingScratch(tmp_path / 'scratch', brief=old_brief)
+        key = first.load_key()
+        first.add_shards(key, list(entries.values()), seed=7)
+        first.save_key(key)
+        revised = rounds.RatingScratch(first.root)
+        rounds.rerate_round(revised, revised.load_key(), entries,
+                            [(f'e{index:02d}', 'p1') for index in range(0, self.COUNT, 2)],
+                            version='v2.2')
+        key_bytes = revised.key_path.read_bytes()
+        key = revised.load_key()
+        before = copy.deepcopy(key)
+        with pytest.raises(ValueError, match='third_00_01'):
+            rounds.third_round(revised, key, entries, {pair[:2] for pair in entries})
+        assert sorted((revised.root / 'shards').glob('third_00*.txt')) == []
+        assert revised.key_path.read_bytes() == key_bytes
+        assert key == before
+
+    def test_keying_a_name_whose_ratings_file_exists_is_refused_naming_it(
+        self, tmp_path: Path,
+    ) -> None:
+        rounds = _Rounds(tmp_path)
+        ratings = rounds.root / 'ratings'
+        ratings.mkdir()
+        (ratings / 'third_00.jsonl').write_text('{"id": "third_00-000", "home": "YES"}\n')
+        key_bytes = (rounds.root / 'key.json').read_bytes()
+        with pytest.raises(ValueError, match=r'third_00\.jsonl'):
+            _mod().third_round(rounds.scratch, rounds.key(), rounds.entries(), {('e0', 'p1')})
+        assert not (rounds.root / 'shards' / 'third_00.txt').exists()
+        assert (rounds.root / 'key.json').read_bytes() == key_bytes
+
+    def test_a_name_already_keyed_is_refused(self, tmp_path: Path) -> None:
+        rounds = _Rounds(tmp_path)
+        key, shard_files = rounds.key(), rounds.shard_files()
+        before = copy.deepcopy(key)
+        with pytest.raises(ValueError, match='primary_00.*already keyed'):
+            rounds.scratch.write_shards(key, [_planned('primary_00', _e9())])
+        assert key == before
+        assert rounds.shard_files() == shard_files
+
+    def test_a_plan_naming_one_shard_twice_is_refused(self, tmp_path: Path) -> None:
+        rounds = _Rounds(tmp_path)
+        key, shard_files = rounds.key(), rounds.shard_files()
+        before = copy.deepcopy(key)
+        with pytest.raises(ValueError, match='primary_09.*twice'):
+            rounds.scratch.write_shards(key, [_planned('primary_09', _e9()),
+                                              _planned('primary_09', _e9())])
+        assert key == before
+        assert rounds.shard_files() == shard_files
+
+    def test_a_planned_shard_of_mixed_bases_is_refused_at_construction(self) -> None:
+        with pytest.raises(ValueError, match=r"reask_01_primary.*\['attach_time', 'current'\]"):
+            _planned('reask_01_primary', _e9('current'), _e9('attach_time'), kind='reask', round_=1)
+        with pytest.raises(ValueError, match='reask_01_primary'):
+            _planned('reask_01_primary', kind='reask', round_=1)
+
+    def test_a_planned_shard_has_the_one_basis_of_its_entries(self) -> None:
+        assert _planned('attach_primary_09', _e9('attach_time')).basis == 'attach_time'
 
 
 class TestShardKind:
