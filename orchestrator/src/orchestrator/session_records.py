@@ -1146,5 +1146,9 @@ def apply_refresh(
             start_ts=datetime.now(UTC).isoformat(),
         )
     if status is not None:
+        if prior.status in TERMINAL_STATUSES and status not in TERMINAL_STATUSES:
+            # A live session an orphan sweep falsely stamped EXITED: leaving
+            # the terminal status voids the sweep's exit_code.
+            prior.exit_code = None
         prior.status = status
     return prior
