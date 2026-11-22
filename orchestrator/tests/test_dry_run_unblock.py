@@ -3586,6 +3586,37 @@ class TestSkillCommandsFitTheEnvelope:
         )
 
 
+def _granted_tools_line(prompt: str) -> str | None:
+    return next(
+        (line for line in prompt.splitlines() if line.startswith('**Granted tools:**')), None,
+    )
+
+
+class TestPromptNamesTheGrantedTools:
+    """Under dontAsk the investigator could not see its own allowlist, so it kept
+    retrying `cat`/`head`/`grep` Bash calls the CLI denies every time (task 8704)."""
+
+    @pytest.mark.asyncio
+    async def test_prompt_names_every_tool_the_envelope_grants(self, tmp_path):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+        line = _granted_tools_line(kwargs['prompt'])
+        assert line is not None, kwargs['prompt']
+
+        unnamed = [tool for tool in kwargs['allowed_tools'] if tool not in line]
+        assert not unnamed, f'the prompt never names the granted {unnamed}: {line}'
+
+    @pytest.mark.asyncio
+    async def test_prompt_names_no_bash_rule_the_envelope_does_not_grant(self, tmp_path):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+        line = _granted_tools_line(kwargs['prompt'])
+        assert line is not None, kwargs['prompt']
+
+        named = re.findall(r'Bash\([^)]*\)', line)
+        assert named, f'the granted-tools line names no Bash rule: {line}'
+        ungranted = [rule for rule in named if rule not in kwargs['allowed_tools']]
+        assert not ungranted, f'the prompt names {ungranted}, which the envelope never grants'
+
+
 # ---------------------------------------------------------------------------
 # task 3125 guard (2): a re-block the latest proposal already covers is not
 # re-investigated, and the coverage key survives a rebase onto a moved main.
