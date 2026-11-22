@@ -39,6 +39,7 @@ from shared.uuid_prefix_guard import (
 )
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.server import markup_guard
 from fused_memory.server.boundary_guards import boundary_guard_chain, install_boundary_guards
 from fused_memory.server.main import _install_tool_dispatch_guards
@@ -312,6 +313,7 @@ class TestAStoredPassthroughValueIsNeverRepaired:
                 ),
             )
             backend = interceptor.taskmaster
+            assert isinstance(backend, SqliteTaskBackend)
             created = await backend.add_task(
                 project_root=root, title='x',
                 metadata=json.dumps({'done_provenance': _STORED_PROVENANCE, 'retry_count': 2}),
