@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Any
 
 import click
-from shared.project_layout import runs_db, tasks_db
+from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, CheckoutRootError, runs_db, tasks_db
 
 from orchestrator.cli_config import CONFIG_OPTION_HELP_PREFIX, pass_config
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.evals.paths import project_checkout
 from orchestrator.main_checkout_defaults import cli_default
 from orchestrator.routing import RoleDefaults, RouteInputs, RoutingDecision, resolve_route
 from orchestrator.shadow_types import ShadowShape
@@ -200,14 +201,14 @@ def eval_list_fixtures_cmd(tasks_dir: Path | None, cohort: str | None, audit: bo
               help='Where fixture JSONs are written (default: orchestrator/evals/tasks)')
 @click.option('--df-root', type=click.Path(path_type=Path), default=None,
               help='dark_factory checkout to discover merges in (default: the main checkout)')
-@click.option('--reify-root', type=click.Path(path_type=Path),
-              default=Path('/home/leo/src/reify'),
-              help='reify checkout to discover merges in')
+@click.option('--reify-root', type=click.Path(path_type=Path), default=None,
+              help=f'reify checkout to discover merges in (default: the reify root '
+                   f'registered in ${KNOWN_PROJECT_ROOTS_ENV})')
 @click.option('--sampled-at', default=None,
               help='ISO-8601 provenance timestamp (default: now, UTC)')
 def eval_sample_cmd(since: str, target_low: int, target_high: int, seed: int,
                     cohort: str, dry_run: bool, tasks_dir: Path | None,
-                    df_root: Path | None, reify_root: Path, sampled_at: str | None):
+                    df_root: Path | None, reify_root: Path | None, sampled_at: str | None):
     """Cut a stratified near-HEAD eval-fixture corpus from both repos.
 
     Discovers completed-task merges in the df + reify checkouts, samples them
@@ -217,12 +218,21 @@ def eval_sample_cmd(since: str, target_low: int, target_high: int, seed: int,
     orchestrator config — the seed + sampled_at are supplied here at the CLI
     boundary so the sampler library stays wall-clock-free.
     """
+    df_root = df_root or cli_default('--df-root', Path)
+    reify_root = reify_root or _registered_reify_root()
     asyncio.run(_run_eval_sample(
         since=since, target_low=target_low, target_high=target_high, seed=seed,
         cohort=cohort, dry_run=dry_run, tasks_dir=tasks_dir,
-        df_root=df_root or cli_default('--df-root', Path), reify_root=Path(reify_root),
-        sampled_at=sampled_at,
+        df_root=df_root, reify_root=reify_root, sampled_at=sampled_at,
     ))
+
+
+def _registered_reify_root() -> Path:
+    """The reify checkout eval-sample discovers in when --reify-root is omitted."""
+    try:
+        return project_checkout('reify')
+    except CheckoutRootError as exc:
+        raise click.UsageError(f'pass --reify-root to name the reify checkout ({exc})') from exc
 
 
 async def _run_eval_sample(*, since: str, target_low: int, target_high: int,
