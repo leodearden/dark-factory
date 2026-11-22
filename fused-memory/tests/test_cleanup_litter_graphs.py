@@ -19,7 +19,9 @@ from pathlib import Path
 import pytest
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
 from _fm_helpers import load_script_module
+from _fm_sockets import refused_port
 from falkordb import FalkorDB
+from redis.exceptions import RedisError
 
 CLEANUP = load_script_module(
     Path(__file__).resolve().parents[1] / 'scripts' / 'cleanup_litter_graphs.py'
@@ -31,9 +33,9 @@ TARGET = 'redis://localhost:6379'
 class FakeGraphServer:
     """A GraphServer over a dict of graph name to node count, recording every call.
 
-    *on_run_id* runs at the start of each ``run_id()`` call, after
-    ``run_id_calls`` counts it, so a test can restart the server or shrink a
-    graph mid-run.
+    *on_run_id* runs at the start of each ``run_id()`` call, so a test can
+    restart the server or shrink a graph mid-run. The *fail_delete_at*-th
+    delete call raises RedisError and deletes nothing.
     """
 
     def __init__(
@@ -42,11 +44,13 @@ class FakeGraphServer:
         run_id: str = 'run-a',
         *,
         on_run_id: Callable[[FakeGraphServer], None] | None = None,
+        fail_delete_at: int | None = None,
     ) -> None:
         self.counts = dict(counts)
         self.current_run_id = run_id
         self.on_run_id = on_run_id
-        self.run_id_calls = 0
+        self.fail_delete_at = fail_delete_at
+        self.delete_calls = 0
         self.counted: list[str] = []
         self.deleted: list[str] = []
 
@@ -58,14 +62,17 @@ class FakeGraphServer:
         return self.counts[name]
 
     def delete(self, name: str) -> None:
+        self.delete_calls += 1
+        if self.delete_calls == self.fail_delete_at:
+            raise RedisError(f'GRAPH.DELETE {name} failed')
         self.deleted.append(name)
         del self.counts[name]
 
     def run_id(self) -> str:
-        self.run_id_calls += 1
         if self.on_run_id is not None:
             self.on_run_id(self)
         return self.current_run_id
+
 
 LITTER = (
     '_probe4748b_bbd3e6b1',
@@ -443,6 +450,203 @@ def test_a_clean_run_sees_one_run_id_throughout():
     assert record.run_id_before == record.run_id_after == 'run-a'
     assert record.outcome == CLEANUP.Exit.OK
 
+
+
+# --- the command line -------------------------------------------------------------------
+
+
+@pytest.fixture
+def refused_target(monkeypatch) -> str:
+    """FALKORDB_URI on a refused port, so no test of main can reach a real server."""
+    with refused_port() as port:
+        uri = f'redis://127.0.0.1:{port}'
+        monkeypatch.setenv('FALKORDB_URI', uri)
+        yield uri
+
+
+def _write_reviewed(path: Path, target: str) -> Path:
+    listing = CLEANUP.Listing(
+        target=target,
+        run_id='run-a',
+        taken_at='2026-11-21T00:00:00+00:00',
+        delete={'_probe': 0},
+        keep={'dark_factory': 41},
+    )
+    CLEANUP.write_listing(path, listing)
+    return path
+
+
+def test_list_against_an_unreachable_server_fails_without_writing(refused_target, tmp_path, capsys):
+    out = tmp_path / 'listing.json'
+
+    code = CLEANUP.main(['list', '--out', str(out)])
+
+    err = capsys.readouterr().err
+    assert code == CLEANUP.Exit.FAILED
+    assert not out.exists()
+    assert err.startswith('failed:')
+    assert len(err.splitlines()) == 1
+
+
+def test_delete_with_a_missing_listing_is_refused_before_connecting(refused_target, tmp_path, capsys):
+    missing = tmp_path / 'absent.json'
+    record = tmp_path / 'record.json'
+
+    code = CLEANUP.main(['delete', '--reviewed', str(missing), '--record', str(record)])
+
+    err = capsys.readouterr().err
+    assert code == CLEANUP.Exit.REFUSED
+    assert str(missing) in err
+    assert not record.exists()
+
+
+def test_delete_with_a_listing_for_another_target_is_refused_naming_both(
+    refused_target, tmp_path, capsys
+):
+    reviewed = _write_reviewed(tmp_path / 'listing.json', 'redis://localhost:6379')
+    record = tmp_path / 'record.json'
+
+    code = CLEANUP.main(['delete', '--reviewed', str(reviewed), '--record', str(record)])
+
+    err = capsys.readouterr().err
+    assert code == CLEANUP.Exit.REFUSED
+    assert 'redis://localhost:6379' in err
+    assert refused_target in err
+    assert not record.exists()
+
+
+def test_delete_with_a_listing_for_this_target_fails_on_the_unreachable_server(
+    refused_target, tmp_path, capsys
+):
+    reviewed = _write_reviewed(tmp_path / 'listing.json', refused_target)
+    record = tmp_path / 'record.json'
+
+    code = CLEANUP.main(['delete', '--reviewed', str(reviewed), '--record', str(record)])
+
+    assert code == CLEANUP.Exit.FAILED
+    assert capsys.readouterr().err.startswith('failed:')
+    assert not record.exists()
+
+
+def test_delete_without_a_record_path_is_a_usage_error(refused_target, tmp_path):
+    reviewed = _write_reviewed(tmp_path / 'listing.json', refused_target)
+
+    with pytest.raises(SystemExit) as exit_info:
+        CLEANUP.main(['delete', '--reviewed', str(reviewed)])
+
+    assert exit_info.value.code == 2
+
+
+@pytest.mark.parametrize(
+    'argv',
+    [
+        pytest.param([], id='no-command'),
+        pytest.param(['list'], id='list-without-out'),
+        pytest.param(['delete', '--record', 'r.json'], id='delete-without-reviewed'),
+        pytest.param(['delete', '--reviewed', 'l.json'], id='delete-without-record'),
+    ],
+)
+def test_the_required_arguments_are_required(argv):
+    with pytest.raises(SystemExit) as exit_info:
+        CLEANUP.build_parser().parse_args(argv)
+
+    assert exit_info.value.code == 2
+
+
+def test_the_pace_defaults_to_ten_seconds():
+    args = CLEANUP.build_parser().parse_args(['delete', '--reviewed', 'l.json', '--record', 'r.json'])
+
+    assert args.pace_seconds == 10.0
+
+
+def test_the_listing_summary_names_the_target_counts_per_pattern_and_every_kept_graph():
+    listing = CLEANUP.build_listing(
+        TARGET,
+        FakeGraphServer(
+            {'probe_e1_gw0': 1, 'probe_e1_gw1': 2, '_probe': 0, 'dark_factory': 41, 'default_db': 0},
+            'run-a',
+        ),
+    )
+
+    lines = CLEANUP.listing_summary(listing)
+
+    text = '\n'.join(lines)
+    assert TARGET in text
+    assert 'run-a' in text
+    assert any(line.split() == ['2', 'probe_e1_gw[0-9]+'] for line in lines)
+    assert any(line.split() == ['1', '_probe'] for line in lines)
+    assert any(line.split() == ['41', 'dark_factory'] for line in lines)
+    assert any(line.split() == ['0', 'default_db'] for line in lines)
+
+
+def _record_json(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text())
+
+
+def test_run_delete_writes_the_finished_record(tmp_path):
+    server = FakeGraphServer({'_probe': 0, 'probe_e1_gw0': 1, 'dark_factory': 41})
+    record_path = tmp_path / 'record.json'
+
+    code = CLEANUP.run_delete(
+        server, _reviewed(('_probe', 'probe_e1_gw0')), record_path,
+        target=TARGET, pace_s=0.0, sleep=RecordingSleep(server),
+    )
+
+    record = _record_json(record_path)
+    assert code == CLEANUP.Exit.OK
+    assert record['before'] == {'_probe': 0, 'probe_e1_gw0': 1, 'dark_factory': 41}
+    assert record['after'] == {'dark_factory': 41}
+    assert record['deleted'] == ['_probe', 'probe_e1_gw0']
+    assert record['outcome'] == 'ok'
+
+
+def test_run_delete_returns_the_runs_outcome(tmp_path):
+    server = FakeGraphServer(
+        {'_probe': 0, 'probe_e1_gw0': 1, 'dark_factory': 41},
+        on_run_id=_after_deletes(1, _restart),
+    )
+    record_path = tmp_path / 'record.json'
+
+    code = CLEANUP.run_delete(
+        server, _reviewed(('_probe', 'probe_e1_gw0')), record_path,
+        target=TARGET, pace_s=0.0, sleep=RecordingSleep(server),
+    )
+
+    assert code == CLEANUP.Exit.SERVER_RESTARTED
+    assert _record_json(record_path)['outcome'] == 'server_restarted'
+
+
+def test_run_delete_keeps_the_record_of_a_run_a_redis_error_interrupted(tmp_path, capsys):
+    server = FakeGraphServer(
+        {'_probe': 0, 'probe_e1_gw0': 1, 'sweep_e4_gw2': 3, 'dark_factory': 41}, fail_delete_at=2
+    )
+    record_path = tmp_path / 'record.json'
+
+    code = CLEANUP.run_delete(
+        server, _reviewed(('_probe', 'probe_e1_gw0', 'sweep_e4_gw2')), record_path,
+        target=TARGET, pace_s=0.0, sleep=RecordingSleep(server),
+    )
+
+    record = _record_json(record_path)
+    assert code == CLEANUP.Exit.FAILED
+    assert record['deleted'] == ['_probe']
+    assert record['before'] == {'_probe': 0, 'probe_e1_gw0': 1, 'sweep_e4_gw2': 3, 'dark_factory': 41}
+    assert record['outcome'] == 'failed'
+    assert 'GRAPH.DELETE probe_e1_gw0 failed' in capsys.readouterr().err
+
+
+def test_run_delete_refuses_a_listing_for_another_target(tmp_path):
+    server = FakeGraphServer({'_probe': 0})
+    record_path = tmp_path / 'record.json'
+
+    code = CLEANUP.run_delete(
+        server, _reviewed(('_probe',)), record_path,
+        target='redis://127.0.0.1:6380', pace_s=0.0, sleep=RecordingSleep(server),
+    )
+
+    assert code == CLEANUP.Exit.REFUSED
+    assert server.deleted == []
+    assert not record_path.exists()
 
 
 # --- the adapter, live on the scratch server --------------------------------------------
