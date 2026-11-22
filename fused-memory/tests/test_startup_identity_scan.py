@@ -30,6 +30,7 @@ from _fm_helpers import (
     extract_cypher,
     extract_params,
 )
+from _graph_access_fake import FakeGraphAccess
 from falkordb.asyncio import FalkorDB
 from redis.exceptions import ResponseError
 
@@ -280,6 +281,31 @@ class TestRunStartupIdentityScan:
         assert stats['graphs_scanned'] == 2
         assert stats['edges_repaired'] == 3  # only g2's 3 counted; g1 failed
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_never_touches_a_graph_outside_the_registry(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The sweep REPAIRS (writes), so its scope is the registry, never the
+        raw server listing: another test's private graph on a shared FalkorDB
+        must not be read, let alone re-minted (task 11326)."""
+        registered = make_graph_mock(ro_rows=[])
+        foreign = make_graph_mock(ro_rows=[])
+        backend = make_backend(
+            mock_config,
+            registered_graph_ids={'alpha_proj'},
+            graph_access=FakeGraphAccess({
+                'alpha_proj': registered,
+                '_test_2207_merge_entities_0badc0de': foreign,
+            }),
+        )
+
+        stats = await backend._run_startup_identity_scan()
+
+        foreign.ro_query.assert_not_awaited()
+        foreign.query.assert_not_awaited()
+        assert registered.ro_query.await_count >= 1
+        assert stats['graphs_scanned'] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -638,3 +664,55 @@ class TestRepairDuplicateEdgeUuidsLiveFalkorDB:
         finally:
             await backend.close()
             await client.aclose()
+
+
+@falkor_skipif()
+@pytest.mark.timeout(15)
+@pytest.mark.integration
+class TestStartupIdentityScanScopeLiveFalkorDB:
+    """Pin the sweep's scope against a REAL FalkorDB server's graph listing:
+    a backend whose registry does not name a graph leaves that graph's
+    deliberately duplicated edge uuids exactly as seeded (task 11326). The
+    unregistered graph stands in for a concurrent test's private graph on the
+    shared scratch server."""
+
+    @pytest.mark.asyncio
+    async def test_a_sweep_leaves_an_unregistered_graphs_dup_uuids_untouched(
+        self, mock_config, startup_scan_live_graph,
+    ):
+        graph_name, graph = startup_scan_live_graph
+
+        await graph.query(
+            "CREATE (:Entity {uuid: 'a', name: 'A'}), "
+            "(:Entity {uuid: 'b', name: 'B'}), "
+            "(:Entity {uuid: 'c', name: 'C'})"
+        )
+
+        async def seed_edge(src, dst, edge_uuid, fact, embedding):
+            await graph.query(
+                'MATCH (a:Entity {uuid: $src}), (b:Entity {uuid: $dst}) '
+                'CREATE (a)-[e:RELATES_TO {uuid: $edge_uuid, name: $name, fact: $fact}]->(b) '
+                'SET e.fact_embedding = vecf32($embedding)',
+                {
+                    'src': src, 'dst': dst, 'edge_uuid': edge_uuid,
+                    'name': 'rel', 'fact': fact, 'embedding': embedding,
+                },
+            )
+
+        await seed_edge('a', 'b', 'dup', 'a relates to b', [1.0, 2.0])
+        await seed_edge('a', 'c', 'dup', 'a relates to c', [3.0, 4.0])
+
+        backend = GraphitiBackend.with_driver(
+            mock_config,
+            _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT),
+            registered_graph_ids=(),
+        )
+        try:
+            await backend._run_startup_identity_scan()
+        finally:
+            await backend.close()
+
+        rows = (await graph.query(
+            'MATCH ()-[e:RELATES_TO]->() RETURN e.uuid, e.superseded_edge_uuid'
+        )).result_set
+        assert rows == [['dup', None], ['dup', None]]
