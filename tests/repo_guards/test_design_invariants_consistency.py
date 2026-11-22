@@ -15,9 +15,12 @@ cross-checks every other site against it. It never stores its own snapshot slug
 list: a hardcoded constant here would be one more lock-step copy, stale on the
 next invariant exactly like the prose sites were.
 
-THE FOUR PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
-  * ``docs/legibility/design-invariants.md`` — SOURCE OF TRUTH. Its
-    ``## INV-N `slug``` headings define the family.
+``docs/legibility/design-invariants.md`` is the SOURCE OF TRUTH: its
+``## INV-N `slug``` headings define the family. It is not a restatement, so it
+is not registered; the enumeration scan skips it as ``NORMATIVE_DOC``.
+
+THE THREE REGISTERED SITES (see ``PINNED_SITES`` for the machine-readable
+registry):
   * ``docs/legibility/design-invariants-fixtures.md`` — one fixture section per
     invariant, plus a rehearsal verdict table pinned for COVERAGE (never for its
     rationale prose, which the doc itself declares a point-in-time snapshot).
@@ -421,14 +424,12 @@ def assert_verdict_table_covers(
     )
 
 
-# Every site this module pins, and WHAT is pinned there. Registration means "this
-# file's enumeration of the family is mechanized".
+# Every site that restates the family, and WHAT is pinned there. Registration
+# means "this file's enumeration of the family is mechanized". NORMATIVE_DOC is
+# not a restatement, so it is not registered; the enumeration scan skips it.
 # `test_every_enumeration_site_is_pinned` checks this registry against a scan, so
 # it cannot quietly fall behind the repo the way the prose sites did.
 PINNED_SITES = {
-    "docs/legibility/design-invariants.md": (
-        "SOURCE OF TRUTH — its `## INV-N `slug`` headings define the family"
-    ),
     "docs/legibility/design-invariants-fixtures.md": (
         "one fixture section per invariant, plus the rehearsal verdict table "
         "pinned for COVERAGE (never for its snapshot rationale prose)"
@@ -2023,7 +2024,9 @@ def test_fixtures_verdict_table_covers_every_invariant_in_both_shapes() -> None:
 #
 # Registration is for files that enumerate. A file pinned as an ABSENCE needs
 # none: CONTRIBUTING.md may carry at most one slug, so it can never clear the
-# threshold, and its own absence test checks it directly.
+# threshold, and its own absence test checks it directly. The normative doc
+# needs none either: it defines the family rather than restating it, so the
+# scan skips it by identity instead of through a registry entry.
 #
 # The point-in-time record trees in `_EXCLUDED_TREES` are excluded BY DESIGN, not
 # by oversight; the reason for each tree sits beside that tuple.
@@ -2141,7 +2144,11 @@ def test_unregistered_enumeration_sites_fails_loudly_on_an_empty_scan(tmp_path: 
 
 
 def test_every_enumeration_site_is_pinned() -> None:
-    """LIVE: no markdown file enumerates the family without being registered.
+    """LIVE: no markdown file restates the family without being registered.
+
+    The normative doc defines the family rather than restating it, so the final
+    scan skips it by identity. The non-vacuity check below still reads it: it
+    clears the threshold, so without that skip it would be reported.
 
     The scan is repo-wide — every ``*.md`` file, minus the point-in-time record
     trees and non-content directories — so the claim in this docstring is the
@@ -2193,7 +2200,10 @@ def test_every_enumeration_site_is_pinned() -> None:
     )
 
     unregistered = unregistered_enumeration_sites(
-        scanned, PINNED_SITES, family, threshold=_ENUMERATION_THRESHOLD
+        [path for path in scanned if path != NORMATIVE_DOC],
+        PINNED_SITES,
+        family,
+        threshold=_ENUMERATION_THRESHOLD,
     )
     assert not unregistered, (
         f"markdown file(s) {unregistered} restate {_ENUMERATION_THRESHOLD}+ "
