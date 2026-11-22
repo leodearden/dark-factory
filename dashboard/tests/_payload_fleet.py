@@ -159,21 +159,23 @@ class FleetCensus:
 
     * costs (110,596 bytes at ``window=all``): spend on 189 of the 3,650
       days, 23 (model, role) pairs, 9 accounts, the 200-event cap full;
-    * burndown (798,490 at ``window=90d`` with the rows' in-progress split
-      stripped, re-measured 2026-11-20 by task 10258): 12 projects, 24,179
-      MEASURED rows over a union of 2,750 labels spanning 61.6 of the 90
-      days; the payload scales with the row count, not the span. At about
-      9.6 KB a day it plateaus near 1,070,650 once the window fills, around
-      2026-12-19. The budget must hold that plateau, so the fleet seeds the
-      full-window steady state, 2,740 rows per root, not today's partly
-      filled window, and serves 1,068,143. Every third hourly row of the odd
-      roots sits one tick early, so each root's row is about 578 spans
-      (live: 43 to 525);
     * recon (35,216): 50 runs listed, 24 writing agents, 400 buffered events;
     * memory (41,065): 173 memory projects, 18 WAL stores, a day of samples;
     * curator (17,057): no pending tickets, every account capped all day;
     * memory-graphs (1,722): 17 operations hourly; the journal's counts are
       five digits a bucket live, a few rows here, a difference of bytes.
+
+    The burndown history is the exception: the fleet serves its projected
+    full-window plateau, not live. Re-measured live on 2026-11-20 by task
+    10258, it was 798,490 bytes at ``window=90d`` with the rows' in-progress
+    split stripped: 12 projects, 24,179 MEASURED rows over a union of 2,750
+    labels spanning 61.6 of the 90 days; the payload scales with the row
+    count, not the span. At about 9.6 KB a day it plateaus near 1,070,650
+    once the window fills, around 2026-12-19. The budget must hold that
+    plateau, so the fleet seeds the full-window steady state, 2,740 rows per
+    root, not today's partly filled window, and serves 1,068,143. Every third
+    hourly row of the odd roots sits one tick early, so each root's row is
+    about 578 spans (live: 43 to 525).
 
     The pending escalations were re-measured live on 2026-11-14, when main's
     cards had shrunk /escalations to 713,606 bytes: 138 pending, 51 of them in

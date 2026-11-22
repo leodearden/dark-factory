@@ -38,9 +38,10 @@ const {
 } = window.DF_TASK_VOCAB;
 
 // ── The nine stacked bands of the status-mix chart ──
-// One band per census member, keyed and sourced by the member's series key.
-// The rows' live/stranded split never reaches the client: the server reads it
-// for the parity verdict, which parityBannerState only renders.
+// One band per census member, keyed and sourced by the member's series key:
+// exactly the series the wire carries
+// (dashboard/src/dashboard/data/redux_api.py::_BURNDOWN_KEYS). The parity
+// verdict arrives pre-computed.
 //
 // Stacked bottom-up terminal → backlog → in_flight, members in TaskStatus
 // declaration order inside each view. The three members task 5591 added
