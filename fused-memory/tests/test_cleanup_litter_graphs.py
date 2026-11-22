@@ -12,9 +12,11 @@ import contextlib
 import json
 import re
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
@@ -270,7 +272,7 @@ def test_a_missing_listing_is_refused_naming_its_path(tmp_path):
 # --- the delete run ---------------------------------------------------------------------
 
 
-def _reviewed(delete: tuple[str, ...], keep: tuple[str, ...] = ()) -> object:
+def _reviewed(delete: tuple[str, ...], keep: tuple[str, ...] = ()) -> Any:
     return CLEANUP.Listing(
         target=TARGET,
         run_id='run-a',
@@ -291,7 +293,7 @@ class RecordingSleep:
         self.calls.append((len(self.server.deleted), seconds))
 
 
-def _execute(server: FakeGraphServer, reviewed: object, *, pace_s: float = 0.0) -> object:
+def _execute(server: FakeGraphServer, reviewed: Any, *, pace_s: float = 0.0) -> Any:
     plan = CLEANUP.plan_cleanup(server.graph_names())
     return CLEANUP.execute(server, plan, reviewed, pace_s=pace_s, sleep=RecordingSleep(server))
 
@@ -456,7 +458,7 @@ def test_a_clean_run_sees_one_run_id_throughout():
 
 
 @pytest.fixture
-def refused_target(monkeypatch) -> str:
+def refused_target(monkeypatch) -> Iterator[str]:
     """FALKORDB_URI on a refused port, so no test of main can reach a real server."""
     with refused_port() as port:
         uri = f'redis://127.0.0.1:{port}'
@@ -647,6 +649,17 @@ def test_run_delete_refuses_a_listing_for_another_target(tmp_path):
     assert code == CLEANUP.Exit.REFUSED
     assert server.deleted == []
     assert not record_path.exists()
+
+
+# --- the adapter ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('reply', [{}, {'run_id': ''}, b'not a map'], ids=['absent', 'empty', 'not-a-map'])
+def test_a_server_that_reports_no_run_id_fails_closed(reply):
+    client = SimpleNamespace(connection=SimpleNamespace(info=lambda section: reply))
+
+    with pytest.raises(RedisError, match='no run_id'):
+        CLEANUP.FalkorGraphServer(client).run_id()
 
 
 # --- the adapter, live on the scratch server --------------------------------------------

@@ -20,10 +20,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
+import contextlib
 import json
 import re
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import IntEnum
@@ -31,7 +32,12 @@ from types import MappingProxyType
 from typing import NamedTuple, Protocol
 
 from falkordb import FalkorDB
+from redis.exceptions import RedisError
+from shared.cli_boundary import LoudArgumentParser, run_cli
 from shared.safe_io import atomic_write_text
+
+from fused_memory.config.falkordb_endpoints import FalkorEndpoint
+from fused_memory.config.schema import FusedMemoryConfig
 
 
 class Exit(IntEnum):
@@ -118,7 +124,10 @@ class FalkorGraphServer:
         self._client.select_graph(require_litter(name)).delete()
 
     def run_id(self) -> str:
-        return str(self._client.connection.info('server')['run_id'])
+        reply = self._client.connection.info('server')
+        if not isinstance(reply, dict) or not reply.get('run_id'):
+            raise RedisError('INFO server reported no run_id, so a restart could not be detected')
+        return str(reply['run_id'])
 
 
 def _frozen(counts: Mapping[str, int]) -> Mapping[str, int]:
@@ -385,3 +394,182 @@ def _outcome(run_id_before: str, run_id_after: str, shrank: tuple[Shrinkage, ...
     if shrank:
         return Exit.KEPT_GRAPH_SHRANK
     return Exit.OK
+
+
+class WrongTarget(ValueError):
+    """A reviewed listing taken on another server than the one the config names."""
+
+    def __init__(self, listing_target: str, target: str) -> None:
+        super().__init__(
+            f'the reviewed listing was taken on {listing_target}, but the config names '
+            f'{target}; run list against {target} and review that listing'
+        )
+
+
+def require_same_target(listing: Listing, target: str) -> Listing:
+    if listing.target != target:
+        raise WrongTarget(listing.target, target)
+    return listing
+
+
+class _RecordFile:
+    """The delete run's record on disk, rewritten whole at each step of the run."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.latest: CleanupRecord | None = None
+
+    def write(self, record: CleanupRecord) -> None:
+        self.latest = record
+        atomic_write_text(self.path, json.dumps(record.to_json(), indent=2) + '\n')
+
+    def write_failed(self) -> None:
+        if self.latest is not None:
+            with contextlib.suppress(OSError):
+                self.write(replace(self.latest, outcome=Exit.FAILED))
+
+
+def run_delete(
+    server: GraphServer,
+    reviewed: Listing,
+    record_path: Path,
+    *,
+    target: str,
+    pace_s: float,
+    sleep: Callable[[float], None],
+) -> Exit:
+    try:
+        require_same_target(reviewed, target)
+    except WrongTarget as error:
+        return _report(Exit.REFUSED, error)
+    record_file = _RecordFile(record_path)
+    try:
+        record = execute(
+            server,
+            plan_cleanup(server.graph_names()),
+            reviewed,
+            pace_s=pace_s,
+            sleep=sleep,
+            on_progress=record_file.write,
+        )
+        record_file.write(record)
+    except (RedisError, OSError) as error:
+        record_file.write_failed()
+        return _report(Exit.FAILED, f'{type(error).__name__}: {error}; record at {record_path}')
+    return _report_outcome(record, record_path)
+
+
+def _report_outcome(record: CleanupRecord, record_path: Path) -> Exit:
+    summary = f'deleted {len(record.deleted)} graphs on {record.target}; record at {record_path}'
+    if record.outcome is Exit.OK:
+        print(f'ok: {summary}')
+        return Exit.OK
+    if record.outcome is Exit.SERVER_RESTARTED:
+        return _report(
+            Exit.SERVER_RESTARTED,
+            f'run_id changed from {record.run_id_before} to {record.run_id_after}; {summary}',
+        )
+    if record.outcome is Exit.KEPT_GRAPH_SHRANK:
+        shrank = ', '.join(f'{s.graph} {s.before}->{s.after}' for s in record.shrank)
+        return _report(Exit.KEPT_GRAPH_SHRANK, f'kept graphs shrank: {shrank}; {summary}')
+    return _report(Exit.FAILED, f'the run finished without an outcome; {summary}')
+
+
+def listing_summary(listing: Listing) -> list[str]:
+    return [
+        f'target {listing.target}, run_id {listing.run_id}, taken at {listing.taken_at}',
+        f'delete {len(listing.delete)} graphs:',
+        *(
+            f'{sum(1 for name in listing.delete if pattern.fullmatch(name)):>7}  {pattern.pattern}'
+            for pattern in LITTER_PATTERNS
+        ),
+        f'keep {len(listing.keep)} graphs:',
+        *(f'{count:>7}  {name}' for name, count in listing.keep.items()),
+    ]
+
+
+def resolve_target() -> tuple[FalkorEndpoint, str | None]:
+    """The FalkorDB the config names (FALKORDB_URI, else config.yaml), and its password."""
+    configured = FusedMemoryConfig().graphiti.falkordb
+    return FalkorEndpoint.from_uri(configured.uri), configured.password or None
+
+
+@contextlib.contextmanager
+def _connected(endpoint: FalkorEndpoint, password: str | None) -> Iterator[FalkorGraphServer]:
+    client = FalkorDB(host=endpoint.host, port=endpoint.port, password=password)
+    try:
+        yield FalkorGraphServer(client)
+    finally:
+        client.close()
+
+
+def _against(
+    endpoint: FalkorEndpoint, password: str | None, command: Callable[[GraphServer], int]
+) -> int:
+    try:
+        with _connected(endpoint, password) as server:
+            return command(server)
+    except (RedisError, OSError) as error:
+        return _report(Exit.FAILED, f'{type(error).__name__}: {error}')
+
+
+def _list(server: GraphServer, target: str, out: Path) -> int:
+    listing = build_listing(target, server)
+    write_listing(out, listing)
+    print('\n'.join(listing_summary(listing)))
+    print(f'listing written to {out}; review it before delete --reviewed {out}')
+    return Exit.OK
+
+
+def build_parser() -> LoudArgumentParser:
+    parser = LoudArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
+    commands = parser.add_subparsers(dest='command', required=True)
+    listing = commands.add_parser(
+        'list', help='write the litter and kept graphs, with node counts, for review; deletes nothing'
+    )
+    listing.add_argument('--out', type=Path, required=True, metavar='PATH')
+    delete = commands.add_parser(
+        'delete', help='delete the litter a reviewed listing names, one graph at a time'
+    )
+    delete.add_argument('--reviewed', type=Path, required=True, metavar='PATH')
+    delete.add_argument('--record', type=Path, required=True, metavar='PATH')
+    delete.add_argument(
+        '--pace-seconds', type=float, default=10.0,
+        help='pause between deletes (default: %(default)s)',
+    )
+    return parser
+
+
+def _report(status: Exit, error: object) -> Exit:
+    print(f'{status.name.lower()}: {error}', file=sys.stderr)
+    return status
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        endpoint, password = resolve_target()
+    except ValueError as error:
+        return _report(Exit.FAILED, error)
+    if args.command == 'list':
+        return _against(endpoint, password, lambda server: _list(server, endpoint.uri, args.out))
+    try:
+        reviewed = require_same_target(read_listing(args.reviewed), endpoint.uri)
+    except (UnreadableListing, WrongTarget) as error:
+        return _report(Exit.REFUSED, error)
+    return _against(
+        endpoint,
+        password,
+        lambda server: run_delete(
+            server,
+            reviewed,
+            args.record,
+            target=endpoint.uri,
+            pace_s=args.pace_seconds,
+            sleep=time.sleep,
+        ),
+    )
+
+
+if __name__ == '__main__':
+    sys.exit(run_cli(main))
