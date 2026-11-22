@@ -806,8 +806,7 @@ def _derive_module_runs(
     that function's own paragraph for why the fallback arm needs the extra
     layer.
     """
-    prefix = mc.prefix + '/'
-    scoped = [f for f in existing_files if f.startswith(prefix) and f.endswith('.py')]
+    scoped = _touched_py_under(mc.prefix, existing_files)
     if not scoped:
         return [PlannedRun(mc.prefix, None, ScopeKind.SKIPPED, 'no files under prefix')]
 
@@ -1123,12 +1122,14 @@ def with_artifact_consumer_modules(
 
     An empty set with ``.py``/``.rs`` source in *files* stays empty: the
     fallback's configured chain already runs every suite, and widening would
-    drop the source file no module owns. Merge role returns the set unchanged
+    drop the source file no module owns. A non-empty set is widened even then
+    (:func:`_source_owned_by_no_module`): the added modules join verify.py's
+    case-(b) full fan-out, which covers their consumer tests. Merge role returns the set unchanged
     (see :func:`_artifact_consumer_demand`). Idempotent, so a boundary may
     resolve it once (``task_verify_dispatch.py::TaskVerifyDispatcher._scope_of``
     does, for the remote spec) and the executor's own call is then a no-op.
     """
-    if not module_configs and _has_source_files(files):
+    if not module_configs and _source_owned_by_no_module(files, module_configs):
         return list(module_configs)
     registry = list(config.module_configs_or_empty.values())
     demand = _artifact_consumer_demand(files, registry, role)
@@ -1435,6 +1436,29 @@ def _has_source_files(files: Sequence[str]) -> bool:
     return any(f.endswith(_SOURCE_EXTENSIONS) for f in files)
 
 
+def _touched_py_under(prefix: str, files: Sequence[str]) -> list[str]:
+    """The ``.py`` paths in *files* under module *prefix* — what :func:`_derive_module_runs` scopes."""
+    return [f for f in files if f.startswith(prefix + '/') and f.endswith('.py')]
+
+
+def _source_owned_by_no_module(
+    files: Sequence[str],
+    module_configs: Sequence[ModuleConfig],
+) -> bool:
+    """True when *files* carry ``.py``/``.rs`` source yet no module in *module_configs* scopes any of it.
+
+    Every module then plans only its 'no files under prefix' SKIPPED run, so
+    ``verify.py::_run_scoped_verification_body`` takes its case-(b)
+    per-subproject full fan-out. Behavioural-artifact consumer demand must
+    never pre-empt that fan-out with a narrower consumer-only run, or adding
+    an artifact to such a diff would shrink coverage (monotonicity, see
+    :func:`_derive_module_runs`).
+    """
+    return _has_source_files(files) and not any(
+        _touched_py_under(mc.prefix, files) for mc in module_configs
+    )
+
+
 def _artifact_consumer_demand(
     existing_files: Sequence[str],
     module_configs: Sequence[ModuleConfig],
@@ -1579,7 +1603,9 @@ def derive_verify_plan(
     Module-config branch (*module_configs* non-empty): each ModuleConfig is
     scoped independently via :func:`_derive_module_runs`, and at role='task'
     the consumer tests of a touched behavioural artifact join its pytest slot
-    (:func:`_with_consumer_tests`). *list_pkg_tests*
+    (:func:`_with_consumer_tests`) — except when the diff's source is owned by
+    no passed module (:func:`_source_owned_by_no_module`), which keeps every
+    module at its 'no files under prefix' run for the caller's full fan-out. *list_pkg_tests*
     (same contract as :func:`reverse_dependent_test_targets`' seam: a module
     prefix to the worktree-root-relative ``.py`` files under its tests tree,
     collectable or not) is how the task-role floor enumerates a module's
@@ -1628,7 +1654,10 @@ def derive_verify_plan(
     if module_configs:
         runs: list[PlannedRun] = []
         merge_full = role == 'merge' and _merge_breadth_is_full(config)
-        demand = _artifact_consumer_demand(existing_files, module_configs, role)
+        demand = (
+            {} if _source_owned_by_no_module(existing_files, module_configs)
+            else _artifact_consumer_demand(existing_files, module_configs, role)
+        )
         for mc in module_configs:
             if merge_full:
                 runs.extend(_derive_full_suite_runs(mc, role))

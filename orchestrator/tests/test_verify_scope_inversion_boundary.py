@@ -108,6 +108,7 @@ import pytest
 from _merge_lane_fakes import lane_scene_config, merge_through_lane
 from _verify_artifact_fixtures import (
     ARTIFACT_MODULES,
+    ARTIFACT_ORCH_MC,
     ROOT_YAML,
     SKILL_PROMPT_CONSUMERS,
     SPAWN_CONSUMERS,
@@ -656,6 +657,24 @@ class TestRow3ProseOnlyTrivialBothRoles:
                 assert all(test in mc.test_command for test in tests), mc.test_command
         assert result.plan is not None
         assert all(run['scope_kind'] != 'trivial' for run in result.plan['runs'])
+
+    @pytest.mark.asyncio
+    async def test_artifact_beside_unowned_source_keeps_the_full_fan_out(self, tmp_path: Path) -> None:
+        """Adding an artifact to an unowned-source diff never shrinks coverage (monotonicity)."""
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
+        source_only = self._write_artifact(tmp_path, 'conftest.py')
+        with_artifact = [*source_only, *self._write_artifact(tmp_path, UNBLOCK_SKILL)]
+
+        _r, baseline, _f = await _drive_producer(
+            tmp_path, config, [ARTIFACT_ORCH_MC], task_files=source_only, role='task',
+        )
+        result, executed, _fake = await _drive_producer(
+            tmp_path, config, [ARTIFACT_ORCH_MC], task_files=with_artifact, role='task',
+        )
+
+        assert not result.trivial
+        assert baseline == {'orchestrator': ARTIFACT_ORCH_MC}
+        assert executed == baseline
 
     @pytest.mark.asyncio
     async def test_prose_stays_trivial_beside_a_consumer_registry(self, tmp_path: Path) -> None:
