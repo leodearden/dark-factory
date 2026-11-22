@@ -139,6 +139,18 @@ def sdk_timeout() -> openai.APITimeoutError:
     return openai.APITimeoutError(request=_REQUEST)
 
 
+def unauthorized() -> openai.AuthenticationError:
+    return openai.AuthenticationError('invalid api key', response=_status(401), body=None)
+
+
+def forbidden() -> openai.PermissionDeniedError:
+    return openai.PermissionDeniedError('permission denied', response=_status(403), body=None)
+
+
+def no_api_key() -> openai.OpenAIError:
+    return openai.OpenAIError('The api_key client option must be set')
+
+
 def bad_request() -> openai.BadRequestError:
     return openai.BadRequestError('bad request', response=_status(400), body=None)
 

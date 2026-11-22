@@ -20,12 +20,15 @@ from _adjudicator_doubles import (
     ScriptedResponses,
     bad_request,
     connection_error,
+    forbidden,
     incomplete_reply,
+    no_api_key,
     rate_limited,
     reply_json,
     reply_text,
     sdk_timeout,
     server_error,
+    unauthorized,
 )
 from _sdk_client_stubs import sdk_client_double
 
@@ -516,8 +519,10 @@ class TestFailures:
     @pytest.mark.parametrize(
         'error',
         [TimeoutError(), sdk_timeout(), connection_error(), rate_limited(),
-         server_error(500), server_error(502), server_error(503)],
-        ids=['timeout', 'sdk-timeout', 'connection', '429', '500', '502', '503'],
+         server_error(500), server_error(502), server_error(503),
+         unauthorized(), forbidden(), no_api_key()],
+        ids=['timeout', 'sdk-timeout', 'connection', '429', '500', '502', '503',
+             '401', '403', 'no-api-key'],
     )
     async def test_a_transport_failure(self, error: BaseException) -> None:
         double = ScriptedResponses(error)

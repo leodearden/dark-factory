@@ -26,10 +26,13 @@ from _adjudicator_doubles import (
     ScriptedResponses,
     connection_error,
     expected_reply,
+    forbidden,
     keep_all_reply,
+    no_api_key,
     rate_limited,
     reply_text,
     server_error,
+    unauthorized,
     verdict_reply,
 )
 
@@ -728,6 +731,16 @@ class TestCalibrationRun:
         assert result.record.figures is None
         assert result.record.unanswered == MAX_UNANSWERED + 1
         assert await _stored(ledger) == result.record
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('refusal', [unauthorized, forbidden, no_api_key])
+    async def test_a_refused_key_never_fails_the_calibration(self, ledger, refusal) -> None:
+        states = [
+            (await _calibrate(ledger, ScriptedResponses(refusal()))).state for _ in range(3)
+        ]
+        assert states == [
+            CalibrationState.INCONCLUSIVE, CalibrationState.INCONCLUSIVE, CalibrationState.STALLED,
+        ]
 
     @pytest.mark.asyncio
     async def test_running_out_of_wall_time_is_inconclusive(self, ledger) -> None:

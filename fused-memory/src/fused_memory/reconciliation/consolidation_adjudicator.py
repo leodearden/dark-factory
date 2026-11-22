@@ -476,14 +476,27 @@ AdjudicationResult = Adjudication | AdjudicationFailure
 
 
 def classify_failure(exc: BaseException) -> FailureKind:
-    """Transport for a timeout, a connection failure, a 429 or a 5xx (K3); content otherwise."""
+    """Transport when no reply arrived; content otherwise.
+
+    K3's transport list (a timeout, a connection failure, a 429, a 5xx) plus the
+    failures that refuse the call before any model answers: a rejected key (401),
+    a denied permission (403), and an SDK client that could not be built (a bare
+    ``OpenAIError``, e.g. no key). Scoring those as content would let an account
+    outage retire the identity, which K5 says a provider outage never does.
+    """
     import openai
 
     if isinstance(
-        exc, (TimeoutError, openai.APITimeoutError, openai.APIConnectionError, openai.RateLimitError),
+        exc,
+        (
+            TimeoutError, openai.APITimeoutError, openai.APIConnectionError,
+            openai.RateLimitError, openai.AuthenticationError, openai.PermissionDeniedError,
+        ),
     ):
         return FailureKind.TRANSPORT
     if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
+        return FailureKind.TRANSPORT
+    if isinstance(exc, openai.OpenAIError) and not isinstance(exc, openai.APIError):
         return FailureKind.TRANSPORT
     return FailureKind.CONTENT
 
