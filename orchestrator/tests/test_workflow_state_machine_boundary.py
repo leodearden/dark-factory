@@ -1518,7 +1518,9 @@ class TestStewardOutcomeRouting:
         wf.scheduler.set_task_status.assert_any_call(  # type: ignore[attr-defined]
             wf.task_id, 'pending',
         )
-        reads = wf.escalation_queue.get_by_task.call_args_list  # type: ignore[union-attr]
+        queue = wf.escalation_queue
+        assert isinstance(queue, MagicMock)
+        reads = queue.get_by_task.call_args_list
         assert all(c.kwargs.get('level') == 1 for c in reads), reads
 
     # -- Row 8: StewardTerminalDecision --------------------------------------
