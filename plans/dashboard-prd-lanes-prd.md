@@ -515,9 +515,18 @@ R5).
   would put two axes of variability in one field (heuristic 3) and touch every Datum call
   site.
 - **Rendering.** `shell.jsx::DatumReading` and `Pip` gain an optional `rule` prop. Their
-  `title` is the non-fresh `reason` when there is one, otherwise the rule. Figures inside a
-  view render through one small component that takes the parent Datum, so `≥`, staleness and
-  em-dash-for-unknown apply uniformly (one-datum decision 7).
+  `title` is the non-fresh `reason` when there is one, otherwise the rule.
+- **A block's provenance is read once, by its head.** `PRD_VIEW` and `PRD_CONTENTION` are each
+  one served Datum, and each is read once per block, not once per figure. `prd_lanes.jsx`
+  renders one shell `Pip` at the head of the lanes page (`ProjectPrdLanes`) and one at the head
+  of the contention line (`PrdContentionLine`), each taking its block's Datum and its served
+  rule. That `Pip` alone carries `≥` for a lower-bound Datum, the age, and the non-fresh
+  `reason` (one-datum decision 7). Every figure inside the block (titles, lane names, state
+  lines, chips, cells) is a plain `ViewFigure` span, not a `Pip`: it carries no `≥` or age of
+  its own, and its `title` is its served rule, preceded by the row detail where the row has
+  one, whatever the Datum's state. A figure's own `≥`, such as the ready cell's oldest age,
+  comes from a served field of that figure, not from the Datum. A Datum that is `unknown`
+  renders its `reason` in place of its block, so no figure inside it renders.
 - **Test.** A test asserts every `FigureId` has a non-empty rule and every figure in a shaped
   payload names one.
 
