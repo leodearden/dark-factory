@@ -6,23 +6,34 @@ category, with the 4716 audit's own hash rule and window semantics, so
 replay_overreach_extraction.py replays and scores it unchanged. Graphs are read
 over GRAPH.RO_QUERY only, through fused_memory/backends/falkor_read_only.py's
 ReadOnlyGraphReader; episode bodies are read only for sampled episodes, and only
-the worksheet carries them, never the frame.
+the worksheet carries them, never the frame. The classifier and router
+fixtures come from the write journal, opened read-only, and keep only inputs
+the production WriteClassifier and ReadRouter send to their LLM.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import os
+import sqlite3
 import sys
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import httpx
 from graphiti_core.utils.maintenance.dedup_helpers import _normalize_string_exact
 from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
+from openai import AsyncOpenAI
 
 from fused_memory.backends.falkor_read_only import PagedQuery, ReadOnlyGraphReader
+from fused_memory.config.schema import FusedMemoryConfig, LLMConfig, RoutingConfig
+from fused_memory.routing.classifier import WriteClassifier
+from fused_memory.routing.router import ReadRouter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audit_ruling_overreach import (
@@ -388,3 +399,114 @@ async def summary_fixtures(
             if item['graph'] == graph:
                 item['episode_content_sha256'] = _sha256(contents[item['episode_uuid']])
     return items
+
+
+# --------------------------------------------------------------------------- #
+# Journal fixtures: the classifier and the router
+# --------------------------------------------------------------------------- #
+
+JOURNAL_ROWS_SQL = 'SELECT id, created_at, params FROM write_ops WHERE operation = ?'
+
+_PROBE_ANSWER = {
+    'primary': 'observations_and_summaries', 'confidence': 0.5,
+    'query_type': 'broad', 'stores': ['graphiti', 'mem0'], 'primary_store': 'graphiti',
+}
+"""One answer both the classifier and the router parse, so the probe logs no parse failure."""
+
+
+def open_journal(path: str | Path) -> sqlite3.Connection:
+    """The write journal, read-only at the SQLite level; a missing file is refused, never created."""
+    resolved = Path(path)
+    if not resolved.exists():
+        raise FileNotFoundError(f'write journal not found: {resolved}')
+    return sqlite3.connect(f'file:{resolved}?mode=ro', uri=True)
+
+
+def _row_key(row_id: str) -> str:
+    return hashlib.sha256(row_id.encode()).hexdigest()
+
+
+def _journal_rows(path: str | Path, operation: str, window: Window) -> list[tuple[str, str, dict[str, Any]]]:
+    """``(id, created_at, params)`` of *operation*'s rows created in *window*, in sha256(id) order."""
+    with contextlib.closing(open_journal(path)) as db:
+        rows = db.execute(JOURNAL_ROWS_SQL, (operation,)).fetchall()
+    kept = []
+    for row_id, created_at, raw in rows:
+        try:
+            params = json.loads(raw or '{}')
+        except json.JSONDecodeError:
+            continue
+        if isinstance(params, dict) and instant_in_window(created_at, *window):
+            kept.append((str(row_id), str(created_at), params))
+    return sorted(kept, key=lambda row: _row_key(row[0]))
+
+
+class LlmReachProbe:
+    """A real AsyncOpenAI whose transport answers locally and counts requests, so the production
+    routing code is asked, through its public openai_client= seam, whether an input reaches its LLM."""
+
+    def __init__(self) -> None:
+        self.requests = 0
+        self.config = FusedMemoryConfig.model_construct(routing=RoutingConfig(), llm=LLMConfig())
+        """Routing defaults: heuristics first, the LLM below the confidence threshold."""
+
+    def client(self) -> AsyncOpenAI:
+        return AsyncOpenAI(
+            api_key='probe', base_url='http://llm-reach-probe.invalid/v1', max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(self._answer)),
+        )
+
+    def _answer(self, request: httpx.Request) -> httpx.Response:
+        self.requests += 1
+        return httpx.Response(200, json={
+            'id': 'probe', 'object': 'chat.completion', 'created': 0, 'model': 'probe',
+            'choices': [{'index': 0, 'finish_reason': 'stop',
+                         'message': {'role': 'assistant', 'content': json.dumps(_PROBE_ANSWER)}}],
+        })
+
+    async def reaches(self, call: Awaitable[Any]) -> bool:
+        before = self.requests
+        await call
+        return self.requests > before
+
+
+async def classifier_fixtures(journal_path: str | Path, window: Window, per_category: int) -> list[dict[str, Any]]:
+    """The first *per_category* window add_memory inputs per journalled category, by sha256(row id),
+    that the production WriteClassifier sends to its LLM. The input is the journal's 200-char prefix."""
+    probe = LlmReachProbe()
+    classifier = WriteClassifier(probe.config, openai_client=probe.client())
+    by_category: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    try:
+        for row_id, created_at, params in _journal_rows(journal_path, 'add_memory', window):
+            content, category = params.get('content'), params.get('category')
+            if not isinstance(content, str) or not isinstance(category, str):
+                continue
+            if len(by_category[category]) < per_category and await probe.reaches(classifier.classify(content)):
+                by_category[category].append(
+                    {'id': row_id, 'created_at': created_at, 'input': content, 'reference_category': category},
+                )
+    finally:
+        await classifier.close()
+    return [fixture for category in sorted(by_category) for fixture in by_category[category]]
+
+
+async def router_fixtures(journal_path: str | Path, window: Window, n: int) -> list[dict[str, Any]]:
+    """The first *n* distinct, untruncated window search queries, by sha256(row id), that the
+    production ReadRouter sends to its LLM."""
+    probe = LlmReachProbe()
+    router = ReadRouter(probe.config, openai_client=probe.client())
+    seen: set[str] = set()
+    fixtures: list[dict[str, Any]] = []
+    try:
+        for row_id, created_at, params in _journal_rows(journal_path, 'search', window):
+            query = params.get('query')
+            if len(fixtures) == n:
+                break
+            if params.get('query_truncated') is not False or not isinstance(query, str) or query in seen:
+                continue
+            seen.add(query)
+            if await probe.reaches(router.route(query)):
+                fixtures.append({'id': row_id, 'created_at': created_at, 'query': query})
+    finally:
+        await router.close()
+    return fixtures
