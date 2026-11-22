@@ -36,7 +36,7 @@ which is gitignored, read-only, and only in the main checkout.
 | File | What | Re-derive |
 |---|---|---|
 | `write_triage_eval_set_v2_live_slates.jsonl` | header + 400 rebuilt live judge-band writes (§4) | `scripts/rebuild_write_triage_live_slates.py` (its docstring gives the command) |
-| `write_triage_eval_set_v2_rounds/key.json` | the scratch key: shard items, raters, rounds, each shard's `brief_sha256`, the `rerates` record, and the `inputs` digests | `scripts/build_write_triage_eval_set.py shards`, `reask`, `third`, `rerate` |
+| `write_triage_eval_set_v2_rounds/key.json` | the scratch key: shard items, raters, rounds, each shard's kind and basis and its `brief_sha256`, the `rerates` record, and the `inputs` digests | `scripts/build_write_triage_eval_set.py shards`, `reask`, `third`, `rerate` |
 | `write_triage_eval_set_v2_rounds/ratings/*.jsonl` | 238 rater files, one per shard, 9,367 lines | written by the blind raters; never edited |
 | `write_triage_eval_set_v2_writes.jsonl` | 884 write rows, each with its ranked targets | `build_write_triage_eval_set.py assemble --snapshot S --out-dir calibration/` |
 | `write_triage_eval_set_v2_verdicts.jsonl` | 8,733 effective rater rows, DIGEST added | the same `assemble` |
