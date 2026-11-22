@@ -395,19 +395,30 @@ class TestFrame:
         assert _frame(ev) == 2
         assert not ev.dir.exists() and not ev.journal.exists()
 
-    def test_a_summary_that_changes_between_the_draw_and_its_restore_exits_1(self, tmp_path: Path) -> None:
-        class _Drifting(_Graph):
-            """The paged Entity read sees one summary, the by-uuid restore another."""
+    def test_summaries_the_live_graph_rewrites_during_the_draw_still_restore_the_manifest(
+        self, tmp_path: Path, routing_cfg: Any,
+    ) -> None:
+        class _Rewriting(_Graph):
+            """Every Entity read answers a newer summary, as a graph still being written does."""
 
-            def _by_uuid(self, cypher: str, wanted: Sequence[str]) -> list[list[Any]]:
-                rows = super()._by_uuid(cypher, wanted)
-                if ':RELATES_TO' in cypher or ':Entity' not in cypher:
-                    return rows
-                return [[row[0], row[1] + ' since edited'] for row in rows]
+            def __init__(self) -> None:
+                super().__init__()
+                self.edits = 0
+
+            async def ro_query(self, cypher: str, params: dict[str, Any] | None = None) -> _Result:
+                result = await super().ro_query(cypher, params)
+                pattern = cypher.split('RETURN')[0]
+                if ':Entity' not in pattern or '-[' in pattern:
+                    return result
+                self.edits += 1
+                return _Result([[*row[:-1], f'{row[-1]} edit {self.edits}'] if len(row) > 1 else row
+                                for row in result.result_set])
 
         ev = _Eval(tmp_path)
-        assert _frame(ev, _Drifting()) == 1
-        assert not ev.dir.exists()
+        assert _frame(ev, _Rewriting()) == 0
+        (inputs,) = ev.lines(ev.summary_inputs)
+        assert inputs['nodes'][0]['summary'].startswith(LONG_SUMMARY)
+        assert _run(ev, 'summaries', _Factory(), None, routing_cfg) == 0
 
 
 # --------------------------------------------------------------------------- #
