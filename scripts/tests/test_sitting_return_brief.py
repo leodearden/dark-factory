@@ -11,9 +11,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import orchestrator_projects
 import pytest
 from escalation.authority import EXECUTOR_IDENTITY, policy_row
 from escalation.models import Escalation
+from fake_systemctl import install_fake_systemctl
 from landing_history import LandingRepo, record_merge_done, record_train
 from orchestrator.decision_registry import (
     AuditOutcome,
@@ -56,6 +58,7 @@ DONE_LINE = re.compile(
     r'^done \(decisions=(\w+), standing_policy=(\w+), landed=(\w+), stuck=(\w+), spend=(\w+), closes=(\w+)\)$'
 )
 EVIDENCE = 'Leo 2026-09-25: "take option A"\nquoted from esc-5580-4'
+DF_UNIT = 'orchestrator-dark-factory.service'
 
 
 @dataclass
@@ -87,6 +90,14 @@ class Env:
     def trigger_state(self) -> Path:
         return self.tmp / 'state' / 'trigger-last-run.json'
 
+    @property
+    def units_dir(self) -> Path:
+        return self.tmp / 'units'
+
+    def units(self) -> fleet_state.OrchestratorUnits:
+        return fleet_state.OrchestratorUnits(
+            orchestrator_projects.scan_units(self.units_dir), fleet_state.systemctl_active_state)
+
     def argv(self, *roots: Path) -> list[str]:
         return [
             *[arg for root in (roots or (self.df,)) for arg in ('--project-root', str(root))],
@@ -102,6 +113,7 @@ class Env:
             '--output', str(self.output),
             '--ledger-out', str(self.ledger_out),
             '--trigger-state', str(self.trigger_state),
+            '--units-dir', str(self.units_dir),
             '--now', NOW_ISO,
         ]
 
@@ -117,6 +129,7 @@ class Env:
             trigger_state_path=self.trigger_state,
             window=fleet_state.Window.trailing(NOW, days=1),
             now=NOW,
+            units=self.units(),
         )
 
 
@@ -186,11 +199,21 @@ def _record_landings(runs_db: Path, repo: LandingRepo) -> None:
         conn.close()
 
 
+def _install_unit(units_dir: Path, unit: str, root: Path) -> None:
+    units_dir.mkdir(parents=True, exist_ok=True)
+    (units_dir / unit).write_text(
+        '[Service]\n'
+        f'ExecStart=/usr/bin/python3 -m orchestrator --config {root}/dark-factory-orchestrator.yaml\n'
+    )
+
+
 @pytest.fixture
-def env(tmp_path, make_tasks_db, project_root_with_tasks_db) -> Env:
+def env(tmp_path, make_tasks_db, project_root_with_tasks_db, monkeypatch) -> Env:
     df = tmp_path / 'src' / 'dark-factory'
     e = Env(tmp_path, df, tmp_path / 'fleet', tmp_path / 'fleet' / 'sessions',
             tmp_path / 'state' / 'preparation.json', tmp_path / 'out')
+    _install_unit(e.units_dir, DF_UNIT, df)
+    install_fake_systemctl(tmp_path / 'fake-bin', monkeypatch, {DF_UNIT: 'active'})
     make_tasks_db([
         *({'id': n, 'status': 'blocked'} for n in range(101, 108)),
         {'id': 109, 'status': 'blocked', 'title': 'blocked behind nothing'},
@@ -396,7 +419,7 @@ class TestHandoverPerProject:
             project_roots=[str(env.df), str(reify)], roots_source='--project-root', decisions_root=env.fleet,
             sessions_root=env.sessions, handover_override=None, preparation_path=env.preparation,
             previous_ledger=env.ledger_out, trigger_state_path=env.trigger_state,
-            window=fleet_state.Window.trailing(NOW, days=1), now=NOW,
+            window=fleet_state.Window.trailing(NOW, days=1), now=NOW, units=env.units(),
         )
 
         key = escalation_key(normalize_escalations_dir(reify / 'data' / 'escalations'), 'esc-101-1')
@@ -548,7 +571,7 @@ class TestMain:
         match = DONE_LINE.match(out.splitlines()[-1])
         assert match is not None and match.group(6) == 'degraded'
 
-    def test_the_only_subprocess_is_git_rev_list_and_there_is_no_network(self, env, capsys, monkeypatch):
+    def test_the_only_subprocesses_are_git_rev_list_and_systemctl_show(self, env, capsys, monkeypatch):
         spawned: list[list[str]] = []
         connected: list[str] = []
         real_popen = subprocess.Popen
@@ -572,8 +595,9 @@ class TestMain:
         assert rc == 0
         assert connected == []
         assert spawned
-        assert {Path(argv[0]).name for argv in spawned} == {'git'}
-        assert all('rev-list' in argv for argv in spawned)
+        assert {Path(argv[0]).name for argv in spawned} == {'git', 'systemctl'}
+        assert all('rev-list' in argv for argv in spawned if Path(argv[0]).name == 'git')
+        assert all('show' in argv for argv in spawned if Path(argv[0]).name == 'systemctl')
 
     def test_a_pinned_now_renders_byte_identical_files(self, env, capsys):
         _run(capsys, env.argv())

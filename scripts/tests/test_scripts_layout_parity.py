@@ -14,6 +14,7 @@ from types import ModuleType
 
 import census_tagger_debris
 import merge_lane_throughput
+import orchestrator_projects
 import pytest
 import suite_census_evidence
 import sweep_toolcall_markup
@@ -44,7 +45,11 @@ def test_fleet_state_measures_landings_and_spend_from_the_layouts_runs_db(tmp_pa
     root.mkdir()
     now = datetime(2026, 10, 1, tzinfo=UTC)
 
-    states = fleet_state.measure_projects([root], {}, window=fleet_state.Window.trailing(now, days=1), now=now)
+    units = fleet_state.OrchestratorUnits(
+        scan=orchestrator_projects.UnitScan(roots={}, problems=()), active_state=lambda _unit: 'inactive')
+
+    states = fleet_state.measure_projects([root], {}, window=fleet_state.Window.trailing(now, days=1), now=now,
+                                          units=units)
 
     (state,) = states.values()
     assert state.landed.source == state.spend.source == str(project_layout.runs_db(root))

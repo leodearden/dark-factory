@@ -6,7 +6,7 @@ import json
 import logging
 import sqlite3
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -31,6 +31,8 @@ WINDOW = mod.Window(NOW - timedelta(days=1), NOW)
 IN_WINDOW = '2026-09-25T18:00:00+00:00'
 BEFORE_WINDOW = '2026-09-20T18:00:00+00:00'
 UNIT = 'orchestrator-dark-factory.service'
+NO_UNITS = mod.OrchestratorUnits(
+    scan=orchestrator_projects.UnitScan(roots={}, problems=()), active_state=lambda _unit: 'inactive')
 
 _RUNS_SCHEMA = """
 CREATE TABLE events (
@@ -577,7 +579,7 @@ class TestCrossProject:
         bare.mkdir(parents=True)
         pending = _pending(df / 'data' / 'escalations', tmp_path=tmp_path)
 
-        states = mod.measure_projects([df, bare], pending, window=WINDOW, now=NOW)
+        states = mod.measure_projects([df, bare], pending, window=WINDOW, now=NOW, units=NO_UNITS)
 
         assert set(states) == {'dark_factory', 'reify'}
         assert states['dark_factory'].landed.value == 3
@@ -593,7 +595,7 @@ class TestCrossProject:
         _write_escalation(recon, id='esc-11-1', level=0, category='risk_identified')
         pending = _pending(df / 'data' / 'escalations', recon, tmp_path=tmp_path)
 
-        state = mod.measure_projects([df], pending, window=WINDOW, now=NOW)['dark_factory']
+        state = mod.measure_projects([df], pending, window=WINDOW, now=NOW, units=NO_UNITS)['dark_factory']
 
         rows = {row.task_id: row for row in state.stuck.value}
         assert rows['11'].open_escalations is not None
@@ -607,7 +609,7 @@ class TestCrossProject:
         twin = tmp_path / 'elsewhere' / 'dark_factory'
         twin.mkdir(parents=True)
 
-        states = mod.measure_projects([df, twin], _pending(tmp_path=tmp_path), window=WINDOW, now=NOW)
+        states = mod.measure_projects([df, twin], _pending(tmp_path=tmp_path), window=WINDOW, now=NOW, units=NO_UNITS)
 
         assert list(states) == ['dark_factory']
         kept = states['dark_factory']
@@ -617,7 +619,7 @@ class TestCrossProject:
             assert collision and 'dark_factory' in collision[0].reason and str(df) in collision[0].reason
 
     def test_one_root_spelled_twice_is_measured_once_with_no_collision(self, df, tmp_path):
-        states = mod.measure_projects([df, f'{df}/'], _pending(tmp_path=tmp_path), window=WINDOW, now=NOW)
+        states = mod.measure_projects([df, f'{df}/'], _pending(tmp_path=tmp_path), window=WINDOW, now=NOW, units=NO_UNITS)
 
         assert list(states) == ['dark_factory']
         assert not any(s.source == 'project_root' for s in states['dark_factory'].landed.shortfalls)
@@ -629,7 +631,7 @@ class TestCrossProject:
         monkeypatch.setattr(mod, 'agreement_report', pathological)
         pending = _pending(df / 'data' / 'escalations', tmp_path=tmp_path)
 
-        state = mod.measure_projects([df], pending, window=WINDOW, now=NOW)['dark_factory']
+        state = mod.measure_projects([df], pending, window=WINDOW, now=NOW, units=NO_UNITS)['dark_factory']
 
         assert state.standing_policy.status == 'unreadable'
         (failure,) = state.standing_policy.shortfalls
@@ -639,7 +641,15 @@ class TestCrossProject:
 
     def test_a_naive_now_is_still_a_configuration_error(self, df, tmp_path):
         with pytest.raises(ValueError, match='aware'):
-            mod.measure_projects([df], _pending(tmp_path=tmp_path), window=WINDOW, now=NOW.replace(tzinfo=None))
+            mod.measure_projects([df], _pending(tmp_path=tmp_path), window=WINDOW, now=NOW.replace(tzinfo=None), units=NO_UNITS)
+
+
+def _units_by_root(states: Mapping[Path, str]) -> mod.OrchestratorUnits:
+    """One unit per root, named after it, whose ActiveState is *states*' entry for that root."""
+    by_unit = {f'orchestrator-{root.name}.service': state for root, state in states.items()}
+    scan = orchestrator_projects.UnitScan(
+        roots={root.resolve(): (f'orchestrator-{root.name}.service',) for root in states}, problems=())
+    return mod.OrchestratorUnits(scan=scan, active_state=by_unit.__getitem__)
 
 
 def _units(root: Path, probe: Callable[[str], str], *, problems: tuple[str, ...] = ()) -> mod.OrchestratorUnits:
@@ -766,6 +776,84 @@ class TestNewEscalations:
         assert (measurement.value, measurement.status) == (0, 'source_missing')
 
 
+def _quiet_root(tmp_path: Path, name: str = 'reify', *, git: bool = True) -> Path:
+    """A root with a runs.db and an empty queue, no landing and no escalation; a git repo unless *git* is False."""
+    root = tmp_path / 'src' / name
+    root.mkdir(parents=True)
+    if git:
+        LandingRepo(root)
+    runs_db = mod.runs_db_path(root)
+    runs_db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(runs_db)
+    conn.executescript(_RUNS_SCHEMA)
+    conn.close()
+    (root / 'data' / 'escalations').mkdir(parents=True)
+    return root
+
+
+def _measure(root: Path, state: str) -> mod.ProjectState:
+    (measured,) = mod.measure_projects([root], {}, window=WINDOW, now=NOW, units=_units_by_root({root: state})).values()
+    return measured
+
+
+class TestActivity:
+    def test_every_root_given_appears_exactly_once(self, df, tmp_path):
+        quiet = _quiet_root(tmp_path)
+
+        states = mod.measure_projects([df, quiet], {}, window=WINDOW, now=NOW,
+                                      units=_units_by_root({df: 'active', quiet: 'inactive'}))
+
+        assert [state.root for state in states.values()] == [str(df), str(quiet)]
+
+    def test_an_active_unit_with_a_pause_row_is_active_and_paused(self, df):
+        _pause(mod.runs_db_path(df), 'cost ceiling reached')
+
+        state = _measure(df, 'active')
+
+        assert state.active and state.inactive_reason is None
+        assert (state.unit_active.value, state.pause_reason.value) == (True, 'cost ceiling reached')
+
+    def test_an_inactive_unit_with_no_landing_and_no_escalation_is_inactive(self, tmp_path):
+        state = _measure(_quiet_root(tmp_path), 'inactive')
+
+        assert not state.active
+        assert state.inactive_reason == mod.INACTIVE_REASON == 'unit inactive, no activity'
+
+    def test_a_landing_in_the_window_keeps_an_inactive_unit_active(self, tmp_path):
+        quiet = _quiet_root(tmp_path)
+        conn = sqlite3.connect(mod.runs_db_path(quiet))
+        record_merge_done(conn, '1', LandingRepo(quiet).fast_forward('landed'), IN_WINDOW)
+        conn.commit()
+        conn.close()
+
+        state = _measure(quiet, 'inactive')
+
+        assert state.landed.value == 1 and state.active
+
+    def test_an_escalation_filed_in_the_window_keeps_an_inactive_unit_active(self, tmp_path):
+        quiet = _quiet_root(tmp_path)
+        _write_escalation(quiet / 'data' / 'escalations', id='esc-30-1', timestamp=IN_WINDOW)
+
+        state = _measure(quiet, 'inactive')
+
+        assert state.new_escalations.value == 1 and state.active
+
+    def test_an_unmeasured_zero_never_hides_a_project(self, tmp_path):
+        state = _measure(_quiet_root(tmp_path, git=False), 'inactive')
+
+        assert state.landed.status == 'unreadable'
+        assert state.active and state.inactive_reason is None
+
+    def test_activity_is_derived_from_the_measurements_of_a_frozen_state(self, tmp_path):
+        state = _measure(_quiet_root(tmp_path), 'inactive')
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            state.unit_active = state.unit_active  # type: ignore[misc]
+        revived = dataclasses.replace(state, unit_active=dataclasses.replace(state.unit_active, value=True))
+        assert (state.active, revived.active) == (False, True)
+        assert revived.inactive_reason is None
+
+
 class TestReadOnly:
     def test_no_gatherer_writes_anything(self, df, tmp_path):
         fleet = tmp_path / 'fleet'
@@ -781,7 +869,7 @@ class TestReadOnly:
         mod.autonomous_closes(fleet, WINDOW, now=NOW)
         mod.standing_policy_rulings([str(queue), str(tmp_path / 'nowhere')], WINDOW, now=NOW)
         mod.preparer_trial([str(queue)], WINDOW, now=NOW)
-        mod.measure_projects([df, tmp_path / 'src' / 'absent'], pending, window=WINDOW, now=NOW)
+        mod.measure_projects([df, tmp_path / 'src' / 'absent'], pending, window=WINDOW, now=NOW, units=NO_UNITS)
 
         assert _snapshot(tmp_path) == before
         assert sorted(path for path in tmp_path.rglob('*') if path.is_dir()) == dirs_before
