@@ -334,6 +334,36 @@ async def test_dispatch_ends_the_episode(tmp_path):
     assert [d['episode_secs'] for d in _refusals(w)] == [interval]
 
 
+@pytest.mark.asyncio
+async def test_leaving_the_candidates_ends_the_episode(tmp_path):
+    clock = _Clock()
+    w, tasks = _peer_park_world(tmp_path, clock)
+    interval = _interval(w)
+    t0 = clock.now
+    assert await w.scheduler.acquire_next() is None
+
+    clock.now = t0 + interval / 2
+    tasks.set([t for t in _peer_tasks() if t['id'] != B])
+    assert await w.scheduler.acquire_next() is None
+    last_tick = event_payloads(w.store, 'scheduler_tick')[-1]['data']
+    assert last_tick['terminal_phase'] == 'select_scored', 'premise: the scan ran without B'
+
+    tasks.set(_peer_tasks())
+    clock.now = t0 + interval
+    assert await w.scheduler.acquire_next() is None
+    assert _refusals(w) == [], 'leaving the candidates ended the episode that was due now'
+
+    clock.now += interval - 1
+    assert await w.scheduler.acquire_next() is None
+    assert _refusals(w) == []
+
+    clock.now += 1
+    assert await w.scheduler.acquire_next() is None
+    assert [d['episode_secs'] for d in _refusals(w)] == [interval], (
+        "the new episode starts at B's return"
+    )
+
+
 def _fix_task(tid: str, files: list[str]) -> dict:
     task = make_task(tid, 'high', files)
     task['metadata'].update({SIGNATURE_KEY: f'sig-{tid}', 'merge_lane': 'high'})
