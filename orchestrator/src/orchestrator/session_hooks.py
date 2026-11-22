@@ -905,7 +905,9 @@ def run_session_start(
             transcript_path=session_records.transcript_path_for_cwd(cwd),
         )
 
-    record.status = session_records.Status.RUNNING
+    record = session_records.apply_refresh(
+        slug, record, status=session_records.Status.RUNNING
+    )
     if forked_from is not None:
         # The rejected env slug IS this nested claude's spawner.
         record.parent_session_id = forked_from
