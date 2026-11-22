@@ -8,7 +8,6 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
@@ -447,36 +446,11 @@ class TestBuildMcpConfigReconReport:
         entry = mcp_config['mcpServers']['recon-report']
         assert entry == {'type': 'http', 'url': 'http://127.0.0.1:9999/mcp/'}
 
-    def test_existing_entries_preserved(self):
-        """fused-memory and jcodemunch entries still present after recon-report injection."""
+    def test_server_set_without_escalation_url(self):
+        """fused-memory and recon-report are the only always-present servers."""
         stage = make_consolidator()
         servers = stage._build_mcp_config()['mcpServers']
-        assert 'fused-memory' in servers, 'fused-memory entry must remain'
-        assert 'jcodemunch' in servers, 'jcodemunch entry must remain'
-
-
-class TestReconJcodemunchLaunchPinned:
-    """The recon-stage jcodemunch entry uses the launch contract in shared/jcodemunch_launch.py."""
-
-    def test_command_matches_shared_constant(self):
-        stage = make_consolidator()
-        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
-
-        assert jc['command'] == JCODEMUNCH_COMMAND
-
-    def test_env_matches_shared_constant(self):
-        """Full dict equality, so a dropped or extra key fails."""
-        stage = make_consolidator()
-        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
-
-        assert jc['env'] == JCODEMUNCH_ENV
-
-    def test_env_is_a_copy_not_the_shared_dict(self):
-        """A caller mutating the returned config must not corrupt the process-wide constant."""
-        stage = make_consolidator()
-        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
-
-        assert jc['env'] is not JCODEMUNCH_ENV
+        assert set(servers) == {'fused-memory', 'recon-report'}
 
 
 class TestStartReportErrorHandling:
