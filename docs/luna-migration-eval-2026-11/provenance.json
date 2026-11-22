@@ -370,7 +370,35 @@
    "The router log (invocation 1) showed two production ERROR lines quoting a SourceStore value that does not parse and three WARNING lines quoting truncated JSON. Each quotes the start of one completion. Which arm produced each was not read; under design.md §2.8 they score as the broad route.",
    "The classifier log held 15 ERROR lines, counted and not read.",
    "The router log (invocation 2) held 2 ERROR and 3 WARNING lines, counted and not read.",
-   "The replay log showed graphiti_core edge_operations WARNING lines (an unparseable valid_at; an edge whose endpoint was not among the extracted nodes); they were not read per arm."
-  ]
+   "The replay log showed graphiti_core edge_operations WARNING lines (an unparseable valid_at; an edge whose endpoint was not among the extracted nodes); they were not read per arm.",
+   "Extraction: before labelling, the adjudicator saw the blind worksheet's TOTAL of 666 minted edges over 54 episodes across both arms, the distribution of edges per episode (1 to 79), and the edge field names (edge_uuid, fact, source_name, target_name). No per-arm edge count, per-arm content or token total was seen.",
+   "Extraction: replay.jsonl, the replay log and anything scored from them were not opened while labelling. After labelling, validate_verdicts read replay.jsonl to check coverage and printed only the accepted and stale counts.",
+   "Extraction: near-duplicate facts sat side by side within an episode, so an adjudicator could infer that the two copies come from different arms. Edges also differed in surface style (e.g. 'Task 166 (solar_challenge_platform)' against 'Task 166'; 'Liveness-snapshot memory' against 'liveness-snapshot memory'). No style-to-arm mapping was checked, and near-duplicates were labelled alike.",
+   "Extraction: the running label tally over the UNION of arms was printed once, after all 54 episodes were labelled; it was never printed per arm."
+  ],
+  "extraction": {
+   "adjudicator": "claude-task-9945-implementer, the role that ran the arms, in a later session of the same task; single, self-blinded, no sub-agents",
+   "procedure": "one sitting in one session on 2026-11-22, after the step-24 data commit 47c32c4115. `replay_overreach_extraction.py worksheet --replay ../docs/luna-migration-eval-2026-11/replay.jsonl --worksheet /tmp/9945-worksheet.jsonl --out /tmp/9945-blind-extraction.jsonl` (rc 0) wrote the blind worksheet. Rows were labelled in worksheet order 0..53, every minted edge in its emitted order, each episode body read in full beside its edges. Per-episode label files were compiled into verdicts-extraction.json once all 54 were written. Identical fact strings within an episode were checked for consistent labels: 0 inconsistent of 657 distinct.",
+   "rubric": "docs/ruling-overreach-guard-design-2026-10-01/design.md §2.6 verbatim, with its §2.10 garble conventions, and design.md §2.6's reading for non-decision records: holding means 'states the record's own assertion within its scope'",
+   "conventions": [
+    "holding: the record's own assertion, its point, stated within its scope. In a status record ('As of D, task X has status S') the status is that assertion, so it is a holding, not bookkeeping.",
+    "bookkeeping: an incidental who, when, which task, run, commit, escalation or file location that is not the record's assertion.",
+    "context: the grounds, measurements, mechanism, history or background a record gives for its assertion, including another task's plan described as background to a coordination rule.",
+    "A dropped 'As of D' on a status fact is not overreach (iv): graphiti carries the record's reference time as the edge's valid_at, and the status itself is unchanged.",
+    "overreach (iv) was applied when a dropped qualifier narrowed who, which or under what condition the assertion holds (e.g. 'a remediation pass's Stage 1', 'whichever lands second', 'In a .worktrees/<id> dispatch', 'Right').",
+    "A faithful fact on a generic or wrong endpoint ('task', 'Stage 2', a task the fact is not about) is misbound, per §2.10."
+   ],
+   "verdict_file": "verdicts-extraction.json",
+   "verdicts": 666,
+   "label_counts_union": {
+    "holding": 426,
+    "bookkeeping": 76,
+    "context": 121,
+    "overreach": 38,
+    "misbound": 5,
+    "unjudgeable": 0
+   },
+   "validated": "replay_overreach_extraction.py::validate_verdicts over both arms' minted edges under frame.json sample.definition: 666 accepted, 0 stale. Only the counts were printed."
+  }
  }
 }
