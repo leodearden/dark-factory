@@ -19,7 +19,11 @@
 # literal deadlines, 542 sleeps and 43 elapsed asserts.  Re-measured over
 # f5902cd44f (task/8254 merged with main 7ee2b5f2a1): main had meanwhile landed
 # three sleeps and one literal deadline in three files, so 1,852 in 439.  Every
-# one was already in the tree, newly SEEN rather than new debt.
+# one was already in the tree, newly SEEN rather than new debt.  Re-measured
+# 2026-11-22 over task/8254 rebased onto main 255de0827b: main had landed three
+# new test files carrying 29 sites, cut the two session-lease test files from 7
+# to 1 while adding 3 in orchestrator/tests/_shared_host_fixtures.py, and grown
+# two shared/tests files by 3, so 1,877 in 442.  Again newly SEEN, not new debt.
 TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     # orchestrator/tests
     'orchestrator/tests/test_merge_queue_request_liveness.py': 46,
@@ -86,7 +90,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_laptop_warm_verify_boundary.py': 4,
     'orchestrator/tests/test_merge_queue_orphan_reaper.py': 4,
     'orchestrator/tests/test_orch_helpers_wait_responsive.py': 4,
-    'orchestrator/tests/test_session_lease_shared_host.py': 4,
+    'orchestrator/tests/test_session_lease_shared_host.py': 1,
     'orchestrator/tests/test_shadow_coordinator.py': 4,
     'orchestrator/tests/test_steward.py': 4,
     'orchestrator/tests/test_task_verify_host_race.py': 4,
@@ -107,7 +111,6 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py': 3,
     'orchestrator/tests/test_merge_verify_lease_guard.py': 3,
     'orchestrator/tests/test_offline_lane.py': 3,
-    'orchestrator/tests/test_session_self_exit.py': 3,
     'orchestrator/tests/test_sighup.py': 3,
     'orchestrator/tests/test_spawn_t3_lane.py': 3,
     'orchestrator/tests/test_verify_cancel_unwind.py': 3,
@@ -117,6 +120,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_workflow_cancellation.py': 3,
     'orchestrator/tests/test_workflow_e2e.py': 3,
     'orchestrator/tests/test_workflow_halt_owner.py': 3,
+    'orchestrator/tests/_shared_host_fixtures.py': 3,
     'orchestrator/tests/_verify_merge_cli_fixtures.py': 2,
     'orchestrator/tests/test_b3_gate_state.py': 2,
     'orchestrator/tests/test_cancel_scope_bounded_cleanup.py': 2,
@@ -243,12 +247,14 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'fused-memory/tests/test_durable_queue.py': 40,
     'fused-memory/tests/test_e2e_durable_queue.py': 27,
     'fused-memory/tests/test_fm_polling.py': 22,
+    'fused-memory/tests/test_durable_queue_park.py': 18,
     'fused-memory/tests/test_event_queue.py': 16,
     'fused-memory/tests/test_harness.py': 16,
     'fused-memory/tests/arm_harness/test_usage_tap.py': 12,
     'fused-memory/tests/test_event_loop_lag.py': 12,
     'fused-memory/tests/test_ticket_worker.py': 11,
     'fused-memory/tests/test_sqlite_watchdog.py': 10,
+    'fused-memory/tests/test_billing_exhaustion_e2e.py': 10,
     'fused-memory/tests/test_memory_service.py': 8,
     'fused-memory/tests/test_cleanup_test_collections.py': 7,
     'fused-memory/tests/test_dead_letter_writer.py': 7,
@@ -343,6 +349,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'fused-memory/tests/test_task_curator.py': 1,
     'fused-memory/tests/test_ticket_parking.py': 1,
     'fused-memory/tests/test_write_triage_judge_wording.py': 1,
+    'fused-memory/tests/test_link_heal_theta_seam.py': 1,
     # shared/tests
     'shared/tests/test_concurrency.py': 46,
     'shared/tests/test_probe_loop.py': 24,
@@ -355,7 +362,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'shared/tests/test_proc_group.py': 8,
     'shared/tests/test_testing_virtual_clock.py': 4,
     'shared/tests/test_usage_gate_exhaustive.py': 7,
-    'shared/tests/test_usage_gate_park_visibility.py': 7,
+    'shared/tests/test_usage_gate_park_visibility.py': 9,
     'shared/tests/test_verify_admission.py': 7,
     'shared/tests/test_systemd_listeners.py': 6,
     'shared/tests/test_usage_gate_probe_hold.py': 6,
@@ -364,7 +371,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'shared/tests/test_usage_gate_scope_selection.py': 5,
     'shared/tests/test_usage_gate_scope_attribution.py': 4,
     'shared/tests/test_auth_failed.py': 3,
-    'shared/tests/test_cli_runner.py': 3,
+    'shared/tests/test_cli_runner.py': 4,
     'shared/tests/test_auth_reprobe_opt_out.py': 2,
     'shared/tests/test_cli_invoke.py': 2,
     'shared/tests/test_invocation_outcome_boundary.py': 2,
