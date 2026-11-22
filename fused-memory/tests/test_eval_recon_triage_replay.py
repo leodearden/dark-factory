@@ -202,6 +202,17 @@ class TestTheHeader:
             for name, path in inputs.items()
         }
 
+    def test_an_input_inside_the_package_is_recorded_relative_to_it_from_any_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        items = SCRIPTS.parent.resolve() / 'calibration' / 'write_triage_v2_soak_items.jsonl'
+        header = _mod().sample_header(seed=7161, allocation=_ALLOCATION, inputs={'items': items})
+        assert header['inputs']['items'] == {
+            'path': 'calibration/write_triage_v2_soak_items.jsonl',
+            'sha256': hashlib.sha256(items.read_bytes()).hexdigest(),
+        }
+
 
 class TestTheDefaultAllocation:
     def test_it_draws_160_headline_children_over_four_projects(self) -> None:
@@ -520,8 +531,28 @@ class _RecordingStage:
         return self._result
 
 
+class _CredentialedStage:
+    """A run_stage_via_cli stand-in that, like the usage gate and the CLI, leaves an OAuth
+    token and a session transcript in the ask's config dir, then returns or raises."""
+
+    def __init__(self, *, raises: Exception | None = None) -> None:
+        self.config_dirs: list[Path] = []
+        self.token_present_during_ask = False
+        self._raises = raises
+
+    async def __call__(self, **arguments: Any) -> StageResult:
+        config_dir = arguments['config_dir']
+        self.config_dirs.append(config_dir.path)
+        config_dir.write_credentials('oauth-token-for-this-ask')
+        (config_dir.path / 'session.jsonl').write_text('{"turn": 1}\n')
+        self.token_present_during_ask = (config_dir.path / '.credentials.json').exists()
+        if self._raises is not None:
+            raise self._raises
+        return StageResult(report=_reply(), success=True, model='sonnet')
+
+
 class TestTheStageCliAsker:
-    def _asker(self, tmp_path: Path, stage: _RecordingStage, **extra: Any) -> Any:
+    def _asker(self, tmp_path: Path, stage: Any, **extra: Any) -> Any:
         return _mod().StageCliAsker(
             run_stage=stage, config=ReconciliationConfig(), model='sonnet',
             cwd=Path('/srv/explore'), config_base=tmp_path / 'configs',
@@ -557,6 +588,23 @@ class TestTheStageCliAsker:
         first, second = stage.calls
         assert first['session_id'] != second['session_id']
         assert first['config_dir'].path != second['config_dir'].path
+
+    def test_an_asks_token_is_removed_once_it_ends_and_its_transcript_kept(self, tmp_path: Path) -> None:
+        stage = _CredentialedStage()
+        asyncio.run(self._asker(tmp_path, stage)(_p1_worklist(tmp_path)))
+        [config_dir] = stage.config_dirs
+        assert stage.token_present_during_ask
+        assert not (config_dir / '.credentials.json').exists()
+        assert (config_dir / 'session.jsonl').read_text() == '{"turn": 1}\n'
+
+    def test_an_asks_token_is_removed_when_the_ask_raises(self, tmp_path: Path) -> None:
+        stage = _CredentialedStage(raises=RuntimeError('CLI crashed'))
+        with pytest.raises(RuntimeError, match='CLI crashed'):
+            asyncio.run(self._asker(tmp_path, stage)(_p1_worklist(tmp_path)))
+        [config_dir] = stage.config_dirs
+        assert stage.token_present_during_ask
+        assert not (config_dir / '.credentials.json').exists()
+        assert (config_dir / 'session.jsonl').exists()
 
     def test_a_failed_run_hands_back_its_error_and_cost(self, tmp_path: Path) -> None:
         stage = _RecordingStage(StageResult(cost_usd=0.1, error='CLI exited 1', model='sonnet'))
@@ -931,6 +979,56 @@ class TestTheCli:
         assert self._sample(inputs, tmp_path / 'sample.jsonl') == 2
         assert 'absent-items.jsonl' in capsys.readouterr().err
         assert not (tmp_path / 'sample.jsonl').exists()
+
+    def test_the_calibration_defaults_name_the_packages_files_from_any_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        calibration = SCRIPTS.parent.resolve() / 'calibration'
+        args = _mod().build_parser().parse_args(['score'])
+        for path in (args.sample, args.decisions, args.items, args.verdicts, args.strata):
+            assert path.parent == calibration
+            assert path.is_file()
+        assert (args.out_json.parent, args.out_md.parent) == (calibration, calibration)
+
+    _DECISIONS_HEADER_LINE = json.dumps({'header': 'recon_triage_replay_decisions'}) + '\n'
+
+    @pytest.mark.parametrize(('text', 'named'), [
+        pytest.param('', ": the first line is not a 'recon_triage_replay_decisions' header", id='empty'),
+        pytest.param(json.dumps({'entry_id': 'x'}) + '\n',
+                     ": the first line is not a 'recon_triage_replay_decisions' header", id='header-less'),
+        pytest.param(json.dumps({'header': 'recon_triage_replay_sample'}) + '\n',
+                     ": the first line is not a 'recon_triage_replay_decisions' header", id='other-header'),
+        pytest.param(_DECISIONS_HEADER_LINE + '{"entry_id": \n', ' line 2: not JSON', id='malformed-line'),
+        pytest.param(_DECISIONS_HEADER_LINE + '[1, 2]\n', ' line 2: not a JSON object', id='non-object-line'),
+    ])
+    def test_score_refuses_a_malformed_decisions_file_exiting_2_naming_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], text: str, named: str,
+    ) -> None:
+        inputs = _e2e_inputs(tmp_path / 'in')
+        sample, decisions, out = tmp_path / 'sample.jsonl', tmp_path / 'decisions.jsonl', tmp_path / 'out'
+        assert self._sample(inputs, sample) == 0
+        decisions.write_text(text)
+        out.mkdir()
+        assert self._score(inputs, sample, decisions, out) == 2
+        err = capsys.readouterr().err
+        assert f'{decisions}{named}' in err
+        assert not any(out.iterdir())
+
+    def test_score_refuses_a_header_less_sample_exiting_2_naming_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        inputs = _e2e_inputs(tmp_path / 'in')
+        sample, out = tmp_path / 'sample.jsonl', tmp_path / 'out'
+        assert self._sample(inputs, sample) == 0
+        sample.write_text(''.join(sample.read_text().splitlines(keepends=True)[1:]))
+        decisions = tmp_path / 'decisions.jsonl'
+        decisions.write_text(self._DECISIONS_HEADER_LINE)
+        out.mkdir()
+        assert self._score(inputs, sample, decisions, out) == 2
+        assert f"{sample}: the first line is not a 'recon_triage_replay_sample' header" in (
+            capsys.readouterr().err)
+        assert not any(out.iterdir())
 
     def test_a_batch_project_with_no_root_exits_2_naming_it(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str],

@@ -7,7 +7,7 @@ invocation with the read-only deny list. Recon answers one repair per child
 from ``recon_triage_replay_scoring.py``'s vocabulary, and that module scores
 the answers against the rated truth.
 
-Subcommands, run from ``fused-memory/``:
+Subcommands; the default ``calibration/`` paths are ``fused-memory/``'s, from any cwd:
 
 - ``sample``: draw and write the frozen sample
   (``calibration/recon_triage_replay_sample.jsonl``, header line first).
@@ -67,6 +67,7 @@ from fused_memory.server.write_triage import OUTCOME_AMENDED, OUTCOME_CONTESTED,
 from fused_memory.utils.script_loader import load_script
 
 _SCRIPTS = Path(__file__).resolve().parent
+_PACKAGE = _SCRIPTS.parent
 
 
 if TYPE_CHECKING:
@@ -160,16 +161,25 @@ DECISIONS_HEADER = 'recon_triage_replay_decisions'
 def sample_header(
     *, seed: int, allocation: Mapping[str, int], inputs: Mapping[str, Path],
 ) -> dict[str, Any]:
-    """The sample file's first line: the seed, the allocation and each input file's sha256."""
+    """The sample file's first line: the seed, the allocation and each input file's sha256.
+
+    An input inside ``fused-memory/`` is recorded relative to it, any other
+    input by its absolute path, so the header never depends on the cwd.
+    """
     return {
         'header': SAMPLE_HEADER,
         'seed': seed,
         'allocation': dict(sorted(allocation.items())),
         'inputs': {
-            name: {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+            name: {'path': _recorded_path(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
             for name, path in inputs.items()
         },
     }
+
+
+def _recorded_path(path: Path) -> str:
+    resolved = path.resolve()
+    return str(resolved.relative_to(_PACKAGE) if resolved.is_relative_to(_PACKAGE) else resolved)
 
 
 @dataclass(frozen=True)
@@ -508,8 +518,9 @@ class StageCliAsker:
     """Asks recon one worklist through the real Stage-1 CLI invocation, read-only.
 
     Each ask runs under a fresh session id and its own config dir under
-    *config_base*, so every transcript is kept; *usage_gate* is the gate
-    recon's harness runs its stages under.
+    *config_base*, so every transcript is kept; the OAuth token the gate
+    writes there is removed once the ask ends, however it ends. *usage_gate*
+    is the gate recon's harness runs its stages under.
     """
 
     def __init__(
@@ -540,21 +551,25 @@ class StageCliAsker:
 
     async def __call__(self, worklist: Worklist) -> AskReply:
         session_id = str(uuid4())
-        result = await self._run_stage(
-            system_prompt=REPLAY_SYSTEM_PROMPT,
-            payload=worklist.payload,
-            disallowed_tools=list(REPLAY_DISALLOWED),
-            config=self._config,
-            mcp_config={'mcpServers': dict(self._servers)},
-            usage_gate=self._usage_gate,
-            model=self._model,
-            cwd=self._cwd,
-            output_schema=dict(REPLAY_OUTPUT_SCHEMA),
-            session_id=session_id,
-            config_dir=TaskConfigDir(
-                task_id=f'recon-replay-{worklist.batch.name}-{session_id}', base_dir=self._config_base,
-            ),
+        config_dir = TaskConfigDir(
+            task_id=f'recon-replay-{worklist.batch.name}-{session_id}', base_dir=self._config_base,
         )
+        try:
+            result = await self._run_stage(
+                system_prompt=REPLAY_SYSTEM_PROMPT,
+                payload=worklist.payload,
+                disallowed_tools=list(REPLAY_DISALLOWED),
+                config=self._config,
+                mcp_config={'mcpServers': dict(self._servers)},
+                usage_gate=self._usage_gate,
+                model=self._model,
+                cwd=self._cwd,
+                output_schema=dict(REPLAY_OUTPUT_SCHEMA),
+                session_id=session_id,
+                config_dir=config_dir,
+            )
+        finally:
+            config_dir.remove_credentials()
         return AskReply(
             report=result.report, cost_usd=result.cost_usd, error=result.error,
             model=result.model or self._model,
@@ -774,7 +789,7 @@ EXIT_INCOMPLETE = 1
 EXIT_REFUSED = 2
 REFUSALS = (ReplayRefused, OSError, ValueError)
 
-_CALIBRATION = Path('calibration')
+_CALIBRATION = _PACKAGE / 'calibration'
 DEFAULT_ITEMS = _CALIBRATION / 'write_triage_v2_soak_items.jsonl'
 DEFAULT_VERDICTS = _CALIBRATION / 'write_triage_v2_soak_verdicts_v2_2.jsonl'
 DEFAULT_STRATA = _CALIBRATION / 'write_triage_v2_soak_strata.json'

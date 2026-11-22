@@ -10,6 +10,8 @@ from __future__ import annotations
 import copy
 import functools
 import json
+import math
+import re
 import types
 from pathlib import Path
 from typing import Any
@@ -510,6 +512,36 @@ class TestHarm:
         assert report['harm_weights_status'] == 'provisional'
         assert report['rubric'] == 'v2.2'
         assert report['bootstrap'] == {'resamples': 10_000, 'seed': 7161}
+
+
+class TestTheHarmWeights:
+    def test_other_weights_are_recorded_as_custom_and_price_the_harm(self) -> None:
+        provisional = {str(cell): weight for cell, weight in _reader().PROVISIONAL_HARM_WEIGHTS.items()}
+        doubled = {cell: 2 * weight for cell, weight in provisional.items()}
+        report, base = _score(harm_weights=doubled), _report()
+        assert report['harm_weights'] == doubled
+        assert report['harm_weights_status'] == 'custom'
+        for arm, harm in base['harm']['per_write'].items():
+            assert report['harm']['per_write'][arm] == pytest.approx(2 * harm, abs=2e-4)
+
+    def test_a_cell_left_out_weighs_nothing(self) -> None:
+        report = _score(harm_weights={})
+        assert report['harm_weights_status'] == 'custom'
+        assert report['harm']['per_write'] == {'judge': 0, 'recon': 0, 'status_quo': 0}
+
+    @pytest.mark.parametrize(('weights', 'named'), [
+        pytest.param({'wrong_hme': 1.0}, "harm weight 'wrong_hme': 1.0 names no cell", id='unknown-cell'),
+        pytest.param({'wrong_home': -1.0}, "harm weight 'wrong_home': -1.0 is not", id='negative'),
+        pytest.param({'wrong_home': math.inf}, "harm weight 'wrong_home': inf is not", id='infinite'),
+        pytest.param({'wrong_home': math.nan}, "harm weight 'wrong_home': nan is not", id='nan'),
+        pytest.param({'wrong_home': True}, "harm weight 'wrong_home': True is not", id='bool'),
+        pytest.param({'wrong_home': '1'}, "harm weight 'wrong_home': '1' is not", id='string'),
+    ])
+    def test_a_weight_that_prices_no_cell_finitely_is_refused_naming_it(
+        self, weights: dict[str, Any], named: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=re.escape(named)):
+            _score(harm_weights=weights)
 
 
 class TestTheTouchedSubset:
