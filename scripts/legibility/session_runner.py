@@ -46,7 +46,7 @@ if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
 from legibility import account_pool  # noqa: E402
-from shared.account_reserve import WorkClass, WorkKind  # noqa: E402
+from shared.account_reserve import WorkClass, WorkKind  # noqa: E402  # debt: task 6760
 from shared.cli_invoke import (  # noqa: E402
     AgentResult,
     AllAccountsCappedException,

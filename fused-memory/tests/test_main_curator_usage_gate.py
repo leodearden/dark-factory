@@ -478,15 +478,16 @@ class TestCuratorRunId:
         assert await _setup_curator_usage_gate(config, run_id='run-x') == (None, None)
 
 
-async def _landed_account_events(db_path: Path, timeout: float = 5.0) -> list[tuple[str, dict, str]]:
-    """Every ``account_events`` row as (event_type, details, run_id), once a write has landed."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
+async def _landed_account_events(db_path: Path) -> list[tuple[str, dict, str]]:
+    """Every ``account_events`` row as (event_type, details, run_id), once a write has landed.
+
+    The per-test timeout is the only hang backstop, so a slow loop cannot fail a write that landed.
+    """
     while True:
         async with aiosqlite.connect(db_path) as conn:
             cursor = await conn.execute('SELECT event_type, details, run_id FROM account_events')
             rows = [(row[0], json.loads(row[1]), row[2]) for row in await cursor.fetchall()]
-        if rows or loop.time() >= deadline:
+        if rows:
             return rows
         await asyncio.sleep(0.02)
 

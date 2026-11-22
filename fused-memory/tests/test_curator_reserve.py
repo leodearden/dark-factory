@@ -87,17 +87,18 @@ def gate_faithful_invoke(answer: AgentResult, leased: list[str]) -> GateInvoke:
     return invoke
 
 
-async def landed_served_details(db_path: Path, timeout: float = 5.0) -> list[dict[str, Any]]:
-    """The details of every ``reserve_served`` row, once the gate's fire-and-forget write landed."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
+async def landed_served_details(db_path: Path) -> list[dict[str, Any]]:
+    """The details of every ``reserve_served`` row, once the gate's fire-and-forget write landed.
+
+    The per-test timeout is the only hang backstop, so a slow loop cannot fail a write that landed.
+    """
     while True:
         async with aiosqlite.connect(db_path) as conn:
             cursor = await conn.execute(
                 "SELECT details FROM account_events WHERE event_type = 'reserve_served'"
             )
             details = [json.loads(row[0]) for row in await cursor.fetchall()]
-        if details or loop.time() >= deadline:
+        if details:
             return details
         await asyncio.sleep(0.02)
 

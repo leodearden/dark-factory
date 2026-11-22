@@ -245,7 +245,7 @@ class TestDrainSitesStepAside:
             with patch('fused_memory.reconciliation.harness._sleep', counting_sleep):
                 loop_task = asyncio.create_task(harness._project_loop('test-project'))
                 try:
-                    await asyncio.wait_for(third_sleep.wait(), timeout=120)
+                    await third_sleep.wait()
                 finally:
                     loop_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -299,12 +299,9 @@ class TestDrainSitesStepAside:
             assert await harness.buffer.count_buffered('test-project') == 2
 
 
-async def wait_until(holds: Callable[[], Awaitable[bool]], timeout: float = 120.0) -> None:
-    """Poll *holds* until it answers True; *timeout* is a deadlock backstop only."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
+async def wait_until(holds: Callable[[], Awaitable[bool]]) -> None:
+    """Poll *holds* until it answers True; the per-test timeout is the only deadlock backstop."""
     while not await holds():
-        assert loop.time() < deadline, 'the awaited condition never held'
         await asyncio.sleep(0.01)
 
 
