@@ -1650,12 +1650,12 @@ def _single_l1(esc_queue, task_id: str):
     return esc
 
 
-async def _blocked_gate_l1(tmp_path: Path, assignment):
-    """Run the REAL gate on ``tmp_path / 'repo'``; assert it blocked; return its one L1."""
+async def _blocked_gate_l1(tmp_path: Path, repo: Path, assignment):
+    """Run the REAL gate on ``repo``; assert it blocked; return its one L1."""
     from escalation.queue import EscalationQueue
 
     esc_queue = EscalationQueue(tmp_path / 'esc')
-    h = _make_real_git_harness(tmp_path / 'repo', escalation_queue=esc_queue)
+    h = _make_real_git_harness(repo, escalation_queue=esc_queue)
     set_status = AsyncMock()
     h.scheduler.set_task_status = set_status
 
@@ -1684,7 +1684,7 @@ class TestUnverifiableRecheckEscalation:
         # back to the symbolic ref, and the real `git worktree add` fails.
         await _init_unborn_repo(repo)
 
-        esc = await _blocked_gate_l1(tmp_path, _make_assignment('8372'))
+        esc = await _blocked_gate_l1(tmp_path, repo, _make_assignment('8372'))
 
         _assert_unverified_text(esc)
         assert 'git worktree add failed' in esc.detail, esc.detail
@@ -1693,7 +1693,7 @@ class TestUnverifiableRecheckEscalation:
 
     @pytest.mark.asyncio
     async def test_recheck_crash_files_unverified_l1(self, tmp_path: Path):
-        seed_repo(tmp_path / 'repo')
+        repo = seed_repo(tmp_path / 'repo')
 
         # run_substrate_recheck catches its own subprocess errors, so patching
         # the public function is the honest way to reach the except branch
@@ -1702,7 +1702,7 @@ class TestUnverifiableRecheckEscalation:
             'orchestrator.substrate_gate.run_substrate_recheck',
             side_effect=RuntimeError('checker host vanished'),
         ):
-            esc = await _blocked_gate_l1(tmp_path, _make_assignment('8372'))
+            esc = await _blocked_gate_l1(tmp_path, repo, _make_assignment('8372'))
 
         _assert_unverified_text(esc)
         assert 'RuntimeError' in esc.detail, esc.detail
@@ -1710,10 +1710,10 @@ class TestUnverifiableRecheckEscalation:
 
     @pytest.mark.asyncio
     async def test_checker_that_cannot_launch_files_unverified_l1(self, tmp_path: Path):
-        seed_repo(tmp_path / 'repo')
+        repo = seed_repo(tmp_path / 'repo')
         assignment = _make_assignment('8372', checker=[str(tmp_path / 'no-such-checker')])
 
-        esc = await _blocked_gate_l1(tmp_path, assignment)
+        esc = await _blocked_gate_l1(tmp_path, repo, assignment)
 
         _assert_unverified_text(esc)
         assert 'rc=99' in esc.detail, esc.detail
@@ -1721,13 +1721,13 @@ class TestUnverifiableRecheckEscalation:
 
     @pytest.mark.asyncio
     async def test_real_probe_failure_still_files_substrate_flip(self, tmp_path: Path):
-        seed_repo(tmp_path / 'repo')
+        repo = seed_repo(tmp_path / 'repo')
         # The probe_set path is appended as an argv the -c script ignores.
         assignment = _make_assignment(
             '8372', checker=[sys.executable, '-c', 'import sys; sys.exit(1)'],
         )
 
-        esc = await _blocked_gate_l1(tmp_path, assignment)
+        esc = await _blocked_gate_l1(tmp_path, repo, assignment)
 
         assert esc.summary == 'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task 8372)'
         assert 're-spec required' in esc.detail, esc.detail

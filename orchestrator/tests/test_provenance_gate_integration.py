@@ -59,7 +59,7 @@ pytestmark = pytest.mark.asyncio
 
 
 # ---------------------------------------------------------------------------
-# Real git repo fixture (mirrors test_git_ops.py's git_repo/_setup_repo).
+# Real git repo fixture (mirrors test_git_ops.py::git_repo, via _git_fixtures.seed_repo).
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
