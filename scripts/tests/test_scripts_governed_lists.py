@@ -46,7 +46,7 @@ MERGE_STATE_PINNED_SITES_LIST = governed_exceptions(
     'unregistered enumeration.',
     sorted(merge_state_vocabulary_consistency.PINNED_SITES),
     default=Debt(TaskRef(7136)),
-    default_covers=6,
+    default_covers=5,
     dispositions={
         'ARCHITECTURE.md': Debt(TaskRef(7136)),
         'OPERATIONS.md': Debt(TaskRef(7136)),

@@ -12,13 +12,14 @@ This module supersedes the hand-maintained enumerations previously duplicated
 across:
 
 - ``escalation/src/escalation/server.py`` (``merge_cancel``'s and
-  ``merge_status``'s docstring state lists)
+  ``merge_status``'s docstring state lists). ``merge_cancel``'s tool
+  description now renders ``CANCEL_STATES`` from this module at import.
 - ``skills/merge-queue/SKILL.md``
 - ``skills/unblock/SKILL.md``
 - ``skills/unblock-low-risk/SKILL.md``
 - ``skills/escalation-watcher/SKILL.md``
 
-Those prose sites keep their value lists INLINE — a runbook an agent executes
+The SKILL.md sites keep their value lists INLINE — a runbook an agent executes
 at runtime must show the values, not a pointer to a Python file — but each
 list now sits inside a ``merge-state-vocab`` marked span naming the partition
 it must equal, and ``scripts/tests/test_merge_state_vocabulary_consistency.py``

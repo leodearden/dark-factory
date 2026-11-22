@@ -336,13 +336,14 @@ def extract_spans(
     The default family is ``merge-state-vocab``, whose name is a partition; another
     family reuses this scanner and its failure contract rather than a second one.
 
-    TWO CARRIERS, one scanner. In markdown the markers ride in HTML comments
-    (``<!-- merge-state-vocab:begin partition=X ... -->`` … ``<!-- …:end -->``); in
-    a Python docstring they are bare lines, because an HTML comment there is
-    nonsense that renders literally in `--help` output and in every agent's
-    context. The markdown sites use the first carrier and the Python docstring
-    uses the second, so a scanner that handled only one would leave the other
-    silently unpinned.
+    TWO CARRIERS, one scanner. In markdown prose the markers ride in HTML comments
+    (``<!-- merge-state-vocab:begin partition=X ... -->`` … ``<!-- …:end -->``);
+    inside a code block they are bare lines, because an HTML comment there is
+    nonsense that renders literally in every agent's context. The markdown prose
+    sites use the first carrier and the fenced code blocks of
+    ``skills/unblock/SKILL.md`` and ``skills/unblock-low-risk/SKILL.md`` use the
+    second, so a scanner that handled only one would leave the other silently
+    unpinned.
 
     Which carrier a marker uses is decided STRUCTURALLY, by
     ``_opens_inside_html_comment`` — an opener on an earlier line counts — rather
@@ -458,8 +459,8 @@ def extract_values(body: str, vocabulary_values: frozenset[str], *, source: str 
     (`` `done` ``), Python string literals (``"done"`` / ``'done'``), bare set
     notation (``{queued, verifying}``) and pipe notation (``done | conflict``) —
     because all four reduce to bare lowercase tokens once punctuation is ignored.
-    The sites are deliberately not forced into one style: a SKILL.md renders
-    backticks and a Python docstring does not.
+    The sites are deliberately not forced into one style: SKILL.md prose renders
+    backticks and its code blocks do not.
 
     Membership filtering is what lets a span carry ordinary English (``— stop
     polling here``) without every noun becoming a phantom member. *vocabulary_values*
@@ -572,11 +573,6 @@ PINNED_SITES: dict[str, tuple[tuple[str, ...], str]] = {
         ("SUBMIT_TERMINAL", "SUBMIT_NON_TERMINAL"),
         "the merge-queue section's step 3 — merge_request's terminal and "
         "non-terminal status lists",
-    ),
-    "escalation/src/escalation/server.py": (
-        ("CANCEL_STATES",),
-        "the `merge_cancel` docstring's CANCEL_STATES span (bare markers — an HTML "
-        "comment in a docstring would render literally)",
     ),
     "skills/merge-queue/SKILL.md": (
         ("SUBMIT_TERMINAL", "SUBMIT_NON_TERMINAL", "LIVE_STATES", "TERMINAL_STATES"),
@@ -797,9 +793,10 @@ _MARKDOWN_SPAN = """\
 Elsewhere in the file, outside every span, the prose discusses `already_merged`.
 """
 
-# The Python-docstring carrier: bare marker lines inside a docstring, where an
-# HTML comment would be nonsense. This is the shape
-# `escalation/src/escalation/server.py::merge_cancel` carries.
+# The bare carrier in a Python docstring, where an HTML comment would be nonsense.
+# `escalation/src/escalation/server.py::merge_cancel` carried this shape until
+# task 7136 rendered its list from CANCEL_STATES; the SKILL.md code blocks still
+# use the bare carrier.
 _DOCSTRING_SPAN = '''\
 def merge_cancel() -> dict:
     """Cancel a pending merge request.
@@ -1146,9 +1143,9 @@ def test_extract_spans_reads_the_markdown_comment_carrier() -> None:
 def test_extract_spans_reads_the_bare_marker_carrier_in_a_docstring() -> None:
     """Bare marker lines inside a Python docstring, where `<!-- -->` is nonsense.
 
-    Both carriers matter: the markdown sites use HTML comments and the docstring
-    in `escalation/src/escalation/server.py` uses bare lines, and a guard that
-    handled only one carrier would leave the other unpinned.
+    Both carriers matter: the markdown prose sites use HTML comments and the
+    SKILL.md code blocks use bare lines, and a guard that handled only one
+    carrier would leave the other unpinned.
     """
     spans = extract_spans(_DOCSTRING_SPAN, source="server.py")
 
@@ -1311,10 +1308,10 @@ _TERMINAL_LITERAL_STYLES = [
 def test_extract_values_reads_every_literal_style_these_files_use(body: str, case: str) -> None:
     """All four styles present across the pinned sites yield the same set.
 
-    The sites are not uniform and must not be forced to be: a SKILL.md renders
-    backticks, a Python docstring writes quoted literals, and a fenced code
-    block carries bare set notation. A guard that read only one style would
-    silently pin nothing in the other files.
+    The sites are not uniform and must not be forced to be: SKILL.md prose
+    renders backticks, and its fenced code blocks write quoted literals or bare
+    set notation. A guard that read only one style would silently pin nothing
+    in the other files.
     """
     values = extract_values(body, vocabulary_values(load_vocabulary()))
 
