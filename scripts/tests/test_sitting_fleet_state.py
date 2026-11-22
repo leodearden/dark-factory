@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from escalation.models import Escalation
 from escalation.shadow_ruling import ShadowRuling, agreement_report
+from landing_history import LandingRepo, record_merge_done, record_train
 from orchestrator.decision_registry import DecisionRecord, normalize_escalations_dir
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import fleet_state as mod
@@ -69,6 +70,7 @@ def _build_runs_db(path: Path) -> Path:
             _completed(conn, task_id, 'done', IN_WINDOW)
         _completed(conn, '4', 'blocked', IN_WINDOW)
         _completed(conn, '5', 'done', BEFORE_WINDOW)
+        _completed(conn, '6', 'done', IN_WINDOW)
         _invocation(conn, '1', 'claude-opus', 'implementer', 1.5, 0)
         _invocation(conn, '1', 'claude-opus', 'implementer', 2.5, 1)
         _invocation(conn, '4', 'claude-sonnet', 'reviewer', 0.5, 0)
@@ -79,6 +81,18 @@ def _build_runs_db(path: Path) -> Path:
     finally:
         conn.close()
     return path
+
+
+def _record_landings(runs_db: Path, repo: LandingRepo) -> None:
+    """One landing before the window, then a fast-forward and a two-member train inside it: 3 landed."""
+    conn = sqlite3.connect(runs_db)
+    try:
+        record_merge_done(conn, '5', repo.fast_forward('landed before the window'), BEFORE_WINDOW)
+        record_merge_done(conn, '1', repo.fast_forward('task 1'), IN_WINDOW)
+        record_train(conn, '3', ['2', '3'], repo.merge('task/2'), IN_WINDOW)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _write_escalation(queue: Path, *, subdir: str = '', **fields) -> Escalation:
@@ -139,7 +153,7 @@ def df(tmp_path, make_tasks_db, project_root_with_tasks_db) -> Path:
         {'id': 12, 'status': 'pending'},
         {'id': 13, 'status': 'done'},
     ], directory=project_root_with_tasks_db(root).parent)
-    _build_runs_db(mod.runs_db_path(root))
+    _record_landings(_build_runs_db(mod.runs_db_path(root)), LandingRepo(root))
     queue = root / 'data' / 'escalations'
     _write_escalation(queue, id='esc-10-1', level=1, category='infra_issue')
     _resolved(queue, 'esc-10-2')
@@ -192,41 +206,58 @@ class TestMeasurement:
 
 
 class TestLanded:
-    def test_equals_the_digest_count_and_an_independent_fixture_count(self, df):
+    def test_counts_landings_as_the_digest_does_not_done_runs(self, df):
         runs_db = mod.runs_db_path(df)
 
-        measurement = mod.landed(runs_db, WINDOW, now=NOW)
+        measurement = mod.landed(runs_db, WINDOW, now=NOW, repo=df)
 
+        conn = sqlite3.connect(runs_db)
+        try:
+            digest_landings = digest.query_landings_in_window(conn, df, *WINDOW.iso())
+            done_runs = digest.query_count_done_in_window(conn, *WINDOW.iso())
+        finally:
+            conn.close()
         assert measurement.status == 'ok'
-        assert measurement.value == digest.count_done_in_window(
-            runs_db, WINDOW.start.isoformat(), WINDOW.end.isoformat()) == 3
+        assert measurement.value == digest_landings == 3
+        assert measurement.value != done_runs
         assert measurement.measured_at == NOW.isoformat()
         assert measurement.source == str(runs_db)
 
-    def test_a_missing_runs_db_is_a_flagged_zero(self, tmp_path):
+    def test_a_root_that_is_not_a_git_repository_is_unreadable(self, df, tmp_path):
+        plain = tmp_path / 'plain'
+        plain.mkdir()
+
+        measurement = mod.landed(mod.runs_db_path(df), WINDOW, now=NOW, repo=plain)
+
+        assert (measurement.value, measurement.status) == (0, 'unreadable')
+        (gap,) = measurement.shortfalls
+        assert gap.path == str(plain)
+        assert 'GitUnavailable' in gap.reason
+
+    def test_a_missing_runs_db_is_a_flagged_zero(self, df, tmp_path):
         runs_db = tmp_path / 'absent' / 'runs.db'
 
-        measurement = mod.landed(runs_db, WINDOW, now=NOW)
+        measurement = mod.landed(runs_db, WINDOW, now=NOW, repo=df)
 
         assert (measurement.value, measurement.status) == (0, 'source_missing')
         assert str(runs_db) in measurement.shortfalls[0].path
         assert not runs_db.parent.exists()
 
-    def test_a_file_that_is_not_a_database_is_unreadable(self, tmp_path):
+    def test_a_file_that_is_not_a_database_is_unreadable(self, df, tmp_path):
         runs_db = tmp_path / 'runs.db'
         runs_db.write_bytes(b'this is not sqlite at all, not even close' * 4)
 
-        measurement = mod.landed(runs_db, WINDOW, now=NOW)
+        measurement = mod.landed(runs_db, WINDOW, now=NOW, repo=df)
 
         assert (measurement.value, measurement.status) == (0, 'unreadable')
 
-    def test_a_database_without_the_events_table_is_unreadable_not_zero(self, tmp_path):
+    def test_a_database_without_the_events_table_is_unreadable_not_zero(self, df, tmp_path):
         runs_db = tmp_path / 'runs.db'
         conn = sqlite3.connect(runs_db)
         conn.execute('CREATE TABLE unrelated (x INTEGER)')
         conn.close()
 
-        measurement = mod.landed(runs_db, WINDOW, now=NOW)
+        measurement = mod.landed(runs_db, WINDOW, now=NOW, repo=df)
 
         assert measurement.status == 'unreadable'
         assert 'events' in measurement.shortfalls[0].reason
@@ -244,11 +275,14 @@ def _drifted_runs_db(path: Path) -> Path:
 class TestQueryFailureIsUnreadableNotZero:
     """The digest's readers answer a failed query with the zero of a quiet night; the page must not."""
 
-    @pytest.mark.parametrize('measure', [mod.landed, mod.spend_and_cap_hits], ids=['landed', 'spend'])
-    def test_a_query_over_drifted_columns_is_unreadable_not_zero(self, tmp_path, measure):
+    @pytest.mark.parametrize('measure', [
+        lambda runs_db, repo: mod.landed(runs_db, WINDOW, now=NOW, repo=repo),
+        lambda runs_db, _repo: mod.spend_and_cap_hits(runs_db, WINDOW, now=NOW),
+    ], ids=['landed', 'spend'])
+    def test_a_query_over_drifted_columns_is_unreadable_not_zero(self, df, tmp_path, measure):
         runs_db = _drifted_runs_db(tmp_path / 'runs.db')
 
-        measurement = measure(runs_db, WINDOW, now=NOW)
+        measurement = measure(runs_db, df)
 
         assert measurement.status == 'unreadable'
         assert 'no such column' in measurement.shortfalls[0].reason
@@ -257,8 +291,8 @@ class TestQueryFailureIsUnreadableNotZero:
     def test_with_logging_disabled_a_clean_read_is_ok_and_a_failed_one_unreadable(self, df, tmp_path):
         logging.disable(logging.CRITICAL)
         try:
-            clean = mod.landed(mod.runs_db_path(df), WINDOW, now=NOW)
-            failed = mod.landed(_drifted_runs_db(tmp_path / 'runs.db'), WINDOW, now=NOW)
+            clean = mod.landed(mod.runs_db_path(df), WINDOW, now=NOW, repo=df)
+            failed = mod.landed(_drifted_runs_db(tmp_path / 'runs.db'), WINDOW, now=NOW, repo=df)
         finally:
             logging.disable(logging.NOTSET)
 
@@ -267,7 +301,7 @@ class TestQueryFailureIsUnreadableNotZero:
         assert 'no such column' in failed.shortfalls[0].reason
 
     def test_a_clean_read_is_still_ok(self, df):
-        assert mod.landed(mod.runs_db_path(df), WINDOW, now=NOW).status == 'ok'
+        assert mod.landed(mod.runs_db_path(df), WINDOW, now=NOW, repo=df).status == 'ok'
 
 
 class TestStuck:
@@ -608,7 +642,7 @@ class TestReadOnly:
         dirs_before = sorted(path for path in tmp_path.rglob('*') if path.is_dir())
 
         pending = _pending(queue, tmp_path=tmp_path)
-        mod.landed(mod.runs_db_path(df), WINDOW, now=NOW)
+        mod.landed(mod.runs_db_path(df), WINDOW, now=NOW, repo=df)
         mod.spend_and_cap_hits(mod.runs_db_path(df), WINDOW, now=NOW)
         mod.stuck(df, pending, now=NOW)
         mod.autonomous_closes(fleet, WINDOW, now=NOW)

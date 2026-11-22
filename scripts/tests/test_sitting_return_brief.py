@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from escalation.authority import EXECUTOR_IDENTITY, policy_row
 from escalation.models import Escalation
+from landing_history import LandingRepo, record_merge_done, record_train
 from orchestrator.decision_registry import (
     AuditOutcome,
     AuditVerdict,
@@ -174,6 +175,17 @@ def _runs_db(path: Path) -> None:
     conn.close()
 
 
+def _record_landings(runs_db: Path, repo: LandingRepo) -> None:
+    """A fast-forward and a two-member train in the window: 3 landed, beside 1 done run."""
+    conn = sqlite3.connect(runs_db)
+    try:
+        record_merge_done(conn, '120', repo.fast_forward('task 120'), IN_WINDOW)
+        record_train(conn, '122', ['121', '122'], repo.merge('task/121'), IN_WINDOW)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def env(tmp_path, make_tasks_db, project_root_with_tasks_db) -> Env:
     df = tmp_path / 'src' / 'dark-factory'
@@ -185,6 +197,7 @@ def env(tmp_path, make_tasks_db, project_root_with_tasks_db) -> Env:
         {'id': 120, 'status': 'done'},
     ], directory=project_root_with_tasks_db(df).parent)
     _runs_db(fleet_state.runs_db_path(df))
+    _record_landings(fleet_state.runs_db_path(df), LandingRepo(df))
     for n in range(101, 107):
         _esc(e.queue, id=f'esc-{n}-1')
     _esc(e.queue, id='esc-107-1', pin_declared_by=['leo'])
@@ -285,7 +298,8 @@ class TestSections:
 
         assert fleet_state.SHADOW_ONLY in sections[TITLES[1]]
         assert f'1 in {brief.AUDIT_SAMPLE_EVERY}' in sections[TITLES[1]]
-        assert 'dark_factory' in sections[TITLES[2]] and '1 task' in sections[TITLES[2]]
+        assert 'dark_factory' in sections[TITLES[2]] and '3 landings on main' in sections[TITLES[2]]
+        assert 'done in the window' not in sections[TITLES[2]]
         assert fleet_state.NO_OPEN_ESCALATION in sections[TITLES[3]] and 'task 109' in sections[TITLES[3]]
         assert 'claude-opus' in sections[TITLES[4]] and '$2.50' in sections[TITLES[4]]
         assert EVIDENCE in sections[TITLES[5]] and 'dec-close-1' in sections[TITLES[5]]
@@ -534,24 +548,32 @@ class TestMain:
         match = DONE_LINE.match(out.splitlines()[-1])
         assert match is not None and match.group(6) == 'degraded'
 
-    def test_no_subprocess_and_no_network(self, env, capsys, monkeypatch):
-        calls: list[str] = []
+    def test_the_only_subprocess_is_git_rev_list_and_there_is_no_network(self, env, capsys, monkeypatch):
+        spawned: list[list[str]] = []
+        connected: list[str] = []
+        real_popen = subprocess.Popen
+
+        def recording_popen(args, *rest, **kwargs):
+            spawned.append([str(arg) for arg in args])
+            return real_popen(args, *rest, **kwargs)
 
         def forbid(name):
             def recorder(*args, **kwargs):
-                calls.append(name)
+                connected.append(name)
                 raise AssertionError(f'{name} called')
             return recorder
 
-        for name in ('run', 'Popen', 'call', 'check_call', 'check_output'):
-            monkeypatch.setattr(subprocess, name, forbid(f'subprocess.{name}'))
+        monkeypatch.setattr(subprocess, 'Popen', recording_popen)
         monkeypatch.setattr(socket, 'create_connection', forbid('socket.create_connection'))
         monkeypatch.setattr(socket.socket, 'connect', forbid('socket.connect'))
 
         rc, _ = _run(capsys, env.argv())
 
         assert rc == 0
-        assert calls == []
+        assert connected == []
+        assert spawned
+        assert {Path(argv[0]).name for argv in spawned} == {'git'}
+        assert all('rev-list' in argv for argv in spawned)
 
     def test_a_pinned_now_renders_byte_identical_files(self, env, capsys):
         _run(capsys, env.argv())
