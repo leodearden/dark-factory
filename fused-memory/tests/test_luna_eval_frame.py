@@ -428,3 +428,112 @@ class TestSummaryFixtures:
         assert item['episode_content_sha256'] == hashlib.sha256(b'the body of ep-1').hexdigest()
         assert item['summary_sha256'] == hashlib.sha256(summary.encode()).hexdigest()
         assert summary not in repr(item) and 'the body of' not in repr(item)
+
+
+# --------------------------------------------------------------------------- #
+# Journal fixtures: the classifier and the router (step 11)
+# --------------------------------------------------------------------------- #
+
+JOURNAL_WINDOW = ('2026-11-04T00:00:00+00:00', '2026-11-18T00:00:00+00:00')
+J_IN, J_OUT = '2026-11-10T12:00:00+00:00', '2026-11-01T12:00:00+00:00'
+CONFIDENT_WRITE = 'The auth service depends on the user database'
+"""One heuristic category at 0.85: classified with no LLM call."""
+AMBIGUOUS_WRITE = 'We decided to migrate before the deadline changed'
+CONFIDENT_QUERY = 'What is the auth service?'
+"""One heuristic query type: routed with no LLM call."""
+
+
+def _journal(tmp_path: Path, rows: Sequence[tuple[str, str, str, dict[str, Any], str]]) -> Path:
+    """A write journal with the production schema; each row is (id, operation, kind, params, created_at)."""
+    import json
+    import sqlite3
+
+    from fused_memory.services.write_journal import SCHEMA_SQL
+
+    path = tmp_path / 'write_journal.db'
+    with sqlite3.connect(path) as db:
+        db.executescript(SCHEMA_SQL)
+        db.executemany(
+            'INSERT INTO write_ops (id, operation, kind, params, created_at) VALUES (?, ?, ?, ?, ?)',
+            [(row_id, op, kind, json.dumps(params), at) for row_id, op, kind, params, at in rows],
+        )
+    return path
+
+
+def _write(row_id: str, content: str, category: str, at: str = J_IN) -> tuple[str, str, str, dict[str, Any], str]:
+    return (row_id, 'add_memory', 'write', {'content': content, 'category': category}, at)
+
+
+def _search(row_id: str, query: str, at: str = J_IN, *, truncated: bool = False) -> tuple[str, str, str, dict[str, Any], str]:
+    return (row_id, 'search', 'read', {'query': query, 'query_truncated': truncated, 'limit': 10}, at)
+
+
+class TestClassifierFixtures:
+    @pytest.mark.asyncio
+    async def test_only_window_inputs_that_reach_the_llm_are_kept(self, tmp_path: Path) -> None:
+        journal = _journal(tmp_path, [
+            _write('w-confident', CONFIDENT_WRITE, RELATIONS),
+            _write('w-ambiguous', AMBIGUOUS_WRITE, TEMPORAL),
+            _write('w-nomatch', 'Hello world', 'observations_and_summaries'),
+            _write('w-outside', 'Hello again', 'observations_and_summaries', J_OUT),
+            ('s-1', 'search', 'read', {'query': 'Hello world', 'query_truncated': False}, J_IN),
+        ])
+        fixtures = await frame_mod.classifier_fixtures(journal, JOURNAL_WINDOW, per_category=10)
+        assert sorted(f['id'] for f in fixtures) == ['w-ambiguous', 'w-nomatch']
+
+    @pytest.mark.asyncio
+    async def test_a_fixture_carries_its_row_input_and_reference_category(self, tmp_path: Path) -> None:
+        journal = _journal(tmp_path, [_write('w-1', AMBIGUOUS_WRITE, TEMPORAL)])
+        (fixture,) = await frame_mod.classifier_fixtures(journal, JOURNAL_WINDOW, per_category=10)
+        assert fixture == {'id': 'w-1', 'created_at': J_IN, 'input': AMBIGUOUS_WRITE, 'reference_category': TEMPORAL}
+
+    @pytest.mark.asyncio
+    async def test_the_first_per_category_by_row_hash(self, tmp_path: Path) -> None:
+        rows = [_write(f'w-{index}', f'Hello world {index}', TEMPORAL) for index in range(5)]
+        rows += [_write('r-1', 'Hello there', RELATIONS)]
+        fixtures = await frame_mod.classifier_fixtures(_journal(tmp_path, rows), JOURNAL_WINDOW, per_category=2)
+        temporal = sorted((f'w-{index}' for index in range(5)), key=lambda row_id: hashlib.sha256(row_id.encode()).hexdigest())
+        assert [f['id'] for f in fixtures if f['reference_category'] == TEMPORAL] == temporal[:2]
+        assert [f['id'] for f in fixtures if f['reference_category'] == RELATIONS] == ['r-1']
+
+
+class TestRouterFixtures:
+    @pytest.mark.asyncio
+    async def test_only_untruncated_window_queries_that_reach_the_llm_are_kept(self, tmp_path: Path) -> None:
+        journal = _journal(tmp_path, [
+            _search('q-confident', CONFIDENT_QUERY),
+            _search('q-nomatch', 'foo bar baz'),
+            _search('q-truncated', 'foo bar qux', truncated=True),
+            _search('q-outside', 'foo bar quux', J_OUT),
+            _write('w-1', 'foo bar baz', TEMPORAL),
+        ])
+        fixtures = await frame_mod.router_fixtures(journal, JOURNAL_WINDOW, n=10)
+        assert fixtures == [{'id': 'q-nomatch', 'created_at': J_IN, 'query': 'foo bar baz'}]
+
+    @pytest.mark.asyncio
+    async def test_identical_queries_are_deduped_and_the_first_n_by_row_hash_kept(self, tmp_path: Path) -> None:
+        rows = [_search(f'q-{index}', f'foo bar {index}') for index in range(5)]
+        rows += [_search('q-dup', 'foo bar 0')]
+        fixtures = await frame_mod.router_fixtures(_journal(tmp_path, rows), JOURNAL_WINDOW, n=3)
+        assert len({f['query'] for f in fixtures}) == len(fixtures) == 3
+        kept = sorted({f['id'] for f in fixtures})
+        ranked = sorted((r[0] for r in rows), key=lambda row_id: hashlib.sha256(row_id.encode()).hexdigest())
+        first_per_query: dict[str, str] = {}
+        for row_id in ranked:
+            first_per_query.setdefault(next(r[3]['query'] for r in rows if r[0] == row_id), row_id)
+        assert kept == sorted(sorted(first_per_query.values(), key=lambda row_id: hashlib.sha256(row_id.encode()).hexdigest())[:3])
+
+
+class TestTheJournalIsReadOnly:
+    def test_a_write_through_the_journal_connection_fails(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        journal = _journal(tmp_path, [_write('w-1', 'Hello world', TEMPORAL)])
+        with frame_mod.open_journal(journal) as db, pytest.raises(sqlite3.OperationalError):
+            db.execute("DELETE FROM write_ops WHERE id = 'w-1'")
+
+    def test_a_missing_journal_is_refused_and_not_created(self, tmp_path: Path) -> None:
+        missing = tmp_path / 'absent.db'
+        with pytest.raises(FileNotFoundError):
+            frame_mod.open_journal(missing)
+        assert not missing.exists()
