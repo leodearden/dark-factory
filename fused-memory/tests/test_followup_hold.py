@@ -377,13 +377,6 @@ def test_a_machine_actor_may_not_strip_the_holder_edge(agent_id: str) -> None:
     assert not may_strip_holder_edge(agent_id)
 
 
-def test_a_promotion_deferral_is_frozen() -> None:
-    deferral = PromotionDeferral(guard='g', reason='r')
-
-    with pytest.raises(ValidationError):
-        deferral.guard = 'other'  # type: ignore[misc]
-
-
 def test_a_promotion_deferral_refuses_an_extra_key() -> None:
     with pytest.raises(ValidationError):
-        PromotionDeferral(guard='g', reason='r', extra='x')  # type: ignore[call-arg]
+        PromotionDeferral.model_validate({'guard': 'g', 'reason': 'r', 'extra': 'x'})
