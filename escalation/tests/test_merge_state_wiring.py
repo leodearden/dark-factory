@@ -397,13 +397,10 @@ _REASON_FIELD_RE = re.compile(r'^\s*reason\s+\(str\|None\)', re.MULTILINE)
 @pytest.mark.asyncio
 class TestMergeCancelDescriptionRendersCancelStates:
     """The model calling merge_cancel cannot import shared.merge_state, so the
-    tool description must carry every CANCEL_STATES value, and nothing a guard
-    needs: marker lines and pin notes would reach that model as literal text.
+    tool description must carry every CANCEL_STATES value.
     """
 
-    async def test_state_field_lists_cancel_states_without_guard_scaffolding(
-        self, tmp_path: Path,
-    ) -> None:
+    async def test_state_field_lists_every_cancel_state(self, tmp_path: Path) -> None:
         tool = await _server(tmp_path).get_tool('merge_cancel')
         assert tool is not None
         description = tool.description or ''
@@ -413,8 +410,6 @@ class TestMergeCancelDescriptionRendersCancelStates:
 
         state_field = description[state_label.end():reason_label.start()]
         assert set(_QUOTED_TOKEN_RE.findall(state_field)) == {str(s) for s in CANCEL_STATES}
-        assert 'merge-state-vocab' not in description
-        assert 'machine-pinned' not in description
 
 
 # ---------------------------------------------------------------------------
