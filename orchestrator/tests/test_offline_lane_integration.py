@@ -189,7 +189,8 @@ _SPAWNS_PER_FIXTURE_COMMIT = 2
 # narrowed-confirm sub-runs (the cold pass's `worktree add` path is 5). `required_timeout_secs`
 # prices each sub-run, an inner pytest session, at the git-spawn MEASURED_SPAWN_LATENCY_SECS too;
 # no separate sub-run price is pinned. The evidence that this still covers a pass is task 11153's
-# run of B4 starved to a 5% CPU quota: call phase 75.67s against the 131.88s modelled.
+# runs starved to a 5% CPU quota: B4's call phase took 77.37s against the 131.88s modelled, and
+# B5's six passes took 271.91s against 320.28s.
 _SPAWNS_PER_RED_PATH_PASS = 6
 
 
