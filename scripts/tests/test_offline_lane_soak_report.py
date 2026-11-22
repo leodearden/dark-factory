@@ -977,6 +977,7 @@ FIGURES = (
     'episodes_by_length',
     'filing_delay',
     'lane_debts',
+    'debt_cycle_owners',
     'due_list',
     'undecided_tests',
     'due_offers_per_pass',
@@ -1118,6 +1119,46 @@ def test_lane_debts_name_the_trigger_evidence_head_owner_and_its_status(tmp_path
             'owner': None, 'owner_status': None,
         },
     ]
+
+
+def test_debt_cycle_owners_list_every_cycles_owner_of_an_offered_test(tmp_path: Path, capsys):
+    project, offering, owners = _debt_project(tmp_path, owned=(NODE_A,))
+    first_owner = owners[NODE_A]
+    project.tasks.tasks[first_owner]['status'] = 'done'
+    again = project.add_pass(
+        UNIT, at=T0 + timedelta(hours=2), detect=[failure(NODE_A)], confirm=[],
+        outcome=Confirmed(ConfirmMode.NARROWED, (), (NODE_A,), ()),
+        effect=effect(debts_offered=(OfferedDebt(NODE_A, DebtTrigger.cleared, HEAD),)),
+    )
+    project.occurrence(again, [NODE_A], FlakeVerdict.passes_in_isolation)
+    row = project.open_lane_debt(NODE_A, DebtTrigger.cleared, again, earlier=[offering], now=T0 + timedelta(hours=2))
+    assert row.open_count == 2
+    second_owner = row.owner_task_id
+    assert second_owner is not None and second_owner != first_owner
+
+    _, report, _ = _report(project, capsys)
+
+    assert _figure(report, 'debt_cycle_owners')[NODE_A] == [
+        {'task_id': first_owner, 'cycle': 1, 'call_site': 'offline_lane', 'trigger': 'cleared', 'status': 'done'},
+        {
+            'task_id': second_owner, 'cycle': 2, 'call_site': 'offline_lane', 'trigger': 'cleared',
+            'status': project.tasks.tasks[second_owner]['status'],
+        },
+    ]
+    assert [debt['owner'] for debt in _figure(report, 'lane_debts') if debt['test'] == NODE_A] == [
+        second_owner, second_owner,
+    ]
+    rule = next(figure['rule'] for figure in report['figures'] if figure['name'] == 'debt_cycle_owners')
+    assert rule
+
+
+def test_a_failed_owner_lookup_is_nothing_to_judge(tmp_path: Path, capsys):
+    project, _, _ = _debt_project(tmp_path)
+    project.tasks.fail_lookups()
+
+    code, report, err = _report(project, capsys)
+
+    _assert_nothing_to_judge(code, report, err, 'task store unreadable')
 
 
 def test_the_due_list_shows_each_item_and_the_stale_count(tmp_path: Path, capsys):
