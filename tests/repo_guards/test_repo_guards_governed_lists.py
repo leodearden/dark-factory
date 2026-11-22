@@ -45,8 +45,11 @@ DESIGN_INVARIANT_PINNED_SITES_LIST = governed_exceptions(
     'A file whose relationship to the design-invariant family is pinned in that '
     'module instead of being flagged as an unregistered enumeration site.',
     sorted(design_invariants_consistency.PINNED_SITES),
-    default=Debt(TaskRef(7136)),
-    default_covers=4,
+    dispositions={
+        'docs/legibility/design-invariants-fixtures.md': Policy('inv12-design-invariants-fixture-corpus'),
+        'skills/prd/references/gates.md': Policy('inv12-g7-trigger-shape-fallback'),
+        'orchestrator/src/orchestrator/agents/code_quality.md': Policy('inv12-code-quality-invariant-mapping'),
+    },
 )
 
 
