@@ -2855,6 +2855,74 @@ class TestMem0BackendScanPayloadText:
             assert cond.match.text == needle
 
     @pytest.mark.asyncio
+    async def test_a_present_custom_needle_is_reported(self, backend):
+        """The discovery-cycle shape: plain prose, no tool-call leak, a
+        caller needle it contains.  Reporting it is the whole point of a
+        custom needle (task 4857's false-absence defect)."""
+        point = _scan_point('prose', {'data': 'The repo has no JS test runner configured.'})
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([point], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), needles=['no JS test runner']
+            )
+
+        assert [m['id'] for m in result['matches']] == ['prose']
+        assert result['matches'][0]['matched_fragments'] == ['no JS test runner']
+        assert result['scanned'] == 1
+
+    @pytest.mark.asyncio
+    async def test_an_absent_custom_needle_is_not_reported_but_is_counted(self, backend):
+        """The literal match is case-sensitive, mirroring un-indexed MatchText,
+        and a walked non-match still counts toward `scanned`."""
+        point = _scan_point('shouty', {'data': 'The repo has NO JS test runner configured.'})
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([point], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), needles=['no JS test runner']
+            )
+
+        assert result['matches'] == []
+        assert result['scanned'] == 1
+
+    @pytest.mark.asyncio
+    async def test_matched_fragments_are_the_distinct_present_needles_in_caller_order(
+        self, backend
+    ):
+        point = _scan_point('p1', {'data': 'gamma then alpha, never the other one.'})
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([point], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), needles=['alpha', 'beta', 'gamma', 'alpha']
+            )
+
+        assert result['matches'][0]['matched_fragments'] == ['alpha', 'gamma']
+
+    @pytest.mark.asyncio
+    async def test_custom_needles_stay_the_verdict_in_exhaustive_mode(self, backend):
+        """`exhaustive` skips only the prefilter.  It is also the only mode
+        that sees text under the fallback keys, so needles + exhaustive is the
+        complete literal enumeration."""
+        fallback = _scan_point('fallback', {'memory': 'The repo has no JS test runner.'})
+        leak_only = _scan_point('leak', {'data': _SCAN_LEAK_TEXT})
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([fallback, leak_only], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(
+                scope=Scope(project_id='p'), needles=['no JS test runner'], exhaustive=True
+            )
+
+        assert [m['id'] for m in result['matches']] == ['fallback']
+        assert result['scanned'] == 2
+        assert mock_client.scroll.call_args.kwargs.get('scroll_filter') is None
+
+    @pytest.mark.asyncio
     async def test_timeout_propagates_not_swallowed(self, backend):
         """The load-bearing raw-Qdrant invariant: a timed-out scan is never
         mistaken for a clean corpus (which is exactly the wrong answer for an

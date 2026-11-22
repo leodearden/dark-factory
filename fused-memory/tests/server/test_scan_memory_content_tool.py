@@ -18,7 +18,7 @@ Sentinel literals use the ``\\x3c`` escape for ``<`` (task 3083 plan pre-1).
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -236,3 +236,39 @@ class TestScanMemoryContentTimeoutSurfaces:
         assert 'error' in result, f'Expected an error dict, got: {result!r}'
         assert result.get('error_type') == 'TimeoutError', f'got: {result!r}'
         assert result.get('matches') != [], 'a timed-out scan must not look clean'
+
+
+class TestScanMemoryContentReportsCustomNeedles:
+    """Real MemoryService + real Mem0Backend, patching ONLY _get_async_qdrant.
+
+    The task 4857 acceptance regression: a record containing a caller's needle
+    came back as the silent ``matches == [] and truncated is False`` shape,
+    because every hit was re-verified with the tool-call-leak detector.  A
+    mocked service cannot see that defect, so the backend runs for real here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_record_containing_the_needle_is_reported(self, mock_config):
+        service = MemoryService(mock_config)
+        service.mem0 = Mem0Backend(mock_config)
+        server = create_mcp_server(service)
+
+        point = MagicMock()
+        point.id = 'prose-1'
+        point.payload = {'data': 'The repo has no JS test runner configured.'}
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([point], None))
+
+        with patch.object(
+            service.mem0, '_get_async_qdrant', AsyncMock(return_value=mock_client)
+        ):
+            result = await server._tool_manager.call_tool(
+                'scan_memory_content',
+                {'project_id': _PROJECT_ID, 'needles': ['no JS test runner']},
+            )
+
+        assert 'error' not in result, f'Unexpected error: {result!r}'
+        assert not (result['matches'] == [] and result['truncated'] is False), (
+            f'a present needle came back as a clean, complete scan: {result!r}'
+        )
+        assert [m['id'] for m in result['matches']] == ['prose-1']
