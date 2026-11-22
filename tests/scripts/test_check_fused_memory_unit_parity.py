@@ -628,18 +628,16 @@ def test_main_fix_rewrites_file(tmp_path: pathlib.Path):
     assert rc == 0
 
 
-def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
-    """main(--fix) on a drifted unit invokes daemon_reload()."""
+def test_main_fix_calls_daemon_reload(tmp_path: pathlib.Path):
+    """main(--fix) on a drifted unit issues exactly one `systemctl --user daemon-reload`.
+
+    Observed at the process boundary through this module's recording
+    `systemctl` stub, not by patching the checker.
+    """
     mod = _load_checker()
     installed = _write_unit(tmp_path, _DRIFTED_WITH_HOST_SPECIFIC)
-    reload_calls: list[None] = []
-
-    def _fake_reload() -> None:
-        reload_calls.append(None)
-
-    monkeypatch.setattr(mod, "daemon_reload", _fake_reload)
     mod.main(["--installed", str(installed), "--fix"])
-    assert len(reload_calls) == 1
+    assert systemctl_calls(tmp_path) == [["--user", "daemon-reload"]]
 
 
 # ---------------------------------------------------------------------------
