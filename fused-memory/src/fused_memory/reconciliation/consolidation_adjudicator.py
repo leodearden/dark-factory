@@ -10,14 +10,22 @@ apply it to a kept list. Imports no executor code.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import json
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from fused_memory.llm.openai_responses import endpoint_host
+from fused_memory.llm.list_prices import list_price
+from fused_memory.llm.openai_responses import (
+    ResponsesCall,
+    ResponsesReply,
+    call_openai_responses,
+    endpoint_host,
+)
 from fused_memory.reconciliation.consolidation_auto import (
     REASON_CODE_CLASSES,
     AutoReasonCode,
@@ -393,7 +401,7 @@ def parse_verdict(text: str, request: AdjudicationRequest, claim_check: ClaimChe
     """
     try:
         body = json.loads(text)
-    except (json.JSONDecodeError, TypeError) as exc:
+    except json.JSONDecodeError as exc:
         raise VerdictInvalid(f'reply is not JSON: {exc}') from None
     if not isinstance(body, dict):
         raise VerdictInvalid(f'reply is not a JSON object: {type(body).__name__}')
@@ -422,3 +430,119 @@ def parse_verdict(text: str, request: AdjudicationRequest, claim_check: ClaimChe
         decision=decision, keep_member_ids=kept, claim=claim,
         reason_code=reason_code, reason=reason,
     )
+
+
+def openai_model_call(config: FusedMemoryConfig) -> ResponsesCall:
+    """The production model call: the endpoint :meth:`AdjudicatorSettings.from_config` names, one attempt."""
+    return functools.partial(call_openai_responses, _openai_client_kwargs(config), max_retries=0)
+
+
+class FailureKind(StrEnum):
+    """K3's two kinds of failure: the reply did not arrive, or it is not a verdict."""
+
+    TRANSPORT = 'transport'
+    CONTENT = 'content'
+
+
+@dataclass(frozen=True)
+class CallMeta:
+    """What one adjudicator call cost and which model answered it (PRD E13)."""
+
+    identity: str
+    resolved_model: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    #: At list price for the requested model; None when unpriced or without usage.
+    cost_usd: float | None
+    latency_s: float
+
+
+@dataclass(frozen=True)
+class Adjudication:
+    verdict: Verdict
+    meta: CallMeta
+
+
+@dataclass(frozen=True)
+class AdjudicationFailure:
+    """Never a judgement. ``meta`` is None when no reply arrived."""
+
+    kind: FailureKind
+    detail: str
+    meta: CallMeta | None
+
+
+AdjudicationResult = Adjudication | AdjudicationFailure
+
+
+def classify_failure(exc: BaseException) -> FailureKind:
+    """Transport for a timeout, a connection failure, a 429 or a 5xx (K3); content otherwise."""
+    import openai
+
+    if isinstance(
+        exc, (TimeoutError, openai.APITimeoutError, openai.APIConnectionError, openai.RateLimitError),
+    ):
+        return FailureKind.TRANSPORT
+    if isinstance(exc, openai.APIStatusError) and exc.status_code >= 500:
+        return FailureKind.TRANSPORT
+    return FailureKind.CONTENT
+
+
+def _call_meta(
+    settings: AdjudicatorSettings, reply: ResponsesReply, latency_s: float,
+) -> CallMeta:
+    price = list_price(settings.model)
+    usage = reply.usage
+    return CallMeta(
+        identity=adjudicator_identity(settings),
+        resolved_model=reply.resolved_model,
+        input_tokens=usage.input_tokens if usage is not None else None,
+        output_tokens=usage.output_tokens if usage is not None else None,
+        cost_usd=(
+            price.usd(usage.input_tokens, usage.output_tokens)
+            if price is not None and usage is not None
+            else None
+        ),
+        latency_s=latency_s,
+    )
+
+
+async def adjudicate(
+    request: AdjudicationRequest,
+    *,
+    settings: AdjudicatorSettings,
+    model_call: ResponsesCall,
+    claim_check: ClaimCheck,
+) -> AdjudicationResult:
+    """One model call on *request*, its reply parsed into a verdict or a typed failure.
+
+    Exactly one attempt: retrying is the caller's choice. A cancellation propagates.
+    """
+    user_content = render_request(request, field_chars=settings.field_chars)
+    started = time.monotonic()
+    try:
+        reply = await model_call(
+            model=settings.model,
+            instructions=INSTRUCTIONS,
+            user_content=user_content,
+            text_format=TEXT_FORMAT,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            timeout=settings.timeout_seconds,
+            reasoning_effort=settings.reasoning_effort,
+        )
+    except Exception as exc:
+        return AdjudicationFailure(
+            kind=classify_failure(exc), detail=f'{type(exc).__name__}: {exc}', meta=None,
+        )
+    meta = _call_meta(settings, reply, time.monotonic() - started)
+    if reply.incomplete:
+        return AdjudicationFailure(
+            kind=FailureKind.CONTENT,
+            detail=f'response incomplete ({reply.incomplete_reason})',
+            meta=meta,
+        )
+    try:
+        verdict = parse_verdict(reply.text or '', request, claim_check)
+    except VerdictInvalid as exc:
+        return AdjudicationFailure(kind=FailureKind.CONTENT, detail=str(exc), meta=meta)
+    return Adjudication(verdict=verdict, meta=meta)

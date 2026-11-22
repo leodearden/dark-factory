@@ -27,18 +27,16 @@ USAGE = TokenUsage(input_tokens=1_000, output_tokens=100, reasoning_tokens=50)
 
 
 class ScriptedResponses:
-    """Records every request's kwargs and answers from *script*.
+    """Records every request's kwargs and answers from *answers*.
 
-    A single answer serves every call; a sequence is consumed one per call and
-    its last entry repeats. With *gate*, every call waits on that event first,
+    The answers are consumed one per call and the last one repeats, so a
+    single answer serves every call. With *gate*, every call waits on that event first,
     so a test can hold calls in flight (or hang them). ``peak_in_flight`` is the
     most calls ever awaiting at once.
     """
 
-    def __init__(self, script: Answer | Sequence[Answer], *, gate: asyncio.Event | None = None):
-        self._script: Sequence[Answer] = (
-            tuple(script) if isinstance(script, (list, tuple)) else (script,)
-        )
+    def __init__(self, first: Answer, *rest: Answer, gate: asyncio.Event | None = None):
+        self._script: Sequence[Answer] = (first, *rest)
         self._gate = gate
         self.requests: list[dict[str, Any]] = []
         self.in_flight = 0
