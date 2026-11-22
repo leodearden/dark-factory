@@ -14,6 +14,10 @@ Usage:
     python scripts/offline_lane_soak_report.py [--project-root ROOT] [--since ISO]
         [--command NAME ...] [--json] [--server-url URL] [--recheck-secs N]
 
+--since defaults to the ledger cut-over: the start of the first pass whose effect block
+records its debts, which is when ε2 (task 6865) went live and the lane began writing
+ledger rows.  The report names it as ``ledger_cut_over``.
+
 Verdict lines go to stderr; stdout carries the figures, or with --json the full report.
 Run it directly, never via `python -m`: it imports flat siblings in scripts/.
 """
@@ -697,6 +701,7 @@ def _report_json(
         'exit_code': exit_code(inputs, results),
         'unjudgeable': None if judged else inputs.reason,
         'since': inputs.since.isoformat() if judged else None,
+        'ledger_cut_over': inputs.ledger_cut_over.isoformat() if judged and inputs.ledger_cut_over else None,
         'now': now.isoformat(),
         'commands': list(inputs.commands) if judged else [],
         'checks': [
@@ -729,7 +734,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--project-root', type=Path, default=None,
                         help='project whose lane to judge (default: the main checkout)')
     parser.add_argument('--since', type=_instant, default=None,
-                        help='window start, ISO-8601 with an offset (default: the first effect-carrying pass)')
+                        help='window start, ISO-8601 with an offset (default: the ledger cut-over, the first '
+                        'pass whose effect block records its debts)')
     parser.add_argument('--command', action='append', default=[], dest='commands',
                         help='a lane command name to judge; repeatable (default: every command with records)')
     parser.add_argument('--json', action='store_true', help='print the full report as JSON on stdout')

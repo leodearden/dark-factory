@@ -43,6 +43,7 @@ from orchestrator.offline_lane_episode_state import (
     CommandRecord,
     EpisodeStore,
     PassEffect,
+    effect_records_debts,
 )
 from orchestrator.offline_lane_records import (
     FailureRecord,
@@ -184,9 +185,11 @@ class EscalationReads:
 class SoakInputs:
     """*tasks* maps each task read to its body, or None for a corroborated absence; *failures* maps
     (command, test) to that test's failure records over every stored pass of the selected commands;
-    *record_bytes* is the size of every file under the run-record root."""
+    *record_bytes* is the size of every file under the run-record root.  *ledger_cut_over* is
+    :func:`_ledger_cut_over` over every stored pass, whatever the window and commands."""
 
     since: datetime
+    ledger_cut_over: datetime | None
     now: datetime
     commands: tuple[str, ...]
     passes: tuple[WindowPass, ...]
@@ -255,10 +258,11 @@ def _missing_store(stores: StoreLocations) -> Unjudgeable | None:
     return None
 
 
-def _cut_over(every_pass: Sequence[StoredPass]) -> datetime | None:
-    """The earliest pass-id start of a pass carrying an effect block, over every command."""
+def _ledger_cut_over(every_pass: Sequence[StoredPass]) -> datetime | None:
+    """ε2's go-live, the first pass that wrote ledger rows: the earliest pass-id start, over every
+    command, of a stored pass whose effect block records its debts."""
     return min(
-        (p.started_at for p in every_pass if p.record is not None and p.record.effect is not None),
+        (p.started_at for p in every_pass if p.record is not None and effect_records_debts(p.record.effect)),
         default=None,
     )
 
@@ -464,7 +468,7 @@ async def load_inputs(
     now: datetime,
     task_reader: TaskReader,
 ) -> SoakInputs | Unjudgeable:
-    """The soak inputs since *since* (default: the cut-over) for *commands* (names; default every command with passes)."""
+    """The soak inputs since *since* (default: the ledger cut-over) for *commands* (names; default every command with passes)."""
     stores = StoreLocations.of(project_root)
     missing = _missing_store(stores)
     if missing is not None:
@@ -474,10 +478,14 @@ async def load_inputs(
         every_pass = list(record_store.stored_passes_since(_BEGINNING))
     except OSError as exc:
         return Unjudgeable(f'run records unreadable: {stores.records}: {exc}')
+    ledger_cut_over = _ledger_cut_over(every_pass)
     if since is None:
-        since = _cut_over(every_pass)
-        if since is None:
-            return Unjudgeable('no pass record carries an effect block, so the cut-over is unknown; pass --since')
+        if ledger_cut_over is None:
+            return Unjudgeable(
+                'no pass record carries an effect block recording its debts (task 6865, ε2), so the ledger '
+                'cut-over is unknown; pass --since',
+            )
+        since = ledger_cut_over
     in_window = [p for p in every_pass if p.started_at >= since]
     selected = {command_key(name) for name in commands} or {p.command_key for p in in_window}
     window = tuple(_window_pass(p) for p in in_window if p.command_key in selected)
@@ -497,6 +505,7 @@ async def load_inputs(
         return escalations
     return SoakInputs(
         since=since,
+        ledger_cut_over=ledger_cut_over,
         now=now,
         commands=tuple(sorted(selected)),
         passes=window,
