@@ -228,6 +228,12 @@ def deps_verdict(
     Emits a separate DEBUG log when the intra-train allowance fires.
     """
     dep_ids = dependency_ids(task)
+    # The one walk of the local deps, so each logs once: the local arm needs
+    # the first unfinished dep, the early-start answer the first two.
+    unfinished = list(islice(
+        _unfinished_local_deps(task, list(dict.fromkeys(dep_ids)), status_map, tasks_by_id),
+        2 if waiting_predecessors else 1,
+    ))
     arms = partial(
         _arm_verdicts,
         task=task,
@@ -239,14 +245,14 @@ def deps_verdict(
         terminal_dep_records=terminal_dep_records,
         deferred_terminal_deps=deferred_terminal_deps,
     )
-    verdict = DepsVerdict.combine(arms(dep_ids))
-    if not waiting_predecessors or verdict.kind is not DepKind.LOCAL:
+    verdict = DepsVerdict.combine(arms(dep_ids, unfinished_local=unfinished))
+    if not waiting_predecessors or len(unfinished) != 1:
         return verdict
-    predecessor = _sole_unfinished_local_dep(task, dep_ids, status_map, tasks_by_id)
-    if predecessor is None or predecessor not in waiting_predecessors:
+    (predecessor,) = unfinished
+    if predecessor not in waiting_predecessors:
         return verdict
     set_aside = [dep_id for dep_id in dep_ids if dep_id != predecessor]
-    if DepsVerdict.combine(arms(set_aside)).satisfied:
+    if DepsVerdict.combine(arms(set_aside, unfinished_local=())).satisfied:
         return DepsVerdict.waiting_on(predecessor)
     return verdict
 
@@ -254,6 +260,7 @@ def deps_verdict(
 def _arm_verdicts(
     dep_ids: list[str],
     *,
+    unfinished_local: Collection[str],
     task: dict,
     status_map: dict[str, str],
     tasks_by_id: dict[str, dict] | None,
@@ -263,8 +270,12 @@ def _arm_verdicts(
     terminal_dep_records: dict[str, dict] | None,
     deferred_terminal_deps: Collection[str],
 ) -> Iterator[DepsVerdict]:
-    """Each arm's verdict over *dep_ids*, lazily and in order: the one home of :func:`deps_verdict`'s arm list."""
-    yield _local_verdict(task, dep_ids, status_map, tasks_by_id)
+    """Each arm's verdict over *dep_ids*, lazily and in order: the one home of :func:`deps_verdict`'s arm list.
+
+    *unfinished_local* is the caller's walk of :func:`_unfinished_local_deps`
+    over *dep_ids*; the local arm reads it rather than walking again.
+    """
+    yield _local_verdict(unfinished_local)
     yield _scheduled_deploy_verdict(
         task, dep_ids, status_map, tasks_by_id, terminal_dep_records, deferred_terminal_deps,
     )
@@ -274,26 +285,12 @@ def _arm_verdicts(
     )
 
 
-def _sole_unfinished_local_dep(
-    task: dict,
-    dep_ids: list[str],
-    status_map: dict[str, str],
-    tasks_by_id: dict[str, dict] | None,
-) -> str | None:
-    """The unfinished local dep when exactly one distinct dep is unfinished, else None."""
-    distinct = list(dict.fromkeys(dep_ids))
-    unfinished = set(islice(_unfinished_local_deps(task, distinct, status_map, tasks_by_id), 2))
-    return unfinished.pop() if len(unfinished) == 1 else None
+def _local_verdict(unfinished_local: Collection[str]) -> DepsVerdict:
+    """The local arm of :func:`deps_verdict`: SATISFIED or UNSATISFIED, never UNKNOWN.
 
-
-def _local_verdict(
-    task: dict,
-    dep_ids: list[str],
-    status_map: dict[str, str],
-    tasks_by_id: dict[str, dict] | None,
-) -> DepsVerdict:
-    """The local arm of :func:`deps_verdict`: SATISFIED or UNSATISFIED, never UNKNOWN."""
-    if next(_unfinished_local_deps(task, dep_ids, status_map, tasks_by_id), None) is None:
+    UNSATISFIED when any dep is unfinished, as :func:`_unfinished_local_deps` decides.
+    """
+    if not unfinished_local:
         return DEPS_SATISFIED
     return DepsVerdict.unsatisfied(DepKind.LOCAL)
 

@@ -604,3 +604,47 @@ class TestTheWaitingPredecessorInvariant:
     def test_an_empty_predecessor_id_is_refused(self):
         with pytest.raises(ValueError):
             DepsVerdict.waiting_on('')
+
+
+def _blocked_line(dep_id: str) -> str:
+    return f'Task T blocked: dep {dep_id} has status in-progress, need done or cancelled'
+
+
+class TestTheEarlyStartAnswerLogsEachDepOnce:
+    """The opt-in answer walks the local deps once, so each dep's DEBUG line appears once per call."""
+
+    def _logged(self, caplog, task, status_map, *args, **kwargs) -> list[str]:
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.scheduler'):
+            deps_verdict(task, status_map, *args, **kwargs)
+        return [r.getMessage() for r in caplog.records if r.name == 'orchestrator.scheduler']
+
+    def test_the_waiting_predecessor_is_logged_once(self, caplog):
+        logged = self._logged(
+            caplog, _dependent('P'), {'P': 'in-progress'}, waiting_predecessors={'P'},
+        )
+
+        assert logged == [_blocked_line('P')]
+
+    def test_two_unfinished_deps_are_each_logged_once(self, caplog):
+        logged = self._logged(
+            caplog,
+            _dependent('P', 'Q'),
+            {'P': 'in-progress', 'Q': 'in-progress'},
+            waiting_predecessors={'P'},
+        )
+
+        assert logged == [_blocked_line('P'), _blocked_line('Q')]
+
+    def test_an_intra_train_allowance_is_logged_once(self, caplog):
+        logged = self._logged(
+            caplog,
+            _train_member('t1', 'M', 'P'),
+            {'M': 'merge-deferred', 'P': 'in-progress'},
+            {'M': _merge_deferred('M', 't1')},
+            waiting_predecessors={'P'},
+        )
+
+        assert logged == [
+            'Task T: intra-train dep satisfied: dep=M train_id=t1',
+            _blocked_line('P'),
+        ]
