@@ -1393,6 +1393,59 @@ Each project has its own queue, so for the fleet:
 5. Ends with a mandatory `/reflect` — decisions and discoveries from the
    unblock session get written to memory before the session closes.
 
+### A task waiting on a peer's park (`park_refused`, task 6328)
+
+Only the scored scan's top candidate earns skips and fairness parks. A task
+below it that is refused its locks by a same-tier (or lower-tier) park earns
+nothing and waits as long as that park's owner does, which can be days when
+the owner itself waits on a holder. The scheduler reports that wait as
+`park_refused`: a dispatch candidate refused by parks alone, none of which
+outranks it. The first event comes once the refusal has lasted
+`park_refused_emit_interval_secs` (default 1800 s, green tier, hot-reloadable),
+then at most once per interval. A dispatch, a refusal by anything else, or the
+task leaving the dispatch candidates ends the episode.
+
+Read it with
+`mcp__fused-memory__get_scheduler_events(project_root=..., event_types=['park_refused'])`.
+The payload is `{task_id, priority, episode_secs, blockers, park_owners}`:
+
+- `blockers` — `[{module, owner, kind: 'parked'}]`, every park that refused
+  the acquire;
+- `park_owners` — one entry per blocking owner: `owner`, its park priority
+  (`source` plus `tier`, or `pin_order`), `park_age_secs`, and `waiting_on`,
+  the owner's own blockers (`null` when the owner is not in the tick's task
+  list).
+
+The lever is to pin the waiting task B:
+
+1. `set_task_priority_override(project_root, task_id=<B>, pinned=True, ttl_secs=<a few hours>)`.
+2. If other pins exist, `reorder_pin_queue` with B first. Only the first
+   `pin_reservation_max_active` (default 1) eligible lock-blocked pins
+   reserve; `get_pin_queue` shows the order.
+3. On the next tick B's pin reservation shadows the peer's park on the shared
+   keys and B dispatches.
+
+What the lever leaves alone: the peer's park comes back the moment B
+dispatches, its park on keys B does not need is never touched, and a held lock
+is never taken. So pinning does not help while any blocker reads
+`kind: 'held'`: B then waits on that holder, and `park_refused` stops naming
+it. Clear the pin afterwards with
+`clear_task_priority_override(project_root, task_id=<B>, field='pinned')` if
+you set no ttl.
+
+The heavier alternative is to defer the park owner. Since task 6518 a deferred
+owner drops its whole footprint, including keys B never needed.
+
+The automatic backstop is the starvation watchdog's `lock_refused` gate (knobs
+`starvation_watchdog.skip_threshold` and `starvation_watchdog.idle_only_secs`;
+`dark-factory-orchestrator.yaml` overrides them). It auto-pins the starving
+task, but only while an auto-pin slot (`starvation_watchdog.auto_pin_max_concurrent`)
+is free.
+
+During the 2026-11 trial with fairness parks off (`fairness.skip_threshold` at
+1000000), the only parks are pin reservations and parks left from before the
+switch, and a pin reservation never produces this event.
+
 ### Merging: the submit → poll protocol
 
 **Never** `git merge --no-ff` directly into a project's main while its
