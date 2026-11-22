@@ -335,6 +335,20 @@ def test_run_session_start_refreshes_existing_record_preserving_fields(tmp_path:
     assert record_path.stat().st_mtime > old_ts
 
 
+def _seed_orphan_swept_record(hook_input: dict[str, str], tmp_path: Path) -> str:
+    slug = sh.hook_session_slug(hook_input, {})
+    session_records.write_record(
+        session_records.SessionRecord(
+            session_slug=slug,
+            status=session_records.Status.EXITED,
+            exit_code=session_reaper.ORPHAN_EXIT_CODE,
+            cwd=hook_input['cwd'],
+        ),
+        root=tmp_path,
+    )
+    return slug
+
+
 def test_run_session_start_clears_orphan_exit_code_when_live_session_resumes(
     tmp_path: Path,
 ) -> None:
@@ -343,22 +357,34 @@ def test_run_session_start_clears_orphan_exit_code_when_live_session_resumes(
         'cwd': '/home/leo/src/dark-factory',
         'source': 'compact',
     }
-    env: dict[str, str] = {}
-    slug = sh.hook_session_slug(hook_input, env)
-    session_records.write_record(
-        session_records.SessionRecord(
-            session_slug=slug,
-            status=session_records.Status.EXITED,
-            exit_code=session_reaper.ORPHAN_EXIT_CODE,
-            cwd='/home/leo/src/dark-factory',
-        ),
-        root=tmp_path,
-    )
+    slug = _seed_orphan_swept_record(hook_input, tmp_path)
 
-    sh.run_session_start(hook_input, env, root=tmp_path)
+    sh.run_session_start(hook_input, {}, root=tmp_path)
 
     record = session_records.read_record(slug, root=tmp_path)
     assert (record.status, record.exit_code) == (session_records.Status.RUNNING, None)
+
+
+@pytest.mark.parametrize(
+    ('run_hook', 'live_status'),
+    [
+        (sh.run_stop, session_records.Status.IDLE),
+        (sh.run_notification, session_records.Status.AWAITING_INPUT),
+    ],
+    ids=['stop', 'notification'],
+)
+def test_turn_hooks_clear_orphan_exit_code_when_live_session_resumes(
+    tmp_path: Path,
+    run_hook: Callable[..., str],
+    live_status: session_records.Status,
+) -> None:
+    hook_input = {'session_id': 'sess-b', 'cwd': '/home/leo/src/dark-factory'}
+    slug = _seed_orphan_swept_record(hook_input, tmp_path)
+
+    run_hook(hook_input, {}, root=tmp_path)
+
+    record = session_records.read_record(slug, root=tmp_path)
+    assert (record.status, record.exit_code) == (live_status, None)
 
 
 def test_run_session_start_hand_launched_uses_session_leader_as_liveness_pid(
