@@ -877,9 +877,15 @@ class TestTheV2ScriptsImportOnlyDownward:
         ('write_triage_rating_rounds', {
             'write_triage_rating_rounds', 'write_triage_reader_rubric',
         }),
+        ('mem0_history_at', {'mem0_history_at'}),
         ('build_write_triage_v2_soak_baseline', {
             'build_write_triage_v2_soak_baseline', 'write_triage_rating_rounds',
-            'write_triage_reader_rubric',
+            'write_triage_reader_rubric', 'mem0_history_at',
+        }),
+        ('rebuild_write_triage_live_slates', {
+            'rebuild_write_triage_live_slates', 'mem0_history_at', 'write_triage_rating_rounds',
+            'write_triage_reader_rubric', 'freeze_write_triage_population',
+            'eval_write_triage_retrieval', 'calibrate_write_triage', 'eval_write_triage_scoring',
         }),
         ('build_write_triage_eval_set', {
             'build_write_triage_eval_set', 'write_triage_rating_rounds',

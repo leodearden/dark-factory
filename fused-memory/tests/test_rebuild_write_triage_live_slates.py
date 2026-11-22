@@ -42,6 +42,11 @@ def _rounds() -> types.ModuleType:
 
 
 @functools.cache
+def _history() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'mem0_history_at.py', mod_name='mem0_history_at')
+
+
+@functools.cache
 def _arms() -> types.ModuleType:
     return load_script_module(
         SCRIPTS / 'run_write_triage_population_arms.py', 'run_write_triage_population_arms',
@@ -268,7 +273,7 @@ def history(tmp_path: Path) -> Any:
         ('P', 'P then', 'P now', 'UPDATE', EARLIER, '2026-10-14T00:00:00+00:00'),
         ('b', 'b older', 'z' * 5000, 'UPDATE', EARLIER, '2026-10-11T21:00:00+00:00'),
     ])
-    return _rounds().MemoryHistory.read(path)
+    return _history().MemoryHistory.read(path)
 
 
 def _slate(history: Any, k: int = 20, points: list[Point] | None = None) -> dict[str, Any]:
