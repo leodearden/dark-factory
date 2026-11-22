@@ -327,6 +327,11 @@ _DISALLOWED_TOOLS: list[str] = [
     'Skill',
 ]
 
+_GRANTED_TOOLS_LINE: str = (
+    f'**Granted tools:** {", ".join(_ALLOWED_TOOLS)}. '
+    'Every other tool call and Bash command is denied permanently: a retry is denied again.'
+)
+
 _INVESTIGATION_ENV_OVERRIDES: Mapping[str, str] = MappingProxyType({
     'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE': '1',
     'DISABLE_AUTO_COMPACT': '1',
@@ -711,7 +716,8 @@ async def run_dry_run_unblock(
             f'Worktree: {worktree}\n'
             f'Block reason: {reason}\n'
             f'Detail: {detail or "(none)"}\n'
-            f'**Reviews directory:** {_reviews_directory(worktree, task_id, reviews_dir)}\n\n'
+            f'**Reviews directory:** {_reviews_directory(worktree, task_id, reviews_dir)}\n'
+            f'{_GRANTED_TOOLS_LINE}\n\n'
             f'{task_context.block}\n\n'
             'Investigate and emit your structured proposal.'
         )
