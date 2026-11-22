@@ -35,7 +35,7 @@ import pwd
 import shutil
 import subprocess
 import tempfile
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -46,6 +46,7 @@ from legibility import trickle_state
 from legibility.state_docs import Malformed, Missing, Ok
 from legibility.trickle_state import (
     CensusFireStreak,
+    CompletionArm,
     RunCounters,
     RunOutcome,
     TrickleState,
@@ -303,6 +304,7 @@ def _state(**overrides) -> TrickleState:
         capped=False,
         consecutive_barren_runs=0,
         consecutive_failed_runs=0,
+        consecutive_deferred_runs=2,
         last_productive_at=_T0,
         last_scheduled_target_date=date(2026, 7, 1),
         census_fired=True,
@@ -315,6 +317,8 @@ def _state(**overrides) -> TrickleState:
         counters=_counters(selected_count=2, zero_signal_dropped=4),
         retry_backlog={date(2026, 6, 29): 1},
         barren_escalated=True,
+        completion_error_streak=1,
+        completion_escalated=True,
     )
     fields.update(overrides)
     return TrickleState(**fields)
@@ -374,10 +378,11 @@ class TestTrickleStateCodec:
             'schema_version', 'project_id', 'target_date', 'recorded_at',
             'exit_code', 'outcome', 'applied', 'commit_made',
             'budget_suppressed', 'capped', 'consecutive_barren_runs',
-            'consecutive_failed_runs', 'last_productive_at',
-            'last_scheduled_target_date', 'census_fired',
+            'consecutive_failed_runs', 'consecutive_deferred_runs',
+            'last_productive_at', 'last_scheduled_target_date', 'census_fired',
             'census_fire_streak', 'counters', 'retry_backlog',
-            'barren_escalated',
+            'barren_escalated', 'completion_error_streak',
+            'completion_escalated',
         }
 
     def test_to_json_uses_iso_text_and_plain_values(self):
@@ -398,6 +403,8 @@ class TestTrickleStateCodec:
             selected_count=2, zero_signal_dropped=4
         ).to_json()
         assert doc['barren_escalated'] is True
+        assert doc['completion_error_streak'] == 1
+        assert doc['completion_escalated'] is True
 
     def test_the_backlog_is_read_only(self):
         assert not isinstance(_state().retry_backlog, MutableMapping)
@@ -447,6 +454,14 @@ class TestLoadState:
                      'consecutive_barren_runs', id='non-int-streak'),
         pytest.param(_pre_gamma_doc(barren_escalated='yes'),
                      'barren_escalated', id='non-bool-escalated'),
+        pytest.param(_pre_gamma_doc(completion_error_streak=-1),
+                     'completion_error_streak', id='negative-completion-streak'),
+        pytest.param(_pre_gamma_doc(completion_error_streak='3'),
+                     'completion_error_streak', id='non-int-completion-streak'),
+        pytest.param(_pre_gamma_doc(completion_error_streak=True),
+                     'completion_error_streak', id='bool-completion-streak'),
+        pytest.param(_pre_gamma_doc(completion_escalated='yes'),
+                     'completion_escalated', id='non-bool-completion-escalated'),
         pytest.param(_pre_gamma_doc(counters={'total_records': 1}),
                      'zero_signal_dropped', id='incomplete-counters'),
     ])
@@ -498,12 +513,15 @@ class TestPreGammaDocuments:
         assert state.outcome == RunOutcome.BARREN
         assert state.consecutive_barren_runs == 2
         assert state.consecutive_failed_runs == 0
+        assert state.consecutive_deferred_runs == 0
         assert state.capped is False
         assert dict(state.retry_backlog) == {}
         assert state.last_scheduled_target_date is None
         assert state.census_fired is None
         assert state.census_fire_streak is None
         assert state.last_productive_at is None
+        assert state.completion_error_streak == 0
+        assert state.completion_escalated is False
         assert not _warnings(caplog)
 
     def test_an_absent_barren_escalated_is_unrecorded_not_false(self, tmp_path):
@@ -521,8 +539,9 @@ class TestPreGammaDocuments:
         assert read.value.barren_escalated is recorded
 
     @pytest.mark.parametrize('field', [
-        'consecutive_failed_runs', 'capped', 'retry_backlog',
-        'last_scheduled_target_date', 'census_fired', 'census_fire_streak',
+        'consecutive_failed_runs', 'consecutive_deferred_runs', 'capped',
+        'retry_backlog', 'last_scheduled_target_date', 'census_fired',
+        'census_fire_streak', 'completion_error_streak', 'completion_escalated',
     ])
     def test_each_later_additive_field_may_be_absent_alone(
         self, tmp_path, field
@@ -1000,6 +1019,13 @@ class TestRecordRunBarrenEscalated:
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
         assert parameter.default is inspect.Parameter.empty
 
+    def test_the_completion_alarm_flag_has_no_default(self):
+        parameter = inspect.signature(trickle_state.write_night).parameters[
+            'completion_alarm_landed'
+        ]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
+
 
 class TestFoldNight:
     """fold_night(prior, project_id, run) is the pure fold write_night
@@ -1018,7 +1044,9 @@ class TestFoldNight:
             _night(day=3, budget_skipped=4, scheduled=True),
         )
 
-        written = trickle_state.write_night(night, barren_escalated=True)
+        written = trickle_state.write_night(
+            night, barren_escalated=True, completion_alarm_landed=False
+        )
 
         assert written == dataclasses.replace(night.state, barren_escalated=True)
         assert night.state.consecutive_barren_runs == 3
@@ -1097,6 +1125,59 @@ class TestBarrenStreakDue:
     def test_due_at_or_past_the_threshold(self, streak, threshold, due):
         state = _state(consecutive_barren_runs=streak)
         assert trickle_state.barren_streak_due(state, threshold) is due
+
+
+_NIGHT_KINDS: dict[str, Callable[[int], trickle_state.NightRun]] = {
+    'barren': lambda day: _night(day=day, below_sampling_cut=3),
+    'failed': lambda day: _night(day=day, exit_code=1),
+    'deferred': lambda day: _night(day=day, capped=True, selected_count=1),
+    'productive': lambda day: _night(day=day, selected_count=1),
+}
+
+
+def _escalation_due_on(kinds, max_runs) -> list[int]:
+    """The 1-based nights of the *kinds* walk, folded one after another, on
+    which barren_escalation_due is true at *max_runs*."""
+    prior = None
+    due = []
+    for number, kind in enumerate(kinds, start=1):
+        night = trickle_state.fold_night(prior, 'p', _NIGHT_KINDS[kind](number))
+        if trickle_state.barren_escalation_due(night, max_runs):
+            due.append(number)
+        prior = night.state
+    return due
+
+
+class TestBarrenEscalationDue:
+    """The nightly's barren-streak escalation schedule: the threshold, then
+    each later multiple of it in BARREN_ESCALATION_MULTIPLES, then silence
+    until a productive or quiet night resets the streak."""
+
+    def test_a_persistent_streak_reescalates_on_a_doubling_backoff_then_stops(self):
+        assert _escalation_due_on(
+            ['barren'] * 30, trickle_state.DEFAULT_MAX_BARREN_RUNS
+        ) == [3, 6, 12, 24]
+
+    @pytest.mark.parametrize('threshold', [1, 2, 5])
+    def test_the_schedule_is_multiples_of_the_threshold(self, threshold):
+        expected = [
+            threshold * multiple
+            for multiple in trickle_state.BARREN_ESCALATION_MULTIPLES
+            if threshold * multiple <= 30
+        ]
+        assert _escalation_due_on(['barren'] * 30, threshold) == expected
+
+    @pytest.mark.parametrize('kinds, due', [
+        (['barren'] * 5 + ['failed', 'barren'], [3, 7]),
+        (['barren'] * 6 + ['failed', 'barren'], [3, 6]),
+        (['barren'] * 6 + ['deferred', 'barren'], [3, 6]),
+    ], ids=['failed-before-a-point', 'failed-on-a-point', 'deferred-on-a-point'])
+    def test_a_carried_night_neither_fires_nor_shifts_the_schedule(self, kinds, due):
+        assert _escalation_due_on(kinds, trickle_state.DEFAULT_MAX_BARREN_RUNS) == due
+
+    def test_a_reset_rearms_the_schedule_from_its_start(self):
+        kinds = ['barren'] * 6 + ['productive'] + ['barren'] * 3
+        assert _escalation_due_on(kinds, trickle_state.DEFAULT_MAX_BARREN_RUNS) == [3, 6, 10]
 
 
 class TestBarrenRemedy:
@@ -1238,8 +1319,9 @@ class TestRecordRunFailedStreak:
 
 
 class TestRecordRunDeferred:
-    """A night the usage cap deferred observed nothing, so it moves neither
-    streak and owes its date a retry."""
+    """A night the usage cap deferred observed nothing, so it leaves the
+    barren and failed streaks where they were, advances only its own
+    deferred streak, and owes its date a retry."""
 
     @pytest.fixture(autouse=True)
     def _state_root(self, tmp_path, monkeypatch):
@@ -1257,6 +1339,7 @@ class TestRecordRunDeferred:
         assert capped.last_productive_at == prod.last_productive_at
         assert capped.consecutive_barren_runs == 1
         assert capped.consecutive_failed_runs == 0
+        assert capped.consecutive_deferred_runs == 1
         assert capped.census_fired is None
         assert capped.census_fire_streak is not None
         assert capped.census_fire_streak.fires == 2
@@ -1274,6 +1357,154 @@ class TestRecordRunDeferred:
         assert deferred.outcome == RunOutcome.DEFERRED
         assert deferred.consecutive_barren_runs == 2
         assert _record(day=4, budget_skipped=4).consecutive_barren_runs == 3
+
+    def test_consecutive_deferred_nights_count_up(self):
+        assert [
+            _record(day=day, capped=True).consecutive_deferred_runs
+            for day in (1, 2, 3)
+        ] == [1, 2, 3]
+
+    @pytest.mark.parametrize('finisher', [
+        pytest.param(dict(selected_count=2), id='productive'),
+        pytest.param(dict(zero_signal_dropped=3), id='quiet'),
+        pytest.param(dict(budget_skipped=4), id='barren'),
+    ])
+    def test_a_finished_night_resets_the_deferred_streak(self, finisher):
+        _record(day=1, capped=True)
+        _record(day=2, capped=True)
+
+        state = _record(day=3, **finisher)
+        assert state.outcome != RunOutcome.DEFERRED
+        assert state.consecutive_deferred_runs == 0
+
+    def test_a_failed_night_carries_the_deferred_streak(self):
+        """Only a finished pass runs a retry, so a crash neither erases the
+        deferral's progress toward losing owed dates nor adds to it."""
+        _record(day=1, capped=True)
+        _record(day=2, capped=True)
+        assert _record(day=3, exit_code=1).consecutive_deferred_runs == 2
+        assert _record(day=4, capped=True).consecutive_deferred_runs == 3
+
+
+_PASS_KINDS: dict[str, dict[str, Any]] = {
+    'P': dict(exit_code=0, capped=False, commit_made=True),
+    'D': dict(exit_code=0, capped=True, commit_made=False),
+    'F': dict(exit_code=1, capped=False, commit_made=False),
+}
+"""A night's kind as one letter: productive, deferred by the usage cap, or
+failed."""
+
+
+def _scheduled_night(night: int, kind: str) -> trickle_state.NightRun:
+    """The *night*-th scheduled pass in production shape, of *kind* (a key
+    of :data:`_PASS_KINDS`): it covers ``_d(1)`` plus *night* days and is
+    recorded the next day at 03:00."""
+    target = _d(1) + timedelta(days=night)
+    return trickle_state.NightRun(
+        target_date=target,
+        recorded_at=datetime.combine(
+            target + timedelta(days=1), datetime.min.time(), UTC
+        ).replace(hour=3),
+        counters=_counters(selected_count=1),
+        census=None,
+        scheduled=True,
+        **_PASS_KINDS[kind],
+    )
+
+
+class TestUnrecoverableOwedDate:
+    """The owed date the retry backlog can no longer recover: what an
+    unfinished run of nights must cost before the progress probe calls it
+    more than weather."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    @pytest.mark.parametrize('short_of_window', [2, 1, 0, -1])
+    def test_the_oldest_owed_date_is_lost_once_the_next_night_is_past_the_window(
+        self, short_of_window
+    ):
+        """The streaks are not read: a finished last night can still leave
+        an owed date the window has passed."""
+        oldest = _T0.date() - timedelta(
+            days=trickle_state.RETRY_MAX_AGE_DAYS - short_of_window
+        )
+        state = _state(
+            retry_backlog={oldest: 1, _T0.date(): 1},
+            consecutive_deferred_runs=0,
+            consecutive_failed_runs=0,
+        )
+
+        lost = trickle_state.unrecoverable_owed_date(state)
+
+        assert lost == (oldest if short_of_window <= 0 else None)
+
+    def test_an_empty_backlog_loses_nothing_whatever_the_deferred_streak(self):
+        state = _state(
+            retry_backlog={},
+            consecutive_deferred_runs=trickle_state.RETRY_MAX_AGE_DAYS + 3,
+        )
+        assert trickle_state.unrecoverable_owed_date(state) is None
+
+    @pytest.mark.parametrize('pattern, loses_first_target', [
+        pytest.param(
+            'D' * (trickle_state.RETRY_MAX_AGE_DAYS - 1), False,
+            id='deferral-one-night-short',
+        ),
+        pytest.param(
+            'D' * trickle_state.RETRY_MAX_AGE_DAYS, True,
+            id='deferral-of-the-window',
+        ),
+        pytest.param(
+            'DDDF' + 'D' * (trickle_state.RETRY_MAX_AGE_DAYS - 4), True,
+            id='crash-inside-the-deferral',
+        ),
+        pytest.param(
+            'D' * (trickle_state.RETRY_MAX_AGE_DAYS - 1) + 'F', True,
+            id='crash-after-the-deferral',
+        ),
+    ])
+    def test_it_names_the_date_the_real_writer_goes_on_to_abandon(
+        self, caplog, pattern, loses_first_target
+    ):
+        """Unfinished nights, then finished ones each running the nightly's
+        retries, through the real writer: the date named after the
+        unfinished nights is exactly the one later abandoned."""
+        lost = [_d(1)] if loses_first_target else []
+        with caplog.at_level('WARNING'):
+            for night, kind in enumerate(pattern):
+                trickle_state.record_run(
+                    'dark_factory', _scheduled_night(night, kind),
+                    barren_escalated=False,
+                )
+            after = trickle_state.read_prior('dark_factory')
+            assert after is not None
+            predicted = trickle_state.unrecoverable_owed_date(after)
+            for night in range(len(pattern), len(pattern) + 12):
+                run = _scheduled_night(night, 'P')
+                state = trickle_state.record_run(
+                    'dark_factory', run, barren_escalated=False
+                )
+                for owed in trickle_state.due_retries(
+                    state, today=run.recorded_at.date()
+                ):
+                    trickle_state.record_retry(
+                        'dark_factory', target_date=owed,
+                        recorded_at=run.recorded_at, exit_code=0, capped=False,
+                        commit_made=True,
+                    )
+
+        assert ([] if predicted is None else [predicted]) == lost
+        assert len(
+            _warnings_naming(caplog, 'trickle retry backlog: abandoning')
+        ) == len(lost)
+        assert all(
+            _warnings_naming(caplog, f'abandoning {owed.isoformat()} ')
+            for owed in lost
+        )
+        final = trickle_state.read_prior('dark_factory')
+        assert final is not None and dict(final.retry_backlog) == {}
 
 
 def _fire(anchor: str | None = '2026-08-02', path=_CENSUS_STATE):
@@ -1395,6 +1626,140 @@ class TestRecordRunCensusFireStreak:
         assert trickle_state.load_state(_path()) == Ok(state)
 
 
+def _observed(completion: CompletionArm | None):
+    """A NO-FIRE census observation carrying *completion*: the completion
+    error streak is independent of whether the trigger fired."""
+    return trickle_state.CensusObservation(
+        fired=False,
+        last_census_at='2026-08-02',
+        census_state_path=_CENSUS_STATE,
+        completion=completion,
+    )
+
+
+def _fold_completion(prior_streak: int | None, census, *, escalated: bool = False):
+    """Fold one night carrying *census* over a prior whose completion error
+    streak is *prior_streak* (``None``: no prior at all) and whose
+    escalation of it has landed iff *escalated*."""
+    prior = None if prior_streak is None else _state(
+        completion_error_streak=prior_streak, completion_escalated=escalated
+    )
+    return trickle_state.fold_night(
+        prior, 'dark_factory', _night(day=2, zero_signal_dropped=1, census=census)
+    )
+
+
+class TestCompletionErrorStreak:
+    """``completion_error_streak``: how many consecutive census evaluations
+    ended in a completion-check ERROR (plans/census-incremental-prd.md C7
+    (a)). Only a concluded check (exit 0 or 75) resets it; a standing night
+    (no previous run, or the run filed nothing) carries it, as does a night
+    that established no completion verdict at all."""
+
+    def test_an_observation_carries_its_completion_arm(self):
+        assert _observed(CompletionArm.ERRORED).completion is CompletionArm.ERRORED
+
+    def test_an_observation_defaults_to_no_completion_verdict(self):
+        observation = trickle_state.CensusObservation(
+            fired=True, last_census_at=None, census_state_path=_CENSUS_STATE,
+        )
+        assert observation.completion is None
+
+    @pytest.mark.parametrize('census, expected', [
+        pytest.param(_observed(CompletionArm.ERRORED), 3, id='errored-counts'),
+        pytest.param(_observed(CompletionArm.CONCLUDED), 0, id='concluded-resets'),
+        pytest.param(_observed(CompletionArm.STANDING), 2, id='standing-carries'),
+        pytest.param(_observed(None), 2, id='no-verdict-carries'),
+        pytest.param(None, 2, id='not-evaluated-carries'),
+    ])
+    def test_the_fold_over_a_streak_of_two(self, census, expected):
+        assert _fold_completion(2, census).state.completion_error_streak == expected
+
+    def test_an_error_with_no_prior_starts_the_streak_at_one(self):
+        night = _fold_completion(None, _observed(CompletionArm.ERRORED))
+        assert night.state.completion_error_streak == 1
+
+    def test_the_threshold_is_three(self):
+        assert trickle_state.DEFAULT_MAX_COMPLETION_ERRORS == 3
+
+    @pytest.mark.parametrize('prior_streak, escalated, arm, reached', [
+        pytest.param(2, False, CompletionArm.ERRORED, True, id='2-to-3-reaches'),
+        pytest.param(3, True, CompletionArm.ERRORED, False, id='3-to-4-already-escalated'),
+        pytest.param(3, False, CompletionArm.ERRORED, True, id='3-to-4-unlanded-retries'),
+        pytest.param(3, True, CompletionArm.STANDING, False, id='standing-escalated'),
+        pytest.param(3, False, CompletionArm.STANDING, True, id='standing-unlanded-retries'),
+        pytest.param(3, True, CompletionArm.CONCLUDED, False, id='3-reset-to-0'),
+        pytest.param(1, False, CompletionArm.ERRORED, False, id='1-to-2-below'),
+        pytest.param(None, False, CompletionArm.ERRORED, False, id='no-prior-to-1'),
+    ])
+    def test_reached_until_an_escalation_of_the_streak_lands(
+        self, prior_streak, escalated, arm, reached
+    ):
+        night = _fold_completion(prior_streak, _observed(arm), escalated=escalated)
+        assert trickle_state.completion_error_streak_reached(night) is reached
+
+    @pytest.mark.parametrize('arm', [
+        pytest.param(CompletionArm.ERRORED, id='errored'),
+        pytest.param(CompletionArm.STANDING, id='standing'),
+        pytest.param(None, id='no-verdict'),
+    ])
+    def test_a_landed_escalation_carries_while_the_streak_stands(self, arm):
+        night = _fold_completion(3, _observed(arm), escalated=True)
+        assert night.state.completion_escalated is True
+
+    def test_a_concluded_check_clears_the_landed_escalation(self):
+        night = _fold_completion(3, _observed(CompletionArm.CONCLUDED), escalated=True)
+        assert night.state.completion_escalated is False
+
+    @pytest.mark.parametrize('escalated, landed, recorded', [
+        pytest.param(False, True, True, id='landing-latches'),
+        pytest.param(False, False, False, id='nothing-landed'),
+        pytest.param(True, False, True, id='latch-survives-a-quiet-night'),
+    ])
+    def test_write_night_latches_a_landed_completion_alarm(
+        self, tmp_path, monkeypatch, escalated, landed, recorded
+    ):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+        night = _fold_completion(3, _observed(CompletionArm.ERRORED), escalated=escalated)
+
+        written = trickle_state.write_night(
+            night, barren_escalated=False, completion_alarm_landed=landed
+        )
+
+        assert written.completion_escalated is recorded
+        assert trickle_state.read_prior('dark_factory') == written
+
+    def test_the_policy_re_arms_after_a_reset(self):
+        prior: TrickleState | None = _state(
+            completion_error_streak=3, completion_escalated=True
+        )
+        reached = []
+        for day, arm in enumerate(
+            [CompletionArm.CONCLUDED, CompletionArm.ERRORED,
+             CompletionArm.ERRORED, CompletionArm.ERRORED],
+            start=2,
+        ):
+            night = trickle_state.fold_night(
+                prior, 'dark_factory', _night(day=day, census=_observed(arm)),
+            )
+            reached.append(trickle_state.completion_error_streak_reached(night))
+            prior = night.state
+
+        assert reached == [False, False, False, True]
+        assert prior.completion_error_streak == 3
+
+    def test_a_custom_threshold_is_honoured(self):
+        night = _fold_completion(4, _observed(CompletionArm.ERRORED))
+        assert trickle_state.completion_error_streak_reached(night, max_errors=5)
+        assert not trickle_state.completion_error_streak_reached(night, max_errors=6)
+
+    def test_the_streak_round_trips_through_the_codec(self):
+        state = _state(completion_error_streak=7, completion_escalated=False)
+        decoded = TrickleState.from_json(state.to_json())
+        assert decoded.completion_error_streak == 7
+        assert decoded.completion_escalated is False
+
+
 class TestReadLastCensusAt:
     """``read_last_census_at(path)``: the ONE quiet read of census-state's
     raw ``last_census_at``, shared by the nightly's pre-launch anchor and
@@ -1420,7 +1785,7 @@ class TestReadLastCensusAt:
         pytest.param('[1, 2]', id='not-an-object'),
     ])
     def test_an_unusable_file_is_malformed_and_quiet(self, tmp_path, caplog, content):
-        """Quiet because census_trigger.load_census_state already logs the
+        """Quiet because census_state.load already logs the
         malformed WARNING for the same file on the same night."""
         path = tmp_path / 'census-state.json'
         path.write_text(content, encoding='utf-8')
@@ -1933,7 +2298,9 @@ class TestRecordRunRetryBacklog:
         assert not _warnings(caplog)
 
         with caplog.at_level('WARNING'):
-            trickle_state.write_night(night, barren_escalated=False)
+            trickle_state.write_night(
+                night, barren_escalated=False, completion_alarm_landed=False
+            )
 
         assert len(_warnings_naming(caplog, '2026-07-01')) == 1
 
@@ -2219,6 +2586,38 @@ class TestRecordRunScheduleCursor:
 
         assert retried.last_scheduled_target_date == _d(3)
         assert dict(retried.retry_backlog) == {}
+
+
+class TestScheduleReached:
+    """``schedule_reached(prior, *, target_date)`` (task 7025): whether the
+    recorded schedule cursor already reached *target_date*, so a scheduled
+    pass over it re-targets a date an earlier scheduled pass covered."""
+
+    @pytest.fixture(autouse=True)
+    def _state_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path))
+
+    def test_no_predecessor_has_not_reached_any_date(self):
+        assert trickle_state.schedule_reached(None, target_date=_d(3)) is False
+
+    def test_a_manual_predecessor_carries_no_cursor(self):
+        prior = _record(day=3)
+
+        assert trickle_state.schedule_reached(prior, target_date=_d(3)) is False
+
+    @pytest.mark.parametrize(('target_day', 'reached'), [
+        pytest.param(3, True, id='the-catch-up-date-re-targeted'),
+        pytest.param(2, True, id='behind-the-cursor'),
+        pytest.param(4, False, id='the-next-night'),
+    ])
+    def test_a_scheduled_predecessor_reached_its_own_date(
+        self, target_day, reached
+    ):
+        prior = _record(day=3, scheduled=True)
+
+        assert trickle_state.schedule_reached(
+            prior, target_date=_d(target_day)
+        ) is reached
 
 
 class TestDueRetries:

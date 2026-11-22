@@ -258,10 +258,15 @@ def _rev_parse(repo, rev):
 # ---------------------------------------------------------------------------
 
 def assert_target_checkout_clean(repo):
-    """*repo* carries no uncommitted change, no worktree but its own, and no
-    deploy branch: everything a landing created was torn down."""
+    """*repo* carries no uncommitted change, and no landing was left behind."""
     status = git(repo, "status", "--porcelain")
     assert status == "", f"the target checkout is dirty:\n{status}"
+    assert_no_landing_left_behind(repo)
+
+
+def assert_no_landing_left_behind(repo):
+    """*repo* has no worktree but its own and no deploy branch: everything a
+    landing created was torn down, whatever else the checkout carries."""
     worktrees = [
         line for line in git(repo, "worktree", "list", "--porcelain").splitlines()
         if line.startswith("worktree ")

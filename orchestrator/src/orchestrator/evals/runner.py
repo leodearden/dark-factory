@@ -9,14 +9,14 @@ import re
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from shared.eval_lane import is_eval_fixture_task_id
 from shared.usage_gate import UsageGate
 
-from orchestrator import verify
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.config import (
     BackendsConfig,
@@ -25,10 +25,12 @@ from orchestrator.config import (
     ModelsConfig,
     OrchestratorConfig,
     PriceEntry,
-    SandboxConfig,
+    RoutingConfig,
 )
 from orchestrator.git_ops import GitOps
+from orchestrator.implementer_brief_variant import execute_iteration_cap
 from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.task_verify_dispatch import TaskVerifyPort
 from orchestrator.workflow import (
     TaskWorkflow,
     WorkflowOutcome,
@@ -47,6 +49,7 @@ from .architect_eval import (
     open_eval_artifacts,
     read_reference_diff,
 )
+from .cell_sandbox import CellSandbox, bind_cell_sandbox_backend
 from .configs import (
     EVAL_CONFIGS,
     JUDGE_OFAT_IMPLEMENTER_PIN,
@@ -59,6 +62,14 @@ from .eval_gate import (
     InjectedGate,
     campaign_usage_gate,
     owned_usage_gate,
+)
+from .fixture_agent_env import fixture_role_env_overrides
+from .fixture_gate import fixture_task_gate, run_fixture_gate
+from .hermeticity import (
+    NO_PRODUCTION_WRITERS,
+    ProductionWriters,
+    refuse_production_writers,
+    writers_held_by,
 )
 from .metrics import (
     EvalMetrics,
@@ -123,6 +134,30 @@ def load_task(task_path: Path) -> dict:
     return task
 
 
+def _admit_claude_role_models(
+    routing: RoutingConfig,
+    models: ModelsConfig,
+    backends: BackendsConfig,
+) -> RoutingConfig:
+    """Return *routing* with every claude-backend role's model in ``allowed_models``.
+
+    Restores, for one eval cell, the invariant
+    ``orchestrator/config.py::OrchestratorConfig._validate_models_in_allowlist``
+    enforces at load time and ``model_copy`` skips. Without it, a candidate
+    model outside the project allowlist (a proxied-endpoint implementer, a
+    fable architect) is rejected by ``resolve_route``'s allowlist layer and
+    the cell silently dispatches the role default under the candidate's label.
+    Only ``allowed_models`` changes; the ladder, ceilings and rules are kept.
+    """
+    claude_role_models = [
+        getattr(models, role)
+        for role in type(models).model_fields
+        if getattr(backends, role, 'claude') == 'claude'
+    ]
+    admitted = list(dict.fromkeys([*routing.allowed_models, *claude_role_models]))
+    return routing.model_copy(update={'allowed_models': admitted})
+
+
 def build_eval_orch_config(
     config: EvalConfig,
     task: dict,
@@ -138,7 +173,8 @@ def build_eval_orch_config(
     Reviewer is the new 1× Opus comprehensive reviewer (matches production
     after the reviewer-panel trial replaced the 5× sonnet panel; merged
     via 594658fbe3 / 2c26a30bca).
-    Only the implementer varies per eval config.
+    Only the implementer varies per eval config, and the implementer candidate's
+    ``harness_variant`` becomes the cell's ``implementer_brief_variant``.
 
     ``architect_config`` (eval-revival μ) drives the both-live end-to-end matrix
     /confirm runs (``run_end_to_end``): when supplied, the architect's
@@ -184,10 +220,23 @@ def build_eval_orch_config(
     ``snapshots._eval_setup_env`` reads from the SAME ``project_root`` (task
     2875, reverting task 2851's worktree-sourced pin). See the BUG 2a comment
     below.
+
+    A fixture from a project other than the base's runs with that project's
+    ``role_env_overrides`` in place of the base's, never merged with them, and
+    one that would outrank the candidate's ``env_overrides`` is refused
+    (``evals/fixture_agent_env.py``).
     """
     if base_config is None:
         raise ValueError('build_eval_orch_config requires an explicit base_config')
-    base = base_config
+    # Re-rooted BEFORE profiling, so the profile's eval-root leaves resolve
+    # against the fixture's project, the project its worktree is cut from.
+    project_root = Path(task.get('project_root', str(base_config.project_root)))
+    base = base_config.model_copy(update={
+        'project_root': project_root,
+        'role_env_overrides': fixture_role_env_overrides(
+            base_config, project_root, config.env_overrides,
+        ),
+    })
 
     # Architect pin: opus/claude/high by default (frozen-plan + plan-only paths),
     # or derived from architect_config for the both-live end-to-end run (μ). When
@@ -264,9 +313,9 @@ def build_eval_orch_config(
         'test_command': task.get('verify_commands', {}).get('test', base.test_command),
         'lint_command': task.get('verify_commands', {}).get('lint', base.lint_command),
         'type_check_command': task.get('verify_commands', {}).get('typecheck', base.type_check_command),
-        'sandbox': SandboxConfig(enabled=False),
-        'project_root': Path(task.get('project_root', str(base.project_root))),
         'env_overrides': config.env_overrides,
+        'implementer_brief_variant': config.harness_variant,
+        'routing': _admit_claude_role_models(profiled.routing, models, backends),
     }
     # BUG 2a: pin the eval verify interpreter to the target's own
     # .python-version (via verify_env['UV_PYTHON']) so `uv run pytest/ruff/
@@ -275,7 +324,7 @@ def build_eval_orch_config(
     # effective_verify_env, so the pin reaches every verify subprocess. Absent a
     # .python-version, inject nothing (fail-safe) — leave verify_env untouched.
     #
-    # pin_source is the target project_root's CURRENT checkout — mirroring
+    # The pin source is the target project_root's CURRENT checkout — mirroring
     # production dispatch, which verifies under the target's current
     # .python-version — and the SAME tree snapshots._eval_setup_env reads for the
     # setup `uv sync`, so setup and verify agree on the interpreter. This reverts
@@ -285,8 +334,7 @@ def build_eval_orch_config(
     # Sourcing from project_root (a 3.13-bearing tree) fixes that AND preserves
     # 2847's setup==verify agreement, now anchored to a 3.13-bearing tree instead
     # of an arbitrarily-old fixture baseline (task 2875).
-    pin_source = Path(task.get('project_root', str(base.project_root)))
-    pin = read_python_pin(pin_source)
+    pin = read_python_pin(project_root)
     if pin is not None:
         update['verify_env'] = {**profiled.verify_env, 'UV_PYTHON': pin}
     # D8: an explicit recording endpoint layers over the profile's null
@@ -320,6 +368,32 @@ def build_eval_orch_config(
     return profiled.model_copy(update=update)
 
 
+class OrchConfigBuilder(Protocol):
+    """How a workflow cell's OrchestratorConfig is built from its candidate, fixture and base."""
+
+    def __call__(
+        self,
+        config: EvalConfig,
+        task: dict,
+        base_config: OrchestratorConfig | None = None,
+        memory_endpoint: str | None = None,
+        architect_config: EvalConfig | None = None,
+        judge_config: EvalConfig | None = None,
+    ) -> OrchestratorConfig: ...
+
+
+@dataclass(frozen=True)
+class CellProfile:
+    """The profile a workflow cell runs under: how its config is built, and its task gate."""
+
+    orch_config_builder: OrchConfigBuilder
+    task_gate: TaskVerifyPort
+
+
+def _corpus_profile() -> CellProfile:
+    return CellProfile(build_eval_orch_config, fixture_task_gate)
+
+
 async def run_eval(
     task_path: Path,
     config: EvalConfig,
@@ -332,6 +406,7 @@ async def run_eval(
     *,
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
+    profile: CellProfile | None = None,
 ) -> EvalResult:
     """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW on its frozen plan.
 
@@ -344,7 +419,11 @@ async def run_eval(
     implementer stays pinned to *config*, and the cell is a JUDGE cell labelled
     by the judge candidate, so ``select_survivors`` ranks judges as their own
     axis. Without it the cell is an IMPLEMENTER cell labelled by *config*.
+
+    A caller running the cell under another profile — the shadow profile —
+    passes it as *profile* (``None``: the corpus profile).
     """
+    cell_profile = profile or _corpus_profile()
     task = load_task(task_path)
     if worktree_path is not None:
         initial_plan = _resume_plan_from_worktree(worktree_path, task)
@@ -357,7 +436,7 @@ async def run_eval(
         )
     return await _run_workflow_cell(
         task,
-        lambda: build_eval_orch_config(
+        lambda: cell_profile.orch_config_builder(
             config, task, base_config, memory_endpoint=memory_endpoint,
             judge_config=judge_config,
         ),
@@ -370,6 +449,7 @@ async def run_eval(
         timeout_override=timeout_override,
         usage_gate=usage_gate,
         store=store or ResultStore.packaged(),
+        task_gate=cell_profile.task_gate,
     )
 
 
@@ -449,6 +529,7 @@ async def run_end_to_end(
     *,
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
+    profile: CellProfile | None = None,
 ) -> EvalResult:
     """Run ONE both-live end-to-end cell: the architect plans live and feeds the live implementer.
 
@@ -457,12 +538,15 @@ async def run_end_to_end(
     question exists (PRD decision 9). The cell is labelled
     ``<architect>+<implementer>``, is an END_TO_END cell, and its architect is
     briefed in the replay frame. It persists into *store* (``None``:
-    :meth:`ResultStore.packaged`).
+    :meth:`ResultStore.packaged`). A caller running the cell under another
+    profile — the shadow profile — passes it as *profile* (``None``: the
+    corpus profile).
     """
+    cell_profile = profile or _corpus_profile()
     task = load_task(task_path)
     return await _run_workflow_cell(
         task,
-        lambda: build_eval_orch_config(
+        lambda: cell_profile.orch_config_builder(
             impl_config, task, base_config,
             memory_endpoint=memory_endpoint, architect_config=arch_config,
         ),
@@ -475,6 +559,7 @@ async def run_end_to_end(
         timeout_override=timeout_override,
         usage_gate=usage_gate,
         store=store or ResultStore.packaged(),
+        task_gate=cell_profile.task_gate,
     )
 
 
@@ -491,6 +576,7 @@ async def _run_workflow_cell(
     timeout_override: int | None,
     usage_gate: InjectedGate,
     store: ResultStore,
+    task_gate: TaskVerifyPort,
 ) -> EvalResult:
     """Run one workflow cell of *task* under *label* and persist it into *store*.
 
@@ -506,11 +592,12 @@ async def _run_workflow_cell(
     worktree, run_id = await _open_cell_worktree(task, worktree)
     address = CellName(task['id'], label, run_id)
     orch_config = build_orch_config()
+    sandbox_backend = bind_cell_sandbox_backend(orch_config)
     replay_frame = REPLAY_FRAME_ID if replay_framed else None
     async with owned_usage_gate(usage_gate, orch_config, label=cell) as gate:
         workflow = _cell_workflow(
             task, orch_config, worktree, initial_plan,
-            replay_framed=replay_framed, usage_gate=gate,
+            replay_framed=replay_framed, usage_gate=gate, task_gate=task_gate,
         )
         outcome = await _await_outcome(
             workflow, timeout_override or task.get('timeout_minutes', 60), cell,
@@ -518,6 +605,7 @@ async def _run_workflow_cell(
         wall_clock_ms = int(time.monotonic() * 1000) - start_ms
         metrics = await _cell_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
+            sandbox_backend=sandbox_backend,
         )
         result = EvalResult(
             task_id=address.task_id,
@@ -557,11 +645,18 @@ def _cell_workflow(
     *,
     replay_framed: bool,
     usage_gate: UsageGate | None,
+    task_gate: TaskVerifyPort,
+    writers: ProductionWriters = NO_PRODUCTION_WRITERS,
 ) -> TaskWorkflow:
     """The real TaskWorkflow for *task*, run in *worktree* against the eval stubs.
 
-    ``initial_plan=None`` makes the workflow's architect plan live.
+    Each verify attempt is gated by *task_gate*. ``initial_plan=None`` makes
+    the workflow's architect plan live. Handed
+    *writers* are refused with ``EvalHermeticityError`` before anything is
+    built, and so is a built workflow holding one it was not handed, so the
+    cell writes no production state (C11).
     """
+    refuse_production_writers(writers)
     task_id = task['id']
     modules = task.get('modules', [])
     assignment = TaskAssignment(
@@ -583,10 +678,17 @@ def _cell_workflow(
         git_ops=GitOps(orch_config.git, orch_config.project_root),
         scheduler=scheduler,
         briefing=briefing,
-        mcp=_EvalMcpStub(orch_config.fused_memory.url),
+        mcp=eval_mcp_lifecycle(orch_config),
         initial_plan=initial_plan,
         usage_gate=usage_gate,
+        escalation_queue=writers.escalation_queue,
+        steward_factory=writers.steward_factory,
+        event_store=writers.event_store,
+        cost_store=writers.cost_store,
+        task_verify=task_gate,
     )
+    if isinstance(workflow, TaskWorkflow):  # tests that patch build_workflow hand back a MagicMock
+        refuse_production_writers(writers_held_by(workflow))
     workflow.worktree = worktree
     return workflow
 
@@ -612,15 +714,20 @@ async def _cell_metrics(
     *,
     role: RoleUnderTest,
     replay_frame: str | None,
+    sandbox_backend: CellSandbox,
 ) -> dict[str, Any]:
     """The cell's metrics; a collection that raised leaves only the stamps the executor knows."""
     try:
         metrics = await collect_metrics(
             workflow, worktree, task, role=role, replay_frame=replay_frame,
+            sandbox_backend=sandbox_backend,
         )
     except Exception as e:
         logger.warning(f'Metric collection failed: {e}')
-        return {'role_under_test': role, 'replay_frame': replay_frame}
+        return {
+            'role_under_test': role, 'replay_frame': replay_frame,
+            'sandbox_backend': sandbox_backend,
+        }
     return metrics.to_dict()
 
 
@@ -631,8 +738,9 @@ async def collect_metrics(
     *,
     role: RoleUnderTest,
     replay_frame: str | None = None,
+    sandbox_backend: CellSandbox,
 ) -> EvalMetrics:
-    """Collect metrics from a completed workflow run, stamped with *role* and *replay_frame*."""
+    """Collect metrics from a completed workflow run, stamped with *role*, *replay_frame* and *sandbox_backend*."""
     wf_metrics = workflow.metrics
 
     # Plan completion
@@ -643,7 +751,7 @@ async def collect_metrics(
     plan_completion = done_count / total_steps
 
     # Verification results (re-read from last run)
-    verification = await verify.run_verification(worktree, workflow.config)
+    verification = await run_fixture_gate(worktree, workflow.config)
 
     # Review stats from artifacts
     reviews = workflow.artifacts.aggregate_reviews() if workflow.artifacts else None
@@ -710,10 +818,16 @@ async def collect_metrics(
         is_local_model=is_local,
         role_under_test=role,
         replay_frame=replay_frame,
+        sandbox_backend=sandbox_backend,
     )
     # False-green guard — catches the 404-bug signature so the same class of
     # silent failure doesn't need manual quarantine in future runs.
-    if is_false_green(m, workflow.config.max_execute_iterations):
+    enforced_cap = execute_iteration_cap(
+        workflow.config.implementer_brief_variant,
+        workflow.config.max_execute_iterations,
+        lambda: plan,
+    )
+    if is_false_green(m, enforced_cap):
         logger.warning(
             'False-green signature for task %s: %d iters @ cap, '
             '$0 cost, 0 lines / 0 files changed, T/T/T — '
@@ -1270,6 +1384,11 @@ class _EvalMcpStub:
         return {}
 
 
+def eval_mcp_lifecycle(orch_config: OrchestratorConfig) -> _EvalMcpStub:
+    """The harness MCP lifecycle every eval cell's workflow is built with."""
+    return _EvalMcpStub(orch_config.fused_memory.url)
+
+
 class _RecordingMemoryHandler(BaseHTTPRequestHandler):
     """Request handler for :class:`RecordingMemorySink`.
 
@@ -1280,7 +1399,7 @@ class _RecordingMemoryHandler(BaseHTTPRequestHandler):
     routes every POST here regardless of path.
     """
 
-    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API name
+    def do_POST(self) -> None:  # BaseHTTPRequestHandler API name
         server: Any = self.server  # _RecordingMemoryServer (carries writes/_envelope)
         length = int(self.headers.get('Content-Length', 0) or 0)
         raw = self.rfile.read(length) if length > 0 else b''
@@ -1300,7 +1419,7 @@ class _RecordingMemoryHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 — stdlib API name
+    def log_message(self, format: str, *args: Any) -> None:  # stdlib API name
         """Silence the default stderr access log (no per-request spam)."""
 
 
@@ -1397,5 +1516,7 @@ class RecordingMemorySink:
 
 
 if __name__ == '__main__':
-    from orchestrator.cli import eval_cmd
+    from orchestrator.cli_config import load_program_dotenv
+    from orchestrator.evals.cli import eval_cmd
+    load_program_dotenv()
     eval_cmd()

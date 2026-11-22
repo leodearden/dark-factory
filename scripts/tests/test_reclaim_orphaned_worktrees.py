@@ -25,14 +25,12 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 import reclaim_orphaned_worktrees as row
 from reclaim_orphaned_worktrees import parse_parking_dir_name
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-from df_pytest_isolation import (
-    _GIT_REDIRECT_ENV,
-    _GIT_REDIRECT_ENV_PREFIXES,
-    git_redirect_env,
-)
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 LOG_PREFIX = "reclaim_orphaned_worktrees:"
 SCRIPT = Path(__file__).parent.parent / "reclaim_orphaned_worktrees.py"
@@ -725,75 +723,6 @@ PRESERVED_GIT_ENV = {
     "GIT_AUTHOR_NAME": "Reclaim Test",
     "GIT_COMMITTER_EMAIL": "test@example.com",
 }
-
-
-def test_scrubbed_git_env_drops_every_redirecting_name():
-    """No redirecting name — exact or indexed-prefix — survives the scrub."""
-    scrubbed = row.scrubbed_git_env(dict(POISONED_GIT_ENV))
-
-    for name in POISONED_GIT_ENV:
-        assert name not in scrubbed, f"{name} survived the scrub"
-
-
-def test_scrubbed_git_env_forces_lc_all_c_over_ambient_locale():
-    """LC_ALL=C is FORCED (porcelain stability), overriding an ambient locale —
-    the one behaviour carried over verbatim from the pre-guard env build."""
-    scrubbed = row.scrubbed_git_env({"LC_ALL": "en_US.UTF-8", "GIT_DIR": "/decoy/.git"})
-
-    assert scrubbed["LC_ALL"] == "C"
-
-
-def test_scrubbed_git_env_preserves_unrelated_vars():
-    """Everything that is not a git-redirecting name passes through verbatim —
-    the scrub is a targeted removal, not a hermetic env rebuild (the systemd
-    unit's PATH/HOME must survive)."""
-    scrubbed = row.scrubbed_git_env(
-        {"PATH": "/usr/bin:/bin", "HOME": "/home/leo", "GIT_DIR": "/decoy/.git"}
-    )
-
-    assert scrubbed["PATH"] == "/usr/bin:/bin"
-    assert scrubbed["HOME"] == "/home/leo"
-
-
-def test_scrubbed_git_env_preserves_ceiling_and_identity_vars():
-    """GIT_CEILING_DIRECTORIES and the identity vars are DELIBERATELY kept."""
-    scrubbed = row.scrubbed_git_env({**POISONED_GIT_ENV, **PRESERVED_GIT_ENV})
-
-    for name, value in PRESERVED_GIT_ENV.items():
-        assert scrubbed[name] == value, f"{name} must survive the scrub"
-
-
-def test_scrubbed_git_env_does_not_mutate_input():
-    """Pure: the caller's mapping (in production, ``os.environ``) is untouched."""
-    environ = dict(POISONED_GIT_ENV)
-    before = dict(environ)
-
-    row.scrubbed_git_env(environ)
-
-    assert environ == before
-
-
-def test_scrubbed_git_env_matches_shared_redirect_classifier():
-    """DRIFT PIN. This module is STDLIB-ONLY by design (the systemd wrapper runs
-    plain `python3`, and df_pytest_isolation imports pytest), so the redirecting
-    names are DUPLICATED into the script rather than imported. This test is the
-    only legal place to import the shared definition, and it pins the copy
-    against it in BOTH directions: a name added to df_pytest_isolation's list
-    that the script does not scrub, or a name the script scrubs that the shared
-    classifier does not consider redirecting, fails here."""
-    assert row._GIT_REDIRECT_ENV == _GIT_REDIRECT_ENV
-    assert row._GIT_REDIRECT_ENV_PREFIXES == _GIT_REDIRECT_ENV_PREFIXES
-
-    # ...and behaviourally, over a mapping derived from the SHARED list (so a
-    # widening there poisons this mapping too): every name the shared classifier
-    # calls redirecting is absent from the scrub's output.
-    derived = {name: "/decoy" for name in _GIT_REDIRECT_ENV}
-    derived.update({f"{prefix}0": "/decoy" for prefix in _GIT_REDIRECT_ENV_PREFIXES})
-    redirecting = git_redirect_env(derived)
-    assert redirecting, "the shared classifier must classify the derived mapping"
-
-    scrubbed = row.scrubbed_git_env(derived)
-    assert [name for name in redirecting if name in scrubbed] == []
 
 
 def test_run_git_chokepoint_scrubs_ambient_redirection(tmp_path, monkeypatch):

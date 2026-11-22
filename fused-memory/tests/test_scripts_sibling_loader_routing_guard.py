@@ -17,6 +17,9 @@ import pathlib
 
 import pytest
 from _ast_guard import calls_named, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS_ROOT = pathlib.Path(__file__).parent.parent / 'scripts'
 
@@ -27,19 +30,11 @@ LOADER_FACTORIES = frozenset({'spec_from_file_location', 'spec_from_loader', 'So
 # same file is still caught.
 EXEMPT_LOADERS = frozenset(
     {
-        # Same policy as load_script; migration owned by pending task 6569.
-        ('census_memory_metadata.py', '_load_probe_module'),
-        ('retro_stamp_topics.py', '_load_probe_module'),
-        ('normalize_topic_slugs.py', 'load_census_module'),
-        ('local_memory_models_eval/harness.py', 'load_probe_module'),
-        # Different policy; migration owned by pending task 7123.
-        # Reuses the cache only when it has a FusedMemoryClient attribute.
-        ('normalize_topic_slugs.py', 'load_mcp_client_module'),
-        # Reuses the cache only when it has a FusedMemoryClient attribute.
-        ('migrate_task_metadata_to_x_namespace.py', '_load_sibling_client'),
-        # Raises FixtureError rather than ImportError when there is no spec.
-        ('bake_off_storage_shape.py', '_load_sibling_script'),
-        # Deliberately execs a fresh copy and never registers it.
+        # Permanent: execs migrate_cross_graph_leak FRESH and never registers
+        # it, because that file's run() is this script's only store-mutation
+        # guard, and a cached sys.modules entry must not decide which guard
+        # runs. Pinned by
+        # tests/test_cgl_eta_auto_apply_impl.py::TestInheritedStoreMutationPreflight.
         ('cgl_eta_auto_apply_impl.py', '_load_migrate'),
     }
 )

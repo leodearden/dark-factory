@@ -382,7 +382,7 @@ _needs_escalation = pytest.mark.skipif(
 
 
 def _pending(tmp_path: Path) -> list:
-    from escalation.queue import EscalationQueue  # noqa: PLC0415
+    from escalation.queue import EscalationQueue
 
     return EscalationQueue(tmp_path / 'data' / 'escalations').get_pending()
 

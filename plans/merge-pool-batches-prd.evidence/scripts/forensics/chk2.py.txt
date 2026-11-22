@@ -1,0 +1,23 @@
+from common import *
+C=json.load(open('/tmp/gate-10069/forensics/cond.json'))
+W=[x for x in C['verifies'] if x['in_window']]
+CT=C['contents']
+# contents appearing in window as own or base
+seen=collections.defaultdict(lambda:[0,0,0,0])  # own-red, own-pass, base-red, base-pass
+for x in W:
+    for r in x['own']:
+        if r['cid']: seen[r['cid']][1 if x['passed'] else 0]+=1
+    for r in x['base_reqs']:
+        if r['cid']: seen[r['cid']][3 if x['passed'] else 2]+=1
+print('distinct contents seen in window:',len(seen),collections.Counter(CT[k]['truth'] for k in seen))
+for tr in ('D','Di','Sm','U'):
+    print('==',tr)
+    for k in sorted(seen,key=lambda k:-sum(seen[k])):
+        c=CT[k]
+        if c['truth']!=tr: continue
+        print('  ',k,'tips',c['tips'],'own red/pass %d/%d base red/pass %d/%d'%tuple(seen[k]),'solofail',c['solofail'],'mr',c['solofail_mr'],'unsound',c['solofail_unsound'],'infra',c['solofail_infra'],'nolog',c['solofail_nolog'])
+print('fates:',collections.Counter((x['state'],x['fate'],'P' if x['passed'] else 'F') for x in W if x['state']!='MAIN'))
+print('main_red flags:',collections.Counter((tuple(x['main_red']),'P' if x['passed'] else 'F') for x in W))
+print('red with fails None:',[(x['vid'],x['task'],x['k']) for x in W if not x['passed'] and x['fails'] is None])
+print('entries per verify:',collections.Counter(len(x['entries']) for x in W))
+print('norow entries:',[(x['vid'],x['ts'][5:16],x['task'],[(e['owner'],e['st'],e['on_main']) for e in x['entries']]) for x in W if any(e['vid'] is None for e in x['entries'])])

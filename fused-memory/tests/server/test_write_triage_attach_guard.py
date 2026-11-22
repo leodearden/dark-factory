@@ -1,7 +1,7 @@
 """Write triage's attach guard (task 7158): two rules that refuse an attach and store the write standalone.
 
 The FLOOR refuses any attach whose target's cosine to the write is below
-``write_triage.min_parent_cosine``; the HOIST GAP refuses, in the judge band
+``write_triage.min_parent_cosine``; the HOIST GAP refuses, on a judged write
 only, a hoist from a matched child to its parent when the parent's cosine is
 more than ``write_triage.hoist_max_cosine_gap`` below the child's. Both are
 hand-set, hot-reloadable operator knobs; ``None`` switches a rule off. The
@@ -22,6 +22,7 @@ import pytest
 import yaml
 from _fm_helpers import load_script_module
 from pydantic import ValidationError
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.reload import RELOADABLE_FIELDS, apply_reload
 from fused_memory.config.schema import FusedMemoryConfig, WriteTriageConfig
@@ -52,6 +53,8 @@ from fused_memory.server.write_triage import (
 from fused_memory.services.memory_service import RRF_K, SearchResults
 from server.write_triage_harness import configure_triage_config, search_candidate
 
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 _SHIPPED_CONFIG = _PACKAGE_ROOT / 'config' / 'config.yaml'
 _CALIBRATION_SCRIPT = _PACKAGE_ROOT / 'scripts' / 'calibrate_write_triage.py'
@@ -77,11 +80,13 @@ def _service_with(**write_triage_leaves) -> types.SimpleNamespace:
     )
 
 
-def _result(id_: str, cosine: float, *, extra_metadata: dict | None = None) -> MemoryResult:
+def _result(
+    id_: str, cosine: float, *, content: str | None = None, extra_metadata: dict | None = None,
+) -> MemoryResult:
     """A post-RRF search hit: the Mem0 cosine sits in ``metadata['store_score']``."""
     return MemoryResult(
         id=id_,
-        content=f'record {id_}',
+        content=content if content is not None else f'record {id_}',
         category=MemoryCategory.procedural_knowledge,
         source_store=SourceStore.mem0,
         relevance_score=1.0 / (RRF_K + 1),
@@ -95,6 +100,11 @@ def _child_of(parent_id: str, kind: str = SIGHTING_KIND) -> dict:
 
 def _child(id_: str, cosine: float, *, kind: str = SIGHTING_KIND) -> MemoryResult:
     return _result(id_, cosine, extra_metadata=_child_of(_PARENT, kind))
+
+
+def _restating_child(id_: str, cosine: float) -> MemoryResult:
+    """A sighting child of ``_PARENT`` whose text the write repeats verbatim, so the write is `restated`."""
+    return _result(id_, cosine, content=_WRITE, extra_metadata=_child_of(_PARENT))
 
 
 def _svc(
@@ -481,7 +491,7 @@ class TestTheHoistGuardInTheJudgeBand:
 class TestTheFloorOnEveryAttach:
     @pytest.mark.asyncio
     async def test_a_restated_parent_below_the_floor_is_refused(self):
-        service = _svc([_child('c', 0.95), _result(_PARENT, 0.55)])
+        service = _svc([_restating_child('c', 0.95), _result(_PARENT, 0.55)])
         judge = _judge(OUTCOME_AMENDED, 'c')
 
         decision = await _triage(service, judge=judge)
@@ -492,7 +502,7 @@ class TestTheFloorOnEveryAttach:
 
     @pytest.mark.asyncio
     async def test_the_gap_does_not_apply_to_a_restated_hoist(self):
-        service = _svc([_child('c', 0.95), _result(_PARENT, 0.70)])
+        service = _svc([_restating_child('c', 0.95), _result(_PARENT, 0.70)])
 
         decision = await _triage(service)
 
@@ -522,7 +532,7 @@ class TestTheFloorOnEveryAttach:
 class TestRefusalsArePlainStoredNotFailOpens:
     @pytest.mark.asyncio
     async def test_a_parent_missing_from_the_store_is_refused_uncounted(self):
-        service = _svc([_child('c', 0.95)], parent_cosines={})
+        service = _svc([_restating_child('c', 0.95)], parent_cosines={})
         counter = _counter()
 
         decision = await _triage(service, counter)
@@ -553,7 +563,7 @@ class TestRefusalsArePlainStoredNotFailOpens:
 
     @pytest.mark.asyncio
     async def test_a_lookup_that_raises_is_a_counted_fail_open(self, caplog):
-        service = _svc([_child('c', 0.95)])
+        service = _svc([_restating_child('c', 0.95)])
         service.cosine_to_memories.side_effect = TimeoutError('Mem0 cosine_to_points blew 5s')
         counter = _counter()
         caplog.set_level(logging.INFO, logger=_TRIAGE_LOGGER)
@@ -569,7 +579,7 @@ class TestRefusalsArePlainStoredNotFailOpens:
 
     @pytest.mark.asyncio
     async def test_with_both_rules_off_a_hoist_attaches_as_before(self):
-        service = _svc([_child('c', 0.95)], min_parent_cosine=None, hoist_max_cosine_gap=None)
+        service = _svc([_restating_child('c', 0.95)], min_parent_cosine=None, hoist_max_cosine_gap=None)
 
         decision = await _triage(service)
 
@@ -591,7 +601,9 @@ class TestTheToolAcksARefusalAsStored:
         mock_service.add_memory.return_value = stored
         mock_service.search.return_value = [
             search_candidate('m1', 0.55, store_rank=2),
-            search_candidate('m2', 0.97, extra_metadata={PARENT_ID_KEY: 'm1', 'kind': SIGHTING_KIND}),
+            search_candidate(
+                'm2', 0.97, content=_WRITE, extra_metadata={PARENT_ID_KEY: 'm1', 'kind': SIGHTING_KIND},
+            ),
         ]
         server = create_mcp_server(mock_service)
 

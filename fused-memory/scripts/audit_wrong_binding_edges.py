@@ -99,7 +99,7 @@ from pathlib import Path
 from typing import Any
 
 from fused_memory.backends.falkor_read_only import PagedQuery, ReadOnlyGraphReader
-from fused_memory.backends.graphiti_client import PagedRead
+from fused_memory.backends.paged_read import PagedRead
 from fused_memory.utils.canonical_labels import (
     Referent,
     parse_node_name,
@@ -1154,7 +1154,7 @@ def _resolve_uri(args: argparse.Namespace) -> str | None:
     if env_uri:
         return env_uri
     try:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         config = FusedMemoryConfig()
         return getattr(getattr(config.graphiti, 'falkordb', None), 'uri', None)

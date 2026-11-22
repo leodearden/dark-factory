@@ -1,0 +1,151 @@
+"""Build per-request dataset: one row per merge request with its first attributable verdict + pre-verify features.
+Input: /tmp/gate-10069/predict/events.jsonl (extract.py), tasks.db (ro), git (read-only rev-list).
+Output: /tmp/gate-10069/predict/requests.json, trials.json
+"""
+import json,collections,sqlite3,subprocess,bisect,datetime as dt
+P='/tmp/gate-10069/predict/'
+E=sorted((json.loads(l) for l in open(P+'events.jsonl')),key=lambda e:e['id'])
+def T(ts): return dt.datetime.fromisoformat(ts).timestamp()
+for e in E: e['t']=T(e['ts'])
+by=collections.defaultdict(lambda: collections.defaultdict(list))
+for e in E: by[e['et']][e['task']].append(e)
+
+# ---- trains: union verify identification
+train_end={}
+for et in('train_merged','train_derailed'):
+    for t,ev in by[et].items():
+        for e in ev: train_end[e['d'].get('train_id')]=(e['t'],et)
+train_windows=collections.defaultdict(list)  # tip task -> [(start,end,train_id,outcome)]
+train_members_pass=set()  # (task, merge ts)
+for t,ev in by['train_started'].items():
+    for e in ev:
+        tid=e['d'].get('train_id'); end=train_end.get(tid,(e['t']+6*3600,'unknown'))
+        train_windows[t].append((e['t'],end[0],tid,end[1]))
+def is_train_union(v):
+    if v['d'].get('speculative') is not None: return False
+    for s,en,tid,o in train_windows.get(v['task'],()):
+        if s<=v['t']<=en+120: return True
+    return False
+
+# ---- requests from merge_finalized
+req={}
+fin_by_task=collections.defaultdict(list)
+for t,ev in by['merge_finalized'].items():
+    for e in ev:
+        rid=e['d']['request_id']
+        r=req.setdefault(rid,{'rid':rid,'task':t,'branch':e['d'].get('branch'),'fin':[]})
+        r['fin'].append(e); fin_by_task[t].append(e)
+for r in req.values():
+    last=r['fin'][-1]; r['final_state']=last['d']['state']; r['final_reason']=(last['d'].get('reason') or '')[:80]
+    r['final_t']=last['t']; r['first_fin_t']=r['fin'][0]['t']; r['landed_via_chain']=last['d'].get('landed_via_chain')
+    r['superseded_by']=last['d'].get('superseded_by')
+# requests still open (queued, no finalized): from merge_queued w/ request_id
+for t,ev in by['merge_queued'].items():
+    for e in ev:
+        rid=e['d'].get('request_id')
+        if rid and rid not in req:
+            req[rid]={'rid':rid,'task':t,'branch':e['d'].get('branch'),'fin':[],'final_state':'open','final_reason':'','final_t':None,'first_fin_t':None,'landed_via_chain':None,'superseded_by':None}
+# order requests per task
+task_reqs=collections.defaultdict(list)
+for r in req.values(): task_reqs[r['task']].append(r)
+for t,rs in task_reqs.items():
+    rs.sort(key=lambda r:(r['final_t'] if r['final_t'] is not None else 9e18))
+    prev_end=-1
+    for r in rs:
+        qs=[e for e in by['merge_queued'].get(t,()) if e['t']>prev_end and (r['final_t'] is None or e['t']<=r['final_t'])]
+        # prefer request-id match when recorded
+        qm=[e for e in by['merge_queued'].get(t,()) if e['d'].get('request_id')==r['rid']]
+        if qm:
+            r['enq_t']=min(qm[0]['t'],qs[0]['t']) if qs else qm[0]['t']; r['first_enqueued_at']=qm[0]['d'].get('first_enqueued_at')
+            r['lane']=qm[-1]['d'].get('lane'); r['tier']=next((q['d'].get('tier') for q in qm if q['d'].get('tier')),None)
+            r['pinned']=any(q['d'].get('pinned') for q in qm)
+        else:
+            r['enq_t']=qs[0]['t'] if qs else None; r['lane']=None; r['tier']=None; r['pinned']=None
+        if r['final_t'] is not None: prev_end=r['final_t']
+
+# ---- verifies -> trials
+fin_ts={t:[e['t'] for e in ev] for t,ev in fin_by_task.items()}
+trials=[]
+seen_sha={}
+for t,ev in by['merge_verify'].items():
+    for v in ev:
+        d=v['d']
+        if d.get('runner')=='history-leg': continue
+        k=d.get('chain_items') or 1
+        rids=d.get('chain_request_ids')
+        if rids: owner=rids[0]
+        else:
+            i=bisect.bisect_left(fin_ts.get(t,[]),v['t'])
+            owner=fin_by_task[t][i]['d']['request_id'] if i<len(fin_ts.get(t,[])) else None
+            if owner is None:
+                # open request of task
+                op=[r for r in task_reqs.get(t,()) if r['final_state']=='open']
+                owner=op[0]['rid'] if op else None
+        tr={'vid':v['id'],'ts':v['ts'],'t':v['t'],'start_t':v['t']-(d.get('duration_ms') or 0)/1000,'task':t,'k':k,'passed':bool(d['passed']),
+            'owner':owner,'members':rids if rids else ([owner] if k==1 else None),'member_tasks':d.get('chain_task_ids'),
+            'runner':d.get('runner'),'base_relation':d.get('base_relation'),'speculative':d.get('speculative'),'depth':d.get('depth'),
+            'attempt':d.get('attempt'),'merge_sha':d.get('merge_sha'),'dur_s':(d.get('duration_ms') or 0)/1000,
+            'red_units':d.get('red_units'),'train_union':is_train_union(v),'cdr':d.get('chain_depth_reason')}
+        trials.append(tr)
+trials.sort(key=lambda x:x['t'])
+# collapse attempts: same task+merge_sha -> keep last, mark earlier as superseded_attempt
+last_idx={}
+for i,tr in enumerate(trials): last_idx[(tr['task'],tr['merge_sha'])]=i
+for i,tr in enumerate(trials): tr['last_attempt']=(last_idx[(tr['task'],tr['merge_sha'])]==i)
+
+# applied-ness of a failed solo: next task-level event among merge_verify / merge_finalized / merge_attempt
+lane_ev=collections.defaultdict(list)
+for et in('merge_verify','merge_finalized','merge_attempt'):
+    for t,ev in by[et].items(): lane_ev[t]+=ev
+for t in lane_ev: lane_ev[t].sort(key=lambda e:e['id'])
+def after(tr,n=3):
+    ev=lane_ev[tr['task']]; ids=[e['id'] for e in ev]; i=bisect.bisect_right(ids,tr['vid']); return ev[i:i+n]
+for tr in trials:
+    nx=after(tr)
+    tr['disposition']=None; tr['applied']=None
+    if not tr['passed'] and tr['k']==1:
+        a=next((e for e in nx[:1] if e['et']=='merge_attempt'),None)
+        tr['attempt_outcome']=a['d'].get('outcome') if a else None
+        tr['disposition']=a['d'].get('disposition') if a else None
+        f=next((e for e in nx[:2] if e['et']=='merge_finalized'),None)
+        tr['applied']=bool(a and a['d'].get('outcome') in('verify_failed','post_merge_pyright_broken') and f and f['d']['state']=='blocked' and (f['d'].get('reason') or '').startswith('Post-merge'))
+        tr['block_reason']=(f['d'].get('reason') or '')[:300] if f else None
+
+# ---- per-request trial lists
+rt=collections.defaultdict(list)
+for tr in trials:
+    if tr['train_union']: continue
+    if tr['members']:
+        for j,m in enumerate(tr['members']): rt[m].append((tr,j))
+    elif tr['owner']: rt[tr['owner']].append((tr,0))
+for r in req.values():
+    lst=sorted(rt.get(r['rid'],[]),key=lambda x:x[0]['t'])
+    r['n_trials']=len(lst); r['red_chain_before']=0; r['void_fails']=0
+    r['label']=None; r['label_src']=None; r['verdict_trial']=None
+    for tr,pos in lst:
+        if tr['k']==1:
+            if tr['passed']: r['label']=0; r['label_src']='solo_pass'; r['verdict_trial']=tr['vid']; break
+            if tr['applied']: r['label']=1; r['label_src']='solo_fail'; r['verdict_trial']=tr['vid']; break
+            r['void_fails']+=1
+        else:
+            if tr['passed']: r['label']=0; r['label_src']='chain_pass'; r['verdict_trial']=tr['vid']; break
+            r['red_chain_before']+=1
+    if r['label'] is None and r['final_state']=='done':
+        r['label']=0; r['label_src']='done_no_solo'  # landed via unrecorded batch (pre-11-15 chain member) or other
+    # later trials (re-verifies) summary
+    r['trials']=[(tr['vid'],pos) for tr,pos in lst]
+# train-merged members: requests superseded by a coalesce train that merged => batch pass
+tm={e['d']['train_id']:e for ev in by['train_merged'].values() for e in ev}
+td={e['d']['train_id']:e for ev in by['train_derailed'].values() for e in ev}
+for r in req.values():
+    sb=r.get('superseded_by')
+    if sb and str(sb).startswith('coalesce'):
+        if sb in tm: r['label']=0; r['label_src']='train_pass'
+        elif sb in td: r['label_src']='train_derailed'   # no attributable verdict for this request id
+        else: r['label_src']='train_unknown'
+json.dump([{k:v for k,v in r.items() if k!='fin'} for r in req.values()],open(P+'requests.json','w'))
+json.dump(trials,open(P+'trials.json','w'))
+c=collections.Counter((r['label_src'],r['final_state']) for r in req.values())
+for k,v in sorted(c.items(),key=lambda x:-x[1]): print(v,k)
+print('trials',len(trials),'train unions',sum(t['train_union'] for t in trials))
+print('failed solo applied/not:',collections.Counter((t['applied'],t.get('attempt_outcome'),t['train_union']) for t in trials if t['k']==1 and not t['passed']))

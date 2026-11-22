@@ -1,0 +1,54 @@
+import sqlite3,json,collections,statistics as st,itertools
+c=sqlite3.connect('file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro',uri=True)
+rs=c.execute("select id,timestamp,data from events where event_type='merge_dequeued' and timestamp>='2026-11-15' and data like '%textual_conflict_pairs%' order by id").fetchall()
+print('rows',len(rs))
+byday=collections.defaultdict(lambda:[0,0,0,0])
+seqs=[]
+allshare=[];fpshare=[]
+for i,ts,d in rs:
+    d=json.loads(d)
+    mem=[w['request_id'] for w in d['waiting'] if w['in_graph']]
+    if d.get('in_graph'): mem=[d['request_id']]+mem
+    m=len(mem); P=m*(m-1)//2
+    tp=len(d['textual_conflict_pairs']); fp=d['footprint_pair_count']
+    b=byday[ts[:10]]; b[0]+=1; b[1]+=P; b[2]+=tp; b[3]+=fp
+    if P: allshare.append(tp/P); fpshare.append(fp/P)
+    edges=set(frozenset(p) for p in d['textual_conflict_pairs'])
+    order_all=[w['request_id'] for w in d['waiting'] if w['in_graph']]
+    order_nr=[w['request_id'] for w in d['waiting'] if w['in_graph'] and not w['reserved']]
+    seqs.append((ts,order_all,order_nr,edges,d.get('waiting_dropped',0)))
+print('day rows pairs textual footprint text_share fp_share')
+T=[0,0,0]
+for k in sorted(byday):
+    r,P,tp,fp=byday[k]; T[0]+=P;T[1]+=tp;T[2]+=fp
+    print(k,r,P,tp,fp,f'{tp/P:.4f}' if P else '-',f'{fp/P:.4f}' if P else '-')
+print('pooled pairs',T[0],'textual',T[1],f'{T[1]/T[0]:.4f}','footprint',T[2],f'{T[2]/T[0]:.4f}')
+print('per-row median textual share',st.median(allshare),'fp',st.median(fpshare))
+p=T[1]/T[0]
+for N in (6,12,16,24): print(f'independence: P(all {N} pairwise clean)=(1-p)^C(N,2)={(1-p)**(N*(N-1)//2):.3f}')
+def analyse(idx,label):
+    print('==',label)
+    elig=[s for s in seqs if len(s[idx])>=24]
+    print(' rows with >=24 waiting',len(elig),'days',sorted(set(s[0][:10] for s in elig)))
+    for N in (12,16,24):
+        clean=0;prefixes=[];greedy=[]
+        for s in elig:
+            seq=s[idx][:N];E=s[3]
+            ok=not any(frozenset(pr) in E for pr in itertools.combinations(seq,2))
+            clean+=ok
+            # longest conflict-free prefix
+            L=0
+            for j in range(len(seq)):
+                if any(frozenset((seq[j],seq[q])) in E for q in range(j)): break
+                L=j+1
+            prefixes.append(L)
+            # greedy skip
+            inc=[]
+            for x in seq:
+                if not any(frozenset((x,y)) in E for y in inc): inc.append(x)
+            greedy.append(len(inc))
+        q=lambda v,f: sorted(v)[int(f*(len(v)-1))]
+        print(f' N={N}: all-clean {clean}/{len(elig)}={clean/len(elig):.2f}; longest clean prefix p10/p50/min {q(prefixes,.1)}/{q(prefixes,.5)}/{min(prefixes)} mean {st.mean(prefixes):.1f}; greedy-skip included p10/p50/min {q(greedy,.1)}/{q(greedy,.5)}/{min(greedy)} mean {st.mean(greedy):.1f}')
+analyse(1,'all in_graph waiting, recorded order')
+analyse(2,'in_graph and not reserved, recorded order')
+print('waiting_dropped max',max(s[4] for s in seqs))

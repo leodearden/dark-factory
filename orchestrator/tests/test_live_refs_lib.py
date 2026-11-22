@@ -8,9 +8,15 @@ gate against the SHIPPED lib, never a copy:
 * ``TestReferenceDetection`` pins the verdicts against real helper processes:
   a cwd hit, an open-fd hit, an mmap hit, a miss, the ``_lane-1``/``_lane-10``
   name-prefix boundary and the batch subset.
+* ``TestMountNamespaceTranslation`` pins boundary row 19 of
+  ``plans/canonical-build-path-shared-cache-prd.md``: a process that names a
+  lane only through a bind-mount point in its own mount namespace holds it
+  live, and a foreign namespace whose root cannot be read adds nothing.
 * ``TestScanFootprint`` pins what a negative verdict may read.  The verdict
-  needs only ``/proc/<pid>/cwd``, ``/proc/<pid>/fd/*`` and ``/proc/<pid>/maps``,
-  so the only directories it may list are ``/proc`` and ``/proc/<pid>/fd``.  It
+  reads ``/proc/<pid>/cwd``, ``/proc/<pid>/fd/*``, ``/proc/<pid>/maps``,
+  ``/proc/<pid>/ns/mnt``, ``/proc/<pid>/mountinfo`` and paths under
+  ``/proc/<pid>/root``, and lists no directory but ``/proc`` and
+  ``/proc/<pid>/fd``.  It
   observes the scan's ``getdents64`` calls under strace: a structural property,
   so it carries no wall-clock bound to flake under host load.
 """
@@ -29,6 +35,12 @@ from pathlib import Path
 from typing import IO
 
 import pytest
+from shared.testing_mount_ns import (
+    MAP_THEN_CLOSE_FDS,
+    Hold,
+    namespaced_holder,
+    unreadable_foreign_namespace_process,
+)
 
 # Reused from the sibling shipped-script contract, as test_lane_state_lib.py
 # does: the script dir is resolved from __file__, and the env drops the keys
@@ -49,21 +61,7 @@ _VERDICT_LINE = re.compile(r'^rc=(\d+)$', re.M)
 
 _FD_DIR = re.compile(r'/proc/\d+/fd')
 
-#: ``mmap.mmap`` keeps a private dup of the fd it maps, so every fd on the file
-#: is closed afterwards: the mapping is then the helper's only reference to it.
-_MAP_THEN_CLOSE_FDS = """
-import mmap, os, sys, time
-path = sys.argv[1]
-with open(path, 'rb') as mapped:
-    mapping = mmap.mmap(mapped.fileno(), 0, prot=mmap.PROT_READ)
-for fd in os.listdir('/proc/self/fd'):
-    try:
-        if os.readlink(f'/proc/self/fd/{fd}') == path:
-            os.close(int(fd))
-    except OSError:
-        pass
-time.sleep(300)
-"""
+_MAP_THEN_CLOSE_FDS_AND_SLEEP = MAP_THEN_CLOSE_FDS + 'import time\ntime.sleep(300)\n'
 
 
 def _run_sourced(
@@ -101,7 +99,7 @@ def _wait_until(predicate: Callable[[], bool], what: str, deadline_s: float = 30
     """Poll *predicate* in 0.05s ticks.
 
     The deadline is a broken-infra backstop, not a timing assertion: the same
-    shape as test_warm_lane_gc.sh::_wait_for_reader_lock.
+    shape as lib_warm_lane_gc_harness.sh::_wait_for_reader_lock.
     """
     deadline = time.monotonic() + deadline_s
     while not predicate():
@@ -214,7 +212,7 @@ class TestReferenceDetection:
 
         proc = helpers(
             cwd=elsewhere,
-            argv=(sys.executable, '-c', _MAP_THEN_CLOSE_FDS, str(mapped)),
+            argv=(sys.executable, '-c', _MAP_THEN_CLOSE_FDS_AND_SLEEP, str(mapped)),
         )
         _wait_until(
             _mapped_with_no_fd_open(proc.pid, mapped),
@@ -260,8 +258,39 @@ class TestReferenceDetection:
         assert set(proc.stdout.splitlines()) == {str(referenced)}
 
 
+class TestMountNamespaceTranslation:
+    """References through a bind-mount point in another mount namespace count."""
+
+    @pytest.mark.parametrize('hold', [Hold.CWD, Hold.OPEN_FILE, Hold.MAPPING])
+    def test_a_hold_through_the_mount_point_is_live(self, tmp_path: Path, hold: Hold) -> None:
+        root = tmp_path.resolve()
+        lane = root / '_lane-1'
+        with namespaced_holder(lane, root / 'canon ws', hold):
+            assert _live_ref_present(lane) == 0
+
+    def test_the_batch_names_only_the_bound_lane_beside_an_unreadable_namespace(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path.resolve()
+        bound, free = root / '_lane-a', root / '_lane-b'
+        free.mkdir()
+        elsewhere = root / 'elsewhere'
+        elsewhere.mkdir()
+        with (
+            namespaced_holder(bound, root / 'canon a', Hold.CWD),
+            unreadable_foreign_namespace_process(cwd=elsewhere),
+        ):
+            proc = _run_sourced(
+                f'live_referenced_paths {shlex.quote(str(bound))} {shlex.quote(str(free))}'
+            )
+
+            assert proc.returncode == 0, f'stderr={proc.stderr!r}'
+            assert set(proc.stdout.splitlines()) == {str(bound)}
+            assert _live_ref_present(free) == 1
+
+
 class TestScanFootprint:
-    """What a negative verdict, which runs both scan halves, may list."""
+    """What a negative verdict, which runs every scan half, may list."""
 
     def test_a_negative_verdict_lists_only_proc_and_per_process_fd_dirs(
         self, tmp_path: Path,
@@ -305,7 +334,9 @@ class TestScanFootprint:
         )
         assert not offending, (
             'a liveness scan lists only /proc and /proc/<pid>/fd — its verdict '
-            'reads /proc/<pid>/cwd, /proc/<pid>/fd/* and /proc/<pid>/maps, '
-            f'nothing else; it listed {len(offending)} other directories, by '
+            'reads /proc/<pid>/cwd, /proc/<pid>/fd/*, /proc/<pid>/maps, '
+            '/proc/<pid>/ns/mnt, /proc/<pid>/mountinfo and paths under '
+            '/proc/<pid>/root without listing them; it listed '
+            f'{len(offending)} other directories, by '
             f'shape: {shapes.most_common(15)}'
         )

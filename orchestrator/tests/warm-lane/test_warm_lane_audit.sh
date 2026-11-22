@@ -19,6 +19,8 @@
 #    RECLAIMABLE-via-terminal, recoverable LANDED/PUSHED/ORPHAN,
 #    residue-only-dirty, LEAKED + stale, measured disk figures, --format
 #    json, the combined B1 fixture + A3 degradation, and B2 read-only.)
+#   Mount refusal and the record age clock (README.md "Delta 16") are pinned
+#   in orchestrator/tests/test_warm_lane_audit_mount_and_age.py instead.
 #
 # Driven by orchestrator/tests/test_warm_lane_bash_suite.py (PORTED_TESTS).
 
@@ -259,6 +261,13 @@ _strict_max() {
         [ "$cand" -gt "$v" ] || return 1
     done
     return 0
+}
+
+# _py_json_check <json> <python3-arg>...
+# Feeds <json> to python3 on stdin; why it is shaped this way:
+# orchestrator/tests/warm-lane/README.md "Delta 11".
+_py_json_check() {
+    printf '%s' "$1" | python3 -I "${@:2}"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -623,13 +632,13 @@ assert "H2: default format is the table (a lane= row is present)" \
 run_helper --mount "$H_MOUNT" --format json
 assert "H3: exit 0 (json format)" test "$RC" -eq 0
 assert "H4: --format json output parses as JSON (python3 json.load)" \
-    bash -c 'printf "%s" "$1" | python3 -c "import json,sys; json.load(sys.stdin)"' _ "$OUT"
+    _py_json_check "$OUT" -c "import json,sys; json.load(sys.stdin)"
 assert "H5: json output contains a classification key" \
     bash -c 'printf "%s\n" "$1" | grep -q "\"classification\""' _ "$OUT"
 assert "H6: json carries 2 lane objects with the full expected key set" \
-    bash -c 'printf "%s" "$1" | python3 "$2"' _ "$OUT" "$H_PY_KEYS"
+    _py_json_check "$OUT" "$H_PY_KEYS"
 assert "H7: json headroom object has resident=2" \
-    bash -c 'printf "%s" "$1" | python3 "$2"' _ "$OUT" "$H_PY_HEADROOM"
+    _py_json_check "$OUT" "$H_PY_HEADROOM"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Block I — B1 headline boundary (4-lane pool) + A3 exit-0 degradation
@@ -921,7 +930,7 @@ PYEOF
 run_helper --mount "$K_MOUNT" --format json
 assert "K6a: exit 0 (json)" test "$RC" -eq 0
 assert "K6b: json lane objects carry a 'live' key with the same LIVE/IDLE values" \
-    bash -c 'printf "%s" "$1" | python3 "$2"' _ "$OUT" "$K_PY_LIVE"
+    _py_json_check "$OUT" "$K_PY_LIVE"
 
 # Release the live-flock lock.
 kill "$K_LOCK_PID" 2>/dev/null || true
@@ -1099,7 +1108,7 @@ done
 run_helper --mount "$L_MOUNT" --format json
 assert "L8a: exit 0 (json)" test "$RC" -eq 0
 assert "L8b: json lane objects carry the same assigned= values as the table rows" \
-    bash -c 'printf "%s" "$1" | python3 "$2" "${@:3}"' _ "$OUT" "$L_PY_ASSIGNED" "${L_PY_ARGS[@]}"
+    _py_json_check "$OUT" "$L_PY_ASSIGNED" "${L_PY_ARGS[@]}"
 
 # ── L9: a present-but-UNREADABLE record is the third way _lane_record's
 # readability guard can fire, and the only one no other fixture reaches.
@@ -1284,7 +1293,7 @@ PYEOF
 
 ORACLE_MAP="$M_MAP" run_helper --mount "$M_MOUNT" --status-cmd "$ORACLE_STUB_DIR/leak-oracle.sh" --format json
 assert "M7: json lane objects carry a 'pin' key with the same raw values" \
-    bash -c 'printf "%s" "$1" | python3 "$2"' _ "$OUT" "$M_PY_PIN"
+    _py_json_check "$OUT" "$M_PY_PIN"
 
 # A failing oracle must not abort and must not invent a status: a pinned lane
 # whose holder cannot be resolved reports pin=unknown (A3's treatment, applied
@@ -1321,12 +1330,16 @@ printf '9101 pending\n9102 pending\n9103 done\n9104 pending\n9105 pending\n9106 
 #
 # `orphan-stale` builds the LEAKED predicate's EXACT shape (non-terminal status
 # + ahead-of-main with no origin => ORPHAN + aged past the default 60-minute
-# knob). Three lanes here are byte-for-byte identical in that respect and differ
-# ONLY in their assignment record -- pinned / quarantined / leaked -- which is
-# what makes "the reserved one reports PINNED, the withheld one QUARANTINED, and
-# only the unreserved one is still LEAKED" a real discrimination rather than a
-# fixture artifact. Dropping the LEAKED control would leave nothing proving the
-# predicate can still fire at all, so the two suppressions would pass vacuously.
+# knob). Aged on BOTH clocks: the lane dir is backdated and so is its record's
+# updated_at, because the audit ages a lane by its record when it has one
+# (README.md "Delta 16") and make_lane_state otherwise stamps it now, which would
+# read the LEAKED control as fresh. Three lanes here are byte-for-byte identical
+# in that respect and differ ONLY in their assignment record's state -- pinned /
+# quarantined / leaked -- which is what makes "the reserved one reports PINNED,
+# the withheld one QUARANTINED, and only the unreserved one is still LEAKED" a
+# real discrimination rather than a fixture artifact. Dropping the LEAKED control
+# would leave nothing proving the predicate can still fire at all, so the two
+# suppressions would pass vacuously.
 #
 # _lane-n-live-unknown is the LIVE x UNKNOWN partition cell: a live consumer on a
 # lane with no readable record. It is counted `live`, NOT `free`, so a warning
@@ -1349,7 +1362,11 @@ for n_case in "${N_CASES[@]}"; do
         _add_ahead_commit "$N_MOUNT/$n_lane"
     fi
     if [ -n "$n_state" ]; then
-        make_lane_state "$N_MOUNT" "$n_lane" "$n_state" "$n_task" "task/$n_task"
+        n_stamp=''
+        if [ "$n_shape" = "orphan-stale" ]; then
+            n_stamp="$(date -u -d '90 minutes ago' +%Y-%m-%dT%H:%M:%S.000000+00:00)"
+        fi
+        make_lane_state "$N_MOUNT" "$n_lane" "$n_state" "$n_task" "task/$n_task" "$n_stamp"
     fi
     if [ "$n_liveness" = "LIVE" ]; then
         _hold_lane_lock "$N_MOUNT" "$n_lane"
@@ -1496,7 +1513,7 @@ ORACLE_MAP="$N_MAP" run_helper --mount "$N_MOUNT" \
     --status-cmd "$ORACLE_STUB_DIR/leak-oracle.sh" --format json
 assert "N6a: exit 0 (json)" test "$RC" -eq 0
 assert "N6b: json headroom carries the same partition + cross-cut fields" \
-    bash -c 'printf "%s" "$1" | python3 "$2" "${@:3}"' _ "$OUT" "$N_PY_HEADROOM" \
+    _py_json_check "$OUT" "$N_PY_HEADROOM" \
     "resident=$n_exp_resident" "live=$n_exp_live" "pinned=$n_exp_pinned" \
     "quarantined=$n_exp_quarantined" "free=$n_exp_free" \
     "assigned=$n_exp_assigned" "state_unknown=$n_exp_state_unknown"
@@ -1643,7 +1660,7 @@ ORACLE_MAP="$O_MAP" run_helper --mount "$O_MOUNT" \
     --status-cmd "$ORACLE_STUB_DIR/leak-oracle.sh" --format json
 assert "O8a: exit 0 (json)" test "$RC" -eq 0
 assert "O8b: json pinned_by_status carries exactly the six buckets, summing to headroom.pinned" \
-    bash -c 'printf "%s" "$1" | python3 "$2" "${@:3}"' _ "$OUT" "$O_PY_PINNED" \
+    _py_json_check "$OUT" "$O_PY_PINNED" \
     "pending=${O_EXPECTED[pending]}" "infra-hold=${O_EXPECTED[infra-hold]}" \
     "blocked=${O_EXPECTED[blocked]}" "terminal=${O_EXPECTED[terminal]}" \
     "other=${O_EXPECTED[other]}" "unknown=${O_EXPECTED[unknown]}"
@@ -1965,5 +1982,25 @@ assert "Q8: HEADROOM reports free=1 and reclaimable=1 (the shared lane's freed c
 
 kill "$Q_SHARED_PID" "$Q_EXCL_PID" 2>/dev/null || true
 _BGPIDS=()  # clear so cleanup doesn't double-kill
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block R — JSON checkers run isolated from their own directory
+# ──────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "--- Block R: JSON checkers run isolated from their own directory ---"
+
+R_DIR="$(mktemp -d /tmp/test-warm-lane-audit-r-XXXXXX)"
+_TMPDIRS+=("$R_DIR")
+printf '%s\n' 'import sys' 'sys.stderr.write("poisoned json.py imported\n")' 'raise SystemExit(97)' > "$R_DIR/json.py"
+printf '%s\n' 'import json, sys' 'assert json.load(sys.stdin) == {"r": 1}' > "$R_DIR/check.py"
+
+_r_from_dir() { (cd "$1" && shift && _py_json_check "$@"); }
+
+assert "R0: without isolation the sibling json.py shadows the stdlib json (exit 97; non-vacuity control)" \
+    bash -c 'printf "%s" "{\"r\": 1}" | env -u PYTHONSAFEPATH python3 "$1"; [ "$?" -eq 97 ]' _ "$R_DIR/check.py"
+assert "R1: a checker script run by _py_json_check imports the stdlib json, not its directory's json.py" \
+    _py_json_check '{"r": 1}' "$R_DIR/check.py"
+assert "R2: a -c checker run by _py_json_check from the poisoned cwd imports the stdlib json" \
+    _r_from_dir "$R_DIR" '{"r": 1}' -c 'import json, sys; assert json.load(sys.stdin) == {"r": 1}'
 
 test_summary

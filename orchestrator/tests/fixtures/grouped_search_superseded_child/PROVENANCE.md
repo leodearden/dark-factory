@@ -19,7 +19,7 @@ mark from every nested entry (task 7156's review).
 | | |
 |---|---|
 | **Grounding** | **Real producer over a stub scenario.** The real `search` MCP tool (`fused-memory/src/fused_memory/server/tools.py::create_mcp_server` → `fused-memory/src/fused_memory/server/grouped_read.py::group_search_results`) ran over a stub memory service; only the service's reads are stubbed. |
-| **Producing code sites** | `fused-memory/src/fused_memory/server/grouped_read.py::_nested_entry_metadata`, through `grouped_read.py::_digest_entry` (the amendment digest) and `grouped_read.py::_pin_matched_child` (the pinned sighting). |
+| **Producing code sites** | `fused-memory/src/fused_memory/server/grouped_read.py::_nested_entry_metadata`, through `grouped_read.py::_amendment_entry` (the amendment entry, whose `content` is `grouped_read.py::amendment_text` at the `write_triage.judge_field_chars` default) and `grouped_read.py::_pin_matched_child` (the pinned sighting). |
 | **Pinning test** | `fused-memory/tests/server/test_grouped_read_supersession.py::TestTheRecordedSupersededReplyIsWhatSearchProduces` re-produces the reply and asserts equality, printing the produced JSON on a mismatch. |
 | **Readers** | `orchestrator/tests/test_memory_recall.py::TestSupersededRender`, through `orchestrator/tests/_briefing_helpers.py::recorded_search_text` with `fixtures=SUPERSEDED_CHILD_FIXTURES`. |
 | **Serialisation** | `pydantic_core.to_jsonable_python` of the tool result, then `json.dumps(..., indent=2, ensure_ascii=False)` plus one trailing newline. |
@@ -32,8 +32,10 @@ them.
 
 Load-bearing facts a reader must not re-derive from prose:
 
-* **The amendment digest carries `metadata.x_superseded_by`**, projected from
-  the child's raw payload.
+* **The amendment entry carries `metadata.x_superseded_by`**, projected from
+  the child's raw payload. Like every amendment entry since task 7518, it
+  carries its text as `content`, capped at the judge's field cap, and has no
+  240-character `digest` key.
 * **The sighting appears only under `grouped.matched_children`**, with its full
   `content` and `metadata.x_superseded_by`. It is not a top-level result: the
   reply has exactly one.

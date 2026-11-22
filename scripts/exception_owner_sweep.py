@@ -14,9 +14,12 @@ Three of the PRD's open questions, as decided:
   idempotence settles the next.
 * Where a finding's key lives (2): a filed task carries it in
   ``metadata.x_inv12_finding``; an escalation carries it in the caller-chosen
-  ``task_id`` slot, checked against one ``get_pending_escalations`` per run.
-  The stamp keeps no ledger of escalated keys, which would be a second home
-  of what is pending.
+  ``task_id`` slot, checked against one ``get_pending_escalations`` per run;
+  and the router converts each such escalation into a task whose
+  ``metadata.escalation_id`` names it, matched against the slot's whole
+  history, read archive-inclusive (PRD D11 as amended by task 9468; the
+  ladder is :func:`decide`).  The stamp keeps no ledger of escalated keys,
+  which would be a second home of what is pending.
 * Self-citation (4): not detected.  Every dead-owner finding states both
   remedies: re-own the site, or fix the suppression the owner's work introduced.
 
@@ -24,7 +27,7 @@ The stamp, ``exception_register.SWEEP_STATE_PATH`` under ``--project-root``, is
 written after every completed run.  A failed run rewrites a prior stamp with
 ``ok`` false and that stamp's ``last_run``, so the stamp's age is the liveness
 signal ``exception_register.py --report`` reads.  ``--dry-run`` writes,
-files and escalates nothing.
+files and escalates nothing, and is the command that lists dead owners.
 """
 
 from __future__ import annotations
@@ -51,6 +54,7 @@ try:
     import exception_register
     from _task_db_scan import UNREADABLE_STORE_ERRORS, tasks_db_path
     from dashboard.config import DEFAULT_FUSED_MEMORY_URLS, DashboardConfig
+    from inline_suppressions import BASELINE_PATH
     from shared.governed_exceptions import (
         MalformedDisposition,
         TaskRef,
@@ -298,6 +302,11 @@ FINDING_KEY_FIELD = 'x_inv12_finding'
 OWNS_NOTE_FIELD = 'x_inv12_owns'
 """Task metadata field carrying the pointer note on a live cited owner."""
 
+CONVERTED_FROM_FIELD = 'escalation_id'
+"""Task metadata field naming the escalation a task was converted from, written by
+``orchestrator/src/orchestrator/escalation_router.py::_submit_arguments`` and by
+the L1 watcher's conversion."""
+
 
 class FindingKind(enum.StrEnum):
     DEAD_OWNER = 'dead_owner'
@@ -374,6 +383,10 @@ ToolCall = Callable[[str, dict[str, object]], Mapping[str, object]]
 AGENT_ROLE = 'exception-owner-sweep'
 
 REPORT_COMMAND = 'uv run --project shared python scripts/exception_register.py --report'
+"""The register: citations, slack and the sweep's age, never findings."""
+
+DRY_RUN_COMMAND = 'uv run --project shared python scripts/exception_owner_sweep.py --dry-run'
+"""The one command that lists every cited owner's verdict now."""
 
 SUBMIT_RESOLVE_WAIT_SECS = 115
 """How long a filing waits for the curator: under the server's 120 s MCP call limit."""
@@ -444,19 +457,39 @@ def _carriers(ports: Ports, field: str) -> tuple[liveness.TaskRow, ...]:
     return _from_store(ports.db, lambda: liveness.read_tasks_carrying(ports.db, field))
 
 
-def pending_escalation_ids(escalation: ToolCall) -> frozenset[str]:
-    """The ``task_id`` of every pending escalation: one ``get_pending_escalations`` call."""
-    answer = _call(escalation, FailureStage.ESCALATION, 'get_pending_escalations', {'compact': True})
+def _result_strings(answer: Mapping[str, object], tool: str, field: str) -> frozenset[str]:
+    """Every record's str *field* in an escalation read's ``{'result': [...]}`` answer.
+
+    A record without one means the server's compact projection changed shape;
+    dropping it would read as an empty queue or history, so it is a failure.
+    """
     records = answer.get('result')
     if not isinstance(records, list):
-        raise SweepFailure(
-            FailureStage.ESCALATION, f'get_pending_escalations answered {answer!r}, not a result list'
-        )
-    return frozenset(
-        record['task_id']
-        for record in records
-        if isinstance(record, dict) and isinstance(record.get('task_id'), str)
-    )
+        raise SweepFailure(FailureStage.ESCALATION, f'{tool} answered {answer!r}, not a result list')
+    values = []
+    for record in records:
+        value = record.get(field) if isinstance(record, dict) else None
+        if not isinstance(value, str):
+            raise SweepFailure(FailureStage.ESCALATION, f'{tool} answered a record with no str `{field}`: {record!r}')
+        values.append(value)
+    return frozenset(values)
+
+
+def pending_escalation_ids(escalation: ToolCall) -> frozenset[str]:
+    """The ``task_id`` of every pending escalation: one ``get_pending_escalations`` call."""
+    tool = 'get_pending_escalations'
+    answer = _call(escalation, FailureStage.ESCALATION, tool, {'compact': True})
+    return _result_strings(answer, tool, 'task_id')
+
+
+def escalation_ids_filed_under(escalation: ToolCall, key: FindingKey) -> frozenset[str]:
+    """The id of every escalation ever filed in *key*'s ``task_id`` slot, at any level or status.
+
+    One archive-inclusive ``get_task_escalations`` call; the ids are compared, never parsed.
+    """
+    tool = 'get_task_escalations'
+    args: dict[str, object] = {'task_id': key.escalation_task_id(), 'compact': True}
+    return _result_strings(_call(escalation, FailureStage.ESCALATION, tool, args), tool, 'id')
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +520,7 @@ class Action(enum.Enum):
 
     SKIP_LIVE_TASK = 'skip_live_task'
     SKIP_PENDING_ESCALATION = 'skip_pending_escalation'
+    SKIP_CONVERTED_TASK = 'skip_converted_task'
     ESCALATE_CLOSED_FINDING = 'escalate_closed_finding'
     FILE_TASK = 'file_task'
     FILE_ESCALATION = 'file_escalation'
@@ -496,23 +530,106 @@ class Action(enum.Enum):
         return f'planned {self.value}'
 
 
-_SKIPS = frozenset({Action.SKIP_LIVE_TASK, Action.SKIP_PENDING_ESCALATION})
+_SKIPS = frozenset({Action.SKIP_LIVE_TASK, Action.SKIP_PENDING_ESCALATION, Action.SKIP_CONVERTED_TASK})
 
 
-def decide(
-    key: FindingKey, *, carriers: Sequence[liveness.TaskRow], pending: frozenset[str]
-) -> Action:
-    """What to do about *key*, given the tasks carrying a finding key and the pending escalations."""
-    mine = [row for row in carriers if FindingKey.from_record(row.metadata.get(FINDING_KEY_FIELD)) == key]
-    if any(row.liveness() is OwnerLiveness.OPEN for row in mine):
+def _any_open(rows: Sequence[liveness.TaskRow]) -> bool:
+    return any(row.liveness() is OwnerLiveness.OPEN for row in rows)
+
+
+@dataclass(frozen=True)
+class FindingHomes:
+    """The tasks that answer one finding: those carrying its key, and those converted from its escalations.
+
+    ``converted`` is read only once neither of the key's own rungs
+    (:func:`_skip_by_key`) answers, because :func:`decide` reads it no sooner.
+    """
+
+    carrying: tuple[liveness.TaskRow, ...]
+    converted: tuple[liveness.TaskRow, ...] = ()
+
+    def latest(self) -> liveness.TaskRow | None:
+        """The newest home, which a re-raise names; None when there is none.
+
+        A task converted from a re-raise naming N is created after N, so it is
+        the one named once it stops being open in turn.
+        """
+        return max((*self.carrying, *self.converted), key=lambda row: row.id, default=None)
+
+
+def _skip_by_key(key: FindingKey, carrying: Sequence[liveness.TaskRow], pending: frozenset[str]) -> Action | None:
+    """The skip *key* earns itself: a live task holding it, or a pending escalation in its slot."""
+    if _any_open(carrying):
         return Action.SKIP_LIVE_TASK
     if key.escalation_task_id() in pending:
         return Action.SKIP_PENDING_ESCALATION
-    if mine and key.kind.escalates_when_closed:
+    return None
+
+
+def decide(key: FindingKey, *, homes: FindingHomes, pending: frozenset[str]) -> Action:
+    """What to do about *key*: nothing where it is already raised, else raise it once.
+
+    A finding is already raised in three places: a live task among
+    ``homes.carrying``, holding its key; a pending escalation in its
+    ``task_id`` slot; and a live task among ``homes.converted``, the tasks
+    converted from any escalation ever filed in that slot (every sweep
+    escalation is an info L0 the router converts).  A dead-owner finding whose
+    home of either kind is no longer open escalates, and is never re-filed.
+    """
+    skip = _skip_by_key(key, homes.carrying, pending)
+    if skip is not None:
+        return skip
+    if _any_open(homes.converted):
+        return Action.SKIP_CONVERTED_TASK
+    if (homes.carrying or homes.converted) and key.kind.escalates_when_closed:
         return Action.ESCALATE_CLOSED_FINDING
     if key.scope in (None, INLINE_SCOPE):
         return Action.FILE_TASK
     return Action.FILE_ESCALATION
+
+
+class _HomeReader:
+    """One run's reads of finding homes, in :func:`decide`'s rung order.
+
+    The escalation history and the converted tasks are read only for a key
+    its own rungs leave unanswered, and the converted tasks only when that
+    history is non-empty.  Store rows are kept until a ``fresh`` read.  A
+    key's history is read once per run: the only escalation the run can add
+    under it is its own, which ``pending`` already holds.
+    """
+
+    def __init__(self, ports: Ports) -> None:
+        self._ports = ports
+        self._rows: dict[str, tuple[liveness.TaskRow, ...]] = {}
+        self._filed_under: dict[FindingKey, frozenset[str]] = {}
+
+    def _rows_carrying(self, field: str, *, fresh: bool) -> tuple[liveness.TaskRow, ...]:
+        if fresh or field not in self._rows:
+            self._rows[field] = _carriers(self._ports, field)
+        return self._rows[field]
+
+    def _filed(self, key: FindingKey) -> frozenset[str]:
+        if key not in self._filed_under:
+            self._filed_under[key] = escalation_ids_filed_under(self._ports.escalation, key)
+        return self._filed_under[key]
+
+    def homes(self, key: FindingKey, pending: frozenset[str], *, fresh: bool) -> FindingHomes:
+        carrying = tuple(
+            row
+            for row in self._rows_carrying(FINDING_KEY_FIELD, fresh=fresh)
+            if FindingKey.from_record(row.metadata.get(FINDING_KEY_FIELD)) == key
+        )
+        if _skip_by_key(key, carrying, pending) is not None:
+            return FindingHomes(carrying)
+        filed = self._filed(key)
+        if not filed:
+            return FindingHomes(carrying)
+        converted = tuple(
+            row
+            for row in self._rows_carrying(CONVERTED_FROM_FIELD, fresh=fresh)
+            if isinstance(source := row.metadata.get(CONVERTED_FROM_FIELD), str) and source in filed
+        )
+        return FindingHomes(carrying, converted)
 
 
 @dataclass(frozen=True)
@@ -577,7 +694,7 @@ def _dead_owner_body(citation: Citation, verdict: liveness.OwnerVerdict) -> _Bod
                 f'{owner} no longer owns the debt it is cited for ({facts}).',
                 f'Scope: {citation.scope}. Sites: {_bounded(citation.sites)}.',
                 f'Remedy: {_DEAD_OWNER_REMEDY}',
-                f'Report: {REPORT_COMMAND}',
+                f'Dead owners, and whether this one is gone once re-owned: {DRY_RUN_COMMAND}',
             ]
         ),
         remedy=_DEAD_OWNER_REMEDY,
@@ -664,6 +781,38 @@ def _unconfirmed_body(body: _Body, filing: FilingOutcome) -> _Body:
     return dataclasses.replace(body, detail=f'{body.detail}\n{why}', observation=f'{body.observation}; {why}')
 
 
+def _reraised_body(body: _Body, home: liveness.TaskRow) -> _Body:
+    """*body* raised again after its home task *home* stopped being open, with the owner still dead.
+
+    The store's (title, files) candidate_key index covers done rows, and the
+    router titles a conversion with the summary and declares no files, so
+    naming the home and its status keeps each re-raise distinct from the task
+    it follows (precedent:
+    ``fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title``).
+    """
+    left = (
+        f'task {home.id}, which answered this finding, is no longer open '
+        f'(status {home.status!r}) while the owner is still dead'
+    )
+    return dataclasses.replace(
+        body,
+        summary=f'{body.summary}, after task {home.id} became {home.status!r}',
+        detail=f'{body.detail}\nRaised again: {left}.',
+        observation=f'{body.observation}; {left}',
+    )
+
+
+def _home_to_name(key: FindingKey, homes: FindingHomes) -> liveness.TaskRow:
+    """The home a re-raise of *key* names: :func:`decide` plans one only when a home exists."""
+    home = homes.latest()
+    if home is None:
+        raise ValueError(
+            f'{key.escalation_task_id()}: planned {Action.ESCALATE_CLOSED_FINDING.value} '
+            'but the finding has no home task to name'
+        )
+    return home
+
+
 def _escalate(key: FindingKey, body: _Body, ports: Ports, now: datetime.datetime) -> None:
     args: dict[str, object] = {
         'task_id': key.escalation_task_id(),
@@ -685,10 +834,15 @@ MAX_OUTPUTS_PER_RUN = 10
 """INV-4's storm bound: filings and escalations per run, plus one overflow roll-up."""
 
 
-def _tighten_body(slack: int) -> _Body:
+def _tighten_body(slack: int, measured_at: datetime.datetime) -> _Body:
+    """The store's (title, files) candidate_key index covers done rows, so the measurement time
+    keeps each recurrence distinct from its closed predecessor (precedent:
+    ``fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title``).
+    """
     remedy = f'Run `{TIGHTEN_COMMAND}` and commit the tightened baseline.'
+    as_of = measured_at.isoformat(timespec='seconds')
     return _Body(
-        summary=f'INV-12: tighten the inline-suppression baseline ({slack} slack)',
+        summary=f'INV-12: tighten the inline-suppression baseline ({slack} slack as of {as_of})',
         detail='\n'.join(
             [
                 f'The inline-suppression baseline allows {slack} more unowned sites than the tree holds.',
@@ -698,11 +852,12 @@ def _tighten_body(slack: int) -> _Body:
         ),
         remedy=remedy,
         observation=f'baseline slack_total {slack}',
+        files=(BASELINE_PATH,),
     )
 
 
 def _overflow_body(count: int) -> _Body:
-    remedy = f'Run `{REPORT_COMMAND}` to see every finding now; the sweep retries them next run.'
+    remedy = f'Run `{DRY_RUN_COMMAND}` to see every finding now; the sweep retries them next run.'
     return _Body(
         summary=f'INV-12 owner sweep: {count} finding(s) over the per-run output bound',
         detail='\n'.join(
@@ -813,32 +968,35 @@ class _Outputs:
         self.reports: list[Report] = []
         self.tighten: Performed | None = None
         self.rolled_up = False
-        self._carriers: tuple[liveness.TaskRow, ...] | None = None
+        self._homes = _HomeReader(ports)
 
     def tally(self) -> Tally:
         return Tally(tuple(self.reports), self.tighten, self.rolled_up)
 
-    def _decide(self, key: FindingKey, *, reread: bool) -> Action:
-        if reread or self._carriers is None:
-            self._carriers = _carriers(self.ports, FINDING_KEY_FIELD)
-        return decide(key, carriers=self._carriers, pending=frozenset(self.pending))
+    def _decide(self, key: FindingKey, *, fresh: bool) -> tuple[Action, FindingHomes]:
+        pending = frozenset(self.pending)
+        homes = self._homes.homes(key, pending, fresh=fresh)
+        return decide(key, homes=homes, pending=pending), homes
 
     def raise_finding(self, key: FindingKey, body: _Body) -> Performed:
         """Perform at most one budgeted output for *key*, returning the step taken.
 
-        The carriers are re-read only where an output can follow (INV-3), so a
+        The homes are re-read only where an output can follow (INV-3), so a
         finding that ends skipped or held back costs no further store scan.
+        A home no longer open is named in its re-raise, read from the act-time homes.
         """
-        if self._decide(key, reread=False) in _SKIPS:
+        if self._decide(key, fresh=False)[0] in _SKIPS:
             return Performed.SKIPPED_EXISTING
         if self.budget == 0:
             return Performed.OVERFLOW
-        action = self._decide(key, reread=True)
+        action, homes = self._decide(key, fresh=True)
         if action in _SKIPS:
             return Performed.SKIPPED_EXISTING
         self.budget -= 1
         if action is Action.FILE_TASK:
             return self._file(key, body)
+        if action is Action.ESCALATE_CLOSED_FINDING:
+            body = _reraised_body(body, _home_to_name(key, homes))
         self._escalate(key, body)
         return Performed.ESCALATED
 
@@ -925,7 +1083,7 @@ def _act_on(scan: Scan, outputs: _Outputs) -> None:
             step = outputs.raise_finding(key, _dead_owner_body(citation, verdict))
         outputs.reports.append(Report(citation.scope, citation.owner, verdict, step))
     if scan.register.slack_total > 0:
-        outputs.tighten = outputs.raise_finding(TIGHTEN_KEY, _tighten_body(scan.register.slack_total))
+        outputs.tighten = outputs.raise_finding(TIGHTEN_KEY, _tighten_body(scan.register.slack_total, scan.measured_at))
     outputs.roll_up()
     _reconcile_notes(outputs.reports, outputs.ports, outputs.now)
 
@@ -967,10 +1125,10 @@ class RunConfig:
 
 def plan(scan: Scan, ports: Ports) -> Tally:
     """Each citation's planned step as of *scan*, ignoring the output bound; reads only."""
-    carriers = _carriers(ports, FINDING_KEY_FIELD)
+    reader = _HomeReader(ports)
 
     def planned(key: FindingKey) -> Action:
-        return decide(key, carriers=carriers, pending=scan.pending)
+        return decide(key, homes=reader.homes(key, scan.pending, fresh=False), pending=scan.pending)
 
     reports = []
     for citation in scan.register.citations:

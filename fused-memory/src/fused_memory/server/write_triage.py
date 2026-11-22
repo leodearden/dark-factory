@@ -35,7 +35,7 @@ regression; see :func:`retrieve_candidates` for the full reasoning. Use the
 seam, and pass the flags a candidate-set consumer needs.
 
 THE JUDGE SLOT IS FILLED. ``server/write_triage_judge.py`` (leaf gamma) is
-the real middle-band judge, and ``server/tools.py`` is the SINGLE place that
+the real judge of every judged write (see :func:`route_band`), and ``server/tools.py`` is the SINGLE place that
 wires it in as ``triage_write(..., judge=judge_write)``. The import direction
 is one-way and load-bearing: that module imports this one for the ``OUTCOME_*``
 constants, so this module must NEVER import it — making the real judge
@@ -60,17 +60,21 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from shared.storm_counter import StormCounter
 
-from fused_memory.memory_metadata import normalize_supersedes
+from fused_memory.memory_metadata import (
+    is_orchestrator_completion_record,
+    normalize_supersedes,
+)
 from fused_memory.middleware._folded_escalation import file_folded_escalation
-from fused_memory.models.enums import MEM0_PRIMARY, SourceStore
+from fused_memory.models.enums import MEM0_PRIMARY
+from fused_memory.models.memory import AddMemoryResponse, Mem0WriteState
 from fused_memory.server.grouped_read import (
-    CHILD_KINDS,
     CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
+    child_parent_id,
 )
 
 # The per-store-cosine reader, IMPORTED rather than re-implemented (INV-5) —
-# the same treatment PARENT_ID_KEY and CHILD_KINDS get above. This module
+# the same treatment PARENT_ID_KEY and child_parent_id get above. This module
 # retires ``near_duplicate_guard``, so a copy here would have been the obvious
 # shortcut; it is also exactly how task 3658's field move (relevance_score →
 # metadata['store_score']) would go wrong a second time. One copy updated and
@@ -87,6 +91,8 @@ from fused_memory.server.grouped_read import (
 # than deleted, and one home for the reader beats a third file to keep in
 # sync.)
 from fused_memory.server.near_duplicate_guard import cosine_of
+from fused_memory.server.near_verbatim import is_near_verbatim
+from fused_memory.services.provider_billing import classify_billing_exhaustion
 from fused_memory.utils.clip_disclosure import TruncationFact
 
 if TYPE_CHECKING:
@@ -118,6 +124,24 @@ CANONICAL_ID_KEY = 'canonical_id'
 #: rare by construction, and additive like the other two.
 FAIL_OPEN_ESCALATION_ID_KEY = 'triage_fail_open_escalation_id'
 
+#: Key on the add_memory ack naming the :class:`FailOpenStage` at which THIS
+#: write failed open. Present only when it did, absent like ``canonical_id``.
+TRIAGE_FAIL_OPEN_KEY = 'triage_fail_open'
+
+
+class FailOpenStage(StrEnum):
+    """Where triage gave up on a write and stored it untriaged (INV-11)."""
+
+    RETRIEVE = 'retrieve'
+    JUDGE = 'judge'
+    ATTACH_GUARD = 'attach_guard'
+    #: The attach's child write raised; the tool stored the write standalone.
+    ATTACH_WRITE = 'attach_write'
+    #: The attach's child write returned no memory_ids.
+    ATTACH_NOT_DURABLE = 'attach_not_durable'
+    #: A verdict the tool has no attach kind wired for.
+    UNWIRED_VERDICT = 'unwired_verdict'
+
 #: The metadata keys an ATTACH outcome OVERWRITES when it reroutes a write
 #: into a child record. This is the definition the force-store predicate
 #: below is derived from, so the two cannot drift: every key the attach
@@ -148,11 +172,15 @@ ATTACH_OWNED_KEYS: frozenset[str] = frozenset({
 })
 
 #: The write was stored as a new standalone memory. Also the fail-open
-#: outcome and the deliberate-stub outcome — from the caller's side those are
-#: indistinguishable from a genuine "nothing matched", which is the point.
+#: outcome and the deliberate-stub outcome: C1 keeps ``routed`` at ``stored``
+#: so the write stays unblocked. A fail-open is still told apart from a
+#: genuine "nothing matched": its decision names the stage in
+#: ``BandDecision.fail_open_stage`` and its ack carries
+#: :data:`TRIAGE_FAIL_OPEN_KEY`.
 OUTCOME_STORED = 'stored'
 
-#: The write restates an existing memory and was attached to it as a sighting.
+#: The write repeats an existing memory near-verbatim, adding nothing, and was
+#: attached to it as a sighting (``server/near_verbatim.py`` holds the rule).
 OUTCOME_RESTATED = 'restated'
 
 #: The write adds to an existing memory and was attached as an amendment.
@@ -163,8 +191,9 @@ OUTCOME_AMENDED = 'amended'
 #: child. Produced by leaf gamma's judge, never by this leaf's stub.
 OUTCOME_CONTESTED = 'contested'
 
-#: INTERNAL routing sentinel: the write landed in the middle band and must be
-#: adjudicated. Deliberately NOT a member of :data:`TRIAGE_OUTCOMES` — the ack
+#: INTERNAL routing sentinel: the write landed in the middle band, or in the
+#: restate band without repeating its winner near-verbatim (:func:`route_band`),
+#: and must be adjudicated. Deliberately NOT a member of :data:`TRIAGE_OUTCOMES` — the ack
 #: says what triage DID with a write, and "sent it to a judge" is not an answer
 #: to that. The judge's own verdict is what a caller eventually sees.
 OUTCOME_JUDGE = 'judge'
@@ -193,7 +222,7 @@ class JudgeUsage(NamedTuple):
 
 
 class TriageJudgeVerdict(NamedTuple):
-    """The middle-band judge's answer: a verdict and the candidate it is about.
+    """The judge's answer: a verdict and the candidate it is about.
 
     This is the judge's return contract, so it lives beside the outcomes it is
     drawn from. ``write_triage_judge`` imports it; this module never imports
@@ -249,12 +278,12 @@ def attach_write_durable(result: Any) -> bool:
     :func:`attach_write_landed`, plus a Mem0 leg ``MemoryService.add_memory``
     deferred for server-side retry: the queued intent already carries the
     triage-stamped parent link, so the retry creates exactly the child the ack
-    names.
+    names. A real response is read through ``AddMemoryResponse.mem0_write_state``;
+    anything else keeps :func:`attach_write_landed`'s lenient reading.
     """
-    pending = getattr(result, 'stores_pending_retry', None)
-    return attach_write_landed(result) or (
-        isinstance(pending, list | tuple) and SourceStore.mem0 in pending
-    )
+    if isinstance(result, AddMemoryResponse):
+        return result.mem0_write_state is not Mem0WriteState.NOT_LANDED
+    return attach_write_landed(result)
 
 
 # --- config defaults --------------------------------------------------------
@@ -419,6 +448,8 @@ class BandDecision:
     winner_id: str | None = None
     #: Why the attach guard refused this write's attach; empty when it did not.
     attach_refusals: frozenset[AttachRefusal] = frozenset()
+    #: Non-``None`` means the write is stored WITHOUT triage, having failed open here.
+    fail_open_stage: FailOpenStage | None = None
 
     @property
     def attach_source_id(self) -> str | None:
@@ -431,7 +462,7 @@ class AttachGuard:
     """Which attach-guard rules are in force for one write, and what they refuse.
 
     The FLOOR refuses any attach whose target's cosine to the write is below
-    ``min_parent_cosine``. The HOIST GAP refuses, in the judge band only, a
+    ``min_parent_cosine``. The HOIST GAP refuses, on a judged write only, a
     hoist whose parent's cosine is more than ``hoist_max_cosine_gap`` below
     the matched child's. ``None`` switches a rule off. The evidence for each
     value is its field description on ``config/schema.py::WriteTriageConfig``.
@@ -516,7 +547,7 @@ def declares_attach_keys(metadata: Any) -> bool:
     Likewise ANY ``parent_id``, well-formed or not: a malformed link is a
     caller bug for ``memory_metadata`` validation to report, and quietly
     converting it into a triage attach would hide it. Contrast
-    ``grouped_read._parent_id_in_meta``, which requires both keys well-formed
+    ``grouped_read.child_parent_id``, which requires both keys well-formed
     because it answers a different question — "does this record group?" rather
     than "did the caller set something an attach would overwrite?".
     """
@@ -544,6 +575,25 @@ def declares_supersession(metadata: Any) -> bool:
     return bool(normalize_supersedes(metadata.get('supersedes')))
 
 
+def is_orchestrator_completion_write(metadata: Any) -> bool:
+    """True when *metadata* is an orchestrator task-completion record's.
+
+    The LEGACY fallback for the completion record's declared
+    ``kind='task_completion'``, which :func:`declares_attach_keys` already
+    force-stores. It covers orchestrators not yet redeployed and any other
+    writer that emits the completion source without the kind.
+
+    It matches the one source constant ``memory_metadata`` owns, by equality
+    and never by parsing, and deliberately not by ``task_id``: an agent
+    memory's ``task_id`` is provenance, not its subject (task 6956).
+
+    Retire it once no writer emits the completion source without the kind:
+    each write it decides logs one ``legacy completion record`` INFO line, so
+    the condition is that those lines stop.
+    """
+    return isinstance(metadata, dict) and is_orchestrator_completion_record(metadata)
+
+
 def canonical_id_of(result: MemoryResult) -> str:
     """The id a write should attach to for *result* — hoisting a CHILD.
 
@@ -569,19 +619,12 @@ def canonical_id_of(result: MemoryResult) -> str:
     (deleted) parent now refuses to ``stored`` instead
     (:attr:`AttachRefusal.TARGET_COSINE_UNAVAILABLE`).
 
-    The child rule mirrors ``grouped_read._parent_id_in_meta`` rule-for-rule —
-    a child ``kind`` AND a non-empty ``str`` ``parent_id``, with a malformed
-    parent link falling back to the record's own id — and both the kind set
-    and the metadata key are IMPORTED from that module rather than spelled as
-    literals (INV-5), because a drift between the write side and the read side
-    is exactly what produces an unfoldable child.
+    The child rule IS ``grouped_read.child_parent_id``, called rather than
+    restated (INV-5), because a drift between the write side and the read side
+    is exactly what produces an unfoldable child. A malformed parent link is
+    not a child link, so it falls back to the record's own id.
     """
-    meta = result.metadata or {}
-    if meta.get('kind') in CHILD_KINDS:
-        parent_id = meta.get(PARENT_ID_KEY)
-        if isinstance(parent_id, str) and parent_id:
-            return parent_id
-    return result.id
+    return child_parent_id(result.metadata) or result.id
 
 
 def decide_band(
@@ -590,12 +633,13 @@ def decide_band(
     t_high: float | None,
     t_low: float | None,
 ) -> BandDecision:
-    """Route a write by the MAXIMUM per-store cosine among *results*.
+    """Label a write's cosine BAND by the MAXIMUM per-store cosine among *results*.
 
-    ``s >= t_high`` is a deterministic :data:`OUTCOME_RESTATED` with no judge
-    call; ``t_low <= s < t_high`` routes to :data:`OUTCOME_JUDGE`; anything
-    below ``t_low``, and an empty or wholly uncomparable candidate set, is
-    :data:`OUTCOME_STORED`. Both edges are INCLUSIVE, matching how the
+    ``s >= t_high`` is the restate band, labelled :data:`OUTCOME_RESTATED`;
+    only a write that repeats the band winner near-verbatim keeps that outcome
+    without a judge call (see :func:`route_band`). ``t_low <= s < t_high`` is
+    :data:`OUTCOME_JUDGE`; anything below ``t_low``, and an empty or wholly
+    uncomparable candidate set, is :data:`OUTCOME_STORED`. Both edges are INCLUSIVE, matching how the
     calibrator derives them: each is an order statistic of measured pairs, so
     the boundary value is itself an observed duplicate.
 
@@ -671,6 +715,41 @@ def decide_band(
     return BandDecision(
         OUTCOME_JUDGE, canonical_id_of(best), similarity, t_high, t_low,
         winner_id=best.id,
+    )
+
+
+def route_band(
+    results: list[MemoryResult],
+    *,
+    content: str,
+    t_high: float | None,
+    t_low: float | None,
+) -> BandDecision:
+    """The routing :func:`triage_write` acts on: :func:`decide_band`, with the restate band narrowed.
+
+    A cosine at or above ``t_high`` says the write is about the same thing as
+    the band winner, not that it adds nothing to it. So a restate-band write
+    keeps :data:`OUTCOME_RESTATED` only when it repeats the band winner, or the
+    winner's canonical, near-verbatim; otherwise it is the same decision routed
+    to :data:`OUTCOME_JUDGE`, band winner kept, so the judge is shown it.
+
+    :func:`decide_band` stays the cosine BAND label, which the eval scripts
+    read as such; this is the one home of the routing rule.
+    """
+    band = decide_band(results, t_high=t_high, t_low=t_low)
+    if band.outcome != OUTCOME_RESTATED or _restates_verbatim(content, results, band):
+        return band
+    return replace(band, outcome=OUTCOME_JUDGE)
+
+
+def _restates_verbatim(
+    content: str, results: Iterable[MemoryResult], decision: BandDecision,
+) -> bool:
+    """Does *content* repeat, near-verbatim, the slate record *decision* attaches from or to?"""
+    compared = {decision.attach_source_id, decision.canonical_id}
+    return any(
+        is_near_verbatim(content, result.content)
+        for result in results if result.id in compared
     )
 
 
@@ -811,9 +890,12 @@ class TriageFailOpenCounter:
 
     def __init__(self, time_provider: Callable[[], float] = time.time) -> None:
         self._counter = StormCounter(time_provider=time_provider)
+        self._billing_exhausted = StormCounter(time_provider=time_provider)
         self._pending_storm: dict[str, Any] | None = None
 
-    def record(self, *, project: str | None = None) -> dict[str, Any] | None:
+    def record(
+        self, *, project: str | None = None, billing_exhausted: bool = False,
+    ) -> dict[str, Any] | None:
         """Record one fail-open; return a storm summary iff a burst just fired.
 
         The summary renames ``StormCounter``'s generic ``labels`` to
@@ -822,7 +904,13 @@ class TriageFailOpenCounter:
         the reader to know the label convention. A project that could not be
         resolved still counts toward the burst — there is simply nothing to
         name it against.
+
+        *billing_exhausted* marks a fail-open caused by an exhausted provider
+        balance; the summary's ``billing_exhausted_in_window`` counts those in
+        the same window, and never changes when the burst fires.
         """
+        if billing_exhausted:
+            self._billing_exhausted.observe(window_seconds=_FAIL_OPEN_STORM_WINDOW_SECONDS)
         summary = self._counter.record(
             threshold=_FAIL_OPEN_STORM_THRESHOLD,
             window_seconds=_FAIL_OPEN_STORM_WINDOW_SECONDS,
@@ -835,6 +923,9 @@ class TriageFailOpenCounter:
             'threshold': summary['threshold'],
             'window_seconds': summary['window_seconds'],
             'projects': summary['labels'],
+            'billing_exhausted_in_window': self._billing_exhausted.prune(
+                _FAIL_OPEN_STORM_WINDOW_SECONDS,
+            ),
             'hint': _FAIL_OPEN_HINT,
         }
         # Stashed as well as returned. Most fail-opens are recorded DEEP inside
@@ -872,7 +963,7 @@ async def _stub_judge(
     decision: BandDecision | None,
     candidates: Any = (),
 ) -> str:
-    """Middle-band adjudication — leaf gamma's ``write_triage_judge`` replaces this.
+    """Adjudication of a judged write — leaf gamma's ``write_triage_judge`` replaces this.
 
     Returns :data:`OUTCOME_STORED` unconditionally. That is a DELIBERATE STUB,
     explicitly NOT a fail-open event: it must never be routed through
@@ -919,6 +1010,7 @@ async def triage_write(
     allow_near_duplicate: bool = False,
     caller_owns_attach_keys: bool = False,
     caller_declares_supersession: bool = False,
+    caller_is_completion_record: bool = False,
 ) -> BandDecision:
     """Route one ``add_memory`` write. NEVER raises, NEVER blocks, NEVER errors.
 
@@ -926,9 +1018,10 @@ async def triage_write(
     stage is wrapped after the force-store checks: any
     exception whatsoever yields :data:`OUTCOME_STORED` plus exactly one
     counted fail-open and a logged warning with ``exc_info``. Nothing escapes,
-    because C1 is absolute — from the caller's side a fail-open is
-    indistinguishable from "nothing matched", which is what keeps the write
-    unblocked.
+    because C1 is absolute: a fail-open keeps ``routed`` at ``stored`` and
+    the write unblocked. The decision still names where triage gave up, in
+    ``fail_open_stage``, which ``add_memory`` surfaces on the ack as
+    :data:`TRIAGE_FAIL_OPEN_KEY`.
 
     This is where the module deliberately DIVERGES from the retired guard's
     call site, which re-raises ``TypeError``/``AttributeError``/``NameError``
@@ -939,12 +1032,13 @@ async def triage_write(
     fail-open — so a changed ``MemoryService.search`` signature surfaces as a
     storm escalation rather than as a stream of errored writes.
 
-    *allow_near_duplicate*, *caller_owns_attach_keys* and
-    *caller_declares_supersession* are passed IN rather than recomputed:
-    ``add_memory`` already derives them from the metadata it holds, and a
-    second derivation here is a second place for them to disagree about who is
-    exempt. :func:`declares_attach_keys` and :func:`declares_supersession` are
-    the one spellings of the last two predicates.
+    *allow_near_duplicate*, *caller_owns_attach_keys*,
+    *caller_declares_supersession* and *caller_is_completion_record* are
+    passed IN rather than recomputed: ``add_memory`` already derives them from
+    the metadata it holds, and a second derivation here is a second place for
+    them to disagree about who is exempt. :func:`declares_attach_keys`,
+    :func:`declares_supersession` and :func:`is_orchestrator_completion_write`
+    are the one spellings of the last three predicates.
 
     There is deliberately no recon-stage arm. It was retired by task 3134
     (leaf iota) once Stage-1 consolidation moved onto ``consolidate_memories``,
@@ -985,6 +1079,15 @@ async def triage_write(
         # candidate can change the answer, so no round-trip is spent asking.
         return BandDecision(OUTCOME_STORED, None, None, None, None)
 
+    if caller_is_completion_record:
+        # A legacy completion record with no kind; see is_orchestrator_completion_write.
+        logger.info(
+            'write_triage legacy completion record force-stored: project=%s; '
+            'its writer declared no kind',
+            project_id,
+        )
+        return BandDecision(OUTCOME_STORED, None, None, None, None)
+
     if caller_declares_supersession:
         # A correction is never filed under the record it retires; see
         # declares_supersession.
@@ -1019,19 +1122,19 @@ async def triage_write(
         # the candidate slate is empty-or-unusable, never merely thinner.
         if getattr(results, 'degraded', False):
             failed = getattr(results, 'failed_stores', None)
-            _record_fail_open(
+            return _fail_open_decision(
                 counter, project_id,
                 RuntimeError(f'search degraded: failed_stores={failed!r}'),
-                stage='retrieve',
+                FailOpenStage.RETRIEVE, t_high=t_high, t_low=t_low,
             )
-            return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)
         decision = replace(
-            decide_band(results, t_high=t_high, t_low=t_low),
+            route_band(results, content=content, t_high=t_high, t_low=t_low),
             truncation_facts=_retrieval_cap_facts(results, k, t_low),
         )
-    except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
-        _record_fail_open(counter, project_id, exc, stage='retrieve')
-        return BandDecision(OUTCOME_STORED, None, None, None, None)
+    except Exception as exc:  # C1: nothing escapes this path.
+        return _fail_open_decision(
+            counter, project_id, exc, FailOpenStage.RETRIEVE, t_high=None, t_low=None,
+        )
 
     judged = decision.outcome == OUTCOME_JUDGE
     if judged:
@@ -1046,8 +1149,10 @@ async def triage_write(
             content=content, project_id=project_id, judged=judged,
         )
     except Exception as exc:  # C1: nothing escapes this path.
-        _record_fail_open(counter, project_id, exc, stage='attach_guard')
-        return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
+        return _fail_open_decision(
+            counter, project_id, exc, FailOpenStage.ATTACH_GUARD,
+            t_high=decision.t_high, t_low=decision.t_low,
+        )
 
 
 async def _judge_band(
@@ -1060,7 +1165,7 @@ async def _judge_band(
     content: str,
     project_id: str,
 ) -> BandDecision:
-    """The middle band's judge slot: the judged decision, or ``stored`` plus one counted fail-open."""
+    """The judge slot for a judged write: the judged decision, or ``stored`` plus one counted fail-open."""
     try:
         answer = await (judge or _stub_judge)(
             memory_service=memory_service,
@@ -1077,12 +1182,17 @@ async def _judge_band(
             # here -- one home for that decision.
             candidates=results,
         )
-        judged = _apply_judge_verdict(decision, answer, results)
+        judged = _file_judged_restatement(
+            _apply_judge_verdict(decision, answer, results),
+            content=content, results=results, project_id=project_id,
+        )
         _log_retarget(decision, judged, project_id)
         return judged
-    except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
-        _record_fail_open(counter, project_id, exc, stage='judge')
-        return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
+    except Exception as exc:  # C1: nothing escapes this path.
+        return _fail_open_decision(
+            counter, project_id, exc, FailOpenStage.JUDGE,
+            t_high=decision.t_high, t_low=decision.t_low,
+        )
 
 
 async def _guard_attach(
@@ -1237,6 +1347,29 @@ def _apply_judge_verdict(
     )
 
 
+def _file_judged_restatement(
+    decision: BandDecision,
+    *,
+    content: str,
+    results: Iterable[MemoryResult],
+    project_id: str,
+) -> BandDecision:
+    """A judged `restated` stands only when the write repeats its record near-verbatim; else it is `amended`.
+
+    A sighting's text is never shown to a reader of its parent, so a
+    restatement that adds anything would hide it. Filed `amended`, its text is
+    digested into the canonical's grouped document instead.
+    """
+    if decision.outcome != OUTCOME_RESTATED or _restates_verbatim(content, results, decision):
+        return decision
+    logger.info(
+        'write_triage judged restatement filed as amended: project=%s candidate=%r '
+        'canonical=%r — the write is not near-verbatim (task 7155)',
+        project_id, decision.attach_source_id, decision.canonical_id,
+    )
+    return replace(decision, outcome=OUTCOME_AMENDED)
+
+
 def _judge_verdict_of(answer: object) -> TriageJudgeVerdict:
     """Read a judge's *answer* as a verdict: a bare word names no candidate."""
     if isinstance(answer, TriageJudgeVerdict):
@@ -1270,12 +1403,26 @@ def _log_retarget(band: BandDecision, judged: BandDecision, project_id: str) -> 
 _WIRING_BUG_CLASSES = (TypeError, AttributeError, NameError)
 
 
+def _fail_open_decision(
+    counter: TriageFailOpenCounter,
+    project_id: str,
+    exc: BaseException,
+    stage: FailOpenStage,
+    *,
+    t_high: float | None,
+    t_low: float | None,
+) -> BandDecision:
+    """Record one fail-open at *stage* and return the untriaged ``stored`` that names it."""
+    _record_fail_open(counter, project_id, exc, stage=stage)
+    return BandDecision(OUTCOME_STORED, None, None, t_high, t_low, fail_open_stage=stage)
+
+
 def _record_fail_open(
     counter: TriageFailOpenCounter,
     project_id: str | None,
     exc: BaseException,
     *,
-    stage: str,
+    stage: FailOpenStage,
 ) -> dict[str, Any] | None:
     """Log and count one fail-open; return a storm summary iff a burst fired.
 
@@ -1284,15 +1431,20 @@ def _record_fail_open(
     """
     level = logging.ERROR if isinstance(exc, _WIRING_BUG_CLASSES) else logging.WARNING
     try:
+        exhaustion = classify_billing_exhaustion(exc)
+        cause = (
+            type(exc).__name__ if exhaustion is None
+            else f'billing_exhausted:{exhaustion.source.value}'
+        )
         logger.log(
             level,
-            'write_triage fail-open at stage=%s project=%s exc=%s — write stored '
-            'WITHOUT triage (contract C1: never block a write)',
-            stage, project_id, type(exc).__name__,
+            'write_triage fail-open at stage=%s project=%s exc=%s cause=%s — write '
+            'stored WITHOUT triage (contract C1: never block a write)',
+            stage, project_id, type(exc).__name__, cause,
             exc_info=exc,
         )
-        return counter.record(project=project_id)
-    except Exception:  # noqa: BLE001 — the alarm must not break the write path.
+        return counter.record(project=project_id, billing_exhausted=exhaustion is not None)
+    except Exception:  # the alarm must not break the write path.
         logger.exception('write_triage fail-open counter itself failed')
         return None
 
@@ -1337,6 +1489,7 @@ def emit_triage_fail_open_storm_escalation(
     """
     count = storm.get('count')
     window_seconds = storm.get('window_seconds')
+    billing_exhausted = storm.get('billing_exhausted_in_window', 0)
     detail = '\n'.join([
         f'project_root={project_root!r}',
         f'fail_opens_in_window={count!r}',
@@ -1348,6 +1501,7 @@ def emit_triage_fail_open_storm_escalation(
         # whichever write happened to cross the threshold.
         f'projects_in_window={storm.get("projects")!r}',
         f'mem0_intents_in_window={storm.get("mem0_intents_in_window")!r}',
+        f'billing_exhausted_in_window={billing_exhausted!r}',
         '',
         'add_memory write triage (PRD leaf beta, task 3127) FAILED OPEN '
         'repeatedly inside one rolling window. This is a DEGRADATION; data loss '
@@ -1397,11 +1551,7 @@ def emit_triage_fail_open_storm_escalation(
         agent_role=_AGENT_ROLE,
         category=_CATEGORY,
         severity='blocking',
-        summary=(
-            f'{count} add_memory write(s) triaged WITHOUT triage in '
-            f'{window_seconds}s — write triage is failing open '
-            f'(see {_PRD_PATH})'
-        ),
+        summary=_storm_summary(count, window_seconds, billing_exhausted),
         detail=detail,
         suggested_action=(
             'check MemoryService.search / mem0 reachability, then the '
@@ -1413,4 +1563,18 @@ def emit_triage_fail_open_storm_escalation(
         log_label='write_triage',
         context=f'fail-open storm {storm!r}',
         level=1,
+    )
+
+
+def _storm_summary(count: Any, window_seconds: Any, billing_exhausted: Any) -> str:
+    summary = (
+        f'{count} add_memory write(s) triaged WITHOUT triage in '
+        f'{window_seconds}s — write triage is failing open (see {_PRD_PATH})'
+    )
+    if not (isinstance(billing_exhausted, int) and billing_exhausted > 0):
+        return summary
+    return (
+        f'Provider credits exhausted behind {billing_exhausted} of these '
+        'fail-opens; not a transient outage, see the provider_billing_exhausted '
+        f'L2 for the provider and key. {summary}'
     )

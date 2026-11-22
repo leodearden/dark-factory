@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     assert_script_loads_before,
     extract_df_data_block,
     extract_function_body,
@@ -432,7 +432,9 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
     (b) sidebar rendered with role="dialog" and an onClose handler / close button.
     (c) sidebar references escalation record fields: detail, suggested_action,
         level, category, severity, agent_role, workflow_state, worktree, resolution.
-    (d) sidebar references linked task card fields: task.title, task.status, task.description.
+    (d) sidebar references linked task card fields task.title and task.status,
+        and does not read task.description: rows carry no prose, so the
+        description comes from the taskProse on-demand read.
     (e) renders the resolved project label.
     (f) the linked task is the row's served task Datum, read through
         escalation_views.js::taskCard, and a card with no measurement renders
@@ -470,11 +472,15 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
         )
 
     # (d) Linked task card fields
-    for field in ('task.title', 'task.status', 'task.description'):
+    for field in ('task.title', 'task.status'):
         assert field in body, (
             f'tab_escalations.jsx detail sidebar does not reference linked task field '
             f'`{field}` — add it to the sidebar linked-task section.'
         )
+    assert 'task.description' not in strip_js_comments(extract_function_body(body, 'EscalationSidebar')), (
+        'EscalationSidebar reads `task.description` off the card, but task rows carry '
+        'no prose — read it through the taskProse on-demand read instead.'
+    )
 
     # (e) Resolved project label
     assert 'row.project' in body, (

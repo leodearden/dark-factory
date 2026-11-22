@@ -1026,7 +1026,19 @@ class TestLayeredConfig:
         assert config.max_concurrent_tasks == 8
         # Preserved from package defaults
         assert config.models.architect == 'opus'
-        assert config.effort.architect == 'max'
+        assert config.effort.architect == 'xhigh'
+        assert config.max_turns.architect == 180
+
+    @pytest.mark.parametrize('role', ['implementer', 'debugger', 'merger', 'deep_reviewer'])
+    def test_packaged_effort_default_is_xhigh(self, tmp_path, role):
+        """A project config with no effort block resolves these roles to xhigh."""
+        project_cfg = tmp_path / 'config.yaml'
+        project_cfg.write_text(yaml.dump({'max_concurrent_tasks': 8}))
+        config = load_config(project_cfg)
+        assert getattr(config.effort, role) == 'xhigh'
+
+    def test_effort_config_deep_reviewer_field_default_is_xhigh(self):
+        assert EffortConfig().deep_reviewer == 'xhigh'
 
     def test_deep_merge_preserves_sibling_keys(self, tmp_path):
         """Overriding one key in a nested dict should not clobber siblings."""
@@ -1272,19 +1284,18 @@ class TestMergeVerifyStormGuardFields:
 
 @pytest.mark.usefixtures("code_default_config")
 class TestMergeVerifyBreadthConfig:
-    """merge_verify_breadth (λ): restart-only knob gating the broad merge gate.
+    """merge_verify_breadth: restart-only knob setting the merge gate's breadth.
 
-    Default 'scoped' preserves legacy per-touched-module verify behaviour
-    (byte-identical rollback path). 'full' — flipped later by the σ
-    capstone — runs every REGISTERED module's full suite at merge-role
-    verify. See config.py's merge_verify_breadth field for the restart-only
-    rationale (task point 3 / design decision: mid-process flips could split
-    behaviour across an in-flight merge on the most load-bearing lane).
+    The shipped default is 'full' (task 7008): merge-role verify runs every
+    REGISTERED module's full suite. 'scoped' is the explicit per-project
+    opt-down to the legacy per-touched-module plan. The knob is restart-only
+    because a mid-process flip could split behaviour across an in-flight
+    merge on the most load-bearing lane. The paired task/merge verify policy
+    is stated once, in defaults.yaml's merge_verify_breadth comment.
     """
 
-    def test_defaults_to_scoped(self):
-        config = OrchestratorConfig()
-        assert config.merge_verify_breadth == 'scoped'
+    def test_pydantic_field_defaults_to_full(self):
+        assert OrchestratorConfig.model_fields['merge_verify_breadth'].default == 'full'
 
     def test_full_override_accepted(self):
         config = OrchestratorConfig(merge_verify_breadth='full')
@@ -1303,13 +1314,13 @@ class TestMergeVerifyBreadthConfig:
         """
         assert 'merge_verify_breadth' not in RELOADABLE_FIELDS, (
             'merge_verify_breadth requires a process restart to take effect '
-            '(flipped by the σ capstone, activated by the τ fleet restart) '
+            '(a mid-process flip could split an in-flight merge\'s breadth) '
             'and must NOT be in RELOADABLE_FIELDS'
         )
 
-    def test_defaults_yaml_carries_scoped(self, tmp_path):
+    def test_defaults_yaml_carries_full(self, tmp_path):
         """The shipped defaults.yaml explicitly carries merge_verify_breadth:
-        scoped (same guard pattern as test_defaults_yaml_has_park_stop_block
+        full (same guard pattern as test_defaults_yaml_has_park_stop_block
         above), and that value flows through both a bare OrchestratorConfig()
         and load_config() over an otherwise-empty explicit config file.
         """
@@ -1317,13 +1328,26 @@ class TestMergeVerifyBreadthConfig:
         assert 'merge_verify_breadth' in defaults, (
             "defaults.yaml is missing 'merge_verify_breadth'"
         )
-        assert defaults['merge_verify_breadth'] == 'scoped'
+        assert defaults['merge_verify_breadth'] == 'full'
 
         config = OrchestratorConfig()
-        assert config.merge_verify_breadth == 'scoped'
+        assert config.merge_verify_breadth == 'full'
 
         config_path = tmp_path / 'config.yaml'
         config_path.write_text(yaml.dump({'project_root': str(tmp_path)}))
+        loaded = load_config(config_path)
+        assert loaded.merge_verify_breadth == 'full'
+
+    def test_project_yaml_scoped_opts_down(self, tmp_path):
+        """A project yaml declaring merge_verify_breadth: scoped beats the
+        shipped 'full' default through the real layered load path
+        (defaults.yaml under the project file).
+        """
+        config_path = tmp_path / 'config.yaml'
+        config_path.write_text(yaml.dump({
+            'project_root': str(tmp_path),
+            'merge_verify_breadth': 'scoped',
+        }))
         loaded = load_config(config_path)
         assert loaded.merge_verify_breadth == 'scoped'
 
@@ -2563,6 +2587,25 @@ class TestPinReservationConfig:
         assert live.pin_reservations_enabled is False
 
 
+class TestMainHealthFixReservedSlotsConfig:
+    """Run slots outside max_concurrent_tasks that only a main-health fix may take (task 8480)."""
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_one_slot_is_reserved_by_default(self):
+        assert OrchestratorConfig().main_health_fix_reserved_slots == 1
+
+    def test_zero_disables_the_reserve(self):
+        assert OrchestratorConfig(main_health_fix_reserved_slots=0).main_health_fix_reserved_slots == 0
+
+    def test_a_negative_reserve_is_rejected(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(main_health_fix_reserved_slots=-1)
+
+    def test_the_reserve_is_restart_only(self):
+        """The run loop builds its RunSlots once, like the max_concurrent_tasks pool beside it."""
+        assert 'main_health_fix_reserved_slots' not in RELOADABLE_FIELDS
+
+
 class TestTransientRequeueBackoffConfig:
     """The two jittered-backoff knobs (task 3317 / PRD contract C3).
 
@@ -3546,7 +3589,7 @@ class TestOrchestratorConfigPrices:
     """
 
     _SEED_KEYS = {
-        'gpt-5.4', 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'o4-mini',
+        'gpt-5.4', 'gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.1-terra', 'o4-mini',
         'gemini-3.1-pro-preview', 'gemini-3-flash',
     }
 
@@ -3558,10 +3601,10 @@ class TestOrchestratorConfigPrices:
         assert config.prices['gpt-5.4'].output_per_1m == 10.00
         assert config.prices['gpt-6-astra'].input_per_1m == 10.00
         assert config.prices['gpt-6-astra'].output_per_1m == 50.00
-        assert config.prices['gpt-5.6-sol'].input_per_1m == 4.00
-        assert config.prices['gpt-5.6-sol'].output_per_1m == 20.00
-        assert config.prices['gpt-5.6-terra'].input_per_1m == 2.00
-        assert config.prices['gpt-5.6-terra'].output_per_1m == 12.00
+        assert config.prices['gpt-6.1-sol'].input_per_1m == 2.00
+        assert config.prices['gpt-6.1-sol'].output_per_1m == 10.00
+        assert config.prices['gpt-6.1-terra'].input_per_1m == 1.00
+        assert config.prices['gpt-6.1-terra'].output_per_1m == 5.00
         assert config.prices['o4-mini'].input_per_1m == 1.10
         assert config.prices['o4-mini'].output_per_1m == 4.40
         assert config.prices['gemini-3.1-pro-preview'].input_per_1m == 1.25
@@ -3580,10 +3623,10 @@ class TestOrchestratorConfigPrices:
         assert OrchestratorConfig().prices['gpt-6-astra'].cached_input_per_1m == 1.00
 
     @pytest.mark.usefixtures("code_default_config")
-    def test_sol_and_terra_have_no_cached_input_rate(self):
+    def test_sol_and_terra_seed_their_published_cached_input_rates(self):
         prices = OrchestratorConfig().prices
-        assert prices['gpt-5.6-sol'].cached_input_per_1m is None
-        assert prices['gpt-5.6-terra'].cached_input_per_1m is None
+        assert prices['gpt-6.1-sol'].cached_input_per_1m == 0.10
+        assert prices['gpt-6.1-terra'].cached_input_per_1m == 0.05
 
     def test_default_price_table_matches_defaults_yaml(self):
         """config.py's `_DEFAULT_PRICES` constant and defaults.yaml's

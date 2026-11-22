@@ -20,8 +20,11 @@ import pytest
 import yaml
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from shared.locking import normalize_lock
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator import verify, verify_plan
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 DF_CONFIG_NAME = 'dark-factory-orchestrator.yaml'
 DECISION_DOC = 'docs/config-retune-gate.md'

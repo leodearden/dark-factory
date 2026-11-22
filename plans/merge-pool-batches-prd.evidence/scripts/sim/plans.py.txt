@@ -1,0 +1,192 @@
+"""Grid plans for gate 10069.  Usage: python plans.py <plan> [<plan> ...]"""
+import sys
+sys.path.insert(0, '/tmp/gate-10069/sim')
+import gridlib as G
+
+N = 100
+
+
+def cell(mode, q, e, dur, env, tag='', **extra):
+    cfg = dict(q=q, e=e, dur=dur, horizon=144.0, warm=24.0)
+    if mode == 'cap':      # capacity-bound: the waiting set is held at 75 (a retirement admits an arrival)
+        cfg.update(closed_N=75)
+    elif mode == 'open':   # today: 75 waiting after a 24 h closed warm-up, then Poisson arrivals 2.4/h
+        cfg.update(closed_N=75, closed_until=24.0, arr=2.4)
+    elif mode == 'arr':    # arrival-bound: no backlog, Poisson 2/h
+        cfg.update(closed_N=0, backlog=0, arr=2.0)
+    if env in ('on', 'mr'):
+        cfg['mainred'] = True
+    if env in ('on', 'rs'):
+        cfg['restarts'] = True
+    cfg.update(extra)
+    name = '%s|q=%.2f|e=%.3f|%s|env=%s%s' % (mode, q, e, dur, env, ('|' + tag) if tag else '')
+    return name, cfg
+
+
+J = lambda **kw: dict(base='J', **kw)
+MAIN = [
+    ('T', dict(base='T')),
+    ('T+i', dict(base='T', fix_i=True)),
+    ('T+ii', dict(base='T', mr_fix=True)),
+    ('T+p', dict(base='T', persist=True)),
+    ('T+', dict(base='T+')),
+    ('TB', dict(base='T+', pool=True, static_depth='table')),
+    ('Jc-J1', J(sus='J1')),
+    ('Jc-J1d', J(sus='J1d')),
+    ('Jc-J2', J(sus='J2')),
+    ('Jc-J2p', J(sus='J2p')),
+    ('Jc1-J1d', J(sus='J1d', cap_add=1)),
+    ('Jc1-J2', J(sus='J2', cap_add=1)),
+    ('Jf-J1d', J(sus='J1d', cap=None)),
+    ('Jf-J2', J(sus='J2', cap=None)),
+    ('Jv-J2', J(sus='J2', cap=None, void_obj=True)),
+    ('Otab', dict(base='O', cap='table')),
+    ('O12', dict(base='O', cap=12)),
+]
+MAIN_OFF = [p for p in MAIN if p[0] not in ('T+ii', 'T+p')]   # identical to T without main-red and restarts
+LITE = [p for p in MAIN if p[0] not in ('Jc-J2p', 'Jf-J1d', 'Jc1-J2')]
+SHORT = [p for p in MAIN if p[0] in ('T', 'T+', 'TB', 'Jc-J1', 'Jc-J1d', 'Jc-J2', 'Jf-J2', 'Jv-J2')]
+QS = (0.05, 0.08, 0.14, 0.20)
+L_TABLE_D = {0.05: 5, 0.08: 4, 0.14: 3, 0.20: 3}   # table depth at 1 - q (fixed-cap variant: no deeper batches for cleared requests)
+ES = (0.0, 0.01, 0.026)
+
+
+def plan(name):
+    global N
+    N = 100
+    P = []
+    if name == 'main_w1_off':
+        for q in QS:
+            for e in ES:
+                P.append(cell('cap', q, e, 'W1', 'off') + (MAIN_OFF, 100 if e == 0.01 else 60))
+    elif name == 'main_w1_on':
+        for q in QS:
+            for e in ES:
+                P.append(cell('cap', q, e, 'W1', 'on') + (MAIN, 100 if e == 0.01 else 60))
+    elif name == 'main_w1_off_e01':   # the e = 0.01 row again (same seeds) with the wait cohort and split calibration
+        for q in QS:
+            P.append(cell('cap', q, 0.01, 'W1', 'off') + (MAIN_OFF, N))
+    elif name == 'main_w2':
+        for q in QS:
+            for env in ('off', 'on'):
+                P.append(cell('cap', q, 0.01, 'W2', env) + (LITE, N))
+    elif name == 'open_arr':
+        for q in (0.08, 0.14):
+            for dur in ('W1', 'W2'):
+                P.append(cell('open', q, 0.01, dur, 'on') + (LITE, 60))
+            P.append(cell('open', q, 0.01, 'W2', 'off') + (LITE, 60))
+            P.append(cell('arr', q, 0.01, 'W1', 'on') + (LITE, 60))
+            P.append(cell('arr', q, 0.01, 'W1', 'off') + (LITE, 60))
+    elif name == 'rules':
+        # the three bookkeeping rules on T+ (no probabilities) against joint inference, same seeds as the main grids
+        TR = lambda **kw: dict(base='T+', pool=True, static_depth='table', **kw)
+        pols = [('T+', dict(base='T+')), ('TB', TR()),
+                ('TR unmark', TR(unmark=True)),
+                ('TR unmark+seq', TR(unmark=True, seq=True)),
+                ('TR unmark+elim', TR(unmark=True, elim=True)),
+                ('TR (unmark+seq+elim)', TR(unmark=True, seq=True, elim=True)),
+                ('TR rolling depth', dict(base='T+', pool=True, unmark=True, seq=True, elim=True)),
+                ('T+ unmark+elim (fifo pick, rolling)', dict(base='T+', unmark=True, elim=True)),
+                ('T unmark+elim (no evidence fixes)', dict(base='T', unmark=True, elim=True)),
+                ('Jc-J1', J(sus='J1')), ('Jc-J1 noconv', J(sus='J1', convict=False)),
+                ('Jc-J1d', J(sus='J1d')), ('Jc-J1d noconv', J(sus='J1d', convict=False)),
+                ('Jc-J1d th=0.80', J(sus='J1d', theta=0.8)),
+                ('Jc-J2 th=0.80', J(sus='J2', theta=0.8)),
+                ('Jc1-J2 th=0.80', J(sus='J2', theta=0.8, cap_add=1))]
+        for q in QS:
+            for env in ('off', 'on'):
+                P.append(cell('cap', q, 0.01, 'W1', env) + (pols, N))
+        for q in (0.08, 0.14):
+            P.append(cell('cap', q, 0.01, 'W2', 'on') + (pols, N))
+            P.append(cell('cap', q, 0.026, 'W1', 'on') + (pols, N))
+            P.append(cell('open', q, 0.01, 'W2', 'on') + (pols, 60))
+    elif name == 'sens_pol':
+        for q in (0.08, 0.14):
+            pols = [('T+', dict(base='T+')), ('TB', dict(base='T+', pool=True, static_depth='table')),
+                    ('T+ nopersist', dict(base='T+', persist=False)),
+                    ('T+ static', dict(base='T+', static_depth='table')),
+                    ('T+ pool', dict(base='T+', pool=True)),
+                    ('Jc-J1', J(sus='J1')), ('Jc-J1d', J(sus='J1d'))]
+            for th in (0.8, 0.95):
+                pols.append(('Jc-J1 th=%.2f' % th, J(sus='J1', theta=th)))
+                pols.append(('Jc-J1d th=%.2f' % th, J(sus='J1d', theta=th)))
+            pols.append(('Jc-J1 noconv', J(sus='J1', convict=False)))
+            pols.append(('Jc-J1d noconv', J(sus='J1d', convict=False)))
+            for dl in (4, 99):
+                pols.append(('Jc-J1d dl=%d' % dl, J(sus='J1d', deadline_mult=dl)))
+                pols.append(('Jf-J2 dl=%d' % dl, J(sus='J2', cap=None, deadline_mult=dl)))
+            for ep in (0.001, 0.026):
+                pols.append(('Jc-J1d e_pol=%.3f' % ep, J(sus='J1d', e_pol=ep)))
+            for m in (0.5, 1.5, 2.0):
+                pols.append(('Jc-J1d prior=%.1fq' % m, J(sus='J1d', prior=q * m)))
+            for rl in (1.05, 1.5):
+                pols.append(('Jc-J1d release=%.2f' % rl, J(sus='J1d', release=rl)))
+            pols.append(('Jc-J1 sticky noconv', J(sus='J1', sticky=True, convict=False)))
+            pols.append(('Jc-J1 sticky', J(sus='J1', sticky=True)))
+            pols.append(('Jc-J1d prune-always', J(sus='J1d', prune='always')))
+            pols.append(('Jc-J1d fixedcap', J(sus='J1d', cap=L_TABLE_D[q])))
+            pols.append(('Jc-J1d nopersist', J(sus='J1d', persist=False)))
+            pols.append(('Jc-J1d cleanfirst', J(sus='J1d', clean_first=True)))
+            pols.append(('Jc-J1d adaptive60', J(sus='J1d', adaptive=60)))
+            pols.append(('Jc-J2', J(sus='J2')))
+            pols.append(('Jc-J2 dl=99', J(sus='J2', deadline_mult=99)))
+            pols.append(('Jc-J2 th=0.80', J(sus='J2', theta=0.8)))
+            pols.append(('Jc1-J1d', J(sus='J1d', cap_add=1)))
+            pols.append(('Jc1-J2', J(sus='J2', cap_add=1)))
+            pols.append(('Jc1-J2 dl=99', J(sus='J2', cap_add=1, deadline_mult=99)))
+            pols.append(('Jc1-J2 th=0.80', J(sus='J2', cap_add=1, theta=0.8)))
+            pols.append(('Jc2-J1d', J(sus='J1d', cap_add=2)))
+            pols.append(('Jc2-J2', J(sus='J2', cap_add=2)))
+            pols.append(('Jf-J1', J(sus='J1', cap=None)))
+            pols.append(('Jv-J1d', J(sus='J1d', cap=None, void_obj=True)))
+            P.append(cell('cap', q, 0.01, 'W1', 'on') + (pols, N))
+    elif name == 'sens_j3':
+        N = 60
+        for q in (0.08, 0.14):
+            pols = [('Jc-J1d', J(sus='J1d')), ('Jc-J1d nostack', J(sus='J1d', nostack=True))]
+            for cn, ckw in (('Jc', {}), ('Jc2', dict(cap_add=2)), ('Jf', dict(cap=None))):
+                for tau in (0.5, 0.65, 0.8):
+                    for ns in (False, True):
+                        pols.append(('%s-J3 tau=%.2f %s' % (cn, tau, 'nostack' if ns else 'stack'),
+                                     J(sus='J2', tau=tau, nostack=ns, **ckw)))
+            for env in ('on', 'off'):
+                P.append(cell('cap', q, 0.01, 'W1', env) + (pols, N))
+    elif name == 'sens_cell':
+        N = 60
+        for q in (0.08, 0.14):
+            for lag in (0.0, 2.0):
+                P.append(cell('cap', q, 0.01, 'W1', 'on', 'lag=%g' % lag, mr_lag=lag) + (SHORT, N))
+            P.append(cell('cap', q, 0.01, 'W1', 'on', 'promptvac', prompt_vac=True) + (SHORT, N))
+            P.append(cell('cap', q, 0.01, 'W1', 'off', 'promptvac', prompt_vac=True) + (SHORT, N))
+            P.append(cell('cap', q, 0.01, 'W1', 'on', 'aging', picker='aging') + (SHORT[:2], N))
+            P.append(cell('cap', q, 0.01, 'W1', 'mr') + (MAIN[:6] + SHORT[3:], N))
+            P.append(cell('cap', q, 0.01, 'W1', 'rs') + (MAIN[:6] + SHORT[3:], N))
+            for K in (2, 4):
+                P.append(cell('cap', q, 0.01, 'W1', 'on', 'K=%d' % K, K=K) + (SHORT, N))
+            P.append(cell('cap', q, 0.01, 'W1', 'on', 'N=30', closed_N=30) + (SHORT, N))
+    elif name == 'sens_regime':
+        N = 60
+        ad = SHORT + [('Jc-J1d adaptive60', J(sus='J1d', adaptive=60)), ('Jc-J1d adaptive30', J(sus='J1d', adaptive=30)),
+                      ('Otab', dict(base='O', cap='table'))]
+        for env in ('off', 'on'):
+            # the defect rate alternates 0.07 / 0.21 in 24 h blocks (mean 0.14); J's long-run prior is 0.14
+            P.append(cell('cap', 0.14, 0.01, 'W1', env, 'blocks.07/.21', q_blocks=(0.07, 0.21, 24.0)) + (ad, N))
+            P.append(cell('cap', 0.14, 0.01, 'W1', env, 'blocks.05/.23x48h', q_blocks=(0.05, 0.23, 48.0)) + (ad, N))
+        het = (0.12, 0.27, 0.115)
+        hp = SHORT + [('Jc-J1 class', J(sus='J1', prior_mode='class')),
+                      ('Jc-J1d class', J(sus='J1d', prior_mode='class')),
+                      ('Jc-J2 class', J(sus='J2', prior_mode='class')),
+                      ('Jf-J2 class', J(sus='J2', cap=None, prior_mode='class')),
+                      ('Jv-J2 class', J(sus='J2', cap=None, void_obj=True, prior_mode='class')),
+                      ('Otab', dict(base='O', cap='table'))]
+        for env in ('off', 'on'):
+            for dur in ('W1', 'W2'):
+                P.append(cell('cap', 0.134, 0.01, dur, env, 'hetero', hetero=het) + (hp, N))
+    else:
+        raise SystemExit('unknown plan ' + name)
+    return P
+
+
+if __name__ == '__main__':
+    for nm in sys.argv[1:]:
+        G.run_plan(nm, plan(nm))

@@ -1,0 +1,22 @@
+import sys
+sys.path.insert(0,'/tmp/gate-10069/critic5')
+from rule6 import fb_release, cost, going, plan
+r,u=0.01,0.07
+print('== greedy walk (all-new pool of 30) vs argmin_f C(f,0)/f, scan=auto, by tree cost t')
+for q in (0.05,0.08,0.14,0.20):
+  for t in (0.05,0.10,0.20,0.30,0.40,0.45,0.50,0.60,0.80):
+    a_f,a_c=going(q,r,t,u)
+    f,c=plan('new',['new']*30,q,r,t,u)
+    per=[cost(k,0,q,r,t,u,a_f,a_c)/k for k in range(1,13)]
+    best=min(range(1,13),key=lambda k:per[k-1])
+    sc=[ (k+2)*t < fb_release(k,q,a_f) for k in range(1,13)]
+    firstscan=next((k for k in range(2,13) if sc[k-1]),None)
+    flag='' if f==best else '  <-- STALL' 
+    print(f'q={q:.2f} t={t:.2f} A_new={a_f:.3f} greedy f={f} argmin f={best} C/f greedy={per[f-1]:.3f} best={per[best-1]:.3f} first scanned n={firstscan}{flag}')
+print('== scan=off (release fallback): greedy vs argmin')
+for q in (0.03,0.05,0.08,0.14,0.20):
+    a_f,a_c=going(q,r,0.05,u,scan='off')
+    f,c=plan('new',['new']*30,q,r,0.05,u,scan='off')
+    per=[cost(k,0,q,r,0.05,u,a_f,a_c,scan='off')/k for k in range(1,13)]
+    best=min(range(1,13),key=lambda k:per[k-1])
+    print(f'q={q:.2f} A_new={a_f:.3f} greedy f={f} argmin={best} per-member greedy={per[f-1]:.3f} best={per[best-1]:.3f}', [round(x,3) for x in per])

@@ -801,7 +801,7 @@ def _repo_relative(path: Path | str) -> str:
 
 def _query_id(text: str, source: str) -> str:
     """A stable, content-derived id, so a re-harvest keeps its row ids."""
-    import hashlib  # noqa: PLC0415
+    import hashlib
 
     digest = hashlib.sha256(text.encode('utf-8')).hexdigest()[:12]
     prefix = 'brief' if source == 'briefing_template' else 'tail'

@@ -1,0 +1,35 @@
+import sqlite3,json,collections,itertools,statistics as st
+c=sqlite3.connect('file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro',uri=True)
+rs=c.execute("select timestamp,data from events where event_type='merge_dequeued' and timestamp>='2026-11-17' and data like '%textual_conflict_pairs%' order by id").fetchall()
+pairs=collections.Counter(); deg=collections.Counter(); rows_with=0
+task={}
+for ts,d in rs:
+    d=json.loads(d)
+    for w in d['waiting']: task[w['request_id']]=w['task_id']
+    if d['textual_conflict_pairs']: rows_with+=1
+    for a,b in d['textual_conflict_pairs']: pairs[(a,b)]+=1
+reqs=set()
+for (a,b) in pairs: deg[a]+=1; deg[b]+=1
+print('rows since 11-17',len(rs),'rows with >=1 textual pair',rows_with,'distinct pairs',len(pairs),'distinct requests in a pair',len(deg))
+print('top degree',[(task.get(r,r),n) for r,n in deg.most_common(8)])
+# empirical 11-17+
+seqs=[]
+for ts,d in rs:
+    d=json.loads(d); E=set(frozenset(p) for p in d['textual_conflict_pairs'])
+    seq=[w['request_id'] for w in d['waiting'] if w['in_graph'] and not w['reserved']]
+    if len(seq)>=24: seqs.append((seq,E))
+print('eligible',len(seqs))
+for N in (12,16,24):
+    clean=pre=gr=0; P=[];G=[]
+    for seq,E in seqs:
+        s=seq[:N]
+        L=0
+        for j in range(N):
+            if any(frozenset((s[j],s[q])) in E for q in range(j)): break
+            L=j+1
+        inc=[]
+        for x in s:
+            if not any(frozenset((x,y)) in E for y in inc): inc.append(x)
+        P.append(L);G.append(len(inc)); clean+=(L==N)
+    q=lambda v,f: sorted(v)[int(f*(len(v)-1))]
+    print(f' N={N}: all-clean {clean}/{len(seqs)}={clean/len(seqs):.2f}; prefix p10/p50/mean {q(P,.1)}/{q(P,.5)}/{st.mean(P):.1f}; greedy p10/p50/min/mean {q(G,.1)}/{q(G,.5)}/{min(G)}/{st.mean(G):.1f}')

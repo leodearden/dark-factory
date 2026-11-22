@@ -26,6 +26,7 @@ from fused_memory.backends.task_backend_types import (
     RemoveTaskResult,
     SetTaskStatusResult,
     StatusWriteNotPersistedResult,
+    TaskFactsRow,
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
@@ -68,7 +69,10 @@ class TaskBackendProtocol(Protocol):
     async def get_tasks(
         self, project_root: str, tag: str | None = None,
         statuses: list[str] | None = None,
-    ) -> GetTasksResult: ...
+        fields: Sequence[str] | None = None,
+    ) -> GetTasksResult:
+        """``fields`` projects each row; the contract is ``fused_memory/backends/task_projection.py``."""
+        ...
 
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None
@@ -96,6 +100,12 @@ class TaskBackendProtocol(Protocol):
         ids: list[str] | None = None,
     ) -> dict[str, str]:
         """Return ``{id_str: status_str}`` without decoding metadata columns."""
+        ...
+
+    async def get_task_facts(
+        self, ids: Sequence[str], project_root: str,
+    ) -> dict[str, TaskFactsRow]:
+        """Status, title, dependencies and done provenance of *ids*; see plans/live-task-facts-at-recall-prd.md C1."""
         ...
 
     async def get_statuses(
@@ -283,6 +293,19 @@ class TaskBackendProtocol(Protocol):
         current value, concatenate locally, then write the COMPLETE new value
         with ``append`` omitted.  ``dependencies`` is also replace-only but is
         deliberately NOT covered.
+
+        **Implementations MUST reject a call that supplies none of ``prompt``,
+        ``metadata``, ``title``, ``description``, ``details``, ``priority`` or
+        ``dependencies``** by raising (``NoFieldsToUpdateError``, which keeps the
+        ``TASKMASTER_TOOL_ERROR`` code and names those parameters).  Such a call
+        can only bump ``updated_at``, and reporting it as a success hid a dropped
+        argument in esc-3147-7 and esc-3671-7 (a misnamed ``metadata`` was
+        ignored and the reply still said ``updated: True``).  ``task_id``,
+        ``project_root``, ``tag``, ``append`` and ``metadata_mode`` do not count:
+        they steer a write, they are not one.  The test is "is the argument
+        ``None``", never "would a column change": ``dependencies=[]`` (clear the
+        list) and ``metadata='{}'`` are real writes.  Refuse after the ``status``
+        and ``metadata_mode`` value refusals and before the row lookup.
 
         **Implementations MUST reject a non-None ``status`` by raising** (e.g.
         ``TaskmasterError('TASKMASTER_TOOL_ERROR', …)``).  ``set_task_status``

@@ -279,7 +279,8 @@ class FakeSearchBackend:
 
     A search embeds its query through the arm's real QueryEmbedder, as the production
     path does, then answers by the scratch graph's index state: with any index it ranks
-    by SEARCH_RANKS[with-indices], with none by SEARCH_RANKS[embedding-only].
+    by SEARCH_RANKS[with-indices], with none by SEARCH_RANKS[embedding-only]. With
+    ``search_error`` set, every search is logged and recorded, then raises it.
     """
 
     def __init__(
@@ -289,11 +290,13 @@ class FakeSearchBackend:
         *,
         builds_indices: bool = True,
         strays_on_build: bool = False,
+        search_error: Exception | None = None,
     ) -> None:
         self.client = client
         self.query_embedder = query_embedder
         self.builds_indices = builds_indices
         self.strays_on_build = strays_on_build
+        self.search_error = search_error
         self.searches: list[dict[str, Any]] = []
 
     async def search(
@@ -303,6 +306,8 @@ class FakeSearchBackend:
         graph = self.client.graphs[group_ids[0]]
         graph.log.append('search')
         self.searches.append({'query': query, 'group_ids': group_ids, 'num_results': num_results})
+        if self.search_error is not None:
+            raise self.search_error
         await self.query_embedder.create(input_data=[query])
         configuration = WITH_INDICES if graph.catalog else EMBEDDING_ONLY
         target = next(uuid for uuid, q in KNOWN_ITEM_QUERIES.items() if q == query)

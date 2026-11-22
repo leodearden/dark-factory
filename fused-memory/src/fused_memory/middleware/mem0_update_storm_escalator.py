@@ -6,7 +6,7 @@ loop leaves behind no new records, no id churn and no failed calls — nothing a
 downstream reader could notice. INV-4 (``storm-escape-required``) therefore
 requires an unconditional escape hatch: ``MemoryService`` counts content-amend
 calls per ``(agent_id, project_id)`` in a rolling window
-(:class:`fused_memory.server.storm_counter.StormCounter`) and, on a burst, calls
+(:class:`shared.storm_counter.KeyedStormCounters`) and, on a burst, calls
 this module to make the condition reach a human.
 
 Design mirrors :mod:`fused_memory.middleware.scope_violation_escalator` — the

@@ -176,7 +176,7 @@ async def delete_point(qdrant_client, collection: str, memory_id: str) -> None:
     """Delete the *memory_id* point from *collection* via a direct Qdrant
     point delete (PointIdsList) -- NOT Mem0's AsyncMemory.delete(), which
     would KeyError on a null-payload record (module docstring)."""
-    from qdrant_client.http import models as qmodels  # noqa: PLC0415
+    from qdrant_client.http import models as qmodels
 
     await qdrant_client.delete(
         collection_name=collection,
@@ -359,26 +359,21 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.models.scope import Scope  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import maintenance_service
+        from fused_memory.models.scope import Scope
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
-        try:
-            await memory.initialize()
+        async with maintenance_service(config=config) as (_, memory):
             collection = Scope(project_id=args.project_id).mem0_collection_name(
                 memory.mem0.config.mem0.collection_prefix,
             )
             qdrant = await memory.mem0._get_async_qdrant()
             return await run(args, qdrant, collection)
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
 
     try:
         report = asyncio.run(_run_live())

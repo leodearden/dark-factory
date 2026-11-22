@@ -1,8 +1,9 @@
 """Real-kernel Landlock enforcement-matrix suite (test_sandbox_enforcement_matrix).
 
-Pins the 12 rows of ``plans/os-sandbox-worktree-containment-prd.md``'s
+Pins the 23 rows of ``plans/os-sandbox-worktree-containment-prd.md``'s
 §Enforcement matrix (task alpha4; D9; INV-1 machine-pin of the §Write-set
-contract) against the REAL production chain: ``compute_write_set()`` ->
+contract; rows 15-23 are task 4627's docs-only main grant) against the REAL
+production chain: ``compute_write_set()`` ->
 ``build_landlock_command()`` -> ``landlock_exec.py``, driven on a real
 landlock-capable kernel (skip-gated elsewhere).
 
@@ -197,15 +198,20 @@ class _Scaffold:
 
 def _run_sandboxed(
     scaffold: _Scaffold, inner_cmd: list[str], *, cwd: Path | None = None,
+    declared_files: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run ``inner_cmd`` landlock-sandboxed, mirroring workflow.py:9911-9914
-    exactly: derive the write-set from the scaffold's worktree/home via the
-    real ``compute_write_set()``, feed its ``writable_paths()`` into
-    ``build_landlock_command()`` as ``writable_extras`` (never a hand-rolled
-    path list — INV-5), and run with ``HOME`` redirected to the scaffold's
-    hermetic fake home.
+    """Run ``inner_cmd`` landlock-sandboxed, mirroring
+    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._invoke``
+    exactly: derive the write-set from the scaffold's worktree/home (and the
+    task's *declared_files*) via the real ``compute_write_set()``, feed its
+    ``writable_paths()`` into ``build_landlock_command()`` as
+    ``writable_extras`` (never a hand-rolled path list — INV-5), and run with
+    ``HOME`` redirected to the scaffold's hermetic fake home.
     """
-    write_set = compute_write_set(scaffold.worktree, task_id=scaffold.task_id, home=scaffold.home)
+    write_set = compute_write_set(
+        scaffold.worktree, task_id=scaffold.task_id, home=scaffold.home,
+        declared_files=declared_files,
+    )
     cmd = build_landlock_command(
         inner_cmd, scaffold.worktree, [],
         writable_extras=[str(p) for p in write_set.writable_paths()],
@@ -263,7 +269,7 @@ def landlock_matrix_scaffold():
     change in the worktree, ready for a row's own ``git commit``; a
     ``<worktree>/.task/plan.json`` symlink into ``<base>/.task-meta/<name>/
     plan.json`` (the target itself is left ABSENT — row 7's child write is
-    what creates it, mirroring ``TaskArtifacts.ensure_lane_plan_symlink``'s
+    what creates it, mirroring ``TaskArtifacts.ensure_lane_symlinks``'s
     real production symlink shape); ``~/.local/share/uv/`` pre-created
     as an empty, non-writable-by-contract sibling of the (writable)
     ``~/.cache/uv/``, so row 8's denial is a true EACCES rather than ENOENT;
@@ -555,3 +561,145 @@ class TestSandboxEnforcementMatrix:
         )
         assert result.returncode == 0, result.stderr
         assert target.read_text() == 'X'
+
+
+_DOCS_DECLARED = ['docs/existing.md', 'docs/prds/new.md', 'CLAUDE.md']
+
+# Mirrors reify's hooks/main-gate-lib.sh::main_gate_mark handshake: a no-op
+# off main; on main it announces itself and marks a sentinel in the common
+# .git dir, which is exactly the write the `.git` directory grant exists for.
+_MAIN_GATE_HOOK = """#!/bin/sh
+[ "$(git symbolic-ref --short HEAD 2>/dev/null)" = main ] || exit 0
+echo MAIN-GATE-HOOK-RAN
+: > "$(git rev-parse --git-common-dir)/main-gate-ok"
+"""
+
+
+@dataclass
+class _DocsMainScaffold:
+    scaffold: _Scaffold
+    main: Path
+    main_sha: str
+    seeded: dict[str, str]
+
+
+@pytest.fixture
+def docs_main_scaffold(landlock_matrix_scaffold):
+    """``landlock_matrix_scaffold`` plus a docs layout committed on main and a
+    main-gate ``pre-commit`` wired through ``core.hooksPath``.
+
+    Separate from the base fixture because ``core.hooksPath`` is shared repo
+    config: wired there, the gate would fire in rows 2/12's worktree commits.
+    The hook path is set AFTER the seed commit, so its sentinel can only come
+    from the row under test.
+    """
+    scaffold = landlock_matrix_scaffold
+    main = scaffold.main
+    seeded = {
+        'docs/existing.md': 'existing\n',
+        'docs/sibling.md': 'sibling\n',
+        'docs/prds/keep.md': 'keep\n',
+        'CLAUDE.md': 'claude\n',
+        'other.md': 'other\n',
+        '.taskmaster/tasks.db': 'tasks\n',
+        'hooks/pre-commit': _MAIN_GATE_HOOK,
+    }
+    for rel, content in seeded.items():
+        (main / rel).parent.mkdir(parents=True, exist_ok=True)
+        (main / rel).write_text(content)
+    (main / 'hooks' / 'pre-commit').chmod(0o755)
+    _git(['add', '-A'], main)
+    _git(['commit', '-m', 'docs-main seed'], main)
+    _git(['config', 'core.hooksPath', str(main / 'hooks')], main)
+    return _DocsMainScaffold(
+        scaffold=scaffold, main=main, main_sha=_git(['rev-parse', 'HEAD'], main),
+        seeded=seeded,
+    )
+
+
+@pytest.mark.skipif(_skip_landlock(), reason=_LANDLOCK_SKIP_REASON)
+class TestDocsMainGrantMatrix:
+    """Rows 15-23: a docs-only task may edit its declared docs paths in the
+    main checkout and land them with the hook-gated direct-main commit, while
+    everything else in the main checkout stays denied."""
+
+    @staticmethod
+    def _run(
+        ds: _DocsMainScaffold, script: str, declared: list[str] = _DOCS_DECLARED,
+    ) -> subprocess.CompletedProcess:
+        return _run_sandboxed(
+            ds.scaffold, ['/bin/sh', '-c', script], cwd=ds.main, declared_files=declared,
+        )
+
+    def _assert_write_denied(self, ds: _DocsMainScaffold, rel: str, declared: list[str]) -> None:
+        target = ds.main / rel
+        result = self._run(ds, f'printf PWNED > {target}', declared)
+        assert target.read_text() == ds.seeded[rel]
+        _assert_denied(result, side_effect_verified=True)
+
+    def test_row15_declared_nested_docs_file_edit_allowed(self, docs_main_scaffold):
+        ds = docs_main_scaffold
+        target = ds.main / 'docs' / 'existing.md'
+        result = self._run(ds, f'printf EDITED > {target}')
+        assert result.returncode == 0, result.stderr
+        assert target.read_text() == 'EDITED'
+
+    def test_row16_declared_top_level_docs_file_edit_allowed(self, docs_main_scaffold):
+        ds = docs_main_scaffold
+        target = ds.main / 'CLAUDE.md'
+        result = self._run(ds, f'printf EDITED > {target}')
+        assert result.returncode == 0, result.stderr
+        assert target.read_text() == 'EDITED'
+
+    def test_row17_declared_new_file_under_existing_dir_allowed(self, docs_main_scaffold):
+        ds = docs_main_scaffold
+        target = ds.main / 'docs' / 'prds' / 'new.md'
+        result = self._run(ds, f'printf NEW > {target}')
+        assert result.returncode == 0, result.stderr
+        assert target.read_text() == 'NEW'
+
+    def test_row18_hook_gated_direct_main_commit_succeeds(self, docs_main_scaffold):
+        ds = docs_main_scaffold
+        paths = ' '.join(_DOCS_DECLARED)
+        script = ' && '.join([
+            "printf 'edited\\n' > docs/existing.md",
+            "printf 'claude edited\\n' > CLAUDE.md",
+            "printf 'new\\n' > docs/prds/new.md",
+            f'git add {paths}',
+            f'git commit --only {paths} -m docs',
+        ])
+        result = self._run(ds, script)
+        assert result.returncode == 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        assert 'MAIN-GATE-HOOK-RAN' in result.stdout + result.stderr
+        assert (ds.main / '.git' / 'main-gate-ok').exists()
+        head = _git(['rev-parse', 'refs/heads/main'], ds.main)
+        assert head != ds.main_sha
+        committed = _git(['show', '--name-only', '--format=', 'HEAD'], ds.main).splitlines()
+        assert sorted(committed) == sorted(_DOCS_DECLARED)
+
+    def test_row19_taskmaster_write_denied(self, docs_main_scaffold):
+        self._assert_write_denied(docs_main_scaffold, '.taskmaster/tasks.db', _DOCS_DECLARED)
+
+    @pytest.mark.parametrize('rel', ['docs/sibling.md', 'other.md'])
+    def test_row20_undeclared_docs_write_denied(self, docs_main_scaffold, rel):
+        self._assert_write_denied(docs_main_scaffold, rel, _DOCS_DECLARED)
+
+    def test_row21_gate_hook_script_write_denied(self, docs_main_scaffold):
+        self._assert_write_denied(docs_main_scaffold, 'hooks/pre-commit', _DOCS_DECLARED)
+
+    def test_row22_declared_new_top_level_file_denied(self, docs_main_scaffold):
+        ds = docs_main_scaffold
+        target = ds.main / 'NEW.md'
+        result = self._run(ds, f'printf NEW > {target}', [*_DOCS_DECLARED, 'NEW.md'])
+        assert not target.exists()
+        _assert_denied(result, side_effect_verified=True)
+
+    def test_row23_non_docs_task_keeps_rows_3_and_6_denied(self, docs_main_scaffold):
+        ds = docs_main_scaffold
+        mixed = ['docs/existing.md', 'src/x.py']
+        self._assert_write_denied(ds, 'docs/existing.md', mixed)
+        result = self._run(
+            ds, f'git update-ref refs/heads/main {ds.scaffold.main_sha}', mixed,
+        )
+        assert _git(['rev-parse', 'refs/heads/main'], ds.main) == ds.main_sha
+        _assert_denied(result, side_effect_verified=True)

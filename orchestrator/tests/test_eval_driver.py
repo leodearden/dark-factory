@@ -66,14 +66,14 @@ def _judge_cfg() -> EvalConfig:
 
 
 def _fake_collect_metrics(collect_side_effect: BaseException | None) -> AsyncMock:
-    """A collect_metrics stand-in that honours its role/replay_frame keywords."""
+    """A collect_metrics stand-in that honours its role/replay_frame/sandbox_backend keywords."""
 
-    async def fake_collect(_wf, _wt, _task, *, role, replay_frame=None):
+    async def fake_collect(_wf, _wt, _task, *, role, replay_frame=None, sandbox_backend=None):
         if collect_side_effect is not None:
             raise collect_side_effect
         return EvalMetrics(
             composite_score=0.9, tests_pass=True,
-            role_under_test=role, replay_frame=replay_frame,
+            role_under_test=role, replay_frame=replay_frame, sandbox_backend=sandbox_backend,
         )
 
     return AsyncMock(side_effect=fake_collect)
@@ -131,6 +131,101 @@ class TestBuildEvalOrchConfigArchitectOverride:
         base = _base_config(tmp_path)
         cfg = build_eval_orch_config(_impl_cfg(), {}, base)
         assert cfg.models.architect == 'opus'
+
+
+# ---------------------------------------------------------------------------
+# task 8371 — every claude-backend seat's model (implementer, architect, judge)
+# that is outside the project's routing.allowed_models is admitted into the
+# CELL's allowlist, so resolve_route does not silently fall back to the role
+# default model. Non-claude seats are never checked against it, so never admitted.
+# ---------------------------------------------------------------------------
+
+def _endpoint_impl_cfg() -> EvalConfig:
+    return EvalConfig(
+        'mimo-v2.6-pro-endpoint', 'claude', 'mimo-v2.6-pro', 'high',
+        env_overrides={
+            'ANTHROPIC_BASE_URL': 'https://endpoint.invalid/anthropic',
+            'ANTHROPIC_AUTH_TOKEN': 'dummy',
+        },
+    )
+
+
+def _fable_arch_cfg() -> EvalConfig:
+    from orchestrator.evals.configs import get_config_by_name
+
+    arch = get_config_by_name('architect-fable-high')
+    assert arch is not None
+    return arch
+
+
+def _off_allowlist_judge_cfg() -> EvalConfig:
+    return EvalConfig('judge-fable', 'claude', 'claude-fable-5', 'medium', role=RoleUnderTest.JUDGE)
+
+
+def _route(cfg, role_name: str):
+    from orchestrator.routing import RoleDefaults, RouteInputs, resolve_route
+
+    return resolve_route(
+        RouteInputs(
+            role_name=role_name,
+            task_id='shadow_1_a',
+            task_metadata={},
+            plan_shape=None,
+            routing_tier=0,
+            dispatch_count=0,
+            role_defaults=RoleDefaults('sonnet', 'high', 5.0, 50),
+        ),
+        cfg,
+    )
+
+
+class TestBuildEvalOrchConfigAdmitsCandidateModel:
+    @pytest.mark.parametrize(
+        ('role_name', 'build_kwargs'),
+        [
+            ('implementer', lambda: {'config': _endpoint_impl_cfg()}),
+            ('architect', lambda: {'config': _impl_cfg(), 'architect_config': _fable_arch_cfg()}),
+            ('judge', lambda: {'config': _impl_cfg(), 'judge_config': _off_allowlist_judge_cfg()}),
+        ],
+        ids=['implementer', 'architect', 'judge'],
+    )
+    def test_claude_candidate_seat_is_admitted_and_routes_unrejected(
+        self, tmp_path: Path, role_name: str, build_kwargs,
+    ):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        kwargs = build_kwargs()
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(task={}, base_config=base, **kwargs)
+        candidate_model = getattr(cfg.models, role_name)
+        assert candidate_model not in base.routing.allowed_models
+
+        assert candidate_model in cfg.routing.allowed_models
+        decision = _route(cfg, role_name)
+        assert decision.model == candidate_model
+        assert decision.source_layer == 'config'
+        assert decision.rejected == ()
+        assert candidate_model not in base.routing.allowed_models
+        assert cfg.routing.ladder == base.routing.ladder
+
+    def test_stock_candidate_leaves_allowed_models_unchanged(self, tmp_path: Path):
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(_impl_cfg(), {}, base)
+
+        assert cfg.routing.allowed_models == base.routing.allowed_models
+
+    def test_non_claude_candidate_model_is_not_admitted(self, tmp_path: Path):
+        from orchestrator.evals.configs import get_config_by_name
+        from orchestrator.evals.runner import build_eval_orch_config
+
+        codex = get_config_by_name('codex-gpt6-astra')
+        assert codex is not None and codex.backend != 'claude'
+        base = _base_config(tmp_path)
+        cfg = build_eval_orch_config(codex, {}, base)
+
+        assert cfg.routing.allowed_models == base.routing.allowed_models
 
 
 # ---------------------------------------------------------------------------
@@ -1065,8 +1160,8 @@ def _ofat_task_loader(path: Path) -> dict:
 # wall-clock win φ's failover was added for, which a per-cell gate forfeits.
 #
 # The probe, the sentinels and the assertion bodies live in
-# _campaign_gate_helpers so test_runner_matrix and test_eval_architect pin the
-# same contract from the same code.
+# _campaign_gate_helpers so test_runner_matrix and test_eval_architect_usage_gate
+# pin the same contract from the same code.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -1659,7 +1754,7 @@ class TestBuildEvalOrchConfigAutoSeedsProxiedPrices:
 
         base = _base_config(tmp_path)
         proxied = EvalConfig(
-            'minimax-m3-endpoint', 'claude', MINIMAX_MODEL, 'high',
+            'minimax-m3.1-flash-endpoint', 'claude', MINIMAX_MODEL, 'high',
             env_overrides={
                 'ANTHROPIC_BASE_URL': MINIMAX_BASE_URL,
                 'ANTHROPIC_AUTH_TOKEN': 'dummy',
@@ -1690,7 +1785,7 @@ class TestBuildEvalOrchConfigAutoSeedsProxiedPrices:
             update={'prices': {MINIMAX_MODEL: manual_rate}},
         )
         proxied = EvalConfig(
-            'minimax-m3-endpoint', 'claude', MINIMAX_MODEL, 'high',
+            'minimax-m3.1-flash-endpoint', 'claude', MINIMAX_MODEL, 'high',
             env_overrides={
                 'ANTHROPIC_BASE_URL': MINIMAX_BASE_URL,
                 'ANTHROPIC_AUTH_TOKEN': 'dummy',

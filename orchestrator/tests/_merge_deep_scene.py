@@ -41,18 +41,20 @@ from typing import Literal, TypedDict
 import pytest
 from _merge_lane_fakes import lane_scene_config
 
-from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
+from orchestrator.config import DepthRow, GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import worker as _mq
 from orchestrator.merge_lane.types import (
     CapPermit,
+    DeepPlacement,
     MergeResult,
     QueuedBranch,
     RealMergeItem,
     SpecPermit,
 )
 from orchestrator.merge_lane.worker import MergeRequest, SpeculativeMergeWorker
+from orchestrator.merge_verify_facts import MergeVerifyDispatchFacts
 
 # ── repo fixtures ────────────────────────────────────────────────────────────
 
@@ -152,13 +154,21 @@ def _make_config(
     """Build an OrchestratorConfig whose ``merge_deep.chain_cap`` is *chain_cap*.
 
     ``chain_cap`` defaults to 0 — α's shipped kill switch — so a test that wants
-    the deep path must opt in explicitly, exactly as an operator would.
+    the deep path must opt in explicitly, exactly as an operator would.  The cap
+    is only the switch; a *chain_cap* of 2 or more also pins the one-row depth
+    table ``[(0.0, chain_cap)]``, which bounds every chain at *chain_cap* items.
     """
     return lane_scene_config(
         repo,
         git_config or _make_spec_git_config(),
-        merge_deep=MergeDeepConfig(chain_cap=chain_cap),
+        merge_deep=_deep_config(chain_cap),
     )
+
+
+def _deep_config(chain_cap: int) -> MergeDeepConfig:
+    if chain_cap < 2:
+        return MergeDeepConfig(chain_cap=chain_cap)
+    return MergeDeepConfig(chain_cap=chain_cap, depth_table=[DepthRow(0.0, chain_cap)])
 
 
 # ── MergeRequest / item helpers ──────────────────────────────────────────────
@@ -202,10 +212,11 @@ def _make_item(
     """Build a RealMergeItem around *req* sitting at *merge_commit*.
 
     ``speculative=True`` is SLOT 2 (the merge-ahead item, stacked on the
-    predecessor's merge commit) — the ONLY kind ``_deep_chain_placement`` gates
-    on, and therefore the only kind the chain walk ever sees;
-    ``speculative=False`` is SLOT 1, the head trust-anchor verify against real
-    main, which δ CANCELS and lands on the tip's authority (PRD decision #3).
+    predecessor's merge commit), which ``_deep_chain_placement`` chains at any
+    verify frontier; ``speculative=False`` is SLOT 1, the head trust-anchor
+    verify against real main, which chains only when alone in the verify
+    frontier (``plans/merge-lane-policy-prd.md`` D5) and which δ otherwise
+    CANCELS and lands on a slot-2 tip's authority (PRD decision #3).
     """
     return RealMergeItem(
         request=req,
@@ -401,6 +412,24 @@ def _abort_hook_at(call_no: int, *, outcome=None, raises=None, bump_repo=None):
 # ── verify-lease / runner helpers ────────────────────────────────────────────
 
 
+def _placed_facts(placement: DeepPlacement) -> MergeVerifyDispatchFacts:
+    """The dispatch facts a real dispatch hands ``_run_inflight_verify``
+    beside *placement*'s chain: the depth reason the policy placed it with."""
+    return MergeVerifyDispatchFacts().with_chain_depth_reason(placement.depth_reason)
+
+
+def _verify_row(passed: bool, *, merge_sha: str, basis: str | None = 'no_estimate',
+                attempt: int = 0, chain_items: int = 1) -> dict:
+    """``merge_verify`` row data as the verify runner writes it."""
+    reason = None if basis is None else {
+        'basis': basis, 'pass_estimate': None, 'row': None, 'queue_depth': 1,
+    }
+    return {
+        'passed': passed, 'merge_sha': merge_sha, 'attempt': attempt,
+        'chain_items': chain_items, 'chain_depth_reason': reason,
+    }
+
+
 def _local_lease():
     """A LOCAL :class:`HostLease` whose runner is never actually driven.
 
@@ -453,10 +482,10 @@ def _fail_verify_result():
 class _StubRemoteAllocator:
     """Minimal HostAllocator stand-in handing out ONE remote lease at a time.
 
-    REMOTE deliberately: a remote lease makes ``_run_post_merge_verify`` build
+    REMOTE deliberately: a remote lease makes ``run_post_merge_verify`` build
     its pool from the injected runner instead of a real ``LocalRunner``, so
     ``VerifyRunnerPool.dispatch`` — the single ``merge_verify`` emission site —
-    genuinely runs and genuinely emits.  Replacing ``_run_post_merge_verify``
+    genuinely runs and genuinely emits.  Replacing ``run_post_merge_verify``
     wholesale (:func:`_spy_post_merge_verify`) emits no event at all, which
     would make every ``chain_items`` telemetry assertion vacuous.
     """
@@ -505,7 +534,7 @@ class _StubRemoteAllocator:
 
 
 def _spy_post_merge_verify(monkeypatch, outcome=None, *, raises=None) -> list[dict]:
-    """Replace ``_run_post_merge_verify`` with a recorder returning *outcome*.
+    """Replace ``run_post_merge_verify`` with a recorder returning *outcome*.
 
     Returns the recorded call list — each entry carries the positional
     ``merge_wt`` plus every keyword argument the worker passed (``merge_sha``,
@@ -523,7 +552,7 @@ def _spy_post_merge_verify(monkeypatch, outcome=None, *, raises=None) -> list[di
         return outcome
 
     monkeypatch.setattr(
-        'orchestrator.merge_lane.worker._run_post_merge_verify', _recording,
+        'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _recording,
     )
     return calls
 
@@ -562,6 +591,9 @@ def _spy_chain_lane_release(monkeypatch) -> list[tuple]:
 
     monkeypatch.setattr(
         'orchestrator.merge_lane.worker.release_chain_build_lane', _recording,
+    )
+    monkeypatch.setattr(
+        'orchestrator.merge_lane.inflight_verify.release_chain_build_lane', _recording,
     )
     return calls
 

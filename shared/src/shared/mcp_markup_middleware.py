@@ -106,8 +106,9 @@ import inspect
 import json
 import logging
 import time
-from collections.abc import Callable, Mapping
-from typing import Annotated, Any, NoReturn
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
+from typing import Annotated, Any, NamedTuple, NoReturn
 
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
@@ -134,9 +135,11 @@ from shared.toolcall_markup import (
     # whether what it carries would trip a downstream blanket consumer. That
     # question has no parameter to be aware of, because the recovered value is
     # the caller's own text rather than something this guard rewrote.
+    Repair,
     detect,
     detect_for,
     markup_override_requested,
+    only_inert_html_closers,
     repair,
     strip_markup_override,
 )
@@ -187,7 +190,7 @@ _REJECT_HINT = (
 #: offer a mechanical retry — there is no repaired call to resend — so it points
 #: at the two things the caller can actually do.
 #:
-#: Spelled ONCE, with the two variants below differing ONLY in the preservation
+#: Spelled ONCE, with the three variants below differing ONLY in the preservation
 #: clause. Composed rather than duplicated for the usual reason (INV-5): a
 #: reworded refusal must not require two edits kept in lock step.
 _UNREPAIRABLE_PREFIX = (
@@ -208,13 +211,22 @@ _UNREPAIRABLE_SUFFIX = (
 #: escalation carrying the FULL raw payload so nothing is discarded. When that
 #: filing did NOT happen, saying it did breaks the contract twice over.
 #:
-#: Selecting between the two keeps the payload's PROSE consistent with its own
-#: ``escalation_id`` field rather than letting the two disagree.
+#: Selecting among the three keeps the payload's PROSE consistent with its own
+#: ``escalation_id`` and ``residue_spool_path`` fields rather than letting them
+#: disagree (:func:`_unrepairable_hint`).
 _UNREPAIRABLE_HINT_PRESERVED = (
     _UNREPAIRABLE_PREFIX
     + 'Your full payload is preserved verbatim in the escalation named above '
     '— resend it from your own copy once your tool-call envelope stops '
     'leaking, rather than reconstructing it from this error.'
+    + _UNREPAIRABLE_SUFFIX
+)
+_UNREPAIRABLE_HINT_SPOOLED = (
+    _UNREPAIRABLE_PREFIX
+    + 'Your full payload is preserved verbatim in the server-side spool file '
+    'named by residue_spool_path, which is a file on disk and not an '
+    'escalation — resend it from your own copy once your tool-call envelope '
+    'stops leaking, rather than reconstructing it from this error.'
     + _UNREPAIRABLE_SUFFIX
 )
 _UNREPAIRABLE_HINT_UNPRESERVED = (
@@ -482,6 +494,64 @@ MARKUP_RESIDUE_ERROR_TYPES = frozenset({
 MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 
 
+def residue_payload_length(record: Mapping[str, Any]) -> int:
+    """How many characters of caller payload a residue record's ``raw_value`` holds."""
+    raw_value = record.get('raw_value')
+    return len(raw_value) if isinstance(raw_value, str) else 0
+
+
+@dataclass(frozen=True)
+class SpooledResidue:
+    """A sink's answer to a residue record that a spool FILE now holds.
+
+    A sink answers with a bare ``str`` when it filed an escalation, which is
+    the contract every queue-backed sink keeps. A host whose last tier is a
+    file on disk answers with this instead, so the caller is pointed at a
+    ``residue_spool_path`` rather than handed a path posing as an escalation id
+    that ``get_escalation`` cannot find (task 4809).
+    """
+
+    #: Absolute, so the file is found without asking the host where it spools.
+    path: str
+
+
+#: Where a residue sink preserved the record: an escalation id, a spool file,
+#: or nowhere.
+ResiduePreservation = str | SpooledResidue | None
+
+
+def _preservation_fields(
+    preserved: ResiduePreservation, *, id_key: str, path_key: str
+) -> dict[str, str | None]:
+    """*preserved* as payload fields, each holding one kind of locator.
+
+    The escalation id under *id_key* is present-and-null, as it always was.
+    The spool file under *path_key* is omitted unless a spool holds the record,
+    the convention ``storm`` follows, because most hosts never spool.
+    """
+    fields: dict[str, str | None] = {
+        id_key: preserved if isinstance(preserved, str) else None,
+    }
+    if isinstance(preserved, SpooledResidue):
+        fields[path_key] = preserved.path
+    return fields
+
+
+def _unrepairable_hint(preserved: ResiduePreservation) -> str:
+    """The refusal hint that matches where the payload actually went."""
+    if isinstance(preserved, SpooledResidue):
+        return _UNREPAIRABLE_HINT_SPOOLED
+    if isinstance(preserved, str):
+        return _UNREPAIRABLE_HINT_PRESERVED
+    return _UNREPAIRABLE_HINT_UNPRESERVED
+
+
+def _holder_label(preserved: str | SpooledResidue) -> str:
+    if isinstance(preserved, SpooledResidue):
+        return f'spool file {preserved.path}'
+    return f'escalation {preserved}'
+
+
 #: The most of ONE attribution axis that reaches a record, a log line or a
 #: caller-facing payload. The marker below is appended PAST it, so a bounded
 #: axis is at most this plus three characters.
@@ -584,14 +654,20 @@ def _caller_label(
 MARKUP_BOUNDARY_STORM_CATEGORY = 'mcp_markup_boundary_storm'
 
 #: Where an operator takes a recurrence of the envelope-markup leak: the live
-#: PRD, never DF 3083, which is done and closed to appends. Interpolated by
-#: this module's storm ERROR line and by the storm and residue text of
-#: fused-memory's markup_guard and markup_tripwire and orchestrator's
-#: markup_sink. The escalation server's filers still keep their own copy
-#: (task 6732).
+#: PRD, never DF 3083, which is done and closed to appends.
 MARKUP_RECURRENCE_ROUTING = (
     'report the recurrence against plans/toolcall-markup-containment-prd.md '
     '(DF 3083 is done and closed to appends, so not against 3083)'
+)
+
+#: All a ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE`` residue record can say about
+#: its call's outcome. :meth:`MarkupGuardMiddleware._handle_markup` files the
+#: dropped slice BEFORE it forwards the call, so no sink can know whether the
+#: call then succeeded.
+MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT = (
+    'This record was filed BEFORE the call ran, so whether the call then '
+    'succeeded is not known here; if it did, whatever it stored is missing '
+    'this value.'
 )
 
 #: Surfaced on the FORWARDED call, whose caller is NOT bounced and would
@@ -613,8 +689,10 @@ _UNRECOVERED_HINT = (
     'NOT be typed against its declared schema (see unrecovered_params) and was '
     'DROPPED — forwarding it verbatim would have failed validation and lost '
     'the whole call. The call went through WITHOUT those parameters; their raw '
-    'values are preserved in the escalation named by unrecovered_residue_id '
-    '(null if preserving them failed too). Resend them yourself if you still '
+    'values are preserved in the escalation named by unrecovered_residue_id, '
+    'or in the server-side file named by unrecovered_residue_spool_path when '
+    'that key is present (the id is null and the key absent if preserving '
+    'them failed too). Resend them yourself if you still '
     'hold them, and fix the envelope leak at its emission.'
 )
 
@@ -640,6 +718,19 @@ class RepairPolicy(enum.StrEnum):
     FORWARD_REPAIR = 'forward_repair'
 
 
+class _MarkupHit(NamedTuple):
+    """One argument :class:`MarkupGuardMiddleware` must act on, schema in hand."""
+
+    param: str
+    value: str
+    #: The gate's pattern, from the param-only scan.
+    pattern: str
+    #: The invoked tool's live JSON-Schema ``properties``.
+    properties: Mapping[str, Any]
+    #: :func:`~shared.toolcall_markup.repair`'s answer; ``None`` is unrepairable.
+    fix: Repair | None
+
+
 class MarkupGuardMiddleware(Middleware):
     """Detect, repair and police leaked envelope markup at the FastMCP boundary.
 
@@ -661,7 +752,9 @@ class MarkupGuardMiddleware(Middleware):
     machinery a registration site will wire them to is largely async in this
     repo — and both are invoked DEFENSIVELY: the call's outcome is already
     decided by the time either runs, so a sink that raises is logged and never
-    changes what the caller sees. See :meth:`_call_sink`.
+    changes what the caller sees. See :meth:`_call_sink`. *escalation_sink*
+    answers a residue record with where it preserved it, a
+    :data:`ResiduePreservation`.
 
     Bursts are counted by a per-instance
     :class:`~shared.boundary_storm_escape.BoundaryStormEscape`
@@ -673,7 +766,7 @@ class MarkupGuardMiddleware(Middleware):
     PLUS the closing tag of the argument's own name, which is the dialect the
     fixed set could never spell and which 212 of 444 measured real corruptions
     take. One residual is accepted by construction and is documented at
-    :meth:`_first_markup_argument`: a closer naming a DIFFERENT parameter of
+    :meth:`_markup_arguments`: a closer naming a DIFFERENT parameter of
     the same tool still passes, because widening to the tool's schema would
     put an awaited round-trip on every clean call.
 
@@ -740,7 +833,11 @@ class MarkupGuardMiddleware(Middleware):
         needle), and the awaited ``get_tool`` round-trip is still deferred
         behind that gate — which is precisely why the scan takes the parameter
         name, already in hand, and not the schema. See
-        :meth:`_first_markup_argument`.
+        :meth:`_markup_arguments`.
+
+        A hit that :func:`~shared.toolcall_markup.repair` cannot fix and that
+        carries only quoted HTML closers is no event at all, exactly like a
+        clean call (task **10396**); see :meth:`_first_live_markup`.
         """
         name = context.message.name
         arguments = context.message.arguments or {}
@@ -759,14 +856,10 @@ class MarkupGuardMiddleware(Middleware):
             await self._apply_override(context, name, arguments)
             return await call_next(context)
 
-        hit = self._first_markup_argument(arguments)
-        if hit is None:
+        live = await self._first_live_markup(context, name, arguments)
+        if live is None:
             return await call_next(context)
-
-        param, value, pattern = hit
-        return await self._handle_markup(
-            context, call_next, name, arguments, param, value, pattern
-        )
+        return await self._handle_markup(context, call_next, name, arguments, live)
 
     # -- the deliberate-quoting override (B6) ------------------------------
 
@@ -833,8 +926,8 @@ class MarkupGuardMiddleware(Middleware):
     # -- detection --------------------------------------------------------
 
     @staticmethod
-    def _first_markup_argument(arguments: Mapping[str, Any]) -> tuple[str, str, str] | None:
-        """Return the first ``(param, value, pattern)`` carrying envelope markup.
+    def _markup_arguments(arguments: Mapping[str, Any]) -> Iterator[tuple[str, str, str]]:
+        """Yield every ``(param, value, pattern)`` carrying envelope markup.
 
         The matched *pattern* is carried out of the scan rather than re-derived
         later: it is needed on all three outcome paths, and only here is it
@@ -845,11 +938,7 @@ class MarkupGuardMiddleware(Middleware):
         defect in the caller's own text emission, so it can only ever land in a
         string.
 
-        First hit wins rather than collecting all of them, because the repair
-        is defined against ONE absorbing parameter — the argument whose value
-        swallowed the rest of the envelope. A second hit downstream of it is
-        either the same leak seen twice or a value that repair() will refuse
-        anyway.
+        Which hit is handled is decided by :meth:`_first_live_markup`.
 
         PARAMETER-AWARE, and free (task **4696**). The scan asks
         :func:`~shared.toolcall_markup.detect_for` with the argument's OWN
@@ -885,7 +974,37 @@ class MarkupGuardMiddleware(Middleware):
             if isinstance(value, str):
                 pattern = detect_for(value, param)
                 if pattern is not None:
-                    return param, value, pattern
+                    yield param, value, pattern
+
+    async def _first_live_markup(
+        self, context, name: str, arguments: Mapping[str, Any]
+    ) -> _MarkupHit | None:
+        """The first hit of :meth:`_markup_arguments` that is a real event.
+
+        That hit is handled, and only that one, because the repair is defined
+        against ONE absorbing parameter — the argument whose value swallowed
+        the rest of the envelope. A second hit downstream of it is either the
+        same leak seen twice or a value that repair() will refuse anyway.
+
+        The schema is read once, lazily, on the first hit, so a clean call
+        still pays no ``get_tool``. Each hit is offered to
+        :func:`~shared.toolcall_markup.repair` FIRST; only a hit it declines is
+        asked :func:`~shared.toolcall_markup.only_inert_html_closers`, so every
+        value repair() can fix is handled exactly as before. An INERT hit (task
+        **10396**) is skipped as if it carried no needle: it is a quoted HTML
+        block, not a leak, and earns no fact, no storm count and no residue,
+        like a clean argument, so a real leak in a later argument is still
+        reached.
+        """
+        properties: Mapping[str, Any] | None = None
+        for param, value, pattern in self._markup_arguments(arguments):
+            if properties is None:
+                properties = await self._schema_properties(context, name)
+            schema_params = tuple(properties)
+            fix = repair(value, param, schema_params, tuple(arguments))
+            if fix is None and only_inert_html_closers(value, param, schema_params):
+                continue
+            return _MarkupHit(param, value, pattern, properties, fix)
         return None
 
     # -- identity ---------------------------------------------------------
@@ -984,15 +1103,16 @@ class MarkupGuardMiddleware(Middleware):
 
     # -- policy -----------------------------------------------------------
 
-    async def _handle_markup(self, context, call_next, name, arguments, param, value, pattern):
+    async def _handle_markup(self, context, call_next, name, arguments, live: _MarkupHit):
         """Apply the declared policy to a detected leak.
 
-        The schema read happens HERE and not on the fast path, so the awaited
+        The schema read and the repair arrive on *live*, resolved by
+        :meth:`_first_live_markup` past the clean-path gate, so the awaited
         ``get_tool`` round-trip is paid only by the 0.26% of calls that
         actually carry a leak.
 
-        ONE PATTERN PER EVENT (task **5283**). *pattern* arrives from
-        :meth:`_first_markup_argument`, which deliberately holds only *param* —
+        ONE PATTERN PER EVENT (task **5283**). ``live.pattern`` comes from
+        :meth:`_markup_arguments`, which deliberately holds only *param* —
         it will not pay ``get_tool`` on the 99.7% clean path. Once the schema
         IS resolved, it is re-derived on the same ``(value, param,
         schema_params)`` triple :func:`repair` now uses, so ``fix.pattern`` and
@@ -1001,12 +1121,11 @@ class MarkupGuardMiddleware(Middleware):
         The rebinding is free: it sits past the clean-path gate, beside an
         awaited round-trip. It can only widen — ``detect_for`` over a superset
         of needles reports earliest-by-text-position — so it is non-``None``
-        whenever the gate fired, and the ``or pattern`` is a belt-and-braces
-        guard that no measured input reaches.
+        whenever the gate fired, and the ``or`` is a belt-and-braces guard that
+        no measured input reaches.
         """
-        properties = await self._schema_properties(context, name)
-        pattern = detect_for(value, param, tuple(properties)) or pattern
-        fix = repair(value, param, tuple(properties), tuple(arguments))
+        param, value, properties, fix = live.param, live.value, live.properties, live.fix
+        pattern = detect_for(value, param, tuple(properties)) or live.pattern
 
         # All three emissions sit SIDE BY SIDE, and every one of them runs
         # BEFORE its outcome is delivered. Two reasons. The detection is a fact
@@ -1152,15 +1271,15 @@ class MarkupGuardMiddleware(Middleware):
         )
         subject = self._subject({**arguments, **fix.recovered})
         storm = await self._record_storm(_OUTCOME_REPAIRED, identity, subject)
-        residue_id = None
+        preserved: ResiduePreservation = None
         if unrecovered:
-            residue_id = await self._preserve_unrecovered(
+            preserved = await self._preserve_unrecovered(
                 name, identity, subject,
                 param, pattern, unrecovered,
             )
         return await self._forward(
             context, call_next, arguments, param, fix, storm,
-            unrecovered=tuple(sorted(unrecovered)), residue_id=residue_id,
+            unrecovered=tuple(sorted(unrecovered)), preserved=preserved,
             quoting=quoting,
         )
 
@@ -1359,7 +1478,7 @@ class MarkupGuardMiddleware(Middleware):
         # otherwise be chasing two different callers.
         agent_id, project = identity
         subject_task_id, subject_agent_role = subject
-        escalation_id = await self._file_residue_escalation({
+        preserved = await self._preserve_residue({
             'error_type': MARKUP_UNREPAIRABLE_ERROR_TYPE,
             'category': _ESCALATION_CATEGORY,
             # INV-7: a machine-readable owner plus a bound. This hold is a
@@ -1384,9 +1503,12 @@ class MarkupGuardMiddleware(Middleware):
             # beside a payload the caller still holds; this is the only
             # surviving copy of data that may never be resent.
             'raw_value': value,
+            # What the record CARRIES, never where it went: it is built before
+            # any sink runs, and a host that preserves it nowhere dumps it to a
+            # log line, where a preservation claim would be false.
             'summary': (
                 f'Unrepairable MCP envelope markup in {name}.{param} — the '
-                'call was refused and its payload preserved here'
+                'call was refused; this record carries its full raw payload'
             ),
             'suggested_action': (
                 'Recover the raw_value for the caller if it is still needed, '
@@ -1408,37 +1530,37 @@ class MarkupGuardMiddleware(Middleware):
             'tool': name,
             'field': param,
             'matched_pattern': pattern,
-            'escalation_id': escalation_id,
+            **_preservation_fields(
+                preserved, id_key='escalation_id', path_key='residue_spool_path'
+            ),
             # NO 'repaired_call'. There is no repair, and offering one would
             # invite a retry that re-sends a guess.
             #
-            # Keyed off the SAME value that populates 'escalation_id' above,
-            # never off ``self._escalation_sink is not None``: a wired sink that
+            # Keyed off the SAME value that populates the fields above, never
+            # off ``self._escalation_sink is not None``: a wired sink that
             # RAISED (a queue I/O failure on the escalation server) or returned
-            # a non-str preserved exactly nothing, and must select the
-            # unpreserved variant too. See the constants for why the claim is
-            # conditional at all.
-            'hint': (
-                _UNREPAIRABLE_HINT_PRESERVED
-                if isinstance(escalation_id, str)
-                else _UNREPAIRABLE_HINT_UNPRESERVED
-            ),
+            # neither a str nor a SpooledResidue preserved exactly nothing, and
+            # must select the unpreserved variant too. See the constants for
+            # why the claim is conditional at all.
+            'hint': _unrepairable_hint(preserved),
         }, storm)))
 
-    async def _file_residue_escalation(self, record: dict[str, Any]) -> str | None:
-        """Hand the residue to the injected sink; never change the outcome.
+    async def _preserve_residue(
+        self, record: dict[str, Any]
+    ) -> ResiduePreservation:
+        """Hand the residue to the injected sink, and return where it was preserved.
 
-        The refusal is already decided by the time this runs, so escalation is
+        The refusal is already decided by the time this runs, so preserving is
         purely ADDITIVE — see :meth:`_call_sink` for the never-raises contract
         and for why an ``async def`` emitter is awaited rather than left as an
         unawaited coroutine, which on THIS path would destroy the only surviving
         copy of the caller's payload.
 
-        Returns the id the sink reports, so the refusal payload can name the
-        record holding the caller's data. A sink that reports something other
-        than a string reports no id — the caller is better told nothing than
-        pointed at a value it cannot look up. A sink that FAILED reports ``None``
-        for the same reason.
+        The sink answers where it preserved the record, so the refusal payload
+        can name what holds the caller's data: an escalation id (``str``) or a
+        :class:`SpooledResidue`. Anything else reports ``None`` — the caller is
+        better told nothing than pointed at a value it cannot look up. A sink
+        that FAILED reports ``None`` for the same reason.
         """
         if self._escalation_sink is None:
             logger.warning(
@@ -1446,23 +1568,22 @@ class MarkupGuardMiddleware(Middleware):
                 '%r will not be preserved anywhere', record.get('tool'),
             )
             return None
-        escalation_id = await self._call_sink(self._escalation_sink, record, 'escalation')
-        if not isinstance(escalation_id, str):
+        preserved = await self._call_sink(self._escalation_sink, record, 'escalation')
+        if not isinstance(preserved, (str, SpooledResidue)):
             return None
-        # Naming the queued record, exactly as emit_markup_storm_escalation
+        # Naming the holding record, exactly as emit_markup_storm_escalation
         # signs off — the operator's entry point to the preserved payload.
         logger.warning(
-            'markup guard: queued %s holding the unrepairable payload of '
-            '%s.%s (%d chars)',
-            escalation_id, record.get('tool'), record.get('field'),
-            len(record.get('raw_value') or ''),
+            'markup guard: %s holds the unrepairable payload of %s.%s (%d chars)',
+            _holder_label(preserved), record.get('tool'), record.get('field'),
+            residue_payload_length(record),
         )
-        return escalation_id
+        return preserved
 
     async def _preserve_unrecovered(
         self, name, identity, subject, param, pattern,
         unrecovered: Mapping[str, str],
-    ) -> str | None:
+    ) -> ResiduePreservation:
         """Queue the slices FORWARD_REPAIR dropped, so nothing is destroyed.
 
         The other half of the drop above. C2 L187 binds every path this guard
@@ -1475,20 +1596,20 @@ class MarkupGuardMiddleware(Middleware):
 
         One record per dropped NAME rather than one per call: each carries a
         different parameter's payload, and the residue channel deliberately does
-        not dedup for exactly that reason. Returns the LAST id filed, which is
-        the one the forwarded call's warning names.
+        not dedup for exactly that reason. Returns where the LAST one went,
+        which is the one the forwarded call's warning names.
 
-        Never raises — ``_file_residue_escalation`` owns that contract, and this
+        Never raises — ``_preserve_residue`` owns that contract, and this
         runs on a path whose outcome (forward) is already decided.
         """
         agent_id, project = identity
         subject_task_id, subject_agent_role = subject
-        residue_id = None
+        preserved: ResiduePreservation = None
         for field, raw in sorted(unrecovered.items()):
-            residue_id = await self._file_residue_escalation({
+            preserved = await self._preserve_residue({
                 # A DISTINCT error_type from the refusal's, because the two
                 # differ in the one way that matters to whoever reads the queue:
-                # this call SUCCEEDED, lossily, and no caller was bounced — so
+                # this call is FORWARDED, lossily, and no caller is bounced — so
                 # nobody is waiting on a retry, and nobody was told.
                 'error_type': MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
                 'category': _ESCALATION_CATEGORY,
@@ -1507,8 +1628,8 @@ class MarkupGuardMiddleware(Middleware):
                 'raw_value': raw,
                 'summary': (
                     f'Recovered {name}.{field} could not be typed against its '
-                    f'declared schema — the call was forwarded WITHOUT it and '
-                    f'the value preserved here'
+                    f'declared schema — the call was forwarded WITHOUT it; '
+                    f'this record carries its full raw payload'
                 ),
                 'suggested_action': (
                     f'Recover the raw_value into {name}.{field} if it is still '
@@ -1516,7 +1637,7 @@ class MarkupGuardMiddleware(Middleware):
                     'chase the harness serialization leak that produced it.'
                 ),
             })
-        return residue_id
+        return preserved
 
     def _reject(
         self, name, arguments, param, fix, storm, quoting: tuple[str, ...]
@@ -1575,7 +1696,7 @@ class MarkupGuardMiddleware(Middleware):
 
     async def _forward(
         self, context, call_next, arguments, param, fix, storm,
-        *, unrecovered: tuple[str, ...] = (), residue_id: str | None = None,
+        *, unrecovered: tuple[str, ...] = (), preserved: ResiduePreservation = None,
         quoting: tuple[str, ...],
     ):
         """Repair in place, let the call through, and say so.
@@ -1638,7 +1759,11 @@ class MarkupGuardMiddleware(Middleware):
         if unrecovered:
             # NAMES only here too. The values went to the residue channel.
             meta['markup_repair']['unrecovered_params'] = list(unrecovered)
-            meta['markup_repair']['unrecovered_residue_id'] = residue_id
+            meta['markup_repair'].update(_preservation_fields(
+                preserved,
+                id_key='unrecovered_residue_id',
+                path_key='unrecovered_residue_spool_path',
+            ))
             meta['markup_repair']['hint'] = _UNRECOVERED_HINT
         return ToolResult(
             content=result.content,

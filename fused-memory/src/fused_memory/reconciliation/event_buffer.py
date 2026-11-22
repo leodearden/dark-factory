@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS event_buffer (
     payload TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'buffered',
     drained_by_run_id TEXT,
-    coalesce_key TEXT
+    coalesce_key TEXT,
+    drained_by_instance_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_eb_project_status ON event_buffer(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_eb_agent_timestamp ON event_buffer(agent_id, timestamp)
@@ -133,6 +134,14 @@ class _PushOutcome(StrEnum):
 class _PushResult(NamedTuple):
     outcome: _PushOutcome
     fold_count: int = 1
+
+
+class DrainedRun(NamedTuple):
+    """One run's drained events, named by the instance that drained them."""
+
+    project_id: str
+    run_id: str
+    instance_id: str
 
 
 _UNFOLDED_PUSH_LOG_LINE = {
@@ -255,6 +264,14 @@ class EventBuffer:
                 ' ON event_buffer(project_id, coalesce_key, status)'
                 ' WHERE coalesce_key IS NOT NULL'
             )
+
+            # Add drained_by_instance_id if missing (task 9655): names the
+            # instance whose lock a drain ran under, so a startup sweep can
+            # recover a dead predecessor's run-less drains.
+            if await add_column_if_missing(db, 'event_buffer', 'drained_by_instance_id', 'TEXT'):
+                logger.info(
+                    'EventBuffer: migrated event_buffer — added drained_by_instance_id column'
+                )
 
             # Drop the now-redundant single-column project index.  idx_dw_project_claimed
             # (project_id, claimed_at) is a strict superset; keeping both wastes write
@@ -584,14 +601,15 @@ class EventBuffer:
     # ── Drain ──────────────────────────────────────────────────────────
 
     async def drain(
-        self, project_id: str, run_id: str | None = None,
+        self, project_id: str, run_id: str,
     ) -> list[ReconciliationEvent]:
-        """Atomically drain buffered events for a project.
+        """Atomically drain a project's buffered events as run *run_id*.
 
-        When ``run_id`` is provided, the drained rows are stamped with
-        ``drained_by_run_id = run_id`` so a later run-scoped ``restore_drained``
-        can restore exactly this run's events without touching a concurrent
-        run's drained rows (task 2711 / E7).
+        Each drained row is stamped ``drained_by_run_id = run_id`` and with this
+        instance's ``drained_by_instance_id``, so a later run-scoped
+        ``restore_drained`` can restore exactly this run's events without
+        touching a concurrent run's drained rows (task 2711 / E7). *run_id* is
+        required so this path can never leave an unattributed row (task 6784).
         """
         rows = await self._require_access().read_all(
             """SELECT * FROM event_buffer
@@ -607,9 +625,9 @@ class EventBuffer:
         placeholders = ','.join('?' for _ in ids)
         async with self._require_access().write() as db:
             await db.execute(
-                f"UPDATE event_buffer SET status = 'drained', drained_by_run_id = ? "
-                f"WHERE id IN ({placeholders})",
-                [run_id, *ids],
+                f"UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?, "
+                f"drained_by_instance_id = ? WHERE id IN ({placeholders})",
+                [run_id, self.instance_id, *ids],
             )
 
         events = []
@@ -626,10 +644,14 @@ class EventBuffer:
         return events
 
     async def drain_oldest_chunk(
-        self, project_id: str, limit: int,
+        self, project_id: str, limit: int, run_id: str,
         before: datetime | None = None,
     ) -> list[ReconciliationEvent]:
-        """Drain the oldest `limit` buffered events for a project.
+        """Drain the oldest `limit` buffered events for a project as run *run_id*.
+
+        Stamps the drained rows like ``drain`` does: ``drained_by_run_id`` and
+        ``drained_by_instance_id``. *run_id* is required so this path can never
+        leave an unattributed row (task 6784).
 
         Args:
             before: If set, only drain events with timestamp < this value.
@@ -658,8 +680,9 @@ class EventBuffer:
         placeholders = ','.join('?' for _ in ids)
         async with self._require_access().write() as db:
             await db.execute(
-                f"UPDATE event_buffer SET status = 'drained' WHERE id IN ({placeholders})",
-                ids,
+                f"UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?, "
+                f"drained_by_instance_id = ? WHERE id IN ({placeholders})",
+                [run_id, self.instance_id, *ids],
             )
 
         events = []
@@ -762,10 +785,11 @@ class EventBuffer:
         placeholders = ','.join('?' for _ in ids)
         async with self._require_access().write() as db:
             cursor = await db.execute(
-                f"""UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?
+                f"""UPDATE event_buffer SET status = 'drained', drained_by_run_id = ?,
+                        drained_by_instance_id = ?
                     WHERE project_id = ? AND id IN ({placeholders})
                       AND status = 'buffered'""",
-                [run_id, project_id, *ids],
+                [run_id, self.instance_id, project_id, *ids],
             )
             rowcount = cursor.rowcount
         return rowcount
@@ -789,10 +813,9 @@ class EventBuffer:
         ``include_unattributed`` additionally restores rows with
         ``drained_by_run_id IS NULL``. This closes the upgrade-boundary gap
         where events drained by a pre-task-2711 process carry no run
-        attribution: since every production drain path stamps
-        ``drained_by_run_id`` as it drains (``drain_by_ids`` requires a
-        ``run_id``, and ``run_full_cycle``, ``drain``'s only production
-        caller, always passes one; task 6453), a NULL row can only be left
+        attribution: since every drain path (``drain``,
+        ``drain_oldest_chunk``, ``drain_by_ids``) requires a ``run_id`` and
+        stamps it as it drains (tasks 6453, 6784), a NULL row can only be left
         over from a process that no longer exists by the time a recovery pass
         runs, so it is provably safe to fold into a *specific* run's recovery
         without reintroducing the concurrent-run clobber the run scoping was
@@ -800,27 +823,47 @@ class EventBuffer:
         Callers that need the exact-match-only contract (e.g. one caller's
         ``mark_drained_run_id`` attribution racing another's) must keep the
         default ``False``.
+
+        A restored row loses both drain stamps, so a stamp only ever names the
+        drain a row is currently in (task 9655).
         """
-        if include_unattributed:
-            async with self._require_access().write() as db:
-                cursor = await db.execute(
-                    "UPDATE event_buffer SET status = 'buffered' "
-                    "WHERE project_id = ? AND status = 'drained' "
-                    "AND (drained_by_run_id = ? OR drained_by_run_id IS NULL)",
-                    (project_id, run_id),
-                )
-                count = cursor.rowcount
-        else:
-            async with self._require_access().write() as db:
-                cursor = await db.execute(
-                    "UPDATE event_buffer SET status = 'buffered' "
-                    "WHERE project_id = ? AND status = 'drained' AND drained_by_run_id = ?",
-                    (project_id, run_id),
-                )
-                count = cursor.rowcount
+        run_match = (
+            '(drained_by_run_id = ? OR drained_by_run_id IS NULL)'
+            if include_unattributed
+            else 'drained_by_run_id = ?'
+        )
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                "UPDATE event_buffer SET status = 'buffered', "
+                "drained_by_run_id = NULL, drained_by_instance_id = NULL "
+                f"WHERE project_id = ? AND status = 'drained' AND {run_match}",
+                (project_id, run_id),
+            )
+            count = cursor.rowcount
         if count:
             logger.info(f'Restored {count} drained events to buffered for {project_id}')
         return count
+
+    async def drained_runs_of_other_instances(self) -> list[DrainedRun]:
+        """Each run with rows still drained under another instance's drain."""
+        rows = await self._require_access().read_all(
+            """SELECT DISTINCT project_id, drained_by_run_id, drained_by_instance_id
+               FROM event_buffer
+               WHERE status = 'drained'
+                 AND drained_by_run_id IS NOT NULL
+                 AND drained_by_instance_id IS NOT NULL
+                 AND drained_by_instance_id != ?
+               ORDER BY project_id, drained_by_run_id""",
+            (self.instance_id,),
+        )
+        return [
+            DrainedRun(
+                project_id=row['project_id'],
+                run_id=row['drained_by_run_id'],
+                instance_id=row['drained_by_instance_id'],
+            )
+            for row in rows
+        ]
 
     async def mark_drained_run_id(
         self, project_id: str, event_ids: list[str], run_id: str,

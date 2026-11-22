@@ -19,7 +19,7 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, ClassVar, Literal, get_args
 
@@ -34,14 +34,28 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
+from shared.cancel_dispositions import CancelDispositionEntry
+from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope
+from shared.followup_hold_records import (
+    FOLLOWUP_HOLD_METADATA_KEY,
+    FOLLOWUP_HOLDER_METADATA_KEY,
+    FollowupHold,
+    FollowupHolder,
+)
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
 from shared.task_deferral import DeferralRecord
 
 __all__ = [
+    'GATE_EPISODE_STAMP_KEYS',
+    'GATE_ESCALATED_AT_KEY',
+    'GATE_ESCALATED_PRECONDITIONS_KEY',
     'HUMAN_CURATOR_ADJUDICATED_AT_KEY',
     'HUMAN_CURATOR_GATE_KEY',
     'KNOWN_ROLE_NAMES',
     'RECHECK_SECS_MIN',
+    'TASK_METADATA_CAPABILITIES',
+    'TRIGGER_CHAIN_KEY',
     'BeforeDone',
     'DoneProvenance',
     'ExternalDep',
@@ -55,11 +69,15 @@ __all__ = [
     'SchemaWarning',
     'SubmodelCardinality',
     'TaskMetadata',
+    'TriggerChain',
+    'TriggerChainRole',
+    'TriggerChainSkill',
     'apply_migrations',
     'is_known_metadata_key',
     'parse_metadata',
     'recheck_secs_milestone_conflict',
     'register_metadata_submodel',
+    'registered_metadata_submodel',
     'script_root_kind_conflict',
     'validate_model_overrides',
 ]
@@ -140,6 +158,19 @@ HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
 # delete the only detector.  An in-process `is`/`id()` check cannot substitute:
 # CPython interns identifier-shaped literals, so it passes either way.
 HUMAN_CURATOR_ADJUDICATED_AT_KEY: str = 'human_curator_adjudicated_at'
+
+# The stamps of a deterministic task's OPEN gate episode
+# (orchestrator/src/orchestrator/deterministic_runner.py). A pure gate, an
+# act-then-ask deploy and a predicate all stamp gate_escalated_at when they
+# file; a pure gate writes gate_escalated_preconditions in the same write
+# (orchestrator/src/orchestrator/gate_preconditions.py). fused-memory removes
+# both from any row on a terminal status crossing
+# (fused-memory/src/fused_memory/middleware/gate_stamp_lifecycle.py, task 3638).
+GATE_ESCALATED_AT_KEY: str = 'gate_escalated_at'
+GATE_ESCALATED_PRECONDITIONS_KEY: str = 'gate_escalated_preconditions'
+GATE_EPISODE_STAMP_KEYS: frozenset[str] = frozenset(
+    {GATE_ESCALATED_AT_KEY, GATE_ESCALATED_PRECONDITIONS_KEY},
+)
 
 
 def validate_model_overrides(value: object) -> None:
@@ -235,8 +266,8 @@ def script_root_kind_conflict(script_root: str, kind: str) -> str | None:
     """Why ``before_done`` may not pair *script_root* with *kind*; ``None`` when it may.
 
     The single statement of the predicate-only rule for factory-rooted scripts,
-    called by ``BeforeDone``, the fused-memory submit guard and
-    ``shared.before_done_paths.resolve_script_base``.
+    called by ``BeforeDone`` and ``shared.before_done_paths.resolve_before_done_paths``
+    (which the fused-memory submit guard and the runner both call).
     """
     if script_root == 'factory' and kind != 'predicate':
         return (
@@ -336,6 +367,7 @@ _DONE_PROVENANCE_RULES: Mapping[str, _KindRules] = MappingProxyType(
         'deterministic-deploy-scheduled': _KindRules(
             evidence=('unit', 'transient_unit', 'fire_delay_secs'),
         ),
+        'deterministic-deploy-unverified': _KindRules(),
         'deterministic-milestone': _KindRules(),
     }
 )
@@ -399,6 +431,7 @@ class DoneProvenance(BaseModel):
         'found_on_main',
         'deterministic-deploy',
         'deterministic-deploy-scheduled',
+        'deterministic-deploy-unverified',
         'deterministic-gate',
         'deterministic-milestone',
         'operational-verified',
@@ -674,6 +707,45 @@ class Milestone(BaseModel):
                 raise ValueError("Milestone: at must not be set when mode='delayed'.")
         return self
 
+    def fired(self, anchor: object, now: datetime) -> bool:
+        """Return whether this milestone has fired at *now* (tz-aware).
+
+        This is the home of milestone semantics. A ``'dated'`` milestone fires
+        once ``now >= at``; *anchor* is ignored. A ``'delayed'`` milestone
+        fires once ``now >= anchor + after_secs``, where *anchor* is the raw
+        ``metadata.milestone_deps_satisfied_at`` value; ``None`` or ``''``
+        means not due yet, so never fires. A tz-naive ``at`` or anchor is read
+        as UTC.
+
+        A malformed spec cannot be a ``Milestone``, so "never fires" for
+        malformed metadata belongs to the caller. For a ``'delayed'``
+        milestone, an *anchor* that is not a string, is unparseable, or cannot
+        be combined with ``after_secs`` into a representable datetime raises
+        ``ValueError``, the only exception malformed input raises here.
+        """
+        if self.mode == 'dated':
+            assert self.at is not None
+            return now >= _as_utc(datetime.fromisoformat(self.at))
+        if anchor is not None and not isinstance(anchor, str):
+            raise ValueError(f'Milestone: anchor={anchor!r} is not an ISO-8601 string.')
+        if not anchor:
+            return False
+        assert self.after_secs is not None
+        try:
+            deadline = _as_utc(datetime.fromisoformat(anchor)) + timedelta(
+                seconds=self.after_secs
+            )
+        except OverflowError as exc:
+            raise ValueError(
+                f'Milestone: anchor={anchor!r} + after_secs={self.after_secs} is not a '
+                f'representable datetime: {exc}'
+            ) from exc
+        return deadline <= now
+
+
+def _as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
 
 class Recurrence(BaseModel):
     """``metadata.recurrence`` — one link of a recurring deterministic chain.
@@ -729,6 +801,66 @@ class Recurrence(BaseModel):
     # nothing legitimate needs the coercion.
     interval_secs: int = Field(gt=0, strict=True)
     minted_from: str | None = None
+
+
+TRIGGER_CHAIN_KEY: str = 'trigger_chain'
+
+TriggerChainRole = Literal['completion_gate', 'human_gate']
+
+TriggerChainSkill = Literal['review', 'hotspot-survey', 'review-all']
+
+
+class TriggerChain(BaseModel):
+    """``metadata.trigger_chain`` — a task's place in an attended run's trigger chain.
+
+    A chain is the completion gate and human gate a run files so the next run
+    of the same skill is scheduled by completion (plans/completion-driven-triggers-prd.md
+    C2). This model owns the shape; the carrier rules live in the fused-memory
+    submit guard.
+    """
+
+    model_config = ConfigDict(extra='allow')
+
+    role: TriggerChainRole
+    skill: TriggerChainSkill
+    run_id: str
+    superseded_by: str | None = None
+
+    @field_validator('skill', mode='before')
+    @classmethod
+    def _skill_is_bare(cls, value: object) -> object:
+        if isinstance(value, str) and value.startswith('/'):
+            raise ValueError(
+                f'trigger_chain.skill={value!r} must be the bare skill name '
+                f'{value.lstrip("/")!r} (no leading slash)'
+            )
+        return value
+
+    @model_validator(mode='after')
+    def _run_ids_name_the_skill(self) -> TriggerChain:
+        _require_run_of(self.skill, 'run_id', self.run_id)
+        if self.superseded_by is not None:
+            _require_run_of(self.skill, 'superseded_by', self.superseded_by)
+        return self
+
+
+def _require_run_of(skill: str, field: str, run_id: str) -> None:
+    """Refuse a *run_id* that is not a run of *skill* (``<skill>-…``).
+
+    A run of a longer skill that *skill* prefixes (``review-all-…`` against
+    ``review``) is refused too: its ``review-`` prefix is not a ``review`` run.
+    """
+    prefix = f'{skill}-'
+    if not run_id.startswith(prefix):
+        raise ValueError(
+            f'trigger_chain.{field}={run_id!r} must start with {prefix!r}, '
+            f'the skill it was run by'
+        )
+    for longer in get_args(TriggerChainSkill):
+        if longer.startswith(prefix) and run_id.startswith(f'{longer}-'):
+            raise ValueError(
+                f'trigger_chain.{field}={run_id!r} is a run of {longer!r}, not of {skill!r}'
+            )
 
 
 class RoutingDecisionMirror(BaseModel):
@@ -1036,6 +1168,11 @@ def register_metadata_submodel(
     _SUBMODEL_CARDINALITY[key] = cardinality
 
 
+def registered_metadata_submodel(key: str) -> type[BaseModel] | None:
+    """The model :func:`register_metadata_submodel` registered for ``metadata[key]``, if any."""
+    return _SUBMODEL_REGISTRY.get(key)
+
+
 # Milestone is the first real W10 registrant: registering at module-import
 # time (rather than lazily) guarantees the 'milestone' slice is validated
 # and typed before any of parse_metadata's many callers across packages run.
@@ -1071,8 +1208,27 @@ register_metadata_submodel('recurrence', Recurrence, cardinality='dict')
 # deferral: plans/deferral-flip-condition-prd.md §5.1.
 register_metadata_submodel('deferral', DeferralRecord, cardinality='dict')
 
+# cancel_dispositions: plans/cancel-with-children-prd.md §4.8.
+register_metadata_submodel('cancel_dispositions', CancelDispositionEntry, cardinality='list')
+
 # strand_converted: shared/src/shared/strand_conversion.py.
 register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardinality='dict')
+
+# declared_scope: plans/follow-up-filing-shape-prd.md §4.2.
+register_metadata_submodel(DECLARED_SCOPE_METADATA_KEY, DeclaredScope, cardinality='dict')
+
+# followup_holder, followup_hold: plans/follow-up-filing-shape-prd.md §4.3.
+register_metadata_submodel(FOLLOWUP_HOLDER_METADATA_KEY, FollowupHolder, cardinality='dict')
+register_metadata_submodel(FOLLOWUP_HOLD_METADATA_KEY, FollowupHold, cardinality='dict')
+
+# trigger_chain: plans/completion-driven-triggers-prd.md C2.
+register_metadata_submodel(TRIGGER_CHAIN_KEY, TriggerChain, cardinality='dict')
+
+# The metadata capabilities this schema's submit guard enforces; the running
+# fused-memory reports it through get_status (PRD C2 "Capability report").
+TASK_METADATA_CAPABILITIES: frozenset[str] = frozenset(
+    {'before_done.recheck_secs', 'before_done.script_root', TRIGGER_CHAIN_KEY}
+)
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
@@ -1223,16 +1379,18 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 # still preserves each value byte-for-value (I1). Blessed keys are NORMALLY
 # disjoint from TaskMetadata.model_fields and _SUBMODEL_REGISTRY — a typed
 # field or a registered submodel already suppresses unknown_key via
-# known_fields, so blessing it too would be redundant. 'recurrence' is the
-# one deliberate overlap: task 4676 / PRD
-# docs/prds/recurring-deterministic-tasks.md R-D4 specifies both, so the key
+# known_fields, so blessing it too would be redundant. 'recurrence',
+# 'cancel_dispositions' and 'trigger_chain' are the three deliberate overlaps:
+# task 4676 / PRD docs/prds/recurring-deterministic-tasks.md R-D4,
+# plans/cancel-with-children-prd.md §4.8 and
+# plans/completion-driven-triggers-prd.md C2 each specify both, so the key
 # stays suppressed if its registration is ever moved or made lazy, and so
 # migrate_task_metadata_to_x_namespace.py refuses to x_-namespace it, which
 # for a submodel-backed key with live readers is the correct refusal.
 #
-# gate_escalated_at / before_done_ran_at / before_done_verified_at /
-# before_done_verified_pid are the DeterministicRunner's own stamps
-# (CLAUDE.md "Deterministic task kind").
+# gate_escalated_at / gate_escalated_preconditions / before_done_ran_at /
+# before_done_verified_at / before_done_verified_pid are the
+# DeterministicRunner's own stamps (CLAUDE.md "Deterministic task kind").
 #
 # Tier-B alias-drift keys (prd/prd_ref/prd_leaf, inv, and the three
 # `related_tasks` aliases — `related_task`, `related_df_tasks`,
@@ -1283,7 +1441,8 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         'combined_at',
         # stamped by the task curator on every create its dedupe pass did not judge; the re-dedupe sweep key
         'dedupe_skipped',
-        'gate_escalated_at',
+        GATE_ESCALATED_AT_KEY,
+        GATE_ESCALATED_PRECONDITIONS_KEY,
         'before_done_ran_at',
         'before_done_verified_at',
         'before_done_verified_pid',
@@ -1461,10 +1620,43 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # against a live reader — renaming it on one task would fork the
         # vocabulary and be re-added on the next block.
         'last_blocked_at',
+        # Merge-lane machine stamps (task 5281). This is the SINGLE in-repo
+        # copy of their census, a point-in-time snapshot of a growing corpus.
+        # `merge_phase_liveness` (task 2991): written by
+        # orchestrator/src/orchestrator/workflow.py::TaskWorkflow::_stamp_merge_phase_entered
+        # at merge entry and on every retry attempt, cleared by
+        # ::_clear_merge_phase_entered. No in-tree reader since task 3002
+        # (c8d53ef10f) retired harness._has_fresh_merge_phase; task 9614
+        # retires the writer, after which it stays blessed for historical
+        # carriers. Not x_-renamed: the live writer re-adds the bare key on the
+        # next merge entry.
+        # `merge_first_enqueued_at`: no writer since task 2172 (54944f69ff,
+        # 2026-07-07) moved the stamp to RetryLedger.merge_first_enqueued_at.
+        # Its reader is the legacy fast path in
+        # workflow.py::TaskWorkflow::_stamp_first_merge_enqueue, which adopts
+        # a numeric top-level value. Blessed for historical carriers on the
+        # 'modules' precedent: an x_ rename would blind that reader and mean
+        # surgery on 209 done records.
+        # Census 2026-11-15 (dark_factory tasks.db, submodel registrations
+        # imported): merge_first_enqueued_at 209 carriers, all done, all float,
+        # 207 with done_provenance, 0 also carrying the retry_ledger value
+        # (also 209 on 2026-08-31, so frozen); merge_phase_liveness 107
+        # carriers (done 101, pending 4, in-progress 1, cancelled 1), all
+        # {entered_at: str}. Together: 316 unknown_key lines.
+        'merge_first_enqueued_at',
+        'merge_phase_liveness',
         # recurrence (task 4676, PRD docs/prds/recurring-deterministic-tasks.md
-        # R-D4) is the ONE blessed key that is also a registered submodel — see
-        # the header note above on why the overlap is deliberate.
+        # R-D4), trigger_chain (below) and cancel_dispositions (below) are the
+        # blessed keys that are also registered submodels — see the header note
+        # above on why the overlap is deliberate.
         'recurrence',
+        # plans/completion-driven-triggers-prd.md C2: the chain record, and the
+        # runner stamps of C1 written by
+        # orchestrator/src/orchestrator/predicate_recheck.py::PREDICATE_RECHECK_KEY
+        # and ::PREDICATE_VERDICT_KEY.
+        TRIGGER_CHAIN_KEY,
+        'predicate_recheck',
+        'predicate_verdict',
         # Recon-stage execution-class discriminator (task 3780): machine-read
         # by live guards at the fused-memory submit boundary, with real
         # dispatch consequences rather than decorative ones. Readers, named
@@ -1500,12 +1692,16 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # unrepairable until task 3777 lifts the presence-only write-authority
         # floor.
         'execution_class',
+        # Written by shared/src/shared/pure_gate_provenance.py::pure_gate_stamped when a
+        # conversion rewrites a submission's routing; values:
+        # shared/src/shared/pure_gate_provenance.py::PureGateTrigger.
+        PURE_GATE_FROM_KEY,
         # Merge-queue priority-lane selector (task 4888). The sole input to
         # lane selection anywhere in the system, and the only way a task can
         # ask to be merged ahead of the normal queue. Writers and reader are
         # named because that is what a future reader greps when deciding
         # whether the key is still load-bearing (all re-verified 2026-09-17):
-        # writers `orchestrator/src/orchestrator/merge_queue.py::
+        # writers `orchestrator/src/orchestrator/merge_lane/worker.py::
         # SpeculativeMergeWorker::_spawn_main_health_fix_task` (auto-heal
         # main-health fix task, 'high'), `orchestrator/src/orchestrator/
         # offline_lane_filing.py::build_lane_fix_task_arguments` and
@@ -1514,8 +1710,10 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # TaskWorkflow::_spawn_main_health_fix_task` (fix-main brief, 'high'),
         # plus the operator tool `escalation/src/escalation/server.py::
         # merge_relane` (task 5246, either value, on every task it re-lanes);
-        # reader `orchestrator/src/orchestrator/merge_queue.py::
-        # lane_for_task_metadata` -> `intake.py::normalize_lane`, consumed at
+        # reader `orchestrator/src/orchestrator/merge_lane/worker.py::
+        # lane_for_task_metadata` ->
+        # `orchestrator/src/orchestrator/merge_lane/intake.py::normalize_lane`,
+        # consumed at
         # `orchestrator/src/orchestrator/workflow.py::TaskWorkflow::
         # _submit_to_merge_queue` to set `MergeRequest.lane` and -- as of this
         # task -- by `escalation/src/escalation/merge_lane_resolution.py::
@@ -1591,6 +1789,16 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # written by orchestrator/src/orchestrator/main_health_fix_owner.py, which
         # also reads it back through find_tasks_by_metadata as its dedupe key.
         'main_health_signature',
+        # The cancelled parent's superseders (plans/cancel-with-children-prd.md
+        # §4.8). Writer: the cancel gate, task β; validated there by
+        # shared/src/shared/cancel_dispositions.py::parse_superseded_by. Readers:
+        # the residue backstop, get_cancel_children and /review phase 3.
+        'superseded_by',
+        # Each child's per-parent disposition record; also a registered list
+        # submodel (one of the three deliberate overlaps, header note above). Writer:
+        # the cancel gate, task β. Readers: the residue backstop,
+        # get_cancel_children (existing_disposition) and /review phase 3.
+        'cancel_dispositions',
     }
 )
 
@@ -1749,7 +1957,10 @@ def parse_metadata(
                 # other malformed sub-model, never escaping uncaught in
                 # read or write+enforce=False.
                 parsed = {**parsed, key: submodel(**raw)}
-        except (ValidationError, TypeError) as exc:
+        # ValueError covers ValidationError (its subclass) and the bare
+        # ValueError a RootModel submodel (DeferralRecord, CancelDispositionEntry)
+        # raises when the stored mapping carries a `root` key beside others.
+        except (TypeError, ValueError) as exc:
             if direction == 'write' and enforce:
                 raise
             warnings.append(SchemaWarning(field=key, code='invalid_submodel', message=str(exc)))

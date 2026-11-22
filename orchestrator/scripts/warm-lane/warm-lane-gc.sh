@@ -233,7 +233,8 @@
 #     i.e. not pool lanes, so the orchestrator mints no LaneLifecycle record for
 #     them by construction. A read there would be dead code that returns
 #     `unknown` for every candidate while implying a coverage that does not
-#     exist. live_ref_present remains their liveness guard (Block Q pins it).
+#     exist. live_ref_present remains their liveness guard
+#     (test_warm_lane_gc.sh Block Q pins it).
 #   - Live-reference gate (task 5572, both passes): the inv.2 flock is held only
 #     across the ACQUIRE reseed, NOT across the consumer's long cargo verify
 #     build, so during that build the flock is FREE and always-reclaim would wipe
@@ -298,8 +299,12 @@
 #     pre-mark live entries was CONSIDERED and rejected: it costs one extra full
 #     scan and only breaks even once ≥2 entries are live at pass start, which a
 #     pool at rest never is.
-#     AMENDED by task 8089: the fd/cwd walk is narrowed, superseding every
-#     per-call figure above; current figures: lib_live_refs.sh's MEASURED COST.
+#     AMENDED by task 8089: the fd/cwd walk is narrowed and live_ref_present
+#     re-measured, superseding the per-call live_ref_present figures above
+#     (~1.9s; ~1.5s cwd/fd, ~0.38s maps), and so leaving the ~2-3 min pool
+#     figure, which scales with them, stale (not re-measured); current
+#     per-call figures: lib_live_refs.sh's MEASURED COST. The ~1ms record read
+#     and the ~18ms _is_reclaimable git pair are unaffected.
 #   - α reuse: the base symlink is resolved to its concrete gen PER LANE, and
 #     flock -s is held on that gen during that lane's α call (D8 reader-refcount
 #     seam; same contract as the acquire path). If no gen can be pinned the seed
@@ -349,8 +354,8 @@ source "$SCRIPT_DIR/lib_live_refs.sh"
 # incomplete, the same class as an unknown flag.
 #
 # Ordered AFTER the lib_live_refs.sh guard deliberately: a copy carrying neither
-# sibling must still report the live-refs one first, which is what Block A9's
-# asserted message pins.
+# sibling must still report the live-refs one first, which is what
+# test_warm_lane_gc.sh A9's asserted message pins.
 if [ ! -f "$SCRIPT_DIR/lib_lane_state.sh" ]; then
     echo "warm-lane-gc.sh: ERROR — scripts/lib_lane_state.sh not found next to warm-lane-gc.sh" >&2
     exit 2
@@ -360,7 +365,7 @@ source "$SCRIPT_DIR/lib_lane_state.sh"
 
 # The Pass-1 skip-unchanged predicate (lane_seed_unchanged), task 7859. Same
 # guard, same exit 2, for the same reason; ordered after the two above so each
-# missing sibling still names itself (Block A12).
+# missing sibling still names itself (test_warm_lane_gc_native.sh A12).
 if [ ! -f "$SCRIPT_DIR/lib_lane_seed.sh" ]; then
     echo "warm-lane-gc.sh: ERROR — scripts/lib_lane_seed.sh not found next to warm-lane-gc.sh" >&2
     exit 2
@@ -631,7 +636,8 @@ fi
 # The interactive band is honoured per-deployment via REIFY_WARM_LANE_IACT_PREFIX
 # (dark-factory's `git.iact_prefix` is config, not a constant — a deployment that
 # renamed it had the old literal protecting a band it never mints while omitting
-# the band it does, the dangerous direction). Pinned by Block X-band.
+# the band it does, the dangerous direction). Pinned by
+# test_warm_lane_gc_native.sh Block X-band.
 #
 # The `||` is load-bearing, not stylistic: this script runs `set -euo pipefail`,
 # and lane_protect_glob fails LOUD (one [warn] naming the failing stage, EMPTY
@@ -641,7 +647,7 @@ fi
 # line and degrades to the machine-checked static backstop
 # (LANE_PROTECT_GLOB_FALLBACK, gated by
 # orchestrator/tests/test_lane_state_lib.py::TestProtectGlobFallbackDrift) —
-# never an empty glob. Pinned by Block X-degrade.
+# never an empty glob. Pinned by test_warm_lane_gc_native.sh Block X-degrade.
 #
 # An explicit --protect-glob / REIFY_WARM_LANE_GC_PROTECT_GLOB still wins, and
 # short-circuits the bridge before it runs: the render costs one interpreter
@@ -747,16 +753,17 @@ fi
 
 # The clock is read ONCE per invocation, not once per lane.
 #
-# That is NOT the up-front-snapshot TOCTOU Block S-toctou forbids. What that
-# test forbids is hoisting the per-lane RECORD READ — one verdict computed once
-# and then consumed across a 25-40 minute traversal, which is how a lane
-# assigned mid-pass got reset out from under a live agent. The record read stays
-# firmly inside the loop; a THRESHOLD is not a per-lane verdict.
+# That is NOT the up-front-snapshot TOCTOU test_warm_lane_gc_native.sh
+# Block S-toctou forbids. What that test forbids is hoisting the per-lane
+# RECORD READ — one verdict computed once and then consumed across a 25-40
+# minute traversal, which is how a lane assigned mid-pass got reset out from
+# under a live agent. The record read stays firmly inside the loop; a THRESHOLD
+# is not a per-lane verdict.
 #
 # The resulting drift is the pass duration against a days-scale bound, so it
 # cannot flip a verdict at any plausible margin, and it drifts CONSERVATIVE:
 # lanes visited later in the pass are judged against an older cutoff, so they
-# are preserved rather than reclaimed. The idiom is warm-lane-audit.sh::_age_min's.
+# are preserved rather than reclaimed. The idiom is warm-lane-audit.sh::NOW_EPOCH's.
 NOW_EPOCH="$(date +%s)"
 
 # ── helper: name matches a glob pattern ───────────────────────────────────────
@@ -873,7 +880,8 @@ _record_gate_downgrade_reason() {
     # The acute valve is NOT subject to this: --disk-pressure is evaluated
     # FIRST and returns before this leg runs, so no unreadable timestamp can
     # hold the ENOSPC valve shut. That ordering is load-bearing, not incidental
-    # line order — Block S-age-degrade Arm B asserts it directly.
+    # line order — test_warm_lane_gc_native.sh Block S-age-degrade Arm B
+    # asserts it directly.
     #
     # ONE warn per affected lane, and the channel stays anomaly-only: a real
     # producer (LaneLifecycle.transition or LaneLifecycle.refresh_assigned)
@@ -881,14 +889,10 @@ _record_gate_downgrade_reason() {
     # wrong. Degrading SILENTLY would be worse than the bound not existing —
     # `downgraded_assigned=0` would read as "nothing was stale" when it means
     # "nothing could be judged".
-    # The empty case is tested SEPARATELY and FIRST, because GNU `date -d ''`
-    # does not fail — it succeeds and answers TODAY, so handing it an absent
-    # `updated_at` would read an unstamped record as freshly stamped:
-    # preserved, for a fabricated reason and with no warn.
+    # The parse, and its `date -d ''` gotcha, live in
+    # lib_lane_state.sh::lane_state_epoch.
     local record_epoch
-    if [ -z "$LANE_STATE_UPDATED_AT" ] \
-       || ! record_epoch="$(date -d "$LANE_STATE_UPDATED_AT" +%s 2>/dev/null)" \
-       || [ -z "$record_epoch" ]; then
+    if ! record_epoch="$(lane_state_epoch "$LANE_STATE_UPDATED_AT")"; then
         warn "$name: cannot judge lane-state record age (updated_at='$LANE_STATE_UPDATED_AT') — the staleness bound does not apply, so the record's preserve stands"
         return 0
     fi
@@ -1102,14 +1106,16 @@ _do_reclaim() {
         #     its protect CSV once and consumed it across a sweep that ran
         #     06:32-06:59 BST while _lane-5 dropped OUT of the protect set at
         #     06:32; and that same sweep reset _lane-5 at 20:55Z while a task-5334
-        #     agent session started 20:36Z was live (PRD §2). Block S-toctou goes
-        #     RED against any such hoist.
+        #     agent session started 20:36Z was live (PRD §2).
+        #     test_warm_lane_gc_native.sh Block S-toctou goes RED against any
+        #     such hoist.
         #   - UNDER the flock this loop already holds, so the read and the reset
         #     share one critical section and nothing can reassign the lane
         #     between verdict and action.
         #   - BEFORE both reset branches below (the --disk-pressure rm and the α
         #     reseed), so neither path can bypass the READ — the same "before
-        #     BOTH branches" property Block K5 pins for the live-reference gate.
+        #     BOTH branches" property test_warm_lane_gc.sh Block K5 pins for
+        #     the live-reference gate.
         #     Its VERDICT, however, is advisory under --disk-pressure: see the
         #     downgrade below. Evaluated-before is not the same as
         #     decisive-always, and conflating the two is what let a stranded

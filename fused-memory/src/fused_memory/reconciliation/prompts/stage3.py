@@ -248,7 +248,11 @@ it as missing.
 - `present: false` and `expected: true` (`reason: 'missing'`) → the run DID reach Stage \
 2 and is within the ledger's retention window, so the row is genuinely lost. Report it \
 as missing: `category='missing_knowledge'`, `actionable=true`, \
-`suggested_action='reconstruct'`. This is not a race you are seeing too early: both of \
+`suggested_action='carry_forward_ledger_write_gap'`. Only the harness's ledger write path \
+(`summary_pool.write_cycle_summary`) creates this row, so no agent write can repair it — a \
+Mem0 `add_memory` lands in a store `get_cycle_summary_presence` never reads; the \
+remediation pass decides the finding against this same ledger and carries it forward \
+unresolved rather than writing a summary. This is not a race you are seeing too early: both of \
 the write paths that precede this check have already had their turn — the stage's own \
 idempotent upsert, and the harness's write-recovered re-attempt with the REAL report, \
 which task 4186 moved ahead of this check (it previously ran after it, in the driver's \
@@ -286,13 +290,13 @@ filters={{'kind': 'cycle_summary', 'run_id': '<run_id>', 'stage': 'task_knowledg
 A return value > 0 means the Stage 2 summary is present. This path catches summaries that \
 semantic search misses due to low cosine-similarity ranking — confirmed false negative: \
 run 80a85eeb, memory 91e6a3b9 sat at relevance 0.71 and never surfaced in 6-angle \
-general searches, triggering wasteful reconstruction (task 1588). \
+general searches, triggering a false missing-summary finding (task 1588). \
 **The `stage` key is REQUIRED in this filter (task 1653):** Stage 1 now also writes a \
 per-cycle summary under `metadata={{'kind': 'cycle_summary', 'run_id': <run_id>, \
 'stage': 'memory_consolidator'}}` using the SAME shared cycle run_id. A double filter \
 of only `{{'kind': 'cycle_summary', 'run_id': <run_id>}}` would therefore return >0 \
 when ONLY the Stage 1 summary exists, falsely concluding the Stage 2 summary is present \
-and suppressing a genuinely-needed reconstruction. Always disambiguate the Stage 2 \
+and suppressing a genuine missing-summary finding. Always disambiguate the Stage 2 \
 summary by `'stage': 'task_knowledge_sync'`.
 
 **Decision rule**: if EITHER path finds the summary, do NOT report it as missing. \
@@ -300,8 +304,8 @@ Only report the summary as missing when BOTH Path 1 returns no matching content 
 Path 2 returns count=0. \
 **Tool error handling**: if `count_memories_by_metadata` returns an error (e.g. backend \
 unavailable), treat as inconclusive and do NOT report the summary as missing — the \
-documented harm is false-positive reconstruction, so bias toward not reconstructing on \
-uncertainty. Note the tool error in your cycle report instead.
+documented harm is a false-positive missing-summary finding, which burns a remediation \
+pass, so bias toward not reporting on uncertainty. Note the tool error in your cycle report instead.
 
 Legacy summaries written before task 1588 lack `metadata.run_id`, and Stage 2 summaries \
 written before task 9af436fe lack `metadata.stage`, so the Path 2 triple filter returns 0 \

@@ -54,9 +54,11 @@ import shutil
 import subprocess
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     extract_function_body,
     find_function_params,
+    jsx_open_tags,
+    jsx_prop_expr,
 )
 
 # ---------------------------------------------------------------------------
@@ -101,7 +103,7 @@ def _extract_signature(src: str, fn_name: str) -> str:
 # ---------------------------------------------------------------------------
 # Extractors.  Each fails LOUDLY on a miss — a silent '' would make a rename
 # turn this whole file into a permanent false GREEN.  Neither needs a guard of
-# its own any more: both are projections over shared `_dashboard_helpers`
+# its own any more: both are projections over shared `_jsx_source_helpers`
 # helpers that RAISE rather than return '' (task 3549, task 4881).
 # `_component_body` takes the BODY via `extract_function_body`;
 # `_extract_signature` above takes the PARAMETER LIST via the same
@@ -178,25 +180,13 @@ def _tick_generator(body: str) -> str:
     return f'{ticks.group(1)}\n  {y_ticks.group(1)}'
 
 
-def _workflow_panel_format_y(tab_analytics_jsx_body: str) -> str:
-    """WorkflowPanel's own percent formatter, from its ``<C.StackedAreaChart>`` call.
-
-    Non-greedy up to ``} />``, which correctly steps over the ``${...}`` brace
-    pair inside the template literal.
-    """
-    body = _component_body(tab_analytics_jsx_body, 'WorkflowPanel')
-    m = re.search(r'<C\.StackedAreaChart\b[^>]*?formatY=\{(.*?)\}\s*/>', body)
-    assert m is not None, (
-        'WorkflowPanel no longer passes a `formatY={...}` to <C.StackedAreaChart> '
-        '— the 100%-normalized resolver-mix axis this task fixes has moved or '
-        'changed shape.'
-    )
-    return m.group(1).strip()
-
-
 # ---------------------------------------------------------------------------
 # Caller-audit extractors — the props (formatY) and flags (countAxis) that each
 # LineChart and StackedAreaChart CALL SITE passes, read out of the tab sources.
+# Each call site is read from its own opening tag, spanned by
+# `_jsx_source_helpers.py::jsx_open_tag_end`, so a quoted `}` or `/>` cannot end
+# it and a child element's attributes are never the chart's. A prop's
+# expression is read out of that tag by `_jsx_source_helpers.py::jsx_prop_expr`.
 #
 # `_line_chart_format_y` returns None for a site that passes no formatter. That
 # None is load-bearing for the esc-per-done ratio guard, which requires the site
@@ -211,40 +201,17 @@ _LINE_CHART_TAG_RE = re.compile(r'<(?:LC|LineChart|C\.LineChart)\b')
 _STACKED_AREA_TAG_RE = re.compile(r'<(?:SA|C\.StackedAreaChart)\b')
 
 
-def _jsx_elements(body: str, tag_re: re.Pattern) -> list:
-    """Every self-closing JSX element in `body` whose tag matches `tag_re`.
-
-    Walks to the element's own `/>` at brace depth 0, so a `series={[{...}]}`
-    prop containing braces (or a `${...}` inside a template literal) cannot end
-    the element early. A regex cannot do this: these props nest.
-    """
-    out = []
-    for m in tag_re.finditer(body):
-        depth = 0
-        i = m.end()
-        while i < len(body):
-            ch = body[i]
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-            elif depth == 0 and ch == '/' and body[i + 1 : i + 2] == '>':
-                out.append(body[m.start() : i + 2])
-                break
-            i += 1
-    return out
-
-
-def _anchored_chart_element(body: str, tag_re: re.Pattern, anchor: str) -> str:
-    """The one chart element in `body` whose tag matches `tag_re` and whose props mention `anchor`.
+def _anchored_chart_tag(body: str, tag_re: re.Pattern, anchor: str) -> str:
+    """The OPENING TAG, where every prop lives, of the one chart call site in
+    `body` whose tag matches `tag_re` and whose props mention `anchor`.
 
     `body` is an already-sliced COMPONENT body: several tabs render more than
     one chart, and the anchor (a series expression such as ``MEMORY_OPS.reads``)
     is what names the axis.
     """
-    matches = [el for el in _jsx_elements(body, tag_re) if anchor in el]
+    matches = [tag for tag in jsx_open_tags(body, tag_re) if anchor in tag]
     assert len(matches) == 1, (
-        f'expected exactly one chart element matching {tag_re.pattern!r} whose '
+        f'expected exactly one chart tag matching {tag_re.pattern!r} whose '
         f'props mention {anchor!r}, found {len(matches)}. The chart was renamed, '
         'removed, or its series expression changed — either way the caller-audit '
         'assertion that depends on it must FAIL rather than quietly measure a '
@@ -259,24 +226,11 @@ def _chart_prop(body: str, tag_re: re.Pattern, anchor: str, prop: str):
     Returns the expression text, or ``None`` when the site does not pass `prop`
     and therefore inherits the component's default.
     """
-    element = _anchored_chart_element(body, tag_re, anchor)
-    m = re.search(rf'\b{prop}=\{{', element)
-    if m is None:
-        return None
-    depth = 1
-    i = m.end()
-    while i < len(element) and depth > 0:
-        if element[i] == '{':
-            depth += 1
-        elif element[i] == '}':
-            depth -= 1
-        i += 1
-    assert depth == 0, f'unbalanced {prop}={{...}} in the element anchored at {anchor!r}'
-    return element[m.end() : i - 1].strip()
+    return jsx_prop_expr(_anchored_chart_tag(body, tag_re, anchor), prop)
 
 
-def _attribute_names_only(element: str) -> str:
-    """`element` with every attribute VALUE blanked to spaces, offsets preserved.
+def _attribute_names_only(opening_tag: str) -> str:
+    """`opening_tag` with every attribute VALUE blanked to spaces, offsets preserved.
 
     Blanks braced expressions (``series={[{ countAxis: 1 }]}``) and quoted
     strings at brace depth 0 (``title="countAxis"``), keeping their delimiters,
@@ -285,7 +239,7 @@ def _attribute_names_only(element: str) -> str:
     depth = 0
     quote = None
     kept = []
-    for ch in element:
+    for ch in opening_tag:
         if quote is not None:
             kept.append(ch if ch == quote else ' ')
             if ch == quote:
@@ -311,9 +265,9 @@ def _chart_flag(body: str, tag_re: re.Pattern, anchor: str, prop: str) -> bool:
     attribute names are scanned (see `_attribute_names_only`), so the token
     inside a braced expression or a quoted string is not an attribute.
     """
-    attributes = _attribute_names_only(_anchored_chart_element(body, tag_re, anchor))
+    attributes = _attribute_names_only(_anchored_chart_tag(body, tag_re, anchor))
     assert re.search(rf'(?<![\w.]){prop}\s*=', attributes) is None, (
-        f'the chart element anchored at {anchor!r} assigns `{prop}=...`. The '
+        f'the chart tag anchored at {anchor!r} assigns `{prop}=...`. The '
         f'caller audit requires the shorthand `{prop}` attribute, so that its '
         'presence is the whole decision; an assigned value could be false or '
         'computed, and would be misread as present or absent.'
@@ -324,6 +278,18 @@ def _chart_flag(body: str, tag_re: re.Pattern, anchor: str, prop: str) -> bool:
 def _line_chart_format_y(body: str, anchor: str):
     """The `formatY={...}` of the LineChart call site at `anchor`, or None (task 4232)."""
     return _chart_prop(body, _LINE_CHART_TAG_RE, anchor, 'formatY')
+
+
+def _workflow_panel_format_y(tab_analytics_jsx_body: str) -> str:
+    """WorkflowPanel's own percent formatter, from its ``<C.StackedAreaChart>`` call."""
+    body = _component_body(tab_analytics_jsx_body, 'WorkflowPanel')
+    format_y = _chart_prop(body, _STACKED_AREA_TAG_RE, 'labels={weeks}', 'formatY')
+    assert format_y is not None, (
+        'WorkflowPanel no longer passes a `formatY={...}` to <C.StackedAreaChart> '
+        '— the 100%-normalized resolver-mix axis this task fixes has moved or '
+        'changed shape.'
+    )
+    return format_y
 
 
 def _line_chart_axis_scalars(body: str) -> str:
@@ -981,3 +947,43 @@ def test_chart_flag_extractor_is_discriminating() -> None:
             'd.depth.values',
             'countAxis',
         ), f'the flag extractor reads a countAxis inside the quoted value {quoted} as the attribute.'
+
+
+@pytest.mark.parametrize(
+    'quoted',
+    ['title="a } b"', 'aria-label="a/>b"'],
+)
+def test_chart_site_readers_confine_each_site_to_its_own_opening_tag(quoted: str) -> None:
+    """A `}` or `/>` inside a quoted attribute neither ends nor derails the chart's tag."""
+    src = f'<LC {quoted} series={{[{{ values: d.depth.values }}]}} countAxis />'
+
+    assert _chart_flag(src, _LINE_CHART_TAG_RE, 'd.depth.values', 'countAxis'), (
+        f'the caller audit loses the chart whose quoted attribute is {quoted}: '
+        'a count axis that declares countAxis would be reported as renamed or '
+        'removed, and the audit would fail on the prose, not the chart.'
+    )
+
+
+def test_a_child_elements_attributes_are_not_the_charts() -> None:
+    """A chart with children is read from its opening tag only."""
+    with_flagged_child = '<LC series={[{ values: d.depth.values }]}>\n  <Legend countAxis />\n</LC>'
+    assert not _chart_flag(with_flagged_child, _LINE_CHART_TAG_RE, 'd.depth.values', 'countAxis'), (
+        "the flag extractor reads a child <Legend>'s countAxis as the chart's: a "
+        'fraction axis with such a child would pass the audit while snapping to 0%..400%.'
+    )
+
+    with_formatting_child = '<LC series={[{ values: d.depth.values }]}>\n  <Legend formatY={x} />\n</LC>'
+    assert _line_chart_format_y(with_formatting_child, 'd.depth.values') is None, (
+        "the prop extractor reads a child <Legend>'s formatY as the chart's: the "
+        'ratio guard would accept a site that in fact keeps the rounding default.'
+    )
+
+
+def test_chart_site_readers_strip_comments_before_walking() -> None:
+    """An apostrophe in a comment inside a multi-line prop must not derail the walk."""
+    src = "<LC\n  series={[\n    // don't snap: a ratio\n    { values: row.ratio },\n  ]}\n  countAxis\n/>"
+
+    assert _chart_flag(src, _LINE_CHART_TAG_RE, 'row.ratio', 'countAxis'), (
+        "an apostrophe in a comment inside the chart's series reads as an open "
+        'quote, so the audit would mis-span the chart and misreport its countAxis.'
+    )

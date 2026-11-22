@@ -28,13 +28,15 @@ from _workflow_helpers import (
     _make_resolving_steward,
     _make_review,
     _make_status_setting_steward,
+    agent_side_artifacts,
     fixed_prompt,
 )
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import outcome_allows_status
+from shared.usage_gate import SessionBudgetExhausted
 
-from orchestrator import session_registry
+from orchestrator import session_records
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, JUDGE, MERGER
 from orchestrator.artifacts import TaskArtifacts
@@ -61,7 +63,7 @@ from orchestrator.workflow import (
     WorkflowOutcome,
     WorkflowState,
 )
-from orchestrator.workflow_types import DryRunSpawn
+from orchestrator.workflow_types import DryRunSpawn, PublishedStewardOutcome
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -836,6 +838,61 @@ class TestVerifyDebugfixLoop:
 # ---------------------------------------------------------------------------
 
 
+class ReplanningReviewStub(AgentStub):
+    """The comprehensive reviewer blocks the first round; the replan adds step-3, which the implementer lands."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.replans = 0
+
+    def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+        if self.replans == 0 and role == 'reviewer_comprehensive':
+            review = _make_review(role, 'ISSUES_FOUND', [{
+                'severity': 'blocking',
+                'location': 'lib.py:5',
+                'category': 'missing_edge_case',
+                'description': 'No test for empty name',
+                'suggested_fix': 'Add test_farewell_empty',
+            }])
+            return AgentResult(
+                success=True, output=json.dumps(review),
+                structured_output=review, cost_usd=0.10,
+            )
+        review = _make_review(role)
+        return AgentResult(
+            success=True, output=json.dumps(review), structured_output=review, cost_usd=0.10,
+        )
+
+    async def _architect(self, cwd: Path) -> AgentResult:
+        plan_path = agent_side_artifacts(cwd).artifact_path('plan.json')
+        if not plan_path.exists():
+            return await super()._architect(cwd)
+        plan = json.loads(plan_path.read_text())
+        plan['steps'].append({
+            'id': 'step-3', 'type': 'test', 'description': 'Add test for empty name',
+            'status': 'pending', 'commit': None,
+        })
+        plan_path.write_text(json.dumps(plan, indent=2) + '\n')
+        self.replans += 1
+        return AgentResult(success=True, output='Plan updated', cost_usd=0.40)
+
+    async def _implementer(self, cwd: Path) -> AgentResult:
+        artifacts = agent_side_artifacts(cwd)
+        if not any(step['id'] == 'step-3' for step in artifacts.get_pending_steps()):
+            return await super()._implementer(cwd)
+        test_file = cwd / 'test_lib.py'
+        test_file.write_text(
+            test_file.read_text()
+            + '\ndef test_farewell_empty():\n    assert farewell("") == "Goodbye, "\n'
+        )
+        await _run(['git', 'add', '-A'], cwd=cwd)
+        await _run(['git', 'commit', '-m', 'Complete step-3'], cwd=cwd)
+        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=cwd)
+        artifacts.update_step_status('step-3', 'done', commit=sha)
+        return AgentResult(success=True, output='Completed step-3', cost_usd=1.00)
+
+
+
 @pytest.mark.asyncio
 class TestReviewLoop:
     """Review finds blocking issues → re-plan → re-execute → pass."""
@@ -843,93 +900,7 @@ class TestReviewLoop:
     async def test_blocking_review_triggers_replan(
         self, config, git_ops, task_assignment, monkeypatch
     ):
-        review_round = 0
-
-        class ReviewAgentStub(AgentStub):
-            def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
-                nonlocal review_round
-                # First round: reviewer finds blocking issue
-                if review_round == 0 and role == 'reviewer_comprehensive':
-                    review = _make_review(role, 'ISSUES_FOUND', [{
-                        'severity': 'blocking',
-                        'location': 'lib.py:5',
-                        'category': 'missing_edge_case',
-                        'description': 'No test for empty name',
-                        'suggested_fix': 'Add test_farewell_empty',
-                    }])
-                    return AgentResult(
-                        success=True, output=json.dumps(review),
-                        structured_output=review, cost_usd=0.10,
-                    )
-                # All other reviews pass
-                review = _make_review(role)
-                return AgentResult(
-                    success=True, output=json.dumps(review),
-                    structured_output=review, cost_usd=0.10,
-                )
-
-            async def _architect(self, cwd: Path) -> AgentResult:
-                """On re-plan, add a new step to address the review feedback."""
-                nonlocal review_round
-                task_dir = TaskArtifacts(cwd).task_root
-                plan_path = task_dir / 'plan.json'
-
-                if plan_path.exists():
-                    # This is a re-plan — read existing, add fix step
-                    plan = json.loads(plan_path.read_text())
-                    plan['steps'].append({
-                        'id': 'step-3',
-                        'type': 'test',
-                        'description': 'Add test for empty name',
-                        'status': 'pending',
-                        'commit': None,
-                    })
-                    plan_path.write_text(json.dumps(plan, indent=2) + '\n')
-                    review_round += 1
-                    return AgentResult(success=True, output='Plan updated', cost_usd=0.40)
-
-                # First plan
-                result = await super()._architect(cwd)
-                return result
-
-            async def _implementer(self, cwd: Path) -> AgentResult:
-                """Handle the extra step-3 on second pass.
-
-                First-round (step-1 test + step-2 impl): delegate to the
-                parent implementer so lib.py and test_lib.py actually land
-                — Decision-1's pre-merge subset check needs the branch to
-                touch the files declared in plan['files'].
-                """
-                artifacts = TaskArtifacts(cwd)
-                pending = artifacts.get_pending_steps()
-
-                if not pending:
-                    return AgentResult(success=True, output='Nothing to do')
-
-                # If step-3 (re-plan-added) is in the pending set, handle it
-                # explicitly here; otherwise let the parent implementer do
-                # the normal first-round work.
-                step_3 = next(
-                    (s for s in pending if s['id'] == 'step-3'), None,
-                )
-                if step_3 is None:
-                    return await super()._implementer(cwd)
-
-                test_content = (cwd / 'test_lib.py').read_text()
-                test_content += (
-                    '\ndef test_farewell_empty():\n'
-                    '    assert farewell("") == "Goodbye, "\n'
-                )
-                (cwd / 'test_lib.py').write_text(test_content)
-                await _run(['git', 'add', '-A'], cwd=cwd)
-                await _run(['git', 'commit', '-m', 'Complete step-3'], cwd=cwd)
-                _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=cwd)
-                artifacts.update_step_status('step-3', 'done', commit=sha)
-                return AgentResult(
-                    success=True, output='Completed step-3', cost_usd=1.00,
-                )
-
-        stub = ReviewAgentStub()
+        stub = ReplanningReviewStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
@@ -1513,7 +1484,7 @@ def _build_workflow_no_merge_worker(
     config: OrchestratorConfig,
     git_ops: GitOps,
     assignment: TaskAssignment,
-    agent_stub: AgentStub,  # noqa: ARG001
+    agent_stub: AgentStub,
     tmp_path: Path,
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
     """Thin delegate over `_build_workflow_with_escalation(spawn_merge_worker=False)`.
@@ -1540,13 +1511,13 @@ def _make_dismissing_steward(queue: EscalationQueue, task_id: str) -> type:
     from escalation.models import Escalation
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -1570,9 +1541,10 @@ def _make_dismissing_steward(queue: EscalationQueue, task_id: str) -> type:
             )
             queue.submit(l1)
             if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardReescalatedL1(esc_id=l1.id),
-                )
+                for esc in pending:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id, StewardReescalatedL1(esc_id=l1.id),
+                    ))
 
         async def stop(self) -> None:
             pass
@@ -1591,23 +1563,28 @@ def _make_resolve_then_dismiss_chained_steward(
 
     Mirrors the live failure mode that drove the original Fix A: the
     steward chains a fresh L0 and gives up on it rather than the one the
-    workflow itself submitted (``created_l0_id``).  Publishes
-    ``StewardResolved`` (for the resolved workflow L0) THEN
-    ``StewardReescalatedL1`` (for the chained give-up) — the same dual
-    publish the real steward performs — so the workflow's drain+reduce
-    (task 2248 / W9-delta review fix) must see past the leading
-    ``StewardResolved`` to route to ESCALATED.
+    workflow itself submitted (``created_l0_id``).  Like the real producer it
+    publishes one envelope per L0: ``StewardResolved`` tagged with each
+    workflow L0, THEN ``StewardReescalatedL1`` tagged with the chained L0.
+
+    Neither waiter reaches ESCALATED through that trailing publication.
+    ``_mark_blocked``'s wait is scoped to its own L0 (task 5563), so the
+    chained outcome is foreign and discarded; ESCALATED comes from the
+    ``has_open_l1`` source-of-truth override in
+    ``TaskWorkflow._await_steward_completion``, which replaces the in-scope
+    ``StewardResolved``.  ``run()``'s ESCALATED wait never routes on the
+    channel at all: its tail reads the open L1 from the escalation queue.
     """
     from escalation.models import Escalation
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -1618,18 +1595,17 @@ def _make_resolve_then_dismiss_chained_steward(
                     esc.id, 'Resolved by FakeSteward (workflow L0)',
                     resolved_by='fake-steward',
                 )
-            # Faithful to the real steward's dual publish (task 2248 /
-            # W9-delta review fix): TaskSteward._handle_escalation publishes
-            # StewardResolved for the workflow's own L0 (steward.py:563)
-            # BEFORE it ever chains a follow-on escalation of its own — so
-            # the channel must carry [StewardResolved, StewardReescalatedL1],
-            # not just the trailing re-escalation.
+            # Publication order as the real producer emits it:
+            # TaskSteward._handle_escalation publishes StewardResolved for the
+            # workflow's own L0 BEFORE it ever chains a follow-on escalation.
             if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(
-                        resolution_text='Resolved by FakeSteward (workflow L0)',
-                    ),
-                )
+                for esc in pending:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardResolved(
+                            resolution_text='Resolved by FakeSteward (workflow L0)',
+                        ),
+                    ))
             chained = Escalation(
                 id=queue.make_id(task_id),
                 task_id=task_id,
@@ -1658,9 +1634,9 @@ def _make_resolve_then_dismiss_chained_steward(
             )
             queue.submit(l1)
             if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardReescalatedL1(esc_id=l1.id),
-                )
+                self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                    chained.id, StewardReescalatedL1(esc_id=l1.id),
+                ))
 
         async def stop(self) -> None:
             pass
@@ -2854,7 +2830,7 @@ class TestPlanFinalizeMarker:
                 self.completion_called = False
 
             async def build_plan_completion_prompt(
-                self, task, partial_plan, worktree=None, context=None,
+                self, task, partial_plan, worktree=None, context=None, *, rulings=(),
             ) -> str:
                 self.completion_called = True
                 return 'Complete the partial plan'
@@ -3028,13 +3004,15 @@ class TestMarkBlockedFalseDoneGuard:
         THAT one with terminate=True, the workflow must still treat it
         as "agent gives up".
 
-        Task 2248 / W9-delta: the old timestamp-window dismissal guard
-        that used to catch this case is deleted; the fake steward now
-        publishes ``StewardReescalatedL1`` (mirroring the real give-up
-        choke point) and ``_mark_blocked``'s single isinstance dispatch
-        (SO-1) routes it to ESCALATED — no re-pend, no duplicate L1.  This
-        still exercises the "not just created_l0_id" case: the dismissed
-        L0 is NOT the one the workflow itself submitted.
+        The steward's ``StewardReescalatedL1`` is about the chained L0, so
+        ``_mark_blocked``'s scoped wait discards it (task 5563) and receives
+        only its own L0's ``StewardResolved``.  The ``has_open_l1``
+        source-of-truth override in ``_await_steward_completion`` turns that
+        would-be requeue into ``StewardReescalatedL1``, which
+        ``_mark_blocked``'s single isinstance dispatch (SO-1) routes to
+        ESCALATED — no re-pend, no duplicate L1.  This still exercises the
+        "not just created_l0_id" case: the dismissed L0 is NOT the one the
+        workflow itself submitted.
         """
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -3121,7 +3099,7 @@ class TestMarkBlockedFalseDoneGuard:
         invocations: list[str] = []
 
         class _SpyStewardFactory:
-            def __call__(self, wt_path, cfg_dir):  # noqa: ARG002
+            def __call__(self, wt_path, cfg_dir):
                 invocations.append('init')
                 return _SpyStewardFactory.Steward()
 
@@ -3317,10 +3295,8 @@ class TestMarkBlockedFalseDoneGuard:
         """
         from unittest.mock import AsyncMock, patch
 
-        from orchestrator.merge_lane.worker import (
-            TRANSIENT_INFRA_REASON_PREFIX,
-            MergeOutcome,
-        )
+        from orchestrator.merge_lane.verify_failure_outcome import TRANSIENT_INFRA_REASON_PREFIX
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -5576,13 +5552,13 @@ def _make_l1_escalating_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -5606,9 +5582,10 @@ def _make_l1_escalating_steward(
             )
             queue.submit(l1)
             if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardReescalatedL1(esc_id=l1.id),
-                )
+                for esc in pending:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id, StewardReescalatedL1(esc_id=l1.id),
+                    ))
 
         async def stop(self) -> None:
             pass
@@ -6824,8 +6801,6 @@ class TestSessionBudgetExhaustionEscalation:
         self, config, git_ops, task_assignment, monkeypatch, tmp_path
     ):
         """L1 escalation summary carries budget limit and cost-spent figures."""
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -6885,8 +6860,6 @@ class TestSessionBudgetExhaustionEscalation:
         Before step-4 impl, the detail defaults to the summary string (no separate
         detail is passed to _mark_blocked), so the metric-label assertions fail.
         """
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -6952,8 +6925,6 @@ class TestFirstInvocationBudgetExhaustion:
           (iii) detail contains 'last_completed_role=n/a'  (new label + default fallback)
           (iv)  summary contains 'last completed role: n/a'  (new summary wording)
         """
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -7013,13 +6984,13 @@ def _make_done_setting_steward(
     'done' is terminal, mirroring ``_make_status_setting_steward``.
     """
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
 
         def set_outcome_channel(self, channel) -> None:
             self._outcome_channel = channel
 
-        def set_wip_probe(self, probe) -> None:  # noqa: ARG002
+        def set_wip_probe(self, probe) -> None:
             pass
 
         async def start(self) -> None:
@@ -7032,9 +7003,11 @@ def _make_done_setting_steward(
                 done_provenance={'note': 'phantom-done regression test'},
             )
             if self._outcome_channel is not None:
-                self._outcome_channel.put_nowait(
-                    StewardResolved(resolution_text='Implementation already shipped'),
-                )
+                for esc in pending:
+                    self._outcome_channel.put_nowait(PublishedStewardOutcome(
+                        esc.id,
+                        StewardResolved(resolution_text='Implementation already shipped'),
+                    ))
 
         async def stop(self) -> None:
             pass
@@ -8021,7 +7994,7 @@ class TestMergeRetryLoopSoftCancelExits:
 
         GREEN once step-2 lands (SOFT_CANCELLED enum + _handle_soft_cancel update).
         """
-        import logging as _logging  # noqa: PLC0415
+        import logging as _logging
 
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
@@ -8091,9 +8064,9 @@ class TestMergeRetryLoopSoftCancelExits:
         RED before step-4 (loop retries on REQUEUED regardless of cancel_event).
         GREEN after step-4 (cancel re-check exits before "retrying merge" log).
         """
-        import logging as _logging  # noqa: PLC0415
+        import logging as _logging
 
-        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+        from orchestrator.config import OrchestratorConfig
 
         # Use max_merge_retries=2 so the RED path exhausts in 2 iters, not 3.
         config_2 = OrchestratorConfig(
@@ -8167,7 +8140,7 @@ class TestDryRunUnblockE2EGuardOptOut:
 
     async def test_stub_raises_assertion_error_on_call(self):
         """Calling run_dry_run_unblock without opt-in raises a descriptive AssertionError."""
-        import orchestrator.workflow as _wf  # noqa: PLC0415
+        import orchestrator.workflow as _wf
 
         # The guard installs a synchronous stub (not a coroutine), so the call
         # raises AssertionError immediately.  Pin the marker name as the stable
@@ -8197,7 +8170,7 @@ class TestDryRunUnblockE2EGuardOptIn:
 
     async def test_async_mock_installed_when_marker_present(self):
         """run_dry_run_unblock is an AsyncMock when mocks_dry_run_unblock marker is set."""
-        import orchestrator.workflow as _wf  # noqa: PLC0415
+        import orchestrator.workflow as _wf
 
         assert isinstance(_wf.run_dry_run_unblock, AsyncMock), (
             f'Expected AsyncMock, got {type(_wf.run_dry_run_unblock)!r}'
@@ -8792,7 +8765,7 @@ class TestBuildSpawnEnv:
         (_architect_spawn_session_id stashed), a post-architect role's
         CLAUDE_SPAWN_PARENT_ID is the architect's reconstructed
         SessionStart-hook registry slug -- built via the exact same
-        session_registry.build_session_slug the architect's own hook uses,
+        session_records.build_session_slug the architect's own hook uses,
         so it matches that real record precisely."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
         workflow._architect_spawn_session_id = 'arch-uuid-xyz'
@@ -8800,11 +8773,11 @@ class TestBuildSpawnEnv:
         env = workflow._build_spawn_env(IMPLEMENTER)
 
         assert env['CLAUDE_SPAWN_ROLE'] == 'implementer'
-        assert env['CLAUDE_SPAWN_PARENT_ID'] == session_registry.build_session_slug(
+        assert env['CLAUDE_SPAWN_PARENT_ID'] == session_records.build_session_slug(
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            'arch-uuid-xyz',  # type: ignore[arg-type]  # deliberate str in launcher_pid slot; see session_hooks.hook_session_slug
+            'arch-uuid-xyz',
         )
 
     async def test_architect_still_receives_workflow_root_when_stashed(
@@ -8855,11 +8828,13 @@ class TestBuildSpawnEnv:
         implementer_kwargs = captured_calls[1]
         implementer_spawn_env = implementer_kwargs['spawn_env']
         assert implementer_spawn_env['CLAUDE_SPAWN_ROLE'] == 'implementer'
-        assert implementer_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == session_registry.build_session_slug(
+        architect_session_id = workflow._architect_spawn_session_id
+        assert architect_session_id is not None
+        assert implementer_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == session_records.build_session_slug(
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            workflow._architect_spawn_session_id,  # type: ignore[arg-type]  # deliberate str in launcher_pid slot; see session_hooks.hook_session_slug
+            architect_session_id,
         )
 
 

@@ -1,0 +1,18 @@
+{
+  "task_id": "7721",
+  "reason": "Amendment to task 7721's spec-lane release fix (reviewer suggestion 2). git_ops.py::GitOps::_spec_lane_registered (+2, two guards): a _spec- lane still registered whose directory vanished has its registration removed with a scoped git worktree remove --force and takes create-once. Without it, releasing the lane on any exception (this task's fix) let WarmLanePool.try_acquire re-draw the same broken lane and raise WorktreeMissing on every later acquire, turning each speculative verify that drew it into a terminal block.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1539,
+      "current": 1541
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5343,
+      "current": 5345
+    }
+  ]
+}

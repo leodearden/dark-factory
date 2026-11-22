@@ -26,6 +26,9 @@ import startup_completion_fixtures as scf
 from _oauth_accounts import ALL_TOKEN_LETTERS, available_tokens
 
 from shared import cli_invoke
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Live re-probe gate — account scan single-homed in _oauth_accounts (task 3700);
 # see its module docstring for the history and for the two letter sets.

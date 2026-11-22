@@ -9,14 +9,19 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from fused_memory.reconciliation.finding_task_escalation import (
     FINDING_TASK_ESCALATION_CATEGORY,
+    LIVENESS_UNKNOWN_DETAIL_KEY,
     build_finding_task_escalation_kwargs,
     is_routable_task_id,
+    liveness_unknown_detail,
+    recent_conversion_suppresses_refile,
     resolve_finding_task_target,
+    routed_record_carries_finding,
     routed_record_covers_finding,
 )
 
@@ -411,6 +416,33 @@ class TestBuildFindingTaskEscalationKwargs:
         assert payload['task_id'] == '4458'
         json.loads(payload['detail'])
 
+    def test_detail_lists_its_own_target_when_the_target_liveness_is_unknown(self):
+        detail = json.loads(self._build(target_liveness_unknown=True)['detail'])
+        assert detail[LIVENESS_UNKNOWN_DETAIL_KEY] == ['4458']
+        assert detail['finding_fingerprint'] == 'fp-a'
+        assert detail['run_id'] == 'abcdef0123456789'
+
+    @pytest.mark.parametrize('over', [{}, {'target_liveness_unknown': False}])
+    def test_detail_omits_the_liveness_unknown_key_by_default(self, over):
+        payload = self._build(**over)
+        assert LIVENESS_UNKNOWN_DETAIL_KEY not in json.loads(payload['detail'])
+
+
+class TestLivenessUnknownDetail:
+    """The one shape both the recon-queue and the routed record carry."""
+
+    def test_lists_the_ids_sorted(self):
+        assert liveness_unknown_detail({'902', '777'}) == {
+            LIVENESS_UNKNOWN_DETAIL_KEY: ['777', '902'],
+        }
+
+    def test_no_ids_leaves_the_key_absent_rather_than_empty(self):
+        assert liveness_unknown_detail(frozenset()) == {}
+
+    def test_the_key_spelling_is_a_persisted_contract(self):
+        # Recon-queue records already on disk carry this spelling.
+        assert LIVENESS_UNKNOWN_DETAIL_KEY == 'liveness_unknown_task_ids'
+
 
 _REAPER_DETAIL_SUFFIX = '\n\n[note] originating worktree may be reaped; branch=task/4458'
 
@@ -473,3 +505,90 @@ class TestRoutedRecordCoversFinding:
     def test_other_category_never_folds(self, level):
         other = _record('fp-a', category='risk_identified', level=level)
         assert routed_record_covers_finding(other, 'fp-a') is False
+
+
+class TestRoutedRecordCarriesFinding:
+    """Fingerprint identity of a routed record, at any level and in any status."""
+
+    @pytest.mark.parametrize('level', [0, 1])
+    def test_same_fingerprint_is_carried_at_any_level(self, level):
+        assert routed_record_carries_finding(_record('fp-a', level=level), 'fp-a') is True
+
+    def test_distinct_fingerprint_is_not_carried(self):
+        assert routed_record_carries_finding(_record('fp-a'), 'fp-b') is False
+
+    def test_other_category_is_not_carried(self):
+        other = _record('fp-a', category='risk_identified')
+        assert routed_record_carries_finding(other, 'fp-a') is False
+
+    def test_empty_query_fingerprint_never_matches_an_empty_stored_one(self):
+        assert routed_record_carries_finding(_record(''), '') is False
+
+    @pytest.mark.parametrize(
+        'detail',
+        [
+            '',
+            'not json',
+            '[]',
+            json.dumps({'finding_fingerprint': 5}),
+            json.dumps({'finding_id': 'f-1'}),
+        ],
+    )
+    def test_unreadable_or_legacy_detail_is_not_carried(self, detail):
+        assert routed_record_carries_finding(_record(detail=detail), 'fp-a') is False
+
+    def test_promoted_record_with_a_suffixed_detail_is_not_carried(self):
+        promoted = _record('fp-a', level=1)
+        promoted.detail += _REAPER_DETAIL_SUFFIX
+        assert routed_record_carries_finding(promoted, 'fp-a') is False
+
+
+@dataclass
+class _TerminalRecord:
+    resolution_class: str | None
+    resolved_at: object
+
+
+_NOW = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
+_WINDOW = timedelta(hours=24)
+
+
+def _suppresses(record: _TerminalRecord | None) -> bool:
+    return recent_conversion_suppresses_refile(
+        record, converted_class='converted', now=_NOW, window=_WINDOW,
+    )
+
+
+class TestRecentConversionSuppressesRefile:
+    """Whether the newest terminal routed record of a finding holds back its refile."""
+
+    def test_no_record_does_not_suppress(self):
+        assert _suppresses(None) is False
+
+    def test_fresh_conversion_suppresses(self):
+        fresh = (_NOW - timedelta(hours=1)).isoformat()
+        assert _suppresses(_TerminalRecord('converted', fresh)) is True
+
+    @pytest.mark.parametrize('age', [_WINDOW, _WINDOW + timedelta(seconds=1)])
+    def test_conversion_at_or_past_the_window_edge_does_not_suppress(self, age):
+        stale = (_NOW - age).isoformat()
+        assert _suppresses(_TerminalRecord('converted', stale)) is False
+
+    @pytest.mark.parametrize(
+        'resolution_class',
+        [None, 'benign', 'actionable', 'addressed', 'observation-consumed'],
+    )
+    def test_any_other_class_does_not_suppress(self, resolution_class):
+        fresh = (_NOW - timedelta(hours=1)).isoformat()
+        assert _suppresses(_TerminalRecord(resolution_class, fresh)) is False
+
+    @pytest.mark.parametrize('resolved_at', [None, '', 'garbage', 1763208000])
+    def test_unreadable_stamp_does_not_suppress(self, resolved_at):
+        assert _suppresses(_TerminalRecord('converted', resolved_at)) is False
+
+    @pytest.mark.parametrize(
+        ('age', 'suppresses'), [(timedelta(hours=1), True), (_WINDOW, False)],
+    )
+    def test_naive_stamp_reads_as_utc(self, age, suppresses):
+        naive = (_NOW - age).replace(tzinfo=None).isoformat()
+        assert _suppresses(_TerminalRecord('converted', naive)) is suppresses

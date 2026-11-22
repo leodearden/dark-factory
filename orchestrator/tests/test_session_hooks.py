@@ -30,6 +30,7 @@ from _session_hook_fixtures import (
 )
 
 from orchestrator import session_hooks as sh
+from orchestrator import session_records
 from orchestrator import session_registry as sr
 
 
@@ -93,13 +94,11 @@ def test_resolve_hook_identity_uses_os_getcwd_when_cwd_absent(
 def test_hook_session_slug_keyed_on_session_id_hand_launched() -> None:
     hook_input = {'session_id': 'abc-123', 'cwd': '/home/leo/src/dark-factory'}
     slug = sh.hook_session_slug(hook_input, env={})
-    # session_id ('abc-123', a str) fills the launcher_pid slot deliberately;
-    # see session_hooks.hook_session_slug's docstring.
-    assert slug == sr.build_session_slug(
+    assert slug == session_records.build_session_slug(
         'session',
         'dark-factory',
         None,
-        'abc-123',  # type: ignore[arg-type]
+        'abc-123',
     )
 
 
@@ -111,11 +110,11 @@ def test_hook_session_slug_keyed_on_session_id_spawned() -> None:
         'CLAUDE_SPAWN_TASK_ID': '2085',
     }
     slug = sh.hook_session_slug(hook_input, env=env)
-    assert slug == sr.build_session_slug(
+    assert slug == session_records.build_session_slug(
         'unblock',
         'df',
         '2085',
-        'abc-123',  # type: ignore[arg-type]
+        'abc-123',
     )
 
 
@@ -138,11 +137,11 @@ def test_hook_session_slug_uses_cwd_fallback_when_absent(
     monkeypatch.chdir(tmp_path)
     hook_input = {'session_id': 'sess-3'}
     slug = sh.hook_session_slug(hook_input, env={})
-    assert slug == sr.build_session_slug(
+    assert slug == session_records.build_session_slug(
         'session',
         tmp_path.name,
         None,
-        'sess-3',  # type: ignore[arg-type]
+        'sess-3',
     )
 
 
@@ -176,11 +175,11 @@ def test_hook_session_slug_falls_back_when_claude_spawn_session_id_absent(
     if spawn_session_id is not None:
         env['CLAUDE_SPAWN_SESSION_ID'] = spawn_session_id
     slug = sh.hook_session_slug(hook_input, env=env)
-    assert slug == sr.build_session_slug(
+    assert slug == session_records.build_session_slug(
         'session',
         'dark-factory',
         None,
-        'abc-123',  # type: ignore[arg-type]
+        'abc-123',
     )
 
 
@@ -188,7 +187,7 @@ def test_hook_session_slug_sanitizes_malformed_claude_spawn_session_id() -> None
     hook_input = {'session_id': 'uuid-x', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': 'bad/id#x'}
     slug = sh.hook_session_slug(hook_input, env=env)
-    assert slug == sr.sanitize_slug('bad/id#x')
+    assert slug == session_records.sanitize_slug('bad/id#x')
     assert slug == 'bad-id-x'
 
 
@@ -225,29 +224,29 @@ def test_hook_session_slug_sanitizes_all_dots_claude_spawn_session_id(
 # ---------------------------------------------------------------------------
 
 
-def _make_hook_record(**overrides: object) -> sr.SessionRecord:
+def _make_hook_record(**overrides: object) -> session_records.SessionRecord:
     """Minimal SessionRecord for hook_display_title's record-title fallback tests."""
     fields: dict = {
         'session_slug': 'session-dark-factory-sess-1',
-        'status': sr.Status.RUNNING,
+        'status': session_records.Status.RUNNING,
         'title': '',
     }
     fields.update(overrides)
-    return sr.SessionRecord(**fields)
+    return session_records.SessionRecord(**fields)
 
 
 def test_osc_retitle_sequence_running_uses_gear_glyph() -> None:
-    seq = sh.osc_retitle_sequence(sr.Status.RUNNING, 'unblock:df#2085')
+    seq = sh.osc_retitle_sequence(session_records.Status.RUNNING, 'unblock:df#2085')
     assert seq == '\033]0;⚙ unblock:df#2085\007'
 
 
 def test_osc_retitle_sequence_awaiting_input_uses_pause_glyph_and_label() -> None:
-    seq = sh.osc_retitle_sequence(sr.Status.AWAITING_INPUT, 'unblock:df#2085')
+    seq = sh.osc_retitle_sequence(session_records.Status.AWAITING_INPUT, 'unblock:df#2085')
     assert seq == '\033]0;⏸ AWAITING unblock:df#2085\007'
 
 
 def test_osc_retitle_sequence_idle_uses_check_glyph() -> None:
-    seq = sh.osc_retitle_sequence(sr.Status.IDLE, 'unblock:df#2085')
+    seq = sh.osc_retitle_sequence(session_records.Status.IDLE, 'unblock:df#2085')
     assert seq == '\033]0;✅ unblock:df#2085\007'
 
 
@@ -294,12 +293,12 @@ def test_run_session_start_hand_launched_creates_new_running_record(tmp_path: Pa
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     assert record.role == 'session'
     assert record.project == 'dark-factory'
     assert record.cwd == '/home/leo/src/dark-factory'
-    assert record.transcript_path == sr.transcript_path_for_cwd('/home/leo/src/dark-factory')
+    assert record.transcript_path == session_records.transcript_path_for_cwd('/home/leo/src/dark-factory')
 
 
 def test_run_session_start_refreshes_existing_record_preserving_fields(tmp_path: Path) -> None:
@@ -309,24 +308,24 @@ def test_run_session_start_refreshes_existing_record_preserving_fields(tmp_path:
     hook_input = {'session_id': 'sess-b', 'cwd': '/home/leo/src/dark-factory'}
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.LAUNCHING,
+        status=session_records.Status.LAUNCHING,
         role='unblock',
         project='df',
         task_id='2085',
         cwd='/home/leo/src/dark-factory',
         prompt='/unblock 2085',
     )
-    sr.write_record(existing, root=tmp_path)
-    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
+    record_path = session_records.record_path_for_slug(slug, root=tmp_path)
     old_ts = record_path.stat().st_mtime - 10
     os.utime(record_path, (old_ts, old_ts))
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     # Previously-populated fields survive the refresh untouched.
     assert record.role == 'unblock'
     assert record.project == 'df'
@@ -351,7 +350,7 @@ def test_run_session_start_hand_launched_uses_session_leader_as_liveness_pid(
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.launcher_pid == os.getsid(0)
 
 
@@ -366,7 +365,7 @@ def test_run_session_start_spawned_still_prefers_explicit_launcher_pid_env(
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.launcher_pid == 4242
 
 
@@ -382,8 +381,8 @@ def test_run_session_start_create_path_stamps_parent_session_id(tmp_path: Path) 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     assert record.parent_session_id == 'unblock-df-2085-4242'
 
 
@@ -393,24 +392,24 @@ def test_run_session_start_refresh_path_stamps_parent_session_id_preserving_fiel
     hook_input = {'session_id': 'sess-p2', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_PARENT_ID': 'unblock-df-2085-4242'}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.LAUNCHING,
+        status=session_records.Status.LAUNCHING,
         role='unblock',
         project='df',
         task_id='2085',
         cwd='/home/leo/src/dark-factory',
         prompt='/unblock 2085',
     )
-    sr.write_record(existing, root=tmp_path)
-    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
+    record_path = session_records.record_path_for_slug(slug, root=tmp_path)
     old_ts = record_path.stat().st_mtime - 10
     os.utime(record_path, (old_ts, old_ts))
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     assert record.parent_session_id == 'unblock-df-2085-4242'
     # Previously-populated fields survive the enrichment write.
     assert record.role == 'unblock'
@@ -429,7 +428,7 @@ def test_run_session_start_no_parent_id_env_leaves_parent_session_id_none(tmp_pa
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.parent_session_id is None
 
 
@@ -446,10 +445,10 @@ def test_run_session_start_converges_onto_spawn_claude_launching_record(
     # Code session_id, but CLAUDE_SPAWN_SESSION_ID=S) must advance that SAME
     # record rather than creating a second, uuid-keyed one.
     slug = 'session-cockpit-3215033'
-    result_file = str(sr.record_path_for_slug(slug, root=tmp_path).parent / 'result.md')
-    launching = sr.SessionRecord(
+    result_file = str(session_records.record_path_for_slug(slug, root=tmp_path).parent / 'result.md')
+    launching = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.LAUNCHING,
+        status=session_records.Status.LAUNCHING,
         role='session',
         project='cockpit',
         task_id=None,
@@ -458,15 +457,15 @@ def test_run_session_start_converges_onto_spawn_claude_launching_record(
         launcher_pid=3215033,
         result_file=result_file,
     )
-    sr.write_record(launching, root=tmp_path)
+    session_records.write_record(launching, root=tmp_path)
 
     hook_input = {'session_id': 'uuid-x', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     # Rich pre-existing fields survive the convergence refresh untouched.
     assert record.role == 'session'
     assert record.project == 'cockpit'
@@ -474,36 +473,36 @@ def test_run_session_start_converges_onto_spawn_claude_launching_record(
     assert record.launcher_pid == 3215033
     assert record.result_file == result_file
     # No separate uuid-keyed duplicate: exactly one dir in sessions_dir.
-    dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    dirs = list(session_records.sessions_dir(root=tmp_path).iterdir())
     assert len(dirs) == 1
     assert dirs[0].name == slug
 
 
 def test_full_lifecycle_converges_on_one_slug_through_exit(tmp_path: Path) -> None:
     slug = 'session-cockpit-3215034'
-    sr.write_record(
-        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215034),
+    session_records.write_record(
+        session_records.SessionRecord(session_slug=slug, status=session_records.Status.LAUNCHING, launcher_pid=3215034),
         root=tmp_path,
     )
     hook_input = {'session_id': 'uuid-y', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
     sh.run_session_start(hook_input, env, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.RUNNING
 
     sh.run_notification(hook_input, env, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.AWAITING_INPUT
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.AWAITING_INPUT
 
     sh.run_stop(hook_input, env, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.IDLE
 
-    sr.update_status(slug, root=tmp_path, status=sr.Status.EXITED, exit_code=0)
-    final = sr.read_record(slug, root=tmp_path)
-    assert final.status == sr.Status.EXITED
+    session_records.update_status(slug, root=tmp_path, status=session_records.Status.EXITED, exit_code=0)
+    final = session_records.read_record(slug, root=tmp_path)
+    assert final.status == session_records.Status.EXITED
     assert final.exit_code == 0
 
     # One record dir throughout the whole lifecycle -- never a second one.
-    dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    dirs = list(session_records.sessions_dir(root=tmp_path).iterdir())
     assert len(dirs) == 1
     assert dirs[0].name == slug
 
@@ -512,22 +511,22 @@ def test_run_notification_and_stop_converge_onto_spawn_claude_slug_not_uuid(
     tmp_path: Path,
 ) -> None:
     slug = 'session-cockpit-3215035'
-    sr.write_record(
-        sr.SessionRecord(session_slug=slug, status=sr.Status.RUNNING, launcher_pid=3215035),
+    session_records.write_record(
+        session_records.SessionRecord(session_slug=slug, status=session_records.Status.RUNNING, launcher_pid=3215035),
         root=tmp_path,
     )
     hook_input = {'session_id': 'uuid-z', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
     sh.run_notification(hook_input, env, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.AWAITING_INPUT
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.AWAITING_INPUT
 
     sh.run_stop(hook_input, env, root=tmp_path)
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.IDLE
 
     uuid_slug = sh.hook_session_slug({'session_id': 'uuid-z', 'cwd': hook_input['cwd']}, env={})
     assert uuid_slug != slug
-    assert not sr.record_path_for_slug(uuid_slug, root=tmp_path).exists()
+    assert not session_records.record_path_for_slug(uuid_slug, root=tmp_path).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -551,20 +550,20 @@ def test_run_notification_and_run_stop_flip_status_and_return_osc(
     hook_input = {'session_id': 'sess-c', 'cwd': '/home/leo/src/dark-factory'}
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         role='session',
         project='dark-factory',
         cwd='/home/leo/src/dark-factory',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
     handler = getattr(sh, handler_name)
 
     osc = handler(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status(expected_status)
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status(expected_status)
     assert osc == f'\033]0;{expected_glyph_prefix} session:dark-factory\007'
 
 
@@ -572,12 +571,12 @@ def test_run_notification_prefers_persisted_record_title(tmp_path: Path) -> None
     hook_input = {'session_id': 'sess-d', 'cwd': '/home/leo/src/dark-factory'}
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         title='unblock:df#2085 routing-mechanism',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
 
     osc = sh.run_notification(hook_input, env, root=tmp_path)
 
@@ -597,19 +596,19 @@ def test_run_notification_stamps_question_from_message(tmp_path: Path) -> None:
     }
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         role='session',
         project='dark-factory',
         cwd='/home/leo/src/dark-factory',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
 
     sh.run_notification(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.AWAITING_INPUT
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.AWAITING_INPUT
     assert record.question is not None
     assert record.question.text == 'Claude needs your permission to run Bash'
     # asked_at is a non-empty, genuinely parseable ISO-8601 timestamp.
@@ -627,20 +626,20 @@ def test_run_notification_question_stamp_preserves_other_fields(tmp_path: Path) 
     }
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         title='unblock:df#2085 routing-mechanism',
         role='unblock',
         project='df',
         task_id='2085',
         cwd='/home/leo/src/dark-factory',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
 
     sh.run_notification(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.title == 'unblock:df#2085 routing-mechanism'
     assert record.role == 'unblock'
     assert record.project == 'df'
@@ -665,19 +664,19 @@ def test_run_notification_no_question_when_message_absent_or_blank(
     hook_input = {'session_id': 'sess-q3', 'cwd': '/home/leo/src/dark-factory', **hook_input_extra}
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         role='session',
         project='dark-factory',
         cwd='/home/leo/src/dark-factory',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
 
     osc = sh.run_notification(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.AWAITING_INPUT
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.AWAITING_INPUT
     assert record.question is None
     assert osc == '\033]0;⏸ AWAITING session:dark-factory\007'
 
@@ -692,19 +691,19 @@ def test_run_stop_does_not_stamp_question_even_with_message(tmp_path: Path) -> N
     }
     env: dict[str, str] = {}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         role='session',
         project='dark-factory',
         cwd='/home/leo/src/dark-factory',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
 
     sh.run_stop(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.IDLE
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.IDLE
     assert record.question is None
 
 
@@ -728,7 +727,7 @@ def test_main_notification_stamps_question_via_stdin(
 
     assert rc == 0
     slug = sh.hook_session_slug(hook_input, env={})
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.question is not None
     assert record.question.text == 'Claude needs your permission to run Bash'
 
@@ -750,7 +749,7 @@ def test_main_session_start_creates_running_record_and_returns_zero(
 
     assert rc == 0
     slug = sh.hook_session_slug(hook_input, env={})
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.RUNNING
 
 
 def test_main_notification_writes_osc_to_stdout(
@@ -765,10 +764,10 @@ def test_main_notification_writes_osc_to_stdout(
     rc = sh.main(['notification'])
 
     assert rc == 0
-    expected = sh.osc_retitle_sequence(sr.Status.AWAITING_INPUT, 'session:dark-factory')
+    expected = sh.osc_retitle_sequence(session_records.Status.AWAITING_INPUT, 'session:dark-factory')
     assert capsys.readouterr().out.strip() == expected
     slug = sh.hook_session_slug(hook_input, env={})
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.AWAITING_INPUT
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.AWAITING_INPUT
 
 
 def test_main_stop_writes_osc_to_stdout(
@@ -783,10 +782,10 @@ def test_main_stop_writes_osc_to_stdout(
     rc = sh.main(['stop'])
 
     assert rc == 0
-    expected = sh.osc_retitle_sequence(sr.Status.IDLE, 'session:dark-factory')
+    expected = sh.osc_retitle_sequence(session_records.Status.IDLE, 'session:dark-factory')
     assert capsys.readouterr().out.strip() == expected
     slug = sh.hook_session_slug(hook_input, env={})
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.IDLE
 
 
 def test_main_session_start_fail_soft_on_empty_stdin(
@@ -820,7 +819,7 @@ def test_main_fail_soft_when_registry_write_raises(
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise OSError('disk on fire')
 
-    monkeypatch.setattr(sr, 'write_record', _boom)
+    monkeypatch.setattr(session_records, 'write_record', _boom)
 
     with caplog.at_level(logging.ERROR):
         rc = sh.main(['session-start'])
@@ -845,10 +844,10 @@ def test_main_session_start_notification_stop_share_one_record(
     stdin_json(monkeypatch, hook_input)
     assert sh.main(['stop']) == 0
 
-    session_dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    session_dirs = list(session_records.sessions_dir(root=tmp_path).iterdir())
     assert len(session_dirs) == 1
     slug = sh.hook_session_slug(hook_input, env={})
-    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+    assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.IDLE
 
 
 def test_main_session_start_failure_still_returns_zero_not_one(
@@ -864,7 +863,7 @@ def test_main_session_start_failure_still_returns_zero_not_one(
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise OSError('disk on fire')
 
-    monkeypatch.setattr(sr, 'write_record', _boom)
+    monkeypatch.setattr(session_records, 'write_record', _boom)
 
     assert sh.main(['session-start']) == 0
 
@@ -876,11 +875,11 @@ def test_main_session_start_failure_still_returns_zero_not_one(
 
 def test_notification_takes_no_self_exit_decision(tmp_path: Path) -> None:
     slug = 'prd-df-7193-7193250'
-    record_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
-    sr.write_record(
-        sr.SessionRecord(
+    record_dir = session_records.record_path_for_slug(slug, root=tmp_path).parent
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             self_exit=True,
             claude_session_id='uuid-owner',
             claude_owner_pid=7_193_201,
@@ -888,8 +887,8 @@ def test_notification_takes_no_self_exit_decision(tmp_path: Path) -> None:
         ),
         root=tmp_path,
     )
-    (record_dir / sr.RESULT_FILENAME).write_text('outcome: done\n', encoding='utf-8')
-    marker = record_dir / sr.EXIT_REQUESTED_FILENAME
+    (record_dir / session_records.RESULT_FILENAME).write_text('outcome: done\n', encoding='utf-8')
+    marker = record_dir / session_records.EXIT_REQUESTED_FILENAME
     marker.write_text('uuid-owner', encoding='utf-8')
 
     sh.run_notification(
@@ -899,8 +898,8 @@ def test_notification_takes_no_self_exit_decision(tmp_path: Path) -> None:
         process_tree=claude_process_tree(7_193_201, 7_193_200),
     )
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status is sr.Status.AWAITING_INPUT
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status is session_records.Status.AWAITING_INPUT
     assert record.exit_request is None
     assert marker.exists()
 
@@ -921,25 +920,25 @@ def _write_t3_record(
     tmp_path: Path,
     *,
     session_id: str,
-    status: sr.Status = sr.Status.RUNNING,
+    status: session_records.Status = session_records.Status.RUNNING,
     owner_pid: int = _T3_OWNER,
 ) -> None:
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=_T3_SLUG,
             status=status,
             title='t3 child',
             cwd=_T3_CWD,
             launcher_pid=7_489_900,
-            display=sr.Display(kind=sr.DisplayKind.T3.value, t3_thread_id='thread-7489'),
+            display=session_records.Display(kind=session_records.DisplayKind.T3.value, t3_thread_id='thread-7489'),
             claude_session_id=session_id,
             claude_launch_session_id=session_id,
             claude_owner_pid=owner_pid,
         ),
         root=tmp_path,
     )
-    sr.write_claude_session_pointer(session_id, _T3_SLUG, root=tmp_path)
-    sr.write_session_pointer(owner_pid, _T3_SLUG, root=tmp_path)
+    session_records.write_claude_session_pointer(session_id, _T3_SLUG, root=tmp_path)
+    session_records.write_session_pointer(owner_pid, _T3_SLUG, root=tmp_path)
 
 
 def _reaped_pid() -> int:
@@ -959,7 +958,7 @@ def _hand_slug(session_id: str, tmp_path: Path) -> str:
 
 
 def _session_slugs(tmp_path: Path) -> set[str]:
-    return {path.name for path in sr.sessions_dir(root=tmp_path).iterdir()}
+    return {path.name for path in session_records.sessions_dir(root=tmp_path).iterdir()}
 
 
 def _t3_event(session_id: str, **extra: str) -> dict[str, str]:
@@ -969,23 +968,23 @@ def _t3_event(session_id: str, **extra: str) -> dict[str, str]:
 @pytest.mark.parametrize(
     ('handler', 'expected'),
     [
-        (sh.run_session_start, sr.Status.RUNNING),
-        (sh.run_notification, sr.Status.AWAITING_INPUT),
-        (sh.run_stop, sr.Status.IDLE),
+        (sh.run_session_start, session_records.Status.RUNNING),
+        (sh.run_notification, session_records.Status.AWAITING_INPUT),
+        (sh.run_stop, session_records.Status.IDLE),
     ],
 )
 def test_session_id_pointer_resolves_every_event_onto_the_t3_record(
     tmp_path: Path,
     handler: Callable[..., object],
-    expected: sr.Status,
+    expected: session_records.Status,
 ) -> None:
-    _write_t3_record(tmp_path, session_id='sid-t3', status=sr.Status.LAUNCHING)
+    _write_t3_record(tmp_path, session_id='sid-t3', status=session_records.Status.LAUNCHING)
 
     handler(_t3_event('sid-t3'), {}, root=tmp_path, process_tree=claude_process_tree(_T3_OWNER))
 
-    record = sr.read_record(_T3_SLUG, root=tmp_path)
+    record = session_records.read_record(_T3_SLUG, root=tmp_path)
     assert record.status is expected
-    assert record.display is not None and record.display.kind == sr.DisplayKind.T3.value
+    assert record.display is not None and record.display.kind == session_records.DisplayKind.T3.value
     assert _session_slugs(tmp_path) == {_T3_SLUG}
 
 
@@ -999,23 +998,23 @@ def test_session_start_keeps_the_t3_display_over_an_inherited_tmux_env(tmp_path:
         process_tree=claude_process_tree(_T3_OWNER),
     )
 
-    display = sr.read_record(_T3_SLUG, root=tmp_path).display
+    display = session_records.read_record(_T3_SLUG, root=tmp_path).display
     assert display is not None
-    assert (display.kind, display.t3_thread_id) == (sr.DisplayKind.T3.value, 'thread-7489')
+    assert (display.kind, display.t3_thread_id) == (session_records.DisplayKind.T3.value, 'thread-7489')
 
 
 def test_a_session_id_pointer_the_record_no_longer_vouches_for_falls_through(
     tmp_path: Path,
 ) -> None:
     _write_t3_record(tmp_path, session_id='sid-current')
-    sr.write_claude_session_pointer('sid-stale', _T3_SLUG, root=tmp_path)
+    session_records.write_claude_session_pointer('sid-stale', _T3_SLUG, root=tmp_path)
 
     sh.run_notification(
         _t3_event('sid-stale'), {}, root=tmp_path, process_tree=claude_process_tree(_T3_OWNER)
     )
 
-    t3 = sr.read_record(_T3_SLUG, root=tmp_path)
-    assert (t3.status, t3.claude_session_id) == (sr.Status.RUNNING, 'sid-current')
+    t3 = session_records.read_record(_T3_SLUG, root=tmp_path)
+    assert (t3.status, t3.claude_session_id) == (session_records.Status.RUNNING, 'sid-current')
     assert _session_slugs(tmp_path) == {_T3_SLUG, _hand_slug('sid-stale', tmp_path)}
 
 
@@ -1030,12 +1029,12 @@ def test_pid_pointer_rebinds_the_t3_record_on_a_remint(tmp_path: Path, source: s
         process_tree=claude_process_tree(_T3_OWNER),
     )
 
-    record = sr.read_record(_T3_SLUG, root=tmp_path)
+    record = session_records.read_record(_T3_SLUG, root=tmp_path)
     assert record.claude_session_id == 'sid-after'
     assert record.claude_launch_session_id == 'sid-before'
     assert record.claude_owner_pid == _T3_OWNER
-    assert sr.resolve_session_slug_for_claude_session_id('sid-after', root=tmp_path) == _T3_SLUG
-    assert sr.resolve_session_slug_for_pid(_T3_OWNER, root=tmp_path) == _T3_SLUG
+    assert session_records.resolve_session_slug_for_claude_session_id('sid-after', root=tmp_path) == _T3_SLUG
+    assert session_records.resolve_session_slug_for_pid(_T3_OWNER, root=tmp_path) == _T3_SLUG
     assert _session_slugs(tmp_path) == {_T3_SLUG}
 
 
@@ -1053,7 +1052,7 @@ def test_pid_pointer_does_not_rebind_the_t3_record_on_a_plain_session_start(
         process_tree=claude_process_tree(_T3_OWNER),
     )
 
-    assert sr.read_record(_T3_SLUG, root=tmp_path).claude_session_id == 'sid-before'
+    assert session_records.read_record(_T3_SLUG, root=tmp_path).claude_session_id == 'sid-before'
     assert _session_slugs(tmp_path) == {_T3_SLUG, _hand_slug('sid-new', tmp_path)}
 
 
@@ -1065,20 +1064,20 @@ def test_a_nested_claude_cannot_capture_the_t3_record(tmp_path: Path) -> None:
     sh.run_session_start(_t3_event('sid-nested-2', source='compact'), {}, root=tmp_path, process_tree=nested)
     sh.run_stop(_t3_event('sid-nested-2'), {}, root=tmp_path, process_tree=nested)
 
-    t3 = sr.read_record(_T3_SLUG, root=tmp_path)
+    t3 = session_records.read_record(_T3_SLUG, root=tmp_path)
     assert (t3.status, t3.claude_session_id, t3.claude_owner_pid) == (
-        sr.Status.RUNNING,
+        session_records.Status.RUNNING,
         'sid-t3',
         _T3_OWNER,
     )
-    assert sr.resolve_session_slug_for_pid(_T3_OWNER, root=tmp_path) == _T3_SLUG
+    assert session_records.resolve_session_slug_for_pid(_T3_OWNER, root=tmp_path) == _T3_SLUG
     assert _session_slugs(tmp_path) == {_T3_SLUG, _hand_slug('sid-nested', tmp_path)}
 
 
 def test_an_env_slug_binding_writes_a_session_id_pointer(tmp_path: Path) -> None:
     slug = 'session-cockpit-7489300'
-    sr.write_record(
-        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=7_489_300),
+    session_records.write_record(
+        session_records.SessionRecord(session_slug=slug, status=session_records.Status.LAUNCHING, launcher_pid=7_489_300),
         root=tmp_path,
     )
 
@@ -1089,7 +1088,7 @@ def test_an_env_slug_binding_writes_a_session_id_pointer(tmp_path: Path) -> None
         process_tree=claude_process_tree(7_489_311, 7_489_310),
     )
 
-    assert sr.resolve_session_slug_for_claude_session_id('sid-env', root=tmp_path) == slug
+    assert session_records.resolve_session_slug_for_claude_session_id('sid-env', root=tmp_path) == slug
 
 
 def test_a_hand_launched_record_carries_its_owner_pid_and_both_pointers(tmp_path: Path) -> None:
@@ -1099,8 +1098,8 @@ def test_a_hand_launched_record_carries_its_owner_pid_and_both_pointers(tmp_path
 
     assert record.session_slug == _hand_slug('sid-hand', tmp_path)
     assert record.claude_owner_pid == 7_489_401
-    assert sr.resolve_session_slug_for_pid(7_489_401, root=tmp_path) == record.session_slug
-    assert sr.resolve_session_slug_for_claude_session_id('sid-hand', root=tmp_path) == record.session_slug
+    assert session_records.resolve_session_slug_for_pid(7_489_401, root=tmp_path) == record.session_slug
+    assert session_records.resolve_session_slug_for_claude_session_id('sid-hand', root=tmp_path) == record.session_slug
 
 
 def test_a_hand_launched_clear_keeps_the_session_on_its_record(tmp_path: Path) -> None:
@@ -1110,8 +1109,8 @@ def test_a_hand_launched_clear_keeps_the_session_on_its_record(tmp_path: Path) -
     sh.run_session_start(_t3_event('sid-second', source='clear'), {}, root=tmp_path, process_tree=tree)
     sh.run_stop(_t3_event('sid-second'), {}, root=tmp_path, process_tree=tree)
 
-    record = sr.read_record(_hand_slug('sid-first', tmp_path), root=tmp_path)
-    assert (record.status, record.claude_session_id) == (sr.Status.IDLE, 'sid-second')
+    record = session_records.read_record(_hand_slug('sid-first', tmp_path), root=tmp_path)
+    assert (record.status, record.claude_session_id) == (session_records.Status.IDLE, 'sid-second')
     assert _session_slugs(tmp_path) == {_hand_slug('sid-first', tmp_path)}
 
 
@@ -1126,12 +1125,12 @@ def test_a_resume_in_a_new_process_reclaims_a_dead_owner_then_rebinds_on_compact
 
     sh.run_session_start(_t3_event('sid-t3', source='resume'), {}, root=tmp_path, process_tree=resumed)
 
-    assert sr.read_record(_T3_SLUG, root=tmp_path).claude_owner_pid == _T3_RESUMED
-    assert sr.resolve_session_slug_for_pid(_T3_RESUMED, root=tmp_path) == _T3_SLUG
+    assert session_records.read_record(_T3_SLUG, root=tmp_path).claude_owner_pid == _T3_RESUMED
+    assert session_records.resolve_session_slug_for_pid(_T3_RESUMED, root=tmp_path) == _T3_SLUG
 
     sh.run_session_start(_t3_event('sid-compacted', source='compact'), {}, root=tmp_path, process_tree=resumed)
 
-    assert sr.read_record(_T3_SLUG, root=tmp_path).claude_session_id == 'sid-compacted'
+    assert session_records.read_record(_T3_SLUG, root=tmp_path).claude_session_id == 'sid-compacted'
     assert _session_slugs(tmp_path) == {_T3_SLUG}
 
 
@@ -1147,5 +1146,5 @@ def test_a_same_session_id_from_a_new_process_leaves_a_live_owner_in_place(
         process_tree=claude_process_tree(_T3_RESUMED, os.getpid()),
     )
 
-    assert sr.read_record(_T3_SLUG, root=tmp_path).claude_owner_pid == os.getpid()
-    assert sr.resolve_session_slug_for_pid(_T3_RESUMED, root=tmp_path) is None
+    assert session_records.read_record(_T3_SLUG, root=tmp_path).claude_owner_pid == os.getpid()
+    assert session_records.resolve_session_slug_for_pid(_T3_RESUMED, root=tmp_path) is None

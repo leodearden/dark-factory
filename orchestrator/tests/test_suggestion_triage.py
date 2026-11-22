@@ -7,13 +7,14 @@ import json
 import logging
 from pathlib import Path
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _mcp_transport_harness import tool_reply_envelope
+from _mcp_client_recorder import RecordingClientFactory
 from _orch_helpers import pydantic_spec
 from _review_fixtures import review_aggregation, review_issue
 from shared.cli_invoke import AllAccountsCappedException
+from shared.testing_mcp_stub import StubMcpServer, tool_reply_body
 
 from orchestrator.agents.triage import suggestion_hash
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
@@ -29,7 +30,7 @@ from orchestrator.workflow import StewardInterrupted, WorkflowOutcome
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_workflow(*, escalation_queue=None, escalation_event=None):
+def _make_workflow(*, escalation_queue=None, escalation_event=None, mcp_url='http://mcp.invalid:8002'):
     """Build a minimal TaskWorkflow-like object with the methods under test."""
     from orchestrator.workflow import TaskWorkflow
 
@@ -47,7 +48,7 @@ def _make_workflow(*, escalation_queue=None, escalation_event=None):
     scheduler = MagicMock()
 
     mcp = MagicMock()
-    mcp.url = 'http://localhost:8002'
+    mcp.url = mcp_url
 
     briefing = MagicMock()
 
@@ -76,7 +77,7 @@ def _fake_reviews(suggestions=None, blocking_issues=None):
 
 def _ticket_response(ticket: str = 'tkt-1') -> MagicMock:
     """A delivered ``submit_task`` POST: FastMCP's envelope around a curator ticket."""
-    envelope = tool_reply_envelope({'ticket': ticket})
+    envelope = tool_reply_body({'ticket': ticket})
     return MagicMock(status_code=200, json=lambda: envelope)
 
 
@@ -112,7 +113,8 @@ def _make_escalation(**overrides):
 # ---------------------------------------------------------------------------
 
 class TestEscalateSuggestions:
-    def test_creates_escalation_with_correct_fields(self):
+    @pytest.mark.asyncio
+    async def test_creates_escalation_with_correct_fields(self):
         queue = MagicMock()
         queue.make_id.return_value = 'esc-42-0'
         wf = _make_workflow(escalation_queue=queue)
@@ -125,7 +127,7 @@ class TestEscalateSuggestions:
         ]
         reviews = _fake_reviews(suggestions)
 
-        wf._escalate_suggestions(reviews)
+        await wf._escalate_suggestions(reviews)
 
         queue.submit.assert_called_once()
         esc = queue.submit.call_args[0][0]
@@ -138,16 +140,18 @@ class TestEscalateSuggestions:
         json_start = detail.index('#', 6) + 1
         assert json.loads(detail[json_start:]) == suggestions
 
-    def test_noop_without_queue(self):
+    @pytest.mark.asyncio
+    async def test_noop_without_queue(self):
         wf = _make_workflow(escalation_queue=None)
         reviews = _fake_reviews([{'description': 'something'}])
-        wf._escalate_suggestions(reviews)
+        await wf._escalate_suggestions(reviews)
 
-    def test_noop_without_suggestions(self):
+    @pytest.mark.asyncio
+    async def test_noop_without_suggestions(self):
         queue = MagicMock()
         wf = _make_workflow(escalation_queue=queue)
         reviews = _fake_reviews([])
-        wf._escalate_suggestions(reviews)
+        await wf._escalate_suggestions(reviews)
         queue.submit.assert_not_called()
 
 
@@ -171,7 +175,8 @@ class TestEscalateSuggestionsCharacterization:
              'description': 'Add coverage for X', 'suggested_fix': 'Write test'},
         ]
 
-    def test_detail_uses_shared_hash_helper(self):
+    @pytest.mark.asyncio
+    async def test_detail_uses_shared_hash_helper(self):
         """detail must start with '#hash:<shared_hash>#' — not a re-inlined hash."""
         from orchestrator.review_suggestions.dedup import review_suggestion_payload_hash
 
@@ -183,14 +188,15 @@ class TestEscalateSuggestionsCharacterization:
 
         suggestions = self._suggestions()
         reviews = _fake_reviews(suggestions)
-        wf._escalate_suggestions(reviews)
+        await wf._escalate_suggestions(reviews)
 
         queue.submit.assert_called_once()
         esc = queue.submit.call_args[0][0]
         expected_hash = review_suggestion_payload_hash(suggestions)
         assert esc.detail.startswith(f'#hash:{expected_hash}#')
 
-    def test_skips_when_prior_matching_hash(self):
+    @pytest.mark.asyncio
+    async def test_skips_when_prior_matching_hash(self):
         """submit must NOT be called when a prior escalation with the same hash exists."""
         from orchestrator.review_suggestions.dedup import (
             hash_marker,
@@ -210,11 +216,12 @@ class TestEscalateSuggestionsCharacterization:
         wf = _make_workflow(escalation_queue=queue)
         wf.state = MagicMock(value='review')
 
-        wf._escalate_suggestions(_fake_reviews(suggestions))
+        await wf._escalate_suggestions(_fake_reviews(suggestions))
 
         queue.submit.assert_not_called()
 
-    def test_does_not_skip_when_prior_has_different_hash(self):
+    @pytest.mark.asyncio
+    async def test_does_not_skip_when_prior_has_different_hash(self):
         """submit IS called when the prior escalation has a different hash."""
         from orchestrator.review_suggestions.dedup import hash_marker
 
@@ -231,7 +238,7 @@ class TestEscalateSuggestionsCharacterization:
         wf = _make_workflow(escalation_queue=queue)
         wf.state = MagicMock(value='review')
 
-        wf._escalate_suggestions(_fake_reviews(suggestions))
+        await wf._escalate_suggestions(_fake_reviews(suggestions))
 
         queue.submit.assert_called_once()
 
@@ -1087,14 +1094,14 @@ class TestAwaitStewardCompletion:
     @pytest.mark.asyncio
     async def test_returns_immediately_if_no_queue(self):
         wf = _make_workflow(escalation_queue=None)
-        await wf._await_steward_completion()
+        await wf._await_steward_completion(escalation_id=None)
 
     @pytest.mark.asyncio
     async def test_returns_immediately_if_no_pending(self):
         queue = MagicMock()
         queue.get_by_task.return_value = []
         wf = _make_workflow(escalation_queue=queue)
-        await wf._await_steward_completion()
+        await wf._await_steward_completion(escalation_id=None)
 
     @pytest.mark.asyncio
     async def test_returns_when_resolved(self):
@@ -1111,7 +1118,7 @@ class TestAwaitStewardCompletion:
             event.set()
 
         task = asyncio.create_task(_resolve_after_delay())
-        await wf._await_steward_completion()
+        await wf._await_steward_completion(escalation_id=None)
         await task
 
         queue.submit.assert_not_called()
@@ -1131,7 +1138,7 @@ class TestAwaitStewardCompletion:
         wf._steward_outcome_channel = asyncio.Queue()  # nothing published
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=False)
         queue.submit.assert_not_called()
@@ -1143,7 +1150,8 @@ class TestAwaitStewardCompletion:
 # ---------------------------------------------------------------------------
 
 class TestReviewLoopRouting:
-    def test_escalates_instead_of_memory_write_when_queue_available(self):
+    @pytest.mark.asyncio
+    async def test_escalates_instead_of_memory_write_when_queue_available(self):
         queue = MagicMock()
         queue.make_id.return_value = 'esc-42-0'
         wf = _make_workflow(escalation_queue=queue)
@@ -1153,15 +1161,16 @@ class TestReviewLoopRouting:
         reviews = _fake_reviews(suggestions)
 
         with patch.object(wf, '_write_suggestions_to_memory') as mock_write:
-            wf._escalate_suggestions(reviews)
+            await wf._escalate_suggestions(reviews)
             mock_write.assert_not_called()
             queue.submit.assert_called_once()
 
-    def test_falls_back_to_memory_write_without_queue(self):
+    @pytest.mark.asyncio
+    async def test_falls_back_to_memory_write_without_queue(self):
         wf = _make_workflow(escalation_queue=None)
         suggestions = [{'description': 'something'}]
         reviews = _fake_reviews(suggestions)
-        wf._escalate_suggestions(reviews)
+        await wf._escalate_suggestions(reviews)
 
 
 # ---------------------------------------------------------------------------
@@ -1540,11 +1549,10 @@ class TestCuratorSubmitTransport:
     The payload-shape tests above stayed green through ~3 months of silently
     discarded submissions: they patch ``httpx.AsyncClient.post`` and inspect
     the body, which cannot distinguish a delivered POST from one absorbed by
-    the ``/mcp/`` -> ``/mcp`` 307.  These drive a real client through the
-    MockTransport server in ``_mcp_transport_harness`` instead — a
-    ``_``-prefixed sibling rather than the ``test_mcp_post_transport`` module
-    that also uses it, so no test module's collection depends on another's.
-    The older tests are left intact — they were never wrong, only insufficient.
+    the ``/mcp/`` -> ``/mcp`` 307.  These drive a real client over a real
+    socket to ``StubMcpServer`` instead, which records what arrived and which
+    tool calls it answered.  The older tests are left intact — they were never wrong, only
+    insufficient.
     """
 
     def _suggestions(self):
@@ -1565,36 +1573,27 @@ class TestCuratorSubmitTransport:
     @pytest.mark.asyncio
     async def test_submit_task_call_lands_at_the_mcp_path(self):
         """THE regression: the submit_task tools/call must arrive at /mcp."""
-        from _mcp_transport_harness import (
-            MCP_PATH,
-            RecordingClientFactory,
-            RecordingMcpServer,
-        )
-
-        wf = _make_workflow()
-        server = RecordingMcpServer()
-        factory = RecordingClientFactory(server)
-
-        with patch('httpx.AsyncClient', factory):
+        with StubMcpServer(stateful=False, payload={'ticket': 'tkt-1'}) as server:
+            wf = _make_workflow(mcp_url=server.url)
             await self._route(wf, self._suggestions())
 
-        calls = server.tool_calls('submit_task')
+        calls = server.tool_call_arguments('submit_task')
         assert len(calls) == 1, (
-            f'expected 1 submit_task delivered at {MCP_PATH}, got {len(calls)}. '
-            f'redirected={server.redirected!r} not_acceptable={server.not_acceptable!r}'
+            f'expected 1 submit_task answered at /mcp, got {len(calls)}. '
+            f'arrived at {[r.path for r in server.requests]!r}'
         )
-        assert server.redirected == [], 'POSTed to the redirecting /mcp/ path'
-        server.assert_every_request_accepted_json()
+        assert server.off_endpoint_paths == (), 'POSTed off /mcp, e.g. to the redirecting /mcp/'
 
     @pytest.mark.asyncio
     async def test_client_is_constructed_with_follow_redirects(self):
         """Task's explicit ask (a), first half."""
-        from _mcp_transport_harness import RecordingClientFactory, RecordingMcpServer
+        factory = RecordingClientFactory()
 
-        wf = _make_workflow()
-        factory = RecordingClientFactory(RecordingMcpServer())
-
-        with patch('httpx.AsyncClient', factory):
+        with (
+            StubMcpServer(stateful=False, payload={'ticket': 'tkt-1'}) as server,
+            patch('httpx.AsyncClient', factory),
+        ):
+            wf = _make_workflow(mcp_url=server.url)
             await self._route(wf, self._suggestions())
 
         factory.assert_follows_redirects()

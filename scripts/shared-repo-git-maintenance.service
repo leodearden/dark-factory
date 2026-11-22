@@ -1,0 +1,15 @@
+[Unit]
+Description=Incremental repack + commit-graph of every orchestrator-managed shared repo (task 8076)
+Documentation=file:///home/leo/src/dark-factory/docs/shared-repo-git-maintenance.md
+
+[Service]
+Type=oneshot
+# A thin shell around the committed wrapper; the logic lives in
+# scripts/shared_repo_git_maintenance.py.
+WorkingDirectory=/home/leo/src/dark-factory
+ExecStart=/home/leo/src/dark-factory/scripts/shared-repo-git-maintenance.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=timers.target

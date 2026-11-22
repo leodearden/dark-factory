@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 from _orch_helpers import HermeticMcpSession
+from shared.task_read import TaskAbsent, TaskFound, TaskReadFailed
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import Scheduler
@@ -102,7 +103,7 @@ def _scheduler(tmp_path: Path, session: _GetTaskReplySession) -> Scheduler:
     ],
     ids=['task-not-found', 'invalid-task-id', 'server-backstop', 'bad-project-root'],
 )
-async def test_error_reply_is_absence_not_a_task_row(
+async def test_get_task_answers_none_for_any_error_reply(
     tmp_path: Path, envelope, task_id: str, payload: dict,
 ) -> None:
     session = _GetTaskReplySession(envelope(payload))
@@ -173,3 +174,121 @@ async def test_task_row_logs_no_warning(
     assert await scheduler.get_task('42') is not None
 
     assert _warnings_from(caplog, 'orchestrator.scheduler', 'shared.mcp_envelope') == []
+
+
+class _UnreachableSession(HermeticMcpSession):
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict,
+        timeout: float = 30,
+    ) -> dict:
+        raise RuntimeError('fused-memory unreachable')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'envelope',
+    [_text_only, _structured_and_text],
+    ids=['text-only', 'structured-content'],
+)
+async def test_read_task_reports_task_not_found_as_absence(
+    tmp_path: Path, envelope,
+) -> None:
+    session = _GetTaskReplySession(envelope(TASK_NOT_FOUND))
+    scheduler = _scheduler(tmp_path, session)
+
+    assert await scheduler.read_task('999') == TaskAbsent()
+    assert session.get_task_ids == ['999']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('envelope', 'task_id', 'payload'),
+    [
+        (envelope, task_id, payload)
+        for envelope in (_text_only, _structured_and_text, _is_error)
+        for task_id, payload in (
+            ('infra', INVALID_TASK_ID),
+            ('7', SERVER_BACKSTOP),
+            ('8', BAD_PROJECT_ROOT),
+        )
+    ] + [(_is_error, '999', TASK_NOT_FOUND)],
+    ids=[
+        f'{envelope_id}-{payload_id}'
+        for envelope_id in ('text-only', 'structured-content', 'is-error')
+        for payload_id in ('invalid-task-id', 'server-backstop', 'bad-project-root')
+    ] + ['is-error-task-not-found'],
+)
+async def test_read_task_reports_any_other_error_reply_as_a_failed_read(
+    tmp_path: Path, envelope, task_id: str, payload: dict,
+) -> None:
+    session = _GetTaskReplySession(envelope(payload))
+    scheduler = _scheduler(tmp_path, session)
+
+    assert isinstance(await scheduler.read_task(task_id), TaskReadFailed)
+
+
+@pytest.mark.asyncio
+async def test_read_task_finds_a_row_with_metadata_normalised(tmp_path: Path) -> None:
+    session = _GetTaskReplySession(_text_only(dict(WELL_FORMED_ROW)))
+    scheduler = _scheduler(tmp_path, session)
+
+    read = await scheduler.read_task('42')
+
+    assert isinstance(read, TaskFound)
+    assert read.task['metadata'] == {'files': ['a.py']}
+
+
+@pytest.mark.asyncio
+async def test_read_task_normalises_a_copy_and_leaves_the_reply_as_sent(tmp_path: Path) -> None:
+    reply = _structured_and_text(dict(WELL_FORMED_ROW))
+    scheduler = _scheduler(tmp_path, _GetTaskReplySession(reply))
+
+    read = await scheduler.read_task('42')
+
+    assert isinstance(read, TaskFound)
+    assert read.task['metadata'] == {'files': ['a.py']}
+    assert reply['structuredContent']['metadata'] == '{"files": ["a.py"]}'
+
+
+@pytest.mark.asyncio
+async def test_read_task_reports_a_dispatch_fault_as_a_failed_read(tmp_path: Path) -> None:
+    scheduler = Scheduler(
+        OrchestratorConfig(project_root=tmp_path), mcp_session=_UnreachableSession(),
+    )
+
+    read = await scheduler.read_task('42')
+
+    assert isinstance(read, TaskReadFailed)
+    assert 'RuntimeError' in read.reason
+
+
+@pytest.mark.asyncio
+async def test_read_task_failed_read_logs_one_warning_naming_task_and_error_type(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger='orchestrator.scheduler')
+    session = _GetTaskReplySession(_text_only(INVALID_TASK_ID))
+    scheduler = _scheduler(tmp_path, session)
+
+    assert isinstance(await scheduler.read_task('infra'), TaskReadFailed)
+
+    records = _warnings_from(caplog, 'orchestrator.scheduler')
+    assert len(records) == 1, [r.getMessage() for r in records]
+    message = records[0].getMessage()
+    assert 'infra' in message
+    assert 'TaskmasterError' in message
+
+
+@pytest.mark.asyncio
+async def test_read_task_absence_logs_no_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger='orchestrator.scheduler')
+    session = _GetTaskReplySession(_text_only(TASK_NOT_FOUND))
+    scheduler = _scheduler(tmp_path, session)
+
+    assert await scheduler.read_task('999') == TaskAbsent()
+
+    assert _warnings_from(caplog, 'orchestrator.scheduler') == []

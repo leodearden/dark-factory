@@ -62,6 +62,7 @@ def _make_harness(config: OrchestratorConfig, scheduler: Scheduler) -> Harness:
     harness._merge_queue = asyncio.Queue()
     harness._merge_worker = None
     harness._merge_inflight_registry = InFlightMergeRegistry()
+    harness._task_verify_dispatcher = MagicMock()
     harness.event_store = None
     harness.cost_store = None
     harness._run_id = 'run-test'

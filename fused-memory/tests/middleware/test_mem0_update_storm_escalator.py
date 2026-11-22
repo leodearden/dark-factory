@@ -2,8 +2,9 @@
 
 Task 3088. In-place content amendment is a silent-rewrite primitive: an agent
 stuck in a rewrite loop leaves no new records behind, so nothing downstream can
-tell it is happening. The storm counter (``server/storm_counter.StormCounter``)
-detects the burst; this escalator is the channel that makes it reach an operator.
+tell it is happening. The storm counter
+(``shared/src/shared/storm_counter.py::KeyedStormCounters``) detects the burst;
+this escalator is the channel that makes it reach an operator.
 
 Modelled on ``tests/test_scope_violation_escalator.py`` — same defensive-import
 skip marker, same per-``project_root`` queue-cache assertion, same

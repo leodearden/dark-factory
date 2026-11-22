@@ -102,11 +102,11 @@ tasks:
     title: "host-qualified liveness: ProcessIdentity on launcher/owner pids, one predicate for every dead decision"
     capabilities:
       - name: "session-liveness-module-exists"
-        binding: "capability→producer δ (new file) over shared/src/shared/process_identity.py::liveness (present, OTHER_HOST present); absent on main"
+        binding: "capability→producer δ (new file, homed in shared per Leo ruling A 2026-11-04 esc-8125-3, PRD D16) over shared/src/shared/process_identity.py::liveness (present, OTHER_HOST present); absent on main"
         verdict: PASS
         delivered_check:
           kind: path
-          paths: ["orchestrator/src/orchestrator/session_liveness.py"]
+          paths: ["shared/src/shared/session_liveness.py"]
           expect: present
       - name: "record-carries-launcher-identity"
         binding: "field population: stamped by session_registry.py::_run_launching on the production path; field added by δ; absent on main"

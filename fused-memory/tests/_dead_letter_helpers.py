@@ -7,7 +7,10 @@ an append ran off the caller's thread. ``parked_queue`` is its drainer-side
 counterpart: a running EventQueue whose drainer cannot commit anything until
 the block exits, so ``journaled_events`` and ``journaled_ids`` (what a fresh
 journal reader still lists) show the settled-at-enqueue state without racing
-the drain.
+the drain. ``overflowed_queue`` is an unstarted EventQueue of capacity one
+whose second event has already overflowed to the dead-letter writer.
+``record_dead_letter_writes`` spies on ``DeadLetterWriter.append`` and hands
+the test every write's future, so it can wait until a write has resolved.
 """
 
 from __future__ import annotations
@@ -23,11 +26,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
+from fused_memory.reconciliation.dead_letter_writer import DeadLetterWriter
 from fused_memory.reconciliation.event_journal import EventJournal
 from fused_memory.reconciliation.event_queue import EventQueue
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable, Mapping
+    from concurrent.futures import Future
+    from typing import Any
+
+    import pytest
 
     from fused_memory.models.reconciliation import ReconciliationEvent
 
@@ -83,6 +91,47 @@ class HeldFifo:
 
 def hold_fifo(path: Path) -> HeldFifo:
     return HeldFifo(path).start()
+
+
+def record_dead_letter_writes(monkeypatch: pytest.MonkeyPatch) -> list[Future[bool]]:
+    """Every future ``DeadLetterWriter.append`` returns from now on, in call order."""
+    writes: list[Future[bool]] = []
+    real_append = DeadLetterWriter.append
+
+    def append(
+        self: DeadLetterWriter,
+        record: Mapping[str, Any],
+        *,
+        on_settled: Callable[[bool], None] | None = None,
+    ) -> Future[bool]:
+        written = real_append(self, record, on_settled=on_settled)
+        writes.append(written)
+        return written
+
+    monkeypatch.setattr(DeadLetterWriter, 'append', append)
+    return writes
+
+
+@asynccontextmanager
+async def overflowed_queue(
+    dead_letter_path: Path,
+    accepted: ReconciliationEvent,
+    overflowed: ReconciliationEvent,
+    *,
+    journal_path: Path | None = None,
+) -> AsyncIterator[EventQueue]:
+    """An unstarted EventQueue of capacity one that holds ``accepted`` and has
+    handed ``overflowed`` to its dead-letter writer. Leaving the block closes it.
+    """
+    queue = EventQueue(
+        AsyncMock(), dead_letter_path=dead_letter_path, journal_path=journal_path, maxsize=1,
+    )
+    try:
+        assert queue.enqueue(accepted) is True
+        assert queue.enqueue(overflowed) is False
+        yield queue
+    finally:
+        await queue.close()
 
 
 @asynccontextmanager

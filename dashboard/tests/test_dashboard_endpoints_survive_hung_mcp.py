@@ -26,9 +26,10 @@ Three properties keep this probe from quietly stopping checking:
 * the hang stub is ``await asyncio.Event().wait()`` on an event nothing ever
   sets — it has no duration at all, so no budget value can make pre-fix code
   pass, unlike a slow-sleep stub;
-* a NON-VACUITY assertion requires each task-lookup endpoint's OWN request
-  to reach the hang, for its own root, so the sweep cannot pass by never
-  exercising one, nor by one endpoint's reach standing in for another's.
+* a NON-VACUITY assertion requires each task-lookup endpoint's OWN request,
+  and ``/prds``' lineage refresh, to reach the hang for its own root, so the
+  sweep cannot pass by never exercising one, nor by one endpoint's reach
+  standing in for another's.
 
 A lookup whose deadline would enclose a cold snapshot read is served from a
 pre-warmed unit instead, so its cold read is checked only by the warm-up
@@ -47,6 +48,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from _dashboard_routes import dashboard_get_paths
 from escalation.models import Escalation
 
 # The task-prose probe's route budget: the stub never returns, so the route
@@ -56,8 +58,13 @@ _PROSE_BUDGET = 0.05
 # Each task-lookup endpoint pays this once, against the hung fetch_task seam.
 _LOOKUP_BUDGET = 0.5
 
+# /prds waits on its lineage refresh, and the refresh on the hung projected
+# read, for this and no longer.
+_LINEAGE_BUDGET = 0.05
+
 # The warm-up must finish within this many snapshot budgets, or the read is unbounded.
 _WARM_UP_BUDGETS = 10
+
 
 
 @dataclass(frozen=True)
@@ -70,41 +77,16 @@ class HungSeams:
     must reach. ``cold_read_roots`` maps each endpoint left a cold snapshot
     unit to the root whose ``task_snapshot.fetch_tasks`` seam its own request
     must reach; every other lookup root is served from a pre-warmed unit.
+    ``lineage_roots`` maps each endpoint reading the lineage index to the root
+    whose ``task_lineage.fetch_metadata_projection`` seam — the one caller of
+    that binding is the index's background refresh — its own request must
+    reach.
     """
 
     reached: list[tuple[str, str]]
     lookup_roots: Mapping[str, str]
     cold_read_roots: Mapping[str, str]
-
-
-def _dashboard_get_paths() -> list[str]:
-    """Every LITERAL GET route under /api/v2/dashboard/, read off the live app.
-
-    Templated routes (``/api/v2/dashboard/task/{project:path}/T-{task_id}``) are excluded: this
-    sweep requests each path verbatim, so a templated one would be fetched as
-    the literal string ``.../{task_id}`` and answer 404/422 — a false failure
-    about path construction, reported under a message about hung dependencies,
-    in a probe whose whole point is to be self-maintaining. A templated route
-    needs its own probe that binds real parameter values; see the guard in
-    :func:`test_templated_dashboard_routes_are_not_silently_unswept`, which
-    fails loudly if one is ever added rather than letting it go unswept.
-    """
-    return [p for p in _all_dashboard_get_paths() if '{' not in p]
-
-
-def _all_dashboard_get_paths() -> list[str]:
-    """Every GET route under /api/v2/dashboard/, templated ones included."""
-    from dashboard.app import app
-
-    # ``app.routes`` is typed ``list[BaseRoute]``, which declares no ``path``
-    # — bind it once via getattr (as the filter already did) so the duck-typed
-    # sweep still covers every route class, Mount included.
-    return sorted({
-        path
-        for route in app.routes
-        if (path := getattr(route, 'path', '')).startswith('/api/v2/dashboard/')
-        and 'GET' in (getattr(route, 'methods', None) or set())
-    })
+    lineage_roots: Mapping[str, str]
 
 
 @pytest.fixture()
@@ -121,6 +103,7 @@ def hung_mcp(request, monkeypatch, tmp_path, client):
     from dashboard.data import (
         escalation_corpus,
         orchestrator,
+        task_lineage,
         task_lookup,
         task_snapshot,
     )
@@ -161,13 +144,23 @@ def hung_mcp(request, monkeypatch, tmp_path, client):
         'dashboard.data.task_lookup.fetch_task',
         _make_stub('dashboard.data.task_lookup'),
     )
+    # /prds' lineage index reads one projected get_tasks per root.
+    monkeypatch.setattr(
+        'dashboard.data.task_lineage.fetch_metadata_projection',
+        _make_stub('dashboard.data.task_lineage'),
+    )
 
     # A snapshot read outlasts any lookup's whole deadline, so none may enclose one.
     monkeypatch.setattr(task_lookup, 'LOOKUP_BUDGET_SECONDS', _LOOKUP_BUDGET)
     monkeypatch.setattr(task_snapshot, 'PER_CALL_TIMEOUT', 2 * _LOOKUP_BUDGET)
+    # The request waits on the lineage refresh, and the refresh on the hang,
+    # for these and no longer.
+    monkeypatch.setattr(task_lineage, 'LINEAGE_REQUEST_WAIT_SECONDS', _LINEAGE_BUDGET)
+    monkeypatch.setattr(task_lineage, 'LINEAGE_READ_TIMEOUT', _LINEAGE_BUDGET)
 
     def _clear_caches() -> None:
         task_snapshot.clear_snapshot_cache()
+        task_lineage.clear_lineage_state()
         task_lookup._lookup_cache_clear()
         escalation_corpus._corpus_cache_clear()
         _esc._analytics_memo_clear()
@@ -214,6 +207,10 @@ def hung_mcp(request, monkeypatch, tmp_path, client):
     # /escalations reads its root's unit itself, deadline-free, before its
     # lookup, so its request keeps that cold read against the hang.
     cold_read_roots = {'/api/v2/dashboard/escalations': str(proj)}
+    # /prds reads the lineage index of every configured root; the client has one.
+    lineage_roots = {
+        '/api/v2/dashboard/prds': str(client.app.state.config.project_root),
+    }
     monkeypatch.setattr(task_snapshot, 'SNAPSHOT_TTL_SECONDS', 3600.0)
     assert client.portal is not None, 'the warm-up runs inside a live TestClient'
     client.portal.call(
@@ -226,7 +223,10 @@ def hung_mcp(request, monkeypatch, tmp_path, client):
     request.addfinalizer(_seed_merge_attempt(client.app.state.config.project_root))
 
     return HungSeams(
-        reached=reached, lookup_roots=lookup_roots, cold_read_roots=cold_read_roots,
+        reached=reached,
+        lookup_roots=lookup_roots,
+        cold_read_roots=cold_read_roots,
+        lineage_roots=lineage_roots,
     )
 
 
@@ -291,8 +291,17 @@ def _seed_merge_attempt(project_root):
 
 
 def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp):
-    """Every GET endpoint answers 200 while the fetch_tasks seam hangs."""
-    paths = _dashboard_get_paths()
+    """Every GET endpoint answers 200 while the fetch_tasks seam hangs.
+
+    Only the LITERAL routes are swept. A templated one
+    (``/api/v2/dashboard/task/{project}/T-{task_id}``) would be fetched as the
+    literal brace string and answer 404/422 — a false failure about path
+    construction, reported under a message about hung dependencies. A
+    templated route needs its own probe that binds real parameter values; see
+    :func:`test_templated_dashboard_routes_are_not_silently_unswept`, which
+    fails loudly if one is ever added rather than letting it go unswept.
+    """
+    paths = dashboard_get_paths().literal
 
     # The sweep is derived, and may not silently shrink. 14 is the count at
     # the time this probe was written; a NEW endpoint raises it, and a route
@@ -303,8 +312,9 @@ def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp):
         'this probe was written; a check that quietly stops checking is '
         'indistinguishable from a passing one'
     )
-    assert set(hung_mcp.lookup_roots) <= set(paths), (
-        f'task-lookup endpoint(s) {sorted(set(hung_mcp.lookup_roots) - set(paths))} '
+    must_reach = set(hung_mcp.lookup_roots) | set(hung_mcp.lineage_roots)
+    assert must_reach <= set(paths), (
+        f'task-reading endpoint(s) {sorted(must_reach - set(paths))} '
         'are no longer swept, so their reach of the hang cannot be checked'
     )
 
@@ -339,6 +349,15 @@ def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp):
             f'root {root} (that request reached: {sorted(reached_by_path[path])}) '
             '— its cold snapshot read went unexercised. Check that nothing '
             'earlier in the sweep warms that root.'
+        )
+    # ...and each lineage endpoint's own request must have waited on the hung
+    # projected read for its own root, or /prds' bound is unexercised.
+    for path, root in hung_mcp.lineage_roots.items():
+        assert ('dashboard.data.task_lineage', root) in reached_by_path[path], (
+            f'{path} never reached the task_lineage fetch_metadata_projection '
+            f'hang for its root {root} (that request reached: '
+            f'{sorted(reached_by_path[path])}) — its lineage refresh went '
+            'unexercised. Check the endpoint preconditions in the hung_mcp fixture.'
         )
 
 
@@ -379,15 +398,15 @@ def test_task_prose_route_survives_a_hung_fetch_task_prose(client, monkeypatch):
 def test_templated_dashboard_routes_are_not_silently_unswept():
     """A templated route must be noticed, not quietly dropped from the sweep.
 
-    ``_dashboard_get_paths`` filters out ``{``-bearing paths because the sweep
-    cannot request them verbatim. That filter is the right call — but a silent
+    The sweep requests only ``dashboard_get_paths().literal``, because it
+    cannot request a templated path verbatim. That filter is the right call — but a silent
     filter is how coverage rots, so this test fails the moment one appears and
     says what to do about it. Extend the expected set below ONLY together with
     a dedicated probe that exercises the new route with real parameter values
     against a hung dependency, as
     :func:`test_task_prose_route_survives_a_hung_fetch_task_prose` does.
     """
-    templated = sorted(p for p in _all_dashboard_get_paths() if '{' in p)
+    templated = list(dashboard_get_paths().templated)
 
     assert templated == ['/api/v2/dashboard/task/{project:path}/T-{task_id}'], (
         f'templated GET route(s) {templated} exist under /api/v2/dashboard/; '

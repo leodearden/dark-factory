@@ -1,0 +1,12 @@
+{
+  "task_id": "8528",
+  "reason": "Task 8528 (merge-lane policy zeta, as amended by Leo's ruling on esc-8528-11, 2026-11-18): the rolling pass-rate depth table replaces the halving state. The cluster's cognitive total rises 5345 -> 5368, which is the new pure module merge_lane/chain_policy.py (24) less one in worker.py; no per-file or per-function measure that exists on main rises. Net-additive work: the depth choice and the start-up seed of its window are new behaviour, held in a new module so worker.py does not grow.",
+  "measures": [
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5345,
+      "current": 5368
+    }
+  ]
+}

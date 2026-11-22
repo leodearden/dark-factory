@@ -3,6 +3,7 @@ import logging
 import pytest
 
 from orchestrator.evals.cell_admission import (
+    candidate_cost_usd,
     cost_per_plan,
     is_plan_only,
     is_unmeasurable,
@@ -77,6 +78,46 @@ class TestIsUnmeasurable:
 
     def test_cap_tainted_implementer_cell_is_measurable(self):
         assert is_unmeasurable(_implementer(cap_tainted=True)) is False
+
+
+class TestCandidateCostUsd:
+    """A plan-only cell's spend nets out its plan judge; a workflow cell's does not."""
+
+    def test_post_upsilon_plan_only_cell_is_the_architects_own_spend(self):
+        cell = _architect(cost_usd=1.4, judge_cost_usd=0.4)
+        assert candidate_cost_usd(cell) == pytest.approx(1.0)
+
+    def test_pre_upsilon_plan_only_cell_is_its_cost_usd(self):
+        assert candidate_cost_usd(_architect(cost_usd=1.0, judge_cost_usd=0.0)) == 1.0
+
+    def test_plan_only_cell_without_a_judge_cost_key_is_its_cost_usd(self):
+        assert candidate_cost_usd(_architect(cost_usd=1.0)) == 1.0
+
+    def test_implementer_cell_keeps_its_completion_judge_spend(self):
+        cell = _implementer(cost_usd=2.0, judge_cost_usd=0.5)
+        assert candidate_cost_usd(cell) == 2.0
+
+    def test_judge_role_cell_keeps_its_judge_spend(self):
+        cell = {
+            'role_under_test': RoleUnderTest.JUDGE,
+            'cost_usd': 2.0,
+            'judge_cost_usd': 0.5,
+        }
+        assert candidate_cost_usd(cell) == 2.0
+
+    @pytest.mark.parametrize('cell', [_architect(), _architect(cost_usd=None)])
+    def test_absent_or_none_cost_reads_as_zero(self, cell):
+        assert candidate_cost_usd(cell) == 0.0
+
+    def test_judge_spend_above_the_total_raises_naming_the_cell(self):
+        cell = _architect(cost_usd=0.3, judge_cost_usd=0.5)
+        with pytest.raises(ValueError) as excinfo:
+            candidate_cost_usd(cell, where='f1 x arch-cfg')
+        message = str(excinfo.value)
+        assert 'f1 x arch-cfg' in message
+        assert '0.3' in message
+        assert '0.5' in message
+        assert 'subset' in message
 
 
 class TestJudgedWithoutReference:

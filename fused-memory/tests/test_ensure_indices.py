@@ -51,6 +51,7 @@ from _falkor_index_doubles import (
     statements_read,
     statements_written,
 )
+from _graph_access_fake import FakeGraphAccess, wait_forever, with_backend_budgets
 
 from fused_memory.backends.falkor_indices import (
     IndexHeaderShapeError,
@@ -62,7 +63,7 @@ from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
 
 
 def _wire(backend, graph) -> None:
-    """Point the backend's driver at *graph* — the seam ``_graph_for`` resolves through."""
+    """Point the backend's driver at *graph* — the seam ``graph_access.graph`` resolves through."""
     backend._driver._get_graph = MagicMock(return_value=graph)
 
 
@@ -324,7 +325,7 @@ class TestGroupArgCanonicalization:
     """The ``@_canonicalize_group_args`` seam (PRD seam S4), POSITIVE form.
 
     Correctness, not hygiene: the CREATE statements resolve a FalkorDB graph KEY
-    through ``_graph_for(group_id)``.  The inner ``list_indices`` call being
+    through ``graph_access.graph(group_id)``.  The inner ``list_indices`` call being
     decorated does not cover it — the diff read and the writes resolve the key
     independently.
 
@@ -437,6 +438,37 @@ class TestUnreachableDriverPropagates:
         backend._driver.client.list_graphs = AsyncMock(
             side_effect=redis.exceptions.ConnectionError('down')
         )
+
+        with pytest.raises(redis.exceptions.ConnectionError):
+            await backend.ensure_indices(group_id='test')
+
+        assert statements_written(graph) == []
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_existence_probe_fails_on_the_read_budget(
+        self, mock_config, make_backend, make_graph_mock, make_graph_driver,
+    ):
+        graph = make_graph_mock([], header=LIVE_HEADER)
+        graph.ro_query = AsyncMock(side_effect=EMPTY_KEY_ERROR)
+        driver = make_graph_driver({'test': graph})
+        driver.client.list_graphs = AsyncMock(side_effect=wait_forever)
+        backend = make_backend(
+            with_backend_budgets(mock_config, read_s=0.05, write_s=0.08), driver=driver,
+        )
+
+        with pytest.raises(TimeoutError) as raised:
+            await asyncio.wait_for(backend.ensure_indices(group_id='test'), 5.0)
+
+        assert str(raised.value) == 'Graphiti list_graphs timed out after 0.05s'
+        assert statements_written(graph) == []
+
+    @pytest.mark.asyncio
+    async def test_the_existence_probe_reads_the_injected_provider(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        graph = make_graph_mock([], header=LIVE_HEADER)
+        graph.ro_query = AsyncMock(side_effect=redis.exceptions.ConnectionError('down'))
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({'test': graph}))
 
         with pytest.raises(redis.exceptions.ConnectionError):
             await backend.ensure_indices(group_id='test')

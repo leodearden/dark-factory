@@ -273,7 +273,7 @@ def test_the_sampler_excludes_the_outcomes_the_streak_carves_out(
     absent key must be KEPT; that is the arm the coalesce in the SELECT exists
     for, and dropping it would sample nothing at all on today's live corpus.
     """
-    from orchestrator.harness import (  # noqa: PLC0415
+    from orchestrator.harness import (
         _BY_DESIGN_RESTORE_OUTCOMES,
     )
 
@@ -300,6 +300,34 @@ def test_the_sampler_excludes_the_outcomes_the_streak_carves_out(
     assert sample.min_gap_secs == timedelta(hours=6).total_seconds()
 
 
+def test_steward_rows_never_feed_the_streak_so_are_never_sampled(
+    tmp_path, anchor,
+):
+    """A steward's rejected live-continuation resume (task 5579) never reaches
+    ``Harness.note_resume_failed``, so, like the by-design carve-out above, it
+    must not shorten a measured gap.
+    """
+    feeder_gaps = [timedelta(hours=h) for h in range(4, 4 + swb.MIN_GAP_ROWS)]
+    feeders = _spaced(anchor, feeder_gaps)
+    rows: list[dict] = [
+        {'timestamp': when.isoformat(), 'event_type': 'session_resume_failed',
+         'data': {'stage': 'cli', 'role': 'implementer'}}
+        for when in feeders
+    ]
+    rows += [
+        {'timestamp': (when + timedelta(minutes=1)).isoformat(),
+         'event_type': 'session_resume_failed',
+         'data': {'stage': 'cli', 'role': 'steward'}}
+        for when in feeders
+    ]
+
+    sample = swb.observed_storm_window_inputs(_make_db(tmp_path / 's.db', rows))
+
+    assert sample is not None
+    assert sample.gaps_secs == tuple(g.total_seconds() for g in feeder_gaps)
+    assert sample.min_gap_secs == min(feeder_gaps).total_seconds()
+
+
 def test_the_runs_db_locator_is_shared_with_resume_age_bound():
     """ONE runs.db locator and ONE timestamp parser for every derived-bound
     guard in this submodel — but not necessarily one slice width.
@@ -316,7 +344,7 @@ def test_the_runs_db_locator_is_shared_with_resume_age_bound():
     NESTING: a strictly narrower window is a subset of the wider one by
     construction, so the corpora always overlap.
     """
-    from orchestrator import resume_age_bound as rab  # noqa: PLC0415
+    from orchestrator import resume_age_bound as rab
 
     assert swb.default_runs_db_path is rab.default_runs_db_path
     assert swb.parsed_utc is rab.parsed_utc

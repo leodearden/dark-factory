@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from _dashboard_helpers import destructure_bindings, extract_function_body, strip_js_comments
+from _jsx_source_helpers import destructure_bindings, extract_function_body, strip_js_comments
 
 _MODULE_DESTRUCTURE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.(DF_\w+)\s*;')
 

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from orchestrator.session_registry import SessionRecord, parse_result_outcome
+from orchestrator.session_records import SessionRecord, parse_result_outcome
 from review_all_program_fixture import (
     FIXTURE_DIR,
     PROGRAM_DIR,
@@ -28,8 +28,11 @@ from review_all_program_fixture import (
     load_state,
     running_fake_store,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from shared import task_statuses
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 state = load_state()
 
@@ -47,6 +50,7 @@ _ALLOWED_FIRST_PARTY = {
     'shared.task_statuses',
     'shared.mcp_post',
     'shared.mcp_envelope',
+    'shared.mcp_unknown_arguments',
 }
 _LOADED_NON_STDLIB = """
 import json, sys

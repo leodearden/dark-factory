@@ -15,9 +15,9 @@ real Claude Code JSONL schema (observed in
 
 Every helper below returns a plain dict (or writes one) — no behavior, pure
 scaffolding reused by every test class in this file. Import the target
-module as `import digest as mod`, resolved via scripts/tests/conftest.py's
-sys.path insertion (both scripts/ and scripts/legibility/ are on sys.path;
-no package __init__ needed).
+module as `from legibility import digest as mod`, the one spelling every
+legibility module is reached by (scripts/ is on sys.path via
+scripts/tests/conftest.py; no package __init__ needed).
 """
 from __future__ import annotations
 
@@ -26,10 +26,10 @@ import logging
 import re
 from pathlib import Path
 
-import digest as mod
 import pytest
 import yaml
 from legibility import detectors, reingestion
+from legibility import digest as mod
 from legibility import inventory as inventory_mod
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
@@ -40,14 +40,18 @@ from legibility_carrier_fixtures import (
     TASK_NOTIFICATION_TEXT,
     TRICKLE_CODER_PREAMBLE,
     UNKNOWN_PROVENANCE_TEXT,
+    UNMARKED_HEADLESS_SDK_PROMPT_TEXTS,
     WATCHER_ROTATION_PROMPT,
     briefing_text,
+    census_synthesis_prompt,
+    census_verifier_prompt,
     coder_judgment,
     json_fenced,
     merger_prompt,
     pre_5356_replan_prompt,
     prior_round_adjudicator_prompt,
     recon_run_review_text,
+    sdk_prompt,
     steward_continuation_prompt,
     with_origin,
 )
@@ -1072,6 +1076,34 @@ class TestTrickleCoderSessionDigest:
 
         assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 7
 
+    def test_frontmatter_instrument_version_is_at_or_past_the_headless_sdk_prompt_generation(
+        self,
+    ):
+        """A version floor only. Generation 8 is the first whose gold section
+        and dialogue carriers exclude headless SDK-delivered prompts. The
+        exclusion itself is pinned by TestHeadlessSdkPromptFilter."""
+        digest = mod.render_digest(
+            [_with_session_meta(_user_text('please fix the bug'))], agent_class='interactive',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 8
+
+    def test_frontmatter_instrument_version_is_at_or_past_the_census_prompt_generation(self):
+        """A version floor only. Generation 9 is the first whose gold section
+        and dialogue carriers exclude the periodic-census verifier and
+        synthesis prompts. The exclusion itself is pinned by the census params
+        of
+        TestHarnessInjectedTurnFilter.test_render_digest_injected_prose_prompt_session_has_no_gold_section."""
+        digest = mod.render_digest(
+            [_with_session_meta(_user_text('please fix the bug'))], agent_class='interactive',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 9
+
 
 # ---------------------------------------------------------------------------
 # find_retry_loops — same tool name + canonical (sort_keys) input signature
@@ -1727,6 +1759,7 @@ def _frontmatter_meta():
         'score': 12.5,
         'n_user_turns': 3,
         'truncated_items': 0,
+        'parent_session': '',
         'signal_counts': {
             'tool_error': 1,
             'self_correct': 2,
@@ -1759,7 +1792,7 @@ class TestRenderFrontmatter:
         assert top_level_keys == [
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
             'size_bytes', 'score', 'n_user_turns', 'truncated_items',
-            'instrument_version', 'signal_counts',
+            'parent_session', 'instrument_version', 'signal_counts',
         ]
 
     def test_signal_counts_nested_in_contract_order(self):
@@ -1827,6 +1860,7 @@ class TestRenderFrontmatter:
         assert mod.FRONTMATTER_KEYS[:-1] == (
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
             'size_bytes', 'score', 'n_user_turns', 'truncated_items',
+            'parent_session',
         )
 
     def test_instrument_version_emits_as_a_bare_numeric_scalar(self):
@@ -2041,17 +2075,6 @@ def _resume_and_context_block_records():
     ]
 
 
-def _sdk_prompt(text):
-    """A prompt delivered over the SDK, shaped like the steward continuation
-    records sighted in reify session 77fb6617: promptSource and turnOrigin
-    'sdk', no 'origin', and the 'isMeta' key ABSENT rather than False."""
-    rec = _user_text(text)
-    rec.pop('isMeta')
-    rec['promptSource'] = 'sdk'
-    rec['turnOrigin'] = 'sdk'
-    return rec
-
-
 _BLOCKED_LITERAL = 'BLOCKED: merge gate refused the branch'
 
 INJECTED_PROSE_PROMPTS = (
@@ -2061,9 +2084,15 @@ INJECTED_PROSE_PROMPTS = (
     ),
     pytest.param(pre_5356_replan_prompt(_BLOCKED_LITERAL), id='pre_5356_replan'),
     pytest.param(WATCHER_ROTATION_PROMPT, id='watcher_rotation'),
+    pytest.param(
+        census_verifier_prompt(_BLOCKED_LITERAL, 'cat: x: No such file or directory'),
+        id='census_verifier',
+    ),
+    pytest.param(census_synthesis_prompt(_BLOCKED_LITERAL), id='census_synthesis'),
 )
-"""The generation-7 harness prose prompts. Two carry a df_guard literal in
-their review free text, which must not count as this session's signal."""
+"""Harness prose prompts that open a session. All but the watcher rotation
+embed free text quoting signal literals, review text or another session's
+cluster, which must not count as this session's signal."""
 
 
 class TestHarnessInjectedTurnFilter:
@@ -2277,9 +2306,9 @@ class TestHarnessInjectedTurnFilter:
         # The 77fb6617 shape: two continuation prompts around real dialogue.
         continuation = steward_continuation_prompt(tmp_path)
         records = [
-            _sdk_prompt(continuation),
+            sdk_prompt(continuation, entrypoint=None),
             _user_text('please fix the bug'),
-            _sdk_prompt(continuation),
+            sdk_prompt(continuation, entrypoint=None),
         ]
 
         turns = mod.iter_user_turns(records)
@@ -2298,7 +2327,7 @@ class TestHarnessInjectedTurnFilter:
         prompt = steward_continuation_prompt(
             tmp_path, summary='BLOCKED: merge gate refused the branch',
         )
-        records = [_with_session_meta(_sdk_prompt(prompt)) for _ in range(2)]
+        records = [_with_session_meta(sdk_prompt(prompt, entrypoint=None)) for _ in range(2)]
 
         digest = mod.render_digest(records, agent_class='orchestrated-task')
 
@@ -2313,7 +2342,7 @@ class TestHarnessInjectedTurnFilter:
     def test_injected_prose_prompt_is_excluded_from_iter_user_turns(self, prompt):
         # The 16e1a37b / 2880c011 / 4aaf48b0 shape: the injected prompt is
         # the session's first user record.
-        records = [_sdk_prompt(prompt), _user_text('please fix the bug')]
+        records = [sdk_prompt(prompt, entrypoint=None), _user_text('please fix the bug')]
 
         turns = mod.iter_user_turns(records)
 
@@ -2322,7 +2351,7 @@ class TestHarnessInjectedTurnFilter:
     @pytest.mark.parametrize('prompt', INJECTED_PROSE_PROMPTS)
     def test_render_digest_injected_prose_prompt_session_has_no_gold_section(self, prompt):
         digest = mod.render_digest(
-            [_with_session_meta(_sdk_prompt(prompt))], agent_class='orchestrated-task',
+            [_with_session_meta(sdk_prompt(prompt, entrypoint=None))], agent_class='orchestrated-task',
         )
 
         frontmatter_yaml, _ = _split_frontmatter(digest)
@@ -2641,6 +2670,40 @@ class TestNonHumanOriginFilter:
 
 
 # ---------------------------------------------------------------------------
+# Headless-SDK prompt exclusion (task 6953): a prompt delivered to headless
+# `claude --print` (promptSource 'sdk', entrypoint 'sdk-cli') is excluded by
+# provenance alone, while a human turn typed into an SDK GUI client stays gold.
+# ---------------------------------------------------------------------------
+
+class TestHeadlessSdkPromptFilter:
+    def test_headless_prompts_are_excluded_and_dialogue_keeps_its_index(self):
+        gui_client_turn = sdk_prompt("what's the status of the PR?", entrypoint='sdk-ts')
+        typed_turn = {**_user_text('please fix the bug'), 'promptSource': 'typed', 'entrypoint': 'cli'}
+        records = [sdk_prompt(text) for text in UNMARKED_HEADLESS_SDK_PROMPT_TEXTS.values()]
+        records += [gui_client_turn, typed_turn]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [
+            (4, "what's the status of the PR?"),
+            (5, 'please fix the bug'),
+        ]
+
+    def test_render_digest_headless_prompt_session_has_no_gold_section(self):
+        records = [
+            _with_session_meta(sdk_prompt(f'{text}\nBLOCKED: merge gate refused the branch'))
+            for text in UNMARKED_HEADLESS_SDK_PROMPT_TEXTS.values()
+        ]
+
+        digest = mod.render_digest(records, agent_class='orchestrated-task')
+
+        meta = yaml.safe_load(_split_frontmatter(digest)[0])
+        assert '## User Corrections' not in digest
+        assert meta['n_user_turns'] == 0
+        assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
+
+
+# ---------------------------------------------------------------------------
 # Run-review-prompt exclusion via is_harness_injected_turn -- R1 (confusion
 # census 2026-07-31 §1.1 facet (b), :81/:85): 5 sightings across 5 sessions
 # where the flagged "User Correction" is a full Reconciliation Run Review.
@@ -2770,9 +2833,26 @@ class TestRenderDigest:
         assert meta['cwd'] == _DIGEST_CWD
         assert meta['date'] == '2026-07-11'
         assert meta['agent_class'] == 'interactive'
-        # No transcript path given -> encoded_dir falls back to the mirror of
-        # session_registry.encode_cwd (every '/', '.' and '_' maps to '-').
+        # No transcript path given -> encoded_dir falls back to
+        # inventory.encode_cwd (every '/', '.' and '_' maps to '-').
         assert meta['encoded_dir'] == '-home-leo-src-dark-factory'
+
+    # Observed on-disk ~/.claude/projects dir names, hard-coded as literals:
+    # an expected value computed by an encoder cannot catch that encoder's bug.
+    @pytest.mark.parametrize(('cwd', 'expected_dir'), [
+        ('/home/leo/src/dark-factory/.worktrees/2573', '-home-leo-src-dark-factory--worktrees-2573'),
+        ('/home/leo/src/warm-lanes/worktrees/_lane-39', '-home-leo-src-warm-lanes-worktrees--lane-39'),
+        ('/media/leo/data_lv_1/leo/reify-build', '-media-leo-data-lv-1-leo-reify-build'),
+    ])
+    def test_encoded_dir_fallback_matches_real_on_disk_dir_names(self, cwd, expected_dir):
+        records = [_with_session_meta(_user_text('hi'), cwd=cwd)]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['encoded_dir'] == expected_dir
 
     def test_encoded_dir_prefers_transcript_path_parent_dir_name(self, tmp_path):
         # An arbitrary dir name unrelated to cwd's mirror encoding, so a
@@ -2824,7 +2904,7 @@ class TestRenderDigest:
 
 def _oversized_not_found_records(n=600):
     """One gold user-correction plus *n* not-found hits -- enough bytes to
-    exceed the default 15360-byte soft cap on its own."""
+    exceed the DEFAULT_MAX_BYTES soft cap on its own."""
     records = [_with_session_meta(_user_text('This approach is wrong, please redo it properly.'))]
     for i in range(n):
         records.append(_with_session_meta(
@@ -2853,7 +2933,7 @@ class TestRenderDigestTruncation:
     def test_default_cap_is_respected_and_gold_survives(self):
         digest = mod.render_digest(_oversized_not_found_records(), agent_class='interactive')
 
-        assert len(digest.encode('utf-8')) <= 15360
+        assert len(digest.encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
         assert '## User Corrections' in digest
         # truncation genuinely trimmed the low-signal section, not a no-op
         assert digest.count('command not found') < 600
@@ -2882,21 +2962,52 @@ class TestRenderDigestTruncation:
         assert digest.count('Bash x3:') < 60
 
 
+class TestDefaultMaxBytes:
+    def test_default_max_bytes_is_the_prd_7_2_cap(self):
+        assert mod.DEFAULT_MAX_BYTES == 15360
+
+    def test_render_digest_defaults_to_the_module_cap(self):
+        records = _oversized_not_found_records()
+
+        default = mod.render_digest(records, agent_class='interactive')
+
+        assert default == mod.render_digest(
+            records, agent_class='interactive', max_bytes=mod.DEFAULT_MAX_BYTES,
+        )
+        assert default != mod.render_digest(
+            records, agent_class='interactive', max_bytes=mod.DEFAULT_MAX_BYTES - 1024,
+        )
+
+    def test_build_digest_defaults_to_the_module_cap(self, tmp_path):
+        path = _write_jsonl(tmp_path, _oversized_not_found_records())
+
+        assert mod.build_digest(path) == mod.build_digest(path, max_bytes=mod.DEFAULT_MAX_BYTES)
+
+    def test_cli_max_bytes_defaults_to_the_module_cap(self, tmp_path, capsys):
+        path = _write_jsonl(tmp_path, _oversized_not_found_records())
+
+        mod.main([str(path)])
+
+        assert capsys.readouterr().out == (
+            mod.build_digest(path, max_bytes=mod.DEFAULT_MAX_BYTES) + '\n'
+        )
+
+
 # ---------------------------------------------------------------------------
 # _cap_item / _item_byte_cap -- R2 part 1 (confusion census 2026-07-24 Sec
 # 4): a per-item byte cap applied at the single _build_sections choke
 # point, so ONE oversized item (an enormous pasted user turn, a huge
 # tool_result echo, ...) can never evict every sibling section before
 # being popped itself. Capping is byte-wise and UTF-8-safe: the whole
-# digest budget is measured in UTF-8 bytes (_resolve_size_bytes, the 15360
-# soft cap), so a naive character-wise slice would not actually bound it
+# digest budget is measured in UTF-8 bytes (_resolve_size_bytes, the
+# DEFAULT_MAX_BYTES soft cap), so a naive character-wise slice would not actually bound it
 # for non-ASCII content, and a naive byte slice can split a multi-byte
 # codepoint mid-sequence.
 # ---------------------------------------------------------------------------
 
 def _oversized_user_correction_records():
     """One ORDINARY (non-briefing-shaped) human user turn whose text alone
-    exceeds the default 15360-byte soft cap, plus a genuine is_error
+    exceeds the DEFAULT_MAX_BYTES soft cap, plus a genuine is_error
     tool_result error neighborhood and a 'command not found' not-found
     hit. Deliberately NOT briefing-shaped: R2 (whole-item truncation
     eviction) is a distinct pathology from R1 (harness-turn exclusion), so
@@ -3023,7 +3134,7 @@ class TestPerItemByteCap:
         assert '## User Corrections' in digest
         assert '## Error Neighborhoods' in digest
         assert '## Not Found' in digest
-        assert len(digest.encode('utf-8')) <= 15360
+        assert len(digest.encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
         assert mod.ITEM_TRUNCATION_MARKER in digest
 
     def test_gold_section_still_precedes_error_neighborhoods_under_cap(self):
@@ -3072,7 +3183,7 @@ def _multiple_oversized_items_records():
 
 class TestTruncatedItemsFrontmatter:
     def test_truncated_items_is_zero_when_nothing_was_truncated(self):
-        # _all_signals_records() is well under the 15360 default cap, so
+        # _all_signals_records() is well under the DEFAULT_MAX_BYTES cap, so
         # nothing is truncated and the key must say so rather than be absent.
         digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
 
@@ -3629,7 +3740,7 @@ class TestBuildDigestBoundary:
         for heading in ('User Corrections', 'Error Neighborhoods', 'Self-Corrections', 'Retry Loops'):
             assert f'## {heading}' in digest, f'missing heading: {heading}'
 
-        assert len(digest.encode('utf-8')) <= 15360
+        assert len(digest.encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
 
         frontmatter_yaml, _ = _split_frontmatter(digest)
         meta = yaml.safe_load(frontmatter_yaml)
@@ -3665,7 +3776,7 @@ class TestMainCLI:
         assert '## User Corrections' in captured.out
         # print() appends exactly one trailing newline beyond the digest
         # itself -- strip it before checking the digest's own soft cap.
-        assert len(captured.out.rstrip('\n').encode('utf-8')) <= 15360
+        assert len(captured.out.rstrip('\n').encode('utf-8')) <= mod.DEFAULT_MAX_BYTES
 
     def test_agent_class_flag_overrides_frontmatter_class(self, tmp_path, capsys):
         path = _write_jsonl(tmp_path, _boundary_records())

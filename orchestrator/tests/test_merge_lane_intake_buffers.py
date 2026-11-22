@@ -110,6 +110,7 @@ class Scene:
     events: EventStore
     config: OrchestratorConfig
     admission: list[bool]
+    reserved: set[str]
 
 
 def any_writer(structure: str) -> None:
@@ -126,13 +127,17 @@ def scene(tmp_path: Path) -> Scene:
     return build_scene(tmp_path, assert_merger_owns=any_writer)
 
 
-def build_scene(tmp_path: Path, *, assert_merger_owns: Callable[[str], None]) -> Scene:
+def build_scene(
+    tmp_path: Path, *, assert_merger_owns: Callable[[str], None], repo: Path | None = None,
+) -> Scene:
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lifecycle = RecordingLifecycle()
     halt = HaltState(LANES, on_resume=lambda: None)
     events = EventStore(db_path=tmp_path / 'events.db', run_id='intake-buffers')
-    git_ops = GitOps(_GIT, tmp_path)
+    root = repo or tmp_path
+    git_ops = GitOps(_GIT, root)
     admission = [False]
+    reserved: set[str] = set()
     intake = MergeIntake(
         queue=queue,
         lanes=LANES,
@@ -147,10 +152,11 @@ def build_scene(tmp_path: Path, *, assert_merger_owns: Callable[[str], None]) ->
         frozen_prefix_tip=lambda sha: sha,
         retire_item=lifecycle.retire,
         assert_merger_owns=assert_merger_owns,
+        is_reserved=lambda request_id: request_id in reserved,
     )
     return Scene(
         intake, queue, lifecycle, halt, events,
-        OrchestratorConfig(project_root=tmp_path), admission,
+        OrchestratorConfig(project_root=root), admission, reserved,
     )
 
 
@@ -260,6 +266,58 @@ async def test_the_pick_holds_everything_while_admission_is_halted(scene: Scene)
 
     scene.admission[0] = False
     assert scene.intake.pop_next_pickable() is req
+
+
+# ---------------------------------------------------------------------------
+# (c2) A deep chain's reserved links are invisible to the pick (task 7720)
+# ---------------------------------------------------------------------------
+
+
+async def test_the_pick_skips_a_reserved_head_and_leaves_it_buffered(scene: Scene) -> None:
+    head, behind = request(scene, '101'), request(scene, '102')
+    scene.intake.buffer_owned_request(head)
+    scene.intake.buffer_owned_request(behind)
+    scene.reserved.add(head.request_id)
+
+    assert scene.intake.pop_next_pickable() is behind
+    assert scene.intake.pop_next_pickable() is None
+    assert scene.intake.buffered('normal') == (head,)
+    assert scene.lifecycle.current(head.request_id) is State.LANE_BUFFERED
+    assert (head.request_id, State.LANE_BUFFERED, State.MERGING) not in scene.lifecycle.hops
+
+
+async def test_a_lane_of_only_reserved_requests_falls_through(scene: Scene) -> None:
+    high, normal = request(scene, '101', lane='high'), request(scene, '102')
+    scene.intake.buffer_owned_request(high)
+    scene.intake.buffer_owned_request(normal)
+    scene.reserved.add(high.request_id)
+
+    assert scene.intake.pop_next_pickable() is normal
+    assert scene.intake.pop_next_pickable() is None
+    assert scene.intake.buffered('high') == (high,)
+
+
+async def test_a_reserved_older_neighbour_does_not_block_the_item_behind_it(
+    tmp_path: Path,
+) -> None:
+    repo = seed_repo(tmp_path / 'repo', README_SEED)
+    scene = build_scene(tmp_path, assert_merger_owns=any_writer, repo=repo)
+    git_ops = GitOps(_GIT, repo)
+    younger = request(scene, '101', merge_first_enqueued_at=300.0)
+    older = request(scene, '102', merge_first_enqueued_at=100.0)
+    for req in (younger, older):
+        worktree = (await git_ops.create_worktree(req.task_id)).path
+        (worktree / 'clique.py').write_text(f'{req.task_id}\n')
+        await git_ops.commit(worktree, f'{req.task_id}: clique')
+        scene.intake.buffer_owned_request(req)
+    await scene.intake.recompute_suffix_conflict_graph()
+    graph = scene.intake.suffix_conflict_graph
+    assert graph.footprint_neighbors(younger.request_id) == {older.request_id}
+
+    scene.reserved.add(older.request_id)
+
+    assert scene.intake.pop_next_pickable() is younger
+    assert scene.intake.buffered('normal') == (older,)
 
 
 # ---------------------------------------------------------------------------

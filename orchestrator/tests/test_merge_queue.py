@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import logging
 import os
 import re
@@ -23,13 +24,13 @@ from _merge_lane_fakes import (
     VerifyScript,
     fails,
     hangs_until,
-    healthy_verify_clock,
     lane_scene_config,
     main_health_probe_spawned,
     make_lane,
     merge_through_lane,
     passes,
     raises,
+    remerge_on_main,
     running_lane,
     times_out,
 )
@@ -48,7 +49,7 @@ from _resolution_merges import resolution_merge
 from _verify_result_doubles import fake_verify_result
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
     AdvanceOutcome,
@@ -61,6 +62,8 @@ from orchestrator.git_ops import (
 from orchestrator.merge_lane.gates import (
     DropGuardResult,
     _check_plan_files_touched_in_branch,
+    _reverify_rebased_tree,
+    note_queue_verified_main_tip,
 )
 from orchestrator.merge_lane.intake import (
     MERGE_LANES,
@@ -69,8 +72,19 @@ from orchestrator.merge_lane.intake import (
 )
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
 from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
+from orchestrator.merge_lane.remerge_base import RemergeClaim
 from orchestrator.merge_lane.reverify_gate_decision import GateClearance
-from orchestrator.merge_lane.types import DiskGuardOutcome, QueuedBranch, TerminalOutcomeRecord
+from orchestrator.merge_lane.types import (
+    DiskGuardOutcome,
+    QueuedBranch,
+    RemergeBase,
+    RemergeReason,
+    TerminalOutcomeRecord,
+)
+from orchestrator.merge_lane.verify_failure_outcome import (
+    TRANSIENT_INFRA_REASON_PREFIX,
+    verify_hit_enospc,
+)
 from orchestrator.merge_lane.worker import (
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     NEEDS_REBASE_REASON_PREFIX,
@@ -78,7 +92,6 @@ from orchestrator.merge_lane.worker import (
     TRAIN_INCOMPLETE_REASON_PREFIX,
     TRAIN_PARTIAL_FLIP_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
-    TRANSIENT_INFRA_REASON_PREFIX,
     WORKTREE_MISSING_REASON_PREFIX,
     CapPermit,
     DecidedItem,
@@ -95,10 +108,9 @@ from orchestrator.merge_lane.worker import (
     _classify_branch_presence,
     _ensure_verify_disk_space,
     _is_speculation_race,
-    _verify_hit_enospc,
     item_merge_wt,
 )
-from orchestrator.verify import VerifyResult
+from orchestrator.verify import VerifyResult, cached_main_baseline_failing_ids
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 
 # Per-test ceiling for classes whose stacked wait_responsive merge waits outgrow
@@ -194,9 +206,14 @@ def _gated_verify(
     return AsyncMock(side_effect=_side_effect)
 
 
-def _mock_verify_pass():
-    """Return a mock that makes run_scoped_verification always pass."""
-    return AsyncMock(return_value=fake_verify_result(passed=True, summary=''))
+def _mock_verify_pass(*, failing_test_ids: frozenset[str] | None = None):
+    """Return a mock that makes run_scoped_verification always pass.
+
+    Only a non-None *failing_test_ids* lets the pass seed main's baseline.
+    """
+    return AsyncMock(return_value=fake_verify_result(
+        passed=True, summary='', failing_test_ids=failing_test_ids,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -1340,7 +1357,7 @@ class TestMergeLaneSingleRequest:
         await git_ops.commit(worktree, 'Add queued file')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
         req = _make_request('1', 'queue-basic', worktree, config)
         result = await merge_through_lane(lane, queue, req)
 
@@ -1378,7 +1395,7 @@ class TestMergeLaneSingleRequest:
         })
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         async def _fake_drop_check(*_args, **_kwargs):
             return DropGuardResult(dropped=['dropped.py'])
@@ -1431,7 +1448,7 @@ class TestMergeLaneSingleRequest:
         })
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         # The "merge commit" merges the task tip into main but keeps the tree
         # of a task-branch commit that predates dropped.py. The real detector
@@ -1508,7 +1525,7 @@ class TestMergeLaneSingleRequest:
 
         # req.snapshot_tip = SNAP (the already-merged tip)
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         req = MergeRequest(
             task_id='snap-am-test',
@@ -1547,7 +1564,7 @@ class TestMergeLaneSingleRequest:
         # snapshot_tip=None — the check should use worktree HEAD
         # HEAD is a non-ancestor of main (branch not yet merged) → proceed to merge
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         req = MergeRequest(
             task_id='snap-bc-none',
@@ -1579,7 +1596,7 @@ class TestMergeLaneSingleRequest:
         event_store = EventStore(db_path=db_path, run_id='test-run')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue, event_store=event_store)
 
         # 'ghost-4011' was never created here — no task/ghost-4011 ref exists.
         req = _make_request(
@@ -1622,7 +1639,7 @@ class TestMergeLaneSingleRequest:
         await git_ops.commit(worktree, 'Add prefixed file')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         # Submit with the PREFIXED branch string, not the bare id
         req = _make_request('4778', 'task/queue-prefixed', worktree, config)
@@ -1663,7 +1680,7 @@ class TestMergeLaneSingleRequest:
         assert await git_ops.resolve_branch_sha('task/orphan-merge-test') is None
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         req = _make_request('orphan-merge', 'orphan-merge-test', wt, config)
         outcome = await merge_through_lane(lane, queue, req)
@@ -1704,7 +1721,7 @@ class TestMergeLaneSingleRequest:
         assert await git_ops.resolve_branch_sha('task/misroute-test') is None
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         req = _make_request('misroute', 'misroute-test', wt, config)
 
@@ -2410,7 +2427,7 @@ class TestSpeculativeMergeWorker:
         """_run_inflight_verify raising must resolve N's Future and release the slot.
 
         γ structural note: the γ restructuring replaced _verify_and_advance (the old
-        single-method verify+CAS) with _dispatch_item + _run_inflight_verify + _finalize_inflight.
+        single-method verify+CAS) with VerifyDispatcher.dispatch + _run_inflight_verify + _finalize_inflight.
         The new _verifier_loop no longer calls _verify_and_advance; it calls
         _run_inflight_verify via asyncio.ensure_future, awaits the task in
         _finalize_inflight, and catches unexpected exceptions in the finalize-head
@@ -2439,7 +2456,7 @@ class TestSpeculativeMergeWorker:
 
         # γ: patch _run_inflight_verify (the verify half of the new split) instead of
         # _verify_and_advance (which is now only a compat shim not called by the loop).
-        original_riv = worker._run_inflight_verify
+        original_riv = worker.verify_dispatch.run_inflight_verify
         call_count = 0
 
         async def mock_riv(item, lease, **kwargs):  # type: ignore[no-untyped-def]
@@ -2449,7 +2466,7 @@ class TestSpeculativeMergeWorker:
                 raise RuntimeError('Unexpected verifier error')
             return await original_riv(item, lease, **kwargs)
 
-        worker._run_inflight_verify = mock_riv  # type: ignore[method-assign]
+        vars(worker.verify_dispatch)['run_inflight_verify'] = mock_riv
 
         req_n = _make_request('vex-n', 'vex-n', wt_n, config)
         req_n1 = _make_request('vex-n1', 'vex-n1', wt_n1, config)
@@ -2505,6 +2522,10 @@ class TestSpeculativeMergeWorker:
         With fix: except clause resolves N+1's Future as 'blocked' with
         'Verifier error'; finally clause always sets _speculation_slot.
         """
+        # Deep chains off (task 8527): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the _remerge this scene raises in.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(
             git_ops, 'vre-n', 'file_vre_n.py', 'n = 1\n',
         )
@@ -3609,6 +3630,10 @@ class TestSpeculativeMergeWorker:
         and re-merged. We patch merge_to_main so the re-merge produces a
         conflict for N+1, causing a conflict emit inside _remerge.
         """
+        # Deep chains off (task 10617): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the _remerge this scene asserts on.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         db_path = tmp_path / 'events_remerge.db'
         event_store = EventStore(db_path=db_path, run_id='test-run')
 
@@ -3987,7 +4012,7 @@ class TestSpeculativeMergeWorker:
         )
 
     async def test_verifier_already_delivered_token_drives_nfailed_chain(
-        self, git_ops: GitOps, config: OrchestratorConfig,
+        self, git_ops: GitOps, config: OrchestratorConfig, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """already_delivered failure token flips n_failed, triggering _remerge.
 
@@ -4023,15 +4048,16 @@ class TestSpeculativeMergeWorker:
             immediate_outcome=remerge_outcome,
             already_delivered=False,
         )
-        worker._remerge = AsyncMock(return_value=remerged_item)  # type: ignore[method-assign]
+        remerge = AsyncMock(return_value=remerged_item)
+        monkeypatch.setattr(worker, '_remerge', remerge)
 
         # token2 is discarded by the n_failed short-circuit and replaced by
         # worker._remerge's mocked return value — it must be a REAL item
-        # (immediate_outcome=None), not DECIDED: _dispatch_item's
+        # (immediate_outcome=None), not DECIDED: VerifyDispatcher.dispatch's
         # immediate-outcome branch returns a passthrough entry BEFORE the
         # chain-invalidation check ever runs, so a DECIDED token2 would skip
         # _remerge entirely. merge_wt/merge_result content is unread on the
-        # exercised path (mocked _remerge only takes req + started_monotonic),
+        # exercised path (the mocked _remerge reads nothing from the item),
         # so a dummy worktree path (established pattern elsewhere in this file)
         # is a safe filler.
         dummy_wt2 = git_ops.project_root / '.worktrees' / 'vot-b2-stale'
@@ -4048,7 +4074,12 @@ class TestSpeculativeMergeWorker:
 
         await worker._verifier_loop()
 
-        worker._remerge.assert_awaited_once()  # type: ignore[attr-defined]
+        remerge.assert_awaited_once()
+        # Nothing is verifying, so the claim falls to main (task 8524).
+        assert remerge.await_args is not None
+        claim = remerge.await_args.kwargs.get('claim')
+        assert isinstance(claim, RemergeClaim), remerge.await_args
+        assert claim.anchor == RemergeBase(None, RemergeReason.NO_TIP)
         assert not worker._speculation_slot.locked(), (
             '_speculation_slot must have a free permit after verifier drains both tokens'
         )
@@ -4513,7 +4544,7 @@ class TestSpeculativeMergeWorker:
         via an in-flight worker predecessor.  To exercise the genuine stale-base
         pickup-rebase (the original intent), we use a SINGLE non-speculative request
         and advance main OUT-OF-BAND between the merger building it (base=M0) and the
-        verifier dispatching it.  We interpose on `_dispatch_item` to land a disjoint
+        verifier dispatching it.  We interpose on `VerifyDispatcher.dispatch` to land a disjoint
         commit on main exactly once before the first dispatch, so at pickup
         base_sha==M0 != current_main==M1 → Mechanism 2 fires (speculative=False).
 
@@ -4541,7 +4572,7 @@ class TestSpeculativeMergeWorker:
         # Interpose on the verifier's per-item dispatch: the FIRST time the item is
         # about to be dispatched, advance main out-of-band (disjoint file, clean
         # re-merge) so the dispatch-time staleness check sees base_sha != main.
-        original_dispatch = worker._dispatch_item
+        original_dispatch = worker.verify_dispatch.dispatch
         advanced = {'done': False}
 
         async def dispatch_with_oob_advance(item):  # type: ignore[no-untyped-def]
@@ -4552,7 +4583,7 @@ class TestSpeculativeMergeWorker:
                 await _run(['git', 'commit', '-m', 'oob advance M0->M1'], cwd=git_ops.project_root)
             return await original_dispatch(item)
 
-        worker._dispatch_item = dispatch_with_oob_advance  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = dispatch_with_oob_advance
         worker_task = asyncio.create_task(worker.run())
 
         with patch('orchestrator.merge_lane.worker.run_scoped_verification', side_effect=tracking_verify):
@@ -4615,7 +4646,7 @@ class TestSpeculativeMergeWorker:
         successor built behind an in-flight worker predecessor now ATTACHes
         speculatively (base never stale), so the genuine stale-base pickup-rebase
         is exercised with a SINGLE non-speculative request and an OUT-OF-BAND main
-        advance interposed on `_dispatch_item`.
+        advance interposed on `VerifyDispatcher.dispatch`.
 
         N+1 is built against M0 with pre_rebased=True and skip_verify=False
         (task-1724: the build-time skip fast path is removed entirely).  At pickup
@@ -4643,7 +4674,7 @@ class TestSpeculativeMergeWorker:
         worker = SpeculativeMergeWorker(git_ops, queue, event_store=event_store)
 
         # Interpose: advance main out-of-band once, before the first dispatch.
-        original_dispatch = worker._dispatch_item
+        original_dispatch = worker.verify_dispatch.dispatch
         advanced = {'done': False}
 
         async def dispatch_with_oob_advance(item):  # type: ignore[no-untyped-def]
@@ -4654,7 +4685,7 @@ class TestSpeculativeMergeWorker:
                 await _run(['git', 'commit', '-m', 'oob advance M0->M1'], cwd=git_ops.project_root)
             return await original_dispatch(item)
 
-        worker._dispatch_item = dispatch_with_oob_advance  # type: ignore[method-assign]
+        worker.verify_dispatch.dispatch = dispatch_with_oob_advance
         worker_task = asyncio.create_task(worker.run())
 
         with patch('orchestrator.merge_lane.worker.run_scoped_verification', side_effect=tracking_verify):
@@ -4721,7 +4752,7 @@ class TestSpeculativeMergeWorker:
           - asserts the SAFETY CONSEQUENCE (no file on main), not merely call counts
 
         RED on current code: skip_verify=True (pre_rebased AND main unchanged) →
-        _run_post_merge_verify bypassed → outcome='done' → file lands on main →
+        run_post_merge_verify bypassed → outcome='done' → file lands on main →
         all three assertions fail.
         GREEN after step-2: skip_verify=False → verify runs → passed=False →
         outcome='blocked' → file NOT on main.
@@ -4809,6 +4840,10 @@ class TestSpeculativeMergeWorker:
           (3) N+2's verify sees BOTH N's and N+1's files (proves it merged on top
               of the advanced tree, not a stale base).
         """
+        # Deep chains off (task 7720): under the operational yaml's chain_cap the
+        # merger waits for each speculative item's chain decision, so it builds
+        # nothing ahead of an item still waiting for a host.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         db_path = tmp_path / 'events_follower.db'
         event_store = EventStore(db_path=db_path, run_id='test-follower')
 
@@ -4933,6 +4968,10 @@ class TestSpeculativeMergeWorker:
         — proving the merge gate ran before advance_main.  All outcomes 'done';
         all files land on main.
         """
+        # Deep chains off (task 7720): under the operational yaml's chain_cap the
+        # merger waits for each speculative item's chain decision, so it builds
+        # nothing ahead of an item still waiting for a host.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         db_path = tmp_path / 'events_1687a.db'
         event_store = EventStore(db_path=db_path, run_id='test-1687a')
 
@@ -5005,7 +5044,7 @@ class TestSpeculativeMergeWorker:
             assert out.strip(), f'{fname} not found on main'
 
         # (A) N+2's verify must run at least once and see all three files —
-        #     proving the merge gate (_run_post_merge_verify) ran before
+        #     proving the merge gate (run_post_merge_verify) ran before
         #     advance_main on a tree that now contains N's and N+1's commits.
         #     RED on the old skip_verify path: verify never called → count == 0.
         n2_verify_calls = [fs for fs in verify_worktrees if 'file_pr_n2.py' in fs]
@@ -5046,6 +5085,10 @@ class TestSpeculativeMergeWorker:
           file_prb_n2.py is NOT on main (red tree did not advance).
           file_prb_n.py and file_prb_n1.py ARE on main (unaffected).
         """
+        # Deep chains off (task 7720): under the operational yaml's chain_cap the
+        # merger waits for each speculative item's chain decision, so it builds
+        # nothing ahead of an item still waiting for a host.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         db_path = tmp_path / 'events_1687b.db'
         event_store = EventStore(db_path=db_path, run_id='test-1687b')
 
@@ -5941,17 +5984,16 @@ class TestLaneSceneVerifyIsNotCalledDead:
         The in-flight abort poll measures its no-progress budget off the
         FakeClock's ``monotonic()``, which the lane's own periodic loops push
         forward by far more than a poll per real second, so that budget buys
-        no dependable real time. What keeps a verify alive is content progress under its merge
-        worktree, as a healthy verify shows. With the budget shrunk to ten
-        polls, a verify parked for a real second must still run once, not be
-        called dead and requeued.
+        no dependable real time. With the budget shrunk to ten polls, a lane
+        built by ``make_lane`` with no clock must still run a verify parked
+        for a real second once, not call it dead and requeue it.
         """
         wt = await _make_branch_with_file(git_ops, 'slow-verify', 'sv.py', 'x = 1\n')
         gate = asyncio.Event()
         verifier = FakeVerifier(default=dataclasses.replace(passes(), release=gate))
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
-        lane.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 10 * lane.VERIFY_ABANDON_POLL_SECS
+        lane = make_lane(git_ops, queue, verifier=verifier)
+        lane.verify_dispatch.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 10 * lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS
 
         async with running_lane(lane) as run:
             req = _make_request('slow-verify', 'slow-verify', wt, config)
@@ -6050,7 +6092,7 @@ class TestMergeVerifyTimeoutLoopBreaker:
         )
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         verifier = FakeVerifier(default=fails(category='test_failure', summary='tests failed'))
-        lane = make_lane(git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue, verifier=verifier)
 
         async with running_lane(lane) as run:
             # More submissions than the abandon threshold: none may abandon.
@@ -6088,7 +6130,7 @@ class TestMergeVerifyTimeoutLoopBreaker:
         )
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         verifier = FakeVerifier()
-        lane = make_lane(git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue, verifier=verifier)
         assert lane.MAX_POST_MERGE_VERIFY_TIMEOUTS == 2
 
         async with running_lane(lane) as run:
@@ -6326,7 +6368,7 @@ class TestWipHaltSpeculativeMergeWorker:
 
         # Build a real flowing item BEFORE the patch block so _remerge's
         # own merge paths run against the real git_ops (not the raising mock).
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem), (
             f'_remerge must succeed; got {item!r}'
         )
@@ -7574,7 +7616,7 @@ class TestCasRetryStaysInLane:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue, event_store=event_store)
 
         original_advance = git_ops.advance_main
         call_count = 0
@@ -7883,7 +7925,7 @@ class TestPushHook:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         push_mock = AsyncMock(return_value='error')
         with patch.object(git_ops, 'push_main', push_mock):
@@ -8600,17 +8642,17 @@ def _enospc_verify_result() -> VerifyResult:
 
 
 class TestVerifyHitEnospc:
-    """Unit tests for the _verify_hit_enospc string-match detector."""
+    """Unit tests for the verify_hit_enospc string-match detector."""
 
     def test_detects_no_space_left_phrase(self):
-        assert _verify_hit_enospc(_enospc_verify_result()) is True
+        assert verify_hit_enospc(_enospc_verify_result()) is True
 
     def test_detects_os_error_28_in_lint_output(self):
         v = VerifyResult(
             passed=False, test_output='', lint_output='build: os error 28',
             type_output='', summary='',
         )
-        assert _verify_hit_enospc(v) is True
+        assert verify_hit_enospc(v) is True
 
     def test_bare_enospc_token_is_not_evidence(self):
         """Task 7037: a bare ENOSPC token names the condition; only an OS
@@ -8619,7 +8661,7 @@ class TestVerifyHitEnospc:
             passed=False, test_output='', lint_output='',
             type_output='write failed: ENOSPC', summary='',
         )
-        assert _verify_hit_enospc(v) is False
+        assert verify_hit_enospc(v) is False
 
     @pytest.mark.parametrize('test_output', [
         'E   AssertionError: expected the BOUNDED shared enospc/infra retry budget '
@@ -8637,19 +8679,19 @@ class TestVerifyHitEnospc:
             passed=False, test_output=test_output, lint_output='',
             type_output='', summary='Failures: tests failed',
         )
-        assert _verify_hit_enospc(v) is False
+        assert verify_hit_enospc(v) is False
 
     def test_ordinary_test_failure_is_not_enospc(self):
         v = VerifyResult(
             passed=False, test_output='2 failed, 3 passed',
             lint_output='', type_output='', summary='tests failed',
         )
-        assert _verify_hit_enospc(v) is False
+        assert verify_hit_enospc(v) is False
 
     def test_non_string_outputs_are_skipped_without_raising(self):
         # A bare MagicMock (the shape several existing verify tests use) must
         # not raise — non-string attributes are filtered out, yielding False.
-        assert _verify_hit_enospc(
+        assert verify_hit_enospc(
             fake_verify_result(passed=False, summary='tests failed'),
         ) is False
 
@@ -8825,7 +8867,7 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
             captured.update(kwargs)
             return None  # verify passes
 
-        with patch('orchestrator.merge_lane.worker._run_post_merge_verify', _recording_verify):
+        with patch('orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', _recording_verify):
             req = _make_request('ledger-snap', 'ledger-snap', wt, config)
             await queue.put(req)
             outcome = await wait_responsive(req.result, label='ledger-snap: MergeOutcome')
@@ -8833,7 +8875,7 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
         assert outcome.status == 'done', f'unexpected: {outcome}'
         # The worker must have forwarded keep_worktrees.
         assert 'keep_worktrees' in captured, (
-            'expected keep_worktrees kwarg passed to _run_post_merge_verify'
+            'expected keep_worktrees kwarg passed to run_post_merge_verify'
         )
         kw = captured['keep_worktrees']
         # p1 and p2 were in the ledger before the merge was processed.
@@ -8940,7 +8982,7 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
         worker = SpeculativeMergeWorker(git_ops, queue)
 
         _, req = await self._setup_overlap_branch_for_gate(git_ops, branch, config)
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem), (
             f'_remerge must succeed; got {item!r}'
         )
@@ -9266,7 +9308,9 @@ class TestMergedBranchTipCarryThroughRebuild:
         With the PRIMARY fix, it is carried through.
 
         advance_main is mocked: first call → 'cas_failed', second call → 'advanced'.
-        _resolve_second_parent is patched to None (eliminate term-1).
+        The retried advance lands a single-parent (rebase-flattened) commit, as
+        advance_main's CAS-retry rebase does, so advanced_sha^2 does not exist
+        (term-1 = None).
         req.snapshot_tip is None by default (eliminate term-3).
         So only term-2 (merged_branch_tip from the rebuilt item) can provide the tip.
 
@@ -9295,6 +9339,21 @@ class TestMergedBranchTipCarryThroughRebuild:
         assert merge_result.merge_worktree is not None
         actual_merge_commit = merge_result.merge_commit
         worker._register_owned_merge_worktree(merge_result.merge_worktree)
+
+        rc, out, err = await _run(
+            [
+                'git', 'commit-tree', f'{actual_merge_commit}^{{tree}}',
+                '-p', base_sha, '-m', 'Flattened landing (test)',
+            ],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        flattened = out.strip()
+        rc, _, _ = await _run(
+            ['git', 'rev-parse', '--verify', '-q', f'{flattened}^2'],
+            cwd=git_ops.project_root,
+        )
+        assert rc != 0, 'the flattened landing must have no second parent'
 
         req = _make_request(branch, branch, branch_wt, config)
         # req.snapshot_tip = None by default → term-3 = None
@@ -9325,17 +9384,12 @@ class TestMergedBranchTipCarryThroughRebuild:
             advance_calls[0] += 1
             if advance_calls[0] == 1:
                 return AdvanceOutcome('cas_failed')
-            return AdvanceOutcome('advanced', advanced_sha=actual_merge_commit)
+            return AdvanceOutcome('advanced', advanced_sha=flattened)
 
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
         with (
             patch.object(git_ops, 'advance_main', side_effect=_fake_advance),
             patch.object(git_ops, 'get_main_sha', AsyncMock(return_value=base_sha)),
-            # Eliminate term-1 so only term-2 (merged_branch_tip) can provide the tip.
-            patch(
-                'orchestrator.merge_lane.gates._resolve_second_parent',
-                AsyncMock(return_value=None),
-            ),
             patch(
                 'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 side_effect=_spy_equiv,
@@ -9350,7 +9404,8 @@ class TestMergedBranchTipCarryThroughRebuild:
         assert advanced, 'Expected True (main advanced)'
         outcome = req.result.result()
         assert outcome.status == 'done', f'unexpected outcome: {outcome!r}'
-        # Term-1 = None (patched); term-3 = None (snapshot_tip default).
+        # Term-1 = None (the retried advance landed a single-parent, rebase-flattened
+        # commit, so advanced_sha^2 does not exist); term-3 = None (snapshot_tip default).
         # RED: without PRIMARY fix, cas_failed rebuild drops merged_branch_tip
         # → merged_tip=None ≠ ORIGINAL_TIP.
         assert captured_equiv_kw.get('merged_tip') == ORIGINAL_TIP, (
@@ -9448,7 +9503,8 @@ class TestMergedBranchTipCarryThroughRebuild:
 
         def _spy_replace(obj, **changes):
             rebuilt = _real_replace(obj, **changes)
-            captured.append(rebuilt)
+            if isinstance(rebuilt, (RealMergeItem, DecidedItem)):
+                captured.append(rebuilt)
             return rebuilt
 
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
@@ -9534,7 +9590,8 @@ class TestMergedBranchTipCarryThroughRebuild:
 
         def _spy_replace(obj, **changes):
             rebuilt = _real_replace(obj, **changes)
-            captured.append(rebuilt)
+            if isinstance(rebuilt, (RealMergeItem, DecidedItem)):
+                captured.append(rebuilt)
             return rebuilt
 
         advance_calls = [0]
@@ -9549,12 +9606,6 @@ class TestMergedBranchTipCarryThroughRebuild:
         with (
             patch.object(git_ops, 'advance_main', side_effect=_fake_advance),
             patch.object(git_ops, 'get_main_sha', AsyncMock(return_value=new_main_sha)),
-            # Eliminate term-1 so an unrelated merged_branch_tip regression
-            # elsewhere can't accidentally mask a dropped field here too.
-            patch(
-                'orchestrator.merge_lane.gates._resolve_second_parent',
-                AsyncMock(return_value=None),
-            ),
             patch(
                 'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
@@ -9639,7 +9690,9 @@ class TestEnsureVerifyDiskSpace:
                 gops, tmp_path, 10 * _GIB, 't1',
             )
         assert reason is not None
-        assert reason.startswith(TRANSIENT_INFRA_REASON_PREFIX)
+        assert reason.startswith(f'{TRANSIENT_INFRA_REASON_PREFIX} (disk pressure): '), (
+            f'expected the transient-infra reason naming disk pressure, got: {reason!r}'
+        )
         gops.prune_stale_merge_worktrees.assert_awaited_once()
 
     async def test_oserror_on_first_stat_fails_open(self, tmp_path: Path):
@@ -9927,7 +9980,7 @@ class TestGroupMergeRequestHappyPath:
         req = await _make_stacked_train(git_ops, config)
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         # Count merge commits on main before the train lands
         _, before_log, _ = await _run(
@@ -9999,7 +10052,7 @@ class TestGroupMergeRequestTrainIncomplete:
         main_before = main_before.strip()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         # Spy on merge_to_main: should NOT be called
         with patch.object(git_ops, 'merge_to_main', wraps=git_ops.merge_to_main) as spy_merge:
@@ -10061,7 +10114,7 @@ class TestGroupMergeRequestRebaseConflict:
         main_sha_after = main_sha_after.strip()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         with patch.object(git_ops, 'merge_to_main', wraps=git_ops.merge_to_main) as spy_merge:
             outcome = await merge_through_lane(lane, queue, req)
@@ -10124,7 +10177,7 @@ class TestGroupMergeRequestMainAdvancedClean:
         external_sha = external_sha_out.strip()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         outcome = await merge_through_lane(lane, queue, req)
 
@@ -10455,7 +10508,7 @@ class TestGroupMergeRequestPartialMemberFlipFailure:
         merge_commits_before = int(before_log.strip())
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         outcome = await merge_through_lane(lane, queue, req)
 
@@ -10597,7 +10650,7 @@ class TestMergeFailureDiagnostic:
         worker = SpeculativeMergeWorker(git_ops, queue)
 
         req = _make_request('ghost', 'ghost', git_ops.project_root, config)
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert isinstance(item, DecidedItem)
         outcome = item.immediate_outcome
@@ -12308,7 +12361,7 @@ class TestSpeculationRaceRetry:
         actual_main = await git_ops.get_main_sha()
 
         with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'):
-            item = await worker._remerge(req, None)
+            item = await remerge_on_main(worker, req)
 
         # merge_to_main must have been called exactly twice
         assert call_count == 2, f'Expected 2 calls to merge_to_main, got {call_count}'
@@ -12404,7 +12457,7 @@ class TestSpeculationRaceRetry:
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         # Exactly 2 calls — no 3rd retry
         assert call_count == 2, f'Expected exactly 2 calls, got {call_count}'
@@ -12488,7 +12541,7 @@ class TestSpeculationRaceRetry:
             )
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_base_is_main)
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert call_count == 1, (
             f'Expected exactly 1 call (base==main, not a race), got {call_count}'
@@ -12518,7 +12571,7 @@ class TestSpeculationRaceRetry:
             )
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_non_loadbearing)
-        item2 = await worker._remerge(req2, None)
+        item2 = await remerge_on_main(worker, req2)
 
         assert call_count == 1, (
             f'Expected 1 call (non-race stderr), got {call_count}'
@@ -12588,7 +12641,7 @@ class TestSpeculationRaceRetry:
         monkeypatch.setattr(git_ops, 'cleanup_merge_worktree', fake_cleanup)
         monkeypatch.setattr('orchestrator.merge_lane.worker._emit_merge_attempt', fake_emit)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         # Exactly 2 calls — no 3rd retry
         assert call_count == 2, f'Expected 2 calls, got {call_count}'
@@ -12662,7 +12715,7 @@ class TestSpeculationRaceRetry:
 
         monkeypatch.setattr(git_ops, 'merge_to_main', fake_merge_to_main)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert call_count == 2, f'Expected 2 calls, got {call_count}'
         assert isinstance(item, RealMergeItem), (
@@ -12695,7 +12748,7 @@ class TestSpeculationRaceRetry:
         """task-1724: _remerge always returns skip_verify=False (unconditionally fail-closed).
 
         The force_verify/prev_skip_verify/prev_merge_tree parameters were removed.
-        _remerge(req, None) with pre_rebased=True and main unchanged yields
+        remerge_on_main(worker, req) with pre_rebased=True and main unchanged yields
         skip_verify=False regardless of request state.
         """
         wt = await _make_branch_with_file(
@@ -12705,7 +12758,7 @@ class TestSpeculationRaceRetry:
         worker = SpeculativeMergeWorker(git_ops, queue)
         req = _make_request('fv-a', 'fv-a', wt, config, pre_rebased=True)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert isinstance(item, RealMergeItem), (
             f'Expected flowing item; got {item!r}'
@@ -12751,7 +12804,7 @@ class TestRemergeAlwaysVerifies:
         req = _make_request('tp-a', 'tp-a', wt, config, pre_rebased=True)
 
         # task-1724: simplified call — no probe needed, no kwargs.
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
 
         assert isinstance(item, RealMergeItem), (
             f'Expected flowing item; got {item!r}'
@@ -12778,7 +12831,7 @@ class TestRemergeAlwaysVerifies:
     ) -> None:
         """(b) Minimal call → always fail-closed → skip_verify=False.
 
-        _remerge(req, None) is the canonical production call shape after task-1724.
+        remerge_on_main(worker, req) is the no-tip production call shape after task-1724.
         The prev_skip_verify/prev_merge_tree parameters were removed; skip_verify
         is structurally always False on the return value.
         """
@@ -12787,7 +12840,7 @@ class TestRemergeAlwaysVerifies:
         worker = SpeculativeMergeWorker(git_ops, queue)
         req = _make_request('tp-c', 'tp-c', wt, config, pre_rebased=True)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         _wt = item_merge_wt(item)
         if _wt:
             await git_ops.cleanup_merge_worktree(_wt)
@@ -12820,7 +12873,7 @@ class TestTrainLifecycleEvents:
         event_store = EventStore(db_path=db_path, run_id='train-lifecycle-run')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue, event_store=event_store)
 
         outcome = await merge_through_lane(lane, queue, req)
 
@@ -12929,7 +12982,7 @@ class TestTrainLifecycleEvents:
             details='Conflicting files:\ntrn-c.py\n', conflicted_paths=listed,
         ))
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue, event_store=event_store)
 
         outcome = await merge_through_lane(lane, queue, req)
 
@@ -12969,7 +13022,7 @@ class TestTrainLifecycleEvents:
         await _run(['git', 'commit', '-m', 'Conflicting commit on main'], cwd=git_ops.project_root)
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue, event_store=event_store)
 
         outcome = await merge_through_lane(lane, queue, req)
         assert outcome is not None
@@ -13011,7 +13064,7 @@ class TestTrainLifecycleEvents:
         event_store = EventStore(db_path=db_path, run_id='train-member-deferred-run')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue, event_store=event_store)
 
         outcome = await merge_through_lane(lane, queue, req)
         assert outcome is not None
@@ -13050,7 +13103,7 @@ class TestTrainLifecycleEvents:
 
 
 # ---------------------------------------------------------------------------
-# TestRunPostMergeVerify — unit tests for the _run_post_merge_verify helper
+# TestRunPostMergeVerify — unit tests for the run_post_merge_verify helper
 # ---------------------------------------------------------------------------
 
 
@@ -13070,27 +13123,23 @@ def _infra_category_verify_result(category: str = 'semaphore_timeout') -> Verify
     )
 
 
-class _ScriptedVerifier(FakeVerifier):
-    """A :class:`FakeVerifier` that answers per CALL instead of per task id.
+class _AnswerListVerifier(FakeVerifier):
+    """A :class:`FakeVerifier` whose every step answers from a call-ordered
+    list whose last entry repeats.
 
-    The direct ``_run_post_merge_verify`` tests each drive ONE task, and most
+    The direct ``run_post_merge_verify`` tests each drive ONE task, and most
     of them are about what the SECOND answer does — an infra-transient
     failure that clears on the bounded retry, a narrowed retry budget running
-    out, a disk guard that relents after a prune. ``answers`` and
-    ``disk_reasons`` are consumed one entry per call and the last entry
-    repeats once exhausted, so a test scripts only the calls whose answer it
-    cares about.
+    out, a disk guard that relents after a prune — so a test scripts only the
+    calls whose answer it cares about. Unlike a mock's ``side_effect`` list,
+    an exhausted script repeats rather than raising, so an over-eager caller
+    is caught by the call-count assertion the test already makes.
 
-    Unlike a mock's ``side_effect`` list, an exhausted script repeats rather
-    than raising, so an over-eager caller is caught by the call-count
-    assertion the test already makes rather than by an opaque StopIteration.
-
-    ``scoped_calls`` and ``disk_guard_calls`` record what each step was asked,
-    the way the parent records ``verified`` and ``investigations``.
-
-    Per-CALL and the parent's per-TASK-ID scripting are mutually exclusive:
-    the parent resolves ``scripts[task_id]`` first, so a caller that supplied
-    both would silently never run its ``answers``.
+    Scoped ``answers`` ride the parent's ``sequence=``/``default=``, so the
+    scoped entry recording is the parent's own — see
+    ``orchestrator/tests/_merge_lane_fakes.py::FakeVerifier``. They are the
+    whole scoped script: do not also set the parent's ``scripts`` or call
+    ``then``, which would silently change which answer repeats.
     """
 
     def __init__(
@@ -13099,22 +13148,16 @@ class _ScriptedVerifier(FakeVerifier):
         answers: Sequence[VerifyScript] = (),
         gates: Sequence[Any] = (),
         disk_reasons: Sequence[str | None] = (None,),
-        **kwargs: Any,
     ) -> None:
-        if answers and 'scripts' in kwargs:
-            raise TypeError(
-                '_ScriptedVerifier answers per call: `answers` and the parent '
-                "FakeVerifier's per-task `scripts` cannot both be supplied, "
-                'because the task-id script wins and no answer would ever run.'
-            )
         if not disk_reasons:
             raise ValueError(
                 '`disk_reasons` must name at least one outcome — the last entry '
                 'is what repeats once the script is exhausted. Omit the argument '
                 'for the always-free default.'
             )
-        super().__init__(**kwargs)
-        self.answers = list(answers)
+        super().__init__(
+            default=answers[-1] if answers else None, sequence=answers[:-1],
+        )
         self.gates = list(gates)
         self.disk_reasons = list(disk_reasons)
         self.scoped_calls: list[dict[str, Any]] = []
@@ -13124,9 +13167,9 @@ class _ScriptedVerifier(FakeVerifier):
     def _consume(script: list[Any]) -> Any:
         """Take the next entry, or keep answering with the last one.
 
-        Every caller guarantees a non-empty script — ``answers`` and ``gates``
-        at their call sites, ``disk_reasons`` in ``__init__`` — so this says so
-        by name rather than letting an empty list surface as an IndexError from
+        Every caller guarantees a non-empty script — ``gates`` at its call
+        sites, ``disk_reasons`` in ``__init__`` — so this says so by name
+        rather than letting an empty list surface as an IndexError from
         somewhere inside the step it was scripting.
         """
         assert script, '_consume called with an empty script'
@@ -13134,15 +13177,7 @@ class _ScriptedVerifier(FakeVerifier):
 
     async def run_scoped(self, *args: Any, **options: Any) -> VerifyResult:
         self.scoped_calls.append(options)
-        if not self.answers:
-            return await super().run_scoped(*args, **options)
-        # This call's answer is played through a parent instance holding it as
-        # its only script: how a VerifyScript resolves (release / error /
-        # result) stays defined in exactly one place, and `self.default` is
-        # never rewritten to smuggle the answer down into the parent.
-        self.verified.append(options.get('task_id'))  # recorded as the parent would
-        answer = FakeVerifier(default=self._consume(self.answers))
-        return await answer.run_scoped(*args, **options)
+        return await super().run_scoped(*args, **options)
 
     async def run_unscoped_typechecks(self, *args: Any, **options: Any) -> Any:
         if not self.gates:
@@ -13190,8 +13225,47 @@ def _production_verifier_with(**steps: Any) -> VerifyPort:
 
 
 @pytest.mark.asyncio
+class TestAnswerListVerifier:
+    """The per-call verifier double keeps its parent's recording contract."""
+
+    async def test_answers_play_in_call_order_and_the_last_repeats(self) -> None:
+        verifier = _AnswerListVerifier(answers=[
+            fails(category='env_transient', summary='first'),
+            passes(summary='then'),
+        ])
+
+        results = [
+            await verifier.run_scoped(Path('wt'), None, [], task_id='t')
+            for _ in range(3)
+        ]
+
+        assert [r.summary for r in results] == ['first', 'then', 'then']
+
+    async def test_every_answered_call_is_a_recorded_entry(self) -> None:
+        verifier = _AnswerListVerifier(answers=[passes()])
+
+        await verifier.run_scoped(Path('wt'), None, [], task_id='a')
+        await verifier.run_scoped(Path('wt'), None, [], task_id='b')
+
+        assert verifier.verified == ['a', 'b']
+        assert verifier.entered_count == len(verifier.verified)
+        assert [c.task_id for c in verifier.verify_calls] == ['a', 'b']
+        await wait_responsive(
+            verifier.await_entry(2), label='second answered scoped verify entry',
+        )
+
+    async def test_no_answers_falls_back_to_a_passing_verify(self) -> None:
+        verifier = _AnswerListVerifier()
+
+        result = await verifier.run_scoped(Path('wt'), None, [], task_id='t')
+
+        assert result.passed is True
+        assert verifier.entered_count == 1
+
+
+@pytest.mark.asyncio
 class TestRunPostMergeVerify:
-    """Direct unit tests for the _run_post_merge_verify module-level helper.
+    """Direct unit tests for the run_post_merge_verify module-level helper.
 
     The helper is imported at the top of the test class (not at module level)
     so a missing symbol produces a readable ImportError on collection rather
@@ -13221,7 +13295,7 @@ class TestRunPostMergeVerify:
 
     async def test_disk_guard_none_verify_passed_returns_none(self) -> None:
         """(a) disk guard returns None + verify passed → returns None; merge_wt NOT cleaned."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13230,8 +13304,8 @@ class TestRunPostMergeVerify:
         enospc_retries: dict[str, int] = {}
 
         passed_result = fake_verify_result(passed=True, summary='', timed_out=False)
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=passed_result)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=passed_result)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries=enospc_retries,
             max_timeouts=2, max_enospc=1,
@@ -13243,15 +13317,15 @@ class TestRunPostMergeVerify:
 
     async def test_disk_guard_returns_reason_blocks(self) -> None:
         """(b) disk guard returns reason string → MergeOutcome('blocked') with that reason; merge_wt cleaned once."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
         merge_wt = MagicMock()
         disk_reason = f'{TRANSIENT_INFRA_REASON_PREFIX}: no space'
 
-        verifier = _ScriptedVerifier(disk_reasons=[disk_reason])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(disk_reasons=[disk_reason])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -13270,7 +13344,7 @@ class TestRunPostMergeVerify:
 
     async def test_verify_fails_non_enospc_blocks_and_cleans(self) -> None:
         """(c) verify fails (non-ENOSPC) → MergeOutcome('blocked') reason starts 'Post-merge verification failed:' and merge_wt cleaned."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13282,8 +13356,8 @@ class TestRunPostMergeVerify:
         failed_result.lint_output = ''
         failed_result.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=failed_result)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=failed_result)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -13302,7 +13376,7 @@ class TestRunPostMergeVerify:
 
     async def test_verify_timeout_bumps_timeouts_dict(self) -> None:
         """(d) verify fails with timed_out=True → timeouts dict bumped to 1 for req.task_id."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13314,8 +13388,8 @@ class TestRunPostMergeVerify:
         timed_out_result.lint_output = ''
         timed_out_result.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=timed_out_result)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=timed_out_result)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -13330,7 +13404,7 @@ class TestRunPostMergeVerify:
 
     async def test_persistent_enospc_prunes_and_escalates(self) -> None:
         """(e) persistent ENOSPC (both attempts) → prune awaited, enospc_retries bumped, transient infra blocked."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13339,8 +13413,8 @@ class TestRunPostMergeVerify:
 
         enospc_result = _enospc_verify_result()
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=enospc_result)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries,
             max_timeouts=2, max_enospc=1,
@@ -13349,9 +13423,9 @@ class TestRunPostMergeVerify:
 
         assert result is not None
         assert result.status == 'blocked'
-        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
-            f'expected transient-infra reason, got: {result.reason!r}'
-        )
+        assert result.reason.startswith(
+            f'{TRANSIENT_INFRA_REASON_PREFIX} (disk pressure): ',
+        ), f'expected the transient-infra reason naming disk pressure, got: {result.reason!r}'
         git_ops.prune_stale_merge_worktrees.assert_awaited_once()
         assert enospc_retries.get(req.task_id, 0) == 1, (
             f'expected enospc_retries[task_id]=1, got: {enospc_retries}'
@@ -13368,7 +13442,7 @@ class TestRunPostMergeVerify:
         the set-membership check cannot silently keep passing with only the
         default 'semaphore_timeout' covered.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13379,10 +13453,10 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result(category=category)), VerifyScript(result=passing)],
         )
-        result = await _run_post_merge_verify(
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries,
             max_timeouts=2, max_enospc=1,
@@ -13402,12 +13476,11 @@ class TestRunPostMergeVerify:
         not the generic branch-blaming block); no timeout-counter bump (no
         merge verify attempt consumed) and no dry-run debugger spawn.
         Parametrized over every INFRA_TRANSIENT_CATEGORIES member (task 2591
-        amendment, reviewer_comprehensive/test_coverage).
+        amendment, reviewer_comprehensive/test_coverage). The reason header
+        names the measured category, never disk pressure (task 3177).
         """
-        from orchestrator.merge_lane.worker import (
-            _DryRunInvestigationHandles,
-            _run_post_merge_verify,
-        )
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+        from orchestrator.merge_lane.verify_failure_outcome import DryRunInvestigationHandles
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13417,21 +13490,24 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result(category=category)
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=infra_result)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries=enospc_retries,
             max_timeouts=2, max_enospc=1,
             # Live handles, so "no investigation spawned" is a real assertion
             # rather than one the None-safe no-op would satisfy anyway.
-            dry_run_handles=_DryRunInvestigationHandles(scheduler=MagicMock()),
+            dry_run_handles=DryRunInvestigationHandles(scheduler=MagicMock()),
             verifier=verifier,
         )
 
         assert result is not None
         assert result.status == 'blocked'
-        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
-            f'expected transient-infra reason, got: {result.reason!r}'
+        assert result.reason.startswith(
+            f'{TRANSIENT_INFRA_REASON_PREFIX} (category={category}): ',
+        ), (
+            f'the generic infra hold must name its measured category, not a '
+            f'disk-pressure cause; got: {result.reason!r}'
         )
         assert len(verifier.verified) == 2, (
             f'expected exactly one bounded infra retry (2 total calls), got {len(verifier.verified)}'
@@ -13463,7 +13539,7 @@ class TestRunPostMergeVerify:
         than skipping env_transient on the assumption "it already got a
         retry". Two independent retry layers stacking is deliberate.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13474,10 +13550,10 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result(category='env_transient')), VerifyScript(result=passing)],
         )
-        result = await _run_post_merge_verify(
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries,
             max_timeouts=2, max_enospc=1,
@@ -13504,10 +13580,8 @@ class TestRunPostMergeVerify:
         retry chance. Seeds enospc_retries[task_id]=max_enospc to simulate
         the budget already being spent.
         """
-        from orchestrator.merge_lane.worker import (
-            _DryRunInvestigationHandles,
-            _run_post_merge_verify,
-        )
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+        from orchestrator.merge_lane.verify_failure_outcome import DryRunInvestigationHandles
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13519,14 +13593,14 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result()
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=infra_result)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries=enospc_retries,
             max_timeouts=2, max_enospc=1,
             # Live handles, so "no investigation spawned" is a real assertion
             # rather than one the None-safe no-op would satisfy anyway.
-            dry_run_handles=_DryRunInvestigationHandles(scheduler=MagicMock()),
+            dry_run_handles=DryRunInvestigationHandles(scheduler=MagicMock()),
             verifier=verifier,
         )
 
@@ -13555,7 +13629,7 @@ class TestRunPostMergeVerify:
         or routed to the transient-infra hold — it takes the ordinary
         generic-block path, unchanged.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13570,8 +13644,8 @@ class TestRunPostMergeVerify:
             category='test_failure',
         )
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_failure_result)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=test_failure_result)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -13592,15 +13666,15 @@ class TestRunPostMergeVerify:
 
     async def test_verify_exception_propagates_no_cleanup(self) -> None:
         """(f) run_scoped_verification raises RuntimeError → exception propagates; merge_wt NOT cleaned."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
         merge_wt = MagicMock()
 
-        verifier = _ScriptedVerifier(answers=[raises(RuntimeError('boom'))])
+        verifier = _AnswerListVerifier(answers=[raises(RuntimeError('boom'))])
         with pytest.raises(RuntimeError, match='boom'):
-            await _run_post_merge_verify(
+            await run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
@@ -13610,14 +13684,14 @@ class TestRunPostMergeVerify:
         git_ops.cleanup_merge_worktree.assert_not_awaited()
 
     async def test_blocked_merge_outcome_carries_verify_fingerprint_fields(self) -> None:
-        """task-1688 step-3: _run_post_merge_verify copies category/cause_hint to MergeOutcome.
+        """task-1688 step-3: run_post_merge_verify copies category/cause_hint to MergeOutcome.
 
         Stubs run_scoped_verification to return a failing VerifyResult with
         category='gui_tsc' and cause_hint='StatusBar.tsx:42 error TS2322: Type X not
         assignable'.  Asserts the returned blocked MergeOutcome has those values
         in failure_category and failure_cause_hint verbatim.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13629,8 +13703,8 @@ class TestRunPostMergeVerify:
         failing_verify.lint_output = ''
         failing_verify.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=failing_verify)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=failing_verify)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -13648,7 +13722,7 @@ class TestRunPostMergeVerify:
 
     async def test_keep_worktrees_forwarded_to_disk_guard(self) -> None:
         """keep_worktrees is forwarded verbatim to _ensure_verify_disk_space."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13657,8 +13731,8 @@ class TestRunPostMergeVerify:
         l2 = Path('/fake/_merge-l2')
 
         passed_result = fake_verify_result(passed=True, summary='', timed_out=False)
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=passed_result)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=passed_result)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -13672,7 +13746,7 @@ class TestRunPostMergeVerify:
 
     async def test_enospc_retry_prunes_with_keep_set_union(self) -> None:
         """ENOSPC retry passes keep = {merge_wt} | keep_worktrees to prune."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13682,8 +13756,8 @@ class TestRunPostMergeVerify:
         enospc_retries: dict[str, int] = {}
 
         enospc_result = _enospc_verify_result()
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=enospc_result)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries,
             max_timeouts=2, max_enospc=1,
@@ -13698,7 +13772,7 @@ class TestRunPostMergeVerify:
 
     async def test_default_enospc_retry_keeps_only_merge_wt(self) -> None:
         """Default keep_worktrees=None → ENOSPC retry keep == {merge_wt} (regression)."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13706,8 +13780,8 @@ class TestRunPostMergeVerify:
         enospc_retries: dict[str, int] = {}
 
         enospc_result = _enospc_verify_result()
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=enospc_result)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries,
             max_timeouts=2, max_enospc=1,
@@ -13727,7 +13801,7 @@ class TestRunPostMergeVerify:
         passes no archive_root (→ default None), so run_scoped_verification receives
         archive_root=None.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13737,8 +13811,8 @@ class TestRunPostMergeVerify:
 
         expected_archive_root = tmp_path / 'data' / 'verify-logs'
 
-        verifier = _ScriptedVerifier(answers=[passes(summary='ok')])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[passes(summary='ok')])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -13759,7 +13833,7 @@ class TestRunPostMergeVerify:
         Fails today because the generic failure block (merge_queue.py:890) does not
         append the category to the reason string.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13771,9 +13845,9 @@ class TestRunPostMergeVerify:
         timed_out_result.lint_output = ''
         timed_out_result.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=timed_out_result)])
-        with patch('orchestrator.merge_lane.worker._classify_main_health_red', AsyncMock(return_value=None)):
-            result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=timed_out_result)])
+        with patch('orchestrator.merge_lane.verify_failure_outcome.classify_main_health_red', AsyncMock(return_value=None)):
+            result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
                 max_timeouts=99, max_enospc=1,
@@ -13794,7 +13868,7 @@ class TestRunPostMergeVerify:
 
         Fails today because the generic failure block does not append the category.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13806,9 +13880,9 @@ class TestRunPostMergeVerify:
         test_fail_result.lint_output = ''
         test_fail_result.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_fail_result)])
-        with patch('orchestrator.merge_lane.worker._classify_main_health_red', AsyncMock(return_value=None)):
-            result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=test_fail_result)])
+        with patch('orchestrator.merge_lane.verify_failure_outcome.classify_main_health_red', AsyncMock(return_value=None)):
+            result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
@@ -13837,7 +13911,7 @@ class TestRunPostMergeVerify:
         corroborated).  Three consecutive infra-transient results are
         retried up to max_narrowed=3 before a fourth dispatch passes.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13848,20 +13922,20 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=passing)],
         )
         with (
             patch(
-                'orchestrator.merge_lane.worker._build_attempt0_payload',
+                'orchestrator.merge_lane.post_merge_verify.build_attempt0_payload',
                 AsyncMock(return_value=object()),
             ),
             patch(
-                'orchestrator.merge_lane.worker._assemble_retry_verify_env',
+                'orchestrator.merge_lane.post_merge_verify.assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
         ):
-            result = await _run_post_merge_verify(
+            result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries=(er := {}),
                 max_timeouts=2, max_enospc=1,
@@ -13890,7 +13964,7 @@ class TestRunPostMergeVerify:
         INFRA_TRANSIENT_CATEGORIES — so it takes the ordinary generic-block
         path on the very first dispatch.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13906,18 +13980,18 @@ class TestRunPostMergeVerify:
             category='test_failure',
         )
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_failure_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=test_failure_result)])
         with (
             patch(
-                'orchestrator.merge_lane.worker._build_attempt0_payload',
+                'orchestrator.merge_lane.post_merge_verify.build_attempt0_payload',
                 AsyncMock(return_value=object()),
             ),
             patch(
-                'orchestrator.merge_lane.worker._assemble_retry_verify_env',
+                'orchestrator.merge_lane.post_merge_verify.assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
         ):
-            result = await _run_post_merge_verify(
+            result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries=(er := {}),
                 max_timeouts=2, max_enospc=1,
@@ -13949,7 +14023,7 @@ class TestRunPostMergeVerify:
         NOT keep consuming budget up to max_narrowed=3 just because
         verify.passed stayed False.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -13965,20 +14039,20 @@ class TestRunPostMergeVerify:
             category='test_failure',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=test_failure_result)],
         )
         with (
             patch(
-                'orchestrator.merge_lane.worker._build_attempt0_payload',
+                'orchestrator.merge_lane.post_merge_verify.build_attempt0_payload',
                 AsyncMock(return_value=object()),
             ),
             patch(
-                'orchestrator.merge_lane.worker._assemble_retry_verify_env',
+                'orchestrator.merge_lane.post_merge_verify.assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
         ):
-            result = await _run_post_merge_verify(
+            result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
@@ -14009,7 +14083,7 @@ class TestRunPostMergeVerify:
         invariant: the larger narrowed budget is gated on ACTUAL narrowing
         (the D2 producer applying retry_env), not on the raw
         req.retry_failed_only flag. With the flag on but NO sidecar present
-        in merge_wt, the real (unstubbed) _build_attempt0_payload returns
+        in merge_wt, the real (unstubbed) build_attempt0_payload returns
         None (task 3059), narrowed stays False, and the retry must still use
         the small legacy enospc_retries/max_enospc budget even though a
         generous max_narrowed=5 is supplied.
@@ -14017,7 +14091,7 @@ class TestRunPostMergeVerify:
         merge_wt is a REAL empty directory, not a MagicMock: the production
         payload builder resolves the sidecar path under it.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -14026,8 +14100,8 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result('semaphore_timeout')
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=infra_result)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=(er := {}),
             max_timeouts=2, max_enospc=1,
@@ -14058,7 +14132,7 @@ class TestRunPostMergeVerify:
         (TRANSIENT_INFRA_REASON_PREFIX) as the legacy ENOSPC-budget
         exhaustion path — never an unbounded retry loop.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -14067,18 +14141,18 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result('semaphore_timeout')
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=infra_result)])
         with (
             patch(
-                'orchestrator.merge_lane.worker._build_attempt0_payload',
+                'orchestrator.merge_lane.post_merge_verify.build_attempt0_payload',
                 AsyncMock(return_value=object()),
             ),
             patch(
-                'orchestrator.merge_lane.worker._assemble_retry_verify_env',
+                'orchestrator.merge_lane.post_merge_verify.assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
         ):
-            result = await _run_post_merge_verify(
+            result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries=(er := {}),
                 max_timeouts=2, max_enospc=1,
@@ -14111,7 +14185,7 @@ class TestRunPostMergeVerify:
         max_narrowed budget — and leaves the pre-seeded ENOSPC counter
         untouched.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -14122,20 +14196,20 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=passing)],
         )
         with (
             patch(
-                'orchestrator.merge_lane.worker._build_attempt0_payload',
+                'orchestrator.merge_lane.post_merge_verify.build_attempt0_payload',
                 AsyncMock(return_value=object()),
             ),
             patch(
-                'orchestrator.merge_lane.worker._assemble_retry_verify_env',
+                'orchestrator.merge_lane.post_merge_verify.assemble_retry_verify_env',
                 AsyncMock(return_value={'REIFY_VERIFY_RETRY_SCOPE': 'failed_only'}),
             ),
         ):
-            result = await _run_post_merge_verify(
+            result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
                 # Simulate an already-exhausted legacy ENOSPC budget from an
                 # earlier, unrelated event in this task's merge lifecycle.
@@ -14194,7 +14268,7 @@ def _make_request_with_module_configs(
 @pytest.mark.asyncio
 class TestUnscopedTypecheckGate:
     """Tests for the pre-advance, fail-closed unscoped type-check gate wired into
-    _run_post_merge_verify (step-5 RED / step-6 GREEN).
+    run_post_merge_verify (step-5 RED / step-6 GREEN).
 
     Patches run_scoped_verification to always pass so only the new unscoped
     gate can block the merge.
@@ -14205,12 +14279,12 @@ class TestUnscopedTypecheckGate:
         git_ops: GitOps,
         config: OrchestratorConfig,
     ) -> None:
-        """(a) _run_post_merge_verify with a failing type_check_command → blocked.
+        """(a) run_post_merge_verify with a failing type_check_command → blocked.
 
         reason starts with 'Post-merge verification failed', names the failing
         subproject, and merge_wt is cleaned up.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         # Create a branch and merge it (to get a real merge_wt)
         branch = 'gate-typecheck-a'
@@ -14238,7 +14312,7 @@ class TestUnscopedTypecheckGate:
         scoped_pass = fake_verify_result(passed=True, summary='', timed_out=False)
         # Only the scoped verify and the disk guard are injected: the unscoped
         # gate under test must run the real `type_check_command`.
-        outcome = await _run_post_merge_verify(
+        outcome = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -14256,7 +14330,7 @@ class TestUnscopedTypecheckGate:
         assert 'frontend' in outcome.reason, (
             f'"frontend" not in reason: {outcome.reason!r}'
         )
-        # merge_wt should have been cleaned up by _run_post_merge_verify on failure
+        # merge_wt should have been cleaned up by run_post_merge_verify on failure
         assert not merge_wt.exists(), 'merge_wt should be cleaned up on blocked outcome'
 
     async def test_lane_blocks_red_tip_main_sha_unchanged(
@@ -14314,11 +14388,11 @@ class TestUnscopedTypecheckGate:
 
         Patches run_scoped_verification to pass and run_verification (used inside
         _run_unscoped_typechecks) to simulate a timed-out type-check (timed_out=True,
-        passed=False). Calls _run_post_merge_verify and asserts:
+        passed=False). Calls run_post_merge_verify and asserts:
         (a) the outcome is MergeOutcome('blocked') — fail-closed on timeout, not fail-open;
         (b) the timeouts dict has been incremented for req.task_id.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         # Create a branch and merge it (to get a real merge_wt)
         branch = 'gate-timeout-c'
@@ -14351,7 +14425,7 @@ class TestUnscopedTypecheckGate:
         # The unscoped gate itself must be the real one, so `run_verification`
         # — which it calls, one layer BELOW the port — stays patched.
         with patch('orchestrator.merge_lane.gates.run_verification', AsyncMock(return_value=timeout_result)):
-            outcome = await _run_post_merge_verify(
+            outcome = await run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts=timeouts, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
@@ -15169,225 +15243,6 @@ class TestFinalizeAdvancedMerge:
             f'got merge_sha={outcome.merge_sha!r}, expected {ADVANCED!r}'
         )
 
-    # ------- Task-1928 FAIL-SAFE: _finalize_advanced_merge wiring tests -------
-
-    async def test_failsafe_skips_gate_when_no_tip_and_linear_commit(self) -> None:
-        """FAIL-SAFE positive: when all three tip terms are None AND advanced_sha
-        is positively linear (_commit_is_linear=True), _check_post_merge_equivalence
-        must be invoked with allow_worktree_head_fallback=False — skipping the
-        live worktree-HEAD read.  Outcome must be 'done'.
-
-        The rebased tree was already re-verified green by _reverify_rebased_tree
-        on this path, so reading a potentially drifted worktree HEAD is redundant
-        and hazardous.  The fail-safe eliminates that risk without suppressing the
-        gate when a trusted tip IS recoverable (see negative guard below).
-
-        RED: AttributeError — _commit_is_linear does not exist yet (step-6 adds it).
-        """
-        from orchestrator.merge_lane.worker import (
-            _finalize_advanced_merge,
-        )
-
-        LINEAR_SHA = 'aabbccdd1234567890' * 2  # fake but deterministic
-        git_ops = self._make_git_ops()
-        req = self._make_req()
-        req.snapshot_tip = None  # ensure term-3 = None
-        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
-        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
-
-        captured_equiv_kw: dict = {}
-
-        async def _spy_equiv(*args, **kwargs):
-            captured_equiv_kw.update(kwargs)
-            return []  # clean — gate would pass if invoked
-
-        with (
-            patch(
-                'orchestrator.merge_lane.gates._resolve_second_parent',
-                AsyncMock(return_value=None),  # term-1 = None
-            ),
-            # Patch _commit_is_linear → True: advanced_sha is positively linear.
-            # RED: AttributeError because _commit_is_linear does not exist yet.
-            patch(
-                'orchestrator.merge_lane.gates._commit_is_linear',
-                AsyncMock(return_value=True),
-            ),
-            patch(
-                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
-                side_effect=_spy_equiv,
-            ),
-            patch(
-                'orchestrator.merge_lane.gates._check_post_merge_pyright',
-                AsyncMock(return_value=pyright_clean),
-            ),
-        ):
-            outcome = await _finalize_advanced_merge(
-                git_ops, req, None,
-                merge_commit_fallback='fallback-sha',
-                base_sha='base-sha',
-                started_monotonic=0.0,
-                cas_retries=cas_retries,
-                timeouts=timeouts,
-                enospc_retries=enospc_retries,
-                merged_branch_tip=None,  # term-2 = None; all three terms collapse
-                advanced_sha=LINEAR_SHA,
-            )
-
-        assert outcome.status == 'done', (
-            f'expected done (fail-safe should skip gate → clean); got {outcome!r}'
-        )
-        assert outcome.merge_sha == LINEAR_SHA
-        # Key assertion: gate must have been invoked with allow_worktree_head_fallback=False
-        # so it skipped the live HEAD read.
-        # RED: without step-6 wiring, allow_worktree_head_fallback is not passed
-        # → captured_kw has no such key → .get() returns None (≠ False).
-        assert captured_equiv_kw.get('allow_worktree_head_fallback') is False, (
-            f'_check_post_merge_equivalence must be called with '
-            f'allow_worktree_head_fallback=False when all tip terms are None '
-            f'and advanced_sha is linear; '
-            f'got {captured_equiv_kw.get("allow_worktree_head_fallback")!r}'
-        )
-
-    async def test_failsafe_not_taken_when_second_parent_recoverable(self) -> None:
-        """FAIL-SAFE negative guard (B): when _resolve_second_parent returns a
-        real tip (term-1 non-None), resolved_merged_tip is non-None → fail-safe
-        MUST NOT fire.  A genuine file drop is still detected and blocks.
-
-        The gate is invoked with merged_tip=RECOVERABLE_TIP and the default
-        allow_worktree_head_fallback=True (i.e. NOT suppressed).
-
-        This test passes in both RED and GREEN states: it validates that the
-        fail-safe never weakens the gate when the 2nd parent IS structurally
-        recoverable.  It does NOT reference _commit_is_linear (which would
-        fail with AttributeError in RED state).
-        """
-        from orchestrator.merge_lane.worker import (
-            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-            _finalize_advanced_merge,
-        )
-
-        RECOVERABLE_TIP = 'dead' * 10  # fake recoverable branch tip
-        git_ops = self._make_git_ops()
-        req = self._make_req()
-        req.snapshot_tip = None
-        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
-
-        captured_equiv_kw: dict = {}
-
-        async def _spy_equiv_drop(*args, **kwargs):
-            captured_equiv_kw.update(kwargs)
-            return ['dropped.py']  # genuine drop detected
-
-        with (
-            # _resolve_second_parent returns the real branch tip → term-1 non-None
-            # → resolved_merged_tip = RECOVERABLE_TIP → fail-safe never fires.
-            patch(
-                'orchestrator.merge_lane.gates._resolve_second_parent',
-                AsyncMock(return_value=RECOVERABLE_TIP),
-            ),
-            patch(
-                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
-                side_effect=_spy_equiv_drop,
-            ),
-            patch(
-                'orchestrator.merge_lane.gates._check_post_merge_pyright',
-                AsyncMock(),
-            ),
-        ):
-            outcome = await _finalize_advanced_merge(
-                git_ops, req, None,
-                merge_commit_fallback='fallback-sha',
-                base_sha='base-sha',
-                started_monotonic=0.0,
-                cas_retries=cas_retries,
-                timeouts=timeouts,
-                enospc_retries=enospc_retries,
-                merged_branch_tip=None,  # term-2 = None; term-1 provides the tip
-            )
-
-        # Genuine drop → outcome must be 'blocked' (fail-safe did NOT skip the gate).
-        assert outcome.status == 'blocked', (
-            f'expected blocked (genuine drop, fail-safe must not skip); got {outcome!r}'
-        )
-        assert outcome.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
-        # Gate was called with the real recovered tip, not suppressed.
-        assert captured_equiv_kw.get('merged_tip') == RECOVERABLE_TIP, (
-            f'gate must use RECOVERABLE_TIP; got {captured_equiv_kw.get("merged_tip")!r}'
-        )
-        # allow_worktree_head_fallback must be True (the default) — fail-safe NOT active.
-        fb = captured_equiv_kw.get('allow_worktree_head_fallback', True)
-        assert fb is not False, (
-            f'allow_worktree_head_fallback must be truthy when tip is recoverable; '
-            f'got {fb!r}'
-        )
-
-    async def test_failsafe_not_taken_when_nonlinear_commit(self) -> None:
-        """FAIL-SAFE micro-guard: when resolved_merged_tip is None BUT advanced_sha
-        is NON-linear (_commit_is_linear=False, e.g. transient ^2 git error on a
-        real --no-ff merge), the fail-safe must NOT fire.
-
-        The gate is called with allow_worktree_head_fallback=True (legacy HEAD
-        read retained) so a real drop on a non-rebased merge is not masked.
-
-        RED: AttributeError — _commit_is_linear does not exist yet (step-6 adds it).
-        """
-        from orchestrator.merge_lane.worker import (
-            _finalize_advanced_merge,
-        )
-
-        git_ops = self._make_git_ops()
-        req = self._make_req()
-        req.snapshot_tip = None  # term-3 = None
-        cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
-        pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
-
-        captured_equiv_kw: dict = {}
-
-        async def _spy_equiv_clean(*args, **kwargs):
-            captured_equiv_kw.update(kwargs)
-            return []
-
-        with (
-            patch(
-                'orchestrator.merge_lane.gates._resolve_second_parent',
-                AsyncMock(return_value=None),  # term-1 = None (transient error)
-            ),
-            # _commit_is_linear=False: advanced_sha has 2+ parents (real merge commit,
-            # or linearity check failed due to transient git error).
-            # RED: AttributeError because _commit_is_linear does not exist yet.
-            patch(
-                'orchestrator.merge_lane.gates._commit_is_linear',
-                AsyncMock(return_value=False),
-            ),
-            patch(
-                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
-                side_effect=_spy_equiv_clean,
-            ),
-            patch(
-                'orchestrator.merge_lane.gates._check_post_merge_pyright',
-                AsyncMock(return_value=pyright_clean),
-            ),
-        ):
-            outcome = await _finalize_advanced_merge(
-                git_ops, req, None,
-                merge_commit_fallback='fallback-sha',
-                base_sha='base-sha',
-                started_monotonic=0.0,
-                cas_retries=cas_retries,
-                timeouts=timeouts,
-                enospc_retries=enospc_retries,
-                merged_branch_tip=None,  # all terms None; non-linear → fail-safe inert
-            )
-
-        assert outcome.status == 'done', f'unexpected: {outcome!r}'
-        # Gate must use the LEGACY HEAD path (allow_worktree_head_fallback=True)
-        # because linearity was NOT confirmed — fail-safe must stay inert.
-        fb = captured_equiv_kw.get('allow_worktree_head_fallback', True)
-        assert fb is not False, (
-            f'allow_worktree_head_fallback must be truthy for non-linear advanced_sha; '
-            f'got {fb!r}'
-        )
-
 
 # ---------------------------------------------------------------------------
 # TestMapAdvanceFailure — unit tests for the _map_advance_failure helper
@@ -16069,6 +15924,10 @@ class TestReverifyRebasedTree:
         run_scoped_verification called exactly once, merge_wt still exists.
     (c) Overlapping, red verify → returns blocked MergeOutcome,
         merge_wt cleaned up.
+    (d) A green re-verify of a real advance_main rebase seeds main's baseline
+        at the rebased sha, and the follow-up advance lands exactly that sha.
+    (e) A trusted disjoint skip clears with no verify and seeds NO baseline
+        at the rebased sha: an unverified tree is never every-module-green.
     """
 
     async def _make_merge_wt(
@@ -16082,6 +15941,14 @@ class TestReverifyRebasedTree:
         req = _make_request(branch_name, branch_name, wt, config)
         return result.merge_worktree, req
 
+    @staticmethod
+    async def _commit_drift(git_ops: GitOps, branch_name: str) -> str:
+        """Commit a file disjoint from *branch_name*'s onto main; return main's new sha."""
+        (git_ops.project_root / f'{branch_name}_drift.py').write_text('d = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        return await git_ops.get_main_sha()
+
     async def _rebased_onto_drift(
         self, git_ops: GitOps, config: OrchestratorConfig, branch_name: str,
     ) -> tuple[Path, MergeRequest, str, str, str]:
@@ -16089,19 +15956,35 @@ class TestReverifyRebasedTree:
         merge_wt, req = await self._make_merge_wt(git_ops, branch_name, config)
         rebased_from = await git_ops.get_main_sha()
         _, verified, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
-        (git_ops.project_root / f'{branch_name}_drift.py').write_text('d = 1\n')
-        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
-        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
-        rebased_onto = await git_ops.get_main_sha()
+        rebased_onto = await self._commit_drift(git_ops, branch_name)
         rc, _, err = await _run(['git', 'rebase', rebased_onto], cwd=merge_wt)
         assert rc == 0, err
         return merge_wt, req, verified.strip(), rebased_from, rebased_onto
+
+    async def _advance_onto_drift(
+        self, git_ops: GitOps, config: OrchestratorConfig, branch_name: str,
+    ) -> tuple[Path, MergeRequest, str, str, str, str]:
+        """A real advance_main parked on a drift: (merge_wt, req, verified, rebased_from, rebased_onto, rebased_sha)."""
+        merge_wt, req = await self._make_merge_wt(git_ops, branch_name, config)
+        _, verified, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=merge_wt)
+        base = await git_ops.get_main_sha()
+        await self._commit_drift(git_ops, branch_name)
+        outcome = await git_ops.advance_main(
+            verified.strip(), merge_wt,
+            branch=branch_name, expected_main=base, reverify_on_rebase=True,
+        )
+        assert outcome.result == 'rebased_pending_reverify', outcome
+        assert outcome.rebased_from and outcome.rebased_onto and outcome.advanced_sha, outcome
+        return (
+            merge_wt, req, verified.strip(),
+            outcome.rebased_from, outcome.rebased_onto, outcome.advanced_sha,
+        )
 
     async def test_same_tree_skips_without_a_verify(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
         """(s) A rebased sha whose tree IS the verified tree clears with no verify."""
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree, _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         merge_wt, req, verified, rebased_from, rebased_onto = await self._rebased_onto_drift(
             git_ops,
@@ -16130,7 +16013,9 @@ class TestReverifyRebasedTree:
                     max_timeouts=3,
                     max_enospc=1,
                     merge_sha=rewritten.strip(),
-                    run_post_merge_verify=_run_post_merge_verify,
+                    run_post_merge_verify=functools.partial(
+                        run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                    ),
                     event_store=None,
                 )
             assert result == GateClearance.same_tree, result
@@ -16144,7 +16029,7 @@ class TestReverifyRebasedTree:
         self, git_ops: GitOps, config: OrchestratorConfig, verified_merge_sha: str,
     ) -> None:
         """(s) Fail closed: no tree to compare means the whole-tree gate re-verifies."""
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree, _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         merge_wt, req, _, rebased_from, rebased_onto = await self._rebased_onto_drift(
             git_ops,
@@ -16170,7 +16055,9 @@ class TestReverifyRebasedTree:
                     max_timeouts=3,
                     max_enospc=1,
                     merge_sha=rebased_sha.strip(),
-                    run_post_merge_verify=_run_post_merge_verify,
+                    run_post_merge_verify=functools.partial(
+                        run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                    ),
                     event_store=None,
                 )
             assert result == GateClearance.reverified, result
@@ -16186,8 +16073,7 @@ class TestReverifyRebasedTree:
         is one this queue landed green: gate returns None and does NOT call
         run_scoped_verification.  merge_wt still exists.
         """
-        from orchestrator.merge_lane.gates import note_queue_verified_main_tip
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree, _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         # This repo's own config declares merge_verify_breadth='full' (a
         # whole-tree merge gate), which alone denies the fast path.  Exercise
@@ -16224,7 +16110,9 @@ class TestReverifyRebasedTree:
                     enospc_retries={},
                     max_timeouts=3,
                     max_enospc=1,
-                    run_post_merge_verify=_run_post_merge_verify,
+                    run_post_merge_verify=functools.partial(
+                        run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                    ),
                     event_store=None,
                 )
             assert result == GateClearance.disjoint, (
@@ -16250,7 +16138,7 @@ class TestReverifyRebasedTree:
         Disjointness alone must NOT clear the gate when the intervening tip is
         not one this queue landed green.
         """
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree, _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         # Diff-scoped breadth, so the ONLY thing denying the fast path is the
         # drift's unknown provenance.
@@ -16285,7 +16173,9 @@ class TestReverifyRebasedTree:
                     enospc_retries={},
                     max_timeouts=3,
                     max_enospc=1,
-                    run_post_merge_verify=_run_post_merge_verify,
+                    run_post_merge_verify=functools.partial(
+                        run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                    ),
                     event_store=None,
                 )
             assert result == GateClearance.reverified, (
@@ -16308,8 +16198,7 @@ class TestReverifyRebasedTree:
         a tip this queue landed green — and the P2 kill switch does not cover
         this arm.
         """
-        from orchestrator.merge_lane.gates import note_queue_verified_main_tip
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree, _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         merge_wt, req = await self._make_merge_wt(
             git_ops, 'rvrt-whole-tree', config,
@@ -16346,7 +16235,9 @@ class TestReverifyRebasedTree:
                     enospc_retries={},
                     max_timeouts=3,
                     max_enospc=1,
-                    run_post_merge_verify=_run_post_merge_verify,
+                    run_post_merge_verify=functools.partial(
+                        run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                    ),
                     event_store=None,
                 )
             assert result == GateClearance.reverified, (
@@ -16366,7 +16257,7 @@ class TestReverifyRebasedTree:
         """(b) Overlapping + green verify: gate returns None,
         run_scoped_verification called exactly once, merge_wt still exists.
         """
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree, _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-overlap-green', config)
         fork_sha = await git_ops.get_main_sha()
@@ -16393,7 +16284,9 @@ class TestReverifyRebasedTree:
                     enospc_retries={},
                     max_timeouts=3,
                     max_enospc=1,
-                    run_post_merge_verify=_run_post_merge_verify,
+                    run_post_merge_verify=functools.partial(
+                        run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                    ),
                     event_store=None,
                 )
             assert result == GateClearance.reverified, (
@@ -16411,7 +16304,7 @@ class TestReverifyRebasedTree:
         """(c) Overlapping + red verify: gate returns blocked MergeOutcome,
         merge_wt cleaned up.
         """
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree, _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-overlap-red', config)
         fork_sha = await git_ops.get_main_sha()
@@ -16440,7 +16333,9 @@ class TestReverifyRebasedTree:
                 enospc_retries={},
                 max_timeouts=3,
                 max_enospc=1,
-                run_post_merge_verify=_run_post_merge_verify,
+                run_post_merge_verify=functools.partial(
+                    run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                ),
                 event_store=None,
             )
         assert result is not None, 'Red verify: expected a MergeOutcome, got None'
@@ -16448,16 +16343,108 @@ class TestReverifyRebasedTree:
         assert result.status == 'blocked', (
             f'Red verify: expected blocked status, got {result.status!r}'
         )
-        # _run_post_merge_verify cleans up merge_wt on failure
+        # run_post_merge_verify cleans up merge_wt on failure
         assert not merge_wt.exists(), 'merge_wt must be cleaned up after red verify'
 
+    async def test_reverified_rebased_landing_seeds_landed_sha_baseline(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(d) The whole-tree gate re-verifies the rebased tree green, which seeds
+        main's baseline at the rebased sha before the follow-up advance lands it.
+
+        Covers the inline re-verify arm (dispatch_reverify=False), which only the
+        train path takes. The single-branch loop's dispatched arm is not pinned here.
+        """
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+
+        branch_name = 'rvrt-seed-reverified'
+        merge_wt, req, verified, rebased_from, rebased_onto, rebased_sha = (
+            await self._advance_onto_drift(
+                git_ops, config.model_copy(update={'merge_verify_breadth': 'full'}), branch_name,
+            )
+        )
+        verify_mock = _mock_verify_pass(failing_test_ids=frozenset())
+        try:
+            with patch('orchestrator.merge_lane.worker.run_scoped_verification', verify_mock):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    verified_merge_sha=verified,
+                    rebased_from=rebased_from,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha=rebased_sha,
+                    run_post_merge_verify=functools.partial(
+                        run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                    ),
+                    event_store=None,
+                )
+            assert result == GateClearance.reverified, result
+            verify_mock.assert_called_once()
+            assert cached_main_baseline_failing_ids(rebased_sha) == frozenset(), (
+                'a green re-verify must seed the rebased sha as every-module-green'
+            )
+
+            landed = await git_ops.advance_main(
+                rebased_sha, merge_wt,
+                branch=branch_name, expected_main=rebased_onto, reverify_on_rebase=True,
+            )
+            assert landed.result == 'advanced', landed
+            assert await git_ops.get_main_sha() == rebased_sha, (
+                'the seeded sha must be the one that lands on main'
+            )
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_disjoint_skip_clearance_seeds_no_baseline(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(e) Real git disjointness over a queue-verified drift clears with no
+        verify, so nothing may record the rebased sha's tree as green.
+        """
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+
+        scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
+        merge_wt, req, verified, rebased_from, rebased_onto, rebased_sha = (
+            await self._advance_onto_drift(git_ops, scoped, 'rvrt-seed-disjoint')
+        )
+        note_queue_verified_main_tip(git_ops.project_root, rebased_onto)
+        verify_mock = _mock_verify_pass(failing_test_ids=frozenset())
+        try:
+            with patch('orchestrator.merge_lane.worker.run_scoped_verification', verify_mock):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    verified_merge_sha=verified,
+                    rebased_from=rebased_from,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                    merge_sha=rebased_sha,
+                    run_post_merge_verify=functools.partial(
+                        run_post_merge_verify, verifier=PRODUCTION_VERIFIER,
+                    ),
+                    event_store=None,
+                )
+            assert result == GateClearance.disjoint, result
+            verify_mock.assert_not_called()
+            assert cached_main_baseline_failing_ids(rebased_sha) is None, (
+                'a tree no verify ran on must not be seeded as every-module-green'
+            )
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
     async def test_keep_worktrees_forwarded_to_run_post_merge_verify(self) -> None:
-        """keep_worktrees kwarg must be forwarded verbatim to _run_post_merge_verify.
+        """keep_worktrees kwarg must be forwarded verbatim to run_post_merge_verify.
 
         RED: TypeError because the parameter doesn't exist yet.
         GREEN after step-10 adds keep_worktrees param and forwards it.
         """
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         git_ops = MagicMock()
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -16502,20 +16489,19 @@ class TestReverifyRebasedTree:
 
         assert result == GateClearance.reverified, f'expected a green re-verify, got {result!r}'
         assert 'keep_worktrees' in captured_kw, (
-            'keep_worktrees not forwarded to _run_post_merge_verify'
+            'keep_worktrees not forwarded to run_post_merge_verify'
         )
         assert captured_kw['keep_worktrees'] == {l1, l2}, (
             f"keep_worktrees forwarded incorrectly: {captured_kw['keep_worktrees']!r}"
         )
 
     async def test_default_keep_worktrees_forwards_none(self) -> None:
-        """Without keep_worktrees, _run_post_merge_verify receives keep_worktrees=None
+        """Without keep_worktrees, run_post_merge_verify receives keep_worktrees=None
         (legacy single-keep = {merge_wt} behaviour unchanged).
 
         Regression guard: after step-10 adds keep_worktrees to the signature,
         the default None must be forwarded (not omitted).
         """
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         git_ops = MagicMock()
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -16571,7 +16557,7 @@ class TestReverifyRebasedTree:
 class TestSpeculativeMergeWorkerGate:
     """End-to-end integration tests for the disjoint-delta re-verify gate.
 
-    Each test builds a SpeculativeItem via worker._remerge(req, None),
+    Each test builds a SpeculativeItem via remerge_on_main(worker, req),
     simulates intervening main movement by committing directly in
     project_root, then drives drive_verify_and_advance(worker, item) and asserts
     the expected outcome and run_scoped_verification call count.
@@ -16640,7 +16626,7 @@ class TestSpeculativeMergeWorkerGate:
         _, req = await self._setup_overlap_branch(git_ops, branch, config)
 
         # _remerge: merge branch into current main
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem), (
             f'_remerge must succeed; got {item!r}'
         )
@@ -16708,7 +16694,7 @@ class TestSpeculativeMergeWorkerGate:
 
         _, req = await self._setup_overlap_branch(git_ops, branch, config)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem), (
             f'_remerge must succeed; got {item!r}'
         )
@@ -16764,7 +16750,6 @@ class TestSpeculativeMergeWorkerGate:
         Fast path: the gate detects no overlap and skips re-verify.
         run_scoped_verification called exactly once (initial verify only).
         """
-        from orchestrator.merge_lane.gates import note_queue_verified_main_tip
 
         branch = 'smwg-disjoint'
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -16778,7 +16763,7 @@ class TestSpeculativeMergeWorkerGate:
         scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
         req = _make_request(branch, branch, branch_wt, scoped)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem)
 
         # Move main: add a DISJOINT file (no shared files touched)
@@ -16840,7 +16825,7 @@ class TestSpeculativeMergeWorkerGate:
         scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
         req = _make_request(branch, branch, branch_wt, scoped)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem)
 
         # Drift from a writer that is NOT the merge queue — never registered
@@ -16885,7 +16870,7 @@ class TestSpeculativeMergeWorkerGate:
         )
         req = _make_request(branch, branch, branch_wt, config)
 
-        item = await worker._remerge(req, None)
+        item = await remerge_on_main(worker, req)
         assert isinstance(item, RealMergeItem)
 
         # main does NOT move
@@ -17266,7 +17251,7 @@ class TestSnapshotOwnedMergeWorktrees:
         p1.mkdir()
         worker._register_owned_merge_worktree(p1)  # resolve happens HERE, once
 
-        def _explode(self, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ARG001
+        def _explode(self, *a, **kw):
             raise AssertionError(
                 'snapshot() resolved a ledger path at read time — the resolve '
                 'must be memoised at _register_owned_merge_worktree time'
@@ -17300,7 +17285,7 @@ class TestSnapshotOwnedMergeWorktrees:
         direct.mkdir()
         worker._owned_merge_worktrees.add(direct)  # NO memo entry
 
-        def _explode(self, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ARG001
+        def _explode(self, *a, **kw):
             raise AssertionError('fallback path must not resolve at read time')
 
         monkeypatch.setattr(Path, 'resolve', _explode)
@@ -18501,7 +18486,7 @@ class TestLaneGenerationChain:
         branch_head_sha = branch_head_out.strip()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
         req = _make_request('wt-1', 'chain-wt', wt, config)
         finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
 
@@ -18622,7 +18607,7 @@ class TestSMWGenerationChain:
         finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
 
         with (
-            patch('orchestrator.merge_lane.worker._run_post_merge_verify', AsyncMock(return_value=None)),
+            patch('orchestrator.merge_lane.verify_dispatch.run_post_merge_verify', AsyncMock(return_value=None)),
             patch('orchestrator.merge_lane.worker._finalize_advanced_merge', finalize_mock),
         ):
             advanced = await drive_verify_and_advance(worker, item)
@@ -18704,7 +18689,7 @@ class TestTrainEquivalenceNeverAutoChains:
         """
         req = await _make_stacked_train(git_ops, config)
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
 
@@ -18823,7 +18808,7 @@ class TestBoundaryTableWorkerEntry:
         assert len(_bt9_entry.waiters) == 2, 'must have 2 waiters'
 
         queue: asyncio.Queue = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
         outcome_primary = await merge_through_lane(lane, queue, req, timeout=30.0)
         outcome_wf = await asyncio.wait_for(wf_future, timeout=5.0)
 
@@ -18995,7 +18980,7 @@ class TestBoundaryTableWorkerEntry:
             return await _real_finalize(*args, **kwargs)
 
         queue: asyncio.Queue = asyncio.Queue()
-        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue)
 
         with patch('orchestrator.merge_lane.worker._finalize_advanced_merge', _spy_finalize):
             outcome = await merge_through_lane(lane, queue, req, timeout=30.0)
@@ -19148,7 +19133,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_merge_ahead_bound_kwarg_raises_type_error(self, tmp_path: Path):
         """check_merge_liveness_margin no longer accepts merge_ahead_bound kwarg."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with pytest.raises(TypeError):
@@ -19156,7 +19141,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_num_hosts_kwarg_raises_type_error(self, tmp_path: Path):
         """check_merge_liveness_margin no longer accepts num_hosts kwarg."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with pytest.raises(TypeError):
@@ -19164,7 +19149,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_threshold_equals_safety_factor_times_liveness(self, tmp_path: Path):
         """threshold_secs == safety_factor * liveness_secs (injected)."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         result = check_merge_liveness_margin(cfg, safety_factor=0.5, liveness_secs=3600.0)
@@ -19175,7 +19160,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_safe_flag_matches_comparison(self, tmp_path: Path):
         """safe == (worst_case_secs < threshold_secs)."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         # Shipped defaults: floor=600, threshold=8100 → safe=True
@@ -19198,7 +19183,7 @@ class TestMergeLivenessAssessmentFields:
 
     def test_new_fields_present(self, tmp_path: Path):
         """Assessment exposes heartbeat_poll_secs, touch_miss_tolerance, safety_factor."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         result = check_merge_liveness_margin(cfg)
@@ -19215,7 +19200,7 @@ class TestMergeLivenessAssessmentFields:
 
     def test_old_fields_absent(self, tmp_path: Path):
         """Assessment no longer has timeout_secs, merge_ahead_bound, num_hosts, max_verify_timeouts."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         result = check_merge_liveness_margin(cfg)
@@ -19286,7 +19271,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """liveness_secs=600 → threshold=450 ≤ floor=600 → safe=False + exactly one WARNING."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
@@ -19307,7 +19292,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """Shipped defaults → safe=True → no WARNING emitted."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
@@ -19325,7 +19310,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """WARNING names the heartbeat model; does NOT mention cold_timeout or merge_ahead_bound."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
@@ -19349,7 +19334,7 @@ class TestCheckMergeLivenessMarginInvariant:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """liveness_secs=600 with safety_factor=0.5 → .safe False + exactly one WARNING."""
-        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
@@ -19695,7 +19680,7 @@ class TestSoftCancelMidVerify:
         on a cancelled future — no log emitted.  Likewise 5053 (disk-skip)
         and 5061 (verify-fail).
 
-    (A) _run_post_merge_verify has no abandonment poll, so a detach landing
+    (A) run_post_merge_verify has no abandonment poll, so a detach landing
         mid-verify burns one full 10-40 min verify cycle (wasted compute).
 
     (C) Regression guard: normal sole-waiter happy path (no cancel) still
@@ -19822,7 +19807,7 @@ class TestSoftCancelMidVerify:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
         # Fast poll so the test doesn't take seconds — abort within ~0.01 s.
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
 
         req = _make_request('sc-a', 'sc-a', wt, config)
         registry = InFlightMergeRegistry()
@@ -19975,7 +19960,7 @@ class TestSoftCancelMidVerify:
         """Compact B/verify-fail: _resolve_or_drop_abandoned logs at 5061.
 
         Pre-cancel req.result via detach, then immediately return a failed
-        MergeOutcome from _run_post_merge_verify.  The poll loop breaks with
+        MergeOutcome from run_post_merge_verify.  The poll loop breaks with
         ``out`` and _resolve_or_drop_abandoned must emit 'abandoned by waiter'
         rather than silently skipping set_result.
         """
@@ -20014,7 +19999,7 @@ class TestSoftCancelMidVerify:
 
         with (
             patch(
-                'orchestrator.merge_lane.worker._run_post_merge_verify',
+                'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify',
                 AsyncMock(return_value=MergeOutcome('blocked', reason='test failed')),
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'),
@@ -20079,7 +20064,7 @@ class TestSoftCancelMidVerify:
 
         with (
             patch(
-                'orchestrator.merge_lane.worker._run_post_merge_verify',
+                'orchestrator.merge_lane.verify_dispatch.run_post_merge_verify',
                 AsyncMock(return_value=MergeOutcome(
                     'blocked', reason='low disk space', verify_skipped=True,
                 )),
@@ -20782,7 +20767,7 @@ class TestOperatorHalt:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
 
         req = _make_request('op-halt', 'op-halt', wt, config)
         item = RealMergeItem(
@@ -20876,7 +20861,7 @@ class TestOperatorHalt:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
-        worker.VERIFY_ABANDON_POLL_SECS = 0.01  # type: ignore[attr-defined]
+        worker.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
 
         req = _make_request('wip-noabort', 'wip-noabort', wt, config)
         item = RealMergeItem(
@@ -20978,7 +20963,7 @@ class TestDoTrainMergeTrainScope:
         db_path = tmp_path / 'train_scope.db'
         event_store = EventStore(db_path=db_path, run_id='test-train-scope')
         queue: asyncio.Queue = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
+        lane = make_lane(git_ops, queue, event_store=event_store)
 
         outcome = await merge_through_lane(lane, queue, req)
 
@@ -21014,7 +20999,7 @@ class TestDoTrainMergeTrainScope:
 
 @pytest.mark.asyncio
 class TestRunPostMergeVerifyRouting:
-    """_run_post_merge_verify routes through VerifyRunnerPool and stays byte-identical."""
+    """run_post_merge_verify routes through VerifyRunnerPool and stays byte-identical."""
 
     def _make_git_ops(self) -> MagicMock:
         git_ops = MagicMock()
@@ -21048,7 +21033,7 @@ class TestRunPostMergeVerifyRouting:
         self, tmp_path: Path,
     ) -> None:
         """PASS path: returns None and emits one merge_verify event with runner='local'."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -21060,11 +21045,11 @@ class TestRunPostMergeVerifyRouting:
         )
         clean_gate = MagicMock(broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[])
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=passed_result)],
             gates=[clean_gate],
         )
-        result = await _run_post_merge_verify(
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -21096,9 +21081,9 @@ class TestRunPostMergeVerifyRouting:
 
         Pins that the LocalRunner resolves run_scoped_verification through the
         merge_queue module namespace at call time (not at import time), so test
-        patches applied BEFORE _run_post_merge_verify is called keep intercepting.
+        patches applied BEFORE run_post_merge_verify is called keep intercepting.
         """
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -21121,7 +21106,7 @@ class TestRunPostMergeVerifyRouting:
             unscoped=AsyncMock(return_value=clean_gate),
         )
         with patch('orchestrator.merge_lane.worker.run_scoped_verification', side_effect=capturing_verify):
-            await _run_post_merge_verify(
+            await run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
@@ -21133,7 +21118,7 @@ class TestRunPostMergeVerifyRouting:
 
     async def test_scoped_failure_consults_main_health_probe(self) -> None:
         """Scoped failure: MergeOutcome 'blocked' and _classify_main_health_red consulted."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -21144,9 +21129,9 @@ class TestRunPostMergeVerifyRouting:
             summary='test-fail',
         )
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=failed_result)])
-        with patch('orchestrator.merge_lane.worker._classify_main_health_red', AsyncMock(return_value=None)) as mock_mh:
-            result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=failed_result)])
+        with patch('orchestrator.merge_lane.verify_failure_outcome.classify_main_health_red', AsyncMock(return_value=None)) as mock_mh:
+            result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
@@ -21165,7 +21150,7 @@ class TestRunPostMergeVerifyRouting:
         self,
     ) -> None:
         """Unscoped gate broken: correct reason, NO main-health probe consulted."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -21179,12 +21164,12 @@ class TestRunPostMergeVerifyRouting:
             timed_out_subprojects=[], detail='type errors here',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=passed_scoped)],
             gates=[broken_gate],
         )
-        with patch('orchestrator.merge_lane.worker._classify_main_health_red', AsyncMock()) as mock_mh:
-            result = await _run_post_merge_verify(
+        with patch('orchestrator.merge_lane.verify_failure_outcome.classify_main_health_red', AsyncMock()) as mock_mh:
+            result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts={}, enospc_retries={},
                 max_timeouts=2, max_enospc=1,
@@ -21204,7 +21189,7 @@ class TestRunPostMergeVerifyRouting:
 
     async def test_unscoped_gate_timeout_increments_counter(self) -> None:
         """Unscoped gate timeout: correct reason and timeout counter incremented (fail-closed)."""
-        from orchestrator.merge_lane.worker import _run_post_merge_verify
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -21219,11 +21204,11 @@ class TestRunPostMergeVerifyRouting:
         )
 
         timeouts: dict = {}
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=passed_scoped)],
             gates=[timeout_gate],
         )
-        result = await _run_post_merge_verify(
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -21244,10 +21229,8 @@ class TestRunPostMergeVerifyRouting:
         self, tmp_path: Path,
     ) -> None:
         """Scoped ENOSPC: prune called, second dispatch still ENOSPC → transient-infra reason."""
-        from orchestrator.merge_lane.worker import (
-            TRANSIENT_INFRA_REASON_PREFIX,
-            _run_post_merge_verify,
-        )
+        from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+        from orchestrator.merge_lane.verify_failure_outcome import TRANSIENT_INFRA_REASON_PREFIX
 
         git_ops = self._make_git_ops()
         git_ops.prune_stale_merge_worktrees = AsyncMock(return_value=[tmp_path / 'old-wt'])
@@ -21259,8 +21242,8 @@ class TestRunPostMergeVerifyRouting:
             lint_output='', type_output='', summary='disk full',
         )
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
-        result = await _run_post_merge_verify(
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=enospc_result)])
+        result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
@@ -21283,15 +21266,14 @@ class TestRunPostMergeVerifyRouting:
 
 @pytest.mark.asyncio
 class TestMergeShaThreading:
-    """merge_sha is threaded from all callers into _run_post_merge_verify/pool.dispatch."""
+    """merge_sha is threaded from all callers into run_post_merge_verify/pool.dispatch."""
 
     async def test_reverify_rebased_tree_accepts_and_forwards_merge_sha(self) -> None:
         """_reverify_rebased_tree must accept a merge_sha kwarg and forward it.
 
         RED: TypeError because the parameter doesn't exist yet.
-        GREEN after step-14 adds merge_sha param and forwards it to _run_post_merge_verify.
+        GREEN after step-14 adds merge_sha param and forwards it to run_post_merge_verify.
         """
-        from orchestrator.merge_lane.worker import _reverify_rebased_tree
 
         git_ops = MagicMock()
         git_ops.cleanup_merge_worktree = AsyncMock()
@@ -21337,7 +21319,7 @@ class TestMergeShaThreading:
 
         assert result == GateClearance.reverified, f'expected a green re-verify, got {result!r}'
         assert captured_sha == ['c' * 40], (
-            f'merge_sha not forwarded to _run_post_merge_verify; captured: {captured_sha!r}'
+            f'merge_sha not forwarded to run_post_merge_verify; captured: {captured_sha!r}'
         )
 
     async def test_do_train_merge_forwards_merge_sha_in_event(
@@ -21565,6 +21547,10 @@ class TestSpeculationSlotSemaphoreDepth:
         Fails RED because _speculation_slot is still an Event (depth-1); with the Event
         the merger only builds N+1 speculatively (peak ≤ 2), so ≥ 3 assertion fails.
         """
+        # Deep chains off (task 7720): under the operational yaml's chain_cap the
+        # merger waits for each speculative item's chain decision, so it builds
+        # nothing ahead of an item still waiting for a host.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(git_ops, 'k2d-n', 'k2d_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'k2d-n1', 'k2d_n1.py', 'n1 = 2\n')
         wt_n2 = await _make_branch_with_file(git_ops, 'k2d-n2', 'k2d_n2.py', 'n2 = 3\n')
@@ -21691,6 +21677,10 @@ class TestSpeculationPermitLeakOnMergerError:
         """(a) WorktreeMissing raised during N+1's merger step must release
         the speculation permit (currently leaks → deadlock at next look-ahead).
         """
+        # Deep chains off (task 8527): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the merger step this scene raises in.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(git_ops, 'leak-wm-n', 'leak_wm_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'leak-wm-n1', 'leak_wm_n1.py', 'n1 = 2\n')
         wt_n2 = await _make_branch_with_file(git_ops, 'leak-wm-n2', 'leak_wm_n2.py', 'n2 = 3\n')
@@ -21755,6 +21745,10 @@ class TestSpeculationPermitLeakOnMergerError:
         """(b) Generic Exception raised during N+1's merger step must release
         the speculation permit (currently leaks → deadlock at next look-ahead).
         """
+        # Deep chains off (task 8527): under the operational yaml's chain_cap N,
+        # alone in the verify frontier, would chain N+1 rather than leave it to
+        # the merger step this scene raises in.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         wt_n = await _make_branch_with_file(git_ops, 'leak-ex-n', 'leak_ex_n.py', 'n = 1\n')
         wt_n1 = await _make_branch_with_file(git_ops, 'leak-ex-n1', 'leak_ex_n1.py', 'n1 = 2\n')
         wt_n2 = await _make_branch_with_file(git_ops, 'leak-ex-n2', 'leak_ex_n2.py', 'n2 = 3\n')
@@ -22813,8 +22807,8 @@ class TestSnapshotInflightCollection:
         surfaces in snapshot() as a 'dispatching' entry (task 2435 kappa-b:
         closes the task-2068 census gap).
 
-        DISPATCHING brackets `await self._dispatch_item(item)` (mq:9203-9214,
-        9571-9580) — the item is off the redispatch park/_verifier_queue but not yet
+        DISPATCHING brackets each `await self._dispatch_deciding(item)` in
+        `merge_lane/worker.py::SpeculativeMergeWorker._verifier_loop` — the item is off the redispatch park/_verifier_queue but not yet
         appended to _inflight. Historically this window was covered only by
         the census-only `_dispatching_item` field, which snapshot()'s
         'entries' section never read (task 2068 gap). Now that DISPATCHING

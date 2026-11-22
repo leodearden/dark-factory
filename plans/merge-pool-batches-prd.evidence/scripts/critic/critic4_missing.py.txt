@@ -1,0 +1,18 @@
+import sqlite3, json
+con = sqlite3.connect("file:/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db?mode=ro", uri=True)
+hits = json.load(open("hits.json"))
+for i, s, t, terms, indraft in hits:
+    if indraft: continue
+    title, desc, det, meta, prio = con.execute("select title, description, details, metadata, priority from tasks where id=?", (i,)).fetchone()
+    try:
+        files = json.loads(meta or "{}").get("files") or []
+    except Exception:
+        files = []
+    files = [f.split("/")[-1] for f in files][:6]
+    deps = [f"{d}" for (d,) in con.execute("select depends_on from dependencies d join tasks t on t.id=d.depends_on where d.task_id=? and t.status not in ('done','cancelled')", (i,))]
+    print(f"## {i} [{prio}] open-deps={deps} files={files}")
+    print("T:", title[:330])
+    d = (desc or "").replace("\n", " ")
+    # skip if title is a prefix of description
+    print("D:", d[:420])
+    print()

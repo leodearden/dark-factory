@@ -18,6 +18,9 @@ import shutil
 import subprocess
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # task-2438 step-01 RED: TestExtractAttributedClaims

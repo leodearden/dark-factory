@@ -44,12 +44,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypeGuard
 
-from shared.mcp_envelope import parse_tool_result
+from shared.mcp_envelope import parse_tool_result, tool_error_text
 from shared.safe_io import load_json_or_warn
+from shared.task_read import TASK_NOT_FOUND_ERROR_TYPE
 from shared.task_statuses import TERMINAL
 from shared.task_submit import SubmitFailed, SubmitOutcome
-
-from orchestrator.mcp_lifecycle import tool_error_text
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
@@ -706,13 +705,6 @@ def _extract_statuses_map(result: object) -> tuple[dict[str, str], Exception | N
     return {str(key): str(value) for key, value in statuses.items()}, None
 
 
-# The `error_type` fused-memory's `get_task` tool answers with when its query ran and
-# found no row (backends/task_backend_errors.py::TaskNotFoundError, structured by
-# server/tool_errors.py::mcp_tool_errors).  The one error that is an ANSWER, not a
-# failure — and a type, so the discrimination never rests on message wording.
-_TASK_NOT_FOUND_ERROR_TYPE = 'TaskNotFoundError'
-
-
 def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     """Extract a ``get_task`` response's task from a ``dispatch_tool`` envelope (see
     :func:`_unwrap_dispatch_envelope`), as a ``(task, error)`` pair.
@@ -722,7 +714,7 @@ def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
 
     - ``(task, None)`` — a dict carrying ``status``, after descending one ``data``
       layer (the wrapper ``scheduler.py::Scheduler.get_task`` also unwraps);
-    - ``(None, None)`` — :data:`_TASK_NOT_FOUND_ERROR_TYPE`, a CORROBORATED ABSENCE;
+    - ``(None, None)`` — :data:`TASK_NOT_FOUND_ERROR_TYPE`, a CORROBORATED ABSENCE;
     - ``(None, exc)`` — any other ``error``, or an answer with no task in it.
 
     Construct-don't-raise.  ``metadata`` is deliberately left as the tool sent it: the
@@ -730,7 +722,7 @@ def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     dict, a JSON string or ``None``.
     """
     envelope = _unwrap_dispatch_envelope(result)
-    if envelope.get('error_type') == _TASK_NOT_FOUND_ERROR_TYPE:
+    if envelope.get('error_type') == TASK_NOT_FOUND_ERROR_TYPE:
         return None, None
     if 'error' in envelope:
         return None, _response_error('get_task answered with an error', envelope)
@@ -890,9 +882,11 @@ class SchedulerChronicFlakeTaskClient:
         so the ledger's warning carries the real cause.  The id is coerced to ``str``
         for the same reason ``get_statuses`` coerces its ids.
 
-        Not delegated to ``scheduler.py::Scheduler.get_task``: that returns ``None`` for
-        a failed read AND for a missing task, the very conflation this pair exists to
-        remove.
+        ``scheduler.py::Scheduler.read_task`` types the same reply as TaskFound /
+        TaskAbsent / TaskReadFailed, and :func:`_extract_task` still disagrees with it
+        on an ``isError`` envelope, a row without ``status`` and an ``error_type``-only
+        reply.  Projecting this pair from ``read_task`` and deleting
+        :func:`_extract_task` is ticket tkt_0RWS67MFHYSKHF60BWRYE8F1VR.
         """
         try:
             result = await self._scheduler.dispatch_tool(
@@ -906,21 +900,23 @@ class SchedulerChronicFlakeTaskClient:
         return _extract_task(result)
 
     async def find_tasks_by_metadata(
-        self, key: str, value: str, statuses: Sequence[str],
+        self, key: str, value: str | None, statuses: Sequence[str], *, include_value: bool = False,
     ) -> tuple[list[dict], Exception | None]:
         """Every task in one of *statuses* whose top-level metadata *key* holds *value*,
         read page by page via ``dispatch_tool('find_tasks_by_metadata', ...)``.
 
+        A ``None`` *value* is a presence lookup, and *include_value* adds each row's
+        ``matched_value``; neither alters the wire of a call that omits them.
         An empty list is an answer (no such task), so a failure is reported in band as
         ``([], error)``: never a partial list, and never a raise, like its siblings.
         """
-        arguments = {
-            'project_root': self._project_root,
-            'key': key,
-            'value': value,
-            'statuses': list(statuses),
-            'limit': _METADATA_LOOKUP_PAGE,
-        }
+        arguments: dict = {'project_root': self._project_root, 'key': key}
+        if value is not None:
+            arguments['value'] = value
+        arguments['statuses'] = list(statuses)
+        arguments['limit'] = _METADATA_LOOKUP_PAGE
+        if include_value:
+            arguments['include_value'] = True
         rows: list[dict] = []
         has_more = True
         while has_more:
@@ -941,7 +937,7 @@ class SchedulerChronicFlakeTaskClient:
         except Exception as exc:
             logger.warning(
                 'chronic_flake: find_tasks_by_metadata dispatch failed for %s=%s',
-                arguments['key'], arguments['value'], exc_info=True,
+                arguments['key'], arguments.get('value'), exc_info=True,
             )
             return [], False, exc
         return _extract_metadata_matches(result)

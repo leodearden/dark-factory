@@ -136,6 +136,11 @@ def _attr_chain(node: ast.expr) -> tuple[ast.expr, str] | None:
     return node, '.'.join(reversed(parts))
 
 
+#: The name every default assertion's bare construction calls, so a module
+#: that cannot name it holds none.
+CONFIG_CLASS_NAME = OrchestratorConfig.__name__
+
+
 def _is_bare_config_call(node: ast.AST | None) -> bool:
     """True for exactly ``OrchestratorConfig()`` — no args, no keywords.
 
@@ -146,7 +151,7 @@ def _is_bare_config_call(node: ast.AST | None) -> bool:
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id == 'OrchestratorConfig'
+        and node.func.id == CONFIG_CLASS_NAME
         and not node.args
         and not node.keywords
     )
@@ -558,6 +563,13 @@ def iter_config_path_blanking_sites(
     ``qualname`` joins the enclosing class and function names with dots, or
     is ``'<module>'`` at module level."""
     tree = ast.parse(Path(path).read_text(), filename=str(path))
+    yield from config_path_blanking_sites_in(tree)
+
+
+def config_path_blanking_sites_in(
+    tree: ast.Module,
+) -> Iterator[tuple[str, int, ConfigPathWrite]]:
+    """:func:`iter_config_path_blanking_sites` over an already-parsed module."""
     yield from _blanking_sites(tree, ())
 
 
@@ -678,7 +690,13 @@ def iter_default_asserting_tests(
     default assertions appears several times.
     """
     source = Path(path).read_text()
-    tree = ast.parse(source, filename=str(path))
+    yield from default_asserting_tests_in(ast.parse(source, filename=str(path)))
+
+
+def default_asserting_tests_in(
+    tree: ast.Module,
+) -> Iterator[tuple[str | None, str, int, str, Any]]:
+    """:func:`iter_default_asserting_tests` over an already-parsed module."""
     if _scope_isolates(tree):
         return
 

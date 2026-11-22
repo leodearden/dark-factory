@@ -87,6 +87,7 @@ def build_cell(**overrides: Any) -> ShadowCell:
         'base_sha': 'a' * 40,
         'state': ShadowCellState.SETTLED,
         'cost_basis': CostBasis.METERED,
+        'configured_model': 'glm-5.3',
         'opened_at': OPENED_AT,
         'settle_deadline': OPENED_AT + timedelta(hours=168),
     }

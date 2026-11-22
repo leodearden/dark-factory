@@ -159,6 +159,27 @@ class TestExistence:
         assert store.paths_matching('t', 'cfg') == []
 
 
+class TestTaskCells:
+    def test_every_config_of_the_task_is_listed_in_path_order(
+        self, store: ResultStore
+    ):
+        b = store.save(_result(task_id='df_task_1', config_name='cfg-b'))
+        a = store.save(_result(task_id='df_task_1', config_name='cfg-a'))
+        store.save(_result(task_id='df_task_12', config_name='cfg-a'))
+        store.save(_result(task_id='u', config_name='cfg-a'))
+        assert store.paths_for_task('df_task_1') == sorted([a, b])
+
+    def test_names_outside_the_grammar_are_not_cells(self, store: ResultStore):
+        cell = store.save(_result(task_id='df_task_1', config_name='cfg'))
+        payload = json.dumps(_result(task_id='df_task_1', config_name='cfg').to_dict())
+        (store.directory / 'df_task_1__cfg.json').write_text(payload)
+        (store.directory / 'df_task_1__cfg__r__x.json').write_text(payload)
+        assert store.paths_for_task('df_task_1') == [cell]
+
+    def test_a_missing_directory_lists_no_task_cells(self, store: ResultStore):
+        assert store.paths_for_task('t') == []
+
+
 class TestCellPaths:
     def test_only_top_level_json_files_are_cells(self, store: ResultStore):
         cell = store.save(_result())
@@ -355,7 +376,7 @@ class TestLegacyInvocationErrorRule:
         ]
 
     def test_a_two_marker_string_is_one_record_driven_by_the_first(self):
-        from orchestrator.evals.report import format_invocation_errors
+        from orchestrator.evals.measurement import format_invocation_errors
 
         marker = 'architect:timeout: no answer within 60m; judge:raised: RuntimeError: x'
         normalized = normalize_legacy_metrics({'invocation_error': marker})
@@ -364,7 +385,7 @@ class TestLegacyInvocationErrorRule:
         assert format_invocation_errors(normalized['invocation_errors']) == marker
 
     def test_a_clipped_reason_keeps_its_trailing_space(self):
-        from orchestrator.evals.report import format_invocation_errors
+        from orchestrator.evals.measurement import format_invocation_errors
 
         marker = 'architect:cap_exhausted: all accounts capped after 1 '
         normalized = normalize_legacy_metrics({'invocation_error': marker})
@@ -460,9 +481,10 @@ async def _fake_create_wt(*_a, **_k):
     return Path('/fake/wt'), 'run-b1'
 
 
-async def _fake_collect(_wf, _wt, _task, *, role, replay_frame=None):
+async def _fake_collect(_wf, _wt, _task, *, role, replay_frame=None, sandbox_backend=None):
     return EvalMetrics(
         composite_score=0.9, tests_pass=True, role_under_test=role, replay_frame=replay_frame,
+        sandbox_backend=sandbox_backend,
     )
 
 

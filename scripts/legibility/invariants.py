@@ -4,7 +4,7 @@ This module is the one home of the heading shape that declares an invariant:
 ``## INV-<id> `<slug>``` on its own line, where ``<id>`` is ``<n>`` or
 ``<FAMILY>-<n>``. The census coder lists the slugs in its prompt, the codebook
 merger checks sightings against them, and
-scripts/tests/test_design_invariants_consistency.py parses dark-factory's doc
+tests/repo_guards/test_design_invariants_consistency.py parses dark-factory's doc
 through it (plans/census-incremental-prd.md D10).
 
 Stdlib-only, so it imports under ``uv run --project shared``.

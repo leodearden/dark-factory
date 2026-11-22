@@ -20,7 +20,6 @@ from _git_fixtures import seed_repo
 from _merge_lane_fakes import (
     FakeVerifier,
     hangs_until,
-    healthy_verify_clock,
     lane_scene_config,
     lane_state,
     make_lane,
@@ -270,7 +269,7 @@ async def test_an_operator_halt_requeues_the_verify_and_unhalting_lands_it(
     first_verify = asyncio.Event()
     verifier = FakeVerifier(sequence=[hangs_until(first_verify), passes()])
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    lane = make_lane(git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
+    lane = make_lane(git_ops, queue, verifier=verifier)
     before = await main_tip(git_ops)
 
     async with running_lane(lane) as run:

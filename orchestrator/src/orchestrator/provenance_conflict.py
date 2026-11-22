@@ -130,6 +130,71 @@ def _reopen_at_matches(caller_value: object, memo_value: str) -> bool:
     return parsed_caller == _parse_reopen_at(memo_value)
 
 
+def _record_binds(record: Any, reopen_at: object) -> bool:
+    """True when the pending conflict *record* still binds a caller at *reopen_at*.
+
+    The single definition shared by the read side
+    (:meth:`ProvenanceConflictSink.arbitration_pending`) and the write side
+    (:func:`_refresh_folded_parent`).  The recorded values are the
+    ``reopen_at`` in the record's own ``detail`` plus the one in every fold
+    refresh — an amendment whose ``agent_role`` is
+    ``PROVENANCE_CONFLICT_AGENT_ROLE``.  Amendments by any other role are not
+    reopen evidence and are skipped, so a human note can never wedge a task.
+
+    ANY recorded value matching binds: a task's live ``reopen_at`` only moves
+    forward, so no caller presents a value older than the newest entry and
+    "any" agrees with "newest" without ordering the amendments.  Every
+    ambiguity binds too — an unparseable ``detail``, or a recorded value that
+    is absent or not a string.
+
+    Residual: refreshes share the amendment list with every other writer, and
+    ``escalation/src/escalation/amendments.py::MAX_AMENDMENTS`` sheds the
+    oldest entry, so that many foreign amendments after the newest refresh
+    shed it and a cold sink releases at the live ``reopen_at``.  Closing that
+    needs an atomic fold-plus-refresh primitive in the escalation package.
+    """
+    details = [getattr(record, 'detail', None)]
+    details.extend(
+        amendment.get('detail')
+        for amendment in getattr(record, 'amendments', None) or ()
+        if isinstance(amendment, dict)
+        and amendment.get('agent_role') == PROVENANCE_CONFLICT_AGENT_ROLE
+    )
+    for detail in details:
+        try:
+            recorded = json.loads(detail or '{}').get('reopen_at')
+        except (TypeError, ValueError, AttributeError):
+            return True
+        if not isinstance(recorded, str) or _reopen_at_matches(reopen_at, recorded):
+            return True
+    return False
+
+
+def _refresh_folded_parent(
+    queue: EscalationQueue, parent_id: str, esc: Escalation, reopen_at: str,
+) -> None:
+    """Make the folded-into parent bind *reopen_at* by appending *esc*'s framing.
+
+    A dedupe fold never touches the parent's ``detail``, so after a re-reopen
+    the durable record would still carry only the first ``reopen_at`` and a
+    cold sink would release a live hold.  The refresh is written only when
+    the parent does not already bind *reopen_at*, so same-reopen repeats from
+    any writer site add nothing (INV-4).  The ``get``/``amend`` pair is not
+    atomic, so two writers folding at once can each append a refresh; both
+    bind the same value, and the amendment cap bounds them.  ``amend``'s
+    status is ignored:
+    ``not_pending`` / ``not_found`` mean the parent was resolved in between,
+    which already released the hold.
+    """
+    parent = queue.get(parent_id)
+    if parent is None or _record_binds(parent, reopen_at):
+        return
+    queue.amend(
+        parent_id, summary=esc.summary, detail=esc.detail,
+        agent_role=PROVENANCE_CONFLICT_AGENT_ROLE,
+    )
+
+
 class ProvenanceConflictSink:
     """Records ``done_evidence_stale`` rejections; gates per-tick re-attempts.
 
@@ -188,6 +253,10 @@ class ProvenanceConflictSink:
         ``None`` when no queue is bound yet — the memo is still updated
         (with a ``None`` escalation id) so ``should_skip`` still gates the
         in-process retry even before the queue is late-bound.
+
+        A fold at a ``reopen_at`` the parent does not yet bind appends a
+        sink-authored amendment, so the durable record binds the newest
+        ``reopen_at`` (see :func:`_refresh_folded_parent`).
         """
         if self.escalation_queue is None:
             # task 2677 amendment (reviewer_comprehensive
@@ -239,6 +308,8 @@ class ProvenanceConflictSink:
         )
         result = submit_or_dedupe(self.escalation_queue, esc, _dedupe_config())
         escalation_id = str(result['id'])
+        if result.get('status') == 'dedup_skipped':
+            _refresh_folded_parent(self.escalation_queue, escalation_id, esc, reopen_at)
         self._memo[task_id] = (reopen_at, evidence_commit, escalation_id)
         return escalation_id
 
@@ -338,8 +409,9 @@ class ProvenanceConflictSink:
         pending, keeping the ambiguity-holds asymmetry below.
 
         Shares :meth:`should_skip`'s reopen_at INVALIDATION ARM, comparing
-        the caller's value against the one ``record()`` serialised into the
-        escalation's ``detail`` JSON.  That arm is load-bearing, not
+        the caller's value against every ``reopen_at`` the record carries: its
+        own ``detail`` JSON plus each fold refresh ``record()`` appended (see
+        :func:`_record_binds`).  That arm is load-bearing, not
         incidental — ``merge_queue.py`` names it as the self-heal for a task
         reopened after its conflict was filed — so a hold that ignored it
         would trade the cold-memo bug for a permanent wedge (neither
@@ -370,15 +442,7 @@ class ProvenanceConflictSink:
                 # depending on every present and future caller having
                 # remembered `status='pending'` on its read.
                 continue
-            if reopen_at is _UNKNOWN_REOPEN:
-                return True
-            try:
-                recorded = json.loads(
-                    getattr(record, 'detail', None) or '{}',
-                ).get('reopen_at')
-            except (TypeError, ValueError, AttributeError):
-                return True
-            if not isinstance(recorded, str) or _reopen_at_matches(reopen_at, recorded):
+            if reopen_at is _UNKNOWN_REOPEN or _record_binds(record, reopen_at):
                 return True
         return False
 

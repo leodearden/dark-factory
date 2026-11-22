@@ -4,7 +4,10 @@ FakeMergeQueue behind it that lands for real in a temp git repo."""
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
+import pathlib
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -12,7 +15,14 @@ import threading
 import time
 
 import pytest
-from _merge_queue_landing import Landing, LandingFailure, LandingNotConfirmed, land_file
+from _merge_queue_landing import (
+    Landing,
+    LandingFailure,
+    LandingNotConfirmed,
+    land_file,
+    land_files,
+    reclaim_retained_deploys,
+)
 from config_reload_script_fakes import (
     TOOL_RAISED,
     TRANSPORT_FAULTS,
@@ -25,15 +35,28 @@ from config_reload_script_fakes import (
 from merge_queue_fakes import (
     TRANSPORT_FAULT,
     FakeMergeQueue,
+    assert_no_landing_left_behind,
     assert_target_checkout_clean,
     deploy_tmpdir_env,
 )
+from retained_deploy_fakes import CANCEL_REFUSED_WHILE_LANDING, branch_exists, retained_deploy
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 CONFIG = "dark-factory-orchestrator.yaml"
 SEED = "project_root: /nowhere\nknob: 0\n"
 EDITED = b"project_root: /nowhere\nknob: 1\n"
 LABEL = "test-knob-1"
 MESSAGE = "chore(test): set knob=1"
+
+PRD = "plans/demo-prd.md"
+PRD_SEED = b"# Demo PRD\n\nDraft.\n"
+DOCS = {
+    PRD: b"# Demo PRD\n\nDecomposed.\n",
+    "plans/demo-prd.capability-manifest.md": b"# Demo PRD capability manifest\n",
+    "plans/demo-prd.capability-manifest.yaml": b"capabilities: []\n",
+}
 
 
 @pytest.fixture
@@ -52,8 +75,33 @@ def repo(tmp_path):
     return checkout
 
 
+@pytest.fixture
+def docs_repo(repo):
+    """The target checkout, also tracking PRD as PRD_SEED; DOCS' other paths
+    are new to it."""
+    (repo / PRD).parent.mkdir()
+    (repo / PRD).write_bytes(PRD_SEED)
+    git(repo, "add", PRD)
+    git(repo, "commit", "-q", "-m", "seed the PRD")
+    return repo
+
+
 def _main(repo):
     return git(repo, "rev-parse", "main").strip()
+
+
+def _land_docs(repo, queue, files=DOCS, *, base=None, **kwargs):
+    """land_files of *files* onto *repo*'s main, from *base* (default: main),
+    through *queue*."""
+    with FakeEscalationMcp(tool_handlers=queue.handlers()) as server:
+        return land_files(
+            str(repo), files, base or _main(repo),
+            port=str(server.port), label=LABEL, message=MESSAGE, **kwargs,
+        )
+
+
+def _files_in(repo, commit):
+    return sorted(git(repo, "show", "--name-only", "--format=", commit).split())
 
 
 def _land(repo, queue, **kwargs):
@@ -70,7 +118,18 @@ def _land(repo, queue, **kwargs):
 
 def _assert_left_nothing_behind(repo, scratch):
     assert_target_checkout_clean(repo)
+    _assert_scratch_removed(scratch)
+
+
+def _assert_scratch_removed(scratch):
     assert os.listdir(scratch) == [], f"the deploy scratch dir was left: {os.listdir(scratch)}"
+
+
+def _checkout_state(repo, *paths):
+    """What a landing must leave alone in *repo*: its staged and unstaged
+    diffs, and the bytes on disk at each of *paths*."""
+    return (git(repo, "diff", "--cached"), git(repo, "diff"),
+            {path: (repo / path).read_bytes() for path in paths})
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +246,26 @@ def test_a_rebased_landing_is_confirmed_by_patch_identity(repo, scratch):
     _assert_left_nothing_behind(repo, scratch)
 
 
+def test_three_docs_paths_land_as_one_commit_through_one_request(docs_repo, scratch):
+    """Two of the three paths are new at base: a docs landing adds files."""
+    repo = docs_repo
+    base = _main(repo)
+    queue = FakeMergeQueue(repo, states=["verifying", "done"])
+
+    landing = _land_docs(repo, queue)
+
+    assert len(queue.calls_to("merge_request")) == 1, queue.calls
+    assert isinstance(landing, Landing)
+    assert landing.request_id == queue.request_id
+    assert landing.landed_as == _main(repo) == queue.merge_sha
+    assert _files_in(repo, landing.tip_sha) == sorted(DOCS)
+    assert git(repo, "log", "-1", "--format=%s", landing.tip_sha).strip() == MESSAGE
+    assert sorted(git(repo, "diff", "--name-only", base, "main").split()) == sorted(DOCS)
+    for path, content in DOCS.items():
+        assert (repo / path).read_bytes() == content, path
+    _assert_left_nothing_behind(repo, scratch)
+
+
 # ---------------------------------------------------------------------------
 # Every way a request can fail to land
 #
@@ -211,9 +290,45 @@ def _refused_by(repo, queue, **kwargs):
         return _refusal(repo, server.port, **kwargs)
 
 
+def _docs_refused_by(repo, queue, files, **kwargs):
+    """The LandingNotConfirmed land_files of *files* raises through *queue*."""
+    with pytest.raises(LandingNotConfirmed) as caught:
+        _land_docs(repo, queue, files, **kwargs)
+    return caught.value
+
+
 def _assert_untouched(repo, before, scratch):
     assert _main(repo) == before, "main moved on a landing that was refused"
     _assert_left_nothing_behind(repo, scratch)
+
+
+CEILING_SECS = 1
+
+
+class _ManualClock:
+    """A monotonic clock that stands still until a test moves it."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _refused_at_the_ceiling(repo, queue, *, passed_by):
+    """The LandingNotConfirmed land_file raises through *queue* on a
+    CEILING_SECS budget whose clock passes the ceiling as the queue answers
+    *passed_by*, however long git setup and the queue calls really take."""
+    clock = _ManualClock()
+    handlers = queue.handlers()
+    handlers[passed_by] = _acting_after(
+        handlers[passed_by], lambda: clock.advance(CEILING_SECS + 1),
+    )
+    with FakeEscalationMcp(tool_handlers=handlers) as server:
+        return _refusal(repo, server.port, timeout_secs=CEILING_SECS, clock=clock)
 
 
 @pytest.mark.parametrize("terminal", [
@@ -229,6 +344,7 @@ def test_a_poll_that_settles_without_landing_is_not_landed(repo, scratch, termin
 
     assert refusal.failure is LandingFailure.NOT_LANDED
     assert refusal.state == terminal["state"]
+    assert refusal.reason == terminal.get("reason")
     assert terminal["state"] in refusal.detail, refusal.detail
     assert terminal.get("reason", "") in refusal.detail, refusal.detail
     _assert_untouched(repo, before, scratch)
@@ -242,9 +358,27 @@ def test_a_submit_that_settles_without_landing_is_not_landed(repo, scratch, stat
     refusal = _refused_by(repo, queue)
 
     assert refusal.failure is LandingFailure.NOT_LANDED
+    assert refusal.reason == f"why-{status}"
     assert status in refusal.detail, refusal.detail
     assert f"why-{status}" in refusal.detail, refusal.detail
     assert queue.calls_to("merge_status") == []
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_three_path_landing_the_queue_refuses_names_its_outcome_and_reason(docs_repo,
+                                                                             scratch):
+    repo = docs_repo
+    before = _main(repo)
+    queue = FakeMergeQueue(
+        repo, states=["verifying", {"state": "blocked", "reason": "verify failed: 2 tests"}],
+    )
+
+    refusal = _docs_refused_by(repo, queue, DOCS)
+
+    assert len(queue.calls_to("merge_request")) == 1, queue.calls
+    assert refusal.failure is LandingFailure.NOT_LANDED
+    assert refusal.state == "blocked"
+    assert refusal.reason == "verify failed: 2 tests"
     _assert_untouched(repo, before, scratch)
 
 
@@ -256,6 +390,7 @@ def test_a_submit_the_server_refuses_is_submit_rejected(repo, scratch):
     refusal = _refused_by(repo, queue)
 
     assert refusal.failure is LandingFailure.SUBMIT_REJECTED
+    assert refusal.reason == error
     assert error in refusal.detail, refusal.detail
     _assert_untouched(repo, before, scratch)
 
@@ -263,7 +398,8 @@ def test_a_submit_the_server_refuses_is_submit_rejected(repo, scratch):
 def test_a_dead_socket_at_submit_is_transport_failed(repo, scratch):
     before = _main(repo)
 
-    refusal = _refusal(repo, ClosedPort().port)
+    with ClosedPort() as closed:
+        refusal = _refusal(repo, closed.port)
 
     assert refusal.failure is LandingFailure.TRANSPORT_FAILED
     assert "merge_request" in refusal.detail, refusal.detail
@@ -302,10 +438,27 @@ def test_a_request_still_live_at_the_ceiling_is_cancelled(repo, scratch):
     before = _main(repo)
     queue = FakeMergeQueue(repo, states=["verifying"])
 
-    refusal = _refused_by(repo, queue, timeout_secs=1)
+    refusal = _refused_at_the_ceiling(repo, queue, passed_by="merge_status")
 
     assert refusal.failure is LandingFailure.TIMED_OUT
+    assert len(queue.calls_to("merge_status")) == 1
     assert "verifying" in refusal.detail, refusal.detail
+    assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_ceiling_passed_during_the_submit_cancels_without_a_poll(repo, scratch):
+    """The ceiling counts the submit's own time: a request whose submit
+    answers past it is cancelled on the submit's state, and the abandoned
+    request leaves nothing behind."""
+    before = _main(repo)
+    queue = FakeMergeQueue(repo, states=["verifying"])
+
+    refusal = _refused_at_the_ceiling(repo, queue, passed_by="merge_request")
+
+    assert refusal.failure is LandingFailure.TIMED_OUT
+    assert "still queued" in refusal.detail, refusal.detail
+    assert queue.calls_to("merge_status") == []
     assert queue.calls_to("merge_cancel") == [{"request_id": queue.request_id}]
     _assert_untouched(repo, before, scratch)
 
@@ -313,16 +466,12 @@ def test_a_request_still_live_at_the_ceiling_is_cancelled(repo, scratch):
 def test_a_cancel_refused_while_live_keeps_the_deploy_branch(repo, scratch):
     """The merge worker reads the source from the deploy worktree, so a
     request that may still land must keep it."""
-    queue = FakeMergeQueue(repo, states=["verifying"], cancel_reply={
-        "cancelled": False,
-        "state": "finalizing",
-        "reason": "Request is landing (its CAS is in progress)",
-        "code": "finalize_window",
-    })
+    queue = FakeMergeQueue(repo, states=["verifying"], cancel_reply=CANCEL_REFUSED_WHILE_LANDING)
 
-    refusal = _refused_by(repo, queue, timeout_secs=1)
+    refusal = _refused_at_the_ceiling(repo, queue, passed_by="merge_status")
 
     assert refusal.failure is LandingFailure.TIMED_OUT
+    assert len(queue.calls_to("merge_status")) == 1
     (submitted,) = queue.calls_to("merge_request")
     worktree, branch = submitted["worktree"], f"task/{submitted['branch']}"
     assert os.path.isdir(worktree), "a live request's worktree was removed"
@@ -402,19 +551,284 @@ def test_content_equal_to_the_base_is_refused_before_any_call(repo, scratch):
     _assert_untouched(repo, before, scratch)
 
 
-@pytest.mark.parametrize("bad", [
-    {"base": "0" * 40},
-    {"path": "absent.yaml"},
-], ids=["base_not_a_commit", "path_not_at_base"])
-def test_a_base_without_the_file_is_refused_before_any_call(repo, scratch, bad):
+def test_an_unchanged_path_among_changed_ones_is_refused_before_any_call(docs_repo, scratch):
+    """The landed commit carries exactly the named paths, so each must change."""
+    repo = docs_repo
     before = _main(repo)
     queue = FakeMergeQueue(repo)
 
-    refusal = _refused_by(repo, queue, **bad)
+    refusal = _docs_refused_by(repo, queue, {**DOCS, PRD: PRD_SEED})
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE
+    assert PRD in refusal.detail, refusal.detail
+    changed = [path for path in DOCS if path != PRD]
+    assert not any(path in refusal.detail for path in changed), refusal.detail
+    assert queue.calls == []
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_base_that_is_not_a_commit_is_refused_before_any_call(repo, scratch):
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _refused_by(repo, queue, base="0" * 40)
 
     assert refusal.failure is LandingFailure.INVALID_CHANGE
     assert queue.calls == []
     _assert_untouched(repo, before, scratch)
+
+
+# ---------------------------------------------------------------------------
+# The path set is validated before any call
+# ---------------------------------------------------------------------------
+
+def test_an_empty_path_set_is_refused_before_any_call(repo, scratch):
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(repo, queue, {})
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE
+    assert queue.calls == []
+    _assert_untouched(repo, before, scratch)
+
+
+@pytest.mark.parametrize("case", [
+    "parent_relative", "absolute_elsewhere", "through_a_symlink", "under_dot_git",
+    "nested_dot_git", "dot_git_in_another_case", "the_root",
+])
+def test_a_path_outside_the_checkout_is_refused_before_any_call(docs_repo, scratch, tmp_path,
+                                                                case):
+    """Refused per path: each bad path rides alongside a good one. The
+    refusal names the rule, because a later backstop would refuse some of
+    these shapes too, less clearly."""
+    repo = docs_repo
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / "linked").symlink_to(outside, target_is_directory=True)
+    git(repo, "add", "linked")
+    git(repo, "commit", "-q", "-m", "link a directory outside the checkout")
+    bad, escape, rule = {
+        "parent_relative": ("../outside.md", tmp_path / "outside.md", "is outside the checkout"),
+        "absolute_elsewhere": (str(tmp_path / "elsewhere.md"), tmp_path / "elsewhere.md",
+                               "is outside the checkout"),
+        "through_a_symlink": ("linked/escape.md", outside / "escape.md",
+                              "crosses a symlink in the checkout"),
+        "under_dot_git": (".git/config", None, "has a .git component"),
+        "nested_dot_git": ("plans/.git/x", None, "has a .git component"),
+        "dot_git_in_another_case": ("plans/.Git/x", None, "has a .git component"),
+        "the_root": (".", None, "itself"),
+    }[case]
+    git_config = (repo / ".git" / "config").read_bytes()
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(repo, queue, {PRD: DOCS[PRD], bad: b"escaped\n"})
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE, refusal.detail
+    assert bad in refusal.detail, refusal.detail
+    assert rule in refusal.detail, refusal.detail
+    assert queue.calls == []
+    assert escape is None or not escape.exists(), f"{escape} was written"
+    assert (repo / ".git" / "config").read_bytes() == git_config
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_symlink_only_the_base_carries_is_refused_before_any_call(docs_repo, scratch,
+                                                                    tmp_path):
+    """The deploy commit is written at the base, which may carry a symlink
+    the checkout has since dropped."""
+    repo = docs_repo
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / "linked").symlink_to(outside, target_is_directory=True)
+    git(repo, "add", "linked")
+    git(repo, "commit", "-q", "-m", "link a directory outside the checkout")
+    base = _main(repo)
+    git(repo, "rm", "-q", "linked")
+    git(repo, "commit", "-q", "-m", "drop the link")
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(
+        repo, queue, {PRD: DOCS[PRD], "linked/escape.md": b"escaped\n"}, base=base,
+    )
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE, refusal.detail
+    assert "linked/escape.md" in refusal.detail, refusal.detail
+    assert queue.calls == []
+    assert not (outside / "escape.md").exists(), "the write followed the base's symlink"
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_symlink_the_checkout_gained_after_the_base_is_refused_before_any_call(docs_repo,
+                                                                                 scratch,
+                                                                                 tmp_path):
+    """The base has no symlink to follow, so only the checkout shows that the
+    path lands where main now carries one."""
+    repo = docs_repo
+    base = _main(repo)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / "linked").symlink_to(outside, target_is_directory=True)
+    git(repo, "add", "linked")
+    git(repo, "commit", "-q", "-m", "link a directory outside the checkout")
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(
+        repo, queue, {PRD: DOCS[PRD], "linked/escape.md": b"escaped\n"}, base=base,
+    )
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE, refusal.detail
+    assert "linked/escape.md" in refusal.detail, refusal.detail
+    assert queue.calls == []
+    assert not (outside / "escape.md").exists(), "the write followed the checkout's symlink"
+    _assert_untouched(repo, before, scratch)
+
+
+@pytest.mark.parametrize("bad", [f"{CONFIG}/under-a-file.md", f"{CONFIG}/deeper/under.md",
+                                 "plans"], ids=["under_a_file", "deeper_under_a_file",
+                                                "over_a_directory"])
+def test_a_path_git_cannot_hold_as_a_file_at_the_base_is_invalid(docs_repo, scratch, bad):
+    repo = docs_repo
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(repo, queue, {PRD: DOCS[PRD], bad: b"misplaced\n"})
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE, refusal.detail
+    assert bad in refusal.detail, refusal.detail
+    assert queue.calls == []
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_scratch_write_the_host_refuses_is_not_blamed_on_the_change(docs_repo, scratch,
+                                                                      monkeypatch):
+    """A full or read-only scratch filesystem is the host's fault: the tag
+    must not send the operator looking at the paths."""
+    repo = docs_repo
+    write_bytes = pathlib.Path.write_bytes
+
+    def full_scratch(self, data):
+        if str(self).startswith(scratch):
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), str(self))
+        return write_bytes(self, data)
+
+    monkeypatch.setattr(pathlib.Path, "write_bytes", full_scratch)
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(repo, queue, DOCS)
+
+    assert refusal.failure is LandingFailure.SCRATCH_WRITE_FAILED, refusal.detail
+    assert os.strerror(errno.ENOSPC) in refusal.detail, refusal.detail
+    assert queue.calls == []
+    _assert_untouched(repo, before, scratch)
+
+
+@pytest.mark.parametrize("spelling", ["dot_segment", "absolute"])
+def test_two_spellings_of_one_path_are_refused(docs_repo, scratch, spelling):
+    repo = docs_repo
+    other = {"dot_segment": "plans/./demo-prd.md", "absolute": str(repo / PRD)}[spelling]
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(repo, queue, {PRD: DOCS[PRD], other: b"# Another draft\n"})
+
+    assert refusal.failure is LandingFailure.INVALID_CHANGE
+    assert queue.calls == []
+    _assert_untouched(repo, before, scratch)
+
+
+def test_an_absolute_path_inside_the_checkout_lands_as_its_repo_relative_path(docs_repo,
+                                                                              scratch):
+    repo = docs_repo
+    queue = FakeMergeQueue(repo)
+
+    landing = _land_docs(repo, queue, {str(repo / PRD): DOCS[PRD]})
+
+    assert _files_in(repo, landing.tip_sha) == [PRD]
+    assert (repo / PRD).read_bytes() == DOCS[PRD]
+    _assert_left_nothing_behind(repo, scratch)
+
+
+# ---------------------------------------------------------------------------
+# The target checkout's own state
+#
+# The lane's advance refuses to move main over uncommitted state at a landed
+# path, and halts the whole queue doing so; untracked state there it
+# overwrites. Any other state in the checkout is not the landing's to touch.
+# ---------------------------------------------------------------------------
+
+def _commit(repo, path, content):
+    (repo / path).write_bytes(content)
+    git(repo, "add", path)
+    git(repo, "commit", "-q", "-m", f"add {path}")
+
+
+@pytest.mark.parametrize("dirt", ["unstaged_edit", "staged_edit", "untracked_new_file"])
+def test_uncommitted_state_at_a_landed_path_is_refused_before_any_call(docs_repo, scratch, dirt):
+    repo = docs_repo
+    dirty = "plans/demo-prd.capability-manifest.md" if dirt == "untracked_new_file" else PRD
+    (repo / dirty).write_bytes(b"# a session's uncommitted draft\n")
+    if dirt == "staged_edit":
+        git(repo, "add", dirty)
+    state = _checkout_state(repo, dirty)
+    before = _main(repo)
+    queue = FakeMergeQueue(repo)
+
+    refusal = _docs_refused_by(repo, queue, DOCS)
+
+    assert refusal.failure is LandingFailure.CHECKOUT_DIRTY, refusal.detail
+    assert dirty in refusal.detail, refusal.detail
+    clean = [path for path in DOCS if path != dirty]
+    assert not any(path in refusal.detail for path in clean), refusal.detail
+    assert queue.calls == []
+    assert _main(repo) == before
+    assert _checkout_state(repo, dirty) == state
+    assert_no_landing_left_behind(repo)
+    _assert_scratch_removed(scratch)
+
+
+def test_other_staged_and_dirty_state_is_left_alone_when_the_queue_refuses(docs_repo, scratch):
+    repo = docs_repo
+    _commit(repo, "notes.md", b"notes\n")
+    (repo / CONFIG).write_bytes(EDITED)
+    git(repo, "add", CONFIG)
+    (repo / "notes.md").write_bytes(b"notes, edited\n")
+    (repo / "draft.txt").write_bytes(b"an untracked draft\n")
+    state = _checkout_state(repo, CONFIG, "notes.md", "draft.txt")
+    before = _main(repo)
+    queue = FakeMergeQueue(
+        repo, states=["verifying", {"state": "blocked", "reason": "verify failed: 2 tests"}],
+    )
+
+    refusal = _docs_refused_by(repo, queue, DOCS)
+
+    assert refusal.failure is LandingFailure.NOT_LANDED, refusal.detail
+    assert _main(repo) == before
+    assert _checkout_state(repo, CONFIG, "notes.md", "draft.txt") == state
+    assert_no_landing_left_behind(repo)
+    _assert_scratch_removed(scratch)
+
+
+def test_unrelated_dirty_state_survives_a_landing(docs_repo, scratch):
+    """No staged change here: the fake lands with a real `git merge`, which
+    aborts on a dirty index that the lane's own advance would park."""
+    repo = docs_repo
+    (repo / CONFIG).write_bytes(EDITED)
+    (repo / "draft.txt").write_bytes(b"an untracked draft\n")
+    state = _checkout_state(repo, CONFIG, "draft.txt")
+    queue = FakeMergeQueue(repo, states=["verifying", "done"])
+
+    landing = _land_docs(repo, queue)
+
+    assert landing.landed_as == _main(repo) == queue.merge_sha
+    assert _files_in(repo, landing.tip_sha) == sorted(DOCS)
+    assert _checkout_state(repo, CONFIG, "draft.txt") == state
+    assert_no_landing_left_behind(repo)
+    _assert_scratch_removed(scratch)
 
 
 # ---------------------------------------------------------------------------
@@ -586,9 +1000,10 @@ def test_a_lost_submit_the_queue_never_answers_for_keeps_the_deploy_branch(repo,
     would land from is kept."""
     queue = FakeMergeQueue(repo, lose_submit_reply=True, states=[TRANSPORT_FAULT])
 
-    refusal = _refused_by(repo, queue, timeout_secs=1)
+    refusal = _refused_at_the_ceiling(repo, queue, passed_by="merge_status")
 
     assert refusal.failure is LandingFailure.TIMED_OUT
+    assert len(queue.calls_to("merge_status")) == 1
     assert refusal.state == "unknown"
     assert queue.calls_to("merge_cancel") == []
     (submitted,) = queue.calls_to("merge_request")
@@ -611,6 +1026,27 @@ def test_teardown_tolerates_a_lane_that_already_removed_the_deploy_branch(repo, 
     _assert_left_nothing_behind(repo, scratch)
 
 
+def test_a_submitted_request_is_named_before_the_wait_for_it(repo, scratch, capsys):
+    """A run killed while it waits reports no outcome, so the request it left
+    in the queue must already be named."""
+    queue = FakeMergeQueue(repo, states=["verifying", "done"])
+    handlers = queue.handlers()
+    logged_by_the_first_poll = []
+    handlers["merge_status"] = _acting_after(
+        handlers["merge_status"], lambda: logged_by_the_first_poll.append(capsys.readouterr().err),
+        when=lambda reply: not logged_by_the_first_poll,
+    )
+
+    with FakeEscalationMcp(tool_handlers=handlers) as server:
+        landing = land_file(
+            str(repo), CONFIG, _main(repo), EDITED,
+            port=str(server.port), label=LABEL, message=MESSAGE,
+        )
+
+    (err,) = logged_by_the_first_poll
+    assert landing.branch in err and f"request_id={queue.request_id}" in err, err
+
+
 def test_a_teardown_git_refuses_keeps_the_landing(repo, scratch, capsys):
     """The knob is on main: a deploy branch git will not remove is reported,
     not raised over the landing."""
@@ -625,6 +1061,133 @@ def test_a_teardown_git_refuses_keeps_the_landing(repo, scratch, capsys):
     assert (repo / CONFIG).read_bytes() == EDITED
     err = capsys.readouterr().err
     assert landing.branch in err and "locked" in err, err
+
+
+# ---------------------------------------------------------------------------
+# Reclaiming a deploy an earlier landing retained
+#
+# A caller that lands on a cadence asks first whether an earlier run left a
+# deploy behind that may still land; one that can no longer land is torn down.
+# ---------------------------------------------------------------------------
+
+def _retained_deploy(repo):
+    """The (branch, worktree) a landing of EDITED as CONFIG kept in *repo*."""
+    return retained_deploy(repo, {CONFIG: EDITED}, label=LABEL)
+
+
+def _reclaim(repo, answers=None, *, label=LABEL):
+    """reclaim_retained_deploys of *label* in *repo*, through a fresh queue
+    whose merge_status answers each handle with its *answers* sequence.
+    Returns (the deploys kept, the server's tool calls)."""
+    queue = FakeMergeQueue(repo, states=answers or {})
+    with FakeEscalationMcp(tool_handlers=queue.handlers()) as server:
+        kept = reclaim_retained_deploys(str(repo), label, port=str(server.port))
+        calls = server.tool_calls()
+    return kept, calls
+
+
+def _bare(branch):
+    return branch.removeprefix("task/")
+
+
+def test_a_repo_without_a_retained_deploy_reclaims_nothing_and_asks_nothing(repo, scratch):
+    kept, calls = _reclaim(repo)
+
+    assert kept == ()
+    assert calls == []
+
+
+def test_a_retained_deploy_still_live_is_kept_and_reported(repo, scratch):
+    branch, worktree = _retained_deploy(repo)
+
+    kept, calls = _reclaim(repo, {_bare(branch): ["verifying"]})
+
+    assert kept == (branch,)
+    assert calls == [("merge_status", {"branch": _bare(branch)})]
+    assert worktree.is_dir(), "a deploy that may still land lost its worktree"
+    assert branch_exists(repo, branch)
+
+
+@pytest.mark.parametrize("settled", ["abandoned", "conflict"])
+def test_a_retained_deploy_the_queue_settled_is_torn_down(repo, scratch, settled):
+    before = _main(repo)
+    branch, _ = _retained_deploy(repo)
+
+    kept, calls = _reclaim(repo, {_bare(branch): [settled]})
+
+    assert kept == ()
+    assert calls == [("merge_status", {"branch": _bare(branch)})]
+    _assert_untouched(repo, before, scratch)
+
+
+def test_a_retained_deploy_main_already_carries_is_torn_down_without_asking(repo, scratch):
+    branch, _ = _retained_deploy(repo)
+    git(repo, "merge", "--no-ff", "-q", "-m", f"Merge {branch} into main", branch)
+
+    kept, calls = _reclaim(repo, {_bare(branch): ["verifying"]})
+
+    assert kept == ()
+    assert calls == []
+    _assert_left_nothing_behind(repo, scratch)
+
+
+def test_a_retained_deploy_whose_poll_is_dropped_is_kept(repo, scratch):
+    """A dropped poll cannot rule out that the request lands."""
+    branch, worktree = _retained_deploy(repo)
+
+    kept, _ = _reclaim(repo, {_bare(branch): [TRANSPORT_FAULT]})
+
+    assert kept == (branch,)
+    assert worktree.is_dir()
+    assert branch_exists(repo, branch)
+
+
+def test_a_deploy_of_another_label_sharing_the_prefix_is_left_alone(repo, scratch, tmp_path):
+    other = f"task/deploy-{LABEL}-x-20261114T050000Z"
+    worktree = tmp_path / "other-label-worktree"
+    git(repo, "branch", "--no-track", other, "main")
+    git(repo, "worktree", "add", "-q", str(worktree), other)
+
+    kept, calls = _reclaim(repo, {_bare(other): ["abandoned"]})
+
+    assert kept == ()
+    assert calls == []
+    assert worktree.is_dir()
+    assert branch_exists(repo, other)
+
+
+def test_a_settled_retained_deploy_whose_worktree_vanished_loses_its_branch(repo, scratch):
+    """A reboot that cleared TMPDIR leaves git a worktree record naming a
+    directory that is gone."""
+    branch, worktree = _retained_deploy(repo)
+    shutil.rmtree(worktree.parent)
+
+    kept, _ = _reclaim(repo, {_bare(branch): ["abandoned"]})
+
+    assert kept == ()
+    assert not branch_exists(repo, branch)
+    assert str(worktree) not in git(repo, "worktree", "list", "--porcelain")
+    _assert_left_nothing_behind(repo, scratch)
+
+
+def test_a_settled_deploy_checked_out_where_no_landing_put_it_is_left_alone(
+        repo, scratch, tmp_path, capsys):
+    """An operator inspecting a deploy branch in a checkout of their own may
+    have work there, which a forced removal would discard."""
+    branch, worktree = _retained_deploy(repo)
+    git(repo, "worktree", "remove", "--force", str(worktree))
+    inspection = tmp_path / "inspection"
+    git(repo, "worktree", "add", "-q", str(inspection), branch)
+    notes = inspection / "notes.txt"
+    notes.write_text("an operator's uncommitted notes\n")
+
+    kept, _ = _reclaim(repo, {_bare(branch): ["abandoned"]})
+
+    assert kept == ()
+    assert notes.read_text() == "an operator's uncommitted notes\n"
+    assert branch_exists(repo, branch)
+    err = capsys.readouterr().err
+    assert f"leaving {inspection}" in err and branch in err, err
 
 
 class _SignalStandIn:
@@ -749,6 +1312,8 @@ def test_failure_tags_are_the_wire_vocabulary():
         "interrupted",
         "queue_done_not_on_main",
         "checkout_not_synced",
+        "checkout_dirty",
         "invalid_change",
+        "scratch_write_failed",
         "git_failed",
     }

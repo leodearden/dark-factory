@@ -1,11 +1,11 @@
-"""Validate the COMMITTED entities-omission corpus-repair artifacts (tasks 6060, 6067).
+"""Validate the COMMITTED entities-omission corpus-repair artifacts (tasks 6060, 6067, 7117).
 
 The repair amends live Mem0 records in place, so its deliverable is evidence,
 not code. This module reads only the committed files under
 ``docs/entities-omission-advice-repair/`` and never touches a live store:
 the corpus takes concurrent writes, and a store outage must not turn into a
 spurious task failure. Same stance as ``test_toolcall_xml_leak_sweep_artifacts.py``.
-Its one outside read is a read-only ``git log`` of the fix commit phase 2 cites.
+Its one outside read is a read-only ``git log`` of the fix commits phases 2 and 3 cite.
 
 ``census.json`` is the pre-mutation capture: every target, its verbatim
 pre-image, and the searches that found it. Each ``phaseN-apply.json`` is one
@@ -13,10 +13,15 @@ mutation record: each amendment's raw ``update_memory`` reply, its raw
 ``get_memory_by_id`` readback, and the census searches re-run afterwards.
 Phase 1 (task 6060) said the rejection was a defect awaiting task 6059;
 phase 2 (task 6067) replaced that correction block to say 6059 fixed it.
+Phase 3 (task 7117) has its own capture, ``phase3-census.json``, because its
+targets were written after ``census.json`` was taken: records that still
+taught omission, found by the same searches plus a literal sweep of every
+record in each project. ``phase3-apply.json`` gave each the phase-2 wording,
+updated to say task 6826 fixed the residual that 6059 left.
 
 The referent-attribution checks run the correction text through the
 PRODUCTION ``resolve_referents``, not a recorded snapshot of its output, and
-only for ``CURRENT_APPLY``: what matters is how today's scanner reads the text
+only for ``CURRENT_APPLIES``: what matters is how today's scanner reads the text
 that is in the store today. Superseded phase-1 text is no longer in the store.
 """
 
@@ -30,9 +35,12 @@ import uuid
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_resolution import resolve_referents
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_DIR = REPO_ROOT / 'docs' / 'entities-omission-advice-repair'
@@ -60,11 +68,25 @@ RECORD_DISPOSITIONS = {'teaches_omission', 'frames_defect_as_rule', NOT_TARGET}
 AUTO_MEMORY_DISPOSITIONS = {'teaches_omission', 'already_corrected'}
 
 APPLY_FILES = ('phase1-apply.json', 'phase2-apply.json')
-CURRENT_APPLY = 'phase2-apply.json'
+CURRENT_APPLIES = ('phase2-apply.json', 'phase3-apply.json')
 
 FIX_TASK_NUMBER = '6059'
 FIX_MERGE_SUBJECT = 'Merge task/6059 into main'
+RESIDUAL_FIX_TASK_NUMBER = '6826'
+RESIDUAL_FIX_MERGE_SUBJECT = 'Merge task/6826 into main'
 PHASE2_TASK_ID = '6067'
+PHASE3_TASK_ID = '7117'
+PHASE3_TASK_NAMED_TARGETS = {
+    ('dark_factory', '40ee5c37-6783-4f15-b96b-77030c867d49'),
+    ('dark_factory', '1d186423-2543-4492-bc51-ed275b075165'),
+    ('dark_factory', '2c9f2deb-0fff-4fe2-93d3-5a1dd7cfc6cc'),
+    ('dark_factory', '8e910959-b343-48e1-a48d-64f1079d3855'),
+    ('dark_factory', 'c2a7ec63-3b79-4bdd-b182-f5954c0828e1'),
+    ('dark_factory', 'a3ff92b5-b799-423f-b8ee-727587c782b4'),
+    ('dark_factory', 'dff68a97-af84-4b70-949d-ac23ff8e1242'),
+    ('dark_factory', '7eced4d1-92ff-41fc-8b7b-340abdae3867'),
+    ('reify', 'fe0ef70a-f61b-43f6-809a-4099be005183'),
+}
 LOCAL_PROJECT = 'dark_factory'
 REPLY_FAILURE_KEYS = ('error', 'error_type', '_mcp_is_error', '_raw')
 ZERO_UUID = '00000000-0000-0000-0000-000000000000'
@@ -94,8 +116,18 @@ def phase2() -> dict:
 
 
 @pytest.fixture(scope='module')
-def current() -> dict:
-    return _load(CURRENT_APPLY)
+def phase3_census() -> dict:
+    return _load('phase3-census.json')
+
+
+@pytest.fixture(scope='module')
+def phase3() -> dict:
+    return _load('phase3-apply.json')
+
+
+@pytest.fixture(scope='module', params=CURRENT_APPLIES, ids=('phase2', 'phase3'))
+def current(request) -> dict:
+    return _load(request.param)
 
 
 @pytest.fixture(scope='module', params=APPLY_FILES, ids=('phase1', 'phase2'))
@@ -104,8 +136,8 @@ def apply_artifact(request) -> dict:
 
 
 @pytest.fixture(scope='module')
-def correction_markers(phase1, phase2) -> set[str]:
-    return {phase1['correction_marker'], phase2['correction_marker']}
+def correction_markers(phase1, phase2, phase3) -> set[str]:
+    return {phase1['correction_marker'], phase2['correction_marker'], phase3['correction_marker']}
 
 
 @pytest.fixture(scope='module')
@@ -316,11 +348,8 @@ def test_every_current_correction_block_cites_only_dark_factory_tasks(current):
             )
 
 
-@pytest.mark.reads_git_history
-def test_phase2_names_its_task_and_the_measured_fix(phase2):
-    assert phase2['task'] == {'id': PHASE2_TASK_ID, 'project_id': LOCAL_PROJECT}
-    fix = phase2['fix_task']
-    assert fix['id'] == FIX_TASK_NUMBER
+def _assert_measured_merge(fix: dict, task_number: str, subject: str) -> None:
+    assert fix['id'] == task_number
     assert fix['project_id'] == LOCAL_PROJECT
     assert fix['status_at_apply'] == 'done'
     merge_commit = fix['merge_commit']
@@ -334,8 +363,14 @@ def test_phase2_names_its_task_and_the_measured_fix(phase2):
             f'fix merge commit {merge_commit} is not in the local history of {REPO_ROOT} '
             f'(shallow clone or source export without .git?): {measured.stderr.strip()}'
         )
-    sha, merged_at, subject = measured.stdout.rstrip('\n').split('\x00')
-    assert (sha, merged_at, subject) == (merge_commit, fix['merged_at'], FIX_MERGE_SUBJECT)
+    measured_fields = tuple(measured.stdout.rstrip('\n').split('\x00'))
+    assert measured_fields == (merge_commit, fix['merged_at'], subject)
+
+
+@pytest.mark.reads_git_history
+def test_phase2_names_its_task_and_the_measured_fix(phase2):
+    assert phase2['task'] == {'id': PHASE2_TASK_ID, 'project_id': LOCAL_PROJECT}
+    _assert_measured_merge(phase2['fix_task'], FIX_TASK_NUMBER, FIX_MERGE_SUBJECT)
 
 
 def test_every_phase2_correction_cites_the_fix_merge_commit_and_date(phase2):
@@ -372,4 +407,103 @@ def test_phase2_authority_probe_was_a_not_found_under_the_curator_identity(phase
     assert arguments['agent_id'] == phase2['agent_id']
     assert 'content' in arguments
     assert 'metadata_patch' in arguments
+    assert probe['reply']['error_type'] == 'MemoryNotFound', probe['reply']
+
+
+def test_phase3_census_names_its_task_and_both_fix_tasks(phase3_census):
+    assert phase3_census['task'] == {'id': PHASE3_TASK_ID, 'project_id': LOCAL_PROJECT}
+    assert phase3_census['fix_task']['id'] == FIX_TASK_NUMBER
+    assert phase3_census['residual_fix_task']['id'] == RESIDUAL_FIX_TASK_NUMBER
+    assert phase3_census['agent_id'].startswith('curator-')
+
+
+def test_phase3_census_repeated_every_census_search_in_every_project(census, phase3_census):
+    assert phase3_census['projects'] == census['projects']
+    assert phase3_census['queries'] == census['queries']
+    for project_id in census['projects']:
+        assert set(phase3_census['search_hits'][project_id]) == set(census['queries']), project_id
+        assert phase3_census['literal_sweep']['scanned'][project_id] > 0, project_id
+
+
+def test_every_phase3_record_is_well_formed_unique_and_found(phase3_census):
+    records = phase3_census['records']
+    sweep = {tuple(m) for m in phase3_census['literal_sweep']['matches']}
+    for record in records:
+        uuid.UUID(record['memory_id'])
+        assert record['disposition'] in RECORD_DISPOSITIONS
+        assert record['before_content'].strip()
+        key = _record_key(record)
+        found_by_search = record['memory_id'] in _found_ids(phase3_census['search_hits'][key[0]])
+        assert found_by_search or key in sweep, key
+    keys = [_record_key(r) for r in records]
+    assert len(keys) == len(set(keys))
+
+
+def test_phase3_targets_are_new_and_include_every_task_named_record(census, phase3_census):
+    targets = _census_targets(phase3_census)
+    assert targets >= PHASE3_TASK_NAMED_TARGETS
+    assert not targets & _census_targets(census)
+
+
+def test_phase3_amended_exactly_its_targets_from_their_census_pre_images(phase3_census, phase3):
+    keys = [_record_key(a) for a in phase3['amendments']]
+    assert len(keys) == len(set(keys))
+    assert set(keys) == _census_targets(phase3_census)
+    before = {_record_key(r): r['before_content'] for r in phase3_census['records']}
+    marker = phase3['correction_marker']
+    for amendment in phase3['amendments']:
+        key = _record_key(amendment)
+        assert _readback_content(amendment['pre_read'], key[1]) == before[key], key
+        body = _observation_body(amendment['amended_content'], marker)
+        kept = difflib.SequenceMatcher(None, before[key], body, autojunk=False).ratio()
+        assert kept >= OBSERVATION_KEPT_MIN_RATIO, (key, kept)
+
+
+@pytest.mark.reads_git_history
+def test_phase3_names_its_task_and_both_measured_fixes(phase3):
+    assert phase3['task'] == {'id': PHASE3_TASK_ID, 'project_id': LOCAL_PROJECT}
+    _assert_measured_merge(phase3['fix_task'], FIX_TASK_NUMBER, FIX_MERGE_SUBJECT)
+    _assert_measured_merge(
+        phase3['residual_fix_task'], RESIDUAL_FIX_TASK_NUMBER, RESIDUAL_FIX_MERGE_SUBJECT,
+    )
+
+
+def test_every_phase3_correction_cites_both_merge_commits_and_dates(phase3):
+    marker = phase3['correction_marker']
+    for amendment in phase3['amendments']:
+        block = _correction_block(amendment['amended_content'], marker)
+        for fix in (phase3['fix_task'], phase3['residual_fix_task']):
+            assert fix['merge_commit'][:10] in block, amendment['memory_id']
+            assert fix['merged_at'][:10] in block, amendment['memory_id']
+
+
+def test_phase3_rerun_keeps_targets_findable_and_new_hits_unmarked(
+    phase3_census, phase3, correction_markers,
+):
+    rerun = phase3['search_hits_after']
+    assert set(rerun) == set(phase3_census['projects'])
+    targets = _census_targets(phase3_census)
+    for project_id, memory_id in targets:
+        if memory_id in _found_ids(phase3_census['search_hits'][project_id]):
+            assert memory_id in _found_ids(rerun[project_id]), memory_id
+    target_ids = {memory_id for _, memory_id in targets}
+    for project_id in phase3_census['projects']:
+        for query in phase3_census['queries']:
+            before = phase3_census['search_hits'][project_id][query]
+            for memory_id in set(rerun[project_id][query]) - set(before) - target_ids:
+                content = _readback_content(phase3['new_hit_readbacks'][memory_id], memory_id)
+                for marker in correction_markers:
+                    assert marker not in content, (memory_id, marker)
+
+
+def test_phase3_literal_sweep_after_left_no_unreviewed_omission_advice(phase3_census, phase3):
+    after = phase3['literal_sweep_after']
+    assert after['patterns'] == phase3_census['literal_sweep']['patterns']
+    assert after['unreviewed_uncorrected'] == []
+
+
+def test_phase3_authority_probe_was_a_not_found_under_the_curator_identity(phase3):
+    probe = phase3['authority_probe']
+    assert probe['arguments']['memory_id'] == ZERO_UUID
+    assert probe['arguments']['agent_id'] == phase3['agent_id']
     assert probe['reply']['error_type'] == 'MemoryNotFound', probe['reply']

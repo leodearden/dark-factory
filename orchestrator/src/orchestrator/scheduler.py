@@ -1,4 +1,4 @@
-"""Task selection and module lock management."""
+"""Task selection and dispatch; the module lock table it drives lives in ``orchestrator/src/orchestrator/lock_table.py``."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import random
 import re
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -20,7 +20,6 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
-    NamedTuple,
     Protocol,
     TypeVar,
     overload,
@@ -30,12 +29,18 @@ from typing import (
 from shared import safe_io
 from shared.capability_manifest import CHECK_SUBJECT_FIELD
 from shared.cli_invoke import is_server_error_status
+from shared.declared_checks import declared_checks
 from shared.locking import (
     files_to_modules,
-    modules_conflict,
     normalize_lock,
 )
-from shared.mcp_envelope import parse_tool_result, resolver_failed
+from shared.mcp_envelope import (
+    EnvelopeShape,
+    parse_tool_result,
+    resolver_failed,
+    tool_error_text,
+    tool_text_blocks,
+)
 from shared.mcp_idempotency import maybe_inject_client_op_id
 from shared.project_layout import scheduler_state_json
 from shared.psi import PsiSample, read_psi_sample
@@ -47,17 +52,27 @@ from shared.scheduler_state import (
     SchedulerStateSnapshot,
 )
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
+from shared.task_metadata import Milestone
 from shared.task_metadata_wire import coerce_task_metadata
+from shared.task_read import (
+    TaskAbsent,
+    TaskFound,
+    TaskRead,
+    TaskReadFailed,
+    parse_get_task_result,
+)
 from shared.task_statuses import TaskStatus
 from shared.task_submit import SubmitFailed, SubmitOutcome, parse_submit_task_result
 
 from orchestrator import git_ops
+from orchestrator.age_anchors import AgeAnchor, AgeAnchors
 from orchestrator.already_landed_tick_view import (
     AlreadyLandedGate,
     AlreadyLandedTickView,
     PendingEscalationsByTask,
 )
 from orchestrator.anchor_coverage_gate import AnchorCoverageGate
+from orchestrator.blocker_liveness import LockWorld
 from orchestrator.config import (
     DEFAULT_TIER,
     PRIORITY_RANK,
@@ -71,12 +86,19 @@ from orchestrator.config import (
 from orchestrator.delivered_check_owner import derive_check_owner
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.dependency_verdict import DepKind, DepState, deps_verdict, task_external_deps
+from orchestrator.deploy_state import awaits_scheduled_restart
 from orchestrator.eligibility_clock import EligibilityClock, EligibilityClockStore
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
-from orchestrator.guard_state import PersistentMap, guard_path
 from orchestrator.hold_history import HoldHistory
-from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool_error_text
+from orchestrator.id_tie_break import id_tie_break
+from orchestrator.lock_table import (
+    ModuleLockTable,
+    UncontestedAcquisition,
+    one_holder_per_key,
+)
+from orchestrator.main_health_fix_owner import is_main_health_fix
+from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
@@ -84,16 +106,13 @@ from orchestrator.pause_policy import PauseClass, PausePolicy, policy_for
 from orchestrator.pending_age import AnchorReading, read_pending_age
 from orchestrator.pin_reservation import (
     Blocker,
-    BlockerKind,
     ParkPriority,
     PinBlockedLimiter,
     PinOrder,
     ReservationSource,
-    is_pin_rank,
     park_rank,
     pin_release_reason,
     priority_payload,
-    rank_payload,
 )
 from orchestrator.recovery_emission import (
     LeaveReason,
@@ -109,23 +128,27 @@ from orchestrator.recovery_emission import (
     veto_signature,
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
-from orchestrator.sentinel_l1 import file_sentinel_l1
+from orchestrator.run_slots import DispatchScope
+from orchestrator.scheduler_priority_lookup import LookupPins, last_written_tiers
+from orchestrator.sentinel_l1 import file_sentinel_l1, resolve_sentinel_l1
+from orchestrator.starvation_cap import CapReport, cap_report, sync_cap_l1
+from orchestrator.starvation_state import WatchdogState
 from orchestrator.starvation_watchdog import (
     AUTO_PIN_CAP_SENTINEL,
     STARVATION_WATCHDOG_ROLE,
     CandidateFacts,
     Finding,
-    LockRefusals,
     ParkBlock,
     PinOutcome,
     StarvationDisposition,
-    cap_escalation,
     classify,
     escalation_text,
 )
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.strict_event_reads import task_ids_with_event
+from orchestrator.task_priority import TaskPriority
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
+from orchestrator.time_sources import resolve_monotonic_time_source, resolve_wall_time_source
 from orchestrator.work_product import (
     BranchWork,
     WorkProductProbe,
@@ -133,18 +156,12 @@ from orchestrator.work_product import (
     read_branch_work,
 )
 
-# How long a task's age-anchor record outlives the last write that recorded
-# it (task 5352).  Every age-guard write re-records every anchor in the active
-# fetch, so only a departed task's record expires, or a live one through a
-# whole TTL with no write; a restart then re-anchors that task to its own id.
-# The longest of the four guard TTLs because its subject is the longest-lived.
-_RESURRECTION_GUARD_TTL = timedelta(days=30)
-
 if TYPE_CHECKING:
     # Task 2408 mechanism 2: the scheduler only ever calls read-only methods
     # (get_by_task) on an injected EscalationQueue instance (harness.py wires
     # the real one at startup) — no runtime import needed, avoiding a
     # scheduler<->escalation module-load coupling.
+    from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
 # Geometric emission schedule for per-task diagnostics that can repeat every
@@ -244,7 +261,6 @@ __all__ = [
     'McpSessionLike',
     'RequeueRecord',
     'TaskAssignment',
-    'ModuleLockTable',
     'Scheduler',
     'SetTaskStatusRejected',
     'TerminalExitRejection',
@@ -456,41 +472,69 @@ TRANSIENT_ERROR_TYPES = (
 )
 
 
+def _decoded_payload(result: dict) -> Any:
+    """The tool's payload: a dict ``structuredContent``, else the JSON of the first text block."""
+    structured = result.get('structuredContent')
+    if isinstance(structured, dict):
+        return structured
+    texts = tool_text_blocks(result)
+    if not texts:
+        return None
+    try:
+        return json.loads(texts[0])
+    except (ValueError, TypeError):
+        return None
+
+
+def _json_rpc_error_payload(error: Mapping) -> dict:
+    """The rejection payload standing for a JSON-RPC body's ``error`` object."""
+    return {
+        'error': EnvelopeShape.JSON_RPC_ERROR.value,
+        'hint': f"{error.get('code')}: {error.get('message')}",
+    }
+
+
+def _rejection_payload(response: Any) -> dict | None:
+    """The rejection payload of a fused-memory tool reply, or None when the write landed.
+
+    *response* is the whole JSON-RPC body or its CallToolResult, never a bare
+    tool payload.
+    """
+    if not isinstance(response, dict):
+        return None
+    if isinstance(response.get('error'), Mapping):
+        return _json_rpc_error_payload(response['error'])
+    result = response.get('result', response)
+    if not isinstance(result, dict):
+        return None
+    payload = _decoded_payload(result)
+    if isinstance(payload, dict) and (payload.get('error') or payload.get('success') is False):
+        return payload
+    error_text = tool_error_text(result)
+    if error_text is not None:
+        return {'error': EnvelopeShape.IS_ERROR.value, 'hint': error_text}
+    return None
+
+
 def extract_rejection(response: Any) -> str | None:
     """Return a one-line description of a fused-memory rejection, or None on success.
 
     fused-memory's set_task_status returns structured error dicts (terminal-exit
-    gate, phantom-done gate, done_provenance validation) without raising. The
-    payload arrives wrapped in MCP envelope:
-    ``{result: {structuredContent: {...}, content: [{type: text, text: <json>}], isError: bool}}``.
-
-    A rejection has either ``error`` (truthy) or ``success: False`` in the payload.
+    gate, phantom-done gate, done_provenance validation) without raising, as the
+    reply's ``structuredContent`` or JSON text block. A rejection has either
+    ``error`` (truthy) or ``success: False`` in that payload. An ``isError`` reply
+    is a rejection even when its text is not JSON, rendered ``IS_ERROR — <prose>``,
+    and so is a JSON-RPC error body, rendered ``JSON_RPC_ERROR — <code>: <message>``.
     A no-op (same-status) returns ``success: True, no_op: True`` and is treated
     as success.
     """
-    if not isinstance(response, dict):
-        return None
-    result = response.get('result', response)
-    if not isinstance(result, dict):
-        return None
-    payload = result.get('structuredContent')
-    if not isinstance(payload, dict):
-        # Fall back to parsing the text content block.
-        for block in result.get('content', []) or []:
-            if isinstance(block, dict) and block.get('type') == 'text':
-                try:
-                    payload = json.loads(block.get('text') or '')
-                except (ValueError, TypeError):
-                    payload = None
-                break
-    if not isinstance(payload, dict):
+    payload = _rejection_payload(response)
+    if payload is None:
         return None
     if payload.get('error'):
         hint = payload.get('hint') or payload.get('error_type') or ''
         return f'{payload["error"]}{" — " + hint if hint else ""}'
-    if payload.get('success') is False:
-        return f'success=False payload={payload!r}'
-    return None
+    return f'success=False payload={payload!r}'
 
 
 def extract_structured_rejection(response: Any) -> dict | None:
@@ -500,29 +544,11 @@ def extract_structured_rejection(response: Any) -> dict | None:
     callers can inspect typed fields (``error``, ``from_status``, …) without
     re-parsing the rendered string. Used by ``set_task_status`` to classify
     ``terminal_exit_rejected`` responses as logical contradictions worthy of
-    raising ``TerminalExitRejection``.
+    raising ``TerminalExitRejection``. An ``isError`` reply whose text carries
+    no structured error yields ``{'error': 'IS_ERROR', 'hint': <its prose>}``,
+    and a JSON-RPC error body ``{'error': 'JSON_RPC_ERROR', 'hint': <code: message>}``.
     """
-    if not isinstance(response, dict):
-        return None
-    result = response.get('result', response)
-    if not isinstance(result, dict):
-        return None
-    payload = result.get('structuredContent')
-    if not isinstance(payload, dict):
-        for block in result.get('content', []) or []:
-            if isinstance(block, dict) and block.get('type') == 'text':
-                try:
-                    payload = json.loads(block.get('text') or '')
-                except (ValueError, TypeError):
-                    payload = None
-                break
-    if not isinstance(payload, dict):
-        return None
-    if payload.get('error'):
-        return payload
-    if payload.get('success') is False:
-        return payload
-    return None
+    return _rejection_payload(response)
 
 
 def is_transient_rejection(rejection: str | None) -> bool:
@@ -908,6 +934,17 @@ def _delivered_checks_descriptor_digest(checks: list | None) -> str:
     ).hexdigest()
 
 
+def _terminal_record_is_immutable(record: dict) -> bool:
+    """Whether a fetched TERMINAL dep record can be served from the cross-tick cache.
+
+    A record carrying ``metadata.delivered_checks`` may have its descriptor
+    corrected in place, and a scheduled self-deploy's ``deploy_state.phase``
+    advances after it goes done; both must be re-fetched.
+    """
+    metadata = record.get('metadata') or {}
+    return declared_checks(metadata).is_empty and not awaits_scheduled_restart(metadata)
+
+
 class McpSessionLike(Protocol):
     """Structural interface for MCP session objects.
 
@@ -982,6 +1019,9 @@ class SchedulerFacade(Protocol):
         *,
         persist_files: list[str] | None = ...,
     ) -> BlastRadiusResult: ...
+    async def acquire_uncontested(
+        self, task_id: str, modules: list[str], /, *, reason: str,
+    ) -> UncontestedAcquisition: ...
     async def get_status(self, task_id: str, /) -> str | None: ...
     async def get_task(self, task_id: str, /) -> dict | None: ...
     async def update_task(
@@ -1060,7 +1100,7 @@ class TickContext:
 
     Built once per tick (after the pre-ctx preamble in ``acquire_next`` —
     guards, ``get_tasks``, empty-tasks drain, status/id index build, and
-    ``_update_age_anchors``) and passed to each ``_phase_*`` method in
+    ``AgeAnchors.observe``) and passed to each ``_phase_*`` method in
     ``Scheduler._TICK_PHASE_ORDER`` order. Fields are the six task-named
     fields (``tasks``, ``status_map``, ``tasks_by_id``, ``external_cache``,
     ``overrides``, ``candidates``) plus every other piece of per-tick state a
@@ -1080,12 +1120,15 @@ class TickContext:
     a just-completed dep carrying ``metadata.delivered_checks`` would
     otherwise be invisible to the delivered-check gate. Populated by
     ``_phase_backfill_terminal_dep_records`` (via the lean per-id
-    ``get_task`` primitive) and consulted ONLY by the two delivered-check
-    consumers (``_deps_satisfied``, ``_compute_delivered_check_cache``) as
-    a purely additive fallback when ``tasks_by_id.get(dep_id)`` is
-    ``None`` — NEVER merged into ``tasks_by_id`` itself, since ~20 other
-    phases (``_phase_stale_sweep``, ``_phase_park_gc``, ...) assume
-    ``tasks_by_id`` holds only active tasks.
+    ``get_task`` primitive) and consulted ONLY by the delivered-check and
+    scheduled-deploy arms of ``dependency_verdict.py::deps_verdict`` and by
+    ``_compute_delivered_check_cache``, as a purely additive fallback when
+    ``tasks_by_id.get(dep_id)`` is ``None`` — NEVER merged into
+    ``tasks_by_id`` itself, since ~20 other phases (``_phase_stale_sweep``,
+    ``_phase_park_gc``, ...) assume ``tasks_by_id`` holds only active tasks.
+    ``deferred_terminal_deps`` names the deps that phase's fetch budget
+    deferred before their record was ever cached, so the scheduled-deploy
+    arm waits on them rather than failing open.
     """
 
     tasks: list[dict]
@@ -1096,6 +1139,7 @@ class TickContext:
     external_resolver_failed: bool = False
     delivered_check_cache: dict[str, bool] | None = field(default_factory=dict)
     terminal_dep_records: dict[str, dict] = field(default_factory=dict)
+    deferred_terminal_deps: frozenset[str] = frozenset()
     overrides: dict[str, OverrideRow] = field(default_factory=dict)
     overrides_for_diff: dict[str, OverrideRow] = field(default_factory=dict)
     effective_priorities: dict[str, str] = field(default_factory=dict)
@@ -1106,6 +1150,7 @@ class TickContext:
     stale_ids: set[str] = field(default_factory=set)
     psi_hold: PsiHold | None = None
     dispatch_deferred_emitted: bool = False
+    scope: DispatchScope = DispatchScope.ANY
 
 
 # Sentinel a `_phase_*` method returns to mean "proceed to the next phase in
@@ -1192,1051 +1237,6 @@ class _BackfillScanCache:
 
     parks: dict[str, dict] | None = None
     delays: dict[str, float] = field(default_factory=dict)
-
-
-def _tie_break(task_id: str) -> tuple[float, str]:
-    """THE id tie-break (PRD I-4): older numeric ids first, then non-numeric ids in string order.
-
-    Both dispatch order (``Scheduler._score_candidates``) and park order
-    (:class:`_ParkKey`) end in it, so the two cannot diverge.
-    """
-    return (float(int(task_id)) if task_id.isdecimal() else math.inf, task_id)
-
-
-class _ParkKey(NamedTuple):
-    """THE park order (task 7799): the smaller key outranks; see ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md`` §7, Amendment (task 7799)."""
-
-    rank: int
-    id_rank: float
-    owner: str
-
-    @classmethod
-    def of(cls, owner: str, rank: int) -> _ParkKey:
-        return cls(rank, *_tie_break(owner))
-
-
-def _as_stamp(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None
-
-
-def _pending_since(task: dict) -> str | None:
-    """The task's D3 ``metadata.pending_since`` stamp; None when absent or
-    malformed, never raising, because every tick reads it."""
-    metadata = task.get('metadata')
-    return _as_stamp(metadata.get('pending_since')) if isinstance(metadata, dict) else None
-
-
-@dataclass(frozen=True)
-class _AgeAnchor:
-    """A task's age anchor and the ``pending_since`` stamp it was taken at.
-
-    A later stamp that differs is D3's cancelled -> pending, which resets the
-    anchor (``Scheduler._update_age_anchors``).
-    """
-
-    anchor: int
-    pending_since: str | None
-
-    def is_reset_by(self, stamp: str | None) -> bool:
-        """Whether *stamp* differs from a known stamp.  A first stamp, where
-        none was known, is not a reset, and neither is a missing one."""
-        return bool(self.pending_since and stamp and stamp != self.pending_since)
-
-    def to_record(self) -> dict:
-        return {'anchor': self.anchor, 'pending_since': self.pending_since}
-
-    @classmethod
-    def from_record(cls, raw: object) -> _AgeAnchor | None:
-        """Parse a guard-file record; a malformed one reads as absent, keeping
-        guard_state's fail-open contract."""
-        if not isinstance(raw, dict):
-            return None
-        anchor = raw.get('anchor')
-        if not isinstance(anchor, int) or isinstance(anchor, bool):
-            return None
-        return cls(anchor, _as_stamp(raw.get('pending_since')))
-
-
-def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
-    """Return *ts* if provided, else the stdlib ``time.monotonic`` callable.
-
-    Centralises the ``None``-fallback logic so ``ModuleLockTable`` and
-    ``Scheduler`` don't each inline a redundant lambda.
-    """
-    return ts if ts is not None else (lambda: time.monotonic())
-
-
-def _resolve_wall_time_source(
-    ts: Callable[[], datetime] | None,
-) -> Callable[[], datetime]:
-    """Return *ts* if provided, else a real wall-clock ``datetime.now(UTC)``.
-
-    Distinct from :func:`_resolve_time_source` (``time.monotonic``, which
-    resets across process restarts): milestone anchors (task 2335 β) are
-    persisted wall-clock timestamps that must survive a restart, so callers
-    that need restart-safe, human-meaningful timestamps inject/resolve a
-    wall clock here instead.
-    """
-    return ts if ts is not None else (lambda: datetime.now(UTC))  # clock-exempt: single-capture writer
-
-
-class ModuleLockTable:
-    """Hierarchical module locking — two modules conflict if one is a prefix
-    of the other (parent/child), but siblings are independent.
-
-    Examples (all conflict):
-        autopilot/analyze  <->  autopilot/analyze/asr   (parent <-> child)
-        src/server         <->  src/server               (exact match)
-
-    Examples (no conflict):
-        autopilot/analyze/asr  <->  autopilot/analyze/speech  (siblings)
-    """
-
-    def __init__(
-        self,
-        config: OrchestratorConfig,
-        *,
-        time_source: Callable[[], float] | None = None,
-        wall_time_source: Callable[[], datetime] | None = None,
-    ):
-        self._limits: dict[str, int] = {}
-        self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
-        # normalized_module -> LIFO stack of (owner_task_id, priority_rank).
-        # Top = last element = the ACTIVE reservation.  Preemption by an entry
-        # with a smaller _ParkKey PUSHES (shadows) the top entry instead of
-        # destroying it.  Restoration happens when the top entry is removed.
-        # INV-3: every stack is strictly ordered by _ParkKey, smallest key on
-        # top (task 7799), so its depth is bounded by one entry per owner per
-        # band (tier, pin, task 6040).  An owner's pin entry sits above its
-        # own tier entry.
-        self._parked: dict[str, list[tuple[str, int]]] = {}
-        # task_id -> ISO8601 timestamp of first install_parks call for that owner
-        self._park_install_at: dict[str, str] = {}
-        self._config = config
-        self._time_source: Callable[[], float] = _resolve_time_source(time_source)
-        # WALL clock for park install stamps (task 3823 / PRD task η).  Distinct
-        # from _time_source (monotonic, no epoch relation): _park_install_at
-        # holds ISO-8601 strings that must be comparable with the Scheduler's
-        # own _wall_now() when park_age_secs() computes an age, and with the
-        # timestamps in the event log.  Resolved through the shared helper so
-        # there is exactly one None-fallback rule for wall clocks.
-        self._wall_time_source: Callable[[], datetime] = _resolve_wall_time_source(
-            wall_time_source
-        )
-
-    # --- Hierarchy helpers ---
-
-    @staticmethod
-    def _conflicts(a: str, b: str) -> bool:
-        """Two modules conflict if one is a prefix of the other (or exact match).
-
-        Thin delegate to ``shared.locking.modules_conflict`` so the prefix rule
-        has a single definition shared with the dashboard's holder lookup.
-        """
-        return modules_conflict(a, b)
-
-    def _conflicting_holders(
-        self, module: str, exclude_task: str | None = None
-    ) -> set[str]:
-        """The *other* tasks holding a lock that conflicts with ``module``."""
-        return {
-            task_id
-            for task_id, task_modules in self._held.items()
-            if task_id != exclude_task
-            and any(self._conflicts(held, module) for held in task_modules)
-        }
-
-    def _count_conflicts(self, module: str, exclude_task: str | None = None) -> int:
-        """Count how many *other* tasks hold a lock that conflicts with ``module``."""
-        return len(self._conflicting_holders(module, exclude_task=exclude_task))
-
-    # --- Park (reservation) helpers ---
-
-    def _precedence_blocking_parks(
-        self,
-        module: str,
-        task_id: str,
-        *,
-        ignore_owners: frozenset[str],
-    ) -> list[tuple[str, str]]:
-        """``(owner, parked_key)`` for every foreign active top *task_id* cannot pass on *module*.
-
-        A buried (shadowed) reservation is never consulted — only the active
-        top of each stack (INV-2).  Order is ``_parked`` iteration order.
-
-        INV-8, park precedence (task 7799): a foreign conflicting top blocks a
-        requester that owns parks only when that entry's :class:`_ParkKey`
-        precedes the requester's best key (:meth:`_best_park_key`, over every
-        entry it holds, at any level and on any key).  A requester that owns
-        no park is blocked by every conflicting foreign top.  So every park
-        wait points at an owner whose best key is strictly smaller than the
-        waiter's, and the wait-for graph between park owners is acyclic in
-        every reachable state; the owner with the smallest key waits only on
-        live holders.  Rationale: ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md``
-        §7, Amendment (task 7799).
-
-        *ignore_owners* (task 3823 / PRD C7) names park owners whose parks are
-        treated as absent for this request — the EASY-backfill admission
-        bypass.  It is scoped to the park rule alone and has no bearing on the
-        held-lock limit gate.
-        """
-        own = self._best_park_key(task_id)
-        blocking: list[tuple[str, str]] = []
-        for parked_module, stack in self._parked.items():
-            if not stack:
-                continue
-            owner, rank = stack[-1]  # active TOP only (INV-2)
-            if owner == task_id or owner in ignore_owners:
-                continue
-            if not self._conflicts(parked_module, module):
-                continue
-            if own is not None and own < _ParkKey.of(owner, rank):
-                continue
-            blocking.append((owner, parked_module))
-        return blocking
-
-    def _iter_blocking_park_owners(
-        self,
-        module: str,
-        task_id: str,
-        *,
-        ignore_owners: frozenset[str] = frozenset(),
-    ) -> Iterator[str]:
-        """EVERY owner of an ACTIVE park that blocks *task_id* on *module*.
-
-        THE single precedence-aware park-blocking rule (INV-8, over
-        :meth:`_precedence_blocking_parks`).  ``_blocking_park_owner`` is the
-        first-match view over it, ``_is_parked_blocks`` the bool view, and
-        ``park_owners_blocking`` the naming view — one rule, three views
-        (INV-5).  Forking the precedence logic is what would let admission believe it
-        can borrow through a park that ``try_acquire`` then refuses: churn with
-        no dispatch.
-
-        More than one owner can block a single requested module — two owners
-        parked on different children of the same requested parent both
-        conflict with it — and admission needs ALL of them, because
-        ``try_acquire`` re-checks every park and admits only the owners it was
-        handed.
-
-        Capacity (task 7313): a park takes one of its key's slots instead of
-        reserving the key exclusively.  A park on key K that
-        :meth:`_precedence_blocking_parks` names blocks when either term fires:
-
-        (a) the hold term — a park counts as its owner's hold, so the request
-            is refused once *module* is at ``_limit_for(module)`` counting the
-            foreign holders and the blocking park owners, each task once;
-        (b) the owner's-slot term — a park keeps one slot of its own key, so
-            the request is refused when granting it would fill K for the owner
-            (:meth:`_park_owner_slot_taken`).
-
-        A limit of 1 on *module* makes the hold term always fire, and a limit
-        of 1 on K makes the owner's-slot term fire for every requester not
-        already counted on K, so a limit-1 park admits no new occupant,
-        hierarchical cases included.  The hold term counts park owners first
-        and scans holders only when the owners alone leave *module* room, so a
-        limit-1 request pays no extra scan.  The rule is
-        monotone in *ignore_owners*: ignoring an owner only removes hold-term
-        occupants, and the owner's-slot term reads holders only, never
-        *ignore_owners* — so once admission's named owners are ignored, no
-        remaining park starts blocking.
-
-        The hold term needs the full count, so nothing is yielded before every
-        park has been scanned; a generator keeps every view's call shape.
-        """
-        parks = self._precedence_blocking_parks(module, task_id, ignore_owners=ignore_owners)
-        if not parks:
-            return
-        park_owners = {owner for owner, _key in parks}
-        limit = self._limit_for(module)
-        if len(park_owners) >= limit or len(
-            park_owners | self._conflicting_holders(module, exclude_task=task_id)
-        ) >= limit:
-            yield from (owner for owner, _key in parks)
-            return
-        for owner, key in parks:
-            if self._park_owner_slot_taken(owner, key, task_id):
-                yield owner
-
-    def _park_owner_slot_taken(self, owner: str, key: str, requester: str) -> bool:
-        """Would granting *requester* a key conflicting with *key* take *owner*'s slot on it?
-
-        True when the grant is what leaves the park owner's own later
-        acquisition of *key* no room under the held gate: *requester* does not
-        already hold a key conflicting with *key*, and the holders conflicting
-        with *key* plus *owner* itself already reach ``_limit_for(key)``.  A
-        requester already counted on *key* — say, expanding to a sibling under
-        a parked parent — leaves the owner's room unchanged.
-        """
-        holders = self._conflicting_holders(key)
-        if requester in holders:
-            return False
-        return len(holders | {owner}) >= self._limit_for(key)
-
-    def _blocking_park_owner(
-        self,
-        module: str,
-        task_id: str,
-        *,
-        ignore_owners: frozenset[str] = frozenset(),
-    ) -> str | None:
-        """The FIRST active park owner blocking *task_id* on *module*, or None.
-
-        The first-match view of :meth:`_iter_blocking_park_owners`.  Enough for
-        the gate (``_is_parked_blocks`` only needs to know THAT something
-        blocks).  Callers that must reason about every blocking owner —
-        admission — drain the generator instead.
-        """
-        return next(
-            self._iter_blocking_park_owners(
-                module, task_id, ignore_owners=ignore_owners
-            ),
-            None,
-        )
-
-    def park_owners_blocking(self, task_id: str, modules: list[str]) -> list[str]:
-        """Distinct active-top park owners that would make ``try_acquire`` refuse.
-
-        Sorted for determinism.  Normalizes *modules* exactly as
-        ``try_acquire`` does, so the answer is about the same keys the gate
-        will actually test.
-
-        This is C7's ``c.modules ∩ M ≠ ∅`` clause: the hierarchical
-        ``_conflicts`` rule already IS the intersection test, so an empty list
-        means there is nothing to backfill through and admission must refuse.
-
-        UNIONS every blocking owner per module, not the first one found: two
-        owners parked on different children of one requested parent both
-        conflict with it, and a set missing the second would be handed to
-        ``try_acquire`` as ``admitted_parks`` — which re-checks every park and
-        would refuse on the owner nobody named.  That failure mode is silent
-        (admission pays for the full prediction pipeline every tick and the
-        acquire always fails), so it has to be excluded here rather than
-        detected downstream.
-
-        A READ — it mutates nothing and evicts nothing.
-        """
-        depth = self._config.lock_depth
-        normalized = {normalize_lock(m, depth) for m in modules}
-        owners: set[str] = set()
-        for module in normalized:
-            owners.update(self._iter_blocking_park_owners(module, task_id))
-        return sorted(owners)
-
-    def blocking_holders(
-        self, modules: list[str], *, exclude_task: str
-    ) -> dict[str, list[str]]:
-        """``{requested_module: [foreign holders]}`` for modules at/over their limit.
-
-        Only modules that are ACTUALLY blocked appear; everything free is
-        omitted, so an empty mapping means the requester could take all of
-        *modules* right now.  Keys are the requested modules in normalized
-        form (not the holders' own keys), because the caller asked about those.
-
-        Honours ``_limit_for`` rather than mere presence: a module with
-        headroom (``max_per_module`` > current holders) is free to take, so it
-        contributes no wait.  Built from the existing ``_conflicting_holders``
-        / ``_limit_for`` pair — no third conflict rule.
-        """
-        depth = self._config.lock_depth
-        result: dict[str, list[str]] = {}
-        for module in {normalize_lock(m, depth) for m in modules}:
-            holders = self._conflicting_holders(module, exclude_task=exclude_task)
-            if holders and len(holders) >= self._limit_for(module):
-                result[module] = sorted(holders)
-        return result
-
-    def blockers(self, task_id: str, modules: list[str]) -> list[Blocker]:
-        """Every holder and active park that would make ``try_acquire`` refuse.
-
-        Composed from :meth:`blocking_holders` and
-        :meth:`_iter_blocking_park_owners` over the same normalized keys the
-        gate tests, so it names exactly what the gate honours (INV-5): never
-        a buried park, never the requester's own.  Sorted and de-duplicated;
-        empty means the acquire would succeed.  A READ.
-        """
-        depth = self._config.lock_depth
-        found: set[Blocker] = {
-            Blocker(module, holder, BlockerKind.HELD)
-            for module, holders in self.blocking_holders(
-                modules, exclude_task=task_id
-            ).items()
-            for holder in holders
-        }
-        for module in {normalize_lock(m, depth) for m in modules}:
-            found.update(
-                Blocker(module, owner, BlockerKind.PARKED)
-                for owner in self._iter_blocking_park_owners(module, task_id)
-            )
-        return sorted(found)
-
-    def _is_parked_blocks(
-        self,
-        module: str,
-        task_id: str,
-        *,
-        ignore_owners: frozenset[str] = frozenset(),
-    ) -> bool:
-        """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*,
-        is owned by a different task that task_id does not precede (INV-2,
-        INV-8), and fires the two-term capacity rule of
-        :meth:`_iter_blocking_park_owners` (task 7313).
-
-        The bool view of :meth:`_blocking_park_owner`, which carries the
-        precedence logic.  Kept as a delegate rather than inlined so ``try_acquire`` /
-        ``try_acquire_additional`` and every existing test keep their call
-        shape, and so the naming view (``park_owners_blocking``) and this
-        gating view can never disagree (INV-5).
-        """
-        return self._blocking_park_owner(
-            module, task_id, ignore_owners=ignore_owners
-        ) is not None
-
-    def _owned_ranks(self, task_id: str) -> dict[str, int]:
-        """``{key: rank}`` for every stack holding *task_id* at ANY level, top or buried.
-
-        THE single definition of "the owner already parks this key": the
-        install idempotency skip, the completion remainder, ``has_parks`` and
-        :meth:`_best_park_key` all read it, so they cannot disagree about a
-        buried entry.  The rank is the owner's best (lowest) one on that key.
-        """
-        owned: dict[str, int] = {}
-        for module, stack in self._parked.items():
-            ranks = [rank for owner, rank in stack if owner == task_id]
-            if ranks:
-                owned[module] = min(ranks)
-        return owned
-
-    def _best_park_key(self, task_id: str) -> _ParkKey | None:
-        """*task_id*'s smallest :class:`_ParkKey` over every entry it holds, at any level; None without parks."""
-        owned = self._owned_ranks(task_id)
-        return _ParkKey.of(task_id, min(owned.values())) if owned else None
-
-    @staticmethod
-    def _covers(held_rank: int | None, rank: int | None) -> bool:
-        """True iff an owner entry at *held_rank* already covers a request at *rank*.
-
-        *held_rank* None means the owner has no entry on the key.  *rank* None
-        means "at any rank".  An entry covers a request at its own rank or any
-        weaker one; it never covers a stronger one, which is a re-rank.
-        """
-        return held_rank is not None and (rank is None or held_rank <= rank)
-
-    def has_parks(self, task_id: str) -> bool:
-        """Return True if *task_id* owns any reservation at ANY stack level (INV-5).
-
-        A pure query over :meth:`_owned_ranks`, so an owner buried beneath a
-        higher-priority shadow still counts as parked.
-        """
-        return bool(self._owned_ranks(task_id))
-
-    def reservation_source(
-        self, owner: str, modules: Iterable[str] | None = None
-    ) -> ReservationSource:
-        """Why *owner*'s parks exist, derived from their ranks (task 6040).
-
-        PIN if any of the owner's entries, top or buried, sits in the pin band;
-        otherwise FAIRNESS.  *modules* (normalized keys) narrows the question
-        to the owner's best entry on each of those keys — a restore exposes
-        one specific entry, and an owner holding a pin reservation elsewhere
-        can have a fairness entry exposed here.  An owner with no matching
-        parks reads FAIRNESS, so callers that ask after a removal get the
-        automatic default rather than an error.
-        """
-        owned = self._owned_ranks(owner)
-        keys = owned.keys() if modules is None else owned.keys() & set(modules)
-        if any(is_pin_rank(owned[key]) for key in keys):
-            return ReservationSource.PIN
-        return ReservationSource.FAIRNESS
-
-    def unparked_modules(
-        self,
-        task_id: str,
-        modules: list[str],
-        priority: ParkPriority | None = None,
-    ) -> list[str]:
-        """The completion rule's remainder (task 5308): keys *task_id* has not parked.
-
-        Normalizes *modules* exactly as :meth:`install_parks` does, drops empty
-        keys, de-duplicates, and subtracts every key the owner already parks
-        at ANY stack level.  Sorted.
-
-        For a tier *priority*, or none, an entry at ANY rank counts as owned —
-        a buried entry and a pin entry included — because fairness completion
-        fills coverage gaps and never re-ranks.  For a :class:`PinOrder`, a
-        key counts as owned only at that pin rank or better (task 6040): the
-        owner's own fairness entry does not cover its pin reservation, which
-        :meth:`install_parks` then stacks above it.
-        """
-        depth = self._config.lock_depth
-        owned = self._owned_ranks(task_id)
-        floor = park_rank(priority) if isinstance(priority, PinOrder) else None
-        requested = {normalize_lock(m, depth) for m in modules}
-        return sorted(
-            m for m in requested if m and not self._covers(owned.get(m), floor)
-        )
-
-    def install_parks(
-        self, task_id: str, modules: list[str], priority: ParkPriority
-    ) -> tuple[list[str], list[tuple[str, list[str]]]]:
-        """Install reservations on the normalized form of *modules* for *task_id*.
-
-        Returns ``(installed, shadowed)`` where *installed* is the list of
-        normalized modules NEWLY parked, or re-ranked upward, as the active
-        top by this call and *shadowed* is a list of
-        ``(owner_id, modules_shadowed)`` for any parks with a larger
-        :class:`_ParkKey` (a lower priority, or the same rank and a later id)
-        that were PUSHED beneath the new reservation (retained, not destroyed).
-
-        *priority* is a tier name or a :class:`PinOrder`; :func:`park_rank`
-        resolves either to the stack rank (task 6040).
-
-        Idempotent per owner (task 5308): a key *task_id* already parks at
-        *priority* or better, at any stack level (:meth:`_owned_ranks`), is
-        skipped, and so is a second input normalizing to a key this call
-        already handled.  A key it parks at a LOWER priority is a rank
-        upgrade: it runs the same conflict scan at the new rank and, unless
-        blocked, a new entry goes on top at the new rank and the key is
-        reported in *installed*; a blocked upgrade keeps the old entry.  The
-        upgrade replaces the owner's old entry in the SAME band
-        (:func:`is_pin_rank`).  A pin reservation leaves the owner's tier
-        entry in place beneath it (task 6040), so releasing the pin restores
-        that fairness park as it was.  Either way the owner holds at most one
-        entry per band per stack, never reports shadowing itself, and is
-        never downgraded.
-
-        Preemption (INV-1): if the active TOP of a conflicting stack has a
-        larger :class:`_ParkKey` than the new entry (a lower priority, or the
-        same rank and a later id), the new entry is PUSHED on top of the stack
-        (shadowing, not destroying, the top entry).  A top with a smaller key
-        BLOCKS installation for that module (INV-3, task 7799).
-
-        Hierarchical (different-key) conflicts: victim parks are kept under
-        their ORIGINAL keys (not re-keyed onto the preemptor's key).
-        Precedence-aware blocking in ``_is_parked_blocks`` (INV-8) lets the
-        preemptor acquire its own module without needing to move victim entries.  This preserves each
-        victim's original module identity so that ALL victims are independently
-        restorable after the preemptor clears (step-12 fix).
-        """
-        depth = self._config.lock_depth
-        rank = park_rank(priority)
-        key = _ParkKey.of(task_id, rank)
-        installed: list[str] = []
-        # Accumulate shadows: victim_owner -> list of original module keys shadowed.
-        shadow_acc: dict[str, list[str]] = {}
-        # Track insertion order of shadowed owners for stable output.
-        shadow_order: list[str] = []
-        owned = self._owned_ranks(task_id)
-        for m in modules:
-            normalized = normalize_lock(m, depth)
-            if not normalized or self._covers(owned.get(normalized), rank):
-                continue
-            # Scan only the ACTIVE TOP of each conflicting stack (INV-2).
-            to_shadow: list[tuple[str, str]] = []  # (parked_m_key, victim_owner)
-            blocked = False
-            for parked_m, stack in list(self._parked.items()):
-                if not stack:
-                    continue
-                owner, existing_rank = stack[-1]  # active TOP (INV-2)
-                if owner == task_id:
-                    continue
-                if not self._conflicts(parked_m, normalized):
-                    continue
-                # Hierarchical conflict with a different top owner.
-                if _ParkKey.of(owner, existing_rank) > key:
-                    # The new entry outranks TOP → shadow (push), retain beneath.
-                    to_shadow.append((parked_m, owner))
-                else:
-                    # TOP outranks the new entry → block our install (INV-3).
-                    blocked = True
-                    break
-            if blocked:
-                continue
-            # Record shadows — all victim parks stay under their ORIGINAL keys.
-            # For exact-match conflicts (parked_m == normalized), the victim's
-            # entry stays in its stack; the new entry will be pushed on top
-            # in the install step below.  For hierarchical (different-key)
-            # conflicts, the victim park is also left untouched: precedence-
-            # aware blocking in _is_parked_blocks lets the preemptor acquire its own
-            # module without moving victim entries (step-12 fix).
-            for parked_m, victim_owner in to_shadow:
-                if victim_owner not in shadow_acc:
-                    shadow_acc[victim_owner] = []
-                    shadow_order.append(victim_owner)
-                shadow_acc[victim_owner].append(parked_m)
-
-            # Push task_id onto the top of the (possibly freshly created)
-            # stack, dropping the same-band entry a rank upgrade replaces.
-            stack = [
-                (owner, entry_rank)
-                for owner, entry_rank in self._parked.get(normalized, [])
-                if owner != task_id or is_pin_rank(entry_rank) != is_pin_rank(rank)
-            ]
-            stack.append((task_id, rank))
-            self._parked[normalized] = stack
-            owned[normalized] = rank
-            installed.append(normalized)
-
-        # Build shadowed list in first-seen victim order, original module keys sorted.
-        shadowed = [
-            (owner, sorted(shadow_acc[owner]))
-            for owner in shadow_order
-        ]
-        if installed:
-            # ``setdefault``, not assignment: C7's ``park_age(p)`` is the owner's
-            # TOTAL wait, so a re-install must not reset the clock — a refreshed
-            # stamp would make an indefinitely-starving park read as permanently
-            # fresh and keep admitting backfillers through it.
-            self._park_install_at.setdefault(
-                task_id, self._wall_time_source().isoformat()
-            )
-        return installed, shadowed
-
-    def _remove_owner(
-        self, task_id: str, *, source: ReservationSource | None = None
-    ) -> list[tuple[str, list[str]]]:
-        """Remove *task_id* from every stack at any level and return restored pairs.
-
-        With *source*, only the owner's entries of that source go (task 6040):
-        releasing a pin reservation leaves the owner's fairness parks where
-        they are.
-
-        For each module stack whose ACTIVE TOP was removed: after removal
-        the new last element (if any) becomes the active top and is reported as a
-        ``(owner, sorted_modules)`` restored pair — with *source*, possibly
-        the owner's own remaining entry.  Removing a buried (non-top)
-        entry leaves the top unchanged and is NOT reported as a restore (INV-4).
-
-        Drops ``_park_install_at[task_id]`` only when task_id has no remaining
-        parks at any level after removal (INV-6: preserved for shadowed owners
-        who are removed from buried slots but still have other parks).
-
-        Returns ``list[(restored_owner, sorted_modules)]`` in first-seen order.
-        Callers use the returned pairs to emit ``reservation_restored`` events.
-
-        **Hierarchical victim note**: for hierarchical (different-key) shadows,
-        the hierarchical victim's own stack is NEVER touched during the
-        preemptor's removal — the preemptor only appears in its own normalized
-        key's stack, so ``was_top`` only fires for that key.  The victim becomes
-        acquirable the instant the preemptor is removed (precedence-aware blocking in
-        ``_is_parked_blocks`` stops gating on the now-absent foreign top), but no
-        ``reservation_restored`` pair is returned and no event is emitted.  This
-        asymmetry is intentional (documented in the plan's design decisions):
-        adding cross-key restore detection would require scanning all stacks for
-        newly-unblocked entries on every removal.  Exact-match shadows (same
-        key) always produce a restore pair; hierarchical shadows do not.
-        """
-        def removed(entry: tuple[str, int]) -> bool:
-            owner, rank = entry
-            return owner == task_id and (
-                source is None or ReservationSource.source_of_rank(rank) is source
-            )
-
-        # Track which modules had a removed entry as their ACTIVE TOP.
-        was_top = {m for m, stack in self._parked.items() if stack and removed(stack[-1])}
-
-        # Rebuild stacks without the removed entries.
-        new_parked: dict[str, list[tuple[str, int]]] = {}
-        for m, stack in self._parked.items():
-            new_stack = [entry for entry in stack if not removed(entry)]
-            if new_stack:
-                new_parked[m] = new_stack
-        self._parked = new_parked
-
-        # Drop install_at only when task_id is fully gone.
-        if not self.has_parks(task_id):
-            self._park_install_at.pop(task_id, None)
-
-        # Identify newly-exposed tops: modules where task_id WAS the top and
-        # a lower entry is now exposed.
-        restored_acc: dict[str, list[str]] = {}  # new_top_owner -> [modules]
-        restored_order: list[str] = []
-        for m in was_top:
-            new_stack = self._parked.get(m)
-            if new_stack:  # there is a newly-exposed lower entry
-                new_top_owner, _ = new_stack[-1]
-                if new_top_owner not in restored_acc:
-                    restored_acc[new_top_owner] = []
-                    restored_order.append(new_top_owner)
-                restored_acc[new_top_owner].append(m)
-
-        return [
-            (owner, sorted(restored_acc[owner]))
-            for owner in restored_order
-        ]
-
-    def clear_parks_for(self, task_id: str) -> list[tuple[str, list[str]]]:
-        """Remove every reservation owned by *task_id* and return restored pairs.
-
-        Delegates to ``_remove_owner`` for the actual removal + restore detection.
-        Returns ``[(restored_owner, sorted_modules)]`` for each module whose
-        newly-exposed lower entry becomes the active top — empty list when there
-        are no buried entries beneath task_id's reservations (INV-4).
-
-        Callers (Scheduler dispatch/release paths) use the returned pairs to
-        emit ``reservation_restored`` events (step-8).
-        """
-        return self._remove_owner(task_id)
-
-    def prune_owners(
-        self,
-        predicate: Callable[[str], bool],
-        *,
-        source: ReservationSource | None = None,
-    ) -> tuple[list[str], list[tuple[str, list[str]]]]:
-        """Evict every park whose owner satisfies *predicate* at ANY stack level.
-
-        Iterates unique owners across all levels of all stacks (deduped,
-        first-seen order), calls ``predicate(owner_id)`` at most once per
-        owner, and removes all entries for matching owners via ``_remove_owner``.
-        With *source*, only owners holding an entry of that source are asked,
-        and only those entries are removed (task 6040).
-
-        Returns ``(evicted_owners, restored_pairs)`` where *evicted_owners* is
-        the list of removed owner IDs in first-seen order and *restored_pairs*
-        is a flattened list of ``(owner, sorted_modules)`` for every stack
-        whose newly-exposed top is still the top once the whole sweep is
-        done.  The Scheduler's ``_park_gc`` sweep loop uses restored_pairs to
-        emit ``reservation_restored`` events (step-8).
-        """
-        # Collect unique owners in first-seen order across all stack levels.
-        seen: dict[str, bool] = {}
-        for stack in self._parked.values():
-            for owner, rank in stack:
-                if source is not None and ReservationSource.source_of_rank(rank) is not source:
-                    continue
-                if owner not in seen:
-                    seen[owner] = predicate(owner)
-        # Build evicted list.
-        evicted = [owner for owner, should in seen.items() if should]
-        # Remove each evicted owner and accumulate restored pairs.
-        all_restored_acc: dict[str, list[str]] = {}  # deduplicate across calls
-        all_restored_order: list[str] = []
-        for owner in evicted:
-            for restored_owner, mods in self._remove_owner(owner, source=source):
-                if restored_owner not in all_restored_acc:
-                    all_restored_acc[restored_owner] = list(mods)
-                    all_restored_order.append(restored_owner)
-                else:
-                    # Merge modules for the same restored owner across multiple calls.
-                    merged = sorted(set(all_restored_acc[restored_owner]) | set(mods))
-                    all_restored_acc[restored_owner] = merged
-        # Keep only restores that survived the rest of the sweep.  When
-        # removing top Z exposes lower Y, but a later removal in this sweep
-        # takes Y's entry too, the caller would otherwise emit a spurious
-        # reservation_restored for an entry that is gone.  Asking the stacks
-        # rather than the evicted set keeps a source-scoped sweep right: there
-        # an evicted owner's other-source entry can be the surviving top.
-        all_restored = [
-            (owner, survivors)
-            for owner in all_restored_order
-            if (survivors := [m for m in all_restored_acc[owner] if self._top_owner(m) == owner])
-        ]
-        return evicted, all_restored
-
-    def _top_owner(self, module: str) -> str | None:
-        """The owner of *module*'s active top entry, or None for no stack."""
-        stack = self._parked.get(module)
-        return stack[-1][0] if stack else None
-
-    def force_clear(
-        self, owner: str
-    ) -> tuple[list[str], list[tuple[str, list[str]]]]:
-        """Evict all parks held by *owner* and return (modules, restored_pairs).
-
-        Thin wrapper over :meth:`prune_owners` that pre-collects the sorted
-        list of modules the owner was parked on before the eviction removes
-        them from the stacks.  LIFO restoration of newly-exposed tops is
-        handled by :meth:`prune_owners` → :meth:`_remove_owner`.
-
-        Returns:
-            modules: sorted list of module keys the owner was parked on.
-                     Empty list if the owner has no parks (idempotent no-op).
-            restored_pairs: list of (owner, sorted_modules) for each buried
-                            owner newly exposed as the active top.
-        """
-        modules = sorted(
-            m for m, stack in self._parked.items()
-            if any(o == owner for o, _ in stack)
-        )
-        _evicted, restored = self.prune_owners(lambda o: o == owner)
-        return modules, restored
-
-    # --- Snapshot helpers (public accessors for observability) ---
-
-    def park_age_secs(self, owner: str, *, now: datetime) -> float | None:
-        """Seconds since *owner* FIRST installed a park, or ``None`` if unknown.
-
-        **``None`` means "age unknown ⇒ the caller must REFUSE".**  This is
-        deliberately the OPPOSITE of the dashboard's ``_park_age_seconds``
-        (dashboard/src/dashboard/data/scheduler.py), which fails soft to ``0``
-        because it is rendering a number for a human and a wrong zero there is
-        a harmless display artefact.  Here the age GATES AN ADMISSION (task
-        3823 / PRD C7 refuses backfill through a park older than
-        ``backfill_max_park_age_secs``), so a soft zero would make an
-        unreadable park look brand new and ADMIT a backfiller through it —
-        fail-soft in the unsafe direction.  The two contracts must disagree;
-        do not "fix" the divergence by consolidating them.
-
-        Reads ``_park_install_at``, which is written once per owner via
-        ``setdefault`` — so this is the owner's TOTAL wait, which is what C7's
-        ``park_age(p)`` means, not the time since its most recent re-park.
-
-        A stamp in the FUTURE clamps to ``0.0`` rather than going negative:
-        a negative age would sail under every ``age > cutoff`` test, so an NTP
-        step backwards would silently re-open admission through arbitrarily
-        old parks.
-
-        This is a READ.  It never evicts a park — task 1228 removed park
-        leases deliberately and nothing here reintroduces wall-clock park
-        death.
-        """
-        raw = self._park_install_at.get(owner)
-        if not raw:
-            return None
-        try:
-            installed_at = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
-        except (ValueError, TypeError):
-            logger.warning(
-                'park_age_secs: unparseable install stamp %r for park owner %s — '
-                'returning None (age unknown; callers must refuse)',
-                raw, owner,
-            )
-            return None
-        try:
-            return max(0.0, (now - installed_at).total_seconds())
-        except TypeError:
-            # Naive/aware mismatch — same "unknown, refuse" answer as a bad parse.
-            logger.warning(
-                'park_age_secs: cannot compare install stamp %r for park owner %s '
-                'against now=%r — returning None (age unknown)',
-                raw, owner, now,
-            )
-            return None
-
-    def snapshot_parks(self) -> dict[str, dict]:
-        """Return a snapshot of current parks: ``{task_id: {modules, installed_at}}``.
-
-        Reports only the ACTIVE-TOP owner of each module stack (INV-7).  Buried
-        (shadowed) owners do not appear — the snapshot contract is identical to
-        the pre-stack single-owner semantics, keeping the dashboard's
-        ``_module_contention_counts`` and fused-memory ``get_scheduler_state``
-        working without changes.
-
-        Builds a fresh dict from ``_parked`` and ``_park_install_at`` so callers
-        cannot mutate internal state.  Preferred over direct ``_parked`` access in
-        :meth:`Scheduler.get_state_snapshot`.
-        """
-        result: dict[str, dict] = {}
-        for module, stack in self._parked.items():
-            if not stack:
-                continue
-            owner, _rank = stack[-1]  # active TOP only (INV-7)
-            if owner not in result:
-                result[owner] = {
-                    'modules': [],
-                    'installed_at': self._park_install_at.get(owner, ''),
-                }
-            result[owner]['modules'].append(module)
-        return result
-
-    def snapshot_park_stacks(self) -> dict[str, list[dict]]:
-        """Return a snapshot of the full LIFO park stack per module.
-
-        Keys by MODULE (distinct from :meth:`snapshot_parks`, which keys by owner).
-        Each value is the stack list in bottom→top order — ``list[-1]`` is the
-        active top (the owner that :meth:`snapshot_parks` would report), and
-        every preceding element is a shadowed (buried) owner.
-
-        Each entry dict contains:
-        - ``owner``: str — task id
-        - ``rank``: int — :func:`park_rank` value: a PRIORITY_RANK tier, or a
-          negative pin rank (task 6040); lower = higher priority, INV-3
-        - ``shadowed``: bool — True for every entry except the active top
-        - ``installed_at``: str — ISO8601 timestamp from ``_park_install_at``,
-          or ``''`` if the owner has no recorded install timestamp
-        - ``source``: ``'pin'`` | ``'fairness'`` — derived from ``rank`` by
-          :func:`~orchestrator.pin_reservation.rank_payload`
-        - ``pin_order``: int (pin entries only) / ``tier``: str (fairness
-          entries only) — the priority behind ``rank``
-
-        INV-3: ranks are non-increasing top-ward (``entry[i].rank >= entry[i+1].rank``),
-        and equal ranks are ordered by the id tie-break of :class:`_ParkKey`.
-
-        Builds fresh dicts/lists from ``_parked`` and ``_park_install_at`` so
-        callers cannot mutate internal state.
-        """
-        result: dict[str, list[dict]] = {}
-        for module, stack in self._parked.items():
-            if not stack:
-                continue
-            last_index = len(stack) - 1
-            entries: list[dict] = []
-            for idx, (owner, rank) in enumerate(stack):
-                entries.append({
-                    'owner': owner,
-                    'rank': rank,
-                    'shadowed': idx != last_index,
-                    'installed_at': self._park_install_at.get(owner, ''),
-                    **rank_payload(rank),
-                })
-            result[module] = entries
-        return result
-
-    def snapshot_pin_reservations(self) -> dict[str, dict]:
-        """``{owner: {modules, installed_at}}`` for every pin-ranked park entry.
-
-        Unlike :meth:`snapshot_parks`, a buried pin entry is listed too: this
-        is "which modules does each pin hold a reservation on" (task 6040),
-        not "who tops each stack".  Tier-ranked owners never appear.  Fresh
-        dicts, sorted modules.
-        """
-        result: dict[str, dict] = {}
-        for module, stack in self._parked.items():
-            for owner, rank in stack:
-                if not is_pin_rank(rank):
-                    continue
-                entry = result.setdefault(owner, {
-                    'modules': [],
-                    'installed_at': self._park_install_at.get(owner, ''),
-                })
-                entry['modules'].append(module)
-        for entry in result.values():
-            entry['modules'].sort()
-        return result
-
-    def snapshot_holders(self) -> dict[str, str]:
-        """Return a snapshot of current lock holders: ``{module: task_id}``.
-
-        Builds a fresh dict from ``_held`` so callers cannot mutate internal state.
-        Preferred over direct ``_held`` access in :meth:`Scheduler.get_state_snapshot`.
-        """
-        result: dict[str, str] = {}
-        for task_id, modules in self._held.items():
-            for m in modules:
-                result[m] = task_id
-        return result
-
-    # --- Limit lookup (unchanged) ---
-
-    def _limit_for(self, module: str) -> int:
-        module = normalize_lock(module, self._config.lock_depth)
-        if module not in self._limits:
-            mc = self._config.for_module(module)
-            if mc and mc.module_overrides and module in mc.module_overrides:
-                self._limits[module] = mc.module_overrides[module]
-            elif module in self._config.module_overrides:
-                self._limits[module] = self._config.module_overrides[module]
-            elif mc and mc.max_per_module is not None:
-                self._limits[module] = mc.max_per_module
-            else:
-                self._limits[module] = self._config.max_per_module
-        return self._limits[module]
-
-    # --- Public API ---
-
-    def is_held(self, task_id: str) -> bool:
-        """Return True if task_id currently holds any module locks."""
-        return task_id in self._held
-
-    def try_acquire(
-        self,
-        task_id: str,
-        modules: list[str],
-        *,
-        admitted_parks: frozenset[str] = frozenset(),
-    ) -> bool:
-        """Non-blocking attempt to acquire all module locks.
-
-        Uses hierarchical conflict detection: a lock on ``A/B`` conflicts with
-        ``A/B/C`` (and vice-versa) but NOT with ``A/D``.  Also refuses if any
-        requested module hierarchically conflicts with an active reservation
-        owned by a different task (see ``install_parks``) under the capacity
-        rule of ``_iter_blocking_park_owners``.
-
-        Returns True if all acquired, False if any unavailable.
-
-        *admitted_parks* (task 3823 / PRD task η, C7) names park owners whose
-        reservations this request has been ADMITTED THROUGH by EASY-backfill:
-        their parks are ignored by the park gate below, and by nothing else.
-
-        **The held-lock gate is deliberately untouched, and this is the whole
-        safety property of C7 (INV-3).**  The limit check below is evaluated on
-        LIVE state at call time, inside this method, on every call — admitted
-        or not.  Admission never pre-computes a "c's modules are otherwise
-        free" set and then acquires on that basis, because a stale scoring-time
-        snapshot used as the ACTING basis is precisely the failure class INV-3
-        exists to prevent.  So an admitted candidate whose modules turn out to
-        be genuinely contended simply fails here and does not dispatch; the
-        bypass can only ever waive a PARK, never a real holder.
-
-        Admission also does not disturb the parks it borrows through: nothing
-        here removes, shadows or re-ranks them.  Backfill borrows a gap the
-        owner was going to wait anyway — PRD §7 rejects preemption of a held
-        lock, and this is the mirror-image discipline for parks.
-        """
-        depth = self._config.lock_depth
-        normalized = list({normalize_lock(m, depth) for m in modules})
-
-        # Check every requested module against all other tasks' held locks and
-        # active reservations owned by other tasks.
-        for module in normalized:
-            # INV-3: live held-lock state, never bypassed by admitted_parks.
-            if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
-                return False
-            if self._is_parked_blocks(module, task_id, ignore_owners=admitted_parks):
-                return False
-
-        self._held[task_id] = set(normalized)
-        logger.info(f'Task {task_id} acquired locks: {normalized}')
-        return True
-
-    def release(self, task_id: str) -> None:
-        """Release all module locks held by a task."""
-        modules = self._held.pop(task_id, set())
-        if modules:
-            logger.info(f'Task {task_id} released locks: {list(modules)}')
-
-    def release_subset(self, task_id: str, modules: list[str]) -> list[str]:
-        """Drop a subset of the task's held modules. Returns the normalized
-        modules actually released (may be empty). Removes the task's entry
-        entirely when no held modules remain so downstream iteration over
-        ``_held`` behaves the same as after a full ``release``.
-        """
-        held = self._held.get(task_id)
-        if not held:
-            return []
-        depth = self._config.lock_depth
-        to_drop = {normalize_lock(m, depth) for m in modules} & held
-        if not to_drop:
-            return []
-        held.difference_update(to_drop)
-        if not held:
-            del self._held[task_id]
-        released = sorted(to_drop)
-        logger.info(f'Task {task_id} released subset: {released}')
-        return released
-
-    def try_acquire_additional(self, task_id: str, additional: list[str]) -> bool:
-        """Non-blocking attempt to expand lock set for a task."""
-        depth = self._config.lock_depth
-        current = self._held.get(task_id, set())
-        new_modules = [
-            normalize_lock(m, depth)
-            for m in additional
-            if normalize_lock(m, depth) not in current
-        ]
-        if not new_modules:
-            return True
-
-        for module in new_modules:
-            if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
-                return False
-            if self._is_parked_blocks(module, task_id):
-                return False
-
-        self._held.setdefault(task_id, set()).update(new_modules)
-        logger.info(f'Task {task_id} expanded locks: {new_modules}')
-        return True
 
 
 def _iter_pending_deps_in(
@@ -2362,6 +1362,17 @@ def _psi_degradations(sample: PsiSample, cfg: PsiAdmissionConfig) -> dict[str, s
     return degraded
 
 
+def _describe_records_flipped_past(rows: Sequence[Escalation]) -> str:
+    """Name the open records a stranded-blocked flip went past; the caller
+    has already decided that none of them pins."""
+    if not rows:
+        return 'no open escalation'
+    return 'open escalation(s) that do not pin: ' + ', '.join(
+        f'{e.id} (severity={e.severity}, level={e.level}, category={e.category})'
+        for e in rows
+    )
+
+
 class Scheduler:
     """Selects next eligible task and manages module locks."""
 
@@ -2426,13 +1437,13 @@ class Scheduler:
         # callbacks= collapses to an all-None SchedulerCallbacks so bare-
         # Scheduler unit tests are unaffected.
         self._callbacks: SchedulerCallbacks = callbacks or SchedulerCallbacks()
-        self._time_source: Callable[[], float] = _resolve_time_source(time_source)
+        self._time_source: Callable[[], float] = resolve_monotonic_time_source(time_source)
         # Wall-clock source (task 2335 β) for the milestone time-gate: unlike
         # self._time_source (monotonic, resets across restarts), milestone
         # anchors/deadlines are persisted wall-clock timestamps that must
         # compare correctly after a process restart. Injectable so tests can
         # drive deterministic dated/delayed milestone scenarios.
-        self._wall_now: Callable[[], datetime] = _resolve_wall_time_source(wall_time_source)
+        self._wall_now: Callable[[], datetime] = resolve_wall_time_source(wall_time_source)
         # Jitter draw for the transient-requeue backoff (task 3317 / PRD C3).
         # NOT a clock: a ``(lo, hi) -> float`` uniform draw, the same seam
         # ``fm_retry_backoffs``'s ``rng`` parameter exposes, so deterministic
@@ -2455,19 +1466,15 @@ class Scheduler:
         # NOTE: callers MUST inject a monotonic-style source (no epoch relation,
         # immune to NTP/clock skew).  Injecting ``time.time`` will break trip
         # semantics under clock adjustments.
-        self._park_stop_clock: Callable[[], float] = (
-            monotonic_clock_source if monotonic_clock_source is not None else time.monotonic
+        self._park_stop_clock: Callable[[], float] = resolve_monotonic_time_source(
+            monotonic_clock_source
         )
-        # Both clocks are passed down (task 3823 / PRD task η): the monotonic
-        # _time_source as before, and the injectable WALL clock so park install
-        # stamps share one epoch with _emit_lock_event's timestamps and with
-        # the ISO strings in the event log.  Without it, park_age_secs() would
-        # be measuring `Scheduler._wall_now() - <some other clock>`.
-        self.lock_table = ModuleLockTable(
-            config,
-            time_source=self._time_source,
-            wall_time_source=self._wall_now,
-        )
+        # Only the injectable WALL clock is passed down (task 3823 / PRD task
+        # η), so park install stamps share one epoch with _emit_lock_event's
+        # timestamps and with the ISO strings in the event log.  Without it,
+        # park_age_secs() would be measuring
+        # `Scheduler._wall_now() - <some other clock>`.
+        self.lock_table = ModuleLockTable(config, wall_time_source=self._wall_now)
         self.event_store = event_store
         # Module hold-duration predictor (task 3822 / PRD task ζ).  Built
         # unconditionally, BEFORE any event store exists: the Harness
@@ -2574,11 +1581,15 @@ class Scheduler:
         self._merge_phase_at: dict[str, float] = {}
         self._memory_url = config.fused_memory.url
         self._project_root = str(config.project_root)
-        # Starvation watchdog inputs (task 3821): the durable eligibility age
-        # and the count of scans that refused a task its locks while a
-        # lower-ranked candidate dispatched.
+        # Starvation watchdog inputs (tasks 3821, 9636), all durable in the
+        # eligibility clock's file: the eligibility age, and the watchdog state
+        # (lock refusals, announced tasks, the cap cohort and its last
+        # announcement).
         self._eligibility = EligibilityClock(eligibility_clock_store, self._project_root)
-        self._lock_refusals = LockRefusals()
+        self._watchdog_state = WatchdogState.load_from(
+            None if eligibility_clock_store is None else eligibility_clock_store.db_path,
+            self._project_root,
+        )
         # The continuity probe's one git child (task 3820, PRD C3); git.* is
         # restart-only, so binding the branch names at construction is correct.
         self._branch_work_reader: Callable[[], Mapping[str, BranchWork]] = branch_work_reader or partial(
@@ -2651,24 +1662,28 @@ class Scheduler:
         # currently-dispatched task so acquire_next can count slots at-or-below
         # a candidate's tier without re-walking the full task graph.
         self._dispatched_priority: dict[str, str] = {}
-        # Age-anchor bookkeeping for score(): one anchor per task in the
-        # active fetch, taken with its pending_since stamp and read and
-        # written through _held_age_anchor / _hold_age_anchor /
-        # _release_age_anchor.  Each is recorded durably (task 5352) whenever
-        # it changes, and only a changed pending_since resets it: D3 in
-        # plans/scheduler-dispatch-scoring-and-lock-layer-prd.md is the rule.
-        self._pending_anchor: dict[str, int] = {}
-        self._anchor_pending_since: dict[str, str | None] = {}
-        self._age_anchors: PersistentMap = PersistentMap(
-            guard_path(self._project_root, 'scheduler_age_anchors.json'),
-            ttl=_RESURRECTION_GUARD_TTL,
-        )
-        # Effective-priority cache: populated at the end of each acquire_next tick
-        # so get_state_snapshot() can include it without re-fetching tasks.
-        # Empty dict before the first tick.
-        self._last_effective_priorities: dict[str, str] = {}
+        # The legacy score's age anchors (age_anchors.py).
+        self.age_anchors = AgeAnchors(self._project_root)
+        # Test-injectable override for the _write_snapshot_best_effort write
+        # target (task 2418), and so for the construction-time read of the
+        # last-written tiers just below.  None (default) preserves current behavior: the
+        # path is derived from _project_root and the no-project-root guard
+        # applies.  When set, the write goes to this exact path instead —
+        # bypassing both the derivation and the guard, since an explicit path
+        # is always honored — decoupling the on-disk write target from
+        # _project_root, which some tests must also use as an OverrideStore
+        # lookup key.  Mirrors the _read_psi_sample-style constructor-vs-
+        # instance-attr seam pattern used elsewhere in this class.
+        self._state_snapshot_path: Path | None = state_snapshot_path
+        # Effective-priority cache: seeded from the last-written snapshot, then
+        # replaced at the end of each acquire_next tick so get_state_snapshot()
+        # can include it without re-fetching tasks.
+        self._last_effective_priorities: dict[str, str] = last_written_tiers(self._snapshot_path())
         # --- Priority-override state ---
         self._override_store: OverrideStore | None = override_store
+        self._lookup_pins = LookupPins(
+            lambda: self._override_store, self._project_root, clock=self._time_source,
+        )
         # Public alias for shutdown-path callers (harness checkpoint) — read-only.
         self.override_store: OverrideStore | None = override_store
         # Snapshot from the previous tick, used to diff-detect override changes
@@ -2692,13 +1707,13 @@ class Scheduler:
         # The I-6 arming gate and its storm-escape state (task 3819, PRD D12).
         self._anchor_gate = AnchorCoverageGate()
         # The continuity work-product probe (task 3820, PRD C3).  The lambdas
-        # and the bound method read self at call time, so a hot TTL retune and
-        # the late attribute-injected escalation_queue are both honoured.
+        # read self at call time, so a hot TTL retune and the late
+        # attribute-injected escalation_queue are both honoured.
         self.work_product = WorkProductProbe(
             ttl_secs=lambda: self.config.scoring.continuity_probe_ttl_secs,
             clock=self._time_source,
             escalate=lambda l1: file_sentinel_l1(self.escalation_queue, l1),
-            resolve=self._resolve_sentinel_l1,
+            resolve=lambda sentinel, resolution: resolve_sentinel_l1(self.escalation_queue, sentinel, resolution),
         )
         # --- Startup gate (task 2235, W10-α) ---
         # False until finish_startup() is called.  acquire_next() asserts
@@ -2885,23 +1900,22 @@ class Scheduler:
         # _external_hold_streak / _external_hold_cause.
         # ALIASED to _streak_resolver_degraded.counts (task 2124).
         self._external_resolver_degraded_counts = self._streak_resolver_degraded.counts
-        # --- Starvation watchdog state (tasks 1880, 3821) ---
-        # The eligibility age lives in self._eligibility (durable, wall clock)
-        # and the rank-relative lock refusals in self._lock_refusals; the
-        # streak counter holds only the escalated set.
-        # Tasks for which a STARVATION_WATCHDOG INFO escalation is currently open.
-        # Prevents re-filing per tick (belt-and-suspenders with the harness-side
-        # get_by_task dedup).  Cleared when the task dispatches or is GC'd.
+        # --- Starvation watchdog state (tasks 1880, 3821, 9636) ---
+        # The eligibility age lives in self._eligibility and the lock
+        # refusals, announced tasks and cap cohort in self._watchdog_state,
+        # both durable; the streak counter holds the escalated set, seeded
+        # from the durable announced set so a restart re-announces nothing.
+        # Cleared when the task dispatches or is GC'd.
         # ALIASED to _streak_starvation.escalated (task 2124).
         self._starvation_escalated = self._streak_starvation.escalated
+        for tid in self._watchdog_state.announced():
+            self._streak_starvation.mark_escalated(tid)
         # Whether the escalated set has been seeded from the open watchdog
         # escalations a previous process filed (task 3821).
         self._starvation_rehydrated = False
-        # Pin-gate findings the auto-pin cap turned away, not escalated, each
-        # delivered again once a watchdog pin slot frees; and whether the cap
-        # L1 naming them may be open, so it is resolved once none waits.
-        self._starvation_capped: set[str] = set()
-        self._cap_sentinel_maybe_open = False
+        # The cap report the queue last reflected; the cap L1 is re-synced
+        # only when the report changes (a failed sync retries next tick).
+        self._last_cap_report: CapReport | None = None
         # --- Warm-base hard-down watchdog state (task 2061) ---
         # SINGLETON latch — one host-scoped warm-lane CoW seed base, so exactly
         # one signal/window/L2 (unlike the starvation watchdog's per-task dict/
@@ -2956,16 +1970,6 @@ class Scheduler:
         # tick. Default None so bare-Scheduler unit tests are unaffected.
         self._already_landed_gate: AlreadyLandedGate | None = None
         # --- Snapshot write throttle (task 1332) ---
-        # Test-injectable override for the _write_snapshot_best_effort write
-        # target (task 2418).  None (default) preserves current behavior: the
-        # path is derived from _project_root and the no-project-root guard
-        # applies.  When set, the write goes to this exact path instead —
-        # bypassing both the derivation and the guard, since an explicit path
-        # is always honored — decoupling the on-disk write target from
-        # _project_root, which some tests must also use as an OverrideStore
-        # lookup key.  Mirrors the _read_psi_sample-style constructor-vs-
-        # instance-attr seam pattern used elsewhere in this class.
-        self._state_snapshot_path: Path | None = state_snapshot_path
         # Monotonic timestamp of the last successful _write_snapshot_best_effort
         # disk write.  None before the first write; the first write always
         # proceeds regardless of the throttle interval.
@@ -3278,6 +2282,16 @@ class Scheduler:
         if not isinstance(metadata, dict):
             return False
         return metadata.get('task_kind') == 'deterministic'
+
+    @staticmethod
+    def _exempt_from_psi_hold(task: dict) -> bool:
+        """Whether a dispatch-admission hold must still let *task* dispatch.
+
+        A deterministic task is light (DA-D4); a main-health fix is the exit
+        owner of every merge-waiter hold (DA-D10). Both decisions live in
+        docs/prds/dispatch-admission-load-cap.md.
+        """
+        return Scheduler.is_deterministic(task) or is_main_health_fix(task)
 
     async def tasks_by_train(self, train_id: str) -> list[dict]:
         """Return tasks belonging to ``train_id``, sorted ascending by train.order (root→tip).
@@ -3638,7 +2652,8 @@ class Scheduler:
         ``None`` is itself the clear value — see ``_CLAIMANT_ABSENT``.
 
         Best-effort: any exception (including a raised transient MCP error,
-        or a rejection embedded in the response) is logged and swallowed.
+        or a rejection embedded in the response, an ``isError`` reply
+        included) is logged and swallowed.
         Unlike ``set_task_status``, a lost heartbeat/clear does not strand
         the caller — a missed refresh self-corrects on the next cadence
         tick, and a missed clear self-heals (next heartbeat, or W10's
@@ -3731,8 +2746,15 @@ class Scheduler:
         A fused-memory error reply (``{'error', 'error_type'}``:
         TaskNotFoundError for a deleted task, INVALID_TASK_ID for a
         non-numeric id, server faults) is never a task row. Callers that must
-        tell absence from failure read through
-        ``orchestrator/src/orchestrator/chronic_flake.py::SchedulerChronicFlakeTaskClient.get_task``.
+        tell absence from failure call :meth:`read_task`.
+        """
+        read = await self.read_task(task_id)
+        return read.task if isinstance(read, TaskFound) else None
+
+    async def read_task(self, task_id: str) -> TaskRead:
+        """Read one task for a caller that must tell absence from failure.  Never raises.
+
+        The outcome taxonomy lives in ``shared/src/shared/task_read.py``.
         """
         try:
             result = await self.dispatch_tool(
@@ -3745,19 +2767,17 @@ class Scheduler:
                 'Failed to get task %s: %s: %s',
                 task_id, type(e).__name__, e,
             )
-            return None
-        task, parse_err = parse_tool_result(result, None, dict)
-        if parse_err is not None or task is None:
-            return None
-        if 'error' in task:
-            logger.warning(
-                'get_task(%s): fused-memory answered with an error reply, not a task row '
-                '(error_type=%s): %.200s — returning None',
-                task_id, task.get('error_type'), task.get('error'),
-            )
-            return None
-        self._normalize_task_metadata(task)
-        return task
+            return TaskReadFailed(f'get_task dispatch raised {type(e).__name__}: {e}')
+        read = parse_get_task_result(result)
+        if isinstance(read, TaskFound):
+            task = dict(read.task)
+            self._normalize_task_metadata(task)
+            return TaskFound(task)
+        if isinstance(read, TaskAbsent):
+            logger.info('get_task(%s): fused-memory reports no such task', task_id)
+        else:
+            logger.warning('get_task(%s): could not read the task: %.300s', task_id, read.reason)
+        return read
 
     async def submit_task(self, arguments: dict, *, timeout: float = 30) -> SubmitOutcome:
         """Submit one task to fused-memory and return its typed outcome.
@@ -4360,8 +3380,7 @@ class Scheduler:
                     # WARNING on every such fetch failure so the bypass is
                     # operator-visible rather than silent.
                     continue
-                checks = (dep_task.get('metadata') or {}).get('delivered_checks')
-                if not checks:
+                if declared_checks(dep_task.get('metadata')).is_empty:
                     continue
                 checked_deps[dep_id] = dep_task
                 deps_by_dependent.setdefault(task_id, set()).add(dep_id)
@@ -4417,8 +3436,9 @@ class Scheduler:
             # DIFFERENT key than the one a prior sweep cached against, so
             # the edit is a cache MISS (re-evaluate) rather than continuing
             # to serve a verdict computed against the old descriptor.
-            checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
-            descriptor_digest = _delivered_checks_descriptor_digest(checks)
+            declared = declared_checks(dep_task.get('metadata'))
+            checks = declared.checks
+            descriptor_digest = _delivered_checks_descriptor_digest(list(checks))
             cache_key = (dep_id, main_sha, descriptor_digest)
             # Prune any stale digest variant(s) left behind by an earlier
             # descriptor for this SAME (dep, sha) (task 2975): bounds cache
@@ -4436,11 +3456,13 @@ class Scheduler:
             ]
             for stale_key in stale_variant_keys:
                 del self._delivered_check_cache[stale_key]
-            if cache_key in self._delivered_check_cache:
+            if not declared.unreadable and cache_key in self._delivered_check_cache:
                 # Only the monotone-safe DELIVERED=True result is ever
                 # cached (see the FAILED branch below) — a cache hit is
                 # therefore always True, served straight from cache with no
-                # checks re-run this sweep.
+                # checks re-run this sweep. The digest covers ``checks``
+                # alone, so a declaration with unreadable entries is never
+                # served from it.
                 cached = self._delivered_check_cache[cache_key]
                 projection[dep_id] = cached
                 # A dep resolved definitively (cached True) on a prior sweep
@@ -4452,11 +3474,13 @@ class Scheduler:
 
             results: list[tuple[dict, DeliveredCheckResult]] = []
             over_budget = False
-            # Only the first dep this sweep actually evaluates gets the
+            # Only the first dep this sweep that runs a check gets the
             # forward-progress guarantee; every later dep still respects
-            # the budget exactly as before.
-            guaranteed_dep = first_dep_this_sweep
-            first_dep_this_sweep = False
+            # the budget exactly as before. A wholly unreadable declaration
+            # runs none, so it leaves the guarantee for the next dep.
+            guaranteed_dep = first_dep_this_sweep and bool(checks)
+            if guaranteed_dep:
+                first_dep_this_sweep = False
             for check in checks:
                 if used >= budget and not guaranteed_dep:
                     over_budget = True
@@ -4503,7 +3527,9 @@ class Scheduler:
                     dep_id, len(checks), budget,
                 )
 
-            if all(r is DeliveredCheckResult.DELIVERED for _c, r in results):
+            if not declared.unreadable and all(
+                r is DeliveredCheckResult.DELIVERED for _c, r in results
+            ):
                 self._delivered_check_cache[cache_key] = True
                 projection[dep_id] = True
                 self._delivered_check_error_streak.pop(dep_id, None)
@@ -4559,11 +3585,12 @@ class Scheduler:
             )
             error_log(
                 'Delivered-check dep %s: at least one check has ERRORED for '
-                '%d consecutive sweep(s) (checks=%r) — left uncached '
-                '(fail-safe wait; no dispatch-gate event/streak per row 7). '
-                'This may indicate a misconfigured check (bad regex/path, '
-                'or a missing/non-executable script).',
-                dep_id, error_streak, errored_names,
+                '%d consecutive sweep(s) (checks=%r, not check descriptors=%r) '
+                '— left uncached (fail-safe wait; no dispatch-gate event/streak '
+                'per row 7). This may indicate a misconfigured check (bad '
+                'regex/path, or a missing/non-executable script) or a '
+                'malformed metadata.delivered_checks.',
+                dep_id, error_streak, errored_names, declared.unreadable,
             )
 
         # Hold-visibility + grace-streak escalation: per dependent, decided
@@ -4651,7 +3678,7 @@ class Scheduler:
         detail = fail_detail_by_dep.get(dep_id) or {}
         check_name = detail.get('name')
         dep_task = checked_deps.get(dep_id) or {}
-        checks = (dep_task.get('metadata') or {}).get('delivered_checks') or []
+        checks = declared_checks(dep_task.get('metadata')).checks
         check = next((c for c in checks if c.get('name') == check_name), None)
         if check is None:
             check = {'name': check_name, 'kind': detail.get('kind')}
@@ -4704,36 +3731,84 @@ class Scheduler:
         ``starvation_watchdog.py`` and delivers every finding whose task a
         live status read still shows ``pending`` (INV-3); a failed read
         delivers nothing, so the findings recur next tick.  A capped task
-        waiting on a full cap is not re-delivered until a slot frees.  Called
-        once per tick by ``_phase_starvation``, whose try/except keeps a
-        watchdog failure from ever aborting the tick (PROPERTY 1).
+        waiting on a full cap is not re-delivered until a slot frees, and
+        leaves the waiting cohort once it is a candidate that no longer fires
+        a pinning gate (a hot-reload) or the watchdog is disabled.  Every pass
+        ends by syncing the cap L1 with the cohort.  Called once per tick by
+        ``_phase_starvation``, whose try/except keeps a watchdog failure from
+        ever aborting the tick (PROPERTY 1).
         """
         now = self._wall_now()
         candidates = {str(t.get('id', '')): t for t in ctx.candidates}
         candidates.pop('', None)
         self._eligibility.observe(candidates, now)
         self._rehydrate_starvation_escalated()
+        state = self._watchdog_state
         if not self.config.starvation_watchdog.enabled:
+            state.drop_waiting(list(state.waiting()))
+            self._sync_cap_l1(ctx, now)
             return
         free_slots = self.config.starvation_watchdog.auto_pin_max_concurrent - sum(
             1 for row in ctx.overrides.values()
             if row.pinned and row.source is OverrideSource.STARVATION_WATCHDOG
         )
+        all_findings = self._starvation_findings(candidates, now)
+        firing = {f.facts.task_id for f in all_findings if f.gate.pins}
+        state.drop_waiting([
+            tid for tid in state.waiting() if tid in candidates and tid not in firing
+        ])
         findings = [
-            f for f in self._starvation_findings(candidates, now)
+            f for f in all_findings
             if free_slots > 0 or not self._awaits_pin_slot(f, ctx.overrides)
         ]
         if findings:
             statuses, err = await self.get_statuses([f.facts.task_id for f in findings])
-            if err is not None:
+            if err is None:
+                live = [f for f in findings if statuses.get(f.facts.task_id) == 'pending']
+                await self._deliver_starvation_findings(ctx, live, free_slots, now)
+            else:
                 logger.warning(
                     'Starvation watchdog: live status read failed (%r); delivering '
                     'none of %d finding(s) this tick', err, len(findings),
                 )
-                return
-            live = [f for f in findings if statuses.get(f.facts.task_id) == 'pending']
-            await self._deliver_starvation_findings(ctx, live, free_slots, now)
-        self._resolve_cap_sentinel_once_drained()
+        self._sync_cap_l1(ctx, now)
+
+    def _sync_cap_l1(self, ctx: TickContext, now: datetime) -> None:
+        """Bring the auto-pin cap L1 in line with the waiting cohort (task 9636).
+
+        The L1 is open only while the cohort is non-empty and alarming, and
+        names that cohort; a tick with no lock held changes nothing, and
+        ``starvation_cap.py`` holds the rule.  Blockers,
+        in-flight slots and held locks are read here with no await between
+        them, so the report is one snapshot of the lock state after the
+        tick's live status read; each task's blockers are read once per pass.
+        """
+        known: dict[str, tuple[Blocker, ...]] = {}
+
+        def blockers_of(task_id: str) -> tuple[Blocker, ...]:
+            if task_id not in known:
+                task = ctx.tasks_by_id.get(task_id)
+                known[task_id] = () if task is None else tuple(
+                    self.lock_table.blockers(task_id, self._get_modules(task)),
+                )
+            return known[task_id]
+
+        world = LockWorld(
+            tasks=ctx.tasks_by_id,
+            blockers_of=blockers_of,
+            now=now,
+            claimant_ttl=timedelta(seconds=self.config.claimant_liveness_ttl_secs),
+            in_flight=frozenset(self._dispatched),
+        )
+        report = cap_report(
+            self._watchdog_state.waiting(), world,
+            cap=self.config.starvation_watchdog.auto_pin_max_concurrent,
+            locks_held=bool(self.lock_table.snapshot_held_by_task()),
+        )
+        if report == self._last_cap_report:
+            return
+        if sync_cap_l1(self.escalation_queue, report, self._watchdog_state):
+            self._last_cap_report = report
 
     def _starvation_findings(
         self, candidates: Mapping[str, dict[str, Any]], now: datetime,
@@ -4749,7 +3824,7 @@ class Scheduler:
                 task_id=tid,
                 eligible_age_secs=self._eligibility.age_secs(tid, now),
                 skip_count=self._skip_count.get(tid, 0),
-                lock_refusals=self._lock_refusals.count(tid),
+                lock_refusals=self._watchdog_state.refusals(tid),
                 park_block=self._park_blocked(tid, parks, now),
             )
             gate = classify(facts, cfg)
@@ -4761,7 +3836,7 @@ class Scheduler:
     def _awaits_pin_slot(self, finding: Finding, overrides: Mapping[str, OverrideRow]) -> bool:
         """Whether *finding* is a capped task that only a free watchdog pin slot can serve."""
         tid = finding.facts.task_id
-        return finding.gate.pins and tid in self._starvation_capped and tid not in overrides
+        return finding.gate.pins and tid in self._watchdog_state.waiting() and tid not in overrides
 
     def _rehydrate_starvation_escalated(self) -> None:
         """Seed the escalated set, once per process, from open watchdog escalations.
@@ -4782,10 +3857,8 @@ class Scheduler:
             )
             return
         for esc in pending:
-            if esc.agent_role == STARVATION_WATCHDOG_ROLE:
-                self._streak_starvation.mark_escalated(esc.task_id)
-            elif esc.task_id == AUTO_PIN_CAP_SENTINEL:
-                self._cap_sentinel_maybe_open = True
+            if esc.agent_role == STARVATION_WATCHDOG_ROLE and esc.task_id != AUTO_PIN_CAP_SENTINEL:
+                self._mark_starvation_announced(esc.task_id)
         self._starvation_rehydrated = True
 
     async def _deliver_starvation_findings(
@@ -4793,13 +3866,11 @@ class Scheduler:
     ) -> None:
         """Deliver this pass's findings oldest first, auto-pinning within *free_slots*.
 
-        A pin-gate finding the cap turns away files no escalation of its own
-        and is announced once: one sentinel L1 names the newly capped cohort,
-        and the task waits in ``_starvation_capped`` for a slot.  A failure on
-        one finding is logged and leaves it undelivered, to retry next tick
-        (PROPERTY 1).
+        A pin-gate finding the cap turns away files no escalation of its own:
+        it is delivered once and joins the durable waiting cohort until a slot
+        frees, and the cap L1 speaks for the cohort.  A failure on one finding
+        is logged and leaves it undelivered, to retry next tick (PROPERTY 1).
         """
-        newly_capped: list[Finding] = []
         for finding in sorted(findings, key=lambda f: f.facts.eligible_age_secs, reverse=True):
             tid = finding.facts.task_id
             row = ctx.overrides.get(tid)
@@ -4813,40 +3884,14 @@ class Scheduler:
                 if row is None and outcome.auto_pinned:
                     free_slots -= 1
                 capped = outcome.disposition is StarvationDisposition.CAP_REACHED
-                if capped and tid in self._starvation_capped:
+                if capped and tid in self._watchdog_state.waiting():
                     continue
                 await self._deliver_starvation_finding(finding, outcome)
-                if capped:
-                    newly_capped.append(finding)
             except Exception:
                 logger.warning(
                     'Starvation watchdog delivery for %s raised; retrying next tick',
                     tid, exc_info=True,
                 )
-        if newly_capped:
-            l1 = cap_escalation(newly_capped, self.config.starvation_watchdog)
-            file_sentinel_l1(self.escalation_queue, l1)
-            self._cap_sentinel_maybe_open = True
-
-    def _resolve_cap_sentinel_once_drained(self) -> None:
-        """Resolve the open auto-pin cap L1 once no capped task still waits on a slot."""
-        queue = self.escalation_queue
-        if self._starvation_capped or not self._cap_sentinel_maybe_open or queue is None:
-            return
-        try:
-            for esc in queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending'):
-                queue.resolve(
-                    esc.id,
-                    'auto-resolved: no starving task waits on a watchdog pin slot',
-                    resolved_by=STARVATION_WATCHDOG_ROLE,
-                )
-        except Exception:
-            logger.warning(
-                'Starvation watchdog: cannot resolve the auto-pin cap L1; retrying next pass',
-                exc_info=True,
-            )
-            return
-        self._cap_sentinel_maybe_open = False
 
     def _starvation_pin(
         self,
@@ -4940,8 +3985,8 @@ class Scheduler:
     async def _deliver_starvation_finding(self, finding: Finding, outcome: PinOutcome) -> None:
         """Emit ``starvation_detected``, then file the task's escalation trail.
 
-        A finding the cap turned away is not escalated: it waits in
-        ``_starvation_capped`` and is delivered again once a slot frees.
+        A finding the cap turned away is not escalated: it joins the durable
+        waiting cohort and is delivered again once a slot frees.
         """
         facts, gate = finding.facts, finding.gate
         data: dict[str, Any] = {
@@ -4959,9 +4004,9 @@ class Scheduler:
                 EventType.starvation_detected, task_id=facts.task_id, data=data,
             )
         if outcome.disposition is StarvationDisposition.CAP_REACHED:
-            self._starvation_capped.add(facts.task_id)
+            self._watchdog_state.wait(facts.task_id, gate)
             return
-        self._starvation_capped.discard(facts.task_id)
+        self._watchdog_state.drop_waiting([facts.task_id])
         if self._callbacks.on_starvation_warn is not None:
             summary, detail = escalation_text(
                 facts, gate, self.config.starvation_watchdog, finding.blockers,
@@ -4969,37 +4014,37 @@ class Scheduler:
             await self._callbacks.on_starvation_warn(
                 facts.task_id, summary=summary, detail=detail, level=gate.escalation_level,
             )
-        self._streak_starvation.mark_escalated(facts.task_id)
+        self._mark_starvation_announced(facts.task_id)
+
+    def _mark_starvation_announced(self, task_id: str) -> None:
+        """Record that *task_id*'s watchdog escalation is filed, durably, so no process re-files it."""
+        self._streak_starvation.mark_escalated(task_id)
+        self._watchdog_state.announce(task_id)
 
     def _forget_starvation_inputs(self, status_map: Mapping[str, str]) -> None:
-        """Drop the eligibility anchor, lock refusals and cap wait of every task no longer pending.
+        """Drop the eligibility anchor and every watchdog fact of each task no longer pending.
 
         Covers terminal tasks and tasks absent from this tick's active fetch as
         well as live non-pending ones.  A pending task that merely sat out a
         tick (cooldown, PSI hold) keeps them, so its age is never reset by a gap.
         """
-        tracked = (
-            self._eligibility.task_ids() | self._lock_refusals.task_ids() | self._starvation_capped
-        )
+        tracked = self._eligibility.task_ids() | self._watchdog_state.task_ids()
         gone = [tid for tid in tracked if status_map.get(tid) != 'pending']
         self._eligibility.forget(gone)
-        for tid in gone:
-            self._lock_refusals.forget(tid)
-        self._starvation_capped.difference_update(gone)
+        self._watchdog_state.forget(gone)
 
     async def _settle_starvation_on_dispatch(self, task_id: str) -> None:
         """Close *task_id*'s watchdog state now that it is dispatching.
 
         Resolves its open watchdog escalation, if any, and forgets its
-        eligibility anchor, lock refusals and cap wait: a later return to ``pending``
+        eligibility anchor and every watchdog fact: a later return to ``pending``
         starts a fresh eligibility age.  Releases its watchdog pin whether or
         not this process escalated it, so a pin a previous process left is
         released too.  Called at BOTH dispatch sites, each
         of which wraps it so a failure can NEVER abort a dispatch (PROPERTY 1).
         """
         self._eligibility.forget([task_id])
-        self._lock_refusals.forget(task_id)
-        self._starvation_capped.discard(task_id)
+        self._watchdog_state.forget([task_id])
         self._release_watchdog_pin(task_id)
         in_escalated = self._streak_starvation.is_escalated(task_id)
         if in_escalated and self._callbacks.on_starvation_resolve is not None:
@@ -5270,12 +4315,7 @@ class Scheduler:
             # level deeper.  Delegate to extract_structured_rejection(result) which
             # correctly unwraps both shapes (mirrors set_task_status at :1608).
             if (rej := extract_structured_rejection(result)) is not None:
-                logger.error(
-                    'Failed to update task %s (%s): %s',
-                    task_id,
-                    rej.get('error_type'),
-                    rej.get('error'),
-                )
+                logger.error('Failed to update task %s: rejected %r', task_id, rej)
                 return False
             return True
         except Exception as e:
@@ -5295,6 +4335,7 @@ class Scheduler:
         external_resolver_failed: bool = False,
         delivered_check_cache: dict[str, bool] | None = None,
         terminal_dep_records: dict[str, dict] | None = None,
+        deferred_terminal_deps: Collection[str] = frozenset(),
     ) -> bool:
         """The boolean view of ``dependency_verdict.py::deps_verdict``: True iff SATISFIED.
 
@@ -5307,6 +4348,7 @@ class Scheduler:
             external_resolver_failed=external_resolver_failed,
             delivered_check_cache=delivered_check_cache,
             terminal_dep_records=terminal_dep_records,
+            deferred_terminal_deps=deferred_terminal_deps,
         ).satisfied
 
     def _dispatch_cooldown_signal(self, task: dict) -> str | None:
@@ -5485,98 +4527,48 @@ class Scheduler:
         """Return True when *task* must be withheld from dispatch by its
         ``metadata.milestone`` time gate (task 2335 β).
 
-        Pure predicate — sibling to :meth:`_deferred_watch_gated`.  Reads the
-        RAW ``metadata.milestone`` dict directly, NOT the heavier
-        :func:`~shared.task_metadata.parse_metadata` pipeline used by
-        ``dependency_verdict.py::task_external_deps``: the α ``Milestone``
-        model-validator and δ's submit guard already validate at write time,
-        so this gate is defense-in-depth, not the primary validation path.
-
-        Modes (``metadata.milestone['mode']``):
-        - ``'dated'``: withhold while ``now_wall < milestone['at']``.
-        - ``'delayed'``: withhold while
-          ``metadata.milestone_deps_satisfied_at`` is unset, OR while
-          ``now_wall < anchor + after_secs``.  The anchor is stamped once,
-          frozen-once, by :meth:`_stamp_milestone_deps_satisfied`.
+        Pure predicate — sibling to :meth:`_deferred_watch_gated`.  The rule
+        itself lives in :meth:`shared.task_metadata.Milestone.fired`; this
+        method only parses the raw ``metadata.milestone`` dict into a
+        ``Milestone``, hands it the frozen-once
+        ``metadata.milestone_deps_satisfied_at`` anchor (stamped by
+        :meth:`_stamp_milestone_deps_satisfied`) and *now_wall*, and maps the
+        outcome onto a withhold decision.
 
         No ``metadata.milestone`` (missing/falsy) → not gated (``False``).
-        Any malformed or unrecognised value — a non-dict milestone, an
-        unknown mode, an unparseable ``at``/anchor timestamp, or an
-        ``after_secs`` that can't combine with a timestamp — fails safe:
-        withhold (``True``) plus a WARNING log, rather than crash the
-        dispatch tick or let a broken milestone spec dispatch early.  The
-        WARNING is deduped per (task_id, malformed value) by
-        :meth:`_note_milestone_malformed` so a permanently-broken spec logs
-        once instead of spamming every tick; it re-fires if the malformed
-        value actually changes.  A task that fails safe here has no other
-        path to human attention (no automatic escalation) — this is a
-        known, deliberately deferred gap (task 2335 β amendment: reviewer_
-        comprehensive robustness finding; see commit message for rationale).
-
-        ``at``/anchor timestamps that parse as tz-naive are normalized to
-        UTC (``.replace(tzinfo=UTC)``): the α model only requires
-        ``datetime.fromisoformat``-parseable, not tz-aware, but comparing a
-        tz-naive and tz-aware datetime directly raises ``TypeError`` — left
-        unhandled that would otherwise fall into the fail-safe branch and
-        withhold the task forever.
+        A delayed milestone whose anchor is still unset is withheld without a
+        warning (it is simply not due yet).  Anything malformed — a non-dict
+        milestone, a spec ``Milestone`` rejects, a non-string or unparseable
+        anchor, an anchor + ``after_secs`` deadline that cannot be
+        represented — fails safe: withhold (``True``) plus a WARNING deduped per
+        (task_id, malformed value) by :meth:`_note_milestone_malformed`.
+        That WARNING is a malformed spec's only route to human attention.
         """
         metadata = task.get('metadata') or {}
-        milestone = metadata.get('milestone')
-        if not milestone:
+        raw = metadata.get('milestone')
+        if not raw:
             return False
         task_id = str(task.get('id', '?'))
-        if not isinstance(milestone, dict):
+        if not isinstance(raw, dict):
             self._note_milestone_malformed(
-                task_id, f'not-a-dict:{milestone!r}',
+                task_id, f'not-a-dict:{raw!r}',
                 'Task %s: metadata.milestone is not a dict (%r) — fail-safe '
                 'withhold (this task will remain pending indefinitely until '
                 'metadata.milestone is corrected)',
-                task_id, milestone,
+                task_id, raw,
             )
             return True
 
-        mode = milestone.get('mode')
+        anchor = metadata.get('milestone_deps_satisfied_at')
         try:
-            if mode == 'dated':
-                at_raw = milestone.get('at')
-                if not isinstance(at_raw, str):
-                    raise ValueError(f'milestone.at must be a string, got {at_raw!r}')
-                at_dt = datetime.fromisoformat(at_raw)
-                if at_dt.tzinfo is None:
-                    at_dt = at_dt.replace(tzinfo=UTC)
-                return now_wall < at_dt
-            elif mode == 'delayed':
-                anchor_raw = metadata.get('milestone_deps_satisfied_at')
-                if not anchor_raw:
-                    return True
-                if not isinstance(anchor_raw, str):
-                    raise ValueError(
-                        f'milestone_deps_satisfied_at must be a string, got {anchor_raw!r}'
-                    )
-                anchor_dt = datetime.fromisoformat(anchor_raw)
-                if anchor_dt.tzinfo is None:
-                    anchor_dt = anchor_dt.replace(tzinfo=UTC)
-                after_secs = milestone.get('after_secs')
-                if not isinstance(after_secs, int):
-                    raise ValueError(f'milestone.after_secs must be an int, got {after_secs!r}')
-                fire_at = anchor_dt + timedelta(seconds=after_secs)
-                return now_wall < fire_at
-            else:
-                self._note_milestone_malformed(
-                    task_id, f'unknown-mode:{mode!r}',
-                    'Task %s: metadata.milestone has unknown mode %r — fail-safe '
-                    'withhold (this task will remain pending indefinitely until '
-                    'metadata.milestone is corrected)',
-                    task_id, mode,
-                )
-                return True
-        except Exception:
+            return not Milestone.model_validate(raw).fired(anchor, now_wall)
+        except ValueError:
             self._note_milestone_malformed(
-                task_id, f'exception:{milestone!r}',
+                task_id, f'invalid:{raw!r}:{anchor!r}',
                 'Task %s: malformed metadata.milestone %r — fail-safe withhold '
                 '(this task will remain pending indefinitely until '
                 'metadata.milestone is corrected)',
-                task_id, milestone,
+                task_id, raw,
                 exc_info=True,
             )
             return True
@@ -5589,6 +4581,8 @@ class Scheduler:
         *,
         external_status_cache: dict[str, str] | None = None,
         external_resolver_failed: bool = False,
+        terminal_dep_records: dict[str, dict] | None = None,
+        deferred_terminal_deps: Collection[str] = frozenset(),
     ) -> None:
         """Per-tick sweep: stamp the frozen-once ``milestone_deps_satisfied_at``
         wall-clock anchor for pending 'delayed' milestone tasks (task 2335 β).
@@ -5601,8 +4595,9 @@ class Scheduler:
         ``metadata.milestone`` whose ``mode == 'delayed'`` that does NOT
         already carry a truthy ``metadata.milestone_deps_satisfied_at``: if
         :meth:`_deps_satisfied` holds — forwarding *external_status_cache* /
-        *external_resolver_failed* so the anchor reflects the SAME complete
-        local+external dependency evaluation dispatch uses (PRD § 2 gap 2) —
+        *external_resolver_failed* / *terminal_dep_records* so the anchor
+        reflects the SAME local+external+scheduled-deploy dependency
+        evaluation dispatch uses (PRD § 2 gap 2) —
         stamp ``self._wall_now().isoformat()`` via
         ``update_task(..., metadata_mode='merge')`` so sibling metadata keys
         are preserved.
@@ -5647,6 +4642,8 @@ class Scheduler:
                     task, status_map, tasks_by_id,
                     external_status_cache=external_status_cache,
                     external_resolver_failed=external_resolver_failed,
+                    terminal_dep_records=terminal_dep_records,
+                    deferred_terminal_deps=deferred_terminal_deps,
                 ):
                     continue
                 await self.update_task(
@@ -5672,6 +4669,7 @@ class Scheduler:
         external_resolver_failed: bool = False,
         delivered_check_cache: dict[str, bool] | None = None,
         terminal_dep_records: dict[str, dict] | None = None,
+        deferred_terminal_deps: Collection[str] = frozenset(),
     ) -> tuple[bool, str | None]:
         """Check whether *task* passes all eligibility gates for dispatch.
 
@@ -5706,7 +4704,9 @@ class Scheduler:
         *tasks_by_id* (task 2692, δ/ε follow-up — the active-only
         ``get_tasks`` fetch excludes done/cancelled producers). When ``None``
         (the default), the fallback is inert — byte-identical to before this
-        param existed.
+        param existed.  *deferred_terminal_deps* travels with it: the TERMINAL
+        deps whose record the backfill's fetch budget deferred before caching
+        (``dependency_verdict.py::deps_verdict``).
 
         Park GC evaluates the same three caches through
         ``dependency_verdict.py::deps_verdict`` (task 6518), so it and
@@ -5755,6 +4755,7 @@ class Scheduler:
             external_resolver_failed=external_resolver_failed,
             delivered_check_cache=delivered_check_cache,
             terminal_dep_records=terminal_dep_records,
+            deferred_terminal_deps=deferred_terminal_deps,
         ):
             return False, None
         signal_label = self._dispatch_cooldown_signal(task)
@@ -5904,7 +4905,8 @@ class Scheduler:
 
         - ``reservation_installed`` only when something was NEWLY parked,
           carrying just that increment (plus ``reservation_shadowed`` per
-          outranked owner, one with a larger :class:`_ParkKey`, pushed
+          outranked owner, one with a larger park key
+          (``orchestrator/src/orchestrator/lock_table.py::_ParkKey``), pushed
           beneath it);
         - ``reservation_install_blocked`` whenever fewer modules were parked
           than requested — empty and partial installs are one signal.
@@ -5943,7 +4945,7 @@ class Scheduler:
                 source=source,
             )
             # Emit reservation_shadowed (non-destructive shadow) for each
-            # outranked owner (larger _ParkKey: lower priority, or the same
+            # outranked owner (larger park key: lower priority, or the same
             # rank and a later id) whose park was pushed beneath task_id.
             # reservation_evicted is RETAINED as an enum member for historical
             # event-log back-compat but is no longer emitted on preemption.
@@ -6101,99 +5103,7 @@ class Scheduler:
             memo[tid] = bfs(tid)
         return memo
 
-    def _compute_age(self, task_id: str, max_id: int) -> int:
-        """Return this task's age, in "newer-task-count" units.
-
-        Anchors are lazily initialized in :meth:`_update_age_anchors`; one
-        is reset to the *current* max_id only when the task's
-        ``pending_since`` changed (D3), so a resurrected task does not inherit
-        accumulated age.
-        """
-        anchor = self._pending_anchor.get(task_id)
-        if anchor is None:
-            return 0
-        return max(0, max_id - anchor)
-
-    def _update_age_anchors(self, tasks: list[dict], max_id: int) -> None:
-        """Maintain one age anchor per task in the active fetch.
-
-        The rule is D3 in
-        ``plans/scheduler-dispatch-scoring-and-lock-layer-prd.md``: only a
-        cancelled -> pending return resets a task's wait, and fused-memory
-        marks exactly that return by overwriting ``metadata.pending_since``.
-
-        - A task with an empty or terminal status is skipped: it is not an
-          observation of the active population, and recording its departure
-          is :meth:`_phase_stale_sweep`'s job alone.
-        - Any other task keeps its known anchor: the held one, else the
-          recorded one, else its own numeric id (so a genuinely-old task
-          carries its accumulated age), else *max_id*.  So a requeue, an
-          unblock, an undefer, an infra-hold resume, a done reopen and a
-          restart all keep the wait.
-        - If the task's stamp resets the known anchor
-          (:meth:`_AgeAnchor.is_reset_by`), the anchor moves to *max_id*.
-
-        An anchor is recorded as soon as it differs from its record, so the
-        stamp it was taken at survives a restart.  A cancel and reopen while
-        no process runs is therefore still reset at the next start, and a
-        reset is applied ONCE, because its record carries the new stamp.  A
-        tick that changes no anchor writes nothing.
-        """
-        changed: dict[str, _AgeAnchor] = {}
-        resets: dict[str, _AgeAnchor] = {}
-        for t in tasks:
-            tid = str(t.get('id', ''))
-            status = t.get('status', '')
-            if not tid or not status or status in TERMINAL_STATUSES:
-                continue
-            stamp = _pending_since(t)
-            stored = self._held_age_anchor(tid) or _AgeAnchor.from_record(self._age_anchors.get(tid))
-            known = stored or _AgeAnchor(int(tid) if tid.isdecimal() else max_id, stamp)
-            if known.is_reset_by(stamp):
-                current = _AgeAnchor(max_id, stamp)
-                resets[tid] = current
-            else:
-                current = _AgeAnchor(known.anchor, stamp or known.pending_since)
-            if current != stored:
-                changed[tid] = current
-            self._hold_age_anchor(tid, current)
-        self._record_age_anchors(changed)
-        self._journal_age_resets(resets)
-
-    def _held_age_anchor(self, tid: str) -> _AgeAnchor | None:
-        if tid not in self._pending_anchor:
-            return None
-        return _AgeAnchor(self._pending_anchor[tid], self._anchor_pending_since.get(tid))
-
-    def _hold_age_anchor(self, tid: str, anchor: _AgeAnchor) -> None:
-        self._pending_anchor[tid] = anchor.anchor
-        self._anchor_pending_since[tid] = anchor.pending_since
-
-    def _release_age_anchor(self, tid: str) -> _AgeAnchor | None:
-        held = self._held_age_anchor(tid)
-        self._pending_anchor.pop(tid, None)
-        self._anchor_pending_since.pop(tid, None)
-        return held
-
-    def _record_age_anchors(self, records: dict[str, _AgeAnchor]) -> None:
-        """Write *records*, and every held anchor with them, in ONE write.
-
-        One write, because each write rewrites the whole file: a cold start
-        or a mass departure of N tasks would otherwise perform N writes of an
-        N-entry file.  Re-recording the held anchors adds no write and
-        refreshes their TTL, so a task that stays in the fetch keeps its
-        record while any write lands within ``_RESURRECTION_GUARD_TTL``.  No
-        records, no write.
-        """
-        if not records:
-            return
-        held = {
-            tid: _AgeAnchor(anchor, self._anchor_pending_since.get(tid))
-            for tid, anchor in self._pending_anchor.items()
-        }
-        self._age_anchors.put_many({tid: a.to_record() for tid, a in {**held, **records}.items()})
-
-    def _journal_age_resets(self, resets: dict[str, _AgeAnchor]) -> None:
+    def _journal_age_resets(self, resets: Mapping[str, AgeAnchor]) -> None:
         """Journal each applied reset (INV-11)."""
         if not self.event_store:
             return
@@ -6213,7 +5123,7 @@ class Scheduler:
         """The pre-C2 dispatch score, still live as the I-6 fallback.
 
         ``score = TIER_BASE[tier] + min(α*age + β*log1p(trans), TIER_WIDTH - 1)``,
-        where *age* is a newer-task count (:meth:`_compute_age`), not seconds.
+        where *age* is a newer-task count (``age_anchors.py::AgeAnchors.age``), not seconds.
         A tick whose anchor coverage is below
         ``scoring.new_scoring_min_anchor_coverage`` scores every candidate
         with this formula.
@@ -6731,8 +5641,8 @@ class Scheduler:
         already populated) and before ``delivered_check_gate`` and both
         candidate-dispatch loops — all of which consult
         ``ctx.terminal_dep_records`` as an additive fallback source for the
-        two delivered-check consumers (``_deps_satisfied``,
-        ``_compute_delivered_check_cache``).
+        delivered-check and scheduled-deploy arms of ``_deps_satisfied`` and
+        for ``_compute_delivered_check_cache``.
 
         Correctness crux (mirrors γ2's ``_phase_backfill_dep_status``, but
         for RECORDS rather than statuses): the active-only ``get_tasks``
@@ -6744,24 +5654,25 @@ class Scheduler:
         delivered-check consumers key off ``tasks_by_id.get(dep_id)`` and
         silently skip the gate entirely (task 2692's root cause).
 
-        Gated by (``config.delivered_checks.enabled`` AND a non-empty
-        missing-id set) — zero extra cost when the gate is off or nothing
-        is missing, mirroring ``_phase_delivered_check_gate``'s own kill
-        switch. Only PENDING tasks' deps are considered, and only deps
-        whose ``status_map`` entry is TERMINAL.
+        Gated by a non-empty missing-id set — zero extra cost when nothing
+        is missing. NOT gated by ``config.delivered_checks.enabled``: the
+        scheduled-deploy hold reads these records too, and the
+        delivered-check arm is switched off by its own ``None`` cache. Only
+        PENDING tasks' deps are considered, and only deps whose
+        ``status_map`` entry is TERMINAL.
 
         Cross-tick record cache (task 2692, reviewer_comprehensive
         performance amendment): a dep_id already present in
         ``self._terminal_dep_record_cache`` is served straight into
         ``ctx.terminal_dep_records`` with NO ``get_task`` call at all,
-        PROVIDED the cached record carries no ``metadata.delivered_checks``
-        — such a checkless terminal task's record is treated as immutable
-        once fetched. Without this, every pending task's completed local
-        deps would be re-fetched on EVERY tick forever, even in the common
-        case where none of them carry ``metadata.delivered_checks``. A
-        cached record that DOES carry ``metadata.delivered_checks`` is
-        instead treated as a cache MISS and re-fetched every sweep (task
-        2977, closing the loop with task 2975's descriptor-digest
+        PROVIDED :func:`_terminal_record_is_immutable` holds: it carries no
+        ``metadata.delivered_checks`` and is not a scheduled self-deploy
+        still awaiting its restart (whose ``deploy_state.phase`` the
+        settler advances later). Without this, every pending task's
+        completed local deps would be re-fetched on EVERY tick forever. A
+        mutable cached record is instead treated as a cache MISS and
+        re-fetched every sweep (task 2977, closing the loop with task
+        2975's descriptor-digest
         self-heal): otherwise an operator's in-place correction of a DONE
         dep's check descriptor, at a fixed main SHA, would be served
         stale forever, since this phase is the sole source
@@ -6782,10 +5693,18 @@ class Scheduler:
         deferred ids are simply "needed" again next tick (they're never
         negatively cached, and any id fetched this tick is cached and so
         never recompetes for a future tick's budget), so this is fail-safe
-        deferral, not silent dropping.
+        deferral, not silent dropping. A deferred dep with no cached record
+        is named in ``ctx.deferred_terminal_deps``, and its dependents wait
+        (UNKNOWN on the scheduled-deploy arm) rather than fail open: after a
+        restart the cold cache needs ceil(terminal deps / budget) ticks to
+        warm, and a held self-deploy sorting late would otherwise release
+        its dependents on every one of them.
 
-        Budget priority (task 2977, reviewer_comprehensive performance
-        amendment): genuinely-NEW dep_ids (absent from
+        Budget priority: a held scheduled-deploy re-validation goes first
+        of all, since only a fresh read can release its hold (a deferred
+        one is served from cache, see below). Then (task 2977,
+        reviewer_comprehensive performance amendment): genuinely-NEW
+        dep_ids (absent from
         ``_terminal_dep_record_cache`` entirely — typically a dependent's
         first-ever evaluation of that dep) are always ordered ahead of
         already-warmed checks-carrying dep_ids up for re-validation, so a
@@ -6809,26 +5728,28 @@ class Scheduler:
 
         Fetches are issued concurrently via ``asyncio.gather`` over
         ``self.get_task`` (the lean per-id fetch primitive), which already
-        returns ``None`` on failure/absence. A dep that fails to fetch is
-        left out of ``ctx.terminal_dep_records`` (and NOT cached, so it's
-        retried next tick) for this tick's fail-safe wait — but a pending
-        dependent's delivered-check gate on THAT dep is bypassed
-        (fail-open) rather than withheld for this tick, since both
-        delivered-check consumers treat "dep record unavailable" as "not
-        checked" (:meth:`_deps_satisfied`, :meth:`_compute_delivered_check_cache`).
-        This is a conscious trade-off (reviewer_comprehensive robustness
-        amendment): the alternative (fail-safe-WAIT whenever a terminal
-        dep record can't be fetched) risks permanently deadlocking a
-        dependent whose dep record genuinely can never be fetched. A
-        bounded WARNING is logged for every such fetch failure so the
-        bypass is operator-visible instead of silent. The whole
+        returns ``None`` on failure/absence. A cached held scheduled-deploy
+        record is served into ``ctx.terminal_dep_records`` before its
+        re-fetch, so a re-fetch that returns ``None``, raises, or is
+        deferred by the budget leaves that held record in place: the hold
+        is released only by a fresh read showing a landed phase (fail-safe,
+        WARNING ``hold retained``). Only a not-yet-cached terminal dep that
+        fails to fetch fails open: it is left out of
+        ``ctx.terminal_dep_records`` (and NOT cached, so it's retried next
+        tick), and a pending dependent's delivered-check gate or
+        scheduled-deploy hold on it is bypassed this tick, since every
+        consumer treats "dep record unavailable" as "not checked"
+        (:meth:`_deps_satisfied`, :meth:`_compute_delivered_check_cache`).
+        That cold-cache window is a conscious trade-off
+        (reviewer_comprehensive robustness amendment): fail-safe-WAIT on
+        every unfetchable record risks permanently deadlocking a dependent
+        whose dep record genuinely can never be fetched. A bounded WARNING
+        names every such bypass. The whole
         collection+fetch is further wrapped in try/except so an
         unexpected failure logs a WARNING and leaves
         ``ctx.terminal_dep_records`` as-is (fail-safe), mirroring
         ``_phase_delivered_check_gate``. Always continues.
         """
-        if not self.config.delivered_checks.enabled:
-            return _CONTINUE
         try:
             needed: set[str] = set()
             for _t in ctx.tasks:
@@ -6846,63 +5767,57 @@ class Scheduler:
             if not needed:
                 return _CONTINUE
 
+            _held_to_fetch: set[str] = set()
             _new_to_fetch: list[str] = []
             _revalidate_to_fetch: list[str] = []
             for _dep_id in needed:
                 _cached_record = self._terminal_dep_record_cache.get(_dep_id)
-                # Task 2977: a warmed record is served from cache ONLY when
-                # it carries no delivered_checks. The record cache is never
-                # evicted, so if a checks-carrying record were always
-                # served from cache, an operator correcting a DONE dep's
-                # check descriptor in place (at a fixed main SHA) would be
-                # served the stale descriptor forever — freezing task
-                # 2975's (dep_id, main_sha, descriptor_digest) self-heal,
-                # whose digest is computed from whatever this phase serves
-                # into ctx.terminal_dep_records. Treating a checks-carrying
-                # cache entry as a MISS forces a re-fetch every sweep (the
-                # loop below overwrites the cache with the fresh record),
-                # so a corrected descriptor is observed on the very next
-                # tick. Checkless records — the common case and the entire
-                # performance rationale for this cache — are still served
-                # for free. Documented boundary: adding delivered_checks to
-                # a previously-checkless, already-warmed record is NOT
-                # observed until an orchestrator restart resets the cache.
-                if _cached_record is not None and not (
-                    (_cached_record.get('metadata') or {}).get('delivered_checks')
-                ):
-                    ctx.terminal_dep_records[_dep_id] = _cached_record
-                elif _cached_record is not None:
-                    # Already warmed but checks-carrying — a re-validation,
-                    # not a first-time fetch (budget priority below).
-                    _revalidate_to_fetch.append(_dep_id)
-                else:
+                # A warmed record skips the re-fetch ONLY while immutable.
+                # The cache is never evicted, so a mutable record served from
+                # it alone would be stale forever: a corrected check
+                # descriptor (task 2977, freezing task 2975's digest
+                # self-heal) or a scheduled self-deploy's phase (task 7276,
+                # holding its dependents forever). A held record is served
+                # AND re-fetched: only an affirmative fresh read replaces it.
+                # Documented boundary: adding delivered_checks to a
+                # previously-checkless, already-warmed record is NOT
+                # observed until an orchestrator restart.
+                if _cached_record is None:
                     _new_to_fetch.append(_dep_id)
-            if not _new_to_fetch and not _revalidate_to_fetch:
+                elif _terminal_record_is_immutable(_cached_record):
+                    ctx.terminal_dep_records[_dep_id] = _cached_record
+                elif awaits_scheduled_restart(_cached_record.get('metadata')):
+                    ctx.terminal_dep_records[_dep_id] = _cached_record
+                    _held_to_fetch.add(_dep_id)
+                else:
+                    _revalidate_to_fetch.append(_dep_id)
+            if not (_held_to_fetch or _new_to_fetch or _revalidate_to_fetch):
                 return _CONTINUE
 
-            # Task 2977 (reviewer_comprehensive performance amendment): a
-            # genuinely-new dep_id always gets budget priority over an
-            # already-warmed re-validation dep_id — see this method's
-            # "Budget priority" docstring paragraph. Each group is sorted
-            # independently for determinism.
-            _ordered = sorted(_new_to_fetch) + sorted(_revalidate_to_fetch)
+            # See this method's "Budget priority" docstring paragraph. Each
+            # group is sorted independently for determinism.
+            _ordered = (
+                sorted(_held_to_fetch) + sorted(_new_to_fetch) + sorted(_revalidate_to_fetch)
+            )
             _budget = self.config.delivered_checks.max_checks_per_tick
             if len(_ordered) > _budget:
                 _total = len(_ordered)
-                _deferred = _ordered[_budget:]
+                _deferred = set(_ordered[_budget:])
                 _ordered = _ordered[:_budget]
-                _new_set = set(_new_to_fetch)
-                _deferred_new = sum(1 for _d in _deferred if _d in _new_set)
-                _deferred_revalidate = len(_deferred) - _deferred_new
+                ctx.deferred_terminal_deps = frozenset(_deferred.intersection(_new_to_fetch))
                 logger.warning(
                     'acquire_next: terminal dep record backfill has %d '
-                    'dep(s) to fetch this tick (%d new, %d re-validation), '
-                    'exceeding delivered_checks.max_checks_per_tick (%d) — '
-                    'fetching %d, deferring %d (%d new, %d re-validation) '
+                    'dep(s) to fetch this tick (%d held, %d new, %d '
+                    're-validation), exceeding '
+                    'delivered_checks.max_checks_per_tick (%d) — fetching '
+                    '%d, deferring %d (%d held, %d new, %d re-validation) '
                     'to a later tick.',
-                    _total, len(_new_to_fetch), len(_revalidate_to_fetch),
-                    _budget, len(_ordered), _total - len(_ordered),
-                    _deferred_new, _deferred_revalidate,
+                    _total, len(_held_to_fetch), len(_new_to_fetch),
+                    len(_revalidate_to_fetch), _budget, len(_ordered),
+                    len(_deferred),
+                    len(_deferred.intersection(_held_to_fetch)),
+                    len(_deferred.intersection(_new_to_fetch)),
+                    len(_deferred.intersection(_revalidate_to_fetch)),
                 )
             _fetched = await asyncio.gather(
                 *(self.get_task(_dep_id) for _dep_id in _ordered)
@@ -6911,12 +5826,21 @@ class Scheduler:
                 if _record is not None:
                     ctx.terminal_dep_records[_dep_id] = _record
                     self._terminal_dep_record_cache[_dep_id] = _record
+                elif _dep_id in _held_to_fetch:
+                    logger.warning(
+                        'acquire_next: terminal dep %s record fetch '
+                        'returned None (transient?) — hold retained: the '
+                        'cached scheduled-deploy record is served and its '
+                        'dependents stay held this tick; will retry next tick.',
+                        _dep_id,
+                    )
                 else:
                     logger.warning(
                         'acquire_next: terminal dep %s record fetch '
                         'returned None (transient?) — any pending '
-                        "dependent's delivered-check gate on this dep is "
-                        'bypassed (fail-open, not affirmatively passed) '
+                        "dependent's delivered-check gate on this dep, or "
+                        'scheduled-deploy hold on this not-yet-cached dep, '
+                        'is bypassed (fail-open, not affirmatively passed) '
                         'this tick; will retry next tick.',
                         _dep_id,
                     )
@@ -6976,7 +5900,9 @@ class Scheduler:
         - ``'deps_unsatisfied:external'`` — the resolver reports a
           cross-project dependency other than done;
         - ``'deps_unsatisfied:delivered_check'`` — a dependency's delivered
-          check ran and failed.
+          check ran and failed;
+        - ``'deps_unsatisfied:scheduled_deploy'`` — a dependency is a
+          scheduled self-deploy whose restart is not yet verified.
 
         A dependency that is merely UNKNOWN this tick keeps the parks:
         expiry needs affirmative evidence
@@ -6997,6 +5923,7 @@ class Scheduler:
             external_resolver_failed=ctx.external_resolver_failed,
             delivered_check_cache=ctx.delivered_check_cache,
             terminal_dep_records=ctx.terminal_dep_records,
+            deferred_terminal_deps=ctx.deferred_terminal_deps,
         )
         if verdict.state is not DepState.UNSATISFIED:
             return None
@@ -7046,11 +5973,11 @@ class Scheduler:
 
         Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes:
         ``ctx.stale_ids``. Drops ``_last_dispatch_at`` / ``_skip_count`` /
-        ``_module_cache`` / ``_pending_anchor`` entries for tasks that are
+        ``_module_cache`` entries and the age anchors for tasks that are
         (a) in a terminal status, or (b) absent from tasks_by_id
         (active-only filter dropped them), recording each dropped id in
-        ``ctx.stale_ids`` and its age anchor in ``_age_anchors``, which a
-        return restores. Then sweeps every
+        ``ctx.stale_ids``; ``AgeAnchors.record_departures`` records each
+        anchor so a return restores it. Then sweeps every
         registered ``StreakRegistry`` counter (task 2124) via
         ``self._streak_registry.gc`` — CONSUMED here, not re-collapsed
         into a hand loop — unioning in tasks that left the candidate pool
@@ -7074,12 +6001,11 @@ class Scheduler:
         """
         stale_ids: set[str] = set()
         terminal_ids: set[str] = set()
-        departed_anchors: dict[str, _AgeAnchor] = {}
         all_tracked: set[str] = (
             set(self._last_dispatch_at)
             | set(self._skip_count)
             | set(self._module_cache)
-            | set(self._pending_anchor)
+            | self.age_anchors.tracked_ids()
         )
         for tid_str in all_tracked:
             is_terminal = ctx.status_map.get(tid_str) in TERMINAL_STATUSES
@@ -7089,11 +6015,8 @@ class Scheduler:
                 self._last_dispatch_at.pop(tid_str, None)
                 self._skip_count.pop(tid_str, None)
                 self._module_cache.pop(tid_str, None)
-                departed = self._release_age_anchor(tid_str)
-                if departed is not None:
-                    departed_anchors[tid_str] = departed
                 stale_ids.add(tid_str)
-        self._record_age_anchors(departed_anchors)
+        self.age_anchors.record_departures(stale_ids)
         self._forget_starvation_inputs(ctx.status_map)
         starvation_non_eligible = {
             tid for tid in self._starvation_escalated
@@ -7260,7 +6183,7 @@ class Scheduler:
                     now=now,
                 ),
             )
-        except Exception as exc:  # noqa: BLE001 — telemetry never disturbs a sweep
+        except Exception as exc:  # telemetry never disturbs a sweep
             logger.warning(
                 'Task %s: recovery-disposition emission failed (non-fatal): %s',
                 task_id, exc,
@@ -7298,7 +6221,7 @@ class Scheduler:
             for tracked_site, tid in tuple(tracker.tracked()):
                 if str(tracked_site) == site and tid not in observed:
                     tracker.clear(tracked_site, tid)
-        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a tick
+        except Exception as exc:  # bookkeeping never aborts a tick
             logger.warning(
                 'recovery veto-streak release failed (non-fatal): %s', exc,
             )
@@ -7338,7 +6261,8 @@ class Scheduler:
         QUEUE_HANDOFF (L1/L2, or an L0 whose filer is still live) pins; a
         DEAD_L0 does not, because its handoff has no consumer left; an
         ``info`` record never pins at any level; and a record set consisting
-        ENTIRELY of merge-remediable categories does not pin, because those
+        ENTIRELY of merge-remediable categories does not pin, unless one of
+        them needs a human (``escalation.pins.needs_human``), because those
         records ASK for the remediation this sweep performs.  The precedence
         chain itself is documented once, in ``escalation/pins.py``.
 
@@ -7489,7 +6413,11 @@ class Scheduler:
                 # provably dead.  Every escape hatch against a redispatch loop
                 # is untouched above: the kill switch, the `_dispatched`
                 # membership gate, `workflow_cancel_recent`, the requeue
-                # cooldown, `_deps_satisfied`, and the reblock guard.
+                # cooldown and `_deps_satisfied`.  The reblock guard is not
+                # one: `Harness._check_reblock_guard` counts only
+                # escalation-resolution flips, never this one, so it is the
+                # predicate's needs-a-human exemption that keeps a merge-entry
+                # gate from re-pending here (task 6145).
                 #
                 # `live_claimant=False` is EXACT, not an assumption:
                 # `is_stranded_blocked(task, ...)` returned True immediately
@@ -7515,8 +6443,9 @@ class Scheduler:
                     continue
                 logger.warning(
                     'Task %s: crash-stranded-blocked-redispatch — flipping blocked -> '
-                    'pending (no live claimant, deps satisfied, no open escalation)',
+                    'pending (no live claimant, deps satisfied, %s)',
                     tid,
+                    _describe_records_flipped_past(rows),
                 )
                 await self.clear_claim_then_set_status(tid, 'pending')
             except Exception:
@@ -7658,8 +6587,9 @@ class Scheduler:
         """Stamp the frozen-once ``milestone_deps_satisfied_at`` anchor.
 
         Reads: ``ctx.tasks``, ``ctx.status_map``, ``ctx.tasks_by_id``,
-        ``ctx.external_cache``, ``ctx.external_resolver_failed``. Writes:
-        none on ctx (persists via ``_stamp_milestone_deps_satisfied``). For
+        ``ctx.external_cache``, ``ctx.external_resolver_failed``,
+        ``ctx.terminal_dep_records``. Writes: none on ctx (persists via
+        ``_stamp_milestone_deps_satisfied``). For
         pending 'delayed' milestone tasks whose full (local + external)
         deps just became satisfied (task 2335 β). Placed after the
         external-dep cache phase so the anchor reflects the SAME complete
@@ -7672,6 +6602,8 @@ class Scheduler:
             ctx.tasks, ctx.status_map, ctx.tasks_by_id,
             external_status_cache=ctx.external_cache,
             external_resolver_failed=ctx.external_resolver_failed,
+            terminal_dep_records=ctx.terminal_dep_records,
+            deferred_terminal_deps=ctx.deferred_terminal_deps,
         )
         return _CONTINUE
 
@@ -7842,6 +6774,7 @@ class Scheduler:
             override_boosts=override_boosts or None,
         )
         self._last_effective_priorities = dict(effective_priorities)
+        self._lookup_pins.adopt(ctx.overrides)
         transitive_counts = self._compute_transitive_counts(
             ctx.tasks_by_id, reverse_index, ctx.status_map
         )
@@ -7859,13 +6792,14 @@ class Scheduler:
         tasks whose deps are all done and that aren't dispatched or in
         their post-requeue cooldown window. ``_eligible_for_dispatch``
         (UNCHANGED) encapsulates all gates so the pin-dispatch loop below
-        uses the same logic (single source of truth). Always continues.
+        uses the same logic (single source of truth). A task ``ctx.scope``
+        does not admit is dropped first. Always continues.
         """
         candidates: list[dict] = []
         candidate_signals: dict[str, str | None] = {}
         for t in ctx.tasks:
             tid_str = str(t.get('id', ''))
-            if not tid_str:
+            if not tid_str or not ctx.scope.admits(t):
                 continue
             eligible, signal_label = self._eligible_for_dispatch(
                 t, tid_str, ctx.status_map, ctx.tasks_by_id,
@@ -7873,6 +6807,7 @@ class Scheduler:
                 external_resolver_failed=ctx.external_resolver_failed,
                 delivered_check_cache=ctx.delivered_check_cache,
                 terminal_dep_records=ctx.terminal_dep_records,
+                deferred_terminal_deps=ctx.deferred_terminal_deps,
             )
             if not eligible:
                 continue
@@ -8078,13 +7013,21 @@ class Scheduler:
         ``orchestrator/pin_reservation.py``'s module docstring.
         :meth:`_bound_pin_reservations` enforces that bound at phase start
         (so a PSI-held tick still applies it) and after each head reserves.
+        A pin the PSI hold defers keeps the reservation that bound left it,
+        so it still counts as a head: an exempt pin behind it then never
+        reserves only to be displaced in the same tick.
         Every lock-blocked pin also reports ``pin_blocked``
         (:meth:`_note_pin_blocked`).  With ``pin_reservations_enabled`` off, a
         blocked pin neither reserves nor reports, as before task 6040.
         Returns ``TickOutcome(TaskAssignment)`` on a successful dispatch,
         else ``_CONTINUE`` to fall through to the scored loop.
+
+        A tick restricted to a scope other than ANY skips this phase, so it
+        neither dispatches a pin the scope does not admit nor releases pin
+        reservations; an admitted pinned task dispatches through
+        ``_phase_select_scored`` as an ordinary candidate.
         """
-        if not self._override_store:
+        if not self._override_store or ctx.scope is not DispatchScope.ANY:
             return _CONTINUE
         queue = self._pin_queue(ctx)
         reservable = tuple(
@@ -8094,14 +7037,16 @@ class Scheduler:
         self._bound_pin_reservations(ctx, reservable)
         heads = 0
         for pin in queue:
-            if ctx.psi_hold and not self.is_deterministic(pin.task):
+            if ctx.psi_hold and not self._exempt_from_psi_hold(pin.task):
                 # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
-                # doesn't reduce host load, so a pinned HEAVY candidate is
-                # deferred exactly like a scored one — deterministic pins
-                # remain exempt.  ctx.psi_hold and _note_heavy_deferral are
-                # the SAME once-per-tick decision/helper the scored loop
-                # uses below, so both loops share one hold and one event.
+                # doesn't reduce host load, so a pinned candidate is deferred
+                # exactly like a scored one (see `_exempt_from_psi_hold`).
+                # ctx.psi_hold and _note_heavy_deferral are the SAME
+                # once-per-tick decision/helper the scored loop uses below,
+                # so both loops share one hold and one event.
                 self._note_heavy_deferral(ctx, ctx.psi_hold, pin.task_id)
+                if self.lock_table.reservation_source(pin.task_id) is ReservationSource.PIN:
+                    heads += 1
                 continue
             modules = self._get_modules(pin.task)
             if self.lock_table.try_acquire(pin.task_id, modules):
@@ -8171,8 +7116,8 @@ class Scheduler:
         pin ahead of it in the queue has already been tried this tick, so the
         cap keeps this tick's heads first, and a displaced pin is outranked by
         the head's pin rank on every key they share.  (Pins with no stored
-        pin_order tie at one rank, and tied pins resolve by the id tie-break of
-        :class:`_ParkKey`, so only a head whose id follows the displaced pin's
+        pin_order tie at one rank, and tied pins resolve by the park key's id
+        tie-break, so only a head whose id follows the displaced pin's
         waits for its next completion on the shared key.)  Owners that fail the park-hold predicate
         (:meth:`_park_hold_refusal`) lost every park, pin entries included, in
         park GC earlier in the tick; completion runs only for an owner that
@@ -8248,6 +7193,7 @@ class Scheduler:
             external_resolver_failed=ctx.external_resolver_failed,
             delivered_check_cache=ctx.delivered_check_cache,
             terminal_dep_records=ctx.terminal_dep_records,
+            deferred_terminal_deps=ctx.deferred_terminal_deps,
         )
         if not eligible:
             return False, None
@@ -8328,18 +7274,6 @@ class Scheduler:
             file_sentinel_l1(self.escalation_queue, verdict.escalation)
         return verdict.armed
 
-    def _resolve_sentinel_l1(self, sentinel: str, resolution: str) -> None:
-        """Resolve each open L1 the scheduler filed under *sentinel*, its condition cleared; never raises."""
-        queue = self.escalation_queue
-        if queue is None:
-            return
-        try:
-            for esc in queue.get_by_task(sentinel, status='pending', level=1, agent_role='orchestrator-scheduler'):
-                queue.resolve(esc.id, resolution, resolved_by='orchestrator-scheduler')
-                logger.info('Auto-resolved L1 %s escalation %s', sentinel, esc.id)
-        except Exception:
-            logger.warning('Failed to resolve %s escalation', sentinel, exc_info=True)
-
     def _load_work_product(self, store: EventStore) -> WorkProductSnapshot:
         """Git's task branches plus the restart-safe zero-progress gate, on a worker thread (PRD C3).
 
@@ -8387,10 +7321,10 @@ class Scheduler:
                     has_work_product=work.has_work_product(tid, now=now_ts, max_age_secs=max_age),
                 )
             else:
-                score = self._compute_score_legacy(pri, self._compute_age(tid, ctx.max_id), transitive)
+                score = self._compute_score_legacy(pri, self.age_anchors.age(tid, ctx.max_id), transitive)
             scored.append((score, tid, t, pri))
 
-        scored.sort(key=lambda entry: (-entry[0], *_tie_break(entry[1])))
+        scored.sort(key=lambda entry: (-entry[0], *id_tie_break(entry[1])))
         return scored
 
     async def _phase_select_scored(self, ctx: TickContext) -> object:
@@ -8444,11 +7378,10 @@ class Scheduler:
         refused: list[str] = []
         try:
             for _score, task_id, task, pri in scored:
-                if ctx.psi_hold and not self.is_deterministic(task):
-                    # Dispatch-admission gate (DA3): defer this HEAVY candidate —
-                    # deterministic candidates are exempt (DA-D4) and lower-
-                    # ranked exempt/light candidates behind it still get a turn
-                    # (per-candidate `continue`, not a top-level `return None`).
+                if ctx.psi_hold and not self._exempt_from_psi_hold(task):
+                    # Dispatch-admission gate (DA3): a per-candidate `continue`,
+                    # so exempt candidates ranked behind this one (see
+                    # `_exempt_from_psi_hold`) still get a turn.
                     self._note_heavy_deferral(ctx, ctx.psi_hold, task_id)
                     continue
                 modules = self._get_modules(task)
@@ -8478,7 +7411,7 @@ class Scheduler:
                     refused.append(task_id)
                 if acquired:
                     self._dispatched.add(task_id)
-                    self._lock_refusals.note_scan(refused)
+                    self._watchdog_state.note_scan(refused)
                     # Starvation-watchdog settle (tasks 1880, 3821): resolve any
                     # open watchdog escalation and forget the task's watchdog
                     # inputs.  Wrapped so a failure can NEVER abort a successful
@@ -8523,16 +7456,21 @@ class Scheduler:
         await self._write_snapshot_best_effort()
         return TickOutcome(None)
 
-    async def acquire_next(self) -> TaskAssignment | None:
+    async def acquire_next(self, scope: DispatchScope = DispatchScope.ANY) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
         Dispatch order is determined by ``_score_candidates()``: tier base is
         dominant, age + CPM (+ continuity) bonuses order tasks within a tier,
         and per-tier slot caps reserve headroom for higher-value work.
 
+        A *scope* other than ANY restricts this tick's dispatch to the tasks
+        the scope admits (the harness passes MAIN_HEALTH_FIX when only the
+        reserved run slot is free).
+
         Returns ``None`` immediately when the scheduler is paused (park-stop).
-        No MCP round-trips, no GC, no override snapshots are performed while
-        paused — all resume cleanly on the first unpaused tick.
+        The only work while paused is the priority lookup's pin re-read, at
+        most once a minute, into a map of its own (not the tick's override
+        snapshot); everything else resumes on the first unpaused tick.
         """
         assert self._started, (
             'acquire_next() called before finish_startup() — startup '
@@ -8544,6 +7482,7 @@ class Scheduler:
                 'acquire_next() short-circuit: scheduler is paused (reason=%r)',
                 self._pause_reason,
             )
+            await self._lookup_pins.refresh_if_due()
             return None
 
         try:
@@ -8577,7 +7516,7 @@ class Scheduler:
             # exactly an fm outage/restart.  Defer instead — the next
             # successful tick will drain any still-queued requests safely.
             self._note_fm_read_failure()
-            self._emit_tick_telemetry(None, tick_started, {}, 'get_tasks_failed', None)
+            self._emit_tick_telemetry(None, tick_started, {}, 'get_tasks_failed', None, scope)
             return None
         self._reset_fm_read_failure_streak()
         if not tasks:
@@ -8591,7 +7530,7 @@ class Scheduler:
             self._drain_park_eviction_requests(
                 TickContext(tasks=[], status_map={}, tasks_by_id={})
             )
-            self._emit_tick_telemetry(None, tick_started, {}, 'no_active_tasks', None)
+            self._emit_tick_telemetry(None, tick_started, {}, 'no_active_tasks', None, scope)
             return None
 
         # Status + id indices, built once per tick.
@@ -8608,7 +7547,7 @@ class Scheduler:
                 max_id = max(max_id, int(tid))
 
         # Maintain age anchors (resurrected tasks reset their anchor).
-        self._update_age_anchors(tasks, max_id)
+        self._journal_age_resets(self.age_anchors.observe(tasks, max_id))
 
         # Per-tick mutable state threaded through the phase methods below
         # (W10-β). Constructed once the status/id indices + age anchors are
@@ -8620,6 +7559,7 @@ class Scheduler:
             status_map=status_map,
             tasks_by_id=tasks_by_id,
             max_id=max_id,
+            scope=scope,
         )
 
         # Ordering-as-data (task 2236, W10-β): drive the whole tick from
@@ -8666,7 +7606,7 @@ class Scheduler:
             return None
         finally:
             self._emit_tick_telemetry(
-                ctx, tick_started, phase_ms, terminal_phase, assignment,
+                ctx, tick_started, phase_ms, terminal_phase, assignment, scope,
             )
 
     def _emit_tick_telemetry(
@@ -8676,6 +7616,7 @@ class Scheduler:
         phase_ms: dict[str, int],
         terminal_phase: str | None,
         assignment: TaskAssignment | None,
+        scope: DispatchScope,
     ) -> None:
         """Emit one ``scheduler_tick`` event summarising the tick just finished.
 
@@ -8699,10 +7640,21 @@ class Scheduler:
                     'phases': phase_ms,
                     'terminal_phase': terminal_phase,
                     'candidates': len(candidates) if candidates is not None else None,
+                    'scope': scope.value,
                 },
             )
         except Exception:
             logger.warning('scheduler_tick telemetry emit failed', exc_info=True)
+
+    def task_priority(self, task_id: str) -> TaskPriority:
+        """*task_id*'s effective tier, base tier and pin, read from this scheduler's memory.
+
+        The base tier is the one :meth:`get_state_snapshot` exports as
+        ``effective_priorities`` (unknown for a task no tick ranked); the pin
+        comes from the lookup's own pin map (unknown when no override store is
+        wired). A pure dict read: never touches the override store.
+        """
+        return self._lookup_pins.priority(task_id, self._last_effective_priorities.get(task_id))
 
     def get_state_snapshot(self) -> SchedulerStateSnapshot:
         """Return a frozen copy of the scheduler's current state.
@@ -8744,6 +7696,7 @@ class Scheduler:
                         exc_info=True,
                     )
 
+        held_by_task = self.lock_table.snapshot_held_by_task()
         return SchedulerStateSnapshot(
             skip_counts=dict(self._skip_count),
             parks=_park_records(self.lock_table.snapshot_parks()),
@@ -8755,7 +7708,9 @@ class Scheduler:
             effective_priorities=dict(self._last_effective_priorities),
             pin_queue=tuple(pin_queue),
             overrides=overrides,
-            current_holders=self.lock_table.snapshot_holders(),
+            current_holders=one_holder_per_key(held_by_task),
+            held_by_task=held_by_task,
+            holder_limits=self.lock_table.snapshot_holder_limits(),
             lock_depth=self.config.lock_depth,
             is_paused=self.is_paused,
             pause_reason=self.pause_reason,
@@ -8817,6 +7772,14 @@ class Scheduler:
         if payload is None:
             payload = json.dumps(self.get_state_snapshot().to_json())
         safe_io.atomic_write_text(path, payload, encoding='utf-8', mkdir=True)
+
+    def _snapshot_path(self) -> Path | None:
+        """The state snapshot's file: the injected path, else under the project root; ``None`` for an unset root."""
+        if self._state_snapshot_path is not None:
+            return Path(self._state_snapshot_path)
+        if not self._project_root or self._project_root == 'None':
+            return None
+        return scheduler_state_json(self._project_root)
 
     async def _write_snapshot_best_effort(self, force: bool = False) -> None:
         """Write the scheduler state snapshot to the default path off the event loop.
@@ -8884,9 +7847,8 @@ class Scheduler:
         # 2418): an explicit injected path is always honored regardless of
         # ``_project_root``, which some callers must independently set to a
         # non-writable value for use as an OverrideStore lookup key.
-        if self._state_snapshot_path is None and (
-            not self._project_root or self._project_root == 'None'
-        ):
+        path = self._snapshot_path()
+        if path is None:
             if not self._snapshot_guard_warned:
                 self._snapshot_guard_warned = True
                 logger.warning(
@@ -8937,11 +7899,6 @@ class Scheduler:
                 # applies.  Passed directly to _write_state_snapshot_raw to avoid a
                 # second get_state_snapshot() call on the actual write path.
                 disk_payload = json.dumps(state.to_json())
-                path = (
-                    Path(self._state_snapshot_path)
-                    if self._state_snapshot_path is not None
-                    else scheduler_state_json(self._project_root)
-                )
                 await asyncio.to_thread(self._write_state_snapshot_raw, path, disk_payload)
                 # Bookkeeping advanced only after a confirmed successful write.
                 # _write_state_snapshot_raw propagates exceptions so these lines are
@@ -9010,6 +7967,33 @@ class Scheduler:
                 task_id,
             )
         return updated
+
+    async def acquire_uncontested(
+        self, task_id: str, modules: list[str], *, reason: str,
+    ) -> UncontestedAcquisition:
+        """The live-slot widen: take every free key of *modules*, name the rest.
+
+        For a task whose workflow is running. Unlike
+        :meth:`handle_blast_radius_expansion`, which re-pends the row and
+        releases every lock on a conflict and so must never be used mid-EXECUTE
+        (task 3090 ruling), this never re-pends, never releases and never
+        writes status. A contested key comes back as a Blocker naming its
+        holder. Acquired keys emit ``lock_acquired`` with *reason* through the
+        single lock-event writer and refresh the module cache through its
+        single writer.
+        """
+        result = self.lock_table.acquire_uncontested(task_id, modules)
+        if result.acquired:
+            self._emit_lock_event(
+                EventType.lock_acquired,
+                task_id=task_id,
+                modules=list(result.acquired),
+                reason=reason,
+            )
+            self._write_module_cache(
+                task_id, sorted(self.lock_table.held_modules(task_id))
+            )
+        return result
 
     async def handle_blast_radius_expansion(
         self,
@@ -9305,8 +8289,7 @@ class Scheduler:
         armed_n = self._pending_transient_cooldown.pop(task_id, None)
         if requeued:
             self._arm_requeue_cooldown(task_id, armed_n)
-        modules = list(self.lock_table._held.get(task_id, set()))
-        self.lock_table.release(task_id)
+        modules = self.lock_table.release(task_id)
         # Defensive: dispatch already settled this task's parks, so this only
         # clears parks installed after dispatch (e.g. a park rehydrated at
         # startup for a task that is already running).
@@ -9345,7 +8328,7 @@ class Scheduler:
 
     def note_workflow_cancelled(self, tid: str) -> None:
         """Stamp *tid* as just-cancelled, opening the reconcile grace window."""
-        self._workflow_cancel_at[tid] = time.monotonic()
+        self._workflow_cancel_at[tid] = self._time_source()
 
     def clear_workflow_cancel(self, tid: str) -> None:
         """Clear *tid*'s cancel stamp, if any (no-op if absent)."""
@@ -9365,7 +8348,7 @@ class Scheduler:
         cancelled_at = self._workflow_cancel_at.get(tid)
         return (
             cancelled_at is not None
-            and time.monotonic() - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
+            and self._time_source() - cancelled_at < self._RECONCILE_CANCEL_GRACE_S
         )
 
     # --- Pre-enqueue MERGE-phase grace accessors (task 2753) ---
@@ -9377,11 +8360,11 @@ class Scheduler:
     def note_merge_phase_entered(self, tid: str) -> None:
         """Stamp *tid* as entering the pre-enqueue MERGE-phase window.
 
-        Re-stamps ``time.monotonic()`` on each call (each REQUEUED retry
-        re-runs a vulnerable pre-merge verify), so the grace tracks the most
-        recent entry.
+        Re-stamps from the scheduler's time source on each call (each
+        REQUEUED retry re-runs a vulnerable pre-merge verify), so the grace
+        tracks the most recent entry.
         """
-        self._merge_phase_at[tid] = time.monotonic()
+        self._merge_phase_at[tid] = self._time_source()
 
     def clear_merge_phase(self, tid: str) -> None:
         """Clear *tid*'s merge-phase stamp, if any (no-op if absent)."""
@@ -9399,7 +8382,7 @@ class Scheduler:
         """
         if grace_secs <= 0:
             return False
-        now = time.monotonic()
+        now = self._time_source()
         return any(
             now - stamp < grace_secs for stamp in self._merge_phase_at.values()
         )
@@ -9921,7 +8904,7 @@ class Scheduler:
         that emitted without feeding would leave the event stream complete —
         so nothing would look broken — while the live history silently drifted
         from what ``seed_from_event_store`` would reconstruct off the same
-        stream.  test_scheduler_hold_history.py enforces the single site
+        stream.  test_lock_event_emit_site_guard.py enforces the single site
         structurally, by AST scan.
 
         The predictor is fed even when ``self.event_store`` is None: the

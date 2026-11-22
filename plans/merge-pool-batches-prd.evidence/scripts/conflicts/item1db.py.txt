@@ -1,0 +1,10 @@
+import sqlite3,json,collections
+c=sqlite3.connect('file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro',uri=True)
+rs=c.execute("select timestamp,data from events where event_type='merge_verify' and timestamp>='2026-11-19' and json_extract(data,'$.chain_depth_reason') is not null").fetchall()
+t=collections.Counter()
+for ts,d in rs:
+    d=json.loads(d); r=d['chain_depth_reason']
+    req=r.get('row')[1] if r.get('row') else None
+    t[(req, min(req or 0, r.get('queue_depth')) if req else None, d['chain_items'])]+=1
+    print(ts[:19], r.get('basis'), r.get('row'), r.get('queue_depth'), d['chain_items'], d['passed'])
+print(sorted(t.items(),key=str))

@@ -115,6 +115,7 @@ async def _dispatch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.spawns_agent_cli
 @_DISPATCH_PATHS
 async def test_dispatched_claude_session_resets_bash_cwd_by_default(
     fake_claude, tmp_path, sandbox_modules, dispatch_context,
@@ -134,6 +135,7 @@ async def test_dispatched_claude_session_resets_bash_cwd_by_default(
 
 
 @pytest.mark.asyncio
+@pytest.mark.spawns_agent_cli
 @_DISPATCH_PATHS
 async def test_explicit_env_override_wins(
     fake_claude, tmp_path, sandbox_modules, dispatch_context,

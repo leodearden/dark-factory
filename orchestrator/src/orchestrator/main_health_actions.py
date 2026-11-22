@@ -20,3 +20,6 @@ class MainHealthNextAction(StrEnum):
 
     AUTO_HEAL_EXHAUSTED = 'investigate_main_rebreak_after_auto_heal'
     """The auto-heal fix already ran for this signature and the break recurred; automation has stopped."""
+
+    STEWARD_RERUN_IN_ISOLATION = 'rerun_failures_in_isolation_resume_if_green'
+    """For the blocked task's steward (the task-verify L0): the pre-existing verdict can be a host-load false positive, so re-run the named failures in isolation in the task's worktree and resume if they pass; if they fail there too, the fix-main task named in the detail owns the fix, and with none named, re-escalate so one is filed."""

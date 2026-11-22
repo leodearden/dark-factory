@@ -94,3 +94,63 @@ def test_paths_list_the_current_file_then_each_rotation(tmp_path: Path):
         tmp_path / 'dl.jsonl.2',
     ]
     assert DeadLetterWriter(path, keep_rotations=0).paths() == [path]
+
+
+def test_on_settled_runs_before_the_append_future_resolves(tmp_path: Path):
+    held = hold_fifo(tmp_path / 'dl.jsonl')
+    writer = DeadLetterWriter(held.path)
+    record = {'event': {'id': 'e1'}, 'reason': 'overflow_drop'}
+    seen: list[tuple[bool, bool]] = []
+
+    written = writer.append(record, on_settled=lambda ok: seen.append((ok, written.done())))
+
+    held.release.set()
+    assert held.records() == [record]
+    assert written.result(timeout=5) is True
+    assert seen == [(True, False)], 'on_settled ran after the future resolved'
+
+
+def test_on_settled_receives_false_when_the_write_fails(tmp_path: Path):
+    (tmp_path / 'blocker').write_text('a regular file, not a directory')
+    writer = DeadLetterWriter(tmp_path / 'blocker' / 'dl.jsonl')
+    seen: list[bool] = []
+
+    written = writer.append({'event': {'id': 'e1'}}, on_settled=seen.append)
+
+    assert written.result(timeout=5) is False
+    assert seen == [False]
+
+
+def test_on_settled_runs_inline_when_the_record_cannot_be_handed_off(tmp_path: Path):
+    writer = DeadLetterWriter(tmp_path / 'dl.jsonl')
+    seen: list[bool] = []
+
+    written = writer.append({'event': object()}, on_settled=seen.append)
+
+    assert seen == [False]
+    assert written.result(timeout=0) is False
+
+
+def test_a_raising_on_settled_still_resolves_the_future(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    path = tmp_path / 'dl.jsonl'
+    writer = DeadLetterWriter(path)
+
+    def raising_hook(_ok: bool) -> None:
+        raise RuntimeError('hook bug')
+
+    with caplog.at_level(logging.ERROR, logger=_WRITER_LOGGER):
+        written = writer.append({'event': {'id': 'e1'}}, on_settled=raising_hook)
+        assert written.result(timeout=5) is True
+
+    assert writer.records_written == 1
+    hook_failures = [
+        rec for rec in caplog.records
+        if rec.name == _WRITER_LOGGER
+        and rec.levelno == logging.ERROR
+        and rec.exc_info is not None
+        and rec.exc_info[0] is RuntimeError
+    ]
+    assert len(hook_failures) == 1, caplog.records
+    assert str(path) in hook_failures[0].getMessage()

@@ -229,7 +229,6 @@ class TestRunStatus:
             'failed',
             'rolled_back',
             'circuit_breaker',
-            'interrupted',
         }
         assert {e.value for e in RunStatus} == expected
 

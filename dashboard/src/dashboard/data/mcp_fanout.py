@@ -95,7 +95,7 @@ _failure_streaks: KeyedStreaks[tuple[str, str]] = KeyedStreaks(threshold=1)
 # missed the warm fast path and queued on a latch that would only have
 # released at process exit.
 #
-# _LOCK_ACQUIRE_TIMEOUT_SECONDS bounds that wait. It must exceed every
+# LOCK_ACQUIRE_TIMEOUT_SECONDS bounds that wait. It must exceed every
 # observed HEALTHY refresh so happy-path single-flight is never disturbed —
 # post-restart the incident's own endpoints returned in 0.22s / 0.3s /
 # 4.2s, and tasks.fetch_tasks documents a cold-session worst case of
@@ -111,7 +111,7 @@ _failure_streaks: KeyedStreaks[tuple[str, str]] = KeyedStreaks(threshold=1)
 # Whether this bound is reachable on that lock depends on the caller's
 # enclosing deadline. The Tasks tab and the census projection
 # (active_tasks.collect_tasks_with_counts, collect_census_snapshots) admit
-# each root under active_tasks._TASKS_PER_PROJECT_BUDGET (14.0 s), shorter
+# each root under active_tasks.TASKS_BUDGET.per_project (14.0 s), shorter
 # than this bound, so their callers are cancelled before it can fire and a
 # wedge surfaces as the snapshot unit's stale/unknown state — its documented
 # degradation story — never as a bypass. task_lookup._lookup_cache is
@@ -122,7 +122,8 @@ _failure_streaks: KeyedStreaks[tuple[str, str]] = KeyedStreaks(threshold=1)
 # burndown._SNAPSHOT_PER_ROOT_BUDGET, 60.0 s), app._memory_evals_cache,
 # scheduler._scheduler_cache, escalation_corpus._corpus_cache and
 # api.escalations._analytics_memo.
-_LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
+LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
+"""Bound on each wait a caller makes on a key's refresh (lock acquisition, or joining an inherited bypass), and the age past which a bypass is treated as dead; callers under a shorter enclosing deadline never reach it."""
 
 # A bypass must leave its own journal trace — reusing the SAME
 # transition-only policy as _FANOUT_REWARN_EVERY above rather than
@@ -216,6 +217,20 @@ FANOUT_FAILURE_EXCEPTIONS: tuple[type[Exception], ...] = (
     TimeoutError,
     ValueError,
 )
+
+# The transport failures raised before a request byte leaves the client: no
+# connection was established, the connect timed out, or no pool slot was ever
+# acquired. Only these prove a mutating call was not delivered.
+_UNDELIVERED_FAILURES: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
+
+
+def _delivery_ruled_out(exc: BaseException) -> bool:
+    subject = exc.__cause__ if isinstance(exc, PreformattedFanoutError) else exc
+    return isinstance(subject, _UNDELIVERED_FAILURES)
 
 
 # ── per-URL whole-operation deadline (task 4958) ────────────────────
@@ -328,6 +343,9 @@ class PreformattedFanoutError(ValueError):
     legitimate message whose first token happened to look like an identifier
     followed by ``': '`` would be silently stripped of its real type name,
     with no way for a call site to opt out.
+
+    Raise it ``from`` the real cause: :func:`first_success` reads
+    ``__cause__`` to decide whether delivery was ruled out.
     """
 
 
@@ -502,6 +520,7 @@ async def first_success(
     offline_result: Callable[[list[str]], V],
     log_failures: bool = True,
     per_url_timeout: float | None = None,
+    ambiguous_result: Callable[[list[str]], V] | None = None,
 ) -> V:
     """Call *call(url)* for each URL in order; return the first success.
 
@@ -512,7 +531,8 @@ async def first_success(
     ``TimeoutError``, or a caller-raised ``ValueError`` signalling a soft
     failure; see that tuple for what each one means — the failing URL's cached
     MCP session is invalidated, the error is recorded, and the loop continues
-    to the next URL. Any other exception type propagates uncaught.
+    to the next URL, unless ``ambiguous_result`` is given (see below). Any
+    other exception type propagates uncaught.
 
     Before the builtin ``TimeoutError`` was listed there, it propagated
     uncaught (it is not a ``httpx.TimeoutException``), which is why
@@ -525,6 +545,16 @@ async def first_success(
     caller reproduce its own existing offline shape (e.g.
     ``{'offline': True, 'error': '; '.join(errors)}``) while preserving the
     per-URL error detail.
+
+    ``ambiguous_result=None`` means every caught failure fails over, which is
+    right for reads. A callable is for MUTATING calls: a failure that may have
+    reached the server ends the fan-out with ``ambiguous_result(errors)``,
+    because every URL reaches the same store and repeating the call on another
+    one could apply it twice (DESIGN.md "Curator Tickets & Routing
+    Invariant"). Only the members of :data:`_UNDELIVERED_FAILURES` rule
+    delivery out and still fail over. The whole-operation deadline counts as
+    ambiguous, because the abandoned exchange keeps running
+    (``memory.py::_post``).
 
     **Per-URL failures are surfaced at WARNING on transition only** — see
     :func:`log_fanout_failure`. The fall-through is silent to the caller (a
@@ -566,7 +596,8 @@ async def first_success(
     in their own 2-5s ``asyncio.wait_for``. A caller wanting a looser bound
     passes a larger float; a caller wanting a tighter one keeps its own
     enclosing ``wait_for``. Expiry is an ordinary per-URL failure: it is logged,
-    collected, invalidated and fallen through like any other.
+    collected, invalidated and fallen through like any other, except under
+    ``ambiguous_result``, where it counts as ambiguous and ends the fan-out.
 
     **A cancellation invalidates the in-flight URL's session and then
     re-raises.** ``asyncio.CancelledError`` derives from ``BaseException``, so
@@ -610,6 +641,8 @@ async def first_success(
                 log_fanout_failure(log_label, url, e)
             errors.append(f'{url}: {describe_exc(e)}')
             invalidate_session(url)
+            if ambiguous_result is not None and not _delivery_ruled_out(e):
+                return ambiguous_result(errors)
         else:
             # Unconditional, unlike the failure report: a timeout can open a
             # streak even at a log_failures=False site, and a streak left open
@@ -735,12 +768,12 @@ class TTLCache(Generic[V, K]):
     waiter when a subsequent attempt might succeed.
 
     **Single-flight is bounded, not guaranteed.** Lock acquisition on the cold
-    path waits at most ``_LOCK_ACQUIRE_TIMEOUT_SECONDS``; a refresh that
+    path waits at most ``LOCK_ACQUIRE_TIMEOUT_SECONDS``; a refresh that
     outlives the bound is bypassed — run without the lock. Concurrent
     bypasses for the SAME key still collapse onto one shared refresh
     (:meth:`_bypass_refresh`), but joining that shared refresh is ITSELF
     bounded (task 4789 review fix): a caller waits at most
-    ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` again on a bypass it did not start, and
+    ``LOCK_ACQUIRE_TIMEOUT_SECONDS`` again on a bypass it did not start, and
     never on one already known to have outlived that bound — such a caller
     is instead promoted to running its own refresh, superseding the dead one
     for whoever comes next. A caller in that position is in exactly the
@@ -860,7 +893,7 @@ class TTLCache(Generic[V, K]):
         # ONE per key (see _bypass_refresh) rather than one per timed-out
         # caller. The timestamp lets a LATER caller decide whether this
         # bypass is still safe to inherit, or has itself outlived
-        # _LOCK_ACQUIRE_TIMEOUT_SECONDS -- joining one already over-age
+        # LOCK_ACQUIRE_TIMEOUT_SECONDS -- joining one already over-age
         # would just trade one dead task for another, so such a caller
         # starts a fresh bypass instead, superseding this entry (task 4789
         # review fix). A completed entry is removed instantly by the task's
@@ -902,7 +935,7 @@ class TTLCache(Generic[V, K]):
           only resident memory. Dropping an over-age ``_bypass_tasks`` entry
           changes no observable value either: every joiner's own wait
           deadline IS that entry's deadline (``started_at +
-          _LOCK_ACQUIRE_TIMEOUT_SECONDS``, see :meth:`_bypass_refresh`), so
+          LOCK_ACQUIRE_TIMEOUT_SECONDS``, see :meth:`_bypass_refresh`), so
           once an entry is over-age no caller can still be parked on it —
           dropping it strands nobody. Doing so also reclaims the last
           reference this cache holds to a wedged refresh's task, so the
@@ -984,7 +1017,7 @@ class TTLCache(Generic[V, K]):
         # left to remove), OR it is over-age. The predicate is deliberately
         # age-based rather than the lock sweep's "not locked() and no
         # _waiters" above: every joiner's own wait deadline IS
-        # `started_at + _LOCK_ACQUIRE_TIMEOUT_SECONDS` (see
+        # `started_at + LOCK_ACQUIRE_TIMEOUT_SECONDS` (see
         # _bypass_refresh), so once an entry passes that instant no caller
         # can still be parked on it and dropping it strands nobody — while a
         # WITHIN-bound entry must survive, since pruning it would silently
@@ -994,7 +1027,7 @@ class TTLCache(Generic[V, K]):
         # background and may still store a late value.
         dead_bypasses = [
             k for k, (started_at, task) in self._bypass_tasks.items()
-            if task.done() or (now - started_at) >= _LOCK_ACQUIRE_TIMEOUT_SECONDS
+            if task.done() or (now - started_at) >= LOCK_ACQUIRE_TIMEOUT_SECONDS
         ]
         for key in dead_bypasses:
             del self._bypass_tasks[key]
@@ -1155,7 +1188,7 @@ class TTLCache(Generic[V, K]):
         refresh is ever TRACKED as "the" bypass for a key at a time: a
         caller that finds a live, WITHIN-BOUND one joins it via
         :func:`asyncio.shield`; a caller that finds none, or one already
-        known to have outlived ``_LOCK_ACQUIRE_TIMEOUT_SECONDS``, becomes the
+        known to have outlived ``LOCK_ACQUIRE_TIMEOUT_SECONDS``, becomes the
         creator of a new one instead (:meth:`_start_bypass`). Without the
         per-key sharing, a genuinely wedged refresh (one that never returns —
         this task's own 2026-08-27 incident) would let every subsequent
@@ -1230,7 +1263,7 @@ class TTLCache(Generic[V, K]):
                 return await self._start_or_join_at_cap(key, refresh, cache_ok)
 
             started_at, running = entry
-            remaining = (started_at + _LOCK_ACQUIRE_TIMEOUT_SECONDS) - time.monotonic()
+            remaining = (started_at + LOCK_ACQUIRE_TIMEOUT_SECONDS) - time.monotonic()
             if not running.done() and remaining > 0:
                 try:
                     return await asyncio.wait_for(asyncio.shield(running), remaining)
@@ -1288,12 +1321,12 @@ class TTLCache(Generic[V, K]):
             if loud:
                 logger.warning(
                     opening, key, _MAX_LIVE_BYPASSES_PER_KEY,
-                    _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak,
+                    LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak,
                 )
             else:
                 logger.debug(
                     repeat, key, _MAX_LIVE_BYPASSES_PER_KEY,
-                    _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak,
+                    LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak,
                 )
             return
         if reason == 'inherited_bypass':
@@ -1321,9 +1354,9 @@ class TTLCache(Generic[V, K]):
                 '(refresh=%s), running without the lock (%d consecutive)'
             )
         if loud:
-            logger.warning(opening, key, _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak)
+            logger.warning(opening, key, LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak)
         else:
-            logger.debug(repeat, key, _LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak)
+            logger.debug(repeat, key, LOCK_ACQUIRE_TIMEOUT_SECONDS, name, streak)
 
     def _note_lock_acquired(self, key: K) -> None:
         """Close an open bypass streak for *key*, logging recovery.
@@ -1355,7 +1388,7 @@ class TTLCache(Generic[V, K]):
         """Return a fresh cached value for *key*, refreshing at most once.
 
         Fast path: a warm entry is returned with no lock. Otherwise lock
-        acquisition is BOUNDED to ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` (task
+        acquisition is BOUNDED to ``LOCK_ACQUIRE_TIMEOUT_SECONDS`` (task
         4789). On a NORMAL (within-bound) acquisition, freshness is re-checked
         (another waiter may have just filled it), and — if still cold —
         :meth:`_refresh_and_store` runs ``refresh()`` and stores the result
@@ -1372,7 +1405,7 @@ class TTLCache(Generic[V, K]):
         is itself bounded — see :meth:`_bypass_refresh` for both bounds: at
         most one TRACKED live bypass per key at any instant (not one per
         timed-out caller), and INHERITANCE of that bypass is itself bounded
-        to ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` — a caller never waits on one
+        to ``LOCK_ACQUIRE_TIMEOUT_SECONDS`` — a caller never waits on one
         already known to have outlived it, and is instead promoted to
         running its own refresh. The bypassed result is stored under the
         same ``cache_ok`` rule as the locked path, which is what lets a
@@ -1408,7 +1441,7 @@ class TTLCache(Generic[V, K]):
 
         lock = self._locks.setdefault(key, asyncio.Lock())
         try:
-            await asyncio.wait_for(lock.acquire(), _LOCK_ACQUIRE_TIMEOUT_SECONDS)
+            await asyncio.wait_for(lock.acquire(), LOCK_ACQUIRE_TIMEOUT_SECONDS)
         except TimeoutError:
             # Report the bypass BEFORE the freshness re-check below: the
             # wedge outliving the bound is the thing being reported, not

@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from fused_memory.middleware.curator_types import CandidateTask
+from fused_memory.utils.safe_yaml import YamlListFileError
 
 # ──────────────────────────────────────────────────────────────────────────────
 # step-1 RED: TestLoadOperationalRegistry
@@ -68,84 +69,76 @@ class TestLoadOperationalRegistry:
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 0
 
-    def test_load_missing_path_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) Missing file returns [] and emits exactly one WARNING."""
+    def test_load_missing_path_raises(self, tmp_path):
+        """(b) A missing file raises YamlListFileError naming the path."""
         from fused_memory.middleware.operational_ask_registry import load_operational_registry
 
         missing = tmp_path / "does_not_exist.yaml"
-        with caplog.at_level("WARNING"):
-            entries = load_operational_registry(missing)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_operational_registry(missing)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == missing
+        assert str(excinfo.value) == f"file not found: {missing}"
 
     @pytest.mark.skipif(
         sys.platform == "win32" or getattr(os, "getuid", lambda: -1)() == 0,
         reason="chmod not reliable on Windows or when running as root",
     )
-    def test_load_unreadable_file_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) Unreadable file returns [] and emits exactly one WARNING."""
+    def test_load_unreadable_file_raises(self, tmp_path):
+        """(b) An unreadable file raises YamlListFileError naming the path."""
         from fused_memory.middleware.operational_ask_registry import load_operational_registry
 
         locked = tmp_path / "unreadable.yaml"
         locked.write_text("- name: x\n", encoding="utf-8")
         locked.chmod(0o000)
         try:
-            with caplog.at_level("WARNING"):
-                entries = load_operational_registry(locked)
+            with pytest.raises(YamlListFileError) as excinfo:
+                load_operational_registry(locked)
         finally:
             locked.chmod(0o644)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == locked
+        assert str(locked) in str(excinfo.value)
 
-    def test_load_malformed_yaml_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) Malformed YAML returns [] and emits exactly one WARNING."""
+    def test_load_malformed_yaml_raises(self, tmp_path):
+        """(b) Malformed YAML raises YamlListFileError."""
         from fused_memory.middleware.operational_ask_registry import load_operational_registry
 
         bad_yaml = tmp_path / "bad.yaml"
         bad_yaml.write_text("key: [unclosed bracket\n: invalid\n", encoding="utf-8")
 
-        with caplog.at_level("WARNING"):
-            entries = load_operational_registry(bad_yaml)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_operational_registry(bad_yaml)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == bad_yaml
+        assert "YAML parse error" in str(excinfo.value)
 
-    def test_load_undecodable_encoding_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) File with bytes that are not valid UTF-8 returns [] and emits
-        exactly one WARNING, on this module's own logger.
-        """
+    def test_load_undecodable_encoding_raises(self, tmp_path):
+        """(b) A file whose bytes are not valid UTF-8 raises YamlListFileError."""
         from fused_memory.middleware.operational_ask_registry import load_operational_registry
 
         bad_encoding = tmp_path / "bad_encoding.yaml"
         bad_encoding.write_bytes(b"\xff\xfe- name: x\x00")
 
-        with caplog.at_level("WARNING"):
-            entries = load_operational_registry(bad_encoding)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_operational_registry(bad_encoding)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
-        assert str(bad_encoding) in warnings[0].getMessage()
-        assert warnings[0].name == "fused_memory.middleware.operational_ask_registry"
+        assert excinfo.value.path == bad_encoding
+        assert str(bad_encoding) in str(excinfo.value)
+        assert "UTF-8" in str(excinfo.value)
 
-    def test_load_non_list_top_level_returns_empty_and_warns(self, tmp_path, caplog):
-        """(b) A non-list top-level YAML document returns [] and emits one WARNING."""
+    def test_load_non_list_top_level_raises(self, tmp_path):
+        """(b) A non-list top-level YAML document raises YamlListFileError."""
         from fused_memory.middleware.operational_ask_registry import load_operational_registry
 
         p = tmp_path / "not_a_list.yaml"
         p.write_text("just_a_key: just_a_value\n", encoding="utf-8")
 
-        with caplog.at_level("WARNING"):
-            entries = load_operational_registry(p)
+        with pytest.raises(YamlListFileError) as excinfo:
+            load_operational_registry(p)
 
-        assert entries == []
-        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
-        assert len(warnings) == 1
+        assert excinfo.value.path == p
+        assert "expected a YAML list" in str(excinfo.value)
 
     def test_load_entry_missing_required_field_skips_and_warns(self, tmp_path, caplog):
         """(c) Entry missing title_substrings is skipped with WARNING; well-formed entries returned."""
@@ -719,7 +712,7 @@ class TestSeedOperationalAskRegistry:
         candidate = CandidateTask(
             title="Fix null pointer in task_curator batch dedup when candidates list is empty",
             description=(
-                "Add a guard so curate_batch_prepared does not crash on an empty "
+                "Add a guard so curate_prepared does not crash on an empty "
                 "candidates list; add a regression test."
             ),
         )

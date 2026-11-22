@@ -1,7 +1,7 @@
 """Elo rating system for pairwise eval judging.
 
 DEMOTED (task 2477 λ / decision 10): the primary eval leaderboard is now
-:func:`orchestrator.evals.report.build_composite_report` — every run yields a
+``composite_report.py::build_composite_report`` — every run yields a
 dense composite score, whereas pairwise judge data is sparse and this Elo path
 was ~32% self-admitted noise. The pairwise machinery below is RETAINED, not
 deleted (``judge.run_elo_tournament`` and the CLI ``--judge`` path still use
@@ -116,7 +116,7 @@ def is_pairwise_data_dense(
       least *min_matches_per_pair* times per ``pool.pair_counts``.
 
     A single under-filled (or unjudged → 0) pair makes the pool non-dense, so a
-    caller can fall back to :func:`report.build_composite_report` (the dense
+    caller can fall back to ``composite_report.py::build_composite_report`` (the dense
     composite-score leaderboard) rather than trusting a sparse Elo ranking. Pure
     query over ``pool.ratings`` / ``pool.pair_counts``.
     """

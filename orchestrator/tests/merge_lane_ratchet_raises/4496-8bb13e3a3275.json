@@ -1,0 +1,18 @@
+{
+  "task_id": "4496",
+  "reason": "Review fix (task 4496, suggestion 1): one new test in test_harness_already_landed_gate_wiring.py pins LandingRejectRecorder.release at Harness._launch_slot, the dispatch edge that defines the landing_evidence_rejected counting unit (one row per signature per dispatch). It drives Harness._already_landed_dispatch_gate twice and Harness._launch_slot once; neither has a public entry point (+3 private_reads).",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_already_landed_gate_wiring.py",
+      "baseline": 294,
+      "current": 297
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6440,
+      "current": 6443
+    }
+  ]
+}

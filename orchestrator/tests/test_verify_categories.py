@@ -485,8 +485,8 @@ class TestClassifierByteIdentityGolden:
     def test_classify_failure_returns_legacy_str_with_byte_identical_json(
         self, rc, output, timed_out, expected,
     ):
-        from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
-        from orchestrator.verify_cmd import ToolKind  # noqa: PLC0415
+        from orchestrator.verify_classify import classify_failure
+        from orchestrator.verify_cmd import ToolKind
 
         category = classify_failure(ToolKind.OPAQUE, rc, output, timed_out)
         assert category == expected
@@ -576,9 +576,9 @@ class TestCrossModulePreexistingSingleSourced:
 
     def test_merge_queue_preexisting_is_the_derived_object(self):
         from orchestrator import verify_categories
-        from orchestrator.merge_lane import worker as merge_queue
+        from orchestrator.merge_lane import main_health_probe
         assert (
-            merge_queue.PREEXISTING_BREAK_SKIP_CATEGORIES
+            main_health_probe.PREEXISTING_BREAK_SKIP_CATEGORIES
             is verify_categories.PREEXISTING_BREAK_SKIP_CATEGORIES
         )
 

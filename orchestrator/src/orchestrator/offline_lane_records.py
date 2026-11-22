@@ -20,7 +20,7 @@ from orchestrator.verify_classify import is_external_kill_rc
 
 logger = logging.getLogger(__name__)
 
-RECORD_RETENTION = timedelta(days=14)
+RECORD_RETENTION = timedelta(days=60)
 FIRST_LINE_MAX_CHARS = 300
 
 # Underscored because command_key's alphabet cannot produce '_', so no slug is a

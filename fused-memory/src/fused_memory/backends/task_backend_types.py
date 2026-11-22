@@ -95,7 +95,9 @@ class GetTasksResult(TypedDict):
     """DTO for ``get_tasks`` — the task-tree snapshot.
 
     Task objects in ``tasks`` have their top-level ``id``, ``title``,
-    ``status``, etc. already flattened — no further unwrapping needed.
+    ``status``, etc. already flattened — no further unwrapping needed. They
+    are full ``_row_to_task`` rows unless ``fields`` projected them
+    (``fused_memory/backends/task_projection.py``).
     """
 
     tasks: list[dict]
@@ -125,10 +127,28 @@ class MetadataLookupResult(TypedDict):
     malformed_metadata_ids: list[int]
 
 
+class DependencyFact(TypedDict):
+    """One local dependency of a task; ``status`` is ``None`` when it names no task."""
+
+    id: str
+    status: str | None
+
+
+class TaskFactsRow(TypedDict):
+    """One task in ``get_task_facts``' reply; see plans/live-task-facts-at-recall-prd.md C1."""
+
+    status: str
+    title: str
+    dependencies: list[DependencyFact]
+    done_provenance_kind: str | None
+    done_provenance_commit: str | None
+
+
 __all__ = [
     'AddTaskResult',
     'AmendmentAdvisory',
     'DefectWriteResult',
+    'DependencyFact',
     'DependencyResult',
     'GetTasksResult',
     'MetadataLookupResult',
@@ -136,6 +156,7 @@ __all__ = [
     'RemoveTaskResult',
     'SetTaskStatusResult',
     'StatusWriteNotPersistedResult',
+    'TaskFactsRow',
     'UpdateTaskResult',
     'ValidateDependenciesResult',
 ]

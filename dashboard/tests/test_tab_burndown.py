@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import re
 
-from _dashboard_helpers import (
+import pytest
+from _jsx_source_helpers import (
     DF_CHARTS_DESTRUCTURE_RE,
     DF_CHARTS_EXPORT_RE,
     destructure_bindings,
     extract_function_body,
+    jsx_open_tag_end,
+    jsx_open_tags,
+    jsx_prop_expr,
     strip_js_comments,
-    walk_balanced,
 )
 
 # ---------------------------------------------------------------------------
@@ -53,8 +56,8 @@ _VALUES_RE = re.compile(r'values[:=]\s*\{?([^,}\n]+)')
 # come off the same series object. Only where the values root is written moved.
 _STACKS_BUILDER_RE = re.compile(r'stacks=\{\s*\w+\(\s*([A-Za-z_$][\w$.]*)\s*[,)]')
 _TAG_START_RE = re.compile(r'<([A-Za-z_$][\w$]*)')
-# Any tag start or end inside an element's attribute list means the element is
-# not flat self-closing, so a regex chunk cannot be attributed to it safely.
+# Any tag start or end inside an element's opening tag means a nested element
+# sits in its attribute list, so a regex chunk cannot be attributed to it safely.
 _TAG_BOUNDARY_RE = re.compile(r'</?[A-Za-z_$]')
 # A trailing call suffix such as `.map(String)` is presentation, not series identity.
 _CALL_SUFFIX_RE = re.compile(r'\.\w+\([^()]*\)$')
@@ -102,8 +105,7 @@ def _element_at(src, pos):
         lt = src.rfind('<', 0, cursor)
         if lt == -1:
             raise AssertionError(
-                f'no enclosing JSX tag found for the prop at offset {pos} '
-                f'(line {src.count(chr(10), 0, pos) + 1})'
+                f'no enclosing JSX tag found for the prop {src[pos : pos + 80]!r}'
             )
         m = _TAG_START_RE.match(src, lt)
         if m:
@@ -117,27 +119,30 @@ def _chart_sites(src):
     Each record is a dict with `tag`, `labels_expr`, `labels_root`,
     `values_exprs` and `values_roots`.
 
-    An element runs from its tag start to the first `/>` after it.  That is only
-    a sound bound for a FLAT SELF-CLOSING element, so it is asserted rather than
-    assumed: if a chart is ever rewritten as `<LC ...>...</LC>` (say to nest a
-    legend), or a `<` otherwise appears in its attribute list, the chunk would
-    run past the element and silently attribute a DIFFERENT element's props to
-    it — a spurious failure, or worse a spurious pass.  Failing loudly on an
-    element this probe cannot parse is the safe direction.
+    An element's props are read from its opening tag, spanned by
+    `_jsx_source_helpers.py::jsx_open_tag_end`, so a chart with children
+    (`<LC ...>...</LC>`, say to nest a legend) is read correctly and a quoted
+    `/>` cannot end it.  A nested element INSIDE the attribute list still fails
+    loudly: its own props would be attributed to the chart — a spurious
+    failure, or worse a spurious pass.
     """
+    src = strip_js_comments(src)
     sites = []
     for lm in _LABELS_PROP_RE.finditer(src):
         tag, start = _element_at(src, lm.start())
-        end = src.find('/>', start)
-        boundary = _TAG_BOUNDARY_RE.search(src, start + 1)
-        limit = boundary.start() if boundary else len(src)
-        assert end != -1 and end < limit, (
-            f'<{tag}> element at line {src.count(chr(10), 0, start) + 1} is not a '
-            'flat self-closing element, so this probe cannot attribute its props '
-            '(a following element\'s labels/values would be read as its own). '
-            'Teach _chart_sites to parse it rather than deleting the assertion.'
+        end = jsx_open_tag_end(src, start)
+        assert (
+            end is not None
+            and end > lm.start()
+            and _TAG_BOUNDARY_RE.search(src, start + 1, end) is None
+        ), (
+            f'<{tag}> element {src[start : start + 80]!r} does not '
+            'close as one flat opening tag holding this labels prop, so this probe '
+            'cannot attribute its props (a nested element\'s labels/values would be '
+            'read as its own). Teach _chart_sites to parse it rather than deleting '
+            'the assertion.'
         )
-        chunk = src[start:end + 2]
+        chunk = src[start:end]
         labels_m = _LABELS_RE.search(chunk)
         labels_expr = labels_m.group(1).strip() if labels_m else None
         values_exprs = [v.strip() for v in _VALUES_RE.findall(chunk)]
@@ -260,6 +265,91 @@ class TestChartLabelValuePairing:
         assert not unknown, (
             f'labels props found on non-chart components {unknown}; DF_CHARTS '
             f'aliases in tabs.jsx: {sorted(aliases)}'
+        )
+
+
+class TestChartSitesProbe:
+    """`_chart_sites` reads each chart's props from its own opening tag, and
+    fails loudly on a tag whose props it cannot attribute."""
+
+    def test_a_chart_with_children_is_read_from_its_opening_tag(self):
+        src = '<SA labels={pb.labels} stacks={burndownStacks(pb, CP)}>\n  <Legend />\n</SA>'
+        sites = _chart_sites(src)
+
+        assert [(s['tag'], s['labels_expr'], s['values_roots']) for s in sites] == [
+            ('SA', 'pb.labels', ['pb'])
+        ]
+
+    def test_a_self_close_inside_a_quoted_attribute_does_not_end_the_tag(self):
+        src = '<LC title="a/>b" labels={d.labels} series={[{ values: d.values }]} />'
+        sites = _chart_sites(src)
+
+        assert [(s['labels_expr'], s['values_roots']) for s in sites] == [('d.labels', ['d'])]
+
+    def test_an_apostrophe_in_a_comment_does_not_derail_the_walk(self):
+        src = (
+            '<LC\n'
+            '  labels={d.labels}\n'
+            '  series={[\n'
+            "    // don't snap: a ratio\n"
+            '    { values: d.values },\n'
+            '  ]}\n'
+            '/>'
+        )
+        sites = _chart_sites(src)
+
+        assert [(s['labels_expr'], s['values_roots']) for s in sites] == [('d.labels', ['d'])]
+
+    def test_a_commented_out_chart_is_not_a_site(self):
+        src = (
+            '// <LC labels={x.labels} series={[{ values: y.values }]} />\n'
+            '<LC labels={d.labels} series={[{ values: d.values }]} />'
+        )
+        sites = _chart_sites(src)
+
+        assert [(s['labels_expr'], s['values_roots']) for s in sites] == [('d.labels', ['d'])]
+
+    @pytest.mark.parametrize(
+        'src',
+        [
+            '<LC legend={<Leg />} labels={d.labels} series={[{ values: d.values }]} />',
+            '<LC labels={d.labels} legend={<Leg />} series={[{ values: d.values }]} />',
+            '<LC labels={d.labels} series={[{ values: d.values }]}',
+        ],
+        ids=['nested-before-labels', 'nested-after-labels', 'never-closed'],
+    )
+    def test_a_tag_whose_props_cannot_be_attributed_fails_loudly(self, src):
+        with pytest.raises(AssertionError, match='cannot attribute its props'):
+            _chart_sites(src)
+
+    @pytest.mark.parametrize(
+        ('src', 'snippet', 'wrong_line'),
+        [
+            (
+                '/* one\n two\n three\n four */\n'
+                '<LC labels={d.labels} legend={<Leg />} series={[{ values: d.values }]} />',
+                '<LC labels={d.labels} legend={<Leg />}',
+                'line 2',
+            ),
+            ('/* a\n b */\nlabels={d.labels}', 'labels={d.labels}', 'line 2'),
+        ],
+        ids=['nested-element-after-a-block-comment', 'no-enclosing-tag-after-a-block-comment'],
+    )
+    def test_the_failure_quotes_the_text_it_cannot_attribute(self, src, snippet, wrong_line):
+        with pytest.raises(AssertionError) as exc:
+            _chart_sites(src)
+
+        # Only the first line is the probe's own message: pytest's assertion
+        # rewriting appends the operands, and for a source this short that
+        # repeats the whole of src.
+        message = str(exc.value).splitlines()[0]
+        assert snippet in message, (
+            f'the failure does not quote {snippet!r}, so the next agent cannot tell '
+            f"which of tabs.jsx's call sites it is about: {message!r}"
+        )
+        assert wrong_line not in message, (
+            f'the failure points at {wrong_line!r}, a line counted over comment-stripped '
+            f'text that lands on the block comment, not the call site: {message!r}'
         )
 
 
@@ -419,44 +509,17 @@ def _burn_tab_body(tabs_jsx_body):
     return strip_js_comments(extract_function_body(tabs_jsx_body, 'BurnTab'))
 
 
-def _self_closing_elements(src, tag):
-    """Every flat ``<tag ... />`` element's attribute text, braces respected.
-
-    Walks brace depth so an arrow's ``=>`` or a nested JSX value inside a
-    ``{...}`` prop cannot end the element early; only a ``/>`` at depth 0 does.
-    """
-    elements = []
-    for m in re.finditer(rf'<{tag}\b', src):
-        depth = 0
-        for i in range(m.end(), len(src)):
-            c = src[i]
-            if c == '{':
-                depth += 1
-            elif c == '}':
-                depth -= 1
-            elif depth == 0 and src.startswith('/>', i):
-                elements.append(src[m.end():i])
-                break
-        else:
-            raise AssertionError(f'<{tag} at offset {m.start()} is never closed')
-    return elements
+def _opening_tags(src, tag_name):
+    return jsx_open_tags(src, re.compile(rf'<{tag_name}\b'))
 
 
-def _prop_expr(attrs, name):
-    """The expression inside ``name={...}``, or None when the prop is absent."""
-    m = re.search(rf'\b{name}=\{{', attrs)
-    if not m:
-        return None
-    return walk_balanced(attrs, m.end() - 1)[1:-1].strip()
-
-
-def _prop_label(attrs):
-    m = re.search(r'\blabel=["\']([^"\']*)["\']', attrs)
+def _prop_label(opening_tag):
+    m = re.search(r'\blabel=["\']([^"\']*)["\']', opening_tag)
     return m.group(1) if m else None
 
 
 def _burn_tiles(body):
-    return {_prop_label(a): a for a in _self_closing_elements(body, 'ST')}
+    return {_prop_label(opening_tag): opening_tag for opening_tag in _opening_tags(body, 'ST')}
 
 
 def _assert_served_datum(body, where, expr):
@@ -491,22 +554,43 @@ class TestBurnTabReadsServedDatums:
         body = _burn_tab_body(tabs_jsx_body)
         tiles = _burn_tiles(body)
         assert set(tiles) == _BURN_TILE_LABELS
-        for label, attrs in tiles.items():
-            _assert_served_datum(body, f'the {label!r} tile', _prop_expr(attrs, 'datum'))
+        for label, opening_tag in tiles.items():
+            _assert_served_datum(body, f'the {label!r} tile', jsx_prop_expr(opening_tag, 'datum'))
 
     def test_every_pip_and_cell_renders_a_served_datum(self, tabs_jsx_body):
         """The per-project pips and table cells read the same served Datums as the tiles."""
         body = _burn_tab_body(tabs_jsx_body)
-        for tag in ('Pip', 'DatumReading'):
-            elements = _self_closing_elements(body, tag)
-            assert elements, f'BurnTab renders no <{tag}>'
-            for attrs in elements:
-                _assert_served_datum(body, f'a <{tag}>', _prop_expr(attrs, 'datum'))
+        for tag_name in ('Pip', 'DatumReading'):
+            opening_tags = _opening_tags(body, tag_name)
+            assert opening_tags, f'BurnTab renders no <{tag_name}>'
+            for opening_tag in opening_tags:
+                _assert_served_datum(body, f'a <{tag_name}>', jsx_prop_expr(opening_tag, 'datum'))
 
     def test_forecast_tile_formats_the_served_range(self, tabs_jsx_body):
         """No client point estimate: the server refuses to synthesise one on sparse history."""
         body = _burn_tab_body(tabs_jsx_body)
-        assert _prop_expr(_burn_tiles(body)['Forecast clear'], 'format') == 'forecastText'
+        assert jsx_prop_expr(_burn_tiles(body)['Forecast clear'], 'format') == 'forecastText'
+
+
+class TestBurnTileReader:
+    """`_burn_tiles` reads each tile's props from its own opening tag only."""
+
+    def test_a_brace_inside_a_quoted_label_does_not_lose_the_tile(self):
+        tiles = _burn_tiles('<ST label="a } b" datum={d} />')
+
+        assert set(tiles) == {'a } b'}
+        assert jsx_prop_expr(tiles['a } b'], 'datum') == 'd'
+
+    def test_a_childs_props_are_not_the_tiles(self):
+        tile = _burn_tiles('<ST label="x" datum={d}>\n  <Pip datum={other} />\n</ST>')['x']
+
+        assert jsx_prop_expr(tile, 'datum') == 'd'
+        assert 'other' not in tile
+
+    def test_a_comment_between_attributes_is_stripped(self):
+        tiles = _burn_tiles("<ST\n  label=\"y\"\n  // don't\n  datum={d}\n/>")
+
+        assert jsx_prop_expr(tiles['y'], 'datum') == 'd'
 
 
 # ---------------------------------------------------------------------------
@@ -524,9 +608,9 @@ class TestCompletedPerDayIsServerSeries:
         body = strip_js_comments(extract_function_body(tabs_jsx_body, 'OrchTab'))
         label_at = body.find('Completed / day')
         assert label_at != -1, "OrchTab no longer labels a 'Completed / day' spark"
-        sparks = _self_closing_elements(body[label_at:], 'SP')
+        sparks = _opening_tags(body[label_at:], 'SP')
         assert sparks, "no <SP> follows OrchTab's 'Completed / day' label"
-        values = _prop_expr(sparks[0], 'values')
+        values = jsx_prop_expr(sparks[0], 'values')
         assert values and 'BURNDOWN_BY_PROJECT' in values and 'completed_per_day' in values, (
             f"the 'Completed / day' spark plots {values!r}, not the project's served "
             'completed_per_day series'

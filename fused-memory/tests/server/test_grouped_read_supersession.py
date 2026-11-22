@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from pydantic_core import to_jsonable_python
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.memory_metadata import SUPERSEDED_BY_METADATA_KEY
 from fused_memory.models.enums import MemoryCategory, SourceStore
@@ -29,6 +30,8 @@ from fused_memory.server.grouped_read import (
 )
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import SearchResults
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT_ID = 'dark_factory'
 P = '11111111-1111-4111-8111-111111111111'
@@ -93,7 +96,7 @@ def _entry_for(entries: list[dict[str, Any]], memory_id: str) -> dict[str, Any]:
 
 class TestNestedEntriesKeepTheSupersessionMark:
     @pytest.mark.asyncio
-    async def test_a_digest_carries_the_mark(self) -> None:
+    async def test_an_amendment_entry_carries_the_mark(self) -> None:
         service = _service([_row(A1, 'amendment', 'old amendment', **MARK)])
 
         block = await build_grouped_document(service, PROJECT_ID, P)
@@ -135,9 +138,9 @@ class TestNestedEntriesKeepTheSupersessionMark:
         entries = await group_search_results(service, PROJECT_ID, hits)
 
         assert [entry['id'] for entry in entries] == [P]
-        digest = _entry_for(entries[0]['grouped']['amendments'], A1)
-        assert digest['matched'] is True
-        assert digest['metadata'] == MARK
+        entry = _entry_for(entries[0]['grouped']['amendments'], A1)
+        assert entry['matched'] is True
+        assert entry['metadata'] == MARK
 
     @pytest.mark.asyncio
     async def test_the_parents_point_read_carries_the_mark(self) -> None:

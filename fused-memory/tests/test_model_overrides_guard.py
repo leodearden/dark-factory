@@ -11,6 +11,7 @@ import json
 import logging
 
 import pytest
+from _census_helpers import census_lines
 
 from fused_memory.middleware.model_overrides_guard import model_overrides_error
 
@@ -145,23 +146,17 @@ class TestModelOverridesErrorPresenceGate:
 # Unreadable metadata is discarded loudly, under the shared wire rule
 # ---------------------------------------------------------------------------
 
-_SCHEMA_WARNING = 'task_metadata.schema_warning'
-_SOURCE = 'source=model_overrides_guard'
-
-
-def _discard_lines(caplog) -> list[str]:
-    messages = (r.getMessage() for r in caplog.records)
-    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+_SOURCE = 'model_overrides_guard'
 
 
 class TestUnreadableMetadataIsDiscardedLoudly:
     def test_malformed_string_accepts_and_logs_one_census_line(self, caplog):
         with caplog.at_level(logging.WARNING):
             assert model_overrides_error('{not json') is None
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
     @pytest.mark.parametrize('metadata', [None, ''])
     def test_absent_metadata_logs_no_census_line(self, metadata, caplog):
         with caplog.at_level(logging.WARNING):
             assert model_overrides_error(metadata) is None
-        assert _discard_lines(caplog) == []
+        assert census_lines(caplog, _SOURCE) == []

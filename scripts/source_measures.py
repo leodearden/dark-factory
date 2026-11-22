@@ -20,20 +20,23 @@ import subprocess
 import tokenize
 import tomllib
 from collections import Counter
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from io import StringIO
 from pathlib import Path
 from types import MappingProxyType
 from typing import NamedTuple
 
-# NOTE: module scope imports only the stdlib ON PURPOSE. complexipy and radon
-# are imported lazily inside the functions that need them (see
-# ``_import_complexipy``), so this module stays importable and type-checkable in
-# environments whose dev group does not carry them -- notably the ``shared``
-# project, which owns the ``ruff check scripts/`` and ``pyright scripts/`` gates
-# for this file. Laziness is not softness: the moment a measure actually needs
-# the tool, a missing or wrong-version one raises MetricsError with a named
-# cause (INV-11).
+import _checkout
+
+# NOTE: module scope imports only the stdlib, plus the stdlib-only
+# scripts/_checkout.py, ON PURPOSE. Importing _checkout binds this checkout's
+# members, as it does for every script. complexipy and radon are imported lazily
+# inside the functions that need them (see ``_import_complexipy``), so this
+# module stays importable and type-checkable in environments whose dev group
+# does not carry them -- notably the ``shared`` project, which owns the
+# ``ruff check scripts/`` and ``pyright scripts/`` gates for this file.
+# Laziness is not softness: the moment a measure actually needs the tool, a
+# missing or wrong-version one raises MetricsError with a named cause (INV-11).
 
 
 class MetricsError(Exception):
@@ -324,15 +327,18 @@ def reexport_names_in_tree(tree: ast.Module) -> list[str]:
 # committed baseline number was measured with.
 #
 # CEILING (<7) is PERFORMANCE, and it is not hygiene -- it is what keeps this
-# instrument from becoming a suite-truncating landmine. 7.0.1's cost grows
-# roughly cubically in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so
-# the whole 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0. The
-# ratchet carries pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT) = 300s, and
-# exceeding it does not merely fail the test: pytest-timeout's thread method
-# os._exit()s the xdist worker and --max-worker-restart=0 then truncates the
-# ENTIRE orchestrator suite, reporting against an innocent test (the esc-3980-1
-# / esc-3787-1 mode documented at orchestrator/tests/_orch_helpers.py::
-# WHOLE_TREE_SCAN_TEST_TIMEOUT).
+# instrument from becoming a timeout landmine. 7.0.1's cost grows roughly
+# cubically in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so the
+# whole 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0, unloaded.
+# Under verify load multiply that by the tree-scan family's measured ~4.8x
+# inflation (the MEASURED history at
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT),
+# which puts 7.x past the ceiling. The ratchet carries
+# pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT); exceeding it fails the
+# ratchet test, and only once complexipy's Rust call returns, because signal
+# cannot interrupt it sooner (see
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT,
+# whose MECHANISM block owns this fact and the thread-era history).
 #
 # The tuples are the source of truth; the human-readable specifier is derived
 # from them, so the message and the check can never disagree. The same string
@@ -350,9 +356,11 @@ _COMPLEXIPY_RANGE_REASON = (
     '(merge_queue.py totals 2031 at 3.0.0, 2092 at 5.0.0, 2133 at 6.x/7.x), so '
     'an unpinned engine would silently rewrite every baseline figure; and 7.x '
     'is ~48x slower on the monolith (247.0s vs 4.75s at 6.2.0, ~330s+ vs 9.52s '
-    'cluster-wide) against the ratchet test\'s 300s timeout, which pytest-'
-    'timeout enforces by os._exit()ing the xdist worker and truncating the '
-    'whole suite. Install the pinned version: `uv sync --all-packages`.'
+    'cluster-wide, before the ~4.8x load inflation measured for whole-tree '
+    'scans) against the ratchet test\'s WHOLE_TREE_SCAN_TEST_TIMEOUT; a '
+    'breach fails the ratchet test, and only '
+    'once complexipy\'s Rust call returns. Install the pinned version: '
+    '`uv sync --all-packages`.'
 )
 
 
@@ -417,7 +425,7 @@ def require_complexipy() -> str:
     return version
 
 
-def _import_complexipy():  # noqa: ANN202 - third-party module object
+def _import_complexipy():  # third-party module object
     """Import complexipy LAZILY, naming it in the failure.
 
     Lazy so this module stays importable and type-checkable under the
@@ -438,7 +446,7 @@ def _import_complexipy():  # noqa: ANN202 - third-party module object
     return complexipy
 
 
-def _file_complexity(path: Path):  # noqa: ANN202 - complexipy.FileComplexity
+def _file_complexity(path: Path):  # complexipy.FileComplexity
     complexipy = _import_complexipy()
     try:
         return complexipy.file_complexity(str(path))
@@ -887,6 +895,13 @@ def tracked_python_files(root: Path) -> tuple[str, ...]:
     return tracked_files(root, '*.py')
 
 
+def blob_sha(path: Path) -> str:
+    """Git's blob id of *path*'s content on disk, equal to its index entry when committed and unmodified."""
+    if not path.is_file():
+        raise MetricsError(f'{path}: no such file, so it has no blob id')
+    return _git_output(path.parent, 'hash-object', '--', path.name).strip()
+
+
 # ---------------------------------------------------------------------------
 # The workspace domain: each member's tracked .py files, classified.
 
@@ -896,19 +911,40 @@ class FileKind(enum.StrEnum):
     TESTS = 'tests'
 
 
+def _dotted_below(root: str, path: str) -> str:
+    """The dotted name of ``.py`` *path* below *root*; a package's ``__init__.py``
+    is named by its package."""
+    dotted = path[len(root) + 1:].removesuffix('.py').replace('/', '.')
+    return dotted.removesuffix('.__init__')
+
+
 @dataclasses.dataclass(frozen=True)
 class MemberRoots:
     """Where one member's source and test files live, repo-relative.
 
     One rule for real and pseudo members alike: a path under ``tests_root`` is a
     test file, else a path under ``src_root`` is a source file named by its
-    dotted path below that root, else it is not the member's.
+    dotted path below that root, and also by its dotted path below each extra
+    import root that contains it, else it is not the member's.
     """
 
     name: str
     pseudo: bool
     src_root: str | None
     tests_root: str
+    extra_import_roots: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        outside = [
+            root
+            for root in self.extra_import_roots
+            if self.src_root is None or not root.startswith(self.src_root + '/')
+        ]
+        if outside:
+            raise ValueError(
+                f'member {self.name!r}: extra import root(s) {outside!r} must lie '
+                f'strictly below its src_root {self.src_root!r}'
+            )
 
     @classmethod
     def declared(cls, name: str) -> MemberRoots:
@@ -926,19 +962,28 @@ class MemberRoots:
             return FileKind.SRC
         return None
 
+    def _is_source_module(self, path: str) -> bool:
+        return path.endswith('.py') and self.kind_of(path) is FileKind.SRC
+
     def import_name(self, path: str) -> str | None:
         """The dotted import name of source file *path*; None for anything else.
 
         A package's ``__init__.py`` is named by its package.
         """
-        if (
-            self.src_root is None
-            or not path.endswith('.py')
-            or self.kind_of(path) is not FileKind.SRC
-        ):
+        if self.src_root is None or not self._is_source_module(path):
             return None
-        dotted = path[len(self.src_root) + 1:].removesuffix('.py').replace('/', '.')
-        return dotted.removesuffix('.__init__')
+        return _dotted_below(self.src_root, path)
+
+    def extra_import_names(self, path: str) -> tuple[str, ...]:
+        """The dotted names of source file *path* below each extra import root
+        holding it, in ``extra_import_roots`` order; () for anything else."""
+        if not self._is_source_module(path):
+            return ()
+        return tuple(
+            _dotted_below(root, path)
+            for root in self.extra_import_roots
+            if path.startswith(root + '/') and path != f'{root}/__init__.py'
+        )
 
 
 def src_module_name(path: str) -> str | None:
@@ -953,6 +998,14 @@ class DomainFile:
     blob: str
     kind: FileKind
     import_name: str | None
+    extra_import_names: tuple[str, ...]
+
+    @property
+    def import_names(self) -> tuple[str, ...]:
+        """Every name the file imports as: ``import_name``, then the extra names."""
+        if self.import_name is None:
+            return self.extra_import_names
+        return (self.import_name, *self.extra_import_names)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -962,8 +1015,38 @@ class DomainMember:
     files: tuple[DomainFile, ...]
 
 
+def unique_import_paths(
+    domain: Iterable[DomainMember], names_of: Callable[[DomainFile], Iterable[str]]
+) -> dict[str, str]:
+    """Each name *names_of* gives a file of *domain*, to the path of the one file it names.
+
+    An import of a name two files share is ambiguous, so MetricsError names each
+    such name and its sorted paths.
+    """
+    holders: dict[str, set[str]] = {}
+    for member in domain:
+        for domain_file in member.files:
+            for name in names_of(domain_file):
+                holders.setdefault(name, set()).add(domain_file.path)
+    shared = {name: sorted(paths) for name, paths in sorted(holders.items()) if len(paths) > 1}
+    if shared:
+        raise MetricsError(
+            'import name(s) shared by two or more source files, so an import of one is '
+            'ambiguous: ' + '; '.join(f'{name!r} names {paths!r}' for name, paths in shared.items())
+        )
+    return {name: path for name, (path,) in holders.items()}
+
+
 _SCRIPTS_PSEUDO_MEMBER = MemberRoots(
-    name='scripts', pseudo=True, src_root='scripts', tests_root='scripts/tests'
+    name='scripts',
+    pseudo=True,
+    src_root='scripts',
+    tests_root='scripts/tests',
+    # scripts/tests/conftest.py puts each root on sys.path, mirrored by the root
+    # pyproject.toml [tool.pyright].extraPaths. Pinned equal to the first by
+    # scripts/tests/test_source_measures_import_roots.py and to the second by
+    # tests/scripts/test_source_measures.py::TestExtraImportNames.
+    extra_import_roots=('scripts/local-model-serving',),
 )
 _TESTS_PSEUDO_MEMBER = MemberRoots(name='tests', pseudo=True, src_root=None, tests_root='tests')
 
@@ -977,7 +1060,6 @@ PSEUDO_MEMBERS: tuple[MemberRoots, ...] = (_SCRIPTS_PSEUDO_MEMBER, _TESTS_PSEUDO
 _SINGLE_PACKAGE_PSEUDO_MEMBERS: tuple[MemberRoots, ...] = (_SCRIPTS_PSEUDO_MEMBER,)
 
 
-_MEMBERS_KEY = '[tool.uv.workspace].members'
 _PROJECT_NAME_KEY = '[project].name'
 
 
@@ -1000,38 +1082,23 @@ def _lookup(config: object, *keys: str) -> object:
     return found
 
 
-def _member_list(path: Path, config: dict[str, object]) -> list[str]:
-    found = _lookup(config, 'tool', 'uv', 'workspace', 'members')
-    if (
-        not isinstance(found, list)
-        or not found
-        or not all(isinstance(member, str) for member in found)
-    ):
-        raise MetricsError(
-            f'{path}: {_MEMBERS_KEY} must be a non-empty list of member directory '
-            f'names; found {found!r}'
-        )
-    return found
+def _declared_members(path: Path) -> tuple[str, ...]:
+    """The workspace members the pyproject.toml at *path* declares.
 
-
-def _declared_members(path: Path, config: dict[str, object]) -> tuple[str, ...]:
-    """``[tool.uv.workspace].members`` of the pyproject.toml at *path*, read as *config*.
-
-    Each must be a plain directory name (uv's glob expansion cannot be
-    reproduced from the index), listed once, and not a pseudo-member's name.
+    The acceptance rule is ``_checkout.workspace_members``'. Here a member is
+    also refused if it is listed twice or shares a pseudo-member's name.
     """
-    members = _member_list(path, config)
-    globbed = [member for member in members if any(char in member for char in '*?[')]
-    if globbed:
-        raise MetricsError(
-            f'{path}: {_MEMBERS_KEY} holds glob member(s) {globbed!r}, which are not '
-            'supported -- list each member directory by name'
-        )
+    try:
+        members = _checkout.workspace_members(path.parent)
+    except _checkout.CheckoutBindingError as exc:
+        raise MetricsError(str(exc)) from exc
     duplicates = sorted({member for member in members if members.count(member) > 1})
     if duplicates:
-        raise MetricsError(f'{path}: {_MEMBERS_KEY} lists duplicate member(s) {duplicates!r}')
-    _require_no_pseudo_collision(path, _MEMBERS_KEY, members, PSEUDO_MEMBERS)
-    return tuple(members)
+        raise MetricsError(
+            f'{path}: {_checkout.MEMBERS_KEY} lists duplicate member(s) {duplicates!r}'
+        )
+    _require_no_pseudo_collision(path, _checkout.MEMBERS_KEY, members, PSEUDO_MEMBERS)
+    return members
 
 
 def _require_no_pseudo_collision(
@@ -1050,8 +1117,8 @@ def _project_name(path: Path, config: dict[str, object]) -> str:
     name = _lookup(config, 'project', 'name')
     if not isinstance(name, str) or not name:
         raise MetricsError(
-            f'{path}: has neither {_MEMBERS_KEY} nor a {_PROJECT_NAME_KEY}; a uv workspace '
-            f'declares its members, and a single-package project is named by its '
+            f'{path}: has neither {_checkout.MEMBERS_KEY} nor a {_PROJECT_NAME_KEY}; '
+            'a uv workspace declares its members, and a single-package project is named by its '
             f'[project] table -- found {_PROJECT_NAME_KEY} = {name!r}'
         )
     return name
@@ -1070,8 +1137,8 @@ def _single_package_members(
     package = MemberRoots.single_package(name)
     if not _git_output(root, 'ls-files', '-z', '--', f'{package.src_root}/*.py'):
         raise MetricsError(
-            f'{path}: declares no {_MEMBERS_KEY}, so it is read as the single-package '
-            f'project {name!r} in the src layout ({package.src_root}/ and '
+            f'{path}: declares no {_checkout.MEMBERS_KEY}, so it is read as the '
+            f'single-package project {name!r} in the src layout ({package.src_root}/ and '
             f'{package.tests_root}/), but {package.src_root}/ holds no tracked .py; '
             "declare the workspace's members or keep the package under "
             f'{package.src_root}/'
@@ -1086,7 +1153,7 @@ def _domain_members(root: Path) -> tuple[MemberRoots, ...]:
     if _lookup(config, 'tool', 'uv', 'workspace') is None:
         return _single_package_members(root, path, config)
     return (
-        *(MemberRoots.declared(name) for name in _declared_members(path, config)),
+        *(MemberRoots.declared(name) for name in _declared_members(path)),
         *PSEUDO_MEMBERS,
     )
 
@@ -1119,7 +1186,13 @@ def _domain_member(
     member: MemberRoots, entries: tuple[tuple[str, str], ...]
 ) -> DomainMember:
     files = tuple(
-        DomainFile(path=path, blob=blob, kind=kind, import_name=member.import_name(path))
+        DomainFile(
+            path=path,
+            blob=blob,
+            kind=kind,
+            import_name=member.import_name(path),
+            extra_import_names=member.extra_import_names(path),
+        )
         for path, blob in sorted(entries)
         if (kind := member.kind_of(path)) is not None
     )

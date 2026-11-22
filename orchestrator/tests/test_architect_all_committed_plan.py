@@ -201,7 +201,7 @@ _MARK_COMMITTED = 'mcp__plan-tools__mark_step_committed'
 
 class TestArchitectCanReachMarkStepCommitted:
     def test_architect_is_granted_mark_step_committed(self):
-        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
+        from orchestrator.agents.roles import ARCHITECT
 
         assert _MARK_COMMITTED in ARCHITECT.allowed_tools, (
             f'ARCHITECT.allowed_tools omits {_MARK_COMMITTED!r} — the backend '
@@ -218,13 +218,13 @@ class TestArchitectCanReachMarkStepCommitted:
         with a description tag claiming committed provenance would defeat the
         whole TDD bookkeeping.
         """
-        from orchestrator.agents.roles import IMPLEMENTER  # noqa: PLC0415
+        from orchestrator.agents.roles import IMPLEMENTER
 
         assert _MARK_COMMITTED not in IMPLEMENTER.allowed_tools
         assert 'mcp__plan-tools__mark_step_done' in IMPLEMENTER.allowed_tools
 
     def test_debugger_is_not_granted_mark_step_committed(self):
-        from orchestrator.agents.roles import DEBUGGER  # noqa: PLC0415
+        from orchestrator.agents.roles import DEBUGGER
 
         assert _MARK_COMMITTED not in DEBUGGER.allowed_tools
 
@@ -236,7 +236,7 @@ class TestArchitectCanReachMarkStepCommitted:
         ``plan_tools`` family; asserted here too so a grant added without the
         family declaration fails in this suite as well.
         """
-        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
+        from orchestrator.agents.roles import ARCHITECT
 
         assert 'plan_tools' in ARCHITECT.mcp_families
 
@@ -249,7 +249,7 @@ class TestGrantedToolActuallyExists:
         Mirrors the registration assertion at test_plan_tools_server.py:1089 —
         an allowlist entry for a non-existent tool is a silent dead grant.
         """
-        from orchestrator.mcp import plan_tools  # noqa: PLC0415
+        from orchestrator.mcp import plan_tools
 
         artifacts = TaskArtifacts(tmp_path)
         artifacts.init('42', 'X', 'desc', base_commit='base')
@@ -343,18 +343,21 @@ class TestDetectCommittedBranchWork:
 
         assert await workflow._detect_committed_branch_work() == []
 
-    async def test_unset_base_commit_returns_empty(
+    async def test_unset_stored_base_still_lists_only_the_branch_s_commit(
         self, config, git_ops, task_assignment,
     ):
+        """The fork point bounds the range, so main's 'Initial' is excluded."""
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
         workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
         artifacts.update_base_commit('')
 
         (wt / 'impl.py').write_text('x = 1\n')
-        await git_ops.commit(wt, 'feat: GREEN — x')
+        sha = await git_ops.commit(wt, 'feat: GREEN — x')
 
-        assert await workflow._detect_committed_branch_work() == []
+        assert await workflow._detect_committed_branch_work() == [
+            {'sha': sha, 'subject': 'feat: GREEN — x'},
+        ]
 
     @pytest.mark.parametrize('missing', ['worktree', 'git_ops', 'artifacts'])
     async def test_missing_collaborator_returns_empty(
@@ -398,7 +401,7 @@ class TestDetectCommittedBranchWork:
 @pytest.fixture
 def briefing_assembler(tmp_path: Path):
     """Real BriefingAssembler, mirroring test_briefing.py's construction."""
-    from orchestrator.agents.briefing import BriefingAssembler  # noqa: PLC0415
+    from orchestrator.agents.briefing import BriefingAssembler
 
     return BriefingAssembler(OrchestratorConfig(
         project_root=tmp_path,
@@ -534,7 +537,7 @@ class TestArchitectPromptCommittedWorkSection:
         long-lived branch, and the section's protocol asks for one
         ``git show`` per bullet. Cap it, and make the truncation VISIBLE
         (no-silent-caps norm)."""
-        from orchestrator.agents.briefing import COMMIT_BULLET_LIMIT  # noqa: PLC0415
+        from orchestrator.agents.briefing import COMMIT_BULLET_LIMIT
 
         overflow = 7
         commits = [
@@ -577,7 +580,7 @@ class TestCommitBulletHelper:
     """
 
     def test_renders_abbreviated_sha_and_subject(self):
-        from orchestrator.agents.briefing import _format_commit_bullets  # noqa: PLC0415
+        from orchestrator.agents.briefing import _format_commit_bullets
 
         assert _format_commit_bullets(_COMMITTED_WORK) == (
             f"- `{_SHA_A[:12]}` — feat: GREEN — the thing\n"
@@ -585,7 +588,7 @@ class TestCommitBulletHelper:
         )
 
     def test_unlimited_by_default(self):
-        from orchestrator.agents.briefing import _format_commit_bullets  # noqa: PLC0415
+        from orchestrator.agents.briefing import _format_commit_bullets
 
         commits = [{'sha': f'{i:040x}', 'subject': f's{i}'} for i in range(200)]
 
@@ -593,7 +596,7 @@ class TestCommitBulletHelper:
         assert 'more commit(s)' not in _format_commit_bullets(commits)
 
     def test_limit_truncates_head_first_and_names_the_remainder(self):
-        from orchestrator.agents.briefing import _format_commit_bullets  # noqa: PLC0415
+        from orchestrator.agents.briefing import _format_commit_bullets
 
         rendered = _format_commit_bullets(_COMMITTED_WORK, limit=1)
 
@@ -614,11 +617,11 @@ class TestCommitBulletHelper:
 
 
 def _make_plan_workflow(tmp_path: Path) -> tuple[TaskWorkflow, AsyncMock]:
-    from unittest.mock import AsyncMock as _AsyncMock  # noqa: PLC0415
+    from unittest.mock import AsyncMock as _AsyncMock
 
-    from _orch_helpers import pydantic_spec  # noqa: PLC0415
-    from _workflow_helpers import invoke_stub_awaiting_builder  # noqa: PLC0415
-    from shared.cli_invoke import AgentResult  # noqa: PLC0415
+    from _orch_helpers import pydantic_spec
+    from _workflow_helpers import invoke_stub_awaiting_builder
+    from shared.cli_invoke import AgentResult
 
     assignment = MagicMock()
     assignment.task_id = '3033'
@@ -887,7 +890,7 @@ class TestA1PartiallyCommittedPlanStillRunsExecute:
         invoke, build_implementer_prompt = _stub_execute_collaborators(workflow)
 
         async def _mark_pending_done(_role, build_prompt, *_args, **_kwargs):
-            from shared.cli_invoke import AgentResult  # noqa: PLC0415
+            from shared.cli_invoke import AgentResult
 
             await build_prompt()
             artifacts.update_step_status('step-2', 'done', 'impl-commit-sha')
@@ -988,7 +991,7 @@ class TestSkippedExecuteWritesDurableLogEntry:
     ):
         """The entry must satisfy _iteration_entry_is_work AND, with a real
         diverged HEAD, _has_prior_implementation."""
-        from orchestrator.workflow import _iteration_entry_is_work  # noqa: PLC0415
+        from orchestrator.workflow import _iteration_entry_is_work
 
         workflow, artifacts, head_sha = await self._run_all_committed(
             config, git_ops, task_assignment,
@@ -1011,7 +1014,7 @@ class TestClassifierExtensionOpensNoFalseDoneHole:
 
     @staticmethod
     def _is_work(entry: dict) -> bool:
-        from orchestrator.workflow import _iteration_entry_is_work  # noqa: PLC0415
+        from orchestrator.workflow import _iteration_entry_is_work
 
         return _iteration_entry_is_work(entry)
 
@@ -1089,7 +1092,7 @@ class TestA1VerifyRemainsTheGate:
         requires a PRIOR passing workflow_verify recorded at the EXACT tip — a
         condition a falsely pre-satisfied branch cannot meet.
         """
-        from orchestrator.verify_checkpoint import (  # noqa: PLC0415
+        from orchestrator.verify_checkpoint import (
             green_checkpoint_at_tip,
         )
 
@@ -1139,8 +1142,9 @@ class TestA1VerifyRemainsTheGate:
 #
 # Review blocker (robustness / false-DONE at workflow.py:6193): the entry's
 # steps_completed is derived purely from `status == 'done'` and ignores
-# `commit` entirely. α's authoring-time guard `_sha_exists_on_branch`
-# (mcp/plan_tools.py:514) is `git merge-base --is-ancestor <sha> HEAD`, which
+# `commit` entirely. α's authoring-time guard
+# (orchestrator/mcp/branch_probes.py::sha_exists_on_branch) is
+# `git merge-base --is-ancestor <sha> HEAD`, which
 # is satisfied by `base_commit` ITSELF and by every main ancestor below base.
 # An architect can therefore pre-satisfy every step against base-reachable
 # shas on a branch carrying ZERO commits beyond base and still get a
@@ -1234,11 +1238,11 @@ class TestSkippedExecuteEntryRequiresBeyondBaseProvenance:
     ):
         """WHY status alone is insufficient: α's guard is reachability-only.
 
-        If α's ``_sha_exists_on_branch`` is ever tightened to REJECT
+        If α's ``branch_probes.sha_exists_on_branch`` is ever tightened to REJECT
         base-reachable shas, this assertion fails loudly and the writer-side
         filter below can be revisited rather than silently kept forever.
         """
-        from orchestrator.mcp import plan_tools  # noqa: PLC0415
+        from orchestrator.mcp import branch_probes
 
         await _advance_main(config, 'below_base')
         _rc, below_base_sha, _err = await _run(
@@ -1246,13 +1250,13 @@ class TestSkippedExecuteEntryRequiresBeyondBaseProvenance:
         )
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
 
-        assert plan_tools._sha_exists_on_branch(
+        assert branch_probes.sha_exists_on_branch(
             wt_info.path, wt_info.base_commit,
         ) is True, 'PREMISE: the guard admits base_commit itself'
-        assert plan_tools._sha_exists_on_branch(
+        assert branch_probes.sha_exists_on_branch(
             wt_info.path, below_base_sha,
         ) is True, 'PREMISE: the guard admits arbitrary main ancestors below base'
-        assert plan_tools._sha_exists_on_branch(
+        assert branch_probes.sha_exists_on_branch(
             wt_info.path, _ABSENT_SHA,
         ) is False, 'PREMISE: the guard does reject a non-existent sha'
 

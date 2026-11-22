@@ -8,8 +8,10 @@ invocation_end event tagging, sha-stamping, and keep-last-N trim.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json as _json
 import logging
+import os
 import re
 import subprocess
 from datetime import datetime
@@ -17,6 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _agent_result_fakes import make_agent_result as _make_agent_result
 from _orch_helpers import (
     pydantic_spec,
     skip_role_config_layer,
@@ -27,12 +30,16 @@ from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
     AllAccountsCappedException,
+    SubprocessResult,
     classify_agent_failure,
 )
 from shared.config_dir import TaskConfigDir
 from shared.process_cost import ProcessCostBasis
 from shared.testing import make_gate_mock
 
+from orchestrator.agents import sandbox_dispatch
+from orchestrator.agents.invoke import invoke_agent
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
 from orchestrator.dry_run_unblock import _TASK_EMPTY_STATE, _TASK_UNAVAILABLE_STATE
 from orchestrator.scheduler import Scheduler
@@ -113,9 +120,10 @@ def _make_config(*, enabled=True, budget_usd=5.0, timeout_seconds=600.0,
                  attended_b3_enabled=False, b3_merge_cap_per_24h=6,
                  b3_proposal_keep_last=5, working_idle_secs=1800.0,
                  invocation_timeout=7200.0, project_root=None,
-                 transcript_archive=None, main_branch='main'):
+                 transcript_archive=None, main_branch='main', sandbox_enabled=False):
     cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     cfg.git.main_branch = main_branch
+    cfg.sandbox.enabled = sandbox_enabled
     cfg.unblock_auto.enabled = enabled
     cfg.unblock_auto.budget_usd = budget_usd
     cfg.unblock_auto.timeout_seconds = timeout_seconds
@@ -171,51 +179,6 @@ def _init_git_repo(path) -> str:
     subprocess.run(['git', '-C', p, 'commit', '-m', 'initial commit'], check=True, capture_output=True)
     result = subprocess.run(['git', '-C', p, 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True)
     return result.stdout.strip()
-
-
-def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
-                       subtype='', output='', duration_ms=1000,
-                       timed_out=False, transcript_turns=None, session_id='',
-                       stderr='', turns=0, api_error_status=None,
-                       schema_salvaged=False, output_tokens=None,
-                       ended_awaiting_background=False):
-    # NOTE: duplicated verbatim in test_b3_gate.py (task 2020 review:
-    # code_duplication). Both copies must be extended together whenever
-    # shared.cli_invoke.AgentResult gains/renames a field consumed by
-    # classify_agent_failure(). Out of this task's locked scope: hoisting
-    # both into the existing orchestrator/tests/_orch_helpers.py shared-helper
-    # module (the established convention for cross-suite test helpers in this
-    # package) is a follow-up.
-    r = MagicMock()
-    r.success = success
-    r.cost_usd = cost_usd
-    r.structured_output = structured_output
-    r.subtype = subtype
-    r.output = output
-    r.duration_ms = duration_ms
-    # Faithful diagnostic-field defaults (mirrors shared.cli_invoke.AgentResult).
-    # A bare MagicMock auto-vivifies every unset attribute as a truthy
-    # MagicMock, which would silently corrupt classify_agent_failure()'s
-    # decision rules: .timed_out truthy -> misclassifies every failure as
-    # TIMED_OUT -> infra; .schema_salvaged truthy -> misclassifies a generic
-    # failure as STRUCTURAL instead of UNKNOWN. Setting explicit defaults for
-    # every field classify_agent_failure() consults (including
-    # .output_tokens, read when formatting the MAX_TURNS summary) keeps
-    # these mocks faithful stand-ins for its decision rules.
-    r.timed_out = timed_out
-    r.transcript_turns = transcript_turns
-    r.session_id = session_id
-    r.stderr = stderr
-    r.turns = turns
-    r.api_error_status = api_error_status
-    r.schema_salvaged = schema_salvaged
-    r.output_tokens = output_tokens
-    # task 2761: classify_agent_failure now reads .ended_awaiting_background
-    # (rule 2, above the timed_out rule). A bare MagicMock auto-vivifies it as
-    # a truthy stand-in, which would misclassify every failure as
-    # ENDED_AWAITING_BACKGROUND -> investigation_failed. Default it False.
-    r.ended_awaiting_background = ended_awaiting_background
-    return r
 
 
 def _assert_one_proposal_persist(scheduler) -> None:
@@ -2796,32 +2759,53 @@ class _TaskDocScheduler:
         return dict(self._task_doc)
 
 
-async def _capture_investigation_call(tmp_path, scheduler) -> dict:
-    """Run one investigation and return the kwargs handed to the agent."""
+_LOW_RISK_PROPOSAL = {
+    'proposal_text': 'Rebase on main and rerun verify',
+    'risk_label': 'low',
+    'files_referenced': [],
+}
+
+
+def _investigation_kwargs(tmp_path, scheduler, config=None, **overrides) -> dict:
+    """The ``run_dry_run_unblock`` arguments of one investigation of task 42.
+
+    *overrides* replace or add keyword arguments.
+    """
+    return {
+        'task_id': '42',
+        'worktree': str(tmp_path),
+        'reason': 'verify exhausted',
+        'detail': 'All 5 attempts timed out',
+        'scheduler': scheduler,
+        'mcp': MagicMock(),
+        'config': config if config is not None else _make_config(),
+        **overrides,
+    }
+
+
+async def _capture_investigation_call(tmp_path, scheduler, config=None, **overrides) -> dict:
+    """Run one investigation and return the kwargs handed to the agent.
+
+    *overrides* replace or add ``run_dry_run_unblock`` keyword arguments.
+    """
     from orchestrator.dry_run_unblock import run_dry_run_unblock
 
-    agent_result = _make_agent_result(structured_output={
-        'proposal_text': 'Rebase on main and rerun verify',
-        'risk_label': 'low',
-        'files_referenced': [],
-    })
+    agent_result = _make_agent_result(structured_output=dict(_LOW_RISK_PROPOSAL))
     mock_invoke = AsyncMock(return_value=agent_result)
+    investigation = _investigation_kwargs(tmp_path, scheduler, config, **overrides)
     with patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke):
-        await run_dry_run_unblock(
-            task_id='42',
-            worktree=str(tmp_path),
-            reason='verify exhausted',
-            detail='All 5 attempts timed out',
-            scheduler=scheduler,
-            mcp=MagicMock(),
-            config=_make_config(),
-        )
+        await run_dry_run_unblock(**investigation)
+    assert mock_invoke.call_args is not None, 'the investigation never reached the agent'
     return dict(mock_invoke.call_args.kwargs)
 
 
-async def _capture_investigation_prompt(tmp_path, scheduler) -> str:
+async def _capture_investigation_prompt(tmp_path, scheduler, **overrides) -> str:
     """Run one investigation and return the prompt handed to the agent."""
-    return (await _capture_investigation_call(tmp_path, scheduler))['prompt']
+    return (await _capture_investigation_call(tmp_path, scheduler, **overrides))['prompt']
+
+
+def _reviews_directory_line(prompt: str) -> str:
+    return next(line for line in prompt.splitlines() if line.startswith('**Reviews directory:**'))
 
 
 class TestPromptCarriesTaskContext:
@@ -2858,6 +2842,36 @@ class TestPromptCarriesTaskContext:
         assert 'verify exhausted' in prompt, prompt
         assert 'All 5 attempts timed out' in prompt, prompt
         assert 'Investigate and emit your structured proposal.' in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_names_the_task_scoped_reviews_directory(self, tmp_path):
+        """Reviewer verdicts live in the task root, which no lane `.task/` link reaches."""
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler())
+
+        reviews_dir = TaskArtifacts.for_task(tmp_path, '42').artifact_path('reviews')
+        assert f'**Reviews directory:** {reviews_dir}' in prompt.splitlines(), prompt
+        assert str(tmp_path / '.task' / 'reviews') not in prompt, prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_names_the_reviews_directory_its_caller_chose(self, tmp_path):
+        """The dispatching workflow decides which root holds its reviews (an
+        eval-mode worktree keeps them in its lane root), so its choice wins."""
+        chosen = tmp_path / 'lane-root' / 'reviews'
+        prompt = await _capture_investigation_prompt(
+            tmp_path, _TaskDocScheduler(), reviews_dir=chosen,
+        )
+
+        assert _reviews_directory_line(prompt) == f'**Reviews directory:** {chosen}', prompt
+
+    @pytest.mark.asyncio
+    async def test_unroutable_task_id_degrades_only_the_reviews_line(self, tmp_path):
+        """A task id no task root can be named for costs the investigator its
+        reviews path, never the investigation."""
+        prompt = await _capture_investigation_prompt(tmp_path, _TaskDocScheduler(), task_id='4 2')
+
+        assert _reviews_directory_line(prompt).startswith(
+            "**Reviews directory:** (unavailable: invalid task id '4 2'"
+        ), prompt
 
     @pytest.mark.asyncio
     async def test_oversized_task_text_is_bounded_and_marked(self, tmp_path):
@@ -3215,27 +3229,59 @@ _FILE_WRITING_GIT_FLAGS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _rendered_argv(kwargs: dict) -> list[str]:
-    """The CLI argv the captured investigation call becomes."""
-    from shared.cli_invoke import build_claude_argv
+# The behaviours the host's user settings file supplied before the
+# investigation stopped reading it, and that it still relies on.
+_PINNED_INVESTIGATION_ENV = {
+    'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE': '1',
+    'DISABLE_AUTO_COMPACT': '1',
+}
 
-    argv, temp_files = build_claude_argv(
-        model=kwargs['model'],
-        max_budget_usd=kwargs['max_budget_usd'],
-        system_prompt=kwargs['system_prompt'],
-        max_turns=kwargs['max_turns'],
-        permission_mode=kwargs['permission_mode'],
-        allowed_tools=kwargs['allowed_tools'],
-        disallowed_tools=kwargs['disallowed_tools'],
-        mcp_config=None,
-        output_schema=kwargs['output_schema'],
-        effort=kwargs['effort'],
-        resume_session_id=None,
-        session_id=kwargs['session_id'],
-    )
-    for path in temp_files:
-        Path(path).unlink(missing_ok=True)
-    return argv
+
+async def _capture_investigation_spawn(tmp_path, config=None) -> tuple[list[str], dict[str, str]]:
+    """Run one investigation through the real ``invoke_agent`` and return the
+    argv and env its CLI would be spawned with.
+
+    The pinned env vars are removed from this process's environment first, so
+    the captured env shows what the investigation supplies, not what the
+    test's own shell happened to inherit.
+    """
+    from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+    spawns: list[tuple[list[str], dict[str, str]]] = []
+
+    async def recording_runner(cmd, cwd, env, **kwargs) -> SubprocessResult:
+        spawns.append((list(cmd), dict(env)))
+        return SubprocessResult(
+            stdout=_json.dumps({
+                'result': 'ok',
+                'is_error': False,
+                'subtype': 'success',
+                'total_cost_usd': 0.01,
+                'num_turns': 1,
+                'session_id': 'spawn-capture',
+                'structured_output': _LOW_RISK_PROPOSAL,
+            }),
+            stderr='',
+            returncode=0,
+            duration_ms=1,
+        )
+
+    mcp = MagicMock()
+    mcp.mcp_config_json.return_value = {'mcpServers': {}}
+    with (
+        patch.dict(os.environ),
+        patch(
+            'orchestrator.dry_run_unblock.invoke_agent',
+            new=functools.partial(invoke_agent, runner=recording_runner),
+        ),
+    ):
+        for name in _PINNED_INVESTIGATION_ENV:
+            os.environ.pop(name, None)
+        await run_dry_run_unblock(
+            **_investigation_kwargs(tmp_path, _TaskDocScheduler(), config, mcp=mcp),
+        )
+    assert len(spawns) == 1, f'expected exactly one CLI spawn; got {len(spawns)}'
+    return spawns[0]
 
 
 def _bash_rule_matches(rule: str, command: str) -> bool:
@@ -3281,17 +3327,15 @@ class TestInvestigationPermissionEnvelope:
 
     @pytest.mark.asyncio
     async def test_investigation_runs_under_dont_ask_not_bypass(self, tmp_path):
-        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+        argv, _ = await _capture_investigation_spawn(tmp_path)
 
-        assert kwargs.get('permission_mode') == 'dontAsk', kwargs.get('permission_mode')
-        argv = _rendered_argv(kwargs)
         assert argv[argv.index('--permission-mode') + 1] == 'dontAsk', argv
 
     @pytest.mark.asyncio
     async def test_every_builtin_file_writing_tool_is_denied(self, tmp_path):
-        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+        argv, _ = await _capture_investigation_spawn(tmp_path)
 
-        denied = set(_flag_values(_rendered_argv(kwargs), '--disallowed-tools'))
+        denied = set(_flag_values(argv, '--disallowed-tools'))
         missing = sorted({'Edit', 'Write', 'NotebookEdit'} - denied)
         assert not missing, f'file-writing tools not denied: {missing}'
 
@@ -3323,6 +3367,159 @@ class TestInvestigationPermissionEnvelope:
             if not any(_bash_rule_matches(rule, command) for rule in kwargs['disallowed_tools'])
         ]
         assert not undenied, f'file-writing git forms the envelope does not deny: {undenied}'
+
+
+@pytest.fixture
+def landlock_backend():
+    """Prefer landlock for one test, restoring the process-global backend and refusal dedup after."""
+    saved = sandbox_dispatch.get_backend()
+    sandbox_dispatch.reset_escalation_dedupe()
+    sandbox_dispatch.set_backend('landlock')
+    yield
+    sandbox_dispatch.set_backend(saved)
+    sandbox_dispatch.reset_escalation_dedupe()
+
+
+def _landlock_writable_grants(argv: list[str]) -> list[Path]:
+    inner_start = argv.index('--')
+    return [Path(argv[i + 1]) for i in range(inner_start) if argv[i] == '--writable']
+
+
+class TestInvestigationIsConfined:
+    """The CLI matches deny rules against raw command text, so a quoted
+    ``--outp''ut=F`` passes them; the OS sandbox is the write boundary."""
+
+    @pytest.mark.asyncio
+    async def test_enabled_sandbox_confines_the_investigation_to_its_task_dir(
+        self, tmp_path, landlock_backend,
+    ):
+        with patch('orchestrator.agents.landlock.is_landlock_available', return_value=True):
+            kwargs = await _capture_investigation_call(
+                tmp_path, _TaskDocScheduler(), config=_make_config(sandbox_enabled=True),
+            )
+            argv = sandbox_dispatch.wrap_command(
+                ['claude'], kwargs['cwd'], kwargs['sandbox_modules'], kwargs.get('sandbox_extras'),
+            )
+
+        assert kwargs['sandbox_modules'] == []
+        assert not kwargs.get('sandbox_extras')
+        grants = _landlock_writable_grants(argv)
+        assert grants == [tmp_path.resolve() / '.task']
+        assert Path(kwargs['config_dir']).resolve().is_relative_to(grants[0])
+
+    @pytest.mark.asyncio
+    async def test_disabled_sandbox_leaves_the_investigation_unconfined(self, tmp_path):
+        kwargs = await _capture_investigation_call(
+            tmp_path, _TaskDocScheduler(), config=_make_config(sandbox_enabled=False),
+        )
+
+        assert kwargs['sandbox_modules'] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('backend', ['codex', 'gemini', 'pi'])
+    async def test_only_the_claude_backend_is_confined_by_the_os_sandbox(self, tmp_path, backend):
+        kwargs = await _capture_investigation_call(
+            tmp_path, _TaskDocScheduler(), config=_make_config(sandbox_enabled=True, backend=backend),
+        )
+
+        assert kwargs['sandbox_modules'] is None
+
+    @pytest.mark.asyncio
+    async def test_an_unavailable_sandbox_refuses_the_launch(self, tmp_path, landlock_backend):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        scheduler = _TaskDocScheduler()
+        mock_invoke = AsyncMock(return_value=_make_agent_result())
+        with (
+            patch('orchestrator.agents.landlock.is_landlock_available', return_value=False),
+            patch('orchestrator.dry_run_unblock.invoke_agent', new=mock_invoke),
+        ):
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='All 5 attempts timed out',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(sandbox_enabled=True),
+            )
+
+        mock_invoke.assert_not_called()
+        entry = _persisted_entry(scheduler)
+        assert entry['status'] == 'investigation_failed'
+        assert entry['risk_label'] == 'human-review-required'
+        assert 'unconfined' in entry['proposal_text']
+
+    @pytest.mark.asyncio
+    async def test_a_refused_dry_run_leaves_the_outage_escalation_to_the_role_dispatches(
+        self, tmp_path, landlock_backend,
+    ):
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        with (
+            patch('orchestrator.agents.landlock.is_landlock_available', return_value=False),
+            patch('orchestrator.dry_run_unblock.invoke_agent', new=AsyncMock()),
+        ):
+            await run_dry_run_unblock(
+                task_id='42',
+                worktree=str(tmp_path),
+                reason='verify exhausted',
+                detail='All 5 attempts timed out',
+                scheduler=_TaskDocScheduler(),
+                mcp=MagicMock(),
+                config=_make_config(sandbox_enabled=True),
+            )
+            with pytest.raises(sandbox_dispatch.SandboxUnavailable) as refusal:
+                sandbox_dispatch.resolve_backend_or_refuse()
+
+        assert refusal.value.should_escalate is True
+
+    @pytest.mark.asyncio
+    async def test_backend_none_is_the_escape_hatch_and_runs_unconfined(self, tmp_path, landlock_backend, caplog):
+        sandbox_dispatch.set_backend('none')
+        with caplog.at_level(logging.WARNING, logger='orchestrator.agents.sandbox_dispatch'):
+            kwargs = await _capture_investigation_call(
+                tmp_path, _TaskDocScheduler(), config=_make_config(sandbox_enabled=True),
+            )
+
+        assert kwargs['sandbox_modules'] is None
+        assert any('UNSANDBOXED' in record.getMessage() for record in caplog.records)
+
+
+class TestInvestigationReadsNoAmbientSettings:
+    """The per-investigation config dir symlinks the host's settings files, and
+    the cwd is the blocked task's own worktree, whose ``.claude/`` settings the
+    task under investigation may have written: any settings source would merge
+    its allow rules into the dontAsk envelope."""
+
+    @pytest.mark.asyncio
+    async def test_the_unsandboxed_spawn_reads_no_settings_file(self, tmp_path):
+        argv, _ = await _capture_investigation_spawn(
+            tmp_path, config=_make_config(sandbox_enabled=False),
+        )
+
+        assert '--setting-sources' in argv, argv
+        assert argv[argv.index('--setting-sources') + 1] == '', argv
+
+    @pytest.mark.asyncio
+    async def test_the_sandboxed_spawn_reads_no_settings_file(self, tmp_path, landlock_backend):
+        """The sandboxed path builds its own argv, so it is pinned separately."""
+        with patch('orchestrator.agents.landlock.is_landlock_available', return_value=True):
+            argv, _ = await _capture_investigation_spawn(
+                tmp_path, config=_make_config(sandbox_enabled=True),
+            )
+
+        assert '--setting-sources' in argv, argv
+        assert argv[argv.index('--setting-sources') + 1] == '', argv
+
+    @pytest.mark.asyncio
+    async def test_the_spawn_keeps_what_the_settings_file_used_to_supply(self, tmp_path):
+        """The watchdog and the zero-output retry read the transcript, and
+        compaction stays off as before."""
+        _, env = await _capture_investigation_spawn(tmp_path)
+
+        pinned = {name: env.get(name) for name in _PINNED_INVESTIGATION_ENV}
+        assert pinned == _PINNED_INVESTIGATION_ENV
 
 
 _FENCE = re.compile(r'^```(\w*)\n(.*?)^```', re.MULTILINE | re.DOTALL)

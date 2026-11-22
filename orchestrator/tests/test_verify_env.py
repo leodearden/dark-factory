@@ -11,6 +11,8 @@ orchestrator/src/orchestrator/verify.py::_target_subprocess_env.
 import os
 from pathlib import Path
 
+import pytest
+
 from orchestrator import verify
 from orchestrator.verify import _target_subprocess_env
 
@@ -267,3 +269,41 @@ class TestOrchEnvScrub:
         assert env["MY_ORCH_CONFIG"] == "/my"
         assert env["FOO_ORCH"] == "1"
 
+
+class TestAccountPoolScrub:
+    """A target verify child inherits every credential except the Claude OAuth
+    account pool (``CLAUDE_OAUTH_TOKEN_*``), so a target test that prints its
+    environment cannot write the pool into a verify log (task 6828)."""
+
+    def test_pool_scrubbed_and_other_credentials_kept(self, monkeypatch):
+        fake_environ = {
+            "CLAUDE_OAUTH_TOKEN_A": "pool-a-probe",
+            "CLAUDE_OAUTH_TOKEN_H": "pool-h-probe",
+            "OPENAI_API_KEY": "openai-probe",
+            "CLAUDE_CODE_OAUTH_TOKEN": "session-probe",
+            "HOME": "/home/leo",
+            "PATH": "/usr/bin:/bin",
+        }
+        monkeypatch.setattr(verify.os, "environ", fake_environ)
+
+        env = _target_subprocess_env(None)
+
+        assert [k for k in env if k.startswith("CLAUDE_OAUTH_TOKEN_")] == []
+        assert env["OPENAI_API_KEY"] == "openai-probe"
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "session-probe"
+        assert env["HOME"] == "/home/leo"
+
+    @pytest.mark.asyncio
+    async def test_a_verify_leg_runs_without_the_pool(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_OAUTH_TOKEN_B", "pool-b-probe")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-probe")
+
+        rc, out, timed_out = await verify._run_cmd(
+            'printf "%s|%s" "${CLAUDE_OAUTH_TOKEN_B-absent}" "${OPENAI_API_KEY-absent}"',
+            tmp_path,
+            timeout=5.0,
+        )
+
+        assert rc == 0, out
+        assert not timed_out
+        assert "absent|openai-probe" in out

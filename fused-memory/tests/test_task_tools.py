@@ -10,8 +10,12 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 import yaml
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.middleware.task_text_write_guard import text_fp_of
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _TOOLS_LOGGER = 'fused_memory.server.tools'
 
@@ -191,6 +195,7 @@ async def test_update_task_param_forwarding(
         'dependencies': None,
         'agent_id': None,
         'client_op_id': None,
+        'expected_text_fp': None,
     }
     expected_kwargs = {**base_kwargs, **expected_overrides}
     task_interceptor.update_task.assert_called_once_with(**expected_kwargs)
@@ -419,7 +424,7 @@ async def test_update_task_replace_retires_a_key_on_a_done_task_across_surfaces(
     key; dropping done_provenance is refused with the same canonical dict the
     interceptor returns. Metadata is sent as a dict, so the tool's own
     json.dumps coercion is on the path."""
-    from _fm_helpers import _init_git_repo
+    from _fm_git_repos import _init_git_repo
 
     from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
     from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
@@ -553,9 +558,9 @@ async def test_update_task_null_metadata_reads_as_omitted_at_mcp_surface(
 ):
     """Through the MCP tool, a 'null' metadata payload is decoded to an
     omitted metadata argument (task 6130): the call writes no metadata, so the
-    stored blob, done_provenance included, is left untouched."""
-    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
-
+    stored blob, done_provenance included, is left untouched. With no other
+    field it is a fieldless call, which task 4867 refuses instead of
+    reporting a success that wrote nothing."""
     server, interceptor = real_task_stack
     root = str(tmp_path)
     before = await _seed_task_with_done_provenance(interceptor, root)
@@ -563,7 +568,7 @@ async def test_update_task_null_metadata_reads_as_omitted_at_mcp_surface(
     result = await server._tool_manager.call_tool(
         'update_task', {'id': '1', 'project_root': root, 'metadata': 'null'},
     )
-    assert interceptor_write_succeeded(result), result
+    assert result['error_type'] == 'NoFieldsToUpdateError', result
     assert (await interceptor.get_task('1', root))['metadata'] == before
 
 
@@ -776,6 +781,36 @@ async def test_update_task_status_none_still_allowed(
     task_interceptor.update_task.assert_called_once()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'ignored_arguments',
+    [{}, {'append': True}, {'metadata_mode': 'merge'}, {'tag': 'master'}],
+    ids=['bare', 'append-only', 'metadata_mode-only', 'tag-only'],
+)
+async def test_update_task_with_no_mutating_field_returns_typed_error(
+    real_task_stack, tmp_path, ignored_arguments,
+):
+    """Task 4867: a fieldless update_task reports failure, never ``updated``.
+
+    esc-3147-7 and esc-3671-7 came from a misnamed ``metadata`` argument being
+    dropped, so the call wrote nothing and still reported success. The
+    refusal reaches callers as the same ``error_type`` dict every other raw
+    backend refusal uses, through the real tool, interceptor and backend. No
+    task is created: the refusal is a floor that precedes the row lookup.
+    """
+    server, _interceptor = real_task_stack
+
+    result = await server._tool_manager.call_tool(
+        'update_task',
+        {'id': '1', 'project_root': str(tmp_path), **ignored_arguments},
+    )
+
+    assert result['error_type'] == 'NoFieldsToUpdateError', result
+    assert result['error'].startswith('TASKMASTER_TOOL_ERROR: '), result
+    assert 'metadata' in result['error'], result
+    assert 'updated' not in result, result
+
+
 # ------------------------------------------------------------------
 # Defensive tool registration (always registered, even without Taskmaster)
 # ------------------------------------------------------------------
@@ -919,6 +954,7 @@ async def test_set_task_status_accepts_merge_deferred(
         deferral=None,
         expected_stamped_at=None,
         restamp_only=False,
+        release_holder=False,
     )
 
 
@@ -1021,7 +1057,121 @@ async def test_update_task_accepts_agent_id_and_forwards_existing_kwargs_unchang
         dependencies=None,
         agent_id='recon-stage-7',
         client_op_id=None,
+        expected_text_fp=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_update_task_forwards_expected_text_fp_verbatim(
+    mcp_server_with_tasks, task_interceptor,
+):
+    await mcp_server_with_tasks._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1',
+            'project_root': '/project',
+            'details': 'New body.',
+            'expected_text_fp': 'tfp:abc',
+        },
+    )
+
+    _, kwargs = task_interceptor.update_task.call_args
+    assert kwargs['expected_text_fp'] == 'tfp:abc'
+
+
+async def _real_backend_task(real_task_stack, tmp_path, details: str):
+    from _fm_git_repos import _init_git_repo
+
+    server, interceptor = real_task_stack
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _init_git_repo(repo)
+    root = str(repo)
+    await interceptor.taskmaster.add_task(
+        project_root=root, title='T', description='Summary.', details=details,
+    )
+
+    async def read() -> dict:
+        return await server._tool_manager.call_tool(
+            'get_task', {'id': '1', 'project_root': root},
+        )
+
+    async def write(**params: object) -> dict:
+        return await server._tool_manager.call_tool(
+            'update_task',
+            {
+                'id': '1', 'project_root': root,
+                'agent_id': 'recon-stage-task_knowledge_sync', **params,
+            },
+        )
+
+    return read, write
+
+
+@pytest.mark.asyncio
+async def test_two_recon_writers_on_one_read_cannot_clobber_each_other(
+    real_task_stack, tmp_path,
+):
+    """Task 4650's user-observable signal: two writers compose against the
+    same read; the first lands and reads back, the second is refused instead
+    of overwriting it, and lands only after re-reading."""
+    read, write = await _real_backend_task(real_task_stack, tmp_path, 'Original body.')
+
+    token_a = (await read())['task_text_fp']
+    token_b = (await read())['task_text_fp']
+
+    landed_a = await write(details='Body from writer A.', expected_text_fp=token_a)
+    assert landed_a['text_verified'] is True, landed_a
+
+    refused_b = await write(details='Body from writer B.', expected_text_fp=token_b)
+    assert refused_b['error_type'] == 'TaskTextBaseStale', refused_b
+    assert (await read())['details'] == 'Body from writer A.'
+
+    reread = await read()
+    landed_b = await write(
+        details=reread['details'] + ' Amended by writer B.',
+        expected_text_fp=reread['task_text_fp'],
+    )
+    assert landed_b['text_verified'] is True, landed_b
+    assert (await read())['details'] == 'Body from writer A. Amended by writer B.'
+
+
+@pytest.mark.asyncio
+async def test_a_recon_append_onto_description_hears_the_backend_floor_first(
+    real_task_stack, tmp_path,
+):
+    read, write = await _real_backend_task(real_task_stack, tmp_path, 'Original body.')
+
+    refused = await write(description='More summary.', append=True)
+
+    assert refused['error_type'] == 'AppendUnsupportedFieldError', refused
+    assert (await read())['description'] == 'Summary.'
+
+
+@pytest.mark.asyncio
+async def test_a_recon_details_append_reads_back_verified_on_the_real_backend(
+    real_task_stack, tmp_path,
+):
+    read, write = await _real_backend_task(real_task_stack, tmp_path, 'Original body.')
+
+    landed = await write(details='Appended section.', append=True)
+
+    assert landed['text_verified'] is True, landed
+    assert (await read())['details'] == 'Original body.\n\nAppended section.'
+
+
+@pytest.mark.asyncio
+async def test_a_recon_trimming_replace_reads_back_verified_on_the_real_backend(
+    real_task_stack, tmp_path,
+):
+    read, write = await _real_backend_task(
+        real_task_stack, tmp_path, 'Para A. Para B is a false premise.',
+    )
+
+    landed = await write(details='Para A.', expected_text_fp=(await read())['task_text_fp'])
+
+    assert landed['text_verified'] is True, landed
+    assert (await read())['details'] == 'Para A.'
 
 
 # ------------------------------------------------------------------
@@ -1817,7 +1967,7 @@ async def test_resolve_ticket_idempotent_passthrough_strips_whitespace(
 
     The MCP wire schema enforces ``ticket: str``, so int passthrough is
     only meaningful at the interceptor layer; it's covered by the
-    ``_looks_like_task_id`` unit tests in test_task_interceptor.py.
+    ``looks_like_task_id`` unit tests in shared/tests/test_task_submit.py.
     """
     from unittest.mock import AsyncMock
     task_interceptor.resolve_ticket = AsyncMock()
@@ -2108,6 +2258,33 @@ async def test_get_task_stamps_project_id(mcp_server_with_tasks, task_intercepto
     assert result.get('id') == 1654
     assert result.get('title') == 'real df task'
     assert result.get('status') == 'done'
+
+
+@pytest.mark.asyncio
+async def test_get_task_carries_the_task_text_fingerprint(
+    mcp_server_with_tasks, task_interceptor,
+):
+    row = {'id': '4650', 'description': 'Summary.', 'details': 'Body.', 'status': 'pending'}
+    task_interceptor.get_task = AsyncMock(return_value=row)
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task', {'id': '4650', 'project_root': '/project'},
+    )
+
+    assert result['task_text_fp'] == text_fp_of(row)
+
+
+@pytest.mark.asyncio
+async def test_get_task_error_carries_no_task_text_fingerprint(
+    mcp_server_with_tasks, task_interceptor,
+):
+    task_interceptor.get_task = AsyncMock(return_value={'error': 'Task 4650 not found'})
+
+    result = await mcp_server_with_tasks._tool_manager.call_tool(
+        'get_task', {'id': '4650', 'project_root': '/project'},
+    )
+
+    assert 'task_text_fp' not in result
 
 
 @pytest.mark.asyncio

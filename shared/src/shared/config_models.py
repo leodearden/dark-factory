@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
+
+from shared.account_reserve import InvalidReserve, Reserve, parse_reserve
 
 __all__ = [
     'AccountConfig',
     'UsageCapConfig',
 ]
+
+logger = logging.getLogger(__name__)
 
 
 class AccountConfig(BaseModel):
@@ -62,6 +67,18 @@ class UsageCapConfig(BaseModel):
     wait_for_reset: bool = Field(default=True)
     probe_interval_secs: int = Field(default=300)
     max_probe_interval_secs: int = Field(default=1800)
+    probe_slot_hold_secs: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            "The longest a resumed account's single probe claim waits for its "
+            "holder's verdict before the account opens to every caller. A "
+            'capped account fails its first API call during CLI startup, so a '
+            'holder still running past this bound is being served (task 9327). '
+            'A bound shorter than CLI startup opens the account before that '
+            'first call can report a cap, which forfeits single-task testing.'
+        ),
+    )
     auth_reprobe_secs: int = Field(
         default=3600,
         description='Seconds between auth re-probes for auth_failed accounts.',
@@ -99,6 +116,27 @@ class UsageCapConfig(BaseModel):
         ),
     )
 
+    _reserve: Reserve | None = PrivateAttr(default=None)
+
+    @property
+    def reserve(self) -> Reserve | None:
+        """The accounts file's ``reserve:`` block; None when it has none (PRD §6.2, D2).
+
+        Not a field, so no project config gains a ``usage_cap.reserve`` key and the
+        orchestrator's unknown-key census still reports one written there.
+        """
+        return self._reserve
+
+    @model_validator(mode='before')
+    @classmethod
+    def _warn_on_inline_reserve(cls, data: object) -> object:
+        if isinstance(data, dict) and 'reserve' in data:
+            logger.warning(
+                f'usage_cap.reserve {data["reserve"]!r} ignored: the reserve is read only from '
+                "the accounts file's reserve: block"
+            )
+        return data
+
     @model_validator(mode='after')
     def _load_accounts_file(self) -> UsageCapConfig:
         """Load accounts from external file when accounts_file is set."""
@@ -108,13 +146,14 @@ class UsageCapConfig(BaseModel):
         if not path.is_absolute():
             path = path.resolve()
         if not path.exists():
-            import logging
-
-            logging.getLogger(__name__).warning(
-                f'accounts_file not found: {path} — using inline accounts'
-            )
+            logger.warning(f'accounts_file not found: {path} — using inline accounts')
             return self
         data = yaml.safe_load(path.read_text())
         entries = data.get('accounts', [])
         self.accounts = [AccountConfig(**entry) for entry in entries]
+        if 'reserve' in data:
+            reserve = parse_reserve(data['reserve'], [account.name for account in self.accounts])
+            if isinstance(reserve, InvalidReserve):
+                logger.warning(f'accounts_file {path}: reserve is invalid and inert: {reserve.reason}')
+            self._reserve = reserve
         return self

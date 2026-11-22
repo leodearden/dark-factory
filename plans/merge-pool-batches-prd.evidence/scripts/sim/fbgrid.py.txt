@@ -1,0 +1,206 @@
+"""Runner for the unscannable-fallback run.  Usage: fbgrid.py <plan> ...   -> results/F_<plan>.json
+A row is (cell, policy name, engine cfg, policy spec); every row of a cell runs seeds 0..n-1."""
+import json, os, sys, time
+from multiprocessing import Pool
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import lane as L, gridlib as G, fbcfg as F
+
+N = 60
+CHUNK = 10
+
+
+def _work(task):
+    i, cfg, pname, spec, s0, s1 = task
+    out = []
+    for s in range(s0, s1):
+        m = L.run_one(cfg, (pname, spec), s)
+        m['seed'] = s
+        out.append(m)
+    return i, out
+
+
+def _q(v, p):
+    if not v:
+        return None
+    v = sorted(v)
+    return v[min(len(v) - 1, int(p * len(v)))]
+
+
+def agg(cell, pname, cfg, runs):
+    full = dict(L.DEFAULT_CFG); full.update(cfg)
+    r = G.aggregate(cell, cfg, pname, runs)
+    n = len(runs)
+    span = full['horizon'] - full['warm']
+    sw = [x for m in runs for x in m['scan_waits']]
+    sh = [x for m in runs for x in m['scan_holds']]
+    bb = [x for m in runs for x in m['b2b_w']]
+    nres = (full['scan'] or {}).get('offhost') or 0
+    ps = r['pstat']
+    r.update(
+        unscan_per_run=sum(m['n_unscan'] for m in runs) / n, noscan_per_run=sum(m.get('n_noscan', 0) for m in runs) / n,
+        scans_run=sum(m['n_scan'] for m in runs) / n, noev_per_run=sum(m['n_noev'] for m in runs) / n,
+        scan_n=len(sw), scan_wait_p50=_q(sw, 0.5), scan_wait_p95=_q(sw, 0.95), scan_wait_mean=(sum(sw) / len(sw) if sw else None),
+        scan_hold_p50=_q(sh, 0.5), scan_hold_p95=_q(sh, 0.95),
+        scan_util=(sum(m['scan_res_busy'] for m in runs) / (nres * span * n)) if nres else None,
+        scan_q_end=sum(m['scan_q_end'] for m in runs) / n, scan_qmax=max(m['scan_qmax'] for m in runs),
+        b2b_p50=_q(bb, 0.5), b2b_p95=_q(bb, 0.95),
+        kb=runs[0]['kb'], a_q=runs[0]['a_q'],
+        batch_unc=ps.get('ub_fresh', 0) / max(1, ps.get('ub', 0)), batch_all=ps.get('ub_n', 0) / max(1, ps.get('ub', 0)),
+        fb_per_run=ps.get('fb_n', 0) / n, fb_void_per_run=ps.get('fb_void', 0) / n,
+        wrong_per100=r['conv_wrong_per100'] + r['false_block_per100'] + r['nb_wrong_per100'],
+        verifies_by_kind={k: v for k, v in r['kinds'].items()},
+        noev_share=r['cat'].get('noev', 0.0),
+    )
+    for k in ('calib', 'calib_head', 'calib_stack', 'kind_out', 'head', 'om'):
+        r.pop(k, None)
+    return r
+
+
+def ref_rows(q, dur):
+    c = '%s|q=%.2f' % (dur, q)
+    b = F.base_cfg(q, dur)
+    ex, sp = F.DEFAULT_S
+    ex2, sp2 = F.scan_pair(0.0)
+    return [(c, 'TODAY', b, dict(base='T')), (c, 'U (draft 3)', b, F.U()), (c, 'U+S default', dict(b, **ex), sp),
+            (c, 'U+S corrected m=0', dict(b, **ex2), sp2)]
+
+
+def fb_rows(q, dur, model, ms):
+    c = '%s|q=%.2f' % (dur, q)
+    out = []
+    for m in ms:
+        for name, fb in F.FBS:
+            ex, sp = F.scan_pair(m, model, fb)
+            out.append((c, '%s|m=%.2f|%s' % (model, m, name), F.base_cfg(q, dur, **ex), sp))
+        ex, sp = F.scan_pair(m, model, 'infer', pol_extra=F.F3B)
+        out.append((c, '%s|m=%.2f|F3b inference, suspects priced without the scan' % (model, m), F.base_cfg(q, dur, **ex), sp))
+    return out
+
+
+def plan(name):
+    R = []
+    if name == 'ref':
+        for dur in ('W1', 'W2'):
+            for q in F.QS:
+                R += ref_rows(q, dur)
+    elif name in ('coin_lo', 'coin_hi', 'sticky_lo', 'sticky_hi'):
+        for q in (F.QS[:2] if name.endswith('lo') else F.QS[2:]):
+            R += fb_rows(q, 'W1', name.split('_')[0], F.MS)
+    elif name == 'w2':
+        for q in F.QS:
+            for model in ('coin', 'sticky'):
+                R += fb_rows(q, 'W2', model, (0.16,))
+    elif name == 'tog':
+        # each correction alone on the default (prefix scan, k + 1 trees, on the verify host), no misses
+        var = [('default', dict(mode='lin', t1=False, t2=False, t3=0, t4=False)),
+               ('member-alone scan (n+2 trees)', dict(mode='solo', t1=False, t2=False, t3=0, t4=False)),
+               ('T1 confirm', dict(mode='lin', t1=True, t2=False, t3=0, t4=False)),
+               ('T2 first culprit only', dict(mode='lin', t1=False, t2=True, t3=0, t4=False)),
+               ('T3 off-host x1', dict(mode='lin', t1=False, t2=False, t3=1, t4=False)),
+               ('T3 off-host x1, rule keeps c_t', dict(mode='lin', t1=False, t2=False, t3=1, t4=False, rule_ct=0.05)),
+               ('T3 off-host x2', dict(mode='lin', t1=False, t2=False, t3=2, t4=False)),
+               ('T4 no evidence 1%', dict(mode='lin', t1=False, t2=False, t3=0, t4=True)),
+               ('n+2, T1, T4 on host', dict(mode='solo', t1=True, t2=False, t3=0, t4=True)),
+               ('n+2, T1, T3x1, T4 (corrected)', dict()),
+               ('n+2, T1, T3x2, T4', dict(t3=2)),
+               ('n+2, T1, T2, T3x1, T4', dict(t2=True))]
+        for q in F.QS:
+            c = 'W1|q=%.2f' % q
+            for nm, kw in var:
+                if q in (0.08, 0.14) or 'T3' in nm:
+                    ex, sp = F.scan_pair(0.0, **kw)
+                    R.append((c, nm, F.base_cfg(q, **ex), sp))
+    elif name == 'sens':
+        for q in (0.08, 0.14):
+            c = 'W1|q=%.2f' % q
+            for model in ('coin', 'sticky'):
+                for nm, fb, kw in (('F1 alone', 'alone', {}), ('F2 halve', 'halve', {}), ('F4 bisect', 'bisect', {})):
+                    for tag, px, sx in (('cap 6/24', dict(max_fresh=6), {}), ('cap 8/24', dict(max_fresh=8), {}), ('x2 scan', None, dict(t3=2)),
+                                        ('rule keeps c_t', None, dict(rule_ct=0.05))):
+                        ex, sp = F.scan_pair(0.16, model, fb, pol_extra=px, **sx)
+                        R.append((c, '%s|m=0.16|%s|%s' % (model, nm, tag), F.base_cfg(q, **ex), sp))
+                ex, sp = F.scan_pair(0.16, model, 'infer', pol_extra=dict(F.F3B, convict=False))
+                R.append((c, '%s|m=0.16|F3b|no conviction' % model, F.base_cfg(q, **ex), sp))
+    elif name == 'f1u':
+        for dur, qs in (('W1', F.QS), ('W2', F.QS)):
+            for q in qs:
+                c = '%s|q=%.2f' % (dur, q)
+                for model in ('coin', 'sticky'):
+                    for m in ((0.05, 0.10, 0.16, 0.25) if dur == 'W1' else (0.16,)):
+                        ex, sp = F.scan_pair(m, model, 'alone_u')
+                        R.append((c, '%s|m=%.2f|F1u alone, rest released on block' % (model, m), F.base_cfg(q, dur, **ex), sp))
+        for dur, qs in (('W1', F.QS), ('W2', (0.08, 0.14))):
+            for q in qs:
+                ex, sp = F.scanoff_pair('alone_u')
+                R.append(('X1|%s|q=%.2f' % (dur, q), 'F1u alone, rest released on block', F.base_cfg(q, dur, **ex), sp))
+    elif name == 'x1':
+        for dur, qs in (('W1', F.QS), ('W2', (0.08, 0.14))):
+            for q in qs:
+                c = 'X1|%s|q=%.2f' % (dur, q)
+                b = F.base_cfg(q, dur)
+                R += [(c, 'TODAY', b, dict(base='T')), (c, 'T+', b, dict(base='T+')), (c, 'TB', b, dict(base='T+', pool=True, static_depth='table')),
+                      (c, 'F3 plain U', b, F.U())]
+                for nm, fb in (('F1 alone', 'alone'), ('F2 halve', 'halve'), ("F2' halve, green half implies red half", 'halve2'), ('F4 bisect', 'bisect')):
+                    ex, sp = F.scanoff_pair(fb)
+                    R.append((c, nm, dict(b, **ex), sp))
+    elif name in ('x2a', 'x2b'):
+        q = 0.08 if name == 'x2a' else 0.14
+        c = 'X2|W1|q=%.2f' % q
+        FB = (('F1', 'alone', None), ('F2', 'halve', None), ('F3b', 'infer', F.F3B))
+        for nm, fb, px in FB[:2] + (('F3', 'infer', None),):
+            ex, sp = F.never_pair(fb)
+            R.append((c, 'never|%s' % nm, F.base_cfg(q, **ex), sp))
+        for ct in (0.05, 0.10, 0.20, 0.30, 0.50, 0.80):
+            for nm, fb, px in FB:
+                ex, sp = F.scan_pair(0.16, 'sticky', fb, ct=ct, pol_extra=px)
+                R.append((c, 'always|ct=%.2f|%s' % (ct, nm), F.base_cfg(q, **ex), sp))
+                for pr in ('cost', 'queue'):
+                    ex, sp = F.scan_pair(0.16, 'sticky', fb, ct=ct, pol_extra=dict(px or {}, scan_pred=pr))
+                    R.append((c, 'pred-%s|ct=%.2f|%s' % (pr, ct, nm), F.base_cfg(q, **ex), sp))
+            for nm, fb, px in FB[:2]:
+                ex, sp = F.scan_pair(0.16, 'sticky', fb, ct=ct, mode='pbin', pol_extra=px)
+                R.append((c, 'pbin|ct=%.2f|%s' % (ct, nm), F.base_cfg(q, **ex), sp))
+            if ct in (0.05, 0.20):
+                ex, sp = F.scan_pair(0.16, 'sticky', 'infer', ct=ct)
+                R.append((c, 'always|ct=%.2f|F3 as is' % ct, F.base_cfg(q, **ex), sp))
+    elif name == 'x2r':
+        FB = (('F1', 'alone', None), ('F2', 'halve', None), ('F3b', 'infer', F.F3B))
+        for q in (0.08, 0.14):
+            c = 'X2|W1|q=%.2f' % q
+            for ct in (0.05, 0.10, 0.20, 0.30, 0.50, 0.80):
+                for nm, fb, px in FB:
+                    ex, sp = F.scan_pair(0.16, 'sticky', fb, ct=ct, pol_extra=dict(px or {}, scan_pred='rule'))
+                    R.append((c, 'pred-rule|ct=%.2f|%s' % (ct, nm), F.base_cfg(q, **ex), sp))
+    elif name == 'x3':
+        c = 'X3|W1|q=0.14'
+        for ct in (0.05, 0.20):
+            for nres, ks in ((1, (1, 2, 4, 8)), (2, (1, 2, 4))):
+                for k in ks:
+                    for tag, m, fb in (('m=0', 0.0, 'infer'), ('m=0.16 sticky F1', 0.16, 'alone')):
+                        ex, sp = F.scan_pair(m, 'sticky', fb, ct=ct, t3=nres, conc=k)
+                        R.append((c, 'ct=%.2f|res=%d|k=%d|%s' % (ct, nres, k, tag), F.base_cfg(0.14, **ex), sp))
+    else:
+        raise SystemExit('unknown plan ' + name)
+    return R
+
+
+def run(name, workers=4, n=N):
+    rows = plan(name)
+    t0 = time.time()
+    tasks = [(i, cfg, pn, sp, s0, min(n, s0 + CHUNK)) for i, (c, pn, cfg, sp) in enumerate(rows) for s0 in range(0, n, CHUNK)]
+    acc = {}
+    with Pool(workers) as pool:
+        for k, (i, out) in enumerate(pool.imap_unordered(_work, tasks, chunksize=1)):
+            acc.setdefault(i, []).extend(out)
+            if (k + 1) % 100 == 0:
+                print('  %s: %d/%d tasks, %.0fs' % (name, k + 1, len(tasks), time.time() - t0), flush=True)
+    recs = [agg(rows[i][0], rows[i][1], rows[i][2], acc[i]) for i in range(len(rows))]
+    with open(os.path.join(G.RES, 'F_%s.json' % name), 'w') as f:
+        json.dump(dict(plan=name, elapsed=time.time() - t0, recs=recs), f)
+    print('%s done: %d rows, %.0fs' % (name, len(recs), time.time() - t0), flush=True)
+
+
+if __name__ == '__main__':
+    for nm in sys.argv[1:]:
+        run(nm)

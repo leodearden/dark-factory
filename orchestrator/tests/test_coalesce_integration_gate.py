@@ -57,9 +57,9 @@ def _solo_gate(target_task_id: str, gate_release: asyncio.Event) -> FakeVerifier
     """A ``VerifyPort`` that parks *target_task_id*'s solo verify on *gate_release*.
 
     Injected as ``SpeculativeMergeWorker(..., verifier=...)``.  A dispatched
-    single reaches it through the ``LocalRunner(run_scoped=self._verifier
-    .run_scoped, task_id=req.task_id)`` built in
-    ``merge_queue.py::SpeculativeMergeWorker._dispatch_item``, and
+    single reaches it through the ``LocalRunner`` a local host slot is acquired
+    with (``orchestrator/src/orchestrator/merge_lane/post_merge_verify.py::placeholder_local_runner``),
+    which binds the injected verifier's ``run_scoped`` and ``task_id=req.task_id``, and
     ``verify_runner.py::LocalRunner.run_merge_verify`` forwards that ``task_id``
     into ``run_scoped``, so the script selects exactly one request rather than
     blocking the first verify positionally.  Every other task verifies green immediately.
@@ -166,8 +166,8 @@ class TestScenario1:
 
     async def test_three_singles_coalesce_end_to_end(
         self,
-        git_ops: GitOps,  # noqa: F811 — pytest injects the re-exported fixture
-        coalesce_config: OrchestratorConfig,  # noqa: F811
+        git_ops: GitOps,  # pytest injects the re-exported fixture
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         from unittest.mock import patch
@@ -402,8 +402,8 @@ class TestScenario2:
 
     async def test_partial_stackability_overlap_keeps_solo(
         self,
-        git_ops: GitOps,  # noqa: F811
-        coalesce_config: OrchestratorConfig,  # noqa: F811
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         from orchestrator.event_store import EventStore
@@ -566,8 +566,8 @@ class TestScenario3:
 
     async def test_confidence_gate_excludes_blocked_member(
         self,
-        git_ops: GitOps,  # noqa: F811
-        coalesce_config: OrchestratorConfig,  # noqa: F811
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         from orchestrator.event_store import EventStore
@@ -735,8 +735,8 @@ class TestScenario4:
 
     async def test_inflight_and_cancelled_excluded(
         self,
-        git_ops: GitOps,  # noqa: F811
-        coalesce_config: OrchestratorConfig,  # noqa: F811
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         from orchestrator.event_store import EventStore
@@ -857,8 +857,8 @@ class TestBookkeeping:
 
     async def test_speculative_caps_return_to_k_after_train(
         self,
-        git_ops: GitOps,  # noqa: F811
-        coalesce_config: OrchestratorConfig,  # noqa: F811
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         from unittest.mock import patch

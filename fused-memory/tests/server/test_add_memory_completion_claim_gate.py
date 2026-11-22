@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _task_facts_rows import task_facts_rows
 from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
 from fused_memory.memory_metadata import MemoryMetadataValidationError, MetadataViolation
@@ -32,7 +33,11 @@ from fused_memory.server.tools import create_mcp_server
 # The shared write-triage harness (tests/server/write_triage_harness.py),
 # imported rather than re-derived: reaching add_memory's C1 fallback call site
 # needs triage enabled with a calibrated candidate.
-from server.write_triage_harness import configure_triage_config, search_candidate
+from server.write_triage_harness import (
+    configure_pass_through_add_memory,
+    configure_triage_config,
+    search_candidate,
+)
 
 _PROJECT_ID = 'dark_factory'
 _CLAIM_CONTENT = "task 5422's de-flake fix has been applied"
@@ -42,9 +47,7 @@ _IN_PROGRESS = {'5422': 'in-progress'}
 
 def _mock_service(**config_overrides) -> AsyncMock:
     mock_service = AsyncMock()
-    mem_result = MagicMock()
-    mem_result.model_dump.return_value = {'id': 'mem-1'}
-    mock_service.add_memory.return_value = mem_result
+    configure_pass_through_add_memory(mock_service)
     configure_triage_config(
         mock_service,
         **{'enabled': False, 'near_dup_guard_enabled': False, **config_overrides},
@@ -56,15 +59,15 @@ def _server(mock_service, root: Path, *, statuses: dict | None = None):
     return _multi_project_server(
         mock_service,
         known_projects={_PROJECT_ID: str(root)},
-        get_statuses=AsyncMock(return_value=statuses or {}),
+        get_task_facts=AsyncMock(return_value=task_facts_rows(statuses or {})),
     )
 
 
 def _multi_project_server(
-    mock_service, *, known_projects: dict[str, str], get_statuses: AsyncMock,
+    mock_service, *, known_projects: dict[str, str], get_task_facts: AsyncMock,
 ):
     task_interceptor = MagicMock()
-    task_interceptor.get_statuses = get_statuses
+    task_interceptor.get_task_facts = get_task_facts
     task_interceptor.get_ticket_row = AsyncMock(return_value=None)
     server = create_mcp_server(
         mock_service,
@@ -175,7 +178,7 @@ class TestInertPaths:
 
         result = await _call(server, content=_NO_CLAIM_CONTENT)
 
-        task_interceptor.get_statuses.assert_not_awaited()
+        task_interceptor.get_task_facts.assert_not_awaited()
         task_interceptor.get_ticket_row.assert_not_awaited()
         assert 'unverified_claim' not in mock_service.add_memory.call_args.kwargs
         assert 'unverified_claim' not in result
@@ -230,7 +233,7 @@ class TestGateOrdering:
             f'{result!r}'
         )
         mock_service.add_memory.assert_not_awaited()
-        task_interceptor.get_statuses.assert_not_awaited()
+        task_interceptor.get_task_facts.assert_not_awaited()
         assert _pending_escalations(tmp_path) == []
 
     @pytest.mark.asyncio
@@ -305,7 +308,7 @@ class TestNonAssertiveMoodIsNotTagged:
         assert 'unverified_claim' not in mock_service.add_memory.call_args.kwargs
         assert 'unverified_claim' not in result, f'{result!r}'
         assert _pending_escalations(tmp_path) == []
-        task_interceptor.get_statuses.assert_not_awaited()
+        task_interceptor.get_task_facts.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_declarative_landing_is_still_tagged(self, tmp_path):
@@ -391,20 +394,20 @@ class TestForeignQualifiedRefIsAdjudicatedInItsOwnProject:
         df_root.mkdir()
         solar_root.mkdir()
 
-        async def statuses_by_root(*, project_root, ids):
-            return {'6141': status} if project_root == str(df_root) else {}
+        async def facts_by_root(*, project_root, ids):
+            return task_facts_rows({'6141': status} if project_root == str(df_root) else {})
 
-        get_statuses = AsyncMock(side_effect=statuses_by_root)
+        get_task_facts = AsyncMock(side_effect=facts_by_root)
         mock_service = _mock_service()
         server, _ = _multi_project_server(
             mock_service,
             known_projects={'dark_factory': str(df_root), 'solar_challenge': str(solar_root)},
-            get_statuses=get_statuses,
+            get_task_facts=get_task_facts,
         )
 
         result = await _call(server, content=content, project_id='solar_challenge')
 
-        consulted = [call.kwargs for call in get_statuses.await_args_list]
+        consulted = [call.kwargs for call in get_task_facts.await_args_list]
         assert {'project_root': str(df_root), 'ids': ['6141']} in consulted, consulted
         assert all(kw.get('project_root') != str(solar_root) for kw in consulted), consulted
         assert 'unverified_claim' not in mock_service.add_memory.call_args.kwargs

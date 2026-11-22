@@ -11,18 +11,29 @@ constructs no worker and handed to a helper that does, as callers of
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _tree_scan import (
+    ORCHESTRATOR_TESTS,
+    TESTS_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# Whole-tree scanner: see WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-_TESTS_DIR = Path(__file__).parent
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 _WORKER_CONSTRUCTORS = frozenset({'SpeculativeMergeWorker', 'MergeLane', 'make_lane'})
+
+_CONFIG_CLASS = 'OrchestratorConfig'
 
 _PROBE_FLAG = 'escalate_preexisting_main_break'
 
@@ -42,49 +53,77 @@ def _constructs_a_worker(tree: ast.Module) -> bool:
     )
 
 
-def _imported_modules(tree: ast.Module) -> set[str]:
+def _imported_modules(tree: ast.Module) -> frozenset[str]:
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             imported.add(node.module)
         elif isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
-    return imported
+    return frozenset(imported)
 
 
-def _implicit_probe_lines(tree: ast.Module) -> list[int]:
-    return sorted(
+def _implicit_probe_lines(tree: ast.Module) -> tuple[int, ...]:
+    return tuple(sorted(
         node.lineno for node in ast.walk(tree)
         if isinstance(node, ast.Call)
-        and _called_name(node) == 'OrchestratorConfig'
+        and _called_name(node) == _CONFIG_CLASS
         and {'project_root', 'git'} <= {keyword.arg for keyword in node.keywords}
         and _PROBE_FLAG not in {keyword.arg for keyword in node.keywords}
+    ))
+
+
+@dataclass(frozen=True)
+class _ModuleFacts:
+    """``worker_imports`` are the module's imports when it constructs a worker, else empty: only a worker module's imports join the scan."""
+
+    constructs_a_worker: bool
+    worker_imports: frozenset[str]
+    implicit_probe_lines: tuple[int, ...]
+
+
+_NO_FACTS = _ModuleFacts(constructs_a_worker=False, worker_imports=frozenset(), implicit_probe_lines=())
+
+
+def _module_facts(tree: ast.Module) -> _ModuleFacts:
+    constructs_a_worker = _constructs_a_worker(tree)
+    return _ModuleFacts(
+        constructs_a_worker,
+        _imported_modules(tree) if constructs_a_worker else frozenset(),
+        _implicit_probe_lines(tree),
     )
 
 
-def _implicit_probe_scene_configs(trees: dict[str, ast.Module]) -> dict[str, list[int]]:
+def _parsed_module_facts(module: ParsedModule) -> _ModuleFacts:
+    if not module.may_name(*_WORKER_CONSTRUCTORS, _CONFIG_CLASS):
+        return _NO_FACTS
+    return _module_facts(module.tree)
+
+
+def _implicit_probe_scene_configs(modules: dict[str, _ModuleFacts]) -> dict[str, list[int]]:
     """Lines of scene configs that leave the probe flag implicit, by module name.
 
-    Scans the modules among *trees* that construct a worker, and the sibling
-    modules among *trees* they import.
+    Scans the modules among *modules* that construct a worker, and the sibling
+    modules among *modules* they import.
     """
-    worker_modules = {name for name, tree in trees.items() if _constructs_a_worker(tree)}
-    scanned = worker_modules.union(*(_imported_modules(trees[name]) for name in worker_modules))
-    found = {name: _implicit_probe_lines(trees[name]) for name in sorted(scanned & trees.keys())}
+    worker_modules = {name for name, facts in modules.items() if facts.constructs_a_worker}
+    scanned = worker_modules.union(*(modules[name].worker_imports for name in worker_modules))
+    found = {name: list(modules[name].implicit_probe_lines) for name in sorted(scanned & modules.keys())}
     return {name: lines for name, lines in found.items() if lines}
 
 
-@pytest.fixture(scope='module')
-def implicit_scene_configs_by_module() -> dict[str, list[int]]:
-    return _implicit_probe_scene_configs({
-        module.stem: ast.parse(module.read_text(encoding='utf-8'))
-        for module in sorted(_TESTS_DIR.glob('*.py'))
-    })
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem,
+    files=lambda: (path for path in ORCHESTRATOR_TESTS() if path.parent == TESTS_DIR),
+    extract=_parsed_module_facts,
+)
+TREE_ANALYSES = (ANALYSIS,)
 
 
-def test_no_worker_module_builds_a_probe_on_scene_config_implicitly(
-    implicit_scene_configs_by_module: dict[str, list[int]],
-) -> None:
+def test_no_worker_module_builds_a_probe_on_scene_config_implicitly(tree_pass: TreePass) -> None:
+    modules = {path.stem: facts for path, facts in tree_pass.facts(ANALYSIS).items()}
+    assert any(facts.constructs_a_worker for facts in modules.values()), 'sweep found no worker module'
+    implicit_scene_configs_by_module = _implicit_probe_scene_configs(modules)
     assert implicit_scene_configs_by_module == {}, (
         f'scene config(s) with the main-health probe implicitly on, by module and line: '
         f'{implicit_scene_configs_by_module}. Build them with '
@@ -93,8 +132,32 @@ def test_no_worker_module_builds_a_probe_on_scene_config_implicitly(
     )
 
 
+def test_the_extract_reads_names_as_the_parser_normalizes_them(tmp_path: Path) -> None:
+    probe_dir = tmp_path.resolve()
+    sources = {
+        '_scene_helper': (
+            'def scene_config(repo, git):\n'
+            '    return ＯrchestratorConfig(project_root=repo, git=git)\n'
+        ),
+        'test_scene': (
+            'from _scene_helper import scene_config\n'
+            'def scene(git_ops):\n'
+            '    lane = ｍake_lane(git_ops)\n'
+        ),
+    }
+    for stem, source in sources.items():
+        (probe_dir / f'{stem}.py').write_text(source, encoding='utf-8')
+    probe = TreeAnalysis(
+        'lane_scene_probe', files=lambda: [probe_dir / f'{stem}.py' for stem in sources], extract=_parsed_module_facts,
+    )
+
+    facts = TreePass.run([probe]).facts(probe)
+
+    assert _implicit_probe_scene_configs({path.stem: fact for path, fact in facts.items()}) == {'_scene_helper': [2]}
+
+
 def _flagged(**modules: str) -> dict[str, list[int]]:
-    return _implicit_probe_scene_configs({name: ast.parse(source) for name, source in modules.items()})
+    return _implicit_probe_scene_configs({name: _module_facts(ast.parse(source)) for name, source in modules.items()})
 
 
 _BARE_SCENE_HELPER = (

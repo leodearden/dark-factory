@@ -40,14 +40,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import RepairPolicy
 from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     INVOKE_CLOSER,
     closer_for,
 )
 
-from fused_memory.server.markup_guard import install_markup_guard
+from fused_memory.server.boundary_guards import install_boundary_guards
 from fused_memory.server.markup_tripwire import (
     _MARKUP_STORM_THRESHOLD,
     _MARKUP_STORM_WINDOW_SECONDS,
@@ -86,7 +85,7 @@ def _pass_through(mock_service: AsyncMock, method: str) -> None:
     An unspecced AsyncMock chains AsyncMock all the way down, so
     ``result.model_dump()`` would be an unawaited coroutine unless the return
     value is an explicit MagicMock (mirrors
-    test_add_memory_near_duplicate_gate.py::_configure_pass_through_add_memory).
+    tests/server/write_triage_harness.py::configure_pass_through_add_memory).
     """
     result = MagicMock()
     result.model_dump.return_value = {'id': 'ok'}
@@ -227,8 +226,8 @@ class TestAddMemoryOnlyTheBoundaryRejects:
         )
         mock_service.add_memory.assert_called_once()
 
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
         mock_service.add_memory.reset_mock()
         with pytest.raises(ToolError) as exc_info:
@@ -247,8 +246,8 @@ class TestAddMemoryOnlyTheBoundaryRejects:
         more than the excerpt, and resubmittable rather than merely diagnostic.
         """
         server, _mock_service = memory_server
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
 
         with pytest.raises(ToolError) as exc_info:
@@ -295,8 +294,8 @@ class TestAddMemoryOnlyTheBoundaryRejects:
         exercised against the GUARDED server, which is the party that reads it.
         """
         server, mock_service = memory_server
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
 
         result = await server._tool_manager.call_tool(
@@ -326,8 +325,8 @@ class TestAddMemoryOnlyTheBoundaryRejects:
         the strip would persist a control flag into the corpus.
         """
         server, mock_service = memory_server
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
 
         await server._tool_manager.call_tool(
@@ -370,8 +369,8 @@ class TestAddMemoryOnlyTheBoundaryRejects:
             await server._tool_manager.call_tool('add_memory', arguments)
         )
 
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
         mock_service.add_memory.reset_mock()
         with pytest.raises(ToolError) as exc_info:
@@ -408,8 +407,8 @@ class TestAddEpisodeOnlyTheBoundaryRejects:
         )
         mock_service.add_episode.assert_called_once()
 
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
         mock_service.add_episode.reset_mock()
         with pytest.raises(ToolError) as exc_info:
@@ -433,8 +432,8 @@ class TestAddEpisodeOnlyTheBoundaryRejects:
     @pytest.mark.asyncio
     async def test_override_lets_deliberate_markup_through(self, memory_server):
         server, mock_service = memory_server
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
 
         result = await server._tool_manager.call_tool(
@@ -483,8 +482,8 @@ class TestAddEpisodeOnlyTheBoundaryRejects:
             await server._tool_manager.call_tool('add_episode', arguments)
         )
 
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
         with pytest.raises(ToolError) as exc_info:
             await server._tool_manager.call_tool('add_episode', arguments)
@@ -518,8 +517,8 @@ class TestSubmitTaskOnlyTheBoundaryRejects:
         )
         interceptor.submit_task.assert_called_once()
 
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
         interceptor.submit_task.reset_mock()
         with pytest.raises(ToolError) as exc_info:
@@ -555,8 +554,8 @@ class TestSubmitTaskOnlyTheBoundaryRejects:
         )
         interceptor.submit_task.assert_called_once()
 
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
         interceptor.submit_task.reset_mock()
         with pytest.raises(ToolError) as exc_info:
@@ -593,8 +592,8 @@ class TestSubmitTaskOnlyTheBoundaryRejects:
         the JSON-string spelling an agent actually sends over the wire too.
         """
         server, interceptor = task_server
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
         metadata = {'allow_mcp_markup': True, 'execution_class': 'code_tdd'}
 
@@ -622,8 +621,8 @@ class TestSubmitTaskOnlyTheBoundaryRejects:
         that declares ``metadata``.
         """
         server, interceptor = task_server
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
 
         await server._tool_manager.call_tool(
@@ -663,8 +662,8 @@ class TestUpdateTaskOnlyTheBoundaryRejects:
         )
         interceptor.update_task.assert_called_once()
 
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
         interceptor.update_task.reset_mock()
         with pytest.raises(ToolError) as exc_info:
@@ -685,8 +684,8 @@ class TestUpdateTaskOnlyTheBoundaryRejects:
         )
         interceptor.update_task.assert_called_once()
 
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
         interceptor.update_task.reset_mock()
         with pytest.raises(ToolError) as exc_info:
@@ -720,8 +719,8 @@ class TestUpdateTaskOnlyTheBoundaryRejects:
         blocked.
         """
         server, interceptor = task_server
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
 
         result = _parse(await server._tool_manager.call_tool(
@@ -748,8 +747,8 @@ class TestUpdateTaskOnlyTheBoundaryRejects:
         outliving the single write that set it.
         """
         server, interceptor = task_server
-        install_markup_guard(
-            server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+        install_boundary_guards(
+            server, known_projects=None, prefix_resolver=None
         )
 
         await server._tool_manager.call_tool(
@@ -826,7 +825,7 @@ _BOUNDARY_SPECIMENS = [
 
 
 def _install_boundary_guard(server) -> None:
-    """Install the guard the way main.py does, minus the safe wrapper.
+    """Install the boundary chain the way main.py does, minus the safe wrapper.
 
     ``known_projects=None`` on purpose: a burst then resolves to no
     project_root and the sink files NOTHING, so this suite cannot write an
@@ -834,8 +833,8 @@ def _install_boundary_guard(server) -> None:
     the storm threshold anyway (each builds its own server, and so its own
     counter), but the belt is free.
     """
-    install_markup_guard(
-        server, policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=None
+    install_boundary_guards(
+        server, known_projects=None, prefix_resolver=None
     )
 
 
@@ -1390,10 +1389,8 @@ class TestMarkupStormAtTheBoundary:
         open a queue at a relative directory named after the project.
         """
         server, _mock_service, _interceptor = mixed_server
-        install_markup_guard(
-            server,
-            policy=RepairPolicy.REJECT_WITH_REPAIR,
-            known_projects={_PROJECT_ID: str(tmp_path)},
+        install_boundary_guards(
+            server, known_projects={_PROJECT_ID: str(tmp_path)}, prefix_resolver=None
         )
         calls: list[tuple] = []
 

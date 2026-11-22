@@ -1,6 +1,6 @@
 """Internal task writers that never cross MCP dispatch meet the storage gate legibly.
 
-The MCP boundary guard (``server/markup_guard.py::install_markup_guard``)
+The MCP boundary guard (``server/boundary_guards.py::install_boundary_guards``)
 cannot see these writers: they run below it, in-process, and reach
 ``SqliteTaskBackend`` directly. Task 4419 guards the backend's two write
 sinks; these tests drive the two riskiest internal writers over a real
@@ -76,9 +76,8 @@ async def ticket_store(tmp_path):
 
 
 @pytest_asyncio.fixture
-async def build_interceptor(backend, ticket_store, tmp_path, monkeypatch):
+async def build_interceptor(backend, ticket_store, tmp_path):
     """Build TaskInterceptors around an injected curator; each is closed at teardown."""
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
     buffer = EventBuffer(db_path=tmp_path / 'events.db', buffer_size_threshold=100)
     await buffer.initialize()
     built: list[TaskInterceptor] = []

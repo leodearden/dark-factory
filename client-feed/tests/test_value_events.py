@@ -25,7 +25,8 @@ from client_feed.contract import (
 )
 from client_feed.envelope import Stamp
 from client_feed.fold import fold
-from client_feed.sources.events import FactoryStatus, OpenEscalation, OpenEscalations
+from client_feed.sources.escalations import OpenEscalation, OpenEscalations
+from client_feed.sources.events import FactoryStatus
 from client_feed.sources.prds import PrdText
 from client_feed.sources.tasks import TaskRow
 from client_feed.sources.tree import LineCounts, VisibleTree

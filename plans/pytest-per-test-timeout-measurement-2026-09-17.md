@@ -31,7 +31,8 @@ Superseded by the task 6556 addendum: the rule is now
 Adopted wholesale from what this repo already justifies, rather than invented:
 
 - The **8x headroom factor** is
-  `orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR`.
+  `shared/src/shared/testing_timeout_headroom.py::UNDER_LOAD_HEADROOM_FACTOR`
+  (moved from `orchestrator/tests/_orch_helpers.py` by task 6555).
   8x rather than 2x because the xdist worker deaths the cap exists to avoid were
   observed at loadavg 250-423 — one inflation step PAST the load at which
   measurements can be taken — so the value has to clear a figure nobody has

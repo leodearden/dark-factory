@@ -1,4 +1,4 @@
-"""Multi-backend agent invocation: Claude Code, Codex, and Gemini CLIs.
+"""Multi-backend agent invocation: Claude Code, Codex, Gemini, pi, ZCode and MiMo Code CLIs.
 
 Claude-specific invocation is delegated to ``shared.cli_invoke`` so that
 other subsystems (e.g. fused-memory reconciliation) can reuse it without
@@ -9,39 +9,49 @@ to route through the multi-backend dispatcher below.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import re
-import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-# Re-export shared Claude invocation primitives for backwards compatibility
-from shared.cli_invoke import (  # noqa: F401
-    CAP_HIT_RESUME_PROMPT,
-    CRASH_RECOVERY_RESUME_PROMPT,
+from shared.cli_invoke import (
     AgentResult,
-    _materialize_stdin,
-    _parse_claude_output,
-    _run_subprocess,
-    _SubprocessResult,
+    ArgvWrapper,
+    CliRunner,
+    SubprocessResult,
+    TranscriptWatch,
     apply_spawn_env,
     build_claude_argv,
     invoke_claude_agent,
-    invoke_with_cap_retry,
+    parse_claude_output,
     require_non_blank_prompt,
+    run_cli_subprocess,
 )
-
-# Process-group termination helper for subprocess tree cleanup
-from shared.proc_group import terminate_process_group
 from shared.process_cost import ProcessCostBasis
-from shared.python_env import without_python_env_selection
-from shared.secret_env import agent_subprocess_env, without_agent_endpoint_vars
+from shared.secret_env import agent_subprocess_env
 
+from orchestrator.agents.agent_run_home import require_operator_home
+from orchestrator.agents.mimo_backend import (
+    MimoEndpoint,
+    mimo_config_document,
+    mimo_permission_rules,
+    mimo_run_argv,
+    mimo_run_home,
+    mimo_spawn_env,
+    parse_mimo_sessions,
+    read_mimo_sessions,
+)
 from orchestrator.agents.sandbox_git_config import sandbox_git_config_env
+from orchestrator.agents.zcode_backend import (
+    ZCodeEndpoint,
+    parse_zcode_output,
+    zcode_argv,
+    zcode_run_home,
+    zcode_spawn_env,
+)
 
 # MCP startup-timeout injection (bounded drop-on-fail for all projects)
 from orchestrator.mcp_lifecycle import apply_mcp_startup_env
@@ -142,15 +152,22 @@ async def invoke_agent(
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
     resume_prior_total_cost_usd: float | None = None,
+    *,
+    setting_sources: list[str] | None = None,
+    runner: CliRunner = run_cli_subprocess,
 ) -> AgentResult:
     """Invoke an agent via CLI and return structured result.
 
-    Dispatches to the appropriate backend (claude, codex, gemini, pi).
+    Dispatches to the appropriate backend (claude, codex, gemini, pi, zcode, mimo).
     *strict_mcp_config* (claude backend ONLY): when True, ``--strict-mcp-config``
     is emitted alongside ``--mcp-config`` so the invocation is scoped to only
     the servers in *mcp_config*, ignoring the ambient project ``.mcp.json``
     merge (the recon-watch isolation pattern; task 2796, THREAD 2). The
     codex/gemini/pi backends ignore it — ``--strict-mcp-config`` is claude-only.
+    *setting_sources* (claude backend ONLY) names the settings files the CLI
+    reads; ``[]`` reads none, so no ambient permission allow rule reaches the
+    call. It is forwarded to ``shared.cli_invoke.build_claude_argv``, which
+    validates it; the other backends ignore it.
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
     *resume_session_id*, when set, resumes an existing Claude session.
@@ -169,11 +186,13 @@ async def invoke_agent(
     *working_idle_secs* / *absolute_cap_secs*, when BOTH set (claude backend
     only), extend the working-regime watchdog past *timeout_seconds* while
     the transcript keeps advancing. Default ``None`` for both → no extension.
-    *prices*, when set (codex/gemini backends only — claude reports native
+    *prices*, when set (codex/gemini/zcode/mimo backends only — claude reports native
     cost), is forwarded to the parser's cost estimator in place of the
     packaged default price table; see ``_estimate_cost``.
     The codex backend maps *allowed_tools* / *disallowed_tools* onto its
     sandbox (see ``codex_exec_argv``).
+    *runner* spawns every backend's CLI; tests inject one in place of
+    ``run_cli_subprocess``.
     """
     if backend == 'claude':
         return await _invoke_claude_with_sandbox(
@@ -195,6 +214,8 @@ async def invoke_agent(
             absolute_cap_secs=absolute_cap_secs,
             strict_mcp_config=strict_mcp_config,
             resume_prior_total_cost_usd=resume_prior_total_cost_usd,
+            setting_sources=setting_sources,
+            runner=runner,
         )
     elif backend == 'codex':
         return await _invoke_codex(
@@ -205,6 +226,7 @@ async def invoke_agent(
             timeout_seconds=timeout_seconds, prices=prices,
             max_turns=max_turns,
             allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+            runner=runner,
         )
     elif backend == 'gemini':
         return await _invoke_gemini(
@@ -213,6 +235,7 @@ async def invoke_agent(
             sandbox_modules=sandbox_modules, sandbox_extras=sandbox_extras,
             effort=effort,
             timeout_seconds=timeout_seconds, prices=prices,
+            runner=runner,
         )
     elif backend == 'pi':
         return await _invoke_pi(
@@ -224,9 +247,52 @@ async def invoke_agent(
             oauth_token=oauth_token, resume_session_id=resume_session_id,
             session_id=session_id, timeout_seconds=timeout_seconds,
             env_overrides=env_overrides, prices=prices,
+            runner=runner,
+        )
+    elif backend == 'zcode':
+        return await _invoke_zcode(
+            prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
+            max_turns=max_turns, max_budget_usd=max_budget_usd,
+            allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+            mcp_config=mcp_config, sandbox_modules=sandbox_modules,
+            sandbox_extras=sandbox_extras, effort=effort,
+            timeout_seconds=timeout_seconds, env_overrides=env_overrides, prices=prices,
+            runner=runner,
+        )
+    elif backend == 'mimo':
+        return await _invoke_mimo(
+            prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
+            max_turns=max_turns, max_budget_usd=max_budget_usd,
+            allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+            mcp_config=mcp_config, sandbox_modules=sandbox_modules,
+            sandbox_extras=sandbox_extras, effort=effort,
+            timeout_seconds=timeout_seconds, env_overrides=env_overrides, prices=prices,
+            runner=runner,
         )
     else:
         raise ValueError(f'Unknown backend: {backend!r}')
+
+
+def _sandbox_wrap(
+    cwd: Path,
+    sandbox_modules: list[str] | None,
+    sandbox_extras: list[str] | None,
+) -> ArgvWrapper | None:
+    """The argv wrap a requested sandbox applies, or None when none is requested."""
+    if sandbox_modules is None:
+        return None
+    from orchestrator.agents.sandbox_dispatch import wrap_command
+
+    def wrap(cmd: list[str]) -> list[str]:
+        return wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras)
+    return wrap
+
+
+def _sandbox_env(env: Mapping[str, str], sandbox_modules: list[str] | None) -> dict[str, str]:
+    """A copy of *env*, with rerere turned off when a sandbox is requested."""
+    if sandbox_modules is None:
+        return dict(env)
+    return {**env, **sandbox_git_config_env(env)}
 
 
 def _sandbox_spawn(
@@ -237,13 +303,8 @@ def _sandbox_spawn(
     sandbox_extras: list[str] | None,
 ) -> tuple[list[str], dict[str, str]]:
     """The argv and env every backend spawns: a requested sandbox wraps *cmd* and turns rerere off."""
-    if sandbox_modules is None:
-        return cmd, dict(env)
-    from orchestrator.agents.sandbox_dispatch import wrap_command
-    return (
-        wrap_command(cmd, cwd, sandbox_modules, writable_extras=sandbox_extras),
-        {**env, **sandbox_git_config_env(env)},
-    )
+    wrap = _sandbox_wrap(cwd, sandbox_modules, sandbox_extras)
+    return (wrap(cmd) if wrap is not None else cmd), _sandbox_env(env, sandbox_modules)
 
 
 # ---------------------------------------------------------------------------
@@ -294,13 +355,17 @@ async def _invoke_claude_with_sandbox(
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
     resume_prior_total_cost_usd: float | None = None,
+    *,
+    setting_sources: list[str] | None = None,
+    runner: CliRunner,
 ) -> AgentResult:
     """Invoke Claude Code CLI with optional bwrap sandboxing.
 
     Delegates to shared.cli_invoke for the core invocation; adds
-    orchestrator-specific sandbox wrapping. *strict_mcp_config* threads through
-    to ``build_claude_argv`` (both the sandboxed and non-sandbox sub-paths),
-    emitting ``--strict-mcp-config`` alongside ``--mcp-config`` (task 2796).
+    orchestrator-specific sandbox wrapping. *strict_mcp_config* and
+    *setting_sources* thread through to ``build_claude_argv`` (both the
+    sandboxed and non-sandbox sub-paths), emitting ``--strict-mcp-config``
+    alongside ``--mcp-config`` (task 2796) and ``--setting-sources``.
     """
     # Inject per-session CLI env defaults into every claude agent's subprocess
     # env.  MCP_TIMEOUT: a slow, hung, or incompatible stdio MCP is dropped
@@ -311,8 +376,8 @@ async def _invoke_claude_with_sandbox(
     # miss a dispatch site.  setdefault lets explicit caller values win.
     env_overrides = apply_bash_cwd_reset_env(apply_mcp_startup_env(env_overrides))
 
-    # For sandboxed invocations we need to build the command ourselves
-    # and use the lower-level shared primitives
+    # For sandboxed invocations we build the command ourselves and hand the
+    # runner the sandbox wrap to apply before spawn.
     if sandbox_modules is not None:
         from orchestrator.agents.sandbox_dispatch import resolve_active_backend
         active = resolve_active_backend()
@@ -344,6 +409,7 @@ async def _invoke_claude_with_sandbox(
                 resume_session_id=resume_session_id,
                 session_id=session_id,
                 strict_mcp_config=strict_mcp_config,
+                setting_sources=setting_sources,
             )
 
             # User prompt piped via stdin to avoid ARG_MAX
@@ -362,19 +428,23 @@ async def _invoke_claude_with_sandbox(
             # LAUNCHER_PID scrub.
             apply_spawn_env(env, spawn_env)
 
-            cmd, env = _sandbox_spawn(cmd, env, cwd, sandbox_modules, sandbox_extras)
-
             try:
-                result = await _run_subprocess(
-                    cmd, cwd, env, model, timeout_seconds,
+                result = await runner(
+                    cmd, cwd, _sandbox_env(env, sandbox_modules),
+                    backend='claude',
+                    model=model,
+                    timeout_seconds=timeout_seconds,
                     stdin_data=stdin_data,
-                    session_id=(resume_session_id or session_id),
-                    config_dir=config_dir,
-                    startup_grace_secs=startup_grace_secs,
-                    working_idle_secs=working_idle_secs,
-                    absolute_cap_secs=absolute_cap_secs,
+                    wrap_argv=_sandbox_wrap(cwd, sandbox_modules, sandbox_extras),
+                    transcript=TranscriptWatch(
+                        session_id=(resume_session_id or session_id),
+                        config_dir=config_dir,
+                        startup_grace_secs=startup_grace_secs,
+                        working_idle_secs=working_idle_secs,
+                        absolute_cap_secs=absolute_cap_secs,
+                    ),
                 )
-                return _parse_claude_output(
+                return parse_claude_output(
                     result,
                     resumed=bool(resume_session_id),
                     prior_total_cost_usd=resume_prior_total_cost_usd,
@@ -404,12 +474,18 @@ async def _invoke_claude_with_sandbox(
         absolute_cap_secs=absolute_cap_secs,
         strict_mcp_config=strict_mcp_config,
         resume_prior_total_cost_usd=resume_prior_total_cost_usd,
+        setting_sources=setting_sources,
+        runner=runner,
     )
 
 
 # ---------------------------------------------------------------------------
 # Codex backend
 # ---------------------------------------------------------------------------
+
+# codex-cli's auth env vars (0.167.0 binary: "provide an API key through a supported auth env var");
+# its ChatGPT login lives in ~/.codex and needs none.
+CODEX_CREDENTIAL_VARS = frozenset({'OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN'})
 
 _CODEX_WRITE_TOOLS = frozenset({'Edit', 'Write'})
 
@@ -526,6 +602,8 @@ async def _invoke_codex(
     max_turns: int | None = None,
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
+    *,
+    runner: CliRunner,
 ) -> AgentResult:
     """Invoke OpenAI Codex CLI.
 
@@ -549,8 +627,8 @@ async def _invoke_codex(
     uniformity/observability only: codex-cli (verified 0.143.0, full `codex
     exec --help`) has NO native --max-turns flag and NO budget flag, so
     neither cap is natively enforceable here. The wall-clock watchdog
-    (*timeout_seconds*, enforced by `_run_subprocess_local`'s
-    `asyncio.wait_for`) is the sole ceiling on a codex invocation — parity
+    (*timeout_seconds*, enforced by the runner's flat timeout,
+    ``transcript=None``) is the sole ceiling on a codex invocation — parity
     with the pi backend (PRD open-Q3). Do not read cap enforcement into the
     mere presence of these params.
     """
@@ -571,22 +649,23 @@ async def _invoke_codex(
     codex_input = f'{system_prompt}\n\n{prompt}'.encode()
 
     cmd, env = _sandbox_spawn(
-        cmd, without_python_env_selection(os.environ), cwd, sandbox_modules, sandbox_extras,
+        cmd, agent_subprocess_env(os.environ, credentials=CODEX_CREDENTIAL_VARS),
+        cwd, sandbox_modules, sandbox_extras,
     )
 
-    result = await _run_subprocess_local(
-        cmd, cwd, env, 'codex', model, max_budget_usd, timeout_seconds,
-        stdin_data=codex_input,
+    result = await runner(
+        cmd, cwd, env, backend='codex', model=model, timeout_seconds=timeout_seconds,
+        stdin_data=codex_input, transcript=None,
     )
     return _parse_codex_output(result, model, prices)
 
 
-def _codex_exit_line(result: _SubprocessResult) -> str:
+def _codex_exit_line(result: SubprocessResult) -> str:
     return f'codex exited rc={result.returncode}' + (' (timed out)' if result.timed_out else '')
 
 
 def _parse_codex_output(
-    result: _SubprocessResult,
+    result: SubprocessResult,
     model: str,
     prices: dict[str, Any] | None = None,
 ) -> AgentResult:
@@ -744,6 +823,9 @@ def _parse_codex_output(
 # Gemini backend
 # ---------------------------------------------------------------------------
 
+# The two API-key variables the gemini CLI reads (task 7311, measured).
+GEMINI_CREDENTIAL_VARS = frozenset({'GEMINI_API_KEY', 'GOOGLE_API_KEY'})
+
 async def _invoke_gemini(
     prompt: str,
     system_prompt: str,
@@ -756,6 +838,8 @@ async def _invoke_gemini(
     sandbox_extras: list[str] | None = None,
     timeout_seconds: float | None = None,
     prices: dict[str, Any] | None = None,
+    *,
+    runner: CliRunner,
 ) -> AgentResult:
     """Invoke Google Gemini CLI."""
     temp_files: list[Path] = []
@@ -775,10 +859,14 @@ async def _invoke_gemini(
         cmd = ['gemini', '-p', prompt, '-m', model, '-o', 'json', '--yolo']
 
         cmd, env = _sandbox_spawn(
-            cmd, without_python_env_selection(os.environ), cwd, sandbox_modules, sandbox_extras,
+            cmd, agent_subprocess_env(os.environ, credentials=GEMINI_CREDENTIAL_VARS),
+            cwd, sandbox_modules, sandbox_extras,
         )
 
-        result = await _run_subprocess_local(cmd, cwd, env, 'gemini', model, max_budget_usd, timeout_seconds)
+        result = await runner(
+            cmd, cwd, env, backend='gemini', model=model, timeout_seconds=timeout_seconds,
+            transcript=None,
+        )
         return _parse_gemini_output(result, model, prices)
 
     finally:
@@ -787,7 +875,7 @@ async def _invoke_gemini(
 
 
 def _parse_gemini_output(
-    result: _SubprocessResult,
+    result: SubprocessResult,
     model: str,
     prices: dict[str, Any] | None = None,
 ) -> AgentResult:
@@ -880,6 +968,9 @@ def _write_gemini_settings(
 # behind every divergence from the codex/gemini shape below.
 # ---------------------------------------------------------------------------
 
+# plans/pi-spike-findings.md "Auth"; any other provider key reaches pi only through env_overrides.
+PI_CREDENTIAL_VARS = frozenset({'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY'})
+
 _PI_BUILTIN_TOOL_MAP: dict[str, str] = {
     'Read': 'read',
     'Write': 'write',
@@ -940,7 +1031,7 @@ def _pi_thinking(effort: str | None) -> str | None:
 
 
 def _parse_pi_output(
-    result: _SubprocessResult,
+    result: SubprocessResult,
     model: str,
     prices: dict[str, Any] | None = None,
 ) -> AgentResult:
@@ -1134,6 +1225,8 @@ async def _invoke_pi(
     timeout_seconds: float | None = None,
     env_overrides: dict[str, str] | None = None,
     prices: dict[str, Any] | None = None,
+    *,
+    runner: CliRunner,
 ) -> AgentResult:
     """Invoke the pi coding agent CLI (@earendil-works/pi-coding-agent).
 
@@ -1230,16 +1323,12 @@ async def _invoke_pi(
 
         cmd.append(prompt)
 
-        env = without_agent_endpoint_vars(os.environ)
+        env = agent_subprocess_env(os.environ, credentials=PI_CREDENTIAL_VARS)
         if oauth_token:
-            # Strip a lingering ANTHROPIC_API_KEY so it can't shadow the
-            # OAuth token pi is being asked to use (mirrors
-            # _invoke_claude_with_sandbox's credential-precedence guard) —
-            # otherwise the multi-account OAuth failover oauth_token exists
-            # for is silently defeated whenever both are present in the
-            # inherited environment. Left untouched when oauth_token is
-            # unset so a direct ANTHROPIC_API_KEY credential (pi's
-            # non-OAuth Anthropic auth path) keeps working.
+            # An inherited ANTHROPIC_API_KEY would shadow the OAuth token pi
+            # is asked to use (mirrors _invoke_claude_with_sandbox's
+            # credential precedence). Without oauth_token it stays, as pi's
+            # non-OAuth Anthropic auth path.
             env.pop('ANTHROPIC_API_KEY', None)
             env['ANTHROPIC_OAUTH_TOKEN'] = oauth_token
         if env_overrides:
@@ -1248,7 +1337,10 @@ async def _invoke_pi(
         cmd, env = _sandbox_spawn(cmd, env, cwd, sandbox_modules, sandbox_extras)
         _warn_if_argv_near_arg_max(cmd)
 
-        result = await _run_subprocess_local(cmd, cwd, env, 'pi', model, max_budget_usd, timeout_seconds)
+        result = await runner(
+            cmd, cwd, env, backend='pi', model=model, timeout_seconds=timeout_seconds,
+            transcript=None,
+        )
         return _parse_pi_output(result, model, prices)
 
     finally:
@@ -1325,115 +1417,124 @@ def _warn_if_pi_mcp_cache_unwarmed(server_names: Iterable[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers (orchestrator-local, for non-Claude backends)
+# ZCode backend — its translation layer is orchestrator.agents.zcode_backend
 # ---------------------------------------------------------------------------
 
-async def _run_subprocess_local(
-    cmd: list[str],
+async def _invoke_zcode(
+    prompt: str,
+    system_prompt: str,
     cwd: Path,
-    env: dict[str, str],
-    backend: str,
     model: str,
+    max_turns: int,
     max_budget_usd: float,
-    timeout_seconds: float | None = None,
-    stdin_data: bytes | None = None,
-) -> _SubprocessResult:
-    """Run a subprocess, log output, enforce budget timeout.
-
-    *stdin_data*, when set, is delivered on the process's stdin (mirrors
-    shared.cli_invoke._run_subprocess's stdin_data param, used by the
-    codex backend to deliver instructions without a worktree file — see
-    _invoke_codex). When None (gemini/pi callers), behavior is
-    byte-identical to before this param existed.
-
-    Like the shared runner, the payload is pre-materialized into an unlinked
-    temp file BEFORE spawn rather than written to a pipe afterwards, so an
-    event-loop stall cannot make the child miss its stdin deadline (task 3147
-    — see shared.cli_invoke._materialize_stdin for the confirmed failure mode).
-    The helper is imported, never re-implemented, so the two runners cannot
-    drift apart.
-    """
-    logger.info(f'Invoking agent: backend={backend} model={model} cwd={cwd} budget=${max_budget_usd}')
-    logger.info(f'Command: {" ".join(cmd[:15])}...')
-
-    start_ms = int(time.monotonic() * 1000)
-
-    # Pre-materialize the payload BEFORE the child exists (task 3147); see the
-    # docstring above.  stdin_data is None must still yield stdin=None.
-    stdin_file = _materialize_stdin(stdin_data) if stdin_data is not None else None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(cwd),
-            env=env,
-            stdin=stdin_file,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+    allowed_tools: list[str] | None,
+    disallowed_tools: list[str] | None,
+    mcp_config: dict | None,
+    sandbox_modules: list[str] | None,
+    sandbox_extras: list[str] | None,
+    effort: str | None,
+    timeout_seconds: float | None,
+    env_overrides: dict[str, str] | None,
+    prices: dict[str, Any] | None,
+    *,
+    runner: CliRunner,
+) -> AgentResult:
+    """Invoke the ZCode CLI in a private run home; the wall clock is its only bound."""
+    endpoint = ZCodeEndpoint.from_env_overrides(env_overrides)
+    if timeout_seconds is None:
+        raise ValueError(
+            'the zcode backend needs timeout_seconds: ZCode has no turn or cost bound, so the '
+            'wall-clock watchdog is its only ceiling (plans/zcode-harness-probe-2026-11.md)',
         )
-    finally:
-        # Close the parent's handle once the child has its own dup — this is
-        # what delivers EOF to the child.  In a `finally` so a raising
-        # create_subprocess_exec cannot leak the fd.
-        if stdin_file is not None:
-            stdin_file.close()
-    # Capture pgid at spawn; start_new_session guarantees pgid == pid.
-    pgid = proc.pid
+    logger.debug(
+        'zcode backend: max_turns=%r max_budget_usd=%r effort=%r allowed_tools=%r are not '
+        'enforced or expressible by zcode; only the wall clock (timeout_seconds=%r) bounds it',
+        max_turns, max_budget_usd, effort, allowed_tools, timeout_seconds,
+    )
+    base_env = {**os.environ, **(env_overrides or {})}
+    operator_home = require_operator_home(base_env, backend='zcode')
+    with zcode_run_home(
+        system_prompt=system_prompt, model=model, endpoint=endpoint, mcp_config=mcp_config,
+        operator_home=operator_home, worktree=cwd,
+    ) as home:
+        cmd, env = _sandbox_spawn(
+            zcode_argv(prompt, home, disallowed_tools),
+            zcode_spawn_env(base_env, home),
+            cwd, sandbox_modules, [*(sandbox_extras or []), str(home.root)],
+        )
+        result = await runner(
+            cmd, cwd, env, backend='zcode', model=model, timeout_seconds=timeout_seconds,
+            transcript=None,
+        )
+    return parse_zcode_output(
+        result,
+        cost_of=lambda uncached, output, cached: _estimate_cost(
+            model, uncached + cached, output, prices, cached_input_tokens=cached,
+        ),
+    )
 
-    # Outer try: a cancel landing *inside* the TimeoutError handler's
-    # terminate_process_group await (SIGTERM already sent, SIGKILL escalation
-    # pending) must still be caught here too — an exception raised inside an
-    # except block is not caught by a sibling handler of the same try, so a
-    # CancelledError handler that was only a sibling of `except TimeoutError:`
-    # would let that escalation be abandoned with a SIGTERM-ignoring child
-    # left alive.
-    try:
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                # No `input=`: stdin was pre-materialized as a real fd before
-                # spawn (task 3147), so communicate() performs reads only.
-                proc.communicate(),
-                timeout=timeout_seconds,
+
+# ---------------------------------------------------------------------------
+# MiMo Code backend — its translation layer is orchestrator.agents.mimo_backend
+# ---------------------------------------------------------------------------
+
+async def _invoke_mimo(
+    prompt: str,
+    system_prompt: str,
+    cwd: Path,
+    model: str,
+    max_turns: int,
+    max_budget_usd: float,
+    allowed_tools: list[str] | None,
+    disallowed_tools: list[str] | None,
+    mcp_config: dict | None,
+    sandbox_modules: list[str] | None,
+    sandbox_extras: list[str] | None,
+    effort: str | None,
+    timeout_seconds: float | None,
+    env_overrides: dict[str, str] | None,
+    prices: dict[str, Any] | None,
+    *,
+    runner: CliRunner,
+) -> AgentResult:
+    """Run one ``mimo run`` in a private MIMOCODE_HOME, then read its usage from that home's session store."""
+    endpoint = MimoEndpoint.from_env_overrides(env_overrides)
+    if timeout_seconds is None:
+        raise ValueError(
+            "the mimo backend needs timeout_seconds: its step cap relies on the endpoint "
+            "honouring tool_choice 'none' and it retries 429/404 without limit, so the "
+            'wall-clock watchdog is its only hard ceiling (plans/mimo-code-harness-probe-2026-11.md)',
+        )
+    logger.debug(
+        'mimo backend: max_budget_usd=%r allowed_tools=%r are not enforced by mimo',
+        max_budget_usd, allowed_tools,
+    )
+    base_env = {**os.environ, **(env_overrides or {})}
+    operator_home = require_operator_home(base_env, backend='mimo')
+    document = mimo_config_document(
+        model=model, endpoint=endpoint, mcp_config=mcp_config,
+        permission=mimo_permission_rules(disallowed_tools), max_turns=max_turns,
+    )
+    with mimo_run_home(
+        system_prompt=system_prompt, config_document=document, operator_home=operator_home,
+    ) as home:
+        env = mimo_spawn_env(base_env, home)
+        extras = [*(sandbox_extras or []), str(home.root)]
+
+        async def spawn(argv: list[str], timeout: float, stdin: bytes = b'') -> SubprocessResult:
+            cmd, wrapped_env = _sandbox_spawn(argv, env, cwd, sandbox_modules, extras)
+            return await runner(
+                cmd, cwd, wrapped_env, backend='mimo', model=model, timeout_seconds=timeout,
+                stdin_data=stdin, transcript=None,
             )
-        except TimeoutError:
-            await terminate_process_group(proc, pgid)
-            duration_ms = int(time.monotonic() * 1000) - start_ms
-            return _SubprocessResult(
-                stdout='',
-                stderr=f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)',
-                returncode=1,
-                duration_ms=duration_ms,
-                timed_out=True,
-            )
-    except asyncio.CancelledError:
-        # Orchestrator shutdown / steward-stop path: the awaiting task was
-        # cancelled.  Without this, proc.communicate() is cancelled but the
-        # child process GROUP is never signalled and the agent survives as an
-        # orphan still editing/committing in its worktree.  Mirrors the
-        # already-blessed handler in shared/src/shared/cli_invoke.py (:2433)
-        # and orchestrator/src/orchestrator/steward.py (:405).
-        # No comm_task to reap: asyncio.wait_for already cancels and awaits
-        # its inner task before propagating CancelledError.
-        if proc.returncode is None:
-            logger.warning(
-                f'Subprocess cancelled — terminating process group for pid {proc.pid}'
-            )
-            await terminate_process_group(proc, pgid, grace_secs=5.0)
-        raise
 
-    duration_ms = int(time.monotonic() * 1000) - start_ms
-
-    stderr_text = stderr.decode()[-2000:] if stderr else ''
-    if stderr_text:
-        logger.info(f'Agent stderr (last 1000): {stderr_text[-1000:]}')
-    logger.info(f'Agent exit code: {proc.returncode}')
-    logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout.decode()[:500]}')
-
-    return _SubprocessResult(
-        stdout=stdout.decode(),
-        stderr=stderr_text,
-        returncode=proc.returncode if proc.returncode is not None else 1,
-        duration_ms=duration_ms,
+        run = await spawn(mimo_run_argv(model, cwd, effort), timeout_seconds, prompt.encode())
+        exports = await read_mimo_sessions(spawn)
+    return parse_mimo_sessions(
+        exports, run, max_turns=max_turns,
+        cost_of=lambda uncached, output, cached: _estimate_cost(
+            model, uncached + cached, output, prices, cached_input_tokens=cached,
+        ),
     )
 
 

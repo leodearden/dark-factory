@@ -19,6 +19,11 @@ from orchestrator.shadow_types import (
 )
 
 _OPENED_AT = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
+_RAN = {
+    'state': ShadowCellState.AWAITING_REFERENCE,
+    'running_at': _OPENED_AT + timedelta(minutes=5),
+    'run_ended_at': _OPENED_AT + timedelta(minutes=50),
+}
 
 
 def _cell(**overrides) -> ShadowCell:
@@ -33,6 +38,7 @@ def _cell(**overrides) -> ShadowCell:
         'base_sha': 'a' * 40,
         'state': ShadowCellState.OPENED,
         'cost_basis': CostBasis.METERED,
+        'configured_model': 'MiniMax-M3.1-Flash',
         'opened_at': _OPENED_AT,
         'settle_deadline': _OPENED_AT + timedelta(hours=168),
     }
@@ -65,11 +71,31 @@ class TestShadowCellInvariants:
 
     @pytest.mark.parametrize(
         'field',
-        ['owner', 'cell_id', 'project_id', 'task_id', 'candidate', 'incumbent', 'base_sha'],
+        [
+            'owner', 'cell_id', 'project_id', 'task_id', 'candidate', 'incumbent', 'base_sha',
+            'configured_model',
+        ],
     )
     def test_empty_identity_string_is_refused(self, field):
         with pytest.raises(ValueError, match=field):
             _cell(**{field: ''})
+
+    @pytest.mark.parametrize('served_model', ['', '  '])
+    def test_a_blank_served_model_is_refused(self, served_model):
+        with pytest.raises(ValueError, match='served_model must be None or non-blank'):
+            _cell(served_model=served_model, **_RAN)
+
+    def test_a_cell_whose_run_ended_carries_its_served_model(self):
+        assert _cell(served_model='glm-5.3', **_RAN).served_model == 'glm-5.3'
+
+    @pytest.mark.parametrize(
+        'run_times',
+        [{}, {'running_at': _RAN['running_at']}, {'run_ended_at': _RAN['run_ended_at']}],
+        ids=['never_ran', 'still_running', 'ended_without_starting'],
+    )
+    def test_a_served_model_needs_a_run_that_started_and_ended(self, run_times):
+        with pytest.raises(ValueError, match='served_model.*running_at.*run_ended_at'):
+            _cell(served_model='glm-5.3', **run_times)
 
     @pytest.mark.parametrize('field', ['opened_at', 'settle_deadline', 'running_at', 'settled_at'])
     def test_naive_timestamp_is_refused(self, field):
@@ -129,6 +155,7 @@ class TestShadowCellInvariants:
         assert cell.owner == 'shadow_coordinator'
         assert cell.cost_usd == 0.0
         assert cell.cost_credits == 0.0
+        assert cell.served_model is None
 
     def test_an_aware_non_utc_timestamp_is_accepted(self):
         plus_two = timezone(timedelta(hours=2))
@@ -231,6 +258,17 @@ class TestShadowCellsTable:
         store.insert_shadow_cell(cell)
         assert store.get_shadow_cell(cell.cell_id) == cell
 
+    def test_both_model_columns_round_trip(self, store):
+        served = _cell(configured_model='gpt-6.1-terra', served_model='gpt-6.1-terra', **_RAN)
+        unobserved = _cell(cell_id='01JCELLBBBBBBBBBBBBBBBBBBB', candidate='kimi-endpoint')
+        store.insert_shadow_cell(served)
+        store.insert_shadow_cell(unobserved)
+
+        assert store.get_shadow_cell(served.cell_id) == served
+        read_back = store.get_shadow_cell(unobserved.cell_id)
+        assert read_back is not None
+        assert read_back.served_model is None
+
     def test_an_unknown_cell_reads_none(self, store):
         assert store.get_shadow_cell('01JNOSUCHCELL') is None
 
@@ -300,7 +338,7 @@ class TestShadowCellsTable:
 _RAW_COLUMNS = (
     'cell_id', 'parent_cell_id', 'project_id', 'task_id', 'shape', 'candidate', 'incumbent',
     'stratum', 'base_sha', 'state', 'reason', 'cost_basis', 'cost_usd', 'cost_credits',
-    'opened_at', 'settle_deadline', 'owner',
+    'configured_model', 'served_model', 'opened_at', 'settle_deadline', 'owner',
 )
 
 
@@ -320,6 +358,8 @@ def _raw_values(**overrides) -> dict[str, object]:
         'cost_basis': 'metered',
         'cost_usd': 0,
         'cost_credits': 0,
+        'configured_model': 'c-model',
+        'served_model': None,
         'opened_at': '2026-10-19T12:00:00+00:00',
         'settle_deadline': '2026-10-26T12:00:00+00:00',
         'owner': 'shadow_coordinator',
@@ -343,8 +383,8 @@ def _raw_insert(db_path: Path, **overrides) -> None:
 
 
 class TestShadowCellsSchemaRedundancy:
-    """A raw writer bypassing ShadowCell meets the DDL's NOT NULL, reason, cost, owner and
-    self-parent rules; enum membership is refused only on read."""
+    """A raw writer bypassing ShadowCell meets the DDL's NOT NULL, reason, cost, owner, model
+    and self-parent rules; enum membership is refused only on read."""
 
     @pytest.mark.parametrize(
         'overrides',
@@ -360,6 +400,9 @@ class TestShadowCellsSchemaRedundancy:
             {'cost_basis': 'subscription', 'cost_credits': -1.0},
             {'owner': ''},
             {'parent_cell_id': '01JRAW'},
+            {'configured_model': None},
+            {'configured_model': '  '},
+            {'served_model': ''},
         ],
         ids=lambda o: ','.join(f'{k}={v!r}' for k, v in o.items()),
     )

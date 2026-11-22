@@ -139,7 +139,7 @@ def _persisted_mode(update_task: AsyncMock) -> str | None:
 def _fake_run(*, head: str = 'HEAD-SHA', rc: int = 0):
     """Return an async stand-in for orchestrator.workflow._run (git rev-parse)."""
 
-    async def _run(cmd, cwd=None, **kwargs):  # noqa: ARG001
+    async def _run(cmd, cwd=None, **kwargs):
         if rc == 0:
             return (0, head + '\n', '')
         return (rc, '', 'fatal: bad revision')
@@ -783,7 +783,7 @@ class TestResumeGuard:
 
         seen: list[dict] = []
 
-        async def _capture(branch_name):  # noqa: ARG001
+        async def _capture(branch_name):
             seen.append(f.wf.plan)
             return WorkflowOutcome.DONE
 

@@ -63,7 +63,7 @@ No binding failed. Decisions the decomposition had to take without a human:
 
 | Capability | Evidence | Verdict | Check |
 |---|---|---|---|
-| `session_liveness.py` exists | producer δ over `shared/src/shared/process_identity.py::liveness` (present; `OTHER_HOST` present); absent on main | PASS | path `orchestrator/src/orchestrator/session_liveness.py` present |
+| `session_liveness.py` exists | producer δ over `shared/src/shared/process_identity.py::liveness` (present; `OTHER_HOST` present); absent on main; homed in `shared` per Leo ruling A, 2026-11-04, esc-8125-3 (PRD D16) | PASS | path `shared/src/shared/session_liveness.py` present |
 | records carry `launcher_identity` | stamped by `_run_launching` on the production path | PASS | grep `launcher_identity` in `session_registry.py` |
 | self-exit refuses `other-host` | `SelfExitRefusal.OTHER_HOST` ahead of the pid comparison in `_first_refusal` (present) | PASS | grep `OTHER_HOST` in `session_self_exit.py` |
 | `OTHER_HOST` branch | declared seam: no production producer on this host; proven by B9 alone; consumer the future multi-host PRD (PRD §3, §9) | PASS | manual |

@@ -21,6 +21,9 @@ escalation_port: 8102
 # reify adds warm-lane + worktree roots; the inventory pre-filters
 # ~/.claude/projects encoded dir names by these prefixes (57 encodings for
 # dark-factory today: main checkout + .worktrees/.claude-worktrees children).
+# Each encoded dir's <sid>.jsonl and its sub-agents' <sid>/subagents/**/agent-*.jsonl
+# (Agent-tool and Workflow-tool) are enumerated; a sub-agent is its own session, keyed
+# <parent sid>/subagents/agent-<agentId> (scripts/legibility/inventory.py::TranscriptIdentity).
 cwd_prefixes:
   - /home/leo/src/dark-factory
 # Additional archive roots the miner enumerates ALONGSIDE ~/.claude/projects:
@@ -36,9 +39,9 @@ sampling:
   top_fraction: 0.12
   per_stratum_min: 2
 census:
-  max_interval_days: 10
-  tasks_landed_threshold: 120
-  tasks_landed_min_days: 7
+  # The previous run's completion share that fires the census; see the Census
+  # model in scripts/legibility/config.py.
+  completion_threshold_pct: 70
   novelty_spike:
     count: 4
     window_hours: 72
@@ -73,7 +76,7 @@ census:
       - -p
       - "no:cacheprovider"
       - --timeout=300
-      - scripts/tests/test_codebook.py
+      - scripts/tests/test_live_codebook.py
       - scripts/tests/test_legibility_coder.py
     timeout_secs: 900
 models:
@@ -93,7 +96,10 @@ timeouts:
 # D8-D11): counts per-step plan deviations under meta_roots (relative to
 # project_root) plus archived note-to-file / observation-consumed escalations,
 # and on a rate rise or a dominant pattern files ONE blocking design_concern on
-# task id plan-deviation-census-<project_id>. Validated per field, never
+# task id plan-deviation-census-<project_id>. Rate arms are records per
+# finalized plan, one per source against its own baseline, and a source still
+# warming up cannot fire; prose_only_min is the prose-only arm's count floor.
+# Validated per field, never
 # failing config load, by
 # scripts/legibility/plan_deviation_census.py::settings_from_mapping. Pinned
 # here, like timeouts:, so a schema-default change cannot silently move it.

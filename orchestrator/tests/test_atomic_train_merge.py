@@ -34,15 +34,16 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import AdvanceOutcome, GitOps, TrainMembership, _run
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.verify_failure_outcome import TRANSIENT_INFRA_REASON_PREFIX
 from orchestrator.merge_lane.worker import (
     ABANDONED_REASON_PREFIX,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
-    TRANSIENT_INFRA_REASON_PREFIX,
     GroupMergeRequest,
     MergeOutcome,
     MergeRequest,
 )
+from orchestrator.quarantine_provenance import QuarantineOutcome
 from orchestrator.verify import VerifyResult, run_scoped_verification
 
 # Real git + real cargo integration module (see module docstring): a workspace
@@ -262,7 +263,7 @@ class TestScenario1HappyPath:
 
     async def test_happy_path_3_train_single_merge(
         self,
-        cargo_or_skip,            # noqa: ARG002  (skip guard; value unused)
+        cargo_or_skip,  # (skip guard; value unused)
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -646,7 +647,7 @@ class TestScenario5GroupMergeVerify:
 
     async def test_group_merge_workspace_verify_green(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -730,7 +731,7 @@ class TestScenario5GroupMergeVerify:
     @pytest.mark.exercise_merge_verify
     async def test_group_merge_workspace_verify_red(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -1097,7 +1098,7 @@ class TestScenario6ParkPrefixDerail:
         # to this test's live-vs-orphan routing.
         harness.git_ops.mark_pool_storage_present()
         harness.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=False)
-        harness.git_ops.quarantine_worktree = AsyncMock(return_value=tmp_path / "q-dest")
+        harness.git_ops.quarantine_worktree = AsyncMock(return_value=QuarantineOutcome(dest=tmp_path / "q-dest"))
         harness.git_ops.cleanup_worktree = AsyncMock()
         harness.git_ops.prune_worktrees = AsyncMock()
         harness.config.worktree_orphan_reaper_enabled = True
@@ -1307,7 +1308,7 @@ class TestScenario8MainAdvances:
 
     async def test_main_advances_then_train_merges_clean(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -1724,7 +1725,7 @@ class TestScenario11NonTrainRegression:
 
     async def test_non_train_regression(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -1824,7 +1825,7 @@ class TestScenario12DegenerateTrainOfOne:
 
     async def test_degenerate_train_of_one(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -2016,7 +2017,7 @@ async def _setup_gate_train(
 class TestGate01TrainDiskGuard:
     """step-01 RED: _do_train_merge has no disk guard; disk pressure is ignored.
 
-    After step-02 (GREEN): _do_train_merge uses _run_post_merge_verify which
+    After step-02 (GREEN): _do_train_merge uses run_post_merge_verify which
     runs the pre-verify disk guard; persistent low disk → blocked/verify_skipped.
     """
 

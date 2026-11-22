@@ -19,19 +19,19 @@ from typing import Any
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _merge_lane_fakes import (
-    healthy_verify_clock,
+    FakeVerifier,
+    delegates_to,
     lane_scene_config,
     make_lane,
     merge_through_lane,
     running_lane,
 )
-from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import git_env_with_ceiling, wait_responsive
 from _recording_event_store import _RecordingEventStore
 from df_pytest_isolation import git_redirect_env
 from test_merge_queue_concurrent_verify import _gated_runner, _inject_two_host_allocator
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeLane, MergeRequest, QueuedBranch
 from orchestrator.verify import VerifyResult
@@ -101,9 +101,14 @@ def _scene(tmp_path: Path) -> _Scene:
         main_branch='main', branch_prefix='task/', worktree_dir='.worktrees',
         push_after_advance=False,
     )
+    # Deep chains off (task 8527): under the operational yaml's chain_cap a head
+    # alone in the verify frontier chains its follower, which these scenes need
+    # verified on its own.
     return _Scene(
         repo=repo, git_ops=GitOps(git, repo),
-        config=lane_scene_config(repo, git, merge_verify_breadth='full'),
+        config=lane_scene_config(
+            repo, git, merge_verify_breadth='full', merge_deep=MergeDeepConfig(chain_cap=0),
+        ),
     )
 
 
@@ -127,7 +132,7 @@ def _lane(
 ) -> tuple[MergeLane, asyncio.Queue[Any]]:
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
-        scene.git_ops, queue, verifier=ScriptedVerifier(verify), event_store=store,
+        scene.git_ops, queue, verifier=FakeVerifier(delegates_to(verify)), event_store=store,
     )
     return lane, queue
 
@@ -242,8 +247,8 @@ async def test_in_flight_follower_of_a_carried_head_is_not_cascaded(tmp_path: Pa
     store = _RecordingEventStore()
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
-        scene.git_ops, queue, verifier=ScriptedVerifier(head_parks),
-        clock=healthy_verify_clock(), event_store=store,
+        scene.git_ops, queue, verifier=FakeVerifier(delegates_to(head_parks)),
+        event_store=store,
     )
     async with running_lane(lane) as run:
         allocator = _inject_two_host_allocator(lane, remote)
@@ -265,9 +270,10 @@ async def test_in_flight_follower_of_a_carried_head_is_not_cascaded(tmp_path: Pa
     remote.cancel_verify.assert_not_awaited()
     assert [record for name, record in store.events if name == 'verdict_voided'] == []
     follower_verifies = [awaited.args[0] for awaited in remote.run_merge_verify.await_args_list]
-    assert len(follower_verifies) == 2, follower_verifies
-    assert follower_verifies[1] == follower_outcome.merge_sha != follower_verifies[0], (
-        'the follower verifies once, then gates its rebased tree on the host it holds'
+    assert follower_verifies[:1] != [follower_outcome.merge_sha], follower_verifies
+    assert follower_verifies[1:] + head_verified[1:] == [follower_outcome.merge_sha], (
+        'the follower verifies once, then its rebased tree re-verifies as a dispatch '
+        f'(task 8525); remote={follower_verifies} local={head_verified}'
     )
     assert [
         record['task_id'] for name, record in store.events if name == 'merge_reverify_gate'

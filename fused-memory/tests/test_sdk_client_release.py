@@ -3,7 +3,7 @@
 An ``AsyncOpenAI`` / ``AsyncAnthropic`` that is dropped without ``close()`` is
 finalised at an arbitrary later point, where it can resurrect an ``aclose()``
 task onto an unrelated event loop (the mechanism is documented once, at
-tests/_fm_helpers.py::reap_leaked_async_httpx_clients). These tests drive each
+tests/_fm_httpx_leaks.py::reap_leaked_async_httpx_clients). These tests drive each
 owner through its public ``close()`` and assert that nothing it built is left
 open.
 """
@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_helpers import (
+from _fm_httpx_leaks import (
     _leaked_async_httpx_clients,
     reap_leaked_async_httpx_clients,
     track_async_httpx_clients,
@@ -281,7 +281,9 @@ class TestRoutingClientsClose:
         mock_config.routing.llm_fallback = True
         owner = owner_cls(mock_config)
         with mock_openai_server() as server:
-            monkeypatch.setenv('OPENAI_BASE_URL', server.base_url)
+            monkeypatch.delenv('OPENAI_BASE_URL', raising=False)
+            monkeypatch.delenv('OPENAI_API_BASE', raising=False)
+            mock_config.routing.openai_api_url = server.base_url
             server.chat_content = answer
             await _start_census()
             await ask(owner)

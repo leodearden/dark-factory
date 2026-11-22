@@ -1,0 +1,53 @@
+"""No-stacking cost model for batch depth k (lane.py::cycle_ratio / followup).
+
+One cycle = one batch verify of k requests (each bad with probability q, independent)
+plus, when it is red, the isolation that follows:
+  one   : test one member at a time in pool order; a red single is blocked by its own
+          verify and the untested rest is RELEASED; a passing single lands; when only
+          one member is left it is blocked with no verify (elimination) if elim is on.
+  split : test the prefix whose pass chance is nearest tau (0.5 = binary splitting);
+          a passing prefix lands and the rest still holds a bad one; a red prefix keeps
+          the bad one and the rest is released; recurse; last one left: elimination.
+A sound batch fails with probability e and is then walked the same way.
+Verifies per landing = E[verifies in the cycle] / E[landings in the cycle] (renewal-reward;
+released members go back to the pool at their prior).  Dorfman = every member alone after a red."""
+import sys
+sys.path.insert(0, '/tmp/gate-10069/sim')
+import lane as L
+
+
+def dorfman(k, q, e):
+    G = (1 - q) ** k
+    return (1 + (1 - (1 - e) * G) * k) / (k * (1 - q)) if k > 1 else 1 / (1 - q)
+
+
+def elim_on(q, e, theta=0.9):
+    return e <= 0 or q / (q + (1 - q) * e) >= theta
+
+
+if __name__ == '__main__':
+    KS = list(range(1, 25))
+    for e in (0.0, 0.01):
+        print('\n== false-failure rate e = %.3f; elimination on when q/(q+(1-q)*0.009) >= 0.9 (policy e 0.009) ==' % e)
+        print('q     table | Dorfman at table, its optimum | one-at-a-time+release%s: at table, optimum k* -> verifies/landing | split tau=.5: at table, optimum | split tau=.65: at table, optimum | info bound'
+              % '')
+        for q in (0.02, 0.03, 0.05, 0.08, 0.14, 0.20):
+            td = L.table_row(1 - q, L.TABLE_NEW)
+            el = elim_on(q, 0.009)
+            import math
+            H = (-q * math.log2(q) - (1 - q) * math.log2(1 - q)) / (1 - q)
+            row = ['%.2f  %2d  %s' % (q, td, 'elim on ' if el else 'elim OFF')]
+            dk = min(KS, key=lambda k: dorfman(k, q, e))
+            row.append('Dorfman %.3f, k=%d: %.3f' % (dorfman(td, q, e), dk, dorfman(dk, q, e)))
+            for mode, tau in (('one', 0.5), ('split', 0.5), ('split', 0.65)):
+                f = lambda k: L.cycle_ratio(k, q, e, mode, tau, el)
+                kb = min(KS, key=f)
+                row.append('%s%s %.3f, k*=%d: %.3f' % (mode, '' if mode == 'one' else tau, f(td), kb, f(kb)))
+            row.append('info %.3f' % H)
+            print(' | '.join(row))
+        print('\nverifies per landing by depth k (one-at-a-time / split .5), e=%.3f' % e)
+        for q in (0.05, 0.08, 0.14, 0.20):
+            el = elim_on(q, 0.009)
+            print('q=%.2f one  : ' % q + ' '.join('%d:%.3f' % (k, L.cycle_ratio(k, q, e, 'one', 0.5, el)) for k in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 20, 24)))
+            print('q=%.2f split: ' % q + ' '.join('%d:%.3f' % (k, L.cycle_ratio(k, q, e, 'split', 0.5, el)) for k in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 20, 24)))
+            print('q=%.2f one, per item resolved: ' % q + ' '.join('%d:%.3f' % (k, L.cycle_ratio(k, q, e, 'one', 0.5, el, per='item')) for k in (1, 2, 3, 4, 5, 6, 8, 10, 12)))

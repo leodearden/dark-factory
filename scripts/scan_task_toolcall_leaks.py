@@ -3,10 +3,10 @@
 
 READ-ONLY / DETECTION-ONLY: this module and its CLI never mutate task text.
 Every database connection it opens goes through
-``_task_db_scan.py::connect_ro``, a read-only SQLite URI (``mode=ro``),
-so the sweep is structurally incapable of the auto-mutation this tool is
-explicitly forbidden from doing. Remediation of any match this tool finds is
-a separate, manual, individually-reviewed follow-up (matching the
+``shared/src/shared/tasks_db_readonly.py::connect_ro``, a read-only SQLite URI
+(``mode=ro``), so the sweep is structurally incapable of the auto-mutation this
+tool is explicitly forbidden from doing. Remediation of any match this tool
+finds is a separate, manual, individually-reviewed follow-up (matching the
 safe-vs-irreversible handling already applied to tasks 2080 and 2865) —
 never bulk-edited by this script.
 
@@ -67,12 +67,12 @@ from typing import NamedTuple
 from _task_db_scan import (
     SCAN_EXIT_CODE_EPILOG,
     add_db_discovery_args,
-    connect_ro,
     format_json,
     group_matches_by_db,
     run_scan_cli,
     truncate,
 )
+from shared.tasks_db_readonly import connect_ro
 
 # THE detector lives in fused_memory.utils.toolcall_xml_leak and is re-exported
 # here (task 3083). It is deliberately NOT redefined locally: a second copy of
@@ -111,6 +111,9 @@ if str(_FM_SRC) not in sys.path:
 # identical bootstrap and already pay it. Making a leaf importable without the
 # package init would be a shared-wide change and is deliberately not one this
 # task takes on.
+# The shared.tasks_db_readonly import ABOVE is sound without it: importing
+# _task_db_scan already ran `import _checkout`, which bound this checkout's
+# shared/src.
 _SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
@@ -149,9 +152,10 @@ class LeakMatch(NamedTuple):
 def scan_db(db_path: str) -> list[LeakMatch]:
     """Scan *db_path* read-only for leaked tool-call fragments.
 
-    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
-    refusals). Applies :func:`detect_leak` to each of ``SCANNED_COLUMNS`` per
-    row; ``metadata`` is deliberately never read (see module docstring).
+    Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro``
+    (read-only; see there for refusals). Applies :func:`detect_leak` to each of
+    ``SCANNED_COLUMNS`` per row; ``metadata`` is deliberately never read (see
+    module docstring).
     """
     matches: list[LeakMatch] = []
     conn = connect_ro(db_path)

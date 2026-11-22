@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import strip_js_comments
+from _jsx_source_helpers import strip_js_comments
 
 CONSUMERS = (
     'tabs.jsx',

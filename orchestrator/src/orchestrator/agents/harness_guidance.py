@@ -349,26 +349,49 @@ cannot express them, and a second pass over the matches can.
 """
 
 
+# Both spliced into _GREP_PCRE_BASH_RECOURSE by `+`; executed in a real repo
+# fixture by orchestrator/tests/test_roles_grep_escape_hatch_command.py.
+GIT_GREP_PCRE_COMMAND_TEMPLATE = "git grep --untracked -nP '<pattern>' -- <path>"
+GREP_PCRE_FALLBACK_COMMAND_TEMPLATE = "command grep -rP --include='*.py' '<pattern>' <path>"
+
+
 # Recourse for the roles holding unqualified `Bash`. Concatenated onto
 # _GREP_ENGINE_LIMITS below -- never used alone.
 _GREP_PCRE_BASH_RECOURSE = """
 When look-around or a backreference is genuinely required, the escape hatch
-is `Bash`:
+is `git grep`, through `Bash`:
 
-    command grep -rP --include='*.py' --exclude-dir=.venv --exclude-dir=node_modules --exclude-dir=.git '<pattern>' <path>
+    """ + GIT_GREP_PCRE_COMMAND_TEMPLATE + """
 
-`-P` is real PCRE, so the rejected pattern runs unchanged, and `--include=`
-is the glob filter `Grep` would have applied.
+`-P` is real PCRE, so the rejected pattern runs unchanged. It reads only the
+files git knows about: the tracked ones, plus the untracked ones
+`--untracked` adds, minus anything an ignore file excludes. That is the
+`.gitignore` filtering `Grep` also does, with no per-project exclude list to get right:
+`.venv`, `node_modules`, a build-output tree such as `target/` and a main
+checkout's task-worktree copies are all skipped, whatever a project calls
+them. So running it from the checkout root, or leaving out `-- <path>`, is
+safe. From a main checkout's root a recursive grep was still reading when its
+timeout killed it; git grep answered in well under a second. Narrow by file type with
+a pathspec glob after `--`, as in `-- '*.py'`: git's `*` crosses directory
+boundaries, so it matches at every depth.
 
-The `--exclude-dir=` flags are not boilerplate: they stand in for a SECOND
-filter `Grep` applied for you and real grep does not. `Grep` reads ignore
-files — `.gitignore` at each level, including the catch-all one a virtualenv
-writes inside itself — while GNU grep reads none of them and walks straight
-into a vendored tree. Measured in this worktree, `--include='*.py'` ALONE
-still matched hundreds of third-party site-packages files under `.venv` for a
-pattern as ordinary as `config\\.[a-z_]+`, not one of which `Grep` would have
-returned. So point `<path>` at a source directory rather than the repo root,
-and if the rejected `Grep` call omitted `path`, do not simply substitute `.`.
+Its blind spot is the other side of that filter. A file git ignores, or a
+directory outside any repository, is invisible to it, and git grep reports
+that as exit 1 with no output, not as an error. So exit 1 over a virtualenv's
+site-packages or a build artifact is NOT evidence of absence. Exit 128 means
+git refused the command: read its `fatal:` line. A malformed pattern is fixed
+in the pattern. `not a git repository`, or a git built without
+Perl-compatible regex support, means fall back to real grep.
+
+The fallback, for exactly what git cannot see:
+
+    """ + GREP_PCRE_FALLBACK_COMMAND_TEMPLATE + """
+
+`--include=` is its glob filter. It reads no ignore files and skips no
+directory, so it searches exactly the tree you name, and all of it. So point
+`<path>` at a source directory, or at the one ignored tree you need to
+search, never at the repo root; and if the rejected `Grep` call omitted
+`path`, do not simply substitute `.`.
 
 The `command` prefix is load-bearing, not decoration. The harness shell
 snapshot shadows some search commands with shell functions, and WHICH ones is
@@ -377,21 +400,25 @@ not stable across sessions or hosts: one measured shadow wrapped `grep` in a
 a fast, confident, empty result. `command` reaches the real `/usr/bin/grep`
 either way.
 
-`rg --pcre2` also works, and needs none of those exclusions — `rg` IS the
-engine `Grep` wraps, so it honours the same ignore files. Its one limit is
+`rg --pcre2` also works, and honours the same ignore files `Grep` does,
+because `rg` IS the engine `Grep` wraps. Its one limit is
 where it survives. `rg` here is currently a shell FUNCTION that re-execs the
 Claude Code bundle, not a binary on `PATH`, so it is lost in a nested shell
 PROCESS: a `bash -c` or `sh -c`, or a standalone script file you write and
 then run. It DOES survive a pipeline, a `$(...)` substitution and an explicit
 `( ... )` subshell in the top-level `Bash` call — those stay in the shell that
 defines it. `which rg` finds nothing either way, so do not use that to decide.
-Reach for `command grep -rP` when a nested shell process is involved.
+When a nested shell process is involved, use `git grep` or `command grep -rP`
+instead: both run real binaries on `PATH`.
 """
 
 
-# JUDGE's recourse. Its `Bash` grant is `Bash(git:*)`, so the escape hatch
-# above would land it a permission denial rather than a result -- naming a
-# command the role cannot run is the failure this variant exists to avoid.
+# JUDGE's recourse. Its `Bash` grant is `Bash(git:*)`, so the escape hatch's
+# `command grep -rP` fallback and `rg` would land it a permission denial rather
+# than a result -- naming a command the role cannot run is the failure this
+# variant exists to avoid. The `git grep` lead is a git command, but whether
+# that grant admits it in judge's own permission context is unmeasured, so it
+# is not offered here either.
 # Concatenated onto _GREP_ENGINE_LIMITS below -- never used alone.
 _GREP_PCRE_READ_ONLY_RECOURSE = """
 Shelling out is NOT available to you here: your `Bash` grant is restricted to

@@ -22,6 +22,13 @@ to :data:`MARKUP_STAMP_MAX_EVENTS` individual events, and one static ``note``
 naming what the block means — so a reader who has never seen the key does not
 have to infer it.
 
+WRITTEN EAGERLY, at refusal time, rather than buffered until the next accepted
+write, which would have left a refused call's ``plan.json`` byte-identical.
+Buffering's one hole is the worst case: an architect whose LAST plan-tools call
+is a refusal, and which then stops, would have its losses silently dropped —
+the situation most in need of explanation. (The pending buffer below holds only
+refusals that arrive before any plan exists.)
+
 WHAT AN EVENT HOLDS: ``ts``, ``tool``, ``param``, ``outcome``, and nothing
 else. :data:`STAMP_EVENT_KEYS` is the DECLARED allowlist, and
 :func:`build_event` copies FROM it rather than filtering the record — so a fact
@@ -73,7 +80,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import Plan, TaskArtifacts
 
 logger = logging.getLogger(__name__)
 
@@ -471,7 +478,7 @@ _PENDING_LOCK = threading.Lock()
 # So it is held here and adopted by the plan ``_create_plan`` is about to write.
 #
 # PROCESS-GLOBAL STATE IS THE ESTABLISHED SHAPE HERE, not an invention:
-# ``plan_tools._REPORTED_REFUSALS`` is exactly this, with an autouse fixture
+# ``plan_markup_repair._REPORTED_REFUSALS`` is exactly this, with an autouse fixture
 # clearing it per test — which a consumer of THIS buffer must do too, or one
 # test's buffered refusal inflates the next one's count.
 #
@@ -592,9 +599,9 @@ def make_plan_stamp(
              registration and schema, ``outcome`` from the guard's closed
              vocabulary, ``ts`` from the clock.
 
-    What the byte pin was a PROXY for is preserved in full. ``create_server``'s
-    comment justifies the reject policy because "forwarding a repair would
-    write a guessed-at document that every later reader inherits", and the
+    What the byte pin was a PROXY for is preserved in full. This module's
+    docstring justifies the reject policy because "forwarding a repair would
+    write a guessed-at document every later reader inherits", and the
     middleware header says "no middleware-repaired value can ever reach
     plan.json". Both are about VALUES. Nothing guessed, repaired or
     caller-authored reaches the document through here.
@@ -606,10 +613,11 @@ def make_plan_stamp(
     This is a bookkeeping read of one machine-written key and touches no prose
     field.
 
-    WRITTEN THROUGH ``artifacts.write_plan``, the single owner of
+    WRITTEN THROUGH ``artifacts.write_plan_model``, the single owner of
     ``plan.json``'s byte format and of its atomic/durable write — never an
     open-and-dump here, which would drop ``_schema_version`` and the atomicity
-    every other writer on this file depends on.
+    every other writer on this file depends on. The block is no step-set
+    edit, so the plan's confirmation is kept.
 
     ASYNC, with the blocking work on a worker thread: the middleware calls this
     from inside the server's event loop, and one record costs a read and a
@@ -648,7 +656,7 @@ def make_plan_stamp(
             plan[PLAN_MARKUP_REJECTIONS_KEY] = merge_block(
                 plan.get(PLAN_MARKUP_REJECTIONS_KEY), block_of(event)
             )
-            artifacts.write_plan(plan, mutex_held=True)
+            artifacts.write_plan_model(Plan.from_json(plan), mutex_held=True)
         return str(plan_path)
 
     async def plan_stamp(record: dict[str, Any]) -> str | None:

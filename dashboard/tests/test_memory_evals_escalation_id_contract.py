@@ -10,7 +10,7 @@ with the SAME TYPE, among the rows of the subsection it names.  Nothing pinned
 that before task 3471: the two payloads are built by two producers that never
 reference each other
 
-    MEMORY_EVALS  — `memory_evals._escalation_projection` → `record.get('id')`
+    MEMORY_EVALS  — `memory_evals._escalation_projection` → `escalation.id`
     ESCALATIONS   — `redux_api.shape_escalations`         → `{**esc, ...}`
 
 and no test in this suite has ever built both from one fixture directory (the
@@ -19,8 +19,8 @@ disjoint sets).  A link that resolves is therefore a property of two
 independently-evolving readers happening to agree, not a checked contract.
 
 WHY THE MUTATION TEST BELOW EXISTS.  The contract HOLDS today: both producers
-read `config.reconciliation_escalations_dir` and both pass the id through
-without coercion.  A test that merely asserts "no violations" is therefore
+read the one escalation corpus walk of the reconciliation queue and both pass
+the id through without coercion.  A test that merely asserts "no violations" is therefore
 green on arrival and would stay green if `collect_escalation_id_violations`
 returned `[]` unconditionally — it would pin nothing at all.
 `test_the_id_space_check_catches_a_divergent_projection` is what gives the rest
@@ -32,12 +32,13 @@ only as good as that one.
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from _dashboard_helpers import build_dual_escalation_tree, write_escalation_record
+from _dashboard_helpers import build_dual_escalation_tree, dump_artifact, write_escalation_record
 
 from dashboard.data.escalation_corpus import corpus_queues, measure_corpus, reconciliation_queue
 from dashboard.data.escalations import build_escalation_queues, card_datums
@@ -126,8 +127,8 @@ def collect_escalation_id_violations(
       refuses such a focus, so the link resolves to no row and the tab shows
       its miss notice rather than opening an arbitrary row.  No row can make
       the link work, not even one carrying the same number at the same type.
-      `_escalation_projection` does a bare ``record.get('id')``, so a queue
-      file with no ``id`` field projects ``id: None``.
+      `_escalation_projection` reads ``escalation.id``, which the model never
+      validates, so a queue record whose ``id`` is null projects ``id: None``.
     * ``unscoped``      — the payload names no usable ``escalation_queue``.
       The link renders disabled, or its focus is refused, so nothing resolves.
     * ``absent``        — no row of the named subsection carries this id.  The
@@ -257,8 +258,9 @@ def _build_memory_evals(config) -> dict[str, Any]:
     from dashboard.data.memory_evals import build_memory_evals
 
     queue = reconciliation_queue(config)
+    corpus = measure_corpus(corpus_queues(config), now=NOW)
     return shape_memory_evals(
-        **build_memory_evals(config.memory_evals_dir, queue.directory),
+        **build_memory_evals(config.memory_evals_dir, corpus, queue.id, now=NOW),
         escalation_queue=queue.id,
     )['MEMORY_EVALS']
 
@@ -317,8 +319,8 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
     (2') A NON-STRING id that both sides carry at the same type: no drift for
         a type comparison to see, yet the browser refuses it.
 
-    (3) An UNUSABLE id — a queue record with no `id` field at all, which
-        `record.get('id')` projects as `None`.  Not a mutation of the producer:
+    (3) An UNUSABLE id — a queue record whose `id` is null, which
+        `escalation.id` projects as `None`.  Not a mutation of the producer:
         this arm runs the REAL projection and only writes a degenerate record,
         because the failure is in the artifact rather than in the reader.
 
@@ -353,7 +355,7 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
         mp.setattr(
             memory_evals,
             '_escalation_projection',
-            lambda record: {**real_projection(record), 'id': f'{record.get("id")}-x'},
+            lambda escalation: {**real_projection(escalation), 'id': f'{escalation.id}-x'},
         )
         value_violations = collect_escalation_id_violations(
             _build_memory_evals(config), escalations
@@ -407,7 +409,7 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
         mp.setattr(
             memory_evals,
             '_escalation_projection',
-            lambda record: {**real_projection(record), 'id': str(record.get('id'))},
+            lambda escalation: {**real_projection(escalation), 'id': str(escalation.id)},
         )
         type_violations = collect_escalation_id_violations(
             _build_memory_evals(config), escalations_with_numeric
@@ -437,19 +439,20 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
     # Removed again, so arm (3) sees only its own degenerate record.
     (esc_dir / f'esc-{numeric_id}.json').unlink()
 
-    # (3) UNUSABLE id: a queue record with NO `id` key.  `_escalation_projection`
-    #     reads `record.get('id')`, so the projection emits `id: None` and the
-    #     link's focus carries an undefined id.  Run against the REAL
-    #     projection — nothing is monkeypatched here, because the degenerate
-    #     artifact IS the defect.
+    # (3) UNUSABLE id: a queue record whose `id` is null.  `Escalation.from_dict`
+    #     validates no field types, so the record is read and the projection
+    #     emits `id: None`; the link's focus carries an undefined id.  Run
+    #     against the REAL projection — nothing is monkeypatched here, because
+    #     the degenerate artifact IS the defect.  (A record with NO `id` key is
+    #     unreadable to the corpus, so it reaches neither surface as a row.)
     #
     #     Carries no fingerprint, so it reaches the payload through
     #     `unmatched_escalations`; the filename supplies the record's identity
     #     on disk, which is exactly the trap — the file looks addressable and
     #     the payload is not.
     write_escalation_record(
-        esc_dir, 'esc-eval-idless', omit_id=True, dedupe_fingerprint=None,
-        summary='memory-eval regression whose record has no id',
+        esc_dir, 'esc-eval-idless', id=None, dedupe_fingerprint=None,
+        summary='memory-eval regression whose record has a null id',
     )
     escalations_with_idless = _build_escalations(config)
     idless_payload = _build_memory_evals(config)
@@ -458,8 +461,8 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
         for _path, escalation in _iter_memory_eval_escalations(idless_payload)
     ), (
         'the id-less record did not reach MEMORY_EVALS with `id: None`, so the '
-        'arm below would pass vacuously. `_escalation_projection` uses '
-        "`record.get('id')`; if that changed to a filename fallback, this arm "
+        'arm below would pass vacuously. `_escalation_projection` reads '
+        '`escalation.id`; if that changed to a filename fallback, this arm '
         'should be re-aimed rather than deleted.'
     )
 
@@ -544,9 +547,9 @@ def test_the_id_space_check_scopes_by_queue(tmp_path: Path) -> None:
 # The three reach paths, and WHY it takes two trees to exercise them.
 #
 # MEASURED against the real producer, not assumed: a TRIGGERED storm escape
-# suppresses every per-metric link program-wide.  `_build_eval` only consults
-# the escalation index when `storm is None`; otherwise the fingerprint goes to
-# `storm_suppressed` and the row renders `parity='storm_collapsed'` with
+# suppresses every per-metric link program-wide.  `memory_evals.py::_join_escalation`
+# links a row only when `storm is None`; otherwise the fingerprint goes to
+# `_RowClaims.suppressed` and the row renders `parity='storm_collapsed'` with
 # `escalation: None`.  So `evals[i].metrics[j].escalation` and
 # `storm_escape.escalation` can never BOTH be populated in one payload — they
 # are alternatives by design, since the storm exists precisely to collapse the
@@ -715,3 +718,51 @@ def test_the_id_space_subset_direction_is_asymmetric_by_design(tmp_path: Path) -
         'solely on the consumer side are the DESIGNED state, and reporting them '
         'would make the contract test fire on every escalation an operator closes.'
     )
+
+
+def test_an_unreadable_queue_file_is_reported_identically_by_both_surfaces(
+    tmp_path: Path,
+) -> None:
+    """Both surfaces read one population: what one cannot read, the other names alike.
+
+    Each root ``esc-*.json`` the corpus cannot parse into an ``Escalation`` —
+    a record missing its ``id``, or not JSON at all — is a MEMORY_EVALS
+    ``unreadable_escalation_file`` and a ``skipped`` entry of the reconciliation
+    subsection, at the same path and for the same reason.  A non-escalation
+    resident of the queue directory (``b3-state.json``) is on neither surface.
+    """
+    tree = build_dual_escalation_tree(tmp_path)
+    esc_dir = tree.config.reconciliation_escalations_dir
+    idless = write_escalation_record(
+        esc_dir, 'esc-eval-idless', omit_id=True,
+        summary='memory-eval regression whose record has no id',
+    )
+    not_json = esc_dir / 'esc-eval-garbled.json'
+    not_json.write_text('{ this is not json')
+    dump_artifact(esc_dir / 'b3-state.json', {'state': 'closed', 'opened_at': None})
+
+    memory_evals = _build_memory_evals(tree.config)
+    escalations = _build_escalations(tree.config)
+
+    file_issues = {
+        issue['path']: issue['detail']
+        for issue in memory_evals['issues']
+        if issue['kind'] == 'unreadable_escalation_file'
+    }
+    (reconciliation,) = (
+        sub for sub in escalations['subsections']
+        if sub['id'] == memory_evals['escalation_queue']
+    )
+    root_skips = {
+        skip['path']: skip['error']
+        for skip in reconciliation['skipped']
+        if skip['location'] == 'root'
+    }
+
+    assert set(file_issues) == set(root_skips) == {str(idless), str(not_json)}
+    for path, error in root_skips.items():
+        assert error in file_issues[path], (path, error, file_issues[path])
+    assert reconciliation['summary']['skipped_count'] == len(root_skips)
+    assert 'b3-state' not in json.dumps(memory_evals)
+    assert 'b3-state' not in json.dumps(reconciliation)
+    assert collect_escalation_id_violations(memory_evals, escalations) == []

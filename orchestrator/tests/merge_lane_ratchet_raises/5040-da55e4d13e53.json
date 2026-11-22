@@ -1,0 +1,12 @@
+{
+  "task_id": "5040",
+  "reason": "Move, not growth (PRD plans/merge-lane-quality-prd.md task kappa, part 1, rebased onto main 51e3715697 with task 6670's harness-injected quarantine set, task_held_by host rows and on_host_readmitted hook ported into the moved code): host quarantine leaves worker.py for merge_lane/host_quarantine.py::HostQuarantine, the lane's one writer of the shared quarantine set and the RunnerUnavailable tracker; the worker keeps one-statement delegators only for bench_unavailable_runner and clear_host_quarantine. worker.py lines 21676 -> 20834 (-842), prose_lines 11479 -> 11058 (-421), cognitive 1969 -> 1870 (-99); host_quarantine.py adds 1017 lines, 497 prose_lines, cognitive 90, every function <= 12 (_reprobe_quarantined_hosts 18 decomposed into _reprobe_quarantined_hosts 4, _reprobe_host 3, _RunnerLookup.__call__ 3, _warn_tracked_hosts_cannot_recover 1). Net cluster lines 64365 -> 64542 (+177), prose_lines 32945 -> 33023 (+78): the new module's header, imports and class docstring, and the docstrings of its new public reads (is_quarantined, quarantined_hosts, unavailability, unavailable_hosts), allocator_over, adopt_config, quarantine_divergent and sweep. Cognitive 5368 -> 5359, private_reads 6378 -> 6360, patch_targets 119 -> 119. The one rise: private_reads 0 -> 1 in test_merge_queue_dispatch_fill_redispatch.py, whose public worker.readmit_host call now resolves on the composed HostQuarantine (lane.worker._host_quarantine.readmit_host); the task's design keeps no worker delegator solely so a test seam resolves.",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py",
+      "baseline": 0,
+      "current": 1
+    }
+  ]
+}

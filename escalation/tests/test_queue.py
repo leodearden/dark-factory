@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -31,7 +32,7 @@ from escalation.amendments import (
     MAX_AMENDMENTS,
     amendment_room,
 )
-from escalation.classify import effective_benign
+from escalation.classify import default_resolution_class_for_resolver, effective_benign
 from escalation.models import Escalation
 from escalation.queue import (
     _MAX_LATE_RESOLUTION_CHARS,
@@ -395,6 +396,89 @@ class TestDismissAllPendingKeep:
         level_1 = queue.get('esc-5-1')
         assert level_1 is not None
         assert level_1.status == 'pending'
+
+
+def _peer_resolves(
+    peer: EscalationQueue, esc_id: str, peer_wrote: list[Escalation],
+) -> Callable[[Escalation], bool]:
+    """A ``keep`` predicate through which *peer* resolves *esc_id* first, keeping nothing.
+
+    The record as the peer left it on disk is appended to *peer_wrote*.
+    """
+
+    def keep(esc: Escalation) -> bool:
+        if esc.id == esc_id:
+            peer.resolve(esc_id, 'Fixed by a peer process', resolved_by='steward')
+            written = peer.get(esc_id)
+            assert written is not None
+            peer_wrote.append(written)
+        return False
+
+    return keep
+
+
+class TestDismissAllPendingCountsOnlyAppliedDismissals:
+    """A record a concurrent writer resolves between get_pending() and resolve() is not counted.
+
+    ``keep`` is the injection point: it runs on each snapshot record before that
+    record's resolve(), so a real peer queue resolving there lands in the window.
+    """
+
+    def test_record_resolved_by_a_peer_mid_sweep_is_not_counted(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        peer = EscalationQueue(tmp_path / 'queue')
+        for task_id in ('1', '2', '3'):
+            queue.submit(_make_escalation(f'esc-{task_id}-1', task_id=task_id))
+
+        peer_wrote: list[Escalation] = []
+
+        count = queue.dismiss_all_pending(
+            'Stale from prior run', keep=_peer_resolves(peer, 'esc-2-1', peer_wrote),
+        )
+
+        assert count == 2, f'only the two records this sweep dismissed count: {count}'
+        assert [(e.status, e.resolved_by, e.resolution) for e in peer_wrote] == [
+            ('resolved', 'steward', 'Fixed by a peer process'),
+        ], peer_wrote
+        assert queue.get('esc-2-1') == peer_wrote[0], (
+            'the late sweep resolve left the peer-resolved record untouched'
+        )
+        for esc_id in ('esc-1-1', 'esc-3-1'):
+            swept = queue.get(esc_id)
+            assert swept is not None
+            assert (swept.status, swept.resolved_by) == ('dismissed', 'auto-dismissed'), (
+                f'{esc_id} was dismissed by this sweep: {swept}'
+            )
+
+    def test_peer_resolved_strand_is_not_tallied_as_a_stale_strand(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        peer = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-1-1', age_secs=75480.0, task_id='1'))
+        queue.submit(_aged_escalation('esc-2-1', age_secs=75480.0, task_id='2'))
+        queue.submit(_aged_escalation('esc-3-1', age_secs=90.0, task_id='3'))
+
+        peer_wrote: list[Escalation] = []
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            count = queue.dismiss_all_pending(
+                'Stale from prior run',
+                strand_age_secs=600.0,
+                keep=_peer_resolves(peer, 'esc-2-1', peer_wrote),
+            )
+
+        assert count == 2, f'only the two records this sweep dismissed count: {count}'
+        assert [(e.resolved_by, e.resolution_class) for e in peer_wrote] == [
+            ('steward', default_resolution_class_for_resolver('steward')),
+        ], peer_wrote
+        assert queue.get('esc-2-1') == peer_wrote[0], (
+            'the late sweep resolve neither re-stamped nor otherwise touched the peer-resolved strand'
+        )
+        sweep_lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith('Dismissed ')]
+        assert len(sweep_lines) == 1, f'one sweep INFO line expected: {sweep_lines}'
+        assert 'Dismissed 2 stale L0 escalation(s)' in sweep_lines[0], sweep_lines
+        assert '(1 stale-strand)' in sweep_lines[0], sweep_lines
 
 
 class TestAmendmentRoom:
@@ -6863,6 +6947,7 @@ def _make_esc_with_category(
     *,
     status: str = 'pending',
     level: int = 1,
+    dedupe_fingerprint: str | None = None,
 ) -> Escalation:
     """An Escalation with a caller-chosen category (the top-level _make_escalation
     hardcodes category='task_failure', so has_open_l1 signature tests need this)."""
@@ -6874,6 +6959,7 @@ def _make_esc_with_category(
         category=category,
         summary='merge blocked',
         level=level,
+        dedupe_fingerprint=dedupe_fingerprint,
     )
     esc.status = status
     return esc
@@ -6918,6 +7004,86 @@ class TestHasOpenL1CategoryFilter:
             _make_esc_with_category('esc-T-1', 'T', 'merge_error', status='resolved')
         )
         assert queue.has_open_l1('T', category='merge_error') is False
+
+
+class TestHasOpenL1FingerprintFilter:
+    """has_open_l1 gains an optional keyword-only `dedupe_fingerprint` filter.
+
+    The scheduled memory-eval runner files every metric of one eval under the
+    same synthetic task id, so without this filter one open alarm would
+    suppress every OTHER metric's alarm.  Default None keeps prior behaviour.
+    """
+
+    def _queue_with(self, tmp_path: Path, esc: Escalation) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(esc)
+        return queue
+
+    def test_matching_fingerprint_is_open(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-a',
+        ) is True
+
+    def test_new_fingerprint_not_suppressed_by_unrelated_open_one(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-b',
+        ) is False
+
+    def test_resolved_matching_fingerprint_is_not_open(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            status='resolved', dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-a',
+        ) is False
+
+    def test_level0_matching_fingerprint_is_not_open(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            level=0, dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-a',
+        ) is False
+
+    def test_matching_fingerprint_other_category_is_not_open(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'merge_error',
+            dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-a',
+        ) is False
+
+    def test_default_none_keeps_prior_behaviour(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+        ))
+        assert queue.has_open_l1('memory-eval-e1', category='eval_regression') is True
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint=None,
+        ) is True
+
+    def test_fingerprint_applies_without_category(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1('memory-eval-e1', dedupe_fingerprint='fp-a') is True
+        assert queue.has_open_l1('memory-eval-e1', dedupe_fingerprint='fp-b') is False
 
 
 class TestDismissIfCovered:
@@ -7861,6 +8027,105 @@ class TestFindTerminalByCitation:
         )
 
 
+
+class TestNewestTerminalByTask:
+    """EscalationQueue.newest_terminal_by_task() — the targeted per-task terminal reader.
+
+    The caller states its own identity as a *matches* predicate; the queue owns
+    the targeted glob, the authoritative task_id and category filters, the
+    terminal-status filter and the newest-by-resolved_at selection.
+    ``find_terminal_by_citation`` is the predicate ``citation_sha == sha``.
+    """
+
+    CATEGORY = 'task_failure'
+
+    def _filed(
+        self, queue: EscalationQueue, esc_id: str, *, summary: str, task_id: str = '1',
+        category: str | None = None,
+    ) -> Escalation:
+        esc = _make_escalation(esc_id, task_id=task_id)
+        esc.summary = summary
+        if category is not None:
+            esc.category = category
+        _submit_escalation(queue, esc)
+        return esc
+
+    def _force_resolved_at(self, queue: EscalationQueue, esc_id: str, stamp: str) -> None:
+        (path,) = (queue.queue_dir / 'archive').rglob(f'{esc_id}.json')
+        data = json.loads(path.read_text())
+        data['resolved_at'] = stamp
+        path.write_text(json.dumps(data, indent=2))
+
+    @staticmethod
+    def _is_wanted(esc: Escalation) -> bool:
+        return esc.summary == 'wanted'
+
+    def test_newest_matching_terminal_record_wins_over_a_newer_rejected_one(
+        self, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', summary='wanted')
+        queue.resolve('esc-1-1', 'first adjudication')
+        self._filed(queue, 'esc-1-2', summary='wanted')
+        queue.resolve('esc-1-2', 'second adjudication', dismiss=True)
+        self._filed(queue, 'esc-1-3', summary='unwanted')
+        queue.resolve('esc-1-3', 'newest, but rejected by the predicate')
+        self._force_resolved_at(queue, 'esc-1-1', '2026-01-01T00:00:00+00:00')
+        self._force_resolved_at(queue, 'esc-1-2', '2026-06-01T00:00:00+00:00')
+        self._force_resolved_at(queue, 'esc-1-3', '2026-09-01T00:00:00+00:00')
+
+        found = queue.newest_terminal_by_task('1', self.CATEGORY, self._is_wanted)
+
+        assert found is not None
+        assert found.id == 'esc-1-2', f'expected the newest MATCHING record esc-1-2; got {found.id!r}'
+
+    def test_pending_record_is_never_returned(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', summary='wanted')
+
+        assert queue.newest_terminal_by_task('1', self.CATEGORY, self._is_wanted) is None, (
+            'a still-pending record must not be reported as terminal'
+        )
+
+    def test_record_of_another_category_is_not_returned(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', summary='wanted', category='infra_issue')
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.newest_terminal_by_task('1', self.CATEGORY, self._is_wanted) is None
+
+    def test_glob_over_match_on_hyphenated_sibling_task_is_rejected(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-2-3-9', summary='wanted', task_id='1-2-3')
+        queue.resolve('esc-1-2-3-9', 'confirmed benign')
+
+        assert queue.newest_terminal_by_task('1-2', self.CATEGORY, self._is_wanted) is None, (
+            "task '1-2-3' record leaked into task '1-2' via the glob over-match"
+        )
+        assert queue.newest_terminal_by_task('1-2-3', self.CATEGORY, self._is_wanted) is not None
+
+    def test_returns_none_when_nothing_matches(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        assert queue.newest_terminal_by_task('1', self.CATEGORY, self._is_wanted) is None
+
+        self._filed(queue, 'esc-1-1', summary='unwanted')
+        queue.resolve('esc-1-1', 'confirmed benign')
+
+        assert queue.newest_terminal_by_task('1', self.CATEGORY, self._is_wanted) is None
+
+    def test_archived_record_is_found(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._filed(queue, 'esc-1-1', summary='wanted')
+        queue.resolve('esc-1-1', 'confirmed benign')
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'Pre-condition: the resolved record must have left the queue root'
+        )
+        assert len(list((queue.queue_dir / 'archive').rglob('esc-1-1.json'))) == 1
+
+        found = queue.newest_terminal_by_task('1', self.CATEGORY, self._is_wanted)
+
+        assert found is not None and found.id == 'esc-1-1'
+
 class TestNoteSuppressedRefile:
     """EscalationQueue.note_suppressed_refile() — the INV-4 storm counter (task 4499).
 
@@ -8140,8 +8405,8 @@ class TestResolveOutcomeOutParam:
         """(d) The out-param changed nothing for the callers that ignore it.
 
         `resolve()` has callers that pass positionally (`resolve(id, text,
-        dismiss)`), plus its own member cascade and `dismiss_all_pending` — none
-        of which want the out-param.  Keyword-only with a None default is what
+        dismiss)`), plus its own member cascade — none of which want the
+        out-param.  Keyword-only with a None default is what
         keeps them untouched, asserted the way those callers experience it: a
         third POSITIONAL argument still means `dismiss` (it would have meant
         `outcome` had the new parameter been added positionally), and a call
