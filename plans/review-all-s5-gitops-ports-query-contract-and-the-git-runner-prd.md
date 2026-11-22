@@ -1638,3 +1638,21 @@ parsers → ζ; the 9-arm chain and FAULT literal list → δ; `recover_red_main
    one internal call does not reorder a script).
 4. **`GitOpsLimits` for clusters (e)/(a) after ξ/ο.** `MainLanding` and `lane_lease` take the limits they need
    as parameters; whether `GitOpsLimits` is split per collaborator is decided in ο.
+
+## Cross-references (dated)
+
+- **2026-11-21, task 7140.** `plans/git-ops-split-prd.md` owns two things this
+  PRD leaves without an owner: the ≈6.6k-line `git_ops.py` residual named in
+  §Goal's last bullet and in ρ's signal, and the modules this PRD creates that
+  stay over the 1,500-line ceiling. Measured under that PRD's committed
+  partition at `c787af9409`, as projected lines plus a new module's preamble
+  allowance, those are `main_landing` (≈3.5k lines), `git_queries` (≈2.7k by
+  S5's self-state rule), `worktrees` (≈1.7k after γ) and `task_branch`
+  (≈1.5k). That PRD's α waits on π (9275) and re-measures post-S5 main before any
+  of its move leaves run. Its concern map
+  (`plans/git-ops-split-prd.concern-map.md`, rule R6) records three
+  placements in §Sketch's table that would close cycles: one between
+  `worktrees` and `main_landing` over `PERSISTENT_MERGE_WORKTREE_NAME`, one
+  between `task_branch` and `git_queries` over `ReplayMatch`, and
+  `_rename_branch_aside`, which reads pool state. ξ0, ο0 and λ decide those
+  placements; α records what they did. This note re-anchors nothing above it.
