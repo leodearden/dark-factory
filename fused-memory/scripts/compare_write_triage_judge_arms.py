@@ -12,11 +12,11 @@ writing the comparison JSON with its markdown render beside it.
 Usage
 -----
   python scripts/compare_write_triage_judge_arms.py \\
-      --arm calibration/write_triage_judge_accuracy_report.json \\
-      --arm calibration/write_triage_judge_arms/psi__gpt-6.1-sol.json \\
-      --arm calibration/write_triage_judge_arms/shipped__gpt-6.2-sol.json \\
-      --arm calibration/write_triage_judge_arms/psi__gpt-6.2-sol.json \\
-      --out calibration/write_triage_judge_arms/comparison.json
+      --arm <arm report>.json --arm <arm report>.json ... \\
+      --out <directory>/comparison.json
+
+Task 9045's 2x2 is run, and compared, as
+``calibration/write_triage_judge_arms/README.md`` sets out.
 """
 from __future__ import annotations
 
