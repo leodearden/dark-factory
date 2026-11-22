@@ -57,11 +57,12 @@ class _FakeLLM(LLMClient):
     def __init__(
         self, entities: tuple[str, ...] = ('Alpha', 'Beta'),
         edges: tuple[tuple[str, str, str], ...] = (('Alpha', 'Beta', 'Alpha adopts Beta'),),
-        *, model: str = 'fake-extractor', reasoning_effort: str | None = None,
+        *, model: str = 'fake-extractor', reasoning_effort: str | None = None, endpoint: str = 'configured',
     ) -> None:
         super().__init__(GraphitiLLMConfig(model=model))
         self.token_tracker = AttributingTokenUsageTracker()
         self.reasoning_effort = reasoning_effort
+        self.endpoint = endpoint
         self.entities = entities
         self.edges = edges
         self.calls: list[tuple[str | None, list[Message]]] = []
@@ -300,14 +301,14 @@ class TestTheResult:
 
     @pytest.mark.asyncio
     async def test_a_replayed_record_carries_its_arms_endpoint(self) -> None:
-        luna = await _replay(_FakeLLM(model=mod.LUNA_MODEL, reasoning_effort='low'), 'luna-low')
+        luna = await _replay(_FakeLLM(model=mod.LUNA_MODEL, reasoning_effort='low', endpoint='plan_proxy'), 'luna-low')
         control = await _replay(_FakeLLM(), 'control')
         assert (luna.endpoint, control.endpoint) == (mod.ArmEndpoint.plan_proxy, mod.ArmEndpoint.configured)
         assert mod.replayed_record(luna, _input())['endpoint'] == 'plan_proxy'
         assert mod.replayed_record(control, _input())['endpoint'] == 'configured'
 
     def test_a_failed_record_carries_its_arms_endpoint(self) -> None:
-        llm = _FakeLLM(model=mod.LUNA_MODEL, reasoning_effort='low')
+        llm = _FakeLLM(model=mod.LUNA_MODEL, reasoning_effort='low', endpoint='plan_proxy')
         record = mod.failed_record(mod.ARMS['luna-low'], llm, _worksheet_row(), RuntimeError('proxy down'))
         assert (record['arm'], record['model'], record['endpoint']) == ('luna-low', mod.LUNA_MODEL, 'plan_proxy')
         control = mod.failed_record(mod.ARMS['control'], _FakeLLM(), _worksheet_row(), RuntimeError('down'))
@@ -525,8 +526,26 @@ class TestThePlanProxyEndpoint:
         assert isinstance(client, mod.ExplicitEffortOpenAIClient)
         assert (client.model, client.reasoning_effort) == (mod.LUNA_MODEL, 'low')
         assert _sdk_endpoint(client) == (PROXY_URL, PROXY_KEY)
+        assert mod.client_endpoint(client) == 'plan_proxy'
         assert isinstance(client.token_tracker, AttributingTokenUsageTracker)
         assert mock_config.model_dump() == before
+
+    def test_a_configured_client_declares_the_configured_endpoint(self, mock_config: FusedMemoryConfig) -> None:
+        for llm in (mod.ExtractionLlm(), mod.ExtractionLlm(mod.O6_MODEL, 'low')):
+            client = mod.build_arm_llm(mock_config, llm)
+            assert client is not None and mod.client_endpoint(client) == 'configured'
+
+    def test_a_plan_proxy_llm_sending_no_effort_is_refused(self, mock_config: FusedMemoryConfig) -> None:
+        with pytest.raises(mod.ArmClientMismatch, match='plan_proxy'):
+            mod.build_arm_llm(mock_config, mod.ExtractionLlm(mod.LUNA_MODEL, None, mod.ArmEndpoint.plan_proxy))
+
+    @pytest.mark.asyncio
+    async def test_an_arm_refuses_a_client_on_another_endpoint_before_any_call(self) -> None:
+        llm = _FakeLLM(model=mod.LUNA_MODEL, reasoning_effort='low')
+        with pytest.raises(mod.ArmClientMismatch) as raised:
+            await _replay(llm, 'luna-low')
+        assert 'plan_proxy' in str(raised.value) and 'configured' in str(raised.value)
+        assert llm.calls == []
 
     @pytest.mark.parametrize('llm', [mod.ExtractionLlm(), mod.ExtractionLlm(mod.O6_MODEL, 'low')])
     def test_a_configured_endpoint_llm_builds_on_the_configs_url_and_key(
@@ -762,7 +781,9 @@ class _ClientsByLlm:
         self.asked.append(spec)
         if spec in self.unavailable:
             return None
-        fields: dict[str, Any] = {'model': spec.model or CONFIGURED, 'reasoning_effort': spec.reasoning_effort}
+        fields: dict[str, Any] = {
+            'model': spec.model or CONFIGURED, 'reasoning_effort': spec.reasoning_effort, 'endpoint': spec.endpoint,
+        }
         if spec in self.edges:
             fields['edges'] = self.edges[spec]
         self.clients[spec] = _CountingLLM(**fields)

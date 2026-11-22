@@ -292,17 +292,25 @@ class ExplicitEffortOpenAIClient(OpenAIClient):
     default and is never read: ``reasoning_effort`` is the one copy.
     """
 
-    def __init__(self, built: OpenAIClient, effort: ReasoningEffort) -> None:
+    def __init__(
+        self, built: OpenAIClient, effort: ReasoningEffort, endpoint: ArmEndpoint = ArmEndpoint.configured,
+    ) -> None:
         if effort is None:
             raise ValueError('an effort client sends a chosen effort; build the configured client instead')
         super().__init__(config=built.config, client=built.client, max_tokens=built.max_tokens)
         self.token_tracker = built.token_tracker
         self._reasoning_effort: ReasoningEffort = effort
+        self._endpoint = endpoint
 
     @property
     def reasoning_effort(self) -> ReasoningEffort:
         """The effort every structured call sends."""
         return self._reasoning_effort
+
+    @property
+    def endpoint(self) -> ArmEndpoint:
+        """The endpoint build_arm_llm built the wrapped client on."""
+        return self._endpoint
 
     async def _create_structured_completion(
         self, model: str, messages: list[ChatCompletionMessageParam], temperature: float | None,
@@ -330,6 +338,12 @@ def client_reasoning_effort(llm: LLMClient) -> str | None:
     return getattr(llm, 'reasoning_effort', None)
 
 
+def client_endpoint(llm: LLMClient) -> str:
+    """The endpoint *llm* declares it was built on: its ``endpoint``, or configured when it has
+    none, as graphiti's own clients have none. The one reader of that attribute."""
+    return getattr(llm, 'endpoint', ArmEndpoint.configured)
+
+
 def plan_proxy_endpoint(environ: Mapping[str, str]) -> tuple[str, str]:
     """``(url, key)`` of the plan proxy, from *environ*; an unset or blank variable is refused by name."""
     if missing := [name for name in (PLAN_PROXY_URL_ENV, PLAN_PROXY_KEY_ENV) if not environ.get(name)]:
@@ -351,6 +365,8 @@ def build_arm_llm(
     if llm.model is not None:
         arm_cfg.llm.model = llm.model
     if llm.endpoint is ArmEndpoint.plan_proxy:
+        if llm.reasoning_effort is None:
+            raise ArmClientMismatch('a plan_proxy client is an effort client, so it declares its endpoint')
         url, key = plan_proxy_endpoint(environ)
         arm_cfg.llm.providers.openai = OpenAIProviderConfig(api_url=url, api_key=key)
     client = build_llm_client(arm_cfg)
@@ -361,7 +377,7 @@ def build_arm_llm(
             f'reasoning effort {llm.reasoning_effort} is sent on the Responses API, which the '
             f'{cfg.llm.provider}/{cfg.llm.client_class} client ({type(client).__name__}) does not serve',
         )
-    return ExplicitEffortOpenAIClient(client, llm.reasoning_effort)
+    return ExplicitEffortOpenAIClient(client, llm.reasoning_effort, llm.endpoint)
 
 
 def in_batch_dedupe(edges: Iterable[EntityEdge]) -> list[EntityEdge]:
@@ -383,30 +399,32 @@ def _episodic_node(episode: ReplayInput, *, uuid: str, content: str) -> Episodic
     )
 
 
-def _usage(measurement: TokenMeasurement) -> LlmTokenUsage:
+def measured_usage(measurement: TokenMeasurement) -> LlmTokenUsage:
     if measurement.usage is None:
         raise UnmeasurableClient('the replay needs a client built by build_arm_llm, whose tokens are attributable')
     return measurement.usage
 
 
-def _client_axis(model: str | None, effort: str | None, endpoint: str | None = None) -> str:
-    """The client axes, for an error; *endpoint* None is a client, which does not declare one."""
-    axes = f"model {model or 'as configured'}, effort {effort!r}"
-    return f'({axes}, endpoint {endpoint})' if endpoint is not None else f'({axes})'
+def _client_axis(model: str | None, effort: str | None, endpoint: str) -> str:
+    return f"(model {model or 'as configured'}, effort {effort!r}, endpoint {endpoint})"
 
 
 async def check_arm_client(llm: LLMClient, arm: ReplayArm) -> None:
-    """Raise unless *llm* can replay *arm*: on the arm's model, sending exactly the arm's effort
-    (none for an arm that names none), with attributable tokens. Calls nothing."""
-    effort = client_reasoning_effort(llm)
-    if (arm.llm.model is not None and llm.model != arm.llm.model) or effort != arm.llm.reasoning_effort:
+    """Raise unless *llm* can replay *arm*: on the arm's model and endpoint, sending exactly the
+    arm's effort (none for an arm that names none), with attributable tokens. Calls nothing."""
+    effort, endpoint = client_reasoning_effort(llm), client_endpoint(llm)
+    if (
+        (arm.llm.model is not None and llm.model != arm.llm.model)
+        or effort != arm.llm.reasoning_effort or endpoint != arm.llm.endpoint
+    ):
         raise ArmClientMismatch(
-            f'arm {arm.name} extracts on {_client_axis(arm.llm.model, arm.llm.reasoning_effort)}, '
-            f'but the client is on {_client_axis(llm.model, effort)}',
+            f'arm {arm.name} extracts on '
+            f'{_client_axis(arm.llm.model, arm.llm.reasoning_effort, arm.llm.endpoint)}, '
+            f'but the client is on {_client_axis(llm.model, effort, endpoint)}',
         )
     async with measure_llm_tokens(llm) as probe:
         pass
-    _usage(probe)
+    measured_usage(probe)
 
 
 async def replay_episode(llm: LLMClient, episode: ReplayInput, arm: ReplayArm) -> ReplayResult:
@@ -431,14 +449,16 @@ async def replay_episode(llm: LLMClient, episode: ReplayInput, arm: ReplayArm) -
     names = {node.uuid: node.name for node in nodes}
     return ReplayResult(
         arm=arm.name, model=llm.model, reasoning_effort=client_reasoning_effort(llm),
-        endpoint=arm.llm.endpoint, instructions_version=arm.instructions_version,
+        endpoint=ArmEndpoint(client_endpoint(llm)), instructions_version=arm.instructions_version,
         graph=episode.graph, uuid=episode.uuid, stratum=episode.stratum,
         entities=tuple(node.name for node in nodes),
         minted=tuple(
             MintedEdge(edge.uuid, edge.fact, names[edge.source_node_uuid], names[edge.target_node_uuid])
             for edge in in_batch_dedupe(edges)
         ),
-        tokens=MappingProxyType({'extract_nodes': _usage(node_tokens), 'extract_edges': _usage(edge_tokens)}),
+        tokens=MappingProxyType({
+            'extract_nodes': measured_usage(node_tokens), 'extract_edges': measured_usage(edge_tokens),
+        }),
     )
 
 
@@ -581,7 +601,7 @@ def replayed_record(result: ReplayResult, replay_input: ReplayInput) -> dict[str
 def failed_record(arm: ReplayArm, llm: LLMClient, row: Mapping[str, Any], exc: BaseException) -> dict[str, Any]:
     return {
         'kind': RecordKind.failed, 'arm': arm.name, 'model': llm.model,
-        'reasoning_effort': client_reasoning_effort(llm), 'endpoint': arm.llm.endpoint,
+        'reasoning_effort': client_reasoning_effort(llm), 'endpoint': client_endpoint(llm),
         'graph': row['graph'], 'uuid': row['uuid'], 'stratum': row['stratum'],
         'error_type': type(exc).__name__, 'error': str(exc)[:_ERROR_CHARS],
     }
@@ -969,8 +989,7 @@ def _load_replay_inputs(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 def _arm_clients(arms: Sequence[ReplayArm], llm_factory: LlmFactory) -> ArmClients | None:
     """One client per distinct arm ExtractionLlm, in first-seen order; None if any has none.
-    The factory raises ArmClientMismatch for a client it cannot build. A client is on the
-    endpoint its ExtractionLlm names, since that is what the factory was asked to build on."""
+    The factory raises ArmClientMismatch for a client it cannot build."""
     clients: dict[ExtractionLlm, LLMClient] = {}
     for llm in dict.fromkeys(arm.llm for arm in arms):
         client = llm_factory(llm)
@@ -984,7 +1003,7 @@ def _arm_clients(arms: Sequence[ReplayArm], llm_factory: LlmFactory) -> ArmClien
 
 def _client_conflicts(kept: Iterable[Mapping[str, Any]], arm_clients: ArmClients) -> list[str]:
     client_of = {
-        arm.name: (llm.model, client_reasoning_effort(llm), arm.llm.endpoint) for arm, llm in arm_clients
+        arm.name: (llm.model, client_reasoning_effort(llm), client_endpoint(llm)) for arm, llm in arm_clients
     }
 
     def recorded(record: Mapping[str, Any]) -> tuple[str | None, str | None, str]:

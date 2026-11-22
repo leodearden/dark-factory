@@ -159,7 +159,7 @@ class TestRunSummaries:
         prompt = llm.prompt(SUMMARY_PROMPT)
         assert 'Alpha now runs the merge queue for Beta.' in prompt
         assert all(previous in prompt for previous in PREVIOUS)
-        assert 'Alpha runs the queue for Beta' in prompt
+        assert 'Alpha. Alpha.' in prompt and 'Beta. Beta.' in prompt
         assert [name for name, _ in llm.calls] == [SUMMARY_PROMPT]
 
     @pytest.mark.asyncio
