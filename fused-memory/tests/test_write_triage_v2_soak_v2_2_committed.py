@@ -4,7 +4,8 @@ Built by ``scripts/build_write_triage_v2_soak_baseline.py`` (``rerate
 --brief-version v2.2`` then ``assemble``) from the rounds scratch
 ``calibration/write_triage_v2_soak_rounds/``, the v2.1 soak rounds of task
 7174 with the soak's LOSS-reading pairs re-rated under rater brief v2.2, and
-scored by ``scripts/score_write_triage_reader.py --rubric v2.2``. The
+scored by ``scripts/score_write_triage_reader.py --corpus-record
+calibration/write_triage_v2_soak_derivation_v2_2.json``. The
 invariants below hold whatever the ratings say: no rate and no kappa value is
 pinned. The classes run on one xdist worker, so the cached loads are paid once
 per run.

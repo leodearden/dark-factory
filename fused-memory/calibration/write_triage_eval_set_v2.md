@@ -230,8 +230,12 @@ from the JSON. This narrowing is deliberate.
   under v2.2 is unmeasured, but the direction is down. A comparison must re-rate
   one side's LOSS-consuming pairs under the other's brief first.
 - **The score_reader label**: `score_write_triage_reader.py::score_reader`
-  now takes the brief label as a required `rubric` keyword (CLI `--rubric`),
-  and the report records it. A report over this set should say `v2.2`.
+  takes the brief as a required `brief` keyword, a
+  `write_triage_rating_rounds.py::RaterBrief`, and the report records both
+  its label (`rubric`) and its `brief_sha256`. A report over this set takes
+  its brief from the summary through
+  `write_triage_rating_rounds.py::latest_rerate_brief`, which gives `v2.2` and
+  `7cd0bad3…`.
 
 **The audit of the shift.** An auditor seat checked the v2.2 NO answers for
 false NOs over the 290 re-rated pairs. This was its own analysis, not in the
@@ -437,8 +441,10 @@ discordant pairs, about 5% of the 4,256, and mostly on HOME's boundary with
      write's targets.
    - **The other fields**: `band` is `judge`, `project` and `stratum` come from
      the write row, and the unknown flags are None.
-3. Score with `score_reader(items, verdicts, rubric='v2.2', strata=...)` (or
-   the CLI with `--rubric v2.2`) over `write_triage_eval_set_v2_verdicts.jsonl`.
+3. Score with `score_reader(items, verdicts, brief=latest_rerate_brief(summary),
+   strata=summary['strata'])` (or the CLI with
+   `--corpus-record write_triage_eval_set_v2_summary.json`) over
+   `write_triage_eval_set_v2_verdicts.jsonl`.
    Every binary any outcome's derivation reads is already labelled on every
    pair (§5), so an item built this way needs no new rating.
 
