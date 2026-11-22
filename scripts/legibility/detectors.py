@@ -82,6 +82,41 @@ def user_turn_text(record: Mapping[str, Any]) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class SlashCommandExpansion:
+    """A slash command as Claude Code stores the turn that typed it: *name*
+    as written in ``<command-name>``, *args* (None when no ``<command-args>``
+    tag follows), and the *trailing* text after the expansion."""
+
+    name: str
+    args: str | None
+    trailing: str
+
+
+_SLASH_COMMAND_EXPANSION_RE = re.compile(
+    r"""
+    \s*(?:<command-message>[^<]*</command-message>\s*)?
+    <command-name>(?P<name>[^<]*)</command-name>
+    (?:\s*<command-message>[^<]*</command-message>)?
+    (?:\s*<command-args>(?P<args>.*?)</command-args>)?
+    """,
+    re.DOTALL | re.VERBOSE,
+)
+
+
+def parse_slash_command_expansion(text: str) -> SlashCommandExpansion | None:
+    """The one parse of Claude Code's slash-command expansion, from the START of *text*.
+
+    Both on-disk orders parse: ``<command-message>`` written before
+    ``<command-name>``, or between it and ``<command-args>``. The start
+    anchor rejects a turn that merely QUOTES an expansion.
+    """
+    match = _SLASH_COMMAND_EXPANSION_RE.match(text)
+    if match is None:
+        return None
+    return SlashCommandExpansion(match['name'], match['args'], text[match.end():])
+
+
 def _flatten_content(content: Any) -> str:
     """Flatten a tool_result ``content`` field (a string or a block list) to
     text. Blocks without a 'text' field (e.g. the ``tool_reference`` blocks
