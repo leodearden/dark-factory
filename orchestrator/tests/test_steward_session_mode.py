@@ -207,6 +207,32 @@ class TestFreshPerL0:
         assert len(driver.dispatches) == 3
         assert driver.dispatches[2]['resume_session_id'] == 'sess-cap'
 
+    async def test_a_fresh_retry_inside_a_re_handle_rebuilds_the_briefing_with_both_histories(
+        self, make_steward, queue, driver, two_l0s,
+    ):
+        first, second = two_l0s
+        steward = _build(make_steward, queue, 'fresh_per_l0')
+        await driver.handle(steward, first)
+        driver.scripted = [_timed_out('')]
+        await driver.handle(steward, second)
+
+        steward.usage_gate = make_gate_mock(
+            account_count=2, detect_cap_hit=MagicMock(side_effect=[True, False]),
+        )
+        driver.scripted = [
+            AgentResult(success=False, output='usage limit', cost_usd=0.4, session_id=''),
+        ]
+        with patch(_SLEEP_PATCH, new_callable=AsyncMock):
+            await driver.handle(steward, second)
+
+        assert len(driver.dispatches) == 4
+        assert _carries_no_resume(driver.dispatches[3])
+        initial = steward.briefing.build_steward_initial_prompt
+        assert initial.await_count == 4
+        rebuilt = initial.await_args_list[3]
+        assert rebuilt.kwargs['handled'] == (_resolved_entry(first),)
+        assert rebuilt.kwargs['earlier_attempts'] == EarlierAttempts(timed_out=1)
+
     async def test_a_give_up_is_digested_for_the_next_l0(
         self, make_steward, queue, driver, two_l0s,
     ):
