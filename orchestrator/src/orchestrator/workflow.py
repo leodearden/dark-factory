@@ -5459,7 +5459,7 @@ class TaskWorkflow:
 
     async def _requeue_on_server_error(
         self, result: AgentResult, *, activity: str, iteration: int,
-    ) -> WorkflowOutcome:
+    ) -> WorkflowOutcome | None:
         """Requeue a zero-output agent session attributed to a provider 5xx
         (PRD `plans/server-side-api-error-handling-prd.md` tasks γ and ι,
         contract C2 requeue-not-block invariant). *activity* names the work
@@ -5483,18 +5483,13 @@ class TaskWorkflow:
         decisions 3 and 6) — so this method's only job is to get the row back
         onto the queue with the right evidence attached, not to retry it here.
 
-        Exits via :meth:`_repend_for_requeue` so the REQUEUED return is
-        TRUTHFUL (the row is written ``pending`` before the harness slot is
-        released). A terminal row observed out-of-band during that write is
-        returned INSTEAD of REQUEUED — but the two terminals then diverge at
-        the caller, so neither reading generalises: a ``cancelled`` row wins
-        over the requeue intent and ends the dispatch, while a ``done`` row is
-        returned as DONE, which each caller reads in its own way rather than
-        as a terminal exit: the execute loop returns it, and
-        :meth:`_execute_verify_review_loop` gives it its ordinary
-        ``_execute_iterations`` meaning (execution finished, continue to
-        VERIFY); the debugfix loop drops it and keeps looping, because DONE
-        from that loop would read as a passing verify.
+        Exits via :meth:`_exit_requeued` so the REQUEUED return is TRUTHFUL
+        (the row is written ``pending`` before the harness slot is released).
+        A terminal row observed out-of-band during that write wins over the
+        requeue intent: a ``cancelled`` row returns CANCELLED, which ends the
+        dispatch. A ``done`` row returns ``None``: the requeue was dropped and
+        nothing exited the slot, so the caller decides what its own loop does
+        next.
         """
         cls = classify_agent_failure(result)
         # Compose the `agent API error: HTTP <status>` marker into the reason
@@ -5530,9 +5525,10 @@ class TaskWorkflow:
             'requeueing (transient, exit-on-first)',
             self.task_id, result.api_error_status, activity.lower(), iteration,
         )
-        return await self._exit_requeued(
+        outcome = await self._exit_requeued(
             reason, detail=detail, api_error_status=result.api_error_status,
         )
+        return None if outcome is WorkflowOutcome.DONE else outcome
 
     async def _exit_requeued(
         self, reason: str, *, detail: str, api_error_status: int | None,
@@ -9971,9 +9967,12 @@ class TaskWorkflow:
             # a blocked/L0/steward storm.
             if _is_server_error_zero_output(result):
                 self._capture_zero_output_evidence(result, self.metrics.execute_iterations)
-                return await self._requeue_on_server_error(
+                outcome = await self._requeue_on_server_error(
                     result, activity='Execution', iteration=self.metrics.execute_iterations,
                 )
+                # A done row dropped the requeue: execution reads as finished,
+                # which _execute_verify_review_loop adjudicates from VERIFY on.
+                return WorkflowOutcome.DONE if outcome is None else outcome
 
             # --- Zero-output hang circuit breaker ---
             # Detect consecutive fresh-invocation CLI hangs (reify-4429 pattern):
@@ -11648,9 +11647,8 @@ class TaskWorkflow:
                 outcome = await self._requeue_on_server_error(
                     debug_result, activity='Debug fix', iteration=verify_attempt,
                 )
-                # A done row seen by the re-pend drops the requeue and keeps
-                # looping: DONE returned from here would read as a passing verify.
-                if outcome is not WorkflowOutcome.DONE:
+                # None: a done row dropped the requeue, and the loop goes on.
+                if outcome is not None:
                     return outcome
 
             if not debug_result.success:
