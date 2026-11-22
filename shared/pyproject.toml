@@ -111,9 +111,10 @@ filterwarnings = [
 #
 # 420 IS DERIVED FROM MEASUREMENT. The worst per-test wall clock of an UNMARKED
 # test, across every suite and both inifile-resolution modes under real fleet
-# load, measured 45.48s (orchestrator/tests/test_hard_v2_fixture_pool.py,
-# root-bound); times the 8x headroom factor whose rationale is
-# shared/src/shared/testing_timeout_headroom.py::UNDER_LOAD_HEADROOM_FACTOR = 363.84,
+# load, is recorded at
+# shared/src/shared/testing_ceiling_anchors.py::INI_DEFAULT_MEASURED_WORST_SECS;
+# times the 8x headroom factor whose rationale is
+# shared/src/shared/testing_timeout_headroom.py::UNDER_LOAD_HEADROOM_FACTOR,
 # rounded up to a whole minute = 420. Marked tests are excluded by design,
 # including the slower repo-wide scans in
 # fused-memory/tests/test_check_bare_magicmock_config.py, which carry their own

@@ -20,6 +20,10 @@ from typing import NamedTuple
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.testing_ceiling_anchors import (
+    MAGICMOCK_REPO_SCAN_MEASURED_WORST_SECS,
+    MAGICMOCK_REPO_SCAN_TEST_TIMEOUT,
+)
 from shared.testing_timeout_headroom import UNDER_LOAD_HEADROOM_FACTOR
 from shared.testing_xdist_groups import single_xdist_group
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -1258,15 +1262,8 @@ class TestRuleBIsUnconditional:
         )
 
 
-# Each repo-wide scan sweeps all seven packages' tests/; 61.52s x 8 = 492.16, rounded up to a
-# whole minute. Family rationale: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
-MAGICMOCK_REPO_SCAN_TEST_TIMEOUT = 540
-
 # Both scan classes run on one loadgroup worker, so `repo_test_scan` is built once per run.
 _REPO_SCAN_GROUP_NAME = 'bare_magicmock_repo_scan'
-
-# Worst root-bound wall clock of these scans under real load, task 5442; corpus is plans/pytest-per-test-timeout-measurement-2026-09-17.md.
-_REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE = 61.52
 
 
 def _timeout_seconds(marker: pytest.Mark | None) -> float | None:
@@ -1290,13 +1287,13 @@ def test_only_the_repo_wide_scans_run_under_their_own_ceiling(request):
     if not scan_items:
         pytest.skip('no repo-wide scan item is selected in this session')
     ini_default = float(request.config.getini('timeout'))
-    measured_need = _REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE * UNDER_LOAD_HEADROOM_FACTOR
+    measured_need = MAGICMOCK_REPO_SCAN_MEASURED_WORST_SECS * UNDER_LOAD_HEADROOM_FACTOR
     required = max(measured_need, ini_default)
     ceilings = {item.nodeid: _timeout_seconds(item.get_closest_marker('timeout')) for item in scan_items}
     short = {nodeid: ceiling for nodeid, ceiling in ceilings.items() if ceiling is None or ceiling < required}
     assert short == {}, (
         f'repo-wide scan items resolve a timeout below {required}s, the larger of the measured '
-        f'{_REPO_SCAN_MEASURED_UNDER_LOAD_WORST_CASE}s x headroom {UNDER_LOAD_HEADROOM_FACTOR} '
+        f'{MAGICMOCK_REPO_SCAN_MEASURED_WORST_SECS}s x headroom {UNDER_LOAD_HEADROOM_FACTOR} '
         f'and the {ini_default}s ini default (None = no mark): {short}. Bind '
         '@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT) on the scan class; a closer mark '
         'on a scan test REPLACES it.'
