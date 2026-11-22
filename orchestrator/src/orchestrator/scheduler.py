@@ -7478,11 +7478,7 @@ class Scheduler:
         ends the episode.
         """
         blockers = self.lock_table.blockers(task_id, modules)
-        ranks = {
-            blocker.owner: self.lock_table.top_park_rank(blocker.owner)
-            for blocker in blockers
-        }
-        if not is_park_refusal(tier, blockers, ranks.get):
+        if not is_park_refusal(tier, blockers, self.lock_table.top_park_rank):
             self._park_refusals.end(task_id)
             return
         episode_secs = self._park_refusals.observe(
@@ -7492,6 +7488,10 @@ class Scheduler:
         )
         if episode_secs is None or not self.event_store:
             return
+        ranks = {
+            blocker.owner: self.lock_table.top_park_rank(blocker.owner)
+            for blocker in blockers
+        }
         self.event_store.emit(
             EventType.park_refused,
             task_id=task_id,
@@ -7501,18 +7501,20 @@ class Scheduler:
                 'episode_secs': episode_secs,
                 'blockers': [blocker.as_payload() for blocker in blockers],
                 'park_owners': [
-                    self._park_owner_wait(ctx, owner, rank)
+                    self._park_owner_entry(ctx, owner, rank)
                     for owner, rank in sorted(ranks.items())
                     if rank is not None
                 ],
             },
         )
 
-    def _park_owner_wait(self, ctx: TickContext, owner: str, rank: int) -> dict:
+    def _park_owner_entry(self, ctx: TickContext, owner: str, rank: int) -> dict:
         """One ``park_refused`` park owner: the priority behind its *rank*, its park age, and its own wait.
 
         ``waiting_on`` is None, meaning unknown, when *owner* is not in this
-        tick's task list.
+        tick's task list.  That is a fail-safe, not an expected case:
+        ``_phase_park_gc`` runs earlier in the tick and expires the parks of
+        every owner missing from it.
         """
         owner_task = ctx.tasks_by_id.get(owner)
         waiting_on = None if owner_task is None else [
