@@ -249,10 +249,27 @@ class TestSweepStalePidDirsBounding:
         assert (target / 'payload.txt').exists()
         assert removed == 0
 
-    def test_missing_base_dir_returns_zero_and_does_not_raise(self, tmp_path):
+    def test_missing_base_dir_returns_zero_silently(self, tmp_path, caplog):
         missing = tmp_path / 'does-not-exist'
 
-        assert sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=missing) == 0
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'):
+            assert sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=missing) == 0
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_unlistable_base_dir_returns_zero_and_warns_once(self, tmp_path, caplog):
+        """Unlike a missing base, one that exists but cannot be listed is worth a WARNING."""
+        not_a_dir = tmp_path / 'regular-file'
+        not_a_dir.write_text('')
+
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'):
+            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=not_a_dir)
+
+        assert removed == 0
+        assert len([
+            r for r in caplog.records
+            if r.name == 'shared.config_dir' and r.levelno >= logging.WARNING
+        ]) == 1
 
     def test_rmtree_failure_is_contained_and_logged(self, tmp_path, caplog):
         """One unremovable entry must not abort the sweep.
@@ -341,8 +358,8 @@ class TestSweepStalePidDirsBounding:
         UsageGate.__init__ is synchronous and runs on the event-loop thread
         during harness startup; the pathological /tmp this task addresses has
         a 40 MB directory inode. Blocking time is the risk, so the bound is a
-        deadline, not a removal cap — the population still drains fully across
-        successive process starts.
+        deadline, not a removal cap, and a stop leaves the remainder to later
+        sweeps.
 
         Degenerate case: `deadline_secs=0.0` trips on the very first
         iteration, so nothing at all is removed. The partial-progress case
@@ -409,9 +426,11 @@ class TestSweepStalePidDirsBounding:
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_deadline_bounds_the_directory_read_not_only_the_matches(self, tmp_path, caplog):
-        """Path.glob lists the whole directory before its first yield, so the read must be lazy.
+        """The deadline is consulted on every directory entry, not only on matching ones.
 
-        Task 11171: a >300s hang in UsageGate.__init__ reading a /tmp of ~300k entries.
+        Task 11171: the sweep walked Path.glob and checked the deadline only between
+        matches, so a /tmp of ~300k entries with nothing to sweep hung UsageGate.__init__
+        for >300s.
         """
         unrelated = [tmp_path / f'unrelated-{i}' for i in range(50)]
         for path in unrelated:
@@ -429,6 +448,7 @@ class TestSweepStalePidDirsBounding:
         assert removed == 0
         assert any(
             r.name == 'shared.config_dir' and r.levelno == logging.WARNING
+            and 'incomplete' in r.getMessage().lower()
             for r in caplog.records
         ), "a sweep that ran out of time reading the directory must report itself INCOMPLETE, never read as 'swept everything'"
         assert all(path.exists() for path in unrelated)
