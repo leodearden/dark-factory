@@ -51,6 +51,10 @@ def feed_lines(out_dir: Path) -> list[FeedLine]:
     return [parse_feed_line(text, line_no=i) for i, text in enumerate(feed_texts(out_dir), 1)]
 
 
+def pass_ends(lines: list[FeedLine]) -> list[Heartbeat]:
+    return [ln for ln in lines if isinstance(ln, Heartbeat)]
+
+
 def committed_state(out_dir: Path) -> FeedState:
     return FeedState.model_validate_json((out_dir / STATE_FILENAME).read_text(encoding='utf-8'))
 
@@ -88,16 +92,21 @@ def test_the_committed_state_is_the_fold_at_its_watermark() -> None:
     assert fold(feed_lines(FEED_V1), project_id='demo-client', upto_seq=state.watermark_seq) == state
 
 
+def test_every_heartbeat_of_the_fixture_carries_the_watermark_the_previous_pass_committed() -> None:
+    heartbeats = pass_ends(feed_lines(FEED_V1))
+    committed_before_each = [0, *(hb.seq for hb in heartbeats[:-1])]
+    assert [hb.watermark_seq for hb in heartbeats] == committed_before_each
+
+
 def test_every_pass_of_the_fixture_ends_with_each_prd_counting_its_tasks_as_the_publisher_would() -> None:
     lines = feed_lines(FEED_V1)
-    pass_ends = [ln for ln in lines if isinstance(ln, Heartbeat)]
-    assert committed_state(FEED_V1).watermark_seq in {hb.seq for hb in pass_ends}
-    for hb in pass_ends:
+    assert committed_state(FEED_V1).watermark_seq in {hb.seq for hb in pass_ends(lines)}
+    for hb in pass_ends(lines):
         folded = fold(lines, project_id='demo-client', upto_seq=hb.seq)
         corrections = prd_events(
             tasks=folded.tasks.values(),
             state=folded,
-            summaries=None,
+            summaries={},
             stamp=Stamp(project_id='demo-client', first_seq=hb.seq + 1),
             now=hb.at,
         )
