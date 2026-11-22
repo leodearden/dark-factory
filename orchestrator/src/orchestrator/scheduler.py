@@ -7783,6 +7783,7 @@ class Scheduler:
             current_holders=one_holder_per_key(held_by_task),
             held_by_task=held_by_task,
             holder_limits=self.lock_table.snapshot_holder_limits(),
+            successor_of=self.lock_table.snapshot_successor_of(),
             lock_depth=self.config.lock_depth,
             is_paused=self.is_paused,
             pause_reason=self.pause_reason,
@@ -8066,6 +8067,32 @@ class Scheduler:
                 task_id, sorted(self.lock_table.held_modules(task_id))
             )
         return result
+
+    def acquire_as_successor(
+        self, task_id: str, modules: list[str], *, predecessor: str, priority: str,
+    ) -> bool:
+        """Take *modules* for *task_id* as the successor of *predecessor*; False when refused.
+
+        The lock half of the early-start claim
+        (``plans/early-start-on-predecessor-branch-prd.md`` section 5.4, step
+        c): :meth:`ModuleLockTable.try_acquire_as_successor` declares the
+        relation and takes the keys in one step, and the acquire emits
+        ``lock_acquired`` (with ``successor_of``) through the single
+        lock-event writer.  Synchronous, so it fits the claim's uninterrupted
+        step.  It neither marks the task dispatched nor writes the snapshot;
+        the claim does both around it.
+        """
+        if not self.lock_table.try_acquire_as_successor(
+            task_id, modules, predecessor=predecessor,
+        ):
+            return False
+        self._emit_lock_event(
+            EventType.lock_acquired,
+            task_id=task_id,
+            modules=sorted(self.lock_table.held_modules(task_id)),
+            priority=priority,
+        )
+        return True
 
     async def handle_blast_radius_expansion(
         self,
@@ -8999,7 +9026,10 @@ class Scheduler:
 
         *extra* is merged into the event payload verbatim (``priority`` for an
         acquire, ``reason`` for a partial release), so each site's payload is
-        preserved byte-for-byte.
+        preserved byte-for-byte.  The one addition is derived here, from the
+        lock table: a ``lock_acquired`` of a task that is currently a
+        successor carries ``successor_of``, its predecessor, whichever path
+        acquired the locks.
 
         Each branch names its ``EventType`` constant LITERALLY rather than
         forwarding the ``event_type`` parameter into ``emit``.  That is not
@@ -9012,6 +9042,9 @@ class Scheduler:
         at = self._wall_now().timestamp()
         data = {'modules': modules, **extra}
         if event_type == EventType.lock_acquired:
+            relation = self.lock_table.successor_relation(task_id)
+            if relation is not None and relation.successor == task_id:
+                data['successor_of'] = relation.predecessor
             self._hold_history.observe_acquired(task_id, modules, at=at)
             if self.event_store:
                 self.event_store.emit(
