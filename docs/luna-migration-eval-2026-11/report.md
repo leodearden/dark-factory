@@ -154,6 +154,11 @@ Each is read in full in `design.md` §7.
     `"secondary": "null"`. The production parser rejects that string, so
     each was served as `observations_and_summaries`, the `llm_error`
     fallback.
+  * After scoring, `routing/classifier.py` was changed to read a secondary
+    that names no category as none, keeping the parsed primary. The eval
+    measured the parser as it stood at the pre-registration commit, and
+    nothing is re-scored. The routing layer's FAIL rests on Q1, and the
+    router's parser is untouched.
 * **Proxy overhead.** On every site, luna's input exceeds the control's by
   293 to 318 tokens per call. That matches the ~300-token plan-proxy overhead
   `design.md` §2.9 stated, so luna's tokens per call overstate the model's own.

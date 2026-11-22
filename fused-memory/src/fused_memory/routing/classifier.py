@@ -57,6 +57,14 @@ Respond as JSON:
 }"""
 
 
+def _optional_category(value: object) -> MemoryCategory | None:
+    """The secondary category, or None for any answer that names none ("null", "none", 42, ...)."""
+    try:
+        return MemoryCategory(value)
+    except ValueError:
+        return None
+
+
 class WriteClassifier:
     """Classifies content into a MemoryCategory for write routing.
 
@@ -153,7 +161,7 @@ class WriteClassifier:
 
             data = json.loads(json_str)
             primary = MemoryCategory(data['primary'])
-            secondary = MemoryCategory(data['secondary']) if data.get('secondary') else None
+            secondary = _optional_category(data.get('secondary'))
             confidence = float(data.get('confidence', 0.7))
             reasoning = data.get('reasoning', '')
 

@@ -215,6 +215,36 @@ class TestClassificationFallbackReason:
         assert result.fallback is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('secondary', ['"null"', '"none"', '""', '"nonsense"', '42', '["temporal_facts"]'])
+    async def test_a_secondary_that_is_no_category_keeps_the_primary(self, llm_config, secondary):
+        """task 9945's eval lost 15 valid primaries to a '"secondary": "null"' answer."""
+        classifier = WriteClassifier(
+            llm_config,
+            openai_client=completion_client(
+                f'{{"primary": "decisions_and_rationale", "secondary": {secondary}, "confidence": 0.9}}'
+            ),
+        )
+
+        result = await classifier.classify(_NO_HEURISTIC_MATCH)
+
+        assert (result.primary, result.secondary, result.fallback) == (
+            MemoryCategory.decisions_and_rationale, None, None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_valid_secondary_is_kept(self, llm_config):
+        classifier = WriteClassifier(
+            llm_config,
+            openai_client=completion_client(
+                '{"primary": "decisions_and_rationale", "secondary": "temporal_facts", "confidence": 0.9}'
+            ),
+        )
+
+        result = await classifier.classify(_NO_HEURISTIC_MATCH)
+
+        assert result.secondary == MemoryCategory.temporal_facts
+
+    @pytest.mark.asyncio
     async def test_heuristic_only_no_match_is_no_confident_match(self, classifier):
         result = await classifier.classify(_NO_HEURISTIC_MATCH)
 
