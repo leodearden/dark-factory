@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import types
 from pathlib import Path
 from typing import Any
@@ -382,6 +383,38 @@ class TestMergeCancelEmitsCancelStates:
         assert result['cancelled'] is False
         _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel excepted future')
         assert result['state'] == MergeState.blocked
+
+
+# ---------------------------------------------------------------------------
+# merge_cancel's tool description — the state list a calling model reads
+# ---------------------------------------------------------------------------
+
+_QUOTED_TOKEN_RE = re.compile(r"'([a-z_]+)'")
+_STATE_FIELD_RE = re.compile(r'^\s*state\s+\(str\)', re.MULTILINE)
+_REASON_FIELD_RE = re.compile(r'^\s*reason\s+\(str\|None\)', re.MULTILINE)
+
+
+@pytest.mark.asyncio
+class TestMergeCancelDescriptionRendersCancelStates:
+    """The model calling merge_cancel cannot import shared.merge_state, so the
+    tool description must carry every CANCEL_STATES value, and nothing a guard
+    needs: marker lines and pin notes would reach that model as literal text.
+    """
+
+    async def test_state_field_lists_cancel_states_without_guard_scaffolding(
+        self, tmp_path: Path,
+    ) -> None:
+        tool = await _server(tmp_path).get_tool('merge_cancel')
+        assert tool is not None
+        description = tool.description or ''
+        state_label = _STATE_FIELD_RE.search(description)
+        reason_label = _REASON_FIELD_RE.search(description)
+        assert state_label and reason_label, f'field labels not found in: {description!r}'
+
+        state_field = description[state_label.end():reason_label.start()]
+        assert set(_QUOTED_TOKEN_RE.findall(state_field)) == {str(s) for s in CANCEL_STATES}
+        assert 'merge-state-vocab' not in description
+        assert 'machine-pinned' not in description
 
 
 # ---------------------------------------------------------------------------
