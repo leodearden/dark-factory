@@ -7,9 +7,10 @@ pauses the scheduler when it trips.
 The path-taking readers and writers in this module are fail-open: they return
 sentinels / zeros / None and log warnings rather than raising.  The digest is
 observability, not a correctness gate.  The connection-taking `query_*` forms
-beneath count_done_in_window and model_role_rollup raise sqlite3.Error instead,
-for a caller that must tell a failed read from a quiet window
-(scripts/sitting/fleet_state.py).
+beneath count_done_in_window, landings_in_window and model_role_rollup raise
+instead (sqlite3.Error, and for query_landings_in_window the landing datum's
+typed errors too), for a caller that must tell a failed read from a quiet
+window (scripts/sitting/fleet_state.py).
 
 Design decisions (see plan.json):
 - Pure, Harness-free helpers here; harness.py owns the trigger and state.
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass, field
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
 
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
+from shared.quality_series.landings import landings, parse_utc
 
 from orchestrator.chain_telemetry import ChainTelemetry, summarize_chain_telemetry
 from orchestrator.event_store import EventType
@@ -367,6 +370,43 @@ def count_done_in_window(
     return _query_events_ro(
         events_db, 'count_done_in_window', 0,
         lambda conn: query_count_done_in_window(conn, window_start_iso, window_end_iso),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Landings in the window, from the quality dashboard's landing datum
+# ---------------------------------------------------------------------------
+
+
+def query_landings_in_window(
+    conn: sqlite3.Connection,
+    repo: str | os.PathLike[str],
+    window_start_iso: str,
+    window_end_iso: str,
+) -> int:
+    """Count landings on main whose landed_at lies in the inclusive window.
+
+    The landing datum is shared.quality_series.landings.landings (plans/quality-dashboard-prd.md):
+    each train member counts, and a fast-forward counts like a merge commit. *conn* is neither
+    opened nor closed here. sqlite3.Error and landings()'s typed errors propagate;
+    landings_in_window is the fail-open form. The call runs a blocking ``git rev-list``, so a
+    coroutine calls the path form through ``asyncio.to_thread``.
+    """
+    start, end = parse_utc(window_start_iso), parse_utc(window_end_iso)
+    batch = landings(conn, repo, since_cursor=None)
+    return sum(1 for landing in batch.landings if start <= landing.landed_at <= end)
+
+
+def landings_in_window(
+    events_db: Path,
+    repo: str | os.PathLike[str],
+    window_start_iso: str,
+    window_end_iso: str,
+) -> int | None:
+    """The fail-open form of query_landings_in_window: None, never 0, when it cannot be read."""
+    return _query_events_ro(
+        events_db, 'landings_in_window', None,
+        lambda conn: query_landings_in_window(conn, repo, window_start_iso, window_end_iso),
     )
 
 
