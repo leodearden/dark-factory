@@ -11,7 +11,6 @@ from uuid import uuid4
 
 from shared.config_dir import TaskConfigDir
 from shared.escalation_project_scope import escalation_project_headers
-from shared.jcodemunch_launch import jcodemunch_server_config
 from shared.safe_io import load_json_or_warn
 from shared.transcript_archive import archive_task_transcripts
 
@@ -519,12 +518,12 @@ class BaseStage:
     def _build_mcp_config(self) -> dict:
         """Assemble MCP server config for Claude CLI.
 
-        Always includes the fused-memory server (HTTP or stdio), the
-        jcodemunch stdio server, and the in-process recon-report HTTP server
-        on ``self._recon_report_port``.  The escalation HTTP server is added
-        only if an escalation URL is configured; its entry carries the stage's
-        project as the ``X-Escalation-Project`` header, which scopes the
-        reconciliation escalation server's uuid-prefix guard.
+        Always includes the fused-memory server (HTTP or stdio) and the
+        in-process recon-report HTTP server on ``self._recon_report_port``.
+        The escalation HTTP server is added only if an escalation URL is
+        configured; its entry carries the stage's project as the
+        ``X-Escalation-Project`` header, which scopes the reconciliation
+        escalation server's uuid-prefix guard.
         """
         fm_config = _find_fused_memory_server()
 
@@ -547,7 +546,6 @@ class BaseStage:
 
         servers: dict = {
             'fused-memory': fm_entry,
-            'jcodemunch': jcodemunch_server_config(),
             # PRD γ: recon_report MCP server — in-process only, not in any
             # disallow list because mcp__recon-report__* tools only mutate
             # in-process state (not Graphiti / Mem0 / Taskmaster).
