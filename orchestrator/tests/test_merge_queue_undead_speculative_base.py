@@ -73,10 +73,21 @@ async def _git(repo: Path, *args: str) -> tuple[int, str]:
     return proc.returncode, stdout.decode()
 
 
+def _task_files(listing: str) -> Tree:
+    return frozenset(name for name in listing.split() if name.endswith('.txt'))
+
+
 async def _tree_of(repo: Path, rev: str) -> Tree:
     """The task files (``*.txt``) in *rev*'s tree."""
     _, listing = await _git(repo, 'ls-tree', '--name-only', rev)
-    return frozenset(name for name in listing.split() if name.endswith('.txt'))
+    return _task_files(listing)
+
+
+async def _change_of(repo: Path, rev: str) -> Tree:
+    """The task files (``*.txt``) *rev* changes over its first parent."""
+    rc, listing = await _git(repo, 'diff', '--name-only', f'{rev}^1', rev)
+    assert rc == 0, f'git diff {rev}^1 {rev} failed in {repo}'
+    return _task_files(listing)
 
 
 class _TreeRecordingVerifier(FakeVerifier):
@@ -102,19 +113,35 @@ class _TreeRecordingVerifier(FakeVerifier):
         return await super().run_scoped(worktree, config, module_configs, task_files, **options)
 
 
+@dataclasses.dataclass(frozen=True)
+class _RemoteVerify:
+    """A commit a remote host was asked to verify: the ``*.txt`` names it
+    changes over its first parent, which are the work of the one task branch
+    it brings in, whether it is a ``--no-ff`` merge or a rebased replay, and
+    the ``*.txt`` names of its tree."""
+
+    change: Tree
+    tree: Tree
+
+
 class _TreeRecordingRemote(FakeRemoteRunner):
-    """A remote host that records the ``*.txt`` names of every merge commit it
-    is asked to verify, alongside the ``calls`` ledger."""
+    """A remote host that records each commit it is asked to verify as a
+    ``_RemoteVerify``, alongside the ``calls`` ledger. A verify is recorded on
+    entry, so one handed and then cancelled still counts, and with nothing
+    awaited between recording it and starting it: once ``release`` is set, a
+    recorded verify with the host not ``live`` has returned."""
 
     def __init__(
         self, name: str, repo: Path, *, release: asyncio.Event, entered: asyncio.Event,
     ) -> None:
         super().__init__(name, release=release, entered=entered)
         self.repo = repo
-        self.trees: list[Tree] = []
+        self.verifies: list[_RemoteVerify] = []
 
     async def run_merge_verify(self, merge_sha: str, spec: Any) -> VerifyResult:
-        self.trees.append(await _tree_of(self.repo, merge_sha))
+        change = await _change_of(self.repo, merge_sha)
+        tree = await _tree_of(self.repo, merge_sha)
+        self.verifies.append(_RemoteVerify(change=change, tree=tree))
         return await super().run_merge_verify(merge_sha, spec)
 
 
@@ -182,6 +209,7 @@ class _Run:
     lane: MergeLane
     queue: asyncio.Queue[Any]
     reqs: dict[str, MergeRequest]
+    changes: Mapping[str, Tree]
     local: _TreeRecordingVerifier
     head_host: _TreeRecordingRemote
     release_h: asyncio.Event
@@ -206,9 +234,9 @@ class _Run:
     def local_trees_of(self, task_id: str) -> list[Tree]:
         return [tree for task, tree in self.local.trees if task == task_id]
 
-    def remote_trees_holding(self, name: str) -> list[Tree]:
-        """The trees 'head-host' verified that hold task *name*'s file."""
-        return [tree for tree in self.head_host.trees if f'{name}.txt' in tree]
+    def remote_trees_of(self, task_id: str) -> list[Tree]:
+        """The trees 'head-host' verified for commits bringing in *task_id*'s branch."""
+        return [v.tree for v in self.head_host.verifies if v.change == self.changes[task_id]]
 
     def first_merge_base(self, task_id: str) -> str:
         """The base_sha of *task_id*'s first speculative merge."""
@@ -238,6 +266,9 @@ async def _running(
     speculation_depth: int,
 ) -> AsyncIterator[_Run]:
     reqs = {name: await _request(scene, name) for name in names}
+    changes = {
+        name: await _change_of(scene.repo, req.branch.full_name) for name, req in reqs.items()
+    }
     h_entered, release_h = asyncio.Event(), asyncio.Event()
     head_host = _TreeRecordingRemote(_HEAD_HOST, scene.repo, release=release_h, entered=h_entered)
     local = _TreeRecordingVerifier(local_scripts)
@@ -248,7 +279,7 @@ async def _running(
         event_store=scene.events, escalation_queue=scene.escalations,
     )
     async with running_lane(lane):
-        run = _Run(scene, lane, queue, reqs, local, head_host, release_h)
+        run = _Run(scene, lane, queue, reqs, changes, local, head_host, release_h)
         run.put('H')
         await wait_responsive(
             h_entered.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT,
@@ -371,13 +402,13 @@ class TestAnAbandonedPredecessorsCommitIsDead:
             run.release_h.set()
             assert await run.outcome_status('H') == 'done'
             await _until(
-                lambda: bool(run.remote_trees_holding('T')), label="T's verify on head-host",
+                lambda: bool(run.remote_trees_of('T')), label="T's verify on head-host",
             )
             assert lane_state(run.lane, run.reqs['X'].request_id) == 'verifying', (
                 'precondition: T dispatched while X still verified'
             )
-            assert all('S.txt' not in tree for tree in run.remote_trees_holding('T')), (
-                f"T verified on abandoned S's commit: {run.remote_trees_holding('T')}"
+            assert all('S.txt' not in tree for tree in run.remote_trees_of('T')), (
+                f"T verified on abandoned S's commit: {run.remote_trees_of('T')}"
             )
             voids = run.dispatch_voids_of('T')
             assert [(v['dead_link'], v['killer']) for v in voids] == [
@@ -398,10 +429,10 @@ async def _t_verified_on_s_behind_it(run: _Run) -> None:
     run.release_h.set()
     assert await run.outcome_status('H') == 'done'
     await _until(
-        lambda: bool(run.remote_trees_holding('T')) and not run.head_host.live,
+        lambda: bool(run.remote_trees_of('T')) and not run.head_host.live,
         label="T's verify on head-host passed",
     )
-    assert run.remote_trees_holding('T') == [_ON_S_LIVE_COMMIT]
+    assert run.remote_trees_of('T') == [_ON_S_LIVE_COMMIT]
     assert lane_state(run.lane, run.reqs['S'].request_id) == 'verifying', (
         'precondition: T verified while S still verified'
     )
@@ -409,7 +440,7 @@ async def _t_verified_on_s_behind_it(run: _Run) -> None:
 
 def _assert_t_reverified_without_s(run: _Run) -> None:
     """T's only verify on S's work is the one taken on S's live commit."""
-    t_trees = run.local_trees_of('T') + run.remote_trees_holding('T')
+    t_trees = run.local_trees_of('T') + run.remote_trees_of('T')
     assert [tree for tree in t_trees if 'S.txt' in tree] == [_ON_S_LIVE_COMMIT], t_trees
     assert any('S.txt' not in tree for tree in t_trees), t_trees
 
