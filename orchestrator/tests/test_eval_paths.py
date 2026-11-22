@@ -25,6 +25,7 @@ from shared.project_layout import (
 )
 
 from orchestrator.evals import paths
+from orchestrator.evals.cli import eval_cli
 from orchestrator.evals.prompt_opt import curator_corpus, optimizer
 from orchestrator.evals.prompt_opt.__main__ import cli as prompt_opt_cli
 from orchestrator.evals.reviewer_trial import mining, scorer
@@ -297,3 +298,38 @@ class TestCliDefaultsResolveUnderTheMainCheckout:
         assert result.exit_code != 0, result.output
         assert f'tickets.db not found at {reconciliation_tickets_db(main_checkout_at)}' in result.output
         assert 'decoy' not in result.output
+
+
+class TestEvalSampleFindsReifyInTheRegistry:
+    @staticmethod
+    def _dry_run(tmp_path: Path, *extra: str):
+        return CliRunner().invoke(
+            eval_cli, ['eval-sample', '--dry-run', '--df-root', str(tmp_path / 'no-df'), *extra]
+        )
+
+    def test_the_reify_root_comes_from_the_registry(
+        self, main_checkout_at: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(tmp_path / 'reify'))
+
+        result = self._dry_run(tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert f'reify checkout {tmp_path / "reify"} not found' in result.output
+
+    def test_an_unregistered_reify_is_a_usage_error_naming_the_flag(
+        self, main_checkout_at: Path, tmp_path: Path
+    ) -> None:
+        result = self._dry_run(tmp_path)
+
+        assert result.exit_code == 2, result.output
+        assert 'pass --reify-root' in result.output
+        assert KNOWN_PROJECT_ROOTS_ENV in result.output
+
+    def test_an_explicit_reify_root_needs_no_registry(
+        self, main_checkout_at: Path, tmp_path: Path
+    ) -> None:
+        result = self._dry_run(tmp_path, '--reify-root', str(tmp_path / 'my-reify'))
+
+        assert result.exit_code == 0, result.output
+        assert f'reify checkout {tmp_path / "my-reify"} not found' in result.output
