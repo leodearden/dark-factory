@@ -254,7 +254,7 @@ dispatched agent shell (task 8274's worktree) on host leo-MS-7C35. The journal w
 | 2. watchdog restart-rate sampling, `--report RESTARTS` | every WATCHED unit has an entry with `sampling_since` ≤ window start and a last sample ≤ ~3 min old; the watchdog timer ran across the whole window with no gap far above its 60 s tick; `--report` prints `RESTARTS` for every running unit. (δ keeps only the last 1800 s of samples by design, so §6's "≥ 7 days of samples" is read as `sampling_since` plus timer continuity.) | 7/7 WATCHED units present, each with `sampling_since` 2026-11-11T17:55:04Z and a last sample 2 s old (30 samples, all NRestarts 0). 10 095 timer ticks in the window, median gap 60.2 s, largest 120.4 s (one missed tick). `RESTARTS` printed for 9/9 running units, all `0/success`. Not sampled: scoping-intake and stream-touch, which are not in WATCHED | **PASS**. The WATCHED gap is owned by pending tasks 9321 and 9815 |
 | 3. crash-loop pages | each in-window `orchestrator-crash-loop-*` or `orchestrator-startup-crash-loop` record matches a journal `Scheduled restart job` burst (≥ 5 within 1800 s, or `start-limit-hit`; ≥ 3 consecutive startup crashes for γ's page). Conversely, every such burst has a record | 0 records in the window across the 9 hosted queues. 0 `Scheduled restart job` lines and 0 start-limit hits on all 9 units. 0 `startup_crash:*` rows in all 9 runs.db | **no episode, detector unexercised**: no false page, no missed page |
 | 4. startup-step L1s | list each in-window `orchestrator-startup-<step>` L1 with its `dedupe_count`, and say whether it names a real fault | 0 L1s in the window across the 9 queues. 0 `startup_step_failed` events in the window in all 9 runs.db | **no step failure in the window, runner's failure path unexercised** |
-| 5. merge-lane cost per restart | _pending in this commit_ | _pending in this commit_ | _pending in this commit_ |
+| 5. merge-lane cost per restart | per restart, at most one `MERGE_WORKER_SHUTDOWN_REASON` burst, with events = distinct request_ids; no burst from a `startup_crash:*` run and none per crash iteration; every burst attributable to one sweep or one deliberate restart | 6 fleet-sweep waves in the window, ζ's included. dark-factory: 4 bursts, 57 / 52 / 66 / 33 events. reify: 5 bursts, 2 / 3 / 6 / 4 / 6 events. Every burst lasts < 1 s and has events = distinct request_ids. 0 `startup_crash:*` runs. 3 run ends were SIGKILLed and emitted no burst | **PASS** |
 
 **Item 1 evidence** (measured 2026-11-22T11:19–11:26Z). The query was `SELECT run_id, started_at, completed_at,
 startup_completed_at, exit_reason, code_sha FROM runs WHERE started_at >= '2026-11-15T10:24:00' ORDER BY
@@ -357,3 +357,51 @@ started_at`, run on each project's `data/orchestrator/runs.db`.
   event_type='startup_step_failed' AND timestamp >= '2026-11-15T10:24:00'` returns 0 rows everywhere. The
   all-time counts are 1 each in autopilot-video, dark-factory, know-live and pump-web-ui, all on 2026-11-10 (the
   2c3 fault above), and 0 elsewhere.
+
+**Item 5 evidence** (measured 2026-11-22T11:34–11:45Z).
+
+- The query, on both runs.db: `SELECT run_id, timestamp, task_id, data FROM events WHERE
+  event_type='merge_finalized' AND timestamp >= '2026-11-15T10:24:00' AND json_extract(data,'$.reason') =
+  'Merge worker shutting down'`. The literal is
+  `orchestrator/src/orchestrator/merge_lane/intake_buffers.py::MERGE_WORKER_SHUTDOWN_REASON`. Events are
+  bucketed by event timestamp, so reify's pre-window run ac72adcd8509, which ζ's sweep stopped, is counted.
+  This gives 208 events in dark-factory and 21 in reify, all `state='blocked'`.
+- Restart waves. Each wave stopped all 9 units once, in the same unit order (autopilot-video, know-live,
+  my-solar-challenge, pump-web-ui, reify, scoping-intake, solar-challenge-platform, stream-touch,
+  dark-factory), and every unit has exactly those 6 `Stopping` lines in the window. In the table, "sweep"
+  means `scripts/restart-all-orchestrators.sh`. The wave identification is:
+  - W1, 2026-11-15T10:24–11:00Z: ζ's `--drain` sweep (esc-8273-1).
+  - W2, 11-17T05:51–07:13Z: a sweep, journal identifier `restart-all-orchestrators.sh[1819989]`, which ended
+    "All 9 orchestrator unit(s) restarted and verified fresh".
+  - W3, 11-17T19:40–20:48Z and W4, 11-18T17:30–18:34Z: the same order and pacing, but the driver's own lines
+    are not in the journal under the identifiers searched (`restart-all-orchestrators.sh`, `sh`, `bash`). So
+    the driver is unidentified, though the shape is a fleet sweep.
+  - W5, 11-19T02:28–04:25Z: a sweep, `sh[3752634]`, which ended "All 9 … verified fresh".
+  - W6, 11-21T00:16–01:33Z: unit `orch-redeploy-restart-10802` ran `restart-all-orchestrators.sh --drain`
+    (`sh[4182317]`). It is the sweep that `data/orchestrator/last_redeploy_orchestrator.json` records
+    (2026-11-21T01:33:38Z).
+
+  | project | run_id | burst at (UTC) | events | distinct requests | cause |
+  |---|---|---|---|---|---|
+  | reify | run-ac72adcd8509 | 2026-11-15 10:37:25.16–.19 | 2 | 2 | W1, ζ's sweep |
+  | dark-factory | run-0dac71f2fe0f | none | 0 | 0 | W1, ζ's sweep; SIGKILLed at 11:00:19 (stop-sigterm) |
+  | reify | run-579bc7a3e1c9 | 2026-11-17 06:48:24.81–.87 | 3 | 3 | W2 sweep |
+  | dark-factory | run-64d39f3b97db | none | 0 | 0 | W2 sweep; SIGKILLed at 07:13:42 (stop-sigterm) |
+  | reify | run-bd31446a3fb5 | 2026-11-17 20:14:46.67–.80 | 6 | 6 | W3, fleet sweep (driver not journaled) |
+  | dark-factory | run-fc741c6ac05d | 2026-11-17 20:48:47.48–.99 | 57 | 57 | W3, fleet sweep (driver not journaled) |
+  | reify | run-3fc27174c232 | 2026-11-18 18:17:31.11–.13 | 4 | 4 | W4, fleet sweep (driver not journaled) |
+  | dark-factory | run-7c108b742770 | 2026-11-18 18:34:20.87–21.08 | 52 | 52 (49 tasks) | W4, fleet sweep (driver not journaled) |
+  | reify | run-d774a0682070 | 2026-11-19 03:24:46.54–.58 | 6 | 6 | W5 sweep |
+  | dark-factory | run-9a6d5c55b0a4 | 2026-11-19 04:25:34.69–35.21 | 66 | 66 | W5 sweep |
+  | reify | run-7dfa13be7c9b | none | 0 | 0 | W6 `--drain` sweep; SIGKILLed at 01:28:32 (stop-sigterm) |
+  | dark-factory | run-c1a1cfef15e7 | 2026-11-21 01:33:19.61–20.39 | 33 | 33 | W6 `--drain` sweep |
+
+- Per restart: at most one burst, and none spans more than 0.8 s. No event count exceeds its distinct
+  `request_id` count, so no request was resolved twice. In run-7c108b742770, 3 tasks each had two distinct
+  requests in the queue.
+- Per run: every burst comes from a run with `exit_reason='cancelled'`, or, for ac72adcd8509, from a run
+  that started before the window. No run in the window has `exit_reason` `startup_crash:*`, so there is no
+  crash-iteration burst.
+- Cost per sweep, as burst size (the queued entries resolved as blocked). dark-factory: 0 / 0 / 57 / 52 / 66 /
+  33. reify: 2 / 3 / 6 / 4 / 6 / 0. The three zeros at a SIGKILLed run end are not cheap stops: the SIGKILL
+  skipped `SpeculativeMergeWorker.stop()`, which is the same 90 s stop-sigterm bound as item 1 (task 7247).
