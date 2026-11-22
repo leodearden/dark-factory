@@ -3,12 +3,15 @@
 
 The header, then a Host block, then six sections in the order the task
 mandates. The header states the generation stamp, the window, the queues
-scanned, the project roots measured and where that list came from (with every
-scanned queue outside them), the preparation's freshness, the preparer trial,
-and the sitting trigger evaluator's last run (``sitting.trigger_state``). The
-Host block lists every pending record a host filer raised
-(``authority.HOST_FILER_ROLES``), whatever its level, before anything else.
-Section 1 is the prepare-sitting brief, always recommend-only, rendered by
+scanned, the project roots measured, the preparation's freshness, the preparer
+trial, and the sitting trigger evaluator's last run (``sitting.trigger_state``).
+The roots measured are the roots of the queues scanned (each configured
+root's own queues and every queue the decision registry recorded), then each
+configured root holding no queue. The header names where the configured list
+came from, those queue-less configured roots, and every scanned queue of no
+known shape, which no root holds. The Host block lists every pending record a
+host filer raised (``authority.HOST_FILER_ROLES``), whatever its level, before
+anything else. Section 1 is the prepare-sitting brief, always recommend-only, rendered by
 ``brief.render_brief`` so one numbered-entry renderer serves both documents,
 followed by the "Unanswered since" list: each numbered item, oldest first,
 with the stamp its ledger entry was first presented at. Sections 2-6, the Host
@@ -60,7 +63,7 @@ from orchestrator.fleet_files import fleet_root
 from orchestrator.session_records import sessions_dir
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots
 from shared.safe_io import atomic_write_text
-from sitting import audits, brief, fleet_state, prepare_sitting, trigger_state
+from sitting import audits, brief, fleet_state, inventory, prepare_sitting, trigger_state
 from sitting import ledger as ledgers
 from sitting.audits import AuditDraw, ExecutorClose
 from sitting.fleet_state import (
@@ -81,7 +84,6 @@ from sitting.inventory import (
     audit_key,
     key_str,
     parse_stamp,
-    queue_project_root,
 )
 from sitting.prepare_sitting import Sitting
 from sitting.trigger_state import TriggerLastRun
@@ -124,10 +126,11 @@ class PreparationFreshness:
 
 @dataclass(frozen=True)
 class RootsStatement:
-    """The project roots the per-project sections measured, where that list came from, and each queue outside them."""
+    """The roots the per-project sections measured, the configured list's source, and the queues no root holds."""
 
     roots: tuple[str, ...]
     source: str
+    configured_only: tuple[str, ...]
     outside: tuple[str, ...]
 
 
@@ -189,15 +192,16 @@ def build(
     )
     if audit_draw.ok:
         sitting = replace(sitting, ledger=_number_audits(sitting.ledger, audit_draw.value, now))
+    roots = _measured_roots(project_roots, roots_source, sources.queues_scanned)
     return ReturnBriefDocument(
         generated_at=now.isoformat(),
         window=window,
-        roots=_roots_statement(project_roots, roots_source, sources.queues_scanned),
+        roots=roots,
         trigger=_read_trigger(trigger_state_path),
         host_alarms=fleet_state.host_alarms(sources.inventory.pending, now=now),
         sitting=sitting,
         preparation=_freshness(sources, sitting),
-        projects=fleet_state.measure_projects(project_roots, sources.inventory.pending, window=window, now=now,
+        projects=fleet_state.measure_projects(roots.roots, sources.inventory.pending, window=window, now=now,
                                               units=units),
         closes=fleet_state.unreadable_if_raises(
             'decision_registry', str(decisions_dir(decisions_root)), AutonomousCloses((), (), 0),
@@ -268,10 +272,24 @@ def _roots_source(command_line_roots: Sequence[str] | None) -> str:
     return KNOWN_PROJECT_ROOTS_ENV if known_project_roots() else 'default'
 
 
-def _roots_statement(project_roots: Sequence[str], source: str, queues_scanned: Sequence[str]) -> RootsStatement:
-    measured = {Path(root).resolve() for root in project_roots}
-    outside = tuple(queue for queue in queues_scanned if queue_project_root(queue) not in measured)
-    return RootsStatement(tuple(project_roots), source, outside)
+def _measured_roots(configured: Sequence[str], source: str, queues_scanned: Sequence[str]) -> RootsStatement:
+    """Each root holding a scanned queue in scan order, then each configured root holding none, deduped by path.
+
+    Deduping by path, not by project token, keeps a second root folding to a
+    measured project in the list, so ``measure_projects`` states it as a fold
+    collision rather than one silently replacing the other.
+    """
+    queue_roots = dict.fromkeys(
+        root for queue in queues_scanned if (root := inventory.queue_project_root(queue)) is not None
+    )
+    configured_only: dict[Path, str] = {}
+    for root in configured:
+        resolved = Path(root).resolve()
+        if resolved not in queue_roots:
+            configured_only.setdefault(resolved, root)
+    outside = tuple(queue for queue in queues_scanned if inventory.queue_project_root(queue) is None)
+    held_none = tuple(configured_only.values())
+    return RootsStatement((*map(str, queue_roots), *held_none), source, held_none, outside)
 
 
 def _read_trigger(path: Path) -> TriggerReading:
@@ -347,7 +365,9 @@ def _header(document: ReturnBriefDocument) -> str:
         f'- generated_at: {document.generated_at}',
         f'- window: {window.start.isoformat()} to {window.end.isoformat()}',
         f'- queues scanned: {", ".join(document.sitting.queues_scanned) or "none"}',
-        f'- project roots (source: {document.roots.source}): {", ".join(document.roots.roots) or "none"}',
+        ('- project roots (every root holding a scanned queue, then configured roots holding none; '
+         f'configured list source: {document.roots.source}): {", ".join(document.roots.roots) or "none"}'),
+        f'- configured roots holding no scanned queue: {", ".join(document.roots.configured_only) or "none"}',
         f'- queues scanned outside those roots: {", ".join(document.roots.outside) or "none"}',
         f'- preparation: {_freshness_text(document.preparation, document.generated_at)}',
         '- preparer trial (recommend-only; agreement counts Leo choosing the recommended option):',
