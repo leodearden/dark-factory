@@ -43,25 +43,30 @@ class _Clock:
         return self.now
 
 
-def _set_tasks(w: ParkWorld, tasks: list[dict]) -> None:
-    w.scheduler.get_tasks = AsyncMock(return_value=tasks)
+class _TaskList:
+    """The task list the test owns; the scheduler's ``get_tasks`` returns a copy of it."""
 
+    def __init__(self, world: ParkWorld) -> None:
+        self.rows: list[dict] = []
+        self._lock_table = world.scheduler.lock_table
+        world.scheduler.get_tasks = AsyncMock(side_effect=lambda *args, **kwargs: list(self.rows))
 
-def _tasks(w: ParkWorld) -> list[dict]:
-    return w.scheduler.get_tasks.return_value  # type: ignore[attr-defined]
+    def set(self, rows: list[dict]) -> None:
+        self.rows[:] = rows
 
+    def hold(self, holder: str, module: str) -> None:
+        """*holder* takes *module* and joins the task list as in-progress."""
+        assert self._lock_table.try_acquire(holder, [module])
+        self.rows.append(make_task(holder, 'low', [module], status='in-progress'))
 
-def _hold(w: ParkWorld, holder: str, module: str) -> None:
-    """*holder* takes *module* and joins the task list as in-progress."""
-    assert w.scheduler.lock_table.try_acquire(holder, [module])
-    _set_tasks(w, [*_tasks(w), make_task(holder, 'low', [module], status='in-progress')])
+    def drop(self, *task_ids: str) -> None:
+        """Release each task's locks and remove it from the task list."""
+        for tid in task_ids:
+            self._lock_table.release(tid)
+        self.rows[:] = [t for t in self.rows if t['id'] not in task_ids]
 
-
-def _drop(w: ParkWorld, *task_ids: str) -> None:
-    """Release each task's locks and remove it from the task list."""
-    for tid in task_ids:
-        w.scheduler.lock_table.release(tid)
-    _set_tasks(w, [t for t in _tasks(w) if t['id'] not in task_ids])
+    def add(self, *rows: dict) -> None:
+        self.rows.extend(rows)
 
 
 def _peer_tasks(b_tier: str = 'critical') -> list[dict]:
@@ -72,13 +77,16 @@ def _peer_tasks(b_tier: str = 'critical') -> list[dict]:
     ]
 
 
-def _peer_park_world(tmp_path, clock: _Clock, *, b_tier: str = 'critical') -> ParkWorld:
+def _peer_park_world(
+    tmp_path, clock: _Clock, *, b_tier: str = 'critical',
+) -> tuple[ParkWorld, _TaskList]:
     """The incident: B waits on A's same-tier park on x, and A waits on H's hold of z."""
     w = park_world(tmp_path, time_source=clock)
     assert w.scheduler.lock_table.try_acquire(H, ['z.py'])
     w.scheduler.lock_table.install_parks(A, ['x.py', 'z.py'], 'critical')
-    _set_tasks(w, _peer_tasks(b_tier))
-    return w
+    tasks = _TaskList(w)
+    tasks.set(_peer_tasks(b_tier))
+    return w, tasks
 
 
 def _interval(w: ParkWorld) -> float:
@@ -121,7 +129,7 @@ async def _idle_ticks(w: ParkWorld, clock: _Clock, *, count: int, step: float) -
 @pytest.mark.asyncio
 async def test_6040_replay_peer_park_is_named_and_the_pin_lever_dispatches_b(tmp_path):
     clock = _Clock()
-    w = _peer_park_world(tmp_path, clock)
+    w, _ = _peer_park_world(tmp_path, clock)
     lock_table = w.scheduler.lock_table
 
     def assert_h_and_a_keep_z() -> None:
@@ -168,7 +176,7 @@ async def test_6040_replay_peer_park_is_named_and_the_pin_lever_dispatches_b(tmp
 @pytest.mark.asyncio
 async def test_park_refused_repeats_once_per_interval(tmp_path):
     clock = _Clock()
-    w = _peer_park_world(tmp_path, clock)
+    w, _ = _peer_park_world(tmp_path, clock)
     interval = _interval(w)
     assert await w.scheduler.acquire_next() is None
     clock.now += interval
@@ -200,7 +208,7 @@ async def test_a_lower_tier_park_blocking_a_critical_candidate_is_named(tmp_path
     assert lock_table.try_acquire(H2, ['q.py'])
     lock_table.install_parks(A, ['w.py', 'z.py'], 'critical')
     lock_table.install_parks(L, ['x.py'], 'medium')
-    _set_tasks(w, [
+    _TaskList(w).set([
         make_task(A, 'critical', ['w.py', 'z.py']),
         make_task(B, 'critical', ['x.py', 'y.py']),
         make_task(L, 'medium', ['x.py', 'q.py']),
@@ -227,7 +235,7 @@ async def test_a_lower_tier_park_blocking_a_critical_candidate_is_named(tmp_path
 @pytest.mark.asyncio
 async def test_a_higher_tier_park_never_emits(tmp_path):
     clock = _Clock()
-    w = _peer_park_world(tmp_path, clock, b_tier='high')
+    w, _ = _peer_park_world(tmp_path, clock, b_tier='high')
 
     await _idle_ticks(w, clock, count=4, step=_interval(w))
 
@@ -237,8 +245,8 @@ async def test_a_higher_tier_park_never_emits(tmp_path):
 @pytest.mark.asyncio
 async def test_a_held_blocker_suppresses_park_refused(tmp_path):
     clock = _Clock()
-    w = _peer_park_world(tmp_path, clock)
-    _hold(w, H2, 'y.py')
+    w, tasks = _peer_park_world(tmp_path, clock)
+    tasks.hold(H2, 'y.py')
 
     await _idle_ticks(w, clock, count=4, step=_interval(w))
 
@@ -251,7 +259,7 @@ async def test_a_pin_reservation_blocker_suppresses_park_refused(tmp_path):
     w = park_world(tmp_path, pinned=(P,), time_source=clock)
     assert w.scheduler.lock_table.try_acquire(H, ['z.py'])
     assert w.scheduler.lock_table.try_acquire(H2, ['q.py'])
-    _set_tasks(w, [
+    _TaskList(w).set([
         make_task(A, 'critical', ['x.py', 'z.py']),
         make_task(B, 'critical', ['x.py', 'y.py']),
         make_task(P, 'low', ['x.py', 'q.py']),
@@ -273,15 +281,15 @@ async def test_a_pin_reservation_blocker_suppresses_park_refused(tmp_path):
 @pytest.mark.asyncio
 async def test_a_held_refusal_ends_the_episode(tmp_path):
     clock = _Clock()
-    w = _peer_park_world(tmp_path, clock)
+    w, tasks = _peer_park_world(tmp_path, clock)
     interval = _interval(w)
     t0 = clock.now
     assert await w.scheduler.acquire_next() is None
 
     clock.now = t0 + interval / 2
-    _hold(w, H2, 'y.py')
+    tasks.hold(H2, 'y.py')
     assert await w.scheduler.acquire_next() is None
-    _drop(w, H2)
+    tasks.drop(H2)
 
     clock.now = t0 + interval
     assert await w.scheduler.acquire_next() is None
@@ -299,18 +307,18 @@ async def test_a_held_refusal_ends_the_episode(tmp_path):
 @pytest.mark.asyncio
 async def test_dispatch_ends_the_episode(tmp_path):
     clock = _Clock()
-    w = _peer_park_world(tmp_path, clock)
+    w, tasks = _peer_park_world(tmp_path, clock)
     interval = _interval(w)
     t0 = clock.now
     assert await w.scheduler.acquire_next() is None
 
     clock.now = t0 + interval / 2
-    _set_tasks(w, [t for t in _peer_tasks() if t['id'] != A])
+    tasks.set([t for t in _peer_tasks() if t['id'] != A])
     result = await w.scheduler.acquire_next()
     assert result is not None and result.task_id == B, "premise: A's park expired and B dispatched"
 
     w.scheduler.release(B)
-    _set_tasks(w, _peer_tasks())
+    tasks.set(_peer_tasks())
     w.scheduler.lock_table.install_parks(A, ['x.py', 'z.py'], 'critical')
 
     clock.now = t0 + interval
@@ -337,10 +345,10 @@ def _fix_task(tid: str, files: list[str]) -> dict:
 async def test_a_scoped_tick_keeps_the_episode(tmp_path, admitted_fix):
     """A MAIN_HEALTH_FIX tick (task 8480) filters the candidates; it must not end other episodes."""
     clock = _Clock()
-    w = _peer_park_world(tmp_path, clock)
+    w, tasks = _peer_park_world(tmp_path, clock)
     if admitted_fix:
-        _hold(w, H2, 'f.py')
-        _set_tasks(w, [*_tasks(w), _fix_task(F, ['f.py'])])
+        tasks.hold(H2, 'f.py')
+        tasks.add(_fix_task(F, ['f.py']))
     interval = _interval(w)
     t0 = clock.now
     assert await w.scheduler.acquire_next() is None
