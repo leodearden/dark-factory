@@ -757,3 +757,94 @@ class TestTheCostBlock:
         assert window['share'] == [pytest.approx(weekly / 280.0), pytest.approx(weekly / 470.0)]
         assert window['tag'] == 'inferred'
         assert cost['prices']['as_of'] == pricing.LIST_PRICES_AS_OF
+
+
+# --------------------------------------------------------------------------- #
+# report.json
+# --------------------------------------------------------------------------- #
+
+
+class TestTheReport:
+    def test_a_site_block_carries_each_arms_client_counts_n_failures_and_decision(self) -> None:
+        runs = _agreeing_with_failures(ROUTER, 1)
+        decision = score.routing_label_decision(runs, {})
+        block = score.site_block(runs, decision)
+        assert block['arms'][CONTROL] == {
+            **CLIENTS[CONTROL], 'replayed': 50, 'failed': 0,
+            'tokens': {ROUTER: {'input_tokens': 5000, 'output_tokens': 500, 'llm_calls': 50}},
+        }
+        assert (block['arms'][LUNA]['model'], block['arms'][LUNA]['replayed'], block['arms'][LUNA]['failed']) == (
+            'gpt-6-luna', 49, 1)
+        assert block['n'] == 49
+        assert block['failures'] == decision['statistics']['failures']
+        assert block['decision'] == decision
+
+    def test_an_arm_on_two_models_is_refused(self) -> None:
+        runs = _labelled(ROUTER, {'1': ('temporal', 'temporal'), '2': ('temporal', 'temporal')})
+        runs[-1] = runs[-1] | {'model': 'gpt-6.1-sol'}
+        with pytest.raises(score.RunFileError):
+            score.site_block(runs, _decision(True))
+
+    def test_the_report_echoes_the_frame_by_sha256_and_assembles_its_parts(self) -> None:
+        frame_text = json.dumps(EXTRACTION_FRAME)
+        runs = _labelled(ROUTER, {'1': ('temporal', 'temporal')})
+        sites = {ROUTER: score.site_block(runs, score.routing_label_decision(runs, {}))}
+        layer = score.routing_layer_decision(_decision(True), sites[ROUTER]['decision'])
+        cost = score.cost_block(runs, {ROUTER: 10.0}, (280.0, 470.0))
+        records, verdicts = _extraction_replay()
+        report = score.build_report(frame_text=frame_text, extraction_replay=records, extraction_verdicts=verdicts,
+                                    sites=sites, routing_layer=layer, cost=cost)
+        assert report == {
+            'sample': {'frame_sha256': hashlib.sha256(frame_text.encode()).hexdigest()},
+            'extraction': score.score_extraction(records, verdicts, EXTRACTION_FRAME),
+            'sites': sites, 'routing_layer': layer, 'cost': cost,
+        }
+        json.dumps(report)
+
+
+TEMPORAL = 'temporal_facts'
+EXTRACTION_DEFINITION = audit.SampleDefinition(
+    window_start='2026-08-01T00:00:00Z', window_end='2026-08-11T00:00:00Z', cap=3, strata=(TEMPORAL,),
+)
+EXTRACTION_FRAME = {
+    'sample': {'definition': EXTRACTION_DEFINITION.to_dict(), 'window_days': 10.0,
+               'sizes': {'dark_factory': {TEMPORAL: {'minted': 0, 'corroborated': 0, 'episodes': 2}}}},
+    'strata': {'dark_factory': {TEMPORAL: {'window_population': 20}}},
+}
+EXTRACTION_LABELS = {
+    CONTROL: {'ep1': ('holding', 'overreach'), 'ep2': ('holding', 'context')},
+    LUNA: {'ep1': ('holding',), 'ep2': ('holding', 'holding')},
+}
+
+
+def _extraction_replay() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Both arms replayed over a two-episode frame, and one verdict per minted edge."""
+    records, verdicts = [], []
+    for arm, by_episode in EXTRACTION_LABELS.items():
+        for episode, labels in by_episode.items():
+            minted = [{'edge_uuid': f'{arm}-{episode}-{i}', 'fact': f'fact {i}', 'source_name': 'S',
+                       'target_name': 'T'} for i in range(len(labels))]
+            records.append({
+                'kind': 'replayed', 'arm': arm, **CLIENTS[arm], 'instructions_version': 'none',
+                'graph': 'dark_factory', 'uuid': episode, 'stratum': TEMPORAL, 'previous_count': 0,
+                'entities': ['S', 'T'], 'minted': minted,
+                'tokens': {'extract_nodes': {'input_tokens': 10, 'output_tokens': 1, 'llm_calls': 1}},
+            })
+            verdicts.extend({'graph': 'dark_factory', 'episode_uuid': episode, 'edge_uuid': edge['edge_uuid'],
+                             'fact': edge['fact'], 'label': label, 'rationale': 'quotes the span'}
+                            for edge, label in zip(minted, labels, strict=True))
+    return records, {'sample': EXTRACTION_DEFINITION.to_dict(), 'verdicts': verdicts}
+
+
+class TestTheExtractionLeg:
+    def test_each_candidate_is_judged_by_e1_and_e2_through_the_replays_own_score(self) -> None:
+        records, verdicts = _extraction_replay()
+        scored = score.score_extraction(records, verdicts, EXTRACTION_FRAME)
+        arms = scored['arms']
+        assert scored['comparison'] == {
+            LUNA: score.extraction_noninferiority(
+                arms[CONTROL]['population_weighted'], arms[LUNA]['population_weighted']),
+        }
+        assert set(scored['comparison'][LUNA]['checks']) == {
+            'E1_overreach_upper_within_margin', 'E2_retains_holdings'}
+        assert arms[LUNA]['rates'][TEMPORAL]['label_counts']['holding'] == 3

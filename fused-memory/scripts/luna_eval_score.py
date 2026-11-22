@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Judge each call site of task 9945's luna migration eval against its pre-registered bar.
+"""Score task 9945's luna migration eval: blind worksheets, fail-closed verdict files, each call
+site's decision against its pre-registered bar, cost, and report.json.
 
 This module is the single code home of those bars: design.md §2 cites the
 constants below by name. Every site judges one candidate arm against the
@@ -11,17 +12,26 @@ replay_overreach_extraction.score_replay hands them to its ``decide``.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import sys
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audit_ruling_overreach import WILSON_Z
-from replay_overreach_extraction import CONTROL, HOLDING_RETENTION_MIN, RecordKind
+from replay_overreach_extraction import (
+    CONTROL,
+    HOLDING_RETENTION_MIN,
+    RecordKind,
+    score_replay,
+    token_totals,
+)
+from score_write_triage_pairs import LIST_PRICES, LIST_PRICES_AS_OF, LIST_PRICES_SOURCE
 
 # --------------------------------------------------------------------------- #
 # The pre-registered bars (design.md §2), every one inclusive
@@ -139,6 +149,26 @@ class VerdictError(ValueError):
         self.items: tuple[str, ...] = tuple(sorted(set(items)))
 
 
+class MalformedVerdicts(VerdictError):
+    pass
+
+
+class UnknownLabel(VerdictError):
+    pass
+
+
+class MissingRationale(VerdictError):
+    pass
+
+
+class DuplicateVerdict(VerdictError):
+    pass
+
+
+class OutOfSampleVerdict(VerdictError):
+    pass
+
+
 class MissingVerdicts(VerdictError):
     pass
 
@@ -154,6 +184,7 @@ Pair = tuple[str, RunRecord, RunRecord]
 class SiteRuns:
     """One site's run records: each arm's run lines by fixture, and the fixtures each arm failed."""
 
+    site: str
     candidate: str
     """The one arm other than the control."""
     replayed: Mapping[str, Mapping[str, RunRecord]]
@@ -189,7 +220,7 @@ class SiteRuns:
             if missing := sorted(fixtures - covered[arm]):
                 raise RunFileError(f'arm {arm} holds no line for fixture(s) {missing}')
         return cls(
-            candidate=candidate, replayed=replayed,
+            site=sites.pop(), candidate=candidate, replayed=replayed,
             failed={arm: frozenset(ids) for arm, ids in failed.items()}, fixtures=fixtures,
         )
 
@@ -227,9 +258,13 @@ def _decision(
     }
 
 
-def _refuse_missing(what: str, items: Sequence[str]) -> None:
+def _reject(error: type[VerdictError], items: Sequence[str], problem: str) -> None:
     if items:
-        raise MissingVerdicts(f'{len(items)} {what}: {sorted(items)}', items)
+        raise error(f'{len(set(items))} {problem}: {sorted(set(items))}', items)
+
+
+def _refuse_missing(what: str, items: Sequence[str]) -> None:
+    _reject(MissingVerdicts, items, what)
 
 
 # --------------------------------------------------------------------------- #
@@ -366,3 +401,333 @@ def routing_layer_decision(classifier: Mapping[str, Any], router: Mapping[str, A
     """The classifier and the router share the routing.model leaf, so they flip together or not at all."""
     checks = {'C1_classifier_label_accuracy': classifier['passes'], 'Q1_router_label_accuracy': router['passes']}
     return {'checks': checks, 'passes': all(checks.values())}
+
+
+# --------------------------------------------------------------------------- #
+# Blind worksheets: no arm, model or endpoint is ever named
+# --------------------------------------------------------------------------- #
+
+
+def _sha256_order(fixture_id: str, values: Iterable[str]) -> list[str]:
+    return sorted(values, key=lambda value: hashlib.sha256(f'{fixture_id}:{value}'.encode()).hexdigest())
+
+
+def _fact(edge: Mapping[str, Any]) -> dict[str, str]:
+    return {'uuid': edge['uuid'], 'fact': edge['fact']}
+
+
+def resolve_gold_worksheet(fixtures: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """One row per resolve_edge fixture, by fixture id: the new fact and its candidates, read from the
+    fixture alone, so gold is labelled before any arm's output exists in view."""
+    return [
+        {
+            'fixture_id': fid, 'fact': fixture['fact'],
+            'related': [_fact(edge) for edge in fixture['related']],
+            'invalidation_candidates': [_fact(edge) for edge in fixture['invalidation_candidates']],
+        }
+        for fid, fixture in fixtures.items()
+    ]
+
+
+SUMMARY_LETTERS = ('A', 'B')
+
+
+def summary_rating_worksheet(
+    fixtures: Mapping[str, Mapping[str, Any]], runs: Iterable[RunRecord],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """The rating rows and, separately, their key.
+
+    Each row is one summary item with its inputs and both arms' summaries as A and B:
+    the arm whose sha256(fixture_id:arm) sorts first is A. *fixtures* are run_summaries'
+    restored fixtures by fixture id, each with its ``previous`` episode contents. An empty
+    summary shows as None, a node the arm dropped. The key maps each item's letters to arms
+    and is written apart from the rows.
+    """
+    site_runs = SiteRuns.from_records(runs)
+    by_fixture = {fid: dict(zip(site_runs.arms, (control, candidate), strict=True))
+                  for fid, control, candidate in site_runs.pairs()}
+    rows: list[dict[str, Any]] = []
+    key: list[dict[str, str]] = []
+    for fid, node_uuid in summary_items(site_runs):
+        fixture, letters = fixtures[fid], dict(zip(SUMMARY_LETTERS, _sha256_order(fid, site_runs.arms), strict=True))
+        node = {node['node_uuid']: node for node in fixture['nodes']}[node_uuid]
+        rows.append({
+            'fixture_id': fid, 'node_uuid': node_uuid, 'node_name': node['node_name'],
+            'previous_summary': node['summary'], 'episode_content': fixture['episode_content'],
+            'previous_episodes': list(fixture['previous']),
+            'facts': [edge['fact'] for edge in fixture['edges']
+                      if node_uuid in (edge['source_node_uuid'], edge['target_node_uuid'])],
+            'summaries': {
+                letter: by_fixture[fid][arm]['summaries'].get(node_uuid) or None for letter, arm in letters.items()
+            },
+        })
+        key.append({'fixture_id': fid, 'node_uuid': node_uuid, **letters})
+    return rows, key
+
+
+def routing_discordant_worksheet(
+    fixtures: Mapping[str, str], runs: Iterable[RunRecord], vocabulary: Sequence[str],
+) -> list[dict[str, Any]]:
+    """One row per item the two arms labelled differently: its text, from *fixtures* by fixture id,
+    both labels unattributed in sha256(fixture_id:label) order, and the site's whole *vocabulary*."""
+    site_runs = SiteRuns.from_records(runs)
+    return [
+        {
+            'site': site_runs.site, 'fixture_id': fid, 'text': fixtures[fid],
+            'labels': _sha256_order(fid, {control['label'], candidate['label']}), 'vocabulary': list(vocabulary),
+        }
+        for fid, control, candidate in site_runs.pairs() if control['label'] != candidate['label']
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Verdict files: refused whole, naming each offender
+# --------------------------------------------------------------------------- #
+
+FieldCheck = Callable[[Any], bool]
+
+
+def _is_text(value: Any) -> bool:
+    return isinstance(value, str)
+
+
+def _is_texts(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _is_flag(value: Any) -> bool:
+    return isinstance(value, bool)
+
+
+def _shaped_entries(obj: Any, field: str, shape: Mapping[str, FieldCheck]) -> list[Mapping[str, Any]]:
+    if not isinstance(obj, Mapping) or not isinstance(obj.get(field), list):
+        raise MalformedVerdicts(f"this verdict file is {{'{field}': [...]}}")
+    entries = obj[field]
+    bad = [entry for entry in entries
+           if not isinstance(entry, Mapping) or not all(check(entry.get(name)) for name, check in shape.items())]
+    if bad:
+        raise MalformedVerdicts(f'{len(bad)} entr(ies) lack the fields {sorted(shape)}: {bad!r}')
+    return entries
+
+
+def _checked(
+    entries: Sequence[Mapping[str, Any]], identity: Callable[[Mapping[str, Any]], str],
+    offered: Mapping[str, Any], known: Callable[[Mapping[str, Any], Any], bool],
+) -> list[Mapping[str, Any]]:
+    """*entries*, once each is offered, known against its worksheet row, reasoned and unique, and
+    every offered item is judged."""
+    ids = [identity(entry) for entry in entries]
+    _reject(OutOfSampleVerdict, [i for i in ids if i not in offered], "verdict(s) judge an item the worksheet did not offer")
+    _reject(UnknownLabel, [i for i, entry in zip(ids, entries, strict=True) if not known(entry, offered[i])],
+            'verdict(s) carry a label outside the worksheet vocabulary')
+    _reject(MissingRationale, [i for i, entry in zip(ids, entries, strict=True) if not entry['rationale'].strip()],
+            'verdict(s) lack a rationale')
+    counts = Counter(ids)
+    _reject(DuplicateVerdict, [i for i in ids if counts[i] > 1], 'item(s) are judged twice')
+    _reject(MissingVerdicts, [i for i in offered if i not in counts], 'offered item(s) have no verdict')
+    return list(entries)
+
+
+GOLD_SHAPE: Mapping[str, FieldCheck] = {
+    'fixture_id': _is_text, 'duplicates': _is_texts, 'contradicted': _is_texts, 'judgeable': _is_flag,
+    'rationale': _is_text,
+}
+
+
+def _gold_known(entry: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
+    """Duplicates are among the related edges, contradictions among every candidate, and an
+    unjudgeable fixture names neither."""
+    related = {edge['uuid'] for edge in row['related']}
+    candidates = related | {edge['uuid'] for edge in row['invalidation_candidates']}
+    if not entry['judgeable']:
+        return not entry['duplicates'] and not entry['contradicted']
+    return set(entry['duplicates']) <= related and set(entry['contradicted']) <= candidates
+
+
+def load_resolve_gold(obj: Any, worksheet: Sequence[Mapping[str, Any]]) -> dict[str, ResolveGold]:
+    """``{'gold': [{fixture_id, duplicates, contradicted, judgeable, rationale}]}`` over
+    resolve_gold_worksheet's rows, by fixture id."""
+    entries = _checked(
+        _shaped_entries(obj, 'gold', GOLD_SHAPE), lambda entry: entry['fixture_id'],
+        {row['fixture_id']: row for row in worksheet}, _gold_known,
+    )
+    return {
+        entry['fixture_id']: ResolveGold(
+            duplicates=frozenset(entry['duplicates']), contradicted=frozenset(entry['contradicted']),
+            judgeable=entry['judgeable'],
+        )
+        for entry in entries
+    }
+
+
+RATING_SHAPE: Mapping[str, FieldCheck] = {
+    'fixture_id': _is_text, 'node_uuid': _is_text, 'summary': _is_text, 'rating': _is_text, 'rationale': _is_text,
+}
+
+
+def _item_name(fixture_id: str, node_uuid: str) -> str:
+    return f'{fixture_id}/{node_uuid}'
+
+
+def _rated_name(entry: Mapping[str, Any]) -> str:
+    return f"{_item_name(entry['fixture_id'], entry['node_uuid'])}:{entry['summary']}"
+
+
+def load_summary_ratings(
+    obj: Any, worksheet: Sequence[Mapping[str, Any]], key: Sequence[Mapping[str, str]],
+) -> dict[SummaryItem, dict[str, str]]:
+    """``{'ratings': [{fixture_id, node_uuid, summary, rating, rationale}]}``, one per letter of every
+    worksheet row, unblinded through *key*: item -> arm -> rating."""
+    arms_by_item = {(entry['fixture_id'], entry['node_uuid']): entry for entry in key}
+    items = [(row['fixture_id'], row['node_uuid']) for row in worksheet]
+    if unkeyed := [_item_name(*item) for item in items if item not in arms_by_item]:
+        raise MalformedVerdicts(f'the key does not cover {len(unkeyed)} worksheet item(s): {sorted(unkeyed)}', unkeyed)
+    offered = {f'{_item_name(*item)}:{letter}': item for item in items for letter in SUMMARY_LETTERS}
+    entries = _checked(
+        _shaped_entries(obj, 'ratings', RATING_SHAPE), _rated_name, offered,
+        lambda entry, _: entry['rating'] in SUMMARY_RATINGS,
+    )
+    ratings: dict[SummaryItem, dict[str, str]] = {}
+    for entry in entries:
+        item = (entry['fixture_id'], entry['node_uuid'])
+        ratings.setdefault(item, {})[arms_by_item[item][entry['summary']]] = entry['rating']
+    return ratings
+
+
+ROUTING_SHAPE: Mapping[str, FieldCheck] = {
+    'site': _is_text, 'fixture_id': _is_text, 'label': _is_text, 'rationale': _is_text,
+}
+
+
+def _routing_name(entry: Mapping[str, Any]) -> str:
+    return f"{entry['site']}/{entry['fixture_id']}"
+
+
+def load_routing_verdicts(obj: Any, worksheet: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, str]]:
+    """``{'verdicts': [{site, fixture_id, label, rationale}]}`` over routing_discordant_worksheet's rows,
+    each label from its row's vocabulary, which may be neither arm's: site -> fixture id -> label."""
+    entries = _checked(
+        _shaped_entries(obj, 'verdicts', ROUTING_SHAPE), _routing_name,
+        {_routing_name(row): row for row in worksheet}, lambda entry, row: entry['label'] in row['vocabulary'],
+    )
+    gold: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        gold.setdefault(entry['site'], {})[entry['fixture_id']] = entry['label']
+    return gold
+
+
+# --------------------------------------------------------------------------- #
+# Cost: tokens per call, priced at list for comparison, and the plan-window share
+# --------------------------------------------------------------------------- #
+
+INFERRED = 'inferred'
+DAYS_PER_WEEK = 7
+
+
+def _arm_cost(records: Sequence[RunRecord], calls_per_day: float | None) -> dict[str, Any]:
+    model = _only_value(records, 'model')
+    totals = Counter[str]()
+    for record in records:
+        for usage in record['tokens'].values():
+            totals.update(usage)
+    calls = totals['llm_calls']
+    price = LIST_PRICES.get(model)
+    usd_per_call = None if price is None or not calls else price.usd(
+        totals['input_tokens'], totals['output_tokens']) / calls
+    return {
+        'model': model, 'calls': calls,
+        'input_tokens_per_call': round(totals['input_tokens'] / calls, 1) if calls else None,
+        'output_tokens_per_call': round(totals['output_tokens'] / calls, 1) if calls else None,
+        'usd_per_call': usd_per_call, 'calls_per_day': calls_per_day,
+        'daily_usd': None if usd_per_call is None or calls_per_day is None else usd_per_call * calls_per_day,
+    }
+
+
+def _only_value(records: Sequence[RunRecord], field: str) -> Any:
+    if len(values := {record[field] for record in records}) != 1:
+        raise RunFileError(f'one arm of one site holds records with {field} {sorted(map(str, values))}')
+    return values.pop()
+
+
+def cost_block(
+    runs: Iterable[RunRecord], calls_per_day: Mapping[str, float], window_usd_per_week: tuple[float, float],
+) -> dict[str, Any]:
+    """Each site's arms priced per call at LIST_PRICES, per day at the supplied *calls_per_day* per site,
+    and the candidate arms' weekly API-equivalent USD as a share of each end of *window_usd_per_week*.
+
+    The window is an inference, not a measurement, so its share is tagged so.
+    """
+    by_site: dict[str, dict[str, list[RunRecord]]] = {}
+    for record in runs:
+        if record.get('kind') == RecordKind.replayed:
+            by_site.setdefault(record['site'], {}).setdefault(record['arm'], []).append(record)
+    sites = {
+        site: {arm: _arm_cost(records, calls_per_day.get(site)) for arm, records in sorted(arms.items())}
+        for site, arms in sorted(by_site.items())
+    }
+    candidate_daily = [block['daily_usd'] for arms in sites.values() for arm, block in arms.items()
+                       if arm != CONTROL and block['daily_usd'] is not None]
+    weekly = DAYS_PER_WEEK * sum(candidate_daily)
+    models = sorted({block['model'] for arms in sites.values() for block in arms.values()})
+    return {
+        'prices': {
+            'as_of': LIST_PRICES_AS_OF, 'source': LIST_PRICES_SOURCE,
+            'usd_per_million_tokens': {
+                model: None if (price := LIST_PRICES.get(model)) is None
+                else {'input': price.usd_per_mtok_input, 'output': price.usd_per_mtok_output}
+                for model in models
+            },
+        },
+        'sites': sites,
+        'plan_window': {
+            'weekly_candidate_usd': weekly, 'window_usd_per_week': list(window_usd_per_week),
+            'share': [weekly / end for end in window_usd_per_week], 'tag': INFERRED,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# report.json: every number computed here
+# --------------------------------------------------------------------------- #
+
+
+def _arm_statistics(site_runs: SiteRuns, arm: str) -> dict[str, Any]:
+    replayed = list(site_runs.replayed[arm].values())
+    client = {field: _only_value(replayed, field) if replayed else None
+              for field in ('model', 'reasoning_effort', 'endpoint')}
+    return client | {
+        'replayed': len(replayed), 'failed': len(site_runs.failed[arm]), 'tokens': token_totals(replayed),
+    }
+
+
+def site_block(records: Iterable[RunRecord], decision: Mapping[str, Any]) -> dict[str, Any]:
+    """One site's report entry: each arm's client and counts, the paired n, the failures and *decision*."""
+    site_runs = SiteRuns.from_records(records)
+    return {
+        'arms': {arm: _arm_statistics(site_runs, arm) for arm in site_runs.arms},
+        'n': len(site_runs.pairs()),
+        'failures': site_runs.failures(),
+        'decision': dict(decision),
+    }
+
+
+def score_extraction(
+    replay_records: Sequence[Mapping[str, Any]], verdict_obj: Any, frame: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The extraction leg: replay_overreach_extraction's own score over *frame*, each arm judged by E1 and E2."""
+    return score_replay(replay_records, verdict_obj, frame, decide=extraction_noninferiority)
+
+
+def build_report(
+    *, frame_text: str, extraction_replay: Sequence[Mapping[str, Any]], extraction_verdicts: Any,
+    sites: Mapping[str, Mapping[str, Any]], routing_layer: Mapping[str, Any], cost: Mapping[str, Any],
+) -> dict[str, Any]:
+    """report.json: the frame.json *frame_text* echoed by its sha256, the extraction leg scored over it,
+    each site's site_block, the joint routing verdict, and cost."""
+    return {
+        'sample': {'frame_sha256': hashlib.sha256(frame_text.encode()).hexdigest()},
+        'extraction': score_extraction(extraction_replay, extraction_verdicts, json.loads(frame_text)),
+        'sites': dict(sites),
+        'routing_layer': dict(routing_layer),
+        'cost': dict(cost),
+    }
