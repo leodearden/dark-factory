@@ -35,6 +35,7 @@ from hook_checks_fixture import (
     ModuleSpec,
     make_hook_repo,
 )
+from shared.proc_group import read_stat_fields, unsafe_pgid_reason
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -299,22 +300,32 @@ def _start_commit(repo: HookRepo, hook_tmp: Path, out_path: Path) -> subprocess.
         )
 
 
-def _written_pid(pid_file: Path, out_path: Path) -> int:
+@dataclasses.dataclass(frozen=True)
+class _Unit:
+    pid: int
+    pgid: int
+
+
+def _started_unit(pid_file: Path, out_path: Path) -> _Unit:
+    """The unit that wrote *pid_file*, with its process group read while it is still alive."""
     assert _eventually(lambda: pid_file.is_file() and pid_file.read_text().strip() != '', 120), (
         out_path.read_text(encoding='utf-8')
     )
-    return int(pid_file.read_text())
+    pid = int(pid_file.read_text())
+    stat = read_stat_fields(Path(f'/proc/{pid}'), skip_malformed=False)
+    assert stat is not None, f'unit pid {pid} exited before its process group could be read'
+    return _Unit(pid, stat.pgrp)
 
 
-def _kill_leftovers(commit: subprocess.Popen[bytes], unit_pids: list[int]) -> None:
+def _kill_leftovers(commit: subprocess.Popen[bytes], units: list[_Unit]) -> None:
     """Each unit runs in its own session, which a SIGKILL to the commit's group never reaches."""
     if commit.poll() is None:
         os.killpg(commit.pid, signal.SIGKILL)
         commit.wait()
-    for pid in unit_pids:
-        if _pid_alive(pid):
+    for unit in units:
+        if _pid_alive(unit.pid) and unsafe_pgid_reason(unit.pgid) is None:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
+                os.killpg(unit.pgid, signal.SIGKILL)
 
 
 def _hook_pid(git_pid: int) -> int:
@@ -363,16 +374,16 @@ def test_an_interrupted_commit_stops_its_units_and_removes_their_logs(
     out_path = tmp_path / 'commit.out'
 
     commit = _start_commit(repo, hook_tmp, out_path)
-    unit_pids: list[int] = []
+    units: list[_Unit] = []
     try:
-        pid = _written_pid(pid_file, out_path)
-        unit_pids.append(pid)
+        units.append(_started_unit(pid_file, out_path))
+        pid = units[-1].pid
         interrupt(commit.pid)
         commit.wait(timeout=60)
         stopped = _eventually(lambda: not _pid_alive(pid), 30)
         logs_removed = _eventually(lambda: not any(hook_tmp.iterdir()), 30)
     finally:
-        _kill_leftovers(commit, unit_pids)
+        _kill_leftovers(commit, units)
 
     assert repo.head() == before
     assert stopped, f'unit pid {pid} outlived the interrupted commit'
@@ -395,16 +406,16 @@ def test_an_interrupted_commit_stops_what_an_uncollected_unit_left_when_its_shel
     out_path = tmp_path / 'commit.out'
 
     commit = _start_commit(repo, hook_tmp, out_path)
-    unit_pids: list[int] = []
+    units: list[_Unit] = []
     try:
-        unit_pids.append(_written_pid(blocker_pid_file, out_path))
-        pid = _written_pid(orphan_pid_file, out_path)
-        unit_pids.append(pid)
+        units.append(_started_unit(blocker_pid_file, out_path))
+        units.append(_started_unit(orphan_pid_file, out_path))
+        pid = units[-1].pid
         _ctrl_c(commit.pid)
         commit.wait(timeout=60)
         stopped = _eventually(lambda: not _pid_alive(pid), 30)
     finally:
-        _kill_leftovers(commit, unit_pids)
+        _kill_leftovers(commit, units)
 
     output = out_path.read_text(encoding='utf-8')
     assert repo.head() == before
