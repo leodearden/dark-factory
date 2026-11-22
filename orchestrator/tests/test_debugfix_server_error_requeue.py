@@ -117,7 +117,11 @@ class ScriptedDebuggerStub(AgentStub):
 
 
 class TerminalRowScheduler(FakeScheduler):
-    """A scheduler whose row is already *terminal_status*: 'pending' writes are refused."""
+    """A row moved to *terminal_status* out-of-band: 'pending' writes are refused.
+
+    The refusal records the out-of-band transition in the row's history, so
+    ``get_status`` reports the terminal row the way the real store would.
+    """
 
     def __init__(self, terminal_status: str):
         super().__init__()
@@ -127,6 +131,9 @@ class TerminalRowScheduler(FakeScheduler):
     async def set_task_status(self, task_id: str, status: str, **kwargs) -> None:
         if status == 'pending':
             self.refused_pending_writes.append(task_id)
+            history = self.statuses.setdefault(task_id, [])
+            if history[-1:] != [self.terminal_status]:
+                history.append(self.terminal_status)
             raise TerminalExitRejection(
                 task_id=task_id,
                 old_status=self.terminal_status,
@@ -147,7 +154,7 @@ async def _run(
     stub = ScriptedDebuggerStub(debugger_result)
     workflow, default_scheduler = _build_workflow(config, git_ops, assignment, stub)
     if scheduler is not None:
-        workflow.scheduler = scheduler  # type: ignore[assignment]
+        workflow.scheduler = scheduler
     monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
     monkeypatch.setattr(
         'orchestrator.workflow.run_scoped_verification',
