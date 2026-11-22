@@ -119,10 +119,10 @@ function HostLoadCard({ paused }) {
 }
 
 // Per-(model×role) outcome rollup — invocation count, done%/blocked%,
-// cap-hit%, $/done, plus a per-role turn-cap-saturation readout (task 2534
+// cap-hit%, $ / done run, plus a per-role turn-cap-saturation readout (task 2534
 // δ, boundary test 12). Mirrors orchestrator.digest.render_digest_markdown's
 // '## Per-(model×role) rollup' section so the digest and dashboard read
-// identically: '—' when a cell has no $/done yet, 'n/a' when a role has no
+// identically: '—' when a cell has no $ / done run yet, 'n/a' when a role has no
 // routing_decision max_turns to compare against. Rows arrive unsorted from
 // the server (aggregate_model_role_rollup merges by dict order) — sort here
 // the same way the digest does, by (model, role).
@@ -154,7 +154,7 @@ function ModelRoleRollupPanel() {
                 <th className="num">Done%</th>
                 <th className="num">Blocked%</th>
                 <th className="num">Cap-hit%</th>
-                <th className="num">$/done</th>
+                <th className="num">$ / done run</th>
               </tr>
             </thead>
             <tbody>
