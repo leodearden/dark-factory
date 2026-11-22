@@ -586,9 +586,9 @@ one tally. A root whose store is missing or unreadable is reported as a
 named per-project error with **empty** sections (never a bundle of
 zeros), the remaining projects still print, and the exit code is 1.
 
-Prints six sections per project — landings/day, the four-segment
-lead-time split (queue wait → verify → finalize+CAS residual), verify
-duration by runner, host occupancy, heartbeat queue depth, and the
+Prints six sections per project — landings/day, the lead-time split
+(queue wait → re-queued → verify → finalize+CAS residual, plus a
+non-additive verify->land row), verify duration by runner, host occupancy, heartbeat queue depth, and the
 `merge_attempt`/`merge_finalized` outcome mixes — plus two behind flags:
 `--speculation` (depth distributions, the chain-dead void rate, and a
 cross-project void-rate block) and `--chains` (deep merge-ahead chain
@@ -624,7 +624,7 @@ writes nothing, files nothing, escalates nothing and emits no events, so
 it is safe to run against a live store while the orchestrator is
 merging.
 
-**Four caveats, all of which change how you read the output.**
+**Five caveats, all of which change how you read the output.**
 *(a) Match the window to the row you are reading.* The
 `plans/merge-lane-throughput-prd.md` § Background table is not
 single-windowed: most rows are a 14-day window, but four are explicitly
@@ -655,7 +655,22 @@ verifies but appeared in no heartbeat is still listed, with `0 sample(s)`
 and both sample-based estimators `n/a`, rather than dropped; and if the
 lead-time split fails to decompose for some landing, a `WARNING …
 NEGATIVE finalize+CAS residual` line names the count instead of letting
-it average away inside the residual percentile.
+it average away inside the residual percentile. *(e) Reading the
+lead-time split.* For every landing with an in-span dequeue, lead =
+queue wait + re-queued + verify + finalize+CAS. An internal re-queue
+(`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._requeue_request`,
+reached from the dead-verify no-progress abort among its other callers)
+emits no `merge_queued`, so it shows as a further `merge_dequeued` under
+the same joined queue row. The time from the first to the last in-span
+dequeue, the aborted attempts plus their re-queue waits, is reported as
+re-queued, and verify counts only the landing attempt's `merge_verify`
+rows. A dequeue stamped after the landing (a stale duplicate request
+later found `already_merged`) belongs to no segment. Finalize+CAS still
+holds the gap between the final dispatch and the start of its verify, so
+read verify->land (the landing minus the landing attempt's last
+`merge_verify`) for finalize time alone. Reports produced before task
+5195 put the re-queue time inside finalize+CAS, so compare a dated
+report's residual row only with one produced by the same script version.
 
 ### Stopping gracefully
 
