@@ -4917,9 +4917,11 @@ def create_mcp_server(
         records returned ZERO, and the corpus was structurally unsweepable until this
         tool existed (task 3083).
 
-        Every record returned by the store-side prefilter is RE-VERIFIED in Python
-        with the shared detector (``fused_memory.utils.toolcall_xml_leak``), which is
-        the authoritative verdict — the prefilter is a speed optimisation only.
+        Every walked record is judged in Python, and that is the authoritative
+        verdict: a literal, case-sensitive substring match of your *needles* when
+        given, else the shared tool-call-leak detector
+        (``fused_memory.utils.toolcall_xml_leak``). The store-side prefilter is a
+        speed optimisation only, and it reads only the ``data`` text key.
 
         **Mem0/Qdrant-only scope:** This tool scans only memories stored in the
         Mem0/Qdrant backend (categories: observations_and_summaries,
@@ -4943,13 +4945,15 @@ def create_mcp_server(
 
         Args:
             project_id: Project scope (required)
-            needles: Literal substrings for the store-side prefilter. Omit (None) to
-                use the shared tool-call-leak sentinels. Ignored when *exhaustive*.
+            needles: Literal substrings to find; a record matches when its text
+                contains one. They also drive the prefilter, which *exhaustive*
+                skips. Omit (None) to scan for the shared tool-call-leak sentinels.
             filters: Optional exact metadata key-value pairs narrowing the scan
                 (e.g. {'category': 'procedural_knowledge'}). Applies in both modes.
             exhaustive: Skip the prefilter and walk every record. Slower, but the
-                answer then depends on nothing but the Python detector — use this
-                when establishing a true incidence rate.
+                answer then depends on nothing but the Python verdict, and it also
+                sees text under the ``memory``/``content`` fallback keys — use this
+                when establishing a true incidence rate or a complete literal hunt.
             limit: Maximum records to WALK (default: no limit).
 
         Returns:

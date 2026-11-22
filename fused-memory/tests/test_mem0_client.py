@@ -2584,7 +2584,7 @@ class TestMem0BackendScanPayloadText:
 
         A bare ``async for`` closes the generator when the ITERATION ends or
         raises — but an exception from the loop BODY (a malformed payload
-        reaching the detector) or a cancellation is neither, and leaves
+        reaching the verdict) or a cancellation is neither, and leaves
         scroll_collection_pages suspended mid-walk for the event loop's
         async-generator hooks to finalise at some later, unpredictable point.
         ``contextlib.aclosing`` is what makes the close deterministic; the
@@ -2595,26 +2595,24 @@ class TestMem0BackendScanPayloadText:
         """
         closed = False
 
+        class _MalformedPayload:
+            def keys(self):
+                raise RuntimeError('malformed payload')
+
         def _pager(*args, **kwargs):
             async def _gen():
                 nonlocal closed
                 try:
-                    yield _scan_point('id-1', {'data': _SCAN_LEAK_TEXT})
+                    yield _scan_point('id-1', _MalformedPayload())
                     yield _scan_point('id-2', {'data': _SCAN_LEAK_TEXT})
                 finally:
                     closed = True
 
             return _gen()
 
-        def _explode(_text):
-            raise RuntimeError('malformed payload')
-
         with (
             patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=AsyncMock())),
             patch.object(backend, 'scroll_collection_pages', _pager),
-            patch(
-                'fused_memory.utils.toolcall_xml_leak.find_toolcall_xml_leak', _explode
-            ),
             pytest.raises(RuntimeError, match='malformed payload'),
         ):
             await backend.scan_payload_text(scope=Scope(project_id='p'))

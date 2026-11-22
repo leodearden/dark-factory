@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import aclosing
 from typing import Any, TypeVar
 
@@ -13,6 +13,7 @@ from fused_memory.backends.timeout_budget import await_within, socket_timeout_ou
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
+from fused_memory.utils.toolcall_xml_leak import PREFILTER_NEEDLES, find_toolcall_xml_leak
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,24 @@ def extract_payload_text(payload: dict[str, Any]) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+#: A scan verdict: the fragments of *text* that make it a match (empty: no match).
+_ScanVerdict = Callable[[str], list[str]]
+
+
+def _leak_fragments(text: str) -> list[str]:
+    return [hit.fragment for hit in find_toolcall_xml_leak(text)]
+
+
+def _literal_needle_verdict(needles: Sequence[str]) -> _ScanVerdict:
+    """The distinct *needles* that occur in a text, case-sensitively, in caller order."""
+    distinct = tuple(dict.fromkeys(needles))
+
+    def present(text: str) -> list[str]:
+        return [needle for needle in distinct if needle in text]
+
+    return present
 
 
 #: Default cap on how many pages a single full-enumeration scroll may walk.
@@ -1056,7 +1075,7 @@ class Mem0Backend:
         limit: int | None = None,
         max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
     ) -> dict[str, Any]:
-        """Literal substring scan over Qdrant payload TEXT for leaked tool-call XML.
+        """Literal substring scan over Qdrant payload TEXT (leaked tool-call XML by default).
 
         (a) THIS IS NOT SEMANTIC SEARCH AND NOT METADATA EQUALITY. It is the
         gap that made the corpus unsweepable: :meth:`search` ranks by
@@ -1065,7 +1084,7 @@ class Mem0Backend:
         live 2026-07-26 probe returned zero). :meth:`count_by_metadata` /
         :meth:`scroll_by_metadata` match payload KEYS by equality, which
         cannot see inside the memory text at all. This method walks the
-        records and applies the shared detector to their content.
+        records and judges their text.
 
         (b) PREFILTER. Unless *exhaustive*, one
         ``FieldCondition(key='data', match=MatchText(text=needle))`` per
@@ -1074,23 +1093,28 @@ class Mem0Backend:
         literal, case-sensitive, order-preserving SUBSTRING match — measured
         on qdrant 1.17.1 over 19,321 points at ~70-90 ms for an exact count.
 
-        (c) THE PREFILTER IS AN OPTIMISATION ONLY. Every returned record is
-        RE-VERIFIED with :func:`find_toolcall_xml_leak`, which is the
-        authoritative verdict. This matters because those are un-indexed-field
-        FALLBACK semantics: creating a text payload index on ``data`` would
-        SILENTLY flip ``MatchText`` to tokenized word-matching. That failure is
-        safe here rather than merely unlikely — tokenized matching is strictly
-        MORE permissive for these needles (a record containing a literal
-        serialized opening tag necessarily contains its constituent word
-        tokens), so the prefilter remains a superset and the Python detector
-        still yields the exact answer. Only speed degrades, never correctness.
+        (c) THE PREFILTER IS AN OPTIMISATION ONLY. Every walked record is
+        judged in Python, and that is the authoritative verdict: the caller's
+        *needles*, when given, as a literal, case-sensitive substring match;
+        otherwise :func:`find_toolcall_xml_leak`. This matters because those
+        are un-indexed-field FALLBACK semantics: creating a text payload index
+        on ``data`` would SILENTLY flip ``MatchText`` to tokenized
+        word-matching. That failure is safe here rather than merely unlikely —
+        tokenized matching is strictly MORE permissive for these needles (a
+        record containing a literal serialized opening tag necessarily contains
+        its constituent word tokens), so the prefilter remains a superset and
+        the Python verdict still yields the exact answer. Only speed degrades,
+        never correctness. The prefilter reads only the ``data`` key, so
+        prefiltered mode finds text stored there alone; *exhaustive* mode also
+        sees the ``memory``/``content`` fallbacks.
         ``tests/test_mem0_client.py::TestMem0BackendScanPayloadTextIntegration``
         is the tripwire that fails loudly if those semantics ever change.
 
         (d) ``exhaustive=True`` skips the prefilter entirely and walks the
-        whole collection. Use it when the answer must not depend on prefilter
-        semantics at all — notably when establishing the TRUE incidence rate,
-        so that claim rests on nothing but the shared detector.
+        whole collection; it changes nothing else. Use it when the answer must
+        not depend on prefilter semantics at all — notably when establishing
+        the TRUE incidence rate, so that claim rests on nothing but the
+        Python verdict.
 
         (e) BOTH MODES PAGINATE, and the walk is DELEGATED to
         :meth:`scroll_collection_pages` rather than re-implemented here — one
@@ -1118,11 +1142,13 @@ class Mem0Backend:
 
         Args:
             scope: Project/agent/session scope (selects the collection).
-            needles: Literal substrings for the prefilter. ``None`` or empty
-                defaults to
+            needles: Literal substrings that are both the prefilter and the
+                verdict: a walked record matches when it contains one. ``None``
+                or empty defaults to
                 :data:`~fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES`
-                — never to "no needles", which would scan for nothing and
-                report a clean corpus. Ignored when *exhaustive*.
+                for the prefilter and the leak detector for the verdict —
+                never to "no needles", which would scan for nothing and report
+                a clean corpus. *exhaustive* skips only their prefilter use.
             filters: Optional key→value payload equality filters, AND-ed in
                 via ``must`` exactly as :meth:`count_by_metadata` builds them,
                 to narrow the scan (e.g. ``{'category': ...}``). Applies in
@@ -1210,11 +1236,6 @@ class Mem0Backend:
                 'result as a clean corpus'
             )
 
-        from fused_memory.utils.toolcall_xml_leak import (
-            PREFILTER_NEEDLES,
-            find_toolcall_xml_leak,
-        )
-
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
 
         # Built at the shared home so an exhaustive scan and the count it is
@@ -1225,6 +1246,7 @@ class Mem0Backend:
         # this mode wants — expressed as scroll_filter=None, not as an
         # unfiltered Filter.
         needle_arm = None if exhaustive else list(needles or PREFILTER_NEEDLES)
+        verdict = _literal_needle_verdict(needles) if needles else _leak_fragments
         scroll_filter = (
             self._build_payload_filter(filters, text_needles=needle_arm)
             if (filters or needle_arm)
@@ -1243,7 +1265,7 @@ class Mem0Backend:
             # `aclosing` rather than a bare `async for` because `async for`
             # closes the generator only when the ITERATION ends or raises: a
             # failure in the LOOP BODY below (a malformed payload reaching the
-            # detector) or a cancellation would otherwise leave the pager
+            # verdict) or a cancellation would otherwise leave the pager
             # suspended mid-walk for the event loop's async-generator hooks to
             # finalise at some later, unpredictable point.  This makes the
             # close deterministic on EVERY exit path.
@@ -1260,14 +1282,14 @@ class Mem0Backend:
                 async for point in pages:
                     scanned += 1
                     payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-                    hits = find_toolcall_xml_leak(extract_payload_text(payload))
-                    if not hits:
-                        continue
                     text = extract_payload_text(payload) or ''
+                    fragments = verdict(text)
+                    if not fragments:
+                        continue
                     matches.append({
                         'id': point.id,
                         'created_at': payload.get('created_at'),
-                        'matched_fragments': [hit.fragment for hit in hits],
+                        'matched_fragments': fragments,
                         'excerpt': text[:_EXCERPT_LEN] + ('…' if len(text) > _EXCERPT_LEN else ''),
                         'metadata': payload,
                     })
