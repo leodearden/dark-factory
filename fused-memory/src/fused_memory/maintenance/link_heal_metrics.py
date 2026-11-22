@@ -66,8 +66,10 @@ EVAL_ID = 'link-heal'
 SUMMARY_FILENAME = 'summary.json'
 SUMMARY_FORMAT = 'link-heal-summary/1'
 SUMMARY_WINDOW = timedelta(days=7)
-#: One nightly interval (scripts/fused-memory-link-heal.timer) plus jitter and run time; a missed night expires it.
-SUMMARY_TTL = timedelta(hours=26)
+#: scripts/fused-memory-link-heal.timer fires at 02:15 local time, so runs start up to 25 h 5 min apart (the
+#: autumn clock change plus jitter). 28 h leaves a run nearly 3 h to write its summary, and a missed night
+#: still expires it before the next one.
+SUMMARY_TTL = timedelta(hours=28)
 SUMMARY_SUFFIX = '_7d'
 #: plans/write-triage-link-healing-prd.capability-manifest.md, "Summary key contract (ε → θ)".
 THETA_SUMMARY_KEYS: tuple[str, ...] = (

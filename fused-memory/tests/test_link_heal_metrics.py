@@ -274,7 +274,10 @@ class TestTheSummary:
         assert summary['window']['until'] == format_stamp(NOW)
 
     def test_the_ttl_outlives_one_nightly_interval_but_not_a_missed_night(self):
-        assert timedelta(days=1) < SUMMARY_TTL < timedelta(days=2)
+        jitter = timedelta(minutes=5)
+        longest_night = timedelta(hours=25) + jitter
+        shortest_two_nights = timedelta(hours=23 + 24) - jitter
+        assert longest_night + timedelta(hours=2) < SUMMARY_TTL < shortest_two_nights
 
 
 #: The per-run metrics behind θ's keys: each _7d sum in THETA_KEYS, and the rate's two terms.

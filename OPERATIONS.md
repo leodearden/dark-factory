@@ -4522,15 +4522,22 @@ check.
     was asked, and `adjudications_asked_7d` shows the denominator. The run-report
     escalation names `summary.json`, and its summary line also names the failure
     when the metrics could not be written (`metrics_unwritten`). The summary
-    also carries `expires_at`, 26 h after its window ends
-    (`fused-memory/src/fused_memory/maintenance/link_heal_metrics.py::SUMMARY_TTL`),
-    and `scripts/check_write_triage_readiness_gate.py` fails any gate on a
-    report past its `expires_at`. So θ and its delivered-checks re-run fail
-    closed on a summary no run has replaced, whether the run was refused
-    (exit 2), crashed, or the timer stopped firing; one missed night is
-    enough. A run whose metrics could not be written also removes the
-    previous `summary.json`, because it no longer counts tonight. If even
-    that removal fails, the run-report escalation and the sweep's JSON output
+    also carries `expires_at`, 28 h after its window ends
+    (`fused-memory/src/fused_memory/maintenance/link_heal_metrics.py::SUMMARY_TTL`).
+    That is the longest gap between two 02:15 runs (25 h, at the autumn clock
+    change) plus the 5-minute jitter, and leaves a run just under 3 h to write
+    its summary. `scripts/check_write_triage_readiness_gate.py` fails any gate
+    on a report past its `expires_at`, so θ's own predicate run fails closed on
+    a summary no run has replaced, whether the run was refused (exit 2),
+    crashed, or the timer stopped firing; one missed night is enough. θ's
+    delivered-checks re-run fails closed only once main next advances: the
+    scheduler caches a passing delivered check per main SHA
+    (`orchestrator/src/orchestrator/scheduler.py::Scheduler._compute_delivered_check_cache`).
+    A summary without `expires_at`, as written before task 11287, never
+    expires; the first run that writes its metrics replaces it. A run whose metrics could
+    not be written also removes the previous `summary.json`, because it no
+    longer counts tonight. If even that removal fails, the run-report
+    escalation's detail (not its summary line) and the sweep's JSON output
     name the failure as `stale_summary_unremoved`.
 - **Exit codes.** 0 when the run is complete, or partial only by the write or
   adjudication cap or stale skips. 1 on a read, adjudication or write failure,
