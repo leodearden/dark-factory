@@ -598,23 +598,28 @@ def replayed_record(result: ReplayResult, replay_input: ReplayInput) -> dict[str
     }
 
 
+def failure_fields(exc: BaseException) -> dict[str, str]:
+    """What a failure line records of *exc*: its type and its message, capped."""
+    return {'error_type': type(exc).__name__, 'error': str(exc)[:_ERROR_CHARS]}
+
+
 def failed_record(arm: ReplayArm, llm: LLMClient, row: Mapping[str, Any], exc: BaseException) -> dict[str, Any]:
     return {
         'kind': RecordKind.failed, 'arm': arm.name, 'model': llm.model,
         'reasoning_effort': client_reasoning_effort(llm), 'endpoint': client_endpoint(llm),
         'graph': row['graph'], 'uuid': row['uuid'], 'stratum': row['stratum'],
-        'error_type': type(exc).__name__, 'error': str(exc)[:_ERROR_CHARS],
+        **failure_fields(exc),
     }
 
 
-def _read_jsonl(path: str | Path) -> list[dict[str, Any]]:
+def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     try:
         return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
     except (OSError, json.JSONDecodeError) as exc:
         raise ReplayFileError(f'cannot read {path}: {exc}') from exc
 
 
-def _jsonl(records: Iterable[Mapping[str, Any]]) -> str:
+def jsonl_text(records: Iterable[Mapping[str, Any]]) -> str:
     return ''.join(json.dumps(record, sort_keys=True) + '\n' for record in records)
 
 
@@ -982,7 +987,7 @@ def _live_llm_factory(llm: ExtractionLlm) -> LLMClient | None:
 
 
 def _load_replay_inputs(args: argparse.Namespace) -> list[dict[str, Any]]:
-    rows = _read_jsonl(args.worksheet)
+    rows = read_jsonl(args.worksheet)
     check_worksheet(rows, baseline_cells(read_json(args.baseline_report)))
     return rows
 
@@ -1040,7 +1045,7 @@ async def _replay_rows(
                                        arm.name, exc_info=True)
                         records.append(failed_record(arm, llm, row, exc))
             failures += sum(1 for record in records if record['kind'] == RecordKind.failed)
-            sink.write(_jsonl(records))
+            sink.write(jsonl_text(records))
             sink.flush()
     return failures
 
@@ -1050,7 +1055,7 @@ async def _replay_command(args: argparse.Namespace, llm_factory: LlmFactory, rea
     try:
         rows = _load_replay_inputs(args)
         out = Path(args.out)
-        kept = [r for r in _read_jsonl(out) if r.get('kind') == RecordKind.replayed] if out.exists() else []
+        kept = [r for r in read_jsonl(out) if r.get('kind') == RecordKind.replayed] if out.exists() else []
     except (ReplayFileError, UnreadableInput, WorksheetMismatch) as exc:
         logger.error('invalid inputs, nothing is written: %s', exc)
         return EXIT_INVALID
@@ -1066,7 +1071,7 @@ async def _replay_command(args: argparse.Namespace, llm_factory: LlmFactory, rea
     if conflicts := _client_conflicts(kept, arm_clients):
         logger.error('this --out already holds other clients, nothing is written: %s', conflicts)
         return EXIT_INVALID
-    write_files_atomically({out: _jsonl(kept)})
+    write_files_atomically({out: jsonl_text(kept)})
     async with contextlib.AsyncExitStack() as opened:
         readers: dict[str, EpisodeContextReader] = {}
         for graph in dict.fromkeys(row['graph'] for row in rows):
@@ -1103,19 +1108,19 @@ def blinded_rows(
 
 def _worksheet_command(args: argparse.Namespace) -> int:
     try:
-        rows = _read_jsonl(args.worksheet)
-        by_arm = complete_replay(_read_jsonl(args.replay), ((r['graph'], r['uuid']) for r in rows))
+        rows = read_jsonl(args.worksheet)
+        by_arm = complete_replay(read_jsonl(args.replay), ((r['graph'], r['uuid']) for r in rows))
     except ReplayFileError as exc:
         logger.error('invalid inputs, nothing is written: %s', exc)
         return EXIT_INVALID
-    write_files_atomically({Path(args.out): _jsonl(blinded_rows(rows, by_arm))})
+    write_files_atomically({Path(args.out): jsonl_text(blinded_rows(rows, by_arm))})
     return EXIT_OK
 
 
 def _score_command(args: argparse.Namespace) -> int:
     try:
         report = score_replay(
-            _read_jsonl(args.replay), read_json(args.verdicts), read_json(args.baseline_report),
+            read_jsonl(args.replay), read_json(args.verdicts), read_json(args.baseline_report),
         )
     except (ReplayFileError, UnreadableInput, WorksheetMismatch, VerdictError) as exc:
         logger.error('invalid inputs, nothing is written (%s): %s', type(exc).__name__, exc)
