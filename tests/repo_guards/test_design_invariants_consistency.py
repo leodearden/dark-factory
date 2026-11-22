@@ -1615,27 +1615,29 @@ def test_dark_factory_family_row_fails_loudly(
     )
 
 
-def test_gates_family_row_lists_the_whole_family_in_order() -> None:
-    """LIVE: gates.md's family-inventory row transcribes the family, in order.
+def test_gates_family_row_points_at_the_normative_doc() -> None:
+    """LIVE: gates.md's family-inventory row points at the normative doc, naming no slug.
 
-    Pinned as an ORDERED list, unlike the trigger-shape span below: this row is a
-    straight canonical-order transcription today, so ordering is free signal —
-    a mis-ordered row means someone edited it by hand against a stale copy.
+    An absence pin, like CONTRIBUTING.md's. It cannot go stale when an invariant
+    is added, which is why it replaced the ordered pin over a copied slug list.
     """
     text = GATES_DOC.read_text(encoding="utf-8")
     source = _repo_relative(GATES_DOC)
     row = dark_factory_family_row(text)
-    listed = slugs_in_span(row)
-    canonical = canonical_slugs()
+    canonical = set(canonical_slugs())
+    restated = sorted(set(slugs_in_span(row)) & canonical)
+    normative = _repo_relative(NORMATIVE_DOC)
 
-    assert listed == canonical, (
-        f"{source}: the `| dark-factory |` family-inventory row has drifted from "
-        f"{_repo_relative(NORMATIVE_DOC)} (task 3802).\n"
-        f"  row:       {listed}\n"
-        f"  normative: {canonical}\n"
-        f"Update the row to list every slug in canonical INV-1..N order. It is "
-        f"illustrative — the doc is normative — but an illustration naming the "
-        f"wrong family is worse than none."
+    assert not restated, (
+        f"{source}: the `| dark-factory |` family-inventory row names invariant "
+        f"slug(s) {restated} (task 7136). {normative} is the single normative "
+        f"copy, so a list here is one more site to update by hand on every new "
+        f"invariant. Replace the copy with a pointer to {normative}."
+    )
+    assert normative in row, (
+        f"{source}: the `| dark-factory |` family-inventory row does not point at "
+        f"{normative} (task 7136): {row!r}. The row replaced its slug list with "
+        f"that pointer, so without it the row no longer says where the family is."
     )
 
 
