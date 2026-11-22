@@ -70,6 +70,7 @@ def sweep_stale_pid_dirs(
     min_age_secs: float = 300.0,
     deadline_secs: float = 5.0,
     reclaim: Callable[[Path], object] | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> int:
     """Remove ``{prefix}*`` directories whose embedded trailing PID is dead.
 
@@ -83,8 +84,8 @@ def sweep_stale_pid_dirs(
     WARNING and excluded from the count, so the operator-visible tally can
     never overstate the drain.
 
-    Best-effort by contract: a glob matching nothing is a silent no-op and the
-    function never raises.
+    Best-effort by contract: a directory with no matching entry is a silent
+    no-op and the function never raises.
 
     Safety — three independent conservative guards, all of which must pass
     before anything is deleted:
@@ -107,11 +108,15 @@ def sweep_stale_pid_dirs(
     synchronously on the event-loop thread at startup, and the pathological
     /tmp this guards against has a 40 MB directory inode — a full readdir plus
     hundreds of thousands of ``rmtree`` calls could stall startup for minutes.
-    A wall-clock deadline is the right bound because the population still
-    drains fully across successive process starts, whereas a hard removal cap
-    would leave a permanent residue. A bounded stop is logged at WARNING with
-    examined/removed counts and says so explicitly — it must never read as
-    "swept everything".
+    The bound covers the directory READ itself: the walk is a lazy
+    ``os.scandir`` checked against the deadline on every entry, never
+    ``Path.glob``, which lists the whole directory before its first yield
+    (``shared/tests/test_config_dir.py::TestSweepStalePidDirsBounding::test_deadline_bounds_the_directory_read_not_only_the_matches``).
+    The deadline is measured on *clock*. A wall-clock deadline is the right
+    bound because the population still drains fully across successive process
+    starts, whereas a hard removal cap would leave a permanent residue. A
+    bounded stop is logged at WARNING with examined/removed counts and says so
+    explicitly — it must never read as "swept everything".
 
     Blast radius is *prefix-scoped* — the caller passes the full prefix (e.g.
     ``CONFIG_DIR_PREFIX + 'usage-gate-probe-'``), never the bare
@@ -136,51 +141,59 @@ def sweep_stale_pid_dirs(
     is documented here rather than defended in code.
     """
     base = base_dir or Path(tempfile.gettempdir())
-    deadline = time.monotonic() + deadline_secs
+    deadline = clock() + deadline_secs
     now = time.time()
     removed = 0
     examined = 0
     try:
-        for path in base.glob(f'{prefix}*'):
-            if time.monotonic() >= deadline:
-                logger.warning(
-                    'sweep_stale_pid_dirs(%s): stopped on the %.1fs deadline — this sweep '
-                    'is INCOMPLETE (examined %d, removed %d). Remaining stale dirs are '
-                    'reclaimed by subsequent sweeps.',
-                    prefix, deadline_secs, examined, removed,
-                )
-                break
-            examined += 1
-            if path.is_symlink() or not path.is_dir():
-                continue
-            match = _PID_SUFFIX_RE.search(path.name)
-            if match is None:
-                continue
-            if pid_alive(int(match.group(1))):
-                continue
-            try:
-                if now - path.stat().st_mtime < min_age_secs:
+        try:
+            listing = os.scandir(base)
+        except FileNotFoundError:
+            return 0
+        with listing as entries:
+            for entry in entries:
+                if clock() >= deadline:
+                    logger.warning(
+                        'sweep_stale_pid_dirs(%s): stopped on the %.1fs deadline — this sweep '
+                        'is INCOMPLETE (examined %d, removed %d). Remaining stale dirs are '
+                        'reclaimed by subsequent sweeps.',
+                        prefix, deadline_secs, examined, removed,
+                    )
+                    break
+                examined += 1
+                if not entry.name.startswith(prefix):
                     continue
-                # Deliberately NOT ignore_errors=True. A genuinely unremovable
-                # dir (EACCES, EBUSY, an immutable inode, a partially-removed
-                # tree) must raise so the handler below is live: with errors
-                # ignored, `removed` would count a removal that never happened
-                # and the operator-visible "reclaimed N" INFO would report a
-                # drain that did not occur.
-                (shutil.rmtree if reclaim is None else reclaim)(path)
-            except FileNotFoundError:
-                # Raced by a concurrent sweeper — the fleet restarts its units
-                # together, so several gates can sweep at once — or by the OS
-                # tmp reaper. Already reclaimed: not ours to count, and not a
-                # failure worth a WARNING either.
-                continue
-            except OSError:
-                logger.warning(
-                    'sweep_stale_pid_dirs(%s): failed to reclaim %s — skipping it and '
-                    'continuing the sweep', prefix, path, exc_info=True,
-                )
-                continue
-            removed += 1
+                if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    continue
+                path = Path(entry.path)
+                match = _PID_SUFFIX_RE.search(path.name)
+                if match is None:
+                    continue
+                if pid_alive(int(match.group(1))):
+                    continue
+                try:
+                    if now - path.stat().st_mtime < min_age_secs:
+                        continue
+                    # Deliberately NOT ignore_errors=True. A genuinely unremovable
+                    # dir (EACCES, EBUSY, an immutable inode, a partially-removed
+                    # tree) must raise so the handler below is live: with errors
+                    # ignored, `removed` would count a removal that never happened
+                    # and the operator-visible "reclaimed N" INFO would report a
+                    # drain that did not occur.
+                    (shutil.rmtree if reclaim is None else reclaim)(path)
+                except FileNotFoundError:
+                    # Raced by a concurrent sweeper — the fleet restarts its units
+                    # together, so several gates can sweep at once — or by the OS
+                    # tmp reaper. Already reclaimed: not ours to count, and not a
+                    # failure worth a WARNING either.
+                    continue
+                except OSError:
+                    logger.warning(
+                        'sweep_stale_pid_dirs(%s): failed to reclaim %s — skipping it and '
+                        'continuing the sweep', prefix, path, exc_info=True,
+                    )
+                    continue
+                removed += 1
     except OSError:
         logger.warning(
             'sweep_stale_pid_dirs(%s): could not scan %s — skipping the sweep',
