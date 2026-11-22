@@ -186,7 +186,10 @@ _SPAWNS_PER_FIXTURE_COMMIT = 2
 
 # Task 11153 — MEASURED by `test_out_of_bound_spawn_counts_are_measured_not_asserted`: a warm
 # pass's `get_main_sha`, `worktree list`, `reset --hard` and `clean -xfd`, plus its detect and
-# narrowed-confirm sub-runs (the cold pass's `worktree add` path is 5).
+# narrowed-confirm sub-runs (the cold pass's `worktree add` path is 5). `required_timeout_secs`
+# prices each sub-run, an inner pytest session, at the git-spawn MEASURED_SPAWN_LATENCY_SECS too;
+# no separate sub-run price is pinned. The evidence that this still covers a pass is task 11153's
+# run of B4 starved to a 5% CPU quota: call phase 75.67s against the 131.88s modelled.
 _SPAWNS_PER_RED_PATH_PASS = 6
 
 
@@ -389,7 +392,7 @@ async def _run_lane(worker: OfflineLaneWorker, expected_passes: int) -> None:
     precedent for ``_LANE_PASS_BOUND_SECS``. CEILING: the effective per-test
     pytest-timeout (`_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT` under a
     bare run, `_orch_helpers.py::VERIFY_CLI_PER_TEST_TIMEOUT` under verify;
-    ``timeout_method = "thread"``, ``--max-worker-restart=0``). Task 3491 is
+    ``timeout_method = "signal"``, ``--max-worker-restart=0``). Task 3491 is
     precedent AGAINST a bound near that ceiling, not for one: it REJECTED a
     30s ceiling for
     this exact collision and landed ``asyncio.wait_for(..., timeout=5)``
@@ -404,7 +407,7 @@ async def _run_lane(worker: OfflineLaneWorker, expected_passes: int) -> None:
     can approach or exceed the effective per-test timeout before this
     function's own ``wait_for`` ever fires —
     trading a clean, well-located ``TimeoutError`` here for pytest-timeout's
-    blunter thread-mode worker kill instead (task 3832 review; see
+    blunter whole-test timeout failure instead (task 3832 review; see
     ``orchestrator/pyproject.toml``'s ``timeout``/``timeout_method``
     comment). Such callers carry their own ``@pytest.mark.timeout``
     override, a rule ``test_every_composing_caller_carries_a_timeout_override``
@@ -412,8 +415,8 @@ async def _run_lane(worker: OfflineLaneWorker, expected_passes: int) -> None:
     injected-seam passes; a red-path pass runs real sub-runs and is awaited
     unbounded through :func:`_await_lane_passes`.
 
-    The six 30.0 defaults rest on task 3451's measurement above, not on the
-    retracted task 3491 claim — narrowing them would re-introduce the flake
+    The 30.0 value rests on task 3451's measurement above, not on the
+    retracted task 3491 claim — narrowing it would re-introduce the flake
     commits 289ae708bb / 80ae271a34 fixed. The gap this task (4030) closed
     was composition coverage (the override rule the preceding paragraph
     describes), not the bound value itself.
@@ -585,6 +588,11 @@ _FIXTURE_GIT: dict[str, Any] = {
     'offline_lane_commands': [_FIXTURE_COMMAND],
 }
 
+# Above every red-path row's @pytest.mark.timeout (at most 360s). At the 120s default the poll
+# backstop could arm an unbounded red-path pass itself, so a broken merge-landed trigger would
+# pass slowly instead of failing at the marker.
+_POLL_BACKSTOP_OUT_OF_REACH_SECS = 3600.0
+
 # `test_target`'s verdict is the word in `<control>/test_target`: `red`,
 # `green`, or `flaky` (red on the pass's first run, green after it: the
 # marker it leaves is untracked, so the next worktree reset removes it).
@@ -676,11 +684,13 @@ class _RedLane:
 def _red_lane(
     harness: Harness, git_ops: GitOps, tmp_path: Path, *, command: str, git_overrides: dict[str, Any],
 ) -> _RedLane:
+    """A red-path lane only the merge-landed trigger can arm: its poll backstop never fires within a test."""
     clock = Clock()
     client = FakeLedgerClient([])
     queue = EscalationQueue(tmp_path / 'escalations')
     worker = _build_worker(
-        git_ops, tmp_path, task_client=client, escalation_queue=queue, now=clock, git_overrides=git_overrides,
+        git_ops, tmp_path, task_client=client, escalation_queue=queue, now=clock,
+        git_overrides={'offline_lane_poll_interval_secs': _POLL_BACKSTOP_OUT_OF_REACH_SECS, **git_overrides},
     )
     _wire_lane(harness, worker)
     control = tmp_path / 'control'
@@ -857,11 +867,11 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     proven to never exceed a single `_LANE_PASS_BOUND_SECS`-bounded pass —
     the marker-less budget
     `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` pins.
-    ``test_b2_coalesces_burst_of_advances_to_one_rerun`` is the only member:
-    it starts `_run_lane(expected_passes=2)` via `asyncio.create_task` and
-    then awaits `runner.wait_entered()` — those two bounded waits race the
-    SAME wall clock (max, not sum). The others, b1 and
-    ``test_a_pass_that_raises_fails_its_drive_with_its_own_exception``, each
+    ``test_b2_coalesces_burst_of_advances_to_one_rerun`` is the one member
+    whose two bounded waits race: it starts `_run_lane(expected_passes=2)` via
+    `asyncio.create_task` and then awaits `runner.wait_entered()`, both on the
+    SAME wall clock (max, not sum). b1 and
+    ``test_a_pass_that_raises_fails_its_drive_with_its_own_exception`` each
     drive exactly one `_run_one_lane_pass` call.
 
     Correlation between a marker and a SPECIFIC test's value is done via
@@ -995,10 +1005,8 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             f'effective per-test timeout (the CLI --timeout under verify, else '
             f'the pyproject default), a budget this module neither sets nor '
             f'checks against its worst case. Were that budget ever below '
-            f'{required}s, then under timeout_method="thread" with '
-            f'--max-worker-restart=0, pytest-timeout os._exit()s the xdist '
-            f"worker instead of failing cleanly, discarding _run_lane's own "
-            f'well-located TimeoutError. Add @pytest.mark.timeout(N) with '
+            f'{required}s, pytest-timeout would fail the test before its own '
+            f'condition does. Add @pytest.mark.timeout(N) with '
             f'N >= {required} ({worst_case}s bounded + {out_of_bound} spawns '
             f'x {MEASURED_SPAWN_LATENCY_SECS}s).'
         )
@@ -1015,11 +1023,8 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             f'sum + {out_of_bound} out-of-bound real-git spawns x '
             f'{MEASURED_SPAWN_LATENCY_SECS}s = {spawn_allowance}s — the '
             f'override does not actually clear what it exists to cover: it '
-            f'fires before that worst case completes, and under '
-            f'timeout_method="thread" with --max-worker-restart=0, '
-            f'pytest-timeout os._exit()s the xdist worker instead of '
-            f"failing cleanly, discarding _run_lane's own well-located "
-            f'TimeoutError.'
+            f'fires before that worst case completes, so pytest-timeout fails '
+            f'the test before its own condition does.'
         )
 
 
