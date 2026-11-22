@@ -10,6 +10,7 @@ import json
 import logging
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar, Final
@@ -55,6 +56,7 @@ __all__ = [
     'HolderMinted',
     'HolderProtection',
     'PromotionDeferral',
+    'PromotionDeferredError',
     'PromotionGuard',
     'backfill',
     'citation_ref',
@@ -72,6 +74,7 @@ __all__ = [
     'register_promotion_guard',
     'release_held',
     'releases_holder',
+    'remove_holder_edge',
     'unregister_promotion_guard',
 ]
 
@@ -477,7 +480,26 @@ async def promote(
     not held now promotes nothing. Returns the promoted ids in promotion order; an unknown *by*
     raises ``ValueError``.
     """
-    return await _promote_frontier(tm, project_root, [(held_id, PromotionCause(by), ref)], emit)
+    walk = await _promote_frontier(tm, project_root, [(held_id, PromotionCause(by), ref)], emit)
+    return walk.promoted
+
+
+async def remove_holder_edge(
+    tm: TaskBackendProtocol, project_root: str, held_id: int, *, ref: str, emit: HoldEmit,
+) -> tuple[int, ...]:
+    """A human removing a held task's holder edge promotes it by ``human`` (open question 2).
+
+    Raises :class:`PromotionDeferredError`, with nothing written, when a guard defers *held_id*
+    itself. Same precondition as :func:`promote`.
+    """
+    walk = await _promote_frontier(tm, project_root, [(held_id, PromotionCause.HUMAN, ref)], emit)
+    deferred = walk.deferred.get(held_id)
+    if deferred is not None:
+        holder_id, deferral = deferred
+        raise PromotionDeferredError(
+            task_id=str(held_id), holder_id=str(holder_id), cause=PromotionCause.HUMAN, deferral=deferral,
+        )
+    return walk.promoted
 
 
 async def promote_dependencies_of(
@@ -494,7 +516,7 @@ async def promote_dependencies_of(
     if row.get('status') != TaskStatus.PENDING or held_by(row) is not None:
         return ()
     seeds = [(int(dependency), PromotionCause.DEPENDENT, str(task_id)) for dependency in _local_dependencies(row)]
-    return await _promote_frontier(tm, project_root, seeds, emit)
+    return (await _promote_frontier(tm, project_root, seeds, emit)).promoted
 
 
 async def release_held(
@@ -507,64 +529,112 @@ async def release_held(
     """
     edges = await tm.get_dependency_edges(project_root)
     dependents = sorted(task_id for task_id, dependencies in edges.items() if holder_id in dependencies)
-    return await _promote_frontier(
+    walk = await _promote_frontier(
         tm, project_root, [(dependent, PromotionCause.HUMAN, _RELEASE_REF) for dependent in dependents], emit,
     )
+    return walk.promoted
+
+
+@dataclass(frozen=True)
+class _Walk:
+    promoted: tuple[int, ...]
+    deferred: Mapping[int, tuple[int, PromotionDeferral]]
+    """Each deferred task's holder and the guard's deferral."""
 
 
 async def _promote_frontier(
     tm: TaskBackendProtocol, project_root: str, seeds: Sequence[_Seed], emit: HoldEmit,
-) -> tuple[int, ...]:
+) -> _Walk:
     """Breadth-first over the seeds, then over each promoted task's other dependencies; each task once."""
     frontier = deque(seeds)
     seen: set[int] = set()
     promoted: list[int] = []
+    deferred: dict[int, tuple[int, PromotionDeferral]] = {}
     while frontier:
         task_id, cause, ref = frontier.popleft()
         if task_id in seen:
             continue
         seen.add(task_id)
-        dependencies = await _promote_one(tm, project_root, task_id, cause, ref, emit)
-        if dependencies is not None:
-            promoted.append(task_id)
-            frontier.extend((dependency, PromotionCause.DEPENDENT, str(task_id)) for dependency in dependencies)
-    return tuple(promoted)
+        row = await _live_row(tm, project_root, task_id)
+        record = None if row is None else _current_hold(row)
+        if row is None or record is None:
+            continue
+        deferral = _first_deferral(row, cause, ref)
+        if deferral is not None:
+            deferred[task_id] = (record.holder, deferral)
+            await emit(
+                EventType.followup_promotion_deferred,
+                {'task_id': str(task_id), 'by': cause.value, 'ref': ref, **deferral.model_dump()},
+            )
+            continue
+        remaining = await _write_promotion(tm, project_root, row, record, cause, ref)
+        await emit(EventType.followup_promoted, {'task_id': str(task_id), 'by': cause.value, 'ref': ref})
+        promoted.append(task_id)
+        frontier.extend((dependency, PromotionCause.DEPENDENT, str(task_id)) for dependency in remaining)
+    return _Walk(promoted=tuple(promoted), deferred=deferred)
 
 
-async def _promote_one(
-    tm: TaskBackendProtocol,
-    project_root: str,
-    task_id: int,
-    cause: PromotionCause,
-    ref: str | None,
-    emit: HoldEmit,
-) -> list[int] | None:
-    """The live row's promotion: its remaining dependencies once promoted, None when it stays as it is."""
+async def _live_row(tm: TaskBackendProtocol, project_root: str, task_id: int) -> dict[str, Any] | None:
     try:
-        row = await tm.get_task(str(task_id), project_root)
+        return await tm.get_task(str(task_id), project_root)
     except TaskNotFoundError:
         return None
-    record = _current_hold(row)
-    if record is None:
-        return None
-    deferral = _first_deferral(row, cause, ref)
-    if deferral is not None:
-        await emit(
-            EventType.followup_promotion_deferred,
-            {'task_id': str(task_id), 'by': cause.value, 'ref': ref, **deferral.model_dump()},
-        )
-        return None
+
+
+async def _write_promotion(
+    tm: TaskBackendProtocol,
+    project_root: str,
+    row: Mapping[str, object],
+    record: FollowupHold,
+    cause: PromotionCause,
+    ref: str | None,
+) -> list[int]:
+    """ONE write: the holder edge dropped and the promotion stamped. Returns the dependencies left."""
     remaining = [dependency for dependency in _local_dependencies(row) if dependency != str(record.holder)]
     stamped = record.model_copy(
         update={'promoted': PromotionRecord(by=cause, at=datetime.now(UTC).isoformat(), ref=ref)},
     )
     await tm.update_task(
-        str(task_id), project_root,
+        str(row['id']), project_root,
         metadata=json.dumps({FOLLOWUP_HOLD_METADATA_KEY: stamped.model_dump(mode='json', exclude_none=True)}),
         metadata_mode='merge', dependencies=remaining,
     )
-    await emit(EventType.followup_promoted, {'task_id': str(task_id), 'by': cause.value, 'ref': ref})
     return [int(dependency) for dependency in remaining]
+
+
+_PROMOTION_DEFERRED_HINT = (
+    'A registered promotion guard deferred this promotion, so the held task keeps its holder edge '
+    'and nothing was written. guard and reason say why; the followup_promotion_deferred event '
+    'records the same. Retry once the guard\'s condition clears. See docs/task-authoring.md §3.4.'
+)
+
+
+class PromotionDeferredError(TaskmasterError):
+    """A human removal of a held task's holder edge that a registered promotion guard deferred."""
+
+    ERROR: ClassVar[str] = 'followup_promotion_deferred'
+
+    def __init__(self, *, task_id: str, holder_id: str, cause: PromotionCause, deferral: PromotionDeferral) -> None:
+        self.task_id = task_id
+        self.holder_id = holder_id
+        self.cause = cause
+        self.deferral = deferral
+        super().__init__(
+            TASKMASTER_TOOL_ERROR,
+            f'promotion of task {task_id} deferred by guard {deferral.guard}: {deferral.reason}',
+        )
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': self.ERROR,
+            'error_type': type(self).__name__,
+            'task_id': self.task_id,
+            'holder_id': self.holder_id,
+            'by': self.cause.value,
+            **self.deferral.model_dump(),
+            'hint': _PROMOTION_DEFERRED_HINT,
+        }
 
 
 def _first_deferral(row: Mapping[str, object], cause: PromotionCause, ref: str | None) -> PromotionDeferral | None:
