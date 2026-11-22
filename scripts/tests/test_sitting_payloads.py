@@ -336,9 +336,9 @@ class TestUnlinkedFilingId:
         assert decision_path_for_id(local, root=tmp_path).stem == local
 
     def test_an_item_with_no_decision_and_no_escalation_id_is_refused(self):
-        item = OpenItem(key=decision_key('lone'), project='dark_factory')
+        item = OpenItem(key=decision_key('lone'), project='dark_factory', queue_dir=DF_QUEUE)
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match='only an escalation item'):
             mod.close_decision_argv(item, 'answered', 'gate evidence')
 
 

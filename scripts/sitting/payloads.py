@@ -18,7 +18,11 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, TypeVar
 
-from orchestrator.decision_registry import UNKNOWN_QUEUE, DecisionState
+from orchestrator.decision_registry import (
+    UNKNOWN_QUEUE,
+    DecisionCloseRefused,
+    refuse_unclosable_arguments,
+)
 from shared.project_id import fold_project_token
 from sitting.inventory import OpenItem, queue_tag
 
@@ -34,7 +38,6 @@ RESOLVE_ACTIONS: tuple[str, ...] = ('resume', 'restart', 'park', 'abandon', 'clo
 
 SESSION_REGISTRY_TOOL = 'cli:session_registry'
 FOLLOWUP_SOURCE = 'sitting-preparer'
-CLOSING_STATES = frozenset({DecisionState.ANSWERED, DecisionState.DROPPED})
 MEMORY_DECISION_CATEGORY = 'decisions_and_rationale'
 MEMORY_RATIONALE_CATEGORY = 'observations_and_summaries'
 
@@ -246,14 +249,22 @@ def close_decision_argv(item: OpenItem, state: str, evidence: str) -> ApplyPaylo
     id>``, and closed in the same run on whatever id that filing landed on:
     the project-qualified id for a fresh filing, or a same-project legacy
     record continued in place. So the payload never re-derives write-decision's
-    filing rule. Either way the compare-and-swap, ``--project`` and
-    ``--escalations-dir``, turns a collision with another project's record
-    into a loud non-zero exit rather than a silent close of its gate.
+    filing rule.
+
+    Two mechanisms keep the close off another gate. A linked close is
+    guarded by the compare-and-swap, ``--project`` and ``--escalations-dir``
+    naming the record as read. An unlinked one is guarded by write-decision's
+    cross-project rule, which refuses to file over another project's OPEN
+    record, so the run exits non-zero having filed nothing; the compare-and-swap
+    refuses its close only when a MODE-2 enrichment keeps another queue's stamp.
+    Another project's CLOSED record at the qualified id meets neither:
+    write-decision's existing full-overwrite policy files this ask over it,
+    and the run closes that filing.
     """
-    if state not in CLOSING_STATES:
-        raise ValueError(f'close-decision closes to one of {sorted(CLOSING_STATES)}, not {state!r}')
-    if not evidence.strip():
-        raise ValueError('close-decision needs the deciding evidence verbatim')
+    try:
+        refuse_unclosable_arguments(str(item.key), state, evidence)
+    except DecisionCloseRefused as exc:
+        raise ValueError(str(exc)) from exc
     registry = ['python3', str(Path(session_registry.__file__).resolve())]
     if item.decision_id is not None:
         argv = [*registry, 'close-decision', '--id', item.decision_id, '--state', str(state), '--evidence', evidence,
