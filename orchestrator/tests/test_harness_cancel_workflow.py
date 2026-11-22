@@ -149,7 +149,7 @@ def harness_for_run_slot() -> Harness:
     h._merge_worker = None
     h._merge_inflight_registry = None  # type: ignore[assignment]
     h._task_verify_dispatcher = MagicMock()
-    h._verify_cache = None
+    h._verify_cache = MagicMock()
     h.cost_store = None
     # _collect_slot_report uses these
     h._live_tasks = set()
