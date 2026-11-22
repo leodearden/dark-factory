@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import functools
-import hashlib
 import itertools
 import json
 from collections.abc import Mapping, Sequence
@@ -89,7 +88,7 @@ class Arm:
 def _wording_of(sha: str) -> str:
     """The selectable wording whose prompt hashes to *sha*, else the sha's prefix."""
     for wording in _wording.SELECTABLE_WORDINGS:
-        if hashlib.sha256(_wording.system_prompt(wording).encode()).hexdigest() == sha:
+        if _wording.prompt_sha256(wording) == sha:
             return wording
     return sha[:_SHA_PREFIX]
 
@@ -143,11 +142,11 @@ def check_same_population(arms: Sequence[Arm]) -> None:
     expected = _cases_of(first)
     for arm in arms[1:]:
         pairs = itertools.zip_longest(expected, _cases_of(arm))
-        for index, (theirs, mine) in enumerate(pairs, 1):
-            if theirs != mine:
+        for index, (baseline_case, arm_case) in enumerate(pairs, 1):
+            if baseline_case != arm_case:
                 raise ValueError(
                     f'{arm.path} judged another population than {first.path}: case '
-                    f'{index} is {mine} there and {theirs} here',
+                    f'{index}: {first.path} has {baseline_case}, {arm.path} has {arm_case}',
                 )
 
 
@@ -200,8 +199,11 @@ def _difference(base: Mapping[str, Any], other: Mapping[str, Any]) -> dict[str, 
     """*other* minus *base* on every :data:`EFFECT_FIGURES` entry; ``None`` where either is unmeasured."""
     differences: dict[str, Any] = {}
     for name, path in EFFECT_FIGURES:
-        theirs, ours = _read(base, path), _read(other, path)
-        differences[name] = None if theirs is None or ours is None else round(ours - theirs, 4)
+        base_value, arm_value = _read(base, path), _read(other, path)
+        differences[name] = (
+            None if base_value is None or arm_value is None
+            else round(arm_value - base_value, 4)
+        )
     return differences
 
 

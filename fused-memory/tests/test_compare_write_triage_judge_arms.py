@@ -8,7 +8,6 @@ what an eval run writes. No network, key or store.
 from __future__ import annotations
 
 import functools
-import hashlib
 import json
 import os
 import types
@@ -50,6 +49,17 @@ VERDICTS = {
     ('psi', 'gpt-6.2-sol'): (OUTCOME_CONTESTED, OUTCOME_CONTESTED, OUTCOME_AMENDED),
 }
 
+#: Each arm's figures, counted by hand from POPULATION and VERDICTS: correct
+#: answers in the cosine middle band (of 2), the judged restate band (of 1) and
+#: every judged case (of 3), then contested verdicts on duplicates and on
+#: pseudo-contradictions.
+EXPECTED_FIGURES = {
+    ('shipped', 'gpt-6.1-sol'): (1, 1, 2, 0, 1),
+    ('psi', 'gpt-6.1-sol'): (1, 0, 1, 1, 1),
+    ('shipped', 'gpt-6.2-sol'): (2, 1, 3, 0, 0),
+    ('psi', 'gpt-6.2-sol'): (1, 0, 1, 2, 0),
+}
+
 #: Every provenance field that says WHICH population an arm judged.
 POPULATION_FIELDS = (
     'fixture_path', 'slate_mode', 'project_id', 't_high', 't_low', 'candidate_k',
@@ -65,7 +75,7 @@ def _mod() -> types.ModuleType:
 
 
 def _sha(wording: str) -> str:
-    return hashlib.sha256(_wording().system_prompt(wording).encode()).hexdigest()
+    return _wording().prompt_sha256(wording)
 
 
 def _rows(verdicts) -> list[dict]:
@@ -134,21 +144,45 @@ def _report(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def _sections(markdown: str) -> dict[str, list[dict[str, str]]]:
+    """Each ``## `` section's table, one ``{column: cell}`` per row."""
+    tables: dict[str, list[list[str]]] = {}
+    heading = None
+    for line in markdown.splitlines():
+        if line.startswith('## '):
+            heading = line[3:]
+            tables[heading] = []
+        elif heading is not None and line.startswith('| '):
+            tables[heading].append([cell.strip() for cell in line.strip('|').split('|')])
+    return {
+        heading: [dict(zip(header, row, strict=True)) for row in rows]
+        for heading, (header, *rows) in tables.items()
+    }
+
+
+def _section(sections: dict[str, list[dict[str, str]]], prefix: str) -> tuple[str, list]:
+    [(heading, rows)] = [(h, rows) for h, rows in sections.items() if h.startswith(prefix)]
+    return heading, rows
+
+
+def _rate_cell(block: dict, denominator: str = 'n') -> str:
+    return f'{block["correct"]}/{block[denominator]} = `{block["accuracy"]}`'
+
+
 class TestTheArmsAreReadFromTheirOwnReports:
     def test_each_arm_reads_its_own_figures(self, tmp_path: Path) -> None:
-        for arm, path in zip(_mod().load_arms(_grid(tmp_path)), _grid(tmp_path), strict=True):
-            report = _report(path)
-            confusion = report['confusion']
-            assert _mod().arm_figures(arm) == {
-                'middle_band': report['production_shape']['middle_band'],
-                'restate_band': report['routing']['restate_band'],
-                'judged': report['routing']['judged'],
-                'false_contested': report['false_contested'],
-                'pseudo_contradiction_contested': (
-                    confusion['pseudo_contradiction'][OUTCOME_CONTESTED]
-                ),
-                'duplicate_contested': confusion['duplicate'][OUTCOME_CONTESTED],
-            }
+        for arm in _mod().load_arms(_grid(tmp_path)):
+            figures = _mod().arm_figures(arm)
+            middle, restate, judged, duplicate, pseudo = EXPECTED_FIGURES[(arm.wording, arm.model)]
+            assert (figures['middle_band']['n'], figures['middle_band']['correct']) == (2, middle)
+            assert (
+                figures['restate_band']['judged'], figures['restate_band']['correct'],
+            ) == (1, restate)
+            assert (figures['judged']['n'], figures['judged']['correct']) == (3, judged)
+            assert (
+                figures['duplicate_contested'], figures['pseudo_contradiction_contested'],
+                figures['false_contested'],
+            ) == (duplicate, pseudo, duplicate + pseudo)
 
     def test_the_arms_do_not_all_read_the_same(self, tmp_path: Path) -> None:
         figures = [_mod().arm_figures(arm) for arm in _mod().load_arms(_grid(tmp_path))]
@@ -253,8 +287,10 @@ class TestArmsThatDidNotJudgeOnePopulationAreRefused:
         rows = _rows(VERDICTS[(WORDINGS[1], MODELS[1])])
         rows[2][key] = value
         arms[-1] = _write_arm(tmp_path, WORDINGS[1], MODELS[1], rows=rows)
-        with pytest.raises(ValueError, match='d-middle'):
+        with pytest.raises(ValueError, match='d-middle') as refused:
             _mod().build_comparison(_mod().load_arms(arms))
+        assert f'case 3: {arms[0]} has ' in str(refused.value)
+        assert f', {arms[-1]} has ' in str(refused.value)
 
     def test_two_arms_of_one_cell_are_refused(self, tmp_path: Path) -> None:
         arms = _grid(tmp_path)
@@ -268,6 +304,46 @@ class TestArmsThatDidNotJudgeOnePopulationAreRefused:
         arms = _grid(tmp_path)[:-1]
         with pytest.raises(ValueError, match=f'{WORDINGS[1]}.*{MODELS[1]}'):
             _mod().build_comparison(_mod().load_arms(arms))
+
+
+class TestRenderMarkdown:
+    def test_each_arm_row_carries_that_arms_figures(self, tmp_path: Path) -> None:
+        comparison = _mod().build_comparison(_mod().load_arms(_grid(tmp_path)))
+        rows = _sections(_mod().render_markdown(comparison))['Arms']
+        by_cell = {(row['wording'], row['model']): row for row in rows}
+        assert len(by_cell) == len(rows) == len(EXPECTED_FIGURES)
+        for arm in comparison['arms']:
+            row, figures = by_cell[(arm['wording'], arm['model'])], arm['figures']
+            assert row['cosine middle band'] == _rate_cell(figures['middle_band'])
+            assert row['judged restate band'] == _rate_cell(figures['restate_band'], 'judged')
+            assert row['every judged case'] == _rate_cell(figures['judged'])
+            middle, restate, judged, _, _ = EXPECTED_FIGURES[(arm['wording'], arm['model'])]
+            assert row['cosine middle band'].startswith(f'{middle}/2 ')
+            assert row['judged restate band'].startswith(f'{restate}/1 ')
+            assert row['every judged case'].startswith(f'{judged}/3 ')
+
+    def test_each_effect_row_carries_its_difference_against_the_named_baseline(
+        self, tmp_path: Path,
+    ) -> None:
+        comparison = _mod().build_comparison(_mod().load_arms(_grid(tmp_path)))
+        baseline = comparison['baseline']
+        sections = _sections(_mod().render_markdown(comparison))
+        prompt_heading, prompt_rows = _section(sections, 'Prompt effect')
+        model_heading, model_rows = _section(sections, 'Model effect')
+        assert f'`{baseline["wording"]}`' in prompt_heading
+        assert f'`{baseline["model"]}`' in model_heading
+        assert {(row['model'], row['wording']) for row in prompt_rows} == {
+            (model, wording) for model in MODELS for wording in WORDINGS[1:]
+        }
+        for row in prompt_rows:
+            effect = comparison['effects']['prompt'][row['model']][row['wording']]
+            assert row['judged_accuracy'] == str(effect['judged_accuracy'])
+        assert {(row['wording'], row['model']) for row in model_rows} == {
+            (wording, model) for wording in WORDINGS for model in MODELS[1:]
+        }
+        for row in model_rows:
+            effect = comparison['effects']['model'][row['wording']][row['model']]
+            assert row['judged_accuracy'] == str(effect['judged_accuracy'])
 
 
 class TestMain:

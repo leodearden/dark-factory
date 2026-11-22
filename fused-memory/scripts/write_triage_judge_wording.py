@@ -148,6 +148,11 @@ def system_prompt(wording: str) -> str:
         ) from None
 
 
+def prompt_sha256(wording: str) -> str:
+    """The sha256 of *wording*'s prompt, which a report records as ``judge_system_prompt_sha256``."""
+    return hashlib.sha256(system_prompt(wording).encode()).hexdigest()
+
+
 @contextlib.contextmanager
 def judge_wording(wording: str) -> Iterator[str]:
     """Hold *wording* in force on the shipped judge; yield its prompt's sha256.
@@ -157,6 +162,7 @@ def judge_wording(wording: str) -> Iterator[str]:
     """
     global _in_force
     prompt = system_prompt(wording)
+    sha256 = prompt_sha256(wording)
     if _in_force is not None or write_triage_judge.JUDGE_SYSTEM_PROMPT is not _SHIPPED:
         active = _in_force or 'an unrecognised override'
         raise RuntimeError(
@@ -166,7 +172,7 @@ def judge_wording(wording: str) -> Iterator[str]:
     _in_force = wording
     write_triage_judge.JUDGE_SYSTEM_PROMPT = prompt
     try:
-        yield hashlib.sha256(prompt.encode()).hexdigest()
+        yield sha256
     finally:
         write_triage_judge.JUDGE_SYSTEM_PROMPT = _SHIPPED
         _in_force = None

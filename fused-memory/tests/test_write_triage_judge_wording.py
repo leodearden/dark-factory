@@ -106,6 +106,14 @@ class TestWordings:
         assert 'pre-psi' in str(excinfo.value)
         assert "'psi'" in str(excinfo.value)
 
+    def test_each_frozen_wording_hashes_to_its_pinned_sha(self) -> None:
+        assert _mod().prompt_sha256(_mod().WORDING_PSI) == PSI_SHA256
+        assert _mod().prompt_sha256(_mod().WORDING_PRE_PSI) == PRE_PSI_SHA256
+
+    def test_an_unknown_wording_has_no_sha(self) -> None:
+        with pytest.raises(ValueError, match='post-psi'):
+            _mod().prompt_sha256('post-psi')
+
 
 class TestJudgeWordingOverride:
     @pytest.mark.asyncio
@@ -141,6 +149,11 @@ class TestJudgeWordingOverride:
     def test_the_shipped_wording_yields_the_shipped_sha(self) -> None:
         with _mod().judge_wording(_mod().WORDING_SHIPPED) as sha:
             assert sha == _sha(_mod().system_prompt(_mod().WORDING_SHIPPED))
+
+    @pytest.mark.parametrize('wording', ['shipped', 'pre-psi', 'psi'])
+    def test_the_yielded_sha_is_the_wordings_prompt_sha256(self, wording: str) -> None:
+        with _mod().judge_wording(wording) as sha:
+            assert sha == _mod().prompt_sha256(wording)
 
     def test_the_shipped_prompt_is_restored_when_the_body_raises(self) -> None:
         shipped = _mod().system_prompt(_mod().WORDING_SHIPPED)
