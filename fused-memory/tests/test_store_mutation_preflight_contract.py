@@ -161,15 +161,8 @@ class TestNeutraliseFixture:
     def test_the_probe_leaves_the_redirected_directory_empty(
         self, tmp_path: pathlib.Path
     ) -> None:
-        """Drives the fixture with a base temp private to this test (task 11043).
-
-        The fixture's real directory is shared by the whole session, and a
-        subprocess that imports mem0 under the redirected MEM0_DIR writes mem0's
-        import-time ``config.json`` there
-        (``fused-memory/tests/test_normalize_topic_slugs.py::TestNoLiveCorpusCountIsPinned``
-        does, task 4809). Emptiness is only this test's to assert on a directory
-        no other test can reach.
-        """
+        """Private base temp: the fixture's real directory is session state; see
+        `fused-memory/tests/_store_mutation_preflight_contract.py::neutralise_fixture`."""
         mod = _stub_script_module()
         fx = neutralise_fixture(mod, note='a note')
         private_base = types.SimpleNamespace(getbasetemp=lambda: tmp_path)
