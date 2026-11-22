@@ -11,7 +11,10 @@ from pathlib import Path
 import pytest
 from junit_case_marks import CaseMarks, Unresolved
 from shared.testing_timeout_markers import TimeoutSite
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from verify_log_junits import CaseOutcome, JunitCase
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _UNMARKED_MODULE = '''
     import pytest

@@ -13,6 +13,11 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 SCRIPT = SCRIPTS_DIR / 'install-timeout-headroom-selfcheck-timer.sh'
 WRAPPER = SCRIPTS_DIR / 'timeout-headroom-selfcheck.sh'

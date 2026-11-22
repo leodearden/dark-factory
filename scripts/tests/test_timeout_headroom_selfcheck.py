@@ -16,9 +16,11 @@ import timeout_headroom_selfcheck as selfcheck
 from shared.testing_ceiling_anchors import CeilingAnchor, Population, PopulationKind
 from shared.testing_timeout_headroom import UNDER_LOAD_HEADROOM_FACTOR
 from shared.testing_timeout_markers import SiteKind, TimeoutSite
-from shared.whole_tree_guard_family import min_leg_budget_for_family
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT, min_leg_budget_for_family
 from verify_budget_census import Corpus, Record, RecordPath
 from verify_log_junits import CaseOutcome, JunitCase, JunitRun, TreeRef, TreeSource
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _SPELLED = Population(PopulationKind.SPELLED_THROUGH, constant='BIG')
 _ANCHOR = CeilingAnchor(
