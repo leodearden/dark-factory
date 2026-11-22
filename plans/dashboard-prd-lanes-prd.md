@@ -521,12 +521,24 @@ R5).
   renders one shell `Pip` at the head of the lanes page (`ProjectPrdLanes`) and one at the head
   of the contention line (`PrdContentionLine`), each taking its block's Datum and its served
   rule. That `Pip` alone carries `≥` for a lower-bound Datum, the age, and the non-fresh
-  `reason` (one-datum decision 7). Every figure inside the block (titles, lane names, state
-  lines, chips, cells) is a plain `ViewFigure` span, not a `Pip`: it carries no `≥` or age of
-  its own, and its `title` is its served rule, preceded by the row detail where the row has
-  one, whatever the Datum's state. A figure's own `≥`, such as the ready cell's oldest age,
-  comes from a served field of that figure, not from the Datum. A Datum that is `unknown`
-  renders its `reason` in place of its block, so no figure inside it renders.
+  `reason` (one-datum decision 7). Every rule-titled figure inside a block is a plain
+  `ViewFigure` span, not a `Pip`. Its `title` is its served rule, preceded by the row detail
+  where the row has one (`prd_lanes_view.js::figureTitle`), whatever the Datum's state. These
+  are the lane headers; the row's PRD title, state line, `done/total`, signal, ready and
+  next-action cells; the expanded row's activity line; the dark-matter summary and hidden-high
+  line; the footer's closed, signal-coverage and `multi_link` counts; and the contention
+  entries, held-share and never-started figures. A few figures take their rule from a
+  container's `title`, not from their own: the segment legend (`rules.segments`) and the
+  expanded row's blocker, ready-high and deferred chips (`rules.detail`). The contention meta
+  line is one span titled with `rules.lock_depth` and `rules.snapshot_at` together. Two kinds
+  of figure are titled with something other than a rule: the bar's segments carry their label
+  and count, and the footer's input pips (`prd_lanes.jsx::PrdInputPip`) carry each input's
+  own state and reason (§4.11). Neither is the Datum's reading. No inner figure carries the
+  *Datum's* provenance: its `≥`, age and `reason` appear only on the head `Pip`. A served
+  value may itself be a bound or an age. The ready cell's `≥` comes from the served
+  `oldest_is_lower_bound`, and the contention meta line's "scheduler state changed …" renders
+  the served `snapshot_at`. These are values, not the Datum's provenance. A Datum that is
+  `unknown` renders its `reason` in place of its block, so no figure inside it renders.
 - **Test.** A test asserts every `FigureId` has a non-empty rule and every figure in a shaped
   payload names one.
 
