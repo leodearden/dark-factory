@@ -65,11 +65,15 @@ Usage
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+
 import argparse
 import asyncio
 import json
 import logging
-import sys
 from typing import Any
 
 from fused_memory.utils.mem0_content_keys import mem0_payload_text

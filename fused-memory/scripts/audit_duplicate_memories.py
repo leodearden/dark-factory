@@ -194,6 +194,11 @@ Usage
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+
 import argparse
 import asyncio
 import contextlib
@@ -202,10 +207,8 @@ import json
 import logging
 import math
 import re
-import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from shared.cli_boundary import LoudArgumentParser, run_cli

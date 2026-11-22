@@ -76,6 +76,11 @@ can never be misread as health.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+
 import argparse
 import asyncio
 import contextlib
@@ -83,11 +88,9 @@ import hashlib
 import logging
 import os
 import re
-import sys
 import tempfile
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger('memory_eval_staleness_sweep')
