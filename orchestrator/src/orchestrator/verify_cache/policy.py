@@ -45,7 +45,7 @@ class CacheDecision:
 
 @dataclass(frozen=True)
 class Unavailable:
-    """The registry could not be consulted; *reason* says why."""
+    """What a verify's cache decision could not read (the registry, or the code identity its keys carry); *reason* says why."""
 
     reason: str
 

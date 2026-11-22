@@ -713,7 +713,7 @@ async def run_merge_verify_on_worktree(
         task_id=task_id,
         # A runner reaches no registry: its units settle UNAVAILABLE, and its
         # cache record stays off the wire until gamma2 (task 9123).
-        verify_cache=CacheAccess.on_runner(),
+        verify_cache=await CacheAccess.on_runner(),
     )
     return await runner.run_merge_verify(merge_sha, spec)
 

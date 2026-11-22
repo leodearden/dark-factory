@@ -9573,8 +9573,9 @@ async def run_scoped_verification(
     """Run verification scoped to specific subprojects and optionally to task files.
 
     *verify_cache* joins the verify-result cache: dispatcher-side callers pass
-    ``CacheAccess.on_dispatcher``, a remote runner passes ``CacheAccess.on_runner``,
-    and None leaves the verify outside the cache.
+    the harness's one ``CacheAccess.on_dispatcher``, keyed on its deployed sha;
+    a remote runner passes ``await CacheAccess.on_runner()``, keyed on its gate
+    checkout; and None leaves the verify outside the cache.
 
     A gated *role* verifies as ONE admission plan, stamped here so every leg
     and retry keeps the plan's place in the admission gate's order, and

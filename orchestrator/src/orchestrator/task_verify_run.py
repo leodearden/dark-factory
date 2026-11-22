@@ -55,6 +55,6 @@ async def run_task_verify_on_worktree(
         archive_root=None,
         force_workspace=spec.force_workspace,
         role='task',
-        verify_cache=CacheAccess.on_runner(),
+        verify_cache=await CacheAccess.on_runner(),
     )
     return dataclasses.replace(result, worktree_log_paths=[], archive_log_paths=[])

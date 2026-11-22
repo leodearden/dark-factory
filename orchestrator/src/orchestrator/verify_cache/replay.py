@@ -20,7 +20,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig, VerifyCacheCon
 from orchestrator.verify_cache import keys, policy, toolchain, tree_objects
 from orchestrator.verify_cache.keys import UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
-from orchestrator.verify_cache.policy import CacheDecision, Decision, LegResult
+from orchestrator.verify_cache.policy import CacheDecision, Decision, LegResult, Unavailable
 from orchestrator.verify_cache.recorder import CacheRecord, LegRun, RecordedUnit
 from orchestrator.verify_cache.registry import Entry, Registry, registry_db_path
 from orchestrator.verify_evidence import (
@@ -46,38 +46,46 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-@functools.cache
-def running_code_identity() -> str:
-    """The commit of the checkout holding this running orchestrator code."""
+def _deployed_code(deployed: deployed_sha.DeployedSha | None) -> str | Unavailable:
+    """The code identity a dispatcher's keys carry: its deployed sha, unless that cannot name the running code."""
+    if deployed is None:
+        return Unavailable('no deployed sha was captured for this orchestrator process')
+    if deployed.indeterminate:
+        return Unavailable(
+            f'deployed sha {deployed.sha} is indeterminate: HEAD moved while the verify code was imported',
+        )
+    if deployed.dirty_wire_path:
+        return Unavailable(f'deployed sha {deployed.sha} had uncommitted wire-path edits at import')
+    return deployed.sha
+
+
+def _gate_checkout_code() -> str | Unavailable:
+    """The sha the gate checkout holding a runner's code is pinned at, which
+    ``cli.py::gate_identity`` reports to the dispatcher's handshake."""
     checkout = deployed_sha.resolve_code_checkout()
     if checkout is None:
-        raise toolchain.ToolchainUnavailable('the running orchestrator code is in no git checkout')
+        return Unavailable('the running orchestrator code is in no git checkout')
     try:
         return deployed_sha.checkout_head(checkout)
     except Exception as exc:
-        raise toolchain.ToolchainUnavailable(f'cannot read the running code sha of {checkout}: {exc}') from exc
+        return Unavailable(f'cannot read the gate checkout HEAD of {checkout}: {type(exc).__name__}: {exc}')
 
 
 @dataclass(frozen=True)
 class CacheAccess:
-    """How a verify reaches the registry. ``orchestrator_code`` None means the running code."""
+    """How a verify reaches the registry, and the code identity its keys carry."""
 
     registry: Registry | None
-    orchestrator_code: str | None = None
+    orchestrator_code: str | Unavailable
     clock: Callable[[], datetime] = _utc_now
 
     @classmethod
-    def on_dispatcher(cls, project_root: Path) -> CacheAccess:
-        return cls(registry=Registry(registry_db_path(project_root)))
+    def on_dispatcher(cls, project_root: Path, *, deployed: deployed_sha.DeployedSha | None) -> CacheAccess:
+        return cls(registry=Registry(registry_db_path(project_root)), orchestrator_code=_deployed_code(deployed))
 
     @classmethod
-    def on_runner(cls) -> CacheAccess:
-        return cls(registry=None)
-
-    async def code_identity(self) -> str:
-        if self.orchestrator_code is not None:
-            return self.orchestrator_code
-        return await asyncio.to_thread(running_code_identity)
+    async def on_runner(cls) -> CacheAccess:
+        return cls(registry=None, orchestrator_code=await asyncio.to_thread(_gate_checkout_code))
 
 
 @dataclass(frozen=True)
@@ -234,8 +242,14 @@ async def plan_replay(
     if modes.mode_for(role) is CacheMode.OFF:
         return None
     modules = tuple(ExecutedModule.of(mc, config) for mc in executed)
+    code = access.orchestrator_code
+    if isinstance(code, Unavailable):
+        return _unavailable(role, modes, modules, code.reason)
     try:
-        return await _decide_all(worktree, plan, executed, modules, config=config, role=role, access=access, leg_env=leg_env)
+        return await _decide_all(
+            worktree, plan, executed, modules,
+            config=config, role=role, access=access, orchestrator_code=code, leg_env=leg_env,
+        )
     except Exception as exc:
         logger.warning('verify_cache.plan_replay unavailable: %s: %s', type(exc).__name__, exc)
         return _unavailable(role, modes, modules, f'{type(exc).__name__}: {exc}')
@@ -250,6 +264,7 @@ async def _decide_all(
     config: OrchestratorConfig,
     role: VerifyRole,
     access: CacheAccess,
+    orchestrator_code: str,
     leg_env: LegEnv,
 ) -> ReplayPlan:
     modes = config.verify_cache
@@ -261,7 +276,7 @@ async def _decide_all(
     base = await toolchain.read_toolchain(
         worktree, worktree, tree, role=role, verify_env=leg_env(None),
         preprovision_command=config.verify_cold_preprovision_command,
-        orchestrator_code=await access.code_identity(),
+        orchestrator_code=orchestrator_code,
     )
     plan_dict = None if plan is None else plan.to_dict()
     tree_key = keys.tree_unit_key(tree, executed_spec_hash(plan_dict, modules), base)

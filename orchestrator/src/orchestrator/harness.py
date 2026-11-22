@@ -2198,7 +2198,7 @@ class Harness:
             quarantine=self._runner_quarantine,
             on_unavailable=self._bench_verify_host,
         )
-        self._verify_cache = CacheAccess.on_dispatcher(config.project_root)
+        self._verify_cache = CacheAccess.on_dispatcher(config.project_root, deployed=deployed_sha)
         self._task_verify_dispatcher = TaskVerifyDispatcher(
             self._host_pool, self.git_ops, policy_of=policy_from_config,
             verify_cache=self._verify_cache,
