@@ -15,7 +15,7 @@ cross-checks every other site against it. It never stores its own snapshot slug
 list: a hardcoded constant here would be one more lock-step copy, stale on the
 next invariant exactly like the prose sites were.
 
-THE FIVE PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
+THE FOUR PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
   * ``docs/legibility/design-invariants.md`` — SOURCE OF TRUTH. Its
     ``## INV-N `slug``` headings define the family.
   * ``docs/legibility/design-invariants-fixtures.md`` — one fixture section per
@@ -23,12 +23,14 @@ THE FIVE PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
     rationale prose, which the doc itself declares a point-in-time snapshot).
   * ``skills/prd/references/gates.md`` — TWO independent enumerations: the
     family-inventory row (ordered) and the G7 trigger-shape fallback list (set).
-  * ``CONTRIBUTING.md`` — pinned as an ABSENCE: it may name at most one
-    invariant, never a restatement of the family.
   * ``orchestrator/src/orchestrator/agents/code_quality.md``
     (``docs/code-quality.md`` is a symlink to it) — a PARTIAL
     `INV-N`-to-heuristic mapping, pinned pair-wise against the normative doc,
     never for completeness.
+
+``CONTRIBUTING.md`` is not registered: its absence of a restatement is checked
+directly by ``test_contributing_does_not_restate_the_invariant_family``.
+Registration is for files that enumerate.
 
 STRUCTURE, NEVER WORDING. This guard pins WHICH SLUGS APPEAR WHERE across
 artifacts — the cross-artifact correspondence that fails to auto-extend when an
@@ -421,8 +423,7 @@ def assert_verdict_table_covers(
 
 
 # Every site this module pins, and WHAT is pinned there. Registration means "this
-# file's relationship to the family is mechanized", not "this file enumerates" —
-# CONTRIBUTING.md is registered precisely because it must enumerate NOTHING.
+# file's enumeration of the family is mechanized".
 # `test_every_enumeration_site_is_pinned` checks this registry against a scan, so
 # it cannot quietly fall behind the repo the way the prose sites did.
 PINNED_SITES = {
@@ -436,9 +437,6 @@ PINNED_SITES = {
     "skills/prd/references/gates.md": (
         "two independent enumerations — the family-inventory row (ordered) and "
         "the `inv-trigger-shapes` G7 fallback span (set)"
-    ),
-    "CONTRIBUTING.md": (
-        "pinned as an ABSENCE: at most one by-name citation, never a restatement"
     ),
     "orchestrator/src/orchestrator/agents/code_quality.md": (
         "a partial `INV-N`-to-heuristic mapping, pinned pair-wise against the "
@@ -2025,9 +2023,9 @@ def test_fixtures_verdict_table_covers_every_invariant_in_both_shapes() -> None:
 # left the rest of docs/ and every package tree unwatched — a new enumeration in
 # a package README would have drifted on the next invariant with nothing red.
 #
-# Registration means "this file's relationship to the family is pinned", NOT
-# "this file enumerates": CONTRIBUTING.md is registered and carries ZERO slugs
-# today, because what is pinned there is the ABSENCE of a restatement.
+# Registration is for files that enumerate. A file pinned as an ABSENCE needs
+# none: CONTRIBUTING.md may carry at most one slug, so it can never clear the
+# threshold, and its own absence test checks it directly.
 #
 # The point-in-time record trees in `_EXCLUDED_TREES` are excluded BY DESIGN, not
 # by oversight; the reason for each tree sits beside that tuple.
@@ -2089,7 +2087,7 @@ def test_unregistered_enumeration_sites_is_empty_when_every_site_is_pinned(
     """The green case: over-threshold files are all registered, so nothing is returned.
 
     Includes the two shapes that must NOT be reported — a registered file carrying
-    zero slugs (CONTRIBUTING.md's post-fix state, pinned as an absence) and an
+    zero slugs (a site pinned as an absence) and an
     unregistered file that mentions slugs but stays under the threshold.
     """
     enumerating = _write_fixture_site(tmp_path, "enumerating.md", _FIXTURE_SLUGS[:4])
