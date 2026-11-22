@@ -23,7 +23,7 @@ from _workflow_helpers import (
     AgentStub,
     FakeScheduler,
     _build_workflow,
-    _derive_meta_root_like_production,  # noqa: F401  autouse fixture, see its docstring
+    _derive_meta_root_like_production,
     _init_repo,
 )
 
@@ -38,6 +38,9 @@ from orchestrator.scheduler import (
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
+
+# Autouse; named here so the agent-side doubles resolve the meta_root production does.
+pytestmark = pytest.mark.usefixtures(_derive_meta_root_like_production.__name__)
 
 TASK_ID = '42'
 
