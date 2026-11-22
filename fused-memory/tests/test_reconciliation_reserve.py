@@ -12,11 +12,6 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from fused_memory.reconciliation.reserve_step_aside import (
-    DEFERRAL_LOG_INTERVAL_SECS,
-    ReserveStepAside,
-    StepAsideSite,
-)
 from shared.testing_reserve import (
     PROTECTED,
     RELEASE_AT,
@@ -26,6 +21,12 @@ from shared.testing_reserve import (
     reserve_gate,
 )
 from shared.usage_gate import UsageGate
+
+from fused_memory.reconciliation.reserve_step_aside import (
+    DEFERRAL_LOG_INTERVAL_SECS,
+    ReserveStepAside,
+    StepAsideSite,
+)
 
 _STEP_ASIDE_LOGGER = 'fused_memory.reconciliation.reserve_step_aside'
 
