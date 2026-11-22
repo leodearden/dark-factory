@@ -1177,6 +1177,7 @@ def _make_harness_for_run_slot() -> Harness:
     h._merge_worker = None
     h._merge_inflight_registry = None  # type: ignore[assignment]
     h._task_verify_dispatcher = MagicMock()
+    h._verify_cache = None
     h.cost_store = None
     h._run_store = None
     h._run_id = None
