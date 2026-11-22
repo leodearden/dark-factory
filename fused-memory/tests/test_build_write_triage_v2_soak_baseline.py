@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 from _fm_helpers import load_script_module
+from _mem0_history_db import mem0_history_db
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.grouped_read import DEFAULT_AMENDMENT_TEXT_CHARS
@@ -255,23 +256,6 @@ def _item(**overrides: Any) -> dict[str, Any]:
         'supersedes_target': False, 'superseded_marks': [],
     }
     return {**row, **overrides}
-
-
-def _history_db(path: Path, rows: list[tuple[str, str | None, str, str, str]]) -> Path:
-    connection = sqlite3.connect(path)
-    connection.execute(
-        'CREATE TABLE history (id TEXT PRIMARY KEY, memory_id TEXT, old_memory TEXT,'
-        ' new_memory TEXT, event TEXT, created_at DATETIME, updated_at DATETIME,'
-        ' is_deleted INTEGER, actor_id TEXT, role TEXT)'
-    )
-    for index, (memory_id, old, new, event, updated_at) in enumerate(rows):
-        connection.execute(
-            'INSERT INTO history VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)',
-            (f'h{index}', memory_id, old, new, event, '2026-10-01T00:00:00+00:00', updated_at),
-        )
-    connection.commit()
-    connection.close()
-    return path
 
 
 def _without(row: dict[str, Any], field: str) -> dict[str, Any]:
@@ -608,7 +592,7 @@ class _Bundle:
         self.journal = self._journal(root / 'journal.db', [
             row for row in attaches if row['intent_id'] != self.missing
         ])
-        self.history = _history_db(root / 'history.db', [
+        self.history = mem0_history_db(root / 'history.db', [
             (f'p-{self.edited}', ATTACH_TIME_PARENT, f'parent text of {self.edited}', 'UPDATE',
              '2026-10-12T00:00:00+00:00'),
         ])

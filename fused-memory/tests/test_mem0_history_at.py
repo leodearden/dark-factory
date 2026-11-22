@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from _mem0_history_db import mem0_history_db
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 
@@ -22,27 +23,10 @@ def _mod() -> types.ModuleType:
     return load_script_module(SCRIPTS / 'mem0_history_at.py', mod_name='mem0_history_at')
 
 
-def _history_db(path: Path, rows: list[tuple[str, str | None, str, str, str]]) -> Path:
-    connection = sqlite3.connect(path)
-    connection.execute(
-        'CREATE TABLE history (id TEXT PRIMARY KEY, memory_id TEXT, old_memory TEXT,'
-        ' new_memory TEXT, event TEXT, created_at DATETIME, updated_at DATETIME,'
-        ' is_deleted INTEGER, actor_id TEXT, role TEXT)'
-    )
-    for index, (memory_id, old, new, event, updated_at) in enumerate(rows):
-        connection.execute(
-            'INSERT INTO history VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)',
-            (f'h{index}', memory_id, old, new, event, '2026-10-01T00:00:00+00:00', updated_at),
-        )
-    connection.commit()
-    connection.close()
-    return path
-
-
 @pytest.fixture
 def history(tmp_path: Path) -> Path:
     """p1 edited twice, p2 once, and p3 once by an UPDATE that kept no old text."""
-    return _history_db(tmp_path / 'history.db', [
+    return mem0_history_db(tmp_path / 'history.db', [
         ('p1', None, 'first', 'ADD', '2026-10-01T00:00:00+00:00'),
         ('p1', 'first', 'second', 'UPDATE', '2026-10-05T00:00:00+00:00'),
         ('p1', 'second', 'third', 'UPDATE', '2026-10-09T00:00:00+00:00'),

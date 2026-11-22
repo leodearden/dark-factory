@@ -8,7 +8,6 @@ from __future__ import annotations
 import functools
 import json
 import math
-import sqlite3
 import types
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +16,7 @@ from typing import Any
 import numpy as np
 import pytest
 from _fm_helpers import load_script_module
+from _mem0_history_db import mem0_history_db
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 DIMS = 1536
@@ -106,22 +106,6 @@ def _window(end: datetime | None = None) -> Any:
 def _writes(rows: list[dict[str, Any]], attaches: list[dict[str, Any]] | None = None,
             window: Any = None) -> list[Any]:
     return _mod().soak_writes(rows, attaches or [], window or _window())
-
-
-def _history_db(path: Path, rows: list[tuple[str, str | None, str, str, str, str]]) -> Path:
-    """mem0's history table; each row is (memory_id, old, new, event, created_at, updated_at)."""
-    connection = sqlite3.connect(path)
-    connection.execute(
-        'CREATE TABLE history (id TEXT PRIMARY KEY, memory_id TEXT, old_memory TEXT,'
-        ' new_memory TEXT, event TEXT, created_at DATETIME, updated_at DATETIME,'
-        ' is_deleted INTEGER, actor_id TEXT, role TEXT)'
-    )
-    for index, row in enumerate(rows):
-        connection.execute('INSERT INTO history VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)',
-                           (f'h{index}', *row))
-    connection.commit()
-    connection.close()
-    return path
 
 
 class TestTheSoakConstants:
@@ -268,11 +252,11 @@ def _slate_points() -> list[Point]:
 @pytest.fixture
 def history(tmp_path: Path) -> Any:
     """'a' and 'P' were edited after the write; 'b' was edited before it."""
-    path = _history_db(tmp_path / 'history.db', [
-        ('a', 'a then', 'a now', 'UPDATE', EARLIER, '2026-10-13T00:00:00+00:00'),
-        ('P', 'P then', 'P now', 'UPDATE', EARLIER, '2026-10-14T00:00:00+00:00'),
-        ('b', 'b older', 'z' * 5000, 'UPDATE', EARLIER, '2026-10-11T21:00:00+00:00'),
-    ])
+    path = mem0_history_db(tmp_path / 'history.db', [
+        ('a', 'a then', 'a now', 'UPDATE', '2026-10-13T00:00:00+00:00'),
+        ('P', 'P then', 'P now', 'UPDATE', '2026-10-14T00:00:00+00:00'),
+        ('b', 'b older', 'z' * 5000, 'UPDATE', '2026-10-11T21:00:00+00:00'),
+    ], created_at=EARLIER)
     return _history().MemoryHistory.read(path)
 
 
@@ -430,7 +414,7 @@ class TestTheCli:
         points += [_judge_band_point(index) for index in range(4)]
         points.append(('m-left', _at_cosine(0.2, 300), _payload('text of left', STORED_AT)))
         dump = _dump(tmp_path / 'dump', 'df', points)
-        history = _history_db(tmp_path / 'history.db', [])
+        history = mem0_history_db(tmp_path / 'history.db', [])
         return ['--journal', str(journal), '--attaches', str(attaches),
                 '--history-db', str(history), '--vectors', f'dump:{dump}',
                 '--projects', 'df', '--total', '3', '--seed', '7']
