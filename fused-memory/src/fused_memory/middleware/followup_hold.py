@@ -53,6 +53,7 @@ __all__ = [
     'FollowupHolderProtectedError',
     'FollowupHolders',
     'HoldEmit',
+    'HolderEdgeStripRefusedError',
     'HolderMinted',
     'HolderProtection',
     'PromotionDeferral',
@@ -328,6 +329,38 @@ def releases_holder(task: Mapping[str, object], status: str, *, release_holder: 
 def may_strip_holder_edge(agent_id: str | None) -> bool:
     """Open question 2: only a human may drop a held task's holder edge through a dependency replacement."""
     return derive_actor_class(agent_id) is ActorClass.HUMAN
+
+
+_HOLDER_EDGE_STRIP_HINT = (
+    'This task is a held follow-up: it depends on its project\'s follow-up holder, and a machine '
+    'caller may not drop that edge with a dependencies replacement. Keep the holder id in the '
+    'dependencies list. A held follow-up leaves the hold by promotion: cite it with x_finding_key '
+    'or prd_path, depend on it from a pending task, or have a human call '
+    'remove_dependency(task, holder). See docs/task-authoring.md §3.4.'
+)
+
+
+class HolderEdgeStripRefusedError(TaskmasterError):
+    """A machine-role ``update_task`` whose dependencies replacement drops a held task's holder edge."""
+
+    ERROR: ClassVar[str] = 'followup_holder_edge_strip_refused'
+
+    def __init__(self, *, task_id: str, holder_id: str, agent_id: str | None) -> None:
+        self.task_id = task_id
+        self.holder_id = holder_id
+        self.agent_id = agent_id
+        super().__init__(TASKMASTER_TOOL_ERROR, f'task {task_id} would lose its holder edge to {holder_id}')
+
+    def to_error_dict(self) -> dict[str, Any]:
+        return {
+            'success': False,
+            'error': self.ERROR,
+            'error_type': type(self).__name__,
+            'task_id': self.task_id,
+            'holder_id': self.holder_id,
+            'agent_id': self.agent_id,
+            'hint': _HOLDER_EDGE_STRIP_HINT,
+        }
 
 
 def protected_update(

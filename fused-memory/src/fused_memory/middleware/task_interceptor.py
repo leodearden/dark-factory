@@ -21,6 +21,7 @@ from shared.declared_scope import (
     stamp_violation,
 )
 from shared.defects import DeclareEvent, OutcomeEvent
+from shared.followup_hold_records import PromotionCause
 from shared.followup_items import (
     FOLLOWUP_ITEMS_METADATA_KEY,
     FollowupBundleInvalid,
@@ -116,13 +117,17 @@ from fused_memory.middleware.followup_hold import (
     HOLDER_MINT_SOURCE,
     FollowupHolders,
     HoldEmit,
+    HolderEdgeStripRefusedError,
     HolderProtection,
     PromotionDeferredError,
     backfill,
+    citation_ref,
     held_by,
     hold_at_create,
     hold_scope,
     is_holder,
+    may_strip_holder_edge,
+    promote,
     promote_dependencies_of,
     protected_status,
     protected_update,
@@ -3943,6 +3948,11 @@ class TaskInterceptor:
                 exc,
             )
             return None
+        if not hold_scope(candidate_metadata, candidate.priority):
+            await promote(
+                tm, project_root, int(decision.target_id),
+                by=PromotionCause.COMBINE, ref=ticket_id, emit=self._hold_emit(project_root),
+            )
         await self._advise_text_amendment(
             decision.target_id,
             project_root,
@@ -5933,12 +5943,21 @@ class TaskInterceptor:
                 agent_id=agent_id,
             ):
                 return rejection.to_error_dict()
+            replacement = kwargs.get('dependencies')
+            if before is None and replacement is not None:
+                before = await tm.get_task(task_id, project_root, tag)
             guarded = await _guarded_metadata_write(tm, task_id, project_root, kwargs, before)
             if guarded is not None:
                 if err := _declared_scope_refusal(task_id, guarded):
                     return err
                 if err := await self._holder_update_refusal(tm, task_id, project_root, guarded):
                     return err
+            if before is not None and replacement is not None and (
+                err := await self._settle_holder_edge_replacement(
+                    tm, task_id, project_root, before, replacement, agent_id,
+                )
+            ):
+                return err
 
             async def _do_update_task_write() -> Any:
                 return await self._journal_around(
@@ -5992,6 +6011,8 @@ class TaskInterceptor:
                 # raise — holds for both tools.py (which delegates here) and
                 # direct interceptor callers (task C2).
                 return e.to_error_dict()
+            if interceptor_write_succeeded(result):
+                await self._promote_after_update(tm, task_id, project_root, kwargs)
             # Under the lock, before audit-trail rotation: confirms THIS write, not a rewrite.
             if is_recon_stage_write and interceptor_write_succeeded(result):
                 result = await task_text_write_guard.verify_text_write_landed(
@@ -6343,6 +6364,42 @@ class TaskInterceptor:
                 'promoted': [str(promoted_id) for promoted_id in promoted],
             }
         return await tm.remove_dependency(task_id, depends_on, project_root, tag)
+
+    async def _settle_holder_edge_replacement(
+        self,
+        tm: TaskBackendProtocol,
+        task_id: str,
+        project_root: str,
+        before: Mapping[str, object],
+        replacement: Sequence[object],
+        agent_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Open question 2: a replacement dropping the holder edge is a human promotion, refused to machines.
+
+        Returns the refusal, or None when the replacement keeps the edge or the promotion landed.
+        """
+        holder = held_by(before)
+        if holder is None or str(holder) in {str(dependency).strip() for dependency in replacement}:
+            return None
+        if not may_strip_holder_edge(agent_id):
+            return HolderEdgeStripRefusedError(task_id=task_id, holder_id=str(holder), agent_id=agent_id).to_error_dict()
+        try:
+            await remove_holder_edge(
+                tm, project_root, int(task_id), ref='update_task', emit=self._hold_emit(project_root),
+            )
+        except PromotionDeferredError as e:
+            return e.to_error_dict()
+        return None
+
+    async def _promote_after_update(
+        self, tm: TaskBackendProtocol, task_id: str, project_root: str, kwargs: Mapping[str, Any],
+    ) -> None:
+        """A citation promotes the updated task; a dependencies replacement is an edge insert."""
+        emit = self._hold_emit(project_root)
+        if (ref := citation_ref(kwargs.get('metadata'))) is not None:
+            await promote(tm, project_root, int(task_id), by=PromotionCause.CITATION, ref=ref, emit=emit)
+        if kwargs.get('dependencies') is not None:
+            await promote_dependencies_of(tm, project_root, int(task_id), emit=emit)
 
     @staticmethod
     async def _held_behind(tm: TaskBackendProtocol, task_id: str, project_root: str, tag: str | None) -> str | None:
