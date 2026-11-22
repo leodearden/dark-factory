@@ -255,6 +255,96 @@ class TestRestart:
         assert len(_records(tmp_path)) == 1
 
 
+def _close(tmp_path, page_id: str) -> None:
+    from escalation.queue import EscalationQueue
+
+    EscalationQueue(escalation_queue_dir(tmp_path)).resolve(page_id, 'acknowledged, topping up')
+
+
+class TestAPageClosedWhileCreditsAreStillOut:
+    """A latch must not keep claiming a page a human has already closed."""
+
+    @pytest.mark.asyncio
+    async def test_a_page_resolved_while_still_exhausted_re_pages_after_the_cooldown(
+        self, tmp_path,
+    ):
+        clock = _Clock()
+        alarm = _alarm(tmp_path, clock=clock)
+        await alarm.record_exhausted(_exhaustion(), site='durable_queue:add_episode')
+        [first] = _pending(tmp_path)
+        _close(tmp_path, first['id'])
+
+        clock.advance(timedelta(minutes=1))
+        await alarm.record_exhausted(_exhaustion(), site='mem0_write')
+        assert _pending(tmp_path) == []
+
+        clock.advance(REPAGE_COOLDOWN)
+        await alarm.record_exhausted(_exhaustion(), site='mem0_write')
+
+        [second] = _pending(tmp_path)
+        assert second['id'] != first['id']
+        state = alarm.state()
+        assert state is not None
+        assert state.escalation_id == second['id']
+        assert state.first_seen == _FIRST_SEEN
+        assert state.first_site == 'durable_queue:add_episode'
+        assert _FIRST_SEEN.isoformat() in second['summary']
+
+    @pytest.mark.asyncio
+    async def test_concurrent_observations_after_the_cooldown_re_page_once(self, tmp_path):
+        clock = _Clock()
+        alarm = _alarm(tmp_path, clock=clock)
+        await alarm.record_exhausted(_exhaustion(), site='durable_queue:add_episode')
+        [first] = _pending(tmp_path)
+        _close(tmp_path, first['id'])
+        clock.advance(REPAGE_COOLDOWN)
+
+        await asyncio.gather(*(
+            alarm.record_exhausted(_exhaustion(), site=f'durable_queue:op{n}')
+            for n in range(5)
+        ))
+
+        assert len(_pending(tmp_path)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_page_still_pending_after_the_cooldown_is_not_re_filed(self, tmp_path):
+        clock = _Clock()
+        alarm = _alarm(tmp_path, clock=clock)
+        await alarm.record_exhausted(_exhaustion(), site='durable_queue:add_episode')
+        state = alarm.state()
+        assert state is not None
+        paged = state.escalation_id
+
+        for _ in range(3):
+            clock.advance(REPAGE_COOLDOWN)
+            await alarm.record_exhausted(_exhaustion(), site='mem0_write')
+
+        assert len(_records(tmp_path)) == 1
+        state = alarm.state()
+        assert state is not None
+        assert state.escalation_id == paged
+
+    @pytest.mark.asyncio
+    async def test_a_relatched_page_closed_after_a_restart_re_pages(self, tmp_path):
+        clock = _Clock()
+        await _alarm(tmp_path, clock=clock).record_exhausted(
+            _exhaustion(), site='durable_queue:add_episode',
+        )
+        [first] = _pending(tmp_path)
+
+        restarted = _alarm(tmp_path, clock=clock)
+        await restarted.restore()
+        _close(tmp_path, first['id'])
+        clock.advance(REPAGE_COOLDOWN)
+        await restarted.record_exhausted(_exhaustion(), site='mem0_write')
+
+        [second] = _pending(tmp_path)
+        assert second['id'] != first['id']
+        state = restarted.state()
+        assert state is not None
+        assert state.escalation_id == second['id']
+
+
 class TestNoProjectRoot:
     @pytest.mark.asyncio
     async def test_a_missing_root_warns_and_never_raises(self, caplog):
