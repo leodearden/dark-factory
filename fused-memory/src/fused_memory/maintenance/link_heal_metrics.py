@@ -227,18 +227,21 @@ def _sum(series: Sequence[MetricSeries], metric_id: str) -> int:
 
 @dataclass(frozen=True)
 class SweepMetrics:
-    """Where one run's series and the summary went, and why they were not
-    written, when they were not."""
+    """Where one run's series and the summary went, why they were not written,
+    when they were not, and why the summary an earlier run left could not then
+    be removed, when it could not."""
 
     metrics_path: Path
     summary_path: Path
     unwritten: str | None = None
+    stale_summary_unremoved: str | None = None
 
     def as_detail(self) -> dict[str, str | None]:
         return {
             'metrics_json': str(self.metrics_path),
             'summary_json': str(self.summary_path),
             'metrics_unwritten': self.unwritten,
+            'stale_summary_unremoved': self.stale_summary_unremoved,
         }
 
 
@@ -273,19 +276,21 @@ class SweepMetricsTarget:
             logger.error(
                 'link-heal sweep %s: cannot write its metrics: %s', view.plan.run_id[:8], failure,
             )
-            unwritten = f'{type(failure).__name__}: {failure}'
-            return replace(emitted, unwritten=unwritten + _retire(emitted.summary_path))
+            return replace(
+                emitted,
+                unwritten=f'{type(failure).__name__}: {failure}',
+                stale_summary_unremoved=_retire(emitted.summary_path),
+            )
         return emitted
 
 
-def _retire(stale: Path) -> str:
-    """Remove the summary *stale*; what to add to the run's ``unwritten`` when it
-    could not be removed, else nothing."""
+def _retire(stale: Path) -> str | None:
+    """Remove the summary *stale*; why it could not be removed, else None."""
     try:
         stale.unlink()
     except (FileNotFoundError, NotADirectoryError):
-        return ''
+        return None
     except OSError as failure:
         logger.error('link-heal sweep: cannot remove the stale summary %s: %s', stale, failure)
-        return f'; the stale summary stays ({type(failure).__name__}: {failure})'
-    return ''
+        return f'{type(failure).__name__}: {failure}'
+    return None
