@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1272,10 +1273,14 @@ def test_a_seeded_soak_passes_every_check_and_exits_zero(tmp_path: Path, capsys)
 
 
 class _ToolStub:
-    """A fused-memory client that answers every call with one reply, or raises one exception."""
+    """A fused-memory client that answers every call with one reply, or raises one exception.
 
-    def __init__(self, reply: Any = None, *, raises: Exception | None = None) -> None:
+    Given *replies*, it answers each call with the next of them instead.
+    """
+
+    def __init__(self, reply: Any = None, *, replies: Sequence[Any] = (), raises: Exception | None = None) -> None:
         self.reply = reply
+        self.replies = list(replies)
         self.raises = raises
         self.calls: list[tuple[str, dict]] = []
 
@@ -1283,7 +1288,7 @@ class _ToolStub:
         self.calls.append((name, arguments))
         if self.raises is not None:
             raise self.raises
-        return self.reply
+        return self.replies.pop(0) if self.replies else self.reply
 
 
 def _read(stub: _ToolStub, task_id: str = '42') -> tuple[dict | None, Exception | None]:
@@ -1323,6 +1328,55 @@ def test_the_task_reader_answers_a_transport_failure_with_that_exception():
     failure = httpx.ConnectError('connection refused')
 
     assert _read(_ToolStub(raises=failure)) == (None, failure)
+
+
+def _lookup_page(*task_ids: int, has_more: bool) -> dict[str, Any]:
+    """One find_tasks_by_metadata page as the tool answers it."""
+    return {
+        'results': [{'task_id': task_id, 'title': f'De-flake {NODE_A}', 'status': 'done'} for task_id in task_ids],
+        'tasks_with_key': 2,
+        'pagination': {'has_more': has_more, 'returned': len(task_ids)},
+    }
+
+
+def _lookup(stub: _ToolStub) -> tuple[list[str] | None, Exception | None]:
+    reader = FusedMemoryTaskReader(stub, '/srv/project')
+    return asyncio.run(reader.task_ids_with_metadata('flake_debt_test', NODE_A))
+
+
+def test_the_task_reader_lists_every_task_carrying_a_metadata_value_across_pages():
+    stub = _ToolStub(replies=[_lookup_page(8089, has_more=True), _lookup_page(8231, has_more=False)])
+
+    assert _lookup(stub) == (['8089', '8231'], None)
+    assert [name for name, _ in stub.calls] == ['find_tasks_by_metadata', 'find_tasks_by_metadata']
+    for (_, arguments), offset in zip(stub.calls, (0, 1), strict=True):
+        assert {key: value for key, value in arguments.items() if key != 'limit'} == {
+            'project_root': '/srv/project', 'key': 'flake_debt_test', 'value': NODE_A, 'offset': offset,
+        }
+        assert isinstance(arguments['limit'], int) and arguments['limit'] > 0
+
+
+@pytest.mark.parametrize('reply', [
+    {'error': 'database is locked', 'error_type': 'OperationalError'},
+    {**_lookup_page(8089, has_more=False), MCP_IS_ERROR_KEY: True},
+    {},
+    {'tasks_with_key': 1, 'pagination': {'has_more': False}},
+    {'results': [8089], 'pagination': {'has_more': False}},
+    {'results': [{'task_id': 8089}], 'pagination': {}},
+])
+def test_the_task_reader_answers_a_failed_lookup_as_an_error(reply: Any):
+    task_ids, error = _lookup(_ToolStub(reply))
+
+    assert task_ids is None
+    assert isinstance(error, Exception)
+    assert 'flake_debt_test' in str(error)
+    assert NODE_A in str(error)
+
+
+def test_the_task_reader_answers_a_lookup_transport_failure_with_that_exception():
+    failure = httpx.ConnectError('connection refused')
+
+    assert _lookup(_ToolStub(raises=failure)) == (None, failure)
 
 
 def _tools_call_answered(body: Any) -> httpx.MockTransport:
