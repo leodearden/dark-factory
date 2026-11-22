@@ -9,7 +9,10 @@ hint is pinned by its load-bearing phrases, since it is prose that may grow.
 
 from __future__ import annotations
 
+import pytest
+
 from fused_memory.backends.task_backend_errors import (
+    DependencyCycle,
     DoneProvenanceWriteAuthorityError,
     MetadataNotAnObjectError,
     StatusWriteAuthorityError,
@@ -163,3 +166,50 @@ def test_task_not_found_error_tag_defaults_to_none():
     err = TaskNotFoundError('7')
     assert err.task_id == '7'
     assert err.tag is None
+
+
+# ── DependencyCycle — a refused cycle-closing edge (task 9490) ──────────────
+
+_CYCLE_MESSAGE = (
+    'add_dependency: 9301 → 9288 would close a cycle 9301 → 9288 → 9290 → 9301; '
+    'remove one of those edges first'
+)
+
+
+def test_dependency_cycle_is_a_taskmaster_error_naming_the_path():
+    err = DependencyCycle('add_dependency', (9301, 9288, 9290, 9301))
+
+    assert isinstance(err, TaskmasterError)
+    assert err.code == 'TASKMASTER_TOOL_ERROR'
+    assert err.cycle == (9301, 9288, 9290, 9301)
+    assert err.message == _CYCLE_MESSAGE
+
+
+def test_dependency_cycle_wire_shape_is_json_native():
+    err = DependencyCycle('add_dependency', [9301, 9288, 9290, 9301])
+
+    assert err.to_error_dict() == {
+        'success': False,
+        'error': 'dependency_cycle',
+        'error_type': 'DependencyCycle',
+        'operation': 'add_dependency',
+        'task_id': 9301,
+        'depends_on': 9288,
+        'cycle': [9301, 9288, 9290, 9301],
+        'hint': _CYCLE_MESSAGE,
+    }
+
+
+@pytest.mark.parametrize(
+    ('cycle', 'invariant'),
+    [
+        pytest.param((), 'at least two', id='empty'),
+        pytest.param((9301,), 'at least two', id='one-entry'),
+        pytest.param((9301, 9288, 9290), 'start and end', id='open-path'),
+    ],
+)
+def test_dependency_cycle_refuses_a_malformed_path(cycle: tuple[int, ...], invariant: str):
+    with pytest.raises(ValueError, match=invariant) as caught:
+        DependencyCycle('update_task', cycle)
+
+    assert repr(cycle) in str(caught.value)

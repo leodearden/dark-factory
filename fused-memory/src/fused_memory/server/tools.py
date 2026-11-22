@@ -10623,7 +10623,10 @@ def create_mcp_server(
                 Passing it together with ``append=True`` is REJECTED — see
                 ``append`` above.
             status: New status (e.g. "pending"/"in-progress"/"done")
-            dependencies: Replacement list of dependency task ids (top-level only)
+            dependencies: Replacement list of dependency task ids (top-level only).
+                Each entry must exist (one already stored is exempt), must
+                not be the task itself, and must not close a local cycle (the
+                same ``DependencyCycle`` refusal as ``add_dependency``).
             agent_id: Which agent is writing (optional, auto-derived from MCP
                 context). Resolved here for uniform caller-identity attribution
                 across the task write path (task 2175/rho1b); status= writes
@@ -10800,6 +10803,13 @@ def create_mcp_server(
         Self-loops (same project + same task id) and malformed qualified strings
         raise ``TaskmasterError`` and surface as
         ``{'error': 'TASKMASTER_TOOL_ERROR: …', 'error_type': 'TaskmasterError'}``.
+
+        A bare-integer edge that would close a dependency cycle is refused, with
+        nothing written. The walk runs over the local ``dependencies`` table at
+        every status, and the reply carries ``{'error': 'dependency_cycle',
+        'error_type': 'DependencyCycle', 'cycle': [A, B, …, A], 'hint': …}``:
+        remove one of the named edges. Qualified ``project:id`` deps are not
+        walked.
 
         Args:
             id: Task ID that will depend on another
