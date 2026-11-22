@@ -4521,9 +4521,17 @@ check.
     `skipped_cap_7d` stays 0 while writes are off. The rate is 0.0 when nothing
     was asked, and `adjudications_asked_7d` shows the denominator. The run-report
     escalation names `summary.json`, and its summary line also names the failure
-    when the metrics could not be written (`metrics_unwritten`). Such a run
-    removes the previous `summary.json`, so gate θ fails closed on its absence
-    rather than reading a stale week.
+    when the metrics could not be written (`metrics_unwritten`). The summary
+    also carries `expires_at`, 26 h after its window ends
+    (`fused-memory/src/fused_memory/maintenance/link_heal_metrics.py::SUMMARY_TTL`),
+    and `scripts/check_write_triage_readiness_gate.py` fails any gate on a
+    report past its `expires_at`. So θ and its delivered-checks re-run fail
+    closed on a summary no run has replaced, whether the run was refused
+    (exit 2), crashed, or the timer stopped firing; one missed night is
+    enough. A run whose metrics could not be written also removes the
+    previous `summary.json`, because it no longer counts tonight. If even
+    that removal fails, the run-report escalation and the sweep's JSON output
+    name the failure as `stale_summary_unremoved`.
 - **Exit codes.** 0 when the run is complete, or partial only by the write or
   adjudication cap or stale skips. 1 on a read, adjudication or write failure,
   a stopped run, or a report or metrics it could not write.
