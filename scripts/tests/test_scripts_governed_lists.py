@@ -45,11 +45,14 @@ MERGE_STATE_PINNED_SITES_LIST = governed_exceptions(
     'shared/src/shared/merge_state.py instead of being flagged as an '
     'unregistered enumeration.',
     sorted(merge_state_vocabulary_consistency.PINNED_SITES),
-    default=Debt(TaskRef(7136)),
-    default_covers=5,
     dispositions={
-        'ARCHITECTURE.md': Debt(TaskRef(7136)),
-        'OPERATIONS.md': Debt(TaskRef(7136)),
+        'ARCHITECTURE.md': Policy('inv12-merge-vocab-operating-docs'),
+        'OPERATIONS.md': Policy('inv12-merge-vocab-operating-docs'),
+        'skills/merge-queue/SKILL.md': Policy('inv12-merge-vocab-skill-runbooks'),
+        'skills/unblock/SKILL.md': Policy('inv12-merge-vocab-skill-runbooks'),
+        'skills/unblock-low-risk/SKILL.md': Policy('inv12-merge-vocab-skill-runbooks'),
+        'skills/escalation-watcher/SKILL.md': Policy('inv12-merge-vocab-skill-runbooks'),
+        'skills/_shared/merge-status-reasons.md': Policy('inv12-merge-vocab-skill-runbooks'),
     },
 )
 
