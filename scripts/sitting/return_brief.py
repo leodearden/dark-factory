@@ -11,13 +11,14 @@ configured root holding no queue. The header names where the configured list
 came from, those queue-less configured roots, and every scanned queue of no
 known shape, which no root holds. The Host block lists every pending record a
 host filer raised (``authority.HOST_FILER_ROLES``), whatever its level, before
-anything else. Section 1 is the prepare-sitting brief, always recommend-only, rendered by
-``brief.render_brief`` so one numbered-entry renderer serves both documents,
-followed by the "Unanswered since" list: each numbered item, oldest first,
-with the stamp its ledger entry was first presented at. Sections 2-6, the Host
-block and the header's figures are ``fleet_state`` measurements, each printed
-with its own stamp. A store that cannot be read is a stated shortfall in its
-section; no section is ever omitted.
+anything else. Section 1 is the prepare-sitting brief, always
+recommend-only, rendered by ``brief.render_brief`` so one numbered-entry
+renderer serves both documents, followed by the "Unanswered since" list: each
+numbered item, oldest first, with the stamp its ledger entry was first
+presented at. Sections 2-6, the Host block and the header's figures are
+``fleet_state`` measurements, each printed with its own stamp. A store that
+cannot be read is a stated shortfall in its section; no section is ever
+omitted.
 
 Sections 2-5 list the active projects. A project is inactive only when its
 orchestrator unit is not running and nothing landed or was escalated in the
@@ -45,8 +46,8 @@ earlier night too, for every item a render had already numbered by then.
 
 The subprocesses are one ``git rev-list`` per measured root, for its landings,
 and one ``systemctl --user show`` per orchestrator unit naming a measured
-root; no network. Exit codes: 0 whenever the page is written, degraded or not; 2 on
-a configuration error.
+root; no network. Exit codes: 0 whenever the page is written, degraded or
+not; 2 on a configuration error.
 """
 from __future__ import annotations
 
