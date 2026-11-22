@@ -820,7 +820,7 @@ async def run_calibration(
     if stored is not None and (step := await _step_without_run(ledger, stored, now)) is not None:
         return step
     try:
-        cases = load_eval_set(eval_set_path)
+        cases = await asyncio.to_thread(load_eval_set, eval_set_path)
     except EvalSetInvalid as exc:
         return CalibrationResult(
             record=stored, ran=False,
