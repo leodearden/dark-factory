@@ -15,7 +15,9 @@ from legibility import coder, detectors, digest, inventory, sampling
 from legibility.detectors import AgentClass, CarrierKind, SignalClass
 from legibility_carrier_fixtures import (
     PROSE_QUOTING_THE_SCHEMA,
+    SDK_GUI_CLIENT_HUMAN_TURNS,
     TRICKLE_CODER_PREAMBLE,
+    UNMARKED_HEADLESS_SDK_PROMPTS,
     assistant_record,
     briefing_text,
     census_synthesis_prompt,
@@ -522,6 +524,47 @@ class TestUserTurnText:
 
     def test_a_tool_result_only_record_has_no_turn_text(self):
         assert detectors.user_turn_text(tool_result_record('tu-1', 'output')) is None
+
+
+# ---------------------------------------------------------------------------
+# (g) dialogue_turn_text -- the one rule for "a human addressed this
+# session", behind the digest's gold turns and n_user_turns and the
+# classifier's INTERACTIVE.
+# ---------------------------------------------------------------------------
+
+_RECORDS_NO_HUMAN_ADDRESSED = [
+    pytest.param(user_record('x', isMeta=True), id='meta'),
+    pytest.param(user_record('x', isSidechain=True), id='sidechain'),
+    pytest.param(tool_result_record('tu-1', 'ok'), id='tool_result_only'),
+    pytest.param(assistant_record(text_block('hi')), id='assistant'),
+    pytest.param(user_record(briefing_text()), id='harness_briefing'),
+]
+
+
+class TestDialogueTurnText:
+    def test_a_human_turn_is_its_text(self):
+        assert detectors.dialogue_turn_text(user_record('please redo it')) == 'please redo it'
+
+    @pytest.mark.parametrize('record', _RECORDS_NO_HUMAN_ADDRESSED)
+    def test_a_record_no_human_addressed_has_no_dialogue_text(self, record):
+        assert detectors.dialogue_turn_text(record) is None
+
+    @pytest.mark.parametrize('text', UNMARKED_HEADLESS_SDK_PROMPTS)
+    def test_a_headless_sdk_prompt_has_no_dialogue_text(self, text):
+        assert detectors.dialogue_turn_text(sdk_prompt(text)) is None
+
+    @pytest.mark.parametrize(('text', 'entrypoint'), SDK_GUI_CLIENT_HUMAN_TURNS)
+    def test_a_gui_client_human_turn_is_its_text(self, text, entrypoint):
+        assert detectors.dialogue_turn_text(sdk_prompt(text, entrypoint=entrypoint)) == text
+
+    def test_the_digests_user_turns_are_exactly_the_dialogue_turns(self):
+        records = [
+            user_record('a'), sdk_prompt('b'), user_record('c', isMeta=True),
+            user_record(briefing_text()), user_record('d'),
+        ]
+        dialogue = [text for record in records if (text := detectors.dialogue_turn_text(record)) is not None]
+
+        assert [turn['text'] for turn in digest.iter_user_turns(records)] == dialogue == ['a', 'd']
 
 
 # ---------------------------------------------------------------------------
