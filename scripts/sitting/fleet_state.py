@@ -8,12 +8,15 @@ behind the return brief's "every claim re-checked at generation time and
 timestamped": an unstamped claim is unrepresentable.
 
 The runs.db figures are the connection-taking query forms of
-``orchestrator.digest``'s readers (``query_count_done_in_window``,
+``orchestrator.digest``'s readers (``query_landings_in_window``,
 ``query_model_role_rollup``), run over this module's own ``connect_ro``
-connection. The path-taking digest readers fail open to a zero that cannot be
+connection. The path-taking digest readers fail open to a value that cannot be
 told from a true zero, so this module never calls them: a ``sqlite3.Error``
 from the open or the query flags the figure ``unreadable``, a missing table
-included, since the query names it.
+included, since the query names it. Landed is the landings on main in the
+window, per the quality dashboard's landing datum
+(``shared.quality_series.landings``): merge commits and fast-forwards, each
+train member counted. Its git read failing flags it ``unreadable`` too.
 
 Read-only: every store is opened ``mode=ro`` and every queue is read through
 the unlocked scan helpers, so nothing here creates a file or a directory.
@@ -44,8 +47,10 @@ from orchestrator.decision_registry import (
     decisions_dir,
     normalize_escalations_dir,
 )
-from orchestrator.digest import ModelRoleRow, query_count_done_in_window, query_model_role_rollup
+from orchestrator.digest import ModelRoleRow, query_landings_in_window, query_model_role_rollup
 from shared.project_id import fold_project_token
+from shared.quality_series import UnrecognisedTrainEvent
+from shared.quality_series.git_lines import GitObjectMissing, GitTimeout, GitUnavailable
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 from sitting import inventory, payloads
 from sitting.inventory import QUEUE_SUBDIRS, PendingRecords, Shortfall
@@ -61,6 +66,8 @@ SHADOW_ONLY = (
     'No standing-policy class is adopted (docs/escalation-standing-policy.md), so nothing was ruled '
     'autonomously: every ruling counted here is a shadow-only proposal, a measurement never applied.'
 )
+
+_LANDINGS_UNREADABLE = (GitUnavailable, GitTimeout, GitObjectMissing, UnrecognisedTrainEvent)
 
 T = TypeVar('T')
 Refusal = tuple[Status, Shortfall]
@@ -256,13 +263,17 @@ def project_queue_dirs(project_root: Path | str) -> tuple[str, ...]:
     return tuple(normalize_escalations_dir(Path(project_root) / subdir) for subdir in QUEUE_SUBDIRS)
 
 
-def landed(runs_db: Path | str, window: Window, *, now: datetime) -> Measurement[int]:
-    """Tasks completed ``done`` in *window*, per ``orchestrator.digest.query_count_done_in_window``."""
-    return _from_runs_db(Path(runs_db), 0, lambda conn: query_count_done_in_window(conn, *window.iso()), now)
+def landed(runs_db: Path | str, window: Window, *, now: datetime, repo: Path | str) -> Measurement[int]:
+    """Landings on *repo*'s main in *window*, per ``orchestrator.digest.query_landings_in_window``."""
+    try:
+        return _from_runs_db(Path(runs_db), 0, lambda conn: query_landings_in_window(conn, repo, *window.iso()), now)
+    except _LANDINGS_UNREADABLE as exc:
+        gap = Shortfall('landings', str(repo), f'{type(exc).__name__}: {exc}')
+        return Measurement(0, _stamp(now), str(runs_db), 'unreadable', (gap,))
 
 
 def spend_and_cap_hits(runs_db: Path | str, window: Window, *, now: datetime) -> Measurement[tuple[ModelRoleRow, ...]]:
-    """Per-(model, role) cost, cap-hit rate and $/done, per ``orchestrator.digest.query_model_role_rollup``."""
+    """Per-(model, role) cost, cap-hit rate and $ per done run, per ``orchestrator.digest.query_model_role_rollup``."""
     return _from_runs_db(
         Path(runs_db), (), lambda conn: tuple(query_model_role_rollup(conn, *window.iso()).rows), now,
     )
@@ -506,7 +517,7 @@ def _measure_project(
     return ProjectState(
         project=project,
         root=str(root),
-        landed=guarded('runs_db', str(runs_db), 0, lambda: landed(runs_db, window, now=now)),
+        landed=guarded('runs_db', str(runs_db), 0, lambda: landed(runs_db, window, now=now, repo=root)),
         stuck=guarded('tasks_db', tasks_db, (), lambda: stuck(root, pending, now=now)),
         spend=guarded('runs_db', str(runs_db), (), lambda: spend_and_cap_hits(runs_db, window, now=now)),
         standing_policy=guarded('escalation_queue', queue_source, StandingPolicyRulings(_fold_reports((), window)),

@@ -33,8 +33,9 @@ the number it had. A watcher seeds its session ledger from it
 the numbers his session applies. That holds for a session launched on an
 earlier night too, for every item a render had already numbered by then.
 
-No subprocess, no network, no git. Exit codes: 0 whenever the page is written,
-degraded or not; 2 on a configuration error.
+The one subprocess is a ``git rev-list`` per measured root, for its landings;
+no network. Exit codes: 0 whenever the page is written, degraded or not; 2 on
+a configuration error.
 """
 from __future__ import annotations
 
@@ -473,7 +474,8 @@ def _agreement_lines(rulings: StandingPolicyRulings) -> list[str]:
 
 
 def _landed_lines(count: int) -> list[str]:
-    return [f'{count} task{"" if count == 1 else "s"} done in the window.']
+    return [f'{count} landing{"" if count == 1 else "s"} on main in the window '
+            '(merge commits and fast-forwards; each train member counted).']
 
 
 def _stuck_lines(rows: tuple[StuckRow, ...]) -> list[str]:
