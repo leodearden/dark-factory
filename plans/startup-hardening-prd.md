@@ -252,8 +252,8 @@ dispatched agent shell (task 8274's worktree) on host leo-MS-7C35. The journal w
 |---|---|---|---|
 | 1. `runs` rows started in the window | every row has `startup_completed_at` or `exit_reason` non-NULL; a both-NULL row is a γ defect | dark-factory: 6 rows, 4 `cancelled`, 2 both-NULL. reify: 6 rows, 4 `cancelled`, 2 both-NULL. All 4 both-NULL rows had completed startup: 2 are live, 2 were SIGKILLed after startup. 0 `startup_crash:*` | **FAIL**: γ (task 8269) persists `startup_completed_at` only at exit. Follow-up: _pending in this commit_ |
 | 2. watchdog restart-rate sampling, `--report RESTARTS` | every WATCHED unit has an entry with `sampling_since` ≤ window start and a last sample ≤ ~3 min old; the watchdog timer ran across the whole window with no gap far above its 60 s tick; `--report` prints `RESTARTS` for every running unit. (δ keeps only the last 1800 s of samples by design, so §6's "≥ 7 days of samples" is read as `sampling_since` plus timer continuity.) | 7/7 WATCHED units present, each with `sampling_since` 2026-11-11T17:55:04Z and a last sample 2 s old (30 samples, all NRestarts 0). 10 095 timer ticks in the window, median gap 60.2 s, largest 120.4 s (one missed tick). `RESTARTS` printed for 9/9 running units, all `0/success`. Not sampled: scoping-intake and stream-touch, which are not in WATCHED | **PASS**. The WATCHED gap is owned by pending tasks 9321 and 9815 |
-| 3. crash-loop pages | _pending in this commit_ | _pending in this commit_ | _pending in this commit_ |
-| 4. startup-step L1s | _pending in this commit_ | _pending in this commit_ | _pending in this commit_ |
+| 3. crash-loop pages | each in-window `orchestrator-crash-loop-*` or `orchestrator-startup-crash-loop` record matches a journal `Scheduled restart job` burst (≥ 5 within 1800 s, or `start-limit-hit`; ≥ 3 consecutive startup crashes for γ's page). Conversely, every such burst has a record | 0 records in the window across the 9 hosted queues. 0 `Scheduled restart job` lines and 0 start-limit hits on all 9 units. 0 `startup_crash:*` rows in all 9 runs.db | **no episode, detector unexercised**: no false page, no missed page |
+| 4. startup-step L1s | list each in-window `orchestrator-startup-<step>` L1 with its `dedupe_count`, and say whether it names a real fault | 0 L1s in the window across the 9 queues. 0 `startup_step_failed` events in the window in all 9 runs.db | **no step failure in the window, runner's failure path unexercised** |
 | 5. merge-lane cost per restart | _pending in this commit_ | _pending in this commit_ | _pending in this commit_ |
 
 **Item 1 evidence** (measured 2026-11-22T11:19–11:26Z). The query was `SELECT run_id, started_at, completed_at,
@@ -294,6 +294,11 @@ started_at`, run on each project's `data/orchestrator/runs.db`.
   exits through its `finally`, the column cannot tell §3.6's crashed start from a healthy one.
 - The two class (ii) kills are systemd's 90 s stop-sigterm bound: `Stopping` came 90 s before `Killing` both
   times. So the shutdown drain overran, which is task 7247 and out of scope under §4.
+- The same shape appears across the fleet, from the runs.db of all 9 hosted projects (measured 2026-11-22T11:31Z
+  for the items 3–4 scan). Each project has 6 rows in the window and 0 `startup_crash:*`. Seven projects have 1
+  both-NULL row, the live run. reify and dark-factory have 2, as above. solar-challenge-platform also has 2: one
+  is live (run-37f056969250) and one, run-6d9d7fe5ccbb (started 2026-11-19T03:25:58Z), was SIGKILLed at
+  2026-11-21T01:31:11Z by the same stop-sigterm timeout, about 46 h after it started.
 
 **Item 2 evidence** (measured 2026-11-22T11:27–11:28Z, main checkout at `8436bb9b60`).
 
@@ -324,3 +329,31 @@ started_at`, run on each project's `data/orchestrator/runs.db`.
 - orchestrator-scoping-intake.service and orchestrator-stream-touch.service appear in `--report` but not in
   WATCHED, so they get no crash-loop sampling. Pending tasks 9321 (add both to WATCHED) and 9815 (S24 δ2a:
   derive the liveness set from installed sockets) already own that gap, so nothing new is filed for it.
+
+**Items 3–4 evidence** (measured 2026-11-22T11:30–11:33Z).
+
+- Queues scanned. The roots come from the `--config <root>/dark-factory-orchestrator.yaml` of every installed
+  `~/.config/systemd/user/orchestrator-*.service` except the watchdog: autopilot-video, dark-factory, know-live,
+  solar-challenge (unit my-solar-challenge), pump-web-ui, reify, scoping-intake, solar-challenge-platform,
+  stream-touch. In each `<root>/data/escalations` the scan read every top-level `esc-*.json` and every
+  `archive/<date>/esc-*.json`: 8 764 files in all, none unreadable. It selected records whose `task_id` starts
+  with `orchestrator-crash-loop-` or `orchestrator-startup-` (the latter covers `orchestrator-startup-crash-loop`).
+- In-window records with `timestamp` ≥ 2026-11-15T10:24:00Z: none, in any queue.
+- Excluded as out of window: 8 records, all `orchestrator-startup-2c3-streak-alarms` (an L1 `-1` and an L2 `-2`),
+  filed 2026-11-10T20:57Z–2026-11-11T10:48Z.
+  - In dark-factory both are archived 2026-11-11 as `dismissed`. That L2 was resolved by task 9322, which made
+    both `_alarm_subject` helpers tolerate `task_id=None`; it is done and merged as `0a2ff8bb91`.
+  - In autopilot-video, know-live and pump-web-ui both are still `pending`, with `dedupe_count` 0 and no
+    `updated_at`.
+  - Each of those units restarted 6 times in the window. A recurrence would have refreshed the pending L1 in
+    place (§3.1), so `dedupe_count` 0 is in-window evidence that the 2c3 fault did not recur. The six pending
+    records are stale, not live faults.
+- Journal converse check (`journalctl --user USER_UNIT=orchestrator-<unit>.service --since '2026-11-15 10:24'`,
+  all 9 units). 0 `Scheduled restart job` lines and 0 start-limit lines on every unit. Each unit has 6 `Started`
+  lines, and every one follows a `Stopping` line, so each start was a stop/start: a fleet sweep or a manual
+  restart, never a `Restart=` restart. That agrees with NRestarts 0 throughout item 2. No burst reaches the
+  5-in-1800 s threshold, so no page was missed.
+- runs.db corroboration, all 9 projects: `SELECT run_id, timestamp, data FROM events WHERE
+  event_type='startup_step_failed' AND timestamp >= '2026-11-15T10:24:00'` returns 0 rows everywhere. The
+  all-time counts are 1 each in autopilot-video, dark-factory, know-live and pump-web-ui, all on 2026-11-10 (the
+  2c3 fault above), and 0 elsewhere.
