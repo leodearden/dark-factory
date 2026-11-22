@@ -1611,8 +1611,8 @@ def test_dark_factory_family_row_fails_loudly(
     )
 
 
-def test_gates_family_row_points_at_the_normative_doc() -> None:
-    """LIVE: gates.md's family-inventory row points at the normative doc, naming no slug.
+def test_gates_family_row_does_not_restate_the_invariant_family() -> None:
+    """LIVE: gates.md's family-inventory row names no invariant slug (an absence pin).
 
     An absence pin, like CONTRIBUTING.md's. It cannot go stale when an invariant
     is added, which is why it replaced the ordered pin over a copied slug list.
