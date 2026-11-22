@@ -1345,6 +1345,53 @@ class SessionResumeConfig(BaseModel):
         return self
 
 
+class EarlyStartConfig(BaseModel):
+    """Starting a dependent early on its predecessor's branch while the predecessor waits for its merge.
+
+    ``plans/early-start-on-predecessor-branch-prd.md`` section 7, Config.  The
+    defaults live here only, not in ``defaults.yaml``.  Every leaf is green
+    tier.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            'Gates new early starts only; a live pair and a branch with a ledger '
+            'record are handled whatever it says. Off in the code until T7.'
+        ),
+    )
+    pass_interval_secs: float = Field(
+        default=60,
+        gt=0,
+        description='Seconds between timer-driven early-start selection passes (a pass also runs after a merge request).',
+    )
+    picture_max_age_secs: float = Field(
+        default=600,
+        gt=0,
+        description='Seconds the early-start selection keeps its task picture before building a new one.',
+    )
+    merge_entry_alert_secs: float = Field(
+        default=43200,
+        gt=0,
+        description="Seconds a dependent may wait at its merge phase for its predecessor's slot to end before one escalation; the wait stays.",
+    )
+    stop_streak_pause: int = Field(
+        default=5,
+        ge=1,
+        description='Early starts in a row ending in a stop after which the feature pauses itself and escalates once.',
+    )
+    stop_hard_cancel_secs: float = Field(
+        default=300,
+        gt=0,
+        description='Seconds a stopped dependent has to exit after its soft cancel before it is hard-cancelled.',
+    )
+    unknown_streak_alert: int = Field(
+        default=3,
+        ge=1,
+        description='Unknown answers in a row to the landed question after which one escalation is raised.',
+    )
+
+
 class SpeculationProbeConfig(BaseModel):
     """Variable-depth speculative verify placement (task 2359, sibling of
     task 2340's depth telemetry).
@@ -5662,6 +5709,10 @@ class OrchestratorConfig(BaseSettings):
     # plans/priority-at-later-gates-prd.md). Nothing reads it yet.
     merge_pool: MergePoolConfig = Field(default_factory=MergePoolConfig)
 
+    # Early start on a predecessor's branch (plans/early-start-on-predecessor-branch-prd.md).
+    # The defaults live in EarlyStartConfig only, not in defaults.yaml.
+    early_start: EarlyStartConfig = Field(default_factory=EarlyStartConfig)
+
     # Verify-result cache modes per role (task 5652, plans/verify-result-cache-prd.md).
     # An absent stanza is OFF for both roles.
     verify_cache: VerifyCacheConfig = Field(default_factory=VerifyCacheConfig)
@@ -6930,6 +6981,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # count that drifts reads as a checked claim and is not one — the check is
     # test_config.py::TestSessionResumeConfig::test_leaves_in_reloadable_fields.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
+    # Green tier: T4-T6 read every leaf at use.
+    _submodel_leaf_paths('early_start', EarlyStartConfig),
     # Dispatch-score sub-budgets (task 3819, PRD D8) — same whole-submodel
     # idiom.  Green-tier because a scoring retune used to cost a fleet restart,
     # which is why the old age_alpha / cpm_beta constants were never tuned.

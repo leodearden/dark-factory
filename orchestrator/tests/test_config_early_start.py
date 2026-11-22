@@ -77,4 +77,4 @@ def test_a_reload_applies_to_the_live_config():
 @pytest.mark.parametrize('leaf', ['stop_streak_pause', 'unknown_streak_alert', 'pass_interval_secs'])
 def test_a_zero_is_refused(leaf):
     with pytest.raises(ValidationError, match=leaf):
-        EarlyStartConfig(**{leaf: 0})
+        EarlyStartConfig.model_validate({leaf: 0})
