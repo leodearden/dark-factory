@@ -474,3 +474,7 @@ Leo's rulings of 2026-10-31 add decisions 14, 15 and 16 and cut the parity windo
 | ε | 6673 | three-day window; report adds merge wall under contention; records its hand-run for reify | unchanged |
 | η | 6674 | flip by a ruling at either gate; pauses the gate rather than refusing | ι |
 | reify adoption | reify:8430 | runs beside ε, three-day window; no wait on 6106 | external `dark_factory:6672` |
+
+## 16. Amendment record (2026-11-22)
+
+Base: main `5672c7cdd9`; esc-6672-1, task 8780. Rows 3, 25 and 32, and the sites that state the same facts (§5.2, decisions 1, 5 and 14, §5.6), now describe the shipped code: a laptop exit 1 is `gate` by 6565's classifier, the per-module override refusal is a once-per-dispatcher warning, and readmission is `HostQuarantine.readmit_host` (tasks 5290 and 5040). §12 item 11 was added for a ruling at ε. §14, §15 and the capability manifest are left as dated records, and §15's `_readmit_probed_host` was correct on its base.
