@@ -8,7 +8,7 @@ branch that holds a PRD family not yet on main.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -131,6 +131,21 @@ async def test_prd_family_only_in_a_worktree_is_stamped_there(
     assert not (main / 'plans').exists()
 
 
+#: ``(tmp_path, main, wt) -> (manifest_root, sidecars that must stay untouched)``.
+CaseBuilder = Callable[[Path, Path, Path], tuple[str, list[Path]]]
+
+
+async def assert_refused_before_anything(
+    server: Any, root: Path, task_id: str, result: dict[str, Any], reason_code: str,
+) -> None:
+    assert result.get('error_type') == 'ManifestRootRefused', result
+    assert result['reason_code'] == reason_code, result
+    assert 'manifest_stamping' not in result
+    task = await call(server, 'get_task', {'id': task_id, 'project_root': str(root)})
+    assert task['status'] == 'deferred'
+    assert 'delivered_checks' not in task['metadata']
+
+
 def _other_repository(tmp_path: Path, main: Path, wt: Path) -> tuple[str, list[Path]]:
     other = tmp_path / 'other'
     other.mkdir()
@@ -163,18 +178,24 @@ def _main_checkout_alias(tmp_path: Path, main: Path, wt: Path) -> tuple[str, lis
 
 
 @pytest.mark.parametrize(
-    ('build_case', 'reason_code'),
+    ('build_case', 'target_status', 'reason_code'),
     [
-        pytest.param(_other_repository, 'other_repository', id='other-repository'),
-        pytest.param(_plain_directory, 'not_a_worktree', id='plain-directory'),
-        pytest.param(_missing_directory, 'not_a_worktree', id='missing-directory'),
-        pytest.param(_relative_path, 'not_a_worktree', id='relative-path'),
-        pytest.param(_worktree_subdirectory, 'not_a_worktree', id='worktree-subdirectory'),
-        pytest.param(_main_checkout_alias, 'main_checkout', id='main-checkout-alias'),
+        pytest.param(_other_repository, 'pending', 'other_repository', id='other-repository'),
+        pytest.param(_plain_directory, 'pending', 'not_a_worktree', id='plain-directory'),
+        pytest.param(_missing_directory, 'pending', 'not_a_worktree', id='missing-directory'),
+        pytest.param(_relative_path, 'pending', 'not_a_worktree', id='relative-path'),
+        pytest.param(
+            _worktree_subdirectory, 'pending', 'not_a_worktree', id='worktree-subdirectory',
+        ),
+        pytest.param(_main_checkout_alias, 'pending', 'main_checkout', id='main-checkout-alias'),
+        pytest.param(
+            _other_repository, 'cancelled', 'other_repository', id='other-repository-cancelled',
+        ),
     ],
 )
 async def test_manifest_root_that_is_not_a_worktree_of_the_repo_is_refused(
-    tmp_path: Path, repo_layout: tuple[Path, Path], build_case: Any, reason_code: str,
+    tmp_path: Path, repo_layout: tuple[Path, Path], build_case: CaseBuilder,
+    target_status: str, reason_code: str,
 ) -> None:
     main, wt = repo_layout
     manifest_root, sidecars = build_case(tmp_path, main, wt)
@@ -184,18 +205,57 @@ async def test_manifest_root_that_is_not_a_worktree_of_the_repo_is_refused(
         task_id = await submit_planned(server, main, _producer_metadata())
 
         result = await call(server, 'commit_planning', {
-            'project_root': str(main), 'task_ids': task_id, 'manifest_root': manifest_root,
+            'project_root': str(main), 'task_ids': task_id, 'target_status': target_status,
+            'manifest_root': manifest_root,
         })
 
-        assert result.get('error_type') == 'ManifestRootRefused', result
-        assert result['reason_code'] == reason_code, result
+        await assert_refused_before_anything(server, main, task_id, result, reason_code)
         assert manifest_root in result['error']
-        assert 'manifest_stamping' not in result
-        task = await call(server, 'get_task', {'id': task_id, 'project_root': str(main)})
-        assert task['status'] == 'deferred'
-        assert 'delivered_checks' not in task['metadata']
 
     assert {sidecar: sidecar.read_bytes() for sidecar in sidecars} == snapshot
+
+
+async def test_manifest_root_is_refused_when_project_root_is_not_a_git_checkout(
+    tmp_path: Path, repo_layout: tuple[Path, Path],
+) -> None:
+    _, wt = repo_layout
+    store = tmp_path / 'store'
+    store.mkdir()
+    sidecar = write_prd_family(wt, 'foo', 'alpha')
+    snapshot = sidecar.read_bytes()
+
+    async with task_stack(store) as server:
+        task_id = await submit_planned(server, store, _producer_metadata())
+
+        result = await call(server, 'commit_planning', {
+            'project_root': str(store), 'task_ids': task_id, 'manifest_root': str(wt),
+        })
+
+        await assert_refused_before_anything(server, store, task_id, result, 'other_repository')
+        assert f'project_root {str(store)!r} is not a git checkout' in result['error']
+
+    assert sidecar.read_bytes() == snapshot
+
+
+async def test_manifest_root_is_refused_when_git_cannot_run(
+    tmp_path: Path, repo_layout: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main, wt = repo_layout
+    sidecar = write_prd_family(wt, 'foo', 'alpha')
+    snapshot = sidecar.read_bytes()
+
+    async with task_stack(main) as server:
+        task_id = await submit_planned(server, main, _producer_metadata())
+
+        with monkeypatch.context() as env:
+            env.setenv('PATH', str(tmp_path / 'no-git-here'))
+            result = await call(server, 'commit_planning', {
+                'project_root': str(main), 'task_ids': task_id, 'manifest_root': str(wt),
+            })
+
+        await assert_refused_before_anything(server, main, task_id, result, 'probe_failed')
+
+    assert sidecar.read_bytes() == snapshot
 
 
 @pytest.mark.parametrize('searched', ['main', 'wt'], ids=['manifest-root-omitted', 'worktree'])
