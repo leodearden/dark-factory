@@ -84,12 +84,19 @@ class TestOutcomeDescriptions:
 
 
 class TestResolutionText:
-    def test_a_long_resolution_is_truncated_with_an_ellipsis(self):
+    def _rendered_resolution(self, text: str) -> str:
+        line = _entry_line(render_handled_digest((_resolved('esc-r', text),)), 'esc-r')
+        return line.split('resolved: ', 1)[1]
+
+    def test_a_long_resolution_is_cut_at_the_bound_with_an_ellipsis(self):
         text = ''.join(f'{i:05d}' for i in range(DIGEST_RESOLUTION_MAX_CHARS))
-        line = _entry_line(render_handled_digest((_resolved('esc-long', text),)), 'esc-long')
-        assert text not in line
-        assert text[: DIGEST_RESOLUTION_MAX_CHARS // 2] in line
-        assert line.endswith('…')
+        rendered = self._rendered_resolution(text)
+        assert rendered == text[:DIGEST_RESOLUTION_MAX_CHARS] + '…'
+        assert len(rendered) == DIGEST_RESOLUTION_MAX_CHARS + 1
+
+    def test_a_resolution_at_the_bound_is_kept_whole(self):
+        text = 'x' * DIGEST_RESOLUTION_MAX_CHARS
+        assert self._rendered_resolution(text) == text
 
     def test_a_multi_line_resolution_stays_on_its_entry_line(self):
         block = render_handled_digest(

@@ -43,7 +43,7 @@ class HandledL0:
 def _describe(outcome: StewardOutcome) -> str:
     match outcome:
         case StewardResolved(resolution_text=text):
-            return f'resolved: {text}'
+            return f'resolved: {_bounded(text)}'
         case StewardReescalatedL1(esc_id=esc_id):
             return f're-escalated to level 1 as `{esc_id}`'
         case StewardInterrupted(reason=reason, wip_commits_present=wip):
@@ -70,7 +70,7 @@ def render_handled_digest(handled: Sequence[HandledL0]) -> str:
     newest_first = list(reversed(handled))
     shown = newest_first[:DIGEST_MAX_ENTRIES]
     lines = [
-        f'- `{entry.escalation_id}` [{entry.category}] {_bounded(_describe(entry.outcome))}'
+        f'- `{entry.escalation_id}` [{entry.category}] {_describe(entry.outcome)}'
         for entry in shown
     ]
     hidden = len(newest_first) - len(shown)
