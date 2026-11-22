@@ -55,6 +55,13 @@ from orchestrator.offline_lane_records import (
 )
 from shared.project_layout import escalation_queue_dir
 
+# The de-flake owner's metadata keys, by their PRD section 5.6 names: flake_ledger spells them
+# inline (orchestrator/src/orchestrator/flake_ledger.py::_deflake_metadata) with no public constant.
+DEBT_TEST_KEY = 'flake_debt_test'
+DEBT_CYCLE_KEY = 'flake_debt_open_count'
+DEBT_CALL_SITE_KEY = 'flake_debt_call_site'
+DEBT_TRIGGER_KEY = 'flake_debt_trigger'
+
 _BEGINNING = datetime.min.replace(tzinfo=UTC)
 _LATEST = datetime.max.replace(tzinfo=UTC)
 _LANE_REENTRY_REF = call_site_evidence(FlakeCallSite.offline_lane, observed_at='')['ref']
@@ -234,7 +241,8 @@ class SoakInputs:
     """*tasks* maps each task read to its body, or None for a corroborated absence; *failures* maps
     (command, test) to that test's failure records over every stored pass of the selected commands;
     *record_bytes* is the size of every file under the run-record root.  *ledger_cut_over* is
-    :func:`_ledger_cut_over` over every stored pass, whatever the window and commands."""
+    :func:`_ledger_cut_over` over every stored pass, whatever the window and commands.
+    *cycle_owners* maps each offered test to every de-flake task naming it, one per debt cycle."""
 
     since: datetime
     ledger_cut_over: datetime | None
@@ -244,6 +252,7 @@ class SoakInputs:
     episodes: Mapping[str, CommandRecord]
     tasks: Mapping[str, Mapping[str, Any] | None]
     ledger: LedgerReads
+    cycle_owners: Mapping[str, tuple[str, ...]]
     failures: Mapping[tuple[str, str], tuple[FailureRecord, ...]]
     escalations: EscalationReads
     record_bytes: int
@@ -339,10 +348,15 @@ def _failures(every_pass: Sequence[StoredPass], selected: Collection[str]) -> di
     return {key: tuple(failures) for key, failures in found.items()}
 
 
+def _offered_tests(window: Sequence[WindowPass]) -> list[str]:
+    """The distinct tests the windowed effect blocks list in debts_offered, in first-seen order."""
+    return list(dict.fromkeys(debt.node for p in window if p.effect is not None for debt in p.effect.debts_offered))
+
+
 def _read_ledger(
     db: Path, *, since: datetime, now: datetime, window: Sequence[WindowPass],
 ) -> LedgerReads | Unjudgeable:
-    offered = dict.fromkeys(debt.node for p in window if p.effect is not None for debt in p.effect.debts_offered)
+    offered = _offered_tests(window)
     summary = summarize_due(db, stale_before=now - DUE_ITEM_STALE_AFTER)
     due_items = None if summary is None else read_due_items(db, now=_LATEST, limit=summary.size)
     if summary is None or due_items is None:
@@ -364,13 +378,30 @@ def episode_bindings(episodes: Mapping[str, CommandRecord]) -> dict[tuple[str, s
     }
 
 
-def _task_ids(window: Sequence[WindowPass], episodes: Mapping[str, CommandRecord], ledger: LedgerReads) -> list[str]:
+def _task_ids(
+    window: Sequence[WindowPass],
+    episodes: Mapping[str, CommandRecord],
+    ledger: LedgerReads,
+    cycle_owners: Mapping[str, Sequence[str]],
+) -> list[str]:
     """The ids the windowed effect blocks filed, the tasks the stored episodes are bound to now,
-    and the owners of the offered tests' debts."""
+    the owners of the offered tests' debts, and every cycle's owner of each offered test."""
     filed = [task_id for p in window if p.effect is not None for task_id in p.effect.tasks_filed]
     bound = episode_bindings(episodes).values()
     owners = [row.owner_task_id for row in ledger.debts.values() if row.owner_task_id is not None]
-    return list(dict.fromkeys((*filed, *bound, *owners)))
+    every_cycle = [task_id for task_ids in cycle_owners.values() for task_id in task_ids]
+    return list(dict.fromkeys((*filed, *bound, *owners, *every_cycle)))
+
+
+async def _cycle_owners(tests: Sequence[str], task_reader: TaskReader) -> dict[str, tuple[str, ...]] | Unjudgeable:
+    """Each test to every de-flake task naming it; a failed lookup leaves nothing to judge."""
+    owners: dict[str, tuple[str, ...]] = {}
+    for test in tests:
+        task_ids, error = await task_reader.task_ids_with_metadata(DEBT_TEST_KEY, test)
+        if error is not None or task_ids is None:
+            return Unjudgeable(f'task store unreadable: {DEBT_TEST_KEY}={test}: {error}')
+        owners[test] = tuple(task_ids)
+    return owners
 
 
 def _is_lane_regression(escalation: Escalation, since: datetime) -> bool:
@@ -545,7 +576,10 @@ async def load_inputs(
     episodes = _episodes(project_root, stores.episodes, now, selected)
     if isinstance(episodes, Unjudgeable):
         return episodes
-    tasks = await _read_tasks(_task_ids(window, episodes, ledger), task_reader)
+    cycle_owners = await _cycle_owners(_offered_tests(window), task_reader)
+    if isinstance(cycle_owners, Unjudgeable):
+        return cycle_owners
+    tasks = await _read_tasks(_task_ids(window, episodes, ledger, cycle_owners), task_reader)
     if isinstance(tasks, Unjudgeable):
         return tasks
     escalations = _read_escalations(stores.escalations, since=since, episodes=episodes, window=window)
@@ -560,6 +594,7 @@ async def load_inputs(
         episodes=episodes,
         tasks=tasks,
         ledger=ledger,
+        cycle_owners=cycle_owners,
         failures=_failures(every_pass, selected),
         escalations=escalations,
         record_bytes=_directory_bytes(stores.records),

@@ -38,6 +38,10 @@ from typing import Any
 import _checkout as _checkout
 from migrate_metadata_modules_to_files import DEFAULT_SERVER
 from offline_lane_soak_inputs import (
+    DEBT_CALL_SITE_KEY,
+    DEBT_CYCLE_KEY,
+    DEBT_TEST_KEY,
+    DEBT_TRIGGER_KEY,
     SoakInputs,
     TaskReader,
     Unjudgeable,
@@ -68,11 +72,6 @@ from orchestrator.offline_lane_escalations import PENDING_ESCALATION
 from orchestrator.offline_lane_filing import LANE_METADATA_KEY, covering_lane_task
 from orchestrator.offline_lane_records import FailureRecord, PassRecord
 from shared.project_layout import default_project_root
-
-# The de-flake owner's metadata keys, by their PRD section 5.6 names: flake_ledger spells them
-# inline (orchestrator/src/orchestrator/flake_ledger.py::_deflake_metadata) with no public constant.
-DEBT_CALL_SITE_KEY = 'flake_debt_call_site'
-DEBT_TRIGGER_KEY = 'flake_debt_trigger'
 
 
 class Verdict(StrEnum):
@@ -536,6 +535,36 @@ def _lane_debts(inputs: SoakInputs) -> Figure:
     )
 
 
+def _cycle_owner(inputs: SoakInputs, task_id: str) -> dict[str, Any]:
+    task = inputs.tasks.get(task_id)
+    metadata = {} if task is None else _metadata(task)
+    return {
+        'task_id': task_id,
+        'cycle': metadata.get(DEBT_CYCLE_KEY),
+        'call_site': metadata.get(DEBT_CALL_SITE_KEY),
+        'trigger': metadata.get(DEBT_TRIGGER_KEY),
+        'status': None if task is None else task.get('status'),
+    }
+
+
+def _cycle_order(owner: Mapping[str, Any]) -> tuple[bool, int]:
+    """By cycle, an owner with no integer cycle last; the sort is stable, so ties keep the lookup's id order."""
+    cycle = owner['cycle']
+    return (False, cycle) if isinstance(cycle, int) else (True, 0)
+
+
+def _debt_cycle_owners(inputs: SoakInputs) -> Figure:
+    return Figure(
+        'debt_cycle_owners',
+        f'per test a windowed effect block offered, every de-flake task whose metadata.{DEBT_TEST_KEY} names it, '
+        f'any status, by cycle (metadata.{DEBT_CYCLE_KEY}), with its call site, trigger and status now',
+        {
+            test: sorted((_cycle_owner(inputs, task_id) for task_id in task_ids), key=_cycle_order)
+            for test, task_ids in inputs.cycle_owners.items()
+        },
+    )
+
+
 def _due_list(inputs: SoakInputs) -> Figure:
     items = [
         {
@@ -673,6 +702,7 @@ _FIGURES: tuple[Callable[[SoakInputs], Figure], ...] = (
     _episodes_by_length,
     _filing_delay,
     _lane_debts,
+    _debt_cycle_owners,
     _due_list,
     _undecided_tests,
     _due_offers_per_pass,
