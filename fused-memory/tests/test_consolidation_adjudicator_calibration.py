@@ -47,9 +47,12 @@ from fused_memory.reconciliation.consolidation_adjudicator import (
 from fused_memory.reconciliation.consolidation_adjudicator_calibration import (
     BOUNDS,
     CALLS_IN_FLIGHT,
+    CRASH_AGE,
     EVAL_SET_PATH,
     EVAL_SET_SHA256,
     MAX_UNANSWERED,
+    STALL_BACKOFF,
+    STALL_RUN_CAP,
     TRANSPORT_ATTEMPTS,
     BoundBasis,
     BoundDirection,
@@ -68,6 +71,7 @@ from fused_memory.reconciliation.consolidation_adjudicator_calibration import (
     case_request,
     evaluate,
     load_eval_set,
+    mark_stale_if_drifted,
     pool,
     run_calibration,
     score_run,
@@ -724,3 +728,272 @@ class TestCalibrationRun:
     async def test_now_must_be_timezone_aware(self, ledger) -> None:
         with pytest.raises(ValueError, match='now'):
             await _calibrate(ledger, ScriptedResponses(_key()), now=NOW.replace(tzinfo=None))
+
+
+MINUTE = timedelta(minutes=1)
+SEVEN_FALSE_KEEPS = _keeping_foreign_in
+
+
+def _seven() -> set[str]:
+    return {c.case_id for c in _test_cases(CaseKind.contaminated)[:7]}
+
+
+def _seeded(state: CalibrationState, *, started_at: datetime, **fields) -> CalibrationRecord:
+    return CalibrationRecord(
+        identity=adjudicator_identity(RUN_SETTINGS), state=state, started_at=started_at,
+        model=RUN_SETTINGS.model, endpoint_host=RUN_SETTINGS.endpoint_host,
+        **{'attempt': 1, **fields},
+    )
+
+
+async def _seed(ledger: ReconLedgerStore, record: CalibrationRecord) -> None:
+    await ledger.upsert(record.to_ledger_record(now=record.started_at))
+
+
+async def _crashed_run(ledger: ReconLedgerStore, *, started_at: datetime) -> None:
+    """The ``running`` row a run leaves behind when its process dies mid-run."""
+    stored = await _stored(ledger)
+    assert stored is not None
+    await _seed(ledger, dataclasses.replace(
+        stored, state=CalibrationState.RUNNING, attempt=stored.attempt + 1,
+        started_at=started_at, figures=None,
+    ))
+
+
+def _unanswering() -> ScriptedResponses:
+    return ScriptedResponses(_key(deviations=_unanswered(MAX_UNANSWERED + 1)))
+
+
+async def _row(ledger: ReconLedgerStore):
+    return await ledger.get_by_identity(
+        **adjudicator_calibration_key(adjudicator_identity(RUN_SETTINGS)),
+    )
+
+
+class TestCalibrationLifecycle:
+    @pytest.mark.asyncio
+    async def test_a_fresh_running_row_is_waited_for(self, ledger) -> None:
+        await _seed(ledger, _seeded(
+            CalibrationState.RUNNING, started_at=NOW - CRASH_AGE + MINUTE,
+        ))
+        double = ScriptedResponses(_key())
+
+        result = await _calibrate(ledger, double)
+
+        assert double.requests == []
+        assert (result.state, result.ran, result.finding) == (CalibrationState.RUNNING, False, None)
+        assert result.may_adjudicate is False
+
+    @pytest.mark.asyncio
+    async def test_an_old_running_row_is_marked_crashed_and_the_next_call_runs(
+        self, ledger,
+    ) -> None:
+        first_run = _run(SEVEN_FALSE_KEEPS(_seven()))
+        seeded = _seeded(
+            CalibrationState.RUNNING, started_at=NOW - CRASH_AGE - MINUTE, attempt=2,
+            first_run=first_run, figures=first_run,
+        )
+        await _seed(ledger, seeded)
+        double = ScriptedResponses(_key())
+
+        marked = await _calibrate(ledger, double)
+
+        assert double.requests == []
+        assert (marked.state, marked.ran, marked.finding) == (CalibrationState.CRASHED, False, None)
+        assert marked.record == dataclasses.replace(
+            seeded, state=CalibrationState.CRASHED, stall_count=1,
+        )
+        assert await _stored(ledger) == marked.record
+
+        rerun = await _calibrate(ledger, double, now=NOW + MINUTE)
+
+        assert len(double.requests) == 176
+        assert (rerun.state, rerun.ran) == (CalibrationState.PASS, True)
+        assert rerun.record is not None
+        assert (rerun.record.attempt, rerun.record.stall_count) == (3, 0)
+        assert rerun.record.figures is not None
+        pooled = _figure(rerun.record.figures, BoundName.contaminated_false_keep)
+        assert (pooled.numerator, pooled.denominator) == (7, 90)
+
+    @pytest.mark.asyncio
+    async def test_three_runs_ending_inconclusive_or_crashed_stall_the_calibration(
+        self, ledger,
+    ) -> None:
+        first = await _calibrate(ledger, _unanswering())
+        assert first.state is CalibrationState.INCONCLUSIVE
+        assert first.record is not None
+        assert first.record.stall_count == 1
+        await _crashed_run(ledger, started_at=NOW + MINUTE)
+        crashed = await _calibrate(ledger, _unanswering(), now=NOW + 2 * MINUTE + CRASH_AGE)
+        assert crashed.state is CalibrationState.CRASHED
+        assert crashed.record is not None
+        assert crashed.record.stall_count == 2
+        assert crashed.finding is None
+        stalled_at = NOW + 3 * MINUTE + CRASH_AGE
+
+        stalled = await _calibrate(ledger, _unanswering(), now=stalled_at)
+
+        assert STALL_RUN_CAP == 3
+        assert (stalled.state, stalled.ran) == (CalibrationState.STALLED, True)
+        assert stalled.finding is CalibrationFinding.adjudicator_calibration_stalled
+        assert stalled.record is not None
+        assert (stalled.record.stall_count, stalled.record.stalled_at) == (3, stalled_at)
+        assert await _stored(ledger) == stalled.record
+
+        waiting = ScriptedResponses(_key())
+        backing_off = await _calibrate(
+            ledger, waiting, now=stalled_at + STALL_BACKOFF - timedelta(hours=1),
+        )
+
+        assert waiting.requests == []
+        assert (backing_off.state, backing_off.ran, backing_off.finding) == (
+            CalibrationState.STALLED, False, None,
+        )
+
+        restarted = await _calibrate(ledger, _unanswering(), now=stalled_at + STALL_BACKOFF)
+
+        assert (restarted.state, restarted.ran, restarted.finding) == (
+            CalibrationState.INCONCLUSIVE, True, None,
+        )
+        assert restarted.record is not None
+        assert (restarted.record.stall_count, restarted.record.stalled_at) == (1, None)
+
+    @pytest.mark.asyncio
+    async def test_a_crash_mark_reaching_the_cap_stalls_the_calibration(self, ledger) -> None:
+        await _calibrate(ledger, _unanswering())
+        await _calibrate(ledger, _unanswering(), now=NOW + MINUTE)
+        await _crashed_run(ledger, started_at=NOW + 2 * MINUTE)
+        marked_at = NOW + 3 * MINUTE + CRASH_AGE
+        double = ScriptedResponses(_key())
+
+        stalled = await _calibrate(ledger, double, now=marked_at)
+
+        assert double.requests == []
+        assert (stalled.state, stalled.ran) == (CalibrationState.STALLED, False)
+        assert stalled.finding is CalibrationFinding.adjudicator_calibration_stalled
+        assert stalled.record is not None
+        assert (stalled.record.stall_count, stalled.record.stalled_at) == (
+            STALL_RUN_CAP, marked_at,
+        )
+
+    @pytest.mark.parametrize(
+        ('answer', 'state'),
+        [
+            (expected_reply, CalibrationState.PASS),
+            (_keeping_foreign, CalibrationState.FAIL_FIRST_RUN),
+        ],
+        ids=['pass', 'fail_first_run'],
+    )
+    @pytest.mark.asyncio
+    async def test_a_scored_run_resets_the_stall_count(
+        self, ledger, answer, state: CalibrationState,
+    ) -> None:
+        await _calibrate(ledger, _unanswering())
+        await _calibrate(ledger, _unanswering(), now=NOW + MINUTE)
+
+        scored = await _calibrate(
+            ledger, ScriptedResponses(_key(answer=answer)), now=NOW + 2 * MINUTE,
+        )
+
+        assert scored.state is state
+        assert scored.record is not None
+        assert scored.record.stall_count == 0
+
+    @pytest.mark.asyncio
+    async def test_an_inconclusive_second_run_keeps_the_first_run_for_pooling(
+        self, ledger,
+    ) -> None:
+        first = await _calibrate(ledger, ScriptedResponses(_key(answer=SEVEN_FALSE_KEEPS(_seven()))))
+        assert first.state is CalibrationState.FAIL_FIRST_RUN
+        assert first.record is not None
+
+        second = await _calibrate(ledger, _unanswering(), now=NOW + MINUTE)
+
+        assert second.state is CalibrationState.INCONCLUSIVE
+        assert second.record is not None
+        assert second.record.first_run == first.record.first_run
+
+        third = await _calibrate(ledger, ScriptedResponses(_key()), now=NOW + 2 * MINUTE)
+
+        assert third.state is CalibrationState.PASS
+        assert third.record is not None
+        assert third.record.attempt == 3
+        assert third.record.figures is not None
+        pooled = _figure(third.record.figures, BoundName.contaminated_false_keep)
+        assert (pooled.numerator, pooled.denominator) == (7, 90)
+
+
+async def _pooled_pass(ledger: ReconLedgerStore) -> CalibrationRecord:
+    """A ``pass`` reached by pooling, so it still carries the first run."""
+    await _calibrate(ledger, ScriptedResponses(_key(answer=SEVEN_FALSE_KEEPS(_seven()))))
+    passed = await _calibrate(ledger, ScriptedResponses(_key()), now=NOW + MINUTE)
+    assert passed.state is CalibrationState.PASS
+    assert passed.record is not None
+    assert passed.record.first_run is not None
+    return passed.record
+
+
+class TestDrift:
+    @pytest.mark.asyncio
+    async def test_a_new_resolved_model_marks_a_pass_row_stale(self, ledger) -> None:
+        record = await _pooled_pass(ledger)
+
+        drifted = await mark_stale_if_drifted(
+            ledger, record, 'gpt-6.1-sol-2027-01-01', now=NOW + timedelta(days=1),
+        )
+
+        assert drifted is True
+        assert await _stored(ledger) == dataclasses.replace(record, state=CalibrationState.STALE)
+
+    @pytest.mark.parametrize('resolved_model', [RESOLVED_MODEL, None], ids=['known', 'absent'])
+    @pytest.mark.asyncio
+    async def test_a_known_or_absent_model_writes_nothing(
+        self, ledger, resolved_model: str | None,
+    ) -> None:
+        record = await _pooled_pass(ledger)
+        before = await _row(ledger)
+
+        drifted = await mark_stale_if_drifted(
+            ledger, record, resolved_model, now=NOW + timedelta(days=1),
+        )
+
+        assert drifted is False
+        assert await _row(ledger) == before
+
+    @pytest.mark.asyncio
+    async def test_a_record_that_is_not_a_pass_writes_nothing(self, ledger) -> None:
+        first = await _calibrate(ledger, ScriptedResponses(_key(answer=_keeping_foreign)))
+        assert first.record is not None
+        before = await _row(ledger)
+
+        drifted = await mark_stale_if_drifted(
+            ledger, first.record, 'gpt-6.1-sol-2027-01-01', now=NOW + timedelta(days=1),
+        )
+
+        assert drifted is False
+        assert await _row(ledger) == before
+
+    @pytest.mark.parametrize(
+        ('false_keeps', 'state'),
+        [(0, CalibrationState.PASS), (7, CalibrationState.FAIL_FIRST_RUN)],
+        ids=['clean', 'seven_false_keeps'],
+    )
+    @pytest.mark.asyncio
+    async def test_after_stale_a_fresh_first_run_is_scored(
+        self, ledger, false_keeps: int, state: CalibrationState,
+    ) -> None:
+        record = await _pooled_pass(ledger)
+        later = NOW + timedelta(days=1)
+        assert await mark_stale_if_drifted(ledger, record, 'gpt-6.1-sol-2027-01-01', now=later)
+        seven = set(list(_seven())[:false_keeps])
+
+        rerun = await _calibrate(
+            ledger, ScriptedResponses(_key(answer=SEVEN_FALSE_KEEPS(seven))), now=later + MINUTE,
+        )
+
+        assert (rerun.state, rerun.ran) == (state, True)
+        assert rerun.record is not None
+        assert rerun.record.attempt == 3
+        assert rerun.record.figures is not None
+        figure = _figure(rerun.record.figures, BoundName.contaminated_false_keep)
+        assert (figure.numerator, figure.denominator) == (false_keeps, 45)
