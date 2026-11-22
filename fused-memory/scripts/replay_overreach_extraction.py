@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay ruling-class extraction under an arm, to measure levers O1 (task 9040) and O6 (task 9065).
+"""Replay extraction under an arm: levers O1 (task 9040) and O6 (task 9065), and the luna migration (task 9945).
 
 docs/ruling-overreach-guard-design-2026-10-01/design.md §6 names lever O1:
 ``custom_extraction_instructions`` for the ``decisions_and_rationale`` class.
@@ -12,9 +12,10 @@ graphiti's in-batch exact-fact dedupe (the driver-free fast path of
 edge_operations.py::resolve_extracted_edges). An arm is (instructions, client):
 control and o1 differ only in the instructions they splice into those prompts,
 on the configured client, and o6-low and o6-medium are the control's
-instructions on O6_MODEL at reasoning effort low and medium (esc-9065-2). So
-every arm shares one replay file, one blinded worksheet and one score against
-the control.
+instructions on O6_MODEL at reasoning effort low and medium (esc-9065-2).
+luna-low is the control's instructions on LUNA_MODEL at effort low on the plan
+proxy, the one arm task 9945's migration eval measures. So every arm shares one
+replay file, one blinded worksheet and one score against the control.
 
 Read-only and driver-free: graphiti is handed a GraphitiClients that holds
 only an LLM client, so no FalkorDriver is ever built (see
@@ -46,11 +47,13 @@ Usage (from fused-memory/)::
 
 ``replay`` resumes an existing --out: recorded (arm, episode) pairs are
 skipped and failure lines are retried. Each arm runs on the client its
-ExtractionLlm names, one client per distinct model and reasoning effort, so
-arms on different clients share one --out; an --out recording an arm on
-another model or effort than that arm's client is refused. A record written
-before task 9065 carries no reasoning_effort and reads as None, the configured
-client's. ``worksheet`` interleaves
+ExtractionLlm names, one client per distinct model, reasoning effort and
+endpoint, so arms on different clients share one --out; an --out recording an
+arm on another model, effort or endpoint than that arm's client is refused. A
+record written before task 9065 carries no reasoning_effort and reads as None,
+the configured client's; one written before task 9945 carries no endpoint and
+reads as 'configured'. A plan_proxy arm is built on OPENAI_PLAN_PROXY_URL and
+OPENAI_PLAN_PROXY_KEY, and refused when either is unset. ``worksheet`` interleaves
 every arm's edges by sha256(edge_uuid) and names no arm, for blind
 adjudication; it carries episode bodies, so it is not committed. ``score``
 validates one verdict file over every arm's edges with the audit's own
@@ -105,7 +108,7 @@ from fused_memory.backends.llm_token_usage import (
     TokenMeasurement,
     measure_llm_tokens,
 )
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _graph_script_cli import (
@@ -152,6 +155,19 @@ NO_INSTRUCTIONS = 'none'
 CONTROL = 'control'
 
 
+class ArmEndpoint(StrEnum):
+    """Where an arm's client sends its calls."""
+
+    configured = 'configured'
+    """config ``llm.providers.openai``: production's extraction endpoint and key."""
+    plan_proxy = 'plan_proxy'
+    """The plan proxy at PLAN_PROXY_URL_ENV, authorised by PLAN_PROXY_KEY_ENV."""
+
+
+PLAN_PROXY_URL_ENV = 'OPENAI_PLAN_PROXY_URL'
+PLAN_PROXY_KEY_ENV = 'OPENAI_PLAN_PROXY_KEY'
+
+
 @dataclass(frozen=True)
 class ExtractionLlm:
     """The client an arm extracts on.
@@ -164,6 +180,7 @@ class ExtractionLlm:
 
     model: str | None = None
     reasoning_effort: ReasoningEffort = None
+    endpoint: ArmEndpoint = ArmEndpoint.configured
 
 
 @dataclass(frozen=True)
@@ -181,11 +198,18 @@ O6_MODEL = 'gpt-6.1-sol'
 score_write_triage_pairs.py::LIST_PRICES. Effort low is what the production write-triage
 judge runs it at; medium is the API's default."""
 
+LUNA_MODEL = 'gpt-6-luna'
+"""The plan-window model task 9945 evaluates as gpt-4o-mini's replacement, at effort low: the
+T1 route's and the write-triage judge's effort."""
+
 ARMS: Mapping[str, ReplayArm] = MappingProxyType({
     CONTROL: ReplayArm(CONTROL, None, NO_INSTRUCTIONS),
     'o1': ReplayArm('o1', O1_INSTRUCTIONS, O1_INSTRUCTIONS_VERSION),
     'o6-low': ReplayArm('o6-low', None, NO_INSTRUCTIONS, ExtractionLlm(O6_MODEL, 'low')),
     'o6-medium': ReplayArm('o6-medium', None, NO_INSTRUCTIONS, ExtractionLlm(O6_MODEL, 'medium')),
+    'luna-low': ReplayArm(
+        'luna-low', None, NO_INSTRUCTIONS, ExtractionLlm(LUNA_MODEL, 'low', ArmEndpoint.plan_proxy),
+    ),
 })
 
 EDGE_TYPE_MAP: Mapping[tuple[str, str], list[str]] = MappingProxyType({('Entity', 'Entity'): []})
@@ -223,6 +247,7 @@ class ReplayResult:
     arm: str
     model: str | None
     reasoning_effort: str | None
+    endpoint: ArmEndpoint
     instructions_version: str
     graph: str
     uuid: str
@@ -238,8 +263,8 @@ class UnmeasurableClient(TypeError):
 
 
 class ArmClientMismatch(ValueError):
-    """An arm handed a client on another model or reasoning effort than its own, or an effort
-    that the configured client class cannot send."""
+    """An arm handed a client on another model or reasoning effort than its own, an effort
+    that the configured client class cannot send, or an endpoint whose variables are unset."""
 
 
 def _responses_input(messages: list[ChatCompletionMessageParam]) -> ResponseInputParam:
@@ -303,16 +328,29 @@ def client_reasoning_effort(llm: LLMClient) -> str | None:
     return getattr(llm, 'reasoning_effort', None)
 
 
-def build_arm_llm(cfg: FusedMemoryConfig, llm: ExtractionLlm) -> LLMClient | None:
-    """The configured extraction client on *llm*'s model, sending *llm*'s effort when it sets one.
+def plan_proxy_endpoint(environ: Mapping[str, str]) -> tuple[str, str]:
+    """``(url, key)`` of the plan proxy, from *environ*; an unset or blank variable is refused by name."""
+    if missing := [name for name in (PLAN_PROXY_URL_ENV, PLAN_PROXY_KEY_ENV) if not environ.get(name)]:
+        raise ArmClientMismatch(f"the plan proxy endpoint is unset: {', '.join(missing)}")
+    return environ[PLAN_PROXY_URL_ENV], environ[PLAN_PROXY_KEY_ENV]
 
-    *cfg* itself is never modified. An effort is sent on the Responses API, so
-    a configured client class that serves chat completions only is refused
-    rather than handed an effort it would drop.
+
+def build_arm_llm(
+    cfg: FusedMemoryConfig, llm: ExtractionLlm, environ: Mapping[str, str] = os.environ,
+) -> LLMClient | None:
+    """The configured extraction client on *llm*'s model and endpoint, sending *llm*'s effort when it sets one.
+
+    *cfg* itself is never modified. A plan_proxy endpoint replaces the openai
+    provider's url and key with plan_proxy_endpoint(*environ*)'s. An effort is
+    sent on the Responses API, so a configured client class that serves chat
+    completions only is refused rather than handed an effort it would drop.
     """
     arm_cfg = cfg.model_copy(deep=True)
     if llm.model is not None:
         arm_cfg.llm.model = llm.model
+    if llm.endpoint is ArmEndpoint.plan_proxy:
+        url, key = plan_proxy_endpoint(environ)
+        arm_cfg.llm.providers.openai = OpenAIProviderConfig(api_url=url, api_key=key)
     client = build_llm_client(arm_cfg)
     if client is None or llm.reasoning_effort is None:
         return client
@@ -349,8 +387,10 @@ def _usage(measurement: TokenMeasurement) -> LlmTokenUsage:
     return measurement.usage
 
 
-def _client_axis(model: str | None, effort: str | None) -> str:
-    return f"(model {model or 'as configured'}, effort {effort!r})"
+def _client_axis(model: str | None, effort: str | None, endpoint: str | None = None) -> str:
+    """The client axes, for an error; *endpoint* None is a client, which does not declare one."""
+    axes = f"model {model or 'as configured'}, effort {effort!r}"
+    return f'({axes}, endpoint {endpoint})' if endpoint is not None else f'({axes})'
 
 
 async def check_arm_client(llm: LLMClient, arm: ReplayArm) -> None:
@@ -389,7 +429,7 @@ async def replay_episode(llm: LLMClient, episode: ReplayInput, arm: ReplayArm) -
     names = {node.uuid: node.name for node in nodes}
     return ReplayResult(
         arm=arm.name, model=llm.model, reasoning_effort=client_reasoning_effort(llm),
-        instructions_version=arm.instructions_version,
+        endpoint=arm.llm.endpoint, instructions_version=arm.instructions_version,
         graph=episode.graph, uuid=episode.uuid, stratum=episode.stratum,
         entities=tuple(node.name for node in nodes),
         minted=tuple(
@@ -499,7 +539,8 @@ class RecordKind(StrEnum):
 _ERROR_CHARS = 500
 
 RecordKey = tuple[str, str, str]
-"""``(arm, graph, episode_uuid)``. An arm's name fixes its client, model and effort, so the key needs neither."""
+"""``(arm, graph, episode_uuid)``. An arm's name fixes its client's model, effort and endpoint, so the key
+needs none of them."""
 
 
 class ReplayFileError(ValueError):
@@ -516,10 +557,17 @@ def _record_effort(record: Mapping[str, Any]) -> str | None:
     return record.get('reasoning_effort')
 
 
+def _record_endpoint(record: Mapping[str, Any]) -> str:
+    """A record's endpoint. A record written before task 9945 has no such key: its client was
+    built on the configured endpoint."""
+    return record.get('endpoint', ArmEndpoint.configured)
+
+
 def replayed_record(result: ReplayResult, replay_input: ReplayInput) -> dict[str, Any]:
     return {
         'kind': RecordKind.replayed, 'arm': result.arm, 'model': result.model,
-        'reasoning_effort': result.reasoning_effort, 'instructions_version': result.instructions_version,
+        'reasoning_effort': result.reasoning_effort, 'endpoint': result.endpoint,
+        'instructions_version': result.instructions_version,
         'graph': result.graph, 'uuid': result.uuid, 'stratum': result.stratum,
         'previous_count': len(replay_input.previous),
         'entities': list(result.entities),
@@ -531,7 +579,7 @@ def replayed_record(result: ReplayResult, replay_input: ReplayInput) -> dict[str
 def failed_record(arm: ReplayArm, llm: LLMClient, row: Mapping[str, Any], exc: BaseException) -> dict[str, Any]:
     return {
         'kind': RecordKind.failed, 'arm': arm.name, 'model': llm.model,
-        'reasoning_effort': client_reasoning_effort(llm),
+        'reasoning_effort': client_reasoning_effort(llm), 'endpoint': arm.llm.endpoint,
         'graph': row['graph'], 'uuid': row['uuid'], 'stratum': row['stratum'],
         'error_type': type(exc).__name__, 'error': str(exc)[:_ERROR_CHARS],
     }
@@ -857,7 +905,7 @@ ArmClients = tuple[tuple[ReplayArm, LLMClient], ...]
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='replay_overreach_extraction',
-        description='Read-only replay of ruling-class extraction under lever arms (tasks 9040, 9065).',
+        description='Read-only replay of extraction under lever and migration arms (tasks 9040, 9065, 9945).',
     )
     commands = parser.add_subparsers(dest='command', required=True)
     replay = commands.add_parser('replay', help='Re-extract each worksheet episode under each arm.')
@@ -894,24 +942,30 @@ def _load_replay_inputs(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 def _arm_clients(arms: Sequence[ReplayArm], llm_factory: LlmFactory) -> ArmClients | None:
     """One client per distinct arm ExtractionLlm, in first-seen order; None if any has none.
-    The factory raises ArmClientMismatch for a client it cannot build."""
+    The factory raises ArmClientMismatch for a client it cannot build. A client is on the
+    endpoint its ExtractionLlm names, since that is what the factory was asked to build on."""
     clients: dict[ExtractionLlm, LLMClient] = {}
     for llm in dict.fromkeys(arm.llm for arm in arms):
         client = llm_factory(llm)
         if client is None:
-            logger.error('no extraction LLM for %s at reasoning effort %s; nothing is written',
-                         llm.model or 'the configured llm.model', llm.reasoning_effort)
+            logger.error('no extraction LLM for %s at reasoning effort %s on the %s endpoint; nothing is written',
+                         llm.model or 'the configured llm.model', llm.reasoning_effort, llm.endpoint)
             return None
         clients[llm] = client
     return tuple((arm, clients[arm.llm]) for arm in arms)
 
 
 def _client_conflicts(kept: Iterable[Mapping[str, Any]], arm_clients: ArmClients) -> list[str]:
-    client_of = {arm.name: (llm.model, client_reasoning_effort(llm)) for arm, llm in arm_clients}
+    client_of = {
+        arm.name: (llm.model, client_reasoning_effort(llm), arm.llm.endpoint) for arm, llm in arm_clients
+    }
+
+    def recorded(record: Mapping[str, Any]) -> tuple[str | None, str | None, str]:
+        return record['model'], _record_effort(record), _record_endpoint(record)
+
     return sorted({
-        f'{r["arm"]} was replayed on {_client_axis(r["model"], _record_effort(r))}, '
-        f'not {_client_axis(*client_of[r["arm"]])}'
-        for r in kept if r['arm'] in client_of and (r['model'], _record_effort(r)) != client_of[r['arm']]
+        f'{r["arm"]} was replayed on {_client_axis(*recorded(r))}, not {_client_axis(*client_of[r["arm"]])}'
+        for r in kept if r['arm'] in client_of and recorded(r) != client_of[r['arm']]
     })
 
 
@@ -1043,8 +1097,9 @@ def run(
     """Parse *argv* (default ``sys.argv[1:]``) and run one subcommand.
 
     *llm_factory* maps each selected arm's ExtractionLlm (model None = the
-    configured llm.model, effort None = the configured client) to an
-    extraction client (default: build_arm_llm over the loaded config);
+    configured llm.model, effort None = the configured client, endpoint
+    configured or plan_proxy) to an extraction client (default:
+    build_arm_llm over the loaded config and the process environment);
     *reader_factory* maps a graph name to a ReadOnlyGraphReader (default:
     FalkorDB over GRAPH.RO_QUERY).
     """

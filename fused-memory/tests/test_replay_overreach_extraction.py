@@ -38,7 +38,7 @@ from fused_memory.backends.llm_token_usage import (
     LlmTokenUsage,
     measure_llm_tokens,
 )
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -532,7 +532,7 @@ class TestThePlanProxyEndpoint:
         self, mock_config: FusedMemoryConfig, llm: Any,
     ) -> None:
         cfg = mock_config.model_copy(deep=True)
-        cfg.llm.providers.openai.api_url = CONFIGURED_URL
+        cfg.llm.providers.openai = OpenAIProviderConfig(api_url=CONFIGURED_URL, api_key='test-key')
         client = mod.build_arm_llm(cfg, llm)
         assert client is not None and _sdk_endpoint(client) == (CONFIGURED_URL, 'test-key')
 
