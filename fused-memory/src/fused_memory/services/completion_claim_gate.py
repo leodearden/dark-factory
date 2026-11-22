@@ -39,7 +39,8 @@ a bare participle after a temporal cue ('until merged') a claim about an earlier
 ref (task 7811). A marker predicated of a ref that a contingency, necessity or
 simulation head governs ('depends on task N having landed', 'needs task N merged
 first', 'a mock of task N's edits merged') is not a claim either; nor is one after
-the determiner 'no' or a catch-up 'merged up to' (task 6824). See
+the determiner 'no' or a catch-up 'merged up to' (task 6824), or a merge into a
+pronoun ('merged into it', task 8600). See
 tests/test_completion_claim_mood.py and
 docs/completion-claim-mood-filter-2026-10/measurement.md.
 
@@ -331,12 +332,20 @@ _CATCH_UP_MERGE_RE: re.Pattern[str] = re.compile(
     r'\bmerged\s+up\s+(?:to|with)\b', re.IGNORECASE,
 )
 
+# 'X was merged into it' makes the pronoun's antecedent, the nearest ref, the merge's destination,
+# so it does not land that ref (dark_factory esc-unverified-claim-6670-1). Pinned by
+# tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
+_MERGE_INTO_ANTECEDENT_RE: re.Pattern[str] = re.compile(
+    r'\bmerged\s+into\s+(?:it|them)\b', re.IGNORECASE,
+)
+
 _EXEMPTION_STRIPPERS: tuple[re.Pattern[str], ...] = (
     NEGATED_TERMINAL_RE,
     _NEGATED_EXTENSION_RE,
     FUTURE_ASPIRATIONAL_RE,
     _GOVERNED_VERB_RE,
     _CATCH_UP_MERGE_RE,
+    _MERGE_INTO_ANTECEDENT_RE,
 )
 
 
