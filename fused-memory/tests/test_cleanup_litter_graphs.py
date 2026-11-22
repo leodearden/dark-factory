@@ -24,6 +24,9 @@ from _fm_helpers import load_script_module
 from _fm_sockets import refused_port
 from falkordb import FalkorDB
 from redis.exceptions import RedisError
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 CLEANUP = load_script_module(
     Path(__file__).resolve().parents[1] / 'scripts' / 'cleanup_litter_graphs.py'
