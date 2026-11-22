@@ -2817,15 +2817,16 @@ class TestHarnessDigestDoneCountSource:
             f'got {harness._ewa_value!r}'
         )
 
-        # The rendered digest's "Tasks done in window" figure must also equal 4,
-        # proving both the EWA input AND the displayed count come from EventStore
-        # (single source of truth — task 1421 Fix 1).
+        # The rendered digest's done-runs figure (the EWA denominator) must also
+        # equal 4, proving both the EWA input AND the displayed count come from
+        # EventStore (single source of truth — task 1421 Fix 1).
         digest_dir = tmp_path / 'data' / 'digests'
         digest_files = sorted(digest_dir.glob('digest-*.md'))
         assert digest_files, 'Expected at least one digest file written by _maybe_write_digest'
         content = digest_files[-1].read_text()
-        assert '## Tasks done in window\n4\n' in content, (
-            f'Expected rendered digest to show "Tasks done in window\\n4\\n"; '
+        expected = f'- {digest.DONE_RUNS_LABEL}, the EWA denominator: 4'
+        assert expected in content.splitlines(), (
+            f'Expected rendered digest to show {expected!r}; '
             f'digest content:\n{content}'
         )
 
