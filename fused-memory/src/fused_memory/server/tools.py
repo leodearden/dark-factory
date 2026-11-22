@@ -10470,10 +10470,11 @@ def create_mcp_server(
             # Best-effort/never-raising (PRD γ, task 2578) — stamps real
             # task_ids + copies MECHANICAL delivered_checks for any batch
             # task carrying prd_path/prd_task_label metadata. Reuses the
-            # already-fetched tasks_data (no extra reads). Only attaches the
-            # report key when a sidecar actually exists on disk, so a batch
-            # with no capability-manifest involvement gets a byte-identical
-            # legacy response.
+            # already-fetched tasks_data (no extra reads). Attaches the report
+            # key whenever a batch task carries prd_path (naming any derived
+            # sidecar absent from the root searched under sidecar_not_found),
+            # so a batch with no capability-manifest involvement gets a
+            # byte-identical legacy response.
             manifest_report = await stamp_capability_manifests(
                 project_root=project_root,
                 ids=ids,

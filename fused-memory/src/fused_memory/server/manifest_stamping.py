@@ -25,8 +25,16 @@ Never raises, and NEVER blocks the ``commit_planning`` flip: stamping runs
 after the flip, a sidecar is scoped and may legitimately omit a label, and an
 out-of-plan follow-up legitimately carries ``prd_path`` without a
 ``prd_task_label`` — so a block would reject correct batches with no override.
-Loud instead. No sidecar on disk is a complete no-op (``None``: the caller
-attaches no ``manifest_stamping`` key). Otherwise every batch task whose
+Loud instead. The stamper returns ``None`` (the caller attaches no
+``manifest_stamping`` key) only when no batch task carries ``prd_path``, or
+every derived sidecar path escapes the sidecar root. A derived sidecar absent
+from the root searched is named under the conditional ``sidecar_not_found``
+key as ``{root, paths}``, so a caller can tell "this PRD has no manifest" from
+"the wrong tree was searched". That key is informational: it never blocks the
+flip and never renders an action line, because a PRD with no capability
+manifest is legitimate. With no sidecar found at all the report is
+``{path: None, stamped: [], missing_labels: [], errors, sidecar_not_found}``.
+Otherwise every batch task whose
 ``prd_path`` derives the processed sidecar lands in exactly one bucket —
 ``stamped``, ``missing_labels``, ``external_labels``, ``near_miss_labels``,
 ``near_miss_keys`` or ``unlabeled_tasks``, the last four attached only when
@@ -143,16 +151,30 @@ class _SidecarOutcome:
     """What the on-disk steps 2-4 hand back to the coroutine.
 
     ``bound`` is ``{prd_task_label: task_id}`` for the batch's labeled tasks
-    whose sidecar this is. ``doc`` is None when the sidecar failed to load or
-    its stamp failed to write: the report then ends at ``errors``, with
-    nothing stamped.
+    whose sidecar this is. ``doc`` is None when no derived sidecar exists
+    under ``root`` (``sidecar_rel`` is then None too), or when the sidecar
+    failed to load or its stamp failed to write: the report then ends at
+    ``errors``, with nothing stamped. ``not_found`` names the derived sidecar
+    paths contained under ``root`` but absent from it.
     """
 
     root: Path
-    sidecar_rel: str
+    sidecar_rel: str | None
     bound: Mapping[str, str]
     doc: CapabilityManifestDoc | None
     stamped: tuple[str, ...]
+    errors: tuple[str, ...]
+    not_found: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _SidecarSelection:
+    """Step 2's choice: the sidecar this batch stamps (None when none exists),
+    the contained derived paths absent from the root, and the errors naming
+    the rest."""
+
+    chosen: str | None
+    not_found: tuple[str, ...]
     errors: tuple[str, ...]
 
 
@@ -190,12 +212,14 @@ async def stamp_capability_manifests(
 
     Returns:
         ``None`` when no batch task carries a non-empty ``prd_path``, or
-        when no derived sidecar exists on disk — a complete no-op in both
-        cases. Otherwise a structured report ``{path, stamped,
-        missing_labels, errors}`` (``path`` relative to ``project_root``),
-        plus ``external_labels``, ``near_miss_labels``, ``near_miss_keys``,
-        ``unlabeled_tasks`` and ``polarity_warnings`` when non-empty; see the
-        module docstring.
+        when every derived sidecar path escapes the sidecar root — a
+        complete no-op in both cases. Otherwise a structured report
+        ``{path, stamped, missing_labels, errors}`` (``path`` relative to the
+        sidecar root, None when no derived sidecar exists there), plus
+        ``sidecar_not_found`` (``{root, paths}``: the root searched and the
+        derived sidecars absent from it), ``external_labels``,
+        ``near_miss_labels``, ``near_miss_keys``, ``unlabeled_tasks`` and
+        ``polarity_warnings`` when non-empty; see the module docstring.
 
     This is a thin never-raising wrapper around
     :func:`_stamp_capability_manifests_impl`. The implementation's steps
@@ -284,6 +308,8 @@ async def _stamp_capability_manifests_impl(
         'missing_labels': [],
         'errors': list(outcome.errors),
     }
+    if outcome.not_found:
+        report['sidecar_not_found'] = {'root': str(outcome.root), 'paths': list(outcome.not_found)}
     doc = outcome.doc
     if doc is None:
         _warn_if_action_required(report)
@@ -637,27 +663,36 @@ def _stamp_sidecar_on_disk(
 ) -> _SidecarOutcome | None:
     """Steps 2-4, synchronous: select the batch's sidecar, load it, stamp it.
 
-    Returns None when no derived sidecar is both contained under
-    *sidecar_root* and present on disk — the coroutine's complete no-op.
-    Run via ``asyncio.to_thread``; never call it on the event loop.
+    Returns None when every derived sidecar path escapes *sidecar_root* —
+    the coroutine's complete no-op. Run via ``asyncio.to_thread``; never call
+    it on the event loop.
     """
     root = sidecar_root.resolve()
-    sidecar_rel, selection_errors = _select_sidecar(root, prd_bound)
-    if sidecar_rel is None:
+    selection = _select_sidecar(root, prd_bound)
+    if selection is None:
         return None
+    sidecar_rel = selection.chosen
+    if sidecar_rel is None:
+        return _SidecarOutcome(
+            root=root, sidecar_rel=None, bound={}, doc=None, stamped=(),
+            errors=selection.errors, not_found=selection.not_found,
+        )
     bound = _labels_bound_to(prd_bound, sidecar_rel)
     with _SIDECAR_RMW_LOCK:
         doc, stamped, error = _load_and_stamp(root / sidecar_rel, sidecar_rel, bound)
-    errors = selection_errors if error is None else (*selection_errors, error)
-    return _SidecarOutcome(root, sidecar_rel, bound, doc, stamped, errors)
+    errors = selection.errors if error is None else (*selection.errors, error)
+    return _SidecarOutcome(
+        root=root, sidecar_rel=sidecar_rel, bound=bound, doc=doc, stamped=stamped,
+        errors=errors, not_found=selection.not_found,
+    )
 
 
 def _select_sidecar(
     root: Path, prd_bound: Sequence[_PrdBoundTask]
-) -> tuple[str | None, tuple[str, ...]]:
-    """Step 2: choose the one sidecar this batch stamps, plus the errors naming the rest."""
+) -> _SidecarSelection | None:
+    """Step 2: choose the one sidecar this batch stamps; None when every path escapes *root*."""
     # Keep only distinct rel paths (insertion order) that stay CONTAINED
-    # under the sidecar root and whose file actually exists on disk. prd_path
+    # under the sidecar root, split by whether the file exists. prd_path
     # is author-controlled task metadata (set by the /prd decompose skill,
     # read here without re-validation) — an absolute path or one containing
     # '../' would otherwise let both the read and the step-4 write-back
@@ -666,45 +701,48 @@ def _select_sidecar(
     seen_rel_paths = list(dict.fromkeys(task.sidecar_rel for task in prd_bound))
     unsafe_rel_paths: list[str] = []
     existing_rel_paths: list[str] = []
+    absent_rel_paths: list[str] = []
     for rel in seen_rel_paths:
         resolved = (root / rel).resolve()
         if not resolved.is_relative_to(root):
             unsafe_rel_paths.append(rel)
             continue
-        if resolved.is_file():
-            existing_rel_paths.append(rel)
+        (existing_rel_paths if resolved.is_file() else absent_rel_paths).append(rel)
     # A sidecar a labeled task names always outranks one only unlabeled
     # tasks name, so an out-of-plan follow-up cannot displace the stamp.
     claimed = {task.sidecar_rel for task in prd_bound if task.label is not None}
     existing_rel_paths.sort(key=lambda rel: (rel not in claimed, rel))
-    if not existing_rel_paths:
+    if not existing_rel_paths and not absent_rel_paths:
         if unsafe_rel_paths:
-            # Nothing safe to attach a report to (see the "no sidecar"
-            # no-op contract), but a path-traversal attempt is worth a
-            # server-side signal even so.
+            # No derived path inside the root, so nothing to attach a report
+            # to (the no-op contract), but a path-traversal attempt is worth
+            # a server-side signal even so.
             logger.warning(
                 'stamp_capability_manifests: derived sidecar path(s) resolve '
                 'outside project_root, refusing to read/write: %r',
                 unsafe_rel_paths,
             )
-        return None, ()
+        return None
 
     # One-sidecar-per-batch is the normal contract. An unexpected second
     # distinct sidecar path is processed as the first in that order
     # (deterministic), with the rest — and any containment-rejected
     # candidates — named loudly in errors rather than silently dropped.
-    sidecar_rel = existing_rel_paths[0]
     errors: list[str] = []
     if len(existing_rel_paths) > 1:
         extra = ', '.join(existing_rel_paths[1:])
         errors.append(
             f'multiple capability-manifest sidecars matched this batch; '
-            f'processing {sidecar_rel!r}, ignoring: {extra}'
+            f'processing {existing_rel_paths[0]!r}, ignoring: {extra}'
         )
     if unsafe_rel_paths:
         extra = ', '.join(unsafe_rel_paths)
         errors.append(f'sidecar path(s) resolved outside project_root, refused: {extra}')
-    return sidecar_rel, tuple(errors)
+    return _SidecarSelection(
+        chosen=existing_rel_paths[0] if existing_rel_paths else None,
+        not_found=tuple(absent_rel_paths),
+        errors=tuple(errors),
+    )
 
 
 def _load_and_stamp(
