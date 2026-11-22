@@ -4944,6 +4944,62 @@ entries:
     manifested_phase: recon
     note: A deferred MCP tool (fused-memory get_task) was called before its schema was loaded. The agent guessed an undeclared project_id argument, and validation rejected the call. The digest's own text says the schema was not in the prompt, and the retry path is ToolSearch.
     evidence_quote: 'get_task was called with argument(s) it does not declare: project_id", "code": "unknown_argument", "tool": "get_task", "unknown": [{"name": "project_id", "closest_declared": "project_root"}]. This tool''s input schema was not in your prompt when you called it.'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 66015f9a-5015-4ea1-97c0-1957c17d1c87
+    origin_phase: recon
+    manifested_phase: recon
+    note: Recon agent called mcp__fused-memory__get_task with an undeclared project_id argument before loading the tool schema. The call failed validation on each of five attempts with unknown_argument, and the response notes the schema was not in the prompt.
+    evidence_quote: This tool's input schema was not in your prompt when you called it.
+  - date: '2026-11-19'
+    project: dark_factory
+    session: ce59d42a-6864-48c7-bd83-a6abfb7b7304
+    origin_phase: unknown
+    manifested_phase: recon
+    note: The agent called the deferred MCP tool mcp__fused-memory__get_task with guessed parameters (project_id) before loading its schema via ToolSearch. The call failed validation with unknown_argument, and the agent retried the same guessed call on turns 23, 25 and 27 without calling ToolSearch.
+    evidence_quote: This tool's input schema was not in your prompt when you called it.
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 00672a64-236f-4439-af0f-9e08939b3227
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called mcp__fused-memory__get_task with an undeclared project_id argument before the tool's schema was loaded. The server rejected each call with unknown_argument, and the digest notes the schema was not in the prompt at call time, matching the deferred-tool-before-ToolSearch guessing mechanism. The same wrong call repeated across turns 21, 23 and 25.
+    evidence_quote: 'This tool''s input schema was not in your prompt when you called it. The input schema is: {"type":"object","properties":{"id":{"title":"Id","type":"string"},"project_root":{"title":"Project Root","type":"string"}'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: de1042dd-e561-4466-b215-d9ea653cce11
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called the deferred fused-memory tool count_memories_by_metadata with a guessed parameter name ('metadata') before loading its schema via ToolSearch. The call was rejected by validation with unknown_argument, and the digest shows the schema was not in the prompt at call time.
+    evidence_quote: This tool's input schema was not in your prompt when you called it.
+  - date: '2026-11-19'
+    project: dark_factory
+    session: c531c94e-81f4-4056-aaf9-87fcad43c4f0
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called the deferred fused-memory get_task tool with a guessed project_id argument before loading its schema via ToolSearch. The server rejected the call (unknown_argument) at turns 21 and 23, and the same guessed call was repeated at turn 23.
+    evidence_quote: This tool's input schema was not in your prompt when you called it.
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 4cdb7d28-8c44-4644-90c8-3c1a0ae7fadb
+    origin_phase: recon
+    manifested_phase: recon
+    note: The agent called count_memories_by_metadata with a guessed 'metadata' argument before loading its schema. The server rejected the call, and the error notice states the input schema was not in the prompt and points to ToolSearch for the real parameters.
+    evidence_quote: 'This tool''s input schema was not in your prompt when you called it. The input schema is: {"type":"object","properties":{"project_id":{"title":"Project Id","type":"string"},"filters":{"additionalProperties":true,"title":"Filters","type":"object"}},"required":["project_id","filters"],"title":"count_memories_by_metadataArguments"}'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: a301c5a2-a666-41e9-a5fc-69aa8d643978
+    origin_phase: recon
+    manifested_phase: recon
+    note: A deferred MCP tool (get_task) was called before its schema was loaded, so the agent guessed an undeclared project_id argument and the call was rejected by validation. The digest states the schema was not in the prompt at call time.
+    evidence_quote: 'This tool''s input schema was not in your prompt when you called it. ... get_task was called with argument(s) it does not declare: project_id'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: b920d61e-3ae5-403a-a36b-4b3f9371d907
+    origin_phase: recon
+    manifested_phase: recon
+    note: The get_statuses call was made against a deferred MCP tool whose input schema was not in the prompt, so the agent guessed a parameter (project_id) and the server rejected it on validation.
+    evidence_quote: 'This tool''s input schema was not in your prompt when you called it. The input schema is: {"type":"object","properties":{"project_root":{"title":"Project Root","type":"string"}'
   last_seen_runs:
   - census-dark_factory-20261024
   - census-dark_factory-20261031
@@ -13836,6 +13892,20 @@ entries:
     manifested_phase: recon
     note: The digest renders the not-found signal as a bare template ('does not exist') with no matched substring naming the missing path or symbol, so the reader cannot tell what was not found.
     evidence_quote: '- (turn 34) does not exist'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 04c50c78-2eab-4b46-b0d9-e8077a87cf4a
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The not-found bucket lists bare lowercased templates with no surrounding command or output, so the matched substring is not shown in context.
+    evidence_quote: (turn 116) modulenotfounderror
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 9939f42e-b5e2-4480-a0e0-d3383685853b/subagents/agent-a371aab1c18964e3f
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Guard Trips lines render only a bare 'blocked:' label with no matched substring, and the Not Found lines are bare templates, so the digest drops the evidence that would show what was blocked or missing.
+    evidence_quote: '- (turn 30) blocked:'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -15602,6 +15672,13 @@ entries:
     evidence_quote: '## User Corrections
 
       - (turn 3) ## Stage 3: Cross-System Integrity Check'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 298d816e-484a-4675-ad8d-9549c8b89b08
+    origin_phase: prd
+    manifested_phase: prd
+    note: The 'User Corrections' bucket captures pasted non-corrective report content from another session (a forwarded merge-slot session report with measurements and task filings), not corrective user feedback.
+    evidence_quote: '- (turn 443) From the merge-slot session (fleet id team-dark_factory-1311488; brief ~/.claude/spawn-briefs/merge-slot-holds-and-chain-landing-2026-11-20.md), sent at Leo''s instruction on 2026-11-20.'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -24373,6 +24450,27 @@ entries:
     manifested_phase: unknown
     note: Orchestrated worktree session (agent_class orchestrated-task, cwd in .worktrees/9045) shows six not_found hits ('no such file or directory' and 'does not exist') with tool_error, self_correct, df_guard, and interrupt all at 0. That matches the entry's title mechanism. The digest does not reveal the phase or the underlying cause.
     evidence_quote: (turn 57) no such file or directory
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 46bbc238-d812-496f-8e4a-507f202e0021
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated task running in a .worktrees/8417 cwd logs repeated 'no such file or directory' not_found signals across turns 65, 469, 575, 664 and 673. tool_error, self_correct, df_guard and interrupt are all zero, so no other diagnostic accompanies them. Phase is not evidenced by the digest.
+    evidence_quote: (turn 65) no such file or directory
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 94387a51-1091-4867-9117-4daf94b67d6c
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session in a .worktrees/10866 cwd shows repeated 'no such file or directory' not_found signals (turns 40 and 70) with tool_error, self_correct, and df_guard all at zero, matching the entry's title mechanism. Phases are unknown because the digest does not show where the failure originated.
+    evidence_quote: '- (turn 40) no such file or directory'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 53f2c3cb-ecb1-4a97-92af-3d2a9a80e65f
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session in a .worktrees/ cwd shows repeated not-found failures (4 events, 2 of them 'no such file or directory') while tool_error and all other signal counts are 0, so no other diagnostic accompanies them. The digest does not establish the phase.
+    evidence_quote: (turn 115) no such file or directory
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -25658,6 +25756,13 @@ entries:
     manifested_phase: unknown
     note: The agent polled a background census run by chaining sleep 60 with cat on its task output in a foreground Bash call. The guard blocked the call and directed it to a blocking wait primitive (Monitor), which is the busy-poll-instead-of-wait-primitive mechanism the entry names. The digest does not show pytest or ps/pgrep, so this is a partial match on mechanism.
     evidence_quote: 'Blocked: sleep 60 followed by: cat /tmp/claude-1000/-home-leo-src-dark-factory--worktrees-7095/2d3b41af-7b4e-47af-894b-b8f3f210d036/tasks/bitbwyxsg.output tail -5. To wait for a condition, use Monitor with an until-loop (e.g. `until <check>; do sleep 2; done`). To wait for a command you started, use run_in_background: true. Do not chain shorter sleeps to work around this block.'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 543f6f0c-5af2-4bff-aad4-47c28ae16b6c
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Agent repeatedly polls background test runs (step-2 and step-4 logs) with foreground Bash tail calls instead of a blocking wait primitive. The digest names the polling pattern but not the phase, so phases are unknown.
+    evidence_quote: 'Bash x4: {"command": "tail -c 300 /tmp/6748-step2.log", "description": "Check step-2 test progress"}'
   last_seen_runs:
   - census-dark_factory-20261017
   - census-dark_factory-20261024
@@ -26022,6 +26127,13 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'RECORDS WHAT TASK 5687 DID FOR THIS ENTRY. Task 5687''s whole outcome for this entry was its correction, docs/legibility/coding-records/task-5687-corrections.jsonl: a re-titling and a first cause, with no status change. It did not fix the defect, which stays open. The 2026-10-24 census (0f443e6c0e) read 5687''s done plus a GONE re-verify as a fix and set this entry fixed; 6279723661 restored it to open. This record names 5687 in outcome_of_task, so the merger lists it in this entry''s corrected_by and scripts/legibility/disposition.py never reads its done as a fix again (task 7448).'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: ab114102-154e-4f32-a84c-0d7f334e1655
+    origin_phase: implement
+    manifested_phase: implement
+    note: A python3 heredoc edit script embeds a triple-quoted literal whose pasted content contains a stray ''' that ends the literal early. The tail (# ── --host-config ...) is then parsed as bare code, and the script fails with a SyntaxError. The digest does not show the exact docstring-closing form, so the match rests on the same triple-quote mismatch in a heredoc edit script.
+    evidence_quote: "''','''# ── --host-config ─────────────────────────────────────────────────────────\n        ^\nSyntaxError: unterminated triple-quoted string literal (detected at line 193)"
   cause: 'A `python3` heredoc edit script pasted a docstring into its `old = """..."""` literal together with the docstring''s OWN closing `"""`, ending that literal early and leaving the script tail as bare top-level code.
 
 
@@ -26769,6 +26881,40 @@ entries:
     manifested_phase: unknown
     note: The digest records an interactive session with zero user turns, which is the contradiction this entry's title names. The digest does not show the classifier's catch-all logic, so the match rests on the metadata alone.
     evidence_quote: 'agent_class: "interactive" ... n_user_turns: 0'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 298d816e-484a-4675-ad8d-9549c8b89b08/subagents/agent-a6b8f171e3dbe1881
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest records a subagent-path session classed as interactive while showing zero user turns, which is the contradiction this entry names. The digest does not show the classifier's catch-all path directly, so the match rests on the class-versus-turn-count outcome.
+    evidence_quote: 'agent_class: "interactive" ... n_user_turns: 0'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 75089523-2257-41ab-b838-cc0fc468bc05/subagents/agent-a524a36e15a7a6271
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest records agent_class 'interactive' with n_user_turns 0, the contradiction this entry names. Phase cannot be determined from the digest.
+    evidence_quote: 'agent_class: "interactive"
+
+      n_user_turns: 0'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 9939f42e-b5e2-4480-a0e0-d3383685853b/subagents/agent-ae2dfd8794bbc4d13
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest classifies the session as interactive while reporting zero user turns, the contradiction this entry names. The digest does not show which agent-class marker failed to match, so the catch-all path is inferred from the classification alone.
+    evidence_quote: 'agent_class: "interactive"
+
+      n_user_turns: 0'
+  - date: '2026-11-19'
+    project: dark_factory
+    session: f2509836-c57c-4a96-8226-ffadd58bdb96/subagents/agent-aceec6b8f883cf979
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest records agent_class 'interactive' alongside n_user_turns 0, which is the contradiction this entry names. Phase cannot be determined from the digest.
+    evidence_quote: 'agent_class: "interactive"
+
+      n_user_turns: 0'
   filed_tickets:
   - ticket: tkt_0RW5FRC08TTDX8HFPEYMBKZKDV
     project_root: /home/leo/src/dark-factory
@@ -27851,6 +27997,13 @@ entries:
     manifested_phase: recon
     note: The 'User Corrections' bucket captured the injected spawn-brief dispatch instruction as if it were a user correction.
     evidence_quote: Read /home/leo/.claude/spawn-briefs/team-7736-unblock-findings-2026-11-18.md and follow it as your brief; that file holds your whole task.
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 298d816e-484a-4675-ad8d-9549c8b89b08
+    origin_phase: prd
+    manifested_phase: prd
+    note: The 'User Corrections' bucket records an injected spawn-brief directive from the parent session as if it were a user correction. The directive only points to a briefing file and an output-file format, so it is task briefing, not corrective feedback.
+    evidence_quote: '- (turn 4) Read /home/leo/.claude/spawn-briefs/gate-10069-merge-pool-batches-2026-11-19.md and follow it as your brief; that file holds your whole task.'
   filed_tickets:
   - ticket: tkt_0RW5FRC7ET51RZA763BVXH7ZAA
     project_root: /home/leo/src/dark-factory
@@ -28076,6 +28229,13 @@ entries:
     manifested_phase: ops
     note: The digest's 'User Corrections' bucket captures skill invocation markup (/unblock and /reflect command-message blocks) and the injected spawn instructions rather than user corrections.
     evidence_quote: <command-name>/unblock</command-name>
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 18efe976-535a-40a5-9180-38a078ea1cbd
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest's 'User Corrections' bucket captured a skill invocation (/team command block) as a user correction, which is the mechanism this entry names.
+    evidence_quote: <command-message>team</command-message>
   filed_tickets:
   - ticket: tkt_0RW5FRCC10XP47EPHA3X9HRK50
     project_root: /home/leo/src/dark-factory
@@ -28533,6 +28693,34 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: The digest shows a read-only Bash inspection (git log, git status, ls, cat, head on .task files) denied under don't-ask mode, which is the mechanism this entry names. The digest does not show the verify-failure diagnosis context or any resulting blind guesses, and it gives no phase evidence.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 2b750292-83f3-46ea-86a8-0ad6edaeac04
+    origin_phase: ops
+    manifested_phase: unknown
+    note: Orchestrated-task session repeatedly hit the harness's don't-ask permission mode on read-only Bash inspection (git log, git diff, grep, ls) while investigating test_merge_lane_package.py, so it fell back to other tools and guesses. The permission mode is harness configuration (ops). The digest does not state which phase the investigation belonged to, so manifested_phase is unknown.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 981db70b-9510-43ed-91a1-18ce4a1c26de
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Read-only Bash inspection (ls of the reviews directory, a hashing/git comparison script, an inline_suppressions check) was denied in don't-ask mode at turns 27, 84, and 100. The digest does not state the phase, so both phases are unknown.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 7433e017-742a-419e-b319-773f0817993a
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest shows a read-only Bash inspection (git log, git status, grep over test fixtures) denied because the session runs in don't-ask mode, which is the mechanism the entry title names. The digest does not show the resulting blind guesses or the verify-failure context, and it gives no phase evidence.
+    evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 2af76c94-3acd-4aa7-99b8-1b7e3cdecf29
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task session (agent_class orchestrated-task) had a read-only Bash inspection (ls on reviews, cat .task/plan.json) denied under don't-ask mode. The digest does not show the verify-failure diagnosis or the blind guesses the entry's title also names, so the match rests on the denial mechanism alone. Phases are unsupported by the digest.
     evidence_quote: Permission to use Bash has been denied because Claude Code is running in don't ask mode.
   filed_tickets:
   - ticket: null
@@ -46421,6 +46609,84 @@ candidates:
     origin_phase: implement
     manifested_phase: implement
     evidence_quote: '[*] 1 fixable with the `--fix` option.'
+- id: cand-20261119-1
+  title: Canonical-build driver script crashes after its steps pass, leaving end-of-run stats missing and the unit reported failed
+  cause: The alpha.sh driver hits a shell quoting error (unexpected EOF) and an unbound variable at teardown, after all steps report rc=0. The end-of-run sccache-end.json is never written, so the stats read-back fails. The systemd unit then shows failed, and a reader cannot tell whether the build succeeded.
+  area: orchestration-harness
+  first_seen: '2026-11-19'
+  disposition: pending
+  sightings:
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 8582dd40-50d4-4018-a298-a4e862ec8b57
+    origin_phase: unknown
+    manifested_phase: ops
+    evidence_quote: 'alpha.sh: line 344: unexpected EOF while looking for matching; alpha.sh: line 1: id: unbound variable; head: cannot open ''/home/leo/canon-alpha-20261119/results/W1/sccache-end.json'' for reading: No such file or directory'
+- id: cand-20261119-2
+  title: 'Legibility census entrypoint fails on direct import: sys.path bootstrap and circular package imports make the module unimportable from ordinary invocations'
+  cause: scripts/legibility/census.py mutates sys.path before its 'from legibility import' block, and the census_run, census_filing and census_report submodules import back from the legibility package, forming an import cycle. Importing legibility.census from a probe one-liner therefore fails with a traceback through the cycle, so an agent cannot check the module's imports without reading the whole cycle and working out the cwd-dependent path setup.
+  area: scripts/legibility (census tooling)
+  first_seen: '2026-11-19'
+  disposition: pending
+  sightings:
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 804adcfb-4c7b-436d-af90-c5371271c433
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'from legibility import (  # noqa: E402'
+- id: cand-20261119-3
+  title: Agent-assembled partial scratch copy of the tree lacks sibling modules, and a diagnostic pipeline proceeds past the resulting import failure
+  cause: The agent built a /tmp baseline by git-archiving only selected files, so a required helper module (df_pytest_isolation) was absent. The pytest collection failed with ModuleNotFoundError, the output file was never written, and the downstream awk step then failed on a missing file. A partial view of the tree produced misleading baseline evidence with no check that the copy was complete.
+  area: verify-harness
+  first_seen: '2026-11-19'
+  disposition: pending
+  sightings:
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 9939f42e-b5e2-4480-a0e0-d3383685853b/subagents/agent-a371aab1c18964e3f
+    origin_phase: unknown
+    manifested_phase: verify
+    evidence_quote: 'E   ModuleNotFoundError: No module named ''df_pytest_isolation'''
+- id: cand-20261119-4
+  title: Verify-admission slot holder is unidentifiable when no merge request is visible
+  cause: The merge-queue status surface reports a verify slot as held without naming the holder, so the watcher cannot trace what occupies it and cannot tell whether the wait is real or a stale state. Each diagnosis of queue throughput has to be rebuilt from partial evidence.
+  area: merge-queue observability
+  first_seen: '2026-11-19'
+  disposition: pending
+  sightings:
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 75089523-2257-41ab-b838-cc0fc468bc05
+    origin_phase: unknown
+    manifested_phase: ops
+    evidence_quote: Held with no merge request (7% and 4%). I do not know what holds the slot here. Candidates I have not traced are the build of the next merged tree, the periodic check that runs one verify on both hosts, and the "is main itself broken" check.
+- id: cand-20261119-5
+  title: Edit tool reports 'No changes to make' for edits whose strings differ only in Unicode fullwidth characters
+  cause: The Edit tool appears to normalize Unicode (e.g. NFKC) before comparing old_string and new_string, so an edit that inserts fullwidth characters is rejected as a no-op with a misleading 'exactly the same' message. The agent repeats the rejected edit and loses turns to a wrong diagnosis. The digest shows only the error text, so the normalization mechanism is inferred rather than confirmed.
+  area: tooling
+  first_seen: '2026-11-19'
+  disposition: pending
+  sightings:
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 30bbea07-d341-44ef-81c2-940fcb6f1aa6/subagents/agent-ae9e2db942630b1a4
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: 'No changes to make: old_string and new_string are exactly the same.'
+- id: cand-20261119-6
+  title: fused-memory MCP connection drops mid-call leave tool side-effect status ambiguous, with the agent told to check before retrying
+  cause: When the fused-memory MCP connection closes before a call is answered, the harness reports that the tool 'may have run' and says to check before re-running it. The agent has no structured way to determine whether the call completed, so any retry of a write could duplicate its effect. A later call then fails with 'not connected', so the connection loss persists.
+  area: fused-memory MCP transport and tool-call idempotency
+  first_seen: '2026-11-19'
+  disposition: pending
+  sightings:
+  - date: '2026-11-19'
+    project: dark_factory
+    session: 8bca49b9-389a-42be-885b-5c8c51270ebd
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: 'MCP server "fused-memory" connection closed before the tool call was answered. The tool may have run: check whether it did before running it again.'
 historical_backfill:
   run_id: census-dark_factory-20261024
   unmatched_task_ids:
