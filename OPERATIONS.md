@@ -1442,9 +1442,10 @@ The automatic backstop is the starvation watchdog's `lock_refused` gate (knobs
 task, but only while an auto-pin slot (`starvation_watchdog.auto_pin_max_concurrent`)
 is free.
 
-During the 2026-11 trial with fairness parks off (`fairness.skip_threshold` at
-1000000), the only parks are pin reservations and parks left from before the
-switch, and a pin reservation never produces this event.
+While the `fairness.skip_threshold` TRIAL block in
+`dark-factory-orchestrator.yaml` is in force (review: gate task 10128),
+skip-earned fairness parks are effectively off, but `reserve_now` still
+installs tier-ranked parks, and those can produce this event.
 
 ### Merging: the submit → poll protocol
 
