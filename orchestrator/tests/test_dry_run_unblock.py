@@ -3586,10 +3586,12 @@ class TestSkillCommandsFitTheEnvelope:
         )
 
 
-def _granted_tools_line(prompt: str) -> str | None:
-    return next(
-        (line for line in prompt.splitlines() if line.startswith('**Granted tools:**')), None,
-    )
+_GRANTED_TOOLS_ENTRIES = re.compile(r'^\*\*Granted tools:\*\* (?P<entries>.+?)\. ', re.MULTILINE)
+
+
+def _granted_tools_listed(prompt: str) -> list[str] | None:
+    match = _GRANTED_TOOLS_ENTRIES.search(prompt)
+    return match['entries'].split(', ') if match else None
 
 
 class TestPromptNamesTheGrantedTools:
@@ -3597,24 +3599,16 @@ class TestPromptNamesTheGrantedTools:
     retrying `cat`/`head`/`grep` Bash calls the CLI denies every time (task 8704)."""
 
     @pytest.mark.asyncio
-    async def test_prompt_names_every_tool_the_envelope_grants(self, tmp_path):
+    async def test_prompt_lists_exactly_the_tools_the_envelope_grants(self, tmp_path):
         kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
-        line = _granted_tools_line(kwargs['prompt'])
-        assert line is not None, kwargs['prompt']
+        listed = _granted_tools_listed(kwargs['prompt'])
+        assert listed is not None, kwargs['prompt']
 
-        unnamed = [tool for tool in kwargs['allowed_tools'] if tool not in line]
-        assert not unnamed, f'the prompt never names the granted {unnamed}: {line}'
-
-    @pytest.mark.asyncio
-    async def test_prompt_names_no_bash_rule_the_envelope_does_not_grant(self, tmp_path):
-        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
-        line = _granted_tools_line(kwargs['prompt'])
-        assert line is not None, kwargs['prompt']
-
-        named = re.findall(r'Bash\([^)]*\)', line)
-        assert named, f'the granted-tools line names no Bash rule: {line}'
-        ungranted = [rule for rule in named if rule not in kwargs['allowed_tools']]
-        assert not ungranted, f'the prompt names {ungranted}, which the envelope never grants'
+        granted = set(kwargs['allowed_tools'])
+        assert set(listed) == granted, (
+            f'granted but not listed: {sorted(granted - set(listed))}; '
+            f'listed but not granted: {sorted(set(listed) - granted)}'
+        )
 
 
 # ---------------------------------------------------------------------------

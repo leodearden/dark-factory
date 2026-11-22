@@ -30,11 +30,11 @@ You have been invoked because a task transitioned to `blocked`. The caller has p
 - `**Reviews directory:**` — the absolute path of the task's reviewer verdict files,
   which live in task-scoped storage outside the worktree; `(unavailable: <reason>)`
   means no such path exists for this task, so skip the reviews scan
-- `**Granted tools:**` — every tool and permission rule your run is granted, rendered
-  from the CLI envelope itself. Anything else — `cat`, `head`, `tail`, `ls`, `find`, a
-  shell `grep`, a pipe or a redirection — is denied for the whole session, and a retry
-  is denied again. Read a file with `Read`, search file contents with `Grep`, and list
-  paths with `Glob`
+- `**Granted tools:**` — the tools and Bash command rules your run holds, rendered from
+  the CLI envelope itself. Any shell command no rule there admits — `cat`, `head`,
+  `tail`, `ls`, `find`, a shell `grep`, or any command with a pipe or a redirection — is
+  denied for the whole session, and a retry is denied again. Read a file with `Read`,
+  search file contents with `Grep`, and list paths with `Glob`
 - the blocked task's own record, rendered as `**Title:**`, `**Description:**` and
   `**Details:**` — each capped per field, with an oversized field clipped and marked
   `... [<field> truncated] ...` so you can see when you are reading a partial value
