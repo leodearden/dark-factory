@@ -802,6 +802,17 @@ class TestAdjudicatedRates:
     def test_every_stratum_and_the_roll_up_are_present(self) -> None:
         assert set(mod.adjudicated_rates(RATE_ROWS, _rate_verdicts())) == {*mod.STRATA, 'all'}
 
+    def test_a_caller_naming_its_strata_is_rated_over_them(self) -> None:
+        """Task 9945: a frame stratified by category is rated over its own strata."""
+        strata = ('temporal_facts', 'entities_and_relations', 'procedural_knowledge')
+        rows = [row | {'stratum': stratum} for row, stratum in zip(RATE_ROWS, strata[:2], strict=True)]
+        rates = mod.adjudicated_rates(rows, _rate_verdicts(), strata=strata)
+        assert set(rates) == {*strata, 'all'}
+        assert rates['temporal_facts']['overreach_rate_minted'] == _rate(2, 4)
+        assert rates['entities_and_relations']['misbound_count'] == 1
+        assert rates['procedural_knowledge']['episodes'] == 0
+        assert rates['all'] == mod.adjudicated_rates(RATE_ROWS, _rate_verdicts())['all']
+
 
 class TestPerClassifierRates:
     def test_rates_are_restricted_to_the_episodes_each_classifier_matches(self) -> None:

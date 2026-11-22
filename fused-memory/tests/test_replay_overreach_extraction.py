@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -1084,12 +1085,17 @@ TOKENS = {'control': {'extract_nodes': (100, 10, 1), 'extract_edges': (300, 40, 
           'o1': {'extract_nodes': (150, 10, 1), 'extract_edges': (350, 40, 2)}}
 
 
+DEFINITION_4716 = audit.SampleDefinition().to_dict()
+"""The 4716 report.json's own sample.definition: the audit's default."""
+
+
 def _score_baseline(overreach: dict[str, Any] = BASELINE_OVERREACH, *, window_days: float = 2.0) -> dict[str, Any]:
     cell = {'minted': 0, 'corroborated': 0, 'episodes': 2}
     return {
         'strata': {DF: {RULING: {'population': 90, 'window_population': 20}},
                    REIFY: {OTHER: {'population': 90, 'window_population': 4}}},
-        'sample': {'sizes': {DF: {RULING: cell}, REIFY: {OTHER: cell}}, 'window_days': window_days},
+        'sample': {'definition': DEFINITION_4716, 'sizes': {DF: {RULING: cell}, REIFY: {OTHER: cell}},
+                   'window_days': window_days},
         'adjudicated': {'population_weighted': {'overreach_rate_minted': overreach}},
     }
 
@@ -1284,6 +1290,76 @@ class TestFidelity:
         assert _scored(tmp_path, baseline=baseline)['fidelity']['intervals_overlap'] is overlap
 
 
+TEMPORAL, RELATIONS = 'temporal_facts', 'entities_and_relations'
+FRAME_DEFINITION = audit.SampleDefinition(
+    window_start='2026-09-15T00:00:00+00:00', window_end='2026-11-15T00:00:00+00:00', cap=3,
+    strata=(TEMPORAL, RELATIONS, 'procedural_knowledge'),
+)
+"""A category frame (task 9945): its own strata, cap and window, and no production baseline rate."""
+FRAME_STRATUM = {RULING: TEMPORAL, OTHER: RELATIONS}
+
+
+def _frame_report() -> dict[str, Any]:
+    cell = {'minted': 0, 'corroborated': 0, 'episodes': 2}
+    return {
+        'sample': {'definition': FRAME_DEFINITION.to_dict(), 'window_days': 2.0,
+                   'sizes': {DF: {TEMPORAL: cell}, REIFY: {RELATIONS: cell}}},
+        'strata': {DF: {TEMPORAL: {'window_population': 20}}, REIFY: {RELATIONS: {'window_population': 4}}},
+    }
+
+
+def _frame_inputs(
+    definition: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    records, labels = _score_records(PASSING)
+    records = [record | {'stratum': FRAME_STRATUM[record['stratum']]} for record in records]
+    verdicts = _score_verdicts(records, labels) | {'sample': definition or FRAME_DEFINITION.to_dict()}
+    return records, verdicts
+
+
+class TestScoreOverAFrame:
+    """Task 9945: a frame.json that is not the 4716 sample is scored by the same score_replay."""
+
+    def test_a_frame_report_without_an_adjudicated_block_is_scored(self) -> None:
+        report = mod.score_replay(*_frame_inputs(), _frame_report())
+        assert report['sample'] == FRAME_DEFINITION.to_dict()
+        weighted = report['arms']['control']['population_weighted']
+        assert weighted['overreach_rate_minted'] == audit.weighted_rate([(10.0, 4, 10), (2.0, 2, 10)])
+
+    def test_the_arm_rates_are_keyed_by_the_frames_strata(self) -> None:
+        report = mod.score_replay(*_frame_inputs(), _frame_report())
+        for block in report['arms'].values():
+            assert set(block['rates']) == {*FRAME_DEFINITION.strata, 'all'}
+        assert report['arms']['control']['rates'][TEMPORAL]['label_counts']['overreach'] == 4
+
+    def test_fidelity_is_none_without_a_production_baseline_rate(self) -> None:
+        assert mod.score_replay(*_frame_inputs(), _frame_report())['fidelity'] is None
+
+    def test_a_verdict_file_under_the_4716_definition_is_refused(self) -> None:
+        records, verdicts = _frame_inputs(DEFINITION_4716)
+        with pytest.raises(audit.SampleMismatch):
+            mod.score_replay(records, verdicts, _frame_report())
+
+    def test_the_4716_report_reads_as_the_default_definition(self) -> None:
+        baseline = mod.Baseline.from_report(json.loads(BASELINE_4716.read_text()))
+        assert baseline.definition == audit.SampleDefinition()
+
+    def test_an_injected_decision_judges_each_arm_against_the_control(self) -> None:
+        calls: list[tuple[Any, Any]] = []
+
+        def decide(control: Any, candidate: Any) -> dict[str, Any]:
+            calls.append((control, candidate))
+            return {'candidate_rate': candidate['overreach_rate_minted']['rate']}
+
+        report = mod.score_replay(*_frame_inputs(), _frame_report(), decide=decide)
+        arms = report['arms']
+        assert calls == [(arms['control']['population_weighted'], arms['o1']['population_weighted'])]
+        assert report['comparison'] == {'o1': {'candidate_rate': 0.0}}
+
+    def test_the_default_decision_is_the_lever_rule(self) -> None:
+        assert inspect.signature(mod.score_replay).parameters['decide'].default is mod.lever_decision
+
+
 class TestScoreFailsClosed:
     def _assert_rejected(self, tmp_path: Path, records: list[dict[str, Any]], verdicts: dict[str, Any]) -> None:
         code, out = _run_score(tmp_path, records, verdicts)
@@ -1337,7 +1413,7 @@ class TestScoreFailsClosed:
 CLI_SCORE_BASELINE = {
     'strata': {DF: {RULING: {'population': 90, 'window_population': 20}},
                REIFY: {OTHER: {'population': 90, 'window_population': 4}}},
-    'sample': CLI_BASELINE['sample'] | {'window_days': 2.0},
+    'sample': CLI_BASELINE['sample'] | {'definition': DEFINITION_4716, 'window_days': 2.0},
     'adjudicated': {'population_weighted': {'overreach_rate_minted': BASELINE_OVERREACH}},
 }
 OVERREACHING_FACT = 'Beta overrides Alpha'
