@@ -237,4 +237,60 @@ None: no novel substrate (G3 N/A beyond what §2 verified — `asyncio.Queue` en
 
 ## 9. Observation record (η appends here)
 
-_Empty until η runs._
+### 2026-11-22 — η observation (task 8274)
+
+**Window:** 2026-11-15T10:24:00Z to 2026-11-22T11:19:11Z, 7 d 0 h 55 m (7.04 days). The start is when ζ's
+drained sweep began: the esc-8273-1 resolution reads "restart-all-orchestrators.sh --drain ran 10:24-11:00Z".
+The end is the first measurement. Each item below states its own measurement time.
+
+**Context:** the live stores in the MAIN checkouts (`/home/leo/src/dark-factory/data/…`,
+`/home/leo/src/reify/data/…`), read read-only (sqlite `file:…?mode=ro` URIs from system `python3`) from a
+dispatched agent shell (task 8274's worktree) on host leo-MS-7C35. The journal was read with
+`journalctl --user` and live unit state with `systemctl --user show`.
+
+| item | rule | figure | verdict |
+|---|---|---|---|
+| 1. `runs` rows started in the window | every row has `startup_completed_at` or `exit_reason` non-NULL; a both-NULL row is a γ defect | dark-factory: 6 rows, 4 `cancelled`, 2 both-NULL. reify: 6 rows, 4 `cancelled`, 2 both-NULL. All 4 both-NULL rows had completed startup: 2 are live, 2 were SIGKILLed after startup. 0 `startup_crash:*` | **FAIL**: γ (task 8269) persists `startup_completed_at` only at exit. Follow-up: _pending in this commit_ |
+| 2. watchdog restart-rate sampling, `--report RESTARTS` | _pending in this commit_ | _pending in this commit_ | _pending in this commit_ |
+| 3. crash-loop pages | _pending in this commit_ | _pending in this commit_ | _pending in this commit_ |
+| 4. startup-step L1s | _pending in this commit_ | _pending in this commit_ | _pending in this commit_ |
+| 5. merge-lane cost per restart | _pending in this commit_ | _pending in this commit_ | _pending in this commit_ |
+
+**Item 1 evidence** (measured 2026-11-22T11:19–11:26Z). The query was `SELECT run_id, started_at, completed_at,
+startup_completed_at, exit_reason, code_sha FROM runs WHERE started_at >= '2026-11-15T10:24:00' ORDER BY
+started_at`, run on each project's `data/orchestrator/runs.db`.
+
+- dark-factory, 6 rows. `exit_reason='cancelled'`: 4 (run-fc741c6ac05d, run-7c108b742770, run-9a6d5c55b0a4,
+  run-c1a1cfef15e7). Each has `startup_completed_at` 24–83 s after `started_at`, and each ended in a systemd
+  stop with `status=130`. NULL: 2, both with NULL `startup_completed_at`. No other value appears. Across the
+  whole table only those 4 rows carry `startup_completed_at`.
+- reify, 6 rows. `exit_reason='cancelled'`: 4 (run-579bc7a3e1c9, run-bd31446a3fb5, run-3fc27174c232,
+  run-d774a0682070), with `startup_completed_at` 35–90 s after `started_at`, each ending in a `status=130`
+  stop. NULL: 2, both with NULL `startup_completed_at`. Across the whole table only those 4 rows carry it.
+- run-64d39f3b97db (dark-factory, started 2026-11-15T11:00:28Z: ζ's own restart, unit MainPID 3122636) is
+  class (ii), KILLED AFTER STARTUP. Orchestrator pid 3122652 logged `Started run run-64d39f3b97db` at
+  11:00:28, then `Task tree populated: 3382 pending tasks` and `Speculative merge worker started` at 11:01:13.
+  On 2026-11-17 the unit logged `Stopping` at 07:12:12, then `State 'stop-sigterm' timed out. Killing.` and
+  `status=9/KILL` at 07:13:42. The next line, `Started run run-fc741c6ac05d`, is at 07:13:49.
+- run-be51184228f6 (dark-factory, started 2026-11-21T01:38:14Z) is class (i), LIVE. The unit has been active
+  since 01:33:38 with MainPID 4058288. Its orchestrator child, pid 4058311, is the process that logged
+  `Started run run-be51184228f6`, then `Task tree populated: 3989 pending tasks` and `Speculative merge worker
+  started` at 01:41:01. The unit has logged no `Stopping` or `Started` line since.
+- run-7dfa13be7c9b (reify, started 2026-11-19T03:24:53Z) is class (ii), KILLED AFTER STARTUP. Pid 2452643
+  logged `Task tree populated: 2583 pending tasks` at 03:25:18 and `Speculative merge worker started` at
+  03:25:19. On 2026-11-21 the unit logged `Stopping` at 01:27:02, then `State 'stop-sigterm' timed out.
+  Killing.` and `status=9/KILL` at 01:28:32. The next line, `Started run run-de3958d3e6bf`, is at 01:28:43.
+- run-de3958d3e6bf (reify, started 2026-11-21T01:28:43Z) is class (i), LIVE. The unit has been active since
+  01:28:33 with MainPID 3888978. Its child, pid 3888996, logged `Task tree populated: 2708 pending tasks` at
+  01:29:55 and `Speculative merge worker started` at 01:29:57.
+- Class (iii) (no startup-complete line before a kill): none.
+- Excluded, because it started before the window: dark-factory run-0dac71f2fe0f (started 2026-11-14). ζ's
+  sweep SIGKILLed it at 2026-11-15T11:00:19Z (stop-sigterm timeout), and it has NULL `completed_at`.
+- Mechanism. `orchestrator/src/orchestrator/harness.py::Harness.run` assigns `startup_completed_at` to a local
+  right after `self.scheduler.finish_startup()`. It hands that local to
+  `orchestrator/src/orchestrator/run_store.py::RunStore.finish_run` only from its `finally`, whereas §3.6 above
+  says "stamped at `finish_startup()`". So a row reads both-NULL for as long as its run is live, and forever
+  once a SIGKILL skips the `finally`. That is exactly the row a SIGKILL during startup leaves. Until the process
+  exits through its `finally`, the column cannot tell §3.6's crashed start from a healthy one.
+- The two class (ii) kills are systemd's 90 s stop-sigterm bound: `Stopping` came 90 s before `Killing` both
+  times. So the shutdown drain overran, which is task 7247 and out of scope under §4.
