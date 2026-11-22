@@ -311,3 +311,62 @@ async def test_a_guard_registered_twice_is_consulted_once(store: _Store, guard: 
     await store.promote(held)
 
     assert len(guard.calls) == 1
+
+
+@dataclass
+class _FaultyGuard:
+    faulty: set[int] = field(default_factory=set)
+
+    def __call__(self, task: Mapping[str, object], by: str, ref: str | None) -> PromotionDeferral | None:
+        if int(str(task['id'])) in self.faulty:
+            raise RuntimeError('rider index unavailable')
+        return None
+
+
+@pytest.fixture
+def faulty_guard() -> Iterator[_FaultyGuard]:
+    stub = _FaultyGuard()
+    register_promotion_guard(stub)
+    try:
+        yield stub
+    finally:
+        unregister_promotion_guard(stub)
+
+
+@pytest.mark.asyncio
+async def test_a_guard_that_raises_defers_its_task_and_the_release_goes_on(
+    store: _Store, faulty_guard: _FaultyGuard,
+) -> None:
+    faulted = await store.held('The retry loop swallows the timeout')
+    released = await store.held('The cache key ignores the tenant')
+    faulty_guard.faulty.add(faulted)
+
+    promoted = await release_held(store.stack.backend, store.stack.root, store.holder, emit=store.emit)
+
+    assert promoted == (released,)
+    await _assert_held(store, faulted)
+    [deferred] = store.events(EventType.followup_promotion_deferred)
+    assert {key: deferred[key] for key in ('task_id', 'by', 'ref', 'guard')} == {
+        'task_id': str(faulted), 'by': 'human', 'ref': 'release_holder', 'guard': '_FaultyGuard',
+    }
+    assert 'rider index unavailable' in deferred['reason']
+
+
+@pytest.mark.asyncio
+async def test_releasing_again_promotes_only_what_the_first_release_left_held(
+    store: _Store, guard: _StubGuard,
+) -> None:
+    left_held = await store.held('The retry loop swallows the timeout')
+    released = await store.held('The cache key ignores the tenant')
+    guard.deferred.add(left_held)
+    assert await release_held(store.stack.backend, store.stack.root, store.holder, emit=store.emit) == (released,)
+    guard.deferred.clear()
+    store.emitted.clear()
+
+    promoted = await release_held(store.stack.backend, store.stack.root, store.holder, emit=store.emit)
+
+    assert promoted == (left_held,)
+    assert (await store.record(left_held))['promoted']['ref'] == 'release_holder'
+    assert store.events(EventType.followup_promoted) == [
+        {'task_id': str(left_held), 'by': 'human', 'ref': 'release_holder'},
+    ]

@@ -19,6 +19,7 @@ from fused_memory.middleware.followup_hold import (
     FollowupHolderProtectedError,
     HolderProtection,
     PromotionDeferral,
+    carry_hold_record,
     citation_ref,
     held_by,
     hold_at_create,
@@ -323,7 +324,7 @@ def test_a_malformed_record_is_not_held_and_warns(record: Any, caplog: pytest.Lo
     with caplog.at_level('WARNING', logger='fused_memory.middleware.followup_hold'):
         assert held_by(_held_row(record=record)) is None
 
-    assert any('12' in message for message in caplog.messages)
+    assert any('task 12 carries' in message for message in caplog.messages)
 
 
 @pytest.mark.parametrize(('payload', 'expected'), [
@@ -380,3 +381,32 @@ def test_a_machine_actor_may_not_strip_the_holder_edge(agent_id: str) -> None:
 def test_a_promotion_deferral_refuses_an_extra_key() -> None:
     with pytest.raises(ValidationError):
         PromotionDeferral.model_validate({'guard': 'g', 'reason': 'r', 'extra': 'x'})
+
+
+_STORED_HELD = {FOLLOWUP_HOLD_METADATA_KEY: _HOLD_RECORD, 'files': ['a.py']}
+
+
+@pytest.mark.parametrize(('payload', 'replace', 'expected'), [
+    ({'x_finding_key': ['fk-1']}, True, {'x_finding_key': ['fk-1'], FOLLOWUP_HOLD_METADATA_KEY: _HOLD_RECORD}),
+    ({}, True, {FOLLOWUP_HOLD_METADATA_KEY: _HOLD_RECORD}),
+    ({FOLLOWUP_HOLD_METADATA_KEY: None}, False, {FOLLOWUP_HOLD_METADATA_KEY: _HOLD_RECORD}),
+    (
+        {FOLLOWUP_HOLD_METADATA_KEY: {**_HOLD_RECORD, 'holder': 3}, 'files': ['b.py']}, False,
+        {FOLLOWUP_HOLD_METADATA_KEY: _HOLD_RECORD, 'files': ['b.py']},
+    ),
+], ids=['replace-drops-it', 'replace-with-nothing', 'merge-nulls-it', 'merge-rewrites-it'])
+def test_an_update_that_would_drop_or_rewrite_the_hold_record_carries_it(
+    payload: dict[str, Any], replace: bool, expected: dict[str, Any],
+) -> None:
+    assert carry_hold_record(_STORED_HELD, payload, replace=replace) == expected
+
+
+@pytest.mark.parametrize(('stored', 'payload', 'replace'), [
+    (_STORED_HELD, {'x_finding_key': ['fk-1']}, False),
+    (_STORED_HELD, {**_STORED_HELD, 'files': ['b.py']}, True),
+    (json.dumps(_STORED_HELD), {'files': ['b.py']}, False),
+    ({'files': ['a.py']}, {'files': ['b.py']}, True),
+    (None, {}, True),
+], ids=['merge-without-it', 'replace-echoing-it', 'json-stored', 'never-held', 'no-metadata'])
+def test_an_update_that_leaves_the_hold_record_carries_nothing(stored: Any, payload: dict[str, Any], replace: bool) -> None:
+    assert carry_hold_record(stored, payload, replace=replace) is None

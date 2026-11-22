@@ -428,3 +428,87 @@ async def test_combining_a_held_candidate_into_a_held_task_leaves_it_held(
     assert {key: resolved.get(key) for key in ('status', 'task_id')} == {'status': 'combined', 'task_id': target}
     await _assert_held(stack, target)
     assert await _promoted_events(stack) == []
+
+
+@pytest.mark.asyncio
+async def test_a_replace_write_keeps_the_hold_and_a_replace_citation_promotes(
+    stack: Stack, curator_creates: list[PreparedCandidate],
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    stored = await stack.metadata(held)
+    record = stored[FOLLOWUP_HOLD_METADATA_KEY]
+    without_record = {key: value for key, value in stored.items() if key != FOLLOWUP_HOLD_METADATA_KEY}
+
+    _ok(await stack.call('update_task', id=held, metadata=without_record, metadata_mode='replace'))
+
+    assert (await stack.metadata(held))[FOLLOWUP_HOLD_METADATA_KEY] == record
+    await _assert_held(stack, held)
+
+    _ok(await stack.call(
+        'update_task', id=held, metadata={**without_record, 'x_finding_key': ['fk-1']}, metadata_mode='replace',
+    ))
+
+    await _assert_promoted(stack, held, by='citation', ref='fk-1')
+
+
+def _deferring(task_id: str) -> Any:
+    def guard(task: Mapping[str, object], by: str, ref: str | None) -> PromotionDeferral | None:
+        return PromotionDeferral(guard='stub-guard', reason='riders still open') if str(task['id']) == task_id else None
+
+    return guard
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('status', 'first', 'again'), [
+    ('cancelled', {}, {}),
+    ('deferred', {'deferral': _DEFERRAL}, {}),
+    ('deferred', {'deferral': _DEFERRAL}, {'deferral': _DEFERRAL}),
+], ids=['cancelled', 'deferred', 'deferred-restamped'])
+async def test_releasing_a_released_holder_again_promotes_what_is_still_held(
+    stack: Stack, curator_creates: list[PreparedCandidate], status: str, first: dict[str, Any], again: dict[str, Any],
+) -> None:
+    left_held = await _file_held(stack, 'The retry loop swallows the timeout')
+    released = await _file_held(stack, 'The cache key ignores the tenant')
+    holder = await _holder(stack)
+    guard = _deferring(left_held)
+    register_promotion_guard(guard)
+    try:
+        _ok(await stack.call('set_task_status', id=holder, status=status, release_holder=True, **first))
+    finally:
+        unregister_promotion_guard(guard)
+    await _assert_promoted(stack, released, by='human', ref='release_holder')
+    await _assert_held(stack, left_held)
+
+    _ok(await stack.call('set_task_status', id=holder, status=status, **again))
+    await _assert_held(stack, left_held)
+
+    _ok(await stack.call('set_task_status', id=holder, status=status, release_holder=True, **again))
+
+    assert (await stack.row(holder))['status'] == status
+    await _assert_promoted(stack, left_held, by='human', ref='release_holder')
+    assert sorted(event['task_id'] for event in await _promoted_events(stack)) == sorted([left_held, released])
+
+
+@pytest.mark.asyncio
+async def test_a_release_that_fails_after_the_status_write_warns_and_can_be_finished(
+    stack: Stack, curator_creates: list[PreparedCandidate], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    held = await _file_held(stack, 'The retry loop swallows the timeout')
+    holder = await _holder(stack)
+
+    async def unreadable(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError('dependency table locked')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(stack.backend, 'get_dependency_edges', unreadable)
+        answer = await stack.call('set_task_status', id=holder, status='cancelled', release_holder=True)
+
+    _ok(answer)
+    assert answer['post_write_warnings'] == [{'stage': 'promote_on_transition', 'error': 'dependency table locked'}]
+    assert (await stack.row(holder))['status'] == 'cancelled'
+    assert [event['task_id'] for event in await stack.events(EventType.task_status_changed)][-1] == holder
+    await _assert_held(stack, held)
+
+    _ok(await stack.call('set_task_status', id=holder, status='cancelled', release_holder=True))
+
+    await _assert_promoted(stack, held, by='human', ref='release_holder')

@@ -9252,7 +9252,9 @@ def create_mcp_server(
                 ``followup_holder_protected`` with the holder's ``held_count``. Releasing the
                 holder releases every held follow-up at once, so it is a human act: each one
                 is promoted by human, with one ``followup_promoted`` event apiece, before
-                targeted reconciliation runs. Ignored on any other task. See
+                targeted reconciliation runs. A promotion failure after the status write is
+                reported in ``post_write_warnings``; passing it again on a holder already at
+                that status releases whatever is still held. Ignored on any other task. See
                 docs/task-authoring.md §3.4.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)

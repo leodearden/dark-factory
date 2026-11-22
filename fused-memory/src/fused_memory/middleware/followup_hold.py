@@ -59,17 +59,21 @@ __all__ = [
     'PromotionDeferral',
     'PromotionDeferredError',
     'PromotionGuard',
+    'UpdatePromotion',
     'backfill',
+    'carry_hold_record',
     'citation_ref',
     'held_by',
     'held_count',
     'hold_at_create',
     'hold_scope',
     'is_holder',
+    'judge_update',
     'may_strip_holder_edge',
     'protected_status',
     'protected_update',
     'promote',
+    'promote_after_update',
     'promote_dependencies_of',
     'protection_refusal',
     'register_promotion_guard',
@@ -101,6 +105,8 @@ _BACKFILL_FIELDS: Final = (
 _EXTERNAL_DEPS_FIELDS: Final = ('id', 'metadata.external_deps')
 _METADATA_SOURCE: Final = 'followup_hold'
 _RELEASE_REF: Final = 'release_holder'
+_REMOVE_REF: Final = 'remove_dependency'
+_UPDATE_REF: Final = 'update_task'
 
 
 def is_holder(task: Mapping[str, object]) -> bool:
@@ -386,6 +392,25 @@ def protected_update(
     return None
 
 
+def carry_hold_record(stored_metadata: object, payload: object, *, replace: bool) -> dict[str, Any] | None:
+    """The metadata an update must write instead of *payload* so the stored ``followup_hold`` survives it.
+
+    The record is machine-written, by this module's own backend writes only: every promotion
+    trigger finds a held task through it, so a held task whose record an update dropped or
+    rewrote would wait behind its holder with nothing left to promote it. None when the write
+    leaves the stored record as it is, or the row has none.
+    """
+    stored = raw_metadata_dict(stored_metadata, source=_METADATA_SOURCE)
+    record = stored.get(FOLLOWUP_HOLD_METADATA_KEY)
+    if record is None:
+        return None
+    written = raw_metadata_dict(payload, source=_METADATA_SOURCE)
+    after = written if replace else {**stored, **written}
+    if after.get(FOLLOWUP_HOLD_METADATA_KEY) == record:
+        return None
+    return {**written, FOLLOWUP_HOLD_METADATA_KEY: record}
+
+
 _HOLDER_PROTECTED_HINT = (
     'This task is its project\'s follow-up holder: every held low follow-up depends on it. Done, '
     'cancelled or deferred releases every held follow-up at once, promoting each by human. That '
@@ -488,7 +513,10 @@ def unregister_promotion_guard(guard: PromotionGuard) -> None:
 
 
 HoldEmit = Callable[[EventType, Mapping[str, object]], Awaitable[None]]
-"""Journals one hold event for the project; the backfill and every promotion emit through it."""
+"""Journals one hold event for the project; the backfill and every promotion emit through it.
+
+A caller outside the interceptor takes the journaling one from ``TaskInterceptor.hold_emit``.
+"""
 
 _Seed = tuple[int, PromotionCause, str | None]
 
@@ -507,7 +535,7 @@ async def promote(
     The caller holds the project's interceptor write lock, so each task is read and promoted with
     no write in between. Each promotion is ONE backend write that drops the holder edge and stamps
     ``followup_hold.promoted``, then one ``followup_promoted`` event; ``pending_since`` is never
-    written. A registered guard's deferral leaves its task held, emits
+    written. A registered guard's deferral, or a guard that raises, leaves its task held, emits
     ``followup_promotion_deferred`` and promotes none of that task's dependencies. A task that is
     not held now promotes nothing. Returns the promoted ids in promotion order; an unknown *by*
     raises ``ValueError``.
@@ -517,73 +545,121 @@ async def promote(
 
 
 async def remove_holder_edge(
-    tm: TaskBackendProtocol, project_root: str, held_id: int, *, ref: str, emit: HoldEmit,
-) -> tuple[int, ...]:
+    tm: TaskBackendProtocol, project_root: str, task_id: str, depends_on: str, *, emit: HoldEmit,
+) -> tuple[int, ...] | None:
     """A human removing a held task's holder edge promotes it by ``human`` (open question 2).
 
-    Raises :class:`PromotionDeferredError`, with nothing written, when a guard defers *held_id*
-    itself. Same precondition as :func:`promote`.
+    None when *depends_on* is not the edge *task_id* is held behind, so the caller removes that
+    edge plainly. Raises :class:`PromotionDeferredError`, with nothing written, when a guard defers
+    the task itself. Same precondition as :func:`promote`.
     """
-    walk = await _promote_frontier(tm, project_root, [(held_id, PromotionCause.HUMAN, ref)], emit)
-    deferred = walk.deferred.get(held_id)
+    row = await _live_row(tm, project_root, task_id)
+    record = None if row is None else _current_hold(row)
+    if record is None or str(record.holder) != depends_on.strip():
+        return None
+    walk = await _promote_frontier(tm, project_root, [(int(task_id), PromotionCause.HUMAN, _REMOVE_REF)], emit)
+    deferred = walk.deferred.get(int(task_id))
     if deferred is not None:
-        holder_id, deferral = deferred
         raise PromotionDeferredError(
-            task_id=str(held_id), holder_id=str(holder_id), cause=PromotionCause.HUMAN, deferral=deferral,
+            task_id=task_id, holder_id=str(record.holder), cause=PromotionCause.HUMAN, deferral=deferred,
         )
     return walk.promoted
 
 
-def drops_holder_edge(task: Mapping[str, object], dependencies: Sequence[object]) -> bool:
-    """Whether a replacement dependencies list leaves out the edge *task* is held behind."""
-    holder = held_by(task)
-    return holder is not None and str(holder) not in {str(dependency).strip() for dependency in dependencies}
+@dataclass(frozen=True)
+class UpdatePromotion:
+    """What an ``update_task`` promotes once its write lands, judged by :func:`judge_update` before it."""
+
+    task_id: str
+    human_release: FollowupHold | None = None
+    """The hold a human ``dependencies`` replacement ends; the write itself drops the holder edge."""
+    citation: str | None = None
+    dependencies_written: bool = False
 
 
-async def human_promotion_refusal(
-    task: Mapping[str, object], *, ref: str, emit: HoldEmit,
-) -> PromotionDeferredError | None:
-    """A guard's deferral of a human promotion of *task*, judged before the caller writes anything.
+async def judge_update(
+    tm: TaskBackendProtocol,
+    project_root: str,
+    task_id: str,
+    before: Mapping[str, object] | None,
+    *,
+    metadata: object,
+    dependencies: Sequence[object] | None,
+    agent_id: str | None,
+    emit: HoldEmit,
+) -> UpdatePromotion:
+    """Decision 14 for an update, judged before its write; *before* is the row already read, if any.
 
-    A deferral emits ``followup_promotion_deferred``. Returns None when *task* is not held now.
+    A ``dependencies`` replacement that leaves out a held task's holder edge is a human promotion
+    (open question 2). A machine caller gets :class:`HolderEdgeStripRefusedError`, and a guard's
+    deferral emits ``followup_promotion_deferred`` and raises :class:`PromotionDeferredError`;
+    either way the caller must write nothing. The promotion is carried out only once the write
+    lands (:func:`promote_after_update`), so a write the backend refuses leaves the task held.
+    Same precondition as :func:`promote`.
     """
-    record = _current_hold(task)
-    if record is None:
-        return None
-    deferral = _first_deferral(task, PromotionCause.HUMAN, ref)
-    if deferral is None:
-        return None
-    await emit(
-        EventType.followup_promotion_deferred,
-        {'task_id': str(task['id']), 'by': PromotionCause.HUMAN.value, 'ref': ref, **deferral.model_dump()},
-    )
-    return PromotionDeferredError(
-        task_id=str(task['id']), holder_id=str(record.holder), cause=PromotionCause.HUMAN, deferral=deferral,
+    human_release = None
+    if dependencies is not None:
+        row = before if before is not None else await _live_row(tm, project_root, task_id)
+        if row is not None:
+            human_release = await _replacement_release(row, dependencies, agent_id, emit)
+    return UpdatePromotion(
+        task_id=task_id,
+        human_release=human_release,
+        citation=citation_ref(metadata),
+        dependencies_written=dependencies is not None,
     )
 
 
-async def record_human_promotion(
-    tm: TaskBackendProtocol, project_root: str, before: Mapping[str, object], *, ref: str, emit: HoldEmit,
+async def _replacement_release(
+    row: Mapping[str, object], dependencies: Sequence[object], agent_id: str | None, emit: HoldEmit,
+) -> FollowupHold | None:
+    record = _current_hold(row)
+    if record is None or str(record.holder) in {str(dependency).strip() for dependency in dependencies}:
+        return None
+    task_id = str(row['id'])
+    if not may_strip_holder_edge(agent_id):
+        raise HolderEdgeStripRefusedError(task_id=task_id, holder_id=str(record.holder), agent_id=agent_id)
+    deferral = _first_deferral(row, PromotionCause.HUMAN, _UPDATE_REF)
+    if deferral is not None:
+        await _emit_deferred(emit, task_id, PromotionCause.HUMAN, _UPDATE_REF, deferral)
+        raise PromotionDeferredError(
+            task_id=task_id, holder_id=str(record.holder), cause=PromotionCause.HUMAN, deferral=deferral,
+        )
+    return record
+
+
+async def promote_after_update(
+    tm: TaskBackendProtocol, project_root: str, judged: UpdatePromotion, *, emit: HoldEmit,
 ) -> tuple[int, ...]:
-    """Stamp a human promotion whose holder edge the caller's committed write already dropped.
+    """Carry out what :func:`judge_update` judged, once the update landed; returns the promoted ids.
 
-    *before* is the row as it stood before that write; its hold record is the one stamped. Then
-    every held task the promoted task now depends on is promoted by ``dependent``, as
-    :func:`promote` would. Returns the promoted ids. Same precondition as :func:`promote`.
+    A human release stamps the record the update left (the update dropped the edge), then
+    promotes the task's held dependencies by ``dependent``; a citation promotes the task; a
+    ``dependencies`` replacement is an edge insert. Same precondition as :func:`promote`.
     """
-    record = _current_hold(before)
-    if record is None:
-        return ()
-    task_id = int(str(before['id']))
+    promoted: list[int] = []
+    if judged.human_release is not None:
+        promoted += await _stamp_human_release(tm, project_root, judged.task_id, judged.human_release, emit)
+    if judged.citation is not None:
+        promoted += await promote(
+            tm, project_root, int(judged.task_id), by=PromotionCause.CITATION, ref=judged.citation, emit=emit,
+        )
+    if judged.dependencies_written:
+        promoted += await promote_dependencies_of(tm, project_root, int(judged.task_id), emit=emit)
+    return tuple(promoted)
+
+
+async def _stamp_human_release(
+    tm: TaskBackendProtocol, project_root: str, task_id: str, record: FollowupHold, emit: HoldEmit,
+) -> list[int]:
     await tm.update_task(
-        str(task_id), project_root,
-        metadata=_promoted_metadata(record, PromotionCause.HUMAN, ref), metadata_mode='merge',
+        task_id, project_root,
+        metadata=_promoted_metadata(record, PromotionCause.HUMAN, _UPDATE_REF), metadata_mode='merge',
     )
-    await emit(EventType.followup_promoted, {'task_id': str(task_id), 'by': PromotionCause.HUMAN.value, 'ref': ref})
+    await _emit_promoted(emit, task_id, PromotionCause.HUMAN, _UPDATE_REF)
     row = await _live_row(tm, project_root, task_id)
-    dependencies = [] if row is None else _local_dependencies(row)
-    seeds = [(int(dependency), PromotionCause.DEPENDENT, str(task_id)) for dependency in dependencies]
-    return (task_id, *(await _promote_frontier(tm, project_root, seeds, emit)).promoted)
+    seeds = [] if row is None else _dependent_seeds(task_id, _local_dependencies(row))
+    return [int(task_id), *(await _promote_frontier(tm, project_root, seeds, emit)).promoted]
 
 
 async def promote_dependencies_of(
@@ -593,13 +669,10 @@ async def promote_dependencies_of(
 
     So an edge between two held tasks keeps both held. Same precondition as :func:`promote`.
     """
-    try:
-        row = await tm.get_task(str(task_id), project_root)
-    except TaskNotFoundError:
+    row = await _live_row(tm, project_root, task_id)
+    if row is None or row.get('status') != TaskStatus.PENDING or held_by(row) is not None:
         return ()
-    if row.get('status') != TaskStatus.PENDING or held_by(row) is not None:
-        return ()
-    seeds = [(int(dependency), PromotionCause.DEPENDENT, str(task_id)) for dependency in _local_dependencies(row)]
+    seeds = _dependent_seeds(task_id, _local_dependencies(row))
     return (await _promote_frontier(tm, project_root, seeds, emit)).promoted
 
 
@@ -608,8 +681,9 @@ async def release_held(
 ) -> tuple[int, ...]:
     """The explicit release: every task held behind the holder is promoted by a human.
 
-    Every dependent is seeded before any closure step, so each is attributed to the release. Same
-    precondition as :func:`promote`.
+    Every dependent is seeded before any closure step, so each is attributed to the release. A
+    task already promoted is skipped, so a repeated release finishes one that stopped partway.
+    Same precondition as :func:`promote`.
     """
     edges = await tm.get_dependency_edges(project_root)
     dependents = sorted(task_id for task_id, dependencies in edges.items() if holder_id in dependencies)
@@ -622,8 +696,7 @@ async def release_held(
 @dataclass(frozen=True)
 class _Walk:
     promoted: tuple[int, ...]
-    deferred: Mapping[int, tuple[int, PromotionDeferral]]
-    """Each deferred task's holder and the guard's deferral."""
+    deferred: Mapping[int, PromotionDeferral]
 
 
 async def _promote_frontier(
@@ -633,7 +706,7 @@ async def _promote_frontier(
     frontier = deque(seeds)
     seen: set[int] = set()
     promoted: list[int] = []
-    deferred: dict[int, tuple[int, PromotionDeferral]] = {}
+    deferred: dict[int, PromotionDeferral] = {}
     while frontier:
         task_id, cause, ref = frontier.popleft()
         if task_id in seen:
@@ -645,20 +718,35 @@ async def _promote_frontier(
             continue
         deferral = _first_deferral(row, cause, ref)
         if deferral is not None:
-            deferred[task_id] = (record.holder, deferral)
-            await emit(
-                EventType.followup_promotion_deferred,
-                {'task_id': str(task_id), 'by': cause.value, 'ref': ref, **deferral.model_dump()},
-            )
+            deferred[task_id] = deferral
+            await _emit_deferred(emit, task_id, cause, ref, deferral)
             continue
         remaining = await _write_promotion(tm, project_root, row, record, cause, ref)
-        await emit(EventType.followup_promoted, {'task_id': str(task_id), 'by': cause.value, 'ref': ref})
+        await _emit_promoted(emit, task_id, cause, ref)
         promoted.append(task_id)
-        frontier.extend((dependency, PromotionCause.DEPENDENT, str(task_id)) for dependency in remaining)
+        frontier.extend(_dependent_seeds(task_id, remaining))
     return _Walk(promoted=tuple(promoted), deferred=deferred)
 
 
-async def _live_row(tm: TaskBackendProtocol, project_root: str, task_id: int) -> dict[str, Any] | None:
+def _dependent_seeds(task_id: int | str, dependencies: Iterable[object]) -> list[_Seed]:
+    """Each dependency of a task just promoted, promoted in turn by ``dependent`` with the task as ref."""
+    return [(int(str(dependency)), PromotionCause.DEPENDENT, str(task_id)) for dependency in dependencies]
+
+
+async def _emit_promoted(emit: HoldEmit, task_id: int | str, cause: PromotionCause, ref: str | None) -> None:
+    await emit(EventType.followup_promoted, {'task_id': str(task_id), 'by': cause.value, 'ref': ref})
+
+
+async def _emit_deferred(
+    emit: HoldEmit, task_id: int | str, cause: PromotionCause, ref: str | None, deferral: PromotionDeferral,
+) -> None:
+    await emit(
+        EventType.followup_promotion_deferred,
+        {'task_id': str(task_id), 'by': cause.value, 'ref': ref, **deferral.model_dump()},
+    )
+
+
+async def _live_row(tm: TaskBackendProtocol, project_root: str, task_id: int | str) -> dict[str, Any] | None:
     try:
         return await tm.get_task(str(task_id), project_root)
     except TaskNotFoundError:
@@ -725,8 +813,14 @@ class PromotionDeferredError(TaskmasterError):
 
 
 def _first_deferral(row: Mapping[str, object], cause: PromotionCause, ref: str | None) -> PromotionDeferral | None:
+    """The first registered guard's deferral; a guard that raises defers too, so a fault keeps the task held."""
     for guard in tuple(_PROMOTION_GUARDS):
-        deferral = guard(row, cause.value, ref)
+        try:
+            deferral = guard(row, cause.value, ref)
+        except Exception as exc:
+            name = getattr(guard, '__qualname__', type(guard).__qualname__)
+            logger.warning('followup_hold: promotion guard %s raised for task %s', name, row.get('id'), exc_info=True)
+            return PromotionDeferral(guard=name, reason=f'the guard raised {type(exc).__name__}: {exc}')
         if deferral is not None:
             return deferral
     return None
