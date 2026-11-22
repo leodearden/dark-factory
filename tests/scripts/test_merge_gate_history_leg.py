@@ -93,6 +93,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
         'GitOps over the tmp_path git_repo fixture and its worktrees'
     ),
     'orchestrator/tests/test_git_ops_no_op_landing.py': '_Repo wraps the tmp_path git_repo fixture',
+    'orchestrator/tests/test_git_ops_stacked_worktree.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_git_ops_unstack.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_group_merge_candidate_ordering.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_harness_plan_step_rederive.py': _SEEDS_ITS_OWN_REPO,
