@@ -66,6 +66,13 @@ logger = logging.getLogger(__name__)
 _DONE_OUTCOME: str = WorkflowOutcome.DONE.value
 _BLOCKED_OUTCOME: str = WorkflowOutcome.BLOCKED.value
 
+#: What count_done_in_window counts, named wherever that figure is shown.
+DONE_RUNS_LABEL = (
+    'orchestrator runs that finished done (excludes hand carries and merge-deferred landings)'
+)
+#: The rollup column dividing cost by distinct done tasks (runs), not by landings.
+PER_DONE_RUN_LABEL = '$ per done run'
+
 # ---------------------------------------------------------------------------
 # EWA math
 # ---------------------------------------------------------------------------
@@ -566,11 +573,12 @@ async def cost_in_window(
 # ---------------------------------------------------------------------------
 # Model×role outcome rollup (task 2534 δ, plans/adaptive-model-routing-prd.md,
 # boundary test 12) — per-(model, role) invocation counts, done/blocked
-# rates, cap-hit rate, and $/done, joined from CostStore's `invocations`
+# rates, cap-hit rate, and $ per done run, joined from CostStore's `invocations`
 # table and RunStore's `task_results` table on (run_id, task_id).  Both
 # tables (plus EventStore's `events` table, used for turn-cap saturation
 # below) live in the same runs.db file — see harness.py:1373-1398 — so one
-# DB path is sufficient for the whole rollup.
+# DB path is sufficient for the whole rollup.  Cost per LANDING is the quality
+# dashboard's series (plans/quality-dashboard-prd.md), not this rollup's.
 # ---------------------------------------------------------------------------
 
 
@@ -588,8 +596,8 @@ class ModelRoleRow:
     capped_count: int
     cap_hit_rate: float
     total_cost_usd: float
-    # None when the cell has zero done tasks — distinguishes "no completed
-    # tasks yet" from "$0 per done" (see design_decisions in plan.json).
+    # Cost per done run (PER_DONE_RUN_LABEL); None when the cell has zero done
+    # runs, distinguishing "none finished yet" from "$0 per done run".
     cost_per_done: float | None
 
 
@@ -676,7 +684,9 @@ def query_model_role_rollup(
     nor blocked — an honest representation, not a dropped row.
 
     Rates are derived in Python with divide-by-zero guards; cost_per_done is
-    None (not 0/inf) when a cell has zero distinct done tasks.
+    the cost per done run, None (not 0/inf) when a cell has zero distinct done
+    tasks. Cost per landing is the quality dashboard's series
+    (plans/quality-dashboard-prd.md), not this one.
 
     sqlite3.Error propagates, and *conn* is neither opened nor closed here;
     model_role_rollup is the fail-open form.
@@ -874,6 +884,7 @@ class DigestInputs:
     window_start_iso: str
     window_end_iso: str
     escalation_stats: EscalationStats
+    # count_done_in_window: the EWA denominator, rendered under DONE_RUNS_LABEL.
     done_count: int
     cost_stats: CostStats
     parked_live: int
@@ -910,6 +921,8 @@ class DigestInputs:
     chain_telemetry: ChainTelemetry = field(default_factory=ChainTelemetry)
     # Task 2987 δ; None = durable lane records unreadable.
     lane_record_divergence: tuple[LaneDivergence, ...] | None = ()
+    # Task 8563 ε; landings on main in the window, None = runs.db or git unreadable.
+    landings_count: int | None = None
 
 
 def render_digest_markdown(inputs: DigestInputs) -> str:
@@ -949,9 +962,14 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
         lines.append(f'- Last:  {esc.last_ts}')
     lines.append('')
 
-    # Tasks done
-    lines.append('## Tasks done in window')
-    lines.append(f'{inputs.done_count}')
+    lines.append('## Landings in window')
+    if inputs.landings_count is None:
+        lines.append(
+            '_unavailable: landings could not be read (runs.db or git); '
+            'the orchestrator log names why_'
+        )
+    else:
+        lines.append(f'{inputs.landings_count}')
     lines.append('')
 
     # Cost
@@ -983,6 +1001,7 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
     lines.append(
         f'- Lifecycle events in step (digest gate): {inputs.lifecycle_events_in_step}'
     )
+    lines.append(f'- {DONE_RUNS_LABEL}, the EWA denominator: {inputs.done_count}')
     share = inputs.escalation_stats.dominant_category()
     lines.append(f'- Dominant escalation category: {share if share is not None else "none"}')
     lines.append('')
@@ -1021,7 +1040,9 @@ def render_digest_markdown(inputs: DigestInputs) -> str:
     rollup = inputs.model_role_rollup
     lines.append('## Per-(model×role) rollup')
     if rollup.rows:
-        lines.append('| model | role | invocations | done% | blocked% | cap-hit% | $/done |')
+        lines.append(
+            f'| model | role | invocations | done% | blocked% | cap-hit% | {PER_DONE_RUN_LABEL} |'
+        )
         lines.append('|-------|------|--------------|-------|----------|----------|--------|')
         for row in sorted(rollup.rows, key=lambda r: (r.model, r.role)):
             cost_per_done_str = (
