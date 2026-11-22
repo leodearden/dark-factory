@@ -130,9 +130,10 @@ def _file_decision(
     read boundary (``cockpit/src/cockpit/registry_reader.py``), so any other
     reader comparing a raw ``SessionRecord.project`` must fold it itself.
     This NORMALIZES an unrecognized spelling rather than
-    REJECTING it, deliberately: (1) this verb is fail-soft by contract --
-    run_verb returns 0 and write_decision never raises -- so a rejection
-    would silently DROP the decision, which is precisely the
+    REJECTING it, deliberately: (1) write-decision's runner is fail-soft by
+    contract -- run_verb returns 0 and write_decision never raises -- and
+    this function itself only reports None, so a rejection would silently
+    DROP the decision, which is precisely the
     fail-into-invisibility harm the whole verb exists to prevent; a human's
     parked question would vanish instead of appearing under a slightly-off
     token. (2) An allowlist would mean a genuinely new project cannot file a
@@ -692,7 +693,20 @@ def _run_close_decision(
     return 0
 
 
-def _run_file_and_close_decision(args: argparse.Namespace, filing_record_slug: Callable[[str, str], str]) -> int:
+def _run_file_and_close_decision(
+    local_id: str,
+    project: str,
+    text: str,
+    task_id: str | None,
+    escalation_id: str | None,
+    session_id: str | None,
+    severity: str,
+    escalations_dir: str,
+    *,
+    state: str,
+    evidence: str,
+    record_slug: str,
+) -> int:
     """Run the ``file-and-close-decision`` verb: write-decision's filing, then a close of the id it landed on.
 
     Its caller is scripts/sitting/payloads.py::close_decision_argv, closing an
@@ -705,35 +719,35 @@ def _run_file_and_close_decision(args: argparse.Namespace, filing_record_slug: C
     that lands nothing exits non-zero, as close-decision's refusals do.
     """
     try:
-        decision_registry.refuse_unclosable_arguments(args.id, args.state, args.evidence)
+        decision_registry.refuse_unclosable_arguments(local_id, state, evidence)
     except decision_registry.DecisionCloseRefused as exc:
         print(f'close-decision refused: {exc}', file=sys.stderr)
         return 1
     landed = _file_decision(
-        args.id,
-        args.project,
-        args.text,
-        args.task_id,
-        args.escalation_id,
-        args.session_id,
-        args.severity,
-        args.escalations_dir,
-        record_slug=filing_record_slug(args.id, args.project),
+        local_id,
+        project,
+        text,
+        task_id,
+        escalation_id,
+        session_id,
+        severity,
+        escalations_dir,
+        record_slug=record_slug,
     )
     if landed is None:
         print(
-            f'file-and-close-decision: write-decision filed nothing for --id {args.id} '
+            f'file-and-close-decision: write-decision filed nothing for --id {local_id} '
             '(see the ERROR log); nothing was closed',
             file=sys.stderr,
         )
         return 1
     return _run_close_decision(
         landed,
-        args.state,
-        args.evidence,
+        state,
+        evidence,
         None,
-        expected_project=args.project,
-        expected_escalations_dir=args.escalations_dir,
+        expected_project=project,
+        expected_escalations_dir=escalations_dir,
     )
 
 
@@ -827,7 +841,19 @@ _REFUSING_RUNNERS: dict[str, Callable[[argparse.Namespace, Callable[[str, str], 
         expected_project=args.project,
         expected_escalations_dir=args.escalations_dir,
     ),
-    'file-and-close-decision': _run_file_and_close_decision,
+    'file-and-close-decision': lambda args, filing_record_slug: _run_file_and_close_decision(
+        args.id,
+        args.project,
+        args.text,
+        args.task_id,
+        args.escalation_id,
+        args.session_id,
+        args.severity,
+        args.escalations_dir,
+        state=args.state,
+        evidence=args.evidence,
+        record_slug=filing_record_slug(args.id, args.project),
+    ),
     'reopen-decision': lambda args, _filing_record_slug: _run_reopen_decision(
         args.id,
         args.root,

@@ -1194,6 +1194,28 @@ class TestFileAndCloseDecisionVerb:
         [reread] = dr.list_decisions(root=tmp_path)
         assert (reread.state, reread.closing_evidence) == (dr.DecisionState.DROPPED, '')
 
+    def test_a_mode2_enrichment_keeping_another_queues_stamp_is_refused_and_left_open(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The filing folds into an OPEN record of the project's other queue; the close's CAS names this queue."""
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        orch, recon = two_queues(tmp_path)
+        dr.write_decision(
+            make_decision(
+                id=qid('esc-9-1'), project='df', state=dr.DecisionState.OPEN, escalation_id='esc-9-1',
+                escalations_dir=str(recon),
+            ),
+            root=tmp_path,
+        )
+
+        rc = sr.main(self._argv(orch))
+
+        assert rc != 0
+        assert 'close-decision refused' in capsys.readouterr().err
+        [reread] = dr.list_decisions(root=tmp_path)
+        assert (reread.id, reread.state, reread.closing_evidence) == (qid('esc-9-1'), dr.DecisionState.OPEN, '')
+        assert reread.escalations_dir == dr.normalize_escalations_dir(recon)
+
     @pytest.mark.parametrize(
         'unclosable',
         [pytest.param({'state': 'open'}, id='open-state'), pytest.param({'evidence': '   '}, id='blank-evidence')],
