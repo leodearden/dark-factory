@@ -132,8 +132,9 @@ class TestTheReply:
     @pytest.mark.asyncio
     async def test_the_reply_is_frozen(self) -> None:
         reply, _ = await _call(_client(_response()))
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            reply.text = 'other'  # type: ignore[misc]
+        for field in dataclasses.fields(reply):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(reply, field.name, None)
 
     @pytest.mark.asyncio
     async def test_an_incomplete_answer_is_returned_as_data(self) -> None:

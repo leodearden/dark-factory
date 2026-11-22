@@ -294,8 +294,9 @@ class TestParseVerdict:
             reason_code=VerdictReasonCode.same_lesson,
             reason='Both restate the lesson.',
         )
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            verdict.claim = 'x'  # type: ignore[misc]
+        for field in dataclasses.fields(verdict):
+            with pytest.raises(dataclasses.FrozenInstanceError):
+                setattr(verdict, field.name, None)
 
     @pytest.mark.parametrize(
         ('decision', 'code'),
