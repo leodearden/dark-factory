@@ -496,8 +496,28 @@ class RoutingConfig(BaseModel):
             'llm.providers.openai.api_key. Restart-only, like openai_api_url.'
         ),
     )
+    model: str | None = Field(
+        default=None,
+        description=(
+            "The routing LLM's own model. None or blank INHERITS llm.model. A set "
+            'model is a pin that never inherits an endpoint: it requires both '
+            'openai_api_url and openai_api_key, else routing degrades to its '
+            'non-LLM path (routing/openai_client.py::routing_endpoint). '
+            'Restart-only, like openai_api_url.'
+        ),
+    )
+    reasoning_effort: Literal['low', 'medium', 'high'] | None = Field(
+        default=None,
+        description=(
+            'The reasoning effort the routing call sends. None KEEPS the '
+            'non-reasoning request: temperature 0.0 and max_tokens. Set, it is '
+            'sent with max_completion_tokens and no temperature '
+            '(routing/openai_client.py::routing_chat_params). Restart-only, '
+            'like openai_api_url.'
+        ),
+    )
 
-    @field_validator('openai_api_url', 'openai_api_key')
+    @field_validator('openai_api_url', 'openai_api_key', 'model')
     @classmethod
     def _blank_leaf_inherits(cls, value: str | None) -> str | None:
         return blank_means_inherit(value)

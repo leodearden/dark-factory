@@ -10,7 +10,7 @@ from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import ClassificationFallback, MemoryCategory
 from fused_memory.models.memory import ClassificationResult
 from fused_memory.routing.json_extract import extract_json
-from fused_memory.routing.openai_client import LazyOpenAIClient
+from fused_memory.routing.openai_client import LazyOpenAIClient, routing_chat_params
 
 logger = logging.getLogger(__name__)
 
@@ -129,16 +129,14 @@ class WriteClassifier:
 
     async def _llm_classify(self, content: str) -> ClassificationResult:
         """Use LLM for classification."""
-        client = self._openai.get()
         try:
+            client = self._openai.get()
             response = await client.chat.completions.create(
-                model=self.config.llm.model,
                 messages=[
                     {'role': 'system', 'content': CLASSIFICATION_SYSTEM_PROMPT},
                     {'role': 'user', 'content': content[:2000]},
                 ],
-                temperature=0.0,
-                max_tokens=256,
+                **routing_chat_params(self.config),
             )
             raw = response.choices[0].message.content or ''
 

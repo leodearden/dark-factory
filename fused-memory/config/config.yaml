@@ -98,6 +98,9 @@ routing:
   # config/schema.py::RoutingConfig.
   openai_api_url: null
   openai_api_key: null
+  # The routing call's model and effort; null keeps llm.model at temperature 0.0. See RoutingConfig.
+  model: null
+  reasoning_effort: null
 
 queue:
   semaphore_limit: ${SEMAPHORE_LIMIT:3}

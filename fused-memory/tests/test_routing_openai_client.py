@@ -243,7 +243,7 @@ class TestTheRoutingEndpoint:
             assert len(server.requests_to('/chat/completions')) == 1
 
 
-def _pinned(config, *, effort='low', url=ROUTING_URL, key=ROUTING_KEY):
+def _pinned(config, *, effort='low', url: str | None = ROUTING_URL, key: str | None = ROUTING_KEY):
     """*config* with routing pinned to LUNA at *effort* on the routing leaves *url* and *key*."""
     config.routing.model = LUNA
     config.routing.reasoning_effort = effort
@@ -269,7 +269,7 @@ class TestRoutingModelLeaves:
 
     def test_an_unknown_effort_is_refused(self):
         with pytest.raises(ValidationError):
-            RoutingConfig(reasoning_effort='extreme')
+            RoutingConfig.model_validate({'reasoning_effort': 'extreme'})
 
 
 class TestRoutingChatParams:
