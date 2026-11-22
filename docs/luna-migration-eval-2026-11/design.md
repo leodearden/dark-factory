@@ -408,3 +408,247 @@ This is O6 §2.6's rule, applied to every site.
   of broad.
 * **Classifier frame shortfall.** The frame holds 203 fixtures, not 300, and
   only 3 come from the two graph-bound categories (§2.1).
+
+---
+
+*§3 onward were written after adjudication and scoring. Every measured number
+is cited from this directory's `report.json` by key path, abbreviated `r.`;
+derived figures show their arithmetic. `report.md` is the per-site table. Run
+provenance is in `provenance.json`. §1 and §2 are unchanged.*
+
+## 3. Run
+
+* **Every run exited 0, with 0 failure lines on any site and either arm**
+  (`provenance.json` `runs`; `r.sites.<site>.failures`):
+
+  | run | invocations | records | calls |
+  |---|---|---|---|
+  | extraction replay | 1 | 108, 54 per arm | 216 Responses calls, all HTTP 200 |
+  | resolve_edge | 1 | 400 | 400 |
+  | summaries | 1 | 90, 45 per arm | 90 |
+  | classifier | 1 | 406 | 406 |
+  | router | 2 | 600 | 601 |
+
+  * The extraction replay's calls split 108 to `api.openai.com` and 108 to
+    the plan proxy. No run made an embeddings call.
+  * The router's first invocation was killed after 106 fixtures per arm by an
+    orchestrator restart, not by the run itself. The identical argv resumed
+    the remaining 194 per arm. That restart rebased `task/9945` but changed
+    no file the runs execute (step-24 deviation; `provenance.json`
+    `runs[step=run router].notes`).
+* **Every record names its arm's client.** control is gpt-4o-mini with
+  `reasoning_effort` null on the configured endpoint. luna-low is gpt-6-luna,
+  low, on `plan_proxy` (`r.sites.<site>.arms.<arm>.model`,
+  `.reasoning_effort`, `.endpoint`; `r.extraction.arms.<arm>.model`).
+* **No deterministic failure fired §2.8.** There was no HTTP 400 and no
+  refusal.
+  * 5 luna router completions stopped at exactly 256 output tokens, the
+    `max_completion_tokens` cap, with content that did not parse. None was a
+    failure line, so none was resumed, and §2.8's "again after a resume"
+    never applied. Under §2.8's routing rule each scored as the broad route
+    production serves.
+  * luna's largest classifier output was 219 tokens.
+* **Unparsed routing answers**, attributed after scoring by the request line
+  just before each in the run log. The classifier attribution matches the
+  `fallback` field of `runs.jsonl` exactly.
+  * Classifier: 15 answers sent `"secondary": "null"`, which
+    `routing/classifier.py::WriteClassifier._llm_classify` rejects as a
+    category. 14 were luna's and 1 the control's, and each was served as the
+    `llm_error` fallback, `observations_and_summaries`.
+  * Router: luna gave 6, the 5 at the token cap and 1 empty completion. The
+    control gave 4, each naming a store that is not a `SourceStore`
+    ('mem1' three times, 'error_pages' once). All 10 were served as broad.
+
+## 4. Results, per site
+
+### 4.1 extraction: PASS
+
+| `r.extraction.arms.<arm>` | control | luna-low |
+|---|---|---|
+| minted (unweighted) | 229 | 437 |
+| overreach per minted, population-weighted (`population_weighted.overreach_rate_minted`) | 0.1405 [0.0741, 0.2503] | 0.0211 [0.0066, 0.0653] |
+| holdings / day (`population_weighted.holdings_per_day`) | 7.0 | 8.6 |
+| holding share (`population_weighted.holding_share.rate`) | 0.7033 | 0.6816 |
+| episode hit rate (`rates.all.episode_hit_rate`) | 16 / 54 | 6 / 54 |
+| entities per episode (`entities.mean_per_episode`) | 7.39 | 9.63 |
+
+* **E1 passes.** luna's upper bound is 0.0653
+  (`r.extraction.comparison.luna-low.statistics.candidate_overreach_upper`).
+  The bar is the control's point plus the margin, 0.1405 + 0.05 = 0.1905.
+* **E2 passes.** Holding retention is 1.2261 (`…statistics.holding_retention`),
+  the ratio of unrounded window holdings 934.67 / 762.33
+  (`r.extraction.arms.<arm>.population_weighted.window_counts.holding`),
+  against the bar of 0.8.
+* **E2 depends on a reading fixed while blind.** In a status record ("As of D,
+  task X has status S") the status is the record's own assertion, so it was
+  labelled a holding, not bookkeeping, on both arms (step-25 deviation;
+  `provenance.json` `adjudication.extraction.conventions`). A dropped
+  "As of D" on a status fact was not labelled overreach (iv). The other
+  reading would lower both arms' holdings wherever both mint the status fact.
+  No re-scoring under it was done (§2.8: nothing is re-tuned after a result).
+* **Label counts, unweighted** (`r.extraction.arms.<arm>.rates.all.label_counts`):
+
+  | arm | holding | context | bookkeeping | overreach | misbound | unjudgeable |
+  |---|---|---|---|---|---|---|
+  | control | 147 | 28 | 21 | 28 | 5 | 0 |
+  | luna-low | 279 | 93 | 55 | 10 | 0 | 0 |
+
+* **Entities.** On average, 74.9% of the control's entity names per episode
+  recur by exact normalised name in luna's set
+  (`r.extraction.arms.luna-low.entities.mean_share_of_control`).
+* **No fidelity reading.** This frame has no production baseline report, so
+  `r.extraction.fidelity` is null.
+
+### 4.2 resolve_edge: FAIL, on R2
+
+* **Gold.** 54 of the 200 fixtures hold a duplicate, 146 hold none, 4 hold a
+  contradicted candidate, and none is unjudgeable
+  (`provenance.json` `adjudication.resolve_edge.label_counts`;
+  `r.sites.resolve_edge.decision.statistics.unjudgeable` 0).
+* **R1, merge accuracy, passes**: +0.035 [−0.0117, 0.0817], with b = 15 and
+  c = 8 (`r.sites.resolve_edge.decision.statistics.merge_accuracy`). luna
+  merged 60 fixtures and the control 47. luna missed 5 gold duplicates and
+  the control 14. Those counts are computed from `runs.jsonl` against
+  `gold-resolve-edge.json`.
+* **R2, no false merge, fails**: −0.01 [−0.0466, 0.0266], with b = 6 and c = 8
+  (`…statistics.no_false_merge`). Its lower bound is below −0.03.
+  * luna merged 14 fixtures into a fact gold does not list as a duplicate;
+    the control merged 12.
+  * Only 14 fixtures split the arms here. At n = 200 with b + c = 14, a zero
+    difference gives a lower bound of −1.96·√14/200 = −0.0367. So R2 could
+    pass only with b − c ≥ 2, and luna's was −2. The FAIL comes from the
+    pre-registered margin at this n as much as from the point estimate.
+    Under §2.8 it stands.
+* **Contradiction agreement, reported and not gated**: luna 0.945, control
+  0.725 (`…statistics.contradiction_agreement`). The control invalidated a
+  candidate on 54 fixtures and luna on 11, against 4 gold contradictions.
+
+### 4.3 summaries: PASS
+
+* **S1 passes**: +0.1375 [0.0411, 0.2339], with b = 14 and c = 3, over 80 items
+  (`r.sites.summaries.decision.statistics.faithful_rate`).
+* **Ratings, after the key was opened**: luna 77 faithful and 3 unsupported;
+  the control 66 faithful and 14 unsupported. No summary was dropped.
+* **S1 depends on a reading fixed while blind** (step-26 deviation;
+  `provenance.json` `adjudication.summaries.conventions`). A claim was rated
+  unsupported when it states as current a state that an input in view
+  explicitly retires, removes or supersedes.
+  * That rule decided 5 ratings: items 030 A, 040 A, 050 B, 051 B and 056 B.
+    The key shows all 5 are the control's.
+  * Rated faithful instead, S1 would be +0.075 [−0.0083, 0.1583]: b = 9,
+    c = 3, still a pass. That is a sensitivity reading, not part of the
+    decision.
+
+### 4.4 classifier and router: the routing layer FAILS
+
+* **C1, the classifier, passes**: +0.0591 [−0.0189, 0.1371], with b = 39,
+  c = 27 and 95 discordant items, 29 of them with a gold label neither arm
+  gave (`r.sites.classifier.decision.statistics`).
+  * luna's wins are chiefly items the control called `procedural_knowledge`
+    and gold put elsewhere: 12 preferences_and_norms, 7 entities_and_relations
+    and 6 temporal_facts.
+  * luna's losses are chiefly `observations_and_summaries` answers: 13 where
+    gold is procedural_knowledge.
+  * 6 of luna's 27 losses are its `llm_error` fallbacks (§3).
+* **Q1, the router, fails**: −0.2667 [−0.3322, −0.2011], with b = 21, c = 101
+  and 135 discordant items, 13 with a gold label neither arm gave
+  (`r.sites.router.decision.statistics`).
+  * 88 of the 101 control-only pairs are queries gold labels `broad` where
+    luna named a specific type: entity_lookup 51, procedural 18,
+    relational 12, preference 4 and temporal 3.
+  * 12 more are gold `preference` where luna said broad.
+  * Counting luna's 6 unparsed answers (§3) as luna-correct still gives
+    −0.2267 [−0.2941, −0.1592].
+* **Joint verdict**: `r.routing_layer.passes` is false, with C1 true and Q1
+  false. Under §2.4 both routing sites stay on gpt-4o-mini.
+
+## 5. Cost
+
+The method is §2.7's. The per-call figures are `r.cost.sites.<site>.<arm>`,
+priced at `LIST_PRICES` as of 2026-09-30. The table is in `report.md` §3.
+These are API-list comparisons only.
+
+* **Per call, luna is cheaper at list price on the three graphiti sites:**
+  * extraction $0.000419 against $0.000434;
+  * resolve_edge $0.000135 against $0.000150;
+  * summaries $0.000825 against $0.001162.
+
+  It is dearer on the two routing sites: classifier $0.0000899 against
+  $0.0000789, and router $0.0000951 against $0.0000494. On the router, luna
+  emits 91.4 output tokens per call against 32.1, reasoning tokens included.
+* **Calls/day**, measured over [2026-11-15, 2026-11-22) with the tags and
+  derivations in `provenance.json` `calls_per_day`:
+
+  | site | calls/day | tag |
+  |---|---|---|
+  | extraction | 2.571 | M |
+  | resolve_edge | 5.452 | I |
+  | summaries | 1.286 | I, an upper bound |
+  | classifier | 713.571 | I, an upper bound |
+  | router | 2,114.571 | M |
+
+  * The graphiti sites count non-decision episodes only: 9 in 7 days, against
+    6,486 `decisions_and_rationale` episodes.
+* **Plan-window share, inferred.**
+  * All five sites' luna API-equivalent is $1.877/week, which is 0.67% to
+    0.40% of a $280–470/week window (`r.cost.plan_window`).
+  * The two sites that pass and would move, extraction and summaries, come to
+    7 × ($0.001078 + $0.001061) = $0.0150/week, which is 0.0053% to 0.0032%
+    of the window.
+
+## 6. Decision, as §2.5 maps it
+
+| site | verdict | what §2.5 does with it |
+|---|---|---|
+| extraction | PASS | a flip follow-up, filed with `dependencies='9944'` and routed per `prompt_name` |
+| summaries | PASS | the same follow-up |
+| resolve_edge | FAIL | stays on gpt-4o-mini on `OPENAI_API_KEY` |
+| classifier | PASS, but the routing layer FAILS | stays on gpt-4o-mini on `OPENAI_API_KEY` |
+| router | FAIL | stays on gpt-4o-mini on `OPENAI_API_KEY` |
+
+* No passing site keeps a gpt-4o-mini cap fallback on `OPENAI_API_KEY`.
+* Nothing ships in this task's config: the routing layer failed, and the
+  graphiti sites wait for task 9944.
+* The filings are recorded in `report.md`'s decision section.
+
+## 7. Residuals
+
+* **One self-blinded adjudicator, with no inter-rater agreement.** The
+  conventions fixed while blind are listed per site in `provenance.json`
+  `adjudication.<site>.conventions`, and what was seen is in
+  `adjudication.blinding_residuals`.
+  * Two conventions move a bar: E2 (§4.1) and S1 (§4.3). S1's survives its
+    sensitivity reading.
+  * The router's FAIL rests chiefly on the gold label `broad` for task
+    titles, finding titles and keyword strings. That is one rater's reading
+    of the router prompt's cue phrases, fixed blind (arms unattributed), and
+    the control agreed with it on 88 of the 101 pairs it alone got right.
+  * A second, independent rater on a sample of those router items is the
+    cheap check, should the verdict be contested.
+* **Styles were visible.** In extraction and summaries the two arms wrote in
+  recognisably different styles, though which style was which arm's was not
+  known while labelling (`adjudication.blinding_residuals`). Every
+  supersession-rule unsupported rating, and 28 of the 38 overreach verdicts,
+  landed on the control.
+* **R2's power.** At this frame's n, R2 can pass only if luna wins the
+  no-false-merge discordants outright (§4.2).
+* **Proxy overhead, now measured.** On every site, luna's input tokens per
+  call exceed the control's by 293 to 318: extraction +317.8,
+  resolve_edge +294.2, summaries +294.0, classifier +295.0 and router +293.3.
+  That is consistent with §2.9's ~300-token plan-proxy overhead, so luna's
+  token figures overstate the model's own.
+* **The proxy stripped `max_output_tokens`** from luna's graphiti calls (§2.9).
+  On the routing sites `max_completion_tokens` 256 was enforced: 5 luna
+  router answers stopped at it (§3).
+* **Replay is not production dedupe.** luna mints 1.91× the control's edges
+  (437 against 229). A luna extraction would therefore raise resolve_edge
+  calls per episode above §5's figure, and some of those edges are
+  near-paraphrases that production resolution would merge.
+* **Calls/day.** Three of the five figures are inferred (§5). The
+  graphiti-site volumes are small because non-decision episodes are rare in
+  the measured week.
+* **One run per arm.** gpt-6-luna's run-to-run variance is unmeasured, and
+  no arm was re-run after a result (§2.8).
+* **The §2.9 residuals stand as stated:** graph state at draw time, the
+  classifier's 200-character inputs, the approximate resolve candidates, the
+  frozen summary inputs, and the classifier frame shortfall.

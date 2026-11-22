@@ -362,6 +362,56 @@
     "Invocation 2, the identical argv, started 2026-11-22T13:35:30Z and resumed the remaining fixtures.",
     "The rebase changed no file that any run executes: every code_blob and uv.lock is identical at e5f94986f5 and 18b3d29f3a."
    ]
+  },
+  {
+   "step": "score",
+   "argv": [
+    "uv",
+    "run",
+    "python",
+    "scripts/luna_migration_eval.py",
+    "score",
+    "--dir",
+    "../docs/luna-migration-eval-2026-11",
+    "--calls-per-day",
+    "/tmp/9945-calls-per-day.json",
+    "--plan-window-usd-per-week",
+    "280",
+    "470",
+    "--out",
+    "../docs/luna-migration-eval-2026-11/report.json"
+   ],
+   "cwd": "/home/leo/src/dark-factory/.worktrees/9945/fused-memory",
+   "exit_code": 0,
+   "invocations": 2,
+   "started_at": "2026-11-22T14:51:48Z",
+   "finished_at": "2026-11-22T14:53:42Z",
+   "git_sha": "6e768f83001b08b162aca2f9f3aefd80b3364c1c",
+   "code_blobs": {
+    "fused-memory/scripts/luna_migration_eval.py": "3c71d16244361f5f66b393141ad8dbc6fd2b7a2f",
+    "fused-memory/scripts/luna_eval_score.py": "b36df2371ca17640e05d6cae79dd225b2972c770",
+    "fused-memory/scripts/luna_eval_frame.py": "0e13da23296c4832f51fd95a4b5003fa2d12cfd3",
+    "fused-memory/scripts/luna_eval_sites.py": "737ad397983b85e7f761358f316ad711828c186a",
+    "fused-memory/scripts/replay_overreach_extraction.py": "2d124e2826327593db3fd516643f154d2970bc00",
+    "fused-memory/scripts/audit_ruling_overreach.py": "ed4667d89a800f7e9fb6c699b5805de81a4675f2",
+    "fused-memory/scripts/_graph_script_cli.py": "0031a78823833af525840c841c1942664892af56",
+    "fused-memory/scripts/score_write_triage_pairs.py": "ffed4f3c506764167b8d3b287a596ed9f0472295"
+   },
+   "graphiti_core_version": "0.28.2",
+   "openai_version": "2.31.0",
+   "versions_via": "importlib.metadata.version in this worktree's .venv (CPython 3.13.9)",
+   "output": "report.json",
+   "output_sha256": "05f9a311d5bc5e7d96d0419e422d72577dd75522cf97ffab583d571676346b34",
+   "inputs": {
+    "calls_per_day_file": "/tmp/9945-calls-per-day.json",
+    "calls_per_day_sha256": "36e950896928070e743892acde2106bc99b720e5390f06b19600c2a1e85c9e77"
+   },
+   "notes": [
+    "No LLM, graph or network call: score reads only files in --dir and the calls-per-day file.",
+    "Invocation 1 (14:51:48Z-14:51:53Z) ran the same arguments under '../.venv/bin/python' directly, the interpreter uv run resolves in this worktree. Invocation 2 (14:53:29Z-14:53:42Z) ran the argv above, the one in luna_migration_eval.py's usage docstring. Both exited 0, and report.json was byte-identical (sha256 above).",
+    "Every script this run executed has the same blob as at the router run, so no instrument changed between the arms and the score.",
+    "After scoring, and only then, the classifier and router run logs' ERROR/WARNING lines were read and attributed to an arm by the request line just before each (api.openai.com or the plan proxy). Classifier: 14 luna and 1 control \"'null' is not a valid MemoryCategory\", matching runs.jsonl's fallback field. Router: 6 luna unparsed completions (5 truncated at max_completion_tokens 256, 1 empty) and 4 control answers naming a store that is not a SourceStore. design.md §3 reports them."
+   ]
   }
  ],
  "adjudication": {
@@ -513,6 +563,83 @@
     "After item 079, every summary rated faithful in items 000-049 was re-scanned for pending, planned or hedged claims against an explicit later state in its inputs; none changed."
    ],
    "validated": "luna_eval_score.py::load_summary_ratings over luna_migration_eval.py::_offered_summary_items of runs.jsonl and the key: 80 items, each rated under both arms, 160 entries accepted. Only the counts above, over the union of arms, were printed."
+  }
+ },
+ "calls_per_day": {
+  "measured_at": "2026-11-22T14:48Z-14:50Z",
+  "source": "/home/leo/src/dark-factory/data/reconciliation/write_journal.db, opened file:...?mode=ro (luna_eval_frame.py::open_journal)",
+  "window": [
+   "2026-11-15T00:00:00Z",
+   "2026-11-22T00:00:00Z"
+  ],
+  "days": 7,
+  "queries": [
+   "SELECT b.created_at, w.operation, w.params FROM backend_ops b LEFT JOIN write_ops w ON w.id = b.write_op_id WHERE b.backend='graphiti' AND b.operation='add_episode' AND b.created_at >= ? AND b.created_at < ?",
+   "SELECT params FROM write_ops WHERE operation='add_memory' AND created_at >= ? AND created_at < ?",
+   "SELECT params FROM write_ops WHERE operation='search' AND created_at >= ? AND created_at < ?"
+  ],
+  "llm_reach": "luna_eval_frame.py::LlmReachProbe over each add_memory row's journalled content and each search row's query (no stores override), through the production WriteClassifier.classify and ReadRouter.route; the probe answers locally, so no LLM was called",
+  "measured": {
+   "window": [
+    "2026-11-15T00:00:00",
+    "2026-11-22T00:00:00"
+   ],
+   "days": 7,
+   "graphiti_add_episode_rows": 6495,
+   "graphiti_add_episode_unjoined": 0,
+   "graphiti_add_episode_by_write_op_category": {
+    "add_memory/decisions_and_rationale": 6486,
+    "add_memory/observations_and_summaries": 5,
+    "add_memory/temporal_facts": 4
+   },
+   "add_memory_rows": 8141,
+   "add_memory_by_resolved_category": {
+    "observations_and_summaries": 2890,
+    "decisions_and_rationale": 3732,
+    "procedural_knowledge": 1378,
+    "preferences_and_norms": 137,
+    "temporal_facts": 4
+   },
+   "add_memory_llm_reaching": 4995,
+   "search_rows": 16824,
+   "search_rows_with_stores": 0,
+   "search_rows_truncated": 190,
+   "search_llm_reaching": 14802
+  },
+  "sites": {
+   "extraction": {
+    "calls_per_day": 2.571,
+    "tag": "M",
+    "derivation": "non-decision graphiti add_episode rows/day (M) x 2.0 calls/episode (control replay: 108 llm_calls over 54 episodes, M)"
+   },
+   "resolve_edge": {
+    "calls_per_day": 5.452,
+    "tag": "I",
+    "derivation": "non-decision graphiti add_episode rows/day (M) x 4.24 minted edges/episode (control replay: 229 over 54, M) x 1 resolve call per minted edge (I: assumes every minted edge has a related or hybrid-search candidate edge and misses the exact-fact fast path)"
+   },
+   "summaries": {
+    "calls_per_day": 1.286,
+    "tag": "I",
+    "derivation": "non-decision graphiti add_episode rows/day (M) x 1 batched summaries call/episode (control runs: 1 llm_call per episode record, M), an upper bound (I): an episode none of whose entities exceeds 4 x MAX_SUMMARY_CHARS makes no call"
+   },
+   "classifier": {
+    "calls_per_day": 713.571,
+    "tag": "I",
+    "derivation": "add_memory journal rows/day whose 200-char prefix LlmReachProbe sends to the LLM (4995 of 8141, M), an upper bound (I): the journal records the resolved category, so caller-categorised writes, which skip the classifier, cannot be excluded"
+   },
+   "router": {
+    "calls_per_day": 2114.571,
+    "tag": "M",
+    "derivation": "search journal rows/day with no stores override whose query LlmReachProbe sends to the LLM (14802 of 16824, M); the 190 truncated queries were probed on their journalled prefix"
+   }
+  },
+  "population_note": "The graphiti sites are counted over non-decision episodes only, the class design.md §1 measures and any graphiti flip would move (decisions_and_rationale is excluded). Over all categories the journal holds 6495 graphiti add_episode rows in the window, 927.9/day.",
+  "file": {
+   "extraction": 2.571,
+   "resolve_edge": 5.452,
+   "summaries": 1.286,
+   "classifier": 713.571,
+   "router": 2114.571
   }
  }
 }
