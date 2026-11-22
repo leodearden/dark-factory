@@ -51,6 +51,7 @@ from fused_memory.reconciliation.consolidation_adjudicator_calibration import (
     EVAL_SET_PATH,
     EVAL_SET_SHA256,
     MAX_UNANSWERED,
+    SCORING_FINGERPRINT,
     STALL_BACKOFF,
     STALL_RUN_CAP,
     TRANSPORT_ATTEMPTS,
@@ -75,10 +76,11 @@ from fused_memory.reconciliation.consolidation_adjudicator_calibration import (
     pool,
     run_calibration,
     score_run,
+    scoring_fingerprint,
 )
 from fused_memory.reconciliation.consolidation_auto import AutoReasonCode, FlowReasonCode
 from fused_memory.reconciliation.consolidation_proposal import adjudicator_calibration_key
-from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 
 BANNER = AutoReasonCode.member_carries_correction_banner
 
@@ -280,6 +282,34 @@ class TestBounds:
                 by_name[BoundName.must_not_merge_test].denominator) == (15, 30)
 
 
+def _with_first_bound(**changes: object) -> tuple:
+    return (dataclasses.replace(BOUNDS[0], **changes), *BOUNDS[1:])
+
+
+class TestScoringFingerprint:
+    def test_the_fingerprint_is_derived_from_the_bounds_and_the_eval_set(self) -> None:
+        assert scoring_fingerprint(BOUNDS, EVAL_SET_SHA256) == SCORING_FINGERPRINT
+        assert len(SCORING_FINGERPRINT) == 64
+        assert set(SCORING_FINGERPRINT) <= set('0123456789abcdef')
+
+    def test_the_order_of_the_bounds_is_not_a_rule(self) -> None:
+        assert scoring_fingerprint(tuple(reversed(BOUNDS)), EVAL_SET_SHA256) == SCORING_FINGERPRINT
+
+    @pytest.mark.parametrize(
+        ('bounds', 'eval_sha256'),
+        [
+            (_with_first_bound(numerator=BOUNDS[0].numerator + 1), EVAL_SET_SHA256),
+            (_with_first_bound(direction=BoundDirection.at_least), EVAL_SET_SHA256),
+            (_with_first_bound(basis=BoundBasis.sanity_floor), EVAL_SET_SHA256),
+            (BOUNDS[:-1], EVAL_SET_SHA256),
+            (BOUNDS, '0' * 64),
+        ],
+        ids=['numerator', 'direction', 'basis', 'dropped_bound', 'eval_set'],
+    )
+    def test_any_rule_change_changes_the_fingerprint(self, bounds, eval_sha256: str) -> None:
+        assert scoring_fingerprint(bounds, eval_sha256) != SCORING_FINGERPRINT
+
+
 class TestScoring:
     def test_the_denominators_are_the_adjudicated_populations(self) -> None:
         figures = _run(_answer_key)
@@ -449,6 +479,24 @@ def _unanswered(count: int) -> dict[str, tuple[BaseException, ...]]:
     }
 
 
+RETIRED_FIGURE = {'name': 'retired_bound', 'numerator': 1, 'denominator': 2, 'holds': True}
+OTHER_FINGERPRINT = 'f' * 64
+
+
+def _with_payload(row: ReconLedgerRecord, **changes: object) -> ReconLedgerRecord:
+    payload = {**json.loads(row.payload_json), **changes}
+    return dataclasses.replace(row, payload_json=json.dumps(payload))
+
+
+def _under_other_rules(row: ReconLedgerRecord) -> ReconLedgerRecord:
+    """*row* as a writer scoring under other bounds would have left it."""
+    payload = json.loads(row.payload_json)
+    return _with_payload(row, scoring_fingerprint=OTHER_FINGERPRINT, **{
+        key: None if payload[key] is None else [*reversed(payload[key]), RETIRED_FIGURE]
+        for key in ('figures', 'first_run')
+    })
+
+
 class TestCalibrationRecord:
     def _record(self) -> CalibrationRecord:
         figures = _run(_false_keeps(7))
@@ -481,6 +529,7 @@ class TestCalibrationRecord:
             ('figures', [{'name': 'nope', 'numerator': 1, 'denominator': 2, 'holds': True}]),
             ('cost_usd', -1),
             ('resolved_models', 'gpt'),
+            ('scoring_fingerprint', 7),
         ],
     )
     def test_a_bad_payload_field_is_refused_naming_it(self, field: str, value: object) -> None:
@@ -495,6 +544,71 @@ class TestCalibrationRecord:
     def test_a_naive_timestamp_is_refused(self) -> None:
         with pytest.raises(ValueError, match='started_at'):
             dataclasses.replace(self._record(), started_at=NOW.replace(tzinfo=None))
+
+    def test_a_record_is_scored_under_the_current_rules_by_default(self) -> None:
+        record = self._record()
+        assert record.scoring_fingerprint == SCORING_FINGERPRINT
+        assert record.scored_under_current_rules is True
+
+    def test_figures_stored_in_another_order_still_decode(self) -> None:
+        record = self._record()
+        row = record.to_ledger_record(now=NOW)
+        payload = json.loads(row.payload_json)
+        reordered = _with_payload(
+            row, figures=payload['figures'][::-1], first_run=payload['first_run'][::-1],
+        )
+        decoded = CalibrationRecord.from_ledger_record(reordered)
+        assert decoded == record
+        assert decoded.figures is not None
+        assert tuple(f.name for f in decoded.figures.figures) == tuple(b.name for b in BOUNDS)
+
+    @pytest.mark.parametrize(
+        'edit',
+        [
+            lambda figures: figures[:-1],
+            lambda figures: [*figures, RETIRED_FIGURE],
+            lambda figures: [*figures[:-1], figures[0]],
+        ],
+        ids=['missing', 'seventh', 'duplicate'],
+    )
+    def test_under_the_current_rules_the_figures_name_each_bound_once(self, edit) -> None:
+        row = self._record().to_ledger_record(now=NOW)
+        figures = json.loads(row.payload_json)['figures']
+        with pytest.raises(ValueError, match='figures'):
+            CalibrationRecord.from_ledger_record(_with_payload(row, figures=edit(figures)))
+
+    def test_a_row_scored_under_other_rules_decodes_without_its_figures(self) -> None:
+        record = self._record()
+
+        decoded = CalibrationRecord.from_ledger_record(
+            _under_other_rules(record.to_ledger_record(now=NOW)),
+        )
+
+        assert decoded.state is CalibrationState.FAIL_FIRST_RUN
+        assert (decoded.figures, decoded.first_run) == (None, None)
+        assert decoded.scored_under_current_rules is False
+        assert (
+            decoded.attempt, decoded.model, decoded.endpoint_host, decoded.resolved_models,
+            decoded.cost_usd,
+        ) == (
+            record.attempt, record.model, record.endpoint_host, record.resolved_models,
+            record.cost_usd,
+        )
+
+    def test_figures_are_carried_only_under_the_current_rules(self) -> None:
+        with pytest.raises(ValueError, match='scoring_fingerprint'):
+            dataclasses.replace(self._record(), scoring_fingerprint=OTHER_FINGERPRINT)
+        bare = dataclasses.replace(
+            self._record(), scoring_fingerprint=OTHER_FINGERPRINT, figures=None, first_run=None,
+        )
+        assert bare.scored_under_current_rules is False
+
+    def test_a_pass_scored_under_other_rules_may_not_adjudicate(self) -> None:
+        record = dataclasses.replace(
+            self._record(), state=CalibrationState.PASS, scoring_fingerprint=OTHER_FINGERPRINT,
+            figures=None, first_run=None,
+        )
+        assert CalibrationResult(record=record, ran=False).may_adjudicate is False
 
 
 class TestCalibrationRun:
@@ -543,7 +657,7 @@ class TestCalibrationRun:
         )
         assert record.wall_time_s is not None
         assert record.wall_time_s >= 0
-        assert record.eval_sha256 == EVAL_SET_SHA256
+        assert record.scoring_fingerprint == SCORING_FINGERPRINT
         assert record.unanswered == 0
 
     @pytest.mark.asyncio
@@ -996,3 +1110,72 @@ class TestDrift:
         assert rerun.record.figures is not None
         figure = _figure(rerun.record.figures, BoundName.contaminated_false_keep)
         assert (figure.numerator, figure.denominator) == (false_keeps, 45)
+
+
+async def _seed_under_other_rules(ledger: ReconLedgerStore, record: CalibrationRecord) -> None:
+    await ledger.upsert(_under_other_rules(record.to_ledger_record(now=record.started_at)))
+
+
+def _scored_last_month(state: CalibrationState, **fields) -> CalibrationRecord:
+    return _seeded(state, started_at=NOW - timedelta(days=30), attempt=2, **fields)
+
+
+class TestScoringRulesChange:
+    @pytest.mark.parametrize(
+        'state', [CalibrationState.PASS, CalibrationState.FAIL, CalibrationState.FAIL_FIRST_RUN],
+    )
+    @pytest.mark.asyncio
+    async def test_a_row_scored_under_other_rules_is_scored_afresh(
+        self, ledger, state: CalibrationState,
+    ) -> None:
+        figures = _run(_false_keeps(7))
+        await _seed_under_other_rules(
+            ledger, _scored_last_month(state, first_run=figures, figures=figures),
+        )
+        double = ScriptedResponses(_key())
+
+        result = await _calibrate(ledger, double)
+
+        assert (result.state, result.ran) == (CalibrationState.PASS, True)
+        assert len(double.requests) == 176
+        record = result.record
+        assert record is not None
+        assert record.attempt == 3
+        assert record.scoring_fingerprint == SCORING_FINGERPRINT
+        assert record.first_run is None
+        assert record.figures is not None
+        invalid = _figure(record.figures, BoundName.invalid_replies)
+        assert (invalid.numerator, invalid.denominator) == (0, 176)
+        assert await _stored(ledger) == record
+
+    @pytest.mark.asyncio
+    async def test_a_first_run_under_other_rules_is_never_pooled(self, ledger) -> None:
+        figures = _run(_false_keeps(7))
+        await _seed_under_other_rules(ledger, _scored_last_month(
+            CalibrationState.FAIL_FIRST_RUN, first_run=figures, figures=figures,
+        ))
+
+        result = await _calibrate(ledger, ScriptedResponses(_key(answer=SEVEN_FALSE_KEEPS(_seven()))))
+
+        assert (result.state, result.ran, result.finding) == (
+            CalibrationState.FAIL_FIRST_RUN, True, None,
+        )
+        assert result.record is not None
+        assert result.record.figures is not None
+        figure = _figure(result.record.figures, BoundName.contaminated_false_keep)
+        assert (figure.numerator, figure.denominator) == (7, 45)
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_running_row_under_other_rules_is_waited_for(self, ledger) -> None:
+        await _seed_under_other_rules(ledger, _seeded(
+            CalibrationState.RUNNING, started_at=NOW - CRASH_AGE + MINUTE, attempt=2,
+            first_run=_run(_false_keeps(7)),
+        ))
+        double = ScriptedResponses(_key())
+
+        result = await _calibrate(ledger, double)
+
+        assert double.requests == []
+        assert (result.state, result.ran, result.may_adjudicate) == (
+            CalibrationState.RUNNING, False, False,
+        )
