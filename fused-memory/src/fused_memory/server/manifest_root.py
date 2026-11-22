@@ -20,6 +20,7 @@ flips or writes anything, with one of four ``reason_code`` values:
 
 from __future__ import annotations
 
+import asyncio
 import os
 from enum import StrEnum
 from pathlib import Path
@@ -41,7 +42,7 @@ async def resolve_manifest_root(project_root: str, manifest_root: str) -> Path |
     """The accepted worktree root, realpath'd, or the refusal ``commit_planning`` returns."""
     if not os.path.isabs(manifest_root):
         return _refusal(ManifestRootRefusal.NOT_A_WORKTREE, manifest_root, 'must be an absolute path')
-    if not Path(manifest_root).is_dir():
+    if not await asyncio.to_thread(os.path.isdir, manifest_root):
         return _refusal(ManifestRootRefusal.NOT_A_WORKTREE, manifest_root, 'no such directory')
 
     worktree = await _rev_parse(
@@ -50,21 +51,35 @@ async def resolve_manifest_root(project_root: str, manifest_root: str) -> Path |
     )
     if isinstance(worktree, dict):
         return worktree
-    toplevel, common_dir = worktree
-    real_root = os.path.realpath(manifest_root)
-    if os.path.realpath(toplevel) != real_root:
-        return _refusal(
-            ManifestRootRefusal.NOT_A_WORKTREE, manifest_root,
-            f'is a subdirectory of the worktree {toplevel!r}; pass that root instead',
-        )
-
     project = await _rev_parse(
         manifest_root, project_root, '--git-common-dir',
         not_ok=ManifestRootRefusal.OTHER_REPOSITORY,
     )
     if isinstance(project, dict):
         return project
+    toplevel, common_dir = worktree
     (project_common_dir,) = project
+    return await asyncio.to_thread(
+        _judge_worktree,
+        project_root=project_root,
+        manifest_root=manifest_root,
+        toplevel=toplevel,
+        common_dir=common_dir,
+        project_common_dir=project_common_dir,
+    )
+
+
+def _judge_worktree(
+    *, project_root: str, manifest_root: str, toplevel: str, common_dir: str,
+    project_common_dir: str,
+) -> Path | dict[str, Any]:
+    """Compare the probed git paths by realpath; synchronous, so run off the event loop."""
+    real_root = os.path.realpath(manifest_root)
+    if os.path.realpath(toplevel) != real_root:
+        return _refusal(
+            ManifestRootRefusal.NOT_A_WORKTREE, manifest_root,
+            f'is a subdirectory of the worktree {toplevel!r}; pass that root instead',
+        )
     if os.path.realpath(project_common_dir) != os.path.realpath(common_dir):
         return _refusal(
             ManifestRootRefusal.OTHER_REPOSITORY, manifest_root,
