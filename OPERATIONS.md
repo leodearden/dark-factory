@@ -4414,8 +4414,8 @@ check `applied`/`restart_required` on your reload call, per
 
 | Knob | Default | Scope |
 |---|---|---|
-| `watcher_daily_cost_ceiling_usd` | `50.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
-| `orch_daily_cost_ceiling_usd` | `200.0` | All orchestrator invocations (every role) for the day |
+| `watcher_daily_cost_ceiling_usd` | `150.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
+| `orch_daily_cost_ceiling_usd` | `10000.0` | All orchestrator invocations (every role) for the day |
 
 **Multi-account failover (`usage_cap.*`)** is on in every shipped config. A
 pool whose roster resolves no token is EMPTY, and every invocation then raises

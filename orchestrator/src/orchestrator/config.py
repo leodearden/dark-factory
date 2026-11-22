@@ -5441,7 +5441,7 @@ class OrchestratorConfig(BaseSettings):
     # Disable either ceiling by setting to a very high value (no enable-flag
     # needed — mirrors auto_eval_redo_budget_usd pattern).
     watcher_daily_cost_ceiling_usd: float = Field(
-        default=50.0,
+        default=150.0,
         description=(
             'Daily USD ceiling for escalation-watcher invocations (trailing 24h '
             'sum of cost_usd WHERE role LIKE \'%watcher%\'). On breach, '
@@ -5450,7 +5450,7 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
     orch_daily_cost_ceiling_usd: float = Field(
-        default=200.0,
+        default=10000.0,
         description=(
             'Daily USD ceiling for ALL orchestrator invocations (trailing 24h '
             'sum of all cost_usd rows). On breach, pause_scheduler is called '
