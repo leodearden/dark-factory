@@ -374,7 +374,8 @@
    "Extraction: before labelling, the adjudicator saw the blind worksheet's TOTAL of 666 minted edges over 54 episodes across both arms, the distribution of edges per episode (1 to 79), and the edge field names (edge_uuid, fact, source_name, target_name). No per-arm edge count, per-arm content or token total was seen.",
    "Extraction: replay.jsonl, the replay log and anything scored from them were not opened while labelling. After labelling, validate_verdicts read replay.jsonl to check coverage and printed only the accepted and stale counts.",
    "Extraction: near-duplicate facts sat side by side within an episode, so an adjudicator could infer that the two copies come from different arms. Edges also differed in surface style (e.g. 'Task 166 (solar_challenge_platform)' against 'Task 166'; 'Liveness-snapshot memory' against 'liveness-snapshot memory'). No style-to-arm mapping was checked, and near-duplicates were labelled alike.",
-   "Extraction: the running label tally over the UNION of arms was printed once, after all 54 episodes were labelled; it was never printed per arm."
+   "Extraction: the running label tally over the UNION of arms was printed once, after all 54 episodes were labelled; it was never printed per arm.",
+   "resolve_edge: before labelling, the adjudicator saw the worksheet's 200 rows, their field names (fact, fixture_id, invalidation_candidates, related) and the totals of related facts (566, 1 to 10 per fixture) and invalidation candidates (1844, 0 to 10 per fixture). No arm output was opened while labelling. Some related and candidate facts were near-duplicates in different wording; they carry no arm attribution, since they were drawn from the stored graph before either arm ran."
   ],
   "extraction": {
    "adjudicator": "claude-task-9945-implementer, the role that ran the arms, in a later session of the same task; single, self-blinded, no sub-agents",
@@ -399,6 +400,30 @@
     "unjudgeable": 0
    },
    "validated": "replay_overreach_extraction.py::validate_verdicts over both arms' minted edges under frame.json sample.definition: 666 accepted, 0 stale. Only the counts were printed."
+  },
+  "resolve_edge": {
+   "adjudicator": "claude-task-9945-implementer, the role that ran the arms, in a later session of the same task; single, self-blinded, no sub-agents",
+   "procedure": "one sitting in one session on 2026-11-22, after the step-25 data commit 8900533e16. The worksheet /tmp/9945-resolve-gold.jsonl had been written by `luna_migration_eval.py worksheet --kind resolve_gold --dir $EVAL --out /tmp/9945-resolve-gold.jsonl` (rc 0) in the step-25 session. Fixtures were labelled in worksheet order 000..199, each shown as its new fact, its related facts R0.. and its invalidation candidates I0.., in batches of 12 to 18, every batch written to disk before the next was shown. runs.jsonl was not opened. Labels were compiled into gold-resolve-edge.json, mapping R/I indices to uuids, once all 200 were written.",
+   "rubric": "design.md §2.6 resolve_edge gold: the duplicate set among the related facts, the contradicted candidates among related and invalidation candidates, or unjudgeable",
+   "conventions": [
+    "duplicate: the related fact states the same proposition (same subject, relation and object) as the new fact, and the new fact adds no information the related fact lacks: phrasing-only differences, or the related fact is a strict refinement that entails the new one.",
+    "not a duplicate: the new fact adds a detail, an extra object, a different object/name, or a different relation.",
+    "contradicted: the candidate and the new fact cannot both hold of the same thing at the same time. A different plan, scope or time, or a merely related statement, is not a contradiction.",
+    "unjudgeable: the new fact or its candidates are too garbled to decide either question.",
+    "related facts are drawn from the new edge's own (source, target) node pair (luna_eval_frame.py::_resolve_fixture), so a related fact with a generic subject ('The code', 'The tests') is read as about the same two entities. (Added at fixture 031; fixture 004 re-checked under it before moving on.)",
+    "a later state that supersedes an earlier one on the same thing ('X survives only for Y' then 'X is deleted as Y no longer calls it') is a contradiction.",
+    "(refined at fixture 061, before 061 was written; 031 and 035 re-checked under it) an attribution wrapper describing the same end state ('The decision keeps/places X', 'e702d9e includes X') duplicates a new fact stating that end state. 'keeps X' differs from 'adds X' only when the new fact is about the change itself (035: 'The import additions ... include gc'). A future plan or proposal ('should', 'is proposed', 'will', 'can ... after') is not the fact that it is done.",
+    "(added at fixture 079) an evaluative add-on with no checkable content ('is now a stronger choice') is not added information; a factual qualifier (a condition, time, scope or object) is."
+   ],
+   "verdict_file": "gold-resolve-edge.json",
+   "verdicts": 200,
+   "label_counts": {
+    "with_duplicates": 54,
+    "without_duplicates": 146,
+    "with_contradicted": 4,
+    "unjudgeable": 0
+   },
+   "validated": "luna_eval_score.py::load_resolve_gold over the worksheet rows: 200 accepted. Only the counts above were printed."
   }
  }
 }
