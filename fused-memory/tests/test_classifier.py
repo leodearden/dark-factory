@@ -1,6 +1,7 @@
 """Tests for the write classifier heuristics."""
 
 import pytest
+from _mock_openai_server import mock_openai_server
 from _sdk_client_stubs import completion_client, raising_client
 
 from fused_memory.models.enums import (
@@ -8,7 +9,8 @@ from fused_memory.models.enums import (
     ClassificationFallback,
     MemoryCategory,
 )
-from fused_memory.routing.classifier import WriteClassifier
+from fused_memory.routing.classifier import CLASSIFICATION_SYSTEM_PROMPT, WriteClassifier
+from fused_memory.routing.openai_client import routing_chat_params
 
 _NO_HEURISTIC_MATCH = 'Hello world'
 
@@ -237,3 +239,48 @@ class TestClassificationFallbackReason:
 
         assert result.confidence < 0.7
         assert result.fallback is None
+
+
+_LUNA_REQUEST = {'model': 'gpt-6-luna', 'reasoning_effort': 'low', 'max_completion_tokens': 256}
+_TODAYS_REQUEST = {'model': 'gpt-4o-mini', 'temperature': 0.0, 'max_tokens': 256}
+
+
+class TestTheRoutingRequest:
+    """classify() sends routing_chat_params(config) and its messages, nothing else (task 9945)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('pin', 'expected'),
+        [pytest.param({}, _TODAYS_REQUEST, id='today'),
+         pytest.param({'model': 'gpt-6-luna', 'reasoning_effort': 'low'}, _LUNA_REQUEST, id='luna-low')],
+    )
+    async def test_the_request_is_the_routing_call_and_the_messages(self, llm_only_config, pin, expected):
+        for leaf, value in pin.items():
+            setattr(llm_only_config.routing, leaf, value)
+        client = completion_client('{"primary": "temporal_facts", "confidence": 0.9}')
+        classifier = WriteClassifier(llm_only_config, openai_client=client)
+
+        await classifier.classify('x' * 2500)
+
+        messages = [
+            {'role': 'system', 'content': CLASSIFICATION_SYSTEM_PROMPT},
+            {'role': 'user', 'content': 'x' * 2000},
+        ]
+        sent = client.chat.completions.create.call_args.kwargs
+        assert sent == expected | {'messages': messages}
+        assert sent == routing_chat_params(llm_only_config) | {'messages': messages}
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_model_without_its_endpoint_degrades_and_sends_nothing(self, llm_only_config):
+        """The leaves unset (a missing ${OPENAI_PLAN_PROXY_*}) never fall back onto the llm provider."""
+        with mock_openai_server() as server:
+            llm_only_config.llm.providers.openai.api_url = server.base_url
+            llm_only_config.routing.model = 'gpt-6-luna'
+            classifier = WriteClassifier(llm_only_config)
+
+            result = await classifier.classify(_NO_HEURISTIC_MATCH)
+            await classifier.close()
+
+            assert server.requests_to('/chat/completions') == []
+        assert result.fallback is ClassificationFallback.llm_error
+        assert 'routing.openai_api_url' in result.reasoning
