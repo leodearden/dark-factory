@@ -390,10 +390,12 @@ class TestTheTarget:
         assert emitted.summary_path == root / EVAL_ID / 'summary.json'
         assert load_metric_series(emitted.metrics_path).eval_id == EVAL_ID
         assert emitted.unwritten is None
+        assert emitted.stale_summary_unremoved is None
         assert emitted.as_detail() == {
             'metrics_json': str(emitted.metrics_path),
             'summary_json': str(emitted.summary_path),
             'metrics_unwritten': None,
+            'stale_summary_unremoved': None,
         }
 
     def test_a_root_under_a_regular_file_is_reported_not_raised(self, tmp_path):
@@ -431,6 +433,7 @@ class TestTheTarget:
 
         assert emitted.unwritten is not None
         assert emitted.unwritten.startswith('JSONDecodeError')
+        assert emitted.stale_summary_unremoved is None
         assert not summary_path(root).exists()
 
     def test_a_series_that_cannot_be_written_removes_the_earlier_summary(self, tmp_path):
@@ -443,6 +446,22 @@ class TestTheTarget:
 
         assert emitted.unwritten is not None
         assert not summary_path(root).exists()
+
+    def test_a_stale_summary_that_cannot_be_removed_is_named_apart_from_the_write_failure(
+        self, tmp_path,
+    ):
+        root = tmp_path / 'memory-evals'
+        summary_path(root).mkdir(parents=True)
+
+        emitted = SweepMetricsTarget(root, DF).write(_view(_run(1)), NOW)
+
+        assert emitted.unwritten is not None
+        assert emitted.unwritten.startswith('IsADirectoryError')
+        assert 'stale summary' not in emitted.unwritten
+        assert isinstance(emitted.stale_summary_unremoved, str)
+        assert emitted.stale_summary_unremoved.startswith('IsADirectoryError')
+        assert emitted.as_detail()['stale_summary_unremoved'] == emitted.stale_summary_unremoved
+        assert summary_path(root).exists()
 
 
 @pytest_asyncio.fixture
