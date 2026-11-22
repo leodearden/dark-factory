@@ -362,10 +362,14 @@ class _SummaryGraph:
             minted=minted,
         )
 
+    def entity(self, node: str) -> tuple[str, str]:
+        """``(name, summary)`` of *node* as this read saw it."""
+        return self.entities.get(node, ('', ''))
+
     def items(self, graph: str, episode: str, nodes_per_episode: int) -> list[dict[str, Any]]:
         items = []
         for node in sorted(set(self.mentioned.get(episode, ())), key=lambda uuid: sample_key(graph, uuid)):
-            name, summary = self.entities.get(node, ('', ''))
+            name, summary = self.entity(node)
             edges = [edge for edge in self.minted.get(episode, ()) if node in (edge.source, edge.target)]
             measured = summary_with_edges(summary, [edge.fact for edge in edges])
             if len(measured) > SUMMARY_LLM_THRESHOLD:
@@ -378,35 +382,93 @@ class _SummaryGraph:
                 break
         return items
 
+    def summary_input(
+        self, graph: str, episode: str, items: Sequence[Mapping[str, Any]], content: str, previous: Sequence[str],
+    ) -> dict[str, Any]:
+        """luna_eval_sites.run_summaries' fixture for *episode*'s *items*, from the text this read hashed."""
+        minted = {edge.uuid: edge for edge in self.minted.get(episode, ())}
+        edges = [minted[uuid] for uuid in dict.fromkeys(uuid for item in items for uuid in item['edge_uuids'])]
+        return {
+            'graph': graph, 'episode_uuid': episode, 'episode_valid_at': items[0]['episode_valid_at'],
+            'episode_content': content,
+            'nodes': [
+                {'node_uuid': item['node_uuid'], 'node_name': item['node_name'],
+                 'summary': self.entity(item['node_uuid'])[1]}
+                for item in items
+            ],
+            'edges': [
+                {'uuid': edge.uuid, 'source_node_uuid': edge.source, 'target_node_uuid': edge.target, 'fact': edge.fact}
+                for edge in edges
+            ],
+            'previous': list(previous),
+        }
+
+
+@dataclass(frozen=True)
+class _SummaryDraw:
+    """One read of every graph, the items drawn from it, and the bodies of their episodes."""
+
+    graphs: Mapping[str, _SummaryGraph]
+    items: list[dict[str, Any]]
+    contents: Mapping[tuple[str, str], str]
+
+    @classmethod
+    async def read(
+        cls, readers: Mapping[str, ReadOnlyGraphReader], window: Window, n: int, nodes_per_episode: int,
+    ) -> _SummaryDraw:
+        graphs = {graph: await _SummaryGraph.read(graph, reader) for graph, reader in readers.items()}
+        episodes = sorted(
+            ((sample_key(graph, uuid), graph, uuid) for graph, read in graphs.items()
+             for uuid, (created_at, _) in read.episodes.items() if instant_in_window(created_at, *window)),
+        )
+        items: list[dict[str, Any]] = []
+        for _, graph, episode in episodes:
+            items.extend(graphs[graph].items(graph, episode, nodes_per_episode)[: n - len(items)])
+            if len(items) == n:
+                break
+        contents: dict[tuple[str, str], str] = {}
+        for graph, reader in readers.items():
+            chosen = list(dict.fromkeys(item['episode_uuid'] for item in items if item['graph'] == graph))
+            contents |= {(graph, uuid): body for uuid, body in (await _contents(graph, reader, chosen)).items()}
+        for item in items:
+            item['episode_content_sha256'] = _sha256(contents[item['graph'], item['episode_uuid']])
+        return cls(graphs=graphs, items=items, contents=contents)
+
 
 async def summary_fixtures(
     readers: Mapping[str, ReadOnlyGraphReader], window: Window, n: int, nodes_per_episode: int = 2,
 ) -> list[dict[str, Any]]:
     """The first *n* (episode, mentioned Entity) items graphiti would summarise by LLM, over window
     episodes by sha256(graph:uuid), at most *nodes_per_episode* each; ids and hashes, never text."""
-    graphs = {graph: await _SummaryGraph.read(graph, reader) for graph, reader in readers.items()}
-    episodes = sorted(
-        ((sample_key(graph, uuid), graph, uuid) for graph, read in graphs.items()
-         for uuid, (created_at, _) in read.episodes.items() if instant_in_window(created_at, *window)),
-    )
-    items: list[dict[str, Any]] = []
-    for _, graph, episode in episodes:
-        items.extend(graphs[graph].items(graph, episode, nodes_per_episode)[: n - len(items)])
-        if len(items) == n:
-            break
-    for graph, reader in readers.items():
-        chosen = list(dict.fromkeys(item['episode_uuid'] for item in items if item['graph'] == graph))
-        contents = await _contents(graph, reader, chosen)
-        for item in items:
-            if item['graph'] == graph:
-                item['episode_content_sha256'] = _sha256(contents[item['episode_uuid']])
-    return items
+    return (await _SummaryDraw.read(readers, window, n, nodes_per_episode)).items
 
 
-ENTITY_SUMMARY_CYPHER = 'MATCH (n:Entity) WHERE n.uuid IN $uuids RETURN n.uuid, n.summary'
-EDGE_FACT_CYPHER = (
-    'MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity) WHERE r.uuid IN $uuids RETURN r.uuid, a.uuid, b.uuid, r.fact'
-)
+@dataclass(frozen=True)
+class SummaryFrame:
+    items: list[dict[str, Any]]
+    """fixtures-summaries.json: summary_fixtures' items, ids and hashes only."""
+    inputs: list[dict[str, Any]]
+    """luna_eval_sites.run_summaries' fixture per episode of *items*, private because it carries bodies."""
+
+
+async def summary_frame(
+    readers: Mapping[str, ReadOnlyGraphReader], window: Window, n: int, nodes_per_episode: int = 2,
+) -> SummaryFrame:
+    """summary_fixtures' items, and each of their episodes' body, node summaries, edge facts and
+    previous-episode contents, taken from the one read the items hash. A live graph keeps rewriting the
+    summaries of the entities it mentions, so a second read would not restore the manifest."""
+    draw = await _SummaryDraw.read(readers, window, n, nodes_per_episode)
+    by_episode: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for item in draw.items:
+        by_episode.setdefault((item['graph'], item['episode_uuid']), []).append(item)
+    inputs = []
+    for (graph, episode), items in by_episode.items():
+        content = draw.contents[graph, episode]
+        context = await EpisodeContextReader(readers[graph]).read(
+            {'graph': graph, 'uuid': episode, 'stratum': 'summaries', 'content': content},
+        )
+        inputs.append(draw.graphs[graph].summary_input(graph, episode, items, content, context.previous))
+    return SummaryFrame(items=draw.items, inputs=inputs)
 
 
 class SummaryInputsMismatch(ValueError):
@@ -442,64 +504,6 @@ def check_summary_inputs(items: Sequence[Mapping[str, Any]], inputs: Sequence[Ma
         raise SummaryInputsMismatch(
             f'the summary inputs do not restore the manifest: {differing or "the items are out of order"}',
         )
-
-
-async def _text_by_uuid(
-    graph: str, reader: ReadOnlyGraphReader, cypher: str, uuids: Sequence[str],
-) -> dict[str, list[Any]]:
-    """uuid -> the rest of its row; a uuid the graph no longer holds refuses the frame."""
-    rows = {str(row[0]): list(row[1:]) for row in await reader.read_unpaged(cypher, {'uuids': list(uuids)})}
-    if missing := sorted(set(uuids) - rows.keys()):
-        raise FrameReadIncomplete(f'{graph}: sampled records vanished before their text was read: {missing}')
-    return rows
-
-
-async def _summary_input(
-    graph: str, reader: ReadOnlyGraphReader, episode: str, items: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    content = (await _contents(graph, reader, [episode]))[episode]
-    summaries = await _text_by_uuid(graph, reader, ENTITY_SUMMARY_CYPHER, [item['node_uuid'] for item in items])
-    edge_uuids = list(dict.fromkeys(uuid for item in items for uuid in item['edge_uuids']))
-    edges = await _text_by_uuid(graph, reader, EDGE_FACT_CYPHER, edge_uuids)
-    context = await EpisodeContextReader(reader).read(
-        {'graph': graph, 'uuid': episode, 'stratum': 'summaries', 'content': content},
-    )
-    return {
-        'graph': graph, 'episode_uuid': episode, 'episode_valid_at': items[0]['episode_valid_at'],
-        'episode_content': content,
-        'nodes': [
-            {'node_uuid': item['node_uuid'], 'node_name': item['node_name'],
-             'summary': _text(summaries[item['node_uuid']][0]) or ''}
-            for item in items
-        ],
-        'edges': [
-            {'uuid': uuid, 'source_node_uuid': str(edges[uuid][0]), 'target_node_uuid': str(edges[uuid][1]),
-             'fact': _text(edges[uuid][2]) or ''}
-            for uuid in edge_uuids
-        ],
-        'previous': list(context.previous),
-    }
-
-
-async def summary_inputs(
-    readers: Mapping[str, ReadOnlyGraphReader], items: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """luna_eval_sites.run_summaries' fixture for each episode of the summary_fixtures *items*: their
-    episode body, node summaries, edge facts and previous-episode contents, read once, when the frame is
-    drawn. These carry bodies, so they are kept apart from the committed manifest, which hashes them.
-    A graph that changed between the draw and this read refuses the frame."""
-    by_episode: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
-    for item in items:
-        by_episode.setdefault((item['graph'], item['episode_uuid']), []).append(item)
-    restored = [
-        await _summary_input(graph, readers[graph], episode, episode_items)
-        for (graph, episode), episode_items in by_episode.items()
-    ]
-    try:
-        check_summary_inputs(items, restored)
-    except SummaryInputsMismatch as exc:
-        raise FrameReadIncomplete(f'the graph changed while the frame was drawn: {exc}') from exc
-    return restored
 
 
 # --------------------------------------------------------------------------- #

@@ -106,8 +106,7 @@ from luna_eval_frame import (
     extraction_frame,
     resolve_edge_fixtures,
     router_fixtures,
-    summary_fixtures,
-    summary_inputs,
+    summary_frame,
 )
 from luna_eval_score import (
     RunFileError,
@@ -255,12 +254,12 @@ async def _graph_draw(args: argparse.Namespace, reader_factory: ReaderFactory) -
             readers[graph] = reader_factory(graph)
             opened.push_async_callback(readers[graph].aclose)
         extraction = await extraction_frame(readers, definition)
-        items = await summary_fixtures(readers, window, args.summaries_n, args.nodes_per_episode)
+        summaries = await summary_frame(readers, window, args.summaries_n, args.nodes_per_episode)
         return {
             'extraction': extraction,
             Site.resolve_edge: await resolve_edge_fixtures(readers, window, args.resolve_n),
-            Site.summaries: items,
-            'summary_inputs': await summary_inputs(readers, items),
+            Site.summaries: summaries.items,
+            'summary_inputs': summaries.inputs,
         }
 
 
