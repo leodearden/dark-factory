@@ -56,9 +56,8 @@ class TestAgentRoleCapabilityFields:
 class TestImportTimeCapabilityAssertion:
     """__post_init__ enforces: tool-in-allowed_tools ⟹ matching family declared.
 
-    One-way only — declaring a family with no matching tool is allowed
-    (the judge shape: it needs 'orchestrator' wired for jcodemunch even
-    though it has no fused-memory/escalation tool in allowed_tools).
+    One-way only — declaring a family with no matching tool is a lower
+    bound, never the reverse: it is allowed.
     """
 
     def test_plan_tools_tool_without_plan_tools_family_raises(self):
@@ -108,13 +107,13 @@ class TestImportTimeCapabilityAssertion:
         assert role.mcp_families == frozenset({'orchestrator'})
 
     def test_declaring_family_with_no_matching_tool_is_allowed(self):
-        """judge shape: mcp_families={'orchestrator'} but no fm/esc tool in
-        allowed_tools — the assertion is a lower bound, never the reverse."""
+        """Declaring a family with no matching tool is a lower bound, never
+        the reverse."""
 
         role = AgentRole(
-            name='judge_like',
+            name='family_only',
             system_prompt='x',
-            allowed_tools=['mcp__jcodemunch__*'],
+            allowed_tools=['Read'],
             mcp_families=frozenset({'orchestrator'}),
         )
 
@@ -166,7 +165,7 @@ class TestShippedRoleCapabilityDeclarations:
         'implementer': (frozenset({'orchestrator', 'plan_tools'}), True),
         'debugger': (frozenset({'orchestrator', 'plan_tools'}), True),
         'merger': (frozenset({'orchestrator', 'verdict_tools'}), False),
-        'judge': (frozenset({'orchestrator', 'verdict_tools'}), False),
+        'judge': (frozenset({'verdict_tools'}), False),
         'simple_task': (frozenset({'orchestrator', 'plan_tools'}), True),
         'reviewer_comprehensive': (frozenset({'verdict_tools'}), False),
         'steward': (frozenset({'orchestrator'}), False),
@@ -186,6 +185,12 @@ class TestShippedRoleCapabilityDeclarations:
             f'{role_name}: expected sandboxed={expected_sandboxed!r}, '
             f'got {role.sandboxed!r}'
         )
+
+    def test_judge_mcp_surface_is_its_verdict_server(self):
+        """The judge declares only verdict_tools and grants nothing else, so
+        it runs strictly scoped to its verdict server."""
+
+        assert ROLES['judge'].strict_mcp_scope is True
 
     def test_simple_task_has_both_families(self):
         """Explicit regression guard for reify esc-4943-54: simple_task's
@@ -258,6 +263,32 @@ class TestInverseCapabilityInvariant:
                     f'{name!r} allows verdict-tools tools but does not declare '
                     f"'verdict_tools' in mcp_families (reify esc-4943-54 class)"
                 )
+
+    _FAMILY_PREFIXES = {
+        'orchestrator': ('mcp__fused-memory__', 'mcp__escalation__'),
+        'plan_tools': ('mcp__plan-tools__',),
+        'verdict_tools': ('mcp__verdict-tools__',),
+    }
+
+    @pytest.mark.parametrize('role_name', sorted(ROLES))
+    def test_every_mcp_grant_is_served_by_a_declared_family(self, role_name):
+        """The converse: a role's every mcp__ grant falls under a prefix of a
+        family it declares, so no grant names a server _invoke never wires."""
+
+        role = ROLES[role_name]
+        served = tuple(
+            prefix
+            for family in role.mcp_families
+            for prefix in self._FAMILY_PREFIXES[family]
+        )
+        stray = [
+            t for t in role.allowed_tools
+            if t.startswith('mcp__') and not t.startswith(served)
+        ]
+        assert not stray, (
+            f'{role_name!r} grants {stray!r}, which no family in its '
+            f'mcp_families={sorted(role.mcp_families)!r} serves.'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +617,7 @@ class TestInvokeDerivesGatingFromRole:
     async def test_merger_gets_verdict_server_alongside_orchestrator(
         self, config, git_ops, task_assignment,
     ):
-        """MERGER already declares 'orchestrator' (for jcodemunch); the
+        """MERGER already declares 'orchestrator' (for its escalation tools); the
         verdict-tools gate must ADD its server alongside the
         orchestrator-assembled ones, not replace them (PRD task β, task 2482)."""
 
@@ -712,15 +743,15 @@ class TestInvokeScopesSelfContainedRolesStrictly:
         self, config, git_ops, task_assignment,
     ):
         role = AgentRole(
-            name='probe_verdict_jcm', system_prompt='x',
-            allowed_tools=['mcp__verdict-tools__*', 'mcp__jcodemunch__*'],
+            name='probe_verdict_ambient', system_prompt='x',
+            allowed_tools=['mcp__verdict-tools__*', 'mcp__ambient-probe__*'],
             mcp_families=frozenset({'verdict_tools'}),
         )
         call_kwargs, _workflow, _cwd = await _invoke_probe(role, config, git_ops, task_assignment)
 
         assert call_kwargs['strict_mcp_config'] is False, (
-            'The role grants mcp__jcodemunch__*, which only the orchestrator-'
-            'assembled or the ambient config serves; strict scoping would silently '
+            'The role grants mcp__ambient-probe__*, which only the ambient config '
+            'serves; strict scoping would silently '
             'strip a granted tool. Got '
             f"strict_mcp_config={call_kwargs['strict_mcp_config']!r}."
         )

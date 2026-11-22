@@ -44,7 +44,7 @@ capability↔prompt coupling IS runtime behaviour (unlike the wording), so
 `test_role_holds_every_mcp_tool_its_prompt_names` pins it, generically:
 parametrized over every role in `ROLES` (not just STEWARD, since any role's
 prompt can name a tool its allowlist doesn't grant), and wildcard-aware (a
-role granting `mcp__<family>__*` -- e.g. jcodemunch, verdict-tools --
+role granting `mcp__<family>__*` -- e.g. verdict-tools --
 satisfies any prompt mention of a specific tool in that family). It asserts
 on tool GRANTS, not on wording, so any rephrasing that keeps naming a tool
 still passes, and dropping the tool from the allowlist (or naming a new

@@ -568,7 +568,7 @@ class TestPiToolName:
         """A wildcard `mcp__server__*` spec is not expressible as a single
         direct-tool name — callers drop it from --tools (with a logged
         warning; see TestInvokePiFlags)."""
-        assert _pi_tool_name('mcp__jcodemunch__*') is None
+        assert _pi_tool_name('mcp__verdict-tools__*') is None
 
 
 class TestPiThinking:
