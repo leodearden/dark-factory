@@ -2546,6 +2546,32 @@ class TestADeclaredExemptPathIsNeverRepaired:
                 exempt_paths={'update_task': frozenset({()})},
             )
 
+    @pytest.mark.parametrize(
+        ('declaration', 'offending'),
+        [
+            pytest.param(
+                {'update_task': ('metadata', 'done_provenance')}, 'metadata', id='bare-path'
+            ),
+            pytest.param(
+                {'update_task': [['metadata', 'done_provenance']]},
+                ['metadata', 'done_provenance'],
+                id='list-path',
+            ),
+            pytest.param(
+                {'update_task': [('metadata', None)]}, ('metadata', None), id='non-segment'
+            ),
+        ],
+    )
+    async def test_a_malformed_path_is_refused_at_construction(
+        self, declaration: Mapping[str, Any], offending: object
+    ) -> None:
+        """An untyped caller's slip, which would otherwise silently match nothing."""
+        with pytest.raises(ValueError, match='update_task') as excinfo:
+            guard.UuidPrefixGuardMiddleware(
+                _FakeResolver({}), lambda arguments: PROJECT, exempt_paths=declaration
+            )
+        assert f'declares {offending!r},' in str(excinfo.value)
+
 
 # ---------------------------------------------------------------------------
 # A JSON-string metadata is walked as structure.

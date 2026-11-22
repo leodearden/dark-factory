@@ -597,19 +597,38 @@ def _ambiguity_record(planned: _Planned) -> dict[str, Any]:
 def _declared_paths(
     exempt_paths: Mapping[str, Iterable[tuple[str | int, ...]]],
 ) -> Mapping[str, frozenset[tuple[str | int, ...]]]:
-    """*exempt_paths* frozen read-only, refusing an empty path (heuristic 10).
+    """*exempt_paths* frozen read-only, refusing any path that could never match (heuristic 10).
+
+    Each entry is checked before it is frozen, so a malformed one is refused
+    by name here, never left to silently match nothing at call time (INV-1).
+    """
+    declared: dict[str, frozenset[tuple[str | int, ...]]] = {}
+    for tool, paths in exempt_paths.items():
+        listed = tuple(paths)
+        for path in listed:
+            _refuse_undeclarable_path(tool, path)
+        declared[tool] = frozenset(listed)
+    return MappingProxyType(declared)
+
+
+def _refuse_undeclarable_path(tool: str, path: object) -> None:
+    """Raise unless *path* is a non-empty tuple of str keys and int indices.
 
     An empty path would exempt the whole tool, and that already has one
-    mechanism: ``exempt_tools``.
+    mechanism: ``exempt_tools``. The likeliest malformed one is a bare path
+    where a set of paths belongs, which arrives here one segment at a time.
     """
-    declared = {tool: frozenset(paths) for tool, paths in exempt_paths.items()}
-    for tool, paths in declared.items():
-        if () in paths:
-            raise ValueError(
-                f'exempt_paths[{tool!r}] declares an empty path, which would exempt the '
-                f'whole tool; declare {tool!r} in exempt_tools instead.'
-            )
-    return MappingProxyType(declared)
+    if path == ():
+        raise ValueError(
+            f'exempt_paths[{tool!r}] declares an empty path, which would exempt the '
+            f'whole tool; declare {tool!r} in exempt_tools instead.'
+        )
+    if not (isinstance(path, tuple) and all(isinstance(segment, str | int) for segment in path)):
+        raise ValueError(
+            f'exempt_paths[{tool!r}] declares {path!r}, which is not an argument path. '
+            f'Declare a collection of tuples of str keys and int indices, wrapping even '
+            f"a single path: {{('metadata', 'done_provenance')}}."
+        )
 
 
 class UuidPrefixGuardMiddleware(Middleware):
