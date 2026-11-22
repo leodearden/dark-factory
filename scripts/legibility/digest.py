@@ -43,6 +43,7 @@ from legibility.detectors import (  # noqa: E402  # debt: task 6760
     SignalClass,
     classify_agent_class,
     error_hits,
+    is_client_rendered_turn,
     is_non_dialogue_carrier,
     message_content,
     record_hits,
@@ -509,7 +510,12 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     them. The gold bucket asks the SAME predicate every scalar detector asks
     (:func:`detectors.is_non_dialogue_carrier`) rather than holding a private copy of
     the rule: task 5685's ruling that the fix belongs at the
-    content-classification layer, not per bucket.
+    content-classification layer, not per bucket. Beyond that shared
+    predicate, the gold bucket alone excludes a turn the client composed
+    from a UI action (:func:`detectors.is_client_rendered_turn`): an
+    arg-less slash command, a local command's output echo, and the bare
+    interrupt marker, which stays an interrupt signal the Interrupts section
+    already lists.
 
     This function is the SINGLE source for both the gold user_corrections
     section and render_digest's n_user_turns score component, so this one
@@ -530,7 +536,7 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         text = user_turn_text(record)
         if text is None:
             continue
-        if is_non_dialogue_carrier(record, text):
+        if is_non_dialogue_carrier(record, text) or is_client_rendered_turn(text):
             continue
         turns.append({'index': index, 'text': text})
     return turns
@@ -550,7 +556,7 @@ def _yaml_dquote(value: Any) -> str:
     return f'"{escaped}"'
 
 
-DIGEST_INSTRUMENT_VERSION: int = 9
+DIGEST_INSTRUMENT_VERSION: int = 10
 """Which generation of this instrument produced a given digest.
 
 BUMP POLICY: increment whenever a signal detector or the gold-turn
@@ -587,6 +593,8 @@ keys do NOT bump it.
   9 -- the periodic-census verifier and synthesis prompt markers
        (reingestion.HARNESS_PROMPT_MARKERS, task 6847), consulted by the
        gold-turn filter and every dialogue carrier.
+  10 -- the client-rendered turn rule (detectors.is_client_rendered_turn,
+       task 7442), consulted by the gold-turn filter only.
 
 This answers ``plans/confusion-census-2026-07-31.md:151`` (Sec 6): the
 next census must be able to tell a pre-fix trace from a live regression.
