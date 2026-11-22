@@ -125,6 +125,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_rebase_branch_reset_guard.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebase_drops.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebase_drops_wiring.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_rebase_recovery.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebased_solo_landing_ladder.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_reconcile_done_step_commits.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_recut_ruling_gitops.py': _SEEDS_ITS_OWN_REPO,
@@ -140,6 +141,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_warm_lane_abort_teardown.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_warm_lane_integration_gate.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_warm_lane_pool.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_warm_lane_resume_foreign_head.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_workflow_e2e.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_workflow_helpers.py': _SEEDS_ITS_OWN_REPO,
     'scripts/tests/test_flip_reify_gate_exclude_heavy.py': (
