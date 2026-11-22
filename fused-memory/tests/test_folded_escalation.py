@@ -406,6 +406,24 @@ class TestDedupeFold:
         )
         assert {record['task_id'] for record in filed} == {'filer-one', 'filer-two'}
 
+    def test_another_roles_pending_record_under_our_anchor_does_not_absorb_our_alarm(
+        self, tmp_path,
+    ):
+        """The fold has the scope of pending_folded_escalations: anchor, PENDING
+        and the filer's own role, so it lands on exactly what the pending read
+        returns and resolve closes."""
+        other_role = _emit(tmp_path, agent_role=_OTHER_ROLE, dedupe=False)
+        ours = _emit(tmp_path)
+
+        assert other_role is not None
+        assert ours is not None
+        assert ours != other_role, (
+            "another role's open record under our anchor silenced our alarm"
+        )
+        assert len(_filed(tmp_path)) == 2
+        assert [esc.id for esc in _pending(str(tmp_path))] == [ours]
+        assert _emit(tmp_path) == ours
+
     def test_dedupe_false_files_a_second_record_while_the_first_is_pending(
         self, tmp_path,
     ):
@@ -1614,9 +1632,9 @@ class TestTheFiledAnchorAndTheLookupAreTheSame:
         seen: list = []
         real_get_by_task = _folded_escalation.EscalationQueue.get_by_task
 
-        def _spy(self, task_id, status=None):
+        def _spy(self, task_id, status=None, **kwargs):
             seen.append(task_id)
-            return real_get_by_task(self, task_id, status=status)
+            return real_get_by_task(self, task_id, status=status, **kwargs)
 
         monkeypatch.setattr(_folded_escalation.EscalationQueue, 'get_by_task', _spy)
         _emit(tmp_path, anchor_task_id='a-distinctive-anchor')
