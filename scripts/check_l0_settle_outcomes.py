@@ -36,7 +36,9 @@ ARCHIVE_DAY_FORMAT: Final = '%Y-%m-%d'
 LIVE_RECORD_GLOB: Final = 'esc-*.json'
 # escalation/src/escalation/models.py::Escalation.status
 PENDING_STATUS: Final = 'pending'
+RESOLVED_STATUS: Final = 'resolved'
 DISMISSED_STATUS: Final = 'dismissed'
+KNOWN_STATUSES: Final = frozenset({PENDING_STATUS, RESOLVED_STATUS, DISMISSED_STATUS})
 
 COUNTED_LEVEL: Final = 0
 COUNTED_SEVERITY: Final = 'blocking'
@@ -160,6 +162,13 @@ def _moment(raw: Mapping[str, Any], key: str, path: Path) -> datetime:
         raise UnreadableQueue(path, f'{key} {value!r} is not a usable ISO timestamp') from exc
 
 
+def _status(raw: Mapping[str, Any], path: Path) -> str:
+    value = _text(raw, 'status', path)
+    if value not in KNOWN_STATUSES:
+        raise UnreadableQueue(path, f'status {value!r} is not one of pending, resolved, dismissed')
+    return value
+
+
 def _late_resolved(raw: Mapping[str, Any], path: Path) -> bool:
     entries = raw.get('late_resolutions', [])
     if not isinstance(entries, list):
@@ -169,7 +178,7 @@ def _late_resolved(raw: Mapping[str, Any], path: Path) -> bool:
 
 def parse_record(raw: Mapping[str, Any], path: Path) -> Record:
     """The one boundary where an escalation file's persisted fields become a typed Record."""
-    status = _text(raw, 'status', path)
+    status = _status(raw, path)
     is_open = status == PENDING_STATUS
     return Record(
         id=_text(raw, 'id', path),
