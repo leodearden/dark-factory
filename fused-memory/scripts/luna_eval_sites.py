@@ -278,6 +278,20 @@ def routing_arm(
     )
 
 
+class RoutingCallUnanswered(RuntimeError):
+    """A routing call no chat completion answered. Production serves its non-LLM fallback then, which
+    would score as a label; a failure line instead is retried by a rerun, and what persists counts
+    against luna_eval_score.LUNA_FAILURE_SHARE_MAX."""
+
+
+def _answered_usage(site: Site, client: UsageRecordingOpenAI, mark: int, fixture: Mapping[str, Any],
+                    arm: ReplayArm) -> LlmTokenUsage:
+    usage = client.usage_since(mark)
+    if not usage.llm_calls:
+        raise RoutingCallUnanswered(f'{site} {fixture_id(site, fixture)} under {arm.name}: no chat completion answered')
+    return usage
+
+
 def _routing_client(arm_cfg: FusedMemoryConfig, client: UsageRecordingOpenAI) -> dict[str, Any]:
     return {
         'model': routing_chat_params(arm_cfg)['model'], 'reasoning_effort': arm_cfg.routing.reasoning_effort,
@@ -293,7 +307,8 @@ async def run_classifier(
     mark = len(client.usages)
     result = await WriteClassifier(arm_cfg, openai_client=client).classify(fixture['input'])
     return _record(
-        Site.classifier, arm, _routing_client(arm_cfg, client), fixture, client.usage_since(mark),
+        Site.classifier, arm, _routing_client(arm_cfg, client), fixture,
+        _answered_usage(Site.classifier, client, mark, fixture, arm),
         label=result.primary.value, secondary=result.secondary.value if result.secondary else None,
         fallback=result.fallback.value if result.fallback else None, stores=None, primary_store=None,
     )
@@ -306,7 +321,8 @@ async def run_router(
     mark = len(client.usages)
     result = await ReadRouter(arm_cfg, openai_client=client).route(fixture['query'])
     return _record(
-        Site.router, arm, _routing_client(arm_cfg, client), fixture, client.usage_since(mark),
+        Site.router, arm, _routing_client(arm_cfg, client), fixture,
+        _answered_usage(Site.router, client, mark, fixture, arm),
         label=result.query_type.value, secondary=None, fallback=None,
         stores=[store.value for store in result.stores], primary_store=result.primary_store.value,
     )
