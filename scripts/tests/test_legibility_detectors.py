@@ -913,9 +913,12 @@ class TestLegibilityInstrumentSessions:
         )
 
     def test_the_opener_quoted_inside_a_first_turn_is_foreign(self):
-        record = user_record(f'why is this prompt restratified?\n\n{TRICKLE_CODER_PREAMBLE}')
+        records = [
+            user_record(f'why is this prompt restratified?\n\n{TRICKLE_CODER_PREAMBLE}'),
+            user_record('and why only since Tuesday?'),
+        ]
 
-        assert _classify(record) is AgentClass.INTERACTIVE
+        assert _classify(*records) is AgentClass.INTERACTIVE
 
     def test_the_opener_in_a_tool_result_is_foreign(self):
         records = [
