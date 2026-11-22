@@ -21,7 +21,14 @@ from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, WarmLaneUnavailable, WorktreeInfo, _run
+from orchestrator.git_ops import (
+    GitOps,
+    WarmLaneUnavailable,
+    WorktreeInfo,
+    _run,
+    is_wip_safety_commit,
+    task_citation_pattern,
+)
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool, WarmLanePoolCensus
@@ -2922,11 +2929,6 @@ class TestReclaimWipCommitSubject:
     async def test_subject_names_victim_and_is_not_a_landing_citation(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,
     ):
-        from orchestrator.git_ops import (
-            is_wip_safety_commit,
-            task_citation_pattern,
-        )
-
         sha_a, _sha_main, _marker = await _make_repo_for_reuse_test(wl_git_repo)
         git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
 
