@@ -4509,6 +4509,9 @@ set_task_status (and the privileged stamp_audit_metadata seam) writes
 defect keys (``fused_memory/backends/defect_records.py``).
 """
 
+PASSTHROUGH_ONLY_METADATA_KEYS: frozenset[str] = frozenset(_PASSTHROUGH_ONLY_METADATA_KEYS)
+"""The key names of :data:`_PASSTHROUGH_ONLY_METADATA_KEYS`, for callers outside this backend."""
+
 
 def _refuse_passthrough_only_keys(incoming: dict, task_id: str) -> None:
     """update_task's pre-connect floor outside replace: any carried key is refused, echo included."""
