@@ -12,6 +12,7 @@ Scaffolding patterns mirror test_warm_lane_pool.py.
 from pathlib import Path
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
@@ -19,16 +20,6 @@ from orchestrator.git_ops import GitOps, _run
 # ---------------------------------------------------------------------------
 # Scaffolding helpers (module-local, mirrors test_warm_lane_pool.py patterns)
 # ---------------------------------------------------------------------------
-
-
-async def _init_repo(repo: Path) -> None:
-    """Initialise a bare git repo suitable for worktree tests."""
-    await _run(['git', 'init', '-b', 'main', str(repo)])
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 async def _make_lane_dir(repo: Path, lane_name: str = '_lane-0') -> Path:
@@ -104,9 +95,7 @@ class TestSeedSymlinkResolution:
 
         RED against today's impl which passes str(warm_lane_base_target_path) raw.
         """
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
 
         # Build a reify-style gen-dir base: .gen.0/ + sentinel + target->.gen.0 + .gen.0.lock
         base_dir = tmp_path / 'bases'
@@ -142,9 +131,7 @@ class TestSeedSymlinkResolution:
         Existing default config (base == _merge-verify/target plain dir) must keep
         working unchanged. GREEN against today's impl and must stay green after step-2.
         """
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
 
         # Plain directory — no symlink
         plain_dir = tmp_path / 'plain_base'
@@ -188,9 +175,7 @@ class TestSeedFlockLock:
         RED against today's impl: no flock is held, so the concurrent exclusive probe
         SUCCEEDS (reports FREE).
         """
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
 
         # Build reify-style gen-dir base
         base_dir = tmp_path / 'bases'
@@ -378,9 +363,7 @@ class TestRefreshLandedCommit:
 
         RED against today's no-flag impl (guard exits 1 → returns False).
         """
-        repo = tmp_path / 'repo'
-        repo.mkdir()
-        await _init_repo(repo)
+        repo = seed_repo(tmp_path / 'repo')
 
         rolling_base = tmp_path / 'rolling'
         merge_verify, config = _setup_merge_verify_for_refresh(repo, rolling_base)
