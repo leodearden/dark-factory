@@ -82,6 +82,7 @@ _COLD_START = {
     'current_holders': {},
     'held_by_task': {},
     'holder_limits': {},
+    'successor_of': {},
     'lock_depth': None,
     'is_paused': False,
     'pause_reason': None,
