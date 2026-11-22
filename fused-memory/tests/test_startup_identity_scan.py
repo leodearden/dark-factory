@@ -6,8 +6,8 @@ Covers:
 - GraphitiBackend._run_startup_identity_scan — per-graph orchestrator
 - GraphitiBackend.initialize() wiring
 
-An idempotent startup identity-integrity pass, run per-graph over
-list_graphs() during initialize(). Two responsibilities: (a) dup-NODE
+An idempotent startup identity-integrity pass, run per registered graph
+during initialize(). Two responsibilities: (a) dup-NODE
 alarm — detect exact-name duplicate Entity nodes and emit a LOUD WARN
 naming group_id+name (a safety net for the write-time identity gate, task
 2198/α + task 2202/β — a POSITIVE DETECTION signal, not input rejection);
@@ -235,11 +235,14 @@ class TestRunStartupIdentityScan:
     """GraphitiBackend._run_startup_identity_scan() — per-graph orchestrator."""
 
     @pytest.mark.asyncio
-    async def test_scans_and_repairs_every_graph_and_aggregates_stats(
-        self, mock_config, make_backend,
+    async def test_scans_and_repairs_every_registered_graph_and_aggregates_stats(
+        self, mock_config, make_backend, make_graph_mock,
     ):
-        backend = make_backend(mock_config)
-        backend.list_graphs = AsyncMock(return_value=['g1', 'g2'])
+        backend = make_backend(
+            mock_config,
+            registered_graph_ids={'g1', 'g2'},
+            graph_access=FakeGraphAccess({'g1': make_graph_mock(), 'g2': make_graph_mock()}),
+        )
         backend._scan_duplicate_entity_names = AsyncMock(return_value=[('Foo', 2)])
         backend._repair_duplicate_edge_uuids = AsyncMock(return_value=3)
 
@@ -258,13 +261,16 @@ class TestRunStartupIdentityScan:
 
     @pytest.mark.asyncio
     async def test_one_graph_failure_does_not_abort_the_sweep(
-        self, mock_config, make_backend, caplog,
+        self, mock_config, make_backend, make_graph_mock, caplog,
     ):
         """Per-graph best-effort: a raise on one graph is caught and logged,
         and the sweep still processes the remaining graphs (mirrors the
         initialize() index-setup loop idiom, graphiti_client.py:378-385)."""
-        backend = make_backend(mock_config)
-        backend.list_graphs = AsyncMock(return_value=['g1', 'g2'])
+        backend = make_backend(
+            mock_config,
+            registered_graph_ids={'g1', 'g2'},
+            graph_access=FakeGraphAccess({'g1': make_graph_mock(), 'g2': make_graph_mock()}),
+        )
         backend._scan_duplicate_entity_names = AsyncMock(return_value=[])
 
         async def repair_side_effect(group_id):
