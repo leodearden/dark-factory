@@ -63,10 +63,12 @@ __all__ = [
     'UUID_PREFIX_OVERRIDE_KEY',
     'PrefixToken',
     'find_prefix_tokens',
+    'in_sent_shape',
     'strip_uuid_prefix_override',
     'substitute',
     'substitute_all',
     'uuid_prefix_override_requested',
+    'walkable_arguments',
 ]
 
 
@@ -309,6 +311,47 @@ def _as_metadata_dict(metadata: object) -> dict[str, Any] | None:
         if isinstance(parsed, dict):
             return parsed
     return None
+
+
+def walkable_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """A shallow copy of *arguments* whose JSON-object-string ``metadata`` is decoded.
+
+    The walk then gives that metadata's values structured paths and leaves its
+    keys unscanned, exactly as for a dict ``metadata`` (PRD §4-C1 Walk,
+    erratum 2026-11-22). Any other ``metadata`` is kept as sent. INV-8 cost:
+    one JSON decode per call, and :func:`in_sent_shape` adds at most one
+    encode. Never raises.
+    """
+    walked = dict(arguments)
+    metadata = walked.get('metadata')
+    if isinstance(metadata, str):
+        decoded = _as_metadata_dict(metadata)
+        if decoded is not None:
+            walked['metadata'] = decoded
+    return walked
+
+
+def in_sent_shape(
+    sent: Mapping[str, Any],
+    walked: Mapping[str, Any],
+    repaired: Mapping[str, Any],
+) -> dict[str, Any]:
+    """*repaired* with ``metadata`` back in the wire shape *sent* used.
+
+    *walked* is ``walkable_arguments(sent)`` and *repaired* is
+    :func:`substitute_all` over it. A decoded string that no substitution
+    touched is the caller's own string again, byte-identical; a touched one is
+    re-encoded. Untouched is identity, because :func:`substitute_all` shares
+    every substructure off a token's path by reference.
+    """
+    shaped = dict(repaired)
+    was_decoded = isinstance(sent.get('metadata'), str) and isinstance(walked.get('metadata'), dict)
+    if was_decoded:
+        if repaired['metadata'] is walked['metadata']:
+            shaped['metadata'] = sent['metadata']
+        else:
+            shaped['metadata'] = json.dumps(repaired['metadata'])
+    return shaped
 
 
 def uuid_prefix_override_requested(metadata: object) -> bool:
