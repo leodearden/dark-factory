@@ -11,6 +11,7 @@ mirroring the pattern in tests/scripts/test_orchestrator_watchdog.py::_load_watc
 
 import ast
 import importlib.util
+import os
 import pathlib
 import subprocess
 import sys
@@ -21,6 +22,7 @@ import systemd_unit_parity
 import yaml
 from setup_host_sections import (
     enabled_units,
+    install_recording_systemctl,
     run_section,
     slice_section,
     systemctl_calls,
@@ -51,6 +53,23 @@ def _load_checker() -> types.ModuleType:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
+
+
+@pytest.fixture(autouse=True)
+def _systemctl_is_a_recording_stub(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolve every `systemctl` in this module to the recording stub.
+
+    main(--fix) shells out to `systemctl --user daemon-reload` through PATH;
+    without this fixture three --fix tests reloaded the host's real user
+    manager on every verify (measured, task 7803). The stub records each call
+    for systemctl_calls(tmp_path).
+    """
+    monkeypatch.setenv(
+        "PATH",
+        f"{install_recording_systemctl(tmp_path)}{os.pathsep}{os.environ.get('PATH', '')}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -565,10 +584,8 @@ def test_main_names_the_flagged_compose_up_line_and_the_services_read_from_it(
 def test_fix_never_synthesizes_the_aof_gate_and_reports_it_as_residual_drift(
     tmp_path: pathlib.Path,
     capsys: pytest.CaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     mod = _load_checker()
-    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
     installed = _write_unit(tmp_path, _BARE_COMPOSE_UP_UNIT)
 
     rc = mod.main(["--installed", str(installed), "--fix"])
@@ -1018,7 +1035,6 @@ def test_log_tags_every_physical_line_of_a_multi_line_message(
 def test_main_fix_returns_1_when_execstartpre_unsynthesizable(
     tmp_path: pathlib.Path,
     capsys: pytest.CaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     """main(--fix) returns 1 (not a false 0) when a host-specific prefix directive remains.
 
@@ -1029,7 +1045,6 @@ def test_main_fix_returns_1_when_execstartpre_unsynthesizable(
     return — instead of falsely signalling parity with exit 0.
     """
     mod = _load_checker()
-    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
     installed = _write_unit(tmp_path, _MISSING_MEM0_UNIT)
     rc = mod.main(["--installed", str(installed), "--fix"])
     assert rc == 1
@@ -1042,7 +1057,6 @@ def test_main_fix_returns_1_when_execstartpre_unsynthesizable(
 def test_main_fix_appended_count_excludes_unsynthesizable_prefix(
     tmp_path: pathlib.Path,
     capsys: pytest.CaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     """The '[fixed] Appended N' count reflects only the EXACT directives appended.
 
@@ -1052,7 +1066,6 @@ def test_main_fix_appended_count_excludes_unsynthesizable_prefix(
     therefore be the exact-directive count, never the inflated len(drift).
     """
     mod = _load_checker()
-    monkeypatch.setattr(mod, "daemon_reload", lambda: None)
     full_drift = mod.find_drift(_MISSING_MEM0_UNIT)
     exact_only = mod.find_drift(_MISSING_MEM0_UNIT, required_prefixes=())
     assert len(full_drift) == len(exact_only) + len(mod.REQUIRED_SERVICE_DIRECTIVE_PREFIXES)
