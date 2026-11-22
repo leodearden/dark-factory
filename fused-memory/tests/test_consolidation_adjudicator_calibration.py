@@ -1,20 +1,39 @@
 """The adjudicator's self-calibration (plans/consolidation-adjudicator-prd.md K5, E7).
 
 Public names of ``fused_memory.reconciliation.consolidation_adjudicator_calibration``
-only. No live model: the calibration is scored from synthetic outcomes here.
+only. No live model: the scoring is driven by synthetic outcomes, and a run by
+the scripted double in ``tests/_adjudicator_doubles.py`` over a real ledger.
 """
 from __future__ import annotations
 
+import asyncio
 import collections
 import dataclasses
 import functools
 import hashlib
+import json
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from fractions import Fraction
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
+from _adjudicator_doubles import (
+    RESOLVED_MODEL,
+    USAGE,
+    EvalAnswerKey,
+    ScriptedResponses,
+    connection_error,
+    expected_reply,
+    keep_all_reply,
+    rate_limited,
+    reply_text,
+    server_error,
+    verdict_reply,
+)
 
+from fused_memory.llm.list_prices import list_price
 from fused_memory.reconciliation.consolidation_adjudicator import (
     AdjudicationRequest,
     AdjudicatorSettings,
@@ -23,14 +42,22 @@ from fused_memory.reconciliation.consolidation_adjudicator import (
     MemberInput,
     Verdict,
     VerdictReasonCode,
+    adjudicator_identity,
 )
 from fused_memory.reconciliation.consolidation_adjudicator_calibration import (
     BOUNDS,
+    CALLS_IN_FLIGHT,
     EVAL_SET_PATH,
     EVAL_SET_SHA256,
+    MAX_UNANSWERED,
+    TRANSPORT_ATTEMPTS,
     BoundBasis,
     BoundDirection,
     BoundName,
+    CalibrationFinding,
+    CalibrationRecord,
+    CalibrationResult,
+    CalibrationState,
     CaseKind,
     CaseOutcome,
     CaseSplit,
@@ -42,9 +69,12 @@ from fused_memory.reconciliation.consolidation_adjudicator_calibration import (
     evaluate,
     load_eval_set,
     pool,
+    run_calibration,
     score_run,
 )
 from fused_memory.reconciliation.consolidation_auto import AutoReasonCode, FlowReasonCode
+from fused_memory.reconciliation.consolidation_proposal import adjudicator_calibration_key
+from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
 
 BANNER = AutoReasonCode.member_carries_correction_banner
 
@@ -355,3 +385,342 @@ class TestPooling:
         first, second = _run(_false_keeps(9)), _run(_false_keeps(4))
         assert evaluate(second) == ()
         assert evaluate(pool(first, second)) == (BoundName.contaminated_false_keep,)
+
+
+NOW = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)
+RUN_SETTINGS = _settings(endpoint_host='api.openai.com')
+OTHER_RESOLVED_MODEL = 'gpt-6.1-sol-2026-11-01'
+
+
+@pytest_asyncio.fixture
+async def ledger(tmp_path):
+    store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+    await store.initialize()
+    yield store
+    await store.close()
+
+
+def _no_claim_problems(claim: str, topic: str | None) -> tuple[str, ...]:
+    return ()
+
+
+async def _calibrate(
+    ledger: ReconLedgerStore, double: ScriptedResponses, *, now: datetime = NOW, **kwargs,
+) -> CalibrationResult:
+    return await run_calibration(
+        ledger=ledger, settings=RUN_SETTINGS, model_call=double,
+        claim_check=_no_claim_problems, now=now, retry_delay_s=0, **kwargs,
+    )
+
+
+def _key(**kwargs) -> EvalAnswerKey:
+    return EvalAnswerKey(_cases(), **kwargs)
+
+
+async def _stored(ledger: ReconLedgerStore) -> CalibrationRecord | None:
+    row = await ledger.get_by_identity(
+        **adjudicator_calibration_key(adjudicator_identity(RUN_SETTINGS)),
+    )
+    return None if row is None else CalibrationRecord.from_ledger_record(row)
+
+
+def _test_cases(kind: CaseKind) -> list[EvalCase]:
+    return [c for c in _adjudicated() if c.kind is kind and c.split is CaseSplit.test]
+
+
+def _keeping_foreign(case: EvalCase):
+    return keep_all_reply(case) if case.kind is CaseKind.contaminated else expected_reply(case)
+
+
+def _keeping_foreign_in(case_ids: set[str]):
+    def answer(case: EvalCase):
+        return keep_all_reply(case) if case.case_id in case_ids else expected_reply(case)
+    return answer
+
+
+def _unanswered(count: int) -> dict[str, tuple[BaseException, ...]]:
+    return {
+        c.case_id: tuple(connection_error() for _ in range(TRANSPORT_ATTEMPTS))
+        for c in _adjudicated()[:count]
+    }
+
+
+class TestCalibrationRecord:
+    def _record(self) -> CalibrationRecord:
+        figures = _run(_false_keeps(7))
+        return CalibrationRecord(
+            identity='i' * 64, state=CalibrationState.FAIL_FIRST_RUN, attempt=1,
+            started_at=NOW, model='gpt-6.1-sol', endpoint_host='api.openai.com',
+            first_run=figures, figures=figures, unanswered=2,
+            resolved_models=(RESOLVED_MODEL,), cost_usd=0.5, wall_time_s=12.5,
+        )
+
+    def test_a_record_round_trips_through_its_ledger_row(self) -> None:
+        record = self._record()
+        row = record.to_ledger_record(now=NOW)
+        assert row.state == 'fail_first_run'
+        assert row.expires_at is None
+        assert {
+            'project_id': row.project_id, 'record_kind': row.record_kind, 'task_id': row.task_id,
+            'flag_type': row.flag_type, 'run_id': row.run_id,
+        } == adjudicator_calibration_key(record.identity)
+        assert CalibrationRecord.from_ledger_record(row) == record
+
+    def test_the_failed_bounds_are_read_from_the_figures(self) -> None:
+        assert self._record().failed_bounds == (BoundName.contaminated_false_keep,)
+
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [
+            ('attempt', 'one'),
+            ('started_at', '2026-11-22T12:00:00'),
+            ('figures', [{'name': 'nope', 'numerator': 1, 'denominator': 2, 'holds': True}]),
+            ('cost_usd', -1),
+            ('resolved_models', 'gpt'),
+        ],
+    )
+    def test_a_bad_payload_field_is_refused_naming_it(self, field: str, value: object) -> None:
+        row = self._record().to_ledger_record(now=NOW)
+        payload = json.loads(row.payload_json)
+        payload[field] = value
+        with pytest.raises(ValueError, match=field):
+            CalibrationRecord.from_ledger_record(
+                dataclasses.replace(row, payload_json=json.dumps(payload)),
+            )
+
+    def test_a_naive_timestamp_is_refused(self) -> None:
+        with pytest.raises(ValueError, match='started_at'):
+            dataclasses.replace(self._record(), started_at=NOW.replace(tzinfo=None))
+
+
+class TestCalibrationRun:
+    @pytest.mark.asyncio
+    async def test_a_first_run_in_bounds_passes(self, ledger) -> None:
+        other = _test_cases(CaseKind.fold)[0]
+        double = ScriptedResponses(_key(deviations={
+            other.case_id: (
+                verdict_reply(
+                    Decision.proceed, other.expected.keep_ids, resolved_model=OTHER_RESOLVED_MODEL,
+                ),
+            ),
+        }))
+
+        result = await _calibrate(ledger, double)
+
+        assert (result.state, result.ran, result.finding) == (CalibrationState.PASS, True, None)
+        assert result.may_adjudicate is True
+        assert len(double.requests) == 176
+        assert double.peak_in_flight == CALLS_IN_FLIGHT
+        row = await ledger.get_by_identity(
+            **adjudicator_calibration_key(adjudicator_identity(RUN_SETTINGS)),
+        )
+        assert row is not None
+        assert row.state == 'pass'
+        assert row.expires_at is None
+        record = CalibrationRecord.from_ledger_record(row)
+        assert record == result.record
+        assert record.attempt == 1
+        assert record.figures is not None
+        assert {f.name: (f.numerator, f.denominator) for f in record.figures.figures} == {
+            BoundName.contaminated_false_keep: (0, 45),
+            BoundName.fold_rate: (45, 45),
+            BoundName.must_not_merge_test: (0, 30),
+            BoundName.must_not_merge_dev: (0, 13),
+            BoundName.real_proposal_folds: (6, 6),
+            BoundName.invalid_replies: (0, 176),
+        }
+        assert record.failed_bounds == ()
+        assert record.resolved_models == (RESOLVED_MODEL, OTHER_RESOLVED_MODEL)
+        assert (record.model, record.endpoint_host) == ('gpt-6.1-sol', 'api.openai.com')
+        price = list_price('gpt-6.1-sol')
+        assert price is not None
+        assert record.cost_usd == pytest.approx(
+            176 * price.usd(USAGE.input_tokens, USAGE.output_tokens),
+        )
+        assert record.wall_time_s is not None
+        assert record.wall_time_s >= 0
+        assert record.eval_sha256 == EVAL_SET_SHA256
+        assert record.unanswered == 0
+
+    @pytest.mark.asyncio
+    async def test_the_row_is_running_before_the_first_reply(self, ledger) -> None:
+        gate = asyncio.Event()
+        double = ScriptedResponses(_key(), gate=gate)
+        run = asyncio.create_task(_calibrate(ledger, double))
+        async with asyncio.timeout(10):
+            while double.in_flight < CALLS_IN_FLIGHT:
+                await asyncio.sleep(0)
+
+        stored = await _stored(ledger)
+
+        assert stored is not None
+        assert (stored.state, stored.attempt, stored.started_at) == (
+            CalibrationState.RUNNING, 1, NOW,
+        )
+        gate.set()
+        assert (await run).state is CalibrationState.PASS
+
+    @pytest.mark.asyncio
+    async def test_a_transport_failure_is_retried_and_a_content_failure_is_not(
+        self, ledger,
+    ) -> None:
+        recovered, lost, garbled = _test_cases(CaseKind.fold)[:3]
+        key = _key(deviations={
+            recovered.case_id: (rate_limited(), rate_limited()),
+            lost.case_id: (rate_limited(), server_error(503), connection_error()),
+            garbled.case_id: (reply_text('not json'),),
+        })
+        double = ScriptedResponses(key)
+
+        result = await _calibrate(ledger, double)
+
+        assert key.calls[recovered.case_id] == 3
+        assert key.calls[lost.case_id] == TRANSPORT_ATTEMPTS
+        assert key.calls[garbled.case_id] == 1
+        assert len(double.requests) == 176 + 2 + (TRANSPORT_ATTEMPTS - 1)
+        record = result.record
+        assert record is not None
+        assert record.unanswered == 1
+        assert record.figures is not None
+        figures = {f.name: (f.numerator, f.denominator) for f in record.figures.figures}
+        assert figures[BoundName.invalid_replies] == (2, 176)
+        assert figures[BoundName.fold_rate] == (43, 45)
+        assert result.state is CalibrationState.PASS
+
+    @pytest.mark.asyncio
+    async def test_max_unanswered_cases_still_score(self, ledger) -> None:
+        result = await _calibrate(
+            ledger, ScriptedResponses(_key(deviations=_unanswered(MAX_UNANSWERED))),
+        )
+
+        assert result.state is CalibrationState.PASS
+        assert result.record is not None
+        assert result.record.unanswered == MAX_UNANSWERED
+
+    @pytest.mark.asyncio
+    async def test_one_more_unanswered_case_is_inconclusive(self, ledger) -> None:
+        result = await _calibrate(
+            ledger, ScriptedResponses(_key(deviations=_unanswered(MAX_UNANSWERED + 1))),
+        )
+
+        assert (result.state, result.ran, result.finding) == (
+            CalibrationState.INCONCLUSIVE, True, None,
+        )
+        assert result.may_adjudicate is False
+        assert result.record is not None
+        assert result.record.figures is None
+        assert result.record.unanswered == MAX_UNANSWERED + 1
+        assert await _stored(ledger) == result.record
+
+    @pytest.mark.asyncio
+    async def test_running_out_of_wall_time_is_inconclusive(self, ledger) -> None:
+        double = ScriptedResponses(_key(), gate=asyncio.Event())
+
+        result = await _calibrate(ledger, double, wall_time_limit_s=0.05)
+
+        assert (result.state, result.ran, result.finding) == (
+            CalibrationState.INCONCLUSIVE, True, None,
+        )
+        assert result.record is not None
+        assert result.record.figures is None
+        assert double.in_flight == 0
+        stored = await _stored(ledger)
+        assert stored is not None
+        assert stored.state is CalibrationState.INCONCLUSIVE
+
+    @pytest.mark.asyncio
+    async def test_two_failing_runs_fail_and_the_third_call_runs_nothing(self, ledger) -> None:
+        first = await _calibrate(ledger, ScriptedResponses(_key(answer=_keeping_foreign)))
+
+        assert (first.state, first.ran, first.finding) == (
+            CalibrationState.FAIL_FIRST_RUN, True, None,
+        )
+        assert first.may_adjudicate is False
+        assert first.record is not None
+        assert first.record.first_run is not None
+        assert first.record.first_run == first.record.figures
+        assert first.failed_bounds == (BoundName.contaminated_false_keep,)
+
+        second_double = ScriptedResponses(_key(answer=_keeping_foreign))
+        second = await _calibrate(ledger, second_double, now=NOW + timedelta(minutes=10))
+
+        assert len(second_double.requests) == 176
+        assert (second.state, second.ran) == (CalibrationState.FAIL, True)
+        assert second.finding is CalibrationFinding.adjudicator_calibration_failed
+        assert second.failed_bounds == (BoundName.contaminated_false_keep,)
+        assert second.record is not None
+        assert second.record.attempt == 2
+        assert second.record.figures is not None
+        pooled = _figure(second.record.figures, BoundName.contaminated_false_keep)
+        assert (pooled.numerator, pooled.denominator) == (90, 90)
+        assert await _stored(ledger) == second.record
+
+        third_double = ScriptedResponses(_key())
+        third = await _calibrate(ledger, third_double, now=NOW + timedelta(minutes=20))
+
+        assert third_double.requests == []
+        assert (third.state, third.ran, third.finding) == (CalibrationState.FAIL, False, None)
+        assert third.may_adjudicate is False
+
+    @pytest.mark.asyncio
+    async def test_a_narrow_first_failure_and_a_clean_second_run_pool_to_pass(
+        self, ledger,
+    ) -> None:
+        seven = {c.case_id for c in _test_cases(CaseKind.contaminated)[:7]}
+        first = await _calibrate(ledger, ScriptedResponses(_key(answer=_keeping_foreign_in(seven))))
+        assert first.state is CalibrationState.FAIL_FIRST_RUN
+
+        second = await _calibrate(ledger, ScriptedResponses(_key()), now=NOW + timedelta(minutes=10))
+
+        assert (second.state, second.ran, second.finding) == (CalibrationState.PASS, True, None)
+        assert second.may_adjudicate is True
+        assert second.record is not None
+        assert second.record.figures is not None
+        pooled = _figure(second.record.figures, BoundName.contaminated_false_keep)
+        assert (pooled.numerator, pooled.denominator) == (7, 90)
+
+    @pytest.mark.asyncio
+    async def test_a_pass_row_makes_no_calls(self, ledger) -> None:
+        await _calibrate(ledger, ScriptedResponses(_key()))
+        later = ScriptedResponses(_key())
+
+        result = await _calibrate(ledger, later, now=NOW + timedelta(days=30))
+
+        assert later.requests == []
+        assert (result.state, result.ran, result.finding) == (CalibrationState.PASS, False, None)
+        assert result.may_adjudicate is True
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_callers_produce_one_run(self, ledger) -> None:
+        double = ScriptedResponses(_key())
+
+        results = await asyncio.gather(_calibrate(ledger, double), _calibrate(ledger, double))
+
+        assert len(double.requests) == 176
+        assert sorted(result.ran for result in results) == [False, True]
+        winner, loser = sorted(results, key=lambda result: not result.ran)
+        assert winner.state is CalibrationState.PASS
+        assert (loser.state, loser.finding, loser.may_adjudicate) == (
+            CalibrationState.RUNNING, None, False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_tampered_eval_set_is_refused_before_any_call_or_write(
+        self, ledger, tmp_path: Path,
+    ) -> None:
+        tampered = tmp_path / 'eval.jsonl'
+        tampered.write_bytes(EVAL_SET_PATH.read_bytes().replace(b'"split"', b'"Split"', 1))
+        double = ScriptedResponses(_key())
+
+        result = await _calibrate(ledger, double, eval_set_path=tampered)
+
+        assert result.finding is CalibrationFinding.adjudicator_eval_set_invalid
+        assert (result.state, result.record, result.ran) == (None, None, False)
+        assert result.may_adjudicate is False
+        assert double.requests == []
+        assert await _stored(ledger) is None
+
+    @pytest.mark.asyncio
+    async def test_now_must_be_timezone_aware(self, ledger) -> None:
+        with pytest.raises(ValueError, match='now'):
+            await _calibrate(ledger, ScriptedResponses(_key()), now=NOW.replace(tzinfo=None))
