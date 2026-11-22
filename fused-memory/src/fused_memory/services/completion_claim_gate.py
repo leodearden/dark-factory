@@ -332,9 +332,10 @@ _CATCH_UP_MERGE_RE: re.Pattern[str] = re.compile(
     r'\bmerged\s+up\s+(?:to|with)\b', re.IGNORECASE,
 )
 
-# 'X was merged into it' makes the pronoun's antecedent, the nearest ref, the merge's destination,
-# so it does not land that ref (dark_factory esc-unverified-claim-6670-1). Pinned by
-# tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
+# 'X was merged into it' makes the pronoun's antecedent the merge's destination, so the merge
+# does not land it (dark_factory esc-unverified-claim-6670-1). Blanking the verb also drops
+# whatever ref the marker would bind instead, a subject or a following commit: accepted
+# residuals, pinned with the rule by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
 _MERGE_INTO_ANTECEDENT_RE: re.Pattern[str] = re.compile(
     r'\bmerged\s+into\s+(?:it|them)\b', re.IGNORECASE,
 )

@@ -666,10 +666,30 @@ class TestNonAssertiveScopes:
             ('applied_work', 'task', '5422'),
         ]
 
-    def test_a_merged_into_it_on_the_subject_ref_is_an_accepted_residual(self):
-        # Here 'it' cannot be 5422 itself, so this is a real landing claim the gate gives up.
-        # No specimen evidences it, while every in-repo 'merged into it' names the destination.
-        assert _triples('task 5422 was merged into it') == []
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('task 5422 was merged into it', id='task'),
+            pytest.param('commit abc1234 was merged into it', id='commit'),
+        ],
+    )
+    def test_a_merged_into_it_on_the_subject_ref_is_an_accepted_residual(self, text):
+        # Accepted residual (task 8600): 'it' cannot be the subject itself, so this is a real landing
+        # claim the gate gives up. Over 96,955 Mem0 records and 42,351 Episodic nodes (2026-11-22),
+        # each of the 13 'merged into it/them' hits names the destination.
+        assert _triples(text) == []
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('task 5422 merged into it as commit abc1234', id='as-complement'),
+            pytest.param('the fix was merged into it in commit abc1234', id='in-adjunct'),
+        ],
+    )
+    def test_a_commit_bound_forward_from_merged_into_it_is_an_accepted_residual(self, text):
+        # Blanking 'merged' also gives up the commit the merge produced, which the pronoun never
+        # names and a git probe would settle cheaply; the same corpus holds no such hit.
+        assert _triples(text) == []
 
     def test_a_possessive_merged_tree_is_an_accepted_residual(self):
         # Accepted residual (task 6824): over 93,986 Mem0 records (2026-11-16) about 39 of 42 possessive
