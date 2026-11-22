@@ -254,3 +254,187 @@ def test_a_missing_listing_is_refused_naming_its_path(tmp_path):
 
     with pytest.raises(CLEANUP.UnreadableListing, match=re.escape(str(path))):
         CLEANUP.read_listing(path)
+
+
+# --- the delete run ---------------------------------------------------------------------
+
+
+def _reviewed(delete: tuple[str, ...], keep: tuple[str, ...] = ()) -> object:
+    return CLEANUP.Listing(
+        target=TARGET,
+        run_id='run-a',
+        taken_at='2026-11-21T00:00:00+00:00',
+        delete={name: 0 for name in delete},
+        keep={name: 0 for name in keep},
+    )
+
+
+class RecordingSleep:
+    """A ``sleep`` that records how many deletes had happened at each call, and for how long."""
+
+    def __init__(self, server: FakeGraphServer) -> None:
+        self.server = server
+        self.calls: list[tuple[int, float]] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.calls.append((len(self.server.deleted), seconds))
+
+
+def _execute(server: FakeGraphServer, reviewed: object, *, pace_s: float = 0.0) -> object:
+    plan = CLEANUP.plan_cleanup(server.graph_names())
+    return CLEANUP.execute(server, plan, reviewed, pace_s=pace_s, sleep=RecordingSleep(server))
+
+
+def _after_deletes(count: int, change: Callable[[FakeGraphServer], None]):
+    def hook(server: FakeGraphServer) -> None:
+        if len(server.deleted) == count:
+            change(server)
+
+    return hook
+
+
+def _restart(server: FakeGraphServer) -> None:
+    server.current_run_id = 'run-b'
+
+
+def test_it_deletes_the_reviewed_litter_one_at_a_time_in_plan_order_pacing_between():
+    server = FakeGraphServer(
+        {'probe_e1_gw0': 1, 'dark_factory': 41, '_probe': 0, 'sweep_e4_gw2': 3}
+    )
+    plan = CLEANUP.plan_cleanup(server.graph_names())
+    sleep = RecordingSleep(server)
+
+    record = CLEANUP.execute(
+        server, plan, _reviewed(('sweep_e4_gw2', '_probe', 'probe_e1_gw0')),
+        pace_s=7.5, sleep=sleep,
+    )
+
+    assert server.deleted == ['probe_e1_gw0', '_probe', 'sweep_e4_gw2']
+    assert record.deleted == ('probe_e1_gw0', '_probe', 'sweep_e4_gw2')
+    assert sleep.calls == [(1, 7.5), (2, 7.5)]
+    assert record.target == TARGET
+
+
+def test_unreviewed_litter_is_reported_not_deleted_and_vanished_reviewed_names_are_reported():
+    server = FakeGraphServer({'_probe': 0, 'evalmem_test_0123abcd': 2, 'dark_factory': 41})
+
+    record = _execute(server, _reviewed(('_probe', 'probe_e1_gw7')))
+
+    assert server.deleted == ['_probe']
+    assert record.unreviewed == ('evalmem_test_0123abcd',)
+    assert record.already_absent == ('probe_e1_gw7',)
+    assert 'evalmem_test_0123abcd' in server.counts
+
+
+def test_a_reviewed_listing_naming_a_kept_graph_never_deletes_it():
+    server = FakeGraphServer({'dark_factory': 41, '_probe': 0})
+
+    record = _execute(server, _reviewed(('dark_factory', '_probe')))
+
+    assert server.deleted == ['_probe']
+    assert server.counts == {'dark_factory': 41}
+    assert record.deleted == ('_probe',)
+
+
+def test_a_plan_naming_a_kept_graph_is_refused_at_the_delete():
+    server = FakeGraphServer({'dark_factory': 41})
+    plan = CLEANUP.CleanupPlan(delete=('dark_factory',), keep=())
+
+    with pytest.raises(CLEANUP.NotLitter, match="'dark_factory'"):
+        CLEANUP.execute(
+            server, plan, _reviewed(('dark_factory',)), pace_s=0.0, sleep=RecordingSleep(server)
+        )
+
+    assert server.deleted == []
+
+
+def test_the_record_holds_every_count_before_and_each_kept_count_after():
+    server = FakeGraphServer({'_probe': 0, 'probe_e1_gw0': 1, 'dark_factory': 41, 'reify': 7})
+
+    record = _execute(server, _reviewed(('_probe', 'probe_e1_gw0')))
+
+    assert dict(record.before) == {'_probe': 0, 'probe_e1_gw0': 1, 'dark_factory': 41, 'reify': 7}
+    assert dict(record.after) == {'dark_factory': 41, 'reify': 7}
+    assert record.shrank == ()
+    assert record.outcome == CLEANUP.Exit.OK
+
+
+def test_a_kept_graph_that_shrank_during_the_run_is_flagged():
+    def shrink(server: FakeGraphServer) -> None:
+        server.counts['dark_factory'] = 40
+
+    server = FakeGraphServer(
+        {'_probe': 0, 'probe_e1_gw0': 1, 'dark_factory': 41, 'reify': 7},
+        on_run_id=_after_deletes(1, shrink),
+    )
+
+    record = _execute(server, _reviewed(('_probe', 'probe_e1_gw0')))
+
+    assert record.shrank == (('dark_factory', 41, 40),)
+    assert dict(record.after) == {'dark_factory': 40, 'reify': 7}
+    assert record.outcome == CLEANUP.Exit.KEPT_GRAPH_SHRANK
+
+
+def test_a_kept_graph_that_vanished_during_the_run_is_flagged_as_shrunk_to_zero():
+    def vanish(server: FakeGraphServer) -> None:
+        server.counts.pop('reify', None)
+
+    server = FakeGraphServer(
+        {'_probe': 0, 'probe_e1_gw0': 1, 'dark_factory': 41, 'reify': 7},
+        on_run_id=_after_deletes(1, vanish),
+    )
+
+    record = _execute(server, _reviewed(('_probe', 'probe_e1_gw0')))
+
+    assert record.shrank == (('reify', 7, 0),)
+    assert record.outcome == CLEANUP.Exit.KEPT_GRAPH_SHRANK
+
+
+def test_a_kept_graph_that_grew_is_not_flagged():
+    def grow(server: FakeGraphServer) -> None:
+        server.counts['dark_factory'] = 45
+
+    server = FakeGraphServer(
+        {'_probe': 0, 'probe_e1_gw0': 1, 'dark_factory': 41},
+        on_run_id=_after_deletes(1, grow),
+    )
+
+    record = _execute(server, _reviewed(('_probe', 'probe_e1_gw0')))
+
+    assert record.shrank == ()
+    assert record.outcome == CLEANUP.Exit.OK
+
+
+def test_a_server_restart_stops_the_run_before_the_next_delete():
+    server = FakeGraphServer(
+        {'_probe': 0, 'probe_e1_gw0': 1, 'sweep_e4_gw2': 3, 'dark_factory': 41},
+        on_run_id=_after_deletes(2, _restart),
+    )
+
+    record = _execute(server, _reviewed(('_probe', 'probe_e1_gw0', 'sweep_e4_gw2')))
+
+    assert server.deleted == ['_probe', 'probe_e1_gw0']
+    assert record.deleted == ('_probe', 'probe_e1_gw0')
+    assert record.outcome == CLEANUP.Exit.SERVER_RESTARTED
+    assert (record.run_id_before, record.run_id_after) == ('run-a', 'run-b')
+
+
+def test_a_server_restart_after_the_last_delete_is_still_reported():
+    server = FakeGraphServer(
+        {'_probe': 0, 'dark_factory': 41}, on_run_id=_after_deletes(1, _restart)
+    )
+
+    record = _execute(server, _reviewed(('_probe',)))
+
+    assert record.deleted == ('_probe',)
+    assert record.outcome == CLEANUP.Exit.SERVER_RESTARTED
+    assert (record.run_id_before, record.run_id_after) == ('run-a', 'run-b')
+
+
+def test_a_clean_run_sees_one_run_id_throughout():
+    server = FakeGraphServer({'_probe': 0, 'dark_factory': 41}, 'run-a')
+
+    record = _execute(server, _reviewed(('_probe',)))
+
+    assert record.run_id_before == record.run_id_after == 'run-a'
+    assert record.outcome == CLEANUP.Exit.OK
