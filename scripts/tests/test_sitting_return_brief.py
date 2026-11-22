@@ -991,17 +991,62 @@ class TestRootsStatement:
         line = _line_naming(_header(env.output.read_text()), 'project roots')
         assert 'default' in line and str(env.df) in line
 
-    def test_a_queue_reached_only_through_a_decision_record_is_named(self, env):
+    def test_a_queue_known_only_through_the_registry_gets_rows_in_sections_two_to_five(self, env):
         elsewhere = env.tmp / 'src' / 'elsewhere' / 'data' / 'escalations'
-        elsewhere.mkdir(parents=True)
+        _esc(elsewhere, id='esc-402-1', timestamp=IN_WINDOW)
         _closed_decision(env.fleet, 'dec-elsewhere', closed_at=CLOSED_IN_WINDOW,
                          escalations_dir=normalize_escalations_dir(elsewhere), escalation_id='esc-401-1')
 
-        header = _header(mod.render(env.build()))
+        document = env.build()
+        text = mod.render(document)
 
-        outside = _line_naming(header, 'outside those roots')
-        assert normalize_escalations_dir(elsewhere) in outside
+        assert 'elsewhere' in document.projects
+        sections = _sections(text)
+        for title in TITLES[1:5]:
+            assert '### elsewhere' in sections[title].splitlines(), title
+        assert _line_naming(_header(text), 'outside those roots').endswith(': none')
+
+    def test_a_queue_of_no_known_shape_is_listed_outside_and_not_measured(self, env):
+        odd = env.tmp / 'odd' / 'queue'
+        odd.mkdir(parents=True)
+        _closed_decision(env.fleet, 'dec-odd', closed_at=CLOSED_IN_WINDOW,
+                         escalations_dir=normalize_escalations_dir(odd), escalation_id='esc-403-1')
+
+        document = env.build()
+
+        outside = _line_naming(_header(mod.render(document)), 'outside those roots')
+        assert normalize_escalations_dir(odd) in outside
         assert normalize_escalations_dir(env.queue) not in outside
+        assert list(document.projects) == ['dark_factory']
+
+    def test_a_configured_root_holding_no_queue_is_measured_and_named(self, env):
+        reify = env.tmp / 'src' / 'reify'
+        reify.mkdir(parents=True)
+
+        document = env.build(env.df, reify)
+
+        header = _header(mod.render(document))
+        assert 'reify' in document.projects
+        assert str(reify) in _line_naming(header, 'project roots')
+        holding_none = _line_naming(header, 'configured roots holding no scanned queue')
+        assert str(reify) in holding_none and str(env.df) not in holding_none
+
+    def test_with_every_configured_root_holding_a_queue_none_holds_no_queue(self, env):
+        line = _line_naming(_header(mod.render(env.build())), 'configured roots holding no scanned queue')
+
+        assert line.endswith(': none')
+
+    def test_a_registry_queue_folding_onto_a_configured_project_leaves_the_configured_root_measured(self, env):
+        twin = env.tmp / 'elsewhere' / 'dark_factory'
+        queue = twin / 'data' / 'escalations'
+        queue.mkdir(parents=True)
+        _closed_decision(env.fleet, 'dec-twin', closed_at=CLOSED_IN_WINDOW,
+                         escalations_dir=normalize_escalations_dir(queue), escalation_id='esc-404-1')
+
+        state = env.build().projects['dark_factory']
+
+        assert state.root == str(env.df)
+        assert any(gap.source == 'project_root' and gap.path == str(twin) for gap in state.landed.shortfalls)
 
     def test_with_every_queue_under_a_measured_root_none_is_outside(self, env):
         outside = _line_naming(_header(mod.render(env.build())), 'outside those roots')
