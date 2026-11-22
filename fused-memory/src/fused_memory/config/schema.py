@@ -509,9 +509,11 @@ class RoutingConfig(BaseModel):
     reasoning_effort: Literal['low', 'medium', 'high'] | None = Field(
         default=None,
         description=(
-            'The reasoning effort the routing call sends. None KEEPS the '
-            'non-reasoning request: temperature 0.0 and max_tokens. Set, it is '
-            'sent with max_completion_tokens and no temperature '
+            'The reasoning effort the routing call sends to the pinned '
+            'routing.model, which it requires: an effort on the inherited '
+            'llm.model is refused at load. None KEEPS the non-reasoning '
+            'request: temperature 0.0 and max_tokens. Set, it is sent with '
+            'max_completion_tokens and no temperature '
             '(routing/openai_client.py::routing_chat_params). Restart-only, '
             'like openai_api_url.'
         ),
@@ -521,6 +523,17 @@ class RoutingConfig(BaseModel):
     @classmethod
     def _blank_leaf_inherits(cls, value: str | None) -> str | None:
         return blank_means_inherit(value)
+
+    @model_validator(mode='after')
+    def _effort_needs_a_pinned_model(self) -> 'RoutingConfig':
+        """The API refuses reasoning_effort for a non-reasoning model, and the routing layer degrades
+        every such call to its non-LLM path, so an effort on the inherited llm.model fails at load."""
+        if self.reasoning_effort is not None and self.model is None:
+            raise ValueError(
+                f'routing.reasoning_effort {self.reasoning_effort!r} requires routing.model; '
+                'an effort is never sent to the inherited llm.model',
+            )
+        return self
 
 
 # --- Queue ---

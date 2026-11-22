@@ -11,7 +11,6 @@ from pydantic import ValidationError
 
 from fused_memory.config.env_precedence import reset_warning_cache
 from fused_memory.config.schema import RoutingConfig
-from fused_memory.routing import openai_client
 from fused_memory.routing.openai_client import (
     LazyOpenAIClient,
     RoutingEndpointUnset,
@@ -269,7 +268,17 @@ class TestRoutingModelLeaves:
 
     def test_an_unknown_effort_is_refused(self):
         with pytest.raises(ValidationError):
-            RoutingConfig.model_validate({'reasoning_effort': 'extreme'})
+            RoutingConfig.model_validate({'model': LUNA, 'reasoning_effort': 'extreme'})
+
+    @pytest.mark.parametrize('model', [None, '', '   '])
+    def test_an_effort_without_a_pinned_model_is_refused_naming_both_leaves(self, model):
+        """An effort sent to the inherited llm.model, a non-reasoning gpt-4o-mini today, is refused
+        by the API, and every routing call would degrade to its non-LLM path."""
+        with pytest.raises(ValidationError) as raised:
+            RoutingConfig.model_validate({'model': model, 'reasoning_effort': 'low'})
+
+        assert 'routing.reasoning_effort' in str(raised.value)
+        assert 'routing.model' in str(raised.value)
 
 
 class TestRoutingChatParams:
@@ -283,15 +292,9 @@ class TestRoutingChatParams:
             'model': LUNA, 'reasoning_effort': 'low', 'max_completion_tokens': 256,
         }
 
-    def test_the_model_and_the_effort_vary_independently(self, mock_config):
+    def test_a_pinned_model_without_an_effort_sends_the_non_reasoning_request(self, mock_config):
         mock_config.routing.model = LUNA
         assert routing_chat_params(mock_config) == {'model': LUNA, 'temperature': 0.0, 'max_tokens': 256}
-
-        mock_config.routing.model = None
-        mock_config.routing.reasoning_effort = 'medium'
-        assert routing_chat_params(mock_config) == {
-            'model': 'gpt-4o-mini', 'reasoning_effort': 'medium', 'max_completion_tokens': 256,
-        }
 
 
 class TestRoutingEndpoint:
@@ -363,12 +366,17 @@ class TestTheRoutingClientLog:
 
         assert self._routing_lines(caplog) == []
 
-    def test_a_pinned_model_with_an_unset_leaf_builds_no_client(self, mock_config, monkeypatch):
-        built = []
-        monkeypatch.setattr(openai_client, 'AsyncOpenAI', lambda **kwargs: built.append(kwargs))
-        holder = LazyOpenAIClient(_pinned(mock_config, key=None))
+    @pytest.mark.asyncio
+    async def test_a_pinned_model_with_an_unset_leaf_builds_no_client(self, mock_config, caplog):
+        with mock_openai_server() as server:
+            mock_config.llm.providers.openai.api_url = server.base_url
+            holder = LazyOpenAIClient(_pinned(mock_config, key=None))
 
-        with pytest.raises(RoutingEndpointUnset):
-            holder.get()
+            with caplog.at_level(logging.INFO):
+                for _ in range(2):
+                    with pytest.raises(RoutingEndpointUnset):
+                        holder.get()
+            await holder.close()
 
-        assert built == []
+        assert self._routing_lines(caplog) == []
+        assert server.requests == []
