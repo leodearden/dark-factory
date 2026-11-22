@@ -127,6 +127,10 @@ Each is read in full in `design.md` §7.
   * the summaries supersession reading (S1). All five of the ratings that
     rule decided fell on the control. Without the rule, S1 is still
     +0.0625 [−0.0176, 0.1426], a pass (`design.md` §4.3).
+* **The summary letters follow a public rule**, sha256(fixture_id:arm), so
+  the summaries' blindness rested on the rater not recomputing it. `score`
+  refuses a key file that differs from the rule, and the committed key
+  matches it.
 * **R2 is underpowered at this n.** Only 14 fixtures split the arms on
   no-false-merge. At n = 200 with b + c = 14, even a zero difference gives a
   lower bound of −0.0367, below the −0.03 bar. So R2 could pass only with

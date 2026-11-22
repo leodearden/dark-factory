@@ -110,7 +110,6 @@ from luna_eval_frame import (
 )
 from luna_eval_score import (
     RunFileError,
-    SiteRuns,
     VerdictError,
     build_report,
     cost_block,
@@ -124,7 +123,6 @@ from luna_eval_score import (
     routing_layer_decision,
     site_block,
     summary_decision,
-    summary_items,
     summary_rating_worksheet,
 )
 from luna_eval_sites import (
@@ -435,24 +433,32 @@ def _calls_per_day(obj: Any) -> dict[str, float]:
     return {site: float(calls) for site, calls in obj.items()}
 
 
-def _offered_summary_items(records: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
-    """The items summary_rating_worksheet offered, recomputed from the committed runs alone."""
-    return [{'fixture_id': fid, 'node_uuid': node} for fid, node in summary_items(SiteRuns.from_records(records))]
+def _registered_records(eval_dir: Path, runs: Sequence[Mapping[str, Any]], site: Site) -> list[Mapping[str, Any]]:
+    """*site*'s run records, once they cover exactly the fixtures its committed fixture file
+    pre-registers. A run killed between fixtures leaves no failure line, so without this a
+    decision would quietly be taken over the subset that ran."""
+    records = _site_records(runs, site)
+    registered = _by_fixture_id(site, _read_rows(eval_dir / FIXTURE_FILES[site])).keys()
+    ran = {record['fixture_id'] for record in records}
+    if unran := sorted(registered - ran):
+        raise RunFileError(f'{site}: {len(unran)} pre-registered fixture(s) have no run line under any arm: {unran}')
+    if unregistered := sorted(ran - registered):
+        raise RunFileError(f'{site}: {len(unregistered)} run fixture(s) are not pre-registered: {unregistered}')
+    return records
 
 
 def _site_decisions(eval_dir: Path, runs: Sequence[Mapping[str, Any]]) -> dict[Site, dict[str, Any]]:
+    records = {site: _registered_records(eval_dir, runs, site) for site in Site}
     resolve = _by_fixture_id(Site.resolve_edge, _read_rows(eval_dir / FIXTURE_FILES[Site.resolve_edge]))
     gold = load_resolve_gold(read_json(eval_dir / RESOLVE_GOLD_FILE), resolve_gold_worksheet(resolve))
-    summaries = _site_records(runs, Site.summaries)
     ratings = load_summary_ratings(
-        read_json(eval_dir / SUMMARY_RATINGS_FILE), _offered_summary_items(summaries),
-        read_json(eval_dir / SUMMARY_KEY_FILE),
+        read_json(eval_dir / SUMMARY_RATINGS_FILE), records[Site.summaries], read_json(eval_dir / SUMMARY_KEY_FILE),
     )
     routing = load_routing_verdicts(read_json(eval_dir / ROUTING_VERDICTS_FILE), _routing_worksheet(eval_dir, runs))
     return {
-        Site.resolve_edge: resolve_edge_decision(_site_records(runs, Site.resolve_edge), gold),
-        Site.summaries: summary_decision(summaries, ratings),
-        **{site: routing_label_decision(_site_records(runs, site), routing.get(site, {})) for site in ROUTING_SITES},
+        Site.resolve_edge: resolve_edge_decision(records[Site.resolve_edge], gold),
+        Site.summaries: summary_decision(records[Site.summaries], ratings),
+        **{site: routing_label_decision(records[site], routing.get(site, {})) for site in ROUTING_SITES},
     }
 
 

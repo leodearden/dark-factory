@@ -432,24 +432,36 @@ def resolve_gold_worksheet(fixtures: Mapping[str, Mapping[str, Any]]) -> list[di
 SUMMARY_LETTERS = ('A', 'B')
 
 
+def summary_key(runs: SiteRuns) -> list[dict[str, str]]:
+    """Each summary item's letters to arms: the arm whose sha256(fixture_id:arm) sorts first is A.
+
+    The rule reads only the fixture id and the arm names, so anyone holding the runs can
+    recompute it; blindness rests on the rater not doing so.
+    """
+    return [
+        {'fixture_id': fid, 'node_uuid': node_uuid,
+         **dict(zip(SUMMARY_LETTERS, _sha256_order(fid, runs.arms), strict=True))}
+        for fid, node_uuid in summary_items(runs)
+    ]
+
+
 def summary_rating_worksheet(
     fixtures: Mapping[str, Mapping[str, Any]], runs: Iterable[RunRecord],
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """The rating rows and, separately, their key.
+    """The rating rows and, separately, their summary_key.
 
-    Each row is one summary item with its inputs and both arms' summaries as A and B:
-    the arm whose sha256(fixture_id:arm) sorts first is A. *fixtures* are run_summaries'
-    restored fixtures by fixture id, each with its ``previous`` episode contents. An empty
-    summary shows as None, a node the arm dropped. The key maps each item's letters to arms
-    and is written apart from the rows.
+    Each row is one summary item with its inputs and both arms' summaries under the
+    key's letters. *fixtures* are run_summaries' restored fixtures by fixture id, each
+    with its ``previous`` episode contents. An empty summary shows as None, a node the
+    arm dropped. The key is written apart from the rows.
     """
     site_runs = SiteRuns.from_records(runs)
     by_fixture = {fid: dict(zip(site_runs.arms, (control, candidate), strict=True))
                   for fid, control, candidate in site_runs.pairs()}
+    key = summary_key(site_runs)
     rows: list[dict[str, Any]] = []
-    key: list[dict[str, str]] = []
-    for fid, node_uuid in summary_items(site_runs):
-        fixture, letters = fixtures[fid], dict(zip(SUMMARY_LETTERS, _sha256_order(fid, site_runs.arms), strict=True))
+    for entry in key:
+        fid, node_uuid, fixture = entry['fixture_id'], entry['node_uuid'], fixtures[entry['fixture_id']]
         node = {node['node_uuid']: node for node in fixture['nodes']}[node_uuid]
         rows.append({
             'fixture_id': fid, 'node_uuid': node_uuid, 'node_name': node['node_name'],
@@ -458,10 +470,10 @@ def summary_rating_worksheet(
             'facts': [edge['fact'] for edge in fixture['edges']
                       if node_uuid in (edge['source_node_uuid'], edge['target_node_uuid'])],
             'summaries': {
-                letter: by_fixture[fid][arm]['summaries'].get(node_uuid) or None for letter, arm in letters.items()
+                letter: by_fixture[fid][entry[letter]]['summaries'].get(node_uuid) or None
+                for letter in SUMMARY_LETTERS
             },
         })
-        key.append({'fixture_id': fid, 'node_uuid': node_uuid, **letters})
     return rows, key
 
 
@@ -573,16 +585,31 @@ def _rated_name(entry: Mapping[str, Any]) -> str:
     return f"{_item_name(entry['fixture_id'], entry['node_uuid'])}:{entry['summary']}"
 
 
-def load_summary_ratings(
-    obj: Any, worksheet: Sequence[Mapping[str, Any]], key: Sequence[Mapping[str, str]],
-) -> dict[SummaryItem, dict[str, str]]:
+def _checked_summary_key(key: Any, runs: SiteRuns) -> dict[SummaryItem, dict[str, str]]:
+    """item -> its key entry, once *key* is exactly summary_key over *runs*: a stale or edited key
+    would swap the arms when unblinding."""
+    if not isinstance(key, list) or not all(isinstance(entry, Mapping) for entry in key):
+        raise MalformedVerdicts('the summary key is a list of {fixture_id, node_uuid, A, B}')
+    derived = {(entry['fixture_id'], entry['node_uuid']): entry for entry in summary_key(runs)}
+    given = Counter((entry.get('fixture_id'), entry.get('node_uuid')) for entry in key)
+    by_item = {(entry.get('fixture_id'), entry.get('node_uuid')): dict(entry) for entry in key}
+    differing = [
+        f'{fid}/{node}' for fid, node in derived.keys() | given.keys()
+        if given[(fid, node)] != 1 or by_item.get((fid, node)) != derived.get((fid, node))
+    ]
+    _reject(MalformedVerdicts, differing, 'summary key entr(ies) differ from the sha256(fixture_id:arm) rule')
+    return derived
+
+
+def load_summary_ratings(obj: Any, records: Iterable[RunRecord], key: Any) -> dict[SummaryItem, dict[str, str]]:
     """``{'ratings': [{fixture_id, node_uuid, summary, rating, rationale}]}``, one per letter of every
-    worksheet row, unblinded through *key*: item -> arm -> rating."""
-    arms_by_item = {(entry['fixture_id'], entry['node_uuid']): entry for entry in key}
-    items = [(row['fixture_id'], row['node_uuid']) for row in worksheet]
-    if unkeyed := [_item_name(*item) for item in items if item not in arms_by_item]:
-        raise MalformedVerdicts(f'the key does not cover {len(unkeyed)} worksheet item(s): {sorted(unkeyed)}', unkeyed)
-    offered = {f'{_item_name(*item)}:{letter}': item for item in items for letter in SUMMARY_LETTERS}
+    summary item the run *records* offer, unblinded through *key*: item -> arm -> rating.
+
+    *key* is the key file summary_rating_worksheet wrote; it is refused unless it is exactly the
+    summary_key the records derive.
+    """
+    letters = _checked_summary_key(key, SiteRuns.from_records(records))
+    offered = {f'{_item_name(*item)}:{letter}': item for item in letters for letter in SUMMARY_LETTERS}
     entries = _checked(
         _shaped_entries(obj, 'ratings', RATING_SHAPE), _rated_name, offered,
         lambda entry, _: entry['rating'] in SUMMARY_RATINGS,
@@ -590,7 +617,7 @@ def load_summary_ratings(
     ratings: dict[SummaryItem, dict[str, str]] = {}
     for entry in entries:
         item = (entry['fixture_id'], entry['node_uuid'])
-        ratings.setdefault(item, {})[arms_by_item[item][entry['summary']]] = entry['rating']
+        ratings.setdefault(item, {})[letters[item][entry['summary']]] = entry['rating']
     return ratings
 
 

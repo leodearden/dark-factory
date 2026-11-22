@@ -615,13 +615,15 @@ def _ratings_file(rows: list[dict[str, Any]], **overrides: Any) -> dict[str, Any
 class TestTheSummaryRatingLoader:
     def test_ratings_are_unblinded_through_the_key(self) -> None:
         rows, key = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
-        ratings = score.load_summary_ratings(_ratings_file(rows), rows, key)
+        ratings = score.load_summary_ratings(_ratings_file(rows), SUMMARY_RUNS, key)
         assert ratings[(EPISODE, 'A')] == {CONTROL: 'faithful', LUNA: 'faithful'}
         assert ratings[(EPISODE, 'B')] == {CONTROL: 'faithful', LUNA: 'dropped'}
 
     def test_the_loaded_ratings_drive_the_decision(self) -> None:
         rows, key = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
-        decision = score.summary_decision(SUMMARY_RUNS, score.load_summary_ratings(_ratings_file(rows), rows, key))
+        decision = score.summary_decision(
+            SUMMARY_RUNS, score.load_summary_ratings(_ratings_file(rows), SUMMARY_RUNS, key),
+        )
         assert decision['statistics']['faithful_rate']['control_only'] == 1
 
     @pytest.mark.parametrize(('mutate', 'error', 'offender'), [
@@ -636,14 +638,25 @@ class TestTheSummaryRatingLoader:
         rows, key = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
         obj = {'ratings': mutate(_ratings_file(rows)['ratings'])}
         with pytest.raises(getattr(score, error)) as caught:
-            score.load_summary_ratings(obj, rows, key)
+            score.load_summary_ratings(obj, SUMMARY_RUNS, key)
         assert offender in str(caught.value)
 
-    def test_a_key_that_does_not_cover_the_worksheet_is_refused(self) -> None:
+    @pytest.mark.parametrize(('mutate', 'offender'), [
+        pytest.param(lambda key: key[:1], 'ep-1/B', id='uncovered'),
+        pytest.param(lambda key: [key[0] | {'A': key[0]['B'], 'B': key[0]['A']}, *key[1:]], 'ep-1/A', id='swapped'),
+        pytest.param(lambda key: [*key, key[1]], 'ep-1/B', id='repeated'),
+        pytest.param(lambda key: [*key, key[0] | {'node_uuid': 'Z'}], 'ep-1/Z', id='unoffered'),
+    ])
+    def test_a_key_other_than_the_sha256_rule_is_refused_naming_the_item(self, mutate: Any, offender: str) -> None:
         rows, key = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
         with pytest.raises(score.MalformedVerdicts) as caught:
-            score.load_summary_ratings(_ratings_file(rows), rows, key[:1])
-        assert 'ep-1/B' in str(caught.value)
+            score.load_summary_ratings(_ratings_file(rows), SUMMARY_RUNS, mutate(key))
+        assert offender in str(caught.value)
+
+    def test_a_key_that_is_not_a_list_of_entries_is_refused(self) -> None:
+        rows, _ = score.summary_rating_worksheet(SUMMARY_FIXTURES, SUMMARY_RUNS)
+        with pytest.raises(score.MalformedVerdicts):
+            score.load_summary_ratings(_ratings_file(rows), SUMMARY_RUNS, {'A': CONTROL})
 
 
 class TestTheRoutingVerdictLoader:

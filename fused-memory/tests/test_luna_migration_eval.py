@@ -9,6 +9,7 @@ here reaches a FalkorDB, a journal in data/ or a network.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from collections.abc import Sequence
@@ -705,6 +706,41 @@ class TestScore:
         adjudicated.file(missing).unlink()
         out = adjudicated.private / 'report.json'
         assert _score(adjudicated, out) == 2
+        assert not out.exists()
+
+    def test_runs_missing_a_pre_registered_fixture_exit_2_naming_it(
+        self, adjudicated: _Eval, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A run killed between fixtures leaves no failure line: the decision must not be taken
+        over the fixtures that happened to run."""
+        lines = [r for r in adjudicated.lines(adjudicated.runs) if r['fixture_id'] != 'w-2']
+        adjudicated.runs.write_text(''.join(json.dumps(r) + '\n' for r in lines))
+        out = adjudicated.private / 'report.json'
+        with caplog.at_level(logging.ERROR):
+            assert _score(adjudicated, out) == 2
+        assert 'RunFileError' in caplog.text and "['w-2']" in caplog.text
+        assert not out.exists()
+
+    def test_runs_over_a_fixture_not_pre_registered_exit_2_naming_it(
+        self, adjudicated: _Eval, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        fixtures = adjudicated.file('fixtures-classifier.jsonl')
+        kept = [fixture for fixture in adjudicated.lines(fixtures) if fixture['id'] != 'w-2']
+        fixtures.write_text(''.join(json.dumps(fixture) + '\n' for fixture in kept))
+        out = adjudicated.private / 'report.json'
+        with caplog.at_level(logging.ERROR):
+            assert _score(adjudicated, out) == 2
+        assert 'RunFileError' in caplog.text and "not pre-registered: ['w-2']" in caplog.text
+        assert not out.exists()
+
+    def test_a_summary_key_that_swaps_the_arms_exits_2(self, adjudicated: _Eval, caplog: pytest.LogCaptureFixture) -> None:
+        key = json.loads(adjudicated.file('ratings-summaries-key.json').read_text())
+        _write_json(adjudicated.file('ratings-summaries-key.json'), [entry | {'A': entry['B'], 'B': entry['A']}
+                                                                     for entry in key])
+        out = adjudicated.private / 'report.json'
+        with caplog.at_level(logging.ERROR):
+            assert _score(adjudicated, out) == 2
+        assert 'MalformedVerdicts' in caplog.text and f'{DF}/ep-1/A' in caplog.text
         assert not out.exists()
 
     def test_a_verdict_file_the_loader_refuses_exits_2(self, adjudicated: _Eval) -> None:

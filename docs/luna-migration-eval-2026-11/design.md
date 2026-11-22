@@ -639,6 +639,13 @@ These are API-list comparisons only.
   known while labelling (`adjudication.blinding_residuals`). Every
   supersession-rule unsupported rating, and 28 of the 38 overreach verdicts,
   landed on the control.
+* **The summary letters follow a public rule.** Each item's A and B are its
+  arms in sha256(fixture_id:arm) order
+  (`luna_eval_score.py::summary_key`), which `runs.jsonl` alone determines.
+  So the summaries' blindness rested on the rater not recomputing that rule,
+  not on a secret. `score` re-derives the key from the rule and refuses a
+  `ratings-summaries-key.json` that differs from it. The committed key
+  matches at all 80 items.
 * **R2's power.** At this frame's n, R2 can pass only if luna wins the
   no-false-merge discordants outright (§4.2).
 * **Proxy overhead, now measured.** On every site, luna's input tokens per
