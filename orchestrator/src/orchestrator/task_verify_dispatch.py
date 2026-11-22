@@ -711,7 +711,7 @@ class TaskVerifyDispatcher(DispatchRecords):
         files = await self._task_files(call, tip_sha, base_sha)
         existing = [f for f in files if (call.worktree / f).is_file()]
         modules = tuple(with_artifact_consumer_modules(
-            call.config, call.module_configs, files, 'task',
+            call.config, call.module_configs, existing, 'task',
         ))
         plan = derive_verify_plan(
             existing, list(modules), call.config,

@@ -9574,6 +9574,10 @@ async def _run_scoped_verification_body(
                 role=role,
                 admission_request=plan_request(admission_plan, None),
             )
+        # Filter to files that still exist — tasks may delete files as part of
+        # their work. The artifact widening and both planner sites below read
+        # this one on-disk set.
+        existing_files = [f for f in task_files or () if (worktree / f).exists()]
         if task_files:
             # Task 5296: a touched behavioural artifact (a skills/ script, an
             # agent-prompt SKILL.md, the root yaml) runs the registered
@@ -9581,7 +9585,7 @@ async def _run_scoped_verification_body(
             # Idempotent: the remote task leg already receives the widened
             # set from task_verify_dispatch.py::TaskVerifyDispatcher._scope_of.
             widened_modules = verify_plan.with_artifact_consumer_modules(
-                config, module_configs, task_files, role,
+                config, module_configs, existing_files, role,
             )
             added = [mc.prefix for mc in widened_modules[len(module_configs):]]
             if added:
@@ -9631,8 +9635,6 @@ async def _run_scoped_verification_body(
                 )
             # Apply file-level scoping within each subproject when task_files given
             if task_files:
-                # Filter to files that still exist — tasks may delete files as part of their work
-                existing_files = [f for f in task_files if (worktree / f).exists()]
                 # Shared structural-content cache (task γ amendment): threaded
                 # into derive_verify_plan's worktree_reader below, so a
                 # touched file is read from disk at most once per attempt
@@ -9853,8 +9855,6 @@ async def _run_scoped_verification_body(
 
         # No module_configs — try fallback or global
         if task_files:
-            # Filter to files that still exist — tasks may delete files as part of their work
-            existing_files = [f for f in task_files if (worktree / f).exists()]
             # Mirror the same docs-only short-circuit as the module_configs
             # branch: with no .py/.rs files _build_fallback_config would
             # return None and we'd fall through to the unsafe global pytest.

@@ -2466,6 +2466,15 @@ class TestWithArtifactConsumerModules:
 
         assert with_artifact_consumer_modules(config, [], ['skills/x.py', SPAWN_SH], 'task') == []
 
+    def test_a_non_empty_set_is_widened_beside_unowned_source(self, tmp_path):
+        config = self._config(tmp_path)
+
+        widened = with_artifact_consumer_modules(
+            config, [ARTIFACT_ORCH_MC], ['conftest.py', SPAWN_SH], 'task',
+        )
+
+        assert widened == ARTIFACT_MODULES
+
     def test_merge_role_is_the_identity(self, tmp_path):
         config = self._config(tmp_path)
 

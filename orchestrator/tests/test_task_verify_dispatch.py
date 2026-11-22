@@ -935,6 +935,21 @@ class TestArtifactConsumerWidening:
         assert [run.scope_kind for run in plan.runs] != [ScopeKind.TRIVIAL]
         assert executed_module_prefixes(plan) == frozenset(expected)
 
+    async def test_a_deleted_source_file_never_suppresses_a_present_artifact(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _harness(
+            tmp_path, TaskVerifyPolicy(host_policy='remote_all'), touch=UNBLOCK_SKILL,
+            transport=_Transport(verify=_answers(_result(True))),
+            modules=[], config=_artifact_config(ARTIFACT_MODULES),
+        )
+
+        await h.call(task_files=['skills/factory-init/scripts/find_escalation_port.py', UNBLOCK_SKILL])
+
+        assert h.only_sidecar()['reason'] == 'remote'
+        spec = _sent_spec(h.transport)
+        assert tuple(vc.prefix for vc in spec.verify_commands) == ('orchestrator',)
+
     async def test_eligibility_is_decided_over_the_consumer_modules(self, tmp_path: Path) -> None:
         h = _harness(
             tmp_path, TaskVerifyPolicy(host_policy='remote_modules', remote_modules=('tests/scripts',)),

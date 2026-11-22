@@ -677,6 +677,38 @@ class TestRow3ProseOnlyTrivialBothRoles:
         assert executed == baseline
 
     @pytest.mark.asyncio
+    async def test_unowned_source_fan_out_takes_in_the_artifact_consumer_modules(
+        self, tmp_path: Path,
+    ) -> None:
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
+        files = [*self._write_artifact(tmp_path, 'conftest.py'), *self._write_artifact(tmp_path, SPAWN_SH)]
+
+        result, executed, _fake = await _drive_producer(
+            tmp_path, config, [ARTIFACT_ORCH_MC], task_files=files, role='task',
+        )
+
+        assert not result.trivial
+        assert executed == {mc.prefix: mc for mc in ARTIFACT_MODULES}
+
+    @pytest.mark.asyncio
+    async def test_a_deleted_source_file_never_suppresses_a_present_artifact(
+        self, tmp_path: Path,
+    ) -> None:
+        config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
+        deleted = 'skills/factory-init/scripts/find_escalation_port.py'
+        files = [deleted, *self._write_artifact(tmp_path, UNBLOCK_SKILL)]
+
+        result, executed, _fake = await _drive_producer(
+            tmp_path, config, [], task_files=files, role='task',
+        )
+
+        assert not result.trivial
+        assert set(executed) == {'orchestrator'}
+        test_command = executed['orchestrator'].test_command
+        assert test_command is not None
+        assert all(test in test_command for test in SKILL_PROMPT_CONSUMERS), test_command
+
+    @pytest.mark.asyncio
     async def test_prose_stays_trivial_beside_a_consumer_registry(self, tmp_path: Path) -> None:
         config = registry_config(ARTIFACT_MODULES, project_root=tmp_path, merge_verify_breadth='scoped')
         files = self._write_artifact(tmp_path, 'README.md')

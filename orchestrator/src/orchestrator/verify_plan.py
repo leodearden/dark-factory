@@ -1115,24 +1115,27 @@ def effective_merge_module_configs(
 def with_artifact_consumer_modules(
     config: OrchestratorConfig,
     module_configs: list[ModuleConfig],
-    files: Sequence[str],
+    existing_files: Sequence[str],
     role: Literal['merge', 'task'],
 ) -> list[ModuleConfig]:
     """*module_configs* widened by the registered modules whose tests consume a touched behavioural artifact.
 
-    An empty set with ``.py``/``.rs`` source in *files* stays empty: the
+    *existing_files* is the on-disk set :func:`derive_verify_plan` plans over,
+    so a deleted source path cannot suppress a present artifact's consumers.
+    An empty set with ``.py``/``.rs`` source in it stays empty: the
     fallback's configured chain already runs every suite, and widening would
-    drop the source file no module owns. A non-empty set is widened even then
-    (:func:`_source_owned_by_no_module`): the added modules join verify.py's
-    case-(b) full fan-out, which covers their consumer tests. Merge role returns the set unchanged
-    (see :func:`_artifact_consumer_demand`). Idempotent, so a boundary may
-    resolve it once (``task_verify_dispatch.py::TaskVerifyDispatcher._scope_of``
-    does, for the remote spec) and the executor's own call is then a no-op.
+    drop the source file no module owns. A non-empty set is widened even when
+    no module owns that source: the added modules join verify.py's case-(b)
+    full fan-out, which covers their consumer tests. Merge role returns the
+    set unchanged (see :func:`_artifact_consumer_demand`). Idempotent, so a
+    boundary may resolve it once
+    (``task_verify_dispatch.py::TaskVerifyDispatcher._scope_of`` does, for the
+    remote spec) and the executor's own call is then a no-op.
     """
-    if not module_configs and _source_owned_by_no_module(files, module_configs):
-        return list(module_configs)
+    if not module_configs and _has_source_files(existing_files):
+        return []
     registry = list(config.module_configs_or_empty.values())
-    demand = _artifact_consumer_demand(files, registry, role)
+    demand = _artifact_consumer_demand(existing_files, registry, role)
     present = {mc.prefix for mc in module_configs}
     return [
         *module_configs,
@@ -1616,9 +1619,10 @@ def derive_verify_plan(
     ``'__fallback__'`` module is derived from *config*'s global commands via
     :func:`_derive_fallback_runs`. Its pytest run carries the fallback test
     floor, as an intent record no production caller acts on:
-    ``orchestrator/src/orchestrator/task_verify_dispatch.py::_TaskVerifyDispatcher._scope_of``
-    and ``scripts/hook_module_checks.py::touched_modules`` read only
-    :func:`executed_module_prefixes`, which the floor cannot change. A caller
+    ``orchestrator/src/orchestrator/task_verify_dispatch.py::TaskVerifyDispatcher._scope_of``
+    reads only :func:`executed_module_prefixes`, and
+    ``scripts/hook_module_checks.py::touched_modules`` reads only which
+    lint/type legs execute; the floor changes neither. A caller
     that reconciles this decision against an executed fallback config must
     pass *fallback_test_floor* False, as
     ``orchestrator/src/orchestrator/verify.py::_safe_derive_executed_fallback_plan``
