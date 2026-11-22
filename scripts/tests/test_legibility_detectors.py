@@ -14,6 +14,9 @@ import pytest
 from legibility import coder, detectors, digest, inventory, sampling
 from legibility.detectors import AgentClass, CarrierKind, SignalClass
 from legibility_carrier_fixtures import (
+    CLIENT_RENDERED_IDS,
+    CLIENT_RENDERED_TURNS,
+    LOCAL_COMMAND_STDOUT_TURN,
     PROSE_QUOTING_THE_SCHEMA,
     SLASH_COMMAND_ARGLESS_TURN,
     SLASH_COMMAND_EMPTY_ARGS_TURN,
@@ -572,6 +575,48 @@ class TestParseSlashCommandExpansion:
 
     def test_plain_prose_is_not_an_expansion(self):
         assert detectors.parse_slash_command_expansion('status?') is None
+
+
+class TestClientRenderedTurn:
+    @pytest.mark.parametrize('text', CLIENT_RENDERED_TURNS, ids=CLIENT_RENDERED_IDS)
+    def test_a_whole_turn_the_client_composed_is_client_rendered(self, text):
+        assert detectors.is_client_rendered_turn(text)
+
+    @pytest.mark.parametrize('text', [
+        pytest.param(
+            '<command-name>/login</command-name>\n<command-args>  \n </command-args>',
+            id='whitespace_only_args',
+        ),
+        pytest.param(
+            '<local-command-stderr>Error: not logged in</local-command-stderr>',
+            id='local_command_stderr',
+        ),
+        pytest.param('\n\n[Request interrupted by user]\n\n', id='interrupt_in_blank_lines'),
+    ])
+    def test_other_client_rendered_shapes(self, text):
+        assert detectors.is_client_rendered_turn(text)
+
+    @pytest.mark.parametrize('text', [
+        pytest.param(SLASH_COMMAND_WITH_ARGS_TURN, id='typed_args'),
+        pytest.param(SLASH_COMMAND_ARGLESS_TURN + '\nwhy did that fail?', id='expansion_then_prose'),
+        pytest.param('[Request interrupted by user]\nno, use the other branch', id='interrupt_then_prose'),
+        pytest.param('I hit [Request interrupted by user] by mistake, carry on', id='interrupt_quoted'),
+        pytest.param('what does <command-name>/reflect</command-name> do?', id='expansion_quoted'),
+        pytest.param(LOCAL_COMMAND_STDOUT_TURN + '\nok now commit', id='stdout_then_prose'),
+        pytest.param(
+            '<local-command-stdout>a</local-command-stdout> fix it '
+            '<local-command-stdout>b</local-command-stdout>',
+            id='prose_between_two_stdout_blocks',
+        ),
+        pytest.param('status?', id='plain_prose'),
+    ])
+    def test_a_turn_holding_human_prose_is_not_client_rendered(self, text):
+        assert not detectors.is_client_rendered_turn(text)
+
+    def test_the_bare_interrupt_marker_stays_an_interrupt_signal(self):
+        hits = detectors.record_hits(user_record('[Request interrupted by user]'))
+
+        assert hits.count(SignalClass.INTERRUPT) == 1
 
 
 # ---------------------------------------------------------------------------
