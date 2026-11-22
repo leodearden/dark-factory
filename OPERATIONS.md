@@ -6037,12 +6037,34 @@ an off-cadence run would spend a Fable budget nobody scheduled.
 scripts/install-return-brief-timer.sh
 ```
 
-**Adding a project.** The brief scans every project root that
-`_task_db_scan.discover_project_roots` returns, plus every queue the decision
-registry has recorded. For a project the registry has never seen (e.g.
-know-live), set `DASHBOARD_KNOWN_PROJECT_ROOTS` (comma-separated) in the
-unit's environment. It replaces the default root rather than adding to it,
-so list dark-factory too.
+**Which projects sections 2–5 list.** Every measured project that is active.
+A project is active when its orchestrator unit is running, or when anything
+landed or was escalated in the window. The render finds a root's unit from
+the unit files in `--units-dir` (default `~/.config/systemd/user`, read
+through `scripts/orchestrator_projects.py`) and reads its state with
+`systemctl --user show`. A signal the render cannot read keeps the project
+listed, so an unreadable store never hides one. A paused project keeps its
+rows, each flagged `scheduler paused: <reason>` from its runs.db
+`scheduler_state`. One line closing the page, `Inactive projects (not in
+sections 2–5): ...`, names every other project with its root and reason.
+Section 3, "Landed", counts landings on main per
+`shared/src/shared/quality_series/landings.py::landings` (merge commits and
+fast-forwards, each train member counted), not orchestrator runs that
+finished done. Beside that count it states the unit's state and the window's
+new escalations. So the render runs one `git rev-list` per measured root and
+one `systemctl --user show` per orchestrator unit naming one. It makes no
+network call.
+
+**Adding a project.** The brief measures every project root that holds a
+queue the night scanned: each configured root's own queues, plus every queue
+the decision registry has recorded. So a project appears once the registry
+has seen it. The configured list is what
+`_task_db_scan.discover_project_roots` returns. Set
+`DASHBOARD_KNOWN_PROJECT_ROOTS` (comma-separated) in the unit's environment
+only for a project the registry has never seen and whose root holds no
+queue. The header names those roots on its `configured roots holding no
+scanned queue` line. The variable replaces the default root rather than
+adding to it, so list dark-factory too.
 
 **The apply half is agent work, not timer work.** Leo's answers are applied
 by a watcher session, following `skills/escalation-watcher/SKILL.md`,
