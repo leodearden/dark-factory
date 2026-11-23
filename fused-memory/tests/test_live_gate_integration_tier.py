@@ -11,9 +11,9 @@ import ast
 import textwrap
 from collections.abc import Iterator, Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
-from _ast_guard import parse_python_module
 from shared.pytest_mark_grammar import marker_name, pytestmark_elements
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -56,21 +56,42 @@ def scan_live_gated_tests(tree: ast.Module) -> tuple[list[str], list[str]]:
     return gated, not_integration
 
 
-def test_every_live_gated_test_is_in_the_integration_tier() -> None:
+class LiveGateScan(NamedTuple):
+    examined: int
+    gated: tuple[str, ...]
+    not_integration: tuple[str, ...]
+
+
+def scan_live_gated_tree(root: Path) -> LiveGateScan:
+    """Scan every `test_*.py` under *root*, naming each item `<relpath>::Class::test`."""
+    paths = sorted(root.rglob('test_*.py'))
     gated: list[str] = []
     not_integration: list[str] = []
-    for path in sorted(TESTS_DIR.rglob('test_*.py')):
-        relpath = path.relative_to(TESTS_DIR).as_posix()
-        module_gated, module_not_integration = scan_live_gated_tests(parse_python_module(path))
+    for path in paths:
+        source = path.read_text(encoding='utf-8')
+        if not any(name in source for name in LIVE_GATE_FACTORIES):  # a superset of _is_live_gate
+            continue
+        relpath = path.relative_to(root).as_posix()
+        module_gated, module_not_integration = scan_live_gated_tests(
+            ast.parse(source, filename=str(path)),
+        )
         gated.extend(f'{relpath}::{suffix}' for suffix in module_gated)
         not_integration.extend(f'{relpath}::{suffix}' for suffix in module_not_integration)
+    return LiveGateScan(len(paths), tuple(gated), tuple(not_integration))
 
-    assert gated, f'no test under {TESTS_DIR} applies a live gate; the scan has gone blind'
-    assert not not_integration, (
+
+def test_every_live_gated_test_is_in_the_integration_tier() -> None:
+    scan = scan_live_gated_tree(TESTS_DIR)
+
+    assert scan.gated, (
+        f'none of the {scan.examined} test modules under {TESTS_DIR} applies a live gate; '
+        'the scan has gone blind'
+    )
+    assert not scan.not_integration, (
         'these tests apply a live-service reachability gate but run in the default '
         "-m 'not integration' suite, where a backing-store outage reds the merge gate. "
         'Add @pytest.mark.integration on the test, its class, or the module pytestmark:\n'
-        + '\n'.join(not_integration)
+        + '\n'.join(scan.not_integration)
     )
 
 
