@@ -11,7 +11,6 @@ from __future__ import annotations
 import copy
 import json as _json
 from dataclasses import dataclass
-from os.path import commonprefix
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -23,7 +22,6 @@ from _orch_helpers import (
     pydantic_spec,
 )
 from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
-from shared.elision import elision_marker
 from shared.task_submit import SubmitOutcome, parse_submit_task_result
 
 from orchestrator.config import OrchestratorConfig
@@ -62,6 +60,8 @@ def _make(
     files: list[str] | None = None,
     metadata_backend: FakeMetadataBackend | None = None,
     title: str = 'Document foo',
+    description: str = 'd',
+    details: str | None = None,
 ) -> _Fixture:
     if auto_eval_phases is None:
         auto_eval_phases = {'plan', 'execute', 'verify', 'review'}
@@ -153,17 +153,16 @@ def _make(
         update_task = AsyncMock(return_value=True)
         scheduler.update_task = update_task
 
-    assignment = TaskAssignment(
-        task_id='orig-task',
-        task={
-            'id': 'orig-task',
-            'title': title,
-            'description': 'd',
-            'priority': 'medium',
-            'metadata': metadata,
-        },
-        modules=['mod_a'],
-    )
+    task: dict = {
+        'id': 'orig-task',
+        'title': title,
+        'description': description,
+        'priority': 'medium',
+        'metadata': metadata,
+    }
+    if details is not None:
+        task['details'] = details
+    assignment = TaskAssignment(task_id='orig-task', task=task, modules=['mod_a'])
 
     # ``submit_task`` answers with the real parser over the production
     # JSON-RPC body of ``submit_payload`` (the tool's own return value).
@@ -412,29 +411,24 @@ async def _redo_submit_args(f: _Fixture) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_a_long_original_title_is_clipped_at_a_word_with_a_counted_marker(tmp_path: Path):
-    long = ('Fix the widget renderer so it ' * 12).strip()
-    f = _make(project_root=tmp_path / 'proj', title=long)
+async def test_the_redo_is_filed_with_the_original_description_and_details(tmp_path: Path):
+    description = '\n'.join(f'spec line {i}: do the thing' for i in range(400))
+    details = 'Step 1: read the spec.\nStep 2: implement it.'
+    f = _make(project_root=tmp_path / 'proj', description=description, details=details)
 
     submit_args = await _redo_submit_args(f)
 
-    title = submit_args['title']
-    full = f'[auto-eval redo] {long}'
-    head = commonprefix([title, full])
-    assert len(title) <= 200
-    assert title == head + elision_marker(len(full) - len(head))
-    assert full[len(head)].isspace()
-    assert long in submit_args['description']
+    assert description in submit_args['description']
+    assert submit_args['details'] == details
 
 
 @pytest.mark.asyncio
-async def test_the_redo_description_names_the_original_title(tmp_path: Path):
+async def test_an_original_without_details_files_no_details(tmp_path: Path):
     f = _make(project_root=tmp_path / 'proj')
 
     submit_args = await _redo_submit_args(f)
 
-    assert submit_args['title'] == '[auto-eval redo] Document foo'
-    assert 'Original title: Document foo' in submit_args['description']
+    assert not submit_args.get('details')
 
 
 @pytest.mark.asyncio
