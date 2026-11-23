@@ -52,7 +52,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Required, TypeAlias, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, Required, TypeAlias, TypedDict, TypeVar
 
 from shared.cancel_dispositions import sibling_lookup_values
 from shared.cli_invoke import (
@@ -146,6 +146,7 @@ from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
 from fused_memory.reconciliation.context_assembler import estimate_tokens
 
 if TYPE_CHECKING:
+    from qdrant_client import AsyncQdrantClient
     from qdrant_client.models import ExtendedPointId
     from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
@@ -788,6 +789,12 @@ def _render_batch_prompt(
 CuratorInvoke: TypeAlias = Callable[..., Awaitable[AgentResult]]
 
 
+class CorpusEmbedder(Protocol):
+    """What the corpus needs of an embedder; graphiti_core's OpenAIEmbedder satisfies it."""
+
+    async def create(self, input_data: str) -> list[float]: ...
+
+
 class TaskCurator:
     """LLM-judged drop/combine/create gate plus the Qdrant corpus backing it."""
 
@@ -802,6 +809,8 @@ class TaskCurator:
         config_dir_base: Path | None = None,
         cost_store: CostStore | None = None,
         invoke: CuratorInvoke = invoke_with_cap_retry,
+        embedder: CorpusEmbedder | None = None,
+        qdrant_client: AsyncQdrantClient | None = None,
     ) -> None:
         self._config = config
         self._invoke = invoke
@@ -814,8 +823,9 @@ class TaskCurator:
         # Parent of the per-process config dir; None means the system tempdir.
         self._config_dir_base = config_dir_base
         self._config_dir: TaskConfigDir | None = None  # lazy, gated only
-        self._qdrant_client = None  # AsyncQdrantClient, lazy
-        self._embedder = None  # OpenAIEmbedder, lazy
+        # Owned and closed by the curator whether injected or built lazily.
+        self._qdrant_client: AsyncQdrantClient | None = qdrant_client
+        self._embedder: CorpusEmbedder | None = embedder
         self._initialized_collections: set[str] = set()
         # Idempotency cache: payload_hash -> (decision, monotonic_time)
         self._decision_cache: dict[str, tuple[CuratorDecision, float]] = {}
@@ -852,7 +862,7 @@ class TaskCurator:
     # Lazy init (mirrors task_dedup.py pattern)
     # ------------------------------------------------------------------
 
-    async def _get_qdrant(self):
+    async def _get_qdrant(self) -> AsyncQdrantClient:
         if self._qdrant_client is None:
             from qdrant_client import AsyncQdrantClient
 
@@ -862,7 +872,7 @@ class TaskCurator:
             )
         return self._qdrant_client
 
-    async def _get_embedder(self):
+    async def _get_embedder(self) -> CorpusEmbedder:
         if self._embedder is None:
             cfg = self._config.embedder
             if cfg.provider == 'openai' and cfg.providers.openai:
