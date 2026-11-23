@@ -41,11 +41,31 @@ def is_merge_worker_shutdown(outcome: MergeOutcome) -> bool:
     """Whether *outcome* is the merge worker's graceful-stop / crash outcome.
 
     stop() and the _merger_loop finally block resolve a still-live request with
-    it. The journal keeps such a request (MergeIntake.buffer_owned_request's
-    _on_terminal) so the next start restores it, unlike a deterministic
-    terminal failure, which is removed and not retried on restart.
+    it. Such a request comes back on the next start; see :func:`survives_restart`.
     """
     return outcome.status == 'blocked' and outcome.reason == MERGE_WORKER_SHUTDOWN_REASON
+
+
+def survives_restart(result: asyncio.Future[MergeOutcome]) -> bool:
+    """Whether the request settled through *result* comes back on the next start.
+
+    It does when *result* was cancelled or resolved with the merge worker's
+    shutdown outcome (:func:`is_merge_worker_shutdown`): its branch is still
+    live, so the durable journal keeps it and the next start restores it.
+
+    Every other terminal does not: a ``done``, ``superseded`` or other
+    ``blocked`` outcome (drop-guard, ENOSPC, merge conflict, merger error,
+    verification error, chain-generation bound), or an exception. Those
+    failures are deterministic, so keeping them would retry them on every
+    restart and grow ``merge_queue.json`` without bound. A Future still
+    pending has settled nothing and does not count. A true process crash
+    never asks: the journal entry recorded at intake simply stays.
+    """
+    if result.cancelled():
+        return True
+    if not result.done() or result.exception() is not None:
+        return False
+    return is_merge_worker_shutdown(result.result())
 
 _COALESCE_LIVE_ORIGINAL_SENTINEL_PREFIX = '__merge_coalesce_live_original__'
 
@@ -410,35 +430,13 @@ class MergeIntake:
                 self._journaled_request_ids.add(item.request_id)
 
                 def _on_terminal(fut: asyncio.Future, *, _rid: str = item.request_id) -> None:  # type: ignore[type-arg]
-                    # Decide whether to remove from the durable journal.
-                    #
-                    # KEEP in journal (return early) when the outcome is from the
-                    # graceful-stop / crash path — branch is still live, recovery
-                    # should retry:
-                    #   • fut.cancelled() — explicitly cancelled future; keep.
-                    #   • is_merge_worker_shutdown(result); a true process crash
-                    #     leaves the future unresolved so the callback never fires.
-                    #
-                    # REMOVE from journal for ALL other terminals, including other
-                    # 'blocked' outcomes (drop-guard, ENOSPC, merge conflict, merger
-                    # error, verification error, chain-generation bound) — those
-                    # branches are still live but the failure is deterministic, so
-                    # keep-for-recovery would cause indefinite cross-restart retries
-                    # and unbounded merge_queue.json growth.
-                    #
-                    # Prune _journaled_request_ids on removal so the set does not
-                    # grow without bound and a later re-dispatch with a fresh Future
-                    # can register a new cleanup callback.
+                    # Remove from the durable journal unless the request
+                    # survives_restart. Prune _journaled_request_ids on removal so
+                    # the set does not grow without bound and a later re-dispatch
+                    # with a fresh Future can register a new cleanup callback.
                     try:
-                        if self._merge_store is None:
+                        if self._merge_store is None or survives_restart(fut):
                             return
-                        if fut.cancelled():
-                            return  # explicitly cancelled: keep in journal
-                        try:
-                            if is_merge_worker_shutdown(fut.result()):
-                                return  # crash / graceful-stop path: keep for recovery
-                        except Exception:
-                            pass  # exception-set future: fall through to remove
                         self._merge_store.remove(_rid)
                     except Exception:
                         logger.warning(
