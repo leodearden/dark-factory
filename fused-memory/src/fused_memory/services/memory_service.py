@@ -80,6 +80,7 @@ from fused_memory.models.memory import (
     EpisodeStatus,
     MemoryResult,
     ReadRouteResult,
+    mem0_hit_attribution,
     render_add_memory_message,
 )
 from fused_memory.models.reconciliation import (
@@ -8104,6 +8105,7 @@ class MemoryService:
                 relevance_score=_rrf_score(rank),
                 metadata=metadata,
                 created_at=item.get('created_at'),
+                **mem0_hit_attribution(item, meta),
             ))
         return results
 
