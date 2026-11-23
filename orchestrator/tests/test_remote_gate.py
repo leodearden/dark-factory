@@ -356,10 +356,12 @@ def test_gate_identity_cli_fails_without_a_checkout(monkeypatch):
 
 # Fake `uv sync`: "builds" a gate binary that answers gate-identity with its own
 # checkout's HEAD.  $FAKE_UV_LOG counts builds; $FAKE_UV_BROKEN builds a binary
-# that fails; $FAKE_UV_SLEEP widens the race window.
+# that fails; $FAKE_UV_EXIT fails the sync itself with that status;
+# $FAKE_UV_SLEEP widens the race window.
 _FAKE_UV = r'''#!/usr/bin/env bash
 set -eu
 echo "uv $*" >> "$FAKE_UV_LOG"
+[[ -z ${FAKE_UV_EXIT:-} ]] || exit "$FAKE_UV_EXIT"
 sleep "${FAKE_UV_SLEEP:-0}"
 mkdir -p .venv/bin
 if [[ -n ${FAKE_UV_BROKEN:-} ]]; then
@@ -579,31 +581,59 @@ def test_the_build_lock_file_is_left_in_place(remote: _Remote):
     assert (remote.root / f'.build-{remote.sha}.lock').is_file()
 
 
-@pytest.mark.parametrize('failure', ['handshake', 'build'])
-def test_a_failed_ensure_unlinks_its_build_lock(remote: _Remote, failure: str):
-    """Both failure routes, die() and a ``set -e`` abort, leave no lock behind."""
-    if failure == 'handshake':
-        result = remote.ensure(FAKE_UV_BROKEN='1')
-    else:
-        (Path(remote.env['PATH'].split(':')[0]) / 'uv').write_text('#!/usr/bin/env bash\nexit 1\n')
-        result = remote.ensure()
+@pytest.mark.parametrize(('failure_env', 'status'), [
+    pytest.param({'FAKE_UV_BROKEN': '1'}, 70, id='handshake-die'),
+    pytest.param({'FAKE_UV_EXIT': '1'}, 1, id='build-set-e-abort'),
+])
+def test_a_failed_ensure_unlinks_its_build_lock(
+    remote: _Remote, failure_env: dict[str, str], status: int,
+):
+    result = remote.ensure(**failure_env)
 
-    assert result.returncode not in (0, 255), result.stderr
+    assert result.returncode == status, result.stderr
+    assert remote.gate.exists(), 'the clone runs only under the lock, so this run held it'
     assert not (remote.root / f'.build-{remote.sha}.lock').exists()
 
 
-def _a_flock_waits_on(handle: typing.IO[str]) -> bool:
-    """Whether some process is blocked in flock on the file *handle* has open.
+def _path_with_fake_flock(bindir: Path, script: str, path: str) -> str:
+    """*path* behind a *bindir* holding a ``flock`` that runs *script*."""
+    bindir.mkdir()
+    (bindir / 'flock').write_text(script)
+    (bindir / 'flock').chmod(0o755)
+    return f'{bindir}:{path}'
 
-    /proc/locks marks a blocked waiter with ``->``.  Its ``maj:min:inode`` field
-    names the superblock device, which can differ from st_dev, so only the
-    inode is matched.
+
+def test_an_ensure_that_times_out_on_the_build_lock_leaves_it_in_place(
+    remote: _Remote, tmp_path: Path,
+):
+    """Only the run holding the lock unlinks it, never one that failed to take it."""
+    path = _path_with_fake_flock(tmp_path / 'flockbin', '#!/usr/bin/env bash\nexit 1\n', remote.env['PATH'])
+    remote.root.mkdir(parents=True)
+    lock_path = remote.root / f'.build-{remote.sha}.lock'
+    with lock_path.open('w') as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+
+        result = remote.ensure(PATH=path)
+
+        assert result.returncode == 75, result.stderr
+        assert lock_path.exists()
+        assert os.fstat(held.fileno()).st_ino == lock_path.stat().st_ino
+
+
+def _a_child_flock_waits_on(parent: int, handle: typing.IO[str]) -> bool:
+    """Whether a child of *parent* is blocked in flock on the file *handle* has open.
+
+    A waiter row reads ``<id>: -> FLOCK <mode> <access> <pid> <maj:min:inode> ...``.
+    Its device is the superblock's, which can differ from st_dev, so only the
+    inode is matched; the parent keeps another process's waiter from matching.
     """
     inode = f':{os.fstat(handle.fileno()).st_ino}'
     for line in Path('/proc/locks').read_text().splitlines():
-        fields = line.split()
-        if '->' in fields and any(f.count(':') == 2 and f.endswith(inode) for f in fields):
-            return True
+        match line.split():
+            case [_, '->', 'FLOCK', _, _, pid, file_id, *_] if file_id.endswith(inode):
+                waiter = read_stat_fields(Path('/proc', pid), skip_malformed=True)
+                if waiter is not None and waiter.ppid == parent:
+                    return True
     return False
 
 
@@ -619,7 +649,7 @@ def test_an_ensure_whose_lock_file_is_replaced_while_it_waits_locks_the_new_file
     proc = remote.popen()
     try:
         first = handles[0]
-        assert _holds_within(lambda: _a_flock_waits_on(first), 30)
+        assert _holds_within(lambda: _a_child_flock_waits_on(proc.pid, first), 30)
 
         lock.unlink()
         second = lock.open('w')
@@ -627,7 +657,7 @@ def test_an_ensure_whose_lock_file_is_replaced_while_it_waits_locks_the_new_file
         fcntl.flock(second, fcntl.LOCK_EX)
         first.close()
 
-        assert _holds_within(lambda: _a_flock_waits_on(second), 10)
+        assert _holds_within(lambda: _a_child_flock_waits_on(proc.pid, second), 10)
         assert remote.builds() == 0
 
         second.close()
@@ -1626,14 +1656,11 @@ def test_a_reaper_whose_lock_file_was_replaced_before_it_locked_reaps_nothing(
 ):
     sha = '5' * 40
     idle = _dir(gate_root, sha, days=30)
-    flockbin = tmp_path / 'flockbin'
-    flockbin.mkdir()
-    (flockbin / 'flock').write_text(_REPLACING_FLOCK)
-    (flockbin / 'flock').chmod(0o755)
+    path = _path_with_fake_flock(tmp_path / 'flockbin', _REPLACING_FLOCK, os.environ['PATH'])
     real_flock = shutil.which('flock')
     assert real_flock is not None
 
-    result = _reap(gate_root, PATH=f'{flockbin}:{os.environ["PATH"]}', REAL_FLOCK=real_flock)
+    result = _reap(gate_root, PATH=path, REAL_FLOCK=real_flock)
 
     assert result.returncode == 0, result.stderr
     assert idle.exists()
