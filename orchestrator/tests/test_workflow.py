@@ -854,8 +854,8 @@ class TestSubmitToMergeQueueRebaseDroppedMessage:
     ``git rebase`` drops a branch commit whose change main already carries
     (the 3490 cache-buster bump), so the gate's ``base..HEAD`` read sees the
     file untouched.  The gate is handed the branch, attributes the entry to
-    the dropped commit, and the block reason says so instead of claiming
-    "Implementation has not delivered".  Routing is unchanged.  When the
+    the dropped commit, and the block reason says so instead of listing it
+    among the files no commit touched.  Routing is unchanged.  When the
     architect narrowing pass reports a narrowed plan, the gate runs a second
     time, and that re-check is handed the branch too.
     """
@@ -893,7 +893,7 @@ class TestSubmitToMergeQueueRebaseDroppedMessage:
         assert 'c2e8f8c14d00' in reason
         assert self._SUBJECT in reason
         assert 'dropped by a rebase' in reason
-        assert 'Implementation has not delivered' not in reason
+        assert 'no commit on the branch touched them' not in reason
         assert outcome == WorkflowOutcome.BLOCKED
         assert 'plan_files_not_touched' in _merge_attempt_outcomes(events)
         assert kwargs.get('escalate_to_human') is True

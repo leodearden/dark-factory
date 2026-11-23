@@ -232,7 +232,6 @@ class TestPlanFilesNotTouchedReason:
         assert 're-derive' in reason.lower()
         assert 'current main' in reason
         assert 'no commit on the branch touched them' not in reason
-        assert 'Implementation has not delivered' not in reason
 
     def test_a_mixed_reason_scopes_each_clause_to_its_own_entries(self) -> None:
         reason = plan_files_not_touched_reason(PlanFilesTouchedResult(
