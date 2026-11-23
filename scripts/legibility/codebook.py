@@ -68,10 +68,14 @@ DISPOSITIONS = ["pending", "promoted", "rejected"]
 
 ENTRY_FILING_KEY = "filing"
 ENTRY_FILING_WITHHELD = "withheld"
+ENTRY_FILING_OWED = "owed"
 ENTRY_FILING_FILED = "filed"
-ENTRY_FILINGS = (ENTRY_FILING_WITHHELD, ENTRY_FILING_FILED)
+ENTRY_FILINGS = (ENTRY_FILING_WITHHELD, ENTRY_FILING_OWED, ENTRY_FILING_FILED)
 """An entry's filing marker. WITHHELD: the census's singleton filing gate held
-the entry back until it recurs; FILED: a ticket was filed for it since. An
+the entry back until it recurs; OWED: a fileable entry whose filing did not
+land (dedup store unreachable, submit_task failed, or its curator ticket
+failed) while no back-link routes it, and the next census re-offers it until
+work is routed; FILED: a ticket was filed for it since. An
 entry with no marker was filed on first sight, or predates the gate, and is
 never re-filed. Plain ``str``: ``dump`` is ``yaml.safe_dump``, which cannot
 represent an Enum."""

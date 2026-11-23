@@ -40,6 +40,9 @@ class WireShaped(Protocol):
     def to_wire(self) -> dict[str, object]: ...
 
 
+_PLAIN_JSON_TYPES = frozenset({dict, str, int, float, bool, type(None)})
+
+
 def _render(value: object) -> object:
     """Render one payload, or one element of a sequence of payloads.
 
@@ -61,7 +64,12 @@ def _render(value: object) -> object:
     other container — a dict, a set — passes through, so its producer renders
     it; ``test_datum.py`` pins that boundary so a later leaf meets it at this
     seam.
+
+    An exact builtin scalar or ``dict`` short-circuits the Protocol check,
+    because no instance of one can carry a ``to_wire`` and so satisfy it.
     """
+    if type(value) in _PLAIN_JSON_TYPES:
+        return value
     if isinstance(value, WireShaped):
         return value.to_wire()
     if isinstance(value, (list, tuple)):

@@ -1,6 +1,6 @@
 # The fallback test floor: no fallback diff runs zero tests by accident
 
-Implemented by task 8714, which also lands the core of task 7041.
+Implemented by task 8714; task 7041 adds the no_tests_ran outcome.
 
 ## The question
 
@@ -44,7 +44,8 @@ verbatim. It checks these arms in order, and the first that applies wins:
    ("no tests ran") stays red under task 1852, so a tree with no tests fails
    the merge gate instead of reading green.
 6. **Only the bare `pytest` default, at task role**: no floor. The task-1852
-   skip is kept, and its plan record still reads SKIPPED with a reason.
+   skip still runs no pytest, and its plan record still reads SKIPPED with a
+   reason, but the verdict is now `no_tests_ran` (see below).
 
 The rule is applied at two points, and each record states the floor only for
 its own layer:
@@ -66,6 +67,31 @@ The two layers can disagree. The known case is the task-2368 mixed
 root+single-subproject source-only diff: the decision floors, while execution
 runs the mixed branch's own derived command. `VerifyResult.plan` then does not
 claim the floor.
+
+## When the fallback still runs no tests
+
+`orchestrator/src/orchestrator/verify_fallback_floor.py::fallback_ran_no_tests`
+is applied by
+`orchestrator/src/orchestrator/verify.py::_no_tests_ran_verdict`. A
+passing fallback verify whose executed test slot is empty, while the project
+configures a `test_command`, fails with category `no_tests_ran`, at either
+role.
+
+- Today only arm 6 reaches it. At merge role the floor already fills the slot,
+  so the check is the second enforcement point behind it.
+- A lint or type red from the same run is reported as itself.
+- Its `cause_hint` addresses the agent: add or modify a test and declare it in
+  the task's files. The fallback derives test targets from the task's declared
+  files, not from the diff, so an undeclared new test repeats the failure. The
+  operator remedies below are deliberately left out of the hint.
+- `orchestrator/src/orchestrator/verify.py::verify_failure_is_preexisting_on_main`
+  never probes a `no_tests_ran` failure: main would reproduce it whenever it
+  runs the same fallback over the same files.
+- `verify_allow_no_tests_ran: true` lets it pass, with a WARNING. The knob is
+  read from the local config only until task 7067 carries it on the verify
+  specs.
+- The category is a string sentinel until S4 α (task 9128) makes it a
+  `FailureCategory` member.
 
 ## Who it affects
 
@@ -96,7 +122,10 @@ declared no files.
 
 ## Opting out, or narrowing
 
-- To run no tests at all, set `test_command: "true"`, as autotrade does.
+- To run no tests at all, set `test_command: "true"`, as autotrade does. An
+  empty `test_command` also opts out of tests entirely.
+- To accept a fallback verify whose test slot runs nothing, while keeping
+  tests wherever one is derivable, set `verify_allow_no_tests_ran: true`.
 - For narrower coverage of a path, register a module config for it.
   `tests/scripts/orchestrator.yaml` did exactly that for task 3350. This
   narrows only tasks whose declared files sit under that path; a task that

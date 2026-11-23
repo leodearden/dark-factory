@@ -1,4 +1,4 @@
-"""When the no-module-config verify fallback must run the configured test command whole instead of its diff-derived test slot.
+"""The no-module-config verify fallback's test-slot policy: when it runs the configured test_command whole, and when a slot that ran nothing is the no_tests_ran outcome.
 
 Rationale: docs/fallback-test-floor.md.
 """
@@ -10,11 +10,15 @@ from dataclasses import replace
 from typing import Literal
 
 from orchestrator.config import ModuleConfig
+from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
 
 # Source the Python fallback cannot derive a test target for.
 NON_PYTHON_SOURCE_EXTENSIONS: tuple[str, ...] = ('.rs',)
 
 BARE_PYTEST_DEFAULT = 'pytest'
+
+NO_TESTS_RAN_CATEGORY = 'no_tests_ran'
+_assert_sentinels_disjoint((NO_TESTS_RAN_CATEGORY,), FailureCategory)
 
 # Every reason starts with 'pytest:': verify_plan.planned_run_leg routes a
 # PlannedRun to its test slot by that prefix.
@@ -73,3 +77,10 @@ def apply_fallback_test_floor(
     if reason is None:
         return fallback, None
     return replace(fallback, test_command=test_command), reason
+
+
+def fallback_ran_no_tests(
+    executed_test_command: str | None, configured_test_command: str | None,
+) -> bool:
+    """The fallback's test slot executed nothing although the project configures a test command."""
+    return executed_test_command is None and bool(configured_test_command)

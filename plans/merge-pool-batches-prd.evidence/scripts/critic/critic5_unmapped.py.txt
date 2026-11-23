@@ -1,0 +1,32 @@
+import sqlite3, json, collections, subprocess
+REPO='/home/leo/src/dark-factory'
+db=sqlite3.connect(f'file:{REPO}/data/orchestrator/runs.db?mode=ro', uri=True)
+tips={}
+for id_,ts,task,data in db.execute("""select id,timestamp,task_id,data from events where event_type='merge_verify'
+  and timestamp>='2026-10-21' and json_extract(data,'$.chain_items')>1 and json_extract(data,'$.passed')=0"""):
+    d=json.loads(data); tips[d['merge_sha']]=(ts,task,d.get('runner'),d.get('chain_items'),d.get('units'),id_)
+per=collections.defaultdict(set); ids=collections.defaultdict(list)
+for test_id,verdict,sha,detail in db.execute("select test_id,verdict,merge_sha,detail from flake_occurrence where call_site='merge_gate' and observed_at>='2026-10-21'"):
+    if sha in tips:
+        try: r=json.loads(detail).get('unconfirmable_reason')
+        except Exception: r=None
+        per[sha].add((verdict,r)); ids[sha].append(test_id)
+MODS=['client-feed','cockpit','dashboard','escalation','fused-memory','orchestrator','sampler','scripts','shared','tests/repo_guards','tests/scripts']
+def exists(sha,path):
+    return subprocess.run(['git','-C',REPO,'cat-file','-e',f'{sha}:{path}'],capture_output=True).returncode==0
+print('red chain tips:',len(tips),'with flake rows:',len(per))
+for sha,s in per.items():
+    if any(v=='fails_in_isolation' for v,_ in s): continue
+    if not any(r=='node_ids_unmapped_to_subproject' for _,r in s): continue
+    ts,task,runner,n,units,eid=tips[sha]
+    red=[u['unit'] for u in (units or []) if isinstance(u,dict) and u.get('outcome')=='ran_red']
+    print('---',sha[:10],ts,'owner',task,runner,'n',n,'units',len(units or []),'red',red)
+    have=subprocess.run(['git','-C',REPO,'cat-file','-e',sha],capture_output=True).returncode==0
+    for tid in ids[sha][:6]:
+        fp=tid.split('::',1)[0]
+        cands=[]
+        if have:
+            for m in MODS:
+                if exists(sha,f'{m}/{fp}'): cands.append(m)
+                elif fp.startswith(m+'/') and exists(sha,fp): cands.append(m+'(rootrel)')
+        print('   id',tid[:110],'| maps:',cands if have else 'SHA-ABSENT')

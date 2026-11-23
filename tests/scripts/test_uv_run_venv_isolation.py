@@ -95,6 +95,8 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "scripts/orchestrator-solar-challenge-platform.service",
         "scripts/orchestrator-stream-touch.service",
         "scripts/return-brief.service",
+        "scripts/timeout-headroom-selfcheck.service",
+        "scripts/transcript-secret-sweep.laptop.conf",
         "scripts/transcript-secret-sweep.service",
     }
 )
@@ -107,6 +109,7 @@ _EXPECTED_UV_RUN_SCRIPTS = frozenset(
         "scripts/check_dashboard_payload_budgets.sh",
         "scripts/check_sandbox_soak.sh",
         "scripts/check_write_triage_flip_preconditions.sh",
+        "scripts/deploy/install_laptop_transcript_secret_sweep.sh",
         "scripts/eval_bootstrap_smoke.sh",
         "scripts/exception-owner-sweep.sh",
         "scripts/fused-memory-duplicate-audit.sh",
@@ -115,6 +118,7 @@ _EXPECTED_UV_RUN_SCRIPTS = frozenset(
         "scripts/fused-memory-link-heal.sh",
         "scripts/fused-memory-memory-eval.sh",
         "scripts/install-exception-owner-sweep-timer.sh",
+        "scripts/install-timeout-headroom-selfcheck-timer.sh",
         "scripts/legibility/install-transcript-check-timer.sh",
         "scripts/legibility/install-trickle-health-timer.sh",
         "scripts/legibility/install-trickle-timer.sh",
@@ -122,6 +126,7 @@ _EXPECTED_UV_RUN_SCRIPTS = frozenset(
         "scripts/memory-metadata-coverage-census.sh",
         "scripts/rerun_cap_tainted.sh",
         "scripts/return-brief.sh",
+        "scripts/timeout-headroom-selfcheck.sh",
         "scripts/transcript-secret-sweep.sh",
     }
 )

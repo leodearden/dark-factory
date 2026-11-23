@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -21,6 +21,7 @@ from shared.cli_invoke import (
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
 from orchestrator.config import OrchestratorConfig
+from orchestrator.l0_promotion import promote_l0_to_l1
 from orchestrator.relocated_venv import retire_relocated_venvs
 from orchestrator.review_pre_test import (
     PreTestCommandResult,
@@ -146,10 +147,13 @@ class ReviewCheckpoint:
         config: OrchestratorConfig,
         mcp: McpLifecycle,
         usage_gate: UsageGate | None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.config = config
         self.mcp = mcp
         self.usage_gate = usage_gate
+        self._clock = clock
         self.cost_store: CostStore | None = None
         self.escalation_queue: EscalationQueue | None = None
         self.run_id: str = ''
@@ -207,7 +211,8 @@ class ReviewCheckpoint:
         ``full_review_min_interval_secs`` since the last full review (the very
         first review is unconstrained on time — ``_last_full_review_time`` is
         None) AND at least ``full_review_min_tasks`` merges since the last full
-        review.  ``now`` is a ``time.monotonic()`` reading supplied by the
+        review.  ``now`` must be a reading of this checkpoint's
+        ``clock`` (``time.monotonic`` in production), supplied by the
         caller so it shares a clock with the timestamp ``run_full()`` records.
 
         Only consulted on the run-forever idle path; the exit / --until-idle
@@ -230,7 +235,7 @@ class ReviewCheckpoint:
         if report.ran:
             self._last_review_at_merge = self._merge_count
             # Record full-review trackers so should_run_full() re-closes the gate.
-            self._last_full_review_time = time.monotonic()
+            self._last_full_review_time = self._clock()
             self._last_full_review_at_merge = self._merge_count
             self._merged_modules.clear()
         self._reports.append(report)
@@ -246,7 +251,7 @@ class ReviewCheckpoint:
             )
 
         review_id = datetime.now(UTC).strftime('%Y%m%dT%H%M%S')
-        start = time.monotonic()
+        start = self._clock()
 
         logger.info(
             'Review checkpoint [%s] starting — mode=%s, modules=%s',
@@ -290,15 +295,9 @@ class ReviewCheckpoint:
             role_name='deep_reviewer',
             role_defaults=RoleDefaults(
                 DEEP_REVIEWER.default_model,
-                # Layer-4 effort base kept == EffortConfig.deep_reviewer's
-                # default ('max') — the value config-layer-3 always supplies
-                # today, and the site's own pre-η getattr fallback was
-                # getattr(config.effort,'deep_reviewer','max'). AgentRole has no
-                # default_effort field, so effort is the one RoleDefaults field
-                # not sourced from DEEP_REVIEWER; matching the config default
-                # means a future EffortConfig field removal degrades to the same
-                # effort, not a silent 'max'→'high' drop.
-                'max',
+                # Kept == EffortConfig.deep_reviewer's default, pinned by
+                # orchestrator/tests/test_out_of_band_routing.py::TestDeepReviewerAdoptsResolveRoute
+                'xhigh',
                 DEEP_REVIEWER.default_budget, DEEP_REVIEWER.default_max_turns,
             ),
             config=self.config,
@@ -347,13 +346,13 @@ class ReviewCheckpoint:
                 tasks_created=[],
                 escalated_findings=0,
                 cost_usd=0.0,
-                duration_ms=int((time.monotonic() - start) * 1000),
+                duration_ms=int((self._clock() - start) * 1000),
                 phase1_working_tree=working_tree,
                 pre_test=pre_test,
             )
         completed_at = datetime.now(UTC).isoformat()
 
-        elapsed_ms = int((time.monotonic() - start) * 1000)
+        elapsed_ms = int((self._clock() - start) * 1000)
 
         if self.cost_store:
             try:
@@ -482,8 +481,6 @@ class ReviewCheckpoint:
         if self.escalation_queue is None:
             return 0
 
-        from escalation.models import Escalation
-
         synthetic_task_id = review_escalation_task_id(review_id)
         pending = self.escalation_queue.get_by_task(
             synthetic_task_id, status='pending', level=0,
@@ -493,25 +490,14 @@ class ReviewCheckpoint:
 
         promoted = 0
         for esc in pending:
-            reesc = Escalation(
-                id=self.escalation_queue.make_id(synthetic_task_id),
-                task_id=synthetic_task_id,
+            promote_l0_to_l1(
+                self.escalation_queue, esc,
                 agent_role='review-checkpoint',
-                severity=esc.severity,
-                category=esc.category,
-                summary=esc.summary,
-                detail=esc.detail,
-                suggested_action='manual_intervention',
-                worktree=esc.worktree,
-                workflow_state=esc.workflow_state,
-                level=1,
-            )
-            self.escalation_queue.submit(reesc)
-            self.escalation_queue.resolve(
-                esc.id,
-                'Auto-promoted to level 1 — review checkpoint has no steward',
-                dismiss=True,
+                why='review checkpoint has no steward',
+                detail_suffix='',
+                filing_claimant_run_id=None,
                 resolved_by='review-checkpoint',
+                worktree=esc.worktree,
             )
             promoted += 1
 

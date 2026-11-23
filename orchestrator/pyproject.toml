@@ -269,6 +269,7 @@ markers = [
     "reads_git_history: the test reads the checkout's git history (log, merge-base, rev-list, describe), so a byte-identical tree under a new parent can verify differently; re-run alone on the merge gate's same-tree path by merge_gate_history_test_command. Not deselected by default.",
     "defect(ref): this test reproduces the declared defect <ref>; the binding is read statically by shared/src/shared/defect_enumerator.py (plans/defect-tests-prd.md decision 8). Not deselected by default.",
     "criterion(id): this test evidences acceptance criterion <id> (plans/client-feed-prd.md §7.7). Not deselected by default.",
+    "timing(reason): a deadline, grace period or timeout is the behaviour under test, named by reason=; the timing-dependence lint (fused-memory/scripts/_timing_dependence.py) accepts a real sleep, an elapsed-vs-literal assert or a literal wait deadline only under it. Not deselected by default.",
 ]
 
 [dependency-groups]
@@ -296,10 +297,14 @@ dev = [
     # The CEILING (<7) is not hygiene — it is what keeps the instrument from
     # becoming a timeout landmine. 7.0.1's cost grows roughly cubically
     # in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so the whole
-    # 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0. The ratchet
-    # carries @pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT); exceeding it
-    # fails the ratchet test, and only once complexipy's Rust call returns,
-    # because signal cannot interrupt it sooner (see
+    # 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0, unloaded.
+    # Under verify load multiply that by the tree-scan family's measured ~4.8x
+    # inflation (the MEASURED history at
+    # shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    # which puts 7.x past the ceiling. The ratchet carries
+    # @pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT); exceeding it fails the
+    # ratchet test, and only once complexipy's Rust call returns, because
+    # signal cannot interrupt it sooner (see
     # shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
     # Do not relax to >=6 or drop the <7 ceiling without re-measuring.
     "complexipy>=6.2,<7",
@@ -342,7 +347,7 @@ pytest_add_cli_args = ["-n", "0", "-p", "no:cacheprovider"]
 pytest_add_cli_args_test_selection = [
     "tests/test_atomic_train_merge.py",
     "tests/test_block_disposition.py",
-    "tests/test_cli.py",
+    "tests/test_cli_verify_merge.py",
     "tests/test_coalesce_integration_gate.py",
     "tests/test_concurrent_verify_boundary.py",
     "tests/test_config_disjoint_skip_reload.py",

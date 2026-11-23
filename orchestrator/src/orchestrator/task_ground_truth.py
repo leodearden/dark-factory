@@ -120,6 +120,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'BranchShaSource',
     'BranchState',
     'BranchStateKind',
     'Claimant',
@@ -153,6 +154,23 @@ class BranchStateKind(enum.StrEnum):
     EXISTS_OFF_MAIN = 'exists_off_main'
     GONE_WITH_MERGE_MARKER = 'gone_with_merge_marker'
     GONE_NO_MARKER = 'gone_no_marker'
+
+
+class BranchShaSource(enum.StrEnum):
+    """Where a :class:`BranchState`'s ``sha`` came from."""
+
+    JOURNAL = 'journal'
+    CITATION = 'citation'
+    BRANCH_TIP = 'branch_tip'
+    MERGE_MARKER = 'merge_marker'
+
+
+#: The sources whose sha names a landing commit independent of the branch ref.
+_LANDING_SHA_SOURCES: frozenset[BranchShaSource] = frozenset({
+    BranchShaSource.JOURNAL,
+    BranchShaSource.CITATION,
+    BranchShaSource.MERGE_MARKER,
+})
 
 
 #: The branch shapes that are evidence the work is ON MAIN.  The one definition
@@ -194,11 +212,27 @@ class BranchState:
 
     ``sha`` is carried only for the ``on_main`` / ``gone_with_merge_marker``
     variants — ``exists_off_main`` and ``gone_no_marker`` have no associated
-    merged sha, so it defaults to ``None`` for those.
+    merged sha, so it defaults to ``None`` for those. ``sha_source`` records
+    which resolver arm produced ``sha``. ``landing_sha`` is that sha only when
+    it names a landing commit independent of the branch ref, because the
+    citation-disabled arm's sha is the branch's own tip and proves nothing
+    about what landed.
     """
 
     kind: BranchStateKind
     sha: str | None = None
+    sha_source: BranchShaSource | None = None
+
+    def __post_init__(self) -> None:
+        if self.sha_source is not None and self.sha is None:
+            raise ValueError(
+                f'BranchState invariant: sha_source={self.sha_source!r} '
+                f'names no sha (kind={self.kind!r})'
+            )
+
+    @property
+    def landing_sha(self) -> str | None:
+        return self.sha if self.sha_source in _LANDING_SHA_SOURCES else None
 
 
 @dataclass(frozen=True)
@@ -488,7 +522,9 @@ class TaskGroundTruth:
         """
         row = MergeProvenance.lookup(tid)
         if row is not None:
-            return BranchState(BranchStateKind.ON_MAIN, row.advanced_sha)
+            return BranchState(
+                BranchStateKind.ON_MAIN, row.advanced_sha, BranchShaSource.JOURNAL,
+            )
 
         # Git-archaeology fallback (journal miss). EXACTLY ONCE — this is
         # the sole owner of the is_ancestor -> resolve_branch_sha ->
@@ -551,12 +587,17 @@ class TaskGroundTruth:
                 # (merge_queue.py). dark-factory's default pattern is None, so
                 # this arm is inert on this repo.
                 sha = await self.git_ops.resolve_branch_sha(branch)
-                return BranchState(BranchStateKind.ON_MAIN, sha)
+                return BranchState(
+                    BranchStateKind.ON_MAIN, sha,
+                    BranchShaSource.BRANCH_TIP if sha is not None else None,
+                )
             citation = await self.git_ops.find_task_citation_commit(
                 tid, pattern_template=citation_pattern,
             )
             if citation is not None:
-                return BranchState(BranchStateKind.ON_MAIN, citation)
+                return BranchState(
+                    BranchStateKind.ON_MAIN, citation, BranchShaSource.CITATION,
+                )
             # Trivially-ancestor branch with no attributable citation is NOT a
             # landing. The branch ref genuinely exists (that is how is_ancestor
             # was evaluable), so classify EXISTS_OFF_MAIN — the recovery table
@@ -572,7 +613,10 @@ class TaskGroundTruth:
 
         marker_sha = await self.git_ops.find_merge_marker(branch)
         if marker_sha:
-            return BranchState(BranchStateKind.GONE_WITH_MERGE_MARKER, marker_sha)
+            return BranchState(
+                BranchStateKind.GONE_WITH_MERGE_MARKER, marker_sha,
+                BranchShaSource.MERGE_MARKER,
+            )
         return BranchState(BranchStateKind.GONE_NO_MARKER)
 
     def _resolve_live_claimant(self, tid: str, task: dict, worktree_path: Path) -> Claimant | None:

@@ -3,10 +3,10 @@ alpha's classify_merge_failure_disposition into the production merge-gate
 failure path + every I4 surface.
 
 Boundary rows as tests:
-  row1 (steps 1-2):   MAIN_RED — _classify_main_health_red stamps disposition.
+  row1 (steps 1-2):   MAIN_RED — classify_main_health_red stamps disposition.
   I4 surfacing (steps 3-4): _render_skew_surfaces pure helper.
   rows 2/3/4 (steps 5-6):   _classify_disposition_for_outcome async wrapper.
-  I4 on the real outcome (steps 7-8): _run_post_merge_verify wiring.
+  I4 on the real outcome (steps 7-8): run_post_merge_verify wiring.
 
 This file stays at the merge_queue.py unit layer and does not touch
 TaskWorkflow. The workflow-layer INTEGRATION_SKEW routing contract
@@ -38,14 +38,16 @@ from orchestrator.merge_lane.disposition import (
     MergeFailureDisposition,
     SkewEvidence,
 )
+from orchestrator.merge_lane.inflight_verify import resolve_dispatch_time_merge_base
+from orchestrator.merge_lane.main_health_probe import (
+    MAIN_HEALTH_RED_REASON_PREFIX,
+    classify_main_health_red,
+)
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
 from orchestrator.merge_lane.types import OutcomeKind, QueuedBranch
 from orchestrator.merge_lane.worker import (
-    MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
     MergeRequest,
-    _classify_main_health_red,
-    _run_post_merge_verify,
-    resolve_dispatch_time_merge_base,
 )
 from orchestrator.verify import VerifyResult
 
@@ -169,7 +171,7 @@ def _make_req(
 
 
 class TestClassifyMainHealthRedSetsDisposition:
-    """_classify_main_health_red must stamp disposition=MAIN_RED on the
+    """classify_main_health_red must stamp disposition=MAIN_RED on the
     outcome it returns when the preexisting probe confirms True (I1: probe
     order preserved; the classifier is never invoked for this bucket), while
     the fix-main reason prefix and dedupe_fingerprint stay unchanged."""
@@ -182,7 +184,7 @@ class TestClassifyMainHealthRedSetsDisposition:
 
         _seed_main_health_probe(COMPILE_ERROR_RESULT, MAIN_SHA, preexisting=True)
         outcome = asyncio.run(
-            _classify_main_health_red(git_ops, req, COMPILE_ERROR_RESULT)
+            classify_main_health_red(git_ops, req, COMPILE_ERROR_RESULT)
         )
 
         git_ops.ephemeral_worktree.assert_not_called()
@@ -203,7 +205,7 @@ class TestClassifyMainHealthRedSetsDisposition:
         )
 
     def test_negative_classification_stays_indeterminate(self, tmp_path: Path) -> None:
-        """When probe returns (False, ''), _classify_main_health_red returns
+        """When probe returns (False, ''), classify_main_health_red returns
         None (falls through) — disposition is not this function's concern."""
         config = _make_config(tmp_path)
         git_ops = _make_git_ops(tmp_path)
@@ -212,7 +214,7 @@ class TestClassifyMainHealthRedSetsDisposition:
 
         _seed_main_health_probe(COMPILE_ERROR_RESULT, MAIN_SHA, preexisting=False)
         outcome = asyncio.run(
-            _classify_main_health_red(git_ops, req, COMPILE_ERROR_RESULT)
+            classify_main_health_red(git_ops, req, COMPILE_ERROR_RESULT)
         )
 
         git_ops.ephemeral_worktree.assert_not_called()
@@ -231,7 +233,7 @@ class TestRenderSkewSurfaces:
     returns ('', None)."""
 
     def test_integration_skew_with_evidence_renders_surfaces(self) -> None:
-        from orchestrator.merge_lane.worker import _render_skew_surfaces
+        from orchestrator.merge_lane.verify_failure_outcome import _render_skew_surfaces
 
         evidence = SkewEvidence(
             implicated_commits=('abc123deadbeef',),
@@ -266,7 +268,7 @@ class TestRenderSkewSurfaces:
     def test_non_skew_dispositions_render_nothing(
         self, disposition: MergeFailureDisposition,
     ) -> None:
-        from orchestrator.merge_lane.worker import _render_skew_surfaces
+        from orchestrator.merge_lane.verify_failure_outcome import _render_skew_surfaces
 
         evidence = SkewEvidence(
             implicated_commits=('abc123',),
@@ -276,7 +278,7 @@ class TestRenderSkewSurfaces:
         assert _render_skew_surfaces(disposition, evidence) == ('', None)
 
     def test_integration_skew_with_none_evidence_renders_nothing(self) -> None:
-        from orchestrator.merge_lane.worker import _render_skew_surfaces
+        from orchestrator.merge_lane.verify_failure_outcome import _render_skew_surfaces
 
         assert _render_skew_surfaces(
             MergeFailureDisposition.INTEGRATION_SKEW, None,
@@ -353,7 +355,7 @@ class TestClassifyDispositionForOutcome:
     classifier's own fail-open."""
 
     def test_row2_integration_skew(self, tmp_path: Path) -> None:
-        from orchestrator.merge_lane.worker import _classify_disposition_for_outcome
+        from orchestrator.merge_lane.verify_failure_outcome import _classify_disposition_for_outcome
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -390,7 +392,7 @@ class TestClassifyDispositionForOutcome:
         assert landing_sha in observed.implicated_commits
 
     def test_row3_branch_bug(self, tmp_path: Path) -> None:
-        from orchestrator.merge_lane.worker import _classify_disposition_for_outcome
+        from orchestrator.merge_lane.verify_failure_outcome import _classify_disposition_for_outcome
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -439,7 +441,7 @@ class TestClassifyDispositionForOutcome:
         exploding branch is that fault delivered through a public constructor
         argument.
         """
-        from orchestrator.merge_lane.worker import _classify_disposition_for_outcome
+        from orchestrator.merge_lane.verify_failure_outcome import _classify_disposition_for_outcome
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -486,7 +488,7 @@ async def _drive_verify_with_base_facts(
     merge_base_sha: str | None = None,
     main_sha: str | None = None,
 ) -> MergeOutcome | None:
-    """Call _run_post_merge_verify with standard test parameters, threading
+    """Call run_post_merge_verify with standard test parameters, threading
     the optional merge_base_sha/main_sha kw-params under test.
 
     *verify* is the scoped-verify verdict, supplied through the injected
@@ -496,7 +498,7 @@ async def _drive_verify_with_base_facts(
     seeded False and the generic classification path runs.
     """
     _seed_main_health_probe(verify, await git_ops.get_main_sha(), preexisting=False)
-    outcome = await _run_post_merge_verify(
+    outcome = await run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts={},
         enospc_retries={},
@@ -512,7 +514,7 @@ async def _drive_verify_with_base_facts(
 
 
 class TestRunPostMergeVerifyDispositionWiring:
-    """_run_post_merge_verify threads merge_base_sha/main_sha through to
+    """run_post_merge_verify threads merge_base_sha/main_sha through to
     _classify_disposition_for_outcome on the generic (not-preexisting)
     task-fault path, attaching disposition/failure_diagnostic/reason_suffix
     to the returned MergeOutcome.  Absent base facts (default None) skips
@@ -667,10 +669,10 @@ class TestRunPostMergeVerifyDispositionWiring:
 class TestDispatchTimeMergeBaseResolution:
     """resolve_dispatch_time_merge_base is what turns an item's two FROZEN
     dispatch-time facts — base_sha and merged_branch_tip — into the
-    merge_base_sha threaded into _run_post_merge_verify (task 2383 beta, 2357).
+    merge_base_sha threaded into run_post_merge_verify (task 2383 beta, 2357).
 
     Asserted against git itself rather than against a kwarg captured from a
-    stubbed _run_post_merge_verify, so what is pinned is the computed value
+    stubbed run_post_merge_verify, so what is pinned is the computed value
     and its fail-safe degradation, not the call shape."""
 
     def test_merge_base_of_the_frozen_base_and_branch_tip(
@@ -703,7 +705,7 @@ class TestDispatchTimeMergeBaseResolution:
         self, tmp_path: Path,
     ) -> None:
         """merged_branch_tip=None (best-effort unavailable) -> None rather than
-        raising. _run_post_merge_verify then skips classification entirely,
+        raising. run_post_merge_verify then skips classification entirely,
         which is pinned by TestRunPostMergeVerifyDispositionWiring::
         test_base_facts_absent_skips_classification_byte_identical (I3)."""
         repo = tmp_path / 'repo'
@@ -719,12 +721,12 @@ class TestDispatchTimeMergeBaseResolution:
 @pytest.mark.asyncio
 class TestRunInflightVerifyFreezesDispatchTimeMainSha:
     """The PRODUCTION CALLER half of the two classes either side of this one:
-    ``_run_inflight_verify`` feeds ``_run_post_merge_verify`` the FROZEN
+    ``_run_inflight_verify`` feeds ``run_post_merge_verify`` the FROZEN
     dispatch-time ``item.base_sha`` as ``main_sha`` — never a fresh
     ``git_ops.get_main_sha()`` re-read (task 2383 β, 2357).
 
     Read off the DISPOSITION the whole path produces, with the real
-    ``_run_post_merge_verify`` running underneath, rather than off a kwarg
+    ``run_post_merge_verify`` running underneath, rather than off a kwarg
     captured from a stub of it. What makes the two readings tell apart is the
     orphan fixture of :class:`TestRunPostMergeVerifyRealMainHeadFilter` below,
     lifted one level up:
@@ -826,14 +828,14 @@ class TestRunInflightVerifyFreezesDispatchTimeMainSha:
 
 
 # ---------------------------------------------------------------------------
-# Step-5 (task 2869) — _run_post_merge_verify resolves real main HEAD and
+# Step-5 (task 2869) — run_post_merge_verify resolves real main HEAD and
 # threads it into classification so an orphaned speculative base_sha stops
 # fabricating a false INTEGRATION_SKEW (reify esc-5260-8).
 # ---------------------------------------------------------------------------
 
 
 class TestRunPostMergeVerifyRealMainHeadFilter:
-    """_run_post_merge_verify resolves the CURRENT real main HEAD via a
+    """run_post_merge_verify resolves the CURRENT real main HEAD via a
     fail-safe ``git_ops.get_main_sha()`` at classification time and threads it
     into ``_classify_disposition_for_outcome``. main_sha stays frozen =
     item.base_sha (a possibly ORPHANED speculative train tip); the ancestor
@@ -1053,7 +1055,7 @@ class TestClassifyDispositionForOutcomeObservedEvidence:
         ``observed_evidence`` rather than the adjudicated ``evidence``: an I7
         degrade cited real landings, and that is exactly what the census needs
         to be able to read."""
-        from orchestrator.merge_lane.worker import _classify_disposition_for_outcome
+        from orchestrator.merge_lane.verify_failure_outcome import _classify_disposition_for_outcome
 
         repo = tmp_path / 'repo'
         repo.mkdir()
@@ -1106,7 +1108,7 @@ class TestMergeOutcomeSkewEvidenceField:
 
 
 class TestRunPostMergeVerifySkewEvidenceWiring:
-    """The blocked-outcome construction path in ``_run_post_merge_verify``
+    """The blocked-outcome construction path in ``run_post_merge_verify``
     carries the classifier's gathered bundle onto the MergeOutcome — on the
     INTEGRATION_SKEW path AND on the I7-degraded INDETERMINATE path — while the
     classification-SKIPPED path (base facts absent) leaves it None. That last

@@ -980,7 +980,7 @@ class TestBlockingHolders:
 class TestTryAcquireAdmittedParks:
     """``try_acquire(..., admitted_parks=...)`` bypasses the PARK gate only.
 
-    The held-lock ``_count_conflicts >= _limit_for`` gate is untouched and
+    The held-lock ``_holders_counted_against >= _limit_for`` gate is untouched and
     evaluated on live state at call time.  That is the whole safety property
     of C7 (INV-3): the scoring-time view is advisory, and ``try_acquire``
     under the lock remains the acting basis.
@@ -1261,6 +1261,55 @@ class TestPinReservationRank:
 
         assert lt.blockers('P', ['w.py', 'x.py']) == []
         assert lt.try_acquire('P', ['w.py', 'x.py']) is True
+
+
+class TestTopParkRank:
+    """``top_park_rank``: the strongest rank among the stack tops an owner holds (task 6328)."""
+
+    def test_an_owner_without_parks_has_no_rank(self):
+        assert _lt().top_park_rank('nobody') is None
+
+    def test_a_critical_top_reads_the_critical_rank(self):
+        lt = _lt()
+        lt.install_parks('A', ['x.py', 'z.py'], 'critical')
+
+        assert lt.top_park_rank('A') == PRIORITY_RANK['critical']
+
+    def test_a_shadowed_entry_does_not_count_even_when_stronger(self):
+        lt = _lt()
+        lt.install_parks('M', ['w.py'], 'medium')
+        lt.install_parks('M', ['x.py'], PinOrder(5))
+        lt.install_parks('P', ['x.py'], PinOrder(1))  # buries M's pin entry
+
+        assert lt.top_park_rank('M') == PRIORITY_RANK['medium'], (
+            'only an active top gates a requester (INV-2)'
+        )
+
+    def test_an_owner_buried_on_every_key_has_no_rank(self):
+        lt = _lt()
+        lt.install_parks('B', ['x.py'], 'low')
+        lt.install_parks('A', ['x.py'], 'critical')
+
+        assert lt.top_park_rank('B') is None
+
+    def test_a_pin_top_beside_a_fairness_top_reads_the_pin_rank(self):
+        lt = _lt()
+        lt.install_parks('P', ['w.py'], 'high')
+        lt.install_parks('P', ['x.py'], PinOrder(1))
+
+        assert lt.top_park_rank('P') == PinOrder(1).rank
+
+    def test_the_read_mutates_nothing(self):
+        lt = _lt()
+        lt.install_parks('M', ['w.py', 'x.py'], 'medium')
+        lt.install_parks('A', ['x.py'], 'critical')
+        before = lt.snapshot_park_stacks()
+
+        lt.top_park_rank('M')
+        lt.top_park_rank('A')
+        lt.top_park_rank('nobody')
+
+        assert lt.snapshot_park_stacks() == before
 
 
 class TestRelease:

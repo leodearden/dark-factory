@@ -60,6 +60,7 @@ from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import run_scoped_verification
 from orchestrator.verify_cmd import ToolKind, VerifyCmd, render
+from orchestrator.verify_fallback_floor import NO_TESTS_RAN_CATEGORY
 
 # ---------------------------------------------------------------------------
 # GOLDEN diff shapes (task κ corpus) — see module docstring for provenance.
@@ -826,6 +827,7 @@ class TestFallbackPlanAuthorityGoldens:
         """(b) DATA_MODULE_DIFF on bare pytest -> test_command is None + task-1852 WARNING.
 
         Already GREEN today (see class docstring).
+        Under task 7041 the skipped slot's verdict is no_tests_ran.
         """
         data_path = DATA_MODULE_DIFF[0]
         full = tmp_path / data_path
@@ -843,7 +845,8 @@ class TestFallbackPlanAuthorityGoldens:
                 tmp_path, config, [], task_files=[data_path],
             )
 
-        assert result.passed
+        assert not result.passed
+        assert result.category == NO_TESTS_RAN_CATEGORY
         executed = _executed_module_configs(mock_run_verification)
         assert len(executed) == 1
         assert executed[0].test_command is None
@@ -864,6 +867,7 @@ class TestFallbackPlanAuthorityGoldens:
         (test_verify.py), which this golden must not regress.
 
         Already GREEN today (see class docstring).
+        The verify_allow_no_tests_ran opt-in keeps the pyright subject under test.
         """
         struct_path = STRUCTURAL_FILE_DIFF[0]
         full = tmp_path / struct_path
@@ -873,6 +877,7 @@ class TestFallbackPlanAuthorityGoldens:
         config = OrchestratorConfig(
             project_root=tmp_path,
             test_command='pytest', lint_command='ruff check', type_check_command='pyright',
+            verify_allow_no_tests_ran=True,
         )
 
         mock_run_verification = _run_verification_spy()

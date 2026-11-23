@@ -11,6 +11,7 @@ from pathlib import Path
 from orchestrator.config import OrchestratorConfig
 from orchestrator.task_verify_spec import TaskVerifySpec, apply_task_verify_spec
 from orchestrator.verify import VerifyResult, run_scoped_verification
+from orchestrator.verify_cache.replay import CacheAccess
 
 
 def prepare_task_verify_worktree(worktree: Path) -> None:
@@ -38,8 +39,9 @@ async def run_task_verify_on_worktree(
     """Run *spec*'s task-role verify on *worktree* under this host's *config*.
 
     Exactly the workstation's task-role verify: no lane flock, no unscoped
-    typecheck, no flake suppression.  The returned log paths are this host's,
-    meaningless to the dispatcher, so both lists are emptied.
+    typecheck, no flake suppression.  It joins the verify-result cache with no
+    registry, since a registry is the dispatcher's (I8).  The returned log
+    paths are this host's, meaningless to the dispatcher, so both lists are emptied.
     """
     prepare_task_verify_worktree(worktree)
     applied, modules = apply_task_verify_spec(config, spec)
@@ -53,5 +55,6 @@ async def run_task_verify_on_worktree(
         archive_root=None,
         force_workspace=spec.force_workspace,
         role='task',
+        verify_cache=await CacheAccess.on_runner(),
     )
     return dataclasses.replace(result, worktree_log_paths=[], archive_log_paths=[])

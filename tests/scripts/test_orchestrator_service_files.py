@@ -54,7 +54,7 @@ import re
 
 import pytest
 from orchestrator_projects import scan_units
-from shared.cgroup_slice import project_slice_name
+from shared.cgroup_slice import DAEMON_SUBGROUP, project_slice_name
 from shared.project_id import project_id_for_root
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -548,6 +548,16 @@ def _directives(section_lines: list[str]) -> list[str]:
     ]
 
 
+def _unit_fixture(*service_lines: str) -> str:
+    """A minimal [Service]-shaped unit carrying *service_lines*.
+
+    Shared by the ExecStart parser tests and the cgroup-placement predicate
+    tests below; each asserts only on the lines it passes in.
+    """
+    body = "\n".join(service_lines)
+    return f"[Unit]\nDescription=Fixture\n\n[Service]\nType=simple\n{body}\n"
+
+
 @pytest.mark.parametrize("unit_path", _START_LIMITED_UNITS, ids=lambda p: p.name)
 def test_start_limit_directives_under_unit_section(unit_path: pathlib.Path) -> None:
     """EXPECTED_START_LIMIT must be declared in [Unit], and no StartLimit key in [Service].
@@ -673,6 +683,105 @@ def test_project_unit_runs_under_its_project_slice(unit_name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Memory-only delegation, started in the daemon subgroup (task 10460; contract
+# docs/cgroup-slice-topology.md, plans/per-consumer-resource-recording-prd.md
+# D9/D10)
+#
+# A unit under its project slice also delegates the memory controller and
+# starts its process tree in the daemon subgroup; a unit outside any slice
+# carries none of the three. No unit delegates cpu.
+# ---------------------------------------------------------------------------
+
+_DELEGATE_MEMORY = "Delegate=memory"
+_DELEGATE_SUBGROUP = f"DelegateSubgroup={DAEMON_SUBGROUP}"
+_SYSTEMD_BOOLEAN_TRUE = frozenset({"1", "yes", "y", "true", "t", "on"})
+
+
+def _delegates_cpu(value: str) -> bool:
+    """Whether a Delegate= value hands the cpu controller over; boolean true hands over all."""
+    return value.strip().lower() in _SYSTEMD_BOOLEAN_TRUE or "cpu" in value.split()
+
+
+def _cgroup_placement_problems(service_directives: list[str]) -> list[str]:
+    found = {
+        "Slice=": any(d.startswith("Slice=") for d in service_directives),
+        _DELEGATE_MEMORY: _DELEGATE_MEMORY in service_directives,
+        _DELEGATE_SUBGROUP: _DELEGATE_SUBGROUP in service_directives,
+    }
+    problems = []
+    if len(set(found.values())) > 1:
+        present = ", ".join(name for name, is_present in found.items() if is_present)
+        problems.append(
+            f"Slice=, {_DELEGATE_MEMORY} and {_DELEGATE_SUBGROUP} must appear all three "
+            f"or none; present: {present}"
+        )
+    problems.extend(
+        f"{d} delegates the cpu controller, which no orchestrator unit may"
+        for d in service_directives
+        if d.startswith("Delegate=") and _delegates_cpu(d.removeprefix("Delegate="))
+    )
+    return problems
+
+
+_ALL_THREE = ("Slice=df-x.slice", _DELEGATE_MEMORY, _DELEGATE_SUBGROUP)
+
+
+@pytest.mark.parametrize(
+    "service_lines",
+    [pytest.param((), id="none-of-the-three"), pytest.param(_ALL_THREE, id="all-three")],
+)
+def test_cgroup_placement_accepts_all_three_or_none(service_lines: tuple[str, ...]) -> None:
+    service = _directives(parse_sections(_unit_fixture(*service_lines))["Service"])
+    assert _cgroup_placement_problems(service) == []
+
+
+@pytest.mark.parametrize(
+    ("service_lines", "named"),
+    [
+        pytest.param(("Slice=df-x.slice",), "present: Slice=", id="slice-alone"),
+        pytest.param(
+            ("Slice=df-x.slice", _DELEGATE_MEMORY),
+            f"present: Slice=, {_DELEGATE_MEMORY}",
+            id="slice-and-delegation-without-subgroup",
+        ),
+        pytest.param(
+            (_DELEGATE_MEMORY, _DELEGATE_SUBGROUP),
+            f"present: {_DELEGATE_MEMORY}, {_DELEGATE_SUBGROUP}",
+            id="delegation-without-slice",
+        ),
+        pytest.param(
+            ("Slice=df-x.slice", "Delegate=yes", _DELEGATE_SUBGROUP),
+            "Delegate=yes delegates the cpu controller",
+            id="boolean-true-delegates-cpu",
+        ),
+        pytest.param(
+            ("Slice=df-x.slice", "Delegate=memory cpu", _DELEGATE_SUBGROUP),
+            "Delegate=memory cpu delegates the cpu controller",
+            id="controller-list-names-cpu",
+        ),
+    ],
+)
+def test_cgroup_placement_problems_name_what_is_wrong(
+    service_lines: tuple[str, ...], named: str
+) -> None:
+    service = _directives(parse_sections(_unit_fixture(*service_lines))["Service"])
+    problems = _cgroup_placement_problems(service)
+    assert any(named in problem for problem in problems), problems
+
+
+@pytest.mark.parametrize(
+    "unit_path",
+    [*ALL_ORCHESTRATOR_SERVICE_FILES, REPO_ROOT / FACTORY_INIT_REFERENCE],
+    ids=lambda p: p.name,
+)
+def test_unit_carries_slice_and_memory_delegation_together_or_not_at_all(
+    unit_path: pathlib.Path,
+) -> None:
+    service = _directives(parse_sections(_service_unit_text(unit_path))["Service"])
+    assert _cgroup_placement_problems(service) == []
+
+
+# ---------------------------------------------------------------------------
 # Canonical orchestrator-config filename (task 3641; completes task 3512's sweep)
 #
 # CANONICAL_CONFIG_BASENAME, MalformedExecStart, the token scan and the
@@ -721,12 +830,6 @@ def _exec_start_config_arg(content: str, unit_name: str = "<unit>") -> str | Non
 # _SAMPLE_UNIT): both helpers take a string, so a file would add I/O without
 # adding coverage.
 # ---------------------------------------------------------------------------
-
-
-def _unit_fixture(*service_lines: str) -> str:
-    """A minimal [Service]-shaped unit carrying *service_lines*, for the parsers."""
-    body = "\n".join(service_lines)
-    return f"[Unit]\nDescription=Fixture\n\n[Service]\nType=simple\n{body}\n"
 
 
 @pytest.mark.parametrize(
@@ -950,8 +1053,8 @@ def test_orchestrator_service_points_at_canonical_config_filename(
     canonical, required filename — the dashboard's escalation-URL discovery
     (``_discover_escalation_urls``) keys on it, and legacy spellings
     (``orchestrator.yaml``, ``orchestrator-config.yaml``,
-    ``orchestrator/config.yaml``) are honoured only as a discovery fallback for
-    not-yet-migrated projects, never as a supported choice.  Task 2698
+    ``orchestrator/config.yaml``) are not read by discovery at all (retired,
+    task 7138).  Task 2698
     canonicalized the filename; task 2719 then RETIRED dark-factory's own
     transitional symlinks (guarded by test_legacy_config_symlinks_retired.py),
     which is the precedent that makes the legacy spelling a defect here rather

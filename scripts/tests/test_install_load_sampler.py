@@ -1,11 +1,11 @@
 """Tests for scripts/install-load-sampler.sh and the two systemd unit files it
 installs (task 3592, leaf δ of plans/load-throttle-harmonisation-prd.md).
 
-Drives the installer via subprocess with a FAKE `systemctl` shimmed onto PATH
-(records every invocation, minus `--user`, into a shared JSON state file) --
-mirroring test_install_memory_metadata_coverage_census_timer.py. Real systemd
-is never touched, and DARK_FACTORY_ROOT is pointed at a tmp tree so the row
-check never reads the live corpus.
+Drives the installer via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl`
+first on PATH, and reads the committed units through
+`scripts/tests/conftest.py::unit_values`. Real systemd is never touched, and
+DARK_FACTORY_ROOT is pointed at a tmp tree so the row check never reads the
+live corpus.
 
 The units live in dashboard/ rather than scripts/, which is the only way this
 installer differs in shape from its siblings.
@@ -18,7 +18,6 @@ to test.
 """
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import time
@@ -44,45 +43,7 @@ TIMER_NAME = 'dark-factory-load-sampler.timer'
 # ── the committed unit files ────────────────────────────────────────────────
 
 
-def _directives(name: str) -> dict[str, list[tuple[str, str]]]:
-    """Parse a systemd unit into `{section: [(key, value), ...]}`.
-
-    A raw-substring check on a unit's text cannot tell a live DIRECTIVE from
-    the COMMENT that explains it, and this service unit comments heavily --
-    including prose about the very ExecStart flags asserted below. Duplicate
-    keys are preserved as separate pairs rather than collapsed, matching the
-    sibling suite's parser.
-    """
-    path = TEMPLATES_DIR / name
-    sections: dict[str, list[tuple[str, str]]] = {}
-    current = ''
-    for raw in path.read_text().splitlines():
-        line = raw.strip()
-        # FULL-LINE comments only: systemd treats `#`/`;` as a comment lead-in
-        # at the start of a line, and a value may legitimately contain either.
-        if not line or line[0] in '#;':
-            continue
-        if line.startswith('[') and line.endswith(']'):
-            current = line[1:-1].strip()
-            sections.setdefault(current, [])
-            continue
-        if '=' not in line:
-            continue
-        key, value = line.split('=', 1)
-        sections.setdefault(current, []).append((key.strip(), value.strip()))
-    return sections
-
-
-def _values(directives, section: str, key: str) -> list[str]:
-    """Every value declared for `key` under `[section]`, in file order.
-
-    A list, not a scalar: asserting `== ['x']` pins both the value AND that it
-    is declared exactly once.
-    """
-    return [v for k, v in directives.get(section, []) if k == key]
-
-
-def test_execstart_pins_the_venv_against_mutation():
+def test_execstart_pins_the_venv_against_mutation(unit_values):
     """--no-sync, and the reason is not cosmetic.
 
     There is ONE shared root .venv per checkout with every workspace member
@@ -98,7 +59,7 @@ def test_execstart_pins_the_venv_against_mutation():
     unit's own comment for the three rcs). A no-op flag that looks load-bearing
     is worse than no flag, so the seam that would let one back in is pinned.
     """
-    exec_start, = _values(_directives(SERVICE_NAME), 'Service', 'ExecStart')
+    exec_start, = unit_values(TEMPLATES_DIR / SERVICE_NAME, 'Service', 'ExecStart')
 
     assert '--no-sync' in exec_start.split(), exec_start
     assert not {'--frozen', '--locked'} & set(exec_start.split()), (
@@ -108,137 +69,35 @@ def test_execstart_pins_the_venv_against_mutation():
     assert exec_start.endswith('--project sampler python -m sampler'), exec_start
 
 
-def test_service_is_a_oneshot_in_the_production_checkout():
+def test_service_is_a_oneshot_in_the_production_checkout(unit_values):
     """Type=oneshot is what makes `systemctl start` block until the tick ends.
 
     That is what step-22's row check relies on: the installer gets a
     deterministic point at which to query, rather than sleep-polling a 5 s
     timer.
     """
-    service = _directives(SERVICE_NAME)
+    service = TEMPLATES_DIR / SERVICE_NAME
 
-    assert _values(service, 'Service', 'Type') == ['oneshot']
-    assert _values(service, 'Service', 'WorkingDirectory') == ['%h/src/dark-factory']
+    assert unit_values(service, 'Service', 'Type') == ['oneshot']
+    assert unit_values(service, 'Service', 'WorkingDirectory') == ['%h/src/dark-factory']
 
 
-def test_timer_fires_every_five_seconds():
+def test_timer_fires_every_five_seconds(unit_values):
     """The cadence every sizing number in this task rests on.
 
     17,280 ticks/day x 25 metrics = 432,000 rows/day = 12.96M rows at the
     30-day retention this task also lands. Pinned rather than assumed, because
     changing it silently invalidates the retention sizing.
     """
-    timer = _directives(TIMER_NAME)
+    timer = TEMPLATES_DIR / TIMER_NAME
 
-    assert _values(timer, 'Timer', 'OnUnitActiveSec') == ['5s']
-    assert _values(timer, 'Install', 'WantedBy') == ['timers.target']
+    assert unit_values(timer, 'Timer', 'OnUnitActiveSec') == ['5s']
+    assert unit_values(timer, 'Install', 'WantedBy') == ['timers.target']
 
 
 # ── the installer ───────────────────────────────────────────────────────────
 
-_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
-"""Fake `systemctl` for testing install-load-sampler.sh.
-
-Records every invocation (minus `--user`) into a JSON state file at
-$FAKE_SYSTEMCTL_STATE. `enable --now <unit>` marks each non-flag arg as an
-enabled unit; `start <unit>` is recorded and always succeeds; `list-timers`
-echoes one line per *.timer enabled so far THIS RUN, unless
-FAKE_SYSTEMCTL_OMIT_LIST_TIMERS=1 -- simulating the self-verify failure where
-`enable` nominally succeeded but the unit is absent from `list-timers`.
-"""
-import json
-import os
-import sys
-
-STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
-
-
-def _load():
-    with open(STATE_PATH) as f:
-        return json.load(f)
-
-
-def _save(state):
-    with open(STATE_PATH, "w") as f:
-        json.dump(state, f)
-
-
-def main(argv):
-    args = [a for a in argv[1:] if a != "--user"]
-    if not args:
-        return 1
-    verb, rest = args[0], args[1:]
-
-    state = _load()
-    state.setdefault("calls", []).append(args)
-
-    if verb == "daemon-reload":
-        _save(state)
-        return 0
-
-    if verb == "enable":
-        units = [a for a in rest if not a.startswith("-")]
-        enabled = state.setdefault("enabled_timers", [])
-        for u in units:
-            if u not in enabled:
-                enabled.append(u)
-        _save(state)
-        return 0
-
-    if verb == "start":
-        _save(state)
-        if os.environ.get("FAKE_SYSTEMCTL_FAIL_START") == "1":
-            print("Job for dark-factory-load-sampler.service failed.",
-                  file=sys.stderr)
-            return 1
-        return 0
-
-    if verb == "show":
-        # `show -p WorkingDirectory --value <unit>` is how the installer asks
-        # which directory the UNIT runs in, and therefore which DB to verify.
-        _save(state)
-        print(os.environ.get("FAKE_SYSTEMCTL_WORKDIR", ""))
-        return 0
-
-    if verb == "list-timers":
-        _save(state)
-        if os.environ.get("FAKE_SYSTEMCTL_OMIT_LIST_TIMERS") == "1":
-            print("0 timers listed.")
-            return 0
-        enabled = state.get("enabled_timers", [])
-        for unit in enabled:
-            service = unit.replace(".timer", ".service")
-            print(f"Mon 2026-09-14 05:00:00 UTC 4s left n/a n/a {unit} {service}")
-        print(f"{len(enabled)} timers listed.")
-        return 0
-
-    return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv))
-'''
-
 _ONE_HOST_ROW: Samples = MappingProxyType({SampleKey('runqueue_ratio'): 4.06})
-
-
-def _fake_systemctl(tmp_path: Path):
-    bin_dir = tmp_path / 'bin'
-    bin_dir.mkdir(exist_ok=True)
-    fake = bin_dir / 'systemctl'
-    fake.write_text(_FAKE_SYSTEMCTL_SRC)
-    fake.chmod(0o755)
-
-    state_path = tmp_path / 'systemctl_state.json'
-    state_path.write_text(json.dumps({'calls': [], 'enabled_timers': []}))
-    return bin_dir, state_path
-
-
-def _systemctl_calls(tmp_path: Path) -> list[list[str]]:
-    state_path = tmp_path / 'systemctl_state.json'
-    if not state_path.is_file():
-        return []
-    return json.loads(state_path.read_text())['calls']
 
 
 def _seed_db(
@@ -262,13 +121,12 @@ def _seed_db(
     return db_path
 
 
-def _run_script(tmp_path: Path, *, env=None, reset_state=True):
-    bin_dir, state_path = _fake_systemctl(tmp_path) if reset_state else (
-        tmp_path / 'bin', tmp_path / 'systemctl_state.json')
+def _run_script(fake_timer_systemctl, *, env=None, reset_state=True):
+    if reset_state:
+        fake_timer_systemctl.reset()
 
     full_env = dict(os.environ)
-    full_env['PATH'] = f'{bin_dir}{os.pathsep}{full_env["PATH"]}'
-    full_env['FAKE_SYSTEMCTL_STATE'] = str(state_path)
+    full_env['PATH'] = f'{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env["PATH"]}'
     if env:
         full_env.update(env)
     return subprocess.run(
@@ -301,11 +159,11 @@ def test_script_is_executable():
         f'Expected {SCRIPT} to be executable (os.X_OK); run: chmod +x {SCRIPT}')
 
 
-def test_install_copies_both_units_verbatim_and_enables_the_timer(tmp_path: Path):
+def test_install_copies_both_units_verbatim_and_enables_the_timer(fake_timer_systemctl, tmp_path: Path):
     root = tmp_path / 'root'
     _seed_db(root)
 
-    result = _run_script(tmp_path, env=_install_env(tmp_path, root))
+    result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
     assert result.returncode == 0, (
         f'stdout={result.stdout!r} stderr={result.stderr!r}')
 
@@ -315,14 +173,14 @@ def test_install_copies_both_units_verbatim_and_enables_the_timer(tmp_path: Path
         assert installed.is_file(), f'Expected {installed} to exist after install'
         assert installed.read_bytes() == (TEMPLATES_DIR / name).read_bytes()
 
-    calls = _systemctl_calls(tmp_path)
+    calls = fake_timer_systemctl.calls()
     assert ['daemon-reload'] in calls, calls
     assert ['enable', '--now', TIMER_NAME] in calls, calls
     assert ['list-timers', '--all'] in calls, calls
     assert ['start', SERVICE_NAME] in calls, calls
 
 
-def test_the_timer_is_verified_before_the_service_is_kicked(tmp_path: Path):
+def test_the_timer_is_verified_before_the_service_is_kicked(fake_timer_systemctl, tmp_path: Path):
     """The ordering lesson scripts/install-flag-marker-sweep-timer.sh documents.
 
     A failing kick ends the run -- by the explicit `exit 1` inside the
@@ -333,28 +191,28 @@ def test_the_timer_is_verified_before_the_service_is_kicked(tmp_path: Path):
     root = tmp_path / 'root'
     _seed_db(root)
 
-    result = _run_script(tmp_path, env=_install_env(tmp_path, root))
+    result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
     assert result.returncode == 0, result.stderr
 
-    verbs = [call[0] for call in _systemctl_calls(tmp_path)]
+    verbs = [call[0] for call in fake_timer_systemctl.calls()]
     assert 'list-timers' in verbs and 'start' in verbs, verbs
     assert verbs.index('list-timers') < verbs.index('start'), verbs
 
 
-def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(tmp_path: Path):
+def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_timer_systemctl, tmp_path: Path):
     """Catches "enable nominally succeeded but the unit is absent" -- the case
     a bare `enable` exit code cannot distinguish. And it must stop there."""
     root = tmp_path / 'root'
     _seed_db(root)
 
-    result = _run_script(tmp_path, env={
+    result = _run_script(fake_timer_systemctl, env={
         **_install_env(tmp_path, root),
         'FAKE_SYSTEMCTL_OMIT_LIST_TIMERS': '1',
     })
 
     assert result.returncode != 0
     assert TIMER_NAME in result.stderr, result.stderr
-    verbs = [call[0] for call in _systemctl_calls(tmp_path)]
+    verbs = [call[0] for call in fake_timer_systemctl.calls()]
     assert 'start' not in verbs, f'kicked the service after a failed verify: {verbs}'
 
 
@@ -372,13 +230,13 @@ _HOST_AND_ONE_LEAF: Samples = MappingProxyType({
     ids=['host-only', 'host-and-one-leaf'],
 )
 def test_a_fresh_tick_passes_the_row_check_counting_every_row_it_wrote(
-    tmp_path: Path, tick: Samples
+    fake_timer_systemctl, tmp_path: Path, tick: Samples
 ):
     """A per-leaf row is a real row of the tick, and the report counts it."""
     root = tmp_path / 'root'
     _seed_db(root, tick=tick)
 
-    result = _run_script(tmp_path, env=_install_env(tmp_path, root))
+    result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
 
     assert result.returncode == 0, (
         f'stdout={result.stdout!r} stderr={result.stderr!r}')
@@ -386,7 +244,7 @@ def test_a_fresh_tick_passes_the_row_check_counting_every_row_it_wrote(
         result.stdout)
 
 
-def test_an_empty_db_fails_the_row_check_naming_the_path(tmp_path: Path):
+def test_an_empty_db_fails_the_row_check_naming_the_path(fake_timer_systemctl, tmp_path: Path):
     """The row check must be able to FAIL, not just narrate.
 
     An installer that always exits 0 would report a healthy install for a
@@ -395,23 +253,23 @@ def test_an_empty_db_fails_the_row_check_naming_the_path(tmp_path: Path):
     root = tmp_path / 'root'
     db_path = _seed_db(root, tick={})
 
-    result = _run_script(tmp_path, env=_install_env(tmp_path, root))
+    result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
 
     assert result.returncode != 0
     assert str(db_path) in result.stderr, result.stderr
 
 
-def test_an_absent_db_fails_the_row_check_naming_the_path(tmp_path: Path):
+def test_an_absent_db_fails_the_row_check_naming_the_path(fake_timer_systemctl, tmp_path: Path):
     root = tmp_path / 'root'
     root.mkdir()
 
-    result = _run_script(tmp_path, env=_install_env(tmp_path, root))
+    result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
 
     assert result.returncode != 0
     assert str(root / 'data' / 'load-samples.db') in result.stderr, result.stderr
 
 
-def test_the_verified_db_follows_the_unit_not_the_invoking_shell(tmp_path: Path):
+def test_the_verified_db_follows_the_unit_not_the_invoking_shell(fake_timer_systemctl, tmp_path: Path):
     """The installer must check the file the UNIT writes, not the operator's env.
 
     sampler/__main__.py resolves <DARK_FACTORY_ROOT or CWD>/data and the unit
@@ -430,7 +288,7 @@ def test_the_verified_db_follows_the_unit_not_the_invoking_shell(tmp_path: Path)
     decoy_root = tmp_path / 'decoy-root'
     _seed_db(decoy_root)
 
-    result = _run_script(tmp_path, env={
+    result = _run_script(fake_timer_systemctl, env={
         **_install_env(tmp_path, unit_root),
         'DARK_FACTORY_ROOT': str(decoy_root),
     })
@@ -440,7 +298,7 @@ def test_the_verified_db_follows_the_unit_not_the_invoking_shell(tmp_path: Path)
 
 
 def test_a_leftover_row_from_an_earlier_install_does_not_pass_the_kick_check(
-    tmp_path: Path
+    fake_timer_systemctl, tmp_path: Path
 ):
     """What `pre_kick_ts` is FOR, and nothing exercised it.
 
@@ -454,47 +312,54 @@ def test_a_leftover_row_from_an_earlier_install_does_not_pass_the_kick_check(
     root = tmp_path / 'root'
     db_path = _seed_db(root, ts_offset=-3600)
 
-    result = _run_script(tmp_path, env=_install_env(tmp_path, root))
+    result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
 
     assert result.returncode != 0, result.stdout
     assert str(db_path) in result.stderr, result.stderr
 
 
-def test_a_failed_kick_stops_the_install_naming_the_service(tmp_path: Path):
+def test_a_failed_kick_stops_the_install_naming_the_service(fake_timer_systemctl, tmp_path: Path):
     """The kick-failure branch, unreachable until the fake could refuse to start.
 
     It carries the install's most useful sentence -- the timer IS armed even
     though the tick failed -- and the row check below it must not run, because
     a kick that never happened cannot have written a row and the DB message
     would misdirect an operator onto the sampler's writes.
+
+    The sentence is read from the script's own `ERROR:` line: the fake's
+    `Job for <unit> failed.` line names the service too, so a bare
+    `SERVICE_NAME in stderr` passes even when the script prints nothing.
     """
     root = tmp_path / 'root'
     _seed_db(root)
 
-    result = _run_script(tmp_path, env={
+    result = _run_script(fake_timer_systemctl, env={
         **_install_env(tmp_path, root),
         'FAKE_SYSTEMCTL_FAIL_START': '1',
     })
 
     assert result.returncode != 0, result.stdout
-    assert SERVICE_NAME in result.stderr, result.stderr
+    own_error_lines = [line for line in result.stderr.splitlines() if line.startswith('ERROR:')]
+    assert own_error_lines, f'the installer printed no ERROR: line of its own: {result.stderr}'
+    kick_error = own_error_lines[0]
+    assert SERVICE_NAME in kick_error and 'IS installed and enabled' in kick_error, kick_error
     assert 'load-samples.db' not in result.stderr, (
         'the row check ran after a kick that never happened: '
         f'{result.stderr}'
     )
 
 
-def test_running_twice_is_idempotent(tmp_path: Path):
+def test_running_twice_is_idempotent(fake_timer_systemctl, tmp_path: Path):
     root = tmp_path / 'root'
     _seed_db(root)
     env = _install_env(tmp_path, root)
 
-    first = _run_script(tmp_path, env=env)
+    first = _run_script(fake_timer_systemctl, env=env)
     assert first.returncode == 0, first.stderr
     unit_dir = tmp_path / 'xdg-config' / 'systemd' / 'user'
     before = {n: (unit_dir / n).read_bytes() for n in (SERVICE_NAME, TIMER_NAME)}
 
-    second = _run_script(tmp_path, env=env)
+    second = _run_script(fake_timer_systemctl, env=env)
     assert second.returncode == 0, second.stderr
     after = {n: (unit_dir / n).read_bytes() for n in (SERVICE_NAME, TIMER_NAME)}
     assert before == after

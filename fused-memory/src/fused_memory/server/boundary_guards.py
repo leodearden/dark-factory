@@ -15,7 +15,8 @@ first, installed as ONE wrapping of ``ToolManager.call_tool`` by
 3. the uuid-prefix guard (:class:`shared.uuid_prefix_guard.UuidPrefixGuardMiddleware`),
    innermost of the three, per the order
    ``plans/review-all-s15-fused-memory-mcp-server-boundary-prd.md`` D2 fixes.
-   Present exactly when a prefix resolver is wired.
+   Present exactly when a prefix resolver is wired, and declared never to
+   repair :data:`UUID_PREFIX_EXEMPT_PATHS`.
 
 The safe wrapper must already be installed INSIDE this chain;
 ``fused_memory/server/main.py::_install_tool_dispatch_guards`` owns that
@@ -27,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 from fastmcp.server.middleware import Middleware
@@ -40,7 +42,8 @@ from shared.uuid_prefix_guard import (
     project_from_arguments,
 )
 
-from fused_memory.server.markup_guard import build_markup_guard
+from fused_memory.backends.sqlite_task_backend import PASSTHROUGH_ONLY_METADATA_KEYS
+from fused_memory.server.markup_guard import ResidueFloor, build_markup_guard
 from fused_memory.server.tool_middleware_bridge import install_tool_middleware
 from fused_memory.server.unknown_argument_guard import UnknownArgumentMiddleware
 
@@ -67,6 +70,13 @@ UUID_PREFIX_EXEMPT_TOOLS: frozenset[str] = frozenset({
 #: (PRD D3): losing the write is worse than the defect.
 UUID_PREFIX_FORWARD_ON_AMBIGUITY_TOOLS: frozenset[str] = frozenset({'update_task'})
 
+#: update_task accepts these values only verbatim
+#: (``sqlite_task_backend.py::_assert_passthrough_only_keys``), so repairing a
+#: stored value inside them turns an exact echo into a refusal (task 11331).
+UUID_PREFIX_EXEMPT_PATHS: Mapping[str, frozenset[tuple[str, ...]]] = MappingProxyType({
+    'update_task': frozenset(('metadata', key) for key in PASSTHROUGH_ONLY_METADATA_KEYS),
+})
+
 #: Also folded into the result proper, because the agent's client drops
 #: ``_meta`` (``plans/uuid-prefix-resolution-prd.md`` §11 Q1).
 _ECHOED_META_KEYS: frozenset[str] = frozenset({UUID_PREFIX_REPAIR_META_KEY})
@@ -87,8 +97,13 @@ def boundary_guard_chain(
     *,
     known_projects: Mapping[str, str] | None,
     prefix_resolver: PrefixResolver | None,
+    residue_floor: ResidueFloor | None = None,
 ) -> tuple[Middleware, ...]:
     """The chain's members, outermost first.
+
+    *residue_floor* is the markup guard's floor under its residue queue
+    (``fused_memory/server/markup_guard.py::build_markup_guard`` says what it
+    takes and returns); a refused payload the queue cannot hold goes there.
 
     REJECT_WITH_REPAIR is the PRD's declared markup tier for fused-memory
     (``plans/toolcall-markup-containment-prd.md`` section 4, C2), declared HERE
@@ -96,7 +111,11 @@ def boundary_guard_chain(
     fused-memory should forward repairs instead is that PRD's open question 3.
     """
     members: tuple[Middleware, ...] = (
-        build_markup_guard(policy=RepairPolicy.REJECT_WITH_REPAIR, known_projects=known_projects),
+        build_markup_guard(
+            policy=RepairPolicy.REJECT_WITH_REPAIR,
+            known_projects=known_projects,
+            residue_floor=residue_floor,
+        ),
         UnknownArgumentMiddleware(),
     )
     if prefix_resolver is None:
@@ -108,6 +127,7 @@ def boundary_guard_chain(
             project_from_arguments(known_projects or {}),
             exempt_tools=UUID_PREFIX_EXEMPT_TOOLS,
             forward_on_ambiguity_tools=UUID_PREFIX_FORWARD_ON_AMBIGUITY_TOOLS,
+            exempt_paths=UUID_PREFIX_EXEMPT_PATHS,
             # escalation_sink is unwired here: a burst still logs the storm
             # escape's ERROR line and rides on the caller's response. Wiring it
             # into a queue is task 9988.
@@ -121,12 +141,15 @@ def install_boundary_guards(
     *,
     known_projects: Mapping[str, str] | None,
     prefix_resolver: PrefixResolver | None,
+    residue_floor: ResidueFloor | None = None,
 ) -> None:
     """Install :func:`boundary_guard_chain` on *mcp* as one wrapping; idempotent.
 
-    Both arguments are keyword-only with no default, so every caller declares
-    them at the interception point. Without *prefix_resolver* the uuid-prefix
-    member is absent, and the first install says so once.
+    *known_projects* and *prefix_resolver* are keyword-only with no default, so
+    every caller declares them at the interception point. Without
+    *prefix_resolver* the uuid-prefix member is absent, and the first install
+    says so once. *residue_floor* reaches the markup guard unchanged;
+    ``fused_memory/server/main.py::_install_tool_dispatch_guards`` requires one.
     """
     if getattr(mcp._tool_manager, _BOUNDARY_GUARDED_SENTINEL, False):
         return
@@ -137,7 +160,11 @@ def install_boundary_guards(
         )
     install_tool_middleware(
         mcp,
-        boundary_guard_chain(known_projects=known_projects, prefix_resolver=prefix_resolver),
+        boundary_guard_chain(
+            known_projects=known_projects,
+            prefix_resolver=prefix_resolver,
+            residue_floor=residue_floor,
+        ),
         sentinel=_BOUNDARY_GUARDED_SENTINEL,
         label='boundary guards',
         echoed_meta_keys=_ECHOED_META_KEYS,

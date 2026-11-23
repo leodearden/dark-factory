@@ -48,11 +48,13 @@ ls "$TARGET_CONFIG"
 ```
 
 As of 2026-09-29 every project under `DASHBOARD_KNOWN_PROJECT_ROOTS` carries that file.
-The legacy spellings (`orchestrator.yaml`, `orchestrator-config.yaml`, `config.yaml`,
-`orchestrator/config.yaml`) are honoured only as a discovery fallback for a not-yet-migrated
-project, never as a choice for a new one — and a stray legacy file can sit BESIDE the canonical
-one (autopilot-video still has a `config.yaml`, pump-web-ui an `orchestrator.yaml`), so never let a
-glob over the legacy names win over the canonical path when both exist.
+Dashboard discovery reads only that name: task 7138 retired the legacy spellings
+(`orchestrator.yaml`, `orchestrator-config.yaml`, `orchestrator/config.yaml`), and a bare
+`config.yaml` was never read. A project using any other name still shows its tasks, but until
+renamed its escalation-backed views (escalations, merge queue and halt status, task runtime
+state) go dark and its burndown run-slot capacity reads as unknown. A stray legacy file can still sit BESIDE the canonical one (autopilot-video has a
+`config.yaml`, solar-challenge-platform an `orchestrator.yaml` symlink), so never let a glob over
+the legacy names win over the canonical path when both exist.
 
 Verify the file actually points at the target:
 
@@ -346,7 +348,7 @@ It takes **no path argument** — it always re-reads the process's own `ORCH_CON
 |---|---|
 | Per-role `models` / `budgets` / `max_turns` / `effort` / `timeouts` / `backends` | Reload |
 | `routing.*` (`allowed_models` / `ladder` / `per_model_daily_ceiling_usd` / `rules`) | Reload |
-| Steward grace (`steward_completion_timeout`, `steward_lifetime_budget`) | Reload |
+| Steward (`steward_completion_timeout`, `steward_lifetime_budget`, `steward_session_mode`) | Reload |
 | Scheduler + starvation-watchdog tuning, loop-pass thresholds (`idle_poll_secs`, `orphan_l0_timeout_secs`, watcher-rotation params) | Reload |
 | `review.*` checkpoint knobs, `unblock_auto.*`, `verify_env` | Reload |
 | `git.offline_lane_*` leaf tunables (test threads, poll interval, persist passes, recheck seconds, red-unlanded hours) | Reload |

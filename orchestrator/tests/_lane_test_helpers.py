@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from _git_fixtures import seed_repo
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, WorktreeInfo, _run
@@ -41,19 +42,9 @@ def pure_fs_git_ops(tmp_path: Path, *, pool_size: int = 0) -> GitOps:
 
 
 def make_warm_lane_repo(tmp_path: Path) -> Path:
-    """Temporary git repo with an initial commit + a resolvable warm base.
-
-    Pre-creates the default derived warm-lane base (task 2061 gate) so the
-    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK,
-    and marks `.worktrees/.pool-root` present (task 2099 create-once guard) —
-    mirrors test_lane_lifecycle_gitops.py's git_repo / test_warm_lane_
-    integration_gate.py's ig_git_repo fixtures.
-    """
+    """Temporary git repo with an initial commit + a resolvable warm base."""
     repo = seed_repo(tmp_path / 'repo')
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    seed_default_warm_base(repo)
     return repo
 
 

@@ -12,7 +12,7 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -32,6 +32,9 @@ from fused_memory.config.schema import (  # noqa: E402
     DedupOutageDetectorConfig,
     FusedMemoryConfig,
 )
+from fused_memory.embedder.endpoint_probe import (  # noqa: E402  # debt: task 10130
+    EmbedderEndpointProbe,
+)
 from fused_memory.maintenance.rebuild_summaries import (  # noqa: E402  # debt: ticket tkt_0RWT5KQG42DBD4GM4C51E2Y7NT
     RebuildResult,
 )
@@ -43,6 +46,9 @@ from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
 )
 from fused_memory.server.boundary_guards import (  # noqa: E402  # debt: task 10130
     install_boundary_guards,
+)
+from fused_memory.server.markup_residue_spool import (  # noqa: E402  # debt: task 10130
+    MarkupResidueSpool,
 )
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
@@ -82,6 +88,11 @@ if TYPE_CHECKING:
         async def recover_mem0_intents(
             self, *, on_landed: OnMem0Landed | None = None
         ) -> object: ...
+
+    class _FollowupHoldBackfiller(Protocol):
+        """What the startup follow-up hold backfill calls on the task interceptor."""
+
+        async def backfill_followup_holds(self, project_root: str, *, known_roots: Sequence[str]) -> int: ...
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -595,6 +606,13 @@ async def run_server():
     logger.info(f'  Graphiti: {config.graphiti.provider} ({config.graphiti.falkordb.uri})')
     logger.info(f'  Mem0/Qdrant: {config.mem0.qdrant_url}')
     logger.info(f'  Transport: {config.server.transport}')
+    if config.config_overlay is not None:
+        logger.info(
+            '  Config overlay active: %s (keys: %s)',
+            config.config_overlay.path, ', '.join(config.config_overlay.merged_keys),
+        )
+    embedder_probe = EmbedderEndpointProbe(config.embedder)
+    embedder_probe.start()
     systemd_listeners = take_systemd_listeners()
 
     # Initialize memory service
@@ -1011,11 +1029,17 @@ async def run_server():
         _wire_closure_collaborators(task_interceptor, memory_service)
         _wire_audit_trail_archive(task_interceptor, memory_service)
 
+    if taskmaster is not None:
+        await backfill_followup_holds_at_startup(config, task_interceptor, _known_projects_map.values())
+
     # Machine-derived topic clusters (task 3135). Built in both branches above
     # and never gated on reconciliation.enabled or the autoseed leaf: both of
     # its consumers (consolidate_memories and the add_memory guard) run either
     # way, and the leaf is read live at each of them.
     topic_cluster_store = build_topic_cluster_store(resolve_data_dir(config))
+
+    # The floor under the markup guard's residue queue (task 4809).
+    markup_residue_spool = MarkupResidueSpool(resolve_data_dir(config) / 'markup_residue')
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
@@ -1026,6 +1050,8 @@ async def run_server():
         curator_usage_gate=curator_usage_gate,
         known_projects=_known_projects_map,
         topic_cluster_store=topic_cluster_store,
+        markup_residue_spool=markup_residue_spool,
+        embedder_probe=embedder_probe,
     )
 
     # The ToolManager.call_tool wrappers, in the ONE order that works. The
@@ -1036,6 +1062,7 @@ async def run_server():
         mcp,
         known_projects=_known_projects_map,
         prefix_resolver=per_use_prefix_resolver(memory_service),
+        residue_spool=markup_residue_spool,
     )
 
     mcp.settings.host = config.server.host
@@ -1715,6 +1742,43 @@ def _start_remint_sweep(
     )
 
 
+async def backfill_followup_holds_at_startup(
+    config: FusedMemoryConfig,
+    interceptor: _FollowupHoldBackfiller,
+    project_roots: Iterable[str],
+) -> None:
+    """Hold each known project's pending follow-up stock behind its holder, before serving.
+
+    One project's failure is logged and never blocks startup or the other
+    projects (plans/follow-up-filing-shape-prd.md §3 decision 12). Every
+    project's backfill reads every real root, since another project can wait
+    on its follow-ups.
+    """
+    if not config.followup_hold.backfill_enabled:
+        logger.info('  Follow-up hold backfill: disabled (followup_hold.backfill_enabled)')
+        return
+    real_roots = await _real_project_roots(project_roots)
+    for root in real_roots:
+        try:
+            held = await interceptor.backfill_followup_holds(root, known_roots=real_roots)
+        except Exception:
+            logger.exception('  Follow-up hold backfill failed for %s', root)
+            continue
+        logger.info('  Follow-up hold backfill: held %d task(s) in %s', held, root)
+
+
+async def _real_project_roots(project_roots: Iterable[str]) -> tuple[str, ...]:
+    from fused_memory.models.scope import is_phantom_project_root
+
+    real_roots: list[str] = []
+    for root in project_roots:
+        if await asyncio.to_thread(is_phantom_project_root, root):
+            logger.warning('  Follow-up hold backfill: skipping %s, not a directory', root)
+        else:
+            real_roots.append(root)
+    return tuple(real_roots)
+
+
 async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
     """One pass of WAL TRUNCATE checkpoints over every target.
 
@@ -1889,7 +1953,8 @@ def resolve_data_dir(config: FusedMemoryConfig) -> Path:
     """The server's absolute reconciliation data dir: ``reconciliation.data_dir`` when reconciliation is configured, else ``<checkout>/data``.
 
     It holds the reconciliation-family stores: journal, ledger, event buffer,
-    tickets, curator and report state, write journal and topic clusters.
+    tickets, curator and report state, write journal, topic clusters and the
+    markup residue spool.
     """
     return Path(anchor_at_checkout(config.reconciliation.data_dir if config.reconciliation else 'data'))
 
@@ -2122,6 +2187,7 @@ def _install_tool_dispatch_guards(
     *,
     known_projects: Mapping[str, str] | None,
     prefix_resolver: PrefixResolver | None,
+    residue_spool: MarkupResidueSpool,
 ) -> None:
     """Install the three ``ToolManager.call_tool`` wrappers, in the ONE order that works.
 
@@ -2165,12 +2231,22 @@ def _install_tool_dispatch_guards(
     hosts no write tools and gets no boundary chain; it gets the str
     passthrough, the safe wrapper and the unknown-argument guard through
     :func:`_install_recon_report_guards`.
+
+    *residue_spool* is REQUIRED: its ``preserve`` is the floor under the
+    markup guard's residue queue. ``add_memory`` declares ``content`` before
+    ``project_id``, so a forward-consuming leak in ``content`` eats the routing
+    key, and preservation therefore may not depend on routing (task 4809).
     """
     from fused_memory.server.str_argument_passthrough import install_str_argument_passthrough
 
     install_str_argument_passthrough(mcp)
     _install_safe_tool_wrapper(mcp)
-    install_boundary_guards(mcp, known_projects=known_projects, prefix_resolver=prefix_resolver)
+    install_boundary_guards(
+        mcp,
+        known_projects=known_projects,
+        prefix_resolver=prefix_resolver,
+        residue_floor=residue_spool.preserve,
+    )
 
 
 def _install_recon_report_guards(mcp: Any) -> None:

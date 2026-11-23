@@ -11,7 +11,7 @@ Four classes, in the order a value travels:
 
 * ``TestSelfNameCloserIsSeenByTheReadRepair`` — the prefilter widening (4696).
 * ``TestOneSemanticsPerFieldOnBothArms`` — one leak, one published pattern,
-  whichever arm of ``_repair_one_field`` reports it (5283).
+  whichever arm of ``plan_markup_repair._repair_one_field`` reports it (5283).
 * ``TestQuotedSiblingTagIsNeverTruncated`` — the false positive the widening
   must NOT create.
 * ``TestTheSelfNameTruncationIsAcceptedAndReconstructible`` — the accepted
@@ -46,7 +46,7 @@ from _plan_markup_fixtures import (
 )
 from shared.toolcall_markup import detect
 
-from orchestrator.mcp import plan_tools
+from orchestrator.mcp import plan_markup_repair, plan_tools
 
 # ---------------------------------------------------------------------------
 # Task 4696 — the SELF-NAME closer, invisible to the read-repair prefilter.
@@ -88,7 +88,7 @@ def _seed_self_name_plan(artifacts) -> dict:
 class TestSelfNameCloserIsSeenByTheReadRepair:
     """Epsilon's lazy read-repair was gated on a predicate that could not see it.
 
-    ``_carries_markup`` is the cheap prefilter that decides whether the repair
+    ``plan_markup_repair.carries_markup`` is the cheap prefilter that decides whether the repair
     pass runs at all, and it asked the param-free ``detect``. A plan whose only
     damage is a field mis-closed with its OWN name-echoing tag therefore looked
     CLEAN: the prefilter returned False, the deep copy never happened, and the
@@ -98,7 +98,7 @@ class TestSelfNameCloserIsSeenByTheReadRepair:
 
     The repairer behind that gate was correct for them the whole time. Unlike
     the middleware boundary, this site pays NOTHING to be fully schema-aware:
-    the walk already yields the ``_PlanField`` record, so ``record.field`` and
+    the walk already yields the ``PlanField`` record, so ``record.field`` and
     ``record.schema_params`` are both in hand from the DECLARED table.
     """
 
@@ -114,11 +114,14 @@ class TestSelfNameCloserIsSeenByTheReadRepair:
         plan['design_decisions'][0]['rationale'] = _SELF_NAME_RATIONALE
         plan['reuse'][0]['how'] = _SELF_NAME_HOW
 
-        assert plan_tools._carries_markup(plan) is True
+        assert plan_markup_repair.carries_markup(plan, plan_tools._REPAIRABLE_PLAN_FIELDS) is True
 
     def test_a_genuinely_clean_plan_is_still_not_copied(self):
         """The prefilter's whole purpose survives the widening."""
-        assert plan_tools._carries_markup(corrupt_plan()) is False
+        assert (
+            plan_markup_repair.carries_markup(corrupt_plan(), plan_tools._REPAIRABLE_PLAN_FIELDS)
+            is False
+        )
 
     def test_both_fields_come_back_repaired(self, plan_artifacts):
         _seed_self_name_plan(plan_artifacts)
@@ -230,7 +233,7 @@ _MIXED_HOW = (
 
 #: The SAME leak head on the SAME field, in a shape ``repair`` refuses: the
 #: tail leads with an invoke closer so no candidate parses. Its only purpose is
-#: to drive the OTHER arm of ``_repair_one_field`` for one field.
+#: to drive the OTHER arm of ``plan_markup_repair._repair_one_field`` for one field.
 _UNREPAIRABLE_HOW = (
     _SELF_NAME_HOW_PROSE
     + closer('how')
@@ -243,7 +246,7 @@ _UNREPAIRABLE_HOW = (
 
 
 class TestOneSemanticsPerFieldOnBothArms:
-    """``_repair_one_field``'s two arms publish ``pattern`` from two sources.
+    """``plan_markup_repair._repair_one_field``'s two arms publish ``pattern`` from two sources.
 
     The UNREPAIRABLE arm publishes the gate's ``detect_for(value, field,
     schema_params)`` — the value the in-file comment above the gate already
@@ -322,7 +325,7 @@ class TestOneSemanticsPerFieldOnBothArms:
 class TestQuotedSiblingTagIsNeverTruncated:
     """A plan that TALKS ABOUT the markup must not be rewritten by the reader.
 
-    The widening at ``_carries_markup`` / ``_repair_one_field`` added every
+    The widening at ``plan_markup_repair.carries_markup`` / ``_repair_one_field`` added every
     sibling ``record.schema_params`` name to the gate, and ``repair`` accepts an
     EMPTY tail — a candidate closer at end-of-string recovers ``{}`` and still
     returns ``clean_value = value[:candidate.start()]``. Composed, a rationale

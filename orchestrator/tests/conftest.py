@@ -26,7 +26,31 @@ from _live_mcp_guard import (
     assert_no_live_attempts,
     install_live_mcp_guard,
 )
-from _tree_scan import TreePass, analyses_requested_by
+from _tree_pass_workers import TreePass, pass_requested_by
+
+# Repo root of this worktree.  Also used by the autouse ``_isolate_orch_config``
+# fixture to pin ``ORCH_CONFIG_PATH`` at the canonical top-level
+# ``dark-factory-orchestrator.yaml`` (task 2719: the transitional
+# ``orchestrator/config.yaml`` symlink was retired, so the old CWD-relative
+# ``Path('config.yaml')`` fallback no longer resolves to the operational config).
+#
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd orchestrator && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so this suite wires
+# the defence itself.  APPEND the repo root, never insert(0, ...): at sys.path[0]
+# it would make orchestrator/, shared/ etc. resolve as namespace packages
+# pointing at the project folder instead of src/<pkg>/, and the src dirs
+# inserted below would lose.
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from df_pytest_isolation import (
+    arm_fleet_dir_isolation,
+    arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
+    arm_usage_gate_sweep_confinement,
+    reject_unsafe_basetemp,
+)
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -48,27 +72,14 @@ _CROSS_SUITE_HELPERS_DIR = _TESTS_DIR / "cross_suite_helpers"
 if str(_CROSS_SUITE_HELPERS_DIR) not in sys.path:
     sys.path.insert(0, str(_CROSS_SUITE_HELPERS_DIR))
 
-# Repo root of this worktree.  Used by the autouse ``_isolate_orch_config``
-# fixture to pin ``ORCH_CONFIG_PATH`` at the canonical top-level
-# ``dark-factory-orchestrator.yaml`` (task 2719: the transitional
-# ``orchestrator/config.yaml`` symlink was retired, so the old CWD-relative
-# ``Path('config.yaml')`` fallback no longer resolves to the operational config).
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
-# runs `cd orchestrator && uv run pytest tests/`, which makes rootdir the
-# SUBPROJECT — the repo-root conftest.py is never loaded, so this suite wires
-# the defence itself.  APPEND the repo root, never insert(0, ...): at sys.path[0]
-# it would make orchestrator/, shared/ etc. resolve as namespace packages
-# pointing at the project folder instead of src/<pkg>/, and the src dirs
-# inserted above would lose.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
 
 # Suite-wide single-writer debug asserts (task 1999 / MQ-invariants ξ, I7).
 # Must be set BEFORE any `orchestrator.merge_lane.worker` import so the module-level
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
+
+# Why: test_suite_loads_no_dotenv.py.
+os.environ['PYTHON_DOTENV_DISABLED'] = '1'
 
 from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
@@ -81,19 +92,10 @@ from _orch_helpers import (  # noqa: E402
     reap_leaked_claimant_heartbeats,
     stamp_stock_routing_config,
 )
-from df_pytest_isolation import (  # noqa: E402
-    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
-    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
-    _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
-    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
-    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
-    _df_no_mock_derived_stray_dirs,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
-    _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — the binding IS the wiring
-    arm_leaked_drain_process_guard,
-    arm_usage_gate_sweep_confinement,
-    reject_unsafe_basetemp,
-)
 from shared.config_models import UsageCapConfig  # noqa: E402
+from shared.pytest_fake_clock import (  # noqa: E402  # debt: ticket tkt_0RX7VH710F56TR7A4GHW9M6WNK
+    fake_clock as fake_clock,
+)
 
 from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402
@@ -312,9 +314,9 @@ def tree_pass(request: pytest.FixtureRequest) -> TreePass:
     carries the whole-tree family mark.  NOT prebuilt at collection time
     (unlike shared/tests/session_prebuild.py): every xdist worker collects
     every item, so a prebuild would make every worker parse.  ``_tree_scan``
-    holds the mechanism.
+    holds the mechanism; ``_tree_pass_workers`` runs it in worker processes.
     """
-    return TreePass.run(analyses_requested_by(request.session.items))
+    return pass_requested_by(request.session.items)
 
 
 @pytest.fixture
@@ -368,6 +370,9 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     ``code_default_config`` fixture runs after this autouse fixture and still
     wins (re-pointing ORCH_CONFIG_PATH at a guaranteed-absent file) for the
     default-asserting tests.
+
+    The audit lane runs this suite with DF_VERIFY_CACHE=off, which forces every cache mode off
+    (verify_cache/modes.py::forced_off), so a test that wants the flag sets it explicitly.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
@@ -375,6 +380,9 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
     monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
     monkeypatch.setenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", "")
+    from orchestrator.verify_cache.modes import VERIFY_CACHE_ENV
+
+    monkeypatch.delenv(VERIFY_CACHE_ENV, raising=False)
 
 
 @pytest.fixture
@@ -571,7 +579,7 @@ def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Refuse an unsafe ``--basetemp``, arm the drain-leak guard, register the opt-out markers.
+    """Refuse an unsafe ``--basetemp``, arm the suite-wide defences, register the opt-out markers.
 
     The ``reject_unsafe_basetemp`` call comes FIRST and is unrelated to the
     marker below: it aborts collection when ``--basetemp`` points inside a live
@@ -593,6 +601,8 @@ def pytest_configure(config: pytest.Config) -> None:
     load-bearing yet.
     """
     reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
+    arm_fleet_dir_isolation(config)
     arm_leaked_drain_process_guard(config)
     from shared import usage_gate
 
@@ -1003,6 +1013,10 @@ def make_steward(tmp_path: Path):
       - ``steward_max_timeouts_per_escalation`` = 3,
         ``steward_max_empty_outputs_per_escalation`` = 2
       - ``suggestion_triage_threshold`` = 10
+      - ``steward_session_mode`` = the Field's own production default, read off
+        ``OrchestratorConfig.model_fields`` so mode-agnostic tests run the
+        shipped arm (an unassigned knob would be a MagicMock that silently
+        selects one)
       - triage + steward ``models`` / ``budgets`` / ``max_turns`` / ``effort`` / ``backends``
       - ``escalation.host`` / ``escalation.port``
       - ``timeouts.steward`` / ``steward_completion_timeout`` — the
@@ -1070,6 +1084,7 @@ def make_steward(tmp_path: Path):
         config.steward_max_timeouts_per_escalation = 3
         config.steward_max_empty_outputs_per_escalation = 2
         config.suggestion_triage_threshold = 10
+        config.steward_session_mode = OrchestratorConfig.model_fields['steward_session_mode'].default
         config.models.triage = 'sonnet'
         config.budgets.triage = 2.0
         config.max_turns.triage = 25

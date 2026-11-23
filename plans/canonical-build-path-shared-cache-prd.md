@@ -2,7 +2,9 @@
 
 **Status:** active. Authored 2026-11-18 (`/team /prd`, Leo attending). Amended the same day: the cache
 policy is one setting per host that covers the warm base and verifies (decision 9), and gate κ measures
-three policies.
+three policies. Amended 2026-11-19 after gate α passed (Leo's rulings on its report,
+`plans/canonical-build-path-alpha-2026-11-19/REPORT.md`): the primitive restarts a server whose start-up
+check collided (C5), and the drift probe covers the system libraries reify's build scripts probe (C13).
 **Code anchors** are cited by symbol and were checked against dark-factory main `0dfdd820f1` and reify
 main `11a5990e46` (2026-11-18). Main moves fast; re-locate symbols at implementation time.
 **Evidence** (all under `plans/sccache-path-key-study-2026-11-18/`): `REPORT.md` (the study, a laptop
@@ -260,7 +262,21 @@ Exit 126 means "this command cannot run in the mode its build directory requires
   its device and inode equal the worktree root's. Then change directory to
   `CANON/<path relative to the worktree root>`.
 - Otherwise: `/usr/bin/bwrap --dev-bind / / --bind <worktree root> CANON --chdir CANON/<relative>
-  --die-with-parent`, with the outer process's working directory left at the real path.
+  --die-with-parent --info-fd <fd>`, with the outer process's working directory left at the real path.
+  The outer process does not exec bwrap. It stays resident as bwrap's parent, in the caller's process
+  group, and exits with bwrap's status (the command's status, or 128+N for signal N).
+- Signals at the namespace boundary (ruled by Leo 2026-11-23, esc-10418-3, reify task 10418). bwrap is
+  started with TERM, INT and HUP ignored, except a signal the caller already ignored, which stays ignored.
+  Inside, the command runs under `/usr/bin/env --default-signal=<those signals> --`, so it gets the
+  caller's dispositions back. The outer process forwards TERM, INT and HUP to the `child-pid` bwrap writes
+  to the info fd, through a pidfd. A signal that arrives before the pid is known is delivered once it is.
+  The rule: entering the namespace is invisible to whoever kills the command. On every kill path (TERM or
+  INT to the started pid, TERM or INT to its process group, TERM to each descendant, SIGKILL to the pid
+  or the group), the command's own trap runs, or nothing survives, exactly as in real-path mode. A plain
+  exec of bwrap fails this: bwrap dies of the signal and its parent-death signal SIGKILLs the command
+  mid-trap (measured, bwrap 0.9.0). There is one signal policy, in canon_cache.py's supervisor. The
+  namespace parent reuses its forwarder, and the supervisor never leaves the command ignoring a signal
+  the caller did not ignore.
 - `PWD` is set to the new working directory. Arguments and `CARGO_*` values that are paths under the
   worktree's real root are rewritten to CANON (`--manifest-path`, `--target-dir`, `CARGO_TARGET_DIR`).
 - Exported for the command: `REIFY_CANON_ACTIVE` (the tree's device and inode), and
@@ -299,10 +315,20 @@ Where there is a server:
   store. Failure, or no store configured: backend `local_fallback`, `SCCACHE_DIR` = the fallback directory.
 - Watchdog: while the command runs, probe the store directly on an interval. Two consecutive probes that
   fail or exceed the timeout close the relay and reset its open connections for the rest of the command.
-- A server that started read-only (sccache does this silently when its start-up write check collides with
-  another server's; S5) is detected at exit as misses without writes or write errors, and reported. The
-  start lock removes collisions within a host; a collision across hosts remains possible and is reported
-  the same way.
+- Start-up check collisions. sccache's start-up check reads and then writes one file,
+  `<prefix>/.sccache_check`, and servers starting together collide on it (gate α: 0 to 14 of 20 servers
+  read-only per burst, 10 of 20 in a cross-host burst; S5). A concurrent write gets HTTP 423 and the
+  server runs read-only for its life, printing `storage write check failed` on stderr; a read racing a
+  write gets a truncated body and the server exits (`cache storage failed to read`), after the probe has
+  already passed. So, after starting the server, the primitive checks it: if the server exits before its
+  socket answers, or its stderr carries `storage write check failed`, it stops it, waits a random 0.5 to
+  2 s and starts it again, up to three attempts in all; after the third the backend is `local_fallback`
+  with reason `store_unreachable` (the server never started) or `read_only_server`. The command starts
+  only once a server is read-write or the fallback is chosen. The start lock removes most collisions
+  within a host; the retry covers the rest and those across hosts.
+- A server still read-only at exit (the retry is a start-time check) shows every miss as a write error
+  and no writes; it is reported with reason `read_only_server`. The counters alone do not identify it,
+  because same-key races also produce write errors (S5); the stderr line does.
 
 ### C6. `build_cache` event and the invocation journal
 
@@ -356,8 +382,12 @@ yaml and never carried in `verify_env`, which the workstation copies to the lapt
   file, that directory is removed first and the fact is logged.
 - **Sandboxed agent launches** (`agents/sandbox_dispatch.py::wrap_command`, reached from
   `agents/invoke.py::_sandbox_wrap`): when `build_canon.root` is set, the command is prefixed, before the
-  landlock helper, with `/usr/bin/bwrap --dev-bind / / --bind <lane> <root> --die-with-parent`. The
-  session's working directory and write-set are unchanged. A bwrap that fails is a failed launch.
+  landlock helper, with `/usr/bin/bwrap --dev-bind / / --bind <lane> <root>`. The session's working
+  directory and write-set are unchanged. A bwrap that fails is a failed launch. There is no
+  `--die-with-parent` (ruled by Leo 2026-11-23, esc-10418-3). Agent sessions are always stopped by their
+  process group (`shared/cli_invoke.py`: TERM to the group, a grace period, then SIGKILL), and bwrap stays
+  in that group. So the session gets TERM directly, as an unwrapped landlock launch does today. Adding the
+  flag would SIGKILL it as soon as bwrap died of that same TERM.
 - **All agent launches** (`workflow.py::TaskWorkflow._build_agent_env`): `PATH` as above.
 - `verify.py::run_main_tip_sweep`'s vanished-worktree detection also recognises `build_canon.root` in error
   text, since compiler errors name CANON for a leg that ran there.
@@ -436,7 +466,14 @@ Dark-factory `scripts/deploy/`:
   directories, then signals rclone to drop its directory cache.
 - `build_cache_drift_probe.sh`: prints one digest line per cache-key input of a host (compiler binaries
   including `cc1`, `cc1plus` and `as`, toolchain, system package versions, prebuilt archives, tool
-  versions). It is the committed form of the study's `prd-scout/S8-drift-probe.sh`.
+  versions). It is the committed form of the study's `prd-scout/S8-drift-probe.sh`, plus one line per
+  pkg-config module that reify's dependencies probe, with its version and `libdir`, or `ABSENT`. The
+  module list is derived from reify's `Cargo.lock` each run: every registry crate's
+  `[package.metadata.system-deps]` entries and `x11-dl`'s probe list (32 modules at reify `27c69f616f`).
+  A build script that bakes a pkg-config answer into generated source makes its crate and every
+  dependent miss on a host that answers differently; gate α's 18 cross-host misses were `libxss-dev`
+  present on one host only (`xscrnsaver`), which the fixed package list did not see. Whole-system
+  package or module lists are not compared: the hosts legitimately differ in hundreds of unrelated ones.
 - `check_build_cache_in_service.py --observations <file> --host <runner> --since <ISO> --min-runs N
   [--canon-root <path> --status-json <file>]`:
 
@@ -476,7 +513,7 @@ compiling a C file through `cc`. No row asserts a wall-clock bound.
 | 13 | reify | two concurrent builds in two trees | two servers, two sockets; each binary carries its own tree's marker |
 | 14 | reify | nested: a test in tree A runs the primitive on scratch tree B | B gets its own namespace and server; A's server is not used for B |
 | 15 | reify | the command killed by its process group; and a normal exit | no server or compiler process remains; after the normal exit no socket file |
-| 16 | reify | twenty primitives started at once against one store | every server's entries are written, or its event says `read_only_server` |
+| 16 | reify | twenty primitives started at once against one store | every command ran against a read-write server or the fallback; no server that started read-only or exited at start was used while attempts remained; any event saying `read_only_server` names the third attempt |
 | 17 | reify | session binding: the bind prefix, then dark-factory's landlock helper, then `cargo test` through the trampoline, under `incremental` policy (β1) and under `shared` and `mixed` (β2) | passes at CANON without entering a namespace; the working directory outside cargo is the real path; under `mixed` the workspace crate is compiled incrementally and not cached while the registry crate is a cache hit on the second tree |
 | 18 | reify | seed a lane from a CANON-stamped base with the primitive in the lane's tree; without it; and from an unstamped base | first: no file rewritten, no source touched, the lane's build is all fresh. Second: relocated from CANON, stamp gone, builds at the real path. Third: output identical to today's |
 | 19 | each | a process in a mount namespace with (a) its working directory, (b) only an open file, inside a bound lane, its visible parent killed; plus an unrelated same-user process in a foreign namespace whose root cannot be read | scans report the lane referenced for (a) and (b); CPU ticks are counted for (a); the unrelated process is not reported and is never signalled |
@@ -486,13 +523,16 @@ compiling a C file through `cc`. No row asserts a wall-clock bound.
 | 23 | DF | results in order: 2 degraded; a third; a healthy one; with the L1 closed by hand, 2 more degraded; 10 consecutive; neutral results interleaved; a `real_path` result with and without `expect_canon`; a `read_only_server` result; a `backend none` result under `incremental` policy | L1 at the second; nothing at the third; cleared by the healthy one; refiled; L2 at the tenth with the L1 superseded; neutral changes nothing; `real_path` is degraded only with `expect_canon`; read-only is degraded; `none` under `incremental` is healthy |
 | 24 | DF | a result with `build_cache` `None` | neutral; no observation row |
 | 25 | DF | the lane alarm of the task-verify-lanes PRD after the ladder is extracted | that PRD's own boundary row 20 passes unchanged |
+| 26 | reify | a command at CANON entered through the namespace (C3), whose TERM/INT trap takes 0.3 s; TERM and INT to the started pid and to its group, TERM to each descendant, SIGKILL to the pid and to the group | after a TERM or INT, the trap completes and its status is returned; after a SIGKILL, nothing the command started remains (reify task 10418) |
 
 ## 7. Pre-conditions
 
 - `bwrap` on both hosts (present; unprivileged use measured on both) and `rclone` on the workstation
   (present, v1.75.0).
 - `/opt/reify-canon/ws` provisioned by root on each host: a step of gate ι, not a task.
-- Task α's measurements pass, or its resolution amends this PRD (ruling 5).
+- Task α's measurements pass, or its resolution amends this PRD (ruling 5). Passed 2026-11-19: second-host
+  misses 18 of 1,150 (1.57%), 2,121 of 2,121 tests, the agent session's tests passing
+  (`plans/canonical-build-path-alpha-2026-11-19/REPORT.md`); C5 and C13 amended on its findings.
 - Dark-factory task 10737 (the lane alarm whose ladder η extracts) and 10736 (which edits the same
   configuration and verify modules as ζ) land first.
 
@@ -610,7 +650,9 @@ files (`config.py`, `verify.py`, `harness.py`) are contended, and pinning the ch
   `scripts/tests/test_build_cache_store.py` (new), `OPERATIONS.md`.
   Signal: after the installer, `--check` exits 0 and a PUT then GET through the endpoint round-trips; the
   pruner brings a fixture store under its cap, oldest first, leaving a file younger than ten minutes; the
-  in-service check returns 1, 0, 2 and 75 on fixture observation files. Depends on α. Unlocks ι.
+  in-service check returns 1, 0, 2 and 75 on fixture observation files; the drift probe prints a
+  pkg-config line for `xscrnsaver` and for each module of a fixture `Cargo.lock`'s system-deps crates.
+  Depends on α. Unlocks ι.
 - **λ. Interactive sessions** (reify, about 300 lines). `scripts/setup-dev.sh` installs the trampoline into
   `~/.local/share/reify-canon/bin`, puts it first on login shells' `PATH`, and reports when something
   shadows it; `scripts/run-gui.sh` and `scripts/run-gui-dev.sh` build and launch through
@@ -629,7 +671,8 @@ files (`config.py`, `verify.py`, `harness.py`) are contended, and pinning the ch
   both hosts; install the store on the workstation and `rclone` on the laptop; write the laptop's host
   configuration and `build_canon` in its yaml; reset the laptop's task-verify lanes and merge lane so
   their build directories are recreated; wait for laptop verifies; run the drift probe on both hosts and
-  compare; run the in-service check with `--min-runs 5` and `--canon-root`; then set `expect_canon` for
+  compare (on 2026-11-19, after `libxss-dev` and `libocct-draw-dev` were installed on the workstation, the
+  study's probe and the 32 reify-probed pkg-config modules showed no difference); run the in-service check with `--min-runs 5` and `--canon-root`; then set `expect_canon` for
   the laptop. Watch the laptop's verify memory cap for a killed compile, and verify wall time for a slow
   store (decisions 14, 15).
   Signal: the in-service check exits 0 for the laptop, and an observation row for a laptop verify shows

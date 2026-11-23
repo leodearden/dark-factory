@@ -10,6 +10,7 @@ import json
 import logging
 
 import pytest
+from _census_helpers import census_lines
 
 from fused_memory.middleware.execution_class_guard import execution_class_error
 from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
@@ -137,13 +138,7 @@ class TestInjectExecutionClass:
 # Unreadable metadata is discarded loudly, under the shared wire rule
 # ---------------------------------------------------------------------------
 
-_SCHEMA_WARNING = 'task_metadata.schema_warning'
-_SOURCE = 'source=execution_class_guard'
-
-
-def _discard_lines(caplog) -> list[str]:
-    messages = (r.getMessage() for r in caplog.records)
-    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+_SOURCE = 'execution_class_guard'
 
 
 class TestUnreadableMetadataIsDiscardedLoudly:
@@ -152,14 +147,14 @@ class TestUnreadableMetadataIsDiscardedLoudly:
             error = execution_class_error('{not json', 'recon-stage-task_knowledge_sync', '/proj')
         assert error is not None
         assert error['error_type'] == 'ValidationError'
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
     def test_malformed_string_injects_an_empty_dict_and_logs_one_census_line(self, caplog):
         from fused_memory.middleware.execution_class_guard import inject_execution_class
 
         with caplog.at_level(logging.WARNING):
             assert inject_execution_class('{not json') == {}
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
     @pytest.mark.parametrize('metadata', [None, ''])
     def test_absent_metadata_logs_no_census_line(self, metadata, caplog):
@@ -168,4 +163,4 @@ class TestUnreadableMetadataIsDiscardedLoudly:
         with caplog.at_level(logging.WARNING):
             execution_class_error(metadata, 'recon-stage-task_knowledge_sync', '/proj')
             inject_execution_class(metadata)
-        assert _discard_lines(caplog) == []
+        assert census_lines(caplog, _SOURCE) == []

@@ -7,6 +7,7 @@ tests. Rationale: docs/fallback-test-floor.md.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Literal
 from unittest.mock import AsyncMock, patch
@@ -15,12 +16,15 @@ import pytest
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_cmd import parse_config_command
 from orchestrator.verify_evidence import Leg
 from orchestrator.verify_fallback_floor import (
     CONFIGURED_SUITE_REASON,
     MERGE_BARE_DEFAULT_REASON,
+    NO_TESTS_RAN_CATEGORY,
     apply_fallback_test_floor,
+    fallback_ran_no_tests,
     fallback_test_floor_reason,
     has_configured_suite,
     non_python_reason,
@@ -169,6 +173,27 @@ class TestFallbackTestFloorDecision:
         assert has_configured_suite(test_command) is True
 
 
+class TestFallbackRanNoTests:
+    @pytest.mark.parametrize('test_command', ['pytest', REIFY_TEST_COMMAND])
+    def test_empty_slot_under_a_configured_command_ran_no_tests(self, test_command):
+        assert fallback_ran_no_tests(None, test_command) is True
+
+    @pytest.mark.parametrize('configured', ['', None])
+    def test_no_configured_test_command_is_the_explicit_opt_out(self, configured):
+        assert fallback_ran_no_tests(None, configured) is False
+
+    @pytest.mark.parametrize(('executed', 'configured'), [
+        ('pytest', 'pytest'),
+        (REIFY_TEST_COMMAND, REIFY_TEST_COMMAND),
+        ('pytest tests/test_x.py', 'pytest'),
+    ])
+    def test_a_slot_that_ran_a_command_ran_tests(self, executed, configured):
+        assert fallback_ran_no_tests(executed, configured) is False
+
+    def test_category_is_outside_the_failure_category_namespace(self):
+        assert NO_TESTS_RAN_CATEGORY not in {c.value for c in FailureCategory}
+
+
 def _config(test_command: str) -> OrchestratorConfig:
     return OrchestratorConfig(
         project_root=Path('/fake'),
@@ -272,10 +297,11 @@ def _write_files(root: Path, files: list[str]) -> None:
         path.write_text('# placeholder\n')
 
 
-def _passing_run_verification() -> AsyncMock:
-    return AsyncMock(return_value=verify.VerifyResult(
+def _passing_result() -> verify.VerifyResult:
+    return verify.VerifyResult(
         passed=True, test_output='', lint_output='', type_output='', summary='ok',
-    ))
+        failing_leg_categories=[],
+    )
 
 
 def _executed_configs(spy: AsyncMock) -> list[ModuleConfig]:
@@ -289,21 +315,29 @@ def _plan_pytest_run(plan: dict | None) -> dict:
 
 
 async def _run_fallback(
-    root: Path, test_command: str, files: list[str], role: Literal['merge', 'task'],
-) -> tuple[ModuleConfig, dict]:
+    root: Path,
+    test_command: str,
+    files: list[str],
+    role: Literal['merge', 'task'],
+    *,
+    verdict: verify.VerifyResult | None = None,
+    verify_allow_no_tests_ran: bool = False,
+) -> tuple[ModuleConfig, dict, verify.VerifyResult]:
     config = OrchestratorConfig(
         project_root=root,
         test_command=test_command,
         lint_command='ruff check',
         type_check_command='pyright',
+        verify_allow_no_tests_ran=verify_allow_no_tests_ran,
     )
-    spy = _passing_run_verification()
+    spy = AsyncMock(return_value=verdict if verdict is not None else _passing_result())
     with patch.object(verify, 'run_verification', new=spy):
         result = await verify.run_scoped_verification(
             root, config, [], task_files=files, role=role,
         )
+    spy.assert_awaited_once()
     (executed,) = _executed_configs(spy)
-    return executed, _plan_pytest_run(result.plan)
+    return executed, _plan_pytest_run(result.plan), result
 
 
 @pytest.mark.asyncio
@@ -312,8 +346,11 @@ class TestRunScopedVerificationFallbackFloor:
     async def test_reify_9839_executes_configured_command(self, tmp_path, role):
         _write_files(tmp_path, REIFY_9839_FILES)
 
-        executed, run = await _run_fallback(tmp_path, REIFY_TEST_COMMAND, REIFY_9839_FILES, role)
+        executed, run, result = await _run_fallback(
+            tmp_path, REIFY_TEST_COMMAND, REIFY_9839_FILES, role,
+        )
 
+        assert result.passed is True
         assert executed.test_command == REIFY_TEST_COMMAND
         assert run['scope_kind'] == 'full_suite'
         assert run['module_prefix'] == executed.prefix
@@ -324,7 +361,7 @@ class TestRunScopedVerificationFallbackFloor:
     async def test_reify_9761_polyglot_executes_configured_command(self, tmp_path, role):
         _write_files(tmp_path, REIFY_9761_FILES)
 
-        executed, run = await _run_fallback(tmp_path, REIFY_TEST_COMMAND, REIFY_9761_FILES, role)
+        executed, run, _ = await _run_fallback(tmp_path, REIFY_TEST_COMMAND, REIFY_9761_FILES, role)
 
         assert executed.test_command == REIFY_TEST_COMMAND
         assert run['scope_kind'] == 'full_suite'
@@ -335,7 +372,7 @@ class TestRunScopedVerificationFallbackFloor:
         _write_files(tmp_path, ['backend/pyproject.toml', 'backend/app/x.py'])
         test_command = 'cd backend && uv run pytest'
 
-        executed, run = await _run_fallback(tmp_path, test_command, ['backend/app/x.py'], 'task')
+        executed, run, _ = await _run_fallback(tmp_path, test_command, ['backend/app/x.py'], 'task')
 
         assert executed.prefix == 'backend'
         assert executed.test_command == test_command
@@ -353,7 +390,7 @@ class TestRunScopedVerificationFallbackFloor:
             mixed_files, test_command, role, derived_target=False,
         )
 
-        executed, run = await _run_fallback(tmp_path, test_command, mixed_files, role)
+        executed, run, _ = await _run_fallback(tmp_path, test_command, mixed_files, role)
 
         assert executed.prefix == 'backend'
         assert executed.test_command is not None
@@ -368,24 +405,17 @@ class TestRunScopedVerificationFallbackFloor:
     async def test_bare_default_source_only_runs_whole_at_merge_role(self, tmp_path):
         _write_files(tmp_path, ['pkg/helpers.py'])
 
-        executed, run = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'merge')
+        executed, run, result = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'merge')
 
+        assert result.passed is True
         assert executed.test_command == 'pytest'
         assert run['scope_kind'] == 'full_suite'
-
-    async def test_bare_default_source_only_keeps_the_task_role_skip(self, tmp_path):
-        _write_files(tmp_path, ['pkg/helpers.py'])
-
-        executed, run = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'task')
-
-        assert executed.test_command is None
-        assert run['scope_kind'] == 'skipped'
 
     @pytest.mark.parametrize('role', ROLES)
     async def test_derived_configured_suite_keeps_its_verbatim_reason(self, tmp_path, role):
         _write_files(tmp_path, ['tests/test_widget.py'])
 
-        executed, run = await _run_fallback(
+        executed, run, _ = await _run_fallback(
             tmp_path, REIFY_TEST_COMMAND, ['tests/test_widget.py'], role,
         )
 
@@ -393,3 +423,72 @@ class TestRunScopedVerificationFallbackFloor:
         assert run['reason'] == _unfloored_pytest_run(
             ['tests/test_widget.py'], REIFY_TEST_COMMAND, role,
         ).reason
+
+
+@pytest.mark.asyncio
+class TestNoTestsRanOutcome:
+    async def test_bare_default_source_only_task_role_fails_as_no_tests_ran(self, tmp_path):
+        _write_files(tmp_path, ['pkg/helpers.py'])
+
+        executed, run, result = await _run_fallback(tmp_path, 'pytest', ['pkg/helpers.py'], 'task')
+
+        assert result.passed is False
+        assert result.category == NO_TESTS_RAN_CATEGORY
+        assert result.trivial is False
+        assert result.failing_leg_categories is None
+        assert 'pkg/helpers.py' in result.cause_hint
+        assert 'report_missing_plan_file' in result.cause_hint
+        assert 'verify_allow_no_tests_ran' not in result.cause_hint
+        assert executed.test_command is None
+        assert executed.lint_command is not None
+        assert executed.type_check_command is not None
+        assert run['scope_kind'] == 'skipped'
+
+    async def test_bare_default_test_tree_data_module_fails_as_no_tests_ran(self, tmp_path):
+        data_module = 'shared/tests/silent_fallthrough_allowlist.py'
+        _write_files(tmp_path, [data_module])
+
+        executed, _, result = await _run_fallback(tmp_path, 'pytest', [data_module], 'task')
+
+        assert result.category == NO_TESTS_RAN_CATEGORY
+        assert executed.test_command is None
+
+    async def test_a_lint_red_is_reported_as_itself(self, tmp_path):
+        _write_files(tmp_path, ['pkg/helpers.py'])
+        lint_red = verify.VerifyResult(
+            passed=False, test_output='', lint_output='E1 boom', type_output='',
+            summary='lint failed', category='lint_error',
+        )
+
+        _, _, result = await _run_fallback(
+            tmp_path, 'pytest', ['pkg/helpers.py'], 'task', verdict=lint_red,
+        )
+
+        assert result.category == 'lint_error'
+        assert result.passed is False
+
+    async def test_opt_in_lets_the_empty_slot_pass_with_a_warning(self, tmp_path, caplog):
+        _write_files(tmp_path, ['pkg/helpers.py'])
+
+        with caplog.at_level(logging.WARNING, logger=verify.__name__):
+            _, run, result = await _run_fallback(
+                tmp_path, 'pytest', ['pkg/helpers.py'], 'task', verify_allow_no_tests_ran=True,
+            )
+
+        assert result.passed is True
+        assert result.category != NO_TESTS_RAN_CATEGORY
+        assert run['scope_kind'] == 'skipped'
+        assert any(
+            record.levelno == logging.WARNING
+            and 'verify_allow_no_tests_ran' in record.getMessage()
+            and 'pkg/helpers.py' in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.parametrize('role', ROLES)
+    async def test_empty_test_command_stays_the_explicit_opt_out(self, tmp_path, role):
+        _write_files(tmp_path, ['pkg/helpers.py'])
+
+        _, _, result = await _run_fallback(tmp_path, '', ['pkg/helpers.py'], role)
+
+        assert result.passed is True

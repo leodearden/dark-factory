@@ -254,8 +254,8 @@ class EventType(StrEnum):
     # commit whose verify was suppressed, and when the suppression was decided.
     merge_flake_suppressed = 'merge_flake_suppressed'
     # One firing of Abort trigger 3 (no in-flight verify progress for a full
-    # budget) in orchestrator/src/orchestrator/merge_lane/worker.py::
-    # SpeculativeMergeWorker._run_inflight_verify, requeue and cap-out alike.
+    # budget) in orchestrator/src/orchestrator/merge_lane/inflight_verify.py::
+    # InflightVerifyRun._abort_no_progress, requeue and cap-out alike.
     # task_id-keyed, phase='merge'; data is defined by
     # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::
     # NoProgressAbort.event_data.
@@ -745,6 +745,11 @@ class EventType(StrEnum):
     # when the pin becomes blocked, then at most once per
     # pin_blocked_emit_interval_secs while it stays blocked.
     pin_blocked = 'pin_blocked'
+    # A dispatch candidate was refused its locks by parks alone, none of which
+    # outranks it (task 6328).  Producer, and the one statement of the payload:
+    # scheduler.py::Scheduler._note_park_refusal.  Emitted once the refusal has
+    # lasted park_refused_emit_interval_secs, then at most once per that interval.
+    park_refused = 'park_refused'
     # The starvation watchdog fired on a task (task 3821).  Producer, and the
     # one statement of the payload: scheduler.py::Scheduler._deliver_starvation_finding,
     # whose pin fields come from starvation_watchdog.py::PinOutcome.as_payload;
@@ -1064,10 +1069,13 @@ class EventType(StrEnum):
     #   (landlock/bwrap) OR the explicit ``backend=none`` operator escape hatch
     #   (still emitted — data.backend lets γ1 distinguish deliberately-
     #   unsandboxed from real containment without a third event type).
-    #   role/task_id are first-class columns. Payload: {backend, digest} —
+    #   role/task_id are first-class columns. Payload:
+    #   {backend, digest[, docs_main_paths]} —
     #   ``digest`` is WriteSet.digest(), the STABLE sha256 of the resolved
     #   writable set so an operator can diff exactly what a given invocation
-    #   could touch (INV-2 structured facts). Consumed by γ1's soak predicate.
+    #   could touch (INV-2 structured facts). ``docs_main_paths`` is present
+    #   only when the docs-only project_root grant fired. Consumed by γ1's
+    #   soak predicate.
     sandbox_applied = 'sandbox_applied'
 
     # Recovery-decision emission (PRD plans/task-escalation-state-graph-prd.md
@@ -1397,12 +1405,15 @@ class EventStore:
         data: dict | None = None,
         cost_usd: float | None = None,
         duration_ms: int | None = None,
-    ) -> None:
-        """Write a single event row.  Never raises."""
+    ) -> int | None:
+        """Write a single event row.  Never raises.
+
+        Returns the inserted row's id, or None when the write failed.
+        """
         try:
             conn = self._connect()
             try:
-                conn.execute(
+                cursor = conn.execute(
                     'INSERT INTO events '
                     '(timestamp, run_id, task_id, event_type, phase, role, '
                     ' data, cost_usd, duration_ms) '
@@ -1420,10 +1431,12 @@ class EventStore:
                     ),
                 )
                 conn.commit()
+                return cursor.lastrowid
             finally:
                 conn.close()
         except Exception:
             logger.warning('event_store.emit failed', exc_info=True)
+            return None
 
     def latest_merge_finalized(
         self,

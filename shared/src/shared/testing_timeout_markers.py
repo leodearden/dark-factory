@@ -49,7 +49,7 @@ from __future__ import annotations
 import ast
 import re
 import textwrap
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -64,6 +64,7 @@ __all__ = [
     'SweepFloors',
     'TimeoutSite',
     'TreeScan',
+    'closest_timeout_site',
     'inverts',
     'judge_inversion_band',
     'scan_python_tree',
@@ -118,6 +119,11 @@ class TimeoutSite(NamedTuple):
     a constant naming the same number resolve identically; only the spelling
     tells a marker that moves with a re-derivation from one that must be found
     and hand-edited.
+
+    ``constant`` is the trailing identifier of a bare or dotted NAME argument
+    (``BIG``, ``whole_tree_guard_family.WHOLE_TREE_SCAN_TEST_TIMEOUT`` ->
+    ``'WHOLE_TREE_SCAN_TEST_TIMEOUT'``), read from the AST; None for a
+    literal, a computation or no argument.
     """
 
     qualname: str
@@ -125,6 +131,7 @@ class TimeoutSite(NamedTuple):
     seconds: float | None
     lineno: int
     spelling: str
+    constant: str | None = None
 
 
 def _timeout_call_arg(call: ast.Call) -> ast.expr | None:
@@ -136,20 +143,23 @@ def _timeout_call_arg(call: ast.Call) -> ast.expr | None:
     return None
 
 
+def _constant_name(arg: ast.expr | None) -> str | None:
+    if isinstance(arg, ast.Name):
+        return arg.id
+    if isinstance(arg, ast.Attribute):
+        return arg.attr
+    return None
+
+
 def _resolve_seconds(arg: ast.expr | None, sanctioned: Mapping[str, float]) -> float | None:
-    if arg is None:
-        return None
     if (
         isinstance(arg, ast.Constant)
         and isinstance(arg.value, int | float)
         and not isinstance(arg.value, bool)
     ):
         return float(arg.value)
-    if isinstance(arg, ast.Name):
-        return sanctioned.get(arg.id)
-    if isinstance(arg, ast.Attribute):
-        return sanctioned.get(arg.attr)
-    return None
+    constant = _constant_name(arg)
+    return None if constant is None else sanctioned.get(constant)
 
 
 def _sites_among(
@@ -170,6 +180,7 @@ def _sites_among(
                 seconds=_resolve_seconds(arg, sanctioned),
                 lineno=element.lineno,
                 spelling='' if arg is None else ast.unparse(arg),
+                constant=_constant_name(arg),
             )
         )
     return sites
@@ -222,6 +233,54 @@ def timeout_marker_sites(
 
     walk(tree.body, '')
     return tuple(sites)
+
+
+_DECORATOR_KINDS = frozenset({SiteKind.DECORATOR, SiteKind.CLASS_DECORATOR})
+
+
+def closest_timeout_site(
+    sites: Iterable[TimeoutSite], class_chain: Sequence[str], function: str
+) -> TimeoutSite | None:
+    """The timeout mark pytest's ``get_closest_marker`` would find for a test, from *sites* alone.
+
+    *sites* are one module's :func:`timeout_marker_sites`; the test is
+    *function* collected through the classes *class_chain*, outermost first
+    (empty for a module-level function).  Levels are searched closest first,
+    as pytest walks a test's nodes upward:
+
+    1. the function's own decorators (``A::B::f``);
+    2. each enclosing class, innermost first -- its body ``pytestmark``
+       (``A::B::<pytestmark>``), then its decorators (``A::B``);
+    3. the module ``pytestmark`` (``<module>``).
+
+    Within a level the mark APPLIED first wins, because pytest finds it first:
+    decorators apply bottom-up, so the one nearest ``def``/``class``; a
+    ``pytestmark`` list in its own order; and a class body binds
+    ``pytestmark`` before its decorators append to it.
+
+    Not seen, so a test reached only through them reads as the next level out:
+    marks a ``pytest.param`` or ``parametrize`` applies, marks a hook or plugin
+    adds at collection, and marks on a base class or a method inherited from
+    one (an inherited test answers from its collecting class and the module).
+    """
+    by_qualname: dict[str, list[TimeoutSite]] = {}
+    for site in sites:
+        by_qualname.setdefault(site.qualname, []).append(site)
+    for qualname in _closest_first_qualnames(class_chain, function):
+        level = sorted(by_qualname.get(qualname, ()), key=lambda site: site.lineno)
+        if level:
+            return level[-1] if level[0].kind in _DECORATOR_KINDS else level[0]
+    return None
+
+
+def _closest_first_qualnames(class_chain: Sequence[str], function: str) -> Iterator[str]:
+    prefix = ''.join(f'{name}::' for name in class_chain)
+    yield f'{prefix}{function}'
+    for depth in range(len(class_chain), 0, -1):
+        enclosing = '::'.join(class_chain[:depth])
+        yield f'{enclosing}::{_PYTESTMARK_QUALNAME}'
+        yield enclosing
+    yield _MODULE_QUALNAME
 
 
 def inverts(seconds: float | None, *, verify_cli_budget: int) -> bool:

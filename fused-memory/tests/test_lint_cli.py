@@ -1,9 +1,10 @@
-"""Tests for _lint_cli.py, the CLI and pragma contract shared by the fused-memory/scripts/check_*.py lints.
+"""Tests for _lint_cli.py, the CLI, pragma and per-file debt-budget contract shared by the fused-memory/scripts/check_*.py lints.
 
 Drives only the public surface: ``Violation``, ``exemption_pattern``,
-``is_exempted``, ``discover_files`` and ``run_cli``.  ``run_cli`` is exercised
-with a stub ``find_violations`` so these tests pin the shared driver, not any one
-checker's rule.
+``is_exempted``, ``discover_files``, ``run_cli``, ``DebtEntry``, ``DebtBaseline``
+and ``apply_debt_budget``.  ``run_cli`` is exercised with a stub
+``find_violations``, and the budget with stub message builders, so these tests
+pin the shared machinery, not any one checker's rule.
 """
 from __future__ import annotations
 
@@ -361,3 +362,152 @@ class TestRunCliFileSelection:
 
         assert exit_code == 2
         assert f'error: {missing}: No such file or directory' in capsys.readouterr().err
+
+
+_MERGE_QUEUE_KEY = 'orchestrator/tests/test_merge_queue.py'
+
+
+def _baseline(debt: dict[str, int]):
+    return _lint_cli.DebtBaseline.from_mapping(debt)
+
+
+class TestDebtBaselineEntryFor:
+    """``entry_for`` matches a scanned filename to its row on TRAILING PATH COMPONENTS.
+
+    The nine lint call sites pass repo-relative paths while pytest passes
+    absolutes, so both spellings must reach the same row; a substring must not.
+    """
+
+    def test_returns_the_row_under_the_baselines_own_key(self):
+        entry = _baseline({_MERGE_QUEUE_KEY: 6}).entry_for(_MERGE_QUEUE_KEY)
+        assert entry == _lint_cli.DebtEntry(_MERGE_QUEUE_KEY, 6)
+
+    def test_an_absolute_spelling_matches_the_same_row(self):
+        """The returned key is the baseline's spelling, which a remedy can quote verbatim."""
+        entry = _baseline({_MERGE_QUEUE_KEY: 6}).entry_for(f'/home/someone/repo/{_MERGE_QUEUE_KEY}')
+        assert entry == _lint_cli.DebtEntry(_MERGE_QUEUE_KEY, 6)
+
+    def test_a_backslash_spelling_matches_the_same_row(self):
+        entry = _baseline({_MERGE_QUEUE_KEY: 6}).entry_for(
+            'C:\\repo\\orchestrator\\tests\\test_merge_queue.py'
+        )
+        assert entry == _lint_cli.DebtEntry(_MERGE_QUEUE_KEY, 6)
+
+    @pytest.mark.parametrize(
+        'filename',
+        [
+            'orchestrator/tests/not_test_merge_queue.py',
+            'test_merge_queue.py',
+            'dashboard/tests/test_merge_queue.py',
+        ],
+    )
+    def test_a_filename_sharing_fewer_trailing_components_is_not_matched(self, filename: str):
+        assert _baseline({_MERGE_QUEUE_KEY: 6}).entry_for(filename) is None
+
+    def test_rows_sharing_a_basename_are_told_apart_by_their_package_directory(self):
+        baseline = _baseline({
+            'orchestrator/tests/test_harness.py': 2,
+            'fused-memory/tests/test_harness.py': 7,
+        })
+        assert baseline.entry_for('orchestrator/tests/test_harness.py') == _lint_cli.DebtEntry(
+            'orchestrator/tests/test_harness.py', 2
+        )
+        assert baseline.entry_for('/abs/fused-memory/tests/test_harness.py') == _lint_cli.DebtEntry(
+            'fused-memory/tests/test_harness.py', 7
+        )
+        assert baseline.entry_for('dashboard/tests/test_harness.py') is None
+
+    def test_a_non_debt_file_is_none_and_a_zero_budget_row_is_not(self):
+        """None means "no budget recorded"; a zero budget is a row of its own."""
+        baseline = _baseline({_MERGE_QUEUE_KEY: 0})
+        assert baseline.entry_for('orchestrator/tests/test_brand_new.py') is None
+        assert baseline.entry_for(_MERGE_QUEUE_KEY) == _lint_cli.DebtEntry(_MERGE_QUEUE_KEY, 0)
+
+    def test_the_baseline_is_a_snapshot_of_its_source_mapping(self):
+        debt = {_MERGE_QUEUE_KEY: 6}
+        baseline = _baseline(debt)
+        debt[_MERGE_QUEUE_KEY] = 99
+        debt['orchestrator/tests/test_brand_new.py'] = 1
+        assert baseline.entry_for(_MERGE_QUEUE_KEY) == _lint_cli.DebtEntry(_MERGE_QUEUE_KEY, 6)
+        assert baseline.entry_for('orchestrator/tests/test_brand_new.py') is None
+
+
+_BUDGETED_FILE = '/abs/orchestrator/tests/test_merge_queue.py'
+
+
+def _overrun_msg(entry, found: int) -> str:
+    return f'overrun {entry.key} budget={entry.budget} found={found}'
+
+
+def _slack_msg(entry, found: int) -> str:
+    return f'slack {entry.key} budget={entry.budget} found={found}'
+
+
+def _apply(found: list, budget: int | None) -> list:
+    entry = None if budget is None else _lint_cli.DebtEntry(_MERGE_QUEUE_KEY, budget)
+    return _lint_cli.apply_debt_budget(
+        found,
+        entry,
+        filename=_BUDGETED_FILE,
+        build_overrun_msg=_overrun_msg,
+        build_slack_msg=_slack_msg,
+    )
+
+
+def _sites(*positions: tuple[int, int]) -> list:
+    return [Violation(_BUDGETED_FILE, lineno, col, 'raw site') for lineno, col in positions]
+
+
+class TestApplyDebtBudget:
+    """One rule's per-file violation COUNT against its budget: four branches."""
+
+    def test_a_non_debt_file_reports_every_violation_unchanged(self):
+        found = _sites((9, 0), (2, 4), (2, 0))
+        assert _apply(found, None) == found
+
+    def test_exactly_at_budget_is_silent(self):
+        assert _apply(_sites((9, 0), (2, 4), (2, 0)), 3) == []
+
+    def test_over_budget_reports_the_last_sites_in_source_order_with_the_overrun_message(self):
+        found = _sites((9, 0), (2, 4), (5, 1), (2, 0))
+        message = _overrun_msg(_lint_cli.DebtEntry(_MERGE_QUEUE_KEY, 2), 4)
+        assert _apply(found, 2) == [
+            Violation(_BUDGETED_FILE, 5, 1, message),
+            Violation(_BUDGETED_FILE, 9, 0, message),
+        ]
+
+    @pytest.mark.parametrize('found_count', [0, 2])
+    def test_under_budget_reports_one_file_level_slack_violation(self, found_count: int):
+        found = _sites(*((lineno, 0) for lineno in range(10, 10 + found_count)))
+        message = _slack_msg(_lint_cli.DebtEntry(_MERGE_QUEUE_KEY, 3), found_count)
+        assert _apply(found, 3) == [Violation(_BUDGETED_FILE, 1, 0, message)]
+
+    def test_both_budget_builders_are_required_and_keyword_only(self):
+        """A rule must not be able to inherit another rule's remedy by omission.
+
+        The overrun parameter once carried ``= None`` falling back to Rule B's own
+        builder. Every call site passed it, so the fallback was dead, but a new
+        rule calling ``apply_debt_budget(found, entry)`` would have silently
+        prescribed another rule's remedy, with no type error and no failing test.
+        The slack builder carries the same guard. Requiredness is the whole guard,
+        so it is pinned here rather than trusted.
+
+        Every call passes entry None, so no debt entry is ever built here.
+        """
+        apply_debt_budget = _lint_cli.apply_debt_budget
+
+        def _builder(_entry, _found) -> str:
+            return ''
+
+        builders = {'build_overrun_msg': _builder, 'build_slack_msg': _builder}
+        assert apply_debt_budget([], None, filename=_BUDGETED_FILE, **builders) == [], (
+            'the complete call must succeed, so each TypeError below has one cause'
+        )
+        for name in builders:
+            others = {key: value for key, value in builders.items() if key != name}
+            with pytest.raises(TypeError):
+                apply_debt_budget([], None, filename=_BUDGETED_FILE, **others)
+            with pytest.raises(TypeError):
+                apply_debt_budget([], None, _builder, filename=_BUDGETED_FILE, **others)
+        with pytest.raises(TypeError):
+            apply_debt_budget([], None, _BUDGETED_FILE, _builder, _builder)

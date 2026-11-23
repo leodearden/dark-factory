@@ -64,6 +64,8 @@ PURE_STDLIB_LEAVES = (
     'backends',
     'branch_names',
     'cgroup_slice',
+    'cgroup_stats',
+    'claude_executable',
     'cli_boundary',
     'config_dir',
     'escalation_layout',
@@ -112,8 +114,11 @@ PURE_STDLIB_LEAVES = (
     'task_timestamp',
     'task_transitions',
     'tasks_db_readonly',
+    'testing_ceiling_anchors',
     'testing_fake_claude',
+    'testing_fake_clock',
     'testing_mcp_stub',
+    'testing_own_time',
     'testing_reify_layout',
     'testing_repo_wide_tests',
     'testing_streams',
@@ -123,6 +128,7 @@ PURE_STDLIB_LEAVES = (
     'timestamps',
     'transcript_archive',
     'verify_admission',
+    'verify_scope_tag',
     'whole_tree_guard_family',
 )
 

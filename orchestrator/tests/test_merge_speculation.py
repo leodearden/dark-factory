@@ -99,11 +99,9 @@ from orchestrator.merge_lane.disposition import (
     classify_merge_failure_disposition,
 )
 from orchestrator.merge_lane.landed_outbox import LandedOutbox
+from orchestrator.merge_lane.liveness import _acquire_warm_verify_worktree
 from orchestrator.merge_lane.shadow import _submit_shadow_divergence_escalation  # noqa: F401
-from orchestrator.merge_lane.worker import (
-    MergeRequest,
-    _acquire_warm_verify_worktree,
-)
+from orchestrator.merge_lane.worker import MergeRequest
 from orchestrator.verify import VerifyResult
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
 
@@ -170,47 +168,6 @@ async def _until(
             await asyncio.sleep(0.01)
 
     await wait_responsive(_poll(), timeout=timeout, label=what)
-
-
-# ---------------------------------------------------------------------------
-# Verify port
-# ---------------------------------------------------------------------------
-
-
-class _SequencedVerifier(FakeVerifier):
-    """A ``VerifyPort`` whose scoped verifies follow a per-CALL sequence.
-
-    Injected as ``MergeLane(..., verifier=...)``.  Each call consumes the next
-    :class:`VerifyScript`, the last one repeating for every further call, and
-    sets ``entered[n]`` as call *n* arrives.  The late-arrival scenarios need
-    both halves of that: a first verify that PARKS on a gate (so the Merger's
-    one-shot look-ahead peek has provably run and found nothing before the
-    next request is injected) and a later verify that returns immediately —
-    a per-call shape ``FakeVerifier``'s per-task scripts do not express.
-
-    Usage::
-
-        gate_a_release = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a_release), passes())
-        gate_a_entered = verifier.entered[0]
-    """
-
-    def __init__(self, *sequence: VerifyScript) -> None:
-        super().__init__(default=sequence[-1])
-        self._sequence = list(sequence)
-        self.entered = [asyncio.Event() for _ in sequence]
-
-    async def run_scoped(self, *args: Any, **options: Any) -> VerifyResult:
-        call = len(self.verified)
-        self.verified.append(options.get('task_id'))
-        if call < len(self.entered):
-            self.entered[call].set()
-        script = self._sequence[min(call, len(self._sequence) - 1)]
-        if script.release is not None:
-            await script.release.wait()
-        if script.error is not None:
-            raise script.error
-        return script.result
 
 
 # ---------------------------------------------------------------------------
@@ -899,7 +856,7 @@ async def _run_spec_scenario(
     git_ops: GitOps,
     config: OrchestratorConfig,
     *,
-    verifier: _SequencedVerifier,
+    verifier: FakeVerifier,
     gate_a: asyncio.Event,
     escalation_queue: Any = None,
     max_cas_retries: int | None = None,
@@ -908,7 +865,8 @@ async def _run_spec_scenario(
     """Land A, then verify B speculatively on a warm `_spec-` lane.
 
     *gate_a* releases A's parked verify; *verifier* must park A's verify on it
-    (see ``_SequencedVerifier``).  When *after_b_verify_entered* is supplied it
+    (``FakeVerifier(..., sequence=[hangs_until(gate_a), ...])``).  When
+    *after_b_verify_entered* is supplied it
     runs once B's own verify has entered the port — that is the window in which
     B holds a warm spec lane, where the abort scenarios inject their fault —
     and B's request is NOT awaited afterwards, since an abort leaves it
@@ -935,7 +893,7 @@ async def _run_spec_scenario(
     try:
         await queue.put(req_a)
         await wait_responsive(
-            verifier.entered[0].wait(),
+            verifier.await_entry(1),
             timeout=MERGE_GATE_BARRIER_TIMEOUT,
             label='spec-a: verify entered',
         )
@@ -948,7 +906,7 @@ async def _run_spec_scenario(
         )
         if after_b_verify_entered is not None:
             await wait_responsive(
-                verifier.entered[1].wait(),
+                verifier.await_entry(2),
                 timeout=MERGE_GATE_BARRIER_TIMEOUT,
                 label='spec-b: verify entered',
             )
@@ -980,7 +938,7 @@ class TestSpecLaneWarmPath:
         """B's verify acquires a seeded `_spec-` lane from the pool."""
         git_ops, config = await _spec_lane_git_ops(spec_git_repo)
         gate_a = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a), passes(summary='ok'))
+        verifier = FakeVerifier(passes(summary='ok'), sequence=[hangs_until(gate_a)])
 
         _, req_b = await _run_spec_scenario(
             spec_git_repo, git_ops, config, verifier=verifier, gate_a=gate_a,
@@ -1008,7 +966,7 @@ class TestSpecLaneWarmPath:
         """
         git_ops, config = await _spec_lane_git_ops(spec_git_repo)
         gate_a = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a), passes(summary='ok'))
+        verifier = FakeVerifier(passes(summary='ok'), sequence=[hangs_until(gate_a)])
 
         await _run_spec_scenario(
             spec_git_repo, git_ops, config, verifier=verifier, gate_a=gate_a,
@@ -1038,7 +996,7 @@ class TestSpecLaneWarmPath:
         """
         git_ops, config = await _spec_lane_git_ops(spec_git_repo)
         gate_a = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a), passes(summary='ok'))
+        verifier = FakeVerifier(passes(summary='ok'), sequence=[hangs_until(gate_a)])
 
         req_a, req_b = await _run_spec_scenario(
             spec_git_repo, git_ops, config, verifier=verifier, gate_a=gate_a,
@@ -1100,15 +1058,15 @@ class TestSpecLaneAbortReleasesLane:
         git_ops, config = await _spec_lane_git_ops(spec_git_repo)
         gate_a = asyncio.Event()
         gate_b = asyncio.Event()
-        verifier = _SequencedVerifier(
-            hangs_until(gate_a), hangs_until(gate_b), passes(summary='ok'),
+        verifier = FakeVerifier(
+            passes(summary='ok'), sequence=[hangs_until(gate_a), hangs_until(gate_b)],
         )
 
         async def _cancel_b(lane: MergeLane, req_b: MergeRequest) -> None:
             # The abort-poll ticks at VERIFY_ABANDON_POLL_SECS (a public class
             # attribute production documents as the tests' knob), so shorten it
             # rather than waiting ten seconds for the next tick.
-            lane.VERIFY_ABANDON_POLL_SECS = 0.01
+            lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
             req_b.result.cancel()
             pool = git_ops.spec_warm_lane_pool
             assert pool is not None
@@ -1137,12 +1095,12 @@ class TestSpecLaneAbortReleasesLane:
         git_ops, config = await _spec_lane_git_ops(spec_git_repo)
         gate_a = asyncio.Event()
         gate_b = asyncio.Event()
-        verifier = _SequencedVerifier(
-            hangs_until(gate_a), hangs_until(gate_b), passes(summary='ok'),
+        verifier = FakeVerifier(
+            passes(summary='ok'), sequence=[hangs_until(gate_a), hangs_until(gate_b)],
         )
 
         async def _halt(lane: MergeLane, req_b: MergeRequest) -> None:
-            lane.VERIFY_ABANDON_POLL_SECS = 0.01
+            lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.01
             lane.operator_halt('spec-lane abort scenario')
             pool = git_ops.spec_warm_lane_pool
             assert pool is not None
@@ -1197,7 +1155,7 @@ class TestSpecLaneFinalizeTerminalRelease:
             ops_kwargs={'fail_branch': 'task/spec-b', 'fail_with': fail_with},
         )
         gate_a = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a), passes(summary='ok'))
+        verifier = FakeVerifier(passes(summary='ok'), sequence=[hangs_until(gate_a)])
 
         _, req_b = await _run_spec_scenario(
             repo, git_ops, config, verifier=verifier, gate_a=gate_a,
@@ -1248,7 +1206,7 @@ class TestSpecLaneFinalizeTerminalRelease:
             ops_kwargs={'fail_branch': 'task/spec-b', 'fail_with': 'cas_failed'},
         )
         gate_a = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a), passes(summary='ok'))
+        verifier = FakeVerifier(passes(summary='ok'), sequence=[hangs_until(gate_a)])
 
         _, req_b = await _run_spec_scenario(
             spec_git_repo, git_ops, config, verifier=verifier, gate_a=gate_a,
@@ -1294,8 +1252,7 @@ class TestSpecLaneShadowSafetyValve:
             spec_git_repo, warm_verify_shadow_compare=True,
         )
         gate_a = asyncio.Event()
-        verifier = _SequencedVerifier(
-            hangs_until(gate_a),
+        verifier = FakeVerifier(
             VerifyScript(result=VerifyResult(
                 passed=True,
                 test_output=(
@@ -1305,6 +1262,7 @@ class TestSpecLaneShadowSafetyValve:
                 ),
                 lint_output='', type_output='', summary='',
             )),
+            sequence=[hangs_until(gate_a)],
         )
         escalation_queue = _make_escalation_queue()
 
@@ -1342,7 +1300,7 @@ class TestSpecLaneShadowSafetyValve:
 # The conftest autouse _mock_merge_queue_verification fixture leaves the
 # module-level orchestrator.merge_lane.worker.run_scoped_verification returning
 # passed=True for anything that still resolves it.  These tests do not rely on
-# it and do not displace it: each builds a _SequencedVerifier and passes it as
+# it and do not displace it: each builds a FakeVerifier and passes it as
 # MergeLane(..., verifier=...), so the lane asks its OWN collaborator, for its
 # whole lifetime rather than for the duration of a with-block (PRD
 # plans/merge-lane-quality-prd.md task β).
@@ -1360,7 +1318,7 @@ class _LateArrivalFakeEventStore(EventStore):
 
         store = _LateArrivalFakeEventStore()
         lane, queue = _make_late_arrival_lane(
-            git_ops, event_store=store, verifier=_SequencedVerifier(passes()),
+            git_ops, event_store=store, verifier=FakeVerifier(),
         )
         ...
         spec_events = store.speculative_events(EventType.speculative_merge)
@@ -1507,13 +1465,16 @@ class TestLateArrivalAttaches:
         # ── Gate for A's LOCAL verify ──────────────────────────────────────────
         # Gating the LOCAL verify (run_scoped_verification) holds A in-flight so
         # the Merger's look-ahead peek fires and finds nothing, then blocks waiting
-        # for a new request.  gate_a_entered fires inside _gated_local on the first
-        # call — by then the look-ahead has already completed (it has no yield points
+        # for a new request.  gate_a_entered fires on A's first scoped verify
+        # — by then the look-ahead has already completed (it has no yield points
         # between permit-acquire and pop, so it runs synchronously before the verify
         # task gets an event-loop tick).
         gate_a_release = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a_release), passes(summary='ok'))
-        gate_a_entered = verifier.entered[0]
+        gate_a_entered = asyncio.Event()
+        verifier = FakeVerifier(
+            passes(summary='ok'),
+            sequence=[hangs_until(gate_a_release, entered=gate_a_entered)],
+        )
 
         # ── B's remote runner — passes immediately (no gate needed for step-1) ─
         gate_b_prerelease = asyncio.Event()
@@ -1716,8 +1677,11 @@ class TestLateArrivalCleanCAS:
 
         # ── Gate A's LOCAL verify ──────────────────────────────────────────────
         gate_a_release = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a_release), passes(summary='ok'))
-        gate_a_entered = verifier.entered[0]
+        gate_a_entered = asyncio.Event()
+        verifier = FakeVerifier(
+            passes(summary='ok'),
+            sequence=[hangs_until(gate_a_release, entered=gate_a_entered)],
+        )
 
         # ── Gate B's REMOTE verify — hold until A has landed ─────────────────
         gate_b_release = asyncio.Event()
@@ -1859,7 +1823,7 @@ class TestLateArrivalFailCascade:
     GREEN after step-2: B is a speculative descendant of A; the existing
     cascade in _verifier_loop (7608-7721) finds B in _inflight, cancels its
     verify, re-merges against actual main, re-dispatches through the redispatch park,
-    and emits speculative_discard reason=previous_failed via _dispatch_item.
+    and emits speculative_discard reason=previous_failed via VerifyDispatcher.dispatch.
     """
 
     async def test_predecessor_fail_cascades_to_late_arrival(
@@ -1895,6 +1859,7 @@ class TestLateArrivalFailCascade:
 
         # ── Gate A's LOCAL verify — FAILS on first call, passes on subsequent ─
         gate_a_release = asyncio.Event()
+        gate_a_entered = asyncio.Event()
         # A's verify parks on the gate and then FAILS; every later call (B's
         # re-verify after the cascade) passes.  Real ``VerifyResult`` values,
         # not doubles: the injected port returns the dataclass the production
@@ -1904,17 +1869,16 @@ class TestLateArrivalFailCascade:
         # the same policy bucket as the '' it replaced (in neither
         # INFRA_TRANSIENT_CATEGORIES nor PREEXISTING_BREAK_SKIP_CATEGORIES), so
         # no retry/skip path changes.
-        verifier = _SequencedVerifier(
+        verifier = FakeVerifier(passes(summary='ok'), sequence=[
             VerifyScript(
                 result=VerifyResult(
                     passed=False, test_output='FAIL', lint_output='', type_output='',
                     summary='tests failed', category='test_failure',
                 ),
                 release=gate_a_release,
+                entered=gate_a_entered,
             ),
-            passes(summary='ok'),
-        )
-        gate_a_entered = verifier.entered[0]
+        ])
 
         # ── B's REMOTE verify: liveness-faithful runner to assert cancel-while-live ─
         # _id_liveness_fake_runner tracks whether cancel_verify was called while the
@@ -2013,7 +1977,7 @@ class TestLateArrivalFailCascade:
         # ── DONE-WHEN 4(a): speculative_merge event for B (B was dispatched
         #    speculatively against A's commit — only present after step-2).
         #
-        #    NOTE: speculative_discard is emitted in _dispatch_item only when a
+        #    NOTE: speculative_discard is emitted in VerifyDispatcher.dispatch only when a
         #    speculative item is re-dispatched from the redispatch park with _n_failed=True
         #    (single-host path). In the two-host cascade path, the remerged item
         #    has speculative=False (_remerge sets speculative=False), so
@@ -2124,7 +2088,7 @@ class TestLateArrivalGuards:
         git_ops.merge_to_main = _spy_merge  # type: ignore[method-assign]
 
         # ── A's local verify: passes immediately (no gate) ───────────────────
-        verifier = _SequencedVerifier(passes(summary='ok'))
+        verifier = FakeVerifier(passes(summary='ok'))
 
         # ── B's remote runner: passes immediately ────────────────────────────
         gate_b_prerelease = asyncio.Event()
@@ -2214,8 +2178,11 @@ class TestLateArrivalGuards:
 
         # ── Gate A's verify so the look-ahead peek fires before A lands ──────
         gate_a_release = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a_release), passes(summary='ok'))
-        gate_a_entered = verifier.entered[0]
+        gate_a_entered = asyncio.Event()
+        verifier = FakeVerifier(
+            passes(summary='ok'),
+            sequence=[hangs_until(gate_a_release, entered=gate_a_entered)],
+        )
 
         gate_b_prerelease = asyncio.Event()
         gate_b_prerelease.set()
@@ -2306,8 +2273,11 @@ class TestLateArrivalGuards:
         git_ops = GitOps(git_config, spec_git_repo)
 
         gate_a_release = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a_release), passes(summary='ok'))
-        gate_a_entered = verifier.entered[0]
+        gate_a_entered = asyncio.Event()
+        verifier = FakeVerifier(
+            passes(summary='ok'),
+            sequence=[hangs_until(gate_a_release, entered=gate_a_entered)],
+        )
 
         gate_b_prerelease = asyncio.Event()
         gate_b_prerelease.set()
@@ -2395,8 +2365,11 @@ class TestLateArrivalGuards:
         git_ops.merge_to_main = _spy_merge  # type: ignore[method-assign]
 
         gate_a_release = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a_release), passes(summary='ok'))
-        gate_a_entered = verifier.entered[0]
+        gate_a_entered = asyncio.Event()
+        verifier = FakeVerifier(
+            passes(summary='ok'),
+            sequence=[hangs_until(gate_a_release, entered=gate_a_entered)],
+        )
 
         gate_b_prerelease = asyncio.Event()
         gate_b_prerelease.set()
@@ -2520,8 +2493,11 @@ class TestLateArrivalGuards:
 
         # ── Gate: hold A's local verify in-flight ────────────────────────────
         gate_a_release = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a_release), passes(summary='ok'))
-        gate_a_entered = verifier.entered[0]
+        gate_a_entered = asyncio.Event()
+        verifier = FakeVerifier(
+            passes(summary='ok'),
+            sequence=[hangs_until(gate_a_release, entered=gate_a_entered)],
+        )
 
         gate_b_prerelease = asyncio.Event()
         gate_b_prerelease.set()
@@ -2689,8 +2665,11 @@ class TestLateArrivalSubmissionOrderCAS:
 
         # ── Gate A's LOCAL verify ─────────────────────────────────────────────
         gate_a_release = asyncio.Event()
-        verifier = _SequencedVerifier(hangs_until(gate_a_release), passes(summary='ok'))
-        gate_a_entered = verifier.entered[0]
+        gate_a_entered = asyncio.Event()
+        verifier = FakeVerifier(
+            passes(summary='ok'),
+            sequence=[hangs_until(gate_a_release, entered=gate_a_entered)],
+        )
 
         # ── Gate B's REMOTE verify ─────────────────────────────────────────────
         gate_b_release = asyncio.Event()

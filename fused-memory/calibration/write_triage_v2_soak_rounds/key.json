@@ -8883,6 +8883,7 @@
   ],
   "shards": {
     "attach_primary_00": {
+      "basis": "attach_time",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "attach_primary_00-000",
@@ -8906,11 +8907,13 @@
         "attach_primary_00-018",
         "attach_primary_00-019"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "attach_second_00": {
+      "basis": "attach_time",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "attach_second_00-000",
@@ -8934,11 +8937,13 @@
         "attach_second_00-018",
         "attach_second_00-019"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "primary_00": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_00-000",
@@ -8982,11 +8987,13 @@
         "primary_00-038",
         "primary_00-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_01": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_01-000",
@@ -9030,11 +9037,13 @@
         "primary_01-038",
         "primary_01-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_02": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_02-000",
@@ -9078,11 +9087,13 @@
         "primary_02-038",
         "primary_02-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_03": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_03-000",
@@ -9126,11 +9137,13 @@
         "primary_03-038",
         "primary_03-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_04": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_04-000",
@@ -9174,11 +9187,13 @@
         "primary_04-038",
         "primary_04-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_05": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_05-000",
@@ -9222,11 +9237,13 @@
         "primary_05-038",
         "primary_05-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_06": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_06-000",
@@ -9270,11 +9287,13 @@
         "primary_06-038",
         "primary_06-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_07": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_07-000",
@@ -9318,11 +9337,13 @@
         "primary_07-038",
         "primary_07-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_08": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_08-000",
@@ -9366,11 +9387,13 @@
         "primary_08-038",
         "primary_08-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_09": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_09-000",
@@ -9414,11 +9437,13 @@
         "primary_09-038",
         "primary_09-039"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_10": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_10-000",
@@ -9461,11 +9486,13 @@
         "primary_10-037",
         "primary_10-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_11": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_11-000",
@@ -9508,11 +9535,13 @@
         "primary_11-037",
         "primary_11-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_12": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_12-000",
@@ -9555,11 +9584,13 @@
         "primary_12-037",
         "primary_12-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_13": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_13-000",
@@ -9602,11 +9633,13 @@
         "primary_13-037",
         "primary_13-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_14": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_14-000",
@@ -9649,11 +9682,13 @@
         "primary_14-037",
         "primary_14-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_15": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_15-000",
@@ -9696,11 +9731,13 @@
         "primary_15-037",
         "primary_15-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "primary_16": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "primary_16-000",
@@ -9743,11 +9780,13 @@
         "primary_16-037",
         "primary_16-038"
       ],
+      "kind": "initial",
       "rater": "opus-primary",
       "role": "primary",
       "round": 0
     },
     "rerate_01_primary_00": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_primary_00-000",
@@ -9780,11 +9819,13 @@
         "rerate_01_primary_00-027",
         "rerate_01_primary_00-028"
       ],
+      "kind": "rerate",
       "rater": "opus-primary",
       "role": "primary",
       "round": 1
     },
     "rerate_01_primary_01": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_primary_01-000",
@@ -9816,11 +9857,13 @@
         "rerate_01_primary_01-026",
         "rerate_01_primary_01-027"
       ],
+      "kind": "rerate",
       "rater": "opus-primary",
       "role": "primary",
       "round": 1
     },
     "rerate_01_primary_02": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_primary_02-000",
@@ -9852,11 +9895,13 @@
         "rerate_01_primary_02-026",
         "rerate_01_primary_02-027"
       ],
+      "kind": "rerate",
       "rater": "opus-primary",
       "role": "primary",
       "round": 1
     },
     "rerate_01_second_00": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_second_00-000",
@@ -9889,11 +9934,13 @@
         "rerate_01_second_00-027",
         "rerate_01_second_00-028"
       ],
+      "kind": "rerate",
       "rater": "opus-second",
       "role": "second",
       "round": 1
     },
     "rerate_01_second_01": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_second_01-000",
@@ -9925,11 +9972,13 @@
         "rerate_01_second_01-026",
         "rerate_01_second_01-027"
       ],
+      "kind": "rerate",
       "rater": "opus-second",
       "role": "second",
       "round": 1
     },
     "rerate_01_second_02": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "rerate_01_second_02-000",
@@ -9961,11 +10010,13 @@
         "rerate_01_second_02-026",
         "rerate_01_second_02-027"
       ],
+      "kind": "rerate",
       "rater": "opus-second",
       "role": "second",
       "round": 1
     },
     "second_00": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_00-000",
@@ -10009,11 +10060,13 @@
         "second_00-038",
         "second_00-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_01": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_01-000",
@@ -10057,11 +10110,13 @@
         "second_01-038",
         "second_01-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_02": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_02-000",
@@ -10105,11 +10160,13 @@
         "second_02-038",
         "second_02-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_03": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_03-000",
@@ -10153,11 +10210,13 @@
         "second_03-038",
         "second_03-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_04": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_04-000",
@@ -10201,11 +10260,13 @@
         "second_04-038",
         "second_04-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_05": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_05-000",
@@ -10249,11 +10310,13 @@
         "second_05-038",
         "second_05-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_06": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_06-000",
@@ -10297,11 +10360,13 @@
         "second_06-038",
         "second_06-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_07": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_07-000",
@@ -10345,11 +10410,13 @@
         "second_07-038",
         "second_07-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_08": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_08-000",
@@ -10393,11 +10460,13 @@
         "second_08-038",
         "second_08-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_09": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_09-000",
@@ -10441,11 +10510,13 @@
         "second_09-038",
         "second_09-039"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_10": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_10-000",
@@ -10488,11 +10559,13 @@
         "second_10-037",
         "second_10-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_11": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_11-000",
@@ -10535,11 +10608,13 @@
         "second_11-037",
         "second_11-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_12": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_12-000",
@@ -10582,11 +10657,13 @@
         "second_12-037",
         "second_12-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_13": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_13-000",
@@ -10629,11 +10706,13 @@
         "second_13-037",
         "second_13-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_14": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_14-000",
@@ -10676,11 +10755,13 @@
         "second_14-037",
         "second_14-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_15": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_15-000",
@@ -10723,11 +10804,13 @@
         "second_15-037",
         "second_15-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "second_16": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "second_16-000",
@@ -10770,11 +10853,13 @@
         "second_16-037",
         "second_16-038"
       ],
+      "kind": "initial",
       "rater": "opus-second",
       "role": "second",
       "round": 0
     },
     "third_00": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "third_00-000",
@@ -10819,31 +10904,37 @@
         "third_00-039",
         "third_00-040"
       ],
+      "kind": "third",
       "rater": "opus-third-00",
       "role": "third",
       "round": 0
     },
     "third_01": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "third_01-000",
         "third_01-001"
       ],
+      "kind": "third",
       "rater": "opus-third-01",
       "role": "third",
       "round": 0
     },
     "third_02": {
+      "basis": "current",
       "brief_sha256": "b12cdc1176efc349dc87315c632f72baffbceb54ce329e745246126c1f1f753f",
       "items": [
         "third_02-000",
         "third_02-001"
       ],
+      "kind": "third",
       "rater": "opus-third-02",
       "role": "third",
       "round": 0
     },
     "third_03": {
+      "basis": "current",
       "brief_sha256": "7cd0bad3b1845c40d044b27946c703ba3d20a853aef6abd6140b5df8b56540c1",
       "items": [
         "third_03-000",
@@ -10853,6 +10944,7 @@
         "third_03-004",
         "third_03-005"
       ],
+      "kind": "third",
       "rater": "opus-third-03",
       "role": "third",
       "round": 0

@@ -37,7 +37,6 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import re
 import shlex
 import shutil
 import subprocess
@@ -68,61 +67,6 @@ _RUN_TIMEOUT_SECS = 60
 
 _TASK_ID = "4637"
 _SID = "4396db7a-2b3c-4d5e-8f90-a1b2c3d4e5f6"
-
-_SELF_TEST_DOC_NAME = "self-test-doc.md"
-
-_NO_MARKER_DOC = """\
-- **Session transcript**: `python3 scripts/locate_session_transcript.py <session-id>`
-
-Somewhere else entirely, an unmarked `find / -name '*<session-id>*'`.
-"""
-
-_DUPLICATE_MARKER_DOC = """\
-<!-- session-transcript-lookup:begin -->
-- **Session transcript**: `python3 scripts/locate_session_transcript.py <session-id>`
-<!-- session-transcript-lookup:end -->
-
-## Some later section
-
-<!-- session-transcript-lookup:begin -->
-- **Session transcript**: `ls data/orchestrator/agent-transcripts/*/*/<session-id>.jsonl`
-<!-- session-transcript-lookup:end -->
-"""
-
-
-def _marked_command(text, doc_name):
-    """The command on the :data:`LABEL` bullet between :data:`MARKER`'s begin/end comments."""
-    return vci.marked_span(
-        text,
-        begin=f"{MARKER}:begin",
-        end=f"{MARKER}:end",
-        pattern=re.compile(r"- \*\*" + re.escape(LABEL) + r"\*\*: `([^`]+)`"),
-        what=f"`- **{LABEL}**: <command>` bullet",
-        source=doc_name,
-        label=f"the {LABEL!r} command",
-        task="4637",
-    ).strip()
-
-
-@pytest.mark.parametrize(
-    ("markdown_text", "case"),
-    [
-        (_NO_MARKER_DOC, "missing"),
-        (_DUPLICATE_MARKER_DOC, "duplicated"),
-    ],
-)
-def test_marked_command_fails_loudly_on_a_broken_marker(markdown_text, case):
-    """A missing or duplicated marker RAISES — never '' or None.
-
-    Missing is the vacuity hazard: an extractor that silently returns nothing
-    turns the execution test green while executing nothing at all.
-    """
-    with pytest.raises(AssertionError) as excinfo:
-        _marked_command(markdown_text, _SELF_TEST_DOC_NAME)
-
-    message = str(excinfo.value)
-    assert MARKER in message, case
-    assert _SELF_TEST_DOC_NAME in message, case
 
 
 def _git(*args):
@@ -195,7 +139,13 @@ def test_documented_session_transcript_lookup_finds_an_archived_session_from_a_w
 ):
     """Each doc's recipe must find an archived session from where an agent stands."""
     doc_name = doc_path.relative_to(REPO_ROOT).as_posix()
-    command = _marked_command(doc_path.read_text(encoding="utf-8"), doc_name)
+    command = vci.marked_bullet_command(
+        doc_path.read_text(encoding="utf-8"),
+        slug=MARKER,
+        bullet_label=LABEL,
+        source=doc_name,
+        task="4637",
+    )
     argv = shlex.split(command)
     assert (
         len(argv) == 3

@@ -95,6 +95,16 @@ if [ -d "$DATA_DIR" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 2b. Restore recovery archives
+# The FalkorDB pre-state dumps in scripts/recovery_archive.py::RECOVERY_ARCHIVES
+# (docs/falkordb-recovery-dumps.md), back to their repo paths before any live data.
+# ---------------------------------------------------------------------------
+info "Restoring recovery archives"
+python3 "$REPO_ROOT/scripts/recovery_archive.py" copy "$EXPORT_DIR/recovery-archive" "$REPO_ROOT" \
+  || fail "Recovery archives: the export's recovery-archive/ is missing or a pinned dump in it is altered (listed above). No live data was restored. Re-transfer <export>/recovery-archive/ from the source host, then re-run this import"
+ok "Recovery archives restored to their repo paths"
+
+# ---------------------------------------------------------------------------
 # 3. Restore FalkorDB data
 # ---------------------------------------------------------------------------
 info "Restoring FalkorDB data"

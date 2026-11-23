@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -89,8 +90,11 @@ class RecordingCurator:
         pass
 
 
-@pytest_asyncio.fixture
-async def stack(tmp_path):
+@asynccontextmanager
+async def _built_stack(
+    tmp_path, curator=None,
+) -> AsyncIterator[tuple[TaskInterceptor, SqliteTaskBackend, str]]:
+    """A real backend and interceptor holding the one gate task; closed on exit."""
     backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
     await backend.start()
     unique = uuid.uuid4().hex[:8]
@@ -98,7 +102,9 @@ async def stack(tmp_path):
     await event_buffer.initialize()
     store = TicketStore(tmp_path / f'tickets_{unique}.db')
     await store.initialize()
-    interceptor = TaskInterceptor(backend, None, event_buffer, config=None, ticket_store=store)
+    interceptor = TaskInterceptor(
+        backend, None, event_buffer, config=None, ticket_store=store, curator=curator,
+    )
     root = str(tmp_path)
     await backend.add_task(
         project_root=root,
@@ -113,6 +119,19 @@ async def stack(tmp_path):
         await interceptor.close()
         await backend.close()
         await event_buffer.close()
+
+
+@pytest_asyncio.fixture
+async def stack(tmp_path):
+    async with _built_stack(tmp_path) as built:
+        yield built
+
+
+@pytest_asyncio.fixture
+async def curated_stack(tmp_path):
+    curator = RecordingCurator()
+    async with _built_stack(tmp_path, curator=curator) as (interceptor, backend, root):
+        yield interceptor, backend, root, curator
 
 
 async def recon_cycle(interceptor: TaskInterceptor, root: str, agent_id: str | None) -> dict:
@@ -257,11 +276,9 @@ async def test_a_task_changed_between_planning_and_commit_is_left_alone(stack):
 
 
 @pytest.mark.asyncio
-async def test_a_description_only_the_rotation_rewrote_is_re_embedded(stack):
-    interceptor, backend, root = stack
+async def test_a_description_only_the_rotation_rewrote_is_re_embedded(curated_stack):
+    interceptor, backend, root, curator = curated_stack
     await backend.update_task('1', root, description=DESCRIPTION + '\n\n' + NEW_BLOCK)
-    curator = RecordingCurator()
-    interceptor._curator = curator  # type: ignore[assignment]
     interceptor.set_audit_trail_archive(FakeArchive())
 
     result = await interceptor.update_task(

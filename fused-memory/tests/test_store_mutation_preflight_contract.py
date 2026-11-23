@@ -159,15 +159,19 @@ class TestNeutraliseFixture:
         assert caplog.records == []
 
     def test_the_probe_leaves_the_redirected_directory_empty(
-        self, tmp_path_factory: pytest.TempPathFactory
+        self, tmp_path: pathlib.Path
     ) -> None:
+        """Private base temp: the fixture's real directory is session state; see
+        `fused-memory/tests/_store_mutation_preflight_contract.py::neutralise_fixture`."""
         mod = _stub_script_module()
         fx = neutralise_fixture(mod, note='a note')
+        private_base = types.SimpleNamespace(getbasetemp=lambda: tmp_path)
 
         mp = pytest.MonkeyPatch()
         try:
-            _underlying(fx)(mp, tmp_path_factory)
+            _underlying(fx)(mp, private_base)
             redirected = pathlib.Path(os.environ['MEM0_DIR'])
+            assert redirected.is_relative_to(tmp_path)
             mod.assert_store_mutation_allowed(operation='sweep --apply')
             assert list(redirected.iterdir()) == []
         finally:

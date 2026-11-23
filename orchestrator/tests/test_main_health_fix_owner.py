@@ -39,10 +39,10 @@ from orchestrator.main_health_fix_owner import (
     ensure_main_fix_owner,
     is_main_health_fix,
 )
+from orchestrator.merge_lane.main_health_probe import _build_main_health_outcome
 from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS,
     SpeculativeMergeWorker,
-    _build_main_health_outcome,
 )
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult

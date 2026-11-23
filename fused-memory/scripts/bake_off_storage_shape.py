@@ -1043,10 +1043,10 @@ def _materialize_b_grouped(
     variable from an authoring-quality variable.
 
     The canonical carries ``canonical: True`` and NO ``kind``: ``'canonical'``
-    is not a member of β's ``KIND_REGISTRY`` and would be a fatal
-    ``unknown_kind`` violation.  Canonicality is expressed by the
-    ``canonical`` key; ``kind`` says what a CHILD is (``amendment`` /
-    ``sighting``), and the two are not interchangeable.
+    is not a member of β's ``KIND_REGISTRY`` and would census as an
+    ``unknown_kind`` violation (an unregistered kind).  Canonicality is
+    expressed by the ``canonical`` key; ``kind`` says what a CHILD is
+    (``amendment`` / ``sighting``), and the two are not interchangeable.
 
     Child ``parent_id`` values are derived from the canonical CLAIM id via
     :func:`_derive_record_id`, never minted randomly, so the
@@ -1869,23 +1869,9 @@ def _load_sibling_script(name: str) -> Any:
     other reflection-based decorators look the defining module up there, so
     a module loaded without registering breaks on the way in.
     """
-    import importlib.util
-    import sys
+    from fused_memory.utils.script_loader import load_script
 
-    if name in sys.modules:
-        return sys.modules[name]
-    path = _SCRIPTS_DIR / f'{name}.py'
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise FixtureError(f'cannot load sibling script {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(name, None)
-        raise
-    return module
+    return load_script(_SCRIPTS_DIR / f'{name}.py', name)
 
 
 def load_audit_script() -> Any:
@@ -5680,9 +5666,9 @@ async def run_bake_off(
     # that number is what its docstring exists to forbid.
 
     # Resolved HERE, before the first acquisition below — never in the `with`
-    # header further down.  `load_cleanup_script()` can raise
-    # (`_load_sibling_script` raises `FixtureError` when the spec cannot be
-    # built), and evaluated there it would sit after `mkdtemp` but before the
+    # header further down.  `load_cleanup_script()` can raise (a sibling
+    # whose body raises on first load propagates out of `load_script`), and
+    # evaluated there it would sit after `mkdtemp` but before the
     # `try` — the one window in which a raise leaks the queue directory.  That
     # it is unreachable today (the `ephemeral_collection_prefix` call above
     # has already cached the module) is an accident of ordering

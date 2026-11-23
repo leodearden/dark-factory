@@ -192,7 +192,9 @@ _DOTTED_DIRECTORY_PATHS = [
 # identical to the 2026-07-31 measurement): every tracked path whose final
 # segment contains no '.'.  dark-factory contributes Dockerfile LICENSE
 # pre-commit pre-merge-commit project-checks; reify adds cargo
-# cargo-audit-orphans reference-transaction.  Union = the 8 below.
+# cargo-audit-orphans reference-transaction, and sccache
+# (scripts/canon-bin/guard/sccache, reify task 10232, measured on reify main
+# 2026-11-23).  Union = the 9 below.
 # ---------------------------------------------------------------------------
 
 _CANONICAL_EXTENSIONLESS = [
@@ -204,11 +206,13 @@ _CANONICAL_EXTENSIONLESS = [
     'pre-merge-commit',
     'project-checks',
     'reference-transaction',
+    'sccache',
 ]
 
 # One REAL tracked path per canonical extension-less name — dark-factory unless
 # the comment says reify (same convention as _ACCEPT_PATHS above).  Verified
-# tracked with `git ls-files --error-unmatch` on 2026-08-09.  Enforced complete
+# tracked with `git ls-files --error-unmatch` on 2026-08-09 (the sccache entry
+# on 2026-11-23).  Enforced complete
 # by TestExtensionlessFilenames::test_accept_corpus_covers_every_canonical_name.
 _EXTENSIONLESS_ACCEPT_PATHS = [
     'LICENSE',
@@ -220,6 +224,8 @@ _EXTENSIONLESS_ACCEPT_PATHS = [
     'hooks/reference-transaction',
     # reify
     'scripts/agent-bin/cargo',
+    # reify
+    'scripts/canon-bin/guard/sccache',
     # reify
     'scripts/cargo-audit-orphans',
 ]

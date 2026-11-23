@@ -214,7 +214,12 @@ class PlanDeviationCensus(BaseModel):
     """``plan_deviation_census`` block — the plan-deviation census's defaults
     and the settings type it evaluates with. Validated not by pydantic but by
     ``scripts/legibility/plan_deviation_census.py::settings_from_mapping``;
-    rationale: plans/plan-deviation-recording-prd.md D8."""
+    rationale: plans/plan-deviation-recording-prd.md D8-D9.
+
+    ``rate_rise_factor`` and ``min_records`` set each per-source rate arm,
+    which measures records per finalized plan against that source's own
+    baseline and cannot fire while the source is warming up.
+    ``prose_only_min`` is the prose-only arm's count floor, not a firing bar."""
 
     model_config = ConfigDict(extra='allow', frozen=True)
 

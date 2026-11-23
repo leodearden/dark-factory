@@ -21,7 +21,6 @@ from _merge_lane_fakes import (
     FakeVerifier,
     fails,
     hangs_until,
-    healthy_verify_clock,
     lane_scene_config,
     make_lane,
     merge_through_lane,
@@ -191,7 +190,7 @@ async def test_a_lane_given_remote_runners_verifies_a_single_on_a_free_remote_un
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         remote_scene.git_ops, queue,
-        verifier=verifier, clock=healthy_verify_clock(), remote_runners=[remote],
+        verifier=verifier, remote_runners=[remote],
     )
 
     outcome = await merge_through_lane(lane, queue, single)
@@ -210,7 +209,7 @@ async def test_a_train_verify_holds_the_local_host_slot_until_it_lands(scene: _S
     release = asyncio.Event()
     verifier = FakeVerifier(scripts={train.tip: hangs_until(release, entered=entered)})
     queue: asyncio.Queue[Any] = asyncio.Queue()
-    lane = make_lane(scene.git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
+    lane = make_lane(scene.git_ops, queue, verifier=verifier)
 
     async with running_lane(lane) as run:
         await queue.put(train.request)
@@ -236,7 +235,7 @@ async def test_a_two_member_train_verifies_on_a_free_remote_under_prefer_remote(
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         remote_scene.git_ops, queue,
-        verifier=verifier, clock=healthy_verify_clock(), remote_runners=[remote],
+        verifier=verifier, remote_runners=[remote],
     )
 
     async with running_lane(lane) as run:
@@ -273,7 +272,7 @@ async def _abort_a_train_verifying_on(scene: _Scene, remote: FakeRemoteRunner) -
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         scene.git_ops, queue,
-        verifier=FakeVerifier(), clock=healthy_verify_clock(), remote_runners=[remote],
+        verifier=FakeVerifier(), remote_runners=[remote],
     )
 
     with pytest.raises(asyncio.CancelledError):
@@ -331,7 +330,7 @@ async def test_a_train_of_more_than_two_members_verifies_on_local_until_task_610
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         remote_scene.git_ops, queue,
-        verifier=verifier, clock=healthy_verify_clock(), remote_runners=[remote],
+        verifier=verifier, remote_runners=[remote],
     )
 
     outcome = await merge_through_lane(lane, queue, train.request)
@@ -362,7 +361,7 @@ async def test_a_train_whose_hosts_are_all_taken_verifies_unleased_instead_of_wa
     release_pred = asyncio.Event()
     verifier = FakeVerifier(scripts={'pred': hangs_until(release_pred)})
     queue: asyncio.Queue[Any] = asyncio.Queue()
-    lane = make_lane(scene.git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
+    lane = make_lane(scene.git_ops, queue, verifier=verifier)
 
     async with running_lane(lane) as run:
         await queue.put(pred)
@@ -404,7 +403,7 @@ async def test_a_remote_green_the_local_cross_check_contradicts_benches_the_remo
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         scene.git_ops, queue,
-        verifier=verifier, clock=healthy_verify_clock(), remote_runners=[remote],
+        verifier=verifier, remote_runners=[remote],
     )
     main_before = await scene.git_ops.get_main_sha()
 
@@ -435,7 +434,7 @@ async def test_an_unreachable_remote_moves_the_train_verify_to_local(
     queue: asyncio.Queue[Any] = asyncio.Queue()
     lane = make_lane(
         remote_scene.git_ops, queue,
-        verifier=verifier, clock=healthy_verify_clock(), remote_runners=[remote],
+        verifier=verifier, remote_runners=[remote],
         event_store=store,
     )
 

@@ -10,7 +10,7 @@ the call in ``asyncio.wait_for``. That asymmetry is what this file pins.
 ``/orchestrators`` has since been taken out of the population altogether
 (task 5587): it reads no task tree, so it has no seam to hang behind. It is
 still swept for a 200 — the route list is derived and nothing can opt out of
-it — but it is no longer one of the modules the hang must be reached in.
+it — but it is no longer one of the endpoints that must reach the hang.
 
 Why the per-request timeout was never enough: ``fetch_tasks``' *timeout* is
 threaded into ``mcp_tool_call`` and thence ``client.post``, so it bounds
@@ -26,9 +26,15 @@ Three properties keep this probe from quietly stopping checking:
 * the hang stub is ``await asyncio.Event().wait()`` on an event nothing ever
   sets — it has no duration at all, so no budget value can make pre-fix code
   pass, unlike a slow-sleep stub;
-* a NON-VACUITY assertion requires that the hang was actually reached for
-  each formerly-wedging endpoint that still reads tasks, so the sweep cannot
-  pass by never exercising one.
+* a NON-VACUITY assertion requires each task-lookup endpoint's OWN request,
+  and ``/prds``' lineage refresh, to reach the hang for its own root, so the
+  sweep cannot pass by never exercising one, nor by one endpoint's reach
+  standing in for another's.
+
+A lookup whose deadline would enclose a cold snapshot read is served from a
+pre-warmed unit instead, so its cold read is checked only by the warm-up
+finishing within its bound; ``/escalations`` makes its cold read in its own
+request, deadline-free, and the sweep requires it to.
 """
 
 from __future__ import annotations
@@ -36,63 +42,137 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from collections.abc import Collection, Mapping
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from _dashboard_routes import dashboard_get_paths
 from escalation.models import Escalation
 
-# Budgets are shrunk to this so the whole sweep is fast. The stub never
-# returns, so every bounded call site pays exactly this and then degrades.
-_TINY_BUDGET = 0.05
+# The task-prose probe's route budget: the stub never returns, so the route
+# pays exactly this and then degrades.
+_PROSE_BUDGET = 0.05
 
-_TARGET_MODULES = {
-    'dashboard.data.task_lookup',
-    'dashboard.data.task_lineage',
+# Each task-lookup endpoint pays this once, against the hung fetch_task seam.
+_LOOKUP_BUDGET = 0.5
+
+# /prds waits on its lineage refresh, and the refresh on the hung projected
+# read, for this and no longer.
+_LINEAGE_BUDGET = 0.05
+
+# The warm-up must finish within this many snapshot budgets, or the read is unbounded.
+_WARM_UP_BUDGETS = 10
+
+_SNAPSHOT = 'dashboard.data.task_snapshot'
+_LOOKUP = 'dashboard.data.task_lookup'
+_LINEAGE = 'dashboard.data.task_lineage'
+
+# Every task-read binding the sweep hangs, keyed by the module that imported
+# it by value — patching dashboard.data.tasks.fetch_tasks alone would miss
+# them all. ``dashboard.app`` is absent: its /healthz probe reads
+# ``fetch_task_page`` (task 6321), and this sweep does not reach /healthz
+# anyway. ``dashboard.api.escalations`` binds no task read at all (task 5596):
+# its owner probe reads the snapshot unit's active rows and its cards go
+# through task_lookup. ``dashboard.data.orchestrator`` binds none since task 5587.
+_HUNG_BINDINGS: Mapping[str, str] = {
+    # The Tasks tab's read travelled to the snapshot unit (task 5587);
+    # active_tasks holds no fetch name at all now.
+    _SNAPSHOT: 'fetch_tasks',
+    # /merge-queue and /escalations read their rows' tasks one id at a time
+    # (tasks 5595, 5596).
+    _LOOKUP: 'fetch_task',
+    # /prds' lineage index reads one projected get_tasks per root; the
+    # index's background refresh is that binding's one caller.
+    _LINEAGE: 'fetch_metadata_projection',
 }
-"""The modules whose hang this probe must actually REACH, or it proves nothing.
 
-``dashboard.data.task_lookup`` stands in for both ``dashboard.data.merge_queue``
-(task 5595) and ``dashboard.api.escalations`` (task 5596). Neither endpoint
-fetches a task tree any more: each asks ``task_lookup.lookup_tasks`` for the
-few ids its rows name, and that module's ``fetch_task`` binding is the seam
-both now wait on. The hang must be reached THERE, for EACH endpoint's root —
-the sweep test checks the escalation probe's root separately — or that
-endpoint's bound is unexercised.
 
-``dashboard.data.task_lineage`` is ``/prds``' lineage index, whose background
-refresh is the one caller of ``fetch_metadata_projection``.
+@dataclass(frozen=True)
+class HungSeams:
+    """What ``hung_mcp`` hung, and which seams each endpoint's own request must reach.
 
-``dashboard.data.orchestrator`` was the third, and is deliberately no longer
-here: task 5587 removed ``discover_orchestrators``' task fetch outright, so it
-holds no ``fetch_tasks`` binding to hang. That is the strongest available
-resolution of its share of the 19.8 h incident — a call that does not exist
-cannot wedge — and not a shrinking of the sweep. ``/api/v2/dashboard/orchestrators``
-is still requested below, because the route list is derived from ``app.routes``
-and cannot be opted out of; it must still answer 200 while the seam hangs.
-"""
+    ``reached`` is every ``(module_name, project_root)`` the hang stub was
+    entered with, in order. ``must_reach`` maps each task-reading endpoint's
+    path to the ``(module_name, project_root)`` seams its own request must
+    reach; ``_HUNG_BINDINGS`` names the binding each module's seam hangs.
+    """
+
+    reached: list[tuple[str, str]]
+    must_reach: Mapping[str, frozenset[tuple[str, str]]]
 
 
 @pytest.fixture()
-def hung_mcp(monkeypatch, tmp_path, client):
-    """Hang every task-read binding; shrink every budget; clear every cache.
+def hung_mcp(request, monkeypatch, tmp_path, client):
+    """Hang every task-read binding; bound every budget; warm the timed lookup roots.
 
-    Returns the ``reached`` list of ``(module_name, project_root)`` pairs the
-    stub recorded, so a caller can assert the hang was genuinely exercised.
-    Requests ``client`` so the configured root it seeds is the one the running
-    app reads.
+    Returns :class:`HungSeams` once every lookup root whose read would sit
+    inside its lookup's deadline is cached, so no lookup deadline encloses a
+    snapshot read and a caller can assert each endpoint reached the hang for
+    its own root. Requests ``client`` so the configured root it seeds is the
+    one the running app reads.
     """
     import dashboard.api.escalations as _esc
     from dashboard.data import (
         escalation_corpus,
-        orchestrator,
         task_lineage,
         task_lookup,
         task_snapshot,
     )
-    from dashboard.data.escalation_corpus import QueueKind, QueueRef
 
+    reached = _hang_task_reads(monkeypatch)
+
+    # A snapshot read outlasts any lookup's whole deadline, so none may enclose one.
+    monkeypatch.setattr(task_lookup, 'LOOKUP_BUDGET_SECONDS', _LOOKUP_BUDGET)
+    monkeypatch.setattr(task_snapshot, 'PER_CALL_TIMEOUT', 2 * _LOOKUP_BUDGET)
+    # The request waits on the lineage refresh, and the refresh on the hang,
+    # for these and no longer.
+    monkeypatch.setattr(task_lineage, 'LINEAGE_REQUEST_WAIT_SECONDS', _LINEAGE_BUDGET)
+    monkeypatch.setattr(task_lineage, 'LINEAGE_READ_TIMEOUT', _LINEAGE_BUDGET)
+
+    def _clear_caches() -> None:
+        task_snapshot.clear_snapshot_cache()
+        task_lineage.clear_lineage_state()
+        task_lookup._lookup_cache_clear()
+        escalation_corpus._corpus_cache_clear()
+        _esc._analytics_memo_clear()
+
+    # A warm entry would be served without ever reaching the hang.
+    _clear_caches()
+    # Leave no hang-stubbed entry behind for the next test, even if setup fails.
+    request.addfinalizer(_clear_caches)
+
+    probe_root = str(_seed_probe_root(tmp_path, monkeypatch))
+    config_root = str(client.app.state.config.project_root)
+    must_reach = {
+        # /merge-queue looks up its rows' tasks in the configured root.
+        '/api/v2/dashboard/merge-queue': frozenset({(_LOOKUP, config_root)}),
+        # /escalations reads its root's unit itself, deadline-free, before its
+        # lookup, so its request keeps that cold read against the hang.
+        '/api/v2/dashboard/escalations': frozenset({
+            (_SNAPSHOT, probe_root), (_LOOKUP, probe_root),
+        }),
+        # /prds reads the lineage index of every configured root; the client has one.
+        '/api/v2/dashboard/prds': frozenset({(_LINEAGE, config_root)}),
+    }
+    monkeypatch.setattr(task_snapshot, 'SNAPSHOT_TTL_SECONDS', 3600.0)
+    assert client.portal is not None, 'the warm-up runs inside a live TestClient'
+    client.portal.call(
+        _warm_snapshot_units,
+        client.app.state.http_client,
+        client.app.state.config,
+        _timed_lookup_roots(must_reach),
+    )
+    # /merge-queue looks up only the ids its rows name, so it needs a row.
+    request.addfinalizer(_seed_merge_attempt(client.app.state.config.project_root))
+
+    return HungSeams(reached=reached, must_reach=must_reach)
+
+
+def _hang_task_reads(monkeypatch) -> list[tuple[str, str]]:
+    """Hang every binding in ``_HUNG_BINDINGS``; return the log of reaches it fills."""
     reached: list[tuple[str, str]] = []
 
     def _make_stub(module_name: str):
@@ -106,66 +186,26 @@ def hung_mcp(monkeypatch, tmp_path, client):
 
         return _hang
 
-    # Patch the binding in EVERY module that imported the name by value —
-    # patching dashboard.data.tasks.fetch_tasks alone would miss all of them.
-    # ``dashboard.app`` is absent: its /healthz probe reads ``fetch_task_page``
-    # (task 6321) and holds no ``fetch_tasks`` binding, and this sweep does
-    # not reach /healthz anyway. ``dashboard.api.escalations`` binds no task read
-    # at all (task 5596): its owner probe reads the snapshot unit's active
-    # rows and its cards go through task_lookup. ``dashboard.data.orchestrator``
-    # is absent because it binds the name no longer — see _TARGET_MODULES.
-    for module_name in (
-        # The Tasks tab's binding travelled to the snapshot unit with the read
-        # itself (task 5587); active_tasks holds no fetch name at all now.
-        'dashboard.data.task_snapshot',
-    ):
-        monkeypatch.setattr(
-            f'{module_name}.fetch_tasks', _make_stub(module_name),
-        )
-    # /merge-queue and /escalations read their rows' tasks one id at a time
-    # (tasks 5595, 5596).
-    monkeypatch.setattr(
-        'dashboard.data.task_lookup.fetch_task',
-        _make_stub('dashboard.data.task_lookup'),
-    )
-    # /prds' lineage index reads one projected get_tasks per root.
-    monkeypatch.setattr(
-        'dashboard.data.task_lineage.fetch_metadata_projection',
-        _make_stub('dashboard.data.task_lineage'),
-    )
+    for module_name, binding in _HUNG_BINDINGS.items():
+        monkeypatch.setattr(f'{module_name}.{binding}', _make_stub(module_name))
+    return reached
 
-    # The lookup's ONE deadline encloses its snapshot read before any
-    # fetch_task miss, and that read pays the shrunk PER_CALL_TIMEOUT below
-    # against the same hang. At _TINY_BUDGET the deadline would expire inside
-    # the snapshot read and the fetch_task seam would never be reached.
-    monkeypatch.setattr(task_lookup, 'LOOKUP_BUDGET_SECONDS', 4 * _TINY_BUDGET)
-    # The Tasks tab is already compliant. Its shares are bounded against the
-    # hang by PER_CALL_TIMEOUT, shrunk here so the tab does not dominate the
-    # sweep's wall time. That is NOT optional: it was widened to 4.4 s for
-    # real 5 000-task trees (task 4884), and against a stub that never
-    # returns the sweep would otherwise pay it per call per root.
-    monkeypatch.setattr(task_snapshot, 'PER_CALL_TIMEOUT', _TINY_BUDGET)
-    # The request waits on the lineage refresh, and the refresh on the hang,
-    # for these and no longer.
-    monkeypatch.setattr(task_lineage, 'LINEAGE_REQUEST_WAIT_SECONDS', _TINY_BUDGET)
-    monkeypatch.setattr(task_lineage, 'LINEAGE_READ_TIMEOUT', _TINY_BUDGET)
 
-    def _clear_caches() -> None:
-        task_snapshot.clear_snapshot_cache()
-        task_lineage.clear_lineage_state()
-        task_lookup._lookup_cache_clear()
-        escalation_corpus._corpus_cache_clear()
-        _esc._analytics_memo_clear()
+def _seed_probe_root(tmp_path, monkeypatch) -> Path:
+    """Make the probe root that a running orchestrator and the one escalation queue name.
 
-    # A warm entry would be served without ever reaching the hang.
-    _clear_caches()
+    These preconditions make the target endpoints actually REACH their call
+    site — otherwise the probe would pass vacuously.
+    """
+    import dashboard.api.escalations as _esc
+    from dashboard.data import orchestrator
+    from dashboard.data.escalation_corpus import QueueKind, QueueRef
 
-    # Force the preconditions so the target endpoints actually REACH their
-    # call site — otherwise the probe would pass vacuously. The orchestrator
-    # stub stays even though that endpoint no longer fetches: it is what makes
-    # the sweep exercise discovery's grouping path rather than its empty one.
     proj = tmp_path / 'probe_root'
     (proj / '.taskmaster').mkdir(parents=True)
+    # The orchestrator stub stays even though that endpoint no longer fetches:
+    # it is what makes the sweep exercise discovery's grouping path rather
+    # than its empty one.
     monkeypatch.setattr(
         orchestrator,
         'find_running_orchestrators',
@@ -190,15 +230,49 @@ def hung_mcp(monkeypatch, tmp_path, client):
             directory=escalation_dir, runs_db=proj / 'data' / 'orchestrator' / 'runs.db',
         ),),
     )
-    # /merge-queue looks up only the ids its rows name, so it needs a row.
-    seeded = _seed_merge_attempt(client.app.state.config.project_root)
+    return proj
 
-    yield reached
 
-    seeded()
+def _timed_lookup_roots(must_reach: Mapping[str, frozenset[tuple[str, str]]]) -> frozenset[str]:
+    """Each root a request must look up without itself reaching that root's snapshot read.
 
-    # Leave no hang-stubbed entry behind for the next test in the session.
-    _clear_caches()
+    Left cold, such a lookup would make the snapshot read inside its own
+    deadline, so these roots are warmed before the sweep; a request that must
+    reach the snapshot read keeps its root cold.
+    """
+    return frozenset(
+        root
+        for seams in must_reach.values()
+        for module_name, root in seams
+        if module_name == _LOOKUP and (_SNAPSHOT, root) not in seams
+    )
+
+
+def _describe_seam(seam: tuple[str, str]) -> str:
+    module_name, root = seam
+    return f'{module_name}.{_HUNG_BINDINGS[module_name]} for root {root}'
+
+
+async def _warm_snapshot_units(http_client, config, roots: Collection[str]) -> None:
+    """Cache each root's snapshot unit; failing, not hanging, if its read is unbounded."""
+    from dashboard.data import task_snapshot
+    from dashboard.data.utils import resolve_now
+
+    now = resolve_now(None)
+    bound = _WARM_UP_BUDGETS * task_snapshot.PER_CALL_TIMEOUT
+    try:
+        async with asyncio.timeout(bound):
+            await asyncio.gather(*(
+                task_snapshot.acquire_snapshot(http_client, config, root, now=now)
+                for root in roots
+            ))
+    except TimeoutError:
+        raise AssertionError(
+            f'warming the snapshot units of {sorted(roots)} outlived {bound}s, '
+            f'{_WARM_UP_BUDGETS}x the {task_snapshot.PER_CALL_TIMEOUT}s '
+            'PER_CALL_TIMEOUT, against the hung fetch_tasks — the snapshot '
+            'read is no longer bounded by its own budget'
+        ) from None
 
 
 def _seed_merge_attempt(project_root):
@@ -239,7 +313,7 @@ def _seed_merge_attempt(project_root):
     return _undo
 
 
-def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp, tmp_path):
+def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp):
     """Every GET endpoint answers 200 while the fetch_tasks seam hangs.
 
     Only the LITERAL routes are swept. A templated one
@@ -261,8 +335,15 @@ def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp, 
         'this probe was written; a check that quietly stops checking is '
         'indistinguishable from a passing one'
     )
+    unswept = set(hung_mcp.must_reach) - set(paths)
+    assert not unswept, (
+        f'task-reading endpoint(s) {sorted(unswept)} '
+        'are no longer swept, so their reach of the hang cannot be checked'
+    )
 
+    reached_by_path: dict[str, set[tuple[str, str]]] = {}
     for path in paths:
+        before = len(hung_mcp.reached)
         # TestClient.get is SYNCHRONOUS and blocks for as long as the handler
         # does, so a regression here shows up as a hung or failed call — the
         # 19.8 h symptom in miniature.
@@ -272,21 +353,20 @@ def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp, 
             'seam was hung — a hung dependency must degrade this endpoint, '
             'never wedge or 500 it'
         )
+        reached_by_path[path] = set(hung_mcp.reached[before:])
 
-    # NON-VACUITY: the probe must actually have exercised the hang for each
-    # endpoint that still reads tasks, or it proves nothing at all.
-    modules_reached = {module for module, _ in hung_mcp}
-    assert modules_reached >= _TARGET_MODULES, (
-        f'the hang was never reached in {sorted(_TARGET_MODULES - modules_reached)} '
-        f'(reached: {sorted(modules_reached)}) — the sweep passed without '
-        'exercising the defect, so it proves nothing. Check the endpoint '
-        'preconditions in the hung_mcp fixture.'
-    )
-    escalation_probe = ('dashboard.data.task_lookup', str(tmp_path / 'probe_root'))
-    assert escalation_probe in hung_mcp, (
-        f'/escalations never reached the task_lookup hang for its probe root '
-        f'(reached: {sorted(set(hung_mcp))}) — its card lookup went unexercised'
-    )
+    # NON-VACUITY: each task-reading endpoint's own request must have waited on
+    # every hung seam it names, for that seam's root, or that bound is unexercised.
+    for path, seams in hung_mcp.must_reach.items():
+        missed = sorted(seams - reached_by_path[path])
+        assert not missed, (
+            f'{path} never reached the hung {", ".join(map(_describe_seam, missed))} '
+            f'(that request reached: {sorted(reached_by_path[path])}) — that read '
+            'went unexercised, so the sweep proves nothing about its bound. Check '
+            'the endpoint preconditions in the hung_mcp fixture, and that neither '
+            'the warm-up nor an earlier request in the sweep caches a root this '
+            'request must read cold.'
+        )
 
 
 def test_task_prose_route_survives_a_hung_fetch_task_prose(client, monkeypatch):
@@ -305,7 +385,7 @@ def test_task_prose_route_survives_a_hung_fetch_task_prose(client, monkeypatch):
         await asyncio.Event().wait()  # nothing ever sets it
 
     monkeypatch.setattr(task_prose, 'fetch_task_prose', _hang)
-    monkeypatch.setattr(task_prose, '_TASK_PROSE_BUDGET', _TINY_BUDGET)
+    monkeypatch.setattr(task_prose, '_TASK_PROSE_BUDGET', _PROSE_BUDGET)
     root = client.app.state.config.project_root
 
     resp = client.get(f'/api/v2/dashboard/task/{root.name}/T-1')

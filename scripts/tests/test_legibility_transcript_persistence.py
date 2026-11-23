@@ -26,7 +26,7 @@ import pytest
 from legibility import check_transcript_persistence as mod
 from legibility.config import load_config
 
-from orchestrator import session_records
+from orchestrator import session_reaper, session_records
 
 SCRIPT = Path(__file__).parent.parent / "legibility" / "check_transcript_persistence.py"
 
@@ -64,6 +64,8 @@ def _write_session_record(
     cwd: str = "/home/leo/src/dark-factory",
     start_ts: datetime | None = None,
     exit_code: int | None = 0,
+    claude_session_id: str | None = None,
+    claude_launch_session_id: str | None = None,
 ) -> session_records.SessionRecord:
     """Write a SessionRecord under *fleet_root* via the canonical writer."""
     rec = session_records.SessionRecord(
@@ -73,6 +75,8 @@ def _write_session_record(
         cwd=cwd,
         start_ts=_iso(start_ts) if start_ts is not None else _iso(FIXED_NOW),
         exit_code=exit_code,
+        claude_session_id=claude_session_id,
+        claude_launch_session_id=claude_launch_session_id,
     )
     session_records.write_record(rec, root=fleet_root)
     return rec
@@ -170,6 +174,125 @@ def test_find_completed_spawn_records_filters(tmp_path):
     )
 
     assert {r.session_slug for r in kept} == {"good-exited", "good-failed"}
+
+
+def test_find_completed_spawn_records_skips_unbound_orphan(tmp_path):
+    fleet = tmp_path / "fleet"
+    orphan = session_reaper.ORPHAN_EXIT_CODE
+    in_window = FIXED_NOW - timedelta(hours=1)
+    prompt = "Investigate the flaky merge on task 2500 and report back."
+
+    # (EXCLUDE) reaper-stamped orphan no hook ever bound: nothing shows it started.
+    _write_session_record(
+        fleet, "unbound-orphan", status=session_records.Status.EXITED,
+        prompt=prompt, start_ts=in_window, exit_code=orphan,
+    )
+    # (KEEP) a bound current id proves claude ran.
+    _write_session_record(
+        fleet, "bound-orphan", status=session_records.Status.EXITED,
+        prompt=prompt, start_ts=in_window, exit_code=orphan,
+        claude_session_id="11111111-1111-1111-1111-111111111111",
+    )
+    # (KEEP) a bound launch id alone also proves claude ran.
+    _write_session_record(
+        fleet, "launch-bound-orphan", status=session_records.Status.EXITED,
+        prompt=prompt, start_ts=in_window, exit_code=orphan,
+        claude_launch_session_id="22222222-2222-2222-2222-222222222222",
+    )
+    # (KEEP) unbound, but finish() recorded claude's own exit code.
+    _write_session_record(
+        fleet, "unbound-real-exit", status=session_records.Status.EXITED,
+        prompt=prompt, start_ts=in_window, exit_code=0,
+    )
+
+    kept = mod.find_completed_spawn_records(
+        mod.iter_registry_records(fleet_root=fleet),
+        now=FIXED_NOW,
+        lookback=timedelta(hours=48),
+    )
+
+    assert {r.session_slug for r in kept} == {
+        "bound-orphan", "launch-bound-orphan", "unbound-real-exit",
+    }
+
+
+def test_run_check_does_not_alarm_on_unbound_orphan(tmp_path):
+    fleet = tmp_path / "fleet"
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    _write_session_record(
+        fleet, "team-dark_factory-90994", status=session_records.Status.EXITED,
+        prompt=(
+            "/team Read the brief at /home/leo/.claude/spawn-briefs/"
+            "review-all-dark_factory-20261008-cleanup.md and carry it out "
+            "end-to-end; it is the contract."
+        ),
+        cwd="/home/leo/src/dark-factory",
+        start_ts=FIXED_NOW - timedelta(hours=1),
+        exit_code=session_reaper.ORPHAN_EXIT_CODE,
+    )
+    config_path = _write_config(tmp_path, cwd_prefixes=["/home/leo/src/dark-factory"])
+    poster = _RecordingPoster()
+
+    result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=poster,
+    )
+
+    assert result.exit_code == 0
+    assert result.missing == []
+    assert result.escalated is False
+    assert poster.calls == []
+
+
+def test_run_check_reports_count_of_skipped_unbound_orphans(tmp_path):
+    fleet = tmp_path / "fleet"
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    orphan = session_reaper.ORPHAN_EXIT_CODE
+    in_window = FIXED_NOW - timedelta(hours=1)
+    prompt = "Investigate the flaky merge on task 2500 and report back."
+    member_cwd = "/home/leo/src/dark-factory"
+
+    # (COUNT) two in-window unbound orphans in this project.
+    for slug in ("member-orphan-1", "member-orphan-2"):
+        _write_session_record(
+            fleet, slug, status=session_records.Status.EXITED,
+            prompt=prompt, cwd=member_cwd, start_ts=in_window, exit_code=orphan,
+        )
+    # (NOT COUNTED) another project's unbound orphan.
+    _write_session_record(
+        fleet, "foreign-orphan", status=session_records.Status.EXITED,
+        prompt=prompt, cwd="/home/leo/src/reify", start_ts=in_window, exit_code=orphan,
+    )
+    # (NOT COUNTED) an unbound orphan outside the lookback window.
+    _write_session_record(
+        fleet, "old-orphan", status=session_records.Status.EXITED,
+        prompt=prompt, cwd=member_cwd, start_ts=FIXED_NOW - timedelta(hours=72),
+        exit_code=orphan,
+    )
+    config_path = _write_config(tmp_path, cwd_prefixes=[member_cwd])
+
+    result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=_RecordingPoster(),
+    )
+
+    assert result.exit_code == 0
+    assert result.skipped_unbound_orphans == 2
+    assert "2 unbound orphan record(s) not checked" in result.reason
+
+
+def test_run_check_reason_omits_orphan_clause_when_none_skipped(tmp_path):
+    fleet, projects, config_path = _build_fleet_and_projects(tmp_path, include_lost=False)
+
+    result = mod.run_check(
+        config_path=config_path, fleet_root=fleet, projects_root=projects,
+        now=FIXED_NOW, lookback=timedelta(hours=48), poster=_RecordingPoster(),
+    )
+
+    assert result.skipped_unbound_orphans == 0
+    assert "unbound orphan" not in result.reason
 
 
 # ---------------------------------------------------------------------------

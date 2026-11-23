@@ -139,7 +139,8 @@ def derive_totals(report: dict) -> dict[str, int]:
 # and conflict. Emitting each files/functions/tests entry on exactly ONE line
 # makes those ten edits disjoint hunks that rebase cleanly. The property is
 # asserted by a test rather than left to formatting habit -- see
-# ``TestRenderBaseline::test_every_per_path_entry_occupies_exactly_one_line``.
+# ``orchestrator/tests/test_merge_lane_ratchet_write_gate.py::TestRenderBaseline::
+# test_every_per_path_entry_occupies_exactly_one_line``.
 
 # The ratchet's two COMMITTED ARTIFACTS, relative to the repo root. The
 # baseline holds the frozen measures; its sidecar ledger -- a DIRECTORY holding
@@ -899,8 +900,9 @@ def unrecorded_raises(
 # PURE: two plain dicts in, a list of Violations out. No filesystem, no
 # complexipy, no clock. That is what lets the pytest gate and the CLI's --check
 # share ONE ratchet implementation (SPOT), and what lets the seeded-fixture
-# self-test in test_merge_lane_ratchet.py pin every branch in microseconds
-# instead of only ever reaching them through a 40-second measurement.
+# self-test in orchestrator/tests/test_merge_lane_ratchet_write_gate.py pin every
+# branch in microseconds instead of only ever reaching them through a 40-second
+# measurement.
 
 #: The synthetic key derived totals are reported under, so a totals violation
 #: reads the same way a per-path one does.

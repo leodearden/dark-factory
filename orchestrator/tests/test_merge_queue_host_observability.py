@@ -51,6 +51,7 @@ from orchestrator.merge_lane.types import (
     PendingGate,
     QueuedBranch,
     RealMergeItem,
+    RecoveryEvidence,
 )
 from orchestrator.merge_lane.worker import (
     DecidedItem,
@@ -59,7 +60,6 @@ from orchestrator.merge_lane.worker import (
     MergeOutcome,
     MergeRequest,
     SpeculativeMergeWorker,
-    _HostUnavailability,
 )
 from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
@@ -185,6 +185,7 @@ class _FakeRemoteRunner:
     def __init__(self, name: str, *, healthy: bool = True) -> None:
         self.name = name
         self.health = AsyncMock(return_value=healthy)
+        self.reap_idle_gates = AsyncMock()
 
 
 class _FakeRemoteRunnerCancelFails(_FakeRemoteRunner):
@@ -230,7 +231,7 @@ def _real_worker(
     remotes: list[str] | None = None,
     escalation_queue: _FakeEscalationQueue | EscalationQueue | None = None,
 ):
-    """Bare worker + a REAL HostAllocator sharing worker._runner_quarantine.
+    """Bare worker + a REAL HostAllocator sharing its HostQuarantine's set.
 
     Deliberately NOT a MagicMock: slot state and quarantine membership must be
     genuine for these tests to mean anything.
@@ -238,7 +239,7 @@ def _real_worker(
     q: asyncio.Queue[MergeRequest] = asyncio.Queue()
     worker = SpeculativeMergeWorker(git_ops, q, escalation_queue=escalation_queue)
     runners = [_FakeRemoteRunner(n) for n in (remotes if remotes is not None else ['laptop'])]
-    alloc = HostAllocator(runners, quarantine=worker._runner_quarantine)
+    alloc = worker._host_quarantine.allocator_over(runners)
     worker._host_allocator = alloc
     return worker, alloc, {r.name: r for r in runners}
 
@@ -263,12 +264,19 @@ def _seed_ru(
     first_unavailable_at: float = 1000.0,
     reason: str = 'ssh: connect timed out',
 ) -> None:
-    """Seed the RunnerUnavailable streak tracker directly."""
-    worker._runner_unavailable[host] = _HostUnavailability(
-        streak=streak,
-        first_unavailable_at=first_unavailable_at,
-        reason=reason,
-    )
+    """Bench *host* *streak* times at *first_unavailable_at*: one episode of that streak."""
+    quarantine = worker._host_quarantine
+    for _ in range(streak):
+        quarantine.quarantine_unreachable(host, reason, first_unavailable_at)
+
+
+def _adopt_alarm_thresholds(worker, git_ops: GitOps, *, after_n: int, after_secs: float) -> None:
+    """Hand *worker* the bench-alarm thresholds an operator config would."""
+    worker._host_quarantine.adopt_config(OrchestratorConfig(
+        project_root=Path(git_ops.project_root),
+        verify_host_unreachable_escalate_after_n=after_n,
+        verify_host_unreachable_escalate_after_secs=after_secs,
+    ))
 
 
 def _by_name(snap: dict) -> dict:
@@ -383,6 +391,7 @@ class TestSnapshotHostsBlock:
         worker, alloc, _ = _real_worker(git_ops)
         _seed_ru(worker, 'laptop', streak=2, first_unavailable_at=555.0,
                  reason='ssh: connection reset')
+        alloc.clear_quarantine('laptop')  # lifted from the set, the episode still open
         assert not any(alloc.is_quarantined(h) for h in alloc.host_names), (
             'nothing quarantined yet, on ANY managed host'
         )
@@ -463,8 +472,7 @@ class TestSnapshotHostsBlock:
         worker, alloc, runners = _real_worker(
             git_ops, escalation_queue=_FakeEscalationQueue(),
         )
-        worker._unreachable_escalate_after_secs = 5.0
-        worker._unreachable_escalate_after_n = 3
+        _adopt_alarm_thresholds(worker, git_ops, after_n=3, after_secs=5.0)
 
         now = 2000.0
         lease = alloc.acquire_remote()
@@ -481,7 +489,7 @@ class TestSnapshotHostsBlock:
 
         # Host comes back: health() → True.
         runners['laptop'].health = AsyncMock(return_value=True)
-        await worker._reprobe_quarantined_hosts(now)
+        await worker._host_quarantine.sweep(now)
 
         after = _by_name(worker.snapshot())['laptop']
         assert after['quarantined'] is False
@@ -523,7 +531,7 @@ class TestSnapshotHostsBlock:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
         runner = _FakeRemoteRunnerCancelFails('laptop')
-        alloc = HostAllocator([runner], quarantine=worker._runner_quarantine)
+        alloc = worker._host_quarantine.allocator_over([runner])
         worker._host_allocator = alloc
 
         lease = alloc.acquire_remote()
@@ -603,6 +611,7 @@ class TestSnapshotHostsBlock:
         assert _by_name(worker.snapshot())['local']['unavailable_secs'] is None
 
         # Clock stepped backwards (or a future-stamped entry): clamped, never negative.
+        worker._host_quarantine.readmit_host('laptop', now=time.time(), evidence=RecoveryEvidence.SSH_HEALTH_PROBE)
         _seed_ru(worker, 'laptop', streak=2, first_unavailable_at=time.time() + 3600.0)
         assert _by_name(worker.snapshot())['laptop']['unavailable_secs'] == 0.0
 
@@ -785,7 +794,7 @@ def _logged_heartbeat(worker: SpeculativeMergeWorker, caplog) -> str:
 
 async def _reprobe(worker: SpeculativeMergeWorker) -> None:
     """Run one reprobe sweep of *worker*'s benched hosts now."""
-    await worker._reprobe_quarantined_hosts(time.time())
+    await worker._host_quarantine.sweep(time.time())
 
 
 def _worker_with_events(
@@ -804,7 +813,7 @@ def _worker_with_events(
     )
     worker._heartbeat_interval_s = _HEARTBEAT_INTERVAL_S
     runners = [_FakeRemoteRunner('laptop')]
-    alloc = HostAllocator(runners, quarantine=worker._runner_quarantine)
+    alloc = worker._host_quarantine.allocator_over(runners)
     worker._host_allocator = alloc
     return worker, alloc, runners[0], tmp_path / f'{name}.db'
 
@@ -956,8 +965,7 @@ class TestHeartbeatDegradation:
         worker, alloc, runner, db_path = _worker_with_events(
             git_ops, tmp_path, 'deg7', escalation_queue=_FakeEscalationQueue(),
         )
-        worker._unreachable_escalate_after_secs = 5.0
-        worker._unreachable_escalate_after_n = 3
+        _adopt_alarm_thresholds(worker, git_ops, after_n=3, after_secs=5.0)
         self._add_local_inflight(worker, config, git_repo)
 
         now = 3000.0
@@ -971,7 +979,7 @@ class TestHeartbeatDegradation:
         assert 'DEGRADED' in _hb_message(caplog)
 
         runner.health = AsyncMock(return_value=True)
-        await worker._reprobe_quarantined_hosts(now)
+        await worker._host_quarantine.sweep(now)
 
         caplog.clear()
         # The rate limit is `now - _last_heartbeat_at < _heartbeat_interval_s`,

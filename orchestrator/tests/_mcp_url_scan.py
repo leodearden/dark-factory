@@ -77,6 +77,7 @@ __all__ = [
     'SLASHED_TAIL',
     'SweepFindings',
     'find_trailing_slash_mcp_urls',
+    'may_hold_findings',
     'sweep_parsed',
     'sweep_source',
 ]
@@ -265,6 +266,31 @@ def sweep_source(source: str, *, filename: str) -> SweepFindings:
     parse, exactly as :func:`find_trailing_slash_mcp_urls` does.
     """
     return sweep_parsed(_parse(source, filename=filename), source)
+
+
+_QUOTES = ('\'', '"')
+
+
+def may_hold_findings(source: str) -> bool:
+    """Whether :func:`sweep_source` could report anything for *source*; False
+    proves it reports nothing, so the parse can be skipped.
+
+    A marker needs :data:`ALLOW_MARKER_KEY`. A slashed URL needs a string
+    literal whose value ends with :data:`SLASHED_TAIL`, and a literal's value
+    differs from its text only through a backslash escape or a split across
+    adjacent literals. Without a backslash, either the tail is spelled whole,
+    or some literal ends in a proper prefix of it just before its closing
+    quote.
+    """
+    split_tails = (
+        SLASHED_TAIL[:length] + quote for length in range(1, len(SLASHED_TAIL)) for quote in _QUOTES
+    )
+    return (
+        ALLOW_MARKER_KEY in source
+        or SLASHED_TAIL in source
+        or '\\' in source
+        or any(split_tail in source for split_tail in split_tails)
+    )
 
 
 def sweep_parsed(tree: ast.Module, source: str) -> SweepFindings:

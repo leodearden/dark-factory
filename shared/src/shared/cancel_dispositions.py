@@ -6,7 +6,7 @@ Contract: plans/cancel-with-children-prd.md §4 and §5.
 from __future__ import annotations
 
 import re
-from collections import Counter, deque
+from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,6 +28,7 @@ from pydantic import (
 )
 from pydantic_core import ErrorDetails, PydanticCustomError
 
+from shared.dependency_cycle import cycle_closed_by_edge
 from shared.json_safe import json_safe
 from shared.project_id import normalize_project_id
 from shared.task_statuses import TaskStatus
@@ -467,19 +468,6 @@ def _child_order(child: ChildKey) -> tuple[bool, int, str]:
     return False, child, ''
 
 
-def _reaches(start: int, goal: int, edges: Callable[[int], Sequence[int]]) -> bool:
-    frontier = deque([start])
-    seen = {start}
-    while frontier:
-        task = frontier.popleft()
-        if task == goal:
-            return True
-        unseen = [dep for dep in edges(task) if dep not in seen]
-        seen.update(unseen)
-        frontier.extend(unseen)
-    return False
-
-
 def _check_target(
     field: str,
     target: int,
@@ -511,9 +499,8 @@ def _post_cancel_edges(
     depends_on: Mapping[int, Sequence[int]],
     *,
     parent_id: int,
-    cancelled: frozenset[int],
 ) -> Callable[[int], Sequence[int]]:
-    overrides: dict[int, Sequence[int]] = {task: () for task in cancelled}
+    overrides: dict[int, Sequence[int]] = {}
     for child, disposition in children.items():
         if isinstance(child, int) and isinstance(disposition, RepointDisposition):
             kept = tuple(dep for dep in depends_on.get(child, ()) if dep != parent_id)
@@ -530,7 +517,7 @@ def _closes_cycle(
     return (
         isinstance(child, int)
         and isinstance(disposition, RepointDisposition)
-        and _reaches(target, child, edges)
+        and cycle_closed_by_edge(child, target, edges) is not None
     )
 
 
@@ -570,18 +557,20 @@ def check_targets(
     depends_on: Mapping[int, Sequence[int]],
 ) -> None:
     """Refuse a child the same act co-cancels, then a target that is missing, cancelled
-    (already or by this cancel), or would close a dependency cycle in the graph this cancel
-    leaves behind.
+    (already or by this cancel), or would close a dependency cycle. The cycle test is the
+    store's one rule, shared/src/shared/dependency_cycle.py::cycle_closed_by_edge, run over
+    the literal edge table this cancel leaves behind: every status, cancelled tasks' own
+    edges included.
 
     co_cancelled names the tasks the same act cancels separately (PRD §4.1); target_status
     maps each named target to its status, None when no such task exists; depends_on is the
-    pre-cancel task -> dependency-ids map, and the post-cancel overlay is derived from
-    children, parent_id and co_cancelled. Local children are checked in ascending id order,
-    then external ones by key, then superseded_by.
+    pre-cancel task -> dependency-ids map, and the post-cancel table is derived from it by
+    rewriting each repointed child's list (parent_id out, onto in). Local children are
+    checked in ascending id order, then external ones by key, then superseded_by.
     """
     _check_not_co_cancelled(children, co_cancelled)
     cancelled = _cancelled_by(children, parent_id, co_cancelled)
-    edges = _post_cancel_edges(children, depends_on, parent_id=parent_id, cancelled=cancelled)
+    edges = _post_cancel_edges(children, depends_on, parent_id=parent_id)
     for child in sorted(children, key=_child_order):
         _check_child(child, children[child], target_status, cancelled, edges)
     for target in superseded_by:

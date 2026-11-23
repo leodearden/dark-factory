@@ -7,6 +7,7 @@ so the two must agree word for word (INV-10).
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import shutil
@@ -15,7 +16,9 @@ from typing import Any
 
 import pytest
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, looks_like_capacity_banner
+from shared.claude_endpoint import ClaudeEndpoint
 from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers_config
+from shared.cli_proxy import CLIENT_ENV_PATH, proxy_endpoint
 from shared.neutral_cwd import neutral_cli_cwd
 
 from fused_memory.config.schema import LinkHealConfig
@@ -465,6 +468,9 @@ def _ok(structured_output: Any = None, cost_usd: float = 0.0) -> AgentResult:
     )
 
 
+_ONE_SAME_ANSWER = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+
+
 @pytest.fixture
 def brief(tmp_path):
     path = tmp_path / 'brief.md'
@@ -585,8 +591,7 @@ class TestPromptVersion:
 class TestConfiguredAdjudicator:
     @pytest.mark.asyncio
     async def test_a_given_brief_names_the_model_and_prompt_every_shard_carries(self, tmp_path):
-        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
-        invoke = FakeInvoke(_ok(structured_output=answer))
+        invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
         ask = ClaudeShardAsker(
             brief_text=FIXED_BRIEF, brief_path=tmp_path / 'missing.md', invoke=invoke,
         )
@@ -608,8 +613,7 @@ class TestConfiguredAdjudicator:
     async def test_without_a_brief_text_the_brief_is_read_once_at_construction(self, tmp_path):
         brief = tmp_path / 'brief.md'
         brief.write_text(FIXED_BRIEF, encoding='utf-8')
-        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
-        invoke = FakeInvoke(_ok(structured_output=answer))
+        invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
         config = LinkHealConfig(shard_size=1)
         adjudicate = configured_adjudicator(config, brief_path=brief, invoke=invoke)
         brief.unlink()
@@ -666,13 +670,22 @@ _LIVE_PAIR = LinkPair(
     parent_text='git stash is unsafe here because the stash stack is shared across all worktrees.',
 )
 
+_PROXY = ClaudeEndpoint(base_url='http://127.0.0.1:8317', auth_token='proxy-key')
 
-async def _live_edge_verdict(invoke: Invoke) -> LinkVerdict:
-    """The live pair's verdict; capacity skips and auth reds, per shared/tests/_capacity_skip.py."""
+
+async def _live_edge_verdict(invoke: Invoke, proxy: ClaudeEndpoint | None) -> LinkVerdict:
+    """The live pair's verdict, asked through the host's CLI proxy, never an operator's own login.
+
+    No proxy skips before any call. A capacity banner skips and an auth failure stays red, per
+    shared/tests/_capacity_skip.py.
+    """
+    if proxy is None:
+        pytest.skip(f'the live edge runs through the CLI proxy, and this host has no {CLIENT_ENV_PATH}')
+    proxied = functools.partial(invoke, endpoint=proxy)
     results: list[AgentResult] = []
 
     async def recording(**kwargs: Any) -> AgentResult:
-        result = await invoke(**kwargs)
+        result = await proxied(**kwargs)
         results.append(result)
         return result
 
@@ -694,26 +707,45 @@ class TestTheLiveEdgeCapacityGuard:
         invoke = FakeInvoke(AgentResult(success=False, output=banner))
 
         with pytest.raises(pytest.skip.Exception, match=re.escape(banner)):
-            await _live_edge_verdict(invoke)
+            await _live_edge_verdict(invoke, _PROXY)
 
     @pytest.mark.asyncio
     async def test_an_auth_failure_is_not_skipped(self):
         invoke = FakeInvoke(AgentResult(success=False, output='Not logged in · Please run /login'))
 
-        verdict = await _live_edge_verdict(invoke)
+        verdict = await _live_edge_verdict(invoke, _PROXY)
 
         assert verdict.failed
         assert verdict.failure is AdjudicationFailure.CLI_FAILED
 
     @pytest.mark.asyncio
     async def test_a_successful_reply_is_returned_as_is(self):
-        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
-        invoke = FakeInvoke(_ok(structured_output=answer))
+        invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
 
-        verdict = await _live_edge_verdict(invoke)
+        verdict = await _live_edge_verdict(invoke, _PROXY)
 
         assert not verdict.failed
         assert verdict.verdict is Verdict.SAME
+
+
+class TestTheLiveEdgeRoute:
+    @pytest.mark.asyncio
+    async def test_no_proxy_skips_before_any_call(self):
+        invoke = FakeInvoke(_ok())
+
+        with pytest.raises(pytest.skip.Exception, match=re.escape(str(CLIENT_ENV_PATH))):
+            await _live_edge_verdict(invoke, None)
+
+        assert invoke.calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_proxy_is_the_endpoint_of_every_call(self):
+        invoke = FakeInvoke(_ok(structured_output=_ONE_SAME_ANSWER))
+
+        await _live_edge_verdict(invoke, _PROXY)
+
+        assert [call['endpoint'] for call in invoke.calls] == [_PROXY]
+        assert all('oauth_token' not in call for call in invoke.calls)
 
 
 @pytest.mark.integration
@@ -722,7 +754,7 @@ class TestTheLiveEdge:
     @pytest.mark.asyncio
     @pytest.mark.timeout(600)
     async def test_a_restatement_gets_a_verdict_from_the_real_cli(self):
-        verdict = await _live_edge_verdict(invoke_with_cap_retry)
+        verdict = await _live_edge_verdict(invoke_with_cap_retry, proxy_endpoint())
 
         assert not verdict.failed, verdict
         assert isinstance(verdict.verdict, Verdict)

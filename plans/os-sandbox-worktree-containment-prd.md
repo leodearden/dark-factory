@@ -168,7 +168,21 @@ admin name (`.git` file → `gitdir`), main-repo common `.git` dir, task id,
 | `~/.claude/fleet/` | RW | session-registry hooks |
 | `~/.claude/hooks/state/` | RW | hook state (α1 may drop — see D5) |
 | `/tmp/`, `/dev/` | RW | orchestrator temp files, pytest FIFO, verify-slot semaphores, device nodes |
-| **Everything else** — `<main>` tree, sibling worktrees, other tasks' `.task-meta/`, `~/.claude` remainder, `.git` root (`packed-refs`, `config`, `HEAD`), `refs/heads/main`, `~/.local/share/uv` | **RO** | the containment |
+| *conditional:* `<project_root>/.git/` | RW | docs-only tasks only — the hook-gated direct-main docs commit (§Docs-only main grant) |
+| *conditional:* each declared docs path: a file grant if it exists, else its nearest existing ancestor dir, only when that dir lies in a top-level `docs/` | RW | docs-only tasks only — the edits that commit lands |
+| **Everything else** — `<main>` tree, sibling worktrees, other tasks' `.task-meta/`, `~/.claude` remainder, `.git` root (`packed-refs`, `config`, `HEAD`), `refs/heads/main`, `~/.local/share/uv` | **RO**, unless the docs-only rows apply | the containment |
+
+The two conditional rows exist only when
+`orchestrator/src/orchestrator/agents/docs_scope.py::docs_only_paths(declared_files)`
+is non-empty, where the declared files are the plan's `files`, else the
+task's `metadata.files`. `project_root` itself is never granted as a docs
+path, and neither is any path that lies in or contains `.git`,
+`.taskmaster`, the lane base (the worktree's parent, from
+`git.worktree_dir`) or the `.task-meta` base, so rows 2 and 2b stay the
+only `.task-meta` grants. A base that holds the project root beside its
+lanes is exempt, since its lanes already lie outside the root. `WriteSet`
+re-checks that containment when it is built. Both rows are absent by default, so a non-docs invocation's write
+set and digest are unchanged.
 
 Invariants:
 - The set is computed per invocation from the assigned worktree/lane — a 2505
@@ -193,6 +207,66 @@ Invariants:
 | 10 | write `~/.claude/fleet/sessions/<x>` | — | succeeds |
 | 11 | write `/tmp/<scratch>` | — | succeeds |
 | 12 | `git commit` with auto-maintenance disabled | α5 config applied | succeeds with zero gc/EROFS noise |
+| 13 | write `<base>/.task-meta/task-<id>/plan.json` | own task root exists | succeeds |
+| 14 | write `<base>/.task-meta/task-<other>/plan.json` | another task's root exists | permission error |
+| 15 | in-place edit of declared `<main>/docs/existing.md` | docs-only declared files | succeeds |
+| 16 | in-place edit of declared top-level `<main>/CLAUDE.md` | docs-only declared files | succeeds |
+| 17 | create declared `<main>/docs/prds/new.md` | `docs/prds/` exists | succeeds |
+| 18 | edit + `git add` + `git commit --only` the declared paths on `main` in `<main>` | gate `pre-commit` via `core.hooksPath` | succeeds; hook runs and marks its sentinel in `.git`; `main` advances by exactly those paths |
+| 19 | write `<main>/.taskmaster/tasks.db` | docs-only declared files | permission error; bytes unchanged |
+| 20 | write undeclared `<main>/docs/sibling.md` or `<main>/other.md` | docs-only declared files | permission error; bytes unchanged |
+| 21 | write `<main>/hooks/pre-commit` | docs-only declared files | permission error; the gate script stays tamper-proof |
+| 22 | create declared new top-level `<main>/NEW.md` | docs-only declared files | permission error (documented limitation) |
+| 23 | rows 3 and 6 shapes with `declared_files` holding a non-docs path | mixed declared files | both still denied |
+
+Rows 3 and 6 are unconditional for non-docs tasks; see row 23.
+
+### Docs-only main grant (task 4627)
+
+A project whose instructions prescribe a hook-gated direct-to-main docs
+commit (reify's) needs a sandboxed agent to write the declared docs files in
+the main checkout and to run `git commit` there. The grant rests on facts
+measured on this host (kernel 7.0, landlock ABI 8, 2026-11-13):
+
+- A path-beneath rule on a regular file returns EINVAL unless its mask is the
+  file-only `EXECUTE|WRITE_FILE|READ_FILE`. A file grant then allows in-place
+  writes only: a sibling write, a new file beside it and a temp-file rename
+  over it are all denied. So a brand-new file needs its directory granted.
+- The Claude CLI's atomic writer (2.1.322) falls back to an in-place write
+  when creating its temp file fails with EACCES and the target exists, so the
+  Edit tool works under a file grant.
+- `git commit` creates `index.lock` and `COMMIT_EDITMSG` in `.git`'s root,
+  and reify's gate writes its sentinel and log there, so `.git` must be
+  granted as a directory. The real reify `hooks/pre-commit` passed under
+  `{.git dir, one docs file}`; the only denied write was reify's fail-open
+  verify ledger (`data/verify-logs`).
+
+A directory grant can therefore only be a directory under `docs/`, and a
+new docs file anywhere else (a new top-level `NEW.md`, a new
+`plans/x.md`, a new `src/pkg/NOTES.md`) is refused with a warning rather
+than widening the grant to a non-docs directory.
+
+Residual, named rather than glossed:
+- `--no-verify` stays reachable; reify's `hooks/reference-transaction` is
+  the backstop.
+- A new file's directory grant exposes every file in that `docs/`
+  directory, not only the declared one. They are all docs files.
+- For a docs-only invocation, `.git/config`, the `.git/hooks` entry, other
+  lanes' admin dirs and every ref are writable. That includes `refs/stash`,
+  a single ref every checkout shares and the merge worker's advance path
+  consumes (incident `13674d3c68`). So a `git stash` in the agent's own
+  worktree, which the sandbox denies otherwise, succeeds and lands on the
+  shared stack. The role prompt forbids it, but nothing enforces that.
+- The hook scripts stay read-only only when they live outside `.git`
+  (`core.hooksPath`, or a `.git/hooks` symlink, as in dark-factory and
+  reify; row 21). A project with real files in `.git/hooks/` has them
+  writable under the grant.
+- The grant is gated on the declared files alone. Every docs-only task in
+  every project gets it, including projects whose docs tasks land through
+  the merge queue, and no project setting turns it off.
+
+Each grant is recorded as `docs_main_paths` on that invocation's
+`sandbox_applied` event.
 
 ## Pre-conditions for activating
 

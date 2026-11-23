@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from orchestrator import session_registry as sr
+from orchestrator import session_leases
 
 _START_TS = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC).isoformat()
 _HOLDER_SLUG = 'watcher-df-100'
@@ -45,18 +45,18 @@ def remove_lease_before(monkeypatch: pytest.MonkeyPatch) -> RemoveLeaseBefore:
 
 
 def _claim_watcher_lease(root: Path) -> Path:
-    holder = sr.LeaseHolder(session_slug=_HOLDER_SLUG, pid=os.getpid(), start_ts=_START_TS)
-    sr.claim_lease('watcher-df', holder=holder, root=root)
-    return sr.lease_path_for_name('watcher-df', root=root)
+    holder = session_leases.LeaseHolder(session_slug=_HOLDER_SLUG, pid=os.getpid(), start_ts=_START_TS)
+    session_leases.claim_lease('watcher-df', holder=holder, root=root)
+    return session_leases.lease_path_for_name('watcher-df', root=root)
 
 
 @pytest.mark.parametrize('force', [False, True], ids=['no-force', 'force'])
-@pytest.mark.parametrize('mutate', [sr.release_lease, sr.heartbeat_lease], ids=['release', 'heartbeat'])
+@pytest.mark.parametrize('mutate', [session_leases.release_lease, session_leases.heartbeat_lease], ids=['release', 'heartbeat'])
 def test_a_lease_that_vanishes_mid_check_is_absent_and_quiet(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     remove_lease_before: RemoveLeaseBefore,
-    mutate: Callable[..., sr.LeaseMutation],
+    mutate: Callable[..., session_leases.LeaseMutation],
     force: bool,
 ) -> None:
     lease_path = _claim_watcher_lease(tmp_path)
@@ -66,7 +66,7 @@ def test_a_lease_that_vanishes_mid_check_is_absent_and_quiet(
     with caplog.at_level(logging.WARNING):
         result = mutate('watcher-df', slug=_HOLDER_SLUG, force=force, root=tmp_path)
 
-    assert result is sr.LeaseMutation.ABSENT
+    assert result is session_leases.LeaseMutation.ABSENT
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
     assert not lease_path.exists()
 
@@ -87,8 +87,8 @@ def test_a_lease_that_vanishes_before_the_heartbeat_touch_is_absent_and_quiet(
     remove_lease_before(os, 'utime', lease_path)
 
     with caplog.at_level(logging.WARNING):
-        result = sr.heartbeat_lease('watcher-df', slug=requester, force=force, root=tmp_path)
+        result = session_leases.heartbeat_lease('watcher-df', slug=requester, force=force, root=tmp_path)
 
-    assert result is sr.LeaseMutation.ABSENT
+    assert result is session_leases.LeaseMutation.ABSENT
     assert not lease_path.exists()
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []

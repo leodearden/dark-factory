@@ -1,0 +1,12 @@
+# reify merge test-leg scope probe (read-only): PSI files and process states of user.slice/user-1000.slice/user@1000.service/df.slice/df-reify.slice/df-verify-reify-4ae45bbd-521e658e98c5.scope
+# 2026-11-19T07:23:07Z cpu.weight=100
+cpu.pressure: some avg10=5.17 avg60=10.31 avg300=6.89 total=32249813 full avg10=3.31 avg60=8.56 avg300=5.74 total=26666056 
+memory.pressure: some avg10=0.00 avg60=0.00 avg300=0.03 total=484369 full avg10=0.00 avg60=0.00 avg300=0.03 total=472351 
+io.pressure: some avg10=8.03 avg60=6.97 avg300=3.18 total=14966343 full avg10=7.58 avg60=6.41 avg300=2.91 total=13843346 
+# count stat nice pcpu comm
+     56 SN     5  0.0 bash
+     16 SN     5  0.0 timeout
+      8 SN     5  0.1 bash
+      2 DN     5  1.0 python3
+      1 SNs    5  0.0 bash
+      1 DN     5  0.4 python3

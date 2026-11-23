@@ -275,7 +275,7 @@ window.DF_DATA = {
   //   bucket_minutes}), attempts: Datum ({outcomes, latency: {p50, p95, p99,
   //   mean_ms, with_duration, without_duration}}), recent, recent_total: Datum,
   //   speculative: Datum, active, in_queue: Datum, live_probe_configured,
-  //   active_spark, halt, train_events:
+  //   runs_db_present, active_spark, halt, train_events:
   //   [{event_type, task_id, run_id, timestamp, data: {train_id,
   //   member_task_ids, ...event-specific keys}}], train_throughput: Datum}};
   //   every recent and active row's title is a Datum. The payload's top-level
@@ -292,10 +292,9 @@ window.DF_DATA = {
     // counts+rates, cap-hit rate, $/done, plus per-role turn-cap saturation.
     by_model_role: { rows: [], turn_cap_saturation: {} },
   },
-  // in_progress_live + in_progress_stranded band the in_progress census; the
-  // parity_* fields are the server's cap-breach verdict (task 3543). Seeded so
-  // a cold client renders empty bands and no banner, never `undefined` ones.
-  BURNDOWN: { labels: [], done: [], in_progress: [], in_progress_live: [], in_progress_stranded: [], blocked: [], pending: [], parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
+  // The parity_* fields are the server's cap-breach verdict (task 3543). Seeded
+  // so a cold client renders empty bands and no banner, never `undefined` ones.
+  BURNDOWN: { labels: [], done: [], in_progress: [], blocked: [], pending: [], parity_alarm: false, parity_cap: null, parity_peak: null, parity_breach_count: 0, parity_projects: [] },
   BURNDOWN_BY_PROJECT: {},
   // CURATOR_STATE is an object (not a captured top-level array), so it is NOT
   // added to STABLE_ARRAY_KEYS. applyKey replaces the reference on each poll;
@@ -406,8 +405,8 @@ window.DF_DATA = {
   // Do not reintroduce it.
   __stale: {},
   // Per-endpoint RECEIPTS, keyed by the same flow-control key __stale uses:
-  // each entry is `{servedAt, receivedAt, window, pacingHoldMs}`, published by
-  // refreshOne on the SUCCESS path only. datum.js::plainDatum reads this to
+  // each entry is `{servedAt, receivedAt, window, pacingHoldMs, assetBuild}`,
+  // published by refreshOne on the SUCCESS path only. datum.js::plainDatum reads this to
   // give a value that is not yet served as a Datum the provenance it does have.
   //
   // `pacingHoldMs` is the slowness-pacing hold this success imposed, measured
@@ -422,6 +421,11 @@ window.DF_DATA = {
   // it did not replace. (It also could not be a registry key: four endpoints
   // share the body key, and a registry key is both the body key and the
   // DF_DATA key.) window_chip.js::windowEcho validates it at read.
+  //
+  // `assetBuild` records WHICH server build served these values: `{started,
+  // onDisk}`, the raw values of the two RECEIPT_ASSET_BUILD_HEADERS, each null
+  // when absent. It shares the success-only lifetime for the same reason as
+  // `window`, and asset_skew.js validates it at read, as windowEcho does.
   //
   // DELIBERATELY NOT MERGED WITH __stale, which sits three lines above it.
   // The two answer different questions and have different lifetimes. __stale
@@ -663,6 +667,22 @@ function publishStaleness(stateKey, st) {
   };
 }
 
+// The response headers naming the static/redux build the serving process
+// started with and the one on disk now (dashboard/src/dashboard/asset_build.py).
+const RECEIPT_ASSET_BUILD_HEADERS = Object.freeze({
+  started: 'X-DF-Asset-Build-Started',
+  onDisk: 'X-DF-Asset-Build-On-Disk',
+});
+
+function assetBuildOfResponse(resp) {
+  const headers = resp.headers;
+  if (!headers || typeof headers.get !== 'function') return { started: null, onDisk: null };
+  return {
+    started: headers.get(RECEIPT_ASSET_BUILD_HEADERS.started),
+    onDisk: headers.get(RECEIPT_ASSET_BUILD_HEADERS.onDisk),
+  };
+}
+
 // Record the provenance of the values this response just delivered. Called on
 // the SUCCESS path ONLY — pointedly NOT from `finally`, where publishStaleness
 // lives. See the __receipt seed block for why the asymmetry is the whole point.
@@ -819,7 +839,13 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
     // from `receivedAt` by however long the applies took.
     const receivedAt = deps.now();
     const pacingHoldMs = slownessPacingHoldMs(deps, receivedAt - startedAt);
-    const receipt = { servedAt: body.served_at ?? null, receivedAt, window: body.WINDOW ?? null, pacingHoldMs };
+    const receipt = {
+      servedAt: body.served_at ?? null,
+      receivedAt,
+      window: body.WINDOW ?? null,
+      pacingHoldMs,
+      assetBuild: assetBuildOfResponse(resp),
+    };
     Object.entries(keySpecs).forEach(([k, spec]) => applyKey(k, body[(spec && spec.bodyKey) || k], spec, receipt));
     recordSuccess(st, startedAt, receivedAt, pacingHoldMs);
     publishReceipt(stateKey, receipt);

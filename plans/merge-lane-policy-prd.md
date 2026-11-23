@@ -124,9 +124,15 @@ merger has merged but the verifier has not yet seen; the dispatch-side re-anchor
 the rebased candidate becomes a `RealMergeItem` (`base_sha = rebased_onto`, merge commit = `rebased_sha`,
 `speculative=False`, `remerge_recovery` cleared) dispatched through `_dispatch_item` onto the fastest free
 host; its successors are re-anchored on `rebased_sha` by D1/D2 instead of voided. The gate decision row
-(`reverify_gate_decision.py`) is still written before the verify. Because the rebased head is itself an
-ordinary dispatch it may chain (D5). The 8329 class (void at adoption when the head was gate-rebased) is
-subsumed: the successor is re-anchored, not voided.
+(`reverify_gate_decision.py`) is still written before the verify. Amended 2026-11-18, Leo's ruling (task
+10721): the rebased head never chains. Its first verdict was about its own tree and the re-verify only covers
+the drift on main, so it verifies its own rebased tree alone. Its task carries the D6 un-chained mark from that
+dispatch until its request is retired, which also covers a dispatch-time re-merge onto a main that moved
+again. The successors re-parked behind it, and requests buffered in the lane, still stack speculatively behind
+it and may chain on their own dispatch. Measured: of five rebased heads re-verified as 6-chains on
+2026-11-17/18, four lost the landing (6836, 6904, 10423, 5897). Task 8329, a chain built ON a head that the
+gate then rebases, is a separate successor-side case and this amendment does not change it. The 8329 class
+(void at adoption when the head was gate-rebased) is subsumed: the successor is re-anchored, not voided.
 
 **D4. K = hosts + 1 and the host lease is released at verdict.** `harness.py::Harness._speculation_k`
 returns `1 + enabled runners + 1`. `_finalize_inflight` → `_resolve_and_release` releases the host lease as
@@ -135,9 +141,10 @@ re-verify (D3) or a landing probe re-acquires a host through `HostAllocator.acqu
 policy rather than holding one. Landing itself (`finalizing`, ~3 min) does not need a verify host. The
 serial-laptop policy value is NOT added (Leo: straight to K = hosts + 1).
 
-**D5. The head chains when nothing else is in the frontier.** `_deep_chain_placement` guard 1 becomes
-"not speculative AND another entry is in the verify frontier → None". `_adopt_head_on_tip_authority` tolerates
-the chained item being the head (it currently excludes the tip's own entry and cancels `_inflight[0]`).
+**D5. The head chains when nothing else is in the frontier, except a gate-rebased head (D3).**
+`_deep_chain_placement` guard 1 becomes "not speculative AND another entry is in the verify frontier → None".
+`_adopt_head_on_tip_authority` tolerates the chained item being the head (it currently excludes the tip's own
+entry and cancels `_inflight[0]`).
 
 **D6. A red chain marks its members, and each verifies alone.** Amended 2026-11-18, Leo's ruling on
 esc-8528-11: the un-chained mark of tasks 10617/10723 owns red-chain isolation; the suspect bisect is retired.
@@ -146,17 +153,17 @@ are marked (`worker.py::_next_dispatch_unchained`) and the owner is requeued. A 
 owner nor a link, so its next verify covers its own tree alone and the verdict is its own: a passer lands and
 the red one is blocked with its findings. The mark is removed only when the task's request is retired (landed,
 blocked or dropped; `worker.py::_retire_item`). Requests that are not marked keep chaining at the depth D7
-gives. A chain verify that raises marks its owner the same way. `_chain_halving_state`, `select_chain_depth`
-and `next_halving_state` are retired. (D6 as first ruled, a suspect list searched by halving, never landed.)
+gives. A chain verify that raises marks its owner the same way, and a gate-rebased head's dispatch (D3)
+marks its own task. `_chain_halving_state`, `select_chain_depth` and `next_halving_state` are retired. (D6 as
+first ruled, a suspect list searched by halving, never landed.)
 
 **D7. Depth from a rolling pass-rate estimate, no fixed cap.** p̂ = per-item pass estimate from the last 30
 tip verdicts of the rounds the policy sized, p̂ = pass_rate^(1/mean k). A round the policy did not size (a
 marked task's verify alone, a dispatch that may not chain, the kill switch) is not counted, by the live fold
 or by the start-up seed. An empty window, including after a seed that failed, has no p̂ and takes the table's
-first row (`chain_depth_reason.basis` `no_estimate`). Depth table: 8 if p̂ ≥ 0.93, 4 if
+first row (`chain_depth_reason.basis` `no_estimate`). Depth table, as first ruled: 8 if p̂ ≥ 0.93, 4 if
 ≥ 0.85, 2 if ≥ 0.75, else 1; capped only by queue depth. The table is a config list
-(`merge_deep.depth_table: [[0.93, 8], [0.85, 4], [0.75, 2]]`, green-tier) so the readout (leaf ι) can extend
-it past 8 once the per-item chain wall is measured at depth ≥ 8 (today measured only at k ≤ 2). The first
+(`merge_deep.depth_table`, green-tier) so the readout (leaf ι) can move its rows. The first
 row's depth may exceed `chain_cap`: `chain_cap` becomes the kill switch only (0 = off; any positive value =
 on), documented as such; 3191 ("promote chain_cap 6 → 32") is cancelled by decompose, 3190's canary
 predicate stays (it reads gates per landing and chain-attributed reds, both still meaningful).
@@ -164,6 +171,34 @@ predicate stays (it reads gates per landing and chain-attributed reds, both stil
 duration against the merge wall, move into ι's readout, task 8532; human gate 7860 now waits on 8532.)
 `chain_depth_reason` on `merge_verify` records p̂, the row chosen and the queue depth; it is null when the
 policy did not size the round.
+
+*Amended 2026-11-19, Leo's instruction (task 10920): the table is retuned for the mark.* The first table was
+tuned on the bisect model, which D6 no longer ships. With every member of a red chain verifying alone, a chain
+of k costs one verify, plus k more when it is red: **1/k + (1 − p^k) verifies per item** at per-item pass rate
+p. Each row now sits at the pass rate where its depth starts to cost less than the depth below it:
+
+| p̂ at least | 0.992 | 0.990 | 0.988 | 0.984 | 0.979 | 0.972 | 0.959 | 0.934 | 0.876 | 0.75 | below |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| depth | 12 | 11 | 10 | 9 | 8 | 7 | 6 | 5 | 4 | 3 | 1 |
+
+- Depth 2 has no row: under this cost depth 3 is cheaper than depth 2 at every pass rate.
+- Depth 3 starts at 0.75, above the formula's break-even with no chain (0.693). The formula leaves out
+  results discarded behind a red entry and re-verifies after main moves, and both cost a chain more than
+  a single item.
+- The top row is 12. A 30-verdict window of clean 12-chains bounds the per-item failure rate near 1%, which
+  supports depth 9 to 12 and no more. Rows 7 to 12 also assume a verify takes no longer at that depth; that
+  was measured flat only up to depth 6 (2026-11-18), so the readout (leaf ι, task 8532) checks it.
+- An empty window still takes the first row, which is now depth 12 where it was 8. If the start-up seed
+  fails while the true pass rate is low, the first chain is likely red and its 12 members each verify alone;
+  the estimate then corrects itself. Accepted: the seed normally fills the window.
+- The formula assumes failures are independent. Where they cluster, the estimate falls and the table backs
+  off by itself.
+- On 2026-11-19 the live estimate on dark-factory was 0.89 to 0.90: depth 4 under both tables.
+- Every project with chains on takes this table at its next restart unless its yaml sets its own. reify has
+  `chain_cap: 6` and no table of its own, so it moves too.
+
+`orchestrator/tests/test_config_merge_deep.py` derives the thresholds from the formula, so a row cannot
+drift from it unnoticed.
 
 **D8. Direct commits meet the merge gate's checks before they land.** `hooks/project-checks` (main-only
 tier) gains two legs: (a) for every staged file, the per-module `lint_command` and `type_check` of the module
@@ -308,6 +343,7 @@ module and command named. The screen leg runs `scripts/merge_screen.yaml`'s node
 | 11 | staged `plans/x.capability-manifest.yaml` naming a script that does not exist | | commit refused by the screen leg naming the manifest test |
 | 12 | main-tip sweep reports `type_error` on `module:scripts:type` | 8411 landed | hold armed with F containing `module:scripts:type`; an item whose tree passes the module's type check verifies at once |
 | 13 | canary readout | 7 d after deploy | every §1 ratio computed from the new fields with the report's rules; a false predicate sets `chain_cap: 0` and files one L2 |
+| 14 | gate re-verify of a head alone in the frontier, queue ≥ 2 | D3, chain_cap > 0 | the rebased head's re-verify has `chain_items = 1`, a re-merge at its dispatch included; signal: no `merge_verify` with `chain_items > 1` follows a `merge_reverify_gate{reverify: true}` for the same request before its next `merge_finalized` (`test_merge_queue_deep_reservation.py::TestGTheRebasedHeadReverifiesItsOwnTreeUnchained`) |
 
 ## 8. Decomposition plan
 

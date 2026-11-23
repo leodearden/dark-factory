@@ -16,8 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from shared.git_async import GitResult, run_git
+from shared.project_layout import CheckoutRootError
 
-from orchestrator.evals.reviewer_trial.corpus import DEFAULT_FIXTURE_CWD, CorpusDiff
+from orchestrator.evals.reviewer_trial.corpus import CorpusDiff
 from orchestrator.tree_removal import remove_tree
 
 _SCRATCH_COMMITTER = (
@@ -81,8 +82,9 @@ async def fixture_checkout(
     A diff that does not apply at its recorded base leaves HEAD at that base, and a
     fixture with no recorded base leaves HEAD at the source's HEAD; either way the
     checkout's ``unapplied_reason`` says why. Raises FixtureNotMaterialisable when
-    the source directory is missing, or when git cannot clone the source or check
-    out the base at all, including a step killed after *git_timeout_secs*.
+    the source directory is missing or not derivable (CorpusDiff.source_dir), or
+    when git cannot clone the source or check out the base at all, including a
+    step killed after *git_timeout_secs*.
     """
     scratch = Path(tempfile.mkdtemp(prefix='reviewer-trial-', dir=scratch_parent))
     try:
@@ -92,9 +94,12 @@ async def fixture_checkout(
 
 
 async def _materialise(diff: CorpusDiff, clone: Path, timeout: float) -> FixtureCheckout:
+    try:
+        source_dir = diff.source_dir()
+    except CheckoutRootError as exc:
+        raise FixtureNotMaterialisable(diff.diff_id, str(exc)) from exc
     source = await _required_git(
-        diff, ['rev-parse', '--show-toplevel'], cwd=diff.cwd or DEFAULT_FIXTURE_CWD,
-        timeout=timeout,
+        diff, ['rev-parse', '--show-toplevel'], cwd=source_dir, timeout=timeout,
     )
     await _required_git(
         diff, ['clone', '--shared', '--no-checkout', '--quiet', source, str(clone)],

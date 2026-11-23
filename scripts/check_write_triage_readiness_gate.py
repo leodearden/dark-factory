@@ -17,6 +17,10 @@ Every input is structured argv, never a mini-language:
   --subcheck 'PROGRAM ARG ...'        one string, shlex-tokenized to argv, no shell; exit 0 required
 A PATH is dotted; a segment may select a list element by index (`per_k[3]`)
 or by key match (`per_k[k=20]`). Every malformed or missing input fails closed.
+A report whose top level carries `expires_at` (ISO-8601 with a UTC offset) is
+evidence only until then: its expiry is a leading check, and a past,
+malformed or offset-less expiry fails closed. A report without `expires_at`
+never expires.
 """
 from __future__ import annotations
 
@@ -27,10 +31,12 @@ import re
 import shlex
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 NOTE_CAP = 400
+EXPIRY_KEY = 'expires_at'
 _OPS = {'>=': operator.ge, '<=': operator.le, '>': operator.gt, '<': operator.lt, '==': operator.eq}
 _SEGMENT = re.compile(r'^(?P<key>[^\[\]]+)(?:\[(?P<sel>[^\]]+)\])?$')
 
@@ -101,6 +107,26 @@ def check_equals(reports: dict[str, Any], handle: str, path: str, value: str) ->
     return {'check': label, 'actual': actual, 'ok': str(actual) == value, 'note': None}
 
 
+def expiry_reason(value: Any, now: datetime) -> str | None:
+    if not isinstance(value, str):
+        return 'not an ISO-8601 string'
+    try:
+        expires = datetime.fromisoformat(value)
+    except ValueError:
+        return 'not an ISO-8601 timestamp'
+    if expires.tzinfo is None:
+        return 'no UTC offset'
+    return 'expired' if expires <= now else None
+
+
+def check_expiry(handle: str, doc: Any, now: datetime) -> dict[str, Any] | None:
+    if not isinstance(doc, dict) or EXPIRY_KEY not in doc:
+        return None
+    value = doc[EXPIRY_KEY]
+    reason = expiry_reason(value, now)
+    return {'check': f'{handle}:{EXPIRY_KEY}', 'actual': value, 'ok': reason is None, 'note': reason}
+
+
 def check_subcheck(command: str, timeout: int) -> dict[str, Any]:
     label = f'subcheck {command}'
     try:
@@ -152,13 +178,16 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         return emit({'gate': args.gate, 'verdict': 'fail', 'checks': [], 'error': f'report unreadable: {exc}', 'actions': args.on_fail})
 
-    checks = [check_require(reports, *r) for r in args.require]
-    checks += [check_equals(reports, *e) for e in args.equals]
-    checks += [check_subcheck(s, args.subcheck_timeout) for s in args.subcheck]
-    passed = bool(checks) and all(c['ok'] for c in checks)
+    now = datetime.now(UTC)
+    expiry = [check for handle, doc in reports.items() if (check := check_expiry(handle, doc, now)) is not None]
+    requested = [check_require(reports, *r) for r in args.require]
+    requested += [check_equals(reports, *e) for e in args.equals]
+    requested += [check_subcheck(s, args.subcheck_timeout) for s in args.subcheck]
+    checks = expiry + requested
+    passed = bool(requested) and all(c['ok'] for c in checks)
     return emit({'gate': args.gate, 'verdict': 'pass' if passed else 'fail', 'checks': checks,
                  'actions': args.on_pass if passed else args.on_fail,
-                 **({} if checks else {'error': 'no checks given'})})
+                 **({} if requested else {'error': 'no checks given'})})
 
 
 if __name__ == '__main__':

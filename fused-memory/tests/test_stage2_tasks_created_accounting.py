@@ -214,8 +214,6 @@ def _mock_deps() -> dict:
     write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
     journal_mock = MagicMock()
     journal_mock.write_journal = write_journal_mock
-    journal_mock.record_run_session = AsyncMock()
-    journal_mock.clear_run_session = AsyncMock()
     return {
         'memory_service': AsyncMock(),
         'taskmaster': _AllPresentTaskmaster(),

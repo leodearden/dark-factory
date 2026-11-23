@@ -39,7 +39,7 @@ ABSENT = 'absent'
 #: The tree-relative path naming the whole tree.
 WHOLE_TREE = '.'
 
-_TREE_UNIT_ID = 'tree'
+TREE_UNIT_ID = 'tree'
 _UNIT_ID_PREFIX = {UnitTier.MODULE: 'module:', UnitTier.TEST: 'test:'}
 _SHELL_PUNCTUATION = frozenset('();<>|&')
 
@@ -152,7 +152,7 @@ async def read_tree_inputs(repo: Path, tree: str, plan: VerifyPlan) -> TreeInput
 def tree_unit_key(tree_oid: str, plan_hash: str, toolchain: ToolchainFingerprint) -> UnitKey:
     """The whole-tree unit: this tree, verified by this plan, under this toolchain."""
     return UnitKey.of(
-        _TREE_UNIT_ID, UnitTier.TREE, plan_hash,
+        TREE_UNIT_ID, UnitTier.TREE, plan_hash,
         (('tree', tree_oid), ('spec', plan_hash), *toolchain.as_inputs()),
     )
 
@@ -214,7 +214,7 @@ def test_unit_key(
 
 def _unit_id_fits(tier: UnitTier, unit_id: str) -> bool:
     if tier is UnitTier.TREE:
-        return unit_id == _TREE_UNIT_ID
+        return unit_id == TREE_UNIT_ID
     return unit_id.startswith(_UNIT_ID_PREFIX[tier])
 
 

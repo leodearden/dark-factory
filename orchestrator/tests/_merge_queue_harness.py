@@ -106,7 +106,7 @@ async def _launch_local_verify(
         return None
 
     verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
-        worker._run_inflight_verify(item, lease)
+        worker.verify_dispatch.run_inflight_verify(item, lease)
     )
 
     return _mq.InflightEntry(

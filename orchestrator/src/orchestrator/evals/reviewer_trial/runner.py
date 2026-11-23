@@ -19,12 +19,14 @@ import os
 import sys
 import tempfile
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
 from shared.cli_invoke import invoke_with_cap_retry
+from shared.project_layout import CheckoutRootError
 from shared.safe_io import atomic_write_text
 from shared.usage_gate import UsageGate
 
@@ -40,11 +42,7 @@ from orchestrator.evals.reviewer_trial.checkout import (
     FixtureNotMaterialisable,
     fixture_checkout,
 )
-from orchestrator.evals.reviewer_trial.corpus import (
-    DEFAULT_FIXTURE_CWD,
-    CorpusDiff,
-    CorpusManifest,
-)
+from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest
 from orchestrator.evals.reviewer_trial.scorer import ScoringResult, score_panel_run
 from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
@@ -200,7 +198,7 @@ async def _review_subject(diff: CorpusDiff, checkout: FixtureCheckout) -> Review
         raise FixtureNotMaterialisable(
             diff.diff_id, checkout.unapplied_reason or 'its change is not committed in the clone',
         )
-    conventions_relpath = project_review_config(diff.cwd or DEFAULT_FIXTURE_CWD).briefing_path
+    conventions_relpath = project_review_config(diff.source_dir()).briefing_path
     if not (checkout.root / conventions_relpath).is_file():
         logger.info(
             'Fixture %s: no conventions at %s in its tree; its d2 panel is briefed without them',
@@ -250,7 +248,7 @@ async def _run_single_reviewer(
     role = build_trial_reviewer_role(spec)
     prompt = await _assembler().build_reviewer_prompt(role.name, diff.diff_text, context='')
     return await _review(
-        spec, role, prompt, cwd=diff.cwd or DEFAULT_FIXTURE_CWD, diff_id=diff.diff_id,
+        spec, role, prompt, cwd=diff.source_dir(), diff_id=diff.diff_id,
         max_retries=max_retries, meta_root=meta_root,
     )
 
@@ -584,13 +582,15 @@ async def run_trial(
     Reused legacy panels are counted in one warning.
 
     Raises FixtureEnrichmentMissing, before any reviewer runs, when a
-    context-complete variant meets a fixture with no ``context``. A pair whose
-    fixture cannot be materialised is logged and yields no result.
+    context-complete variant meets a fixture with no ``context``. Fixtures with
+    no resolvable source checkout are named in one warning before any reviewer
+    runs. A pair whose fixture cannot be materialised is logged and yields no result.
     """
     if any(variant.briefing is ReviewBriefing.CONTEXT_COMPLETE for variant in variants):
         unenriched = [diff.diff_id for diff in corpus.diffs if diff.context is None]
         if unenriched:
             raise FixtureEnrichmentMissing(unenriched)
+    _warn_of_sourceless_fixtures(corpus.diffs)
 
     semaphore = asyncio.Semaphore(max_parallel_panels)
     all_results: list[PanelRunResult] = []
@@ -631,6 +631,25 @@ async def run_trial(
             legacy, results_dir or _RESULTS_DIR,
         )
     return all_results
+
+
+def _warn_of_sourceless_fixtures(diffs: Sequence[CorpusDiff]) -> None:
+    projects_by_reason: dict[str, Counter[str]] = {}
+    for diff in diffs:
+        try:
+            diff.source_dir()
+        except CheckoutRootError as exc:
+            projects_by_reason.setdefault(str(exc), Counter())[diff.project or 'this repository'] += 1
+    if not projects_by_reason:
+        return
+    groups = '; '.join(
+        f'{", ".join(f"{project} ({count})" for project, count in sorted(projects.items()))}: {reason}'
+        for reason, projects in projects_by_reason.items()
+    )
+    logger.warning(
+        '%d of %d fixtures have no source checkout, so each is skipped unless its panel is already cached: %s',
+        sum(projects.total() for projects in projects_by_reason.values()), len(diffs), groups,
+    )
 
 
 async def run_and_score(

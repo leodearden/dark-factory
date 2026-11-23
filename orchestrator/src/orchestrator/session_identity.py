@@ -95,7 +95,7 @@ class SessionIdentity:
     def lease_slug(self, name: str) -> str | None:
         """``<name>-<claude pid>``; under a shared host ``<name>-<claude pid>-<session id>``.
 
-        None when that token is underivable -- see ``session_registry.py::default_lease_slug``.
+        None when that token is underivable -- see ``session_leases.py::default_lease_slug``.
         """
         if self.claude_pid is None:
             return None
@@ -180,14 +180,14 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     terminal's whole lifetime -- so it stays alive after the ``claude``
     process it stood in for has crashed.
     ``pid_alive`` would then answer True forever, and because BOTH staleness
-    rules (``session_registry.py::claim_lease``'s ``is_stale`` and
-    ``session_registry.py::reap_stale_leases``' ``stale_pid``)
+    rules (``session_leases.py::claim_lease``'s ``is_stale`` and
+    ``session_leases.py::reap_stale_leases``' ``stale_pid``)
     require a DEAD pid AND an aged heartbeat, a crashed holder's lease would
     become PERMANENTLY unreapable -- recoverable only by a human
     ``lease-release --force``. That is a strictly worse failure than the
     ``--pid $$`` defect this function exists to fix, and the exact opposite of
     the heartbeat-only degradation documented here and in
-    ``session_registry.py::LEASE_HEARTBEAT_TTL``.
+    ``session_leases.py::LEASE_HEARTBEAT_TTL``.
 
     0 makes that documented degradation literally true: ``pid_alive`` returns
     False for every pid <= 0, so an unresolvable session pid collapses the

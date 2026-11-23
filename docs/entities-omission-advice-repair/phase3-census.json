@@ -1,0 +1,1104 @@
+{
+ "task": {
+  "id": "7117",
+  "project_id": "dark_factory"
+ },
+ "fix_task": {
+  "id": "6059",
+  "project_id": "dark_factory",
+  "status_at_census": "done"
+ },
+ "residual_fix_task": {
+  "id": "6826",
+  "project_id": "dark_factory",
+  "status_at_census": "done"
+ },
+ "agent_id": "curator-7117-phase3-entities-advice-repair",
+ "captured_at": "2026-11-19T10:48:37+00:00",
+ "git_sha": "233978faaa8eb11f649ee6f5205c17af1d1bfbf1",
+ "projects": [
+  "dark_factory",
+  "reify",
+  "know_live",
+  "autopilot_video",
+  "solar_challenge_platform"
+ ],
+ "queries": [
+  "add_memory rejects declared entities DeclaredReferentConflictRejected; omitting entities fixes it",
+  "entities parameter conflict rejected task referent declaration gotcha",
+  "omit entities which always succeeds declared referent",
+  "declared_referent_conflict add_memory workaround spell task NNN"
+ ],
+ "search_params": {
+  "limit": 20,
+  "stores": [
+   "mem0"
+  ],
+  "tool": "search"
+ },
+ "search_hits": {
+  "dark_factory": {
+   "add_memory rejects declared entities DeclaredReferentConflictRejected; omitting entities fixes it": [
+    "40ee5c37-6783-4f15-b96b-77030c867d49",
+    "1d186423-2543-4492-bc51-ed275b075165",
+    "454d5a87-bea6-4965-97e9-cf762c9d9e21",
+    "2be6b8c3-788c-4908-95ef-bf213d9c1141",
+    "525ad930-15d7-415f-a701-b155cf86cfce",
+    "7eced4d1-92ff-41fc-8b7b-340abdae3867",
+    "2c9f2deb-0fff-4fe2-93d3-5a1dd7cfc6cc",
+    "1c0bccb0-6ff2-4628-8c7a-b565caabab1c",
+    "d3d753ef-dba4-4ac8-a712-69610ce7a65a",
+    "8e910959-b343-48e1-a48d-64f1079d3855",
+    "c2a7ec63-3b79-4bdd-b182-f5954c0828e1",
+    "a3ff92b5-b799-423f-b8ee-727587c782b4",
+    "b7087fc1-d24c-4d84-909f-ac7bc1c8a377",
+    "dff68a97-af84-4b70-949d-ac23ff8e1242",
+    "b6ed0529-8e96-4ed7-9998-5aa480bdbd62",
+    "b457c0f8-6e2e-47d1-af5b-3267f87d3047",
+    "3bd3b938-0919-4d3f-a54d-32d9999b69c1"
+   ],
+   "entities parameter conflict rejected task referent declaration gotcha": [
+    "b6ed0529-8e96-4ed7-9998-5aa480bdbd62",
+    "1d186423-2543-4492-bc51-ed275b075165",
+    "40ee5c37-6783-4f15-b96b-77030c867d49",
+    "dff68a97-af84-4b70-949d-ac23ff8e1242",
+    "454d5a87-bea6-4965-97e9-cf762c9d9e21",
+    "d3d753ef-dba4-4ac8-a712-69610ce7a65a",
+    "8e910959-b343-48e1-a48d-64f1079d3855",
+    "1c0bccb0-6ff2-4628-8c7a-b565caabab1c",
+    "525ad930-15d7-415f-a701-b155cf86cfce",
+    "2be6b8c3-788c-4908-95ef-bf213d9c1141",
+    "a3ff92b5-b799-423f-b8ee-727587c782b4",
+    "b7087fc1-d24c-4d84-909f-ac7bc1c8a377",
+    "c2a7ec63-3b79-4bdd-b182-f5954c0828e1",
+    "3bd3b938-0919-4d3f-a54d-32d9999b69c1",
+    "7eced4d1-92ff-41fc-8b7b-340abdae3867",
+    "2c9f2deb-0fff-4fe2-93d3-5a1dd7cfc6cc",
+    "74d8f5b1-b1f1-4689-aa45-fbf5fcdd9f89"
+   ],
+   "omit entities which always succeeds declared referent": [
+    "1d186423-2543-4492-bc51-ed275b075165",
+    "7eced4d1-92ff-41fc-8b7b-340abdae3867",
+    "40ee5c37-6783-4f15-b96b-77030c867d49",
+    "2c9f2deb-0fff-4fe2-93d3-5a1dd7cfc6cc",
+    "dff68a97-af84-4b70-949d-ac23ff8e1242",
+    "1c0bccb0-6ff2-4628-8c7a-b565caabab1c",
+    "454d5a87-bea6-4965-97e9-cf762c9d9e21",
+    "d3d753ef-dba4-4ac8-a712-69610ce7a65a",
+    "3bd3b938-0919-4d3f-a54d-32d9999b69c1",
+    "a3ff92b5-b799-423f-b8ee-727587c782b4",
+    "b7087fc1-d24c-4d84-909f-ac7bc1c8a377",
+    "525ad930-15d7-415f-a701-b155cf86cfce",
+    "2be6b8c3-788c-4908-95ef-bf213d9c1141",
+    "8bab7e68-5cc0-443f-b512-388b882185ff",
+    "c2a7ec63-3b79-4bdd-b182-f5954c0828e1",
+    "8e910959-b343-48e1-a48d-64f1079d3855"
+   ],
+   "declared_referent_conflict add_memory workaround spell task NNN": [
+    "1d186423-2543-4492-bc51-ed275b075165",
+    "a3ff92b5-b799-423f-b8ee-727587c782b4",
+    "40ee5c37-6783-4f15-b96b-77030c867d49",
+    "1c0bccb0-6ff2-4628-8c7a-b565caabab1c",
+    "dff68a97-af84-4b70-949d-ac23ff8e1242",
+    "454d5a87-bea6-4965-97e9-cf762c9d9e21",
+    "2c9f2deb-0fff-4fe2-93d3-5a1dd7cfc6cc",
+    "2be6b8c3-788c-4908-95ef-bf213d9c1141",
+    "b6ed0529-8e96-4ed7-9998-5aa480bdbd62",
+    "d3d753ef-dba4-4ac8-a712-69610ce7a65a",
+    "c2a7ec63-3b79-4bdd-b182-f5954c0828e1",
+    "0856d281-6a21-4c61-a7f7-c3dc9000d005",
+    "525ad930-15d7-415f-a701-b155cf86cfce",
+    "93f211b5-94b3-4da5-96ed-b0c9e6066f6d",
+    "b7087fc1-d24c-4d84-909f-ac7bc1c8a377",
+    "8e910959-b343-48e1-a48d-64f1079d3855",
+    "7eced4d1-92ff-41fc-8b7b-340abdae3867"
+   ]
+  },
+  "reify": {
+   "add_memory rejects declared entities DeclaredReferentConflictRejected; omitting entities fixes it": [
+    "fe0ef70a-f61b-43f6-809a-4099be005183",
+    "698589bc-5c97-40bf-be62-8228a592bdd9",
+    "f53e37f8-a1ce-486d-a16c-070cf6a0009a",
+    "8678efb1-de5d-499b-986b-33c1f48604f7",
+    "7a0fa0cf-0fbd-47e3-9547-0a580b561b0e",
+    "b3b137a3-9970-4a68-abb4-8f3453bc2fbe",
+    "5c82302b-2e1f-4750-8d57-fe2aa7190fa1",
+    "8e77de87-58fc-4721-8c1e-41038f7acb18",
+    "1daa961a-9275-4080-9aae-6fafa3051828",
+    "96a73112-21e4-4bf5-a435-3b3940517097",
+    "590ed04d-47f4-4f99-b70c-31ee21557d85",
+    "ce3d0202-8c28-4690-812b-8ac21babe36a",
+    "59a10f60-20e8-4407-9eb2-997894fbf8fe",
+    "ac94c0fd-db74-4e6c-9df3-7e24435cbd5a",
+    "0507cc6a-4f58-4652-8e17-8aff8c39e895",
+    "cade3087-12b9-4787-a748-b1b1b2d519a5",
+    "53ab3122-9b5d-4db3-926f-719d7517697b",
+    "7fdedc48-6f43-4990-be84-8f342a106265",
+    "5e2411ce-acdd-499a-a99d-3bd1d996a3fe"
+   ],
+   "entities parameter conflict rejected task referent declaration gotcha": [
+    "fe0ef70a-f61b-43f6-809a-4099be005183",
+    "59a10f60-20e8-4407-9eb2-997894fbf8fe",
+    "531fa4b0-ac24-4ad3-b6f3-813ef93ab12d",
+    "639f6387-f462-4f3e-9524-71ba87b53835",
+    "21e64056-d5e1-46d0-88e1-24f73f73700b",
+    "1d8a2113-2300-4047-8479-c38603250ab9",
+    "2fadcc99-304a-4237-a253-64865cbe14ad",
+    "6b39d218-79bc-4cd0-bff0-1de17ac501ad",
+    "9ba65ae2-fcaa-40a3-9227-6f5c44dac108",
+    "2a8e7a63-c557-486e-8aaa-2065b75cf00b",
+    "e9f8a92f-2b8a-4bd7-8497-bd8296a006c3",
+    "ba20f3ae-2cbf-4951-9297-3a5a96e13420",
+    "312669f4-db28-4539-9bdb-b981a6d08b7e",
+    "48c4bbb5-8ecb-4151-a005-a5eec790b168",
+    "df7a0a3a-7fb4-4eda-b5d8-aca8ed90f699",
+    "b8e61140-7b85-4ce9-8907-e05a5ad399f4",
+    "c0f3badc-1769-46d6-a5af-4485e2aa2c61",
+    "1fa5e299-14d5-4040-bdef-d84111da4637",
+    "9cffd7da-24d2-42d0-8b8c-3dfe4cc8abf2"
+   ],
+   "omit entities which always succeeds declared referent": [
+    "fe0ef70a-f61b-43f6-809a-4099be005183",
+    "71a2771e-d515-4d29-8edc-1076902cb202",
+    "5e2411ce-acdd-499a-a99d-3bd1d996a3fe",
+    "f53e37f8-a1ce-486d-a16c-070cf6a0009a",
+    "28919cd1-d74b-456b-a9fa-50932ddd0f73",
+    "d7c37995-8419-453c-a15c-f5d0a221e65b",
+    "31ed25c3-581d-4352-940b-1e26842090c6",
+    "f2516540-3988-463b-9d30-e9e30dd7fe30",
+    "72af58bf-3d11-4abf-99a1-60dd5943feba",
+    "32e00560-5f0b-445a-b978-d2d1de706f6d",
+    "90cf3b9c-6a08-443b-b1ea-de6e4f88bb2b",
+    "0507cc6a-4f58-4652-8e17-8aff8c39e895",
+    "67483576-7682-4e07-9dc7-2fa377b0ca67",
+    "93230ffa-24b9-48cb-bdb1-a589656537b1",
+    "5c82302b-2e1f-4750-8d57-fe2aa7190fa1",
+    "5355abd1-fa85-4b31-bcd2-f5191339afd2",
+    "1fa5e299-14d5-4040-bdef-d84111da4637",
+    "7274f7d4-6d10-4369-8e79-36e7c91bbe1a",
+    "8af23952-a6a1-4fd5-92dd-843d4bfa5279"
+   ],
+   "declared_referent_conflict add_memory workaround spell task NNN": [
+    "fe0ef70a-f61b-43f6-809a-4099be005183",
+    "698589bc-5c97-40bf-be62-8228a592bdd9",
+    "7d08210f-ecac-4c46-8a09-542b5ac63cf6",
+    "de1c862c-61b6-4b84-a262-88c69b2197f2",
+    "80998c05-bdb6-478e-b690-5d5fd0d067da",
+    "a3a933c5-a583-4c39-95af-1c208621fafa",
+    "78f3047d-ca12-4e32-bee5-92e402c217e5",
+    "f59c860d-2c56-4789-85aa-3fd430c850ea",
+    "cade3087-12b9-4787-a748-b1b1b2d519a5",
+    "3d77513e-62e9-4825-9515-3c3c956e3143",
+    "7ec05212-9d18-46e7-acc9-3c008282c8e9",
+    "e3fc92aa-af67-4b56-836c-587937e02cca",
+    "bbe11061-aaa9-4f78-afad-8f0f7c73c04d",
+    "da831990-3088-4f4f-8869-30e80e269cd1",
+    "ae4cd354-e2f1-45c4-a528-104f904a9146",
+    "6ad73add-99b4-4d02-9067-41d2b9fea17c",
+    "fc836a4c-f2af-458d-a06e-e84b5d3776c7",
+    "128cb99b-eb32-46da-93d7-fb2c8f53ab64",
+    "7036191c-dd67-44d7-ad2e-31c30457529f"
+   ]
+  },
+  "know_live": {
+   "add_memory rejects declared entities DeclaredReferentConflictRejected; omitting entities fixes it": [
+    "b5f63613-ee9f-415a-8e74-51fe291eb5b3",
+    "a6632e88-2480-49fa-b54a-009a721a012d",
+    "2648bde9-9dee-4868-b812-d98c0fce5b8c",
+    "17baf88d-0004-44c6-aa2c-1d36703d0670",
+    "504d08a7-d7fd-4ef8-8ead-98df892d5284",
+    "90a24a6e-54dc-4072-960a-224ef666da57",
+    "d60f3110-f997-4d9a-997c-c75feb58ca8b",
+    "0945e3d2-7f48-4a8a-a7a8-62691cb1045a",
+    "680f751f-bc91-43d9-840c-7c32a894f311",
+    "7dad0fee-8cdf-4fd2-badd-16d82e9e6ed5",
+    "e3814859-730b-4b3d-8843-ae83f36fb35c",
+    "a8d792fe-b35a-4281-b908-51a783e12766",
+    "9476dd18-7af8-480a-a0fb-5fea95434af5",
+    "30f79060-e54f-416d-9141-9a00bddeced9",
+    "cd34b86c-94af-42f0-ace9-a2f4b0b2d755",
+    "a2296aeb-80ad-48bc-8f13-e96b4b637226",
+    "8b1f438d-954f-46bc-a3df-90f76a46aed6",
+    "78166756-9a7f-402a-88ec-7967104d19ae",
+    "33037736-15ee-428a-bb8c-159437695f9c",
+    "88173e12-7e1e-4f29-a342-6765eaff3a31"
+   ],
+   "entities parameter conflict rejected task referent declaration gotcha": [
+    "b5f63613-ee9f-415a-8e74-51fe291eb5b3",
+    "e06c158b-1724-44b8-add6-f1826176e3fb",
+    "8760e372-d2c2-4516-b4b8-efab433b0c41",
+    "6dc8b1ae-35a2-4f2e-bd02-9d898da32b0b",
+    "952cff7a-c262-4777-ae3e-65bf324de7c7",
+    "b87648cb-e631-446d-b6f0-3ebd77f75ffa",
+    "49e32b64-d6f8-45ff-8f67-57f05e8216c7",
+    "7abe8c9f-ce94-4dac-9f2d-12f8a30e2890",
+    "8cbef16c-a893-455c-bf5a-17633d727b2e",
+    "5508f619-b6af-4864-9c6e-8d49919105a9",
+    "4d416372-1bff-4900-9628-bfb0d45b7a0f",
+    "16d1c500-e251-462c-9185-c3dab2297acb",
+    "4027a34a-c00b-414b-a6a9-513681d543fb",
+    "8a510a90-090b-48d2-84a0-928f2aa0f36d",
+    "4370fb7d-f40b-4b35-a8cc-a55365d4eead",
+    "3f50dd5f-31c9-4460-8c3a-7a40c3086a1b",
+    "8cd20df9-9f74-4ea5-87ee-d051b73fe02b",
+    "73ea42d4-e4d6-41bb-936f-beb12de9c9c6",
+    "9921de15-7aa8-484a-bcff-c11bcbb85dd0",
+    "18eadd73-d559-4a7d-a6d7-2c4a2b53b82a"
+   ],
+   "omit entities which always succeeds declared referent": [
+    "b5f63613-ee9f-415a-8e74-51fe291eb5b3",
+    "df55b2e9-105f-4677-b2a5-523e9f3df4a7",
+    "0345f3c8-b01d-46d3-8935-75b9fa8d9096",
+    "a8d792fe-b35a-4281-b908-51a783e12766",
+    "5508f619-b6af-4864-9c6e-8d49919105a9",
+    "6dc8b1ae-35a2-4f2e-bd02-9d898da32b0b",
+    "bf2a459a-d388-44b9-8aa8-aa224b4ffd9e",
+    "19faaee0-2a52-47e9-8261-2aba6190ca86",
+    "36993ab5-1dc3-44b3-9ea0-e33cb0054f67",
+    "5d48b90b-b4b8-4354-b6ba-1fa50ab18bdd",
+    "7de8ea31-69dc-4484-bac1-078529d21ca1",
+    "753f3c87-d895-4cb6-941c-8f0207a12871",
+    "4370fb7d-f40b-4b35-a8cc-a55365d4eead",
+    "3e65f983-2ab3-4ce8-8d5f-7d13511fdad5",
+    "a82f9d9b-0e8e-48c7-a85b-1eae2afe24bd",
+    "2d7fd7f7-29a4-4c06-b256-4e2a7e46fac7",
+    "6e2d9f40-9631-4515-ae52-d046e0cd0a8f",
+    "2648bde9-9dee-4868-b812-d98c0fce5b8c",
+    "3a74a00f-3d72-448d-887f-4c5bf8e6f26f",
+    "78166756-9a7f-402a-88ec-7967104d19ae"
+   ],
+   "declared_referent_conflict add_memory workaround spell task NNN": [
+    "7dad0fee-8cdf-4fd2-badd-16d82e9e6ed5",
+    "97371e94-34f1-4a03-9131-490ee8b1f67d",
+    "680f751f-bc91-43d9-840c-7c32a894f311",
+    "f5779d3d-3bdf-48fd-8a99-4e625254fbe8",
+    "8b1f438d-954f-46bc-a3df-90f76a46aed6",
+    "30f79060-e54f-416d-9141-9a00bddeced9",
+    "6abb598b-2bd6-4141-845d-0da24d413583",
+    "44d6b97b-f75f-4d07-8db4-e7ed3f857d31",
+    "f4418650-9486-4842-a0bb-8488bca9a9f7",
+    "cb322876-da55-484d-b0f7-5a3a567da4a8",
+    "0945e3d2-7f48-4a8a-a7a8-62691cb1045a",
+    "16d1c500-e251-462c-9185-c3dab2297acb",
+    "87488e12-0996-4051-a7f5-7cb140067d7a",
+    "b2df0c42-e11c-40e1-81a7-7fd9a4fdc5f0",
+    "31b3d061-835c-4256-a90d-fb56007503cd",
+    "4e115ab8-a7bf-44d3-834a-e44b003ea702",
+    "dfb53a3b-d5fb-4f79-b6df-37ac5a251b3e",
+    "eddbb99f-0929-4aa1-9745-a97ed8756933",
+    "a6632e88-2480-49fa-b54a-009a721a012d",
+    "e313e085-5e7d-4f49-b73a-0cabb32f64d8"
+   ]
+  },
+  "autopilot_video": {
+   "add_memory rejects declared entities DeclaredReferentConflictRejected; omitting entities fixes it": [
+    "cab0ab0d-85cb-4802-adf5-b12be4613f79",
+    "83a88214-28ca-433a-812d-21cef8c83c48",
+    "20951367-b180-425b-932b-36ba6364e895",
+    "b8784ccf-bbba-4939-b3bc-aacf4cc55bbf",
+    "86851aa3-fbeb-4a54-934c-28f7c9fc7218",
+    "1aa216ab-8776-4ad6-83d5-7ba6a2a656e4",
+    "7d2e0173-4dbb-4f75-b524-f5d0ee7fce30",
+    "e1733d98-c9cc-4bfe-88a2-51f7d8d0c35b",
+    "259d8987-f73c-4e6c-b2a3-c1bc86cf9d41",
+    "062daebf-c70d-437d-80be-5e9362c993da",
+    "31a52573-d2b2-4f1b-8fe8-6e833f59f0a9",
+    "71d6e87f-b839-4cb2-b684-02f9e16c7e20",
+    "97d343dd-351e-4cfa-963d-77c47bed47d5",
+    "a6530edb-e65c-4e13-88f8-9728ab141b9e",
+    "54e4da00-d5d9-4dbd-adc2-ca26f9b06158",
+    "1ebcbe6b-8fee-46ec-91a7-e2dcb5fcd67a",
+    "688ba1dd-522b-4c56-9495-626d1f68aebc",
+    "2341a3f0-b9d5-4cfd-89be-eef23e51c8a9",
+    "465d7ff4-3d64-44cf-adcc-7280fcc45cb8",
+    "d9107088-a544-4bd0-94da-d9a982938dad"
+   ],
+   "entities parameter conflict rejected task referent declaration gotcha": [
+    "6b51256f-2a8c-4f5c-b928-70ea31245462",
+    "bdc0199d-88ae-4f7f-aaf3-724c5ceb1cd5",
+    "106f13f4-9558-44b3-80ab-1ca176541340",
+    "3cb2580f-69e8-4d79-a498-9a765eee170e",
+    "af41c665-286d-43e4-8385-7b58060ed3fb",
+    "006749a6-e5f5-49c1-b631-4fbfe7e0a0eb",
+    "eb71755b-3c2e-4468-9abe-437f272ebabe",
+    "eae8d2ab-e051-4603-be19-e6bdebb31cfa",
+    "92a877aa-b538-4c7d-8e14-36f1228a72fa",
+    "7132ac64-0175-4732-9a06-29c3840ecd0b",
+    "7847591b-372a-49fc-88a6-276ff72df60e",
+    "8c0a64b8-ebaf-4767-9173-89c0268c1029",
+    "cf5c7cc8-e529-4bba-848e-30e5bff25e22",
+    "2344fda2-f7e2-48d8-9610-7f66acddc956",
+    "227d5e90-e18b-4ea6-bb81-50680d8024b2",
+    "f0c6a333-b3e5-45bd-82d6-3d10d0a3b419",
+    "78c86fb7-e8fa-4901-aed7-e7bf0a27e803",
+    "e5e69d2f-f44d-4ded-ab5e-c9a987c14c24",
+    "ddde4316-a8c8-4418-b4ee-d13c0e2e6898",
+    "9b716701-0121-4feb-9928-95c7376d049a"
+   ],
+   "omit entities which always succeeds declared referent": [
+    "0ffa3584-7336-47d7-a208-482166443ecc",
+    "4ec4e818-cf31-4d8b-bb2a-a0958e28e2d3",
+    "83a88214-28ca-433a-812d-21cef8c83c48",
+    "09130bfc-b8fa-4595-9d4b-6b8eb282f688",
+    "fd600448-56e0-4063-ad41-7f630965bbbc",
+    "6b51256f-2a8c-4f5c-b928-70ea31245462",
+    "cab0ab0d-85cb-4802-adf5-b12be4613f79",
+    "b8784ccf-bbba-4939-b3bc-aacf4cc55bbf",
+    "21b1ea48-c5ec-45aa-a735-d9badf3c31e9",
+    "cf5c7cc8-e529-4bba-848e-30e5bff25e22",
+    "227d5e90-e18b-4ea6-bb81-50680d8024b2",
+    "a4fde6cc-48ec-40d1-94f3-ee014e7cccda",
+    "949f96f2-6737-4d0b-b2d9-2fb077ec1348",
+    "9f1d9a89-35dd-4278-acc9-42dcddbc44f4",
+    "4412fb5e-dd4d-4be3-a2d7-a9ba6bde5de4",
+    "ca797c8c-2958-4858-a8b2-238824b709fb",
+    "a02c0654-66e1-44fd-9c39-ab8ebdfa2b09",
+    "d0a10867-5b84-46e4-8bf6-dec48a60f4a4",
+    "35a0d621-529b-4172-8fb4-7e20102e0254",
+    "f6e24004-9e3d-43ac-af78-31ad2622efad"
+   ],
+   "declared_referent_conflict add_memory workaround spell task NNN": [
+    "af41c665-286d-43e4-8385-7b58060ed3fb",
+    "11b03145-bf43-4fba-96fc-ee6fd1a1ce4b",
+    "29605155-6bb7-4d36-bd9b-afad3681af94",
+    "5b745d09-aa45-43c0-aad3-308057538f8d",
+    "22732671-04a5-4475-a54b-8c4a83e395e8",
+    "cab0ab0d-85cb-4802-adf5-b12be4613f79",
+    "0d8e1b46-9e87-4de1-8cec-7503fddce841",
+    "a96d5799-76ce-4a40-bf40-16da3b95b872",
+    "26a72362-89e3-4d04-a0b0-4314998bac11",
+    "08707cfa-453f-43d7-805e-11ed849cae6b",
+    "71d6e87f-b839-4cb2-b684-02f9e16c7e20",
+    "30026c59-f71b-49cd-abc7-d5417340dac3",
+    "31b2a740-199b-433d-a6d8-31b0f1dc348c",
+    "f02589c5-2039-4906-b41c-b2620da22cf3",
+    "65d3d0bd-a558-4e59-8714-9ba7a8358d38",
+    "0e307750-ed39-4dfe-ab93-cfb33799f318",
+    "b2e3bce6-3394-40c5-8ac2-7552cd473768",
+    "fc3fede9-5ec0-4824-9a7b-a0368d15dc77",
+    "87b4d2cd-3e6f-41a9-b151-07f11081d306",
+    "c0638291-3e22-4e89-b371-a16e348858de"
+   ]
+  },
+  "solar_challenge_platform": {
+   "add_memory rejects declared entities DeclaredReferentConflictRejected; omitting entities fixes it": [
+    "4214c151-8776-4efa-99dd-8a12f02906e1",
+    "148972e8-793b-4d50-a0be-5c83359c69b8",
+    "77540e4c-d494-438f-b425-05806fe20163",
+    "adf28187-6c4a-47ae-8496-83fda34ccfcf",
+    "e9694bc0-8886-4700-a014-2cf192e94e80",
+    "ed20e347-7264-4d53-8355-56bf554d1889",
+    "865bdc31-8f0f-49a6-b4b2-19c861c52347",
+    "a54bb6bf-8366-4cef-944e-b605c830b8bc",
+    "1d9c2ccc-7cb4-4a36-8c06-524989d1f8a8",
+    "740752be-6f09-42a5-94c2-c02898fb3182",
+    "efb86a17-ea67-4a8e-826b-0185bf67ea41",
+    "a919a7d6-72a8-4a7d-bbfb-ad602d547ff5",
+    "2b46c72e-364c-4aec-b7cc-930f283c0073",
+    "1dc09aa9-790d-4fa5-9258-af4c00488e31",
+    "da6b2b36-be45-490a-b8ce-e4503bcd06f3",
+    "ceb8ea65-5fd0-4026-a567-bc90417c8560",
+    "a593bacf-1c15-4e01-a9d0-e068338e962e",
+    "adbfb097-6bfe-49fb-8c08-2375cbc55efd",
+    "6324ba2a-92e1-4497-8b42-c7f76ea844b8",
+    "dc3aade1-06ca-40e1-90f7-409ea44d0a61"
+   ],
+   "entities parameter conflict rejected task referent declaration gotcha": [
+    "4214c151-8776-4efa-99dd-8a12f02906e1",
+    "009467fb-67a2-40b8-b8f4-d0064bd851f3",
+    "c188d2d4-9887-476d-956e-ef088905ef47",
+    "1d9c2ccc-7cb4-4a36-8c06-524989d1f8a8",
+    "94f2dfab-c1ce-4169-b6d6-be286d449d1f",
+    "ed20e347-7264-4d53-8355-56bf554d1889",
+    "0462df25-13e5-4ff8-97cb-df114b74fc40",
+    "9d9f1ccc-e57d-420e-9b7b-271009c52875",
+    "b8bcc53c-270b-41d0-9a30-36ab341899c8",
+    "84554a0e-edf0-43ec-9b75-871460edba41",
+    "295bef91-45c8-48dc-853e-b52277456f9a",
+    "c4e65fa0-6beb-4e48-a8e3-d5a6740c60d9",
+    "93e968aa-370f-402e-aca5-5fd7bfa02b14",
+    "afa2c003-b160-4fb5-895d-deb383476967",
+    "1eb2708c-30cd-4c8a-b6be-cafa6e537b41",
+    "e417c12a-9fef-4c05-92b9-9e5340561e62",
+    "875b0ceb-648c-430a-a3fd-b7e64e96f0bb"
+   ],
+   "omit entities which always succeeds declared referent": [
+    "4214c151-8776-4efa-99dd-8a12f02906e1",
+    "e9694bc0-8886-4700-a014-2cf192e94e80",
+    "3632f827-7aab-4d8a-acd2-ea49433a169b",
+    "34d22ae6-4183-4058-8e74-027834fa8d14",
+    "740752be-6f09-42a5-94c2-c02898fb3182",
+    "ed20e347-7264-4d53-8355-56bf554d1889",
+    "a919a7d6-72a8-4a7d-bbfb-ad602d547ff5",
+    "77540e4c-d494-438f-b425-05806fe20163",
+    "471f0a59-b1c2-4ddc-98a8-dc2ffec1f1f5",
+    "148972e8-793b-4d50-a0be-5c83359c69b8",
+    "7898100b-ca79-4e72-80c7-5687f5acac25",
+    "a9fe2475-aa2e-4c3b-bb99-27a46cd5c53d",
+    "9d9f1ccc-e57d-420e-9b7b-271009c52875",
+    "dcd5ed61-6187-451d-b081-e1d5d6c80815",
+    "2fe9e1de-9746-4f36-b704-b3c20b573753",
+    "c188d2d4-9887-476d-956e-ef088905ef47",
+    "347f32b1-b643-4aa1-af8d-98413c3a2812",
+    "5a4eaaaa-a101-4ae0-9fe1-24436fa02779",
+    "dc93b534-cbd4-433a-84c4-593072da1e80",
+    "c59fae6a-3a56-44ed-a62a-db627f797465"
+   ],
+   "declared_referent_conflict add_memory workaround spell task NNN": [
+    "4214c151-8776-4efa-99dd-8a12f02906e1",
+    "adf28187-6c4a-47ae-8496-83fda34ccfcf",
+    "1d9c2ccc-7cb4-4a36-8c06-524989d1f8a8",
+    "865bdc31-8f0f-49a6-b4b2-19c861c52347",
+    "bcccb503-6cd4-4075-b79e-6ca8add23728",
+    "da6b2b36-be45-490a-b8ce-e4503bcd06f3",
+    "9d9f1ccc-e57d-420e-9b7b-271009c52875",
+    "a1abdb74-8b55-401d-b14a-aac8fe97aa9d",
+    "e154cdae-8358-4df1-8841-0febb375b3d0",
+    "f1784a67-cf9a-47d5-94d9-92fc323398e1",
+    "ee4b45d1-00c4-4400-b1ea-c0404ec2e59f",
+    "6479db06-697a-4d94-b5ca-7658e56d2569",
+    "a919a7d6-72a8-4a7d-bbfb-ad602d547ff5",
+    "4cdcdb9c-07e9-4265-856a-38abdd89f3f3",
+    "697d010d-0f64-4835-a288-b450245b423f",
+    "0995a1f9-881d-4700-b7a7-84103363d063",
+    "45b8c0ae-7169-4d48-aadc-5cb6d72be674",
+    "c55bfe04-2029-496b-83c3-e91affe02828",
+    "1d70c6d1-258e-4331-9990-14537c084d7f",
+    "ca9f3ab0-1e0d-4870-a839-cc7f68345371"
+   ]
+  }
+ },
+ "literal_sweep": {
+  "method": "read-only Qdrant scroll of every point in fused_<project_id>, payload `data` matched in Python",
+  "patterns": {
+   "omit_near_entities": "(omit\\w*|leav\\w* (it |them )?out|drop\\w*|without)[^.\\n]{0,40}\\bentities\\b",
+   "entities_always_succeeds": "\\bentities\\b[^\\n]{0,120}always succeeds",
+   "omitting_always_succeeds": "omitting[^\\n]{0,30}always succeeds",
+   "declare_only_content_referents": "declare only[^\\n]{0,80}content_referents"
+  },
+  "scanned": {
+   "dark_factory": 38337,
+   "reify": 40856,
+   "know_live": 2341,
+   "autopilot_video": 3948,
+   "solar_challenge_platform": 6214
+  },
+  "matches": [
+   [
+    "dark_factory",
+    "1b357196-d445-495f-a418-ee7de6850b08"
+   ],
+   [
+    "dark_factory",
+    "1d186423-2543-4492-bc51-ed275b075165"
+   ],
+   [
+    "dark_factory",
+    "201599f9-7bd8-42f5-835a-1079ec3a6ccb"
+   ],
+   [
+    "dark_factory",
+    "25ba3ae6-b73f-4e10-ad9f-327e9939462e"
+   ],
+   [
+    "dark_factory",
+    "27dd26e9-d057-4af2-a62f-5dea821f6fe3"
+   ],
+   [
+    "dark_factory",
+    "2be6b8c3-788c-4908-95ef-bf213d9c1141"
+   ],
+   [
+    "dark_factory",
+    "2c9f2deb-0fff-4fe2-93d3-5a1dd7cfc6cc"
+   ],
+   [
+    "dark_factory",
+    "3309a452-bf3d-496a-9352-143c30668a89"
+   ],
+   [
+    "dark_factory",
+    "3fafb280-abf9-49a4-8ba4-3741885f75cb"
+   ],
+   [
+    "dark_factory",
+    "40ee5c37-6783-4f15-b96b-77030c867d49"
+   ],
+   [
+    "dark_factory",
+    "43d305b1-53dc-48f1-aff7-b89fa0e29f05"
+   ],
+   [
+    "dark_factory",
+    "454d5a87-bea6-4965-97e9-cf762c9d9e21"
+   ],
+   [
+    "dark_factory",
+    "525ad930-15d7-415f-a701-b155cf86cfce"
+   ],
+   [
+    "dark_factory",
+    "5aa76f29-f83a-455f-a6fd-aff3857a8403"
+   ],
+   [
+    "dark_factory",
+    "6f233d2d-459f-4081-b4b7-1b375cd45a7a"
+   ],
+   [
+    "dark_factory",
+    "7b7b9f83-e30f-475a-bc33-3dc24e9b3102"
+   ],
+   [
+    "dark_factory",
+    "7eced4d1-92ff-41fc-8b7b-340abdae3867"
+   ],
+   [
+    "dark_factory",
+    "7f77f3ff-e57a-4b65-87d1-41f346d889ce"
+   ],
+   [
+    "dark_factory",
+    "8e910959-b343-48e1-a48d-64f1079d3855"
+   ],
+   [
+    "dark_factory",
+    "93f211b5-94b3-4da5-96ed-b0c9e6066f6d"
+   ],
+   [
+    "dark_factory",
+    "9fb0abdd-ee18-40c1-8ca3-3cb605a55429"
+   ],
+   [
+    "dark_factory",
+    "a3ff92b5-b799-423f-b8ee-727587c782b4"
+   ],
+   [
+    "dark_factory",
+    "afd80220-bda0-4915-b6eb-59d1fc653988"
+   ],
+   [
+    "dark_factory",
+    "b457c0f8-6e2e-47d1-af5b-3267f87d3047"
+   ],
+   [
+    "dark_factory",
+    "b7087fc1-d24c-4d84-909f-ac7bc1c8a377"
+   ],
+   [
+    "dark_factory",
+    "c2a7ec63-3b79-4bdd-b182-f5954c0828e1"
+   ],
+   [
+    "dark_factory",
+    "d3d753ef-dba4-4ac8-a712-69610ce7a65a"
+   ],
+   [
+    "dark_factory",
+    "dff68a97-af84-4b70-949d-ac23ff8e1242"
+   ],
+   [
+    "reify",
+    "86fa6e7e-daf0-4ed0-a0f8-3b396b12ecfa"
+   ],
+   [
+    "reify",
+    "a939d235-39f2-4d72-82ef-3e9cb3c2032e"
+   ],
+   [
+    "reify",
+    "edab2428-a7de-4e9d-9591-c7ade3bdaa1e"
+   ],
+   [
+    "reify",
+    "fdc490bc-b56e-458e-b34a-87668b8598e9"
+   ],
+   [
+    "reify",
+    "fe0ef70a-f61b-43f6-809a-4099be005183"
+   ],
+   [
+    "solar_challenge_platform",
+    "4214c151-8776-4efa-99dd-8a12f02906e1"
+   ]
+  ]
+ },
+ "records": [
+  {
+   "project_id": "dark_factory",
+   "memory_id": "a3ff92b5-b799-423f-b8ee-727587c782b4",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-10-01T19:23:05.325401+00:00",
+   "updated_at": "2026-10-01T19:23:05.325401+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search",
+    "literal_sweep"
+   ],
+   "before_content": "More evidence for the add_memory entities-gate false-conflict bug (owner task 6059), seen 2026-10-01 during a /reflect. Four of eight writes were rejected with DeclaredReferentConflictRejected when the content referred to tasks by bare number (\"5303\", \"landed with 5303\", \"Residual of 5303\") while entities declared {'kind':'task','id':5303}. The content scanner recognised only the \"Task NNNN\" / \"task NNNN\" spellings as referents, and in one case mis-extracted 'tip:23313' (a test count) and 'filed:6155' as referents. As a result, every declared task counted as a conflict. Workaround: omit entities; the write then succeeds and the scanner derives referents. Writing \"task 5303\" (with the word) also makes the scanner see the referent.",
+   "disposition": "teaches_omission",
+   "rationale": "Named by task 7117. \"Workaround: omit entities; the write then succeeds\"."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "201599f9-7bd8-42f5-835a-1079ec3a6ccb",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-team-5344-handcarry",
+   "created_at": "2026-10-05T22:01:44.648938+00:00",
+   "updated_at": "2026-10-05T22:01:44.648938+00:00",
+   "parent_id": null,
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "Hand-carry mechanics that worked on 2026-10-05 (task 5344 via carrier task 6377): (a) implement in an out-of-tree worktree (.claude/worktrees/hc-<id>), and when review fixes arrive while a full test_command run is still going in that tree, branch a SECOND worktree from the rebased tip for the fixer instead of editing under the running suite; (b) file the carrier up front with submit_task(planning_mode=True) + add_dependency(carrier -> real task) while the real task is held deferred; at submit time `git branch task/<carrier> <tip>` + `git worktree add .worktrees/<carrier>` (no git worktree move, so no broken venv), walk carrier pending -> in-progress (claimant_run_id) -> merge-deferred, submit with verified_green only if the suite ran on that exact tip; (c) the queue was 9 deep: the carrier was coalesced as a NON-TIP train member (superseded_by coalesce-5479-*), the train landed ~3h after submit under the tip's marker, and mark_member_done flipped the merge-deferred carrier to done ~1 min after the marker appeared (no self-stamp needed or allowed); the real task (deferred) was stamped done with found_on_main at its landed rebased commit, proven by `git cherry main task/<carrier>` all '-'. A Bash safety check refused `bash -c \"$TC\"` (it cannot inspect a variable script for rm); writing the verbatim test_command into a visible script file worked. The fused-memory entities gate rejected declared tasks cited as bare numbers ('carrier 6377', '5371 and 5020') as conflicts; write 'task N' each time or omit entities.",
+   "disposition": "teaches_omission",
+   "rationale": "Found by the literal sweep only. Ends \"write 'task N' each time or omit entities\"."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "1d186423-2543-4492-bc51-ed275b075165",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-team-df-6152",
+   "created_at": "2026-10-08T15:06:34.695639+00:00",
+   "updated_at": "2026-10-08T15:06:34.695639+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search",
+    "literal_sweep"
+   ],
+   "before_content": "add_memory's entities check (declared_referent_conflict) recognises a task referent in the content only in the form 'task NNNN' (or 'Task NNNN'). On 2026-10-07 a write declaring tasks 6152, 6481 and 5807 was REJECTED as conflicting. Its content said 'carrier 6481' and 'μ (5807)', and the scan found only 'task 6152' plus false referents such as 'design:28' and 'anchors:3'. Fix: write 'task 6481' and 'task 5807' in the prose, or omit entities, which always succeeds. Declared entities must each appear as 'task NNNN' in the text.",
+   "disposition": "teaches_omission",
+   "rationale": "Named by task 7117. \"or omit entities, which always succeeds\"."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "2c9f2deb-0fff-4fe2-93d3-5a1dd7cfc6cc",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-10-08T15:18:07.248445+00:00",
+   "updated_at": "2026-10-08T15:18:07.248445+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search",
+    "literal_sweep"
+   ],
+   "before_content": "add_memory's declared-entities gate scans content only for \"task NNNN\" phrasing (observed 2026-10-08).\n\nA content that wrote \"6040's completion\" and \"into 6144\" yielded referents {Task 1229, Task 6518}, the only two ids written as \"task NNNN\". Declaring entities 6040, 6144 and 6328 was then rejected as DeclaredReferentConflictRejected.\n\nFix: write every id you declare as \"task NNNN\" in the content, or omit `entities` (that always succeeds).",
+   "disposition": "teaches_omission",
+   "rationale": "Named by task 7117. \"or omit `entities` (that always succeeds)\"."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "c2a7ec63-3b79-4bdd-b182-f5954c0828e1",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-prd-decompose-deferral",
+   "created_at": "2026-10-09T11:57:18.711407+00:00",
+   "updated_at": "2026-10-09T11:57:18.711407+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search",
+    "literal_sweep"
+   ],
+   "before_content": "add_memory gotcha (dark_factory, 2026-10-08): the entities gate's content scan recognises task referents written as \"tasks 6524\" or \"task 6525\", but not ids written as \"6526 γ\" inside a list. Declaring all six task ids was therefore rejected with DeclaredReferentConflictRejected, with the four unrecognised ids listed as conflicts. Fix: write each id as \"task N\" in the content, or omit entities and let the scan derive them. Omitting always succeeds.",
+   "disposition": "teaches_omission",
+   "rationale": "Named by task 7117. \"or omit entities ... Omitting always succeeds\"."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "40ee5c37-6783-4f15-b96b-77030c867d49",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-10-10T16:38:24.763371+00:00",
+   "updated_at": "2026-10-10T16:38:24.763371+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search",
+    "literal_sweep"
+   ],
+   "before_content": "add_memory's entities declaration is checked against referents the content scanner derives, and the scanner reads only some id forms. On 2026-10-09 a decisions_and_rationale write listing many bare task numbers ('α 6667, β 6668 …') declared those tasks in `entities` and was rejected with DeclaredReferentConflictRejected. The scanner had derived only 'Task 6673', 'reify:8430' and 'amendments:6106' from the prose, so every other declared id counted as a conflict. Retrying with `entities` omitted succeeded.\nRule of thumb: for a memory naming many ids in compact notation, omit `entities`, or rephrase each id as 'task NNNN'.",
+   "disposition": "teaches_omission",
+   "rationale": "Named by task 7117. Rule of thumb \"omit `entities`\" for many compact ids."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "8e910959-b343-48e1-a48d-64f1079d3855",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive-discuss-4082",
+   "created_at": "2026-10-10T16:40:58.110411+00:00",
+   "updated_at": "2026-10-10T16:40:58.110411+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search",
+    "literal_sweep"
+   ],
+   "before_content": "add_memory gotcha (fused-memory, observed 2026-10-09): declaring entities=[{'kind':'task','id':4681}] on content that names the task only inside an escalation id (\"esc-4681-3\") is REJECTED with DeclaredReferentConflictRejected (conflicts: Task 4681). The content scan does not count an escalation id as a task referent. Either name the task in prose (\"task 4681\") or leave it out of `entities`.\n\nSeparately, commit_planning returns manifest_stamping.missing_labels when a newly filed PRD task's label (here η) has no entry in the PRD's capability-manifest yaml. That is informational and harmless when the omission is deliberate.",
+   "disposition": "teaches_omission",
+   "rationale": "Named by task 7117. \"or leave it out of `entities`\"."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "5aa76f29-f83a-455f-a6fd-aff3857a8403",
+   "category": "procedural_knowledge",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-10-10T17:15:27.794803+00:00",
+   "updated_at": "2026-10-10T17:15:27.794803+00:00",
+   "parent_id": null,
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "fused-memory task-tool gotchas hit 2026-10-09 (interactive filing of ~30 writes): (1) update_task refuses priority (and other replace-only columns) combined with append=True — it raises AppendUnsupportedFieldError loudly rather than overwriting; send the priority change as its own call with append omitted, and the details append as a separate call. (2) submit_task's `dependencies` is a comma-separated STRING (\"5411,5064\"), not a list — a list fails pydantic validation. (3) metadata.files rejects directory paths (LockCharterViolation): list individual files or pass files=[] to defer scope to the architect. (4) submit_task returns a ticket (tkt_…) asynchronously; list_tickets is huge (200 KB) — resolve a ticket to its task id by querying .taskmaster/tasks/tasks.db read-only (select id,title from tasks where id>=N) instead; an MCP timeout on submit_task does NOT mean the task was not created (two timed-out submits had landed). (5) add_memory's declared-referent gate rejects an `entities` list whose ids are not what the content is 'about' per its scan; omit entities when a memory names many tasks. (6) search_tasks ignores its status filter and returns ~12 KB per query; for an inventory, read the task store with read-only sqlite instead.",
+   "disposition": "teaches_omission",
+   "rationale": "Found by the literal sweep only. Gotcha (5): \"omit entities when a memory names many tasks\"."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "7eced4d1-92ff-41fc-8b7b-340abdae3867",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive-discuss-4082",
+   "created_at": "2026-10-10T16:43:35.978706+00:00",
+   "updated_at": "2026-10-10T16:43:35.978706+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search",
+    "literal_sweep"
+   ],
+   "before_content": "add_memory `entities` gotcha (fused-memory, measured 2026-10-09): the content scan recognises a task referent only in the form \"task N\" / \"Task N\" (and \"tasks N\"-style prose that it parses). It does NOT count:\n- bare ids in parentheses (\"α (6524)\", \"ζ 6529\");\n- ranges (\"6524–6528\");\n- slash pairs (\"tasks 4082/6578\": only the first was seen);\n- escalation ids (\"esc-4681-3\").\n\nDeclaring any of those in `entities` is REJECTED as DeclaredReferentConflictRejected. The fix is to write \"task 6524\" in the prose, or declare only the ids the rejection's `content_referents` lists.",
+   "disposition": "frames_defect_as_rule",
+   "rationale": "Task 7117's borderline record. States the pre-fix blind spots as rules and advises declaring only the ids `content_referents` lists, i.e. dropping honest declarations."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "dff68a97-af84-4b70-949d-ac23ff8e1242",
+   "category": "procedural_knowledge",
+   "agent_id": "claude-interactive-lme-mu",
+   "created_at": "2026-10-11T10:17:48.215227+00:00",
+   "updated_at": "2026-10-11T10:17:48.215227+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search",
+    "literal_sweep"
+   ],
+   "before_content": "The add_memory declared-referent gate (`entities`) only credits tasks the content scanner itself extracts, and the scanner is narrower than it looks. Two quirks seen on 2026-10-11:\n(1) \"tasks 3867 and 4877\" yielded only Task 3867, so declaring task 4877 was rejected as a DeclaredReferentConflict. Write each id as \"task NNNN\" (e.g. \"task 3867, task 4877\"), or omit `entities`.\n(2) Content that cited esc-3725-1 but never the literal words \"task 3725\" was rejected when entities declared task 3725. The scanner also extracted a spurious referent \"safe:15370\" from prose like \"SAFE ... 15370 MiB\".\nThe safe fallback is to omit `entities`, which always succeeds, and let the scanner derive the referents.",
+   "disposition": "teaches_omission",
+   "rationale": "Named by task 7117. \"The safe fallback is to omit `entities`, which always succeeds\"."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "9fb0abdd-ee18-40c1-8ca3-3cb605a55429",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-10-13T18:33:34.598469+00:00",
+   "updated_at": "2026-10-13T18:33:34.598469+00:00",
+   "parent_id": "40ee5c37-6783-4f15-b96b-77030c867d49",
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "add_memory's declared-referent gate (DeclaredReferentConflictRejected), as observed 2026-10-13. It rejects a write when a task named in `entities` appears in the content only as a passing mention or in a non-subject phrasing. Two rejections in one session: declaring task 2918 when the content said \"the same miss class 2918's census recorded\" was flagged as a conflict, and declaring 6933 when the content said \"Follow-up filed: 6933\" was flagged because the scanner read that as referent 'filed:6933', not 'Task 6933'. Fix: declare only the task(s) the memory is primarily ABOUT, or omit `entities` and let the content scan derive them. Omitting always succeeds, and the retry without entities was stored at once.",
+   "disposition": "teaches_omission",
+   "rationale": "Found by the literal sweep only. \"Omitting always succeeds\"."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "1b357196-d445-495f-a418-ee7de6850b08",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-prd-client-portal",
+   "created_at": "2026-10-15T10:28:13.069732+00:00",
+   "updated_at": "2026-10-15T10:28:13.069732+00:00",
+   "parent_id": "7eced4d1-92ff-41fc-8b7b-340abdae3867",
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "Fact (fused-memory, observed 2026-10-14): add_memory's declared-referent gate rejects an entities list when the content names tasks in a form its scan does not recognise — \"α1 45\" or \"tasks 45-56\" read as not mentioning tasks 46 to 56, and the declared list then conflicts. Writing the ids as \"task 45\" or \"ids 45 to 56\" or omitting entities both succeed; a rejection never loses anything, so resubmit without entities.",
+   "disposition": "teaches_omission",
+   "rationale": "Found by the literal sweep only. \"resubmit without entities\"."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "7b7b9f83-e30f-475a-bc33-3dc24e9b3102",
+   "category": "procedural_knowledge",
+   "agent_id": "claude-team-6862",
+   "created_at": "2026-10-18T08:12:18.586322+00:00",
+   "updated_at": "2026-10-18T08:12:18.586322+00:00",
+   "parent_id": "5aa76f29-f83a-455f-a6fd-aff3857a8403",
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "Fused-memory update_task facts measured 2026-10-18: append=True on the description field is REFUSED with AppendUnsupportedFieldError (the column is replace-only; the server names four live repros where an accepted append overwrote authored prose), so extending a description is read-modify-write of the full text with append omitted; append=True on details IS accepted, which is where landing agents put post-merge notes. add_memory rejects a write whose declared entities conflict with the referents its own content scan finds (DeclaredReferentConflictRejected), for example declaring task 6997 while the text names 4834/7090/7091, or declaring tasks when the text contains a \"filings:\" pattern; passing entities=[] always succeeds.",
+   "disposition": "teaches_omission",
+   "rationale": "Found by the literal sweep only. Offers \"passing entities=[] always succeeds\" as the way past the rejection."
+  },
+  {
+   "project_id": "reify",
+   "memory_id": "86fa6e7e-daf0-4ed0-a0f8-3b396b12ecfa",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-09-30T10:15:52.883964+00:00",
+   "updated_at": "2026-09-30T10:15:52.883964+00:00",
+   "parent_id": null,
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "/team lead lesson (2026-09-30): a fork seat asked to \"wait for the merge queue to go idle then commit\" armed its own 30-minute Monitor, which expired after 15 events with no idle window; the fork then sat idle for hours while the lead believed it was watching. Long waits on the merge queue (typically 1-3 h per full gate, queue depth 3-7) must be owned by the LEAD with a re-armed detect-only monitor (poll `git merge-base --is-ancestor <tip> main` every 60 s plus merge_status every 10 min via the HTTP fallback client), never delegated to a seat. Also: fused-memory's add_memory referent gate rejects `entities` that its own content scan cannot confirm — it recognises \"task NNNN\" / \"Task NNNN\" but NOT bare \"#NNNN\" or \"leaf β #NNNN\", and it mis-reads `value: 5mm` as a \"value:5\" referent; omit `entities` (or write \"task NNNN\") to avoid DeclaredReferentConflictRejected.",
+   "disposition": "teaches_omission",
+   "rationale": "Found by the literal sweep only. \"omit `entities` (or write \"task NNNN\")\"."
+  },
+  {
+   "project_id": "reify",
+   "memory_id": "a939d235-39f2-4d72-82ef-3e9cb3c2032e",
+   "category": "procedural_knowledge",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-10-10T21:40:14.170145+00:00",
+   "updated_at": "2026-10-10T21:40:14.170145+00:00",
+   "parent_id": null,
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "GOTCHAS from spawning and joining /spawn sessions (2026-09-30/10-01): (1) A spawned session's handback lives at ~/.claude/fleet/sessions/<role>-<project>[-<task>]-<pid>/result.md (e.g. sweep-reify-1008764, team-reify-5023-1041019); record.json holds wm_title. A `grep -l <title> ~/.claude/fleet/sessions/*/record.json` can return nothing even when the record exists — list by the role prefix (`ls -td team-reify-*`) and read record.json's wm_title instead. The background Bash task's exit code is liveness only; read result.md for outcome. (2) A spawned session Leo talks to in its own window may legitimately exceed its brief (the stamping brief forbade status changes; rounds 2–3 cancelled 22 tasks on Leo's in-window rulings) — read result.md's per-round attribution before calling it a scope breach. (3) fused-memory add_memory referent gate: content containing \"<word>: <number>\" fragments (e.g. \"structure: 9\", \"method: 7\") is parsed as referents and REJECTS the write with declared_referent_conflict when `entities` names tasks; resubmit without `entities` (omitting always succeeds). (4) resolve_ticket routinely times out at 110 s on the first call while the curator deliberates — retry once; it then returns created/combined with the curator's justification. (5) To pin a spawned session's model, prefix spawn-claude.sh with CLAUDE_SPAWN_MODEL=fable; keep the /team wrapper in the prompt and put the brief in ~/.claude/spawn-briefs/<slug>.md so the fresh context can satisfy gates without asking.",
+   "disposition": "teaches_omission",
+   "rationale": "Found by the literal sweep only. Gotcha (3): \"resubmit without `entities` (omitting always succeeds)\"."
+  },
+  {
+   "project_id": "reify",
+   "memory_id": "fe0ef70a-f61b-43f6-809a-4099be005183",
+   "category": "observations_and_summaries",
+   "agent_id": "prd-S24-session",
+   "created_at": "2026-10-13T15:02:42.995340+00:00",
+   "updated_at": "2026-10-13T15:02:42.995340+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search",
+    "literal_sweep"
+   ],
+   "before_content": "fused-memory add_memory's `entities` declaration is checked against referents scanned from the content. The scanner recognises the 'task #NNNN' phrasing (it found 'task #6935') but not bare '#8822' next to Greek labels. Declaring entities for ids written only as '#NNNN' was rejected as DeclaredReferentConflictRejected. Either write 'task #NNNN' in the content or omit entities.\nSeparately, the unquoted-heredoc backtick trap struck again on 2026-10-13: a `python3 - <<EOF` patch containing `x_seam_wait`, `commit_planning` and `x_subsumed_by` in backticks ran them as shell commands and silently blanked them in a PRD sentence. Always use <<'EOF' for any heredoc whose text holds backticks.",
+   "disposition": "teaches_omission",
+   "rationale": "Named by task 7117. \"Either write 'task #NNNN' in the content or omit entities\"."
+  },
+  {
+   "project_id": "reify",
+   "memory_id": "edab2428-a7de-4e9d-9591-c7ade3bdaa1e",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-10-13T22:39:45.605057+00:00",
+   "updated_at": "2026-10-13T22:39:45.605057+00:00",
+   "parent_id": "5a083271-731d-4cfb-a5eb-1178759ee706",
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "Task-store behaviour observed 2026-10-13 when an interactive lead files a task it will implement itself.\n\n- submit_task(planning_mode=True) creates the task synchronously in `deferred`, which keeps the scheduler from dispatching it.\n- set_task_status deferred -> in-progress as actor 'human' is REJECTED (illegal_transition, task-status-authority Table A).\n- deferred -> done WITH done_provenance {kind: merged, commit} succeeded after the merge landed.\n- So \"planning_mode file, implement, merge-queue land, mark done from deferred\" works for lead-owned tasks without a dispatch race. Used for reify task 8824.\n\nAlso: add_memory's declared-entities gate rejected a declaration whose task ids appeared in the content only as '#NNNN' inside lists. The content scanner did not pick those up, so it flagged a conflict. Omitting `entities` succeeded.",
+   "disposition": "teaches_omission",
+   "rationale": "Found by the literal sweep only. Reports \"Omitting `entities` succeeded\" as the fix, with no counter-advice."
+  },
+  {
+   "project_id": "reify",
+   "memory_id": "fdc490bc-b56e-458e-b34a-87668b8598e9",
+   "category": "procedural_knowledge",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-10-14T09:59:25.783336+00:00",
+   "updated_at": "2026-10-14T09:59:25.783336+00:00",
+   "parent_id": "fe0ef70a-f61b-43f6-809a-4099be005183",
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "Procedural gotcha (fused-memory add_memory entities gate, 2026-10-13): the content scanner recognises a task referent written as 'task #NNNN' but not other phrasings such as 'leaf #NNNN' or 'foundation leaf #8888'; declaring entities=[{kind: task, id: N}] for a task the scanner did not recognise in the prose is rejected as DeclaredReferentConflictRejected. Fix by phrasing every declared task as 'task #NNNN' in the content, or omit entities (always succeeds).",
+   "disposition": "teaches_omission",
+   "rationale": "Found by the literal sweep only (and named by the 7117 architect). \"or omit entities (always succeeds)\"."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "93f211b5-94b3-4da5-96ed-b0c9e6066f6d",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-09-30T19:27:24.333571+00:00",
+   "updated_at": "2026-09-30T19:27:24.333571+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search",
+    "literal_sweep"
+   ],
+   "before_content": "Two more add_memory entities-gate false conflicts seen on 2026-09-29, both the class task 6059 owns. (1) Content saying \"merge carrier 6065\" (a bare number after a noun) with entities=[task 6065] was rejected: the scanner saw no \"Task 6065\" referent. Rewording to \"task 6065 is its merge carrier\" passed. (2) A possessive \"5668's creation-time …\" with entities including task 5668 was rejected; the scanner does not read \"5668's\" as Task 5668. Rewording to \"task 5668's\" passed. Workaround until task 6059 lands: spell every declared task as \"task NNNN\" in the content, and do not drop entities.",
+   "disposition": "reviewed_not_target",
+   "rationale": "Frames the rejection as the 6059 defect and says \"do not drop entities\"; correct advice."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "1c0bccb0-6ff2-4628-8c7a-b565caabab1c",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-10-02T08:18:46.757748+00:00",
+   "updated_at": "2026-10-02T08:18:46.757748+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search"
+   ],
+   "before_content": "add_memory writing lesson (2026-10-02): the entities gate rejects bare ids in a write about a batch.\n\nWhat happened: a session-summary write that referred to tasks as \"α 6181\" or \"(6184)\" while declaring them in `entities` was rejected with DeclaredReferentConflictRejected. The content scan recognises only the spelling \"task NNNN\", so a bare id or a Greek-label id reads as undeclared. This is the false-conflict class root-caused 2026-09-28, owner task 6059.\n\nFix that worked: spell every referent \"task NNNN\" in the text (e.g. \"α = task 6181\"), so the declaration matches. Keep `entities` rather than dropping it.\n\nSeparate pitfall, the completion-claim gate (info-level L0 escalations esc-unverified-claim-*):\n- it flags \"Task N filed …\" as a filing_dispatch claim when N is `pending`;\n- it flags a spec sentence such as \"Task N reads X\" as an applied_work claim.\nBoth are false positives. Close them with resolve_issue(action='close_only') and a stated reason. Prefer phrasing like \"task N will read\" or \"task N is specified to read\".",
+   "disposition": "reviewed_not_target",
+   "rationale": "Frames it as the 6059 defect and says \"Keep `entities` rather than dropping it\"; correct advice."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "b7087fc1-d24c-4d84-909f-ac7bc1c8a377",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive-team-3626",
+   "created_at": "2026-10-04T18:56:34.551430+00:00",
+   "updated_at": "2026-10-04T18:56:34.551430+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search",
+    "literal_sweep"
+   ],
+   "before_content": "Another specimen of the add_memory entities-gate false conflict (owned by Task 6059), seen 2026-10-04.\n- What was rejected: declaring entities for task ids written in the content as 'gate 3626', 'task 5020' or 'depends on 5344' got DeclaredReferentConflictRejected.\n- Why: the content scan only recognised the capitalised form 'Task NNNN'. It also invented referents from ordinary text: 'projects:140' from 'all projects: 140', 'reject:8', and 'termination:5344' from 'Termination: 5344'.\n- Fix that worked: keep the entities, and rewrite each declared id in the content as 'Task NNNN'.\n- What not to do: dropping entities, as the hint suggests, is the anti-lesson that Task 6059 exists to remove.",
+   "disposition": "reviewed_not_target",
+   "rationale": "Says dropping entities \"is the anti-lesson that Task 6059 exists to remove\"; correct advice."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "b457c0f8-6e2e-47d1-af5b-3267f87d3047",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-09-29T16:27:09.965729+00:00",
+   "updated_at": "2026-09-29T16:27:09.965729+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search",
+    "literal_sweep"
+   ],
+   "before_content": "Two compounding facts about add_memory's entities gate (2026-09-28, task 6059): (1) on a Mem0-primary category (observations_and_summaries, procedural_knowledge, preferences_and_norms) with dual_write=False the declaration is validated against the content and then DISCARDED — the add_memory docstring's own scope note says so — so on those writes the gate can only ever cost a false rejection and never buys attribution; the solar_challenge_platform sighting was exactly that category. (2) entities_gate.py::_ENTITIES_CONFLICT_HINT tells the rejected agent to 'drop entities entirely'; agents obeyed and recorded 'omitting entities fixes it' as durable memories (solar_challenge_platform 4214c151-8776-4efa-99dd-8a12f02906e1 by curator-scp-185-rollup-split-2026-09-27; dark_factory 525ad930, 454d5a87, d3d753ef), which teach every future agent to stop declaring — against PRD plans/memory-referent-fidelity-prd.md decision 4, whose adoption census is task 3676. On a Graphiti-primary write, dropping the declaration also misattributes the memory to whichever task the scanner could see.",
+   "disposition": "reviewed_not_target",
+   "rationale": "Census record (reviewed_not_target there): names the omission advice as the harm."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "3309a452-bf3d-496a-9352-143c30668a89",
+   "category": "preferences_and_norms",
+   "agent_id": "claude-task-3675-implementer",
+   "created_at": "2026-09-24T22:07:36.140316+00:00",
+   "updated_at": "2026-09-24T22:07:36.140316+00:00",
+   "parent_id": null,
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "Convention (task 3675): every in-repo site that teaches add_memory/add_episode referent declaration is certified by fused-memory/tests/test_referent_declaration_examples.py. Its _GUARDED_SITES tuple lists them. Each `entities=<list literal>` is EXECUTED against the live entities_gate together with the content= string of its own call. The extractor fails loudly on placeholders (`entities=[<id>]`), on non-literals, and on prose `entities=` with no list after it, so write \"omit `entities`\" without the \"=\". Every guarded site must show at least one NON-EMPTY declaration whose content names the task it declares, because [] alone teaches nothing about the entry shape. A new site is one more _GUARDED_SITES entry: import Python constants, never regex their source. If it is a skills/ file, also register it in SKILLS_CONSUMING_TESTS and in the dark-factory-orchestrator.yaml enumeration. The recon prompts get the text from fused_memory.utils.referent_resolution::render_referent_declaration_guidance, which composes _DECLARED_REFERENT_HINT. Do not restate the entry shape anywhere else.",
+   "disposition": "reviewed_not_target",
+   "rationale": "Census record (reviewed_not_target there): its \"omit `entities`\" is about prose spelling for the example extractor."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "43d305b1-53dc-48f1-aff7-b89fa0e29f05",
+   "category": "procedural_knowledge",
+   "agent_id": "claude-task-6441-architect",
+   "created_at": "2026-11-01T21:52:19.501081+00:00",
+   "updated_at": "2026-11-01T21:52:19.501081+00:00",
+   "parent_id": "3309a452-bf3d-496a-9352-143c30668a89",
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "Gotcha when editing guarded docs (found while planning task 6441): fused-memory/tests/test_referent_declaration_examples.py parses every literal occurrence of the text `entities=` in CLAUDE.md, .claude/commands/memory.md and several skills/*.md files (its _GUARDED_DOCS tuple), and fails unless a Python list literal follows it. So prose in those docs must never write `entities=` followed by a placeholder or a sentence; say \"omit `entities`\" instead.",
+   "disposition": "reviewed_not_target",
+   "rationale": "Same extractor-spelling gotcha as 3309a452; no advice to omit."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "3fafb280-abf9-49a4-8ba4-3741885f75cb",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-interactive",
+   "created_at": "2026-09-29T16:27:10.300088+00:00",
+   "updated_at": "2026-09-29T16:27:10.300088+00:00",
+   "parent_id": null,
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "scan_memory_content CANNOT find ordinary text. Its custom needles are only a store-side prefilter; every candidate is then re-verified with the shared tool-call-leak detector (fused_memory.utils.toolcall_xml_leak), which is the authoritative verdict. Measured 2026-09-28: needles like 'omitting entities' / 'DeclaredReferentConflict' returned scanned=6, matches=0 for dark_factory and 0/0 for every other project although four matching records exist. 'scanned' counts prefilter candidates, not corpus size. For a literal-text hunt use search(query=..., stores=['mem0'], limit=15) per project and filter the results client-side; that is how the four 'omit entities' records were located.",
+   "disposition": "reviewed_not_target",
+   "rationale": "About scan_memory_content needles; quotes \"omitting entities\" only as a search needle."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "27dd26e9-d057-4af2-a62f-5dea821f6fe3",
+   "category": "observations_and_summaries",
+   "agent_id": null,
+   "created_at": "2026-09-30T05:29:24.319079+00:00",
+   "updated_at": "2026-09-30T05:29:24.319079+00:00",
+   "parent_id": null,
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "Task 'Corpus repair: contradict, then amend, the fleet memories that teach 'omit entities to avoid DeclaredReferentConflictRejected'' completed. Landed in commit 6c11fddc816893247e1c430835d834cf4972abd6.",
+   "disposition": "reviewed_not_target",
+   "rationale": "Completion record of task 6060 (phase 1); title only."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "3bd3b938-0919-4d3f-a54d-32d9999b69c1",
+   "category": "observations_and_summaries",
+   "agent_id": null,
+   "created_at": "2026-10-18T10:38:28.131914+00:00",
+   "updated_at": "2026-10-18T10:38:28.131914+00:00",
+   "parent_id": null,
+   "found_by": [
+    "search"
+   ],
+   "before_content": "Task 'entities_gate: a declared referent the scanner cannot see is rejected as a conflict whenever any other task is scannable (false DeclaredReferentConflictRejected)' completed. Landed in commit 1ac3835e85b0fcb2a3c53909dea7444aa0250e15.",
+   "disposition": "reviewed_not_target",
+   "rationale": "Completion record of task 6059 (the fix); title only."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "afd80220-bda0-4915-b6eb-59d1fc653988",
+   "category": "observations_and_summaries",
+   "agent_id": "orchestrator-task-6059",
+   "created_at": "2026-10-18T10:38:27.363673+00:00",
+   "updated_at": "2026-10-18T10:38:27.363673+00:00",
+   "parent_id": "aa2751f3-91a4-48ee-91a2-105f7f8eb508",
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "Completed: entities_gate: a declared referent the scanner cannot see is rejected as a conflict whenever any other task is scannable (false DeclaredReferentConflictRejected)\nDescription: PROBLEM. `add_memory(entities=[...])` rejects HONEST declarations with `DeclaredReferentConflictRejected` whenever the content spells one declared task in a form the label scanner cannot see while ALSO mentioning some other task in a form it can. Reproduced 2026-09-28 against the live code (group_id='reify', but the mechanism is project-independent):\n\n| content | declared | scan sees | verdict |\n|---|---|---|---|\n| `Merged task-173-fillet-fix; closes the loop.` | 173 | nothing | accept |\n| `Merged task-173-fillet-fix after task 170 landed.` | 173 | Task 170 | REJECT |\n| `gate 184 passed; task 190 unblocked.` | 184, 190 | Task 190 | REJECT (184) |\n| `branch task/173 merged; task 5 noted` | 173 | Task 5 | REJECT |\n| `Tasks 5949/5849 ...` (dark_factory, 2026-09-28) | 5849 | Task 5949 | REJECT |\n\nLive sightings: Mem0 memory 4214c151-8776-4efa-99dd-8a12f02906e1 (solar_challenge_platform, 2026-09-27: slug `task-173-liveness-investigation` + `gate 184`), and dark_factory memories 525ad930, d3d753ef, 454d5a87 (2026-09-21/28: `5811's`, `4237 and 5671`, `tasks 3659 and 3500`, `via carrier 6033`). 13 `entities_gate: rejecting` journal lines since 2026-09-01 fleet-wide; the split between genuine typo catches and this false class is unmeasured.\n\nCAUSAL CHAIN (found by /team lead 2026-09-28, verified by direct reproduction):\n1. `fused-memory/src/fused_memory/utils/canonical_labels.py::_LOCAL_MENTION_PATTERN` is precision-over-recall by design (PRD `plans/memory-referent-fidelity-prd.md` resolved decision 8). It matches `task` + whitespace/`#`/`:` + digits and `<project>:<digits>` only. Hyphen slugs (`task-173-foo`), branch names (`task/173`), possessives that the scanner happens to catch or not (`5811's`), slash lists (`5949/5849`), `and`-lists after a plural (`tasks 3659 and 3500`) and non-task vocabulary (`gate 184`, `carrier 6033`) are invisible. The slug and branch-name spellings are NOT on decision 8's published blind list, yet they are this fleet's own naming convention.\n2. Both `referent_resolution.py` and `entities_gate.py` docstrings state the load-bearing rule: the scanner's SILENCE is uninformative and must never reject an honest write.\n3. ROOT CAUSE: `fused-memory/src/fused_memory/utils/referent_resolution.py::_conflicting_referents` applies that rule PER KIND, not PER REFERENT (its docstring, \"choice 4\": \"An EMPTY per-kind scan never conflicts\"). A declared task conflicts iff the scan found ANY task of that kind and not this one. So silence about 173 is \"uninformative\" when the scan found nothing, but becomes \"contradiction\" the moment an unrelated Task 170 appears in the same prose — even though the scanner's inability to see 173 is identical in both cases. The typo-catch (`[3127, 3129]` against 'Task 3127') and the blind-spot tolerance collide in this mixed case, and the rule resolves every such case as \"typo\". `tests/test_referent_resolution.py::TestConflictsAreReportedNotEnforced::test_a_superset_conflicts_per_ref` pins the typo case; `test_the_scanners_blind_list_never_manufactures_a_conflict` pins only the EMPTY-scan blind case, so the mixed case was never exercised.\n4. The design's own statement of purpose is inverted in exactly the case the parameter exists for: the `add_memory` docstring says a declaration \"is how you correct a body whose prose names a task ambiguously or not at all\", and the PRD makes declared > metadata > derived a strict precedence. Under the current rule the derived scan overrules the declaration.\n5. On a Mem0-primary category (observations_and_summaries, procedural_knowledge, preferences_and_norms) the declaration is validated and then DISCARDED (docstring \"scope note\"), so on those writes the gate can only ever cost a false rejection and can never buy anything. The 4214c151 sighting was observations_and_summaries.\n6. `entities_gate.py::_ENTITIES_CONFLICT_HINT` tells the agent to \"drop `entities` entirely\". Agents did, then recorded \"omitting entities fixes it\" as durable memories (the four ids above), which now teach every future agent to stop declaring — directly against PRD decision 4 (declaration rate is the tracked adoption signal; task 3676 is the tighten-or-hold census). For a Graphiti write, dropping the declaration also misattributes the memory: only the scannable task (170) is derived and the real subject (173) is lost.\n\nDELIVERABLE (the fix; the corpus repair is a separate operational task filed alongside this one):\nA. Change `_conflicting_referents` so that a declared referent the scan did not see is a conflict ONLY when the scan supplies positive evidence of a typo, not merely evidence that some other task exists. Recommended rule: conflict iff the scan found, for the same kind (and project, for a foreign declaration), a referent whose number is a NEAR-MISS of the declared one (single-digit substitution / transposition / one-digit insertion-deletion — the adjacent-number typo the PRD's `[3127, 3129]` example describes) AND the declared number itself is absent. A scanned number with no near-miss relation to the declared one is silence, not disagreement. Keep the project-axis conflict (`test_the_project_axis_conflicts`) as is. Record the chosen rule in the docstring beside choices 1-4 and update `test_a_superset_conflicts_per_ref` to say WHY 3129-vs-3127 still conflicts; add the mixed-case tests from the table above as accepts (including `task-173-foo … task 170`, `task/173 … task 5`, `Tasks 5949/5849`, `tasks 3659 and 3500`).\nB. Skip the conflict check entirely for a write whose declaration will be discarded — Mem0-primary category with dual_write=False — OR make the declaration RECORDED on Mem0 writes so it is no longer discarded. Either resolves the \"pure cost\" asymmetry of step 5; pick the first unless the second is trivial, and say which in the task's done summary. Consider whether `add_episode` has the same asymmetry.\nC. Teach `canonical_labels.py` the fleet's own spellings that decision 8 never listed: hyphen slug `task-173(-…)` and branch name `task/173`. Both are bounded, low-false-positive patterns (the `task` word is still required). Extend `_LOCAL_MENTION_PATTERN`'s separator alternation rather than adding a pattern (INV-5: one vocabulary site). `Tasks 5949/5849` / `tasks 3659 and 3500` list forms are OPTIONAL — only if a precision argument can be made in the same style as the existing per-clause measurements.\nD. Rewrite `_ENTITIES_CONFLICT_HINT` (and the add_memory/add_episode docstring lines that echo it) so the remedy is \"spell the task as `task NNN` in the content or fix the declaration\", NEVER \"drop entities\". A hint that trains agents out of the feature is a defect in its own right.\nE. Update `plans/memory-referent-fidelity-prd.md` decision 8's blind list to include slugs/branch names, and the boundary-test sketch to include the mixed case.\n\nVERIFY: `cd fused-memory && uv run pytest tests/test_referent_resolution.py tests/server/test_entities_gate.py tests/server/test_entities_gate_ingestion.py tests/test_referent_declaration_examples.py tests/test_referent_guidance_prompt_drift.py -q`; then the repro table above executed through `entities_gate` must accept every row except a genuine near-miss typo. `ruff check`, pyright on fused-memory.\n\nOUT OF SCOPE: amending the four corpus memories (separate task), the adoption rollout (5555/5866, which now depend on this), the +7-day census decision (3676, likewise). Do not widen the scanner beyond C; every added clause must carry the same measured-false-positive justification the existing ones do.\n\nAnalysis: REVALIDATED 2026-10-12 on HEAD 5e9aed7232 (task/6059 == main tip; no branch commits). Main changes to overlapping files since the prior base 911d179e49 are orthogonal to this task:\n- entities_gate.py: content_excerpt now spreads guard_excerpt.excerpt_fields.\n- models/enums.py: gained ClassificationFallback and LLM_CLASSIFIER_FAILURES.\n- test_entities_gate.py: gained TestBlocksDiscloseTheirExcerptClip. Its [3129] against _LONG_CITES_3127 is a near-miss with 3129 written nowhere, so it still conflicts under rule A and needs no refit.\n- tools.py add_memory: the entities_gate call site is unchanged.\n- memory_service.add_memory: now HOISTS `write_mem0 = resolved_category in MEM0_PRIMARY or dual_write` with a \"never restate it\" comment. `write_graphiti = resolved_category in GRAPHITI_PRIMARY or dual_write` and the stale \"category-INDEPENDENT\" docstring paragraph are still present.\nreferent_resolution.py, canonical_labels.py, audit_wrong_binding_edges.py and every other plan test file are byte-identical to the prior base. No new code consumer of _conflicting_referents, entities_gate, scan_content or render_referent_declaration_guidance has appeared.\n\nNEW FINDING the prior plan missed: tests/server/test_entities_gate_ingestion.py::TestAddEpisodeEntitiesGate::test_the_rejection_is_cheap_no_live_authority_round_trip declares _CONFLICTING ([3129]) against _COMPLETION_CONTENT ('task 5252 has landed ...'). 3129 is not a near-miss of 5252, so rule A would ACCEPT it and the test would go red. step-1 now refits it to declare 5253, which conflicts under both the old rule and A.\n\nNEW SIGHTINGS (task details, 2026-10-08), prototyped with the worktree scanner:\n- (a) 'task 6181 ... 6182 β' [6181, 6182]: accepted under A.\n- (b) '(task 6182) ... 3626 → 6326 (6188)' [6182, 6326, 6188]: accepted under A.\n- (c) 'exactly: 15' scans as the FOREIGN referent exactly:15. 15 is no near-miss of 6182, so A accepts.\n- (d) 'time: 394' scans as time:394. (e) is the 'Γ_A gate' row.\nResidual: (d) and (e) still conflict when the sibling's number (6188, 6186) is written NOWHERE in the content while a near-miss sibling (6183, 6182) is scanned. That is byte-for-byte the PRD's superset typo [3127, 3129], which the task requires to keep conflicting. Mitigations:\n- B: the /reflect writes are most likely Mem0-primary, which is then never conflict-checked.\n- D: the hint's remedy is \"write task NNN\".\nThe 'word: N' qualified-ref false positive is a scanner PRECISION defect that this task's scope bars (\"do not widen the scanner beyond C\"). It is filed as a follow-up.\n\nPREMISES (unchanged from the prior plan, re-verified):\n- referent_resolution.py::_conflicting_referents applies choice 4 (\"an EMPTY per-kind scan never conflicts\") per KIND.\n- canonical_labels.py::_LOCAL_MENTION_PATTERN's separator alternation is `(?:[ \\t]*[#:][ \\t]*|\\s+)`, so task-173 and task/173 are invisible.\n- entities_gate.py::_ENTITIES_CONFLICT_HINT says \"drop `entities` entirely\".\n- tools.add_memory gates whatever the category, while memory_service resolves the declaration only `if write_graphiti`.\n- add_episode always records its declaration.\n\nRULE A (prototyped against the live scanner): a declared d missing from its bucket (kind-scoped, and also project-scoped for a foreign d, which keeps choices 1-3) conflicts only on positive evidence. Either:\n- (a) project axis: a scanned referent carries d's exact number; or\n- (b) typo axis: a scanned number is one Damerau edit from d's AND d's number is not a maximal ASCII digit run anywhere in the content.\nEvery repro row and every live sighting is accepted. [3129], [3127, 3129], [3172], [312] and [31277] against 'Task 3127' still conflict.\n\nC MEASUREMENT: re-run at implementation time. The prior run found 4,686 tracked-file and 6,525 commit-message matches, with 4 letter-suffixed captures. The task-6060 artifacts (now on main) carry only the 'task-173' slug, so test_entities_omission_advice_repair_artifacts.py stays green. Task 6067 (pending, depends on 6059) must re-run it after merge.\n\nThe bash session's `import fused_memory` resolves to MAIN's checkout. Run tests via `cd fused-memory && uv run pytest ...`. The worktree has its own .venv.\nKey decisions: A rejection needs positive evidence on one of two axes. Project axis: a scanned referent in the bucket carries the declared number under another project. Typo axis: a scanned number is exactly one Damerau edit away from the declared number (substitution, adjacent transposition, single insertion or deletion), AND the declared number appears nowhere in the content as a maximal ASCII digit run. The scanner's silence about a referent is uninformative per REFERENT, not per kind.; _written_numbers is implemented with itertools.groupby keyed on the module's existing _is_task_number, not with a regex. It is also not a reuse of scripts/audit_wrong_binding_edges.py::bare_id_present.; Choice 2's bucketing stays unchanged: an own-project declaration is judged against the whole-kind bucket, and a foreign declaration against its own project's bucket. Both evidence axes apply uniformly inside whichever bucket applies, so own-project 3129 against 'reify:3128' still conflicts.\nSteps completed: 10/10\nModules: fused-memory/scripts/audit_wrong_binding_edges.py, fused-memory/src/fused_memory/models/__init__.py, fused-memory/src/fused_memory/models/enums.py, fused-memory/src/fused_memory/server/entities_gate.py, fused-memory/src/fused_memory/server/tools.py, fused-memory/src/fused_memory/services/memory_service.py, fused-memory/src/fused_memory/utils/canonical_labels.py, fused-memory/src/fused_memory/utils/referent_resolution.py, fused-memory/tests/server/test_entities_gate.py, fused-memory/tests/server/test_entities_gate_ingestion.py, fused-memory/tests/test_audit_wrong_binding_edges.py, fused-memory/tests/test_canonical_labels.py, fused-memory/tests/test_enum_models.py, fused-memory/tests/test_referent_queue_threading.py, fused-memory/tests/test_referent_resolution.py, plans/memory-referent-fidelity-prd.md",
+   "disposition": "reviewed_not_target",
+   "rationale": "Completion record of task 6059; quotes the defect report, recommends nothing wrong."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "6f233d2d-459f-4081-b4b7-1b375cd45a7a",
+   "category": "observations_and_summaries",
+   "agent_id": "orchestrator-task-6067",
+   "created_at": "2026-10-19T03:07:14.170434+00:00",
+   "updated_at": "2026-10-19T03:07:14.170434+00:00",
+   "parent_id": null,
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "Completed: Corpus repair phase 2 (after task 6059): re-amend the entities-omission corrections to say the defect is fixed\nDescription: Phase 2 of the entities-omission corpus repair. Phase 1 was done by dark_factory task 6060 (branch task/6060).\n\nWHAT PHASE 1 DID. Task 6060 amended, in place, every live Mem0 record that taught \"omit `entities` to get past DeclaredReferentConflictRejected\". Each now leads with a dated correction block (its first line is the `correction_marker` recorded in docs/entities-omission-advice-repair/phase1-apply.json) saying the rejection is a DEFECT in fused-memory/src/fused_memory/utils/referent_resolution.py::_conflicting_referents, that the workaround is to spell each declared task as \"task NNN\" in the content and KEEP declaring, and that the fix is task 6059, still pending at the time. The body's omission clause was replaced with \"(do NOT omit `entities` — see the correction above)\".\n\nTHE TARGET LIST IS NOT RESTATED HERE. Its single point of truth is docs/entities-omission-advice-repair/census.json: every record whose `disposition` is not 'reviewed_not_target' is a target, and census.json also carries the verbatim pre-images. The phase-1 amended text, raw update replies and readbacks are in docs/entities-omission-advice-repair/phase1-apply.json. The file-only validator is fused-memory/tests/test_entities_omission_advice_repair_artifacts.py.\n\nWHEN. Only after dark_factory task 6059 (\"entities_gate: a declared referent the scanner cannot see is rejected as a conflict …\") is done. This task is filed with dependencies=6059. If 6059 is nevertheless not done when this task is planned, the architect calls report_blocking_dependency(6059) and stops.\n\nHOW. Re-amend each census target IN PLACE with update_memory (content arm, store='mem0', always with a non-empty reason), under a sanctioned curator identity such as agent_id 'curator-6060-phase2-entities-advice-repair'. A sandboxed agent reaches update_memory and get_memory_by_id through scripts/migrate_metadata_modules_to_files.py::FusedMemoryClient over HTTP on :8002: subclass it, set `_client_name`, call through `call_tool_with_retry`, classify every reply with `write_failure_reason`. Run the zero-UUID authority probe from skills/curate-fused-memories/SKILL.md §0d first. Read every target back with get_memory_by_id; a returned id is not proof the text landed. Never add_memory or delete_memory these records: a superseding duplicate beside the wrong text is strictly worse.\n\nWHAT TO SAY. Replace the phase-1 correction block so it says the defect is FIXED as of 6059's merge commit and date (measure both; do not guess), and that declaring `entities` is the expected default. Keep the original observation.\n\nQUALIFICATION. Records outside dark_factory (census.json names them; phase 1 had one in solar_challenge_platform) must cite the fix ONLY in the qualified form dark_factory:6059, never the word form, because the referent scanner reads a bare task number in a foreign project as that project's own task. Check each draft with the production fused_memory.utils.referent_resolution.resolve_referents before sending, as the phase-1 validator does.\n\nEVIDENCE. Add docs/entities-omission-advice-repair/phase2-apply.json (same shape as phase1-apply.json), note it in docs/entities-omission-advice-repair/README.md, and extend the validator to cover it.\n\nAUTO-MEMORY. Two Claude Code auto-memory files also carry the phase-1 wording and need the same \"now fixed\" update: /home/leo/.claude/projects/-home-leo-src-dark-factory/memory/reference_scripted_fused_memory_write_client.md (the two 2026-09-28 paragraphs about add_memory `entities` vs the content scan) and /home/leo/.claude/projects/-home-leo-src-solar-challenge-platform/memory/decompose-filing-gotchas.md (the add_memory sentence in the paragraph about non-planning curator submits; phase 1 handed its correction to the steward). A sandboxed implementer cannot write ~/.claude, so hand those edits to the steward via escalate_blocker(category='scope_violation') with the exact current and replacement text.\nAnalysis: PREMISES (all measured 2026-10-18 by the architect in worktree .worktrees/6067, HEAD=c0b4dfb97c):\n- Task 6059 is `done` and task 6060 is `done` (get_statuses). 6059 landed as merge commit 1ac3835e85b0fcb2a3c53909dea7444aa0250e15, \"Merge task/6059 into main\". Its committer date and author date are both 2026-10-18T11:21:30+01:00, and it is an ancestor of HEAD. 6060 landed as 6c11fddc81 (2026-09-30). So the dependency gate is satisfied, and none of the rejection exits applies.\n- The phase-1 artifacts are on main: docs/entities-omission-advice-repair/{census.json, phase1-apply.json, README.md}, plus the validator fused-memory/tests/test_entities_omission_advice_repair_artifacts.py (251 lines, 14 tests).\n- The phase-1 validator was RE-RUN after 6059 landed, as 6060's review suggestion 5 asks: `cd fused-memory && uv run --frozen pytest tests/test_entities_omission_advice_repair_artifacts.py` gives 14 passed. The two live-scanner tests (test_every_amendment_leads_with_the_task_neutral_correction_marker, test_every_correction_attributes_the_fix_task_to_dark_factory) are still green on the post-6059 scanner. The scanner moved, but phase-1 attribution did not break.\n- census.json has 5 targets (disposition != reviewed_not_target): dark_factory 525ad930-15d7-415f-a701-b155cf86cfce, d3d753ef-dba4-4ac8-a712-69610ce7a65a, 454d5a87-bea6-4965-97e9-cf762c9d9e21 and 2be6b8c3-788c-4908-95ef-bf213d9c1141, plus solar_challenge_platform 4214c151-8776-4efa-99dd-8a12f02906e1. A live get_memory_by_id over HTTP :8002 (FusedMemoryClient subclass, read-only) shows all 5 `found`, and their content is byte-identical to phase1-apply.json `amended_content` (updated_at 2026-09-29T17:51Z). There has been no drift since phase 1.\n- All 5 targets are still found by the re-run census searches. 32 distinct post-census new hits exist across the 5 projects, and each needs a readback in the evidence.\n- Driver feasibility: from the worktree root, `uv run --frozen python` can import BOTH scripts/migrate_metadata_modules_to_files.py (via sys.path insert of scripts/) and fused_memory.utils.referent_resolution, which resolves to the worktree's own src. `.task/` is gitignored. The search reply is {'results': [{'id', 'content', 'source_store', ...}]}. Search's `agent_id` parameter is a FILTER, so the driver must never pass it to search.\n\nWHAT 6059 ACTUALLY FIXED (measured through the live server/entities_gate.py::entities_gate):\n- Now ACCEPTED: 'task 5739 (depends on 5550)'; 'via carrier 6033'; 'tasks 3659 and 3500'; \"5811's\"; '4237 and 5671'; 'Tasks 5949/5849'; SCP 'task-173-…' slug + 'gate 184'.\n- Still REJECTED, by design: declared 3129 beside 'Task 3127' (a near-miss typo).\n- Still REJECTED, a RESIDUAL defect: 'Follow-ups: 6035' with 6035 declared, and 'Related owners: 5308' with 5308 declared. The scanner reads \"word: NNNN\" as a project-qualified referent, and the project axis then conflicts. Records d3d753ef (bullet 3) and 2be6b8c3 (gotcha 2) describe exactly this case. It is tracked as dark_factory task 6826 (pending, low): canonical_labels _QUALIFIED_REF_PATTERN.\n- The gate also no longer conflict-rejects an add_memory whose explicit category discards the declaration (Mem0-primary without dual_write): tools.py `declaration_recorded`.\n- A blanket \"FIXED\" correction would therefore be false for two targets. The phase-2 correction states the fix AND the one residual, citing 6826.\n\nAPPROACH:\n1. Extend the validator (RED). Parametrize the phase-generic checks over both apply files. Scope the live-scanner checks to the CURRENT text (phase 2), as 6060's review suggestion 5 asks. Add phase-2-specific checks: the measured merge commit, verified against git; each correction cites the commit and date; the phase-1 block was replaced and the body kept verbatim; the authority probe was a not-found.\n2. Do the live re-amendment with a throwaway driver in gitignored .task/, never committed. Preflight everything before the first write. Write phase2-apply.json with the same shape as phase 1 plus task/fix_task/authority_probe/pre_read, and turn the validator green.\n3. Update the README.\n4. Hand the two auto-memory files to the steward via escalate_blocker(scope_violation). This is LAST, because that call returns terminate_cleanly.\n\nThe correction template was drafted and checked against the production resolve_referents for all 5 targets. In dark_factory the correction block derives only local tasks 6059/6826/6060/6067. In solar_challenge_platform it derives only dark_factory-qualified tasks. Nothing is ambiguous, and the marker derives no referents. Whole-content scans attribute 6059 correctly in every target.\n\nOUT OF SCOPE, filed: the census re-run surfaced at least 8 records written AFTER the census (2026-10-01..13) that still teach omission. The target SPOT is census.json, so they are not amended here. They were filed as follow-up ticket tkt_0RVYG32127ZF9JAN9XCV4ZKFB4 (phase 3, depends on 6067).\nKey decisions: The phase-2 correction says the defect is FIXED and also names the one measured residual: \"word: NNNN\" prose still rejects a declaration of that number, tracked as task 6826. All 5 targets get one template, with a local and a foreign variant.; Only the correction block is replaced. The body after the first blank line is carried over byte-for-byte from a pre-write read, and that read must equal the phase-1 landed text, or nothing is written.; Checks that are the same for both phases run once, parametrized over APPLY_FILES. The live-scanner checks (marker derives no referent, fix-task attribution, correction cites only dark_factory tasks) run only against CURRENT_APPLY (phase 2). The phase-1 checks that need no scanner stay as they are.\nSteps completed: 4/4\nModules: docs/entities-omission-advice-repair/README.md, docs/entities-omission-advice-repair/phase2-apply.json, fused-memory/tests/test_entities_omission_advice_repair_artifacts.py",
+   "disposition": "reviewed_not_target",
+   "rationale": "Completion record of task 6067 (phase 2); describes the repair."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "25ba3ae6-b73f-4e10-ad9f-327e9939462e",
+   "category": "observations_and_summaries",
+   "agent_id": "orchestrator-task-5866",
+   "created_at": "2026-10-27T19:04:05.849138+00:00",
+   "updated_at": "2026-10-27T19:04:05.849138+00:00",
+   "parent_id": "93196af5-8f46-4abb-86ce-b72a5f2c3f69",
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "Completed: Extend referent-declaration (entities=) adoption to _MEMORY_INSTRUCTIONS and the remaining skills/** add_memory examples\nDescription: Follow-up from task 3675 (PRD plans/memory-referent-fidelity-prd.md leaf kappa). That task made `entities=` the documented default for `add_memory` at five named sites: CLAUDE.md, .claude/commands/memory.md, skills/reflect/SKILL.md, the recon Stage 1/2 prompts (via fused_memory.utils.referent_resolution::render_referent_declaration_guidance), and orchestrator.review_checkpoint::REFLECTION_INSTRUCTIONS. It certified each one by EXECUTING its entities= literals against the live entities_gate, in fused-memory/tests/test_referent_declaration_examples.py (_GUARDED_SITES).\n\nExplicitly out of kappa's scope, and still teaching add_memory with no `entities`:\n- orchestrator/src/orchestrator/agents/roles.py::_MEMORY_INSTRUCTIONS (the `### Writing memories (add_memory)` block spliced into every agent role's system prompt). This is probably the highest-volume writer.\n- The add_memory examples in skills/hotspot-survey/SKILL.md, skills/orchestrate/SKILL.md, skills/review-briefing/SKILL.md, skills/review-briefing/prd.md, skills/review/SKILL.md, skills/review/prd.md and skills/review/references/phase3-triage.md.\n\nSuggested approach: add each site to _GUARDED_SITES in fused-memory/tests/test_referent_declaration_examples.py. That file already imports orchestrator (pythonpath), so _MEMORY_INSTRUCTIONS can be imported, never regexed. Then give each site at least one concrete, executable entities= example whose content names the task it declares. The extractor fails loudly on placeholders like `entities=[<id>]` and on prose `entities=` with no list, so write \"omit `entities`\" without the \"=\". Any newly read skills/ file must also be registered in tests/scripts/test_skills_module_config_decision.py::SKILLS_CONSUMING_TESTS and in the dark-factory-orchestrator.yaml enumeration. The certifier is already registered once, so additional skills files only need their comment updated.\nAnalysis: PREMISE CHECK (HEAD 3c3ac39232, worktree .worktrees/5866). Most of this task's scope has already landed on main through task 5555 (merge 2fa15bb7d2 \"Merge task/5555 into main\", an ancestor of HEAD):\n- roles.py::_MEMORY_INSTRUCTIONS now carries `entities=[{'kind': 'task', 'id': 3127}]` with content naming \"Task 3127\". It is certified through the public ROLES[...].system_prompt as the 'delivered-role-prompts' site in fused-memory/tests/test_referent_declaration_examples.py::_GUARDED_SITES (commits 6d0712ae85 and 5745d67572, task/5555).\n- skills/orchestrate/SKILL.md is in _GUARDED_DOCS and has a non-empty example (b1b5976578, task/5555).\n- Dependency 6059 (entities_gate false-conflict fix) is done and merged (1ac3835e85, an ancestor of HEAD).\nesc-5555-1 (dismissed by the orphan reaper, so there was no human ruling) recommended cancelling 5866 as a duplicate. That holds only in part. Four of the skill sites listed here carry `entities=[]` since commit 20a3ed0ece, but none of them is in _GUARDED_SITES: skills/review/SKILL.md \"## Writing to memory\", skills/review/references/phase3-triage.md \"Step 8\", skills/hotspot-survey/SKILL.md \"## Writing to memory\" (it also carries a placeholder hint, `<the chain's human gate id>`, in a comment) and skills/review-briefing/SKILL.md \"Step 5\". The certifier also refuses a site that teaches only `[]` (`any(example.literal ...)`), so none of the four shows the entry shape. skills/review/prd.md and skills/review-briefing/prd.md only mention add_memory in prose or YAML-trace form and contain no write call. Nothing there for the extractor to certify, so they stay unchanged.\n\nRESIDUAL WORK (this plan): guard the four skill docs in _GUARDED_DOCS and give each one a concrete, executable non-empty declaration whose content names the declared task as `task NNN`. Follow the precedent in skills/orchestrate/SKILL.md: illustrative id 3127 plus a trailing `#` comment saying what to replace and when to use `[]`. Then update the two registration comments that enumerate what the certifier reads: tests/scripts/test_skills_module_config_decision.py::SKILLS_CONSUMING_TESTS, and the dark-factory-orchestrator.yaml enumeration. The tuple entry already exists, so only the comments change.\n\nREFERENT CHOICE per site. Use the task the skill's own flow produces: the trigger chain's human-gate task for /review and /hotspot-survey (contract §11, skills/_shared/filing-the-trigger-chain.md, with `[]` under --findings-only), and the known-gap acceptance task (`accepted_by`) for /review-briefing (`[]` if none was filed).\n\nPROBED against the live gate in this worktree's .venv (fused_memory.server.entities_gate::entities_gate, group_id='dark_factory'). Each candidate content below plus `[{'kind': 'task', 'id': 3127}]` returned None (accepted):\n- the /review templates with \"... Next run gated by task 3127.\" appended;\n- phase3's \"Next run: {chain form}, human gate task 3127.\";\n- hotspot's \"... Next survey gated by task 3127.\";\n- review-briefing's \"... New known gap accepted by task 3127.\".\nNote: scan_content reads the format specs `{as_of_sha:10}` and `{since:10}` as foreign task referents as_of_sha:10 and since:10. They do not conflict with a local 3127.\n\nVERIFY: `cd fused-memory && uv run pytest tests/test_referent_declaration_examples.py -q` (baseline at HEAD: green); `uv run --project shared pytest tests/scripts/test_skills_module_config_decision.py -q`; `ruff check fused-memory/tests/test_referent_declaration_examples.py`. Because this diff touches a .py file, task-role verify runs the certifier (see the KNOWN LIMITATION in its docstring).\nKey decisions: No steps for roles.py::_MEMORY_INSTRUCTIONS or skills/orchestrate/SKILL.md. Both are already adopted and certified on main through task 5555 (commits 6d0712ae85, b1b5976578 and 5745d67572 on task/5555, merged as 2fa15bb7d2). The plan covers only the residual: the four skill docs that carry `entities=[]` but sit outside _GUARDED_SITES.; Leave skills/review/prd.md and skills/review-briefing/prd.md unchanged and unguarded.; Each guarded skill doc declares the task its own flow produces, using illustrative id 3127 plus a trailing `#` replace-me comment. /review and /hotspot-survey declare the trigger chain's human-gate task (`[]` under --findings-only). /review-briefing declares the `accepted_by` acceptance task (`[]` if none). The example is edited in place in the existing template; no second worked call is added.\nSteps completed: 7/7\nModules: dark-factory-orchestrator.yaml, fused-memory/tests/test_referent_declaration_examples.py, skills/hotspot-survey/SKILL.md, skills/review-briefing/SKILL.md, skills/review/SKILL.md, skills/review/references/phase3-triage.md, tests/scripts/test_skills_module_config_decision.py",
+   "disposition": "reviewed_not_target",
+   "rationale": "Completion record of task 5866; its \"omit `entities`\" is the extractor-spelling note."
+  },
+  {
+   "project_id": "dark_factory",
+   "memory_id": "7f77f3ff-e57a-4b65-87d1-41f346d889ce",
+   "category": "observations_and_summaries",
+   "agent_id": "claude-task-7117-architect",
+   "created_at": "2026-11-19T10:13:16.129132+00:00",
+   "updated_at": "2026-11-19T10:13:16.129132+00:00",
+   "parent_id": null,
+   "found_by": [
+    "literal_sweep"
+   ],
+   "before_content": "Task 7117 (entities-omission corpus repair, phase 3) cannot be executed by a dispatched agent as written. Its HOW section, filed 2026-10-18, asks an implementer to amend Mem0 records in place with update_memory under a curator-* identity through the scripted FusedMemoryClient, the same method task 6060 and task 6067 used. docs/task-authoring.md section 11 (\"In-place memory amendments are not task-agent work\", added 2026-10-23 by task 4548) now forbids exactly that. A plan step must not tell a dispatched role to call the content_amend arm, and adopting a curator- agent_id to get past the gate is self-authorization. Measured 2026-11-19: dark_factory dff68a97-af84-4b70-949d-ac23ff8e1242 and reify fe0ef70a still teach \"omit entities\" (updated_at == created_at), as does reify amendment child fdc490bc. The task's architect reported it unactionable. Re-route the amendment to a curator sitting (skills/curate-fused-memories) rather than re-planning it for an implementer.",
+   "disposition": "reviewed_not_target",
+   "rationale": "Task 7117 architect's routing note (2026-11-19); dated measurement, not advice to omit."
+  }
+ ]
+}

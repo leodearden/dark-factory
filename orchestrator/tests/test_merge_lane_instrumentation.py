@@ -18,7 +18,7 @@ from _git_fixtures import seed_repo
 from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, lane_scene_config, passes
 from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT
 from _orch_helpers import wait_responsive
-from test_merge_queue_concurrent_verify import _gated_runner, _GatedVerifier
+from test_merge_queue_concurrent_verify import _gated_runner
 from test_merge_queue_rebased_landing_dead_base import (
     _land_foreign_commit,
     _running_lane,
@@ -199,12 +199,10 @@ async def _cascade(
     cascade tears down a finished verify rather than cancelling a running one.
     """
     a_release, a_entered = asyncio.Event(), asyncio.Event()
-    verifier = _GatedVerifier(
-        entered={None: a_entered},
-        first=dataclasses.replace(
-            fails(category='test_failure', summary='test_failure'), release=a_release,
-        ),
-    )
+    verifier = FakeVerifier(sequence=[dataclasses.replace(
+        fails(category='test_failure', summary='test_failure'),
+        release=a_release, entered=a_entered,
+    )])
     b_release, b_entered = asyncio.Event(), asyncio.Event()
     store = _LateArrivalFakeEventStore()
     laptop = _gated_runner(b_release, b_entered, name='laptop')
@@ -248,7 +246,7 @@ async def _halted_mid_verify(
     store = _LateArrivalFakeEventStore()
 
     async with _running_lane(git_ops, verifier=verifier, event_store=store) as (lane, queue):
-        lane.VERIFY_ABANDON_POLL_SECS = 0.02
+        lane.verify_dispatch.VERIFY_ABANDON_POLL_SECS = 0.02
         if warm_up is not None:
             warm = await _submitted(git_ops, config, warm_up)
             await queue.put(warm)

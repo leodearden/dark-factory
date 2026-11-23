@@ -19,36 +19,11 @@ from fused_memory.utils.referent_resolution import render_referent_declaration_g
 
 logger = logging.getLogger(__name__)
 
-# Base template — use {{project_id}} so it survives .format(tools=...) as {project_id}.
-# Each caller then formats with .format(project_id=self.project_id) at runtime.
-_PROJECT_ID_GUIDELINE = (
-    'Always pass project_id="{{project_id}}" when calling fused-memory MCP tools '
-    '({tools}).'
-)
-
-# Stage 1: Memory Consolidator — memory read/write, no task tools
-_STAGE1_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
-    tools=(
-        'search, get_entity, get_episodes, get_status, add_memory, delete_memory, '
-        'update_edge, update_memory, redact_episode_content, delete_episode'
-    )
-)
-
-# Stage 2: Task-Knowledge Sync — full memory + task access. Bulk-creation
-# tools (expand_task / parse_prd) were retired with the Taskmaster cutover;
-# task decomposition now happens via planning_mode + curator only.
-_STAGE2_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
-    tools=(
-        'search, get_entity, get_episodes, add_memory, delete_memory, update_edge, '
-        'update_memory, redact_episode_content, delete_episode, '
-        'get_tasks, get_task, set_task_status, submit_task, resolve_ticket, '
-        'update_task, remove_task, add_dependency, remove_dependency'
-    )
-)
-
-# Stage 3: Integrity Check — read-only, no writes
-_STAGE3_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
-    tools='search, get_entity, get_episodes, get_status, get_tasks, get_task'
+# System prompts interpolate it raw (the model sees {project_id}); footers .format(project_id=...).
+PROJECT_ID_GUIDELINE = (
+    'Pass project_id="{project_id}" on every fused-memory tool that has a project_id '
+    'parameter; tools that read or write tasks take project_root instead (see the '
+    'project_root line).'
 )
 
 # ---------------------------------------------------------------------------
@@ -512,7 +487,8 @@ _GATE_CLOSURE_ARCHIVE_GUIDANCE = """\
 Scope: a `done` task with `task_kind='deterministic'` and a `done_provenance.kind` of \
 `deterministic-gate` or `deterministic-milestone`.
 
-Call `mcp__fused-memory__get_task(task_id)` — a READ you do hold. `status == 'done'` \
+Call `mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)` — a READ \
+you do hold. `status == 'done'` \
 PLUS `task_kind='deterministic'` PLUS one of those `done_provenance.kind` values IS \
 LEGITIMATE CLOSURE on its own; this rule is primary and sufficient. Since task 3638 \
 `metadata.gate_escalated_at` is removed when a gate closes; older closures may still \
@@ -805,26 +781,14 @@ def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
         + capability_clause
     )
 
-# Shared guidance about the memory_ids=[] + stores_queued=['graphiti'] → graphiti_writes_queued
-# invariant.  Both stages need to teach the LLM not to count async-enqueued Graphiti
-# writes under their `memories_*` stats; only the stat-key tokens differ between stages.
-_GRAPHITI_QUEUED_GUIDANCE_TEMPLATE = (
+# Shared by Stages 1 and 2: async-enqueued Graphiti writes count as graphiti_writes_queued.
+GRAPHITI_QUEUED_GUIDANCE = (
     "Graphiti-only async-enqueued writes show `stores_queued: ['graphiti']` in the response "
     "and return `memory_ids: []` because the write is queued rather than persisted inline. These "
-    "must NOT be counted under {stat_keys_phrase}. Report them instead under "
+    "must NOT be counted under `memories_added`. Report them instead under "
     "a separate `graphiti_writes_queued` stat. The stats verifier enforces this split "
-    "independently and will override any inflated {primary_stat_key} count, but you should "
+    "independently and will override any inflated `memories_added` count, but you should "
     "report it correctly from the start to avoid divergence."
-)
-
-_STAGE1_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
-    stat_keys_phrase="`memories_added` / `memories_written`",
-    primary_stat_key="`memories_added`",
-)
-
-_STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
-    stat_keys_phrase="`memories_written`",
-    primary_stat_key="`memories_written`",
 )
 
 # ---------------------------------------------------------------------------

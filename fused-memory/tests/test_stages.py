@@ -3,6 +3,7 @@
 import contextlib
 import json
 import logging
+import re
 import subprocess
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -117,6 +118,7 @@ from fused_memory.reconciliation.task_filter import (
     MAX_CANCELLED_TASKS_RETAINED,
     MAX_DONE_TASKS_RETAINED,
     FilteredTaskTree,
+    TaskTreeUnavailableReason,
     filter_task_tree,
     format_task_list,
     id_key,
@@ -3540,75 +3542,37 @@ class TestTierConfig:
 
 
 class TestProjectIdGuidelineConstants:
-    """_PROJECT_ID_GUIDELINE template and per-stage constants in prompts/__init__.py."""
+    """PROJECT_ID_GUIDELINE, the one project_id guideline every stage shares."""
 
-    def test_template_exists(self):
-        """_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
-        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
-        assert isinstance(_PROJECT_ID_GUIDELINE, str)
+    PREVIOUSLY_LISTED_TOOLS = (
+        'search', 'get_entity', 'get_episodes', 'get_status', 'add_memory',
+        'delete_memory', 'update_edge', 'update_memory', 'redact_episode_content',
+        'delete_episode', 'get_tasks', 'get_task', 'set_task_status', 'submit_task',
+        'resolve_ticket', 'update_task', 'remove_task', 'add_dependency',
+        'remove_dependency',
+    )
 
-    def test_template_has_tools_placeholder(self):
-        """_PROJECT_ID_GUIDELINE contains a {tools} placeholder."""
-        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
-        assert '{tools}' in _PROJECT_ID_GUIDELINE
+    def test_guideline_formats_its_project_id_placeholder(self):
+        from fused_memory.reconciliation.prompts import PROJECT_ID_GUIDELINE
 
-    def test_template_has_double_brace_project_id(self):
-        """_PROJECT_ID_GUIDELINE escapes project_id as {{project_id}} so it survives .format(tools=...)."""
-        from fused_memory.reconciliation.prompts import _PROJECT_ID_GUIDELINE
-        # After formatting with tools, the {project_id} placeholder must survive
-        formatted = _PROJECT_ID_GUIDELINE.format(tools='search')
-        assert '{project_id}' in formatted
+        assert isinstance(PROJECT_ID_GUIDELINE, str)
+        assert '{project_id}' in PROJECT_ID_GUIDELINE
+        assert 'project_id="p"' in PROJECT_ID_GUIDELINE.format(project_id='p')
 
-    def test_stage1_constant_exists(self):
-        """_STAGE1_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
-        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
-        assert isinstance(_STAGE1_PROJECT_ID_GUIDELINE, str)
+    def test_guideline_names_no_tool(self):
+        from fused_memory.reconciliation.prompts import PROJECT_ID_GUIDELINE
 
-    def test_stage2_constant_exists(self):
-        """_STAGE2_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
-        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
-        assert isinstance(_STAGE2_PROJECT_ID_GUIDELINE, str)
+        for name in self.PREVIOUSLY_LISTED_TOOLS:
+            assert re.search(rf'\b{name}\b', PROJECT_ID_GUIDELINE) is None, name
 
-    def test_stage3_constant_exists(self):
-        """_STAGE3_PROJECT_ID_GUIDELINE exists in prompts/__init__.py."""
-        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
-        assert isinstance(_STAGE3_PROJECT_ID_GUIDELINE, str)
+    def test_guideline_points_task_tools_at_project_root(self):
+        from fused_memory.reconciliation.prompts import PROJECT_ID_GUIDELINE
 
-    def test_stage1_constant_has_project_id_placeholder(self):
-        """_STAGE1_PROJECT_ID_GUIDELINE contains {project_id} placeholder."""
-        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
-        assert '{project_id}' in _STAGE1_PROJECT_ID_GUIDELINE
-
-    def test_stage2_constant_has_project_id_placeholder(self):
-        """_STAGE2_PROJECT_ID_GUIDELINE contains {project_id} placeholder."""
-        from fused_memory.reconciliation.prompts import _STAGE2_PROJECT_ID_GUIDELINE
-        assert '{project_id}' in _STAGE2_PROJECT_ID_GUIDELINE
-
-    def test_stage3_constant_has_project_id_placeholder(self):
-        """_STAGE3_PROJECT_ID_GUIDELINE contains {project_id} placeholder."""
-        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
-        assert '{project_id}' in _STAGE3_PROJECT_ID_GUIDELINE
-        """Stage 1 guideline does not include task write tools (Stage 1 is memory-only)."""
-        from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
-        assert 'get_tasks' not in _STAGE1_PROJECT_ID_GUIDELINE
-        assert 'set_task_status' not in _STAGE1_PROJECT_ID_GUIDELINE
-        assert 'add_task' not in _STAGE1_PROJECT_ID_GUIDELINE
-        assert 'submit_task' not in _STAGE1_PROJECT_ID_GUIDELINE
-        assert 'resolve_ticket' not in _STAGE1_PROJECT_ID_GUIDELINE
-
-    def test_stage3_does_not_include_write_tools(self):
-        """Stage 3 guideline does not include write tools (Stage 3 is read-only)."""
-        from fused_memory.reconciliation.prompts import _STAGE3_PROJECT_ID_GUIDELINE
-        assert 'add_memory' not in _STAGE3_PROJECT_ID_GUIDELINE
-        assert 'delete_memory' not in _STAGE3_PROJECT_ID_GUIDELINE
-        assert 'set_task_status' not in _STAGE3_PROJECT_ID_GUIDELINE
-        assert 'add_task' not in _STAGE3_PROJECT_ID_GUIDELINE
-        assert 'submit_task' not in _STAGE3_PROJECT_ID_GUIDELINE
-        assert 'resolve_ticket' not in _STAGE3_PROJECT_ID_GUIDELINE
+        assert 'project_root' in PROJECT_ID_GUIDELINE
 
 
 class TestStagePayloadProjectIdGuideline:
-    """All three stages include the per-stage project_id guideline in their assembled payload."""
+    """All three stages include the shared PROJECT_ID_GUIDELINE, filled in, in their payload footer."""
 
     @pytest.fixture
     def memory_mock(self):
@@ -3633,32 +3597,11 @@ class TestStagePayloadProjectIdGuideline:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        'stage_class,stage_id,expected_guideline_import,extra_setup,expected_tools,excluded_tools',
+        'stage_class,stage_id,extra_setup',
         [
-            (
-                'MemoryConsolidator',
-                StageId.memory_consolidator,
-                '_STAGE1_PROJECT_ID_GUIDELINE',
-                'limits',
-                ['add_memory'],                          # Stage 1 has memory write access
-                ['get_tasks', 'set_task_status', 'add_task', 'submit_task', 'resolve_ticket'],  # Stage 1 has no task tools
-            ),
-            (
-                'TaskKnowledgeSync',
-                StageId.task_knowledge_sync,
-                '_STAGE2_PROJECT_ID_GUIDELINE',
-                'taskmaster',
-                ['submit_task', 'resolve_ticket', 'set_task_status'],  # Stage 2 has full MCP access
-                [],
-            ),
-            (
-                'IntegrityCheck',
-                StageId.integrity_check,
-                '_STAGE3_PROJECT_ID_GUIDELINE',
-                None,
-                ['get_tasks'],                           # Stage 3 reads tasks
-                ['add_memory', 'delete_memory', 'set_task_status', 'add_task', 'submit_task', 'resolve_ticket'],  # read-only
-            ),
+            ('MemoryConsolidator', StageId.memory_consolidator, 'limits'),
+            ('TaskKnowledgeSync', StageId.task_knowledge_sync, 'taskmaster'),
+            ('IntegrityCheck', StageId.integrity_check, None),
         ],
     )
     async def test_stage_payload_contains_project_id_guideline(
@@ -3666,20 +3609,13 @@ class TestStagePayloadProjectIdGuideline:
         mock_deps_for_stage,
         stage_class,
         stage_id,
-        expected_guideline_import,
         extra_setup,
-        expected_tools,
-        excluded_tools,
     ):
-        """Each stage's assembled payload contains the per-stage project_id guideline
-        with the project_id correctly interpolated, and with the correct tool list."""
-        from fused_memory.reconciliation import prompts as prompts_module
+        """Each stage's payload carries the guideline with its project_id filled in,
+        and its system prompt carries it raw, with the {project_id} placeholder."""
+        from fused_memory.reconciliation.prompts import PROJECT_ID_GUIDELINE
 
-        guideline_template = getattr(prompts_module, expected_guideline_import)
         project_id = 'test_proj'
-        expected_guideline = guideline_template.format(project_id=project_id)
-
-        # Build stage instance
         cls_map = {
             'MemoryConsolidator': MemoryConsolidator,
             'TaskKnowledgeSync': TaskKnowledgeSync,
@@ -3696,30 +3632,10 @@ class TestStagePayloadProjectIdGuideline:
             stage._current_run_id = 'test-run'
             mock_deps_for_stage['taskmaster'].get_tasks.return_value = {'tasks': []}
 
-        watermark = Watermark(project_id=project_id)
-        payload = await stage.assemble_payload([], watermark, [])
+        payload = await stage.assemble_payload([], Watermark(project_id=project_id), [])
 
-        assert expected_guideline in payload, (
-            f'{stage_class} payload missing per-stage project_id guideline.\n'
-            f'Expected: {expected_guideline!r}\n'
-            f'Payload snippet: {payload[-500:]!r}'
-        )
-
-        # Verify stage-specific tool names appear in the guideline within the payload
-        for tool in expected_tools:
-            assert tool in payload, (
-                f'{stage_class} payload guideline missing expected tool {tool!r}. '
-                f'Payload: {payload[-300:]!r}'
-            )
-
-        # Verify excluded tools are not in the guideline portion of the payload
-        # (they may appear elsewhere in the payload's task/memory data, so we check
-        # that the guideline constant itself doesn't include them)
-        for tool in excluded_tools:
-            assert tool not in expected_guideline, (
-                f'{stage_class} guideline should NOT include {tool!r} but does: '
-                f'{expected_guideline!r}'
-            )
+        assert PROJECT_ID_GUIDELINE.format(project_id=project_id) in payload
+        assert PROJECT_ID_GUIDELINE in stage.get_system_prompt()
 
     @pytest.mark.asyncio
     async def test_stage2_payload_contains_project_root_instruction(
@@ -5640,6 +5556,58 @@ class TestBriefingKnownGapsRefresh:
             )
 
         # Second invocation must not call add_task again
+        mock_deps['taskmaster'].add_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unavailable_injected_tree_does_not_suppress_the_dedup_fetch(
+        self, mock_deps, tmp_path, caplog,
+    ):
+        """An unknown injected tree is not 'no pending tasks': the hook fetches its own tree to dedup."""
+        scripts_dir = tmp_path / 'scripts'
+        scripts_dir.mkdir()
+        (scripts_dir / 'refresh_briefing_known_gaps.py').write_text(
+            'import json, sys\n'
+            "print(json.dumps([{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]))\n"
+            'sys.exit(1)\n'
+        )
+        (tmp_path / 'review').mkdir()
+        (tmp_path / 'review' / 'briefing.yaml').write_text('')
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', str(tmp_path))
+        stage.filtered_task_tree = FilteredTaskTree(
+            unavailable_reason=TaskTreeUnavailableReason.fetch_error,
+        )
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                {
+                    'id': '9001',
+                    'status': 'pending',
+                    'title': 'Refresh briefing: remove task 1751 from known_gaps',
+                },
+            ],
+        }
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=StageResult(success=True, report={'summary': 'ok'})),
+            ),
+            caplog.at_level(logging.INFO, logger=_TKS_LOGGER),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-unavailable-tree',
+            )
+
+        queued_records = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.getMessage() == 'briefing_refresh_tasks_queued'
+        ]
+        assert [getattr(r, 'skipped_ids', None) for r in queued_records] == [['1751']]
         mock_deps['taskmaster'].add_task.assert_not_called()
 
     @pytest.mark.asyncio
@@ -12791,10 +12759,6 @@ def stage2_guard_mock_deps():
     write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
     journal_mock = MagicMock()
     journal_mock.write_journal = write_journal_mock
-    # Task 2744: BaseStage.run now records/clears a per-stage CLI session on the
-    # run row around the stage subprocess; these must be awaitable on the mock.
-    journal_mock.record_run_session = AsyncMock()
-    journal_mock.clear_run_session = AsyncMock()
     return {
         'memory_service': AsyncMock(),
         'taskmaster': AsyncMock(),
@@ -15164,108 +15128,48 @@ class TestMemoryConsolidatorMem0ResultsKeyWarns:
         )
 
 
-class TestIntegrityCheckBlockedSnapshotWiring:
-    """IntegrityCheck.run() must apply filter_blocked_snapshot_findings and
-    surface report.stats['blocked_snapshot_findings_dropped'].
-
-    Mirrors TestIntegrityCheckRecordTaskDumpSpotCheck's mock_deps fixture and
-    the test_stage1.py TestStaleCountSnapshotCorrectionWiring pattern.
-
-    RED until step-6 wires filter_blocked_snapshot_findings into run() and
-    sets the stat.
-    """
+class TestIntegrityCheckTaskCountSnapshotWiring:
+    """IntegrityCheck.run() drops task-count snapshot findings for every
+    project and surfaces report.stats['task_count_snapshot_findings_dropped'].
+    'reify' is used because it once kept a snapshot (task 10081)."""
 
     @pytest.fixture
-    def config(self):
-        return ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-
-    @pytest.fixture
-    def mock_deps(self, config):
+    def mock_deps(self):
         return {
             'memory_service': AsyncMock(),
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
+            'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+            'scope': _scope('reify', '/tmp/test'),
         }
 
-    @pytest.mark.asyncio
-    async def test_snapshot_finding_dropped_and_benign_survives_for_blocked_project(
-        self, mock_deps
-    ):
-        """Snapshot missing_knowledge finding is DROPPED and benign finding SURVIVES
-        for project_id='autopilot_video'; stat is set to 1.
-
-        RED: run() does not yet apply the filter or set the stat.
-        """
+    @staticmethod
+    async def _run(mock_deps, items_flagged: list[dict]) -> StageReport:
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.scope = _scope('autopilot_video', stage.scope.project_root)
         stage.filtered_task_tree = None
-
-        snapshot_flag = {
-            'task_id': None,
-            'flag_type': 'missing_knowledge',
-            'category': 'missing_knowledge',
-            'description': 'autopilot_video has no task-count snapshot temporal_fact edge',
-            'suggested_action': 'Add a count snapshot temporal_fact for autopilot_video',
-            'actionable': False,
-        }
-        benign_flag = {
-            'task_id': '42',
-            'flag_type': 'missing_deliverable',
-            'category': 'missing_deliverable',
-            'description': 'task 42 has no design doc',
-            'suggested_action': 'Add a design doc',
-            'actionable': True,
-        }
-
         base_report = StageReport(
             stage=StageId.integrity_check,
             started_at=datetime.now(UTC),
             completed_at=datetime.now(UTC),
-            items_flagged=[snapshot_flag, benign_flag],
+            items_flagged=items_flagged,
             stats={},
         )
-
         with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
-            report = await stage.run(
+            return await stage.run(
                 events=[],
-                watermark=Watermark(project_id='autopilot_video'),
+                watermark=Watermark(project_id='reify'),
                 prior_reports=[],
-                run_id='run-1840',
+                run_id='run-task-count-snapshot',
             )
 
-        categories = [f.get('category') for f in report.items_flagged]
-        assert 'missing_knowledge' not in categories, (
-            "Snapshot missing_knowledge finding must be DROPPED for autopilot_video; "
-            f"got items_flagged={report.items_flagged!r}"
-        )
-        assert 'missing_deliverable' in categories, (
-            "Benign missing_deliverable finding must SURVIVE the snapshot filter; "
-            f"got items_flagged={report.items_flagged!r}"
-        )
-        assert report.stats.get('blocked_snapshot_findings_dropped') == 1, (
-            "run() must set report.stats['blocked_snapshot_findings_dropped'] = 1; "
-            f"got stats={report.stats!r}. RED: stat not yet surfaced."
-        )
-
     @pytest.mark.asyncio
-    async def test_both_findings_survive_for_non_blocked_project(self, mock_deps):
-        """For project_id='reify' (not in blocked set), BOTH findings survive;
-        blocked_snapshot_findings_dropped == 0.
-
-        RED: run() does not yet apply the filter or set the stat.
-        """
-        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.scope = _scope('reify', stage.scope.project_root)
-        stage.filtered_task_tree = None
-
+    async def test_snapshot_finding_is_dropped_and_counted(self, mock_deps):
         snapshot_flag = {
             'task_id': None,
             'flag_type': 'missing_knowledge',
             'category': 'missing_knowledge',
             'description': 'reify has no task-count snapshot temporal_fact edge',
-            'suggested_action': 'Add a count snapshot',
+            'suggested_action': 'Add a count snapshot temporal_fact for reify',
             'actionable': False,
         }
         benign_flag = {
@@ -15277,38 +15181,33 @@ class TestIntegrityCheckBlockedSnapshotWiring:
             'actionable': True,
         }
 
-        base_report = StageReport(
-            stage=StageId.integrity_check,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[snapshot_flag, benign_flag],
-            stats={},
-        )
+        report = await self._run(mock_deps, [snapshot_flag, benign_flag])
 
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
-            report = await stage.run(
-                events=[],
-                watermark=Watermark(project_id='reify'),
-                prior_reports=[],
-                run_id='run-1840',
-            )
+        assert [f['category'] for f in report.items_flagged] == ['missing_deliverable']
+        assert report.stats['task_count_snapshot_findings_dropped'] == 1
 
-        assert len(report.items_flagged) == 2, (
-            "Both findings must survive for non-blocked project 'reify'; "
-            f"got items_flagged={report.items_flagged!r}"
-        )
-        assert report.stats.get('blocked_snapshot_findings_dropped') == 0, (
-            "run() must set report.stats['blocked_snapshot_findings_dropped'] = 0 "
-            "when no flags are dropped; "
-            f"got stats={report.stats!r}"
-        )
+    @pytest.mark.asyncio
+    async def test_stat_is_zero_with_no_snapshot_finding(self, mock_deps):
+        benign_flag = {
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'category': 'missing_deliverable',
+            'description': 'task 42 has no design doc',
+            'suggested_action': 'Add a design doc',
+            'actionable': True,
+        }
+
+        report = await self._run(mock_deps, [benign_flag])
+
+        assert report.items_flagged == [benign_flag]
+        assert report.stats['task_count_snapshot_findings_dropped'] == 0
 
 
 class TestIntegrityCheckContaminationCeilingWiring:
     """IntegrityCheck.run() must apply filter_contamination_ceiling_findings and
     surface report.stats['contamination_ceiling_findings_dropped'] (task 2826).
 
-    Mirrors TestIntegrityCheckBlockedSnapshotWiring's mock_deps fixture and the
+    Mirrors TestIntegrityCheckTaskCountSnapshotWiring's mock_deps fixture and the
     patch.object(BaseStage, 'run', ...) pattern — the new gate is wired into the
     same IntegrityCheck.run() override.
 
@@ -15445,84 +15344,15 @@ class TestIntegrityCheckContaminationCeilingWiring:
         )
 
 
-class TestIntegrityCheckSnapshotStatEdgeWiring:
-    """IntegrityCheck.run() applies filter_snapshot_stat_edge_findings for every
-    project and surfaces report.stats['snapshot_stat_edge_findings_dropped']
-    (task 3487). Mirrors TestIntegrityCheckContaminationCeilingWiring."""
-
-    @pytest.fixture
-    def config(self):
-        return ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-
-    @pytest.fixture
-    def mock_deps(self, config):
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('dark_factory', '/tmp/test'),
-        }
-
-    async def _run(self, mock_deps, flags):
-        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.filtered_task_tree = None
-        base_report = StageReport(
-            stage=StageId.integrity_check,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=flags,
-            stats={},
-        )
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
-            return await stage.run(
-                events=[],
-                watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[],
-                run_id='run-3487',
-            )
-
-    @pytest.mark.asyncio
-    async def test_stat_edge_finding_dropped_for_a_non_blocked_project(self, mock_deps):
-        stat_edge_flag = {
-            'task_id': None,
-            'flag_type': 'stats_mismatch',
-            'category': 'memory_stale',
-            'description': 'Stage 2 reported task_count_snapshot_mem0_written=1 but no '
-                           'Graphiti temporal_facts edge exists',
-            'suggested_action': 'Investigate the rejected write',
-            'actionable': False,
-        }
-        benign_flag = {
-            'task_id': '42',
-            'flag_type': 'missing_deliverable',
-            'category': 'missing_deliverable',
-            'description': 'task 42 has no design doc',
-            'suggested_action': 'Add a design doc',
-            'actionable': True,
-        }
-
-        report = await self._run(mock_deps, [stat_edge_flag, benign_flag])
-
-        assert report.items_flagged == [benign_flag]
-        assert report.stats['snapshot_stat_edge_findings_dropped'] == 1
-
-    @pytest.mark.asyncio
-    async def test_stat_is_zero_with_no_flags(self, mock_deps):
-        report = await self._run(mock_deps, [])
-
-        assert report.stats['snapshot_stat_edge_findings_dropped'] == 0
-
-
 class TestIntegrityCheckPhantomTaskCreationWiring:
     """IntegrityCheck.run() must apply filter_false_phantom_task_creation_flags
     and surface report.stats['phantom_task_creation_findings_dropped'] (task-2525
     step-5).
 
-    Mirrors TestIntegrityCheckBlockedSnapshotWiring's mock_deps fixture and
+    Mirrors TestIntegrityCheckTaskCountSnapshotWiring's mock_deps fixture and
     patch.object(BaseStage, 'run', ...) pattern — the new gate is wired into
     the same IntegrityCheck.run() override, immediately after the existing
-    filter_blocked_snapshot_findings block.
+    filter_task_count_snapshot_findings block.
 
     RED until step-6 wires filter_false_phantom_task_creation_flags into
     run() and sets the stat.

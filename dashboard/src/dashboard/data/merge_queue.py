@@ -20,7 +20,7 @@ import json
 import logging
 import math
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypedDict, TypeVar
@@ -806,11 +806,26 @@ def _leg_or_unread(result: _Leg | BaseException, unread: Callable[[str], _Leg], 
     return result
 
 
+def _unread_project(unread: Datum[Any], *, runs_db_present: bool) -> dict:
+    """A project's per-project entry with every runs.db leg read as *unread*."""
+    return {
+        'depth_timeseries': unread,
+        'attempts': unread,
+        'recent': [],
+        'recent_total': unread,
+        'speculative': unread,
+        'train_events': [],
+        'train_throughput': unread,
+        'runs_db_present': runs_db_present,
+    }
+
+
 async def build_per_project_merge_queue(
     project_dbs: Sequence[tuple[str, aiosqlite.Connection | None]],
     *,
     hours: int,
     now: datetime,
+    runs_db_absent: Collection[str] = frozenset(),
 ) -> dict[str, dict]:
     """Build per-project merge queue stats by querying each project's DB independently.
 
@@ -832,18 +847,26 @@ async def build_per_project_merge_queue(
             from :func:`_project_scoped_dbs_labeled`.
         hours: Look-back window in hours (forwarded to each per-DB function).
         now: Shared reference timestamp captured once per request.
+        runs_db_absent: The ``str(root)`` labels with no runs.db file, from
+            ``dashboard/project_dbs.py::roots_without_file``. Honoured only
+            for a ``db=None`` pair; a label it omits is never assumed absent.
 
     Returns:
-        Dict ``{pid: {depth_timeseries, attempts, recent, recent_total, speculative, train_events, train_throughput}}``,
+        Dict ``{pid: {depth_timeseries, attempts, recent, recent_total, speculative, train_events, train_throughput, runs_db_present}}``,
         where ``depth_timeseries`` is a ``Datum[DepthSeries]`` whose series
         carries its ``bucket_minutes``, ``attempts`` a ``Datum[MergeAttempts]``
         (the shaper projects its outcome chart and latency), ``recent_total``
         a ``Datum[int]``, ``speculative`` a ``Datum[dict]`` and
-        ``train_throughput`` a ``Datum[TrainThroughput]``.
+        ``train_throughput`` a ``Datum[TrainThroughput]``. ``runs_db_present``
+        is False only for a project with no runs.db file, which keeps that
+        project out of the client's runs.db totals.
     """
     bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
 
     async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
+        if db is None and pid in runs_db_absent:
+            absent = unknown_datum('no runs.db file exists for this project', bound)
+            return pid, _unread_project(absent, runs_db_present=False)
         try:
             depth_r, attempts_r, recent_r, spec_r, train_r, throughput_r = await asyncio.gather(
                 queue_depth_timeseries(db, hours=hours, now=now),
@@ -875,6 +898,7 @@ async def build_per_project_merge_queue(
                 'speculative': spec,
                 'train_events': train_events_list,
                 'train_throughput': train_throughput,
+                'runs_db_present': True,
             }
         except Exception as exc:
             logger.warning(
@@ -885,15 +909,7 @@ async def build_per_project_merge_queue(
             unread = unknown_datum(
                 f'the merge history of {pid} could not be read: {describe_exc(exc)}', bound,
             )
-            return pid, {
-                'depth_timeseries': unread,
-                'attempts': unread,
-                'recent': [],
-                'recent_total': unread,
-                'speculative': unread,
-                'train_events': [],
-                'train_throughput': unread,
-            }
+            return pid, _unread_project(unread, runs_db_present=True)
 
     results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
     return dict(results)

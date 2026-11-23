@@ -7,6 +7,8 @@ _fm_helpers' module docstring.
 
 import contextlib
 from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -22,6 +24,14 @@ from _fm_polling import poll_until, poll_until_sync
 # ---------------------------------------------------------------------------
 
 QDRANT_URL = 'http://localhost:6333'
+
+#: The mem0 collection_prefix whose collections scripts/cleanup_test_collections.py reaps.
+#: Its PREFIX is this value plus Scope.mem0_collection_name's '_' separator, so check names with assert_reapable.
+EPHEMERAL_COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
+
+_COLLECTION_REAPER_SCRIPT = (
+    Path(__file__).resolve().parent.parent / 'scripts' / 'cleanup_test_collections.py'
+)
 
 #: Seconds an abandoned collection meta-op may take to show its effect (task 10599).
 META_OP_SETTLE_TIMEOUT_S = 15.0
@@ -63,19 +73,44 @@ def qdrant_skipif(reason: str = 'Qdrant not reachable'):
     return pytest.mark.skipif(not _qdrant_available(), reason=reason)
 
 
+def assert_reapable(collection_name: str) -> None:
+    """Fail unless scripts/cleanup_test_collections.py would delete *collection_name*.
+
+    Loads the reaper under the sys.modules key conftest.py's lease fixture
+    uses. ``_fm_helpers`` is imported lazily, so importing this module never
+    charges its importer for that module's dependencies.
+    """
+    from _fm_helpers import load_script_module
+
+    reaper = load_script_module(_COLLECTION_REAPER_SCRIPT, mod_name='cleanup_test_collections')
+    assert collection_name.startswith(reaper.PREFIXES), (
+        f'{collection_name!r} is not reapable by scripts/cleanup_test_collections.py '
+        f'(PREFIXES={reaper.PREFIXES!r})'
+    )
+
+
+@dataclass(frozen=True)
+class _SettleCheck:
+    """One read of a collection after an abandoned meta-op: whether its effect shows, and what was seen."""
+
+    settled: bool
+    seen: str
+
+
 def _run_meta_op(
     request: Callable[[], Any],
     *,
-    reached: Callable[[], bool],
+    check: Callable[[], _SettleCheck],
     describe: str,
     expected: str,
     timeout: float,
 ) -> None:
-    """Send one collection meta-op; if its answer is abandoned on a read timeout, wait for *reached*.
+    """Send one collection meta-op; if its answer is abandoned on a read timeout, wait for *check* to settle.
 
     A read timeout means the server has the request and may still be applying
     it, so the outcome is judged by the observed state, never by re-sending.
-    Every other failure propagates unchanged.
+    A wait that times out names the state its last check saw. Every other
+    failure propagates unchanged.
     """
     import httpx
     from qdrant_client.http.exceptions import ResponseHandlingException
@@ -85,30 +120,51 @@ def _run_meta_op(
     except ResponseHandlingException as exc:
         if not isinstance(exc.source, httpx.ReadTimeout):
             raise
-        poll_until_sync(
-            reached,
-            timeout=timeout,
-            interval=0.05,
-            message=(
+        last_seen = ''
+
+        def settled() -> bool:
+            nonlocal last_seen
+            observed = check()
+            last_seen = observed.seen
+            return observed.settled
+
+        try:
+            poll_until_sync(settled, timeout=timeout, interval=0.05)
+        except AssertionError:
+            raise AssertionError(
                 f'{describe}: the client stopped waiting for the answer '
                 f'({type(exc.source).__name__}: {exc.source}), and the '
-                f'collection was not {expected} {timeout}s later'
-            ),
-        )
+                f'collection was not {expected} {timeout}s later; last seen: {last_seen}'
+            ) from exc
 
 
-def _is_present_and_empty(client: Any, collection_name: str) -> bool:
-    """Whether *collection_name* exists and holds no points; a transient 404 on the count reads as not yet."""
+def _check_writable_and_empty(client: Any, collection_name: str) -> _SettleCheck:
+    """Settled once every local shard of *collection_name* is Active and it holds no points; a 404 reads as not yet.
+
+    Qdrant lists and counts a collection whose create is still running while
+    its shard is Initializing, and a write then answers 500.
+    """
     from qdrant_client.http.exceptions import UnexpectedResponse
+    from qdrant_client.models import ReplicaState
 
-    if not client.collection_exists(collection_name):
-        return False
     try:
-        return client.count(collection_name, exact=True).count == 0
+        shards = client.collection_cluster_info(collection_name).local_shards
+        if not shards:
+            return _SettleCheck(settled=False, seen='no local shards')
+        if any(shard.state != ReplicaState.ACTIVE for shard in shards):
+            states = ', '.join(shard.state.value for shard in shards)
+            return _SettleCheck(settled=False, seen=f'local shard states [{states}]')
+        points = client.count(collection_name, exact=True).count
+        return _SettleCheck(settled=points == 0, seen=f'every local shard Active, {points} points')
     except UnexpectedResponse as exc:
         if getattr(exc, 'status_code', None) != 404:
             raise
-        return False
+        return _SettleCheck(settled=False, seen='absent')
+
+
+def _check_absent(client: Any, collection_name: str) -> _SettleCheck:
+    present = client.collection_exists(collection_name)
+    return _SettleCheck(settled=not present, seen='present' if present else 'absent')
 
 
 def _create_collection(
@@ -118,9 +174,9 @@ def _create_collection(
         lambda: client.create_collection(
             collection_name=collection_name, vectors_config=vectors_config,
         ),
-        reached=lambda: _is_present_and_empty(client, collection_name),
+        check=lambda: _check_writable_and_empty(client, collection_name),
         describe=f'create of collection {collection_name!r}',
-        expected='present and empty',
+        expected='present, with every local shard Active, and empty',
         timeout=settle_timeout,
     )
 
@@ -128,7 +184,7 @@ def _create_collection(
 def _delete_collection(client: Any, collection_name: str, *, settle_timeout: float) -> None:
     _run_meta_op(
         lambda: client.delete_collection(collection_name),
-        reached=lambda: not client.collection_exists(collection_name),
+        check=lambda: _check_absent(client, collection_name),
         describe=f'delete of collection {collection_name!r}',
         expected='absent',
         timeout=settle_timeout,
@@ -154,8 +210,8 @@ def ensure_fresh_collection(
     ``UnexpectedResponse`` it deletes the stale collection and creates once more.
     Any other ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised — fail
     loud, no retry. A create or delete whose answer the client abandons on a
-    read timeout is judged by whether the collection appears empty, or
-    disappears, within *settle_timeout*. An abandoned create cannot tell its
+    read timeout is judged by whether the collection appears with every local
+    shard Active and empty, or disappears, within *settle_timeout*. An abandoned create cannot tell its
     own collection from a stale one whose 409 it never read, so one that
     appears holding points fails rather than passing as fresh.
 
@@ -167,7 +223,7 @@ def ensure_fresh_collection(
     Args:
         client: A ``qdrant_client.QdrantClient`` (or test double) exposing
             ``collection_exists`` / ``delete_collection`` / ``create_collection``
-            / ``count``.
+            / ``collection_cluster_info`` / ``count``.
         collection_name: The collection to (re)create.
         size: Vector dimensionality for the new collection.
         distance: Optional ``qdrant_client.models.Distance``; defaults to

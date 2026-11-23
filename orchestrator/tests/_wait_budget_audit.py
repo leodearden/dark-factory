@@ -1,7 +1,7 @@
 """Static AST audit of the real wall clock a test's waits can consume,
 beside the timeout each pytest item actually runs under.
 
-Pure: source text and a module namespace in, numbers and names out -- no
+Pure: source text or its parsed tree and a module namespace in, numbers and names out -- no
 file I/O, no imports of the code it scans -- so every function here can be
 driven with foreign input. Callers own reading files and importing modules;
 ``audit_module`` takes the import as a callback so it runs only when there
@@ -194,6 +194,14 @@ def _wait_responsive_budget(call: ast.Call, visible: Mapping[str, float]) -> flo
     )
 
 
+_ASYNCIO = 'asyncio'
+_ASYNCIO_WAIT_FOR = 'wait_for'
+_ASYNCIO_TIMEOUT = 'timeout'
+_ASYNCIO_TIMEOUT_AT = 'timeout_at'
+_AWAIT_OUTCOME = '_await_outcome'
+_STOP_MERGE_WORKER = 'stop_merge_worker'
+
+
 def _is_asyncio_call(node: ast.AST, attr: str) -> bool:
     """Whether *node* is an ``asyncio.<attr>(...)`` call spelled through the
     ``asyncio`` name: ``gate.<attr>(...)`` and ``self.<attr>(...)`` are not."""
@@ -202,18 +210,18 @@ def _is_asyncio_call(node: ast.AST, attr: str) -> bool:
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == attr
         and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == 'asyncio'
+        and node.func.value.id == _ASYNCIO
     )
 
 
 def is_asyncio_wait_for_call(node: ast.AST) -> bool:
     """Whether *node* is an ``asyncio.wait_for(...)`` call (``_is_asyncio_call``)."""
-    return _is_asyncio_call(node, 'wait_for')
+    return _is_asyncio_call(node, _ASYNCIO_WAIT_FOR)
 
 
 def is_asyncio_timeout_call(node: ast.AST) -> bool:
     """Whether *node* is an ``asyncio.timeout(...)`` call (``_is_asyncio_call``)."""
-    return _is_asyncio_call(node, 'timeout')
+    return _is_asyncio_call(node, _ASYNCIO_TIMEOUT)
 
 
 # The helpers that charge their deadline in loop-responsive time, by the name a
@@ -274,7 +282,7 @@ def _call_wait_budget(call: ast.Call, visible: Mapping[str, float]) -> float:
         if timeout is None and len(call.args) >= 2:
             timeout = call.args[1]
         return _resolve_wait_value(timeout, visible)
-    if isinstance(func, ast.Name) and func.id == '_await_outcome':
+    if isinstance(func, ast.Name) and func.id == _AWAIT_OUTCOME:
         timeout = _keyword(call, 'timeout')
         if timeout is None:
             return _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
@@ -284,16 +292,31 @@ def _call_wait_budget(call: ast.Call, visible: Mapping[str, float]) -> float:
         if delay is None and call.args:
             delay = call.args[0]
         return _resolve_wait_value(delay, visible)
-    if _is_asyncio_call(call, 'timeout_at'):
+    if _is_asyncio_call(call, _ASYNCIO_TIMEOUT_AT):
         return math.inf
     if is_responsive_wait_call(call):
         return _wait_responsive_budget(call, visible)
-    if isinstance(func, ast.Name) and func.id == 'stop_merge_worker':
+    if isinstance(func, ast.Name) and func.id == _STOP_MERGE_WORKER:
         join_timeout = _keyword(call, 'join_timeout')
         if join_timeout is None:
             return STOP_WORKER_JOIN_TIMEOUT
         return _resolve_wait_value(join_timeout, visible)
     return 0.0
+
+
+def may_bill_a_wait(may_name: Callable[..., bool]) -> bool:
+    """Whether a module could hold a call ``_call_wait_budget`` bills, asked
+    of its *may_name* (``_tree_scan.py::ParsedModule.may_name``).
+
+    Every billed call spells, as identifiers, a ``RESPONSIVE_WAIT_HELPERS``
+    name, ``_await_outcome`` or ``stop_merge_worker``, or else the
+    ``asyncio`` name AND one of its billed attributes. False therefore
+    proves no item of the module bills anything.
+    """
+    return may_name(*RESPONSIVE_WAIT_HELPERS, _AWAIT_OUTCOME, _STOP_MERGE_WORKER) or (
+        may_name(_ASYNCIO)
+        and may_name(_ASYNCIO_WAIT_FOR, _ASYNCIO_TIMEOUT, _ASYNCIO_TIMEOUT_AT)
+    )
 
 
 def _method_wait_budget(
@@ -332,8 +355,25 @@ def _method_wait_budget(
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
 
 
+def parsed_or_none(source: str) -> ast.Module | None:
+    """*source* parsed, or None when it does not parse: how every
+    source-taking scan here and in _wait_hygiene_scan.py keeps its
+    never-raise contract."""
+    try:
+        return ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+
+
 def collect_test_items(source: str) -> list[tuple[str | None, _FunctionNode]]:
-    """``(owner_class_name, function)`` for every pytest item *source*
+    """:func:`collect_test_items_in` over *source*; unparseable source has
+    no items."""
+    tree = parsed_or_none(source)
+    return [] if tree is None else collect_test_items_in(tree)
+
+
+def collect_test_items_in(tree: ast.Module) -> list[tuple[str | None, _FunctionNode]]:
+    """``(owner_class_name, function)`` for every pytest item *tree*
     defines: each ``test*`` method directly in a top-level ``Test*`` class,
     and each top-level ``test*`` function (owner None). Those are pytest's
     default ``python_classes`` / ``python_functions`` prefixes, which
@@ -341,13 +381,8 @@ def collect_test_items(source: str) -> list[tuple[str | None, _FunctionNode]]:
     methods and conditionally defined classes are out of scope.
 
     The one traversal behind every scan of test items, here and in
-    _wait_hygiene_scan.py. Must never raise: unparseable source has no
-    items.
+    _wait_hygiene_scan.py.
     """
-    try:
-        tree = ast.parse(source)
-    except (SyntaxError, ValueError):
-        return []
     items: list[tuple[str | None, _FunctionNode]] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -572,8 +607,17 @@ def _item_limit(
 def audit_module(
     source: str, load_namespace: Callable[[], Mapping[str, object] | None]
 ) -> list[ItemWaitAudit] | None:
-    """Every item of *source* with a wait bill above zero, beside the
-    timeout it runs under, sorted by item. *source* is parsed once.
+    """:func:`audit_module_in` over *source*, parsed once; None also when
+    *source* does not parse. Never raises on its own account."""
+    tree = parsed_or_none(source)
+    return None if tree is None else audit_module_in(tree, load_namespace)
+
+
+def audit_module_in(
+    tree: ast.Module, load_namespace: Callable[[], Mapping[str, object] | None]
+) -> list[ItemWaitAudit] | None:
+    """Every item of *tree* with a wait bill above zero, beside the
+    timeout it runs under, sorted by item.
 
     *load_namespace* returns the module's runtime globals, which resolve the
     names its waits spell and hold the objects whose marks are read. It is
@@ -581,11 +625,10 @@ def audit_module(
     nothing without the namespace bills nothing with it, since a name
     resolves to no more than unbounded.
 
-    None when there is nothing to audit: *source* does not parse, no item
-    bills, or *load_namespace* returns None. Never raises on its own
-    account.
+    None when there is nothing to audit: no item bills, or *load_namespace*
+    returns None.
     """
-    items = collect_test_items(source)
+    items = collect_test_items_in(tree)
     if not any(_method_wait_budget(function) > 0 for _, function in items):
         return None
     namespace = load_namespace()

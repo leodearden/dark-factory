@@ -5,10 +5,15 @@ the SAME GROUP-BY-(model, role) semantics (invocations LEFT JOIN
 task_results on (run_id, task_id) for done/blocked rates, cap-hit rate,
 $/done) plus per-role turn-cap saturation from the events table
 (routing_decision max_turns vs invocation_end turns), reimplemented here in
-async aiosqlite against the same runs.db file the dashboard already opens
-for cost queries (:mod:`dashboard.data.costs`). Digest and dashboard run in
-different processes with different DB drivers, so the query is written
-twice rather than shared — see plan.json's design_decisions for task 2534.
+async aiosqlite. Digest and dashboard run in different processes with
+different DB drivers, so the query is written twice rather than shared — see
+plan.json's design_decisions for task 2534.
+
+It reads every invocation ledger the cost view hands it
+(``dashboard/src/dashboard/project_dbs.py::_cost_sources``): each project's
+runs.db, plus the curator's CostStore ledger. That ledger has no
+task_results or events table, so it contributes invocation-only cells: zero
+outcomes and no turn-cap saturation.
 
 The window is the CLOSED interval ``[now - days, now]``, both ends inclusive,
 spelled ``BETWEEN ? AND ?`` exactly as
@@ -41,11 +46,53 @@ logger = logging.getLogger(__name__)
 _DONE_OUTCOME = 'done'
 _BLOCKED_OUTCOME = 'blocked'
 
+_OUTCOMES_TABLE = 'task_results'
+_EVENTS_TABLE = 'events'
+_NO_OUTCOMES_RELATION = '(SELECT NULL AS run_id, NULL AS task_id, NULL AS outcome WHERE 0)'
+
+_MODEL_ROLE_CELLS_SQL = (
+    'SELECT i.model, i.role, '
+    '       COUNT(*) AS invocation_count, '
+    '       SUM(i.capped) AS capped_count, '
+    '       SUM(i.cost_usd) AS total_cost_usd, '
+    '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS done_count, '
+    '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS blocked_count, '
+    '       COUNT(DISTINCT CASE WHEN tr.outcome = ? THEN i.task_id END) '
+    '           AS distinct_done_tasks '
+    '  FROM invocations i '
+    '  LEFT JOIN {outcome_relation} tr '
+    '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
+    ' WHERE i.completed_at BETWEEN ? AND ? '
+    ' GROUP BY i.model, i.role'
+)
+
+_MAX_TURNS_BY_ROLE_SQL = (
+    "SELECT role, MAX(json_extract(data, '$.max_turns')) AS max_turns "
+    f'  FROM {_EVENTS_TABLE} '
+    " WHERE event_type = 'routing_decision' "
+    '   AND timestamp BETWEEN ? AND ? '
+    '   AND role IS NOT NULL '
+    ' GROUP BY role'
+)
+
+_INVOCATION_END_TURNS_SQL = (
+    "SELECT role, json_extract(data, '$.turns') AS turns "
+    f'  FROM {_EVENTS_TABLE} '
+    " WHERE event_type = 'invocation_end' "
+    '   AND timestamp BETWEEN ? AND ? '
+    '   AND role IS NOT NULL'
+)
+
 
 def _window_bounds(days: int, *, now: datetime | None = None) -> tuple[str, str]:
     """Return ``(window_start_iso, window_end_iso)`` for ``[now - days, now]``."""
     window_end = resolve_now(now)
     return (window_end - timedelta(days=days)).isoformat(), window_end.isoformat()
+
+
+async def _table_names(db: aiosqlite.Connection) -> frozenset[str]:
+    rows = await db.execute_fetchall("SELECT name FROM sqlite_master WHERE type = 'table'")
+    return frozenset(row[0] for row in rows)
 
 
 async def _query_model_role_cells(
@@ -63,21 +110,14 @@ async def _query_model_role_cells(
     - ``saturation_raw``: ``{role: {'hits', 'total', 'has_max_turns'}}`` —
       raw numerator/denominator so the aggregator can sum them across DBs
       before dividing, rather than averaging already-divided ratios.
+
+    A ledger without task_results joins an empty outcome relation instead,
+    and one without events contributes no saturation.
     """
+    tables = await _table_names(db)
+    outcome_relation = _OUTCOMES_TABLE if _OUTCOMES_TABLE in tables else _NO_OUTCOMES_RELATION
     raw_rows = await db.execute_fetchall(
-        'SELECT i.model, i.role, '
-        '       COUNT(*) AS invocation_count, '
-        '       SUM(i.capped) AS capped_count, '
-        '       SUM(i.cost_usd) AS total_cost_usd, '
-        '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS done_count, '
-        '       SUM(CASE WHEN tr.outcome = ? THEN 1 ELSE 0 END) AS blocked_count, '
-        '       COUNT(DISTINCT CASE WHEN tr.outcome = ? THEN i.task_id END) '
-        '           AS distinct_done_tasks '
-        '  FROM invocations i '
-        '  LEFT JOIN task_results tr '
-        '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
-        ' WHERE i.completed_at BETWEEN ? AND ? '
-        ' GROUP BY i.model, i.role',
+        _MODEL_ROLE_CELLS_SQL.format(outcome_relation=outcome_relation),
         (_DONE_OUTCOME, _BLOCKED_OUTCOME, _DONE_OUTCOME, window_start_iso, window_end_iso),
     )
 
@@ -94,8 +134,10 @@ async def _query_model_role_cells(
             'distinct_done_tasks': int(row['distinct_done_tasks'] or 0),
         })
 
-    saturation_raw = await _compute_turn_cap_saturation_raw(
-        db, window_start_iso, window_end_iso,
+    saturation_raw = (
+        await _compute_turn_cap_saturation_raw(db, window_start_iso, window_end_iso)
+        if _EVENTS_TABLE in tables
+        else {}
     )
     return cells, saturation_raw
 
@@ -112,13 +154,7 @@ async def _compute_turn_cap_saturation_raw(
     saturation=None (fail-open) rather than a misleading 0.0.
     """
     max_turns_rows = await db.execute_fetchall(
-        "SELECT role, MAX(json_extract(data, '$.max_turns')) AS max_turns "
-        '  FROM events '
-        " WHERE event_type = 'routing_decision' "
-        '   AND timestamp BETWEEN ? AND ? '
-        '   AND role IS NOT NULL '
-        ' GROUP BY role',
-        (window_start_iso, window_end_iso),
+        _MAX_TURNS_BY_ROLE_SQL, (window_start_iso, window_end_iso),
     )
     max_turns_by_role: dict[str, float] = {
         row['role']: row['max_turns'] for row in max_turns_rows
@@ -126,12 +162,7 @@ async def _compute_turn_cap_saturation_raw(
     }
 
     turns_rows = await db.execute_fetchall(
-        "SELECT role, json_extract(data, '$.turns') AS turns "
-        '  FROM events '
-        " WHERE event_type = 'invocation_end' "
-        '   AND timestamp BETWEEN ? AND ? '
-        '   AND role IS NOT NULL',
-        (window_start_iso, window_end_iso),
+        _INVOCATION_END_TURNS_SQL, (window_start_iso, window_end_iso),
     )
 
     raw: dict[str, dict] = {}

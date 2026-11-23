@@ -88,6 +88,7 @@ from _tree_scan import (
 )
 from shared.governed_exceptions import Debt, TaskRef, TicketRef, governed_exceptions
 from shared.pytest_mark_grammar import marker_name, pytestmark_elements, scope_binding
+from shared.testing_ceiling_anchors import WHOLE_TREE_FAMILY_MEASURED_WORST_SECS
 from shared.testing_timeout_headroom import UNDER_LOAD_HEADROOM_FACTOR
 from shared.testing_timeout_markers import SiteKind, timeout_marker_sites
 from shared.whole_tree_guard_family import (
@@ -136,7 +137,7 @@ _PERMANENT_PRIVATE_SWEEPS = MappingProxyType({
 _OUTSIDE_THE_SHARED_PASS = MappingProxyType({
     'test_merge_lane_ratchet.py': (
         'a complexipy whole-repo measurement through _merge_lane_census, not an '
-        'AST sweep of a tree; task 6986 owns separating it from the family'
+        'AST sweep of a tree; task 9396 owns its family membership'
     ),
 })
 
@@ -153,26 +154,13 @@ OUTSIDE_THE_SHARED_PASS_DECLARATION = governed_exceptions(
     'A whole-tree guard family member that neither sweeps a tree privately nor '
     'consumes the shared tree pass.',
     _OUTSIDE_THE_SHARED_PASS.keys(),
-    default=Debt(TaskRef(6986)),
+    default=Debt(TaskRef(9396)),
     default_covers=1,
 )
 
-# Worst wall clock MEASURED for a member of this family under REAL load: a
-# per-test TOTAL (setup + call + teardown, what a timeout mark bounds; almost all
-# of it module-fixture setup) of 148.65s for test_merge_lane_ratchet.py::
-# TestLanePatchTargets::test_real_tree_union_anchor, from task 3165's
-# orchestrator verify (2026-10-08, `-n 8`, loadavg 64 -> 79).  The family is
-# every module marked with WHOLE_TREE_SCAN_TEST_TIMEOUT, not only the ones the
-# detector below finds.  The worst run is kept, never the freshest; a figure
-# measured on code since replaced retires with that code.  Corpus:
-# plans/pytest-per-test-timeout-measurement-2026-09-17.md.  That fixture is a
-# whole-repo complexity measurement rather than an AST sweep of this tree, so
-# one member's cost sets the ceiling for the whole family; task 6986 owns
-# separating it.
-_MEASURED_UNDER_LOAD_WORST_CASE = 148.65
-
-# ABSOLUTE floor in seconds: the measured worst case above times
-# UNDER_LOAD_HEADROOM_FACTOR, rounded up to a whole minute.  Deliberately
+# ABSOLUTE floor in seconds: the family's recorded worst case,
+# shared/src/shared/testing_ceiling_anchors.py::WHOLE_TREE_FAMILY_MEASURED_WORST_SECS,
+# times UNDER_LOAD_HEADROOM_FACTOR, rounded up to a whole minute.  Deliberately
 # independent of PYPROJECT_DEFAULT_TIMEOUT, and never-narrow.
 #
 # WHOLE_TREE_SCAN_TEST_TIMEOUT used to be DERIVED (`5 *
@@ -286,7 +274,7 @@ class TestTimeoutConstants:
     def test_whole_tree_scan_timeout_clears_default_with_margin(self) -> None:
         """``WHOLE_TREE_SCAN_TEST_TIMEOUT`` must clear the default several times over.
 
-        Measured basis: ``_MEASURED_UNDER_LOAD_WORST_CASE``, whose corpus is the
+        Measured basis: ``WHOLE_TREE_FAMILY_MEASURED_WORST_SECS``, whose corpus is the
         task 6556 addendum of plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 
         The floor clears 8 x the anchor, and the constant clears both the floor
@@ -313,12 +301,12 @@ class TestTimeoutConstants:
         """
         assert (
             _ABSOLUTE_FLOOR_SECONDS
-            >= _MEASURED_UNDER_LOAD_WORST_CASE * UNDER_LOAD_HEADROOM_FACTOR
+            >= WHOLE_TREE_FAMILY_MEASURED_WORST_SECS * UNDER_LOAD_HEADROOM_FACTOR
         ), (
             f'the absolute floor ({_ABSOLUTE_FLOOR_SECONDS}s) no longer clears '
             f'{UNDER_LOAD_HEADROOM_FACTOR}x the measured-under-load worst case '
-            f'({_MEASURED_UNDER_LOAD_WORST_CASE}s = '
-            f'{_MEASURED_UNDER_LOAD_WORST_CASE * UNDER_LOAD_HEADROOM_FACTOR}s). '
+            f'({WHOLE_TREE_FAMILY_MEASURED_WORST_SECS}s = '
+            f'{WHOLE_TREE_FAMILY_MEASURED_WORST_SECS * UNDER_LOAD_HEADROOM_FACTOR}s). '
             'Either a slower measurement has landed or the floor was lowered; '
             'raise the floor rather than relaxing this arithmetic.'
         )
@@ -333,7 +321,7 @@ class TestTimeoutConstants:
             f'({PYPROJECT_DEFAULT_TIMEOUT}s, asserted separately below) -- so '
             'the likeliest cause of this failure is the constant being lowered '
             'by hand. The family ceiling must stay anchored to the measured '
-            f'cost ({_MEASURED_UNDER_LOAD_WORST_CASE}s under load, with worker '
+            f'cost ({WHOLE_TREE_FAMILY_MEASURED_WORST_SECS}s under load, with worker '
             'deaths at loadavg 250-423), not to whichever '
             'setting it happens to clear -- pin it explicitly rather than '
             'lowering this floor.'
@@ -1437,7 +1425,7 @@ _TIMEOUT_MARK_REMEDY = (
     'A sanctioned private sweeper needs only the timeout entry. These modules '
     'ast.parse() every *.py in a tree, privately or as the item billed the '
     'shared pass; under `-n auto` that has been MEASURED at up to '
-    f'{_MEASURED_UNDER_LOAD_WORST_CASE}s under load, against the per-test '
+    f'{WHOLE_TREE_FAMILY_MEASURED_WORST_SECS}s under load, against the per-test '
     f'default in {ORCH_PYPROJECT.name}. With timeout_method = "signal" a breach '
     'fails that one item, with its own traceback: a false red on a '
     'healthy-but-slow guard, which the ceiling exists to prevent.\n\n'

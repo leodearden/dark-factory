@@ -23,6 +23,7 @@ import pytest
 # AsyncMock leaves every `mem0_update` config leaf a Mock, which the fail-closed
 # authz resolver rejects (tests/test_markup_guard_fused_memory.py does the same).
 import test_consolidate_memories_tool as _consolidate
+from _hermetic_task_stack import hermetic_task_stack
 from _id_resolver_fakes import FakeGraphiti, FakeMem0, RecordingTombstones
 from fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -38,9 +39,11 @@ from shared.uuid_prefix_guard import (
 )
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.server import markup_guard
 from fused_memory.server.boundary_guards import boundary_guard_chain, install_boundary_guards
 from fused_memory.server.main import _install_tool_dispatch_guards
+from fused_memory.server.markup_residue_spool import MarkupResidueSpool
 from fused_memory.server.tools import create_mcp_server, per_use_prefix_resolver
 from fused_memory.server.unknown_argument_guard import UnknownArgumentMiddleware
 from fused_memory.services.memory_service import MemoryService
@@ -141,6 +144,16 @@ _EXPECTED_EXEMPT = frozenset({
     'delete_memory', 'delete_episode', 'delete_entity', 'update_edge',
     'reassign_edge', 'merge_entities', 'consolidate_memories', 'scan_memory_content',
 })
+
+#: update_task's passthrough-only metadata keys as exempt paths, spelled out
+#: here so that adding such a key is a conscious edit of this pin.
+_EXPECTED_EXEMPT_PATHS = {
+    'update_task': frozenset({
+        ('metadata', 'done_provenance'),
+        ('metadata', 'defects'),
+        ('metadata', 'defect_test_retirements'),
+    }),
+}
 
 _SUBSTITUTION = {
     'field': 'content', 'path': ['content'], 'from': PREFIX, 'to': FULL, 'namespace': 'mem0',
@@ -261,6 +274,75 @@ class TestTheUuidPrefixMemberIsRegistered:
         assert 'remove_edge' not in live
         assert member.forward_on_ambiguity_tools == frozenset({'update_task'})
         assert member.forward_on_ambiguity_tools <= live
+
+    @pytest.mark.asyncio
+    async def test_its_declared_exempt_paths_are_update_tasks_passthrough_only_keys(self):
+        member = _uuid_member(RecordingResolver())
+        server = create_mcp_server(AsyncMock(), task_interceptor=AsyncMock())
+        live = {tool.name for tool in await server.list_tools()}
+
+        assert member.exempt_paths == _EXPECTED_EXEMPT_PATHS
+        assert set(member.exempt_paths) <= live
+
+
+_OBSERVATION = '18e5b292'
+_OBSERVATION_FULL = '18e5b292-a32a-420d-8ecc-8a37fc9f3fb3'
+_STORED_PROVENANCE = {
+    'kind': 'merged', 'commit': 'a' * 40, 'note': f'per Mem0 observation {_OBSERVATION}',
+}
+
+
+class TestAStoredPassthroughValueIsNeverRepaired:
+    """A verbatim done_provenance echo under replace survives the guard (task 11331).
+
+    The stored note cites a bare prefix that resolves uniquely. Expanding it
+    would make the echo differ from the stored row, and update_task would
+    refuse the whole write as done_provenance_via_update_task.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('as_json', [False, True], ids=['dict', 'json-string'])
+    async def test_the_echo_lands_and_new_text_is_still_repaired(self, tmp_path, as_json):
+        root = str(tmp_path)
+        async with hermetic_task_stack(tmp_path) as (server, interceptor):
+            install_boundary_guards(
+                server,
+                known_projects={'scratch': root},
+                prefix_resolver=RecordingResolver(
+                    Resolution('unique', (Candidate('mem0', _OBSERVATION_FULL, ''),))
+                ),
+            )
+            backend = interceptor.taskmaster
+            assert isinstance(backend, SqliteTaskBackend)
+            created = await backend.add_task(
+                project_root=root, title='x',
+                metadata=json.dumps({'done_provenance': _STORED_PROVENANCE, 'retry_count': 2}),
+            )
+            task_id = str(created['id'])
+            payload = {
+                'done_provenance': dict(_STORED_PROVENANCE),
+                'retry_ledger': {'retry_count': 2},
+                'x_audit_note': f'nested by task 7135; see {_OBSERVATION}',
+                'allow_mcp_markup': True,
+            }
+
+            result = await _wire(server, 'update_task', {
+                'id': task_id,
+                'project_root': root,
+                'metadata_mode': 'replace',
+                'metadata': json.dumps(payload) if as_json else payload,
+            })
+
+            assert 'error' not in _text_json(result), _text_json(result)
+            stored = (await backend.get_task(task_id, root))['metadata']
+            stored = json.loads(stored) if isinstance(stored, str) else stored
+            assert stored['done_provenance'] == _STORED_PROVENANCE
+            assert stored['retry_ledger'] == {'retry_count': 2}
+            assert 'retry_count' not in stored
+            assert stored['x_audit_note'] == f'nested by task 7135; see {_OBSERVATION_FULL}'
+            assert [record['path'] for record in _repair(result)['substitutions']] == [
+                ['metadata', 'x_audit_note']
+            ]
 
 
 class TestTheUuidPrefixMemberSitsInsideTheMarkupGuard:
@@ -437,14 +519,17 @@ class TestAResolverOutageForwardsUnchanged:
 
 class TestMainInstallsTheUuidMember:
     @pytest.mark.asyncio
-    async def test_the_dispatch_guards_helper_expands_a_unique_prefix(self):
+    async def test_the_dispatch_guards_helper_expands_a_unique_prefix(self, tmp_path):
         resolver = RecordingResolver(UNIQUE)
         mock_service = AsyncMock()
         _pass_through(mock_service, 'add_memory')
         server = create_mcp_server(mock_service)
 
         _install_tool_dispatch_guards(
-            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=resolver
+            server,
+            known_projects=_KNOWN_PROJECTS,
+            prefix_resolver=resolver,
+            residue_spool=MarkupResidueSpool(tmp_path / 'spool'),
         )
         result = await _wire(server, 'add_memory', _add_memory_citing())
 
@@ -452,13 +537,16 @@ class TestMainInstallsTheUuidMember:
         assert _repair(result)['substitutions'] == [_SUBSTITUTION]
 
     @pytest.mark.asyncio
-    async def test_the_dispatch_guards_helper_contains_a_tool_body_escape(self):
+    async def test_the_dispatch_guards_helper_contains_a_tool_body_escape(self, tmp_path):
         mock_service = AsyncMock()
         mock_service.add_memory.side_effect = SystemExit('escaped the tool body')
         server = create_mcp_server(mock_service)
 
         _install_tool_dispatch_guards(
-            server, known_projects=_KNOWN_PROJECTS, prefix_resolver=RecordingResolver(UNIQUE)
+            server,
+            known_projects=_KNOWN_PROJECTS,
+            prefix_resolver=RecordingResolver(UNIQUE),
+            residue_spool=MarkupResidueSpool(tmp_path / 'spool'),
         )
         result = await server._tool_manager.call_tool(
             'add_memory', _add_memory_citing('a note citing nothing')

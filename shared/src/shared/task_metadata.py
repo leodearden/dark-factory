@@ -36,6 +36,12 @@ from pydantic_core import PydanticCustomError
 
 from shared.cancel_dispositions import CancelDispositionEntry
 from shared.declared_scope import DECLARED_SCOPE_METADATA_KEY, DeclaredScope
+from shared.followup_hold_records import (
+    FOLLOWUP_HOLD_METADATA_KEY,
+    FOLLOWUP_HOLDER_METADATA_KEY,
+    FollowupHold,
+    FollowupHolder,
+)
 from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConverted
 from shared.task_deferral import DeferralRecord
@@ -1211,6 +1217,10 @@ register_metadata_submodel(STRAND_CONVERTED_METADATA_KEY, StrandConverted, cardi
 # declared_scope: plans/follow-up-filing-shape-prd.md §4.2.
 register_metadata_submodel(DECLARED_SCOPE_METADATA_KEY, DeclaredScope, cardinality='dict')
 
+# followup_holder, followup_hold: plans/follow-up-filing-shape-prd.md §4.3.
+register_metadata_submodel(FOLLOWUP_HOLDER_METADATA_KEY, FollowupHolder, cardinality='dict')
+register_metadata_submodel(FOLLOWUP_HOLD_METADATA_KEY, FollowupHold, cardinality='dict')
+
 # trigger_chain: plans/completion-driven-triggers-prd.md C2.
 register_metadata_submodel(TRIGGER_CHAIN_KEY, TriggerChain, cardinality='dict')
 
@@ -1691,7 +1701,7 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # ask to be merged ahead of the normal queue. Writers and reader are
         # named because that is what a future reader greps when deciding
         # whether the key is still load-bearing (all re-verified 2026-09-17):
-        # writers `orchestrator/src/orchestrator/merge_queue.py::
+        # writers `orchestrator/src/orchestrator/merge_lane/worker.py::
         # SpeculativeMergeWorker::_spawn_main_health_fix_task` (auto-heal
         # main-health fix task, 'high'), `orchestrator/src/orchestrator/
         # offline_lane_filing.py::build_lane_fix_task_arguments` and
@@ -1700,8 +1710,10 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # TaskWorkflow::_spawn_main_health_fix_task` (fix-main brief, 'high'),
         # plus the operator tool `escalation/src/escalation/server.py::
         # merge_relane` (task 5246, either value, on every task it re-lanes);
-        # reader `orchestrator/src/orchestrator/merge_queue.py::
-        # lane_for_task_metadata` -> `intake.py::normalize_lane`, consumed at
+        # reader `orchestrator/src/orchestrator/merge_lane/worker.py::
+        # lane_for_task_metadata` ->
+        # `orchestrator/src/orchestrator/merge_lane/intake.py::normalize_lane`,
+        # consumed at
         # `orchestrator/src/orchestrator/workflow.py::TaskWorkflow::
         # _submit_to_merge_queue` to set `MergeRequest.lane` and -- as of this
         # task -- by `escalation/src/escalation/merge_lane_resolution.py::

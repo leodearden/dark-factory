@@ -50,7 +50,7 @@ from shared.python_env import without_python_env_selection
 from shared.secret_env import without_account_pool
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
-from orchestrator import verify_evidence, verify_fallback_floor, verify_plan
+from orchestrator import remote_gate, verify_evidence, verify_fallback_floor, verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
@@ -79,6 +79,10 @@ from orchestrator.verify_admission_record import (
     plan_request,
 )
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
+from orchestrator.verify_cache.policy import LegResult
+from orchestrator.verify_cache.recorder import CacheRecord, LegRun
+from orchestrator.verify_cache.registry import Entry
+from orchestrator.verify_cache.replay import CacheAccess, ReplayPlan, plan_replay
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
@@ -89,6 +93,7 @@ from orchestrator.verify_categories import (
     INFRA_TRANSIENT_CATEGORIES,
     PREEXISTING_BREAK_SKIP_CATEGORIES,  # noqa: F401 — re-exported for external consumers
     FailureCategory,
+    _assert_sentinels_disjoint,
     should_archive,
 )
 from orchestrator.verify_classify import (
@@ -786,6 +791,35 @@ def _reported_every_collected_test(stream: str) -> bool:
     return int(final_line.group(1)) == 100
 
 
+# One outcome count of a stats line that names a collected test's outcome:
+# not `deselected`, `warnings` or `rerun`.
+_PYTEST_COLLECTED_OUTCOME_RE = re.compile(r'(\d+) (?:passed|failed|errors?|skipped|xfailed|xpassed)\b')
+
+
+def pytest_reported_when_complete(output: str) -> int | None:
+    """The tests *output*'s pytest sessions reported, when every session reported all it collected.
+
+    Under ``-q`` pytest prints no ``collected N`` line. A final ``[100%]``
+    progress line above a session's tally is pytest's own attestation that the
+    tally counts every collected test. None when any session lacks one, when a
+    session never printed its tally, or when there is no session at all.
+    """
+    total = 0
+    tallies = 0
+    final_percent: int | None = None
+    for line in '\n'.join(_pytest_session_own_streams(output)).splitlines():
+        progress = _PYTEST_PROGRESS_PERCENT_RE.match(line)
+        if progress is not None:
+            final_percent = int(progress.group(1))
+        elif _PYTEST_STATS_LINE_RE.match(line):
+            if final_percent != 100:
+                return None
+            total += sum(int(count) for count in _PYTEST_COLLECTED_OUTCOME_RE.findall(line))
+            tallies += 1
+            final_percent = None
+    return total if tallies and final_percent is None else None
+
+
 def _crashed_session_stop_percent(stream: str) -> int | None:
     """Return the percentage of collected tests a crashed session stopped at.
 
@@ -1321,6 +1355,20 @@ def parse_pytest_failures(test_output: str) -> tuple[PytestFailure, ...]:
     )
 
 
+def failure_sections(test_output: str, failures: Iterable[PytestFailure]) -> dict[PytestFailure, str]:
+    """Each of *failures*' own FAILURES/ERRORS section body in *test_output*, for those a section singles out.
+
+    A failure whose section is absent, or shares its title with another it cannot be told
+    apart from (see ``parse_pytest_failures``), has no entry.
+    """
+    sections = _section_bodies(test_output)
+    return {
+        failure: body
+        for failure in failures
+        if (body := _section_body_of(sections, failure.node_id, failure.kind)) is not None
+    }
+
+
 def node_ids_of(failures: Iterable[PytestFailure]) -> list[str]:
     """Node ids in order, de-duplicated on ``node_id`` alone."""
     return list(dict.fromkeys(failure.node_id for failure in failures))
@@ -1394,6 +1442,7 @@ class _JunitTestIds(NamedTuple):
 
     failing: list[str]
     skipped: list[str]
+    testcases: int
 
 
 # pytest's junitxml records two outcomes of tests that DID run as a
@@ -1466,12 +1515,14 @@ def _extract_test_ids_from_junit(path: Path) -> _JunitTestIds | None:
 
     failing: set[str] = set()
     skipped: set[str] = set()
+    testcases = 0
     for testcase in root.iter('testcase'):
+        testcases += 1
         if testcase.find('failure') is not None or testcase.find('error') is not None:
             failing.add(_junit_testcase_id(testcase))
         elif _junit_testcase_never_ran(testcase):
             skipped.add(_junit_testcase_id(testcase))
-    return _JunitTestIds(failing=sorted(failing), skipped=sorted(skipped))
+    return _JunitTestIds(failing=sorted(failing), skipped=sorted(skipped), testcases=testcases)
 
 
 def extract_test_outcomes_from_junit(path: Path) -> dict[str, str] | None:
@@ -1977,8 +2028,7 @@ def seed_main_baseline(
     *ids* is the whole tree's failing set at *main_sha*; ``frozenset()``
     means every module is green there. Called from the PASS path of a
     merge+full gate run (merge_sha IS the merged tree that is about to
-    CAS-advance to become the next main tip — see merge_queue.py's
-    ``_run_post_merge_verify``), so in steady state
+    CAS-advance to become the next main tip — see merge_lane/post_merge_verify.py::run_post_merge_verify), so in steady state
     ``main_baseline_failing_ids`` below is a cache hit for as long as that
     SHA is main's tip and never pays for a probe (B2); and from that
     function's own whole-tree cold-start probe.
@@ -2362,6 +2412,14 @@ def _worst_category(categories: list[str]) -> str:
     return min(categories, key=_rank, default='')
 
 
+#: An out-of-band category, like the UNSCOPED_TYPECHECK_* gate signals and
+#: verify_fallback_floor.NO_TESTS_RAN_CATEGORY: a verdict replayed from recorded
+#: greens. Never a FailureCategory, ranked lowest by _worst_category as an
+#: unknown, and never archived.
+CACHE_HIT_CATEGORY = 'cache_hit'
+_assert_sentinels_disjoint((CACHE_HIT_CATEGORY,), FailureCategory)
+
+
 def _should_archive_category(category: str) -> bool:
     """Return True when the failure category warrants durable archival.
 
@@ -2710,15 +2768,34 @@ SIGNAL_KILL_SUMMARY_MARKER = 'killed by signal'
 # Same CONSTRAINT ON PRODUCERS as above.  See `_worker_death_leg_note`.
 WORKER_DEATH_SUMMARY_MARKER = 'session aborted after worker death'
 
+# The THIRD (task 5653): a merge verify replayed a recorded green, but the
+# dispatcher could not write that replay's consumption record (I6), so the
+# verdict rests on evidence nothing will ever audit. Same CONSTRAINT ON
+# PRODUCERS as above. See `unconsumed_replay_result`.
+UNCONSUMED_REPLAY_SUMMARY_MARKER = 'replayed verdict without a consumption record'
+
 # Every marker that makes a summary fragment a no-verdict note.
 # `_aggregate_results` carries each such fragment through verbatim, so a new
 # no-verdict note needs only its marker added here.
-_NO_VERDICT_SUMMARY_MARKERS = (SIGNAL_KILL_SUMMARY_MARKER, WORKER_DEATH_SUMMARY_MARKER)
+_NO_VERDICT_SUMMARY_MARKERS = (
+    SIGNAL_KILL_SUMMARY_MARKER, WORKER_DEATH_SUMMARY_MARKER, UNCONSUMED_REPLAY_SUMMARY_MARKER,
+)
 
 
 def is_no_verdict_summary(summary: str) -> bool:
-    """True when *summary* carries a no-verdict note — a signal-killed leg or an xdist-truncated session — so it records no verdict on the code."""
+    """True when *summary* carries a no-verdict note — a signal-killed leg, an xdist-truncated session or an unconsumed replay — so it records no verdict on the code."""
     return any(marker in summary for marker in _NO_VERDICT_SUMMARY_MARKERS)
+
+
+def unconsumed_replay_result(result: 'VerifyResult', reason: str) -> 'VerifyResult':
+    """*result* failed as no verdict: it replayed greens whose consumption could not be recorded (I6)."""
+    return replace(
+        result,
+        passed=False,
+        summary=f'Failures: {UNCONSUMED_REPLAY_SUMMARY_MARKER}: {_without_fragment_separator(reason)}',
+        category='',
+        cause_hint=reason,
+    )
 
 
 def _without_fragment_separator(text: str) -> str:
@@ -3184,6 +3261,10 @@ def _make_infix(module_prefix: 'str | None') -> str:
     return f'.{safe}'
 
 
+#: The root-relative directory a merge-role verify writes its junit reports into.
+MERGE_JUNIT_DIR = '.df-verify-junit'
+
+
 def _prepare_junit_report_path(
     worktree: Path, module_prefix: 'str | None', *, group: 'str | None' = None,
 ) -> 'Path | None':
@@ -3219,7 +3300,7 @@ def _prepare_junit_report_path(
     """
     if not worktree.is_dir():
         return None
-    junit_dir = worktree / '.df-verify-junit'
+    junit_dir = worktree / MERGE_JUNIT_DIR
     try:
         junit_dir.mkdir(exist_ok=True)
         report = junit_dir.resolve() / f'report{_make_infix(module_prefix)}{_make_infix(group)}.xml'
@@ -4086,21 +4167,6 @@ def _apply_cargo_scope(
     )
 
 
-# Source-file extensions that warrant running verify at all. Markdown / YAML /
-# TOML / JSON diffs are inert: every existing scoping branch
-# (scope_module_config filters .py, _build_fallback_config filters .py,
-# _apply_cargo_scope filters .rs) would no-op on them anyway, so the
-# previous global-pytest fall-through was the only path that actually fired
-# — and it was unsafe (see plans/fix-all-root-causes-humble-dream.md R1/R2).
-_SOURCE_EXTENSIONS: frozenset[str] = frozenset({'.py', '.rs'})
-
-
-def _has_source_files(task_files: list[str]) -> bool:
-    """Return True when *task_files* contains at least one .py or .rs path."""
-    exts = tuple(_SOURCE_EXTENSIONS)
-    return any(f.endswith(exts) for f in task_files)
-
-
 def _trivial_pass(reason: str) -> 'VerifyResult':
     """Build a VerifyResult that represents 'verify trivially passed'.
 
@@ -4117,6 +4183,29 @@ def _trivial_pass(reason: str) -> 'VerifyResult':
         cause_hint='',
         trivial=True,
         units=(),
+    )
+
+
+def _replay_hint(replayed: Iterable[tuple[str, Entry]]) -> str:
+    """Name each replayed unit's entry and evidence event (I1)."""
+    return '; '.join(
+        f'replayed {unit_id} from entry {entry.entry_id} (evidence event {entry.evidence_event_id})'
+        for unit_id, entry in replayed
+    )
+
+
+def _cache_hit_result(replay: ReplayPlan, replayed: Iterable[tuple[str, Entry]]) -> 'VerifyResult':
+    """The verdict of units that replay recorded greens: a pass that ran nothing, never readable as a run (I1)."""
+    return VerifyResult(
+        passed=True,
+        summary='All checks passed',
+        test_output='',
+        lint_output='',
+        type_output='',
+        category=CACHE_HIT_CATEGORY,
+        cause_hint=_replay_hint(replayed),
+        units=(),
+        cache_record=CacheRecord(role=replay.role, modes=replay.modes, legs=()),
     )
 
 
@@ -4168,6 +4257,49 @@ def _merge_no_evidence_fail(reason: str) -> 'VerifyResult':
         trivial=False,
         units=(),
     )
+
+
+def _no_tests_ran_fail(passed_result: 'VerifyResult', py_files: list[str]) -> 'VerifyResult':
+    category = verify_fallback_floor.NO_TESTS_RAN_CATEGORY
+    declared = ', '.join(py_files) or '(none)'
+    return replace(
+        passed_result,
+        passed=False,
+        trivial=False,
+        failing_leg_categories=None,
+        category=category,
+        summary=f"No tests ran for the task's declared .py files ({declared}).",
+        cause_hint=(
+            f"{category}: the fallback verify derived no test from the task's declared "
+            f'files ({declared}). Add or modify a test covering the change and declare '
+            "it in the task's files (report_missing_plan_file)."
+        ),
+    )
+
+
+def _no_tests_ran_verdict(
+    result: 'VerifyResult',
+    executed_fallback: ModuleConfig,
+    config: OrchestratorConfig,
+    files: list[str],
+) -> 'VerifyResult':
+    if not (result.passed and verify_fallback_floor.fallback_ran_no_tests(
+        executed_fallback.test_command, config.test_command,
+    )):
+        return result
+    py_files = [f for f in files if f.endswith('.py')]
+    if config.verify_allow_no_tests_ran:
+        logger.warning(
+            'Fallback verify ran no tests for %s; passing because '
+            'verify_allow_no_tests_ran is set',
+            py_files,
+        )
+        return result
+    logger.warning(
+        'Fallback verify ran no tests for %s; failing as %s',
+        py_files, verify_fallback_floor.NO_TESTS_RAN_CATEGORY,
+    )
+    return _no_tests_ran_fail(result, py_files)
 
 
 async def _verify_pipeline_guard_requires_full_gate(
@@ -5179,6 +5311,9 @@ class VerifyResult:
     units: tuple[verify_evidence.VerifyUnit, ...] | None = None
     # Task 5651: a plan-level fact like `plan`, stamped where `plan` is stamped.
     cache_mode: CacheMode = CacheMode.OFF
+    # Task 5653: what this verdict leaves for the verify-result cache. Off-wire:
+    # a runner's record is not shipped, and it never enters equality.
+    cache_record: CacheRecord | None = remote_gate.off_wire_field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         mismatch = _module_attribution_mismatch(
@@ -7464,7 +7599,7 @@ async def _preprovision_shared_venv(
     *,
     verify_env: dict[str, str],
     timeout: float,
-) -> None:
+) -> bool:
     """Synchronously populate the shared ``.venv`` before the test/lint/type gather.
 
     On a COLD verify worktree the shared ``.venv`` is populated only as a SIDE
@@ -7480,10 +7615,13 @@ async def _preprovision_shared_venv(
     through ``_run_cmd`` so it inherits the ghost-venv isolation scrub from
     ``_target_subprocess_env`` (the TARGET's ``uv`` resolves the TARGET's
     ``.venv``) with no new isolation code.
+
+    Returns False only when this call ran the command and it exited non-zero or
+    timed out; an empty knob, a coalesced or recently-done skip, and rc 0 are True.
     """
     cmd = config.verify_cold_preprovision_command
     if not cmd:
-        return
+        return True
     key = str(worktree.resolve())
     # Fast path: recently provisioned for this worktree — skip without taking the
     # lock (the common case once a worktree's first cold verify has run).  TTL'd
@@ -7491,7 +7629,7 @@ async def _preprovision_shared_venv(
     # skipping on a stale "done" key.
     done_at = _PREPROVISION_DONE.get(key)
     if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
-        return
+        return True
     # Get-or-create the per-worktree lock.  Synchronous (no await between the get
     # and the set) → atomic under asyncio, so no separate guard lock is needed.
     lock = _PREPROVISION_LOCKS.get(key)
@@ -7504,7 +7642,7 @@ async def _preprovision_shared_venv(
         # (freshness re-checked against the TTL, as in the fast path).
         done_at = _PREPROVISION_DONE.get(key)
         if done_at is not None and time.monotonic() - done_at < _PREPROVISION_DONE_TTL:
-            return
+            return True
         logger.info('Cold-verify shared-venv pre-provision: running %r in %s', cmd, worktree)
         started = time.monotonic()
         rc, out, _ = await _run_cmd(cmd, worktree, timeout, env=verify_env or None)
@@ -7536,6 +7674,7 @@ async def _preprovision_shared_venv(
         # prune stale entries so the guard stays bounded across many worktrees.
         _PREPROVISION_DONE[key] = time.monotonic()
         _prune_preprovision_guard()
+        return rc == 0
 
 
 async def _provision_main_tip_worktree(
@@ -7543,16 +7682,16 @@ async def _provision_main_tip_worktree(
     config: OrchestratorConfig,
     *,
     role: Literal['merge', 'task', 'background'],
-) -> None:
+) -> bool:
     """Provision a throwaway main-tip worktree the way the merge gate provisions its own.
 
     Goes through ``_preprovision_shared_venv`` (same coalescing and fail-open
     policy), with *role*'s verify env and in the warm timeout tier its verify legs
     use. Such a worktree has no ``.task/``, so ``run_verification``'s ``is_cold``
     gate never provisions it; without this, an environment-only failure on a
-    green main reads as red (task 6917).
+    green main reads as red (task 6917). Returns ``_preprovision_shared_venv``'s result.
     """
-    await _preprovision_shared_venv(
+    return await _preprovision_shared_venv(
         worktree, config,
         verify_env=_resolve_verify_env(config, None, role=role),
         timeout=_resolve_verify_timeout(config, None, is_cold=False),
@@ -7613,8 +7752,13 @@ async def run_verification(
     segment_chained_test: bool = False,
     admission_request: AdmissionRequest | None = None,
     junit_report: Path | None = None,
+    in_verify_cache: bool = False,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
+
+    *in_verify_cache* is True when the verify joined the verify-result cache:
+    only then is the ``cache_record`` built, saying what each leg that ran
+    tells the recorder, from the cost junit reports and the test output.
 
     A caller-named *junit_report* is injected into the test leg at the existing
     chokepoint, cleared before each pytest invocation, and parsed into
@@ -7733,7 +7877,7 @@ async def run_verification(
         worktree,
         module_prefix,
         role=role,
-        merge_breadth_full=verify_plan._merge_breadth_is_full(config),
+        merge_breadth_full=verify_plan.merge_breadth_is_full(config),
         attempt_id=attempt_id,
         task_id=task_id,
         archive_root=archive_root,
@@ -8577,16 +8721,20 @@ async def run_verification(
     # B3 degrade signal. See _extract_test_ids_from_junit's docstring.
     failing_test_ids: list[str] | None = None
     skipped_test_ids: list[str] | None = None
+    junit_testcases: int | None = None
     if junit.kind == 'attributing':
         assert junit.leg_path is not None  # _JunitReportPlan pairs them
         junit_ids = _extract_test_ids_from_junit(junit.leg_path)
         if junit_ids is not None:
-            failing_test_ids, skipped_test_ids = junit_ids
+            failing_test_ids, skipped_test_ids, junit_testcases = junit_ids
+    owned_reports = junit.reports_to_archive(attempt.test.segments)
+    if junit.kind == 'cost' and in_verify_cache:
+        junit_testcases = await _junit_testcases_of(owned_reports)
     # The report dies with its worktree; the LOG archival above is gated on
     # `not passed`, this deliberately is not. The gzip runs off the event
     # loop, which also carries the scheduler, the MCP server and the merge
     # worker: ~0.2s per 6MB report, and a segmented task leg archives several.
-    for report, segment_label in junit.reports_to_archive(attempt.test.segments):
+    for report, segment_label in owned_reports:
         await asyncio.to_thread(
             _archive_junit_report,
             report, archive_root, task_id, _archive_attempt_id(attempt_id),
@@ -8624,6 +8772,10 @@ async def run_verification(
             verify_evidence.module_leg_unit(module_prefix, check.label, check.rc)
             for check in attempt.checks if check.cmd is not None
         ),
+        cache_record=CacheRecord(
+            role=role, modes=config.verify_cache,
+            legs=_leg_runs(attempt.checks, module_config, junit_testcases=junit_testcases),
+        ) if in_verify_cache else None,
     )
 
     # Mark the worktree warm whenever the build completed (no pure timeout),
@@ -8659,6 +8811,34 @@ async def run_verification(
             else:
                 logger.info('Verification failed: %s%s', summary, detail_tail)
     return result
+
+
+async def _junit_testcases_of(reports: list[tuple[Path, str | None]]) -> int | None:
+    """The testcases the cost *reports* hold together; None when any is missing or unparseable."""
+    counts = [await asyncio.to_thread(_extract_test_ids_from_junit, report) for report, _ in reports]
+    if not counts or any(ids is None for ids in counts):
+        return None
+    return sum(ids.testcases for ids in counts if ids is not None)
+
+
+def _leg_runs(
+    checks: Iterable[CheckRun], module_config: ModuleConfig | None, *, junit_testcases: int | None,
+) -> tuple[LegRun, ...]:
+    """What each check that ran says about recording its green (verify_cache/policy.py::LegResult)."""
+    never_cache = module_config is not None and module_config.verify_cache == 'never'
+    prefix = module_config.prefix if module_config is not None else None
+    return tuple(
+        LegRun(verify_evidence.module_leg_name(prefix, check.label), LegResult(
+            leg=verify_evidence.Leg(check.label), rc=check.rc, timed_out=check.timed_out,
+            trivial=False, flake_suppressed=False, never_cache=never_cache,
+            junit_tests=junit_testcases if check.label == verify_evidence.Leg.TEST else None,
+            collected=(
+                pytest_reported_when_complete(check.output)
+                if check.label == verify_evidence.Leg.TEST else None
+            ),
+        ))
+        for check in checks if check.cmd is not None
+    )
 
 
 def _aggregate_failing_ids_by_module(
@@ -8731,8 +8911,9 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
                     parts.append(fragment)
         summary = 'All checks passed' if passed else f'Failures: {_SUMMARY_FRAGMENT_SEPARATOR.join(parts)}'
 
-    # Collect cause_hint from failing child results; join with ' | '.
-    cause_hint = ' | '.join(r.cause_hint for r in results if r.cause_hint)
+    # A failing verdict joins only its failing children's hints, so replay
+    # provenance on a passing child never enters a failure signature.
+    cause_hint = ' | '.join(r.cause_hint for r in (results if passed else failing) if r.cause_hint)
 
     # Pick the worst child category by priority.
     # Empty string is filtered out to avoid pulling the aggregate to '' when
@@ -8823,6 +9004,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         test_leg_failed=any(r.test_leg_failed for r in results),
         admission_legs=tuple(leg for r in results for leg in (r.admission_legs or ())) or None,
         units=_aggregate_units(results),
+        cache_record=CacheRecord.concat(r.cache_record for r in results),
     )
 
 
@@ -9003,7 +9185,8 @@ def _worktree_pkg_test_lister(worktree: Path) -> Callable[[str], list[str]]:
     return _list
 
 
-# Maps a PlannedRun's leg to the ModuleConfig attribute it renders into. Used
+# A PlannedRun renders into its leg's ModuleConfig attribute,
+# verify_evidence.py::COMMAND_FIELD_BY_LEG. Used
 # by _executed_module_configs_from_plan to recover which of
 # test_command/lint_command/type_check_command a PlannedRun belongs to. The
 # leg comes from verify_plan.py::planned_run_leg, which decodes the run's
@@ -9019,13 +9202,6 @@ def _worktree_pkg_test_lister(worktree: Path) -> Callable[[str], list[str]]:
 # commands to.) A SKIPPED run's cmd
 # is None and needs no attribution, since the corresponding ModuleConfig
 # field is simply left unset (None) there.
-_MC_ATTR_BY_LEG: dict[verify_evidence.Leg, str] = {
-    verify_evidence.Leg.LINT: 'lint_command',
-    verify_evidence.Leg.TYPE: 'type_check_command',
-    verify_evidence.Leg.TEST: 'test_command',
-}
-
-
 def _mc_attr_for_run_or_none(run: verify_plan.PlannedRun) -> str | None:
     """Resolve which ModuleConfig attribute *run* renders into, from its reason prefix.
 
@@ -9037,7 +9213,7 @@ def _mc_attr_for_run_or_none(run: verify_plan.PlannedRun) -> str | None:
     variant for callers that have already excluded that shape.
     """
     leg = verify_plan.planned_run_leg(run)
-    return None if leg is None else _MC_ATTR_BY_LEG[leg]
+    return None if leg is None else verify_evidence.COMMAND_FIELD_BY_LEG[leg]
 
 
 def _mc_attr_for_run(run: verify_plan.PlannedRun) -> str:
@@ -9438,6 +9614,106 @@ def _module_fanout_semaphore(
     return asyncio.Semaphore(max(1, cap))
 
 
+#: Runs one executed module, or the global command set for None, exactly as its call site did.
+ModuleRun = Callable[[ModuleConfig | None], Awaitable[VerifyResult]]
+
+
+async def _execute_with_cache(
+    worktree: Path,
+    config: OrchestratorConfig,
+    *,
+    role: Literal['merge', 'task'],
+    access: CacheAccess | None,
+    plan: verify_plan.VerifyPlan | None,
+    executed: Sequence[ModuleConfig | None],
+    run: ModuleRun,
+    is_merge_verify: bool,
+) -> VerifyResult:
+    """Run *executed* through *run*, except the units the verify-result cache replays.
+
+    With no *access*, or the cache off for *role*, this is exactly the uncached run.
+    """
+    replay = await _replay_plan(
+        worktree, config, role=role, access=access, plan=plan, executed=executed,
+        is_merge_verify=is_merge_verify,
+    )
+    if replay is None:
+        return await _run_executed(executed, run)
+    if replay.tree_hit:
+        result = _cache_hit_result(replay, replay.tree_replayed)
+    else:
+        result = await _run_executed(executed, lambda mc: _run_unreplayed(replay, run, mc))
+    return _settled_against(replay, result)
+
+
+def _joined_cache_access(
+    config: OrchestratorConfig, role: Literal['merge', 'task'], access: CacheAccess | None,
+) -> CacheAccess | None:
+    """*access* when a *role* verify given it is decided by, and records into, the verify-result cache; else None."""
+    return access if access is not None and config.verify_cache.mode_for(role) is not CacheMode.OFF else None
+
+
+async def _replay_plan(
+    worktree: Path,
+    config: OrchestratorConfig,
+    *,
+    role: Literal['merge', 'task'],
+    access: CacheAccess | None,
+    plan: verify_plan.VerifyPlan | None,
+    executed: Sequence[ModuleConfig | None],
+    is_merge_verify: bool,
+) -> ReplayPlan | None:
+    """The cache's decision for this verify; None outside the cache or with *role*'s mode off."""
+    joined = _joined_cache_access(config, role, access)
+    if joined is None:
+        return None
+    # A cold tree's .venv is provisioned before keying: read_toolchain keys its interpreter.
+    if is_merge_verify or any(_is_verify_cold(worktree, None if mc is None else mc.prefix) for mc in executed):
+        await _preprovision_shared_venv(
+            worktree, config, verify_env=_resolve_verify_env(config, None, role=role),
+            timeout=_resolve_verify_timeout(config, None, is_cold=True, is_merge_verify=is_merge_verify),
+        )
+    return await plan_replay(
+        worktree, plan, executed, config=config, role=role, access=joined,
+        leg_env=lambda mc: _resolve_verify_env(config, mc, role=role),
+        verify_outputs=(MERGE_JUNIT_DIR,),
+    )
+
+
+async def _run_executed(executed: Sequence[ModuleConfig | None], run: ModuleRun) -> VerifyResult:
+    if len(executed) == 1:
+        return await run(executed[0])
+    return _aggregate_results(list(await gather_unwound(*(run(mc) for mc in executed))))
+
+
+async def _run_unreplayed(replay: ReplayPlan, run: ModuleRun, mc: ModuleConfig | None) -> VerifyResult:
+    """*mc* run without its replayed legs; a cache-hit verdict when every leg replays.
+
+    A passing run's cause_hint names each replay after its own; a failing run's
+    stays what a cache-free run would give, since readers key failures on it.
+    """
+    if mc is None:
+        return await run(None)
+    replayed = replay.replayed(mc.prefix)
+    remaining = replay.without_replayed(mc)
+    if remaining is None:
+        return _cache_hit_result(replay, replayed)
+    result = await run(remaining)
+    if not result.passed:
+        return result
+    hints = (result.cause_hint, _replay_hint(replayed))
+    return replace(result, cause_hint=' | '.join(hint for hint in hints if hint))
+
+
+def _settled_against(replay: ReplayPlan, result: VerifyResult) -> VerifyResult:
+    """*result* with its units settled against *replay*'s decisions, and what it leaves to record."""
+    mode = replay.modes.mode_for(replay.role)
+    if result.units is None or result.cache_record is None:
+        return replace(result, cache_record=None, cache_mode=mode)
+    units, record = replay.settle(result.units, result.cache_record.legs)
+    return replace(result, units=units, cache_record=record, cache_mode=mode)
+
+
 async def run_scoped_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -9453,8 +9729,14 @@ async def run_scoped_verification(
     role: Literal['merge', 'task'] = 'task',
     event_store: 'EventStore | None' = None,
     admission_plan: AdmissionPlan | None = None,
+    verify_cache: CacheAccess | None = None,
 ) -> VerifyResult:
     """Run verification scoped to specific subprojects and optionally to task files.
+
+    *verify_cache* joins the verify-result cache: dispatcher-side callers pass
+    the harness's one ``CacheAccess.on_dispatcher``, keyed on its deployed sha;
+    a remote runner passes ``await CacheAccess.on_runner()``, keyed on its gate
+    checkout; and None leaves the verify outside the cache.
 
     A gated *role* verifies as ONE admission plan, stamped here so every leg
     and retry keeps the plan's place in the admission gate's order, and
@@ -9509,6 +9791,7 @@ async def run_scoped_verification(
         role=role,
         event_store=event_store,
         admission_plan=admission_plan,
+        verify_cache=verify_cache,
     )
     return await _recorded_admission_plan(config, event_store, admission_plan, scoped_verify)
 
@@ -9528,21 +9811,40 @@ async def _run_scoped_verification_body(
     role: Literal['merge', 'task'],
     event_store: 'EventStore | None',
     admission_plan: AdmissionPlan | None,
+    verify_cache: CacheAccess | None,
 ) -> VerifyResult:
-    """``run_scoped_verification``'s scoping and execution; every leg joins *admission_plan*."""
+    """``run_scoped_verification``'s scoping and execution; every leg joins *admission_plan*,
+    and every execution goes through the verify-result cache's funnel."""
     scope_cargo_enabled = config.scope_cargo
     _fanout_sem = _module_fanout_semaphore(config, role)
+    in_verify_cache = _joined_cache_access(config, role, verify_cache) is not None
 
-    async def _verify_module(mc: ModuleConfig, scope_kind: str | None = None) -> 'VerifyResult':
+    async def _verify_alone(mc: ModuleConfig | None, scope_kind: str | None = None) -> 'VerifyResult':
+        return await run_verification(
+            worktree, config, mc,
+            max_retries=max_retries,
+            is_merge_verify=is_merge_verify,
+            attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+            role=role,
+            admission_request=plan_request(admission_plan, None if mc is None else mc.prefix, scope_kind),
+            in_verify_cache=in_verify_cache,
+        )
+
+    async def _verify_module(mc: ModuleConfig | None, scope_kind: str | None = None) -> 'VerifyResult':
         async with _fanout_sem:
-            return await run_verification(
-                worktree, config, mc,
-                max_retries=max_retries,
-                is_merge_verify=is_merge_verify,
-                attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
-                role=role,
-                admission_request=plan_request(admission_plan, mc.prefix, scope_kind),
-            )
+            return await _verify_alone(mc, scope_kind)
+
+    def _verify_planned(plan: verify_plan.VerifyPlan | None) -> ModuleRun:
+        """Each module verified under the test scope kind *plan* gave it."""
+        return lambda mc: _verify_module(mc, None if mc is None else _test_scope_kind(plan, mc.prefix))
+
+    async def _execute(
+        plan: verify_plan.VerifyPlan | None, executed: Sequence[ModuleConfig | None], run: ModuleRun,
+    ) -> VerifyResult:
+        return await _execute_with_cache(
+            worktree, config, role=role, access=verify_cache, plan=plan, executed=executed, run=run,
+            is_merge_verify=is_merge_verify,
+        )
 
     # When the plan didn't provide a file list, try to derive one from git —
     # but only when we're not bypassing scoping entirely (force_workspace=True
@@ -9581,7 +9883,7 @@ async def _run_scoped_verification_body(
             # _run_scoped_verification_with_infra_retry) never takes this
             # fork — breadth is merge-role-gated only, so that call stays on
             # the legacy path unconditionally regardless of the knob.
-            if role == 'merge' and verify_plan._merge_breadth_is_full(config):
+            if role == 'merge' and verify_plan.merge_breadth_is_full(config):
                 # The expansion itself lives in
                 # verify_plan.effective_merge_module_configs (flake-ledger PRD
                 # §8.2 / task 3787 γ) — ONE implementation of "the effective
@@ -9634,10 +9936,7 @@ async def _run_scoped_verification_body(
                             plan_dict, worktree, attempt_id=attempt_id,
                             task_id=task_id, archive_root=archive_root,
                         )
-                        results = await gather_unwound(*(
-                            _verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped
-                        ))
-                        aggregated = _aggregate_results(list(results))
+                        aggregated = await _execute(plan, scoped, _verify_planned(plan))
                         aggregated.plan = plan_dict
                         return aggregated
                     logger.warning(
@@ -9653,16 +9952,27 @@ async def _run_scoped_verification_body(
             logger.info(
                 'Verification mode: workspace (train member — file-scoping bypassed)'
             )
-            return await run_verification(
-                worktree, config,
-                max_retries=max_retries,
-                is_merge_verify=is_merge_verify,
-                attempt_id=attempt_id,
-                task_id=task_id,
-                archive_root=archive_root,
-                role=role,
-                admission_request=plan_request(admission_plan, None),
+            return await _execute(None, [None], _verify_alone)
+        # Filter to files that still exist — tasks may delete files as part of
+        # their work. The artifact widening and both planner sites below read
+        # this one on-disk set.
+        existing_files = [f for f in task_files or () if (worktree / f).exists()]
+        if task_files:
+            # Task 5296: a touched behavioural artifact (a skills/ script, an
+            # agent-prompt SKILL.md, the root yaml) runs the registered
+            # modules whose tests consume it, even when the task owns none.
+            # Idempotent: the remote task leg already receives the widened
+            # set from task_verify_dispatch.py::TaskVerifyDispatcher._scope_of.
+            widened_modules = verify_plan.with_artifact_consumer_modules(
+                config, module_configs, existing_files, role,
             )
+            added = [mc.prefix for mc in widened_modules[len(module_configs):]]
+            if added:
+                logger.info(
+                    'Verification scope: adding %d behavioural-artifact consumer module(s): %s',
+                    len(added), ', '.join(added),
+                )
+            module_configs = widened_modules
         if module_configs:
             # λ (task 2589, R1): the broad merge gate. role=='merge' +
             # merge_verify_breadth=='full' expands module_configs from the
@@ -9704,8 +10014,6 @@ async def _run_scoped_verification_body(
                 )
             # Apply file-level scoping within each subproject when task_files given
             if task_files:
-                # Filter to files that still exist — tasks may delete files as part of their work
-                existing_files = [f for f in task_files if (worktree / f).exists()]
                 # Shared structural-content cache (task γ amendment): threaded
                 # into derive_verify_plan's worktree_reader below, so a
                 # touched file is read from disk at most once per attempt
@@ -9736,7 +10044,8 @@ async def _run_scoped_verification_body(
                     )
                 if not scoped:
                     # No subproject has matching files. Two sub-cases:
-                    #   (a) Diff has no .py/.rs at all (docs, YAML, JSON …) —
+                    #   (a) nothing in the diff needs verifying
+                    #       (verify_plan.is_trivial_diff) —
                     #       every existing scope branch would no-op anyway; the
                     #       previous global-pytest fall-through was unsafe in
                     #       this layout. Trivially pass — UNLESS the merge-role
@@ -9747,7 +10056,7 @@ async def _run_scoped_verification_body(
                     #       (e.g. root-level conftest.py + skills/*.md). Fan
                     #       out per-subproject so each runs in its own venv
                     #       with its own pyproject options.
-                    if not _has_source_files(existing_files):
+                    if verify_plan.is_trivial_diff(existing_files, module_configs, role):
                         if role == 'merge' and is_merge_verify:
                             # INV-1 (task 2883): the ADOPTABLE merge verdict must
                             # never trivially pass a no-evidence resolution. Any
@@ -9820,10 +10129,7 @@ async def _run_scoped_verification_body(
                         'Verification mode: per-subproject fan-out (%d subprojects)',
                         len(module_configs),
                     )
-                    results = await gather_unwound(*(
-                        _verify_module(mc) for mc in module_configs
-                    ))
-                    return _aggregate_results(list(results))
+                    return await _execute(None, module_configs, _verify_module)
                 # Rewrite cargo --workspace → cargo -p <crate> when all task files
                 # are .rs and map to known workspace crates.
                 scoped = [
@@ -9915,22 +10221,17 @@ async def _run_scoped_verification_body(
                 plan = None
                 plan_dict = None
                 logger.info('Verification mode: subproject-scoped (%d subprojects)', len(module_configs))
-            results = await gather_unwound(
-                *(_verify_module(mc, _test_scope_kind(plan, mc.prefix)) for mc in scoped)
-            )
-            aggregated = _aggregate_results(list(results))
+            aggregated = await _execute(plan, scoped, _verify_planned(plan))
             if plan_dict is not None:
                 aggregated.plan = plan_dict
             return aggregated
 
         # No module_configs — try fallback or global
         if task_files:
-            # Filter to files that still exist — tasks may delete files as part of their work
-            existing_files = [f for f in task_files if (worktree / f).exists()]
             # Mirror the same docs-only short-circuit as the module_configs
             # branch: with no .py/.rs files _build_fallback_config would
             # return None and we'd fall through to the unsafe global pytest.
-            if not _has_source_files(existing_files):
+            if verify_plan.is_trivial_diff(existing_files, module_configs, role):
                 if role == 'merge' and is_merge_verify:
                     # INV-1 (task 2883): the ADOPTABLE merge verdict must never
                     # trivially pass a no-evidence resolution. Escalate to the
@@ -10078,41 +10379,44 @@ async def _run_scoped_verification_body(
                     plan_dict, worktree, attempt_id=attempt_id,
                     task_id=task_id, archive_root=archive_root,
                 )
-                fallback_result = await run_verification(
-                    worktree, config, fallback, max_retries=max_retries,
-                    is_merge_verify=is_merge_verify,
-                    attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
-                    role=role,
-                    # Task 3338 / esc-3062-2: the fallback runs the fleet-wide
-                    # `&&` chain, where the shell's short-circuit means an
-                    # unrelated earlier subproject's red skips the clause a
-                    # task's OWN assigned files live in — and one rc cannot say
-                    # so. This is the ONLY call site that opts in.
-                    #
-                    # ...and NOT for role='merge' (amendment). Removing the
-                    # short-circuit is a cost/benefit trade that inverts on the
-                    # merge lane. Benefit: the per-segment diagnostic exists so
-                    # a task AGENT can read its own result instead of proving
-                    # an unrelated red unrelated — but a merge failure goes
-                    # straight to a human, who has the whole chain anyway. Cost:
-                    # a merge verify whose first subproject goes red would now
-                    # run the remaining seven segments, up to the full resolved
-                    # budget, with the queue blocked behind it — on the one path
-                    # this module already treats as latency-critical (see the
-                    # `-n`-cap comment in _run_or_skip_timed: 'merge' is never
-                    # -n-capped for exactly this reason). Budget exhaustion is
-                    # strictly MORE likely once every segment always runs; the
-                    # measured fleet-chain floor (tests/scripts/
-                    # test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS)
-                    # is a lower bound, not the whole chain.
-                    segment_chained_test=role != 'merge',
-                    admission_request=plan_request(
-                        admission_plan, fallback.prefix,
-                        _test_scope_kind(fallback_plan, fallback.prefix),
-                    ),
-                )
+                fallback_scope_kind = _test_scope_kind(fallback_plan, fallback.prefix)
+
+                async def _verify_fallback(mc: ModuleConfig | None) -> VerifyResult:
+                    return await run_verification(
+                        worktree, config, mc, max_retries=max_retries,
+                        is_merge_verify=is_merge_verify,
+                        attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
+                        role=role,
+                        # Task 3338 / esc-3062-2: the fallback runs the fleet-wide
+                        # `&&` chain, where the shell's short-circuit means an
+                        # unrelated earlier subproject's red skips the clause a
+                        # task's OWN assigned files live in — and one rc cannot say
+                        # so. This is the ONLY call site that opts in.
+                        #
+                        # ...and NOT for role='merge' (amendment). Removing the
+                        # short-circuit is a cost/benefit trade that inverts on the
+                        # merge lane. Benefit: the per-segment diagnostic exists so
+                        # a task AGENT can read its own result instead of proving
+                        # an unrelated red unrelated — but a merge failure goes
+                        # straight to a human, who has the whole chain anyway. Cost:
+                        # a merge verify whose first subproject goes red would now
+                        # run the remaining seven segments, up to the full resolved
+                        # budget, with the queue blocked behind it — on the one path
+                        # this module already treats as latency-critical (see the
+                        # `-n`-cap comment in _run_or_skip_timed: 'merge' is never
+                        # -n-capped for exactly this reason). Budget exhaustion is
+                        # strictly MORE likely once every segment always runs; the
+                        # measured fleet-chain floor (tests/scripts/
+                        # test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS)
+                        # is a lower bound, not the whole chain.
+                        segment_chained_test=role != 'merge',
+                        admission_request=plan_request(admission_plan, fallback.prefix, fallback_scope_kind),
+                        in_verify_cache=in_verify_cache,
+                    )
+
+                fallback_result = await _execute(fallback_plan, [fallback], _verify_fallback)
                 fallback_result.plan = plan_dict
-                return fallback_result
+                return _no_tests_ran_verdict(fallback_result, fallback, config, existing_files)
 
             # For Rust projects with no module_configs and no Python fallback
             # (Reify's layout), try to scope the global commands.
@@ -10131,13 +10435,7 @@ async def _run_scoped_verification_body(
                         'Verification mode: cargo-scoped (%d .rs files)',
                         len(existing_files),
                     )
-                    return await run_verification(
-                        worktree, config, rewritten, max_retries=max_retries,
-                        is_merge_verify=is_merge_verify,
-                        attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
-                        role=role,
-                        admission_request=plan_request(admission_plan, rewritten.prefix),
-                    )
+                    return await _execute(None, [rewritten], _verify_alone)
 
         # INV-1 (task 2883) GLOBAL-tail backstop: the merge gate must never
         # reach the final global run_verification with an empty command set —
@@ -10160,13 +10458,7 @@ async def _run_scoped_verification_body(
             return _merge_no_evidence_fail('empty_command_set')
 
         logger.info('Verification mode: global (no scope info)')
-        return await run_verification(
-            worktree, config, max_retries=max_retries,
-            is_merge_verify=is_merge_verify,
-            attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
-            role=role,
-            admission_request=plan_request(admission_plan, None),
-        )
+        return await _execute(None, [None], _verify_alone)
     finally:
         _maybe_prune_archive(archive_root)
 
@@ -10315,6 +10607,8 @@ async def verify_failure_is_preexisting_on_main(
         ``(False, '')`` (fail-safe) for any of:
           - Main probe passes (break is task-own).
           - Different signature (break is task-own or different inherited break).
+          - A ``no_tests_ran`` failure: a property of the diff's fallback
+            scoping, never of main, so it is never probed (task 7041).
           - ``git_ops.get_main_sha()`` fails or returns empty.
           - ``git worktree add --detach`` fails after retries.
           - Any unexpected exception during probing.
@@ -10382,6 +10676,8 @@ async def verify_failure_is_preexisting_on_main(
             return (hint or '').strip().lower()
 
     try:
+        if failing_result.category == verify_fallback_floor.NO_TESTS_RAN_CATEGORY:
+            return False, ''
         # Resolve the current main SHA.
         try:
             main_sha: str = await git_ops.get_main_sha()  # type: ignore[union-attr]

@@ -171,6 +171,11 @@ _ALLOWED_RENAMERS = {
         'refuses it. There is no content to write, only a tree to relink, and '
         'os.rename is chosen so a cross-device destination fails rather than '
         'copying a warm lane build tree.',
+    ('orchestrator/src/orchestrator/rebase_recovery.py', '_move_aside'):
+        'MOVES an interrupted rebase/merge/am state out of a git dir into a '
+        'quarantine specimen (task 10991). There is no content to write, and a '
+        'rename changes no ref, HEAD, index or working tree, which is why it '
+        'is used instead of an abort.',
     ('escalation/src/escalation/sweep.py', '_atomic_move'):
         'Out of task 3223 enumerated scope; moves an existing file, does not write.',
     ('orchestrator/src/orchestrator/digest.py', 'write_digest_entry'):

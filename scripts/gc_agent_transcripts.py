@@ -106,7 +106,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import _checkout as _checkout
-from shared.project_layout import default_project_root
+from shared.project_layout import agent_transcripts_dir, default_project_root
 
 logger = logging.getLogger('gc_agent_transcripts')
 
@@ -119,9 +119,6 @@ SECONDS_PER_DAY = 86_400
 # (orchestrator.config.TranscriptArchiveConfig / RetentionConfig). Pinned
 # against silent drift by test_gc_agent_transcripts.py's drift-guard test —
 # see the module docstring for why the GC does not import OrchestratorConfig.
-# Mirrors TranscriptArchiveConfig().root — resolved against project_root, NOT
-# the per-task worktree (the archive is a durable, git-ignored data dir).
-ARCHIVE_ROOT_RELATIVE = 'data/orchestrator/agent-transcripts'
 # Mirrors RetentionConfig().max_age_days / .max_task_dirs.
 DEFAULT_MAX_AGE_DAYS = 90
 DEFAULT_MAX_TASK_DIRS = 50000
@@ -158,13 +155,13 @@ MIN_RATE_SAMPLE_DAYS = 7
 
 
 def default_archive_root() -> Path:
-    """Return the default archive root (``main checkout / ARCHIVE_ROOT_RELATIVE``).
+    """Return the default archive root: ``agent_transcripts_dir`` of the main checkout.
 
     The single resolution site for the CLI ``--root`` default, mirroring the
     ``resolve_*`` helper shape of :mod:`drain_check`. ``--root`` overrides it;
     there is no env knob (the archive root is a fixed data-dir convention).
     """
-    return default_project_root() / ARCHIVE_ROOT_RELATIVE
+    return agent_transcripts_dir(default_project_root())
 
 
 @dataclass

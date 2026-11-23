@@ -29,6 +29,27 @@ from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
+from shared.account_reserve import (
+    ActiveReserve,
+    ReserveConfig,
+    ReserveEvent,
+    ReserveRefusal,
+    ReserveState,
+    ReserveWaitEnd,
+    WorkClass,
+    WorkClassSource,
+    config_event_details,
+    first_choice,
+    refusal,
+    refuses_account,
+    resolve_work_class,
+    schedule_drift,
+    served_details,
+    wait_end_for_lease,
+    wait_end_without_lease,
+    wait_ended_details,
+    wait_started_details,
+)
 from shared.cli_invoke import (
     BUDGET_EXHAUSTED_SUBTYPE,
     AgentResult,
@@ -64,7 +85,7 @@ from shared.proc_group import terminate_process_group
 from shared.secret_env import agent_subprocess_env
 
 if TYPE_CHECKING:
-    from collections.abc import Collection
+    from collections.abc import Callable, Collection
 
     from shared.cost_store import CostStore
 
@@ -123,6 +144,19 @@ _SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
 # enough not to bury the signal. Deliberately an internal observability
 # constant, not an operator knob.
 _ALL_CAPPED_PARK_LOG_INTERVAL_SECS = 600.0
+
+# How often a caller in the scoped park re-announces itself (task 7243), at
+# the fleet park's interval. It is also the longest single wait of the scoped
+# park; a caller's `max_wait_secs` and `_SCOPE_WAIT_REPOLL_CEIL_SECS` can only
+# shorten it. Deliberately an internal constant, not an operator knob.
+_SCOPE_PARK_LOG_INTERVAL_SECS = _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
+
+# The allowance reserve's wait (plans/allowance-reserve-by-account-prd.md
+# §6.3): a refused caller re-selects at least this often with no account
+# event, which is what bounds a promoted caller and a reserve that capped
+# under its waiters. Its heartbeat is per waiter, at the park's interval.
+_RESERVE_WAIT_REPOLL_SECS = 300.0
+_RESERVE_WAIT_LOG_INTERVAL_SECS = 600.0
 
 # Consecutive spawn failures on ONE account before the gate latches
 # `probe_infra_fault` (task 4512). Greater than 1 so a single transient spawn
@@ -460,6 +494,11 @@ class AccountState:
         elif self.phase == AccountPhase.AUTH_FAILED:
             self.phase = AccountPhase.AVAILABLE
 
+    @property
+    def is_open(self) -> bool:
+        """Neither capped, probe-in-flight nor failing authentication: selection may take it."""
+        return self.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING)
+
 
 @dataclass(frozen=True)
 class AccountLease:
@@ -484,6 +523,26 @@ class AccountLease:
     generation: int
 
 
+@dataclass(frozen=True)
+class _ReserveView:
+    """The reserve rule as one selection pass reads it: the caller's class and the clock, read once.
+
+    Selection and the refusal test of the same pass share it, so they cannot disagree.
+    """
+
+    rule: ReserveConfig
+    caller: WorkClass
+    now: datetime
+
+
+@dataclass(frozen=True)
+class _ParkClock:
+    """One waiter's heartbeat clock, on the monotonic clock."""
+
+    started: float
+    last_logged: float | None = None
+
+
 class SessionBudgetExhausted(Exception):
     """Raised when the per-run session budget is exceeded."""
 
@@ -506,6 +565,9 @@ class PoolFrozen(Exception):
     reset, and a caller must be able to tell the two apart. The structured
     fields say which accounts are in which state, read at the moment of the
     raise; *scope* is the exhausted model scope, or ``None`` for the fleet.
+    *reserved_account* and *release_at* are set when the one open account is
+    the allowance reserve, refused to this caller until *release_at*
+    (plans/allowance-reserve-by-account-prd.md §6.3).
     """
 
     def __init__(
@@ -515,14 +577,27 @@ class PoolFrozen(Exception):
         capped_account_names: tuple[str, ...],
         auth_failed_account_names: tuple[str, ...],
         scope: str | None = None,
+        reserved_account: str | None = None,
+        release_at: datetime | None = None,
     ):
         self.account_count = account_count
         self.capped_account_names = capped_account_names
         self.auth_failed_account_names = auth_failed_account_names
         self.scope = scope
-        where = f'model scope {scope!r} is exhausted on' if scope else 'no account admissible among'
+        self.reserved_account = reserved_account
+        self.release_at = release_at
+        if reserved_account is not None:
+            until = release_at.isoformat() if release_at is not None else 'its release'
+            what = (
+                f'Usage pool refused the reserve {reserved_account!r} until {until}: '
+                f'no other account is admissible among'
+            )
+        elif scope:
+            what = f'Usage pool frozen: model scope {scope!r} is exhausted on'
+        else:
+            what = 'Usage pool frozen: no account admissible among'
         super().__init__(
-            f'Usage pool frozen: {where} all {account_count} account(s) — '
+            f'{what} all {account_count} account(s) — '
             f'capped: {", ".join(capped_account_names) or "none"}; '
             f'auth-failed: {", ".join(auth_failed_account_names) or "none"}'
         )
@@ -550,7 +625,9 @@ class InvokeSlot:
     (``break``, ``continue``, ``return``, exception) unless the slot was
     explicitly settled by :meth:`detect_cap_hit` (returning True),
     :meth:`report` or :meth:`confirm`. The first of those settles the slot's
-    one verdict; a later :meth:`confirm` is a no-op.
+    one verdict; a later :meth:`confirm` is a no-op. That verdict is also when a
+    call on the allowance reserve in its protected window is recorded as
+    ``reserve_served``, with the cost only :meth:`confirm` carries.
 
     Use via :meth:`UsageGate.invoke_slot`::
 
@@ -563,17 +640,20 @@ class InvokeSlot:
         # any other exit: __aexit__ calls release_probe_slot
     """
 
-    __slots__ = ('_gate', 'lease', '_settled', 'scope')
+    __slots__ = ('_gate', 'lease', '_settled', 'scope', 'work_class')
 
     def __init__(
         self,
         gate: UsageGate,
         lease: AccountLease | None,
         scope: str | None = None,
+        *,
+        work_class: WorkClassSource | None = None,
     ) -> None:
         self._gate = gate
         self.lease = lease
         self._settled = False
+        self.work_class = work_class
         # Cap scope for this invocation (PRD task β): the invoked model when it
         # is a scoped-cap model, else None (the general scope). `report` /
         # `detect_cap_hit` forward it to the gate's cap handlers so a scoped
@@ -629,7 +709,7 @@ class InvokeSlot:
             # transition at all: the SCOPED _handle_cap_detected branch
             # (invariant S5) and _handle_near_cap_warning in EITHER scope.
             self._gate.release_probe_slot(self.token)
-            self._settled = True
+            self._settle_with_verdict(None)
         return hit
 
     def confirm(self, cost_usd: float = 0.0) -> None:
@@ -648,7 +728,7 @@ class InvokeSlot:
             return
         self._gate.confirm_account_ok(self.token)
         self._gate.on_agent_complete(cost_usd)
-        self._settled = True
+        self._settle_with_verdict(cost_usd)
 
     def settle(self) -> None:
         """Mark probe state as externally handled.
@@ -657,7 +737,15 @@ class InvokeSlot:
         ``probe_in_flight`` (e.g. ``_handle_cap_detected`` in heuristic
         cap detection).
         """
+        self._settle_with_verdict(None)
+
+    def _settle_with_verdict(self, cost_usd: float | None) -> None:
+        """Settle the slot's one verdict; the only writer of ``_settled = True``."""
+        if self._settled:
+            return
         self._settled = True
+        if self.lease is not None:
+            self._gate._note_reserve_served(self.lease, self.work_class, cost_usd)
 
     def report(self, outcome: InvocationOutcome) -> None:
         """Apply *outcome*'s gate transition and settle the slot, atomically.
@@ -746,7 +834,7 @@ class InvokeSlot:
                 # None` branch deliberately bypasses _transition (invariant S5)
                 # and returns before any phase write, so without this the
                 # PROBE_IN_FLIGHT claim taken by before_invoke() is never
-                # released, and `finally: _settled = True` below also suppresses
+                # released, and settling in the `finally` below also suppresses
                 # invoke_slot()'s __aexit__ safety net — the account is skipped
                 # by before_invoke's predicate forever.
                 self._gate.release_probe_slot(token)
@@ -758,7 +846,7 @@ class InvokeSlot:
             else:
                 self._gate.release_probe_slot(token)
         finally:
-            self._settled = True
+            self._settle_with_verdict(None)
 
 
 class UsageGate:
@@ -826,8 +914,28 @@ class UsageGate:
     _park_last_logged_at: float | None = None
     _park_waiters: int = 0
 
-    def __init__(self, config: UsageCapConfig, *, cost_store: CostStore | None = None):
+    # The allowance reserve's clock (plans/allowance-reserve-by-account-prd.md
+    # §6.2-6.3): read by reserve decisions only, never by the cap timers, which
+    # keep the wall clock. Declared on the class for the same `__new__` reason
+    # as the park clock above.
+    _reserve_clock: Callable[[], datetime] | None = None
+    # The configured reset whose drift was last recorded: PRD §6.2 inv. 5's
+    # "at most once per week", without storing a calendar.
+    _reserve_drift_noted_for: datetime | None = None
+    # Callers in a reserve wait right now, and the Event that wakes them;
+    # created on first use, so a gate without a reserve never allocates it.
+    _reserve_wait_count: int = 0
+    _reserve_wake: asyncio.Event | None = None
+
+    def __init__(
+        self,
+        config: UsageCapConfig,
+        *,
+        cost_store: CostStore | None = None,
+        reserve_clock: Callable[[], datetime] | None = None,
+    ):
         self._config: UsageCapConfig = config
+        self._reserve_clock = reserve_clock
         self._open = asyncio.Event()
         self._open.set()  # start open
         self._lock = asyncio.Lock()
@@ -1077,7 +1185,7 @@ class UsageGate:
             self._reset_probe_spawn_failures(acct, reason='operator hard reset (SIGHUP)')
 
         # --- Centralized _open recompute (DD-5) ---------------------------
-        if any(a.phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING) for a in self._accounts):
+        if any(a.is_open for a in self._accounts):
             self._open.set()
             # Symmetric counterpart to the closing branch below: consume the
             # gate-level pause into _total_pause_secs and clear
@@ -1132,6 +1240,28 @@ class UsageGate:
         elif new_phase == AccountPhase.PROBE_IN_FLIGHT:
             self._arm_probe_hold(acct)
 
+        self._after_transition_for_reserve(acct, new_phase)
+
+    def _after_transition_for_reserve(self, acct: AccountState, new_phase: AccountPhase) -> None:
+        """The reserve's side of a phase edge (PRD §6.3 and §6.6).
+
+        Reserve waiters wake when an account other than the reserve becomes
+        available or probing, SIGHUP's reset included, and when the reserve
+        fails authentication, which is also recorded; the reserve's other
+        edges leave them be.
+        """
+        rule = self._active_reserve_config()
+        if rule is None:
+            return
+        if acct.name != rule.account:
+            if new_phase in (AccountPhase.AVAILABLE, AccountPhase.PROBING):
+                self._reserve_wake_event().set()
+        elif new_phase == AccountPhase.AUTH_FAILED:
+            self._fire_reserve_event(
+                acct.name, ReserveEvent.ACCOUNT_UNAVAILABLE, {'account': acct.name}
+            )
+            self._reserve_wake_event().set()
+
     async def check_at_startup(self) -> None:
         """No-op: pre-existing caps are detected reactively on first invocation.
 
@@ -1149,6 +1279,7 @@ class UsageGate:
         *,
         scope: str | None = None,
         exclude: Collection[str] | None = None,
+        work_class: WorkClassSource | None = None,
     ) -> AccountLease | None:
         """Select an admissible account and return its lease, or ``None`` —
         SYNCHRONOUSLY, and WITHOUT ever blocking.
@@ -1203,9 +1334,37 @@ class UsageGate:
         selection runs out after at most one pass per account. It is opt-in
         and ``before_invoke`` never passes it, so the blocking policy and the
         orchestrator's ordering are unchanged.
+
+        *work_class* is the caller's class for the allowance reserve
+        (plans/allowance-reserve-by-account-prd.md §6.3), a ``WorkClass`` or a
+        function returning one, resolved once per call; ``None`` is background.
+        With an active reserve, the reserve account is skipped for a class the
+        rule refuses, and in the release window it is tried first. Without
+        one, nothing is resolved and the walk is today's.
         """
-        for acct in self._accounts:
-            if acct.capped or acct.probe_in_flight or acct.auth_failed:
+        return self._select(scope=scope, exclude=exclude, view=self._reserve_view(work_class))
+
+    def _select(
+        self,
+        *,
+        scope: str | None,
+        exclude: Collection[str] | None,
+        view: _ReserveView | None,
+    ) -> AccountLease | None:
+        """:meth:`try_lease`'s walk under *view*, the pass's one reading of the reserve rule."""
+        refused: frozenset[str] = frozenset()
+        walk = self._accounts
+        if view is not None:
+            refused = frozenset(
+                acct.name
+                for acct in self._accounts
+                if refuses_account(view.rule, acct.name, view.caller, view.now)
+            )
+            first = first_choice(view.rule, view.now)
+            if first is not None:
+                walk = sorted(self._accounts, key=lambda acct: acct.name != first)
+        for acct in walk:
+            if not acct.is_open:
                 continue
             if exclude and acct.name in exclude:
                 # Checked BEFORE the PROBE_IN_FLIGHT claim below: selecting a
@@ -1214,6 +1373,11 @@ class UsageGate:
                 # the pool less available the harder a caller bounded itself.
                 # Guarded on a truthy `exclude` so the None/empty path stays
                 # byte-identical for every existing caller.
+                continue
+            if acct.name in refused:
+                # Also BEFORE the probe claim, for the same reason: a caller
+                # the reserve refuses must not take a probing reserve's one
+                # probe slot (PRD §6.3).
                 continue
             if scope is not None and self._scope_capped_at(acct, scope, datetime.now(UTC)):
                 # Scope-capped for this model (S2): skip for this scope
@@ -1286,6 +1450,7 @@ class UsageGate:
         *,
         park: bool = True,
         max_wait_secs: float | None = None,
+        work_class: WorkClassSource | None = None,
     ) -> AccountLease | None:
         """Block until at least one account is available. Return its lease.
 
@@ -1310,6 +1475,13 @@ class UsageGate:
         :class:`PoolFrozen`. *park* ``False`` (task 6042) is the zero allowance:
         it raises before parking at all. The default, ``park=True`` with no
         ``max_wait_secs``, parks until an account reopens.
+
+        *work_class* is the caller's class for the allowance reserve, passed to
+        every selection (see :meth:`try_lease`). A caller the reserve refuses
+        while it is the only open account takes the reserve wait, before the
+        scope branch and whatever its scope (PRD §6.3): the pool is not frozen,
+        so ``_open`` and ``paused_reason`` are left alone, and the same deadline
+        raises a :class:`PoolFrozen` naming the reserve and its release time.
         """
         # Session budget check
         if (
@@ -1322,10 +1494,12 @@ class UsageGate:
             raise RuntimeError(f'No OAuth accounts available {_EMPTY_POOL_FIX_HINT}')
 
         park_deadline = _park_deadline(park, max_wait_secs)
+        scope_park_clock: _ParkClock | None = None
         # Find first non-capped account (works with 1 or N)
         while True:
             async with self._lock:
-                lease = self.try_lease(scope=scope)
+                view = self._reserve_view(work_class)
+                lease = self._select(scope=scope, exclude=None, view=view)
                 if lease is not None:
                     return lease
 
@@ -1333,6 +1507,18 @@ class UsageGate:
             refreshed = await self._refresh_capped_accounts()
             if refreshed:
                 continue  # re-check accounts with updated flags
+
+            # The selection's own view: both read one class and one clock.
+            if view is not None and (refused := self._refusal_in(view)) is not None:
+                park_left = _park_time_left(park_deadline)
+                if park_left is not None and park_left <= 0:
+                    raise self._pool_frozen(None, refused)
+                lease = await self._wait_while_reserve_refuses(
+                    refused, view, work_class, scope, park_deadline
+                )
+                if lease is not None:
+                    return lease
+                continue
 
             if scope is not None:
                 # Scope-aware no-freeze fall-through (task γ, S3/S6). The select
@@ -1350,49 +1536,9 @@ class UsageGate:
                     park_left = _park_time_left(park_deadline)
                     if park_left is not None and park_left <= 0:
                         raise self._pool_frozen(scope)
-                    # Fleet is NOT frozen — at least one account is generally
-                    # serviceable, only this scope is exhausted. Park on the
-                    # per-scope waiter toward the soonest scope reset (or the
-                    # max-probe ceiling when unknown) WITHOUT ever touching _open
-                    # or _paused_reason, so scope exhaustion can never freeze the
-                    # fleet (S3) nor delay a concurrent scope=None caller. On
-                    # timeout the loop re-runs the selection-time sweep. INV-4:
-                    # this always eventually returns an account rather than
-                    # blocking indefinitely, so the caller's slot.report(CapHit)
-                    # re-detection advances consecutive_cap_hits and the existing
-                    # max_cap_retries/AllAccountsCappedException bound applies; the
-                    # reactive re-cap installs a FUTURE deadline so uncaps are
-                    # spaced, not a tight spin.
-                    soonest = self._soonest_scope_reset(scope)
-                    sleep_for = (
-                        max(0.0, (soonest - datetime.now(UTC)).total_seconds())
-                        if soonest is not None
-                        else float(self._config.max_probe_interval_secs)
+                    scope_park_clock = await self._park_for_scope(
+                        scope, evt, park_left, scope_park_clock
                     )
-                    # Robustness (task 2857 amendment): the per-scope waiter is
-                    # set() ONLY by the scope-uncap sweep, so it does NOT wake on
-                    # an account-level transition that opens scope headroom. The
-                    # common such case is a PROBE_IN_FLIGHT account finishing its
-                    # probe and going AVAILABLE (confirm_account_ok) — is_paused
-                    # ignores probe_in_flight, so a scoped caller can park here
-                    # while the only otherwise-selectable account is mid-probe.
-                    # When a probe is outstanding, cap the park at a small
-                    # re-poll ceiling so the selection-time sweep re-runs within a
-                    # bounded delay instead of sleeping toward the full scope
-                    # deadline / max_probe_interval_secs. This still never touches
-                    # _open / _paused_reason (S3) and never tight-spins (the
-                    # ceiling is strictly positive); the pure scope-exhaustion
-                    # steady state (no probe in flight) is unchanged — it sleeps
-                    # toward the real deadline. (A bare `await self._open.wait()`
-                    # here would busy-spin: the fleet is NOT frozen precisely
-                    # because some account is generally AVAILABLE, so _open is
-                    # already set and would return at once.)
-                    if any(a.probe_in_flight for a in self._accounts):
-                        sleep_for = min(sleep_for, _SCOPE_WAIT_REPOLL_CEIL_SECS)
-                    if park_left is not None:
-                        sleep_for = min(sleep_for, park_left)
-                    with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(evt.wait(), timeout=sleep_for)
                     continue
                 # else: self.is_paused → the fleet is genuinely frozen (every
                 # account account-level capped/auth_failed). Fall through to the
@@ -1408,7 +1554,10 @@ class UsageGate:
             # _open recompute entirely. This clear() is derived independently:
             # the for-loop above just confirmed every account is non-AVAILABLE
             # and non-PROBING, so clearing here is always correct regardless of
-            # how _open drifted.
+            # how _open drifted. The walk withholds an open account from a caller
+            # in one case only, the reserve refusing it, and the reserve wait
+            # above has already diverted that case: the walk and the refusal
+            # test read one view.
             park_left = _park_time_left(park_deadline)
             if park_left is not None and park_left <= 0:
                 raise self._pool_frozen(None)
@@ -1416,14 +1565,134 @@ class UsageGate:
             self._open.clear()
             await self._wait_for_any_account_to_reopen(park_deadline)
 
-    def _pool_frozen(self, scope: str | None) -> PoolFrozen:
+    def _reserve_now(self) -> datetime:
+        clock = self._reserve_clock
+        return clock() if clock is not None else datetime.now(UTC)
+
+    def _active_reserve_config(self) -> ReserveConfig | None:
+        """The reserve rule in force, or None: the one gate-side test of "the rule applies"."""
+        reserve = self._config.reserve
+        return reserve.config if isinstance(reserve, ActiveReserve) else None
+
+    def _reserve_view(self, work_class: WorkClassSource | None) -> _ReserveView | None:
+        rule = self._active_reserve_config()
+        return None if rule is None else self._view_under(rule, work_class)
+
+    def _view_under(self, rule: ReserveConfig, work_class: WorkClassSource | None) -> _ReserveView:
+        return _ReserveView(rule, resolve_work_class(work_class), self._reserve_now())
+
+    def reserve_refusal(self, work_class: WorkClassSource | None) -> ReserveRefusal | None:
+        """The refusal an unscoped caller of *work_class* would meet now, or None.
+
+        PRD §6.4: a refusal exactly when every open account (``AccountState.is_open``)
+        is the reserve, and the rule refuses this class; None when nothing at all
+        is open. It changes nothing and claims nothing.
+        """
+        view = self._reserve_view(work_class)
+        return None if view is None else self._refusal_in(view)
+
+    def _refusal_in(self, view: _ReserveView) -> ReserveRefusal | None:
+        return refusal(view.rule, self._open_account_names(), view.caller, view.now)
+
+    def _open_account_names(self) -> list[str]:
+        return [acct.name for acct in self._accounts if acct.is_open]
+
+    @property
+    def reserve_state(self) -> ReserveState | None:
+        """Whether the accounts file's reserve is active or invalid; None without a block."""
+        reserve = self._config.reserve
+        return None if reserve is None else reserve.state
+
+    def _pool_frozen(
+        self, scope: str | None, refused: ReserveRefusal | None = None
+    ) -> PoolFrozen:
         """The :class:`PoolFrozen` describing this gate right now."""
         return PoolFrozen(
             account_count=self.account_count,
             capped_account_names=self.capped_account_names,
             auth_failed_account_names=self.auth_failed_account_names,
             scope=scope,
+            reserved_account=refused.account if refused is not None else None,
+            release_at=refused.release_at if refused is not None else None,
         )
+
+    async def _park_for_scope(
+        self,
+        scope: str,
+        evt: asyncio.Event,
+        park_left: float | None,
+        clock: _ParkClock | None,
+    ) -> _ParkClock:
+        """One pass of the scoped no-freeze park (task γ, S3/S6), announced as it waits.
+
+        Reached only while the fleet is OPEN and no account is selectable for
+        *scope*: *scope* is capped on every serviceable account, or the only
+        account that could serve it is mid-probe. So it waits on the
+        per-scope waiter *evt*, toward the soonest scope reset or, when none is
+        known, ``max_probe_interval_secs``, and never touches ``_open`` or
+        ``_paused_reason``: scope exhaustion can neither freeze the fleet (S3)
+        nor delay a concurrent ``scope=None`` caller. A bare
+        ``self._open.wait()`` would busy-spin, ``_open`` being already set. On
+        return ``before_invoke`` re-runs selection and the sweeps, so it
+        eventually returns an account (INV-4): the caller's
+        ``slot.report(CapHit)`` then advances ``consecutive_cap_hits`` under the
+        ``max_cap_retries`` bound, and the reactive re-cap installs a FUTURE
+        deadline, spacing the uncaps rather than spinning.
+
+        PROBE RE-POLL (task 2857 amendment). Only the scope-uncap sweep sets
+        *evt*. An account-level transition that opens scope headroom, chiefly
+        a PROBE_IN_FLIGHT account confirming and going AVAILABLE, does not,
+        and ``is_paused`` ignores probe_in_flight. So while any probe is
+        outstanding the wait is capped at ``_SCOPE_WAIT_REPOLL_CEIL_SECS``,
+        strictly positive, so it never tight-spins. *park_left* is what remains
+        of the caller's ``max_wait_secs``.
+
+        THE HEARTBEAT (task 7243) is per waiter: *clock* is this caller's,
+        handed back for its next pass, and it dies with ``before_invoke``'s
+        frame, so an abandoned park has nothing to bequeath. It logs at most
+        once per ``_SCOPE_PARK_LOG_INTERVAL_SECS``, however often the probe
+        re-poll wakes it. The log line is purely additive: it changes neither
+        what ``before_invoke`` returns nor when it unblocks.
+
+        THE WAIT CAP. The same interval is also the longest single wait of this
+        park, as ``_ALL_CAPPED_PARK_LOG_INTERVAL_SECS`` is for the fleet park, so
+        a park hours from its scope reset keeps announcing itself. The cap can
+        only make the park unblock earlier, never later: each wakeup re-runs
+        selection and the sweeps, so an account-level reset, which sets no
+        scope waiter, is served within one interval rather than at the scope
+        deadline.
+        """
+        now = time.monotonic()
+        clock = clock or _ParkClock(started=now)
+        soonest = self._soonest_scope_reset(scope)
+        if (
+            clock.last_logged is None
+            or now - clock.last_logged >= _SCOPE_PARK_LOG_INTERVAL_SECS
+        ):
+            logger.warning(
+                self._park_heartbeat(
+                    'scoped_park',
+                    now - clock.started,
+                    scope=scope,
+                    soonest_scope_reset_at=(
+                        soonest.isoformat() if soonest is not None else None
+                    ),
+                )
+            )
+            clock = replace(clock, last_logged=now)
+        sleep_for = min(
+            _SCOPE_PARK_LOG_INTERVAL_SECS,
+            max(0.0, (soonest - datetime.now(UTC)).total_seconds())
+            if soonest is not None
+            else float(self._config.max_probe_interval_secs),
+        )
+        if any(a.probe_in_flight for a in self._accounts):
+            sleep_for = min(sleep_for, _SCOPE_WAIT_REPOLL_CEIL_SECS)
+        if park_left is not None:
+            sleep_for = min(sleep_for, park_left)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(evt.wait(), timeout=sleep_for)
+        return clock
 
     async def _wait_for_any_account_to_reopen(self, deadline: float | None) -> None:
         """Block until ``_open`` is set or *deadline* passes, announcing the
@@ -1544,24 +1813,7 @@ class UsageGate:
                     >= _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
                 ):
                     logger.warning(
-                        json.dumps(
-                            {
-                                'event': 'all_capped_park',
-                                'elapsed_s': round(now - self._park_started_at, 1),
-                                'account_count': self.account_count,
-                                'capped_accounts': list(self.capped_account_names),
-                                'auth_failed_accounts': list(self.auth_failed_account_names),
-                                'probe_in_flight_accounts': list(
-                                    self.probe_in_flight_account_names
-                                ),
-                                'soonest_open_at': (
-                                    self.soonest_resets_at.isoformat()
-                                    if self.soonest_resets_at
-                                    else None
-                                ),
-                            },
-                            default=str,
-                        )
+                        self._park_heartbeat('all_capped_park', now - self._park_started_at)
                     )
                     self._park_last_logged_at = now
                 wait_for = _ALL_CAPPED_PARK_LOG_INTERVAL_SECS
@@ -1580,6 +1832,142 @@ class UsageGate:
         finally:
             self._park_waiters -= 1
 
+    def _park_heartbeat(self, event: str, elapsed_s: float, **extra: object) -> str:
+        """A parked caller's heartbeat line: the pool snapshot, then *extra*."""
+        return json.dumps(
+            {
+                'event': event,
+                'elapsed_s': round(elapsed_s, 1),
+                'account_count': self.account_count,
+                'capped_accounts': list(self.capped_account_names),
+                'auth_failed_accounts': list(self.auth_failed_account_names),
+                'probe_in_flight_accounts': list(self.probe_in_flight_account_names),
+                'soonest_open_at': (
+                    self.soonest_resets_at.isoformat() if self.soonest_resets_at else None
+                ),
+                **extra,
+            },
+            default=str,
+        )
+
+    async def _wait_while_reserve_refuses(
+        self,
+        refused: ReserveRefusal,
+        view: _ReserveView,
+        source: WorkClassSource | None,
+        scope: str | None,
+        deadline: float | None,
+    ) -> AccountLease | None:
+        """Wait while the reserve, refused to this caller, is all it could have (PRD §6.3).
+
+        One wait however often the caller is refused again: one
+        ``reserve_wait_started`` and one ``reserve_wait_ended`` row, the latter
+        naming its exit. Selection re-runs at the first of the wake Event, the
+        release time, ``_RESERVE_WAIT_REPOLL_SECS`` and *deadline*. Exits: a
+        lease (account_opened, released or admitted); None when the caller
+        cannot be served here any more (:func:`wait_end_without_lease`), for
+        ``before_invoke`` to take the scope or all-capped path;
+        :class:`PoolFrozen` at the deadline; cancellation. It counts nothing
+        toward a cap. *refused* and *view* are the entry pass's; each pass reads
+        its own, so the heartbeat, the deadline's PoolFrozen and the rows name
+        the release and class the last pass read, and the caller's class
+        function runs only in selection.
+        """
+        started = time.monotonic()
+        last_logged: float | None = None
+        ended_by = ReserveWaitEnd.CANCELLED
+        unclassified = source is None
+        self._reserve_wait_count += 1
+        try:
+            self._fire_reserve_event(
+                refused.account,
+                ReserveEvent.WAIT_STARTED,
+                wait_started_details(view.caller, refused, unclassified=unclassified),
+            )
+            while True:
+                wake = self._reserve_wake_event()
+                wake.clear()
+                await self._refresh_capped_accounts()
+                async with self._lock:
+                    view = self._view_under(view.rule, source)
+                    lease = self._select(scope=scope, exclude=None, view=view)
+                if lease is not None:
+                    ended_by = wait_end_for_lease(view.rule, lease.name, view.now)
+                    return lease
+                end = wait_end_without_lease(
+                    view.rule,
+                    self._open_account_names(),
+                    (*self.capped_account_names, *self.auth_failed_account_names),
+                    view.caller,
+                    view.now,
+                )
+                if end is not None:
+                    ended_by = end
+                    return None
+                refused = ReserveRefusal(view.rule.account, view.rule.release_at(view.now))
+                time_left = _park_time_left(deadline)
+                if time_left is not None and time_left <= 0:
+                    ended_by = ReserveWaitEnd.DEADLINE
+                    raise self._pool_frozen(None, refused)
+                now = time.monotonic()
+                if last_logged is None or now - last_logged >= _RESERVE_WAIT_LOG_INTERVAL_SECS:
+                    logger.warning(
+                        self._park_heartbeat(
+                            'reserve_wait',
+                            now - started,
+                            reserve_account=refused.account,
+                            release_at=refused.release_at.isoformat(),
+                            kind=view.caller.kind.value,
+                            tier=view.caller.tier,
+                            task_id=view.caller.task_id,
+                        )
+                    )
+                    last_logged = now
+                until_release = (refused.release_at - view.now).total_seconds()
+                sleep_for = min(_RESERVE_WAIT_REPOLL_SECS, until_release)
+                if time_left is not None:
+                    sleep_for = min(sleep_for, time_left)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(wake.wait(), timeout=sleep_for)
+        finally:
+            self._reserve_wait_count -= 1
+            self._fire_reserve_event(
+                refused.account,
+                ReserveEvent.WAIT_ENDED,
+                wait_ended_details(
+                    view.caller,
+                    refused,
+                    unclassified=unclassified,
+                    waited_secs=time.monotonic() - started,
+                    ended_by=ended_by,
+                ),
+            )
+
+    def _note_reserve_served(
+        self, lease: AccountLease, source: WorkClassSource | None, cost_usd: float | None
+    ) -> None:
+        """Record a call on the reserve settling in its protected window (PRD §6.6)."""
+        rule = self._active_reserve_config()
+        if self._cost_store is None or rule is None or lease.name != rule.account:
+            return
+        if rule.in_release_window(self._reserve_now()):
+            return
+        self._fire_reserve_event(
+            lease.name,
+            ReserveEvent.SERVED,
+            served_details(resolve_work_class(source), cost_usd=cost_usd),
+        )
+
+    def _reserve_wake_event(self) -> asyncio.Event:
+        if self._reserve_wake is None:
+            self._reserve_wake = asyncio.Event()
+        return self._reserve_wake
+
+    @property
+    def reserve_waiters(self) -> int:
+        """The number of callers in a reserve wait right now (PRD §6.3)."""
+        return self._reserve_wait_count
+
     def _release_park_clock(self) -> None:
         """Clear the shared heartbeat clock as a parked caller leaves, unless a
         sibling is still parked: a frozen pool typically has many waiters, so
@@ -1596,12 +1984,18 @@ class UsageGate:
         *,
         park: bool = True,
         max_wait_secs: float | None = None,
+        work_class: WorkClassSource | None = None,
     ):
         """Acquire an account slot, releasing the probe lock on any exit path.
 
         *park* and *max_wait_secs* are forwarded to :meth:`before_invoke`: a
         spent park allowance raises :class:`PoolFrozen` out of the
         ``async with``, before any account is claimed.
+
+        *work_class*, the caller's class for the allowance reserve, is forwarded
+        to :meth:`before_invoke` when given, so a refused caller takes the
+        reserve wait there and a spent allowance raises a :class:`PoolFrozen`
+        naming the reserve.
 
         Yields an :class:`InvokeSlot` whose ``token`` and ``account_name``
         are ready to use.  On exit, if neither :meth:`~InvokeSlot.detect_cap_hit`
@@ -1628,10 +2022,11 @@ class UsageGate:
                     break          # probe settled by confirm
                 # any other exit path (continue, exception): auto-released
         """
+        reserve_kwargs = {} if work_class is None else {'work_class': work_class}
         lease = await self.before_invoke(
-            scope=scope, park=park, max_wait_secs=max_wait_secs,
+            scope=scope, park=park, max_wait_secs=max_wait_secs, **reserve_kwargs,
         )
-        slot = InvokeSlot(self, lease, scope=scope)
+        slot = InvokeSlot(self, lease, scope=scope, work_class=work_class)
         try:
             yield slot
         finally:
@@ -1946,6 +2341,7 @@ class UsageGate:
         # _refresh_capped_accounts, independent of whether a phase edge fires.
         acct.resets_at = resets_at
         logger.warning(f'Account {acct.name} CAPPED: {reason}')
+        self._note_reserve_drift(acct, resets_at)
         if acct.phase != AccountPhase.CAPPED:
             # _transition owns: the phase write, near_cap clear, the
             # centralized _open recompute, cancelling/starting the
@@ -1956,6 +2352,28 @@ class UsageGate:
             # and re-fire the cost event on every repeat detection.
             self._transition(acct, AccountPhase.CAPPED, resets_at=resets_at, reason=reason)
         return True
+
+    def _note_reserve_drift(self, acct: AccountState, resets_at: datetime | None) -> None:
+        """Record a reserve cap banner whose reset drifted from the configured one (PRD §6.2 inv. 5).
+
+        Account-level caps only: a scoped banner reports its model's own limit, not the account's
+        weekly reset. Recorded at most once per configured reset; the calendar never moves.
+        """
+        rule = self._active_reserve_config()
+        if rule is None or resets_at is None or acct.name != rule.account:
+            return
+        drift = schedule_drift(rule, resets_at)
+        if drift is None or drift.configured_reset == self._reserve_drift_noted_for:
+            return
+        self._reserve_drift_noted_for = drift.configured_reset
+        self._fire_reserve_event(
+            acct.name,
+            ReserveEvent.SCHEDULE_DRIFT,
+            {
+                'configured_reset': drift.configured_reset.isoformat(),
+                'observed_reset': drift.observed_reset.isoformat(),
+            },
+        )
 
     def _handle_near_cap_warning(
         self,
@@ -2384,6 +2802,29 @@ class UsageGate:
             )
         except Exception as exc:
             logger.warning('CostStore write failed for %s/%s: %s', account_name, event_type, exc)
+
+    def attach_cost_store(self, store: CostStore) -> None:
+        """Give the gate its event store after construction: the one way to do so.
+
+        With a ``reserve:`` block in the accounts file it records ``reserve_config``
+        there (PRD §6.6): the account, calendar and tiers of an active reserve, or
+        an invalid one's reason under account name ``''``. The row goes through the
+        fire-and-forget event writer, so call this on a running event loop. A store
+        passed to the constructor records no ``reserve_config`` row.
+        """
+        self._cost_store = store
+        reserve = self._config.reserve
+        if reserve is None:
+            return
+        account_name = reserve.config.account if isinstance(reserve, ActiveReserve) else ''
+        self._fire_reserve_event(
+            account_name, ReserveEvent.CONFIG, config_event_details(reserve, self._reserve_now())
+        )
+
+    def _fire_reserve_event(
+        self, account_name: str, event: ReserveEvent, details: dict[str, object]
+    ) -> None:
+        self._fire_cost_event(account_name, event.value, json.dumps(details))
 
     def _fire_cost_event(
         self,

@@ -166,6 +166,65 @@ class TestParsePressureFileBothWindows:
         }
 
 
+class TestParsePressureTotals:
+    """The cumulative ``total=`` stall (µs) — a second projection of one scan.
+
+    PRD ``plans/per-consumer-resource-recording-prd.md`` D7 reads cgroup
+    pressure files for their totals; ``parse_pressure_file`` keeps its
+    four-key averages shape, pinned by the classes above.
+    """
+
+    def test_both_lines(self):
+        from shared.psi import parse_pressure_totals
+
+        assert parse_pressure_totals(PSI_CPU_TEXT) == {
+            'some_total': 123456,
+            'full_total': 9876,
+        }
+
+    def test_missing_full_line_defaults_to_zero(self):
+        from shared.psi import parse_pressure_totals
+
+        assert parse_pressure_totals(PSI_MEM_TEXT) == {
+            'some_total': 654321,
+            'full_total': 0,
+        }
+
+    @pytest.mark.parametrize(
+        'text',
+        ['', 'garbage line\n', 'some avg10=1.50 avg60=0.20 avg300=0.10\n', 'total=5\n'],
+    )
+    def test_no_total_returns_none(self, text):
+        from shared.psi import parse_pressure_totals
+
+        assert parse_pressure_totals(text) is None
+
+    def test_averages_are_never_mistaken_for_totals(self):
+        from shared.psi import parse_pressure_totals
+
+        assert parse_pressure_totals(
+            'some avg10=1.00 avg60=2.00 avg300=3.00 total=5\n'
+        ) == {'some_total': 5, 'full_total': 0}
+
+    def test_averages_shape_is_unchanged_by_the_totals_projection(self):
+        from shared.psi import parse_pressure_file
+
+        for text in (PSI_CPU_TEXT, PSI_MEM_TEXT, PSI_IO_TEXT):
+            result = parse_pressure_file(text)
+            assert result is not None
+            assert set(result) == {
+                'some_avg10',
+                'some_avg60',
+                'full_avg10',
+                'full_avg60',
+            }
+
+    def test_exported(self):
+        import shared.psi
+
+        assert 'parse_pressure_totals' in shared.psi.__all__
+
+
 class TestPsiSampleV2Fields:
     """PRD `plans/load-throttle-harmonisation-prd.md` §6.1 — the v2 field surface.
 
@@ -722,6 +781,12 @@ CGROUP_NO_SLICE = (
 SLICE_PATH = '/user.slice/user-1000.slice/user@1000.service/df.slice/df-x.slice'
 SCOPE_PATH = f'{SLICE_PATH}/df-verify-x-0123456789ab.scope'
 UNIT_PATH = '/user.slice/user-1000.slice/user@1000.service/app.slice/orchestrator-x.service'
+# plans/per-consumer-resource-recording-prd.md D10 is the home of the daemon-subgroup shape.
+CGROUP_IN_DAEMON_SUBGROUP = (
+    '0::/user.slice/user-1000.slice/user@1000.service/'
+    'df.slice/df-x.slice/orchestrator-x.service/daemon\n'
+)
+DAEMON_PATH = f'{SLICE_PATH}/orchestrator-x.service/daemon'
 
 
 @pytest.fixture(autouse=True)
@@ -782,6 +847,30 @@ class TestResolveOwnCgroup:
 
         assert own.path == UNIT_PATH
         assert own.pressure_path == tmp_path / 'sys' / UNIT_PATH.lstrip('/') / 'cpu.pressure'
+
+    def test_daemon_subgroup_resolves_to_the_project_slice(self, tmp_path):
+        from shared.psi import resolve_own_cgroup
+
+        own = resolve_own_cgroup(
+            'x',
+            proc_cgroup_path=self._cgroup_file(tmp_path, CGROUP_IN_DAEMON_SUBGROUP),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == SLICE_PATH
+        assert own.pressure_path == tmp_path / 'sys' / SLICE_PATH.lstrip('/') / 'cpu.pressure'
+
+    def test_daemon_subgroup_without_project_id_resolves_to_the_raw_leaf(self, tmp_path):
+        """The raw leaf is what the harness hands the slice weight step."""
+        from shared.psi import resolve_own_cgroup
+
+        own = resolve_own_cgroup(
+            None,
+            proc_cgroup_path=self._cgroup_file(tmp_path, CGROUP_IN_DAEMON_SUBGROUP),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path == DAEMON_PATH
 
     def test_none_project_id_resolves_to_the_leaf(self, tmp_path):
         from shared.psi import resolve_own_cgroup

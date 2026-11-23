@@ -4,38 +4,57 @@
 The seeded slate (``eval_write_triage_cases.py::seeded_plan``) is a
 CONSTRUCTION — the correct canonical hoisted to position 0 with a synthetic
 top score. This module is the measured alternative: it drives the shipped
-``retrieve_candidates``, ``decide_band`` and ``select_judge_candidates`` so a
-case's slate, its attach target and its band are the ones production would
-have produced for that content against the live corpus.
+``retrieve_candidates``, ``decide_band``, ``route_band`` and
+``select_judge_candidates`` so a case's slate, its attach target, its band and
+its route are the ones production would have produced for that content against
+the live corpus.
 
 Nothing here decides what "correct" means, and nothing here calls an LLM. It
 produces :class:`Slate` values; ``eval_write_triage_cases.py::plan_from_slates``
-pairs them with the curator labels, and the eval scores them.
+pairs them with the curator labels, and the eval scores them. A
+:class:`SlateSnapshot` keeps one retrieval on disk so several runs judge it.
 
 Imported by path, the same way the eval script imports the calibrator —
-``scripts/`` is not an importable package.
+``scripts/`` is not an importable package. It imports only
+``eval_write_triage_scoring.py``, for the band vocabulary a snapshot is held to.
 """
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, fields
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
     canonical_id_of,
     decide_band,
     retrieve_candidates,
+    route_band,
 )
 from fused_memory.server.write_triage_judge import select_judge_candidates
+from fused_memory.utils.script_loader import load_script
 
 logger = logging.getLogger(__name__)
+
+_SCRIPTS = Path(__file__).resolve().parent
+
+
+# Pyright cannot follow the by-path loader, so it alone resolves `_scoring` through
+# the scripts/ extraPath; at runtime the module is always the by-path load.
+if TYPE_CHECKING:
+    import eval_write_triage_scoring as _scoring
+else:
+    _scoring = load_script(
+        _SCRIPTS / 'eval_write_triage_scoring.py', 'eval_write_triage_scoring',
+    )
 
 
 @dataclass(frozen=True)
 class Slate:
-    """One record's production-shaped candidate set and the band it fell in.
+    """One record's production-shaped candidate set, its band and its route.
 
     ``candidates`` are the records ``select_judge_candidates`` kept, in the
     order the prompt renders them; ``attach_target_id`` is
@@ -47,12 +66,94 @@ class Slate:
     memory_id: str
     candidates: tuple[Mapping[str, Any], ...]
     attach_target_id: str | None
+    #: The ``decide_band`` cosine label, which the band split reads.
     band: str
+    #: The outcome ``route_band`` routes the write to, i.e. what reaches the judge.
+    routed: str
     similarity: float | None
     canonical_present: bool
     retrieved_count: int
     degraded: bool
     self_retrieved: bool
+
+
+#: The on-disk shape of a :class:`SlateSnapshot`; a file of any other is refused.
+SLATE_SNAPSHOT_SCHEMA_VERSION = 1
+
+
+def _require_fields(payload: Mapping[str, Any], cls: type, where: str) -> None:
+    missing = [f.name for f in fields(cls) if f.name not in payload]
+    if missing:
+        raise ValueError(f'{where} is missing field(s) {missing}')
+
+
+def _require_bands(entry: Mapping[str, Any], where: str) -> None:
+    """Refuse a slate whose ``band`` or ``routed`` no ``decide_band``/``route_band`` returns.
+
+    Checked on load, so a corrupt snapshot is refused before any case is judged
+    and paid for, rather than at scoring after all of them.
+    """
+    for name in ('band', 'routed'):
+        if entry[name] not in _scoring.EVAL_BANDS:
+            raise ValueError(
+                f'{where} ({entry["memory_id"]}): {name} {entry[name]!r} is outside '
+                f'{list(_scoring.EVAL_BANDS)}',
+            )
+
+
+@dataclass(frozen=True)
+class SlateSnapshot:
+    """A measured retrieval: one retrieval, banded, routed and trimmed, that several judge runs can be judged over.
+
+    The band edges, widths and project are the ones the slates were measured
+    at. Loading rebuilds each :class:`Slate` field by field as it was
+    measured; nothing is re-banded or re-routed.
+    """
+
+    project_id: str
+    t_high: float | None
+    t_low: float | None
+    candidate_k: int
+    judge_candidate_count: int
+    slates: tuple[Slate, ...]
+
+    def dump(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {f.name: getattr(self, f.name) for f in fields(self)}
+        payload['slates'] = [
+            {
+                **{f.name: getattr(slate, f.name) for f in fields(slate)},
+                'candidates': [dict(row) for row in slate.candidates],
+            }
+            for slate in self.slates
+        ]
+        path.write_text(json.dumps(
+            {'schema_version': SLATE_SNAPSHOT_SCHEMA_VERSION, **payload}, indent=2,
+        ) + '\n')
+
+    @classmethod
+    def load(cls, path: str | Path) -> SlateSnapshot:
+        payload = json.loads(Path(path).read_text())
+        version = payload.get('schema_version')
+        if version != SLATE_SNAPSHOT_SCHEMA_VERSION:
+            raise ValueError(
+                f'{path}: schema_version {version!r} is not this module\'s '
+                f'{SLATE_SNAPSHOT_SCHEMA_VERSION}',
+            )
+        _require_fields(payload, cls, str(path))
+        slates = []
+        for index, entry in enumerate(payload['slates']):
+            _require_fields(entry, Slate, f'{path}: slate {index}')
+            _require_bands(entry, f'{path}: slate {index}')
+            slates.append(Slate(**{
+                **{f.name: entry[f.name] for f in fields(Slate)},
+                'candidates': tuple(entry['candidates']),
+            }))
+        return cls(**{
+            **{f.name: payload[f.name] for f in fields(cls)},
+            'slates': tuple(slates),
+        })
 
 
 async def prefetch_retrievals(
@@ -103,12 +204,13 @@ def retrieved_slates(
     t_low: float | None,
     judge_candidate_count: int,
 ) -> list[Slate]:
-    """Band and trim each record's retrieval exactly as ``triage_write`` does.
+    """Band, route and trim each record's retrieval exactly as ``triage_write`` does.
 
-    ``decide_band`` sees the WHOLE retrieval; ``select_judge_candidates`` trims
-    to what the prompt would carry. The trim is run for every band, not just
-    the middle one, so a deterministic or below-floor case still records the
-    slate its band was decided on.
+    ``decide_band`` labels the band and ``route_band`` routes the record's own
+    content, both over the WHOLE retrieval; ``select_judge_candidates`` trims
+    to what the prompt would carry. The trim is run for every route, not just
+    the judged one, so a deterministic or below-floor case still records the
+    slate its route was decided on.
 
     A degraded retrieval is a counted fail-open in production and reaches here
     as an ordinary empty result, so it is warned about rather than banded
@@ -130,7 +232,10 @@ def retrieved_slates(
         memory_id = str(record['memory_id'])
         retrieval = retrievals[memory_id]
         rows = list(retrieval['results'])
-        decision = decide_band(rows, t_high=t_high, t_low=t_low)
+        band = decide_band(rows, t_high=t_high, t_low=t_low)
+        decision = route_band(
+            rows, content=str(record['content']), t_high=t_high, t_low=t_low,
+        )
         selected = select_judge_candidates(
             rows, judge_candidate_count, canonical_id=decision.canonical_id,
         )
@@ -138,7 +243,8 @@ def retrieved_slates(
             memory_id=memory_id,
             candidates=tuple(normalize(row) for row in selected),
             attach_target_id=decision.canonical_id,
-            band=decision.outcome,
+            band=band.outcome,
+            routed=decision.outcome,
             similarity=decision.similarity,
             canonical_present=bool(retrieval['canonical_present']),
             retrieved_count=len(rows),

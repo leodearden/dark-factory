@@ -507,6 +507,22 @@ class TestPlanFromSlates:
         assert deterministic['band'] == OUTCOME_RESTATED
         assert deterministic['band_winner_id'] == 'zz'
 
+    def test_each_case_carries_its_slates_route_beside_its_band(self) -> None:
+        slates = [
+            _slate('c1-dup-1', candidates=[_live('c1-canon')], band_winner_id='c1-canon',
+                   band=OUTCOME_RESTATED, routed=OUTCOME_JUDGE),
+            _slate('c2-distinct', candidates=[_live('zz')], band_winner_id='zz',
+                   band=OUTCOME_RESTATED),
+        ]
+        plan = _cases_mod().plan_from_slates(self._records(), slates, provenance={})
+        assert [(c['band'], c['routed']) for c in plan.cases] == [
+            (OUTCOME_RESTATED, OUTCOME_JUDGE), (OUTCOME_RESTATED, OUTCOME_RESTATED),
+        ]
+
+    def test_a_seeded_case_is_routed_to_the_judge(self) -> None:
+        plan = _cases_mod().seeded_plan(_corpus(), distractors=2)
+        assert {c['routed'] for c in plan.cases} == {OUTCOME_JUDGE}
+
     def test_a_record_whose_canonical_is_gone_stays_in_the_population(self) -> None:
         """They are production reality, so dropping them would flatter the run."""
         plan = self._plan()
@@ -635,6 +651,21 @@ class TestAJudgeBandCaseIsNeverShownAnEmptySlate:
             'd1', candidates=[_live('canon')], band_winner_id='canon', band=OUTCOME_JUDGE,
         ))
         assert [c['candidates'] for c in plan.cases] == [['canon']]
+
+    def test_a_restate_band_case_routed_to_the_judge_is_refused_on_an_empty_slate(
+        self,
+    ) -> None:
+        with pytest.raises(ValueError, match='d-routed'):
+            self._retrieved(_slate(
+                'd-routed', candidates=[], band_winner_id=None,
+                band=OUTCOME_RESTATED, routed=OUTCOME_JUDGE,
+            ))
+
+    def test_a_case_routed_restated_with_an_empty_slate_is_accepted(self) -> None:
+        plan = self._retrieved(_slate(
+            'd1', candidates=[], band_winner_id='canon', band=OUTCOME_RESTATED,
+        ))
+        assert [c['candidates'] for c in plan.cases] == [[]]
 
     def test_a_stored_band_with_an_empty_slate_is_accepted(self) -> None:
         """Production's own novel or degraded path, answered with no judge at all."""

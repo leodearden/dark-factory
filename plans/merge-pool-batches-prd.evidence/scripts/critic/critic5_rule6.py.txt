@@ -1,0 +1,71 @@
+"""Draft-6 cost rule, as written in the PRD's 6.5. Prints going costs, the batch a new/cleared front builds,
+and the scan predicate's break-even tree cost."""
+import math
+
+def fb_release(n, p, a_f):
+    """Fallback: each alone in order; once one is blocked the rest return as new."""
+    if n <= 1: return 0.0
+    r_n = 1 - (1 - p) ** n
+    if r_n <= 0: return 0.0
+    bbar = sum((j - 1) * (1 - p) ** (j - 1) * p for j in range(1, n + 1)) / r_n
+    return bbar + 1 + (n - 1 - bbar) * a_f
+
+def cost(f, c, q, r, t, u, a_f, a_c, fb=fb_release, scan='auto'):
+    n = f + c
+    if n == 1: return 1.0
+    P = 1 - (1 - q) ** f * (1 - r) ** c
+    if P <= 0: return 1.0
+    k = (f * q + c * r) / P
+    pbar = (f * q + c * r) / n
+    F = fb(n, pbar, a_f)
+    would = scan == 'on' or (scan == 'auto' and (n + 2) * t < F)
+    s = (1 - u) if would else 0.0
+    return 1 + P * (s * (n - k) * a_c + (1 - s) * F)
+
+def going(q, r, t, u, mf=12, mt=24, fb=fb_release, scan='auto'):
+    a_f, a_c = 1.0, 1 / mt
+    for _ in range(200):
+        na_c = min(cost(0, c, q, r, t, u, a_f, a_c, fb, scan) / c for c in range(1, mt + 1))
+        na_f = min(cost(f, 0, q, r, t, u, a_f, na_c, fb, scan) / f for f in range(1, mf + 1))
+        if abs(na_c - a_c) < 1e-9 and abs(na_f - a_f) < 1e-9: break
+        a_f, a_c = na_f, na_c
+    return a_f, a_c
+
+def plan(front, cands, q, r, t, u, mf=12, mt=24, fb=fb_release, scan='auto'):
+    a_f, a_c = going(q, r, t, u, mf, mt, fb, scan)
+    f, c = (1, 0) if front == 'new' else (0, 1)
+    for kind in cands:
+        if f + c >= mt: break
+        if kind == 'new' and f >= mf: continue
+        nf, nc = (f + 1, c) if kind == 'new' else (f, c + 1)
+        add = cost(nf, nc, q, r, t, u, a_f, a_c, fb, scan) - cost(f, c, q, r, t, u, a_f, a_c, fb, scan)
+        if add < (a_f if kind == 'new' else a_c): f, c = nf, nc
+    return f, c
+
+if __name__ == '__main__':
+    r, t = 0.01, 0.05
+    for u in (0.07, 0.16):
+        print(f'--- u={u} r={r} t={t}')
+        for q in (0.03, 0.05, 0.08, 0.14, 0.20):
+            a_f, a_c = going(q, r, t, u)
+            print(f'q={q:.2f} A_new={a_f:.3f} A_cleared={a_c:.3f}',
+                  'new front + 20 new + 10 cleared ->', plan('new', ['new'] * 20 + ['cleared'] * 10, q, r, t, u),
+                  '| cleared front + 10 cleared + 20 new ->', plan('cleared', ['cleared'] * 10 + ['new'] * 20, q, r, t, u),
+                  '| new front, mixed order ->', plan('new', ['cleared', 'new'] * 15, q, r, t, u))
+    print('--- break-even tree cost t for a 12-batch of new (scan iff 14 t < F(12))')
+    for q in (0.05, 0.08, 0.14, 0.20):
+        a_f, a_c = going(q, r, 0.05, 0.07)
+        print(f'q={q:.2f} F(12)={fb_release(12, q, a_f):.2f} break-even t={fb_release(12, q, a_f) / 14:.2f}')
+    print('--- table special case: u=1, F(n)=n')
+    table = [(0.992,12),(0.990,11),(0.988,10),(0.984,9),(0.979,8),(0.972,7),(0.959,6),(0.934,5),(0.876,4),(0.75,3)]
+    def tdepth(p):
+        for thr, d in table:
+            if p >= thr: return d
+        return 1
+    bad = 0; tot = 0
+    for i in range(750, 996):
+        p = i / 1000
+        q = 1 - p
+        best = min(range(1, 13), key=lambda k: (1 + (1 - p ** k) * k) / k if k > 1 else 1.0)
+        tot += 1; bad += best != tdepth(p)
+    print(f'depth mismatches vs table: {bad} of {tot}')

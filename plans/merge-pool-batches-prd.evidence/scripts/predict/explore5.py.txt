@@ -1,0 +1,12 @@
+import json,collections
+E=sorted((json.loads(l) for l in open('/tmp/gate-10069/predict/events.jsonl')),key=lambda e:e['id'])
+for et in ['train_started','train_coalesced','train_merged','train_derailed']:
+    ev=[e for e in E if e['et']==et]
+    print(et,len(ev),ev[0]['ts'][:16],ev[-1]['ts'][:16], collections.Counter(e['ts'][:10] for e in ev).most_common(40))
+    print('   ',ev[0]['task'],json.dumps(ev[0]['d'])[:500])
+    print('   ',ev[-1]['task'],json.dumps(ev[-1]['d'])[:500])
+sup=[e for e in E if e['et']=='merge_finalized' and e['d']['state']=='superseded']
+print(collections.Counter(str(e['d'].get('superseded_by'))[:9] for e in sup))
+print(collections.Counter(e['ts'][:10] for e in sup if str(e['d'].get('superseded_by')).startswith('coalesce')))
+# verify rows with speculative None by day
+print(sorted(collections.Counter(e['ts'][:10] for e in E if e['et']=='merge_verify' and e['d'].get('speculative') is None).items()))

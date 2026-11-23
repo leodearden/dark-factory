@@ -1,13 +1,16 @@
 """The recording reverse proxy between the pinned harness and an arm (arm_harness/usage_tap.py)."""
 
 import http.client
+import io
 import json
 import signal
 import socket
 import threading
 import time
-from contextlib import ExitStack, closing
+from collections.abc import Callable
+from contextlib import ExitStack, closing, redirect_stdout
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
@@ -37,6 +40,7 @@ REQUEST = {
     'response_format': {'type': 'json_schema', 'json_schema': {'name': 'x', 'schema': {}}},
     'messages': [{'role': 'user', 'content': 'extract the entities'}],
 }
+DRAIN_WAITING = 'usage tap: waiting'
 
 
 def _origin(mock) -> str:
@@ -253,17 +257,31 @@ def _post_in_background(tap_url: str, statuses: list[int]) -> threading.Thread:
     return client
 
 
+class _DrainNoticeWatcher(io.StringIO):
+    """Stdout that sets ``draining`` once the closing session announces it is draining."""
+
+    def __init__(self, draining: threading.Event) -> None:
+        super().__init__()
+        self._draining = draining
+
+    def write(self, text: str) -> int:
+        written = super().write(text)
+        if DRAIN_WAITING in self.getvalue():
+            self._draining.set()
+        return written
+
+
 def test_closing_a_session_waits_for_a_call_still_in_flight_and_records_it_inside_the_session(
-    tmp_path, capsys
+    tmp_path,
 ):
     log = tmp_path / 'calls.jsonl'
     received, release = threading.Event(), threading.Event()
     statuses: list[int] = []
     with held_upstream(received, release) as upstream:
-        with usage_tap(upstream, log_path=log) as tap_url:
+        stdout = _DrainNoticeWatcher(draining=release)
+        with redirect_stdout(stdout), usage_tap(upstream, log_path=log) as tap_url:
             client = _post_in_background(tap_url, statuses)
             assert received.wait(timeout=10)
-            threading.Timer(1.0, release.set).start()
         recorded_at_session_exit = load_call_records(log)
         client.join(timeout=10)
 
@@ -272,8 +290,8 @@ def test_closing_a_session_waits_for_a_call_still_in_flight_and_records_it_insid
     assert record.prompt_tokens == HELD_PROMPT_TOKENS
     assert record.outlived_session is False
     assert statuses == [200]
-    (waiting,) = capsys.readouterr().out.splitlines()
-    assert waiting.startswith('usage tap: waiting')
+    (waiting,) = stdout.getvalue().splitlines()
+    assert waiting.startswith(DRAIN_WAITING)
     assert '1 in-flight call' in waiting
 
 
@@ -301,7 +319,7 @@ def test_a_call_still_in_flight_when_the_drain_bound_expires_is_marked_as_outliv
     assert record.status == 200
     assert record.prompt_tokens == HELD_PROMPT_TOKENS
     waiting, expired = capsys.readouterr().out.splitlines()
-    assert waiting.startswith('usage tap: waiting')
+    assert waiting.startswith(DRAIN_WAITING)
     assert expired.startswith('usage tap: drain bound')
     assert '1 call(s) still in flight' in expired
 
@@ -314,44 +332,62 @@ def _raise_interrupted(signum, frame) -> None:
     raise _InterruptedWhileDraining
 
 
-def _interrupt_main_thread_once_closed(tap_url: str) -> threading.Thread:
-    """Signal the main thread once the tap refuses connections: it is then draining."""
-    port = urlsplit(tap_url).port
+def _signal_the_main_thread() -> None:
+    signal.pthread_kill(threading.main_thread().ident or 0, signal.SIGUSR1)
+
+
+def _signal_this_thread() -> None:
+    """The handler then waits on the main thread, whose blocked wait gets no EINTR."""
+    signal.pthread_kill(threading.get_ident(), signal.SIGUSR1)
+
+
+def _interrupt_once_draining(
+    draining: threading.Event, deliver: Callable[[], None]
+) -> threading.Thread:
+    """Deliver an interrupt once the closing session announces it is draining."""
 
     def interrupt() -> None:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            with socket.socket() as probe:
-                probe.settimeout(1)
-                if probe.connect_ex(('127.0.0.1', port)) != 0:
-                    break
-            time.sleep(0.05)
-        time.sleep(0.3)
-        signal.pthread_kill(threading.main_thread().ident or 0, signal.SIGUSR1)
+        if draining.wait(timeout=10):
+            deliver()
 
     interrupter = threading.Thread(target=interrupt, daemon=True)
     interrupter.start()
     return interrupter
 
 
-def test_an_interrupted_drain_still_marks_the_abandoned_call_as_outliving_the_session(tmp_path):
-    log = tmp_path / 'calls.jsonl'
-    received, release = threading.Event(), threading.Event()
+def _drain_interrupted_by(log: Path, deliver: Callable[[], None]) -> list[int]:
+    """Interrupt a session draining one held call, then release it; the client's statuses."""
+    received, release, draining = threading.Event(), threading.Event(), threading.Event()
     statuses: list[int] = []
     previous = signal.signal(signal.SIGUSR1, _raise_interrupted)
     try:
         with held_upstream(received, release) as upstream:
-            with pytest.raises(_InterruptedWhileDraining), usage_tap(
-                upstream, log_path=log
-            ) as tap_url:
+            with pytest.raises(_InterruptedWhileDraining), redirect_stdout(
+                _DrainNoticeWatcher(draining)
+            ), usage_tap(upstream, log_path=log) as tap_url:
                 client = _post_in_background(tap_url, statuses)
                 assert received.wait(timeout=10)
-                interrupter = _interrupt_main_thread_once_closed(tap_url)
+                interrupter = _interrupt_once_draining(draining, deliver)
             interrupter.join(timeout=10)
             release.set()
             client.join(timeout=10)
     finally:
         signal.signal(signal.SIGUSR1, previous)
+    return statuses
+
+
+def test_an_interrupted_drain_still_marks_the_abandoned_call_as_outliving_the_session(tmp_path):
+    log = tmp_path / 'calls.jsonl'
+    statuses = _drain_interrupted_by(log, _signal_the_main_thread)
+
+    assert statuses == [200]
+    (record,) = load_call_records(log)
+    assert record.outlived_session is True
+
+
+def test_an_interrupt_delivered_to_another_thread_still_ends_the_drain(tmp_path):
+    log = tmp_path / 'calls.jsonl'
+    statuses = _drain_interrupted_by(log, _signal_this_thread)
 
     assert statuses == [200]
     (record,) = load_call_records(log)

@@ -142,6 +142,14 @@ MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
     'type_check_command': Classified(
         Fidelity.HOST_DECIDING, _GLOBAL_COMMANDS_FROM_HOST, follow_ups=('agent-followup-5295-global-commands',)
     ),
+    'verify_allow_no_tests_ran': Classified(
+        Fidelity.HOST_DECIDING,
+        'A host whose own config opts in passes a fallback verify whose test slot ran nothing, which '
+        "the dispatcher's default would fail as no_tests_ran. At merge role verify_fallback_floor "
+        'floors every truthy test_command, so the read is reachable only if a future floor arm leaves '
+        'the slot empty. Task 7067 carries the knob on MergeVerifySpec.',
+        follow_ups=('7067',),
+    ),
     # MERGE_NEUTRAL
     'concurrent_verify': Classified(Fidelity.MERGE_NEUTRAL, 'Leg order only: every leg still runs.'),
     'sequential_lint_first': Classified(
@@ -157,6 +165,13 @@ MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
         Fidelity.MERGE_NEUTRAL,
         "The host's project_id, read only to name the project slice the cgroup scope runs under "
         '(task 3394): it places the run among the host\'s cgroups and leaves its commands alone.',
+    ),
+    'verify_cache': Classified(
+        Fidelity.MERGE_NEUTRAL,
+        "Task 5653: the host's verify-result cache mode. A run joins the cache only through a "
+        'CacheAccess its caller passes, and the remote leg reaches it only as CacheAccess.on_runner(), '
+        'whose missing registry makes every unit UNAVAILABLE, so every leg still runs. The mode also '
+        'stamps the off-wire VerifyResult.cache_record, which never reaches the verdict.',
     ),
     'verify_admission_background_promote_secs': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
     'verify_admission_enabled': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),

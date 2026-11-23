@@ -1421,6 +1421,7 @@ def main(argv: list[str] | None = None, *, deps: DepsFactory = build_live_deps) 
         VectorInvariantError,
         ProbeCleanupError,
         RedisError,
+        TimeoutError,
     ) as error:
         return _report(EXIT_RUN_FAILED, _named(error))
 

@@ -168,7 +168,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    Note: once `charged: true` is returned the slot is consumed even if the merge does not succeed.
    Completion is observed via `merge_status` polling (not a blocking return); outcomes that cost a
    slot: `{'error': ...}` (orchestrator down), or a polled/resolved state of `conflict`, `blocked`,
-   `abandoned`, `failed`, `unknown_branch`, or an epistemic merge_status answer that step 9 aborts
+   `abandoned`, `error`, `unknown_branch`, or an epistemic merge_status answer that step 9 aborts
    on. These post-charge aborts cost a slot. This is the accepted §4.2 tradeoff. A hand-off,
    whether at step 8's deadline or from step 9's `superseded` arm, consumes no further slot,
    because resume mode never charges.
@@ -202,8 +202,9 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      The six worker-internal outcomes (`wip_halted`, `done_wip_recovery`,
      `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare;
      `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when
-     observed by polling (`escalation/src/escalation/server.py::_map_terminal_state`) —
-     handle them as `blocked`. (`failed`, which this list named until task 4829, is not a
+     observed by polling (`escalation/src/escalation/merge_status_answer.py::map_terminal_state`) —
+     handle all of them but `done_wip_recovery` (which landed — treat it as `done`) as
+     `blocked`. (`failed`, which this list named until task 4829, is not a
      value the server ever returns; the real one is `error`.)
      The call returns a `request_id` in all
      cases except the `already_merged` ancestor fast-path, which short-circuits before entry
@@ -219,8 +220,12 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      <!-- merge-state-vocab:end -->
      This is a **successful submission**, not a failure. `queued` means the entry is
      waiting in the merge queue; `attached` means it was
-     coalesced with an existing in-flight request. Poll `merge_status` until the entry reaches a
-     terminal state:
+     coalesced with an existing in-flight request.
+     <!-- merge-status-route:begin answer=LIVE_STATES,WAIT
+          Pinned by escalation/tests/test_merge_status_boundary.py (rows B1-B8). -->
+     While the `merge_status` answer is a live state or a wait-state reason, **WAIT**: keep
+     polling, up to the deadline below:
+     <!-- merge-status-route:end -->
 
      ```
      deadline = now() + 1200 s          # 20-minute polling ceiling (resume mode: 3 h — see "Resuming a handed-off merge")
@@ -274,11 +279,14 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      answer that reaches step 9 is therefore not a wait state.
 
 9. **Handle the outcome.** The `merge_request` (in-window) and `merge_status` (polled) vocabularies
-   overlap but differ: `failed`/`unknown_branch` appear only as `merge_request` statuses (the server
-   collapses them to `blocked` when observed via polling); `abandoned` is a polled-only state that
-   `merge_request` never returns; the epistemic states are poll-only.
+   overlap but differ: `error`/`unknown_branch` and the other worker-internal outcomes appear only
+   as `merge_request` statuses (the server collapses them to `blocked`, and `done_wip_recovery` to
+   `done`, when observed via polling); `abandoned` is a polled-only state that `merge_request`
+   never returns; the epistemic states are poll-only.
 
-   - **`done` (polled state) or `already_merged` (submit-time):** success.
+   <!-- merge-status-route:begin answer=done -->
+   - **`done` (polled state) or `already_merged` (submit-time):** **ACCEPT** — success.
+     <!-- merge-status-route:end -->
      `already_merged` comes in two sub-cases:
      - **Fast-path** (ancestor short-circuit): no `request_id`; `commit` is the ancestor sha —
        use `done_provenance={"kind": "merged", "commit": "<commit>"}`.
@@ -330,9 +338,9 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      d. `mcp__escalation__resolve_issue(escalation_id, resolution="Auto-merged low-risk fix
         (unblock-low-risk): <what changed + merge sha>", resolved_by="unblock-low-risk")`.
 
-   - **`conflict` | `blocked` | `abandoned` | `failed` | `unknown_branch`:**
+   - **`conflict` | `blocked` | `abandoned` | `error` | `unknown_branch`:**
      call `mcp__escalation__merge_cancel(request_id)` then **ABORT**. Do not resolve, do not
-     retry, do not direct-merge. (`failed`/`unknown_branch` appear only on the in-window
+     retry, do not direct-merge. (`error`/`unknown_branch` appear only on the in-window
      `merge_request` path; `abandoned` appears only on the polled `merge_status` path.)
 
    - **`superseded`:** **not a failure, and never handled as one.** `superseded` is
@@ -438,12 +446,14 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        which resume mode then polls), else this run's own, with the re-poll's `state` and
        `reason` in `reason`.
 
+     <!-- merge-status-route:begin answer=prior_run_terminal,never_submitted,coalesce_train_id -->
      Every other answer — `prior_run_terminal` (copy `last_outcome`'s `state`, `run_id`,
      `finished_at` and `reason` into the return value's `reason`), `never_submitted`,
      `coalesce_train_id`, a reason the shared doc does not list, or any other re-poll answer
      (a `done` without `kind: "found_on_main"` included, even one carrying a `merge_sha`: that
      sha is the record's, not a git proof, and the row may be an earlier round's) → `mcp__escalation__merge_cancel(request_id)` then
      **ABORT**. Never resubmit, never direct-merge.
+     <!-- merge-status-route:end -->
 
 ### Resuming a handed-off merge (resume mode)
 
@@ -677,7 +687,7 @@ On any ABORT:
   `merge_request` submission (a `request_id` was returned — which excludes the `already_merged`
   fast-path), call `mcp__escalation__merge_cancel(request_id)` FIRST, before anything else, on:
   - an entry still `queued` at step 8's polling deadline;
-  - step 9's `conflict` | `blocked` | `abandoned` | `failed` | `unknown_branch` arm;
+  - step 9's `conflict` | `blocked` | `abandoned` | `error` | `unknown_branch` arm;
   - step 9's epistemic-state arm, on the answers its catch-all routes to `merge_cancel` (not
     `landing_unattributable`, which takes [this skill's dispositions](#ladder-dispositions));
   - the ladder's genuine not-landed outcome ([this skill's dispositions](#ladder-dispositions)).
