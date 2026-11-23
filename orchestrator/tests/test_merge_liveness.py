@@ -26,9 +26,28 @@ from typing import Generic, TypeVar
 from unittest.mock import patch
 
 import pytest
+from _seed_script_stubs import (
+    CURRENT_LOCKING_SEED_SCRIPT,
+    commit_seed_script,
+    make_seed_test_repo,
+    warm_pool_git_config,
+)
+from _worktree_registrations import registered_worktree_paths
 from shared.proc_group import cpu_ticks_under_path
 
-from orchestrator.merge_lane.liveness import VerifyProgressWatch, verify_tree_cpu_ticks
+from orchestrator.config import GitConfig
+from orchestrator.git_ops import (
+    PERSISTENT_MERGE_WORKTREE_NAME,
+    GitOps,
+    WarmSeedUnavailable,
+    WorktreeKind,
+    _run,
+)
+from orchestrator.merge_lane.liveness import (
+    VerifyProgressWatch,
+    drift_check_lane,
+    verify_tree_cpu_ticks,
+)
 
 
 def test_merge_liveness_exports_moved_public_symbols() -> None:
@@ -416,3 +435,90 @@ class TestVerifyTreeCpuTicks:
         finally:
             child.kill()
             child.wait()
+
+
+# ---------------------------------------------------------------------------
+# task 11479: drift_check_lane — the drift check's local-leg lane rule
+# ---------------------------------------------------------------------------
+
+_NO_POOL_GIT_CONFIG = GitConfig(
+    main_branch='main', branch_prefix='task/', remote='origin',
+    worktree_dir='.worktrees', push_after_advance=False,
+)
+
+
+async def _head(repo: Path) -> str:
+    rc, out, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0, err
+    return out.strip()
+
+
+async def _drift_scene(
+    tmp_path: Path, *, pool: bool, warm_base: bool = True,
+) -> tuple[GitOps, Path, str]:
+    repo = make_seed_test_repo(tmp_path, warm_base=warm_base)
+    await commit_seed_script(repo, CURRENT_LOCKING_SEED_SCRIPT)
+    git_ops = (
+        GitOps(warm_pool_git_config(), repo, merge_spec_warm_lane_pool_size=1)
+        if pool else GitOps(_NO_POOL_GIT_CONFIG, repo)
+    )
+    return git_ops, repo, await _head(repo)
+
+
+def _registered_names(repo: Path) -> list[str]:
+    return [Path(p).name for p in registered_worktree_paths(repo)]
+
+
+@pytest.mark.asyncio
+class TestDriftCheckLane:
+    """The drift check's local leg verifies warm wherever a pool is configured,
+    never silently cold; with no pool it keeps today's cold ``_merge-<hex>``
+    throwaway under its task-3018 lane flock. Real git, nothing patched."""
+
+    async def test_no_pool_keeps_the_cold_throwaway_under_its_lane_flock(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops, _repo, head = await _drift_scene(tmp_path, pool=False)
+        assert not git_ops.pool_in_use()
+
+        async with drift_check_lane(git_ops, head) as wt:
+            assert wt.name.startswith('_merge-')
+            assert wt.name != PERSISTENT_MERGE_WORKTREE_NAME
+            assert not (wt / 'target').exists()
+            outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='reap-sim')
+            assert outcome == 'skipped_lease_held'
+            assert wt.exists()
+
+        assert not wt.exists(), 'the lease must close before the cleanup, or the tree leaks'
+
+    async def test_pool_configured_runs_seeded_without_taking_a_spec_lane(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops, _repo, head = await _drift_scene(tmp_path, pool=True)
+        spec_pool = git_ops.spec_warm_lane_pool
+        assert spec_pool is not None
+
+        async with drift_check_lane(git_ops, head) as wt:
+            assert wt.name.startswith(WorktreeKind.DRIFT_CHECK.value)
+            assert (wt / 'target' / 'seeded.bin').exists()
+            spec_lane = await spec_pool.try_acquire()
+            assert spec_lane is not None, 'the drift leg must not consume a _spec- lane'
+            await spec_pool.release(spec_lane)
+
+        assert not wt.exists()
+
+    async def test_pool_configured_without_a_seed_raises_and_builds_nothing_cold(
+        self, tmp_path: Path,
+    ) -> None:
+        git_ops, repo, head = await _drift_scene(tmp_path, pool=True, warm_base=False)
+        entered = False
+
+        with pytest.raises(WarmSeedUnavailable):
+            async with drift_check_lane(git_ops, head):
+                entered = True
+
+        assert not entered
+        assert [
+            name for name in _registered_names(repo)
+            if name.startswith(('_merge-', WorktreeKind.DRIFT_CHECK.value))
+        ] == []
