@@ -4107,6 +4107,14 @@ def _trivial_pass(reason: str) -> 'VerifyResult':
     )
 
 
+def _replay_hint(replayed: Iterable[tuple[str, Entry]]) -> str:
+    """Name each replayed unit's entry and evidence event (I1)."""
+    return '; '.join(
+        f'replayed {unit_id} from entry {entry.entry_id} (evidence event {entry.evidence_event_id})'
+        for unit_id, entry in replayed
+    )
+
+
 def _cache_hit_result(replay: ReplayPlan, replayed: Iterable[tuple[str, Entry]]) -> 'VerifyResult':
     """The verdict of units that replay recorded greens: a pass that ran nothing, never readable as a run (I1)."""
     return VerifyResult(
@@ -4116,10 +4124,7 @@ def _cache_hit_result(replay: ReplayPlan, replayed: Iterable[tuple[str, Entry]])
         lint_output='',
         type_output='',
         category=CACHE_HIT_CATEGORY,
-        cause_hint='; '.join(
-            f'replayed {unit_id} from entry {entry.entry_id} (evidence event {entry.evidence_event_id})'
-            for unit_id, entry in replayed
-        ),
+        cause_hint=_replay_hint(replayed),
         units=(),
         cache_record=CacheRecord(role=replay.role, modes=replay.modes, legs=()),
     )
@@ -9534,13 +9539,17 @@ async def _run_executed(executed: Sequence[ModuleConfig | None], run: ModuleRun)
 
 
 async def _run_unreplayed(replay: ReplayPlan, run: ModuleRun, mc: ModuleConfig | None) -> VerifyResult:
-    """*mc* run without its replayed legs; a cache-hit verdict when every leg replays."""
+    """*mc* run without its replayed legs, its cause_hint naming each replay after its own;
+    a cache-hit verdict when every leg replays."""
     if mc is None:
         return await run(None)
+    replayed = replay.replayed(mc.prefix)
     remaining = replay.without_replayed(mc)
     if remaining is None:
-        return _cache_hit_result(replay, replay.replayed(mc.prefix))
-    return await run(remaining)
+        return _cache_hit_result(replay, replayed)
+    result = await run(remaining)
+    hints = (result.cause_hint, _replay_hint(replayed))
+    return replace(result, cause_hint=' | '.join(hint for hint in hints if hint))
 
 
 def _settled_against(replay: ReplayPlan, result: VerifyResult) -> VerifyResult:

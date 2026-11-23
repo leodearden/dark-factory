@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -453,6 +454,31 @@ class TestFanOutSeam:
             assert units[unit_id].evidence_event_id == 41
             assert _replay_hint(unit_id, recorded[unit_id]) in result.cause_hint
         assert _outcomes(result, _units('beta')) == {UnitOutcome.RAN_GREEN}
+
+    @pytest.mark.asyncio
+    async def test_a_partly_replayed_module_runs_only_its_changed_leg_and_names_each_replay(
+        self, repo, access, registry, markers,
+    ):
+        _commit_edit(repo, 'lint/alpha.cfg', 'strict = true\n')
+        alpha = dataclasses.replace(
+            cache_module('alpha', markers), lint_command=f'echo alpha:lint >> {markers} && cat lint/alpha.cfg',
+        )
+        modules = [alpha, cache_module('beta', markers)]
+        config = cache_config(repo)
+        recorded = await _record_run(registry, await _gate(repo, config, modules, access))
+        _commit_edit(repo, 'lint/alpha.cfg', 'strict = false\n')
+        _clear(markers)
+
+        result = await _gate(repo, config, modules, access)
+
+        alpha_lint = module_leg_name('alpha', Leg.LINT)
+        alpha_replayed = _units('alpha') - {alpha_lint}
+        assert _ran_legs(markers) == {'alpha:lint'}
+        assert result.passed, result.summary
+        assert _outcomes(result, {alpha_lint}) == {UnitOutcome.RAN_GREEN}
+        assert _outcomes(result, alpha_replayed | _units('beta')) == {UnitOutcome.CACHE_HIT}
+        for unit_id in alpha_replayed:
+            assert _replay_hint(unit_id, recorded[unit_id]) in result.cause_hint
 
     @pytest.mark.asyncio
     async def test_a_wholly_replayed_module_reads_as_a_cache_hit_not_a_run(
