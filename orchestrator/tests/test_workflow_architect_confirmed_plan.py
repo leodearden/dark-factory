@@ -30,7 +30,9 @@ T0 = '2026-11-23T10:00:00+00:00'
 T1 = '2026-11-23T11:00:00+00:00'
 
 
-def _make_workflow(tmp_path: Path, *, event_store: _RecordingEventStore | None = None) -> TaskWorkflow:
+def _make_workflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, event_store: _RecordingEventStore | None = None,
+) -> TaskWorkflow:
     assignment = MagicMock()
     assignment.task_id = _TASK_ID
     assignment.task = {'id': _TASK_ID, 'title': 'T', 'description': 'd'}
@@ -58,9 +60,10 @@ def _make_workflow(tmp_path: Path, *, event_store: _RecordingEventStore | None =
         scheduler=MagicMock(),
         briefing=MagicMock(),
         mcp=MagicMock(),
-        event_store=event_store,  # type: ignore[arg-type]
         escalation_queue=escalation_queue,
     )
+    if event_store is not None:
+        monkeypatch.setattr(wf, 'event_store', event_store)
     worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
     wf.worktree = worktree
@@ -68,7 +71,7 @@ def _make_workflow(tmp_path: Path, *, event_store: _RecordingEventStore | None =
     wf.artifacts.init(_TASK_ID, 'T', 'd')
     wf.merge_queue = MagicMock()
     wf._module_configs = []
-    wf._build_agent_env = MagicMock(return_value=None)  # type: ignore[method-assign]
+    monkeypatch.setattr(wf, '_build_agent_env', MagicMock(return_value=None))
     wf.usage_gate = make_gate_mock(
         account_count=2,
         detect_cap_hit=MagicMock(side_effect=[True, False]),
@@ -120,9 +123,9 @@ def _events(rec: _RecordingEventStore, event_type: EventType) -> list[dict]:
 
 @pytest.mark.asyncio
 class TestReDispatchAfterConfirmIsDeclined:
-    async def test_retry_after_the_run_confirmed_its_plan_is_declined_and_salvaged(self, tmp_path):
+    async def test_retry_after_the_run_confirmed_its_plan_is_declined_and_salvaged(self, tmp_path, monkeypatch):
         rec = _RecordingEventStore()
-        wf = _make_workflow(tmp_path, event_store=rec)
+        wf = _make_workflow(tmp_path, monkeypatch, event_store=rec)
         artifacts = wf.artifacts
         assert artifacts is not None
         builder = AsyncMock(return_value='BRIEF')
@@ -139,8 +142,8 @@ class TestReDispatchAfterConfirmIsDeclined:
         assert _events(rec, EventType.invocation_end)[-1]['data']['retry_aborted'] is True
         assert _events(rec, EventType.plan_salvaged)
 
-    async def test_retry_of_an_unconfirmed_plan_still_dispatches(self, tmp_path):
-        wf = _make_workflow(tmp_path)
+    async def test_retry_of_an_unconfirmed_plan_still_dispatches(self, tmp_path, monkeypatch):
+        wf = _make_workflow(tmp_path, monkeypatch)
         artifacts = wf.artifacts
         assert artifacts is not None
         builder = AsyncMock(return_value='BRIEF')
@@ -160,8 +163,8 @@ class TestReDispatchAfterConfirmIsDeclined:
         assert prompts[1] == 'BRIEF'
         assert outcome is None
 
-    async def test_revalidation_reconfirmed_with_a_new_stamp_is_declined(self, tmp_path):
-        wf = _make_workflow(tmp_path)
+    async def test_revalidation_reconfirmed_with_a_new_stamp_is_declined(self, tmp_path, monkeypatch):
+        wf = _make_workflow(tmp_path, monkeypatch)
         artifacts = wf.artifacts
         assert artifacts is not None
         _write_plan(artifacts, finalized_at=T0)
@@ -177,8 +180,8 @@ class TestReDispatchAfterConfirmIsDeclined:
         assert outcome is None
         assert wf.plan['_finalized_at'] == T1
 
-    async def test_revalidation_leaving_the_prior_stamp_still_retries(self, tmp_path):
-        wf = _make_workflow(tmp_path)
+    async def test_revalidation_leaving_the_prior_stamp_still_retries(self, tmp_path, monkeypatch):
+        wf = _make_workflow(tmp_path, monkeypatch)
         artifacts = wf.artifacts
         assert artifacts is not None
         _write_plan(artifacts, finalized_at=T0)
@@ -198,10 +201,10 @@ class TestReDispatchAfterConfirmIsDeclined:
 
 
 def _make_scripted(
-    tmp_path: Path, architect_run: Callable[[TaskArtifacts], None],
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architect_run: Callable[[TaskArtifacts], None],
 ) -> tuple[TaskWorkflow, AsyncMock]:
     """A workflow whose ``_invoke`` runs *architect_run* against the real artifacts and succeeds, and its ``_mark_blocked``."""
-    wf = _make_workflow(tmp_path)
+    wf = _make_workflow(tmp_path, monkeypatch)
     artifacts = wf.artifacts
     assert artifacts is not None
 
@@ -210,8 +213,8 @@ def _make_scripted(
         return AgentResult(success=True, output='done', cost_usd=1.2, turns=14, duration_ms=60_000)
 
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-    wf._invoke = AsyncMock(side_effect=invoke)  # type: ignore[method-assign]
-    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+    monkeypatch.setattr(wf, '_invoke', AsyncMock(side_effect=invoke))
+    monkeypatch.setattr(wf, '_mark_blocked', mark_blocked)
     return wf, mark_blocked
 
 
@@ -241,8 +244,8 @@ def _blocking_dependency(artifacts: TaskArtifacts) -> None:
 
 @pytest.mark.asyncio
 class TestConfirmedPlanAndExitReportConflict:
-    async def test_plan_confirmed_alongside_an_unactionable_report_blocks_on_the_conflict(self, tmp_path):
-        wf, mark_blocked = _make_scripted(tmp_path, _confirm_and(_unactionable))
+    async def test_plan_confirmed_alongside_an_unactionable_report_blocks_on_the_conflict(self, tmp_path, monkeypatch):
+        wf, mark_blocked = _make_scripted(tmp_path, monkeypatch, _confirm_and(_unactionable))
         artifacts = wf.artifacts
         assert artifacts is not None
 
@@ -261,10 +264,10 @@ class TestConfirmedPlanAndExitReportConflict:
         assert plan['_finalized_at'] == T1
         assert len(plan['steps']) == 2
 
-    async def test_plan_confirmed_alongside_a_blocking_dependency_blocks_on_the_conflict(self, tmp_path):
-        wf, mark_blocked = _make_scripted(tmp_path, _confirm_and(_blocking_dependency))
+    async def test_plan_confirmed_alongside_a_blocking_dependency_blocks_on_the_conflict(self, tmp_path, monkeypatch):
+        wf, mark_blocked = _make_scripted(tmp_path, monkeypatch, _confirm_and(_blocking_dependency))
         handle_dep = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-        wf._handle_blocking_dep_report = handle_dep  # type: ignore[method-assign]
+        monkeypatch.setattr(wf, '_handle_blocking_dep_report', handle_dep)
 
         outcome = await wf._run_architect_for_plan(AsyncMock(return_value='BRIEF'))
 
@@ -276,8 +279,8 @@ class TestConfirmedPlanAndExitReportConflict:
         assert wf.artifacts is not None
         assert wf.artifacts.read_blocking_dependency() is None
 
-    async def test_rejection_over_a_plan_confirmed_before_the_phase_still_wins(self, tmp_path):
-        wf, mark_blocked = _make_scripted(tmp_path, _unactionable)
+    async def test_rejection_over_a_plan_confirmed_before_the_phase_still_wins(self, tmp_path, monkeypatch):
+        wf, mark_blocked = _make_scripted(tmp_path, monkeypatch, _unactionable)
         assert wf.artifacts is not None
         _write_plan(wf.artifacts, finalized_at=T0)
 
@@ -287,8 +290,8 @@ class TestConfirmedPlanAndExitReportConflict:
         reason, _kwargs = _only_block(mark_blocked)
         assert reason.startswith('Architect reported task unactionable')
 
-    async def test_a_confirmed_plan_without_a_report_proceeds(self, tmp_path):
-        wf, mark_blocked = _make_scripted(tmp_path, lambda artifacts: _write_plan(artifacts, finalized_at=T1))
+    async def test_a_confirmed_plan_without_a_report_proceeds(self, tmp_path, monkeypatch):
+        wf, mark_blocked = _make_scripted(tmp_path, monkeypatch, lambda artifacts: _write_plan(artifacts, finalized_at=T1))
 
         outcome = await wf._run_architect_for_plan(AsyncMock(return_value='BRIEF'))
 
