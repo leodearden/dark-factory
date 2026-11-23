@@ -29,11 +29,11 @@ _EXCERPT_LEN = 240
 _ScanVerdict = Callable[[str], list[str]]
 
 
-def _leak_fragments(text: str) -> list[str]:
+def _leak_verdict(text: str) -> list[str]:
     return [hit.fragment for hit in find_toolcall_xml_leak(text)]
 
 
-def _literal_needle_verdict(needles: Sequence[str]) -> _ScanVerdict:
+def _needle_verdict_for(needles: Sequence[str]) -> _ScanVerdict:
     """The distinct *needles* that occur in a text, case-sensitively, in caller order."""
     distinct = tuple(dict.fromkeys(needles))
 
@@ -41,6 +41,17 @@ def _literal_needle_verdict(needles: Sequence[str]) -> _ScanVerdict:
         return [needle for needle in distinct if needle in text]
 
     return present
+
+
+def _excerpt_around(text: str, fragments: Sequence[str]) -> str:
+    """At most ``_EXCERPT_LEN`` chars of *text*, centred where its earliest *fragments* hit begins.
+
+    A ``…`` marks each side the window elides, so a window never reads as the whole text.
+    """
+    anchor = min(text.find(fragment) for fragment in fragments)
+    begin = max(0, min(anchor - _EXCERPT_LEN // 2, len(text) - _EXCERPT_LEN))
+    end = begin + _EXCERPT_LEN
+    return ('…' if begin else '') + text[begin:end] + ('…' if end < len(text) else '')
 
 
 #: Default cap on how many pages a single full-enumeration scroll may walk.
@@ -1081,19 +1092,29 @@ class Mem0Backend:
         (c) THE PREFILTER IS AN OPTIMISATION ONLY. Every walked record is
         judged in Python, and that is the authoritative verdict: the caller's
         *needles*, when given, as a literal, case-sensitive substring match;
-        otherwise :func:`find_toolcall_xml_leak`. This matters because those
-        are un-indexed-field FALLBACK semantics: creating a text payload index
-        on ``data`` would SILENTLY flip ``MatchText`` to tokenized
-        word-matching. That failure is safe here rather than merely unlikely —
-        tokenized matching is strictly MORE permissive for these needles (a
-        record containing a literal serialized opening tag necessarily contains
-        its constituent word tokens), so the prefilter remains a superset and
-        the Python verdict still yields the exact answer. Only speed degrades,
-        never correctness. The prefilter reads only the ``data`` key, so
-        prefiltered mode finds text stored there alone; *exhaustive* mode also
-        sees the ``memory``/``content`` fallbacks.
+        otherwise :func:`find_toolcall_xml_leak`. The verdict can only discard
+        records the prefilter returned, never recover ones it skipped, so a
+        prefiltered scan is exact only while the prefilter selects a SUPERSET
+        of the verdict's matches. That rests on un-indexed-field FALLBACK
+        semantics: creating a text payload index on ``data`` would SILENTLY
+        flip ``MatchText`` to tokenized word-matching.
+
+        For the DEFAULT SENTINELS that flip is safe: tokenized matching is
+        strictly MORE permissive for them (a record containing a literal
+        serialized opening tag necessarily contains its constituent word
+        tokens), so the superset holds and only speed degrades. For CUSTOM
+        *needles* it is NOT safe: a needle that is not a whole token, such as
+        the mid-word ``'econciliatio'``, is a literal substring but no token
+        match, so an indexed prefilter would silently skip records the verdict
+        would report. A prefiltered custom-needle scan is therefore exact only
+        under un-indexed substring semantics; ``exhaustive=True`` is the
+        index-independent path. The prefilter also reads only the ``data``
+        key, so prefiltered mode finds text stored there alone; *exhaustive*
+        mode also sees the ``memory``/``content`` fallbacks.
         ``tests/test_mem0_client.py::TestMem0BackendScanPayloadTextIntegration``
-        is the tripwire that fails loudly if those semantics ever change.
+        is the tripwire that fails loudly if those semantics change, but it
+        runs against its own test collection and cannot see an index created
+        on a production one.
 
         (d) ``exhaustive=True`` skips the prefilter entirely and walks the
         whole collection; it changes nothing else. Use it when the answer must
@@ -1134,6 +1155,7 @@ class Mem0Backend:
                 for the prefilter and the leak detector for the verdict —
                 never to "no needles", which would scan for nothing and report
                 a clean corpus. *exhaustive* skips only their prefilter use.
+                No needle may be the empty string.
             filters: Optional key→value payload equality filters, AND-ed in
                 via ``must`` exactly as :meth:`count_by_metadata` builds them,
                 to narrow the scan (e.g. ``{'category': ...}``). Applies in
@@ -1155,14 +1177,19 @@ class Mem0Backend:
                 that a caller's exit-code predicate reads as a complete,
                 successful sweep. Rejecting it is the same no-silent-wrong-value
                 rule that makes a scan timeout propagate rather than collapse
-                into an empty list.
+                into an empty list. Also if any needle is ``''``: the empty
+                string is a substring of every text, so one stray ``''`` would
+                turn a needle hunt into an echo of the whole walked population.
 
         Returns:
             ``{'matches': [...], 'scanned': int, 'truncated': bool,
             'collection': str}`` where each match is ``{'id', 'created_at',
             'matched_fragments', 'excerpt', 'metadata'}``. ``scanned`` counts
             every point walked, including non-matching ones, so it is a correct
-            denominator for an incidence rate.
+            denominator for an incidence rate. ``excerpt`` is at most
+            ``_EXCERPT_LEN`` characters of the text, centred where its earliest
+            matched fragment begins, with ``…`` on each elided side; a tail
+            leak or a needle deep in a record is therefore visible in it.
 
             ``collection`` is the Qdrant collection this call actually
             scrolled — the same name passed to every ``client.scroll`` below,
@@ -1220,6 +1247,12 @@ class Mem0Backend:
                 'non-positive limit walks zero points and would report an empty '
                 'result as a clean corpus'
             )
+        if needles and '' in needles:
+            raise ValueError(
+                f"scan_payload_text needles must not contain '', got {needles!r}; the "
+                'empty string is a substring of every text, so it would report every '
+                'walked record as a match'
+            )
 
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
 
@@ -1231,7 +1264,7 @@ class Mem0Backend:
         # this mode wants — expressed as scroll_filter=None, not as an
         # unfiltered Filter.
         needle_arm = None if exhaustive else list(needles or PREFILTER_NEEDLES)
-        verdict = _literal_needle_verdict(needles) if needles else _leak_fragments
+        verdict = _needle_verdict_for(needles) if needles else _leak_verdict
         scroll_filter = (
             self._build_payload_filter(filters, text_needles=needle_arm)
             if (filters or needle_arm)
@@ -1275,7 +1308,7 @@ class Mem0Backend:
                         'id': point.id,
                         'created_at': payload.get('created_at'),
                         'matched_fragments': fragments,
-                        'excerpt': text[:_EXCERPT_LEN] + ('…' if len(text) > _EXCERPT_LEN else ''),
+                        'excerpt': _excerpt_around(text, fragments),
                         'metadata': payload,
                     })
         except ScrollPointBudgetExhausted:

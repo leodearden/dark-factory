@@ -341,13 +341,16 @@ skips the prefilter, and nothing else, and paginates the whole collection —
 that is the mode for an incidence-rate claim, so the number rests on nothing
 but the Python verdict. The prefilter reads only the `data` key, so a complete
 literal enumeration, one that also sees text under the `memory`/`content`
-fallbacks, passes `needles` with `exhaustive=True, limit=None`. `scanned` is
+fallbacks, passes `needles` with `exhaustive=True, limit=None`; that is also
+the mode that does not depend on `data` staying un-indexed (§7). `scanned` is
 the number of records walked: the prefilter population, or the whole
 collection when exhaustive.
 
 The MCP tool defaults to `limit=1000` and returns each match's `metadata`
-without its text keys; the text is in `excerpt`, and `get_memory_by_id` gives
-the full body. `MemoryService.scan_memory_content` and
+without its text keys. `excerpt` is a fixed-width window of the text centred
+where the earliest matched fragment begins, with `…` on each elided side, so a
+tail leak or a deep needle is visible in it; `get_memory_by_id` gives the full
+body. `MemoryService.scan_memory_content` and
 `Mem0Backend.scan_payload_text` keep no default limit and return the full raw
 payload, because the in-process sweep (§5) repairs from it.
 
@@ -744,18 +747,31 @@ to tokenized word-matching.** A silent semantic flip is precisely the failure
 class this task exists to kill, so the design does not depend on it:
 
 - The prefilter is only ever a **speed optimisation**. Every returned record is
-  re-verified in Python by the shared detector, which is the authoritative
-  verdict.
-- The flip fails **safe**. Tokenized matching is strictly *more* permissive for
-  these needles (text containing `&#60;parameter name=` necessarily contains
-  the tokens `parameter` and `name`), so the prefilter remains a superset and
-  the answer stays exact. Only speed degrades.
-- `exhaustive=True` bypasses the prefilter entirely.
+  judged in Python, which is the authoritative verdict: the shared detector for
+  the default sentinels, and the caller's `needles` as a literal, case-sensitive
+  substring match otherwise (task 4857). The verdict can only discard what the
+  prefilter returned, never recover what it skipped, so a prefiltered answer is
+  exact only while the prefilter is a superset of the verdict's matches.
+- For the **default sentinels** the flip fails **safe**. Tokenized matching is
+  strictly *more* permissive for them (text containing `&#60;parameter name=`
+  necessarily contains the tokens `parameter` and `name`), so the prefilter
+  remains a superset and the answer stays exact. Only speed degrades.
+- For **custom `needles`** the flip is **not** safe. A needle that is not a
+  whole token is a literal substring but no token match (the tripwire's
+  mid-word `econciliatio` is the counter-example), so an indexed prefilter
+  would silently skip records the verdict would report: false absence. A
+  prefiltered custom-needle scan is exact only under un-indexed substring
+  semantics.
+- `exhaustive=True` bypasses the prefilter entirely, so it is the
+  index-independent path for either verdict.
 
 The tripwire is
 `TestMem0BackendScanPayloadTextIntegration::test_matchtext_prefilter_is_a_literal_substring_match`
 in `fused-memory/tests/test_mem0_client.py` — a `qdrant_skipif`-gated
-integration test that fails **loudly** if the semantics ever change.
+integration test that fails **loudly** if the semantics ever change. It runs
+against its own test collection, so it cannot see an index created on a
+production collection; a custom-needle hunt whose completeness matters uses
+`exhaustive=True`.
 
 ---
 

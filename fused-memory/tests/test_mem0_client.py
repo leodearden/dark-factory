@@ -2853,6 +2853,41 @@ class TestMem0BackendScanPayloadText:
             assert cond.match.text == needle
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('needles', [None, []])
+    async def test_absent_needles_make_the_leak_detector_the_verdict(self, backend, needles):
+        """An empty needle list must not become an empty literal verdict, which
+        would match nothing and report a leaking corpus as clean."""
+        leak = _scan_point('leak', {'data': _SCAN_LEAK_TEXT})
+        clean = _scan_point('clean', {'data': _SCAN_BODY})
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([leak, clean], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'), needles=needles)
+
+        assert [m['id'] for m in result['matches']] == ['leak']
+        assert result['matches'][0]['matched_fragments'] == [_SCAN_LEAK_FRAGMENT]
+        assert result['scanned'] == 2
+
+    @pytest.mark.parametrize('needles', [[''], ['no JS test runner', '']])
+    @pytest.mark.asyncio
+    async def test_an_empty_string_needle_raises_rather_than_matching_everything(
+        self, backend, needles
+    ):
+        """'' is a substring of every text, so it would report every walked
+        record as a match."""
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with (
+            patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)),
+            pytest.raises(ValueError, match="must not contain ''"),
+        ):
+            await backend.scan_payload_text(scope=Scope(project_id='p'), needles=needles)
+
+        mock_client.scroll.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_a_present_custom_needle_is_reported(self, backend):
         """The discovery-cycle shape: plain prose, no tool-call leak, a
         caller needle it contains.  Reporting it is the whole point of a
@@ -2900,6 +2935,39 @@ class TestMem0BackendScanPayloadText:
             )
 
         assert result['matches'][0]['matched_fragments'] == ['alpha', 'gamma']
+
+    async def _excerpt_of(self, backend, text: str, needles: list[str] | None = None) -> str:
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([_scan_point('p1', {'data': text})], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scan_payload_text(scope=Scope(project_id='p'), needles=needles)
+
+        return result['matches'][0]['excerpt']
+
+    @pytest.mark.asyncio
+    async def test_the_excerpt_is_centred_on_a_needle_deep_in_the_record(self, backend):
+        needle = 'no JS test runner'
+        excerpt = await self._excerpt_of(backend, 'x' * 1000 + needle + 'y' * 1000, [needle])
+
+        assert excerpt.startswith('…')
+        assert excerpt.endswith('…')
+        assert excerpt.index(needle) * 2 == len(excerpt)
+
+    @pytest.mark.asyncio
+    async def test_the_excerpt_shows_a_tail_leak_and_marks_only_the_elided_head(self, backend):
+        excerpt = await self._excerpt_of(backend, 'word ' * 300 + _SCAN_LEAK_TEXT)
+
+        assert excerpt.startswith('…')
+        assert excerpt.endswith(_SCAN_LEAK_FRAGMENT)
+
+    @pytest.mark.asyncio
+    async def test_the_excerpt_of_a_head_match_starts_at_the_text(self, backend):
+        needle = 'no JS test runner'
+        excerpt = await self._excerpt_of(backend, needle + 'z' * 1000, [needle])
+
+        assert excerpt.startswith(needle)
+        assert excerpt.endswith('…')
 
     @pytest.mark.asyncio
     async def test_custom_needles_stay_the_verdict_in_exhaustive_mode(self, backend):

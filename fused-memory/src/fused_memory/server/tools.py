@@ -4929,7 +4929,10 @@ def create_mcp_server(
         verdict: a literal, case-sensitive substring match of your *needles* when
         given, else the shared tool-call-leak detector
         (``fused_memory.utils.toolcall_xml_leak``). The store-side prefilter is a
-        speed optimisation only, and it reads only the ``data`` text key.
+        speed optimisation only, and it reads only the ``data`` text key. With
+        custom *needles*, a prefiltered scan is complete only while ``data``
+        carries no text index (an index makes the prefilter match whole tokens and
+        skip mid-word needles); ``exhaustive=True`` does not depend on it.
 
         **Mem0/Qdrant-only scope:** This tool scans only memories stored in the
         Mem0/Qdrant backend (categories: observations_and_summaries,
@@ -4958,6 +4961,7 @@ def create_mcp_server(
             needles: Literal substrings to find; a record matches when its text
                 contains one. They also drive the prefilter, which *exhaustive*
                 skips. Omit (None) to scan for the shared tool-call-leak sentinels.
+                An empty-string needle is rejected, since every record contains it.
             filters: Optional exact metadata key-value pairs narrowing the scan
                 (e.g. {'category': 'procedural_knowledge'}). Applies in both modes.
             exhaustive: Skip the prefilter and walk every record. Slower, but the
@@ -4972,9 +4976,13 @@ def create_mcp_server(
             'metadata'}, ...], 'scanned': int, 'truncated': bool, 'exhaustive': ...,
             'limit': ..., 'project_id': ...} on success, or {'error': ...,
             'error_type': ...} on failure. An empty ``matches`` list is a SUCCESSFUL
-            scan of a clean corpus, not an error. A match's ``metadata`` omits the
-            text keys (``data``/``memory``/``content``): the text is in ``excerpt``,
-            and ``get_memory_by_id`` returns the full body.
+            scan of a clean corpus, not an error. A match's ``excerpt`` is a
+            fixed-width window of its text
+            (``fused_memory/backends/mem0_client.py::_EXCERPT_LEN`` characters)
+            centred where the earliest matched fragment begins, with ``…`` marking
+            each elided side. Its ``metadata``
+            omits the text keys (``data``/``memory``/``content``);
+            ``get_memory_by_id`` returns the full body.
         """
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:

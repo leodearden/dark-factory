@@ -338,3 +338,23 @@ class TestScanMemoryContentReportsCustomNeedles:
             f'a present needle came back as a clean, complete scan: {result!r}'
         )
         assert [m['id'] for m in result['matches']] == ['prose-1']
+
+    @pytest.mark.asyncio
+    async def test_an_empty_string_needle_is_a_structured_error(self, mock_config):
+        """'' is in every record, so it would echo the whole walked population."""
+        service = MemoryService(mock_config)
+        service.mem0 = Mem0Backend(mock_config)
+        server = create_mcp_server(service)
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([], None))
+
+        with patch.object(
+            service.mem0, '_get_async_qdrant', AsyncMock(return_value=mock_client)
+        ):
+            result = await server._tool_manager.call_tool(
+                'scan_memory_content', {'project_id': _PROJECT_ID, 'needles': ['']}
+            )
+
+        assert result.get('error_type') == 'ValueError', f'got: {result!r}'
+        assert 'matches' not in result
+        mock_client.scroll.assert_not_awaited()
