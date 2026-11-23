@@ -9,7 +9,9 @@ from typing import get_type_hints
 import aiosqlite
 import pytest
 import pytest_asyncio
+from _parked_queue_fixtures import queue_holding_parked_rows
 from reconciliation.legacy_drains import drain_unattributed
+from shared.write_queue_statuses import AWAITING_OPERATOR, WriteQueueStatus
 
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -479,6 +481,41 @@ async def test_quiescent_when_queue_all_completed(tmp_path):
         assert reason == 'quiescent:165'
     finally:
         await buf.close()
+
+
+async def _trigger_after_165_events(db_path: Path, queue_stats_fn) -> tuple[bool, str]:
+    buf = EventBuffer(
+        db_path=db_path,
+        buffer_size_threshold=500,
+        conditional_trigger_ratio=0.33,
+        queue_stats_fn=queue_stats_fn,
+    )
+    await buf.initialize()
+    try:
+        for _ in range(165):
+            await buf.push(_make_event())
+        return await buf.should_trigger('test-project')
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_parked_rows_do_not_hold_reconciliation_off(tmp_path):
+    async with queue_holding_parked_rows(tmp_path, rows=3) as q:
+        decision = await _trigger_after_165_events(tmp_path / 'q_parked.db', q.get_stats)
+
+    assert decision == (True, 'quiescent:165')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', list(WriteQueueStatus), ids=str)
+async def test_only_rows_the_workers_will_finish_hold_reconciliation_off(tmp_path, status):
+    async def one_row_of(status=status):
+        return {'counts': {status.value: 1}}
+
+    should, _ = await _trigger_after_165_events(tmp_path / 'q_status.db', one_row_of)
+
+    assert should is (status in AWAITING_OPERATOR | {WriteQueueStatus.COMPLETED})
 
 
 @pytest.mark.asyncio
