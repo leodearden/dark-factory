@@ -966,21 +966,16 @@ class RunStore:
         run_id: str,
         report: HarnessReport,
         *,
-        startup_completed_at: datetime | None = None,
         exit_reason: RunExitReason | None = None,
     ) -> None:
         """Update the runs row with final aggregates and how the run ended, at shutdown."""
-        startup_completed_text = (
-            None if startup_completed_at is None else _utc_iso(startup_completed_at)
-        )
         conn = self._connect()
         try:
             conn.execute(
                 'UPDATE runs SET '
                 'completed_at = ?, total_tasks = ?, completed = ?, '
                 'blocked = ?, escalated = ?, total_cost_usd = ?, '
-                'paused_for_cap = ?, cap_pause_secs = ?, '
-                'startup_completed_at = ?, exit_reason = ? '
+                'paused_for_cap = ?, cap_pause_secs = ?, exit_reason = ? '
                 'WHERE run_id = ?',
                 (
                     report.completed_at,
@@ -991,7 +986,6 @@ class RunStore:
                     report.total_cost_usd,
                     int(report.paused_for_cap),
                     report.cap_pause_duration_secs,
-                    startup_completed_text,
                     None if exit_reason is None else exit_reason.column_value,
                     run_id,
                 ),

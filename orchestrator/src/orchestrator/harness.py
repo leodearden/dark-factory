@@ -3184,8 +3184,7 @@ class Harness:
             if self._run_store and self._run_id:
                 try:
                     self._run_store.finish_run(
-                        self._run_id, self.report,
-                        startup_completed_at=startup_completed_at, exit_reason=exit_reason,
+                        self._run_id, self.report, exit_reason=exit_reason,
                     )
                 except Exception as e:
                     logger.warning(f'Failed to finalize run metrics: {e}')
