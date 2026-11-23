@@ -13,9 +13,11 @@
 # Invariant: a dir carrying .ready has answered `gate-identity` for $SHA through
 # its own binary. Builds happen in place (a moved uv venv is dead: its shebangs and
 # editable .pth entries are absolute) under a per-sha build lock; after .ready
-# nothing writes into the dir. stdout carries only the final JSON line; every
-# diagnostic goes to stderr. Exit status 255 is the ssh client's own failure
-# (remote_gate.py::classify_remote_exit), so this script never exits 255.
+# nothing writes into the dir. A holder may unlink the build lock, so a lock is
+# held only once fd 9 is still the file at the lock path. stdout carries only the
+# final JSON line; every diagnostic goes to stderr. Exit status 255 is the ssh
+# client's own failure (remote_gate.py::classify_remote_exit), so this script
+# never exits 255.
 set -euo pipefail
 trap '[[ $? -ne 255 ]] || exit 70' EXIT
 
@@ -30,6 +32,7 @@ die() {
 
 dir="$GATE_ROOT/$SHA"
 gate_bin="$dir/.venv/bin/orchestrator"
+lock="$GATE_ROOT/.build-$SHA.lock"
 
 mkdir -p "$GATE_ROOT"
 touch "$GATE_ROOT/.dark-factory-gate-root"
@@ -54,8 +57,16 @@ handshake() {
 	ORCH_GATE_BIN="$gate_bin" orchestrator gate-identity
 }
 
-exec 9>"$GATE_ROOT/.build-$SHA.lock"
-flock -w 300 9 || die "build lock for $SHA not acquired within 300s" 75
+# A holder may unlink the lock: a lock won on a file no longer at $lock is retaken.
+lock_build() {
+	while :; do
+		exec 9>"$lock"
+		flock -w 300 9 || die "build lock for $SHA not acquired within 300s" 75
+		[[ /dev/fd/9 -ef $lock ]] && return
+	done
+}
+
+lock_build
 
 built=false
 if [[ -e $dir && ! -e $dir/.ready ]]; then
