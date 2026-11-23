@@ -212,7 +212,7 @@ class TestParseGeminiOutputConfigPrices:
 
 class TestParseCodexOutputUnknownModelFallback:
     """An un-listed model must never silently fall back — it logs a WARNING
-    and uses the single defined `_FALLBACK_PRICE` (task 2459)."""
+    and uses the single defined `token_pricing.FALLBACK_PRICE` (task 2459)."""
 
     def test_unknown_model_logs_warning_and_uses_fallback_price(self, caplog):
         events = [
@@ -231,7 +231,7 @@ class TestParseCodexOutputUnknownModelFallback:
         assert any('totally-unknown-model' in r.getMessage() for r in warning_records), (
             f'expected a WARNING mentioning the unknown model; got: {[r.getMessage() for r in warning_records]}'
         )
-        # _FALLBACK_PRICE: input=2.0/1M, output=8.0/1M
+        # FALLBACK_PRICE: input=2.0/1M, output=8.0/1M
         assert agent_result.cost_usd == pytest.approx((200 * 2.0 + 100 * 8.0) / 1_000_000)
 
 
@@ -280,7 +280,7 @@ class TestEstimateCostCachedInput:
     def test_fallback_price_without_cached_key_does_not_raise(self) -> None:
         cost = _estimate_cost('totally-unknown-model', 300, 100, {}, cached_input_tokens=200)
 
-        # _FALLBACK_PRICE has no cached rate: (300 * 2.0 + 100 * 8.0) / 1e6
+        # FALLBACK_PRICE has no cached rate: (300 * 2.0 + 100 * 8.0) / 1e6
         assert cost == pytest.approx((300 * 2.0 + 100 * 8.0) / 1_000_000)
 
 

@@ -259,9 +259,9 @@ class TestArchitectCellResolvesCostProvenance:
         self, caplog,
     ):
         """A proxied candidate with NO price entry degrades to the DEFINED
-        ``_FALLBACK_PRICE`` and says so loudly — never a silent raw-CLI
+        ``FALLBACK_PRICE`` and says so loudly — never a silent raw-CLI
         number (the loud-over-silent-degradation norm)."""
-        from orchestrator.evals.metrics import _FALLBACK_PRICE
+        from orchestrator.agents.token_pricing import FALLBACK_PRICE
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
             result, mocks = await run_architect_eval_hermetic(
@@ -275,8 +275,8 @@ class TestArchitectCellResolvesCostProvenance:
         # change updates this expectation instead of leaving a stale magic
         # number (the single-home discipline of task 2459).
         expected = (
-            1_000_000 * _FALLBACK_PRICE['input_per_1m']
-            + 500_000 * _FALLBACK_PRICE['output_per_1m']
+            1_000_000 * FALLBACK_PRICE['input_per_1m']
+            + 500_000 * FALLBACK_PRICE['output_per_1m']
         ) / 1_000_000
         persisted = mocks['save'].call_args.args[0].metrics
         assert persisted['cost_source'] == 'unpriced_proxy'

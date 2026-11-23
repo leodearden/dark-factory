@@ -9,13 +9,10 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
-# Cost primitives (the USD/1M fallback rate + the PriceEntry-or-dict accessor)
-# have a SINGLE home in agents.invoke (task 2459); this module imports them from
-# agents.invoke rather than re-declaring them, so the three-way copy can never
-# drift (reviewer: code-reuse). resolve_cost_usd below mirrors invoke's Invariant-P5 policy.
-# agents.invoke has no import cycle back to evals (it reaches only
-# config/fm_retry/shared.*), so a module-level import is safe.
-from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
+# The per-token cost formula and its primitives have a SINGLE home in
+# agents.token_pricing, a leaf module that invoke._estimate_cost prices through
+# too, so runtime and eval figures cannot drift apart.
+from orchestrator.agents.token_pricing import FALLBACK_PRICE, rate
 from orchestrator.shadow_types import ReferenceKind
 
 from .cell_sandbox import CellSandbox
@@ -673,11 +670,10 @@ def is_proxied_endpoint(env_overrides: dict[str, str] | None) -> bool:
     return bool((env_overrides or {}).get('ANTHROPIC_BASE_URL'))
 
 
-# ``_FALLBACK_PRICE`` (the DEFINED, logged degradation rate used only for a
+# ``FALLBACK_PRICE`` (the DEFINED, logged degradation rate used only for a
 # PROXIED endpoint whose model is unlisted — Invariant P5 / the
-# loud-over-silent-degradation norm) and ``_rate`` (the PriceEntry-or-dict
-# accessor) are imported from agents.invoke at the top of this module — a single
-# home so the copy cannot drift (reviewer: code-reuse).
+# loud-over-silent-degradation norm) and the per-token formula come from
+# agents.token_pricing, their single home.
 def resolve_cost_usd(
     input_tokens: int,
     output_tokens: int,
@@ -703,18 +699,18 @@ def resolve_cost_usd(
     - **unpriced_proxy** — a PROXIED endpoint (``is_local_model=True`` —
       ``ANTHROPIC_BASE_URL`` set) whose model is unlisted: the CLI cost is
       WRONG for a proxied endpoint, so emit a loud WARNING (mirroring task
-      2459) and fall back to a DEFINED ``_FALLBACK_PRICE`` figure — never a
+      2459) and fall back to a DEFINED ``FALLBACK_PRICE`` figure — never a
       silent or raw-CLI number.
 
     Pure: no I/O, no config access; *prices* is passed in by the caller.
     Accepts ``PriceEntry`` objects and plain dicts interchangeably (via
-    :func:`_rate`), exactly as invoke.py does.
+    :func:`~orchestrator.agents.token_pricing.rate`), exactly as invoke.py does.
     """
     entry = prices.get(model) if prices else None
     if entry is not None:
         cost = (
-            input_tokens * _rate(entry, 'input_per_1m')
-            + output_tokens * _rate(entry, 'output_per_1m')
+            input_tokens * rate(entry, 'input_per_1m')
+            + output_tokens * rate(entry, 'output_per_1m')
         ) / 1_000_000
         return cost, 'price_table'
 
@@ -728,11 +724,11 @@ def resolve_cost_usd(
         'No configured price for proxied-endpoint model %r; the CLI cost is '
         'unreliable for a proxied endpoint, falling back to $%.2f/1M input, '
         '$%.2f/1M output (add it to config.prices to silence)',
-        model, _FALLBACK_PRICE['input_per_1m'], _FALLBACK_PRICE['output_per_1m'],
+        model, FALLBACK_PRICE['input_per_1m'], FALLBACK_PRICE['output_per_1m'],
     )
     cost = (
-        input_tokens * _FALLBACK_PRICE['input_per_1m']
-        + output_tokens * _FALLBACK_PRICE['output_per_1m']
+        input_tokens * FALLBACK_PRICE['input_per_1m']
+        + output_tokens * FALLBACK_PRICE['output_per_1m']
     ) / 1_000_000
     return cost, 'unpriced_proxy'
 

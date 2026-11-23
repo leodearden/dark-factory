@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from orchestrator.agents.invoke import _rate
+from orchestrator.agents.token_pricing import rate
 
 from .table_render import render_fixed_table
 
@@ -23,8 +23,8 @@ def _price_role_entry(model: str, prices: dict[str, Any] | None) -> dict[str, An
     if entry is None:
         return {'source': 'unpriced'}
     return {
-        'input_per_1m': _rate(entry, 'input_per_1m'),
-        'output_per_1m': _rate(entry, 'output_per_1m'),
+        'input_per_1m': rate(entry, 'input_per_1m'),
+        'output_per_1m': rate(entry, 'output_per_1m'),
     }
 
 
@@ -35,9 +35,9 @@ def build_price_table(
 
     Each config's ``model`` is looked up in *prices* (a ``config.prices``-shaped
     map; ``PriceEntry`` objects and plain ``{'input_per_1m','output_per_1m'}``
-    dicts are both accepted via :func:`_rate`). A listed model yields
-    ``{role: {'input_per_1m', 'output_per_1m'}}``; an UNLISTED model yields the
-    explicit ``{role: {'source': 'unpriced'}}`` marker — never a fabricated
+    dicts are both accepted via ``agents.token_pricing.rate``). A listed model
+    yields ``{role: {'input_per_1m', 'output_per_1m'}}``; an UNLISTED model
+    yields the explicit ``{role: {'source': 'unpriced'}}`` marker — never a fabricated
     default (loud-over-silent). Pure over ``(configs, prices)``; the caller
     (μ / CLI) seeds *prices* from ``default_price_table()`` / ``config.prices``.
     Config keys are inserted in sorted order so the table is byte-deterministic.
