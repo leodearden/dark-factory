@@ -29,12 +29,12 @@ from _verify_cache_fixtures import (
     WORKSPACE_SEED,
     cache_config,
     cache_module,
-    clean_unscoped_gate,
     put_pytest_on_path,
 )
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.merge_lane.gates import PostMergePyrightResult
 from orchestrator.verify import VerifyResult, run_scoped_verification
 from orchestrator.verify_cache.registry import registry_db_path
 from orchestrator.verify_evidence import UnitOutcome
@@ -3380,7 +3380,8 @@ class TestRunnerVerifyConsultsNoRegistry:
 
         result = await run_merge_verify_on_worktree(
             repo, config, build_merge_verify_spec(config, modules, None),
-            run_scoped=run_scoped_verification, run_unscoped=clean_unscoped_gate,
+            run_scoped=run_scoped_verification,
+            run_unscoped=AsyncMock(return_value=PostMergePyrightResult()),
         )
 
         assert result.passed, result.summary
