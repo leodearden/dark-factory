@@ -7886,6 +7886,7 @@ class MemoryService:
                         relevance_score=0.0,
                         metadata=custom,
                         created_at=created_at if isinstance(created_at, str) else None,
+                        **mem0_hit_attribution(managed, custom),
                         topic_anchored=True,
                     ))
                     pin_at += 1
