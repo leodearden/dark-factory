@@ -841,7 +841,9 @@ Agent found it depends on work that isn't done yet.
    ```
    mcp__fused-memory__search_tasks(project_root=<project_root>, query="<the prerequisite, in the agent's words>")
    ```
-   Then `mcp__fused-memory__get_task` on each candidate whose `status` is `pending`, `in-progress` or `blocked`, to confirm it is the prerequisite. If `search_tasks` is missing from your toolset or the call is refused (an orchestrator not yet restarted onto the task-10426 grant can still list the tool but deny it), a refusal is not "no match": page `mcp__fused-memory__get_tasks(project_root=<project_root>, statuses=["pending", "in-progress", "blocked"], fields=["title", "status"], page_size=500, offset=...)` until `pagination.has_more` is false before reaching step 3.
+   Then `mcp__fused-memory__get_task` on each candidate whose `status` is not `done` or `cancelled`, to confirm it is the prerequisite. A `deferred` prerequisite is invisible here: the `search_tasks` corpus excludes deferred tasks.
+
+   If the existence check cannot run — `search_tasks` is missing from your toolset, the call is refused (an orchestrator not yet restarted onto the task-10426 grant can still list the tool but deny it), or it returns an `error` payload — that is not "no match", and step 3 does not apply. Do not fall back to paging `get_tasks`: the incomplete set is thousands of rows, far past the MCP response limit. Promote instead, with `root_cause="dependency-check-unavailable:" + <dep_description_slug>`, the refusal or error text verbatim in `evidence`, and a summary that says the existence check could not run, not that no task exists.
 2. **If a matching incomplete task exists:**
    ```
    mcp__fused-memory__add_dependency(id=<task_id>, depends_on=<dep_id>, project_root=<project_root>)
