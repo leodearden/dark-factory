@@ -58,7 +58,7 @@ from orchestrator.routing import DEFAULT_ALLOWED_MODELS, DEFAULT_LADDER
 from orchestrator.shadow_types import ShadowShape
 from orchestrator.task_priority import PRIORITY_TIERS
 from orchestrator.verify_admission_gate import AdmissionOrder
-from orchestrator.verify_cache.modes import CacheMode, VerifyRole
+from orchestrator.verify_cache.modes import CacheMode, VerifyRole, forced_off
 
 logger = logging.getLogger(__name__)
 
@@ -1497,7 +1497,10 @@ class VerifyCacheConfig(BaseModel):
     merge_mode: CacheMode = CacheMode.OFF
 
     def mode_for(self, role: VerifyRole) -> CacheMode:
-        """*role*'s mode; the cache has no background role, so that is always OFF."""
+        """*role*'s mode; the cache has no background role, so that is always OFF.
+        DF_VERIFY_CACHE=off forces every role OFF (plans/verify-result-cache-prd.md, Amendment A3)."""
+        if forced_off():
+            return CacheMode.OFF
         if role == 'task':
             return self.task_mode
         if role == 'merge':

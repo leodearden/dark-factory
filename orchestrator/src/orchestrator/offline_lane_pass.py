@@ -39,6 +39,8 @@ from orchestrator.offline_lane_records import (
     classify_exit,
 )
 from orchestrator.offline_lane_runs import ConfirmRunner, ProbeSeam, confirm_runner, run_probe
+from orchestrator.verify_cache.audit_hook import VerifyCacheAuditHook
+from orchestrator.verify_cache.registry import Registry, registry_db_path
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -58,8 +60,9 @@ ConfirmSeam = Callable[[ConfirmTarget, RunRecord | None, ConfirmRunner], Awaitab
 def lane_pass_outcome_hooks(
     config: OrchestratorConfig, escalation_queue: EscalationQueue | None,
 ) -> tuple[PassOutcomeHook, ...]:
-    """The production section 5.7 hooks, each asked once per red pass that reached an outcome."""
-    return ()
+    """The production section 5.7 hooks, each asked once per red pass that reached an outcome:
+    the verify-cache audit's red handler, over the project's cache registry."""
+    return (VerifyCacheAuditHook(Registry(registry_db_path(Path(config.project_root))), escalation_queue),)
 
 
 class PassObserver(Protocol):
