@@ -21,7 +21,8 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from _fm_helpers import load_script_module
-from shared.task_metadata import RetryLedger
+from pydantic import ValidationError
+from shared.task_metadata import RetryLedger, parse_metadata
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
@@ -53,6 +54,8 @@ CONFLICTING_LEDGER_META = {
     'retry_ledger': {FAILURES: 2, 'merge_first_enqueued_at': ENQUEUED_AT},
 }
 CLEAN_META = {'files': ['b.py'], 'retry_ledger': {FAILURES: 1}}
+# The shape of reify #4880: a null counter, a non-null sibling, no retry_ledger.
+NULL_COUNTER_META = {FAILURES: None, ITERATION: 6, 'done_provenance': DONE_PROVENANCE}
 
 
 class TestNestCounters:
@@ -73,6 +76,7 @@ class TestNestCounters:
         }
         assert plan.lifted == (FAILURES, ITERATION)
         assert plan.shadowed == ()
+        assert plan.dropped == ()
         assert meta == BOTH_COUNTERS_META
 
     def test_nested_value_wins_and_the_shadowed_copy_is_dropped(self):
@@ -85,7 +89,36 @@ class TestNestCounters:
         }
         assert plan.lifted == (ITERATION,)
         assert plan.shadowed == (FAILURES,)
+        assert plan.dropped == ()
         assert meta == CONFLICTING_LEDGER_META
+
+    def test_null_counter_is_dropped_and_its_non_null_sibling_nested(self):
+        meta = copy.deepcopy(NULL_COUNTER_META)
+        plan = nest_counters(meta)
+
+        assert plan is not None
+        assert plan.after == {'done_provenance': DONE_PROVENANCE, 'retry_ledger': {ITERATION: 6}}
+        assert plan.dropped == (FAILURES,)
+        assert plan.lifted == (ITERATION,)
+        assert plan.shadowed == ()
+        assert meta == NULL_COUNTER_META
+        parse_metadata(plan.after, direction='write', enforce=True)
+
+    def test_only_null_counters_leave_no_ledger_behind(self):
+        plan = nest_counters({FAILURES: None, ITERATION: None, 'files': ['a.py']})
+
+        assert plan is not None
+        assert plan.after == {'files': ['a.py']}
+        assert plan.dropped == (FAILURES, ITERATION)
+        assert plan.lifted == ()
+
+    def test_null_counter_is_dropped_even_where_a_nested_value_exists(self):
+        plan = nest_counters({FAILURES: None, 'retry_ledger': {FAILURES: 2}})
+
+        assert plan is not None
+        assert plan.after == {'retry_ledger': {FAILURES: 2}}
+        assert plan.dropped == (FAILURES,)
+        assert plan.shadowed == ()
 
     @pytest.mark.parametrize('ledger', ['oops', [1, 2], 5])
     def test_non_dict_ledger_is_refused_naming_the_value(self, ledger):
@@ -198,6 +231,17 @@ class SilentlyDroppedWriteClient(BackendToolClient):
 @pytest_asyncio.fixture
 async def backend(tmp_path):
     started = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await started.start()
+    yield started
+    await started.close()
+
+
+@pytest_asyncio.fixture
+async def enforcing_backend(tmp_path):
+    """A second backend over the same store, refusing a malformed write as the live server does."""
+    started = SqliteTaskBackend(
+        TaskmasterConfig(project_root=str(tmp_path)), task_metadata_enforce=True,
+    )
     await started.start()
     yield started
     await started.close()
@@ -412,3 +456,25 @@ async def test_raised_write_is_a_problem_and_the_rest_still_migrate(
     conflicting = await _stored(backend, root, seeded['conflicting'])
     assert FAILURES not in conflicting and ITERATION not in conflicting
     assert f"#{seeded['both']}: update_task raised" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_null_counter_row_migrates_through_an_enforcing_store(
+    backend, enforcing_backend, root, tmp_path, capsys,
+):
+    null_row = await _seed(backend, root, NULL_COUNTER_META)
+    with pytest.raises(ValidationError):
+        await enforcing_backend.update_task(
+            null_row, project_root=root, metadata_mode='replace', metadata=json.dumps({
+                'done_provenance': DONE_PROVENANCE,
+                'retry_ledger': {FAILURES: None, ITERATION: 6},
+            }),
+        )
+
+    client = BackendToolClient(enforcing_backend)
+    assert await run(client, [root], apply=True, backup_path=tmp_path / 'backup.json') == 0
+
+    assert await _stored(enforcing_backend, root, null_row) == {
+        'done_provenance': DONE_PROVENANCE, 'retry_ledger': {ITERATION: 6},
+    }
+    assert f'dropped={[FAILURES]}' in capsys.readouterr().out

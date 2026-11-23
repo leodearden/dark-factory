@@ -7,7 +7,9 @@ at the TOP level, and ``shared.task_metadata`` lifts them into ``retry_ledger``
 at parse time. This script moves them in storage with the lift's own semantics
 (a nested value wins and the shadowed top-level copy is dropped; a non-dict
 ledger is refused), so every migrated blob parses to the ``RetryLedger`` its
-readers already see and the lift can be deleted.
+readers already see and the lift can be deleted. A null counter carries no
+information and ``RetryLedger`` rejects it, so it is dropped, not nested
+(ruling esc-7135-5, reify #4880).
 
 It talks to the running fused-memory MCP server: targets come from
 ``find_tasks_by_metadata``, each raw blob from ``get_task``, and each write is
@@ -77,6 +79,7 @@ class NestingPlan:
     after: dict
     lifted: tuple[str, ...]
     shadowed: tuple[str, ...]
+    dropped: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -100,15 +103,16 @@ def nest_counters(meta: dict) -> NestingPlan | None:
     if not present:
         return None
     ledger = meta.get('retry_ledger')
-    if ledger is None:
-        ledger = {}
-    elif not isinstance(ledger, dict):
+    if ledger is not None and not isinstance(ledger, dict):
         raise MalformedRetryLedgerError(f'retry_ledger is not a dict: {ledger!r}')
-    lifted = tuple(key for key in present if key not in ledger)
-    shadowed = tuple(key for key in present if key in ledger)
+    dropped = tuple(key for key in present if meta[key] is None)
+    carried = tuple(key for key in present if meta[key] is not None)
+    lifted = tuple(key for key in carried if key not in (ledger or {}))
+    shadowed = tuple(key for key in carried if key in (ledger or {}))
     after = {key: copy.deepcopy(value) for key, value in meta.items() if key not in COUNTER_KEYS}
-    after['retry_ledger'] = {**copy.deepcopy(ledger), **{key: meta[key] for key in lifted}}
-    return NestingPlan(after=after, lifted=lifted, shadowed=shadowed)
+    if ledger is not None or lifted:
+        after['retry_ledger'] = {**copy.deepcopy(ledger or {}), **{key: meta[key] for key in lifted}}
+    return NestingPlan(after=after, lifted=lifted, shadowed=shadowed, dropped=dropped)
 
 
 def build_update_payload(task_id: str, project_root: str, meta: dict) -> dict:
@@ -247,7 +251,7 @@ async def apply_target(client: ToolClient, target: Target, backup_path: Path) ->
 def _describe(target: Target) -> str:
     return (
         f'  {target.label}: lifted={list(target.plan.lifted)} '
-        f'shadowed={list(target.plan.shadowed)}'
+        f'shadowed={list(target.plan.shadowed)} dropped={list(target.plan.dropped)}'
     )
 
 
