@@ -589,9 +589,13 @@ def _task_green() -> tuple[VerifyResult, UnitKey]:
 
 class TestWorkflowRecordsTaskGreens:
     @staticmethod
+    def _access(tmp_path: Path) -> CacheAccess:
+        return CacheAccess(registry=Registry(tmp_path / 'verify_cache.db'), orchestrator_code=TEST_CODE)
+
+    @staticmethod
     async def _scene(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, forked: bool = False,
-        verify_cache: CacheAccess | None = None,
+        verify_cache: CacheAccess | None,
     ) -> tuple[OrchestratorConfig, EventStore, TaskWorkflow]:
         config = task_scene_config(tmp_path)
         config.pre_merge_reverify = forked
@@ -612,57 +616,70 @@ class TestWorkflowRecordsTaskGreens:
         return verify
 
     @staticmethod
-    async def _recorded_at(config: OrchestratorConfig, key: UnitKey) -> Entry:
-        return (await _recorded(Registry(registry_db_path(config.project_root)), key))[_TASK_UNIT]
+    async def _recorded_in(access: CacheAccess, key: UnitKey) -> Entry:
+        assert access.registry is not None
+        return (await _recorded(access.registry, key))[_TASK_UNIT]
 
     @pytest.mark.asyncio
     async def test_the_implement_site_records_its_green_against_the_review_edge_row(self, tmp_path, monkeypatch):
-        config, store, workflow = await self._scene(tmp_path, monkeypatch)
+        access = self._access(tmp_path)
+        _config, store, workflow = await self._scene(tmp_path, monkeypatch, verify_cache=access)
         result, key = _task_green()
         self._verifies(monkeypatch, result)
 
         assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
 
         [row] = store.fetch_events_by_type(EventType.workflow_verify)
-        entry = await self._recorded_at(config, key)
+        entry = await self._recorded_in(access, key)
         assert entry.evidence_event_id == row['id']
         assert (entry.run_id, entry.sha) == ('r', row['data']['tip_sha'])
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('given_access', [True, False], ids=['given-an-access', 'given-none'])
     async def test_the_pre_merge_site_records_its_green_and_verifies_through_the_access_it_was_given(
-        self, tmp_path, monkeypatch, given_access,
+        self, tmp_path, monkeypatch,
     ):
-        access = (
-            CacheAccess(registry=Registry(tmp_path / 'verify_cache.db'), orchestrator_code=TEST_CODE)
-            if given_access else None
-        )
-        config, store, workflow = await self._scene(tmp_path, monkeypatch, forked=True, verify_cache=access)
+        access = self._access(tmp_path)
+        _config, store, workflow = await self._scene(tmp_path, monkeypatch, forked=True, verify_cache=access)
         result, key = _task_green()
         verify = self._verifies(monkeypatch, result)
 
         assert await workflow._rebase_before_enqueue() is True
 
         [row] = store.fetch_events_by_type(EventType.workflow_verify)
-        entry = await self._recorded_at(config, key)
+        entry = await self._recorded_in(access, key)
         assert entry.evidence_event_id == row['id']
         assert (entry.run_id, entry.sha) == ('r', row['data']['tip_sha'])
         assert verify.await_args is not None
         assert verify.await_args.kwargs['verify_cache'] is access
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('forked', [False, True], ids=['implement-site', 'pre-merge-site'])
+    async def test_a_workflow_outside_the_cache_records_nothing(self, tmp_path, monkeypatch, forked):
+        config, store, workflow = await self._scene(tmp_path, monkeypatch, forked=forked, verify_cache=None)
+        self._verifies(monkeypatch, _task_green()[0])
+
+        if forked:
+            assert await workflow._rebase_before_enqueue() is True
+        else:
+            assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
+
+        assert len(store.fetch_events_by_type(EventType.workflow_verify)) == 1
+        assert not registry_db_path(config.project_root).exists()
+        assert not (tmp_path / 'verify_cache.db').exists()
+
+    @pytest.mark.asyncio
     async def test_a_verdict_without_a_cache_record_records_nothing(self, tmp_path, monkeypatch):
-        config, store, workflow = await self._scene(tmp_path, monkeypatch)
+        _config, store, workflow = await self._scene(tmp_path, monkeypatch, verify_cache=self._access(tmp_path))
         self._verifies(monkeypatch, _result(duration_secs=1.0))
 
         assert await workflow._execute_verify_review_loop() == WorkflowOutcome.DONE
 
         assert len(store.fetch_events_by_type(EventType.workflow_verify)) == 1
-        assert not registry_db_path(config.project_root).exists()
+        assert not (tmp_path / 'verify_cache.db').exists()
 
     @pytest.mark.asyncio
     async def test_an_unresolved_tip_records_nothing(self, tmp_path, monkeypatch):
-        config, store, workflow = await self._scene(tmp_path, monkeypatch)
+        _config, store, workflow = await self._scene(tmp_path, monkeypatch, verify_cache=self._access(tmp_path))
         self._verifies(monkeypatch, _task_green()[0])
         monkeypatch.setattr(workflow, '_verified_tip', AsyncMock(return_value=TipUnresolved.HEAD_UNREADABLE))
 
@@ -670,11 +687,11 @@ class TestWorkflowRecordsTaskGreens:
 
         [row] = store.fetch_events_by_type(EventType.workflow_verify)
         assert row['data']['tip_sha_unresolved'] is True
-        assert not registry_db_path(config.project_root).exists()
+        assert not (tmp_path / 'verify_cache.db').exists()
 
     @pytest.mark.asyncio
     async def test_a_checkpoint_hit_records_nothing(self, tmp_path, monkeypatch):
-        config, store, workflow = await self._scene(tmp_path, monkeypatch)
+        _config, store, workflow = await self._scene(tmp_path, monkeypatch, verify_cache=self._access(tmp_path))
         assert workflow.worktree is not None
         head = scene_git(workflow.worktree, 'rev-parse', 'HEAD')
         EventStore(tmp_path / 'events.db', run_id='prior').emit(
@@ -686,4 +703,4 @@ class TestWorkflowRecordsTaskGreens:
 
         verify.assert_not_awaited()
         assert store.fetch_events_by_type(EventType.workflow_verify) == []
-        assert not registry_db_path(config.project_root).exists()
+        assert not (tmp_path / 'verify_cache.db').exists()

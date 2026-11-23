@@ -257,7 +257,6 @@ from orchestrator.verify import (
     verify_failure_is_preexisting_on_main,
 )
 from orchestrator.verify_cache.recorder import VerifyEvidenceRef, record_greens
-from orchestrator.verify_cache.registry import Registry, registry_db_path
 from orchestrator.verify_cache.replay import CacheAccess
 from orchestrator.verify_categories import (
     INFRA_TRANSIENT_CATEGORIES,
@@ -2775,16 +2774,17 @@ class TaskWorkflow:
     async def _record_task_verify_cache(
         self, result: VerifyResult | None, event_id: int | None, tip: str | TipUnresolved,
     ) -> None:
-        """Record *result*'s admitted greens, citing the workflow_verify row *event_id* at *tip*.
+        """Record *result*'s admitted greens into the joined cache, citing the workflow_verify row *event_id* at *tip*.
 
-        Records nothing without a cache record, a row id, or a resolved tip. The
-        task role writes no consumed rows: I6 is merge-role only.
+        Records nothing outside the cache, without a cache record, a row id, or
+        a resolved tip. The task role writes no consumed rows: I6 is merge-role only.
         """
-        if result is None or result.cache_record is None or event_id is None or not isinstance(tip, str):
+        registry = self._verify_cache.registry if self._verify_cache is not None else None
+        if registry is None or result is None or result.cache_record is None or event_id is None or not isinstance(tip, str):
             return
         assert self.event_store is not None  # event_id is one of its rows
         await record_greens(
-            Registry(registry_db_path(self.config.project_root)), result.cache_record,
+            registry, result.cache_record,
             flake_suppressed=result.flake_suppression is not None,
             evidence=VerifyEvidenceRef(event_id, self.event_store.run_id, tip, result.passed),
         )
