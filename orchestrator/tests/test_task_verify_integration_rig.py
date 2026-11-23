@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _task_verify_integration_rig import ChildExitedBeforeRecording, await_recorded_cold_worktree
@@ -22,7 +23,7 @@ pytestmark = pytest.mark.asyncio
 
 
 @contextlib.asynccontextmanager
-async def a_call_still_running() -> AsyncIterator[asyncio.Future[bool]]:
+async def a_call_still_running() -> AsyncIterator[asyncio.Future[Any]]:
     call = asyncio.ensure_future(asyncio.Event().wait())
     try:
         yield call
