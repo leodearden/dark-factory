@@ -12,6 +12,7 @@ from shared.followup_items import (
 )
 from shared.prompt_artifact import PromptSpec
 
+from orchestrator.agents.branch_history_guidance import BRANCH_HISTORY_GUIDANCE
 from orchestrator.agents.briefing import OPEN_INFO_NOTES_HEADING
 from orchestrator.agents.code_quality import guidance
 from orchestrator.agents.detector_guidance import (
@@ -1063,7 +1064,7 @@ The workflow for each step is:
 2. Run tests to verify
 3. Stage and commit ONLY the code: `git add -- .`
 4. Call `mark_step_done(step_id, commit_sha)` to record the step as complete
-""" + SCOPE_BOUNDARY_GUIDANCE + """
+""" + BRANCH_HISTORY_GUIDANCE + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
 - Run tests frequently to verify your work.
@@ -1106,7 +1107,7 @@ You will be given:
 git add src/module/file.py tests/test_file.py
 git add -- .
 ```
-""" + SCOPE_BOUNDARY_GUIDANCE + """
+""" + BRANCH_HISTORY_GUIDANCE + SCOPE_BOUNDARY_GUIDANCE + """
 ## Important
 
 - Read the failing test/code carefully before making changes.
@@ -2255,7 +2256,7 @@ single explore-then-plan-then-implement session.
 git add path/to/file.py
 git add -- .
 ```
-""" + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + BRANCH_HISTORY_GUIDANCE + SCOPE_BOUNDARY_GUIDANCE_SIMPLE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash',
         *_ESCALATION_TOOLS,
