@@ -12,6 +12,8 @@ lands. A restart neither pages again nor strands the page it inherits.
 from __future__ import annotations
 
 import json
+import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,18 +31,16 @@ from _fm_polling import poll_until
 from shared.project_layout import escalation_queue_dir
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-from fused_memory.middleware import _folded_escalation
+from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.scope import configured_primary_root
+from fused_memory.services.billing_exhaustion_alarm import ANCHOR_TASK_ID
 from fused_memory.services.memory_service import MemoryService
 
-pytestmark = [
-    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
-    pytest.mark.skipif(
-        not _folded_escalation.HAS_ESCALATION,
-        reason='escalation package unavailable (minimal env)',
-    ),
-]
+pytest.importorskip('escalation.queue', reason='escalation package unavailable (minimal env)')
+from escalation.archive import ARCHIVE_SUBDIR  # noqa: E402
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _BILLING = 'provider_billing_exhausted'
 _DEAD_LETTER = 'durable_write_dead_letter'
@@ -278,6 +278,34 @@ class TestARestartMidOutage:
                 lambda: [r['status'] for r in _records(root, _BILLING)] == ['resolved'],
                 timeout=20.0, message='the inherited page was not resolved',
             )
+
+
+class TestReadingPagesWhileAResolveArchivesThem:
+    def test_a_page_archived_between_listing_and_read_is_found_on_the_next_read(
+        self, tmp_path, monkeypatch,
+    ):
+        page_id = file_folded_escalation(
+            str(tmp_path), anchor_task_id=ANCHOR_TASK_ID, agent_role='test-billing-e2e',
+            category=_BILLING, severity='blocking', summary='credits exhausted',
+            detail='a page a resolve archives mid-listing',
+            suggested_action='none; this is a test page',
+            logger=logging.getLogger(__name__), log_label='billing e2e race',
+        )
+        assert page_id
+        doomed = escalation_queue_dir(tmp_path) / f'{page_id}.json'
+        archived = escalation_queue_dir(tmp_path) / ARCHIVE_SUBDIR / '2026-11-23' / doomed.name
+        original_read_text = Path.read_text
+
+        def read_text_racing_a_resolve(self: Path, *args, **kwargs) -> str:
+            if self == doomed and doomed.exists():
+                archived.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(doomed, archived)
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', read_text_racing_a_resolve)
+
+        assert [r.id for r in _records(tmp_path, _BILLING)] in ([], [page_id])
+        assert [r.id for r in _records(tmp_path, _BILLING)] == [page_id]
 
 
 async def _parked_counts(svc: MemoryService, *, at_least: int = 1) -> dict | None:
