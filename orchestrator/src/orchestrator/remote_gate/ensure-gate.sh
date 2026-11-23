@@ -13,11 +13,20 @@
 # Invariant: a dir carrying .ready has answered `gate-identity` for $SHA through
 # its own binary. Builds happen in place (a moved uv venv is dead: its shebangs and
 # editable .pth entries are absolute) under a per-sha build lock; after .ready
-# nothing writes into the dir. stdout carries only the final JSON line; every
-# diagnostic goes to stderr. Exit status 255 is the ssh client's own failure
-# (remote_gate.py::classify_remote_exit), so this script never exits 255.
+# nothing writes into the dir. A failed run unlinks the build lock it holds, by
+# the build lock protocol in reap-gates.sh's header. stdout carries only the
+# final JSON line; every diagnostic goes to stderr. Exit status 255 is the ssh
+# client's own failure (remote_gate.py::classify_remote_exit), so this script
+# never exits 255.
 set -euo pipefail
-trap '[[ $? -ne 255 ]] || exit 70' EXIT
+
+lock_held=false
+on_exit() {
+	local rc=$?
+	[[ $rc -eq 0 || $lock_held == false ]] || rm -f "$lock"
+	[[ $rc -ne 255 ]] || exit 70
+}
+trap on_exit EXIT
 
 die() {
 	echo "ensure-gate: $1" >&2
@@ -30,6 +39,7 @@ die() {
 
 dir="$GATE_ROOT/$SHA"
 gate_bin="$dir/.venv/bin/orchestrator"
+lock="$GATE_ROOT/.build-$SHA.lock"
 
 mkdir -p "$GATE_ROOT"
 touch "$GATE_ROOT/.dark-factory-gate-root"
@@ -54,8 +64,17 @@ handshake() {
 	ORCH_GATE_BIN="$gate_bin" orchestrator gate-identity
 }
 
-exec 9>"$GATE_ROOT/.build-$SHA.lock"
-flock -w 300 9 || die "build lock for $SHA not acquired within 300s" 75
+# A holder may unlink the lock: a lock won on a file no longer at $lock is retaken.
+lock_build() {
+	while :; do
+		exec 9>"$lock"
+		flock -w 300 9 || die "build lock for $SHA not acquired within 300s" 75
+		[[ /dev/fd/9 -ef $lock ]] && return
+	done
+}
+
+lock_build
+lock_held=true
 
 built=false
 if [[ -e $dir && ! -e $dir/.ready ]]; then
@@ -86,6 +105,7 @@ else
 fi
 # The last-used stamp the reaper ages: every ensure refreshes it.
 touch -c "$dir"
+lock_held=false
 exec 9>&-
 
 # The clone's detached HEAD keeps the objects; the transfer ref is spent.
