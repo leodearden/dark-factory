@@ -7190,7 +7190,7 @@ class GitOps:
         try:
             await self.commit(
                 lane,
-                'chore: save WIP before warm-lane reclaim (task 1933)',
+                f'chore: save WIP before warm-lane reclaim [lane {victim_branch}]',
             )
         except Exception:
             logger.warning(
