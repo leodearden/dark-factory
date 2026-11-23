@@ -606,6 +606,38 @@ async def until(predicate: Callable[[], bool], *, what: str) -> None:
     await wait_responsive(poll(), label=what)
 
 
+class ChildExitedBeforeRecording(AssertionError):
+    """The verify-task child exited before recording a cold worktree beside *pgf*; it never can now."""
+
+    def __init__(self, pgf: Path, returncode: int) -> None:
+        super().__init__(
+            f'verify-task exited rc={returncode} before recording a cold worktree beside {pgf}',
+        )
+        self.pgf = pgf
+        self.returncode = returncode
+
+
+async def await_recorded_cold_worktree(
+    pgf: Path, *, child_exit: Callable[[], int | None], watching: asyncio.Future[Any],
+) -> Path:
+    """The worktree recorded beside *pgf*, once it holds its cold ``.task/``.
+
+    It reads no clock.  It fails when the child has exited (*child_exit* gives
+    its returncode) or the *watching* call has ended; a child that lives on
+    without recording is left to the caller's per-test timeout.
+    """
+    while True:
+        recorded = read_worktree_path(pgf)
+        if recorded is not None and (recorded / '.task').is_dir():
+            return recorded
+        if (returncode := child_exit()) is not None:
+            raise ChildExitedBeforeRecording(pgf, returncode)
+        if watching.done():
+            watching.result()
+            raise AssertionError('the call ended before verify-task recorded its worktree')
+        await asyncio.sleep(0.05)
+
+
 @dataclass
 class Turn:
     """A turn the test holds on one gate, from outside any verify."""
