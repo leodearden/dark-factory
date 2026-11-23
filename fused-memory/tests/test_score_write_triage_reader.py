@@ -1,7 +1,8 @@
 """Tests for score_write_triage_reader.py — the rubric v2.1 reader-consequence scorer.
 
 Reached only through the public surface: ``score_reader``, its refusal
-``IncompleteJudgementError``, ``render_markdown`` and the ``main`` CLI. The
+``IncompleteJudgementError``, ``item_readings``, ``render_markdown`` and the
+``main`` CLI. The
 scripts are loaded by path (``scripts/`` is not a package), lazily through
 ``_mod()``.
 
@@ -1109,3 +1110,71 @@ class TestTheCommittedSoakBaseline:
 
     def test_counts_at_least_the_13_parents_edited_after_attach(self) -> None:
         assert _rescored_baseline()['metrics']['m6']['parent_edited'] >= 13
+
+
+class TestItemReadings:
+    """Per-item endings under the scorer's own M3 rule (task 7519)."""
+
+    @staticmethod
+    def _readings() -> dict[str, Any]:
+        items, verdicts = _corpus()
+        items = [item for item in items if item['entry_id'] != 'C5']
+        return {reading.entry_id: reading for reading in _mod().item_readings(items, verdicts)}
+
+    def test_the_hidden_endings_are_the_ones_m3_counts(self) -> None:
+        hidden = _mod().HIDDEN_ENDINGS
+        assert hidden == frozenset({'restated', 'amended', 'stored_unlinked'})
+
+    @pytest.mark.xdist_group('committed_v2_soak_baseline')
+    def test_over_the_committed_soak_they_reproduce_m3(self) -> None:
+        items, verdicts, _ = _committed_inputs()
+        conflict = [
+            reading for reading in _mod().item_readings(items, verdicts)
+            if reading.decided is not None and reading.decided.conflict
+        ]
+        m3 = _rescored_baseline()['metrics']['m3']
+        hidden = [r for r in conflict if r.m3_ending in _mod().HIDDEN_ENDINGS]
+        assert len(hidden) == m3['hits']
+        endings = Counter(reading.m3_ending for reading in conflict)
+        assert {ending: endings[ending] for ending in m3['by_ending']} == m3['by_ending']
+        assert sum(endings.values()) == sum(m3['by_ending'].values())
+
+    def test_each_conflict_write_reads_its_ending(self) -> None:
+        readings = self._readings()
+        assert readings['R3'].m3_ending == 'restated'
+        assert readings['A2'].m3_ending == 'amended'
+        assert readings['C1'].m3_ending == 'contested'
+        assert readings['R3'].stratum == 'r'
+        assert readings['R3'].outcome == 'restated'
+
+    def test_a_non_conflict_or_undecided_write_has_no_ending(self) -> None:
+        items, verdicts = _corpus()
+        readings = {r.entry_id: r for r in _mod().item_readings(items, verdicts)}
+        assert readings['R1'].decided is not None
+        assert not readings['R1'].decided.conflict
+        assert readings['R1'].m3_ending is None
+        assert readings['C5'].decided is None
+        assert readings['C5'].m3_ending is None
+
+    def test_a_stored_conflict_reads_linked_only_when_its_record_is_marked(self) -> None:
+        readings = self._readings()
+        assert readings['S1'].m3_ending == 'stored_linked'
+        assert readings['S2'].m3_ending == 'stored_unlinked'
+
+    def test_a_decisive_tie_refuses_as_score_reader_does(self) -> None:
+        verdicts = [_vote('X', 'P', conflict='YES'),
+                    _vote('X', 'P', rater='sonnet', role='second', conflict='NO', home='YES',
+                          loss='NO')]
+        with pytest.raises(_mod().IncompleteJudgementError) as refusal:
+            _mod().item_readings([_item('X', 'contested', 'P')], verdicts)
+        assert refusal.value.gaps == (('X', 'P', 'conflict', 'tied'),)
+
+    def test_readings_are_sorted_by_entry_id(self) -> None:
+        items, verdicts = _corpus()
+        ids = [reading.entry_id for reading in _mod().item_readings(items[::-1], verdicts)]
+        assert ids == sorted(item['entry_id'] for item in items)
+
+    def test_a_reading_is_frozen(self) -> None:
+        reading = next(iter(self._readings().values()))
+        with pytest.raises(AttributeError):
+            reading.outcome = 'stored'

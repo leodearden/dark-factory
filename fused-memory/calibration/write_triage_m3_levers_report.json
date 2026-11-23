@@ -1,0 +1,5264 @@
+{
+  "arm_order": [
+    "f3p",
+    "f3p-repeat",
+    "a1-partial-dispute",
+    "c1-dispute-marker",
+    "d1-stale-detail-check",
+    "e1-mark-refused-contests",
+    "d1-e1-combined",
+    "a1-e1-combined",
+    "b1-sol-medium",
+    "b2-sol-high"
+  ],
+  "arms": {
+    "a1-e1-combined": {
+      "cost": {
+        "calls": 0,
+        "calls_per_write": 0.0,
+        "fail_open": 0,
+        "p50_seconds": null,
+        "p95_seconds": null,
+        "usd": 0.0,
+        "usd_per_1000_judged_writes": null,
+        "usd_per_1000_writes": 0.0,
+        "writes": 673
+      },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.028,
+        "p95_seconds": 5.011,
+        "usd": 1.830812,
+        "usd_per_1000_judged_writes": 3.097821,
+        "usd_per_1000_writes": 2.720374,
+        "writes": 673
+      },
+      "outcome_agreement_vs_baseline": null,
+      "paired_vs_baseline": {
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 7157
+        },
+        "conflict_set_differs": 0,
+        "false_conflict_change": {
+          "population": 59.47,
+          "sample": 25
+        },
+        "m3_delta": -0.2005,
+        "m3_delta_interval95": [
+          -0.2935,
+          -0.1104
+        ],
+        "transitions": {
+          "amended-sample": {
+            "amended->contested": 8,
+            "stored->contested": 1
+          },
+          "contested-census": {
+            "amended->contested": 13,
+            "stored->contested": 31
+          },
+          "restated-sample": {
+            "amended->contested": 2,
+            "stored->contested": 8
+          }
+        }
+      },
+      "provenance": {
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
+        "effort": null,
+        "model": null,
+        "parent": "a1-partial-dispute",
+        "parent_sha256": "496a67c80e83b1ccd049cd509cc2456c0139fa83ce6bcd98e96cf145ea70abd5",
+        "prompt_sha256": null,
+        "rows": 673
+      },
+      "score": {
+        "closure": null,
+        "harm": {
+          "delta_interval95": [
+            -0.5022,
+            -0.3115
+          ],
+          "delta_per_write": -0.4091,
+          "n": 671,
+          "per_write": {
+            "status_quo": 0.8256,
+            "triage": 0.4165
+          },
+          "population_delta_interval95": [
+            -0.0624,
+            0.1656
+          ],
+          "population_delta_per_write": 0.0535,
+          "population_per_write": {
+            "status_quo": 0.4559,
+            "triage": 0.5094
+          },
+          "unclear": 2
+        },
+        "m1": {
+          "band_unknown": 4,
+          "hits": 5,
+          "n": 91,
+          "population_interval95": [
+            0.0112,
+            0.1017
+          ],
+          "population_rate": 0.0529,
+          "rate": 0.0549,
+          "unclear": 1,
+          "wilson95": [
+            0.0237,
+            0.1222
+          ]
+        },
+        "m2_amended": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 6,
+              "n": 23
+            },
+            "reify": {
+              "hits": 18,
+              "n": 27
+            },
+            "scoping_intake": {
+              "hits": 0,
+              "n": 1
+            },
+            "solar_challenge": {
+              "hits": 23,
+              "n": 43
+            },
+            "solar_challenge_platform": {
+              "hits": 8,
+              "n": 12
+            }
+          },
+          "hits": 55,
+          "n": 106,
+          "population_interval95": [
+            0.3128,
+            0.5383
+          ],
+          "population_rate": 0.4246,
+          "rate": 0.5189,
+          "unclear": 0,
+          "wilson95": [
+            0.4248,
+            0.6117
+          ]
+        },
+        "m2_contested": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 83,
+              "n": 92
+            },
+            "reify": {
+              "hits": 92,
+              "n": 104
+            },
+            "scoping_intake": {
+              "hits": 2,
+              "n": 2
+            },
+            "solar_challenge": {
+              "hits": 75,
+              "n": 102
+            },
+            "solar_challenge_platform": {
+              "hits": 63,
+              "n": 74
+            }
+          },
+          "hits": 315,
+          "n": 374,
+          "population_interval95": [
+            0.7104,
+            0.8747
+          ],
+          "population_rate": 0.7954,
+          "rate": 0.8422,
+          "unclear": 2,
+          "wilson95": [
+            0.8018,
+            0.8757
+          ]
+        },
+        "m3": {
+          "by_ending": {
+            "amended": 12,
+            "contested": 315,
+            "restated": 0,
+            "stored_linked": 12,
+            "stored_unlinked": 32
+          },
+          "hits": 44,
+          "n": 371,
+          "population_interval95": [
+            0.1231,
+            0.3073
+          ],
+          "population_rate": 0.2136,
+          "rate": 0.1186,
+          "unclear": 2,
+          "wilson95": [
+            0.0895,
+            0.1555
+          ]
+        },
+        "m4": {
+          "by_category": {
+            "cross": {
+              "hits": 29,
+              "n": 166,
+              "population_interval95": [
+                0.2402,
+                0.5131
+              ],
+              "population_rate": 0.3784,
+              "rate": 0.1747,
+              "unclear": 1,
+              "wilson95": [
+                0.1245,
+                0.2396
+              ]
+            },
+            "same": {
+              "hits": 59,
+              "n": 316,
+              "population_interval95": [
+                0.2853,
+                0.4805
+              ],
+              "population_rate": 0.3841,
+              "rate": 0.1867,
+              "unclear": 1,
+              "wilson95": [
+                0.1476,
+                0.2333
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 0,
+              "population_interval95": null,
+              "population_rate": null,
+              "rate": null,
+              "unclear": 0,
+              "wilson95": null
+            }
+          },
+          "by_route": {
+            "direct": {
+              "hits": 81,
+              "n": 427,
+              "population_interval95": [
+                0.3197,
+                0.4831
+              ],
+              "population_rate": 0.4015,
+              "rate": 0.1897,
+              "unclear": 1,
+              "wilson95": [
+                0.1553,
+                0.2296
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 2,
+              "population_interval95": [
+                0.0,
+                0.0
+              ],
+              "population_rate": 0.0,
+              "rate": 0.0,
+              "unclear": 0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            },
+            "via_sibling": {
+              "hits": 7,
+              "n": 53,
+              "population_interval95": [
+                0.0291,
+                0.1739
+              ],
+              "population_rate": 0.087,
+              "rate": 0.1321,
+              "unclear": 1,
+              "wilson95": [
+                0.0655,
+                0.2484
+              ]
+            }
+          },
+          "hits": 88,
+          "n": 482,
+          "population_interval95": [
+            0.3037,
+            0.46
+          ],
+          "population_rate": 0.3821,
+          "rate": 0.1826,
+          "unclear": 2,
+          "wilson95": [
+            0.1506,
+            0.2195
+          ]
+        },
+        "m5": {
+          "by_action_changing": {
+            "no": 30,
+            "unknown": 25,
+            "yes": 260
+          },
+          "by_scope": {
+            "central": 154,
+            "secondary": 132,
+            "unknown": 29
+          },
+          "hits": 315,
+          "n": 374,
+          "population_interval95": [
+            0.7104,
+            0.8747
+          ],
+          "population_rate": 0.7954,
+          "rate": 0.8422,
+          "unclear": 2,
+          "wilson95": [
+            0.8018,
+            0.8757
+          ]
+        }
+      }
+    },
+    "a1-partial-dispute": {
+      "cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.028,
+        "p95_seconds": 5.011,
+        "usd": 1.830812,
+        "usd_per_1000_judged_writes": 3.097821,
+        "usd_per_1000_writes": 2.720374,
+        "writes": 673
+      },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.028,
+        "p95_seconds": 5.011,
+        "usd": 1.830812,
+        "usd_per_1000_judged_writes": 3.097821,
+        "usd_per_1000_writes": 2.720374,
+        "writes": 673
+      },
+      "outcome_agreement_vs_baseline": {
+        "agree": 551,
+        "n": 591,
+        "rate": 0.9323
+      },
+      "paired_vs_baseline": {
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 7157
+        },
+        "conflict_set_differs": 0,
+        "false_conflict_change": {
+          "population": 46.22,
+          "sample": 12
+        },
+        "m3_delta": -0.1332,
+        "m3_delta_interval95": [
+          -0.2224,
+          -0.0467
+        ],
+        "transitions": {
+          "amended-sample": {
+            "amended->contested": 8
+          },
+          "contested-census": {
+            "amended->contested": 13,
+            "stored->contested": 4
+          },
+          "restated-sample": {
+            "amended->contested": 2
+          }
+        }
+      },
+      "provenance": {
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
+        "effort": "low",
+        "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
+        "prompt_sha256": "ec895da68a9a35542cf6880f3594da1b21dd245c5ed47141ec9735ef5c6c7296",
+        "rows": 673
+      },
+      "score": {
+        "closure": null,
+        "harm": {
+          "delta_interval95": [
+            -0.4993,
+            -0.3249
+          ],
+          "delta_per_write": -0.4128,
+          "n": 671,
+          "per_write": {
+            "status_quo": 0.8256,
+            "triage": 0.4128
+          },
+          "population_delta_interval95": [
+            -0.0494,
+            0.1723
+          ],
+          "population_delta_per_write": 0.0626,
+          "population_per_write": {
+            "status_quo": 0.4559,
+            "triage": 0.5185
+          },
+          "unclear": 2
+        },
+        "m1": {
+          "band_unknown": 4,
+          "hits": 5,
+          "n": 91,
+          "population_interval95": [
+            0.0112,
+            0.1017
+          ],
+          "population_rate": 0.0529,
+          "rate": 0.0549,
+          "unclear": 1,
+          "wilson95": [
+            0.0237,
+            0.1222
+          ]
+        },
+        "m2_amended": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 6,
+              "n": 23
+            },
+            "reify": {
+              "hits": 18,
+              "n": 27
+            },
+            "scoping_intake": {
+              "hits": 0,
+              "n": 1
+            },
+            "solar_challenge": {
+              "hits": 23,
+              "n": 43
+            },
+            "solar_challenge_platform": {
+              "hits": 8,
+              "n": 12
+            }
+          },
+          "hits": 55,
+          "n": 106,
+          "population_interval95": [
+            0.3128,
+            0.5383
+          ],
+          "population_rate": 0.4246,
+          "rate": 0.5189,
+          "unclear": 0,
+          "wilson95": [
+            0.4248,
+            0.6117
+          ]
+        },
+        "m2_contested": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 79,
+              "n": 87
+            },
+            "reify": {
+              "hits": 90,
+              "n": 100
+            },
+            "scoping_intake": {
+              "hits": 2,
+              "n": 2
+            },
+            "solar_challenge": {
+              "hits": 64,
+              "n": 83
+            },
+            "solar_challenge_platform": {
+              "hits": 57,
+              "n": 66
+            }
+          },
+          "hits": 292,
+          "n": 338,
+          "population_interval95": [
+            0.7106,
+            0.8887
+          ],
+          "population_rate": 0.8022,
+          "rate": 0.8639,
+          "unclear": 2,
+          "wilson95": [
+            0.8232,
+            0.8964
+          ]
+        },
+        "m3": {
+          "by_ending": {
+            "amended": 12,
+            "contested": 292,
+            "restated": 0,
+            "stored_linked": 12,
+            "stored_unlinked": 55
+          },
+          "hits": 67,
+          "n": 371,
+          "population_interval95": [
+            0.1861,
+            0.3746
+          ],
+          "population_rate": 0.2809,
+          "rate": 0.1806,
+          "unclear": 2,
+          "wilson95": [
+            0.1448,
+            0.2229
+          ]
+        },
+        "m4": {
+          "by_category": {
+            "cross": {
+              "hits": 24,
+              "n": 151,
+              "population_interval95": [
+                0.2374,
+                0.5199
+              ],
+              "population_rate": 0.3808,
+              "rate": 0.1589,
+              "unclear": 1,
+              "wilson95": [
+                0.1092,
+                0.2256
+              ]
+            },
+            "same": {
+              "hits": 53,
+              "n": 295,
+              "population_interval95": [
+                0.2898,
+                0.4902
+              ],
+              "population_rate": 0.392,
+              "rate": 0.1797,
+              "unclear": 1,
+              "wilson95": [
+                0.1401,
+                0.2275
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 0,
+              "population_interval95": null,
+              "population_rate": null,
+              "rate": null,
+              "unclear": 0,
+              "wilson95": null
+            }
+          },
+          "by_route": {
+            "direct": {
+              "hits": 76,
+              "n": 418,
+              "population_interval95": [
+                0.3181,
+                0.4823
+              ],
+              "population_rate": 0.4004,
+              "rate": 0.1818,
+              "unclear": 1,
+              "wilson95": [
+                0.1478,
+                0.2216
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 2,
+              "population_interval95": [
+                0.0,
+                0.0
+              ],
+              "population_rate": 0.0,
+              "rate": 0.0,
+              "unclear": 0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            },
+            "via_sibling": {
+              "hits": 1,
+              "n": 26,
+              "population_interval95": [
+                0.0,
+                0.0952
+              ],
+              "population_rate": 0.0249,
+              "rate": 0.0385,
+              "unclear": 1,
+              "wilson95": [
+                0.0068,
+                0.1889
+              ]
+            }
+          },
+          "hits": 77,
+          "n": 446,
+          "population_interval95": [
+            0.3084,
+            0.4685
+          ],
+          "population_rate": 0.3882,
+          "rate": 0.1726,
+          "unclear": 2,
+          "wilson95": [
+            0.1404,
+            0.2105
+          ]
+        },
+        "m5": {
+          "by_action_changing": {
+            "no": 29,
+            "unknown": 24,
+            "yes": 239
+          },
+          "by_scope": {
+            "central": 142,
+            "secondary": 123,
+            "unknown": 27
+          },
+          "hits": 292,
+          "n": 338,
+          "population_interval95": [
+            0.7106,
+            0.8887
+          ],
+          "population_rate": 0.8022,
+          "rate": 0.8639,
+          "unclear": 2,
+          "wilson95": [
+            0.8232,
+            0.8964
+          ]
+        }
+      }
+    },
+    "b1-sol-medium": {
+      "cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.182,
+        "p95_seconds": 6.104,
+        "usd": 1.806996,
+        "usd_per_1000_judged_writes": 3.057523,
+        "usd_per_1000_writes": 2.684987,
+        "writes": 673
+      },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.182,
+        "p95_seconds": 6.104,
+        "usd": 1.806996,
+        "usd_per_1000_judged_writes": 3.057523,
+        "usd_per_1000_writes": 2.684987,
+        "writes": 673
+      },
+      "outcome_agreement_vs_baseline": {
+        "agree": 564,
+        "n": 591,
+        "rate": 0.9543
+      },
+      "paired_vs_baseline": {
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 7157
+        },
+        "conflict_set_differs": 0,
+        "false_conflict_change": {
+          "population": 11.99,
+          "sample": 1
+        },
+        "m3_delta": 0.0238,
+        "m3_delta_interval95": [
+          -0.0515,
+          0.1033
+        ],
+        "transitions": {
+          "amended-sample": {
+            "amended->contested": 2,
+            "contested->amended": 2
+          },
+          "contested-census": {
+            "amended->contested": 7,
+            "contested->amended": 4,
+            "contested->stored": 1,
+            "stored->contested": 1
+          },
+          "restated-sample": {
+            "contested->amended": 3
+          }
+        }
+      },
+      "provenance": {
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
+        "effort": "medium",
+        "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
+        "prompt_sha256": "897885879ce30793ba614b837d1ba28f4732ae8ff27dea41eda65bb1d8fbded5",
+        "rows": 673
+      },
+      "score": {
+        "closure": {
+          "pairs": [
+            [
+              "a9a0a4f6-b2e2-4b00-9def-b7bb0c6ca010",
+              "2597636d-64dd-405e-9872-472fd6b44bce"
+            ]
+          ],
+          "raters": [
+            "replay-bound-home-yes",
+            "replay-bound-home-no"
+          ]
+        },
+        "harm": {
+          "by_closure": {
+            "replay-bound-home-no": {
+              "delta_interval95": [
+                -0.4732,
+                -0.3085
+              ],
+              "delta_per_write": -0.3927,
+              "n": 671,
+              "per_write": {
+                "status_quo": 0.8256,
+                "triage": 0.4329
+              },
+              "population_delta_interval95": [
+                0.0566,
+                0.2318
+              ],
+              "population_delta_per_write": 0.1439,
+              "population_per_write": {
+                "status_quo": 0.4559,
+                "triage": 0.5998
+              },
+              "unclear": 2
+            },
+            "replay-bound-home-yes": {
+              "delta_interval95": [
+                -0.4747,
+                -0.31
+              ],
+              "delta_per_write": -0.3942,
+              "n": 671,
+              "per_write": {
+                "status_quo": 0.8256,
+                "triage": 0.4314
+              },
+              "population_delta_interval95": [
+                0.0563,
+                0.2312
+              ],
+              "population_delta_per_write": 0.1433,
+              "population_per_write": {
+                "status_quo": 0.4559,
+                "triage": 0.5992
+              },
+              "unclear": 2
+            }
+          },
+          "population_delta_per_write": [
+            0.1433,
+            0.1439
+          ]
+        },
+        "m1": {
+          "band_unknown": 4,
+          "hits": 7,
+          "n": 91,
+          "population_interval95": [
+            0.023,
+            0.1333
+          ],
+          "population_rate": 0.0749,
+          "rate": 0.0769,
+          "unclear": 1,
+          "wilson95": [
+            0.0378,
+            0.1504
+          ]
+        },
+        "m2_amended": {
+          "by_closure": {
+            "replay-bound-home-no": {
+              "by_project": {
+                "dark_factory": {
+                  "hits": 6,
+                  "n": 29
+                },
+                "reify": {
+                  "hits": 20,
+                  "n": 32
+                },
+                "scoping_intake": {
+                  "hits": 0,
+                  "n": 1
+                },
+                "solar_challenge": {
+                  "hits": 27,
+                  "n": 52
+                },
+                "solar_challenge_platform": {
+                  "hits": 8,
+                  "n": 15
+                }
+              },
+              "hits": 61,
+              "n": 129,
+              "population_interval95": [
+                0.2911,
+                0.4971
+              ],
+              "population_rate": 0.3924,
+              "rate": 0.4729,
+              "unclear": 0,
+              "wilson95": [
+                0.3887,
+                0.5586
+              ]
+            },
+            "replay-bound-home-yes": {
+              "by_project": {
+                "dark_factory": {
+                  "hits": 6,
+                  "n": 29
+                },
+                "reify": {
+                  "hits": 20,
+                  "n": 32
+                },
+                "scoping_intake": {
+                  "hits": 0,
+                  "n": 1
+                },
+                "solar_challenge": {
+                  "hits": 27,
+                  "n": 52
+                },
+                "solar_challenge_platform": {
+                  "hits": 8,
+                  "n": 15
+                }
+              },
+              "hits": 61,
+              "n": 129,
+              "population_interval95": [
+                0.2911,
+                0.4971
+              ],
+              "population_rate": 0.3924,
+              "rate": 0.4729,
+              "unclear": 0,
+              "wilson95": [
+                0.3887,
+                0.5586
+              ]
+            }
+          },
+          "population_rate": [
+            0.3924,
+            0.3924
+          ]
+        },
+        "m2_contested": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 73,
+              "n": 81
+            },
+            "reify": {
+              "hits": 86,
+              "n": 93
+            },
+            "scoping_intake": {
+              "hits": 2,
+              "n": 2
+            },
+            "solar_challenge": {
+              "hits": 60,
+              "n": 73
+            },
+            "solar_challenge_platform": {
+              "hits": 55,
+              "n": 62
+            }
+          },
+          "hits": 276,
+          "n": 311,
+          "population_interval95": [
+            0.7435,
+            0.9122
+          ],
+          "population_rate": 0.8336,
+          "rate": 0.8875,
+          "unclear": 2,
+          "wilson95": [
+            0.8475,
+            0.918
+          ]
+        },
+        "m3": {
+          "by_ending": {
+            "amended": 25,
+            "contested": 276,
+            "restated": 0,
+            "stored_linked": 12,
+            "stored_unlinked": 58
+          },
+          "hits": 83,
+          "n": 371,
+          "population_interval95": [
+            0.3359,
+            0.5232
+          ],
+          "population_rate": 0.4379,
+          "rate": 0.2237,
+          "unclear": 2,
+          "wilson95": [
+            0.1843,
+            0.2688
+          ]
+        },
+        "m4": {
+          "by_closure": {
+            "replay-bound-home-no": {
+              "by_category": {
+                "cross": {
+                  "hits": 26,
+                  "n": 149,
+                  "population_interval95": [
+                    0.2665,
+                    0.5496
+                  ],
+                  "population_rate": 0.4123,
+                  "rate": 0.1745,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.122,
+                    0.2434
+                  ]
+                },
+                "same": {
+                  "hits": 56,
+                  "n": 293,
+                  "population_interval95": [
+                    0.334,
+                    0.5347
+                  ],
+                  "population_rate": 0.4361,
+                  "rate": 0.1911,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1502,
+                    0.24
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 0,
+                  "population_interval95": null,
+                  "population_rate": null,
+                  "rate": null,
+                  "unclear": 0,
+                  "wilson95": null
+                }
+              },
+              "by_route": {
+                "direct": {
+                  "hits": 81,
+                  "n": 414,
+                  "population_interval95": [
+                    0.3579,
+                    0.524
+                  ],
+                  "population_rate": 0.4416,
+                  "rate": 0.1957,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1603,
+                    0.2366
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 2,
+                  "population_interval95": [
+                    0.0,
+                    0.0
+                  ],
+                  "population_rate": 0.0,
+                  "rate": 0.0,
+                  "unclear": 0,
+                  "wilson95": [
+                    0.0,
+                    0.6576
+                  ]
+                },
+                "via_sibling": {
+                  "hits": 1,
+                  "n": 26,
+                  "population_interval95": [
+                    0.0,
+                    0.0952
+                  ],
+                  "population_rate": 0.0249,
+                  "rate": 0.0385,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.0068,
+                    0.1889
+                  ]
+                }
+              },
+              "hits": 82,
+              "n": 442,
+              "population_interval95": [
+                0.3462,
+                0.5086
+              ],
+              "population_rate": 0.4279,
+              "rate": 0.1855,
+              "unclear": 2,
+              "wilson95": [
+                0.152,
+                0.2244
+              ]
+            },
+            "replay-bound-home-yes": {
+              "by_category": {
+                "cross": {
+                  "hits": 26,
+                  "n": 149,
+                  "population_interval95": [
+                    0.2665,
+                    0.5496
+                  ],
+                  "population_rate": 0.4123,
+                  "rate": 0.1745,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.122,
+                    0.2434
+                  ]
+                },
+                "same": {
+                  "hits": 55,
+                  "n": 293,
+                  "population_interval95": [
+                    0.3323,
+                    0.5329
+                  ],
+                  "population_rate": 0.435,
+                  "rate": 0.1877,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1471,
+                    0.2364
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 0,
+                  "population_interval95": null,
+                  "population_rate": null,
+                  "rate": null,
+                  "unclear": 0,
+                  "wilson95": null
+                }
+              },
+              "by_route": {
+                "direct": {
+                  "hits": 80,
+                  "n": 414,
+                  "population_interval95": [
+                    0.3571,
+                    0.5234
+                  ],
+                  "population_rate": 0.4408,
+                  "rate": 0.1932,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1581,
+                    0.234
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 2,
+                  "population_interval95": [
+                    0.0,
+                    0.0
+                  ],
+                  "population_rate": 0.0,
+                  "rate": 0.0,
+                  "unclear": 0,
+                  "wilson95": [
+                    0.0,
+                    0.6576
+                  ]
+                },
+                "via_sibling": {
+                  "hits": 1,
+                  "n": 26,
+                  "population_interval95": [
+                    0.0,
+                    0.0952
+                  ],
+                  "population_rate": 0.0249,
+                  "rate": 0.0385,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.0068,
+                    0.1889
+                  ]
+                }
+              },
+              "hits": 81,
+              "n": 442,
+              "population_interval95": [
+                0.3456,
+                0.5076
+              ],
+              "population_rate": 0.4272,
+              "rate": 0.1833,
+              "unclear": 2,
+              "wilson95": [
+                0.15,
+                0.222
+              ]
+            }
+          },
+          "population_rate": [
+            0.4272,
+            0.4279
+          ]
+        },
+        "m5": {
+          "by_action_changing": {
+            "no": 26,
+            "unknown": 21,
+            "yes": 229
+          },
+          "by_scope": {
+            "central": 137,
+            "secondary": 112,
+            "unknown": 27
+          },
+          "hits": 276,
+          "n": 311,
+          "population_interval95": [
+            0.7435,
+            0.9122
+          ],
+          "population_rate": 0.8336,
+          "rate": 0.8875,
+          "unclear": 2,
+          "wilson95": [
+            0.8475,
+            0.918
+          ]
+        }
+      }
+    },
+    "b2-sol-high": {
+      "cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 4.083,
+        "p95_seconds": 9.714,
+        "usd": 2.133666,
+        "usd_per_1000_judged_writes": 3.610264,
+        "usd_per_1000_writes": 3.17038,
+        "writes": 673
+      },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 4.083,
+        "p95_seconds": 9.714,
+        "usd": 2.133666,
+        "usd_per_1000_judged_writes": 3.610264,
+        "usd_per_1000_writes": 3.17038,
+        "writes": 673
+      },
+      "outcome_agreement_vs_baseline": {
+        "agree": 566,
+        "n": 591,
+        "rate": 0.9577
+      },
+      "paired_vs_baseline": {
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 7157
+        },
+        "conflict_set_differs": 0,
+        "false_conflict_change": {
+          "population": 12.24,
+          "sample": 1
+        },
+        "m3_delta": 0.0252,
+        "m3_delta_interval95": [
+          -0.0487,
+          0.1049
+        ],
+        "transitions": {
+          "amended-sample": {
+            "amended->contested": 2,
+            "contested->amended": 2
+          },
+          "contested-census": {
+            "amended->contested": 4,
+            "amended->stored": 1,
+            "contested->amended": 6,
+            "contested->stored": 1,
+            "stored->contested": 3
+          },
+          "restated-sample": {
+            "contested->amended": 1,
+            "stored->amended": 1
+          }
+        }
+      },
+      "provenance": {
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
+        "effort": "high",
+        "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
+        "prompt_sha256": "897885879ce30793ba614b837d1ba28f4732ae8ff27dea41eda65bb1d8fbded5",
+        "rows": 673
+      },
+      "score": {
+        "closure": {
+          "pairs": [
+            [
+              "a9a0a4f6-b2e2-4b00-9def-b7bb0c6ca010",
+              "2597636d-64dd-405e-9872-472fd6b44bce"
+            ]
+          ],
+          "raters": [
+            "replay-bound-home-yes",
+            "replay-bound-home-no"
+          ]
+        },
+        "harm": {
+          "by_closure": {
+            "replay-bound-home-no": {
+              "delta_interval95": [
+                -0.462,
+                -0.2973
+              ],
+              "delta_per_write": -0.3823,
+              "n": 671,
+              "per_write": {
+                "status_quo": 0.8256,
+                "triage": 0.4434
+              },
+              "population_delta_interval95": [
+                0.0663,
+                0.2406
+              ],
+              "population_delta_per_write": 0.154,
+              "population_per_write": {
+                "status_quo": 0.4559,
+                "triage": 0.6099
+              },
+              "unclear": 2
+            },
+            "replay-bound-home-yes": {
+              "delta_interval95": [
+                -0.4627,
+                -0.2988
+              ],
+              "delta_per_write": -0.3838,
+              "n": 671,
+              "per_write": {
+                "status_quo": 0.8256,
+                "triage": 0.4419
+              },
+              "population_delta_interval95": [
+                0.0658,
+                0.2401
+              ],
+              "population_delta_per_write": 0.1535,
+              "population_per_write": {
+                "status_quo": 0.4559,
+                "triage": 0.6094
+              },
+              "unclear": 2
+            }
+          },
+          "population_delta_per_write": [
+            0.1535,
+            0.154
+          ]
+        },
+        "m1": {
+          "band_unknown": 4,
+          "hits": 6,
+          "n": 91,
+          "population_interval95": [
+            0.0205,
+            0.1176
+          ],
+          "population_rate": 0.0639,
+          "rate": 0.0659,
+          "unclear": 1,
+          "wilson95": [
+            0.0306,
+            0.1365
+          ]
+        },
+        "m2_amended": {
+          "by_closure": {
+            "replay-bound-home-no": {
+              "by_project": {
+                "dark_factory": {
+                  "hits": 6,
+                  "n": 30
+                },
+                "reify": {
+                  "hits": 20,
+                  "n": 34
+                },
+                "scoping_intake": {
+                  "hits": 0,
+                  "n": 1
+                },
+                "solar_challenge": {
+                  "hits": 25,
+                  "n": 51
+                },
+                "solar_challenge_platform": {
+                  "hits": 8,
+                  "n": 16
+                }
+              },
+              "hits": 59,
+              "n": 132,
+              "population_interval95": [
+                0.2876,
+                0.492
+              ],
+              "population_rate": 0.3889,
+              "rate": 0.447,
+              "unclear": 0,
+              "wilson95": [
+                0.3648,
+                0.5321
+              ]
+            },
+            "replay-bound-home-yes": {
+              "by_project": {
+                "dark_factory": {
+                  "hits": 6,
+                  "n": 30
+                },
+                "reify": {
+                  "hits": 20,
+                  "n": 34
+                },
+                "scoping_intake": {
+                  "hits": 0,
+                  "n": 1
+                },
+                "solar_challenge": {
+                  "hits": 25,
+                  "n": 51
+                },
+                "solar_challenge_platform": {
+                  "hits": 8,
+                  "n": 16
+                }
+              },
+              "hits": 59,
+              "n": 132,
+              "population_interval95": [
+                0.2876,
+                0.492
+              ],
+              "population_rate": 0.3889,
+              "rate": 0.447,
+              "unclear": 0,
+              "wilson95": [
+                0.3648,
+                0.5321
+              ]
+            }
+          },
+          "population_rate": [
+            0.3889,
+            0.3889
+          ]
+        },
+        "m2_contested": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 71,
+              "n": 78
+            },
+            "reify": {
+              "hits": 87,
+              "n": 93
+            },
+            "scoping_intake": {
+              "hits": 2,
+              "n": 2
+            },
+            "solar_challenge": {
+              "hits": 61,
+              "n": 76
+            },
+            "solar_challenge_platform": {
+              "hits": 54,
+              "n": 61
+            }
+          },
+          "hits": 275,
+          "n": 310,
+          "population_interval95": [
+            0.7419,
+            0.9113
+          ],
+          "population_rate": 0.8327,
+          "rate": 0.8871,
+          "unclear": 2,
+          "wilson95": [
+            0.847,
+            0.9177
+          ]
+        },
+        "m3": {
+          "by_ending": {
+            "amended": 28,
+            "contested": 275,
+            "restated": 0,
+            "stored_linked": 12,
+            "stored_unlinked": 56
+          },
+          "hits": 84,
+          "n": 371,
+          "population_interval95": [
+            0.3365,
+            0.5233
+          ],
+          "population_rate": 0.4393,
+          "rate": 0.2264,
+          "unclear": 2,
+          "wilson95": [
+            0.1868,
+            0.2717
+          ]
+        },
+        "m4": {
+          "by_closure": {
+            "replay-bound-home-no": {
+              "by_category": {
+                "cross": {
+                  "hits": 28,
+                  "n": 151,
+                  "population_interval95": [
+                    0.2941,
+                    0.5747
+                  ],
+                  "population_rate": 0.4404,
+                  "rate": 0.1854,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1315,
+                    0.2549
+                  ]
+                },
+                "same": {
+                  "hits": 58,
+                  "n": 293,
+                  "population_interval95": [
+                    0.336,
+                    0.5367
+                  ],
+                  "population_rate": 0.4385,
+                  "rate": 0.198,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1564,
+                    0.2474
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 0,
+                  "population_interval95": null,
+                  "population_rate": null,
+                  "rate": null,
+                  "unclear": 0,
+                  "wilson95": null
+                }
+              },
+              "by_route": {
+                "direct": {
+                  "hits": 85,
+                  "n": 416,
+                  "population_interval95": [
+                    0.3693,
+                    0.5351
+                  ],
+                  "population_rate": 0.4531,
+                  "rate": 0.2043,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1684,
+                    0.2457
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 2,
+                  "population_interval95": [
+                    0.0,
+                    0.0
+                  ],
+                  "population_rate": 0.0,
+                  "rate": 0.0,
+                  "unclear": 0,
+                  "wilson95": [
+                    0.0,
+                    0.6576
+                  ]
+                },
+                "via_sibling": {
+                  "hits": 1,
+                  "n": 26,
+                  "population_interval95": [
+                    0.0,
+                    0.0952
+                  ],
+                  "population_rate": 0.0249,
+                  "rate": 0.0385,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.0068,
+                    0.1889
+                  ]
+                }
+              },
+              "hits": 86,
+              "n": 444,
+              "population_interval95": [
+                0.3571,
+                0.5197
+              ],
+              "population_rate": 0.4391,
+              "rate": 0.1937,
+              "unclear": 2,
+              "wilson95": [
+                0.1596,
+                0.233
+              ]
+            },
+            "replay-bound-home-yes": {
+              "by_category": {
+                "cross": {
+                  "hits": 28,
+                  "n": 151,
+                  "population_interval95": [
+                    0.2941,
+                    0.5747
+                  ],
+                  "population_rate": 0.4404,
+                  "rate": 0.1854,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1315,
+                    0.2549
+                  ]
+                },
+                "same": {
+                  "hits": 57,
+                  "n": 293,
+                  "population_interval95": [
+                    0.3346,
+                    0.5353
+                  ],
+                  "population_rate": 0.4373,
+                  "rate": 0.1945,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1533,
+                    0.2437
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 0,
+                  "population_interval95": null,
+                  "population_rate": null,
+                  "rate": null,
+                  "unclear": 0,
+                  "wilson95": null
+                }
+              },
+              "by_route": {
+                "direct": {
+                  "hits": 84,
+                  "n": 416,
+                  "population_interval95": [
+                    0.3683,
+                    0.5346
+                  ],
+                  "population_rate": 0.4523,
+                  "rate": 0.2019,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1662,
+                    0.2431
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 2,
+                  "population_interval95": [
+                    0.0,
+                    0.0
+                  ],
+                  "population_rate": 0.0,
+                  "rate": 0.0,
+                  "unclear": 0,
+                  "wilson95": [
+                    0.0,
+                    0.6576
+                  ]
+                },
+                "via_sibling": {
+                  "hits": 1,
+                  "n": 26,
+                  "population_interval95": [
+                    0.0,
+                    0.0952
+                  ],
+                  "population_rate": 0.0249,
+                  "rate": 0.0385,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.0068,
+                    0.1889
+                  ]
+                }
+              },
+              "hits": 85,
+              "n": 444,
+              "population_interval95": [
+                0.3559,
+                0.519
+              ],
+              "population_rate": 0.4384,
+              "rate": 0.1914,
+              "unclear": 2,
+              "wilson95": [
+                0.1576,
+                0.2306
+              ]
+            }
+          },
+          "population_rate": [
+            0.4384,
+            0.4391
+          ]
+        },
+        "m5": {
+          "by_action_changing": {
+            "no": 27,
+            "unknown": 23,
+            "yes": 225
+          },
+          "by_scope": {
+            "central": 136,
+            "secondary": 112,
+            "unknown": 27
+          },
+          "hits": 275,
+          "n": 310,
+          "population_interval95": [
+            0.7419,
+            0.9113
+          ],
+          "population_rate": 0.8327,
+          "rate": 0.8871,
+          "unclear": 2,
+          "wilson95": [
+            0.847,
+            0.9177
+          ]
+        }
+      }
+    },
+    "c1-dispute-marker": {
+      "cost": {
+        "calls": 129,
+        "calls_per_write": 0.191679,
+        "fail_open": 0,
+        "p50_seconds": 3.495,
+        "p95_seconds": 6.001,
+        "usd": 0.352734,
+        "usd_per_1000_judged_writes": 2.734372,
+        "usd_per_1000_writes": 0.524122,
+        "writes": 673
+      },
+      "cumulative_cost": {
+        "calls": 720,
+        "calls_per_write": 1.069837,
+        "fail_open": 0,
+        "p50_seconds": 3.124,
+        "p95_seconds": 7.751,
+        "usd": 2.06001,
+        "usd_per_1000_judged_writes": 3.485635,
+        "usd_per_1000_writes": 3.060936,
+        "writes": 673
+      },
+      "outcome_agreement_vs_baseline": null,
+      "paired_vs_baseline": {
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 7157
+        },
+        "conflict_set_differs": 0,
+        "false_conflict_change": {
+          "population": 161.38,
+          "sample": 25
+        },
+        "m3_delta": -0.1636,
+        "m3_delta_interval95": [
+          -0.2551,
+          -0.0715
+        ],
+        "transitions": {
+          "amended-sample": {
+            "amended->contested": 18
+          },
+          "contested-census": {
+            "amended->contested": 16
+          },
+          "restated-sample": {
+            "amended->contested": 10
+          }
+        }
+      },
+      "provenance": {
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
+        "effort": "low",
+        "model": "gpt-6.1-sol",
+        "parent": "f3p",
+        "parent_sha256": "72e65903c9c295bbc3af357b00af92d84c9f9e481c1d86deee5074cde58e1927",
+        "prompt_sha256": "e713c2c63c3e92d8fc0548f2b7e57ee6e77b80d780ba3726df0469b06700a587",
+        "rows": 673
+      },
+      "score": {
+        "closure": null,
+        "harm": {
+          "delta_interval95": [
+            -0.4814,
+            -0.3025
+          ],
+          "delta_per_write": -0.3934,
+          "n": 671,
+          "per_write": {
+            "status_quo": 0.8256,
+            "triage": 0.4322
+          },
+          "population_delta_interval95": [
+            0.0215,
+            0.3015
+          ],
+          "population_delta_per_write": 0.1624,
+          "population_per_write": {
+            "status_quo": 0.4559,
+            "triage": 0.6183
+          },
+          "unclear": 2
+        },
+        "m1": {
+          "band_unknown": 4,
+          "hits": 1,
+          "n": 91,
+          "population_interval95": [
+            0.0,
+            0.0271
+          ],
+          "population_rate": 0.0088,
+          "rate": 0.011,
+          "unclear": 1,
+          "wilson95": [
+            0.0019,
+            0.0597
+          ]
+        },
+        "m2_amended": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 5,
+              "n": 18
+            },
+            "reify": {
+              "hits": 18,
+              "n": 25
+            },
+            "scoping_intake": {
+              "hits": 0,
+              "n": 1
+            },
+            "solar_challenge": {
+              "hits": 18,
+              "n": 32
+            },
+            "solar_challenge_platform": {
+              "hits": 6,
+              "n": 9
+            }
+          },
+          "hits": 47,
+          "n": 85,
+          "population_interval95": [
+            0.3078,
+            0.5533
+          ],
+          "population_rate": 0.4296,
+          "rate": 0.5529,
+          "unclear": 0,
+          "wilson95": [
+            0.4472,
+            0.6541
+          ]
+        },
+        "m2_contested": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 80,
+              "n": 91
+            },
+            "reify": {
+              "hits": 88,
+              "n": 100
+            },
+            "scoping_intake": {
+              "hits": 2,
+              "n": 2
+            },
+            "solar_challenge": {
+              "hits": 69,
+              "n": 93
+            },
+            "solar_challenge_platform": {
+              "hits": 57,
+              "n": 69
+            }
+          },
+          "hits": 296,
+          "n": 355,
+          "population_interval95": [
+            0.5556,
+            0.7607
+          ],
+          "population_rate": 0.6523,
+          "rate": 0.8338,
+          "unclear": 2,
+          "wilson95": [
+            0.7915,
+            0.8689
+          ]
+        },
+        "m3": {
+          "by_ending": {
+            "amended": 6,
+            "contested": 296,
+            "restated": 0,
+            "stored_linked": 12,
+            "stored_unlinked": 57
+          },
+          "hits": 63,
+          "n": 371,
+          "population_interval95": [
+            0.1614,
+            0.3407
+          ],
+          "population_rate": 0.2505,
+          "rate": 0.1698,
+          "unclear": 2,
+          "wilson95": [
+            0.135,
+            0.2114
+          ]
+        },
+        "m4": {
+          "by_category": {
+            "cross": {
+              "hits": 24,
+              "n": 150,
+              "population_interval95": [
+                0.238,
+                0.5209
+              ],
+              "population_rate": 0.3817,
+              "rate": 0.16,
+              "unclear": 1,
+              "wilson95": [
+                0.1099,
+                0.227
+              ]
+            },
+            "same": {
+              "hits": 49,
+              "n": 292,
+              "population_interval95": [
+                0.2735,
+                0.4736
+              ],
+              "population_rate": 0.3754,
+              "rate": 0.1678,
+              "unclear": 1,
+              "wilson95": [
+                0.1293,
+                0.2149
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 0,
+              "population_interval95": null,
+              "population_rate": null,
+              "rate": null,
+              "unclear": 0,
+              "wilson95": null
+            }
+          },
+          "by_route": {
+            "direct": {
+              "hits": 72,
+              "n": 414,
+              "population_interval95": [
+                0.3065,
+                0.4722
+              ],
+              "population_rate": 0.3895,
+              "rate": 0.1739,
+              "unclear": 1,
+              "wilson95": [
+                0.1404,
+                0.2134
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 2,
+              "population_interval95": [
+                0.0,
+                0.0
+              ],
+              "population_rate": 0.0,
+              "rate": 0.0,
+              "unclear": 0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            },
+            "via_sibling": {
+              "hits": 1,
+              "n": 26,
+              "population_interval95": [
+                0.0,
+                0.0952
+              ],
+              "population_rate": 0.0249,
+              "rate": 0.0385,
+              "unclear": 1,
+              "wilson95": [
+                0.0068,
+                0.1889
+              ]
+            }
+          },
+          "hits": 73,
+          "n": 442,
+          "population_interval95": [
+            0.2969,
+            0.4585
+          ],
+          "population_rate": 0.3776,
+          "rate": 0.1652,
+          "unclear": 2,
+          "wilson95": [
+            0.1335,
+            0.2026
+          ]
+        },
+        "m5": {
+          "by_action_changing": {
+            "no": 32,
+            "unknown": 23,
+            "yes": 241
+          },
+          "by_scope": {
+            "central": 142,
+            "secondary": 126,
+            "unknown": 28
+          },
+          "hits": 296,
+          "n": 355,
+          "population_interval95": [
+            0.5556,
+            0.7607
+          ],
+          "population_rate": 0.6523,
+          "rate": 0.8338,
+          "unclear": 2,
+          "wilson95": [
+            0.7915,
+            0.8689
+          ]
+        }
+      }
+    },
+    "d1-e1-combined": {
+      "cost": {
+        "calls": 0,
+        "calls_per_write": 0.0,
+        "fail_open": 0,
+        "p50_seconds": null,
+        "p95_seconds": null,
+        "usd": 0.0,
+        "usd_per_1000_judged_writes": null,
+        "usd_per_1000_writes": 0.0,
+        "writes": 673
+      },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.041,
+        "p95_seconds": 5.167,
+        "usd": 1.948858,
+        "usd_per_1000_judged_writes": 3.29756,
+        "usd_per_1000_writes": 2.895777,
+        "writes": 673
+      },
+      "outcome_agreement_vs_baseline": null,
+      "paired_vs_baseline": {
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 7157
+        },
+        "conflict_set_differs": 0,
+        "false_conflict_change": {
+          "population": 205.61,
+          "sample": 47
+        },
+        "m3_delta": -0.3327,
+        "m3_delta_interval95": [
+          -0.4297,
+          -0.2241
+        ],
+        "transitions": {
+          "amended-sample": {
+            "amended->contested": 20,
+            "stored->amended": 1,
+            "stored->contested": 5
+          },
+          "contested-census": {
+            "amended->contested": 15,
+            "stored->contested": 40
+          },
+          "restated-sample": {
+            "amended->contested": 7,
+            "stored->amended": 1,
+            "stored->contested": 11
+          }
+        }
+      },
+      "provenance": {
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
+        "effort": null,
+        "model": null,
+        "parent": "d1-stale-detail-check",
+        "parent_sha256": "ca0857352968cdfcd080229782b00f40958ca92b8c0041603274008fdc817fc4",
+        "prompt_sha256": null,
+        "rows": 673
+      },
+      "score": {
+        "closure": null,
+        "harm": {
+          "delta_interval95": [
+            -0.4665,
+            -0.2608
+          ],
+          "delta_per_write": -0.3659,
+          "n": 671,
+          "per_write": {
+            "status_quo": 0.8256,
+            "triage": 0.4598
+          },
+          "population_delta_interval95": [
+            -0.0015,
+            0.3124
+          ],
+          "population_delta_per_write": 0.1553,
+          "population_per_write": {
+            "status_quo": 0.4559,
+            "triage": 0.6112
+          },
+          "unclear": 2
+        },
+        "m1": {
+          "band_unknown": 4,
+          "hits": 1,
+          "n": 91,
+          "population_interval95": [
+            0.0,
+            0.0271
+          ],
+          "population_rate": 0.0088,
+          "rate": 0.011,
+          "unclear": 1,
+          "wilson95": [
+            0.0019,
+            0.0597
+          ]
+        },
+        "m2_amended": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 5,
+              "n": 18
+            },
+            "reify": {
+              "hits": 17,
+              "n": 25
+            },
+            "scoping_intake": {
+              "hits": 0,
+              "n": 1
+            },
+            "solar_challenge": {
+              "hits": 21,
+              "n": 34
+            },
+            "solar_challenge_platform": {
+              "hits": 7,
+              "n": 11
+            }
+          },
+          "hits": 50,
+          "n": 89,
+          "population_interval95": [
+            0.3152,
+            0.5622
+          ],
+          "population_rate": 0.4389,
+          "rate": 0.5618,
+          "unclear": 0,
+          "wilson95": [
+            0.4583,
+            0.6602
+          ]
+        },
+        "m2_contested": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 84,
+              "n": 99
+            },
+            "reify": {
+              "hits": 92,
+              "n": 108
+            },
+            "scoping_intake": {
+              "hits": 2,
+              "n": 2
+            },
+            "solar_challenge": {
+              "hits": 85,
+              "n": 121
+            },
+            "solar_challenge_platform": {
+              "hits": 65,
+              "n": 79
+            }
+          },
+          "hits": 328,
+          "n": 409,
+          "population_interval95": [
+            0.5647,
+            0.7536
+          ],
+          "population_rate": 0.6559,
+          "rate": 0.802,
+          "unclear": 2,
+          "wilson95": [
+            0.7606,
+            0.8377
+          ]
+        },
+        "m3": {
+          "by_ending": {
+            "amended": 4,
+            "contested": 328,
+            "restated": 0,
+            "stored_linked": 12,
+            "stored_unlinked": 27
+          },
+          "hits": 31,
+          "n": 371,
+          "population_interval95": [
+            0.0435,
+            0.136
+          ],
+          "population_rate": 0.0813,
+          "rate": 0.0836,
+          "unclear": 2,
+          "wilson95": [
+            0.0595,
+            0.1162
+          ]
+        },
+        "m4": {
+          "by_category": {
+            "cross": {
+              "hits": 36,
+              "n": 175,
+              "population_interval95": [
+                0.2786,
+                0.5434
+              ],
+              "population_rate": 0.4141,
+              "rate": 0.2057,
+              "unclear": 1,
+              "wilson95": [
+                0.1525,
+                0.2716
+              ]
+            },
+            "same": {
+              "hits": 61,
+              "n": 325,
+              "population_interval95": [
+                0.26,
+                0.45
+              ],
+              "population_rate": 0.3565,
+              "rate": 0.1877,
+              "unclear": 1,
+              "wilson95": [
+                0.149,
+                0.2337
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 0,
+              "population_interval95": null,
+              "population_rate": null,
+              "rate": null,
+              "unclear": 0,
+              "wilson95": null
+            }
+          },
+          "by_route": {
+            "direct": {
+              "hits": 80,
+              "n": 429,
+              "population_interval95": [
+                0.3065,
+                0.47
+              ],
+              "population_rate": 0.388,
+              "rate": 0.1865,
+              "unclear": 1,
+              "wilson95": [
+                0.1525,
+                0.2261
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 3,
+              "population_interval95": [
+                0.0,
+                0.0
+              ],
+              "population_rate": 0.0,
+              "rate": 0.0,
+              "unclear": 0,
+              "wilson95": [
+                0.0,
+                0.5615
+              ]
+            },
+            "via_sibling": {
+              "hits": 17,
+              "n": 68,
+              "population_interval95": [
+                0.0956,
+                0.4906
+              ],
+              "population_rate": 0.2806,
+              "rate": 0.25,
+              "unclear": 1,
+              "wilson95": [
+                0.1623,
+                0.3644
+              ]
+            }
+          },
+          "hits": 97,
+          "n": 500,
+          "population_interval95": [
+            0.2997,
+            0.4544
+          ],
+          "population_rate": 0.3765,
+          "rate": 0.194,
+          "unclear": 2,
+          "wilson95": [
+            0.1617,
+            0.2309
+          ]
+        },
+        "m5": {
+          "by_action_changing": {
+            "no": 36,
+            "unknown": 25,
+            "yes": 267
+          },
+          "by_scope": {
+            "central": 155,
+            "secondary": 144,
+            "unknown": 29
+          },
+          "hits": 328,
+          "n": 409,
+          "population_interval95": [
+            0.5647,
+            0.7536
+          ],
+          "population_rate": 0.6559,
+          "rate": 0.802,
+          "unclear": 2,
+          "wilson95": [
+            0.7606,
+            0.8377
+          ]
+        }
+      }
+    },
+    "d1-stale-detail-check": {
+      "cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.041,
+        "p95_seconds": 5.167,
+        "usd": 1.948858,
+        "usd_per_1000_judged_writes": 3.29756,
+        "usd_per_1000_writes": 2.895777,
+        "writes": 673
+      },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 3.041,
+        "p95_seconds": 5.167,
+        "usd": 1.948858,
+        "usd_per_1000_judged_writes": 3.29756,
+        "usd_per_1000_writes": 2.895777,
+        "writes": 673
+      },
+      "outcome_agreement_vs_baseline": {
+        "agree": 514,
+        "n": 591,
+        "rate": 0.8697
+      },
+      "paired_vs_baseline": {
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 7157
+        },
+        "conflict_set_differs": 0,
+        "false_conflict_change": {
+          "population": 161.88,
+          "sample": 26
+        },
+        "m3_delta": -0.2154,
+        "m3_delta_interval95": [
+          -0.3149,
+          -0.1104
+        ],
+        "transitions": {
+          "amended-sample": {
+            "amended->contested": 20,
+            "stored->amended": 1
+          },
+          "contested-census": {
+            "amended->contested": 15,
+            "stored->contested": 6
+          },
+          "restated-sample": {
+            "amended->contested": 7,
+            "stored->amended": 1,
+            "stored->contested": 2
+          }
+        }
+      },
+      "provenance": {
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
+        "effort": "low",
+        "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
+        "prompt_sha256": "40189530eecf3d7eb725dcae3005eb217f4d9c0d8d6581981d9d86ab9e2ef202",
+        "rows": 673
+      },
+      "score": {
+        "closure": null,
+        "harm": {
+          "delta_interval95": [
+            -0.4844,
+            -0.2988
+          ],
+          "delta_per_write": -0.3942,
+          "n": 671,
+          "per_write": {
+            "status_quo": 0.8256,
+            "triage": 0.4314
+          },
+          "population_delta_interval95": [
+            -0.0069,
+            0.2818
+          ],
+          "population_delta_per_write": 0.1369,
+          "population_per_write": {
+            "status_quo": 0.4559,
+            "triage": 0.5928
+          },
+          "unclear": 2
+        },
+        "m1": {
+          "band_unknown": 4,
+          "hits": 1,
+          "n": 91,
+          "population_interval95": [
+            0.0,
+            0.0271
+          ],
+          "population_rate": 0.0088,
+          "rate": 0.011,
+          "unclear": 1,
+          "wilson95": [
+            0.0019,
+            0.0597
+          ]
+        },
+        "m2_amended": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 5,
+              "n": 18
+            },
+            "reify": {
+              "hits": 17,
+              "n": 25
+            },
+            "scoping_intake": {
+              "hits": 0,
+              "n": 1
+            },
+            "solar_challenge": {
+              "hits": 21,
+              "n": 34
+            },
+            "solar_challenge_platform": {
+              "hits": 7,
+              "n": 11
+            }
+          },
+          "hits": 50,
+          "n": 89,
+          "population_interval95": [
+            0.3152,
+            0.5622
+          ],
+          "population_rate": 0.4389,
+          "rate": 0.5618,
+          "unclear": 0,
+          "wilson95": [
+            0.4583,
+            0.6602
+          ]
+        },
+        "m2_contested": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 80,
+              "n": 92
+            },
+            "reify": {
+              "hits": 89,
+              "n": 103
+            },
+            "scoping_intake": {
+              "hits": 2,
+              "n": 2
+            },
+            "solar_challenge": {
+              "hits": 73,
+              "n": 96
+            },
+            "solar_challenge_platform": {
+              "hits": 57,
+              "n": 68
+            }
+          },
+          "hits": 301,
+          "n": 361,
+          "population_interval95": [
+            0.5704,
+            0.7739
+          ],
+          "population_rate": 0.6673,
+          "rate": 0.8338,
+          "unclear": 2,
+          "wilson95": [
+            0.7919,
+            0.8686
+          ]
+        },
+        "m3": {
+          "by_ending": {
+            "amended": 4,
+            "contested": 301,
+            "restated": 0,
+            "stored_linked": 12,
+            "stored_unlinked": 54
+          },
+          "hits": 58,
+          "n": 371,
+          "population_interval95": [
+            0.1222,
+            0.2837
+          ],
+          "population_rate": 0.1987,
+          "rate": 0.1563,
+          "unclear": 2,
+          "wilson95": [
+            0.1229,
+            0.1968
+          ]
+        },
+        "m4": {
+          "by_category": {
+            "cross": {
+              "hits": 26,
+              "n": 154,
+              "population_interval95": [
+                0.2403,
+                0.5204
+              ],
+              "population_rate": 0.3831,
+              "rate": 0.1688,
+              "unclear": 1,
+              "wilson95": [
+                0.1179,
+                0.2359
+              ]
+            },
+            "same": {
+              "hits": 53,
+              "n": 298,
+              "population_interval95": [
+                0.2717,
+                0.4716
+              ],
+              "population_rate": 0.3727,
+              "rate": 0.1779,
+              "unclear": 1,
+              "wilson95": [
+                0.1386,
+                0.2253
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 0,
+              "population_interval95": null,
+              "population_rate": null,
+              "rate": null,
+              "unclear": 0,
+              "wilson95": null
+            }
+          },
+          "by_route": {
+            "direct": {
+              "hits": 76,
+              "n": 421,
+              "population_interval95": [
+                0.3055,
+                0.4695
+              ],
+              "population_rate": 0.3873,
+              "rate": 0.1805,
+              "unclear": 1,
+              "wilson95": [
+                0.1467,
+                0.2201
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 3,
+              "population_interval95": [
+                0.0,
+                0.0
+              ],
+              "population_rate": 0.0,
+              "rate": 0.0,
+              "unclear": 0,
+              "wilson95": [
+                0.0,
+                0.5615
+              ]
+            },
+            "via_sibling": {
+              "hits": 3,
+              "n": 28,
+              "population_interval95": [
+                0.0,
+                0.1923
+              ],
+              "population_rate": 0.071,
+              "rate": 0.1071,
+              "unclear": 1,
+              "wilson95": [
+                0.0371,
+                0.272
+              ]
+            }
+          },
+          "hits": 79,
+          "n": 452,
+          "population_interval95": [
+            0.2961,
+            0.4565
+          ],
+          "population_rate": 0.3762,
+          "rate": 0.1748,
+          "unclear": 2,
+          "wilson95": [
+            0.1425,
+            0.2125
+          ]
+        },
+        "m5": {
+          "by_action_changing": {
+            "no": 34,
+            "unknown": 23,
+            "yes": 244
+          },
+          "by_scope": {
+            "central": 143,
+            "secondary": 131,
+            "unknown": 27
+          },
+          "hits": 301,
+          "n": 361,
+          "population_interval95": [
+            0.5704,
+            0.7739
+          ],
+          "population_rate": 0.6673,
+          "rate": 0.8338,
+          "unclear": 2,
+          "wilson95": [
+            0.7919,
+            0.8686
+          ]
+        }
+      }
+    },
+    "e1-mark-refused-contests": {
+      "cost": {
+        "calls": 0,
+        "calls_per_write": 0.0,
+        "fail_open": 0,
+        "p50_seconds": null,
+        "p95_seconds": null,
+        "usd": 0.0,
+        "usd_per_1000_judged_writes": null,
+        "usd_per_1000_writes": 0.0,
+        "writes": 673
+      },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 2.911,
+        "p95_seconds": 4.596,
+        "usd": 1.707276,
+        "usd_per_1000_judged_writes": 2.888792,
+        "usd_per_1000_writes": 2.536814,
+        "writes": 673
+      },
+      "outcome_agreement_vs_baseline": null,
+      "paired_vs_baseline": {
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 7157
+        },
+        "conflict_set_differs": 0,
+        "false_conflict_change": {
+          "population": 8.25,
+          "sample": 8
+        },
+        "m3_delta": -0.0407,
+        "m3_delta_interval95": [
+          -0.0609,
+          -0.0242
+        ],
+        "transitions": {
+          "contested-census": {
+            "stored->contested": 20
+          },
+          "restated-sample": {
+            "stored->contested": 8
+          }
+        }
+      },
+      "provenance": {
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
+        "effort": null,
+        "model": null,
+        "parent": "f3p",
+        "parent_sha256": "72e65903c9c295bbc3af357b00af92d84c9f9e481c1d86deee5074cde58e1927",
+        "prompt_sha256": null,
+        "rows": 673
+      },
+      "score": {
+        "closure": {
+          "pairs": [
+            [
+              "a9a0a4f6-b2e2-4b00-9def-b7bb0c6ca010",
+              "2597636d-64dd-405e-9872-472fd6b44bce"
+            ]
+          ],
+          "raters": [
+            "replay-bound-home-yes",
+            "replay-bound-home-no"
+          ]
+        },
+        "harm": {
+          "by_closure": {
+            "replay-bound-home-no": {
+              "delta_interval95": [
+                -0.4911,
+                -0.3145
+              ],
+              "delta_per_write": -0.4054,
+              "n": 671,
+              "per_write": {
+                "status_quo": 0.8256,
+                "triage": 0.4203
+              },
+              "population_delta_interval95": [
+                0.0207,
+                0.2015
+              ],
+              "population_delta_per_write": 0.113,
+              "population_per_write": {
+                "status_quo": 0.4559,
+                "triage": 0.5689
+              },
+              "unclear": 2
+            },
+            "replay-bound-home-yes": {
+              "delta_interval95": [
+                -0.4918,
+                -0.3159
+              ],
+              "delta_per_write": -0.4069,
+              "n": 671,
+              "per_write": {
+                "status_quo": 0.8256,
+                "triage": 0.4188
+              },
+              "population_delta_interval95": [
+                0.0201,
+                0.2009
+              ],
+              "population_delta_per_write": 0.1125,
+              "population_per_write": {
+                "status_quo": 0.4559,
+                "triage": 0.5684
+              },
+              "unclear": 2
+            }
+          },
+          "population_delta_per_write": [
+            0.1125,
+            0.113
+          ]
+        },
+        "m1": {
+          "band_unknown": 4,
+          "hits": 5,
+          "n": 91,
+          "population_interval95": [
+            0.0112,
+            0.1017
+          ],
+          "population_rate": 0.0529,
+          "rate": 0.0549,
+          "unclear": 1,
+          "wilson95": [
+            0.0237,
+            0.1222
+          ]
+        },
+        "m2_amended": {
+          "by_closure": {
+            "replay-bound-home-no": {
+              "by_project": {
+                "dark_factory": {
+                  "hits": 6,
+                  "n": 30
+                },
+                "reify": {
+                  "hits": 21,
+                  "n": 35
+                },
+                "scoping_intake": {
+                  "hits": 0,
+                  "n": 1
+                },
+                "solar_challenge": {
+                  "hits": 24,
+                  "n": 49
+                },
+                "solar_challenge_platform": {
+                  "hits": 8,
+                  "n": 14
+                }
+              },
+              "hits": 59,
+              "n": 129,
+              "population_interval95": [
+                0.2992,
+                0.508
+              ],
+              "population_rate": 0.4022,
+              "rate": 0.4574,
+              "unclear": 0,
+              "wilson95": [
+                0.3739,
+                0.5433
+              ]
+            },
+            "replay-bound-home-yes": {
+              "by_project": {
+                "dark_factory": {
+                  "hits": 6,
+                  "n": 30
+                },
+                "reify": {
+                  "hits": 21,
+                  "n": 35
+                },
+                "scoping_intake": {
+                  "hits": 0,
+                  "n": 1
+                },
+                "solar_challenge": {
+                  "hits": 24,
+                  "n": 49
+                },
+                "solar_challenge_platform": {
+                  "hits": 8,
+                  "n": 14
+                }
+              },
+              "hits": 59,
+              "n": 129,
+              "population_interval95": [
+                0.2992,
+                0.508
+              ],
+              "population_rate": 0.4022,
+              "rate": 0.4574,
+              "unclear": 0,
+              "wilson95": [
+                0.3739,
+                0.5433
+              ]
+            }
+          },
+          "population_rate": [
+            0.4022,
+            0.4022
+          ]
+        },
+        "m2_contested": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 75,
+              "n": 82
+            },
+            "reify": {
+              "hits": 87,
+              "n": 93
+            },
+            "scoping_intake": {
+              "hits": 2,
+              "n": 2
+            },
+            "solar_challenge": {
+              "hits": 71,
+              "n": 90
+            },
+            "solar_challenge_platform": {
+              "hits": 62,
+              "n": 72
+            }
+          },
+          "hits": 297,
+          "n": 339,
+          "population_interval95": [
+            0.7865,
+            0.9118
+          ],
+          "population_rate": 0.8572,
+          "rate": 0.8761,
+          "unclear": 2,
+          "wilson95": [
+            0.8368,
+            0.907
+          ]
+        },
+        "m3": {
+          "by_ending": {
+            "amended": 25,
+            "contested": 297,
+            "restated": 0,
+            "stored_linked": 12,
+            "stored_unlinked": 37
+          },
+          "hits": 62,
+          "n": 371,
+          "population_interval95": [
+            0.2656,
+            0.4641
+          ],
+          "population_rate": 0.3734,
+          "rate": 0.1671,
+          "unclear": 2,
+          "wilson95": [
+            0.1326,
+            0.2085
+          ]
+        },
+        "m4": {
+          "by_closure": {
+            "replay-bound-home-no": {
+              "by_category": {
+                "cross": {
+                  "hits": 28,
+                  "n": 160,
+                  "population_interval95": [
+                    0.2871,
+                    0.5628
+                  ],
+                  "population_rate": 0.4304,
+                  "rate": 0.175,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1239,
+                    0.2413
+                  ]
+                },
+                "same": {
+                  "hits": 63,
+                  "n": 310,
+                  "population_interval95": [
+                    0.323,
+                    0.5181
+                  ],
+                  "population_rate": 0.4222,
+                  "rate": 0.2032,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1622,
+                    0.2515
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 0,
+                  "population_interval95": null,
+                  "population_rate": null,
+                  "rate": null,
+                  "unclear": 0,
+                  "wilson95": null
+                }
+              },
+              "by_route": {
+                "direct": {
+                  "hits": 87,
+                  "n": 422,
+                  "population_interval95": [
+                    0.3611,
+                    0.525
+                  ],
+                  "population_rate": 0.4435,
+                  "rate": 0.2062,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1703,
+                    0.2473
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 2,
+                  "population_interval95": [
+                    0.0,
+                    0.0
+                  ],
+                  "population_rate": 0.0,
+                  "rate": 0.0,
+                  "unclear": 0,
+                  "wilson95": [
+                    0.0,
+                    0.6576
+                  ]
+                },
+                "via_sibling": {
+                  "hits": 4,
+                  "n": 46,
+                  "population_interval95": [
+                    0.013,
+                    0.1441
+                  ],
+                  "population_rate": 0.0643,
+                  "rate": 0.087,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.0343,
+                    0.2032
+                  ]
+                }
+              },
+              "hits": 91,
+              "n": 470,
+              "population_interval95": [
+                0.3452,
+                0.5033
+              ],
+              "population_rate": 0.425,
+              "rate": 0.1936,
+              "unclear": 2,
+              "wilson95": [
+                0.1604,
+                0.2318
+              ]
+            },
+            "replay-bound-home-yes": {
+              "by_category": {
+                "cross": {
+                  "hits": 28,
+                  "n": 160,
+                  "population_interval95": [
+                    0.2871,
+                    0.5628
+                  ],
+                  "population_rate": 0.4304,
+                  "rate": 0.175,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1239,
+                    0.2413
+                  ]
+                },
+                "same": {
+                  "hits": 62,
+                  "n": 310,
+                  "population_interval95": [
+                    0.3216,
+                    0.5167
+                  ],
+                  "population_rate": 0.4211,
+                  "rate": 0.2,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1593,
+                    0.2481
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 0,
+                  "population_interval95": null,
+                  "population_rate": null,
+                  "rate": null,
+                  "unclear": 0,
+                  "wilson95": null
+                }
+              },
+              "by_route": {
+                "direct": {
+                  "hits": 86,
+                  "n": 422,
+                  "population_interval95": [
+                    0.3603,
+                    0.5245
+                  ],
+                  "population_rate": 0.4427,
+                  "rate": 0.2038,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1681,
+                    0.2448
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 2,
+                  "population_interval95": [
+                    0.0,
+                    0.0
+                  ],
+                  "population_rate": 0.0,
+                  "rate": 0.0,
+                  "unclear": 0,
+                  "wilson95": [
+                    0.0,
+                    0.6576
+                  ]
+                },
+                "via_sibling": {
+                  "hits": 4,
+                  "n": 46,
+                  "population_interval95": [
+                    0.013,
+                    0.1441
+                  ],
+                  "population_rate": 0.0643,
+                  "rate": 0.087,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.0343,
+                    0.2032
+                  ]
+                }
+              },
+              "hits": 90,
+              "n": 470,
+              "population_interval95": [
+                0.3446,
+                0.5028
+              ],
+              "population_rate": 0.4243,
+              "rate": 0.1915,
+              "unclear": 2,
+              "wilson95": [
+                0.1585,
+                0.2295
+              ]
+            }
+          },
+          "population_rate": [
+            0.4243,
+            0.425
+          ]
+        },
+        "m5": {
+          "by_action_changing": {
+            "no": 27,
+            "unknown": 22,
+            "yes": 248
+          },
+          "by_scope": {
+            "central": 152,
+            "secondary": 117,
+            "unknown": 28
+          },
+          "hits": 297,
+          "n": 339,
+          "population_interval95": [
+            0.7865,
+            0.9118
+          ],
+          "population_rate": 0.8572,
+          "rate": 0.8761,
+          "unclear": 2,
+          "wilson95": [
+            0.8368,
+            0.907
+          ]
+        }
+      }
+    },
+    "f3p": {
+      "cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 2.911,
+        "p95_seconds": 4.596,
+        "usd": 1.707276,
+        "usd_per_1000_judged_writes": 2.888792,
+        "usd_per_1000_writes": 2.536814,
+        "writes": 673
+      },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 2.911,
+        "p95_seconds": 4.596,
+        "usd": 1.707276,
+        "usd_per_1000_judged_writes": 2.888792,
+        "usd_per_1000_writes": 2.536814,
+        "writes": 673
+      },
+      "outcome_agreement_vs_baseline": null,
+      "paired_vs_baseline": null,
+      "provenance": {
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
+        "effort": "low",
+        "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
+        "prompt_sha256": "897885879ce30793ba614b837d1ba28f4732ae8ff27dea41eda65bb1d8fbded5",
+        "rows": 673
+      },
+      "score": {
+        "closure": {
+          "pairs": [
+            [
+              "a9a0a4f6-b2e2-4b00-9def-b7bb0c6ca010",
+              "2597636d-64dd-405e-9872-472fd6b44bce"
+            ]
+          ],
+          "raters": [
+            "replay-bound-home-yes",
+            "replay-bound-home-no"
+          ]
+        },
+        "harm": {
+          "by_closure": {
+            "replay-bound-home-no": {
+              "delta_interval95": [
+                -0.4754,
+                -0.31
+              ],
+              "delta_per_write": -0.3949,
+              "n": 671,
+              "per_write": {
+                "status_quo": 0.8256,
+                "triage": 0.4307
+              },
+              "population_delta_interval95": [
+                0.0261,
+                0.205
+              ],
+              "population_delta_per_write": 0.118,
+              "population_per_write": {
+                "status_quo": 0.4559,
+                "triage": 0.574
+              },
+              "unclear": 2
+            },
+            "replay-bound-home-yes": {
+              "delta_interval95": [
+                -0.4769,
+                -0.3115
+              ],
+              "delta_per_write": -0.3964,
+              "n": 671,
+              "per_write": {
+                "status_quo": 0.8256,
+                "triage": 0.4292
+              },
+              "population_delta_interval95": [
+                0.0257,
+                0.2043
+              ],
+              "population_delta_per_write": 0.1175,
+              "population_per_write": {
+                "status_quo": 0.4559,
+                "triage": 0.5734
+              },
+              "unclear": 2
+            }
+          },
+          "population_delta_per_write": [
+            0.1175,
+            0.118
+          ]
+        },
+        "m1": {
+          "band_unknown": 4,
+          "hits": 5,
+          "n": 91,
+          "population_interval95": [
+            0.0112,
+            0.1017
+          ],
+          "population_rate": 0.0529,
+          "rate": 0.0549,
+          "unclear": 1,
+          "wilson95": [
+            0.0237,
+            0.1222
+          ]
+        },
+        "m2_amended": {
+          "by_closure": {
+            "replay-bound-home-no": {
+              "by_project": {
+                "dark_factory": {
+                  "hits": 6,
+                  "n": 30
+                },
+                "reify": {
+                  "hits": 21,
+                  "n": 35
+                },
+                "scoping_intake": {
+                  "hits": 0,
+                  "n": 1
+                },
+                "solar_challenge": {
+                  "hits": 24,
+                  "n": 49
+                },
+                "solar_challenge_platform": {
+                  "hits": 8,
+                  "n": 14
+                }
+              },
+              "hits": 59,
+              "n": 129,
+              "population_interval95": [
+                0.2992,
+                0.508
+              ],
+              "population_rate": 0.4022,
+              "rate": 0.4574,
+              "unclear": 0,
+              "wilson95": [
+                0.3739,
+                0.5433
+              ]
+            },
+            "replay-bound-home-yes": {
+              "by_project": {
+                "dark_factory": {
+                  "hits": 6,
+                  "n": 30
+                },
+                "reify": {
+                  "hits": 21,
+                  "n": 35
+                },
+                "scoping_intake": {
+                  "hits": 0,
+                  "n": 1
+                },
+                "solar_challenge": {
+                  "hits": 24,
+                  "n": 49
+                },
+                "solar_challenge_platform": {
+                  "hits": 8,
+                  "n": 14
+                }
+              },
+              "hits": 59,
+              "n": 129,
+              "population_interval95": [
+                0.2992,
+                0.508
+              ],
+              "population_rate": 0.4022,
+              "rate": 0.4574,
+              "unclear": 0,
+              "wilson95": [
+                0.3739,
+                0.5433
+              ]
+            }
+          },
+          "population_rate": [
+            0.4022,
+            0.4022
+          ]
+        },
+        "m2_contested": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 72,
+              "n": 79
+            },
+            "reify": {
+              "hits": 85,
+              "n": 90
+            },
+            "scoping_intake": {
+              "hits": 2,
+              "n": 2
+            },
+            "solar_challenge": {
+              "hits": 62,
+              "n": 76
+            },
+            "solar_challenge_platform": {
+              "hits": 56,
+              "n": 64
+            }
+          },
+          "hits": 277,
+          "n": 311,
+          "population_interval95": [
+            0.7931,
+            0.925
+          ],
+          "population_rate": 0.8686,
+          "rate": 0.8907,
+          "unclear": 2,
+          "wilson95": [
+            0.8511,
+            0.9207
+          ]
+        },
+        "m3": {
+          "by_ending": {
+            "amended": 25,
+            "contested": 277,
+            "restated": 0,
+            "stored_linked": 12,
+            "stored_unlinked": 57
+          },
+          "hits": 82,
+          "n": 371,
+          "population_interval95": [
+            0.3104,
+            0.5018
+          ],
+          "population_rate": 0.4141,
+          "rate": 0.221,
+          "unclear": 2,
+          "wilson95": [
+            0.1818,
+            0.266
+          ]
+        },
+        "m4": {
+          "by_closure": {
+            "replay-bound-home-no": {
+              "by_category": {
+                "cross": {
+                  "hits": 27,
+                  "n": 150,
+                  "population_interval95": [
+                    0.2917,
+                    0.5737
+                  ],
+                  "population_rate": 0.4388,
+                  "rate": 0.18,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1268,
+                    0.2492
+                  ]
+                },
+                "same": {
+                  "hits": 57,
+                  "n": 292,
+                  "population_interval95": [
+                    0.3231,
+                    0.5224
+                  ],
+                  "population_rate": 0.4246,
+                  "rate": 0.1952,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1538,
+                    0.2445
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 0,
+                  "population_interval95": null,
+                  "population_rate": null,
+                  "rate": null,
+                  "unclear": 0,
+                  "wilson95": null
+                }
+              },
+              "by_route": {
+                "direct": {
+                  "hits": 83,
+                  "n": 414,
+                  "population_interval95": [
+                    0.3597,
+                    0.5254
+                  ],
+                  "population_rate": 0.4432,
+                  "rate": 0.2005,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1647,
+                    0.2417
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 2,
+                  "population_interval95": [
+                    0.0,
+                    0.0
+                  ],
+                  "population_rate": 0.0,
+                  "rate": 0.0,
+                  "unclear": 0,
+                  "wilson95": [
+                    0.0,
+                    0.6576
+                  ]
+                },
+                "via_sibling": {
+                  "hits": 1,
+                  "n": 26,
+                  "population_interval95": [
+                    0.0,
+                    0.0952
+                  ],
+                  "population_rate": 0.0249,
+                  "rate": 0.0385,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.0068,
+                    0.1889
+                  ]
+                }
+              },
+              "hits": 84,
+              "n": 442,
+              "population_interval95": [
+                0.3475,
+                0.5092
+              ],
+              "population_rate": 0.4295,
+              "rate": 0.19,
+              "unclear": 2,
+              "wilson95": [
+                0.1562,
+                0.2292
+              ]
+            },
+            "replay-bound-home-yes": {
+              "by_category": {
+                "cross": {
+                  "hits": 27,
+                  "n": 150,
+                  "population_interval95": [
+                    0.2917,
+                    0.5737
+                  ],
+                  "population_rate": 0.4388,
+                  "rate": 0.18,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1268,
+                    0.2492
+                  ]
+                },
+                "same": {
+                  "hits": 56,
+                  "n": 292,
+                  "population_interval95": [
+                    0.3216,
+                    0.5214
+                  ],
+                  "population_rate": 0.4234,
+                  "rate": 0.1918,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1507,
+                    0.2408
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 0,
+                  "population_interval95": null,
+                  "population_rate": null,
+                  "rate": null,
+                  "unclear": 0,
+                  "wilson95": null
+                }
+              },
+              "by_route": {
+                "direct": {
+                  "hits": 82,
+                  "n": 414,
+                  "population_interval95": [
+                    0.3593,
+                    0.5246
+                  ],
+                  "population_rate": 0.4424,
+                  "rate": 0.1981,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.1625,
+                    0.2392
+                  ]
+                },
+                "unknown": {
+                  "hits": 0,
+                  "n": 2,
+                  "population_interval95": [
+                    0.0,
+                    0.0
+                  ],
+                  "population_rate": 0.0,
+                  "rate": 0.0,
+                  "unclear": 0,
+                  "wilson95": [
+                    0.0,
+                    0.6576
+                  ]
+                },
+                "via_sibling": {
+                  "hits": 1,
+                  "n": 26,
+                  "population_interval95": [
+                    0.0,
+                    0.0952
+                  ],
+                  "population_rate": 0.0249,
+                  "rate": 0.0385,
+                  "unclear": 1,
+                  "wilson95": [
+                    0.0068,
+                    0.1889
+                  ]
+                }
+              },
+              "hits": 83,
+              "n": 442,
+              "population_interval95": [
+                0.347,
+                0.5085
+              ],
+              "population_rate": 0.4287,
+              "rate": 0.1878,
+              "unclear": 2,
+              "wilson95": [
+                0.1541,
+                0.2268
+              ]
+            }
+          },
+          "population_rate": [
+            0.4287,
+            0.4295
+          ]
+        },
+        "m5": {
+          "by_action_changing": {
+            "no": 26,
+            "unknown": 21,
+            "yes": 230
+          },
+          "by_scope": {
+            "central": 141,
+            "secondary": 110,
+            "unknown": 26
+          },
+          "hits": 277,
+          "n": 311,
+          "population_interval95": [
+            0.7931,
+            0.925
+          ],
+          "population_rate": 0.8686,
+          "rate": 0.8907,
+          "unclear": 2,
+          "wilson95": [
+            0.8511,
+            0.9207
+          ]
+        }
+      }
+    },
+    "f3p-repeat": {
+      "cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 2.857,
+        "p95_seconds": 4.629,
+        "usd": 1.705466,
+        "usd_per_1000_judged_writes": 2.885729,
+        "usd_per_1000_writes": 2.534125,
+        "writes": 673
+      },
+      "cumulative_cost": {
+        "calls": 591,
+        "calls_per_write": 0.878158,
+        "fail_open": 0,
+        "p50_seconds": 2.857,
+        "p95_seconds": 4.629,
+        "usd": 1.705466,
+        "usd_per_1000_judged_writes": 2.885729,
+        "usd_per_1000_writes": 2.534125,
+        "writes": 673
+      },
+      "outcome_agreement_vs_baseline": {
+        "agree": 568,
+        "n": 591,
+        "rate": 0.9611
+      },
+      "paired_vs_baseline": {
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 7157
+        },
+        "conflict_set_differs": 0,
+        "false_conflict_change": {
+          "population": 1.0,
+          "sample": 1
+        },
+        "m3_delta": -0.0196,
+        "m3_delta_interval95": [
+          -0.0989,
+          0.056
+        ],
+        "transitions": {
+          "amended-sample": {
+            "amended->contested": 2,
+            "contested->amended": 1
+          },
+          "contested-census": {
+            "amended->contested": 2,
+            "amended->stored": 1,
+            "contested->amended": 5,
+            "stored->contested": 1
+          },
+          "restated-sample": {
+            "amended->contested": 1,
+            "stored->amended": 1
+          }
+        }
+      },
+      "provenance": {
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
+        "effort": "low",
+        "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
+        "prompt_sha256": "897885879ce30793ba614b837d1ba28f4732ae8ff27dea41eda65bb1d8fbded5",
+        "rows": 673
+      },
+      "score": {
+        "closure": null,
+        "harm": {
+          "delta_interval95": [
+            -0.4694,
+            -0.3033
+          ],
+          "delta_per_write": -0.3897,
+          "n": 671,
+          "per_write": {
+            "status_quo": 0.8256,
+            "triage": 0.4359
+          },
+          "population_delta_interval95": [
+            0.0088,
+            0.1923
+          ],
+          "population_delta_per_write": 0.1013,
+          "population_per_write": {
+            "status_quo": 0.4559,
+            "triage": 0.5572
+          },
+          "unclear": 2
+        },
+        "m1": {
+          "band_unknown": 4,
+          "hits": 4,
+          "n": 91,
+          "population_interval95": [
+            0.0088,
+            0.0859
+          ],
+          "population_rate": 0.0419,
+          "rate": 0.044,
+          "unclear": 1,
+          "wilson95": [
+            0.0172,
+            0.1076
+          ]
+        },
+        "m2_amended": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 6,
+              "n": 28
+            },
+            "reify": {
+              "hits": 21,
+              "n": 35
+            },
+            "scoping_intake": {
+              "hits": 0,
+              "n": 1
+            },
+            "solar_challenge": {
+              "hits": 24,
+              "n": 52
+            },
+            "solar_challenge_platform": {
+              "hits": 8,
+              "n": 14
+            }
+          },
+          "hits": 59,
+          "n": 130,
+          "population_interval95": [
+            0.3026,
+            0.5116
+          ],
+          "population_rate": 0.4066,
+          "rate": 0.4538,
+          "unclear": 0,
+          "wilson95": [
+            0.3708,
+            0.5395
+          ]
+        },
+        "m2_contested": {
+          "by_project": {
+            "dark_factory": {
+              "hits": 73,
+              "n": 80
+            },
+            "reify": {
+              "hits": 85,
+              "n": 91
+            },
+            "scoping_intake": {
+              "hits": 2,
+              "n": 2
+            },
+            "solar_challenge": {
+              "hits": 60,
+              "n": 74
+            },
+            "solar_challenge_platform": {
+              "hits": 56,
+              "n": 64
+            }
+          },
+          "hits": 276,
+          "n": 311,
+          "population_interval95": [
+            0.795,
+            0.9256
+          ],
+          "population_rate": 0.87,
+          "rate": 0.8875,
+          "unclear": 2,
+          "wilson95": [
+            0.8475,
+            0.918
+          ]
+        },
+        "m3": {
+          "by_ending": {
+            "amended": 27,
+            "contested": 276,
+            "restated": 0,
+            "stored_linked": 12,
+            "stored_unlinked": 56
+          },
+          "hits": 83,
+          "n": 371,
+          "population_interval95": [
+            0.2934,
+            0.4844
+          ],
+          "population_rate": 0.3945,
+          "rate": 0.2237,
+          "unclear": 2,
+          "wilson95": [
+            0.1843,
+            0.2688
+          ]
+        },
+        "m4": {
+          "by_category": {
+            "cross": {
+              "hits": 27,
+              "n": 151,
+              "population_interval95": [
+                0.268,
+                0.5503
+              ],
+              "population_rate": 0.413,
+              "rate": 0.1788,
+              "unclear": 1,
+              "wilson95": [
+                0.1259,
+                0.2477
+              ]
+            },
+            "same": {
+              "hits": 56,
+              "n": 292,
+              "population_interval95": [
+                0.3216,
+                0.5216
+              ],
+              "population_rate": 0.4234,
+              "rate": 0.1918,
+              "unclear": 1,
+              "wilson95": [
+                0.1507,
+                0.2408
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 0,
+              "population_interval95": null,
+              "population_rate": null,
+              "rate": null,
+              "unclear": 0,
+              "wilson95": null
+            }
+          },
+          "by_route": {
+            "direct": {
+              "hits": 82,
+              "n": 415,
+              "population_interval95": [
+                0.35,
+                0.515
+              ],
+              "population_rate": 0.4332,
+              "rate": 0.1976,
+              "unclear": 1,
+              "wilson95": [
+                0.1621,
+                0.2386
+              ]
+            },
+            "unknown": {
+              "hits": 0,
+              "n": 2,
+              "population_interval95": [
+                0.0,
+                0.0
+              ],
+              "population_rate": 0.0,
+              "rate": 0.0,
+              "unclear": 0,
+              "wilson95": [
+                0.0,
+                0.6576
+              ]
+            },
+            "via_sibling": {
+              "hits": 1,
+              "n": 26,
+              "population_interval95": [
+                0.0,
+                0.0952
+              ],
+              "population_rate": 0.0249,
+              "rate": 0.0385,
+              "unclear": 1,
+              "wilson95": [
+                0.0068,
+                0.1889
+              ]
+            }
+          },
+          "hits": 83,
+          "n": 443,
+          "population_interval95": [
+            0.3394,
+            0.4988
+          ],
+          "population_rate": 0.4198,
+          "rate": 0.1874,
+          "unclear": 2,
+          "wilson95": [
+            0.1538,
+            0.2263
+          ]
+        },
+        "m5": {
+          "by_action_changing": {
+            "no": 27,
+            "unknown": 22,
+            "yes": 227
+          },
+          "by_scope": {
+            "central": 138,
+            "secondary": 113,
+            "unknown": 25
+          },
+          "hits": 276,
+          "n": 311,
+          "population_interval95": [
+            0.795,
+            0.9256
+          ],
+          "population_rate": 0.87,
+          "rate": 0.8875,
+          "unclear": 2,
+          "wilson95": [
+            0.8475,
+            0.918
+          ]
+        }
+      }
+    }
+  },
+  "baseline": "f3p",
+  "classification": {
+    "by_hit": [
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "outdated_state",
+        "ending": "amended",
+        "entry_id": "210e6449-03cd-4544-9aa7-fdc2d668c607",
+        "home": "yes",
+        "project": "reify",
+        "route": "judge",
+        "scope": "central",
+        "self_declared_correction": "true",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "no",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "outdated_state",
+        "ending": "restated",
+        "entry_id": "26612789-0ccd-42ab-a9d2-e8d2e6d17792",
+        "home": "no",
+        "project": "dark_factory",
+        "route": "force_stored",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "contradiction",
+        "ending": "restated",
+        "entry_id": "318ca1de-a82a-4d45-93ad-57e121a406ec",
+        "home": "yes",
+        "project": "dark_factory",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "newer_measurement",
+        "ending": "amended",
+        "entry_id": "3a4db5b3-fd3b-4750-955c-b51b08f4dab2",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "true",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "contradiction",
+        "ending": "restated",
+        "entry_id": "3c88f869-8247-419b-a985-30c966d68afd",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "central",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "tied",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "true",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "status_overtaken",
+        "ending": "restated",
+        "entry_id": "4113c4e0-5f51-4783-9340-516484e8fa2c",
+        "home": "no",
+        "project": "dark_factory",
+        "route": "force_stored",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "contradiction",
+        "ending": "restated",
+        "entry_id": "56c08b07-48f9-487d-8b87-27e74f597415",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "central",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.60-0.70",
+        "cross_category": "true",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "outdated_state",
+        "ending": "amended",
+        "entry_id": "577bf13e-3a12-480c-870e-d420f4051915",
+        "home": "no",
+        "project": "dark_factory",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "tied",
+        "cos_parent_bucket": "0.70-0.80",
+        "cross_category": "true",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "outdated_state",
+        "ending": "restated",
+        "entry_id": "5b69805c-01a9-4a4c-8cad-2d97c73fdc22",
+        "home": "yes",
+        "project": "reify",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "no",
+        "cos_parent_bucket": "0.70-0.80",
+        "cross_category": "false",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "newer_measurement",
+        "ending": "amended",
+        "entry_id": "5c28efe4-c24a-4019-83e0-5edc292a2ab0",
+        "home": "no",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "no",
+        "cos_parent_bucket": ">=0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "newer_measurement",
+        "ending": "restated",
+        "entry_id": "60e52c18-ad72-421a-87e0-dcd58a861d94",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "true",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "outdated_state",
+        "ending": "restated",
+        "entry_id": "65342d0b-8145-48b8-8859-682f2eb39dd0",
+        "home": "yes",
+        "project": "reify",
+        "route": "judge",
+        "scope": "central",
+        "self_declared_correction": "true",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "newer_measurement",
+        "ending": "restated",
+        "entry_id": "6da027c4-3f03-42b2-9de8-fed7db4926ee",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "central",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "no",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "newer_measurement",
+        "ending": "amended",
+        "entry_id": "78284ede-a92e-4243-ad1d-1cdf8fa64700",
+        "home": "no",
+        "project": "dark_factory",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.70-0.80",
+        "cross_category": "false",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "status_overtaken",
+        "ending": "amended",
+        "entry_id": "7917cebe-0076-4047-9ec0-b7bcdb6bfc8a",
+        "home": "no",
+        "project": "solar_challenge_platform",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.70-0.80",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "status_overtaken",
+        "ending": "amended",
+        "entry_id": "7f5656a9-ddc8-43e1-aae3-7fb3fde88c79",
+        "home": "no",
+        "project": "dark_factory",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "<0.60",
+        "cross_category": "false",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "status_overtaken",
+        "ending": "amended",
+        "entry_id": "812cec63-d56b-48fd-b793-b01fce8c1084",
+        "home": "no",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "tied",
+        "cos_parent_bucket": ">=0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "outdated_state",
+        "ending": "restated",
+        "entry_id": "8423446a-294a-438a-bb32-ea69c1389250",
+        "home": "yes",
+        "project": "solar_challenge_platform",
+        "route": "supersession",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.60-0.70",
+        "cross_category": "false",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "status_overtaken",
+        "ending": "amended",
+        "entry_id": "89d54e80-ff26-4f8e-ba3d-f265952cea1f",
+        "home": "no",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": ">=0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "status_overtaken",
+        "ending": "restated",
+        "entry_id": "8fedaf6a-564d-4f3a-ba70-e5c2f17e75d6",
+        "home": "yes",
+        "project": "reify",
+        "route": "supersession",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "unknown",
+        "cross_category": "false",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "outdated_state",
+        "ending": "restated",
+        "entry_id": "95a00908-8611-4dc3-a67f-c1fc04a2a489",
+        "home": "no",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "central",
+        "self_declared_correction": "true",
+        "soak_band": "none",
+        "stratum": "restated-sample",
+        "via_sibling": "none"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "true",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "newer_measurement",
+        "ending": "restated",
+        "entry_id": "983c3585-6bcc-488a-a310-62df7a12bbca",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "tied",
+        "self_declared_correction": "true",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "no",
+        "cos_parent_bucket": ">=0.90",
+        "cross_category": "true",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "newer_measurement",
+        "ending": "restated",
+        "entry_id": "a91cbded-84a4-46a8-b4a1-60bb5643ae2d",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.70-0.80",
+        "cross_category": "true",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "contradiction",
+        "ending": "restated",
+        "entry_id": "ad2db758-cd47-4fcf-92ec-5584cbc1a1d4",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "central",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "outdated_state",
+        "ending": "restated",
+        "entry_id": "aec777cf-355d-4e9c-9626-7c7543ca5c87",
+        "home": "no",
+        "project": "reify",
+        "route": "judge",
+        "scope": "central",
+        "self_declared_correction": "true",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "tied",
+        "cos_parent_bucket": "0.70-0.80",
+        "cross_category": "true",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "contradiction",
+        "ending": "amended",
+        "entry_id": "b5ce7704-bc40-453c-8340-b4d20950e096",
+        "home": "yes",
+        "project": "dark_factory",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.60-0.70",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "status_overtaken",
+        "ending": "restated",
+        "entry_id": "b6d101df-1f65-45a6-b251-c3b941dbfa44",
+        "home": "yes",
+        "project": "dark_factory",
+        "route": "force_stored",
+        "scope": "central",
+        "self_declared_correction": "true",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "no",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "true",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "contradiction",
+        "ending": "restated",
+        "entry_id": "bc36ee7e-f97b-43ea-a5f1-0530bfed1654",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "central",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "no",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "true",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "newer_measurement",
+        "ending": "restated",
+        "entry_id": "c4a9f150-743a-4254-99ff-72cbc6eab339",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.60-0.70",
+        "cross_category": "false",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "outdated_state",
+        "ending": "amended",
+        "entry_id": "c8aa5fed-d6f6-47a9-b348-a9484199300d",
+        "home": "no",
+        "project": "solar_challenge_platform",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "no",
+        "cos_parent_bucket": ">=0.90",
+        "cross_category": "true",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "newer_measurement",
+        "ending": "restated",
+        "entry_id": "d0e3a0db-fc51-4f49-a6bd-aec186cd15f5",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": ">=0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "newer_measurement",
+        "ending": "restated",
+        "entry_id": "d729ba1a-9db6-40fc-a657-3b20b76e0dc9",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "central",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "true",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "contradiction",
+        "ending": "restated",
+        "entry_id": "de47f94c-b2d4-4fdc-a0bc-557290ebd983",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "central",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "no",
+        "cos_parent_bucket": "0.70-0.80",
+        "cross_category": "false",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "contradiction",
+        "ending": "amended",
+        "entry_id": "e168a848-6ba5-4f5f-a3cc-ee945040fc58",
+        "home": "no",
+        "project": "solar_challenge_platform",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.70-0.80",
+        "cross_category": "true",
+        "dispute_in_child_core": "false",
+        "dispute_kind": "outdated_state",
+        "ending": "amended",
+        "entry_id": "f1cdc725-1051-4679-9eac-b00f9bd7c5dd",
+        "home": "no",
+        "project": "dark_factory",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "status_overtaken",
+        "ending": "amended",
+        "entry_id": "f48f2efa-0400-4460-ab3a-c8799514f68c",
+        "home": "no",
+        "project": "dark_factory",
+        "route": "judge",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "judge",
+        "stratum": "amended-sample",
+        "via_sibling": "false"
+      },
+      {
+        "action_changing": "yes",
+        "cos_parent_bucket": "0.80-0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "contradiction",
+        "ending": "restated",
+        "entry_id": "fa50625d-8f99-4041-85eb-3a00a559fc59",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "judge",
+        "scope": "central",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "tied",
+        "cos_parent_bucket": "0.60-0.70",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "outdated_state",
+        "ending": "restated",
+        "entry_id": "fa95a51d-9709-48ec-b5f3-6c18d237be1c",
+        "home": "no",
+        "project": "solar_challenge_platform",
+        "route": "force_stored",
+        "scope": "secondary",
+        "self_declared_correction": "true",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "true"
+      },
+      {
+        "action_changing": "no",
+        "cos_parent_bucket": ">=0.90",
+        "cross_category": "false",
+        "dispute_in_child_core": "true",
+        "dispute_kind": "newer_measurement",
+        "ending": "restated",
+        "entry_id": "fc5bc6ba-8280-460b-93f3-893951b0253d",
+        "home": "yes",
+        "project": "solar_challenge",
+        "route": "force_stored",
+        "scope": "secondary",
+        "self_declared_correction": "false",
+        "soak_band": "restated",
+        "stratum": "restated-sample",
+        "via_sibling": "false"
+      }
+    ],
+    "dimensions": {
+      "action_changing": {
+        "no": {
+          "n": 10,
+          "population": 45.47
+        },
+        "tied": {
+          "n": 5,
+          "population": 17.24
+        },
+        "yes": {
+          "n": 24,
+          "population": 139.9
+        }
+      },
+      "cos_parent_bucket": {
+        "0.60-0.70": {
+          "n": 5,
+          "population": 39.22
+        },
+        "0.70-0.80": {
+          "n": 8,
+          "population": 75.94
+        },
+        "0.80-0.90": {
+          "n": 17,
+          "population": 65.21
+        },
+        "<0.60": {
+          "n": 1,
+          "population": 12.24
+        },
+        ">=0.90": {
+          "n": 7,
+          "population": 8.75
+        },
+        "unknown": {
+          "n": 1,
+          "population": 1.25
+        }
+      },
+      "cross_category": {
+        "false": {
+          "n": 25,
+          "population": 152.14
+        },
+        "true": {
+          "n": 14,
+          "population": 50.47
+        }
+      },
+      "dispute_in_child_core": {
+        "false": {
+          "n": 15,
+          "population": 117.66
+        },
+        "true": {
+          "n": 24,
+          "population": 84.95
+        }
+      },
+      "dispute_kind": {
+        "contradiction": {
+          "n": 9,
+          "population": 33.23
+        },
+        "newer_measurement": {
+          "n": 11,
+          "population": 46.72
+        },
+        "outdated_state": {
+          "n": 11,
+          "population": 57.71
+        },
+        "status_overtaken": {
+          "n": 8,
+          "population": 64.95
+        }
+      },
+      "home": {
+        "no": {
+          "n": 16,
+          "population": 140.89
+        },
+        "yes": {
+          "n": 23,
+          "population": 61.72
+        }
+      },
+      "project": {
+        "dark_factory": {
+          "n": 10,
+          "population": 78.44
+        },
+        "reify": {
+          "n": 5,
+          "population": 17.24
+        },
+        "solar_challenge": {
+          "n": 19,
+          "population": 67.71
+        },
+        "solar_challenge_platform": {
+          "n": 5,
+          "population": 39.22
+        }
+      },
+      "route": {
+        "force_stored": {
+          "n": 5,
+          "population": 6.25
+        },
+        "judge": {
+          "n": 32,
+          "population": 193.86
+        },
+        "supersession": {
+          "n": 2,
+          "population": 2.5
+        }
+      },
+      "scope": {
+        "central": {
+          "n": 13,
+          "population": 27.24
+        },
+        "secondary": {
+          "n": 25,
+          "population": 174.12
+        },
+        "tied": {
+          "n": 1,
+          "population": 1.25
+        }
+      },
+      "self_declared_correction": {
+        "false": {
+          "n": 32,
+          "population": 182.87
+        },
+        "true": {
+          "n": 7,
+          "population": 19.74
+        }
+      },
+      "soak_band": {
+        "judge": {
+          "n": 15,
+          "population": 172.61
+        },
+        "none": {
+          "n": 1,
+          "population": 1.25
+        },
+        "restated": {
+          "n": 23,
+          "population": 28.75
+        }
+      },
+      "stratum": {
+        "amended-sample": {
+          "n": 14,
+          "population": 171.36
+        },
+        "restated-sample": {
+          "n": 25,
+          "population": 31.25
+        }
+      },
+      "via_sibling": {
+        "false": {
+          "n": 19,
+          "population": 144.64
+        },
+        "none": {
+          "n": 1,
+          "population": 1.25
+        },
+        "true": {
+          "n": 19,
+          "population": 56.72
+        }
+      }
+    },
+    "hits": 39,
+    "population_hits": 202.61
+  },
+  "partial": {},
+  "provenance": {
+    "shipped_prompt_commit": "326b773226",
+    "shipped_prompt_sha256": "897885879ce30793ba614b837d1ba28f4732ae8ff27dea41eda65bb1d8fbded5"
+  },
+  "repro": {
+    "psi-repro": {
+      "agreement": {
+        "agree": 440,
+        "confusion": {
+          "amended": {
+            "amended": 83,
+            "contested": 1,
+            "stored": 16
+          },
+          "contested": {
+            "amended": 49,
+            "contested": 353,
+            "stored": 67
+          },
+          "restated": {
+            "amended": 3,
+            "restated": 4,
+            "stored": 1
+          }
+        },
+        "fail_open": 0,
+        "n": 577,
+        "rate": 0.7626,
+        "wilson95": [
+          0.7262,
+          0.7955
+        ]
+      },
+      "cost": {
+        "calls": 577,
+        "calls_per_write": 1.0,
+        "fail_open": 0,
+        "p50_seconds": 3.266,
+        "p95_seconds": 5.988,
+        "usd": 1.70495,
+        "usd_per_1000_judged_writes": 2.954853,
+        "usd_per_1000_writes": 2.954853,
+        "writes": 577
+      },
+      "provenance": {
+        "cases_sha256": "c145d76ffc73d4b4ffcecc43c1895b94ec19cd797528b6305909adef073a621c",
+        "effort": "low",
+        "model": "gpt-6.1-sol",
+        "parent": null,
+        "parent_sha256": null,
+        "prompt_sha256": "312a8c9a7f6ff5fff7d6e8b0af8d327b73e8f860d7025cbac70ceb9b8304cd6a",
+        "rows": 577
+      }
+    }
+  },
+  "rubric": "v2.1",
+  "soak": {
+    "closure": null,
+    "harm": {
+      "delta_interval95": [
+        -0.0268,
+        0.2377
+      ],
+      "delta_per_write": 0.1028,
+      "n": 671,
+      "per_write": {
+        "status_quo": 0.8525,
+        "triage": 0.9553
+      },
+      "population_delta_interval95": [
+        0.396,
+        0.5742
+      ],
+      "population_delta_per_write": 0.4849,
+      "population_per_write": {
+        "status_quo": 0.4662,
+        "triage": 0.9511
+      },
+      "unclear": 2
+    },
+    "m1": {
+      "band_unknown": 4,
+      "hits": 34,
+      "n": 91,
+      "population_interval95": [
+        0.2766,
+        0.4752
+      ],
+      "population_rate": 0.3744,
+      "rate": 0.3736,
+      "unclear": 1,
+      "wilson95": [
+        0.2812,
+        0.4762
+      ]
+    },
+    "m2_amended": {
+      "by_project": {
+        "dark_factory": {
+          "hits": 4,
+          "n": 27
+        },
+        "reify": {
+          "hits": 12,
+          "n": 28
+        },
+        "scoping_intake": {
+          "hits": 0,
+          "n": 1
+        },
+        "solar_challenge": {
+          "hits": 10,
+          "n": 30
+        },
+        "solar_challenge_platform": {
+          "hits": 5,
+          "n": 14
+        }
+      },
+      "hits": 31,
+      "n": 100,
+      "population_interval95": [
+        0.22,
+        0.4
+      ],
+      "population_rate": 0.31,
+      "rate": 0.31,
+      "unclear": 0,
+      "wilson95": [
+        0.2278,
+        0.4063
+      ]
+    },
+    "m2_contested": {
+      "by_project": {
+        "dark_factory": {
+          "hits": 90,
+          "n": 125
+        },
+        "reify": {
+          "hits": 92,
+          "n": 115
+        },
+        "scoping_intake": {
+          "hits": 2,
+          "n": 2
+        },
+        "solar_challenge": {
+          "hits": 70,
+          "n": 132
+        },
+        "solar_challenge_platform": {
+          "hits": 68,
+          "n": 98
+        }
+      },
+      "hits": 322,
+      "n": 472,
+      "population_interval95": [
+        0.6385,
+        0.7246
+      ],
+      "population_rate": 0.6822,
+      "rate": 0.6822,
+      "unclear": 1,
+      "wilson95": [
+        0.6389,
+        0.7226
+      ]
+    },
+    "m3": {
+      "by_ending": {
+        "amended": 14,
+        "contested": 332,
+        "restated": 25,
+        "stored_linked": 0,
+        "stored_unlinked": 0
+      },
+      "hits": 39,
+      "n": 371,
+      "population_interval95": [
+        0.2686,
+        0.4673
+      ],
+      "population_rate": 0.379,
+      "rate": 0.1051,
+      "unclear": 2,
+      "wilson95": [
+        0.0779,
+        0.1405
+      ]
+    },
+    "m4": {
+      "by_category": {
+        "cross": {
+          "hits": 77,
+          "n": 226,
+          "population_interval95": [
+            0.4125,
+            0.6395
+          ],
+          "population_rate": 0.5314,
+          "rate": 0.3407,
+          "unclear": 1,
+          "wilson95": [
+            0.282,
+            0.4047
+          ]
+        },
+        "same": {
+          "hits": 156,
+          "n": 445,
+          "population_interval95": [
+            0.4656,
+            0.6209
+          ],
+          "population_rate": 0.5465,
+          "rate": 0.3506,
+          "unclear": 1,
+          "wilson95": [
+            0.3077,
+            0.396
+          ]
+        },
+        "unknown": {
+          "hits": 0,
+          "n": 0,
+          "population_interval95": null,
+          "population_rate": null,
+          "rate": null,
+          "unclear": 0,
+          "wilson95": null
+        }
+      },
+      "by_route": {
+        "direct": {
+          "hits": 127,
+          "n": 503,
+          "population_interval95": [
+            0.3882,
+            0.5418
+          ],
+          "population_rate": 0.4658,
+          "rate": 0.2525,
+          "unclear": 1,
+          "wilson95": [
+            0.2165,
+            0.2922
+          ]
+        },
+        "unknown": {
+          "hits": 2,
+          "n": 4,
+          "population_interval95": [
+            0.0,
+            1.0
+          ],
+          "population_rate": 0.5294,
+          "rate": 0.5,
+          "unclear": 0,
+          "wilson95": [
+            0.15,
+            0.85
+          ]
+        },
+        "via_sibling": {
+          "hits": 104,
+          "n": 164,
+          "population_interval95": [
+            0.6694,
+            0.8603
+          ],
+          "population_rate": 0.7749,
+          "rate": 0.6341,
+          "unclear": 1,
+          "wilson95": [
+            0.5581,
+            0.704
+          ]
+        }
+      },
+      "hits": 233,
+      "n": 671,
+      "population_interval95": [
+        0.4761,
+        0.6043
+      ],
+      "population_rate": 0.5416,
+      "rate": 0.3472,
+      "unclear": 2,
+      "wilson95": [
+        0.3122,
+        0.384
+      ]
+    },
+    "m5": {
+      "by_action_changing": {
+        "no": 32,
+        "unknown": 27,
+        "yes": 273
+      },
+      "by_scope": {
+        "central": 158,
+        "secondary": 140,
+        "unknown": 34
+      },
+      "hits": 332,
+      "n": 472,
+      "population_interval95": [
+        0.661,
+        0.7442
+      ],
+      "population_rate": 0.7034,
+      "rate": 0.7034,
+      "unclear": 1,
+      "wilson95": [
+        0.6607,
+        0.7428
+      ]
+    }
+  },
+  "strata": {
+    "amended-sample": 1224,
+    "contested-census": 473,
+    "restated-sample": 125
+  }
+}
