@@ -1,6 +1,6 @@
 // merge_queue.js — the CLIENT twin of dashboard/src/dashboard/data/merge_queue.py,
 // and the ONE reader of the /merge-queue Datums — in_queue, speculative,
-// recent_total, depth and attempts — and of each queued row's enqueue instant. MergeTab's tiles,
+// recent_total, depth, landing_rate and attempts — and of each queued row's enqueue instant. MergeTab's tiles,
 // pips and captions, the Overview live feed and the rail badge all read them
 // here, so no two of them can disagree. Named for its server twin (the
 // datum.js precedent).
@@ -18,8 +18,8 @@
 //
 // THE CLIENT NEVER ALTERS A SERVED COUNT. Each project's `in_queue` is the
 // server's Datum — the live probe, or its own sampled history's last value,
-// stale and saying why — and its `speculative`, `recent_total`, `depth` and
-// `attempts` are its runs.db window reads, unknown when that read failed. The
+// stale and saying why — and its `speculative`, `recent_total`, `depth`,
+// `landing_rate` and `attempts` are its runs.db window reads, unknown when that read failed. The
 // only envelopes built here are datum.js's own: a receipt stamp, an unknown
 // placeholder, and a combined total. A lower-bound total over the readable
 // projects that names the unread ones is a combination, not an alteration.
@@ -208,6 +208,12 @@ function projectDepth(data, project) {
   return projectServed(data, project, 'depth');
 }
 
+// *project*'s landings per day at each point, each over the trailing window the
+// server names; leading zero points trimmed by the server.
+function projectLandingRate(data, project) {
+  return projectServed(data, project, 'landing_rate');
+}
+
 // *project*'s window of attempts: ONE read behind the donut and the latency.
 function projectAttempts(data, project) {
   return projectServed(data, project, 'attempts');
@@ -273,14 +279,40 @@ function latencyCaption(latency) {
   return 'of ' + l.with_duration + ' with recorded duration · ' + l.without_duration + ' without';
 }
 
+// A span of whole minutes in its largest whole unit ('1-day', '6-h',
+// '15-min'), or null for a value that is no positive whole number of minutes.
+function spanText(minutes) {
+  if (!Number.isInteger(minutes) || minutes <= 0) return null;
+  if (minutes % 1440 === 0) return `${minutes / 1440}-day`;
+  if (minutes % 60 === 0) return `${minutes / 60}-h`;
+  return `${minutes}-min`;
+}
+
 // The width the server counted the depth series at
 // (data/merge_queue.py::BUCKET_LADDER), never assumed here; a series naming none states none.
 function depthBucketCaption(depth) {
-  const minutes = (depth || {}).bucket_minutes;
-  if (!Number.isInteger(minutes) || minutes <= 0) return QUEUE_EM_DASH;
-  if (minutes % 1440 === 0) return `${minutes / 1440}-day buckets`;
-  if (minutes % 60 === 0) return `${minutes / 60}-h buckets`;
-  return `${minutes}-min buckets`;
+  const span = spanText((depth || {}).bucket_minutes);
+  return span === null ? QUEUE_EM_DASH : `${span} buckets`;
+}
+
+// The trailing window the server counted each landing-rate point over
+// (data/merge_queue.py::TRAILING_WINDOW_LADDER); a rate naming none states none.
+function landingRateCaption(series) {
+  const span = spanText((series || {}).trailing_minutes);
+  return span === null ? QUEUE_EM_DASH : `landings/day · ${span} trailing`;
+}
+
+function rateText(perDay) {
+  return String(Math.round(perDay * 10) / 10);
+}
+
+// The newest point and the mean over the served points: a reading of the served
+// series, never a re-bucketing of it (the depth panel's peak was the precedent).
+function landingRateReading(series) {
+  const values = series.values;
+  if (values.length === 0) return '0/day · no landings in this window';
+  const mean = values.reduce((sum, v) => sum + v, 0) / values.length;
+  return `now ${rateText(values[values.length - 1])}/day · mean ${rateText(mean)}/day`;
 }
 
 // Module-unique export const, never a bare `API` — the CANONICAL note in
@@ -297,6 +329,9 @@ const MERGE_QUEUE_API = {
   latencyCaption,
   depthBucketCaption,
   projectDepth,
+  projectLandingRate,
+  landingRateCaption,
+  landingRateReading,
   projectAttempts,
   attemptCount,
   attemptsOver,
