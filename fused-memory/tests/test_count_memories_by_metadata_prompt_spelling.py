@@ -11,12 +11,8 @@ import pytest
 from _count_call_spelling import non_keyword_count_calls
 from _recon_prompt_write_scope import recon_system_prompts
 
-from fused_memory.reconciliation.prompts.stage2 import (
-    STAGE2_SYSTEM_PROMPT,
-    build_stage2_system_prompt,
-)
-
 _PROMPTS = recon_system_prompts()
+_STAGE2_PROMPTS = sorted(name for name in _PROMPTS if 'stage2' in name.lower())
 
 _KEYWORD_SUPPRESS_GATE = (
     "count_memories_by_metadata(project_id=..., "
@@ -33,10 +29,6 @@ def test_every_count_call_uses_keyword_filters(name: str) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    'prompt',
-    [STAGE2_SYSTEM_PROMPT, build_stage2_system_prompt('dark_factory')],
-    ids=['STAGE2_SYSTEM_PROMPT', "build_stage2_system_prompt('dark_factory')"],
-)
-def test_stage2_carries_the_keyword_suppress_gate(prompt: str) -> None:
-    assert _KEYWORD_SUPPRESS_GATE in prompt
+@pytest.mark.parametrize('name', _STAGE2_PROMPTS)
+def test_stage2_carries_the_keyword_suppress_gate(name: str) -> None:
+    assert _KEYWORD_SUPPRESS_GATE in _PROMPTS[name]
