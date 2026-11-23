@@ -293,16 +293,16 @@ def test_every_finding_record_round_trips_through_json(index: int) -> None:
     assert record['slot'] == _any_findings()[index].slot()
 
 
-def test_the_slot_is_equal_for_equal_kind_subject_bound_and_required() -> None:
+def test_the_slot_is_equal_for_equal_kind_subject_and_bound_whatever_the_required_value() -> None:
     first = _report(_observation(550.75, name='test_one')).finding
-    same_measurement_other_test = _report(_observation(550.70, name='test_two', run=_run('8000'))).finding
+    better = _report(_observation(300.0, name='test_two', run=_run('8000'))).finding
     worse = _report(_observation(700.0)).finding
     assert first is not None
-    assert same_measurement_other_test is not None
+    assert better is not None
     assert worse is not None
 
-    assert first.slot() == same_measurement_other_test.slot()
-    assert first.slot() != worse.slot()
+    assert len({first.required, better.required, worse.required}) == 3
+    assert first.slot() == better.slot() == worse.slot()
 
 
 def test_the_slot_changes_when_the_bound_changes() -> None:
@@ -500,6 +500,24 @@ def test_a_breach_whose_slot_has_history_is_skipped_and_reported(tmp_path: Path)
     assert result.ok
     assert 'escalate_info' not in escalations.tools()
     assert (result.filed, result.skipped) == ((), (slot,))
+
+
+@pytest.mark.parametrize('second_night_seconds', [300.0, 160.0], ids=['worse', 'better'])
+def test_an_unresized_breach_is_filed_once_across_nights_whose_worst_drifts(
+    tmp_path: Path, second_night_seconds: float
+) -> None:
+    history: dict[str, list[dict]] = {}
+    first_night = _selfcheck_run(_project(tmp_path / 'night-1', scan_seconds=200.0), _Escalations(history=history))
+    for slot in first_night.filed:
+        history[slot] = [{'id': f'esc-{slot}-1', 'status': 'pending'}]
+    second = _Escalations(history=history)
+
+    second_night = _selfcheck_run(_project(tmp_path / 'night-2', scan_seconds=second_night_seconds), second)
+
+    assert first_night.findings[0].required != second_night.findings[0].required
+    assert len(first_night.filed) == 1
+    assert 'escalate_info' not in second.tools()
+    assert second_night.skipped == first_night.filed
 
 
 def test_a_dry_run_calls_no_write_tool_and_writes_no_stamp(tmp_path: Path) -> None:

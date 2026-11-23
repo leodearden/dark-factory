@@ -4634,14 +4634,14 @@ claim the timer is armed; `scripts/user_timers.py check` answers that.
   with no green run is reported `no_run` and is not judged.
 - **Where findings go.** Each breach is one `escalate_info` (`risk_identified`,
   agent role `timeout-headroom-selfcheck`). Its opaque `task_id` slot is
-  `timeout-headroom:<kind>:<subject>:<bound>-><required>`, where `<kind>` is
+  `timeout-headroom:<kind>:<subject>:<bound>`, where `<kind>` is
   `per_test_headroom` or `leg_budget`. `<subject>` is the anchor id or the
   leg's archive infix (`tests/scripts` files as `tests_scripts`), because the
   escalation server mints `esc-<slot>` files from the slot, so it must be one
   file-name component. A run skips any slot that has escalation
-  history (archive-inclusive), so the same measurement is never filed twice.
-  A re-size changes `<bound>` and a materially worse measurement changes
-  `<required>`; either re-arms the check. The info-L0 router turns each record
+  history (archive-inclusive), so an unresized breach is filed once however
+  its 7-day window worst drifts, up or down; the required value travels in the
+  record. A re-size changes `<bound>` and re-arms the check. The info-L0 router turns each record
   into owned work. Ceiling re-sizing belongs to task 9396; the ini default and
   the headroom factor belong to task 7013.
 - **The stamp.** A real run writes `data/timeout-headroom-selfcheck/state.json`

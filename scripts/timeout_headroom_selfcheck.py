@@ -15,9 +15,9 @@ Two checks, each judged from the durable verify archive alone:
   ``tests/scripts/test_module_verify_budgets.py`` and is cited, never read.
 
 Each breach is one :class:`Finding`, filed as an ``escalate_info`` in the
-opaque slot :meth:`Finding.slot` names.  The slot carries the bound and the
-required value, so a re-size or a materially worse measurement raises a new
-finding while the same measurement is never raised twice.
+opaque slot :meth:`Finding.slot` names.  The slot carries the bound but not
+the required value, so a re-size re-arms the check while a window worst that
+drifts up or down under an unchanged bound is never raised twice.
 """
 
 from __future__ import annotations
@@ -256,14 +256,13 @@ class Finding:
         return self.evidence.required
 
     def slot(self) -> str:
-        """The opaque escalation slot ``timeout-headroom:<kind>:<subject>:<bound>-><required>``; compared, never parsed.
+        """The opaque escalation slot ``timeout-headroom:<kind>:<subject>:<bound>``; compared, never parsed.
 
-        ``<subject>`` is the anchor id or the leg's archive infix.
+        ``<subject>`` is the anchor id or the leg's archive infix.  ``required``
+        is left out because it follows the sliding window's worst in both
+        directions; it travels in the record instead.
         """
-        return (
-            f'{_SLOT_PREFIX}:{self.kind}:{self.subject}:'
-            f'{_slot_number(self.bound)}->{_slot_number(self.required)}'
-        )
+        return f'{_SLOT_PREFIX}:{self.kind}:{self.subject}:{_slot_number(self.bound)}'
 
     def record(self) -> dict[str, Any]:
         """The finding as JSON-ready data."""
@@ -449,7 +448,7 @@ AGENT_ROLE = 'timeout-headroom-selfcheck'
 ORCHESTRATOR_CONFIG = 'dark-factory-orchestrator.yaml'
 ARCHIVE_PATH = 'data/verify-logs'
 STAMP_PATH = 'data/timeout-headroom-selfcheck/state.json'
-DRY_RUN_COMMAND = 'uv run --project shared python scripts/timeout_headroom_selfcheck.py --dry-run'
+DRY_RUN_COMMAND = 'uv run --no-sync --project shared python scripts/timeout_headroom_selfcheck.py --dry-run'
 ESCALATION_TIMEOUT_SECS = 30
 _UNRESOLVED_EXAMPLES = 20
 
@@ -770,7 +769,7 @@ def _body(finding: Finding) -> _Body:
 def _file(escalation: ToolCall, finding: Finding, now: datetime) -> None:
     body = _body(finding)
     detail = (
-        f'{body.summary}.\n\nThis slot is filed once per kind, subject, bound and required value. '
+        f'{body.summary}.\n\nThis slot is filed once per kind, subject and bound; a re-size re-arms it. '
         f'Re-measure with `{DRY_RUN_COMMAND}`.\n\n'
         f'{json.dumps(finding.record(), indent=2, sort_keys=True)}'
     )
