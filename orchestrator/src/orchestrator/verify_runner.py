@@ -2821,7 +2821,10 @@ class VerifyRunnerPool:
         emit: Callable[[VerifyResult], int | None],
     ) -> VerifyResult:
         """Emit *result*'s row through *emit*: for a local verdict in the cache, after
-        consuming what it replayed (I6), and before recording its greens citing that row."""
+        consuming what it replayed (I6), and before recording its greens citing that row.
+
+        Only a green rests on its replays, so only a green whose replays could not be
+        consumed becomes a no-verdict; a red keeps its own verdict."""
         registry = self._verify_cache_registry
         record = getattr(result, 'cache_record', None)
         if not runner.is_local or registry is None or not isinstance(record, CacheRecord):
@@ -2829,7 +2832,13 @@ class VerifyRunnerPool:
             return result
         consumed = await consume_replayed(registry, record, landing_sha=merge_sha)
         if not consumed.backs_every_hit:
-            result = verify.unconsumed_replay_result(result, consumed.reason)
+            if result.passed:
+                result = verify.unconsumed_replay_result(result, consumed.reason)
+            else:
+                logger.warning(
+                    'red merge verify of %s keeps its verdict; its replays were not consumed: %s',
+                    merge_sha, consumed.reason,
+                )
         event_id = emit(result)
         if isinstance(event_id, int):
             await record_greens(

@@ -693,6 +693,30 @@ class TestMergeGateRecordsAndConsumes:
         assert store.fetch_events_by_type(EventType.merge_verify)[-1]['data']['passed'] is False
 
     @pytest.mark.asyncio
+    async def test_a_red_gate_keeps_its_own_verdict_when_its_replays_cannot_be_consumed(
+        self, repo, modules, registry, store, tmp_path,
+    ):
+        config = cache_config(repo)
+        await _merge_pool(repo, config, modules, registry, store).dispatch(_head(repo), _spec(config, modules))
+        _commit_edit(repo, 'beta/tests/test_beta.py', 'def test_beta():\n    assert False\n')
+        decided: list[VerifyResult] = []
+
+        async def _decide_then_garble(*args: Any, **kwargs: Any) -> VerifyResult:
+            decided.append(await run_scoped_verification(*args, **kwargs))
+            _garble(tmp_path / 'verify_cache.db')
+            return decided[-1]
+
+        pool = _merge_pool(repo, config, modules, registry, store, run_scoped=_decide_then_garble)
+        result = await pool.dispatch(_head(repo), _spec(config, modules))
+
+        red = decided[-1]
+        assert _outcomes(red, _units('alpha')) == {UnitOutcome.CACHE_HIT}
+        assert not red.passed
+        assert red.category
+        assert not is_no_verdict_summary(red.summary), red.summary
+        assert (result.passed, result.category, result.summary) == (False, red.category, red.summary)
+
+    @pytest.mark.asyncio
     async def test_a_non_local_runner_records_nothing(self, repo, modules, access, registry, store):
         config = cache_config(repo)
         remote_result = await _gate(repo, config, modules, access)
