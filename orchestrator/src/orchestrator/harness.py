@@ -235,6 +235,7 @@ from orchestrator.service_restart import (
 )
 from orchestrator.slot_lease import (
     SlotLease,
+    SlotLendingError,
     SuspendedTask,
     culprit,
     suspended_slot_tasks,
@@ -14821,6 +14822,28 @@ class Harness:
         # its first step, or its finally raised first.  Otherwise a no-op.
         task.add_done_callback(lambda _t, lease=lease: lease.release(requeued=False))
         return task
+
+    def _launch_borrowing_slot(
+        self, assignment, lender_task_id: str, task_reports: list[TaskReport],
+    ) -> asyncio.Task:
+        """Start *assignment*'s slot on a permit borrowed from *lender_task_id*'s live slot.
+
+        Synchronous, so a caller can make it part of one uninterrupted claim
+        step.  Rules: ``plans/early-start-on-predecessor-branch-prd.md``
+        section 5.3 "Slot".
+        """
+        lender = self._slot_lease_registry().get(lender_task_id)
+        if lender is None:
+            raise SlotLendingError(
+                f'slot lending refused: task {lender_task_id} cannot lend to task '
+                f'{assignment.task_id}: a borrower borrows from a live slot, and task '
+                f'{lender_task_id} has none',
+            )
+        slot = self._launch_slot(assignment, lender.lend(assignment.task_id), task_reports)
+        logger.info(
+            'task %s launched on a slot borrowed from task %s', assignment.task_id, lender_task_id,
+        )
+        return slot
 
     def _slot_lease_registry(self) -> dict[str, SlotLease]:
         """The slot-lease registry, lazily created when absent (``_cancel_causes``'s idiom)."""
