@@ -14,7 +14,13 @@ from collections.abc import Iterator
 
 import pytest
 
-from shared.asyncio_tasks import abandon_task, cancel_bounded, gather_unwound, track_task
+from shared.asyncio_tasks import (
+    abandon_task,
+    cancel_all_within,
+    cancel_bounded,
+    gather_unwound,
+    track_task,
+)
 
 
 class _Boom(Exception):
@@ -341,6 +347,57 @@ class TestCancelBounded:
             _collect_and_confirm_gone(task_ref)
 
         assert errors == []
+
+
+class TestCancelAllWithin:
+    async def test_tasks_that_honour_the_cancel_all_end_and_none_are_returned(self):
+        first = asyncio.create_task(_survives_cancels(0, asyncio.Event()))
+        second = asyncio.create_task(_survives_cancels(0, asyncio.Event()))
+        await asyncio.sleep(0)
+
+        assert await cancel_all_within([first, second], timeout_secs=1.0) == set()
+        assert first.cancelled()
+        assert second.cancelled()
+
+    async def test_a_cancel_immune_task_does_not_extend_the_wait_and_is_returned_still_running(self):
+        release = asyncio.Event()
+        sibling = asyncio.create_task(_survives_cancels(0, asyncio.Event()))
+        immune = asyncio.create_task(_survives_cancels(10**6, release))
+        await asyncio.sleep(0)
+        loop = asyncio.get_running_loop()
+        timeout_secs = 0.05
+        try:
+            started = loop.time()
+
+            still_running = await cancel_all_within([sibling, immune], timeout_secs=timeout_secs)
+
+            assert still_running == {immune}
+            assert loop.time() - started < timeout_secs + 1.0
+            assert not immune.done()
+            assert sibling.cancelled()
+        finally:
+            release.set()
+            await _drain(immune)
+
+    async def test_an_exception_raised_while_unwinding_is_consumed_not_raised(self):
+        async def _raises_on_cancel() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise _Boom('raised while unwinding') from None
+
+        with _recorded_loop_errors() as errors:
+            task = asyncio.create_task(_raises_on_cancel())
+            await asyncio.sleep(0)
+            assert await cancel_all_within([task], timeout_secs=1.0) == set()
+            task_ref = weakref.ref(task)
+            del task
+            _collect_and_confirm_gone(task_ref)
+
+        assert errors == []
+
+    async def test_no_tasks_returns_an_empty_set(self):
+        assert await cancel_all_within([], timeout_secs=1.0) == set()
 
 
 async def _all_started(*started: asyncio.Event) -> None:
