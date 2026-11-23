@@ -1,0 +1,1384 @@
+{
+ "verdicts": [
+  {
+   "site": "classifier",
+   "fixture_id": "00269146-2532-4313-bea6-4f25ee9bf898",
+   "label": "temporal_facts",
+   "rationale": "'Task ... completed. Landed in commit 51c901e1' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "04131c1b-c580-4f8e-ba8e-81297f26fa5d",
+   "label": "temporal_facts",
+   "rationale": "'since task 344 (... 2026-11-09; holds on main once task/344 merges)' marks a state change."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "0ad51f2a-25c3-4e07-ac68-559e1dd7b180",
+   "label": "temporal_facts",
+   "rationale": "'Task 6602 made ... the only name for that cap. The former aliases' records a change."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "0b2ef8d0-ba0f-4b89-93de-e5a5b4754768",
+   "label": "preferences_and_norms",
+   "rationale": "'solar_challenge convention (task 1287 ...)' states a rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "0f1f0fd3-ccac-4df4-99bd-9d50ddf27285",
+   "label": "preferences_and_norms",
+   "rationale": "'Reify GUI test convention after task 10011' states a rule for vi.mock factories."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "12d31a19-889b-49ac-a9c7-c22363da0725",
+   "label": "procedural_knowledge",
+   "rationale": "'you can drive scripts/gui-test.sh hermetically. Copy it to ..., create ..., add a stub' gives steps."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "1738ea30-460d-4bd5-8e58-300de25d005d",
+   "label": "preferences_and_norms",
+   "rationale": "'pin an expected-FAILURE arm with assert_eq!(status.code(), Some(1)) ..., not !status.succe' is how tests should be written."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "1ecbcc23-b396-46bd-ac88-b846c3b11a4f",
+   "label": "preferences_and_norms",
+   "rationale": "'Convention (task 6918): shared/src/shared/proc_group.py is the one home' is a placement rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "1fa1e6ac-538e-48df-963f-81bc1fcc187a",
+   "label": "temporal_facts",
+   "rationale": "'Task ... completed. Landed in commit a42a718c' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "2142871e-a0b1-4cc4-b60e-cb5c16e13303",
+   "label": "procedural_knowledge",
+   "rationale": "'each PRD goes scouts ... → author' describes a workflow."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "21e2290f-9cdc-4ab7-85c9-10d9550d99cc",
+   "label": "entities_and_relations",
+   "rationale": "'task 537 ... already does most of task 605's suggested work. Intake takes a clock now=' relates tasks and code."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "22c30a37-ff05-4c0c-b506-f415e51d290d",
+   "label": "procedural_knowledge",
+   "rationale": "'The raters' own kappa can be recomputed from data/...' is how to do it."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "23c922b4-4f52-4308-ba06-f92f9f4973ab",
+   "label": "preferences_and_norms",
+   "rationale": "'Update to the orchestrator CLI test rule make the tmp project root tmp_path ITSELF' is a rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "2bd59da4-09d3-4520-8a69-406a9a655b1e",
+   "label": "preferences_and_norms",
+   "rationale": "'When putting a statistical decision rule to Leo, state it as the estimated effect' is a norm."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "30e35e39-9bb7-417a-a4bb-6a46e4e41112",
+   "label": "temporal_facts",
+   "rationale": "'Task ... completed. Landed in commit 5d497da9' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "34708cd2-9170-4e60-89b7-7c8e11d6f6b1",
+   "label": "preferences_and_norms",
+   "rationale": "'quotes ... verbatim in text blocks; a line ending ... … marks output left out' is a notation convention."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "3d935cd0-139d-4e67-8665-8b7dbd1eda13",
+   "label": "entities_and_relations",
+   "rationale": "'the info-l0 router (..._submit_arguments) writes spawned_from ... only into the spawned TA' is how code connects."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "3e4d427c-9bc6-4936-8ae4-a3e355bd33db",
+   "label": "preferences_and_norms",
+   "rationale": "'fused-memory test convention (task 6388 ...)' states a rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "3eb20b6c-c911-48ce-a03b-ef8f3287d16a",
+   "label": "entities_and_relations",
+   "rationale": "'NotPermitted(*checks: str) keeps .checks' describes code structure."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "4133e98b-b553-426c-8b73-dee8ff9bd523",
+   "label": "temporal_facts",
+   "rationale": "'Task ... completed. Landed in c' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "4706d74a-8e53-4355-a133-b47bced72be2",
+   "label": "temporal_facts",
+   "rationale": "'seeded the ... recurrence chain on 2026-11-14 at 17:12Z as task 10120' is a dated event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "487874d0-cde6-4067-be2d-42c5bdf041d0",
+   "label": "procedural_knowledge",
+   "rationale": "'Cargo tree gotchas measured ...: (1) cargo tree --workspace -e ...' is how-to."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "50400194-a197-453e-8675-75fa9d7b57a3",
+   "label": "entities_and_relations",
+   "rationale": "'adds pub const fn signed_ms ... to touch_frame::test_support beside ms' is code structure."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "52133159-b096-4039-a9cc-568b4466def2",
+   "label": "temporal_facts",
+   "rationale": "'Task ... completed. Landed in commit 64e5e479' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "59f2a54c-82c2-4e7d-842e-aa1aa5d572cc",
+   "label": "preferences_and_norms",
+   "rationale": "'fused-memory test convention (task 8352 ...)' states a rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "5a122e81-abf7-468c-8bc5-c008cc70907b",
+   "label": "preferences_and_norms",
+   "rationale": "'a PRD amendment's (amended <date>, task N) tag and its header entry name the task' is a documentation convention."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "5a1e91b1-f3fb-4c53-b527-35d5c890d210",
+   "label": "temporal_facts",
+   "rationale": "'task 906's amendment pass (2026-11-10, commit 49d119e0): reviewer_comprehensive suggested' is a dated event; no rule or structure is visible."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "5b1e3975-b6c4-4403-adfc-43ac587c04ef",
+   "label": "procedural_knowledge",
+   "rationale": "'fails test_banned_api, because git ls-files needs a repository: run git init' is a gotcha with its fix."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "5b8f29ed-fd2c-47ed-8d47-4c222bd49400",
+   "label": "temporal_facts",
+   "rationale": "'Task ... completed. Landed in commit 75a30bb9' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "617791d7-ae29-466d-a937-e62545661593",
+   "label": "entities_and_relations",
+   "rationale": "'reify_ir::CompiledExpr has child-expression accessors try_for_each_child' is code structure."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "62a3d3a1-e370-43ff-bd35-4baaaa8bdd20",
+   "label": "entities_and_relations",
+   "rationale": "'tests/conftest.py lists _world ... in pytest_plugins, so pytest rewrites the asserts' is how things connect."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "639673f9-7134-4b67-a011-1b25cdc9293e",
+   "label": "procedural_knowledge",
+   "rationale": "'Gotcha (task 8459): ... refuses a malformed runs.db row by raising UnrecognisedTrainEvent' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "6446789d-6605-43c0-8a1b-0c9178944c33",
+   "label": "preferences_and_norms",
+   "rationale": "'The convention still holds: call MCP tools in-process through ...call_tool' is a rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "6d7c635f-91ce-4c69-93cc-82f2b7e35910",
+   "label": "procedural_knowledge",
+   "rationale": "'Gotcha ...: an aiohttp web server decompresses request bodies by default' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "71a521ef-76cb-4ab4-9595-491fcdae1712",
+   "label": "entities_and_relations",
+   "rationale": "'adds a new test helper, tests/_schema_places.py, as the one walk over a pydantic model's JSON schema' is code structure."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "763fba30-ace3-4905-b87b-a7f792e2a588",
+   "label": "entities_and_relations",
+   "rationale": "'the move forms ... all post to one address, _project_page.move_address(key)' is how things connect."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "778736be-2f56-4d4b-a1c2-520f919e373d",
+   "label": "preferences_and_norms",
+   "rationale": "'every caller that mints a reconciliation run id ... must run that run inside' is a rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "790c3f64-477c-472b-a446-80aa6276dce0",
+   "label": "temporal_facts",
+   "rationale": "'the ... tests no longer live in orchestrator/tests/test_briefing.py. They moved to' records a change."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "7a125e21-fcc4-4412-a4d4-bc7d9e83df95",
+   "label": "decisions_and_rationale",
+   "rationale": "'Decision: Readers move from the prefix form' is a decision."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "7afdfd1b-021f-4a75-b9aa-2d7667efe881",
+   "label": "temporal_facts",
+   "rationale": "'Task ... completed. Landed in commit fe4feb78' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "7c140ee8-2384-47ca-ad09-e5bda3a25070",
+   "label": "temporal_facts",
+   "rationale": "'Task ... completed. Landed in commit d35d2d6d' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "7c20e258-77fa-4dab-b68e-c7bb32fc93ec",
+   "label": "preferences_and_norms",
+   "rationale": "'a helper that only asserts and returns None is named assert_...' is a naming rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "7d05932d-f86f-4420-b212-b2b904cd90e8",
+   "label": "procedural_knowledge",
+   "rationale": "'Mem0 payload gotcha ...: nothing in a record's payload marks a write-triage-made sighting' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "7decd9df-e4fa-4923-b294-955f1328e935",
+   "label": "procedural_knowledge",
+   "rationale": "'Reify gotcha ...: reify check --purpose realizes geometry ... BEFORE activate_purpose' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "80c3b449-a43d-430e-b43e-ba47334a5e17",
+   "label": "temporal_facts",
+   "rationale": "'Task S19·β: Delete the write-only LivenessTracker ... completed.' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "81214e71-e262-495c-a11b-1f7a2450e30a",
+   "label": "procedural_knowledge",
+   "rationale": "'GOTCHA ...: _scrape_gate_categories reads the merge-halt category set out of the source' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "813fe4f1-cc3c-4184-a353-e2d470f43ad3",
+   "label": "temporal_facts",
+   "rationale": "'Task ... completed. Landed in commit 2c51084d' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "86bf7b4e-ddee-44ef-83b1-db9357f62780",
+   "label": "temporal_facts",
+   "rationale": "'Task scripts/check_run_completion.py: ... completed. Landed in commit eedbe1d7' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "90ac2462-5461-41c7-aa9d-ca63ce20115a",
+   "label": "preferences_and_norms",
+   "rationale": "'fused-memory test convention (task 6497 ...)' states where the tests live as a rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "925e4425-23a2-4ba7-9a37-541cd867fde7",
+   "label": "preferences_and_norms",
+   "rationale": "'a parameter that holds a value_types key record is named key' is a naming rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "95743158-e9b4-4ad7-b47f-bb863d289a9a",
+   "label": "preferences_and_norms",
+   "rationale": "'a page pin reads each form box in one test. It compares the box whole' is a rule for a test's shape."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "97b8c28f-e127-4406-ba74-e2e2d5212691",
+   "label": "temporal_facts",
+   "rationale": "'Task direction-typing α: ... completed. Landed in c' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "9b16b86e-1a23-4213-afdc-9c60e8dad998",
+   "label": "temporal_facts",
+   "rationale": "'Completed: Train failure attribution ... Description: Follow-up' is a completion record."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "a0d4bb55-a042-4895-b7b0-9f010b3c32fd",
+   "label": "procedural_knowledge",
+   "rationale": "'their map keys appear as literal strings, so git grep -l -a -F <key> -- corpus/recorded/...' is how to find them."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "a119b566-4ff4-42b2-9bd3-0b5a5b31742d",
+   "label": "procedural_knowledge",
+   "rationale": "'solar_challenge test-writing gotcha' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "a6ed4577-45bb-4a54-afd7-e1c1f19f39ff",
+   "label": "procedural_knowledge",
+   "rationale": "'reify gotcha ...: cargo tauri build checks that tauri matches @tauri-apps/api' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "ab0f4177-422f-45b6-adfb-68b7ad667270",
+   "label": "temporal_facts",
+   "rationale": "'Task times.py stamps a kept time ... completed. Landed in commit eacd5cb7' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "ab12f394-3a98-4d5a-8e42-14c91a8e3b67",
+   "label": "preferences_and_norms",
+   "rationale": "'the boundary_<row id>_<slug> test name is kept for tests of a row' is a naming rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "b0d78da7-f4c3-4f33-ad2d-2dcb5e9a0c3f",
+   "label": "procedural_knowledge",
+   "rationale": "'solar_challenge_platform amqtt gotcha, measured 2026-11-05' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "b23ff101-b9f6-43d6-a1ed-2f7237904481",
+   "label": "procedural_knowledge",
+   "rationale": "'fused-memory gotcha ...: checking that a task text write landed by testing whether the payload appears ... gives false confirmations' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "b304dabe-f3d6-42b0-8c27-5a8e5f16cc42",
+   "label": "entities_and_relations",
+   "rationale": "'moves UNDER_LOAD_HEADROOM_FACTOR ... to shared/src/shared/testing_timeout_headroom.py, a pure-stdlib leaf' states where the constant lives."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "b59f86e3-3413-4f86-a2f0-5484837c1017",
+   "label": "temporal_facts",
+   "rationale": "'Completed: Dashboard completion-path card lumps ... Description: Follow-up' is a completion record."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "b87e1fbb-6672-462f-9d7d-5c93535eaac8",
+   "label": "temporal_facts",
+   "rationale": "'Task ... completed. Landed in commit 51da17ce' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "b98d9a90-20dd-4c59-922a-894811c9cc45",
+   "label": "procedural_knowledge",
+   "rationale": "'Gotcha for AST rules over match statements' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "c063b809-d937-4df3-92ea-fa371bce7ab9",
+   "label": "procedural_knowledge",
+   "rationale": "'Cutting a run's text at its first unclosed ( hides a' is a pitfall in applying the rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "c3a3ee72-e3f9-4a46-b196-8bd6b773da56",
+   "label": "procedural_knowledge",
+   "rationale": "'Gotcha in ...deps_verdict: when external_status_cache ... is None ..., that arm is SKIPPED' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "c4776704-e81a-43ab-bfa2-30c090c96b23",
+   "label": "procedural_knowledge",
+   "rationale": "'Reify gotcha, measured while planning task 9869' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "c9db016a-07c5-4032-913b-7b3214ef8ba6",
+   "label": "temporal_facts",
+   "rationale": "'Task Flake debt: ... cleared on the offline lane' is a status record."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "caa8c65b-35c5-4d78-9374-b3f39d349aee",
+   "label": "preferences_and_norms",
+   "rationale": "'solar_challenge stored-run migration convention (task 787 ...)' states a rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "cd4f3bb8-44fa-45ca-8e7a-a107ce4b2799",
+   "label": "preferences_and_norms",
+   "rationale": "'a test file may pin the refusal of a helper it defines itself with its own row' is a norm."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "cda4ad6c-b8f9-46ba-95c7-90675f6b794e",
+   "label": "procedural_knowledge",
+   "rationale": "'Gotcha (... true until task 903 merges): ruff is not installed on main' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "cfc6b7e5-b332-47b8-9c45-da9396790620",
+   "label": "entities_and_relations",
+   "rationale": "'for an absolute import, a module at the execution root ... beats a same-n' is how resolution relates modules."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "d01582b0-a1f9-467e-adb3-4b309a649184",
+   "label": "procedural_knowledge",
+   "rationale": "'Gotcha for gates.py probe tests' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "d22c4b7e-4eca-4827-9c9e-da3d4e7d2576",
+   "label": "procedural_knowledge",
+   "rationale": "'Gotcha (dark-factory merge lane, task 7720)' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "d376102f-c6fd-4c16-919e-0fc63f15aa05",
+   "label": "preferences_and_norms",
+   "rationale": "'CONVENTION update (solar_challenge_platform, ...)' states a rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "d3c90d92-cd9f-4de6-8901-223e25f9cacf",
+   "label": "procedural_knowledge",
+   "rationale": "'Reify gotcha ...: in reify-expr, only the ^ operator runs its result through sanitize_value' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "daeada47-d100-46d4-991b-12c1af123494",
+   "label": "preferences_and_norms",
+   "rationale": "'fused-memory convention (task 7743 ...). The paginated read primitive is moving out of graphiti_client.py into the graphiti-free leaf' is a placement rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "df65d5ba-c399-4b8e-8785-e0802ad43617",
+   "label": "temporal_facts",
+   "rationale": "'Task elastic_result.rs: fold duplicate ... completed. Landed in commit 752e67a3' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "e5c14706-30c8-4211-aa9f-738e7a29a4c1",
+   "label": "temporal_facts",
+   "rationale": "'Completed: The claude-code backend accepts a truncated answer' is a completion record."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "e5f7b9cf-8b88-4c3b-a86b-77028f344dc5",
+   "label": "temporal_facts",
+   "rationale": "'Task Move the LME artifact tests' ... completed. Landed in commit 470b6474' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "e69959e8-be38-40e5-8d5b-d5e25ad0ffbf",
+   "label": "temporal_facts",
+   "rationale": "'Completed: codebook.py: expose a public ENTRY_SEVERITIES ... Description: Follow-up' is a completion record."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "e885c137-fa4c-40c8-ab8e-c432af7b41a9",
+   "label": "preferences_and_norms",
+   "rationale": "'scoping-intake norm, so reviewers stop re-reporting it' states a norm."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "e8ac8866-4599-421d-8965-906ad3047324",
+   "label": "entities_and_relations",
+   "rationale": "'Task 10053 ... design facts, read from source ...: (1) gui/src-tauri/sandbox/landlock_exec.py' are structural facts."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "e94e9889-d2ba-40ee-a013-400e2579d5ba",
+   "label": "preferences_and_norms",
+   "rationale": "'is written ms(n) - 1 or ms(n) + 1, not as a bare ns literal' is a style rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "e95a37fd-fbee-4636-8e1f-87ae51b4ba3d",
+   "label": "temporal_facts",
+   "rationale": "'In stream_touch, since task 325 (task/325, commit c075c5d ...' marks a state change."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "ea84fe09-10e7-4d63-80e1-b694c9fdb86f",
+   "label": "procedural_knowledge",
+   "rationale": "'a code view's content ... is read with tests/_markup_reading.code_content_of(code_view)' is how to do it."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "edbfdaa5-f4f4-42b4-b0ed-448f8830ef0a",
+   "label": "observations_and_summaries",
+   "rationale": "'(measured for task 828 ...), a throwaway mutant made ... Element.text read as_read(raw_text)' reports a measured finding."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "f1b8c503-d891-4b80-b369-079470b1adef",
+   "label": "procedural_knowledge",
+   "rationale": "'Reify GUI test gotcha: ... module-mocks ../editor/FileTabs as a bare div' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "f569b357-4e04-4a8d-b755-3c278a886640",
+   "label": "entities_and_relations",
+   "rationale": "'copy, prompts and static are directories of text with no __init__.py. The import system imports each as a namespace package' is structure."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "f6e0f309-039b-498c-9810-359c501c07c6",
+   "label": "preferences_and_norms",
+   "rationale": "'task 752's plan ... fixes the convention for the_one's sought phrase ... It is a plural naming the kind of element' is a naming rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "f8fb5149-916c-4617-9d7d-c97bcb90b151",
+   "label": "temporal_facts",
+   "rationale": "'Task The PRD §7.2 per-digest cap appears as five 15360 literals ... completed. Landed in commit 07d5f083' is a completion event."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "fac1740c-b938-4303-94f5-0d72c203bebd",
+   "label": "preferences_and_norms",
+   "rationale": "'solar_challenge convention (task 1314 plan ...)' states a rule."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "fca1d83c-2609-4ff1-9392-6673115420e6",
+   "label": "procedural_knowledge",
+   "rationale": "'GOTCHA ...: making a test DB fixture function-scoped has two hidden costs' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "fd354a4d-b41c-42e8-8500-83796a18fad4",
+   "label": "procedural_knowledge",
+   "rationale": "'solar_challenge gotcha for tests under tests/ that exec a source held in a variable' is a gotcha."
+  },
+  {
+   "site": "classifier",
+   "fixture_id": "ff39775b-557b-4636-9598-d66ea272c39d",
+   "label": "temporal_facts",
+   "rationale": "'Task Plans: the rest prompt kind ... completed. Landed in commit 0a6fdf02' is a completion event."
+  },
+  {
+   "site": "router",
+   "fixture_id": "01a06ba9-bfd6-455d-973a-8febe78b1c44",
+   "label": "broad",
+   "rationale": "'Rule C cannot see wall-clock deadlines written as asyncio.timeout(...)' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "06a94d54-e4a5-4ebe-adb5-4d819c34a47a",
+   "label": "broad",
+   "rationale": "'spawned claude session survives its waiter being killed (process repar' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "070cf681-29a2-4f3e-bfe9-75712725c9fc",
+   "label": "broad",
+   "rationale": "'before_done.env is silently dropped on the target_unit restart paths:' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "07aa4294-793b-4d80-9c37-5427af26ef3b",
+   "label": "broad",
+   "rationale": "'S12·ι Container image pins in one root leaf (task 809 amended place) s' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "1160a8f0-83c1-4b7f-b3a9-de7fdc7a2eac",
+   "label": "broad",
+   "rationale": "'fleet execution policy tasks' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "182cb807-249d-4948-b368-7deae779c385",
+   "label": "broad",
+   "rationale": "'Pack candidate generators, hub rule, exclusions, rider reservation, su' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "1c1b3bbd-15da-434e-9d59-3045dce6c029",
+   "label": "broad",
+   "rationale": "'tests/_london_midnight.py checks its own premise at import, that Londo' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "1db5a26f-a2d1-4a7d-b7cc-f1bd8de2b1c1",
+   "label": "broad",
+   "rationale": "'Leo's feed status and the desk's snapshot refusal agree on when a prob' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "2516191a-2432-4e63-9d64-baf33e1b6b11",
+   "label": "broad",
+   "rationale": "'write triage judge eval band-aware scoring corpus vs band-gap' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "2819cbcb-6bb9-4b89-b1bb-545d2f2ac123",
+   "label": "temporal",
+   "rationale": "'recent task completion status': 'recent' asks what changed."
+  },
+  {
+   "site": "router",
+   "fixture_id": "28ddcfb1-04f1-452a-b2bb-9ccf9bf3e903",
+   "label": "broad",
+   "rationale": "'PVConfig.__post_init__ also refuses custom_module_params with no ratin' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "29fe1a68-96ef-48d3-a156-b5964742505b",
+   "label": "broad",
+   "rationale": "'Surface-forms helper: the attribute scan skips an __init__/__post_init' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "2a44a74c-e08e-43d1-b420-ab9ea60326eb",
+   "label": "broad",
+   "rationale": "'One settle function both engines return through: _StepEnergies, _Batte' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "2a4ae46d-d800-45d9-bbe3-59063e7ddc31",
+   "label": "broad",
+   "rationale": "'DashboardConfig from_env ad-hoc probe metrics_db resolves to worktree' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "2bf996af-15a9-46c9-9e8f-888c428cc2ac",
+   "label": "broad",
+   "rationale": "'Shrink the /api/v2/dashboard/memory-evals payload: tripwire item rows' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "32b2c428-8df7-4af1-8879-3b7df629a99a",
+   "label": "broad",
+   "rationale": "'S5·γ IngestHold: whole-message batches with take / confirm release dis' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "32d69eb0-e1ba-40db-87f3-aff21c88e42e",
+   "label": "broad",
+   "rationale": "'splitting a test file READS_ONLY_THROWAWAY_REPOS test_merge_gate_histo' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "3391065b-be3b-4e42-8801-4831279334c0",
+   "label": "broad",
+   "rationale": "'[test-quality] tests/test_record_rules.py:434-438: analysis_listing_a_' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "35a942f4-3208-48ed-a115-ae6771814059",
+   "label": "broad",
+   "rationale": "'refusal page heading \"That could not be done\" spelled only in error_pa' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "3711fd33-6396-452a-a202-e8be89dc5154",
+   "label": "procedural",
+   "rationale": "'ModuleNotFoundError uv run --project shared ...' is an error plus the command that hit it: how to fix it."
+  },
+  {
+   "site": "router",
+   "fixture_id": "3a3b8223-724d-4e4b-9958-b31bf8469117",
+   "label": "broad",
+   "rationale": "'resolution for: config: decide the hot-reload tier ...' asks how an issue was settled, which no type names."
+  },
+  {
+   "site": "router",
+   "fixture_id": "3baf7438-1550-47ce-ba1e-f03fd691607f",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "3bf4812c-866d-4584-89a9-bd321ce8f8ce",
+   "label": "broad",
+   "rationale": "'S19 ι: Public CLI runner in shared.cli_invoke; invoke.py drops its fou' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "3ca1423e-cc2d-4298-a5f2-e58258079b87",
+   "label": "broad",
+   "rationale": "'resolution for: Merge lane records ...' asks how an issue was settled, which no type names."
+  },
+  {
+   "site": "router",
+   "fixture_id": "3e56bf2a-5944-4495-9cfe-dbf454e1df18",
+   "label": "broad",
+   "rationale": "'[test-quality] tests/unit/surface_forms_helper/test_named_classes_modu' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "41b827f5-4d7e-4f95-b27e-060b1e233dfc",
+   "label": "broad",
+   "rationale": "'touch-session record tests: one assert_no_recordings_left(repo, contex' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "428a4a10-2816-47a3-a79b-a5dd98593ab2",
+   "label": "broad",
+   "rationale": "'[design-coherence] CLAUDE.md:60 (GUI launch); .claude/skills/reify-des' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "42be69d0-534b-4672-bf39-d80eb370da13",
+   "label": "preference",
+   "rationale": "'... and testing conventions' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "46860d27-a2b3-453f-b893-4d5fb3c21cc5",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "4c7a3211-a317-4126-85a8-7ad3f19bf4a3",
+   "label": "broad",
+   "rationale": "'granted_files scope widening delivered on re-pend task 3540 5650 scope' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "5299c4e3-6af0-41c2-85e1-53754ae88c04",
+   "label": "broad",
+   "rationale": "'Correct over-claiming docstring in test_apply_coding_record_routes_pro' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "54493cdd-5319-4c40-903a-621013c2e7b9",
+   "label": "broad",
+   "rationale": "'scoping intake project status' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "56fe811e-fa80-4520-8175-8e2aa48d2e27",
+   "label": "broad",
+   "rationale": "'touch-session record: RecordError::Unsynced's `then: Option<Box<Record' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "58f09401-a42f-48b9-8633-2b85e43e4f49",
+   "label": "broad",
+   "rationale": "'One shared loader for the copies of \"load memory_eval_retrieval_probe.' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "59901f2b-1abf-4ea3-a785-1d0975e2bc28",
+   "label": "entity_lookup",
+   "rationale": "'steward guard clear and merge_first_enqueued_at' names two specific identifiers and nothing else."
+  },
+  {
+   "site": "router",
+   "fixture_id": "5b1aad79-5b7c-47ae-9893-ebdb6d9d4b29",
+   "label": "broad",
+   "rationale": "'touch-session: one home for the copy-durable command line that Session' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "5b9a2f5a-4e05-424f-b6d8-5304ee52f3f9",
+   "label": "broad",
+   "rationale": "'touch-session decode pipeline: device check, unit profile, session rec' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "5cdc7e0e-abd5-4fc5-9db9-558a2f8f35aa",
+   "label": "broad",
+   "rationale": "'[naming] scripts/reify_verify/nextest.py:TestRunner: TestRunner's docs' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "5ce9e72c-e2fa-4bbd-a0e3-e5338284b9fd",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "60f12e7e-3c3f-4a76-8389-80f3442f6994",
+   "label": "broad",
+   "rationale": "'test conftest directory mode oracle' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "613cdb50-d5a7-490a-93e7-8e0f4e24c195",
+   "label": "broad",
+   "rationale": "'FeedConsumer and the recording mailer read time through an injected cl' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "61f2af0d-fdf4-42bc-acd7-771e83f37c88",
+   "label": "broad",
+   "rationale": "'screen reader reply lands chat.js focus' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "642c998c-74a8-4bd1-ae7f-8af663dc9078",
+   "label": "broad",
+   "rationale": "'workspace feature union warm lane' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "64dc2715-3904-4bd4-ba25-57b48839c3bf",
+   "label": "broad",
+   "rationale": "'reify compiler structure declarations' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "65582fd5-c502-4f48-aa28-df1061f305ee",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "65972456-55b4-4bc9-a88d-50e4cdd828d5",
+   "label": "entity_lookup",
+   "rationale": "'task 9170 typed Plan model PlanState write_plan_model plan.json' names specific identifiers."
+  },
+  {
+   "site": "router",
+   "fixture_id": "67b6af4b-c038-4437-81db-dbcef333f14b",
+   "label": "broad",
+   "rationale": "'Submit-time legibility for the operational pure-gate conversion: respo' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "69b45a04-e97b-4183-bd4c-99b4ad43fd24",
+   "label": "broad",
+   "rationale": "'agent-filed follow-up targeting an unmerged branch stalls at the archi' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "69c77662-8c2b-4da3-b2dc-221446310c35",
+   "label": "broad",
+   "rationale": "'[naming] crates/touch-frame/src/test_support.rs:119: Heuristic 1 (info' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "6f980f00-23f5-46e9-8d12-74319bdbeeef",
+   "label": "broad",
+   "rationale": "'/census skill: present-tense facts, drop rollback instruction skills' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "6fb9b52b-e33b-4d59-8db5-f293d5f742b2",
+   "label": "broad",
+   "rationale": "'Reword named_classes docstring sentence on module-less class check tes' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "6fcf923c-46c2-4110-843e-4529ced7e102",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "702054c7-f73f-4322-bf73-f4c4d412b04d",
+   "label": "entity_lookup",
+   "rationale": "'lp-keys-v1 Delete and Enter holds' names one specific profile."
+  },
+  {
+   "site": "router",
+   "fixture_id": "7105127f-f721-46a2-9d7a-6986c4bf9dfd",
+   "label": "relational",
+   "rationale": "'blockers for: slow lane: ...' asks what blocks it."
+  },
+  {
+   "site": "router",
+   "fixture_id": "7265e7a8-1386-46cd-acfc-bf63abae1d2d",
+   "label": "broad",
+   "rationale": "'pragma: no cover counted as inline suppression by inline_suppressions.' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "72ceec18-5a73-4001-a30a-38451b5e9c0c",
+   "label": "broad",
+   "rationale": "'stdlib-namespace ε: import-header generation tooling (unresolved name' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "738e9ff7-28d8-4700-a637-da8353ca8385",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "74365361-b221-4c0b-8b16-86d0adc40da6",
+   "label": "broad",
+   "rationale": "'[documentation-drift] docs/prds/v0_6/cell-eval-transaction-closure.cap' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "77eeb372-7196-4081-9401-dfa0a0dc3f62",
+   "label": "entity_lookup",
+   "rationale": "'hub4 override bench Cerbo GX' names specific devices."
+  },
+  {
+   "site": "router",
+   "fixture_id": "78ad8c73-0fd5-44f5-b1b7-cb8f7bd62bcb",
+   "label": "broad",
+   "rationale": "'verify-ledger record is lost when a sandboxed agent makes the hook-gat' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "79c76af5-213e-4ac0-87e1-7c31b28c230b",
+   "label": "broad",
+   "rationale": "'A recovered value carrying sibling parameter opener and NO closing tag' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "7a4068c6-1d16-44c3-a4a9-b752ddc65c64",
+   "label": "broad",
+   "rationale": "'Usage gate: a resumed account's single probe slot is claimed by the ho' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "7b9c357e-4211-442a-abfa-36e2820568c4",
+   "label": "preference",
+   "rationale": "'... web migrate report convention' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "7bba1451-a44a-4699-a049-97371e5a9d5f",
+   "label": "broad",
+   "rationale": "'One parse of the inbox's reveal requests, by type: request_reveal and' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "7bfe887d-b29d-4471-99c9-8b25528b114c",
+   "label": "broad",
+   "rationale": "'[comments] tests/infra/rust_construct_ratchet.py:41: Comments stance.' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "80edee56-7516-4aa9-8b02-09b07d8440e2",
+   "label": "broad",
+   "rationale": "'Test data SPOT: ten sites work out the repo's scenarios directory from' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "8428a032-26ee-4ad8-b6b0-faf08f979367",
+   "label": "broad",
+   "rationale": "'Merge-lane policy α: instrument the lane (runner_reason, base_relation' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "84c6afa4-e6bc-4edb-8ac9-133e958dd84e",
+   "label": "broad",
+   "rationale": "'[test-quality] tests/test_write_up_in_flight.py:320-324: In the new th' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "8524f2e0-dacc-4d41-a0db-8fe1875c6984",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "85f8cb24-0ced-413b-8310-424d43f9bb74",
+   "label": "broad",
+   "rationale": "'One shared test helper for the default warm-lane base + .pool-root set' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "8634fdce-aa55-41f0-aeb6-7e10aada923f",
+   "label": "broad",
+   "rationale": "'new type: ignore fails inline suppression ratchet INV-12 merge screen' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "8634ffd1-df7c-48b2-a157-d4631bb993bd",
+   "label": "broad",
+   "rationale": "'Reviewer sees open info notes and dispositions them via the verdict or' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "86a7c041-e370-4001-83e2-294c34b26005",
+   "label": "broad",
+   "rationale": "'[robustness] src/scoping_intake/forms.py:90: Heuristic 10, invariants' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "89e850ff-e200-4498-a18a-9482070b703a",
+   "label": "broad",
+   "rationale": "'[documentation-drift] crates/reify-eval/build.rs (header comment, 'Wir' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "8a1c78e0-c914-45d2-befd-e64f0290c326",
+   "label": "broad",
+   "rationale": "'tasks 4651 and 3539 ruled no conflict, populations disjoint on status;' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "8ede0bef-f8f8-4b23-9c1b-074e047a6f68",
+   "label": "broad",
+   "rationale": "'compute_soh counts one equivalent full cycle per usable capacity of di' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "8f9f3f21-73dc-42fd-8e8e-ba107f76a0ff",
+   "label": "entity_lookup",
+   "rationale": "'web migrate refused step MigrationReport' is a short query naming specific identifiers."
+  },
+  {
+   "site": "router",
+   "fixture_id": "90bc91fc-519e-493c-afdb-96fa55187a8c",
+   "label": "entity_lookup",
+   "rationale": "'mypy ignore_missing_imports override' is a short query naming one specific config key."
+  },
+  {
+   "site": "router",
+   "fixture_id": "90ea133e-021d-4289-9b63-aa668ead02f5",
+   "label": "broad",
+   "rationale": "'touch-session decode: DecodeLogError names its log structurally, { fai' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "91872a73-3530-4fc7-8347-cefd89d4d6de",
+   "label": "broad",
+   "rationale": "'gui-test.sh contract tests: two more source greps are satisfied by pro' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "9835c50a-4652-40f4-b4f8-67f6cde8c4c5",
+   "label": "broad",
+   "rationale": "'Deep reviewer is never told the review-<review_id> task_id that _promo' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "995646d4-3d5a-4cfc-ab8f-9e2add25b323",
+   "label": "procedural",
+   "rationale": "'git rev-parse --verify --quiet exit code ambiguous prefix empty stderr' is a command plus its symptom: how to fix it."
+  },
+  {
+   "site": "router",
+   "fixture_id": "99c8c6ae-95d1-4d39-aa5b-b5a4887a7da3",
+   "label": "broad",
+   "rationale": "'reify fix --imports: print refusal residuals with file:line:col, and r' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "9a68a140-7a8c-4e4c-a941-b99e5e1f29ce",
+   "label": "broad",
+   "rationale": "'Correct merge-pre-verify-screen PRD: the discriminator shares run_node' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "9b0f4809-2898-4a20-82de-dc3650f9696d",
+   "label": "broad",
+   "rationale": "'task 452 deferred cadence halt decision' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "9d21b542-bd1b-4dc7-a13c-92d6965f6949",
+   "label": "broad",
+   "rationale": "'[architecture] docs/prds/prospect-ux.md:35: Heuristic 11 (SPOT). The a' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "9e4a11d6-b4f9-4a5f-97eb-de550c567701",
+   "label": "broad",
+   "rationale": "'Make the no-claimant predicate public in shared/task_claimant.py (carr' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "a129152e-b271-4e21-9deb-dc4f2f930b82",
+   "label": "broad",
+   "rationale": "'Recon memory cleanup of leaked tool-call markup is refused by the guar' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "a15f0d3d-a168-4f80-9ad0-0c54e3852f56",
+   "label": "broad",
+   "rationale": "'Under the Tests stance, private patch targets locate a missing seam (e' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "a8c5a366-e67c-4046-bdd1-886373aef615",
+   "label": "procedural",
+   "rationale": "'full test suite uv run pytest takes minutes no pytest-xdist' is a command plus its symptom: how to fix it."
+  },
+  {
+   "site": "router",
+   "fixture_id": "aa9a26d8-012b-4fba-90c4-b27c5d451efc",
+   "label": "broad",
+   "rationale": "'An upload Intake keeps is stamped at the time Intake's clock gives, no' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "aac5dc0a-2237-4e33-8b57-190e49ec9a7f",
+   "label": "broad",
+   "rationale": "'One predicate in tests/_package_sources.py for whether an import takes' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "aec55f8f-0061-484b-8628-0085696062a4",
+   "label": "broad",
+   "rationale": "'one-home guard record_event consent grants tests helper' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "b05ec79f-27b0-4a54-9cd2-35a8aa4c75a6",
+   "label": "broad",
+   "rationale": "'Allowance reserve 1a: the rule as a pure module, and optional block in' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "b1d436c7-2530-4d10-98a2-e591af18457b",
+   "label": "broad",
+   "rationale": "'memory: after task/1523 merges, amend note 484c3abe — the repo-root sp' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "b2e80624-7004-42fb-8861-0844767a8fc4",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "b53d1dc9-73ea-4a62-b676-23d237bab009",
+   "label": "broad",
+   "rationale": "'bare-shell tier-1 sibling import session_registry __package__ dual-mod' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "b6cdc1b6-e847-418a-b75a-18ab962b8c29",
+   "label": "broad",
+   "rationale": "'[architecture/naming (comments stance, heuristic 1)] crates/reify-comp' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "b8b6d796-2134-4943-8d0d-0a7acabb6ad9",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "b9aea2c9-aadf-42b8-ab03-6ca14ddd8880",
+   "label": "broad",
+   "rationale": "'[design] scripts/reify_verify/nextest.py:_phase: _phase classifies a p' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "baea482c-ce81-4e7c-babf-77feea45f118",
+   "label": "broad",
+   "rationale": "'quarantine_worktree double-prefix branch naming collision relocation b' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "bcb05327-ed77-4417-a5c3-bc89d1382786",
+   "label": "broad",
+   "rationale": "'forms: refuse a form model holding blank_as only inside field's type w' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "bf3055be-778d-4a9a-95c9-96a9b599ba53",
+   "label": "broad",
+   "rationale": "'[robustness] scripts/workspace-feature-union.py:parse_tree / host_unio' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "bf821ece-2fae-4cf7-be80-242e42a04ef9",
+   "label": "broad",
+   "rationale": "'graphiti extraction model evaluation quality bar' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "c03a62c1-e956-4360-807a-4f802cc90d6e",
+   "label": "broad",
+   "rationale": "'watchdog IONI drive fault handling' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "c09e7b4f-e4bb-4a19-9ca4-79070e307a2d",
+   "label": "procedural",
+   "rationale": "'pyright reportUnhashable ... not hashable' is an error message plus the tool: how to fix it."
+  },
+  {
+   "site": "router",
+   "fixture_id": "c50d1418-8a63-4fb6-af30-b2c72d00b021",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "c6af00d2-0c02-4409-850a-e5933b3bf0f5",
+   "label": "broad",
+   "rationale": "'PRD test citations guard' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "c91a9ba9-de16-4152-9d8f-dd4e089dab2a",
+   "label": "broad",
+   "rationale": "'[naming] tests/_surface_forms.py:211: Out of scope here, as the plan's' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "ce1d0347-2f1a-4e24-a468-1a36e5a537cc",
+   "label": "procedural",
+   "rationale": "'... /usr/bin/python No module named pytest' is an error message plus the test that hit it: how to fix it."
+  },
+  {
+   "site": "router",
+   "fixture_id": "ce8aae31-3659-4cf3-859e-5f36bb88a012",
+   "label": "broad",
+   "rationale": "'import_headers coverage counts a #cfg-gated import as covering uncondi' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "cf6bfaf4-2f79-4f4f-bb16-3359e4b46f24",
+   "label": "broad",
+   "rationale": "'test_uv_run_venv_isolation shell script uv run --no-sync expected scri' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "d12e9e9b-c15b-47ac-8fd7-d8d25b7095e1",
+   "label": "broad",
+   "rationale": "'merge-lane ratchet private_reads test helper cross-class private metho' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "d1af2513-5679-4ffb-8206-ce15e54f012b",
+   "label": "broad",
+   "rationale": "'Consolidate the two readers of [tool.uv.workspace].members in scripts/' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "d36ee1e7-4e27-45d2-8634-450ee8566a09",
+   "label": "relational",
+   "rationale": "'SpeculativeMergeWorker _lane_buffers consumers' asks what uses it."
+  },
+  {
+   "site": "router",
+   "fixture_id": "d3e763e7-e7b2-496d-b251-c0a9ef84c99c",
+   "label": "broad",
+   "rationale": "'tests/test_prompts.py: its three bare exactly-one picks (money_bullets' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "d4785621-3bb8-4c4d-af9c-8cb86bb26854",
+   "label": "broad",
+   "rationale": "'SimulationResults refuses a NaN in an amount series, at construction a' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "d4ee6032-902a-49e0-91c5-efc62f62d75b",
+   "label": "broad",
+   "rationale": "'Re-point the recompute PRD's MONEY_ROUNDING binding to billing/money.p' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "d8a2cd63-52f6-4e7b-bb1a-ab502e7c7109",
+   "label": "broad",
+   "rationale": "'Surface-forms helper: decide whether named_classes refuses a hand-writ' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "d9df712a-b4f0-4388-887e-c483af2ed6dd",
+   "label": "broad",
+   "rationale": "'[test-coverage] crates/reify-compiler/src/compile_builder/entities_pha' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "ddacf7dc-6831-4138-bb78-46bbd731261d",
+   "label": "broad",
+   "rationale": "'merge_status git tier probe_landing found_on_main only two arms ancest' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "e12d7ed5-af97-4573-b833-cf09340133e3",
+   "label": "entity_lookup",
+   "rationale": "'how long cargo test --workspace and cargo test -p touch-session take' asks a property of two specific commands."
+  },
+  {
+   "site": "router",
+   "fixture_id": "e17884ff-ba28-47e7-a3b9-e0191850a1f6",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "e33710bc-1c57-491b-8795-a1f3ce62af18",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "e418d4fa-b9d9-4993-aeed-0e62df383e01",
+   "label": "broad",
+   "rationale": "'submit_review_verdict accepts off-contract issue dicts silently — vali' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "e6704355-7424-49e3-8b42-290d3ec4bfb2",
+   "label": "broad",
+   "rationale": "'[scope / SPOT (heuristic 11)] crates/touch-session/tests/record.rs:55:' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "e7e345dd-b349-48be-9193-1b036c759887",
+   "label": "preference",
+   "rationale": "'conventions and gotchas for ...' asks for the convention."
+  },
+  {
+   "site": "router",
+   "fixture_id": "f18b6893-9af2-4ce9-afaa-fb303d20fa45",
+   "label": "procedural",
+   "rationale": "'pytest collects a test helper ... PytestCollectionWarning cannot collect' is a warning plus the tool: how to fix it."
+  },
+  {
+   "site": "router",
+   "fixture_id": "f33e107a-5c98-40fc-99da-eb25516e3352",
+   "label": "broad",
+   "rationale": "'task 4147 streak tracker restart stranded alarm resolver disk fallback' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "f600eee8-1ed4-4ff6-8d8d-ffad1103681a",
+   "label": "broad",
+   "rationale": "'architect files escalate_blocker for owner ruling while plan still app' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "f9c5b4a6-700c-44cd-a507-a29b518c608b",
+   "label": "broad",
+   "rationale": "'cgroup-stall-ratio.py --json headline reads null for the dark-factory' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "fac42b4b-9b18-40e9-b8fe-2c0e3e4c0c46",
+   "label": "broad",
+   "rationale": "'task 734 require_read_from_the_other_inputs transition_forms._field_ta' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "fb392fca-c955-4f81-9a37-e1f6e24bb65b",
+   "label": "broad",
+   "rationale": "'Wire reify's hooks-armed-guard.sh arm into the cold create_worktree an' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "fdfcebda-8e33-427d-aeb7-551ab8b33058",
+   "label": "broad",
+   "rationale": "'`solar-challenge web migrate --help` omits the rewritten values its re' is a title or topic string with no cue phrase."
+  },
+  {
+   "site": "router",
+   "fixture_id": "fe2ef290-43de-4184-bf8d-f4c9b54c9f3c",
+   "label": "broad",
+   "rationale": "'S17·δ1 CRUD request bodies derive NOT NULL and String(n) constraints f' is a title or topic string with no cue phrase."
+  }
+ ]
+}

@@ -1,0 +1,1670 @@
+{
+ "gold": [
+  {
+   "fixture_id": "solar_challenge_platform/765327c0-eeb8-48b6-862a-1f6a011c6127",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'uses a ReferenceKey for a period other than the canonical_drift_view's (2024-01)' adds the period; R0 'carries a reference of type ReferenceKey' lacks it. No candidate denies it."
+  },
+  {
+   "fixture_id": "solar_challenge/601d4b71-3300-4307-a4cc-1f9225c1578d",
+   "duplicates": [
+    "32aadfeb-5857-4dc2-9cf1-0de75314eb68",
+    "c0e1a978-07c1-4b74-9260-42f58b571c50"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'is verified by mypy strict checks' restates R0 'includes mypy strict checks' and R1 'includes a strict mypy check'."
+  },
+  {
+   "fixture_id": "solar_challenge/7a562c16-f148-4dd9-b4c8-e89f47884d4a",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'has a known-good target based on the resolution' is a different claim from R0 'result is re-verified by the merge queue'."
+  },
+  {
+   "fixture_id": "solar_challenge/732ee0c3-6da0-43e3-b766-4e87db469134",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New is about 'onEnd once with the final JobState or null'; R0 is about 'onState for each progress frame'."
+  },
+  {
+   "fixture_id": "solar_challenge/bfac34a0-6b5b-4035-977e-660dafc204d7",
+   "duplicates": [
+    "d6764071-e155-47c3-89dc-3d45a1ae0198",
+    "b56f5da3-03e3-4ffa-aea1-e16d3b1a57d9",
+    "52b3051e-23ba-435c-804e-e2db011ae35b",
+    "3518163f-beb1-4baa-8b50-48121e5d8146",
+    "754a4850-b57d-4710-9c98-2ad6da6fdb2b",
+    "3daa2521-0602-4953-93a1-21b42a6b7a30",
+    "107150f4-3388-4fee-ac27-59be0ca2afb0",
+    "cb2d2569-495d-473b-b85c-df146693e6a3",
+    "90425700-2292-4395-b2e9-4eb038e41732",
+    "49c96ebd-8f82-4f8b-bbe1-e2e8344ca286"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Flask's internal cycles require the cyclic collector to manage memory' is stated by every related fact on this pair, e.g. R6 'require the cyclic collector to free an app' and R2 'The cyclic collector is needed ... due to reference cycles'."
+  },
+  {
+   "fixture_id": "solar_challenge/3e2a3ea7-a778-4266-a3d0-8222c447c36e",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'scratch merge passed the mypy strict check and the slow peak-rate-import guard'; R0 'guard is verified by mypy' is a different relation."
+  },
+  {
+   "fixture_id": "dark_factory/ba113ca6-4d29-4950-8242-e54dd283586f",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The stat parse is kept inside ... proc_group.py' asserts where the parse lives; R0 only locates 'read_session_id'."
+  },
+  {
+   "fixture_id": "scoping_intake/3dfa45f1-bc95-4c34-900f-1adf330215cc",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The consumer writes nothing the tick writes'; R0 is about 'ClientStore creates and removes the project.json'."
+  },
+  {
+   "fixture_id": "reify/3b999331-fb36-4a9a-9665-02401b29b4ba",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New names 'std.si_units', R0 names 'std.units': a different object; no candidate says NAME does not cover std.si_units."
+  },
+  {
+   "fixture_id": "scoping_intake/34893976-3fb2-40f0-aca9-05167ae6dba6",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'will remain whole, but ... could lead to a split' is a forward plan; R0 'session fixture is moved to tests/_world.py' and I2 'remains whole' are not its negation at one time."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/8741c3dc-fe05-44dc-b823-a39e9a875e95",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'TabBar is imported by AdminApp' vs R0 'AdminApp draws both tab bars through TabBar': a different relation."
+  },
+  {
+   "fixture_id": "stream_touch/fcb70645-05e7-4230-a870-4cbb87ecfa3c",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'declared by sensel_record_command.rs and sensel_signals.rs' adds sensel_signals.rs beyond R0."
+  },
+  {
+   "fixture_id": "solar_challenge/0880bedd-e870-48f0-bbaa-11c5db7700ad",
+   "duplicates": [
+    "87d16b0b-5aff-4a74-a5e6-137c10d4ab75"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'The only conflict after the reverts is tests/unit/test_web_storage_roundtrip.py' restates the new fact; R1 'after the merge' is a different condition."
+  },
+  {
+   "fixture_id": "solar_challenge/8511e173-eed1-41d6-b547-37899a4ff31d",
+   "duplicates": [
+    "24e5982c-718a-4120-958f-dcc6c8201375",
+    "6d1f5201-b969-4dc3-814f-8d3750ab4db7",
+    "217f88fd-6ebf-477b-a95a-74ffadf03dd8",
+    "fd3794c1-ad1d-40f2-a985-4ed8e3b2c08f",
+    "30abcf8a-5737-4e0b-9fe5-e0e48d04cc5e",
+    "a58230b2-4e5a-4b7a-97c0-183128646eda",
+    "222671db-54fc-4b21-aa95-a7aef49ff24b",
+    "2ee1cf42-1617-49dc-8804-485a500ee88e",
+    "64371067-c76f-41b7-bc2d-1b0dc0da283f",
+    "1e2be101-be19-4ac8-ac2a-d13386183fe0"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "Every related fact states 'L2 esc-121-3 is (still) pending and is related to / covered by dark-factory task 5222'; 'covered by' entails 'related to'."
+  },
+  {
+   "fixture_id": "stream_touch/8922e065-c95d-4e1f-9dfe-1bf4333c8056",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'one extra pass over full.stc for touch-downs before judge'; R0 only names 'FULL_STC' as the corpus entry name."
+  },
+  {
+   "fixture_id": "pump_web_ui/d2baf708-cd24-41c0-acf8-e0c694645dfb",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The task's change to pyproject is the entire declaration fix'; R0 is about CI requiring 'SQLAlchemy 2.1'. I6 'unchanged in this task' cannot be tied to the same task."
+  },
+  {
+   "fixture_id": "scoping_intake/33675ae6-7958-40f4-bfac-7e4ef48b486b",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'new layering row ... checks scoping_intake.instrument alone'; R0 'asserts that the instrument does not load the seam' is a different claim."
+  },
+  {
+   "fixture_id": "solar_challenge/3af4d3af-40a1-4318-bfac-58a21faac964",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'added new tests and a home fixture'; R1 'added two sections' and R0 'added every line' carry different objects."
+  },
+  {
+   "fixture_id": "solar_challenge/13e2f499-b9c7-41d6-b70b-09989ad27187",
+   "duplicates": [
+    "260ecc7a-4570-418a-bbef-498c470d1410"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R7 'planned to stop info-severity L2 escalations such as esc-121-3 from gating merges; the change takes effect only once task 5222 lands' restates it; the 'prevents ...' facts lack 'only once 5222 lands'."
+  },
+  {
+   "fixture_id": "scoping_intake/27d40650-87cb-431f-883b-88253e76f54d",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Adding a known_gaps entry ... is Leo's decision during his next /review-briefing pass'; R0-R3 are about prompts and wording reserved for Leo."
+  },
+  {
+   "fixture_id": "solar_challenge/8696dcac-bf9c-4866-a55a-c69984259f6e",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'asserts that submitted_homes is empty for nothing submitted'; R0 only says the module 'has its own client over a recording_job_manager'."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/8515a8b4-f943-4304-8cbe-ccdb7fcac7d4",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'catches Exception and counts the refusal toward the ... circuit breaker'; R0 is about the message carrying 'ExceptionResponse'."
+  },
+  {
+   "fixture_id": "scoping_intake/61b7ac63-97b3-48f1-8dc8-881aa141d22e",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'ClientStore.locked and SessionStore.save_draft are public'; R0/R1 describe read_record and directory responsibilities."
+  },
+  {
+   "fixture_id": "scoping_intake/f4cc09c7-b130-45ee-aa14-7db5a2bb323d",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Not counted list includes cases where a write-up is dropped'; R0 'records the NotPermitted rule wording'."
+  },
+  {
+   "fixture_id": "dark_factory/dde691f7-93fc-48fb-ae17-acee186f23bc",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'A cap with an unknown reset stays open until a resumed'; R0 'A later cap_hit closes the old cap' is a different rule, not its negation."
+  },
+  {
+   "fixture_id": "solar_challenge/bef95e32-e9f6-4124-9a1b-2224a82d9c6d",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'imports _fixtures.py'; R0 says the fixture classes are 'not _fixtures.py' but I4 shows _fixtures.py holds other classes, so the import is not denied."
+  },
+  {
+   "fixture_id": "solar_challenge/e48aabfe-2652-4b45-a7e2-98f8fbd70461",
+   "duplicates": [
+    "d1653a4a-2fac-4e3c-a88e-2cd4db55eb5f",
+    "395b1aff-6a37-41a2-b74f-52528c195997"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R3/R5 'The home fixture is kept in tests/unit/test_web_app.py along with its two SECRET_KEY tests' state the same proposition; the job-manager ordering facts are different."
+  },
+  {
+   "fixture_id": "solar_challenge/397aca2b-16f1-4c9e-bb3f-a3e5d68ec7b7",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'formats its default name from period.rate_per_kwh'; R0 is about the rate check's 'ConfigurationError'."
+  },
+  {
+   "fixture_id": "dark_factory/7c6fa0de-d162-4cb1-8728-8285620e9eb0",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'does not import the new module df_process_group_spawn'; R0 is a 'navigation pointer' in a docstring; I7 'may import only stdlib and pytest' agrees."
+  },
+  {
+   "fixture_id": "solar_challenge/722cf2fb-9c7b-4b99-adf2-7c79e8391df7",
+   "duplicates": [
+    "360eeae2-d77b-4a3d-ac52-a08765169b73",
+    "0b770c7d-6540-4190-bf0e-1dfac4ef8e28",
+    "14ddad58-f804-4769-b268-010874c4a842",
+    "e814caf3-bfb6-49d9-b4ef-489603a0d5d3",
+    "d5e12158-c62f-45f4-875f-e5f0a2dca852",
+    "6052ec44-6746-4351-a535-58cffa91c71c",
+    "1a1d4ad6-3cf3-4755-b2f4-3386ea22e32e",
+    "971409c5-4b07-4ac8-9106-42ce3218ccf9",
+    "be6bf512-e891-45e4-b01e-f4a4f191a414",
+    "3d4949a9-f950-4b89-b2c9-a34f5c162904"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "Every related fact states 'test_a_live_apps_job_manager_is_among_the_live_managers is placed (directly) before the home fixture'."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/d225969e-bbc9-42b6-a150-2a55ca317e1f",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'BOUND_WHOLE is disjoint from READ_SCHEMAS'; R0 only says where each is defined or referenced."
+  },
+  {
+   "fixture_id": "solar_challenge/94a7342d-480b-4670-847b-1cdbbd458f6d",
+   "duplicates": [
+    "61e993e9-6278-47c8-98d9-f26e49784098",
+    "5ace5d10-87f1-49a4-80ec-2c54c1801a21",
+    "8064f368-72c7-4e8b-85d2-f6ea33cf7f52",
+    "529ccc6a-ffa7-45c1-a11a-941897854c88",
+    "8b0e1ca6-d6fd-4827-bef1-415899111123",
+    "bcfced25-8e6d-4c45-8ba9-e4f73b0c04d8",
+    "537bf6e1-2f5a-42a2-835e-58149181e7ff",
+    "06f50b96-92d8-4194-b2b6-e67708945cbe"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0/R3 'test_web_app.py imports live_managers from solar_challenge.web.jobs', on this pair 'The code/tests imports live_managers from solar_challenge.web.jobs', and R4 'The decision specifies to import' the same end state; R1 reverses the importer, R5 is placement."
+  },
+  {
+   "fixture_id": "scoping_intake/054dfe6f-6cf5-457f-85ac-79cb2051dda2",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'delete_client raises KeptByTheDeleteRule for the first readable project'; R0-R6 are Leo's unrelated decisions."
+  },
+  {
+   "fixture_id": "solar_challenge/3503d6b0-5b60-48f0-a70c-b1f9726424d5",
+   "duplicates": [
+    "4964d5ae-48d7-421f-88b7-e101b43e3dc1",
+    "f564578a-eec8-4e87-964e-a90214d2dfde",
+    "54d974f3-b8b8-4c17-9784-ac939a0e9bfe",
+    "390a618d-8448-401a-90b3-6097af33855f"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R4 'added a SECRET_KEY section with its own fixture and helper' and R2/R3/R7 state the same; R8 'includes a section for SECRET_KEY' lacks the fixture and helper; R0/R1/R5/R6 are about _build_app."
+  },
+  {
+   "fixture_id": "solar_challenge/14fa6b12-51d0-4c56-9cb9-14856a325a8b",
+   "duplicates": [
+    "14ebbbcd-bc19-45a4-a047-c5d55536fe9a",
+    "9c6e3510-2e4b-4064-8385-8d0edcde686c",
+    "85dd4185-3dce-44bf-ae79-aa452545842b",
+    "c2da9241-b4bd-45ff-873f-ed201159178a",
+    "bbe3472d-ca0e-483f-ae76-c20a2eb06eeb",
+    "b187ff11-0831-4f49-865b-a501721b5310",
+    "bfb54fdc-f4e9-4254-9d00-ca5a96632785"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R1 'already includes tests that pin the jobs-level behavior regarding live managers' and the TestLiveManagers facts that 'pin/verify the jobs-level' aspect; R3 'job manager's functionality' and R4 (mere inclusion) lack it; R2 names another file after a partition."
+  },
+  {
+   "fixture_id": "solar_challenge/059d59a4-f393-4425-bb04-99b89b3b6567",
+   "duplicates": [
+    "5e819d14-a2fc-4602-aa5a-904f6b7bd7d3",
+    "fa65c298-4c7c-4663-9c9d-2c7a3e386022",
+    "7cb5a8c6-faa6-4133-99db-5f31bbaea163",
+    "6c61da64-46db-43aa-986b-eff7f6ae8369",
+    "9144bd75-92ff-4a6a-aef9-fd6481416a3f",
+    "05861544-5f67-45f5-8a16-acdf60babd39"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0/R3/R4/R5/R6/R9 'includes the import of gc in the stdlib block'; R1/R2/R7/R8 say 'keeps the import of gc', a different relation from an addition."
+  },
+  {
+   "fixture_id": "reify/bf2ccd0c-d921-420f-8fa8-cdd6cfb2037c",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'task 10136 now waits behind task 6592, task 6586, and the task-9739 park'; R0 is Leo accepting an interim between leaf α and β."
+  },
+  {
+   "fixture_id": "reify/5b225675-b5e1-4a1c-b01b-f063548b49fb",
+   "duplicates": [],
+   "contradicted": [
+    "eb7841b9-732a-4e26-a15d-e94955adfe6b"
+   ],
+   "judgeable": true,
+   "rationale": "New 'quat_basis_axis is deleted as frame_plane no longer calls it' supersedes R0 'quat_basis_axis survives only for frame_plane'."
+  },
+  {
+   "fixture_id": "solar_challenge/f574f3c9-c0a4-436d-bd6d-015d8b14a807",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Task 456 depends on Task 454'; R0 'can switch to attribute reads after task 454 lands' is a different claim."
+  },
+  {
+   "fixture_id": "scoping_intake/18ebc38f-cef6-4bd5-81f5-f61381da6386",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'does not fold imported_names into its reading'; R0 'requires the alias and checks for ... a from clause'; I1/I2 'top-level imports only' agree."
+  },
+  {
+   "fixture_id": "solar_challenge/720251e7-ca0a-4a81-abeb-1b8437cbb755",
+   "duplicates": [
+    "11e81602-898f-47db-8da5-73f53119e657"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'The metrics table renders successfully, while the bar chart builds, but the radar is swallowed' entails the new fact."
+  },
+  {
+   "fixture_id": "solar_challenge/dfaa3aef-557e-4bbd-a02c-cfa7ecffefc8",
+   "duplicates": [
+    "645cbe7d-0b63-476a-93d7-4a5cc5e6777f",
+    "37fb1dcb-05ec-49f8-a5be-b62796b54e69"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'task 132 locks jobs.py, preventing edits' and R1 'locks jobs.py for its operations' restate it; R2 is about deleting the hook."
+  },
+  {
+   "fixture_id": "scoping_intake/77508783-eb10-4d01-ae89-e60ba28b2511",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'A module-level function is used in file_reading instead of a classmethod'; R0 'regular-file refusal is implemented in file_reading.opened_for_reading' is a different claim."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/4eb858f8-27bc-44f4-817d-4c85bc48a1ac",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'add_compression_policy should pass schedule_interval'; R0 is '728's telemetry_hh entry must state schedule_interval', a different object."
+  },
+  {
+   "fixture_id": "solar_challenge/8a4c0bf8-afe1-44c4-baa0-434a4d3eca96",
+   "duplicates": [
+    "e12ef458-328b-4861-80b1-4980c7b4a26d"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R1 'uses weakref to reference the job manager' is the same fact; R0 'to manage the app's lifecycle' has a different object."
+  },
+  {
+   "fixture_id": "stream_touch/302b084e-6156-483e-9ebd-d7f9c2aa90a8",
+   "duplicates": [
+    "8d6d6916-18d7-4ef0-8f7d-78c1a0c25839"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'one more a_recorder_* start-failure test beside its three siblings' entails the new fact."
+  },
+  {
+   "fixture_id": "solar_challenge/d1861600-1d29-4ce3-8066-6cf68af76cb3",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New is about 'sort ... RUN_SORTS'; R0 is about 'type ... RUN_TYPES'."
+  },
+  {
+   "fixture_id": "solar_challenge/b061c6fb-cffc-42ca-bffb-4914e64da443",
+   "duplicates": [
+    "d24801e1-1511-46d7-9da2-50faeb6b8734"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'RunRecord raises a ValueError naming the field, the value, and the allowed values when an invalid type or status is provided' entails 'status outside RUN_STATUSES will raise a ValueError, naming the value and the allowed statuses'."
+  },
+  {
+   "fixture_id": "reify/5211e352-1df3-4e57-9043-751db2dbd307",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'A shared env -u helper ... is deferred to follow-up tickets'; R0 is about pinning verification 'at two seams'."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/7e0cf620-10c9-4249-b9f3-ff10c69fe335",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'pytest runs in the gated not-slow lane, which does not include modbus'; R0/R1 are about test markers."
+  },
+  {
+   "fixture_id": "solar_challenge/f97c7bfb-b53e-4592-b49a-f6c0136b48d2",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'one mechanism per axis ... either the default CEC module or custom_module_params'; R0 'A rule for combining the field with custom_module_params is needed'."
+  },
+  {
+   "fixture_id": "dark_factory/176d2b73-9d1a-4d57-8c9b-dd17c85e6b4d",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Resolving the L1 directly should surface the L2s still clustering it'; R0 'one L1 clustered by more than one L2' is the mechanism, not the claim."
+  },
+  {
+   "fixture_id": "solar_challenge/5acc6543-331f-46a4-95dc-d88c85232a44",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New names 'SettingValue', R0 names 'SpecValue': a different object."
+  },
+  {
+   "fixture_id": "reify/5b1cff2c-c574-4f67-8085-97e1307c4fe1",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'adheres to heuristic 14'; R0 'has 1,319 lines' is a measurement, a different claim."
+  },
+  {
+   "fixture_id": "reify/f03010ab-8f44-4a50-bfc0-cf6cbb18b6b7",
+   "duplicates": [],
+   "contradicted": [
+    "82e6abc7-de9e-4af9-abd8-f04b36b37715"
+   ],
+   "judgeable": true,
+   "rationale": "New 'The elastic_static.rs file contains the FeaValueShapeError' contradicts R0 'FeaValueShapeError does not go into elastic_static.rs'."
+  },
+  {
+   "fixture_id": "dark_factory/8eba5ec2-c68b-42a3-9715-5b7467beafd3",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'git_ops.py imports GitOps and QueuedBranch downward'; R0 'Git primitives are implemented as public methods ... on GitOps'."
+  },
+  {
+   "fixture_id": "solar_challenge/14d10c12-7689-4716-8ecb-d732c2192e47",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'would add an Invalid value: label, which changes the verbatim text'; R0 'ValueError also becomes an ERROR row'."
+  },
+  {
+   "fixture_id": "solar_challenge/40d4048e-3788-4a85-b93e-1cb6f94e8a0a",
+   "duplicates": [
+    "55f05b7e-9143-49ca-8f79-78525ce0174a"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R8 'The job-manager tests are placed before test_the_session_cookie_is_not_marked_secure in tests/unit/test_web_app.py' is the same fact; the others place the cookie test after the home fixture or SECRET_KEY tests."
+  },
+  {
+   "fixture_id": "stream_touch/12d8dedf-b8ce-49fe-83bb-ca64ab8a5367",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'rustc checks that every reference resolves, while clippy checks for code quality'; R0 'rustc's -Dwarnings never runs clippy lints' is a different claim, not its negation."
+  },
+  {
+   "fixture_id": "solar_challenge/13133a33-77f1-4129-97b1-e9346a8606d5",
+   "duplicates": [
+    "4d3670cd-b883-4f34-a714-8c7d041f453f",
+    "883ffb17-f79e-421b-a556-1453606eabe4"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'does not create a JobManager because it raises FileNotFoundError before it runs' and R1 'The dashboard-folder test does not create a JobManager because it raises FileNotFoundError' state the same."
+  },
+  {
+   "fixture_id": "reify/8c89282e-1005-4deb-b893-91ae5f663ffd",
+   "duplicates": [
+    "9d9ca68d-8c5a-450f-ab8b-08cfbaee7439"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'The CLAUDE.md infra-test policy mandates ... Python stdlib unittest, not pytest' is the same rule; R1 'requires new tests' drops the infra scope."
+  },
+  {
+   "fixture_id": "solar_challenge/f8d275d9-4b95-4a68-9d1b-82471b9f5944",
+   "duplicates": [
+    "3a408700-a311-49c7-a62c-05cce0d35a7e",
+    "217362a3-1cfe-445b-b026-06c3d609e2db",
+    "9de34c2d-53cd-45d4-a726-1e4d9fb92c32",
+    "a7b0c4ae-fbc5-4d5d-a0d2-7e771c31dac8",
+    "6f43ae28-df09-425e-9f79-4397b93afc5c",
+    "591a726c-67e5-42bc-8ab4-87d0d0c26acf",
+    "c7950759-cbd8-48ea-a3f9-1c48a6eb45be",
+    "0ae634c6-150b-4173-8d29-4997044763a0",
+    "4f4d9e8a-f68c-44f7-8161-ac741aba25a6"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R2 'The import of live_managers from solar_challenge.web.jobs is placed below the import of Flask' and the decision facts that 'place/keep' that same order; R3 'The solar_challenge.web.jobs module imports Flask below its import statement' is garbled."
+  },
+  {
+   "fixture_id": "solar_challenge/cda2fa48-d182-48f7-b72d-267990558c5f",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New names 'GRID_CHARGING_STEPS', R0 names 'SELF_CONSUMING_STEPS'."
+  },
+  {
+   "fixture_id": "scoping_intake/1a98c180-4243-45ee-97a6-aa2565a2aaa2",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The module docstring ... is replaced with a new sentence'; R0 'pins only the found (tag, class) pairs'."
+  },
+  {
+   "fixture_id": "dark_factory/e7b02f42-1a38-48e0-bc96-d0a4bd1a97a3",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'adds about four small methods without moving existing code'; R0/R1 say 'workflow.py exceeds the 2,000-line threshold'."
+  },
+  {
+   "fixture_id": "reify/9b70f254-12bc-49ea-b663-0f20391a216d",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The template-level pair is named get_value_cell_in_template and try_get_value_cell_in_template'; R0 'keeps only the pointer to the resolution contract'."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/63755958-02f7-4b59-adc5-c8c9172a45f0",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'mirrors tests/test_settings_domains.py's load-time pair'; R0 says a test there 'reads from the Field metadata'."
+  },
+  {
+   "fixture_id": "scoping_intake/56458b4e-67d5-46f8-9c8a-d9f9d6af03e6",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New is about 'append_analyst_exchange cannot overwrite the ask form'; R0 is about 'ask_analyst cannot offer the ask form', another function."
+  },
+  {
+   "fixture_id": "dark_factory/20b68d5b-a7ef-40a2-a5fe-0613fc44b5a6",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Leo made rulings on the deep-chain items from esc-3190-1'; R0 'Leo is recommended to defer esc-3190-1' is a recommendation, not a ruling."
+  },
+  {
+   "fixture_id": "dark_factory/0724d5a7-2720-4d3b-a0a1-71dbb99e899b",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'includes the command uv sync --all-packages'; R0/R1 are about whether it spawns or would run uv sync in a fixture."
+  },
+  {
+   "fixture_id": "stream_touch/907722b3-7858-454a-90cf-9341e2e876d1",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'share the same Display format'; R0 'are distinct types', R1 'ExcerptError is retired'."
+  },
+  {
+   "fixture_id": "solar_challenge/bd8b6ef1-77f6-4a40-bdca-764fad14fe73",
+   "duplicates": [
+    "2f7bc7e2-6a63-454c-ba41-321ab40ac19a"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R1 'test_shutdown_all_managers_shuts_down_every_live_manager test in tests/unit/test_web_jobs.py pins the jobs-level aspect of the shutdown process' entails it; R0 states only inclusion."
+  },
+  {
+   "fixture_id": "solar_challenge/b839e565-78dd-4ee1-aae8-169221953de3",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The docstring stays the one home of the rule's statement'; R0 is about a marker constant, R1 about a private predicate."
+  },
+  {
+   "fixture_id": "solar_challenge/26119060-0d91-48bd-942c-5a4fe728b35b",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New is the change 'from 855b8ec to the current state'; R0/R1 describe what '855b8ec' itself changed."
+  },
+  {
+   "fixture_id": "dark_factory/db43946d-de99-432f-bb01-397442a4a4ab",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'resolved in lock_table.py::ModuleLockTable._resolve_limit'; R0 is line count, R1 'was considered for relocation'."
+  },
+  {
+   "fixture_id": "dark_factory/30d8832a-8413-4f99-9e52-c852f62b9894",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'returns task_id as a str'; R0 'returns a real id synchronously' lacks the type."
+  },
+  {
+   "fixture_id": "scoping_intake/ad94c204-100c-493d-9482-4f76c526781e",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'keeps a journal of the type of OSError'; R0 'An OSError ... can occur', R1 'would require patching'."
+  },
+  {
+   "fixture_id": "solar_challenge/dee18f9c-590b-4073-b702-e4800ae19606",
+   "duplicates": [
+    "cc388840-7cbf-4cbc-ae01-001a1e17d198",
+    "d858bc5a-42ff-48e6-890b-c0f0e58610c2"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R1 'The jobs module can reach a live app's job manager while the app is alive' is identical; R0 'While a live app exists, the jobs module can access its job manager' entails it."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/0e4890f4-95c7-4965-9016-0d51802ed58b",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'uses the test_ingest_reconnect.py's FakeMessages to drive run()'; R0 'The hand-rolled clean-end fakes ... drive run()' can hold beside it."
+  },
+  {
+   "fixture_id": "solar_challenge/087063de-60cf-4fff-a0e7-8a77cc574340",
+   "duplicates": [
+    "e10b9907-d8aa-4792-97c2-333fcd13b34e",
+    "ec70a43a-d938-4e59-a884-ecce51c0d7a3",
+    "de58f5bf-e842-4347-82fe-e7fd6c8ec0eb",
+    "57c69d3a-b70d-40f3-b1e6-4014b518f06f",
+    "99fee6ee-71b6-4844-a0a6-9b7aea0bd3f9",
+    "dafcd227-0215-4584-a0e5-bdb2a2e3d702",
+    "9b154501-9895-44ca-93f5-558a252b6745",
+    "3e7bd9a6-6955-42bf-b681-e50190922c77",
+    "6232c17e-0c2f-42c1-91a1-145ba62943cd"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "The pinned-membership facts state 'The membership of app.extensions[job_manager] is pinned with live_managers()'; 'is now a stronger choice' is evaluative. R3 'is a member of live_managers()' states membership, not the pin."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/95a899d6-7d43-45e7-8b2f-297a09604947",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'must have a failed_at timestamp'; R0 'A failure reason exists only if the member message has failed' is a different constraint."
+  },
+  {
+   "fixture_id": "solar_challenge/8fe7c6cf-8a6c-45af-86b6-4a86df74428b",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'keeps ValueError for computed results'; R1/R2 'raises ValueError if it has no homes' are a specific refusal."
+  },
+  {
+   "fixture_id": "solar_challenge/6bbdbd34-84cc-4a74-88c0-4d01e21fc832",
+   "duplicates": [
+    "cb052f13-7da6-433e-a8a9-bd7f5a95a46e",
+    "cf40f820-9616-44db-86d1-1218cf281ca8",
+    "4d3f01d6-ac08-43d2-93be-ffa88e179531"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R9 'a08eacc returns the live managers that are not freed while a job is queued or running' and R0/R6 'a dropped app's manager with a blocked job remains in live_managers() until the job ends'; the rest say 'The state of live_managers() is influenced by the measurement'."
+  },
+  {
+   "fixture_id": "dark_factory/fb3b9e4c-a400-423c-9c34-77380a4420d2",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Cost is computed from report.json arms at ... LIST_PRICES'; R0 is garbled ('is imported into the design document'), R1 is about the test."
+  },
+  {
+   "fixture_id": "solar_challenge/49c9ba2c-472c-4d11-a13f-18353275fea2",
+   "duplicates": [
+    "336f0daa-256c-43c4-b3ef-d76a0cd48497",
+    "df3186cc-5656-4b4e-b9d8-70445c5c5867",
+    "40030804-9424-40ba-9f04-179f945228f8",
+    "6aa2034c-5e0a-4c73-97c4-33a612001794",
+    "9481d508-4281-45fa-b1c8-7c4af1f39480",
+    "153789b4-50fe-4132-8ecf-038cf554bdfb",
+    "bf59af35-403d-4c08-8197-66e98144cd83"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R1/R9 'The per-app hook is deleted with no replacement, and jobs.py is not edited' and R0/R2/R5/R6/R8 'deleted ... jobs.py not edited / untouched / no longer present' state it; R3 is about calls, R4 the module-level atexit hook, R7 a possible future deletion."
+  },
+  {
+   "fixture_id": "solar_challenge/70edd13e-768c-46ce-bf78-5b6729b950a4",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New adds 'will fail the test until its command includes --locked'; R0 'Tasks 222 proposes the css-build lane job' lacks it."
+  },
+  {
+   "fixture_id": "reify/ca31794e-47c2-457f-bcb1-66b1b8e26357",
+   "duplicates": [
+    "3e90e0f8-ee29-40c5-b8f7-0b9e665f3c62"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'ImplicitOptions is part of its own reify-ir module' restates 'is located in the reify-ir module'."
+  },
+  {
+   "fixture_id": "solar_challenge/74842cba-efb2-4ee9-a8fd-ffcb18a73740",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The method's last parameter, sqlite3.Connection, matches the usage'; R0 'requires a connection to sqlite3.connect to write failure reports' is a different claim."
+  },
+  {
+   "fixture_id": "solar_challenge/9b6adf51-24f9-46f9-858a-caafa6f7592e",
+   "duplicates": [
+    "75261232-904d-4f0a-a7ff-b0f71ed49eee",
+    "6aed4477-51a8-4fba-b3c6-e851665ac122",
+    "9f61e77f-f5c0-4baa-9a5f-56649acccd85",
+    "a846c8e4-49ac-4477-a565-d38fd29c10d1",
+    "a6ace45b-9c64-40ef-ab89-0da1ad139068"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R2/R5/R8 'The task 192's tests utilize SECRET_KEY, which is supplied by _build_app' and R3/R7 'The SECRET_KEY is supplied by _build_app, which is used in the new tests' state it; the section/fixture/helper facts do not."
+  },
+  {
+   "fixture_id": "solar_challenge/67d2cff7-d301-41d2-bc6f-50642cced9d2",
+   "duplicates": [
+    "c2c6398a-ffa2-4022-b9fa-8ed146d770a4",
+    "aca58102-c7e3-4d34-8bbb-af9b67175dbc",
+    "4c6c7d1f-ceb5-4c2b-873a-bf50f17efa25",
+    "e6e61301-9c38-4897-8e8d-471d9cfa0fa8"
+   ],
+   "contradicted": [
+    "1ca6a0b6-bca8-49f8-aac5-d19a07c2133e"
+   ],
+   "judgeable": true,
+   "rationale": "R0/R2 'includes the import of Path in the stdlib block', R3/R7 the decision that 'keeps' it there; R4 'includes the Path import after the stdlib block' contradicts 'as part of the stdlib block'."
+  },
+  {
+   "fixture_id": "reify/52adc351-afe2-4c7c-bbb7-cd5cfd4d021f",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Leaving documented_signature_arities in geometry_chunk_smoke.rs would force ... import'; R0 'The guards are moved' is a different claim."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/052fcada-1109-4206-8147-3932ecf4795b",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'raises decimal.InvalidOperation for NaN'; R0 'defined as frozen dataclasses'; I0 'refuse non-finite rates' does not deny it."
+  },
+  {
+   "fixture_id": "dark_factory/300c3b90-7fb1-4bcc-bf64-25029101c141",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'cuts every AtomicConnection store's close at a budget'; R0 is why 'AtomicConnection is used'."
+  },
+  {
+   "fixture_id": "solar_challenge/f6bd89fb-b9e3-4db4-a68e-c590583d8f8f",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'requires MultiYearCurve for its helper's return annotation'; R0 'The MultiYearCurve includes YearPoint points'."
+  },
+  {
+   "fixture_id": "dark_factory/190d79be-5c76-4aa6-8001-508d421e3375",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New adds '128 KiB'; R0 'Linux caps a single argv/env string at MAX_ARG_STRLEN' lacks the figure."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/b9cde6c0-8a01-46a9-8f43-f049be0f6b94",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Existing tests accept hh_start only in UTC or in London'; R0 is how bounds 'carry that zone'."
+  },
+  {
+   "fixture_id": "dark_factory/904dd61c-64be-4b71-ac58-64b54b1e7c50",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'cannot import escalation due to pyright paths'; R0 is the Python version, R1 the __init__.py."
+  },
+  {
+   "fixture_id": "solar_challenge/9b63999d-6493-4300-be28-c96005553ff3",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'both tests fail when may_be_generated is forced to return False on 3.12 and 3.14'; R0 is about 'the no-import test'."
+  },
+  {
+   "fixture_id": "solar_challenge/aca60541-73d9-4141-9fd5-1fa81d21eab9",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'remains a contiguous unit beside its fixture and helper after the addition of the new tests'; no related fact states the contiguity."
+  },
+  {
+   "fixture_id": "reify/bf3dff8f-d66e-48b4-b10d-3fbaaa577aca",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'exceeds heuristic 14's line count alarm'; R0 'has 2191 lines of code' is a measurement."
+  },
+  {
+   "fixture_id": "reify/92ea4b6a-f0fd-4911-ad86-ce4632d680a8",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'ptodo.rs stays whole in this task'; R0 'The owner-position grammar is extracted to ptodo_promise.rs' cannot be tied to the same task."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/510f6fc1-d3c2-4c2f-9008-4c6ccf7cb287",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'must read a parenthetical the same way'; R2 'apply the same policy to how to read a PRD's §9' is a different object."
+  },
+  {
+   "fixture_id": "scoping_intake/716fa465-b701-4548-b51e-9c6b3b2f1dc9",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'configures a World with a FakeClaude-backed model'; R0 'exercises the functionalities of World' lacks the FakeClaude model."
+  },
+  {
+   "fixture_id": "solar_challenge/e7c1b784-a0e6-472e-9c10-9eb4b17c60a1",
+   "duplicates": [
+    "8f528b2d-935d-4a31-b1fc-c9ebc69e1733"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'The shutdown_all_managers() function is called in cli/web.py::start's finally block' entails it."
+  },
+  {
+   "fixture_id": "solar_challenge/095f0db6-925a-49bb-86b1-d2751c6d6422",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'A custom range's dates are sent to the server and judged there'; R0 'tests that the server accepts what the form submits'."
+  },
+  {
+   "fixture_id": "scoping_intake/51efe600-bfba-42f6-9764-b10284393132",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'keeps the detail for any traceback that is printed'; R0-R2 are when pydantic raises it and the hierarchy."
+  },
+  {
+   "fixture_id": "reify/556343c1-dd5f-4da0-bb53-dc10d1431fe0",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'identifies which ValueMap corresponds to a given name'; R0 'transforms inputs into a ValueMap'."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/84759c3f-7f64-48e2-9263-42a816223082",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'allows test_commands.py to pin the builder'; R0/R1 describe the Tests stance's use of tests/test_private_names.py generally."
+  },
+  {
+   "fixture_id": "solar_challenge/96d6a348-ed1a-4c15-bec8-0001f9ed0280",
+   "duplicates": [
+    "fbae7934-64bd-432a-be7b-1e87a558c0a7",
+    "4a1884d3-9b9a-42fc-89f2-1e7037c672c2",
+    "aa734f16-56ae-4fc4-9895-c2cd980d52e9",
+    "5c27f030-2cc0-4b4d-9ccf-fdcd6ff6928b",
+    "46277116-cd69-45ce-a3fe-a1134ea02606",
+    "ba5d68ef-1cc1-4a15-a839-cd64d8cea23e",
+    "d87d080d-9539-4404-9b36-cc636dbe3be4",
+    "4f2d1945-f9b4-4db3-9734-ce9ffad035dc"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R3 'The resolution in tests/unit/test_web_app.py is based on the main branch's file' and the 'resolved by keeping all of main's file' facts entail it; R1 'keeps every line main added' and R8 do not say the file is main's."
+  },
+  {
+   "fixture_id": "solar_challenge/6a22e44b-8b73-45a4-b521-bb8c205b384d",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New adds 'at call time'; R0 'still reaches the box colours' and R1 'monkeypatches entries' are different claims."
+  },
+  {
+   "fixture_id": "stream_touch/38f49339-df61-4eb3-9b64-343c3ea4f1d4",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'module documentation names ... D13-excerpt condition'; R0 states what the κ row's condition requires."
+  },
+  {
+   "fixture_id": "stream_touch/55d11984-c783-46ef-857e-7b69138014c8",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'WriteError::Io has no test associated with it'; R0-R2 are about Display format and types."
+  },
+  {
+   "fixture_id": "solar_challenge/bc69809e-4351-4816-943b-f9fa9a04c0c2",
+   "duplicates": [
+    "aa0cc375-f3e5-4263-b550-008c778fbd15",
+    "4cb369f6-3792-4b68-ae81-fddf92492133",
+    "ed13fe61-06ce-45fb-aaa8-13480e1b0e3f",
+    "9d0c9518-8a24-4b4b-9085-a01f88f686f8",
+    "f3718406-4684-4717-89ef-b9df65c2b6a3",
+    "0cf4edef-e2d8-4dcb-a647-2c060b4d38d0",
+    "2a8bbcf9-432b-45b6-9343-9feda11967d2",
+    "64ddfad4-9686-4f63-8b12-f850ed01361d",
+    "c216e5c1-780a-41a2-8289-fc0f866cee43"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R1 'tests/unit/test_web_jobs.py pins the behavior of shutdown_all_managers()' and the other 'pinned' facts state it; R9 is 'The membership check only reads'."
+  },
+  {
+   "fixture_id": "solar_challenge/191110b0-fe90-465b-82ac-1921e0f6365c",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New is how the change is 'pinned with full anchored messages'; R0 'Battery is clamped by task 580'."
+  },
+  {
+   "fixture_id": "reify/c2edede2-e0c4-49af-a927-c8c8d46be55b",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New names 'shell-extract', R0 names 'shell_extract_compute'; the fact does not settle that they are one target."
+  },
+  {
+   "fixture_id": "solar_challenge/412afc72-c602-4148-98b9-1372724b3f36",
+   "duplicates": [
+    "98c24095-5702-483d-a4d4-f4c43500c43c",
+    "09f751e8-6e1f-4bc5-99d6-76332aa6ce9d",
+    "ef2c768c-9b6f-499d-be77-4a058e21521e"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R1/R2 'The _build_app function in test_web_app.py supplies the SECRET_KEY' and R4 'The tests in test_web_app.py use SECRET_KEY supplied by _build_app' state it."
+  },
+  {
+   "fixture_id": "scoping_intake/bad46309-1fcc-4035-8f5d-2ec21401e5df",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New '2.6 seconds at a poll interval of 0.05'; R0 '6.3 seconds at the default poll interval' is another condition, not a contradiction."
+  },
+  {
+   "fixture_id": "reify/b8d7d23a-148c-4fe9-a6a4-83736e1d35d3",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New names '_require_grammar_substrate', R0 names '_grammar_e2e_status'."
+  },
+  {
+   "fixture_id": "solar_challenge/4db7d80b-e0c2-4808-9044-13815bd1cd31",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'places the import ... directly below pytest.importorskip(flask)'; R0 'imports Flask'."
+  },
+  {
+   "fixture_id": "solar_challenge/7a7b050c-a9f5-4a9c-8985-2ee60de378cf",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'uses build_test_app to build the test app'; R0-R9 are placement and inclusion."
+  },
+  {
+   "fixture_id": "stream_touch/f6092cb8-15bb-417d-bf5a-08f298f2350d",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The session.toml schema can hold only a payload or an errno'; R0/R1 are about cut and the raw log."
+  },
+  {
+   "fixture_id": "solar_challenge/a923c8e4-8e42-4afd-b2ce-14b077b4b915",
+   "duplicates": [
+    "67b91ca0-2a5c-4394-b10f-044949fd039f"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R1 'Plan.json records the instructions from dark-factory agents/briefing.py' is the same proposition; R0 is about the MERGER's prompt."
+  },
+  {
+   "fixture_id": "solar_challenge/6de42fd3-54df-40b8-a43a-d57d616c2576",
+   "duplicates": [
+    "f598aaa3-931b-4391-b01b-177f2ebd5cb4",
+    "39baf7c8-708c-4b9c-a8d7-a88917136eb3",
+    "16412fd4-552f-4441-8d9c-465618e59aea",
+    "bbfb36ef-b242-4443-9d34-f0897f0f9c30",
+    "0834ebef-b544-40b3-8c11-3b1656a72f05",
+    "72133818-3c77-4cbf-966c-06f7b91e9ae6",
+    "2e2d53a0-1ca8-4d3b-9101-0b34a4a37594",
+    "ec2864b8-3546-4b92-9f2c-090347a7300c",
+    "0e2961e3-30c6-4aaf-aead-a35e13225e70"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "The facts 'The task 192's home fixture is placed after the two job-manager tests' state it; R1 is section membership."
+  },
+  {
+   "fixture_id": "scoping_intake/2c63ac8c-ce26-477f-ad1a-c7f0e7344f6c",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'admits any reading at offset +00:00, including timezone.utc'; R0 'validates every time it reads against the UTC standard' is a different claim."
+  },
+  {
+   "fixture_id": "scoping_intake/edf683ba-f7fa-412e-8022-d79d120f559b",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The client id mirrors admin_client_path'; R0 says the names 'pair with existing builders'."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/f5993daa-74fd-450c-bd1c-920dc265d182",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'derive the same CHECK name from the class name'; R0 'The B4 detector compares a two-member Colour CHECK with a three-member Colour Enum'."
+  },
+  {
+   "fixture_id": "solar_challenge/d69017cf-21f1-4efb-bacd-bd7878a35775",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New is about tests/_dashboard_sources.py's purpose; R0 is about tests/_css_classes.py."
+  },
+  {
+   "fixture_id": "dark_factory/f77ea516-01b0-4e2f-a2b1-5fd7224eb052",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The dead else: import state_docs branch ... is not visible to the runtime test'; R0 'follows the codec of TrickleState'."
+  },
+  {
+   "fixture_id": "scoping_intake/a1a4b0d4-82c1-4be6-a609-6a19bc4688e5",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Both ... need the client'; R0 'keep calling served(site)'."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/488b983b-86dc-41b7-bde5-b4045b9eab30",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'should be lowercased and the brief regenerated'; R0 'docsgen --write generates the brief's §5 copy' is the mechanism."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/d8ec4bff-e85e-41dd-a5af-f8c76f97a240",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'PostgreSQL uses hh_start as a leading column'; R0 is what 'The EXPLAIN test asserts'."
+  },
+  {
+   "fixture_id": "solar_challenge/5d2e0c3f-7746-42a3-a3d0-e8c771c737f1",
+   "duplicates": [
+    "478b627d-bedc-4384-9e99-3de674fbabe2",
+    "19b92500-226f-402c-a939-2a17d850c48d",
+    "9a58685e-e013-4aae-88df-d716b142dad9",
+    "499ced61-59a5-4a48-8be5-b97c196de72a",
+    "b44bdcc2-0ac1-4722-92f5-661e60865267",
+    "775200c8-c80b-4a6a-b34c-11e46eec5e73",
+    "05b47d56-475b-48ea-a2a2-26475f18e9b0"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0/R2/R3/R5/R6/R7/R9 'src/solar_challenge/web/app.py auto-merges with (the changes in) tests/unit/test_web_app.py'; R1/R4/R8 'is taken exactly as git auto-merges it' do not name the test file."
+  },
+  {
+   "fixture_id": "reify/86c1d16f-ca29-43fe-a2e2-f87ee5f131aa",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'still contains the reify fence that includes the polygon definition'; R0 'carries 5 bare reify-fragment fences' is a count."
+  },
+  {
+   "fixture_id": "stream_touch/775a91b9-0461-4a1c-a979-553fab40ce88",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'prescribes the invocation of the macro'; R0 'contains conventions explaining the macro's usage and documentation' is a different relation."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/4c43f699-44eb-4a5a-bb04-cc59f94318dd",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'use the partial index when the query's constants imply its predicate'; R0 is about get_pk_constraint."
+  },
+  {
+   "fixture_id": "solar_challenge/d6dd72c8-0f0b-4f5c-90f3-e86865a739dd",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The project_root fixture is defined in tests/conftest.py'; R0 'scenarios_dir ... is built on the project_root fixture'."
+  },
+  {
+   "fixture_id": "solar_challenge/58ff1809-18f4-49c1-a46f-4546bf5d63de",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The implementer re-points the SHAs for step-11'; R0 'Step-11 is marked done at HEAD'."
+  },
+  {
+   "fixture_id": "solar_challenge/f5c71d9e-1fdb-40c4-a858-92bf036e85c4",
+   "duplicates": [
+    "86f3c27a-7d54-4ae5-8834-f585a8348d52",
+    "8e8c9164-975b-4d13-b5ce-b731c72833bb",
+    "1ad0e6b0-3d1a-4b70-bb65-3d14cd3e2704",
+    "95aca538-6bcf-4ff7-b711-ca4ab90f735b"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R3 'tests/conftest.py uses live_managers()' and R0-R2 'live_managers() is used by tests/conftest.py and stays/remains unchanged' state it."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/9ba4fb43-e42e-47a0-984d-792bd3471bce",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Unfiltered reads would push period_coverage above 1'; R0 only defines 'Numeric(precision=11, scale=10)'."
+  },
+  {
+   "fixture_id": "pump_web_ui/40462f1c-5479-402e-b3ed-4b52cd06e6cd",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'polls call_args_list only after sending a trailing non-setpoint set_parameter() write as a sync point'; R0 'assert against the call_args_list' lacks the sync point."
+  },
+  {
+   "fixture_id": "solar_challenge/ffbb436c-94fd-47cc-83e5-05e31cf35392",
+   "duplicates": [
+    "294e7e07-7abe-46ed-8c90-230de3b34a0d"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R1 'The order of operations is agreed upon in task 238's coordination memo, which specifies that the refusal of unrecognised keys should occur after the refusal of retired keys' states the same agreed refusal order; R0/R2 are about the function and its call order alone."
+  },
+  {
+   "fixture_id": "solar_challenge/f4787aa5-efed-44ad-9ec9-7b12273dd3eb",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Mypy covers the src/ directory'; R0 'mypy covers tests/unit/test_web_app.py' and R1 'Mypy is clean' name another scope."
+  },
+  {
+   "fixture_id": "reify/9d9face2-0253-43d2-884d-7ab9b9334644",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New names 'find_named_member_span', R0 names 'count_members_recursive'."
+  },
+  {
+   "fixture_id": "solar_challenge/1117c7ac-7edc-4bf1-9207-4b676d5417a3",
+   "duplicates": [
+    "4c7890a4-0012-4b33-9ab0-e385dfc709d9"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'Main's configuration includes SECRET_KEY set to test-secret-key' refines 'Main's tests utilize the SECRET_KEY in their configuration'."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/dddbaae0-f275-4586-8358-1b4286a5693a",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The changed _BLOCK_END_RE means ... no longer applies verbatim'; R0 'That would restructure _BLOCK_END_RE' is a rejected counterfactual."
+  },
+  {
+   "fixture_id": "solar_challenge/37fb1dcb-05ec-49f8-a5be-b62796b54e69",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'locks jobs.py for its operations'; R0 'may delete jobs.py's module-level hook'."
+  },
+  {
+   "fixture_id": "reify/ac9d9241-06af-4f0a-b953-eb677a5adeb4",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Assertions check the tessellation_diagnostics'; R0 'GuiState has tessellation_diagnostics as one of its diagnostic streams'."
+  },
+  {
+   "fixture_id": "reify/f2ee8314-be00-40a6-a927-e8ae6bddca0b",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New adds 'returns Result or ToleranceLadderError' and the configurable policy; R0 'can be created from ToleranceRungs using a validated constructor' lacks them."
+  },
+  {
+   "fixture_id": "solar_challenge/66c53e23-bd63-4127-9d8c-718fc574f41b",
+   "duplicates": [
+    "a2157839-dbc8-4bca-890e-65a90807527f",
+    "c86dbbda-38e7-490c-b0cd-c9ee3fa33a93",
+    "7245637e-27fa-4fd2-9d83-b951296f96f5",
+    "33b2e3d4-ad4e-4389-8180-213943d30b6f",
+    "caffe941-f9aa-4015-801a-a07c712d1dc5",
+    "455cc163-d90d-4606-b1f4-b25caf813d45"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0/R3/R4/R7/R8 'auto-merges with the changes in tests/unit/test_web_app.py' and R5 '... without conflicts'; R1/R2/R6/R9 'is taken exactly as git auto-merges it' do not name the test file."
+  },
+  {
+   "fixture_id": "scoping_intake/5442531b-3421-49dd-a8fb-b1feb819d744",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New names '/var/lib/scoping-intake-feeds', R0 '/var/lib/scoping-intake': another path."
+  },
+  {
+   "fixture_id": "solar_challenge/c8748d19-b375-4042-8b6d-b8c41179dc67",
+   "duplicates": [
+    "b4654f41-863d-4ab4-8dab-6143b78159ca"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R3 'The TESTING configuration is set to true in the build_test_app function' is the same; R2 'configures TESTING' lacks 'true'; R0/R1 are about the test file."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/634905c8-3336-45b1-b3d5-f6e05a2ef3eb",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New is the downgrade refusing 'while a staff user holds a role that cannot be represented'; R3 'refuses any user whose role disagrees with customer_id' is another condition."
+  },
+  {
+   "fixture_id": "dark_factory/86929b28-66e6-41c7-904e-a729207725d7",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Leo directed two guards against leo-laptop running its battery flat'; R0 'Leo approved an immediate reclaim'."
+  },
+  {
+   "fixture_id": "solar_challenge/cad377b3-b066-4931-bd7a-0af397d22a11",
+   "duplicates": [
+    "586ce1cc-b554-4582-b8ee-84cbcf823bf9",
+    "e5fccc46-3b34-4d98-b694-f52182c32e31"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0/R1 'Step 12 integrates main with git rebase main, not a third git merge --no-ff main' entail it."
+  },
+  {
+   "fixture_id": "dark_factory/8ce0f0f7-9203-4ddb-af29-313945e7d976",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New names test_add_memory_write_triage_gate.py; R0 names test_write_triage.py."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/7618f8f6-a003-4662-992c-92696e99ca8f",
+   "duplicates": [
+    "25f0952a-26e4-4e95-b3be-74db847d0dbe"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'main enforces that every markdown document that marks a region is a document of REGIONS' is the same rule as 'an unregistered document must not mark any region'."
+  },
+  {
+   "fixture_id": "solar_challenge/89b603ec-56a0-4232-ad57-138f7ff5452f",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The jobs module is used by live_managers() to check membership'; every related fact says 'The jobs module still reaches a live app's job manager through live_managers()', a different relation."
+  },
+  {
+   "fixture_id": "solar_challenge/7a7618a8-0bb5-4496-8948-7485638d4c5f",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New adds 'similar to esc-121-1, which is related to dark-factory task 5222'; R0 'Another info filing ... could promote esc-121-3 into a second gate' carries another condition."
+  },
+  {
+   "fixture_id": "scoping_intake/47d98d40-15bf-48c3-9681-80f7947238d4",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'Intake's releasing hook is part of the process that involves ClientStore's locked method'; R1 'Intake re-reads the record under the lock' is a different claim."
+  },
+  {
+   "fixture_id": "dark_factory/d3d28a88-7251-4fae-b497-e8dee0d1c7b7",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New '[Unit] and [Install] cannot be expressed in find_drift'; R0 'uses SERVICE_SECTION in find_drift'."
+  },
+  {
+   "fixture_id": "solar_challenge/1cbb1307-f83e-4085-b23e-c8197cfb64cd",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'public names include member_forms'; R0 'member_forms(Fixed) remains unchanged as {}'."
+  },
+  {
+   "fixture_id": "solar_challenge/ea2ff0fb-5d45-47be-925b-08d809aca345",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'names heat_pump_load from its own column regardless of the producer's name' adds a specific case; R0 is the general naming contract."
+  },
+  {
+   "fixture_id": "pump_web_ui/8382f477-1a32-43a6-93f6-79838ec21326",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'would make a later await watchdog.start() return early'; R0 is the decision to drop the write."
+  },
+  {
+   "fixture_id": "dark_factory/7ab9ee22-2048-4807-9ff0-b80442f8cc50",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'moves the GREP_LOOKAROUND_GUIDANCE family into agents/harness_guidance.py'; R0 'will re-derive its importers'."
+  },
+  {
+   "fixture_id": "solar_challenge/73d077ac-6101-4dfe-8116-c25e101ea15a",
+   "duplicates": [
+    "b24043bb-7e06-4fd5-b3b4-e6bd581ecad4"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R1 'dispatch_tool raises ValueError when there is an invalid numeric parameter' refines it; R0 'returns an error message when a ValueError occurs' is the boundary's handling, not a denial."
+  },
+  {
+   "fixture_id": "dark_factory/63428c5f-b25c-454d-8ced-b67f95b66ad3",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'requires a recovered gate to match the runner's filing'; R0 'leaves gate_escalated_at unstamped'."
+  },
+  {
+   "fixture_id": "solar_challenge/ee8d2c20-5358-4eb9-b9e3-5cd767450b41",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'gets no new work'; R0/R1 describe what sys.modules[__name__] holds."
+  },
+  {
+   "fixture_id": "solar_challenge/e8d36019-6bb2-46e6-ade4-423b33f45d48",
+   "duplicates": [
+    "4d8a10a5-b878-43f7-97d8-239e67f64c6c"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'Main's TestRunSavedWithRetiredOptionalField is followed directly by TestRunSavedWithRetiredPVFields' is the direct relation the new fact names; R1 'pin different shapes' and R2 'uses the helper' are other relations."
+  },
+  {
+   "fixture_id": "solar_challenge/e218ce4b-74cc-4f93-baad-a6456a4459cd",
+   "duplicates": [
+    "98d577bf-ae16-4f9e-836e-b9290d95d266"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'uses weather_cache.put() to seed its tests' entails that it requests the weather_cache."
+  },
+  {
+   "fixture_id": "dark_factory/d66decca-b269-4f86-b305-25342776a397",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'adds a detached worktree at HEAD and registers a gitlink'; R0 'HEAD is re-read and re-checked'."
+  },
+  {
+   "fixture_id": "solar_challenge/ece59427-4c46-45a6-a044-77a3908a938d",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'puts synthetic_june_weather frames indexed in Europe/London'; R0 'Tests ... seed the weather_cache fixture with synthetic_june_weather' lacks the zone."
+  },
+  {
+   "fixture_id": "solar_challenge/1138a7e9-63d3-4c9d-91d6-aeaa24cbc33b",
+   "duplicates": [
+    "76177ecf-de38-41b9-a8ec-82ab575382c9",
+    "eee69c32-81b4-4bcf-a588-148633b524c5",
+    "219ceea6-8c7a-4b8b-9d9e-7fb530cad0cc",
+    "30cf1372-9573-4f2c-b585-de16e0a9841e"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0-R3 'JobManager.shutdown includes a (deployed-server teardown) clause' state it."
+  },
+  {
+   "fixture_id": "solar_challenge/f6c25fec-32ac-41bd-a68c-a33242994b58",
+   "duplicates": [
+    "1ec36469-0cd8-4d36-a769-39575e7a6764"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R5 'Main includes task 256's changes in the resolution' is the same; R1/R3 name only 'the dashboard-folder test', the rest 'does not interact'."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/f3b23c87-b93c-4954-a50f-a843135ab0f0",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'main() returns 0 and does not build a MemoryStore'; R0 is about the seam's prerequisite order."
+  },
+  {
+   "fixture_id": "scoping_intake/779390e7-32dc-47e9-b25b-5b5ff3886430",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'A count of exactly one also catches a §3 bullet that repeats a §4 line'; R0/R1 are other heuristic-11 PRD statements."
+  },
+  {
+   "fixture_id": "reify/322271d7-86c4-4ca1-a5e1-4c1555e88460",
+   "duplicates": [
+    "3c583bee-dd73-401d-b6dd-6e7d119af330"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'seed_prelude_units takes a mutable reference to UnitRegistry' entails that it 'uses UnitRegistry'."
+  },
+  {
+   "fixture_id": "solar_challenge/43172088-bcd5-4c4f-89a0-d7bc8782f431",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New says the session-scoped one 'would still shut down every live manager'; R3 'would still be shut down by shutdown_all_managers()' and R0-R2/R4 'is affected by' are other relations."
+  },
+  {
+   "fixture_id": "solar_challenge/34c43349-d2c4-4458-8637-ce85ae54ca28",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New gives the whole order 'gc, importlib, re, sys, weakref, then Path'; R0-R9 state only 'gc and weakref in the specified order'."
+  },
+  {
+   "fixture_id": "solar_challenge/fe46dfb0-d7f5-4720-80f4-5ee538e62104",
+   "duplicates": [],
+   "contradicted": [
+    "94e72e92-5af8-4bb6-9db0-01aa5ad680d6",
+    "ddbff914-203a-405d-8482-3f7f8c385ef4"
+   ],
+   "judgeable": true,
+   "rationale": "New 'is adjusted to match the order in tests/unit/test_web_jobs.py' supersedes R1 'is reversed compared to' and R2 'differs from' that order."
+  },
+  {
+   "fixture_id": "dark_factory/afac4c16-a7e6-478e-b659-245e128eac7b",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'census_identity gains a downward import of census_state/state_docs'; R0 'census_state deletes census_identity._state_text'."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/ccdfef20-f127-40a1-ae6c-29d6581666e6",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'a context manager that is private to simulated_run.py'; R0 is about patching collaborators."
+  },
+  {
+   "fixture_id": "solar_challenge/c3f33b7e-e577-43ec-9ed1-bee23a360ec0",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New adds 'before invoking the merger'; R0 'The requeue rebase calls the _resolve_and_resubmit function' lacks the order."
+  },
+  {
+   "fixture_id": "solar_challenge_platform/69df0779-edb0-40c4-9cd5-5869750df188",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'drives DispatchLivenessStore through the worker'; R0 is how each 'write' raises on failure."
+  },
+  {
+   "fixture_id": "solar_challenge/280a7637-1c3f-4241-95e9-d7c8bde8c520",
+   "duplicates": [
+    "d8802700-7978-43d0-b681-076f7d69d33d",
+    "1604db8c-405a-403a-a1c0-e185d5f28bc5"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0 'The full verify suite reports 0 failed tests after resolving the merge conflict in tests/unit/test_web_app.py' and R1 'reports 0 failed tests with the auto-merged app.py' state it; R2 'should report' is a requirement."
+  },
+  {
+   "fixture_id": "dark_factory/edb49272-c486-4d39-89b1-31fab59b011d",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The stamp is authoritative for an older L1 folded into a newer L2'; R0/R1 are about L1s clustered by L2s."
+  },
+  {
+   "fixture_id": "solar_challenge/bc8c1c55-00a1-4b8c-9ac5-8541a3b6d835",
+   "duplicates": [
+    "cb9f1f7a-0339-4f88-990a-b39bc5e3e139"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R1 'Plan.json records the instructions for the conflict resolver in dark-factory agents/briefing.py' is the same; R0 names 'the MERGER's prompt', another agent."
+  },
+  {
+   "fixture_id": "dark_factory/85adf67c-19a6-4376-a8e7-fdca26247a93",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'poll_scope.js loads before endpoint_staleness.js'; R0 'The maps are moved from endpoint_staleness.js to poll_scope.js'."
+  },
+  {
+   "fixture_id": "solar_challenge/479efc49-2fca-4c05-95dd-56d31ea8a443",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'A bare InitVar is the class itself ... not an instance of dataclasses.InitVar'; R0 'covers a string representation ... InitVar[float]'."
+  },
+  {
+   "fixture_id": "dark_factory/77353b0a-341f-432f-a26c-52ecd1fbedaf",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'capped inside the pure builder by a module-local AMENDMENT_DIFF_CAP_CHARS'; R0 is how the amendment diff is built."
+  },
+  {
+   "fixture_id": "solar_challenge/74a488d0-422f-4517-a9b7-9df34240f82a",
+   "duplicates": [
+    "efa22895-5c07-45d8-988a-37022af36c2e",
+    "edb5f27f-eb30-498f-a149-115efb3d9410"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R0/R1 'The state of live_managers() is influenced by the measurement (taken) at a08eacc, where a dropped app's manager survives gc.collect() until the job ends' are the same; R4 lacks 'gc.collect()', the rest are other relations."
+  },
+  {
+   "fixture_id": "solar_challenge/b9f07fe2-26a0-410e-933c-91f5d3ad5be0",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'A hung uv, pytest, npm or node cannot stall later lane runs'; R0 'uv run executed pytest with specific parameters'."
+  },
+  {
+   "fixture_id": "dark_factory/0d331d82-2a2c-47d5-8997-bd4d651a0715",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'warns about a coverage hole ... which task 3619 addresses'; R0/R1 state only that 3578 waits behind 3619."
+  },
+  {
+   "fixture_id": "solar_challenge/454cb53b-e8f8-4165-951a-f976da8cb1bc",
+   "duplicates": [
+    "cc4a296f-7440-4d69-9e52-97012fa22003",
+    "73d9ebd2-161c-4c23-8064-a6c67e669bfa",
+    "27d1831b-f6ae-4c70-b933-ad6fc5215d8d",
+    "cfb7da3d-64c2-49db-ade9-e95fb70a6be8",
+    "362b55f8-bb78-4510-9492-96f80b393350"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R8 'The decision keeps the two SECRET_KEY tests in tests/unit/test_web_app.py', R9 'The file keeps the SECRET_KEY tests' and R1/R5/R6 that the file includes/tests SECRET_KEY tests; R2/R3/R4/R7 are about using the key, R0 independence."
+  },
+  {
+   "fixture_id": "solar_challenge/6bccc1c8-732a-4e2d-9fe4-ad37318324ad",
+   "duplicates": [
+    "6d4b802a-3cea-4230-939f-e98493f1bdac",
+    "acf284eb-4bb5-4c98-8c8c-f34eceae26b0",
+    "ea27b487-2b76-4654-a9c6-e2420dd59d67",
+    "527460a7-2948-45da-ac64-40b801c2005c",
+    "87c8080a-4f81-4dcc-bb09-77157d2d6f9c",
+    "b0aa15fc-d326-4aea-99ae-bd80dd7ec906",
+    "279824c1-5073-443a-81da-679967db4169",
+    "829025fe-d70a-42bd-a561-0d296fe6a21f",
+    "a8037075-d3b1-448b-a84e-2c66e5db3407"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "The related facts state 'JobManager.shutdown now documents that atexit hooks run after concurrent.futures has run every queued job'; 'indicating a change in shutdown behavior' is an inference. R1 'JobManager is defined in jobs.py'."
+  },
+  {
+   "fixture_id": "scoping_intake/b353ab53-1d33-4da2-876e-e19915e270a6",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The feeds root check occurs after the invoice config check'; R0 'parametrizations are extended'."
+  },
+  {
+   "fixture_id": "reify/426d8096-fe92-4141-bd4e-b17c045067be",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New adds 'engine_tests.rs will only receive documentation rewording'; R1 'remain intact without any new modules' lacks it."
+  },
+  {
+   "fixture_id": "dark_factory/ce23f832-b921-44bd-a0d6-d2f21fe058d1",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The value of the mark is a scalar string ... written by a merge patch'; R0/R1 describe supersession metadata generally."
+  },
+  {
+   "fixture_id": "solar_challenge/674801e8-1f45-478d-a4c8-22b4556f7e83",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'fitted with Plotly.Plots.resize through a ResizeObserver'; R0 'Plotly rejects a hidden div when resizing'."
+  },
+  {
+   "fixture_id": "solar_challenge/d2975379-5db6-4682-973c-213b01ee5094",
+   "duplicates": [
+    "6378568c-4e80-4ea2-ba0b-2615c6a8c884",
+    "6d165863-1d25-4d97-9726-5647d6cfba0d",
+    "0229f524-b746-4de0-8301-8652c203e1c4",
+    "69271ee3-e370-4aba-ad98-7b836661ae69",
+    "75315b33-0628-471f-9e07-0c0af16b2d6a",
+    "32b05a13-5bdb-4813-9d5b-6fcf1746c220",
+    "7cf5e5b1-d103-4731-921e-727b104891f3",
+    "6f85bb38-4210-4763-9772-1e9b47e8e102",
+    "dc8cccb1-dd2d-45b4-8014-99895e7baf4d"
+   ],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "R2/R7 'tests/unit/test_web_app.py uses build_test_app to create test applications' and the facts that its (job-manager) tests use or call build_test_app; R5 'imports build_test_app' is another relation."
+  },
+  {
+   "fixture_id": "dark_factory/8962893f-e3a6-4e3f-b244-947f9aad9bed",
+   "duplicates": [],
+   "contradicted": [],
+   "judgeable": true,
+   "rationale": "New 'The predicates ... take AgentResult as input'; R0 'A clean split first needs AgentResult moved into a leaf module'."
+  }
+ ]
+}

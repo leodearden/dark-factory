@@ -10,6 +10,8 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,7 +38,7 @@ from fused_memory.backends.llm_token_usage import (
     LlmTokenUsage,
     measure_llm_tokens,
 )
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -54,11 +56,12 @@ class _FakeLLM(LLMClient):
     def __init__(
         self, entities: tuple[str, ...] = ('Alpha', 'Beta'),
         edges: tuple[tuple[str, str, str], ...] = (('Alpha', 'Beta', 'Alpha adopts Beta'),),
-        *, model: str = 'fake-extractor', reasoning_effort: str | None = None,
+        *, model: str = 'fake-extractor', reasoning_effort: str | None = None, endpoint: str = 'configured',
     ) -> None:
         super().__init__(GraphitiLLMConfig(model=model))
         self.token_tracker = AttributingTokenUsageTracker()
         self.reasoning_effort = reasoning_effort
+        self.endpoint = endpoint
         self.entities = entities
         self.edges = edges
         self.calls: list[tuple[str | None, list[Message]]] = []
@@ -128,9 +131,17 @@ class TestTheArms:
         assert mod.ARMS['o1'].instructions_version == mod.O1_INSTRUCTIONS_VERSION
         assert mod.ARMS['control'].instructions_version == mod.NO_INSTRUCTIONS
 
-    def test_o6_is_two_arms_one_per_reasoning_effort(self) -> None:
-        """esc-9065-2: 'o6' could only ever mean one effort, so each measured effort is its own arm."""
-        assert sorted(mod.ARMS) == ['control', 'o1', 'o6-low', 'o6-medium']
+    def test_the_registry_is_one_o6_arm_per_effort_and_the_luna_arm(self) -> None:
+        """esc-9065-2: 'o6' could only ever mean one effort, so each measured effort is its own arm.
+        Task 9945 adds the one luna arm its migration eval measures."""
+        assert sorted(mod.ARMS) == ['control', 'luna-low', 'o1', 'o6-low', 'o6-medium']
+
+    def test_the_luna_arm_is_the_controls_instructions_on_luna_at_low_on_the_plan_proxy(self) -> None:
+        assert mod.LUNA_MODEL == 'gpt-6-luna'
+        assert mod.ARMS['luna-low'] == mod.ReplayArm(
+            'luna-low', None, mod.NO_INSTRUCTIONS,
+            mod.ExtractionLlm(mod.LUNA_MODEL, 'low', mod.ArmEndpoint.plan_proxy),
+        )
 
     @pytest.mark.parametrize('effort', ['low', 'medium'])
     def test_each_o6_arm_is_the_controls_instructions_on_the_stronger_model_at_its_effort(
@@ -144,7 +155,7 @@ class TestTheArms:
     def test_the_control_and_o1_extract_on_the_configured_client(self, arm: str) -> None:
         llm = mod.ARMS[arm].llm
         assert llm == mod.ExtractionLlm()
-        assert (llm.model, llm.reasoning_effort) == (None, None)
+        assert (llm.model, llm.reasoning_effort, llm.endpoint) == (None, None, mod.ArmEndpoint.configured)
 
     def test_an_extraction_llm_is_a_frozen_hashable_key(self) -> None:
         llm = mod.ExtractionLlm(mod.O6_MODEL, 'low')
@@ -286,6 +297,21 @@ class TestTheResult:
         control = await _replay(_FakeLLM(), 'control')
         assert mod.replayed_record(o6_low, _input())['reasoning_effort'] == 'low'
         assert mod.replayed_record(control, _input())['reasoning_effort'] is None
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_record_carries_its_arms_endpoint(self) -> None:
+        luna = await _replay(_FakeLLM(model=mod.LUNA_MODEL, reasoning_effort='low', endpoint='plan_proxy'), 'luna-low')
+        control = await _replay(_FakeLLM(), 'control')
+        assert (luna.endpoint, control.endpoint) == (mod.ArmEndpoint.plan_proxy, mod.ArmEndpoint.configured)
+        assert mod.replayed_record(luna, _input())['endpoint'] == 'plan_proxy'
+        assert mod.replayed_record(control, _input())['endpoint'] == 'configured'
+
+    def test_a_failed_record_carries_its_arms_endpoint(self) -> None:
+        llm = _FakeLLM(model=mod.LUNA_MODEL, reasoning_effort='low', endpoint='plan_proxy')
+        record = mod.failed_record(mod.ARMS['luna-low'], llm, _worksheet_row(), RuntimeError('proxy down'))
+        assert (record['arm'], record['model'], record['endpoint']) == ('luna-low', mod.LUNA_MODEL, 'plan_proxy')
+        control = mod.failed_record(mod.ARMS['control'], _FakeLLM(), _worksheet_row(), RuntimeError('down'))
+        assert control['endpoint'] == 'configured'
 
     def test_a_failed_record_carries_the_clients_model_and_reasoning_effort(self) -> None:
         llm = _FakeLLM(model=mod.O6_MODEL, reasoning_effort='medium')
@@ -472,6 +498,77 @@ class TestBuildArmLlm:
         with pytest.raises(mod.ArmClientMismatch) as raised:
             mod.build_arm_llm(generic, mod.ExtractionLlm(mod.O6_MODEL, 'low'))
         assert 'openai_generic' in str(raised.value) and 'low' in str(raised.value)
+
+
+PROXY_URL, PROXY_KEY = 'http://127.0.0.1:8317/v1', 'proxy-test-key'
+CONFIGURED_URL = 'https://configured.example/v1'
+
+
+@pytest.fixture
+def plan_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('OPENAI_PLAN_PROXY_URL', PROXY_URL)
+    monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', PROXY_KEY)
+
+
+def _sdk_endpoint(client: Any) -> tuple[str, str]:
+    return str(client.client.base_url).rstrip('/'), client.client.api_key
+
+
+@pytest.mark.usefixtures('plan_proxy_env')
+class TestThePlanProxyEndpoint:
+    def test_the_variables_are_the_plan_proxys(self) -> None:
+        assert (mod.PLAN_PROXY_URL_ENV, mod.PLAN_PROXY_KEY_ENV) == ('OPENAI_PLAN_PROXY_URL', 'OPENAI_PLAN_PROXY_KEY')
+
+    def test_a_plan_proxy_llm_builds_the_effort_client_on_the_proxy(self, mock_config: FusedMemoryConfig) -> None:
+        before = mock_config.model_dump()
+        client = mod.build_arm_llm(mock_config, mod.ARMS['luna-low'].llm)
+        assert isinstance(client, mod.ExplicitEffortOpenAIClient)
+        assert (client.model, client.reasoning_effort) == (mod.LUNA_MODEL, 'low')
+        assert _sdk_endpoint(client) == (PROXY_URL, PROXY_KEY)
+        assert mod.client_endpoint(client) == 'plan_proxy'
+        assert isinstance(client.token_tracker, AttributingTokenUsageTracker)
+        assert mock_config.model_dump() == before
+
+    def test_a_configured_client_declares_the_configured_endpoint(self, mock_config: FusedMemoryConfig) -> None:
+        for llm in (mod.ExtractionLlm(), mod.ExtractionLlm(mod.O6_MODEL, 'low')):
+            client = mod.build_arm_llm(mock_config, llm)
+            assert client is not None and mod.client_endpoint(client) == 'configured'
+
+    def test_a_plan_proxy_llm_sending_no_effort_is_refused(self, mock_config: FusedMemoryConfig) -> None:
+        with pytest.raises(mod.ArmClientMismatch, match='plan_proxy'):
+            mod.build_arm_llm(mock_config, mod.ExtractionLlm(mod.LUNA_MODEL, None, mod.ArmEndpoint.plan_proxy))
+
+    @pytest.mark.asyncio
+    async def test_an_arm_refuses_a_client_on_another_endpoint_before_any_call(self) -> None:
+        llm = _FakeLLM(model=mod.LUNA_MODEL, reasoning_effort='low')
+        with pytest.raises(mod.ArmClientMismatch) as raised:
+            await _replay(llm, 'luna-low')
+        assert 'plan_proxy' in str(raised.value) and 'configured' in str(raised.value)
+        assert llm.calls == []
+
+    @pytest.mark.parametrize('llm', [mod.ExtractionLlm(), mod.ExtractionLlm(mod.O6_MODEL, 'low')])
+    def test_a_configured_endpoint_llm_builds_on_the_configs_url_and_key(
+        self, mock_config: FusedMemoryConfig, llm: Any,
+    ) -> None:
+        cfg = mock_config.model_copy(deep=True)
+        cfg.llm.providers.openai = OpenAIProviderConfig(api_url=CONFIGURED_URL, api_key='test-key')
+        client = mod.build_arm_llm(cfg, llm)
+        assert client is not None and _sdk_endpoint(client) == (CONFIGURED_URL, 'test-key')
+
+    @pytest.mark.parametrize('missing', ['OPENAI_PLAN_PROXY_URL', 'OPENAI_PLAN_PROXY_KEY'])
+    @pytest.mark.parametrize('unset', ['absent', 'blank'])
+    def test_the_resolver_refuses_an_unset_variable_by_name(
+        self, monkeypatch: pytest.MonkeyPatch, missing: str, unset: str,
+    ) -> None:
+        if unset == 'absent':
+            monkeypatch.delenv(missing)
+        else:
+            monkeypatch.setenv(missing, '')
+        with pytest.raises(mod.ArmClientMismatch, match=missing):
+            mod.plan_proxy_endpoint(dict(os.environ))
+
+    def test_the_resolver_reads_the_url_and_key(self) -> None:
+        assert mod.plan_proxy_endpoint(dict(os.environ)) == (PROXY_URL, PROXY_KEY)
 
 
 # --------------------------------------------------------------------------- #
@@ -683,7 +780,9 @@ class _ClientsByLlm:
         self.asked.append(spec)
         if spec in self.unavailable:
             return None
-        fields: dict[str, Any] = {'model': spec.model or CONFIGURED, 'reasoning_effort': spec.reasoning_effort}
+        fields: dict[str, Any] = {
+            'model': spec.model or CONFIGURED, 'reasoning_effort': spec.reasoning_effort, 'endpoint': spec.endpoint,
+        }
         if spec in self.edges:
             fields['edges'] = self.edges[spec]
         self.clients[spec] = _CountingLLM(**fields)
@@ -878,6 +977,47 @@ class TestReplayCommand:
         assert not paths['replay'].exists()
         assert all(client.calls == [] for client in factory.clients.values())
 
+    @pytest.mark.usefixtures('plan_proxy_env')
+    @pytest.mark.parametrize('missing', ['OPENAI_PLAN_PROXY_URL', 'OPENAI_PLAN_PROXY_KEY'])
+    def test_a_luna_replay_without_the_proxy_env_exits_2_naming_it_and_writes_nothing(
+        self, tmp_path: Path, mock_config: FusedMemoryConfig, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture, missing: str,
+    ) -> None:
+        monkeypatch.delenv(missing)
+        paths = _cli_inputs(tmp_path)
+        with caplog.at_level(logging.ERROR):
+            code = _run_replay_on(paths, lambda spec: mod.build_arm_llm(mock_config, spec), 'control', 'luna-low')
+        assert code == 2 and not paths['replay'].exists()
+        assert missing in caplog.text
+
+    def test_a_luna_record_names_the_plan_proxy_endpoint(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay_on(paths, _ClientsByLlm(), 'control', 'luna-low') == 0
+        endpoints = {(r['arm'], r['endpoint']) for r in _records(paths['replay'])}
+        assert endpoints == {('control', 'configured'), ('luna-low', 'plan_proxy')}
+
+    def test_a_recorded_arm_on_another_endpoint_than_its_clients_exits_2(self, tmp_path: Path) -> None:
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay_on(paths, _ClientsByLlm(), 'luna-low') == 0
+        rewritten = [r | {'endpoint': 'configured'} for r in _records(paths['replay'])]
+        paths['replay'].write_text(''.join(json.dumps(r) + '\n' for r in rewritten))
+        before = paths['replay'].read_bytes()
+        factory = _ClientsByLlm()
+        assert _run_replay_on(paths, factory, 'luna-low') == 2
+        assert paths['replay'].read_bytes() == before
+        assert all(client.calls == [] for client in factory.clients.values())
+
+    def test_a_record_written_before_9945_resumes_on_the_configured_endpoint(self, tmp_path: Path) -> None:
+        """A record with no 'endpoint' key was replayed on the configured client's endpoint."""
+        paths = _cli_inputs(tmp_path)
+        assert _run_replay_on(paths, _ClientsByLlm(), 'control') == 0
+        legacy = [{k: v for k, v in r.items() if k != 'endpoint'} for r in _records(paths['replay'])]
+        paths['replay'].write_text(''.join(json.dumps(r) + '\n' for r in legacy))
+        second = _ClientsByLlm()
+        assert _run_replay_on(paths, second, 'control', 'luna-low') == 0
+        assert second.clients[CONTROL_LLM].calls == []
+        assert len(_records(paths['replay'])) == 6
+
     def test_the_retired_o6_arm_is_refused(self, tmp_path: Path) -> None:
         paths = _cli_inputs(tmp_path)
         with pytest.raises(SystemExit) as raised:
@@ -965,12 +1105,17 @@ TOKENS = {'control': {'extract_nodes': (100, 10, 1), 'extract_edges': (300, 40, 
           'o1': {'extract_nodes': (150, 10, 1), 'extract_edges': (350, 40, 2)}}
 
 
+DEFINITION_4716 = audit.SampleDefinition().to_dict()
+"""The 4716 report.json's own sample.definition: the audit's default."""
+
+
 def _score_baseline(overreach: dict[str, Any] = BASELINE_OVERREACH, *, window_days: float = 2.0) -> dict[str, Any]:
     cell = {'minted': 0, 'corroborated': 0, 'episodes': 2}
     return {
         'strata': {DF: {RULING: {'population': 90, 'window_population': 20}},
                    REIFY: {OTHER: {'population': 90, 'window_population': 4}}},
-        'sample': {'sizes': {DF: {RULING: cell}, REIFY: {OTHER: cell}}, 'window_days': window_days},
+        'sample': {'definition': DEFINITION_4716, 'sizes': {DF: {RULING: cell}, REIFY: {OTHER: cell}},
+                   'window_days': window_days},
         'adjudicated': {'population_weighted': {'overreach_rate_minted': overreach}},
     }
 
@@ -1165,6 +1310,73 @@ class TestFidelity:
         assert _scored(tmp_path, baseline=baseline)['fidelity']['intervals_overlap'] is overlap
 
 
+TEMPORAL, RELATIONS = 'temporal_facts', 'entities_and_relations'
+FRAME_DEFINITION = audit.SampleDefinition(
+    window_start='2026-09-15T00:00:00+00:00', window_end='2026-11-15T00:00:00+00:00', cap=3,
+    strata=(TEMPORAL, RELATIONS, 'procedural_knowledge'),
+)
+"""A category frame (task 9945): its own strata, cap and window, and no production baseline rate."""
+FRAME_STRATUM = {RULING: TEMPORAL, OTHER: RELATIONS}
+
+
+def _frame_report() -> dict[str, Any]:
+    cell = {'minted': 0, 'corroborated': 0, 'episodes': 2}
+    return {
+        'sample': {'definition': FRAME_DEFINITION.to_dict(), 'window_days': 2.0,
+                   'sizes': {DF: {TEMPORAL: cell}, REIFY: {RELATIONS: cell}}},
+        'strata': {DF: {TEMPORAL: {'window_population': 20}}, REIFY: {RELATIONS: {'window_population': 4}}},
+    }
+
+
+def _frame_inputs(
+    definition: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    records, labels = _score_records(PASSING)
+    records = [record | {'stratum': FRAME_STRATUM[record['stratum']]} for record in records]
+    verdicts = _score_verdicts(records, labels) | {'sample': definition or FRAME_DEFINITION.to_dict()}
+    return records, verdicts
+
+
+class TestScoreOverAFrame:
+    """Task 9945: a frame.json that is not the 4716 sample is scored by the same score_replay."""
+
+    def test_a_frame_report_without_an_adjudicated_block_is_scored(self) -> None:
+        report = mod.score_replay(*_frame_inputs(), _frame_report())
+        assert report['sample'] == FRAME_DEFINITION.to_dict()
+        weighted = report['arms']['control']['population_weighted']
+        assert weighted['overreach_rate_minted'] == audit.weighted_rate([(10.0, 4, 10), (2.0, 2, 10)])
+
+    def test_the_arm_rates_are_keyed_by_the_frames_strata(self) -> None:
+        report = mod.score_replay(*_frame_inputs(), _frame_report())
+        for block in report['arms'].values():
+            assert set(block['rates']) == {*FRAME_DEFINITION.strata, 'all'}
+        assert report['arms']['control']['rates'][TEMPORAL]['label_counts']['overreach'] == 4
+
+    def test_fidelity_is_none_without_a_production_baseline_rate(self) -> None:
+        assert mod.score_replay(*_frame_inputs(), _frame_report())['fidelity'] is None
+
+    def test_a_verdict_file_under_the_4716_definition_is_refused(self) -> None:
+        records, verdicts = _frame_inputs(DEFINITION_4716)
+        with pytest.raises(audit.SampleMismatch):
+            mod.score_replay(records, verdicts, _frame_report())
+
+    def test_the_4716_report_reads_as_the_default_definition(self) -> None:
+        baseline = mod.Baseline.from_report(json.loads(BASELINE_4716.read_text()))
+        assert baseline.definition == audit.SampleDefinition()
+
+    def test_an_injected_decision_judges_each_arm_against_the_control(self) -> None:
+        calls: list[tuple[Any, Any]] = []
+
+        def decide(control: Any, candidate: Any) -> dict[str, Any]:
+            calls.append((control, candidate))
+            return {'candidate_rate': candidate['overreach_rate_minted']['rate']}
+
+        report = mod.score_replay(*_frame_inputs(), _frame_report(), decide=decide)
+        arms = report['arms']
+        assert calls == [(arms['control']['population_weighted'], arms['o1']['population_weighted'])]
+        assert report['comparison'] == {'o1': {'candidate_rate': 0.0}}
+
+
 class TestScoreFailsClosed:
     def _assert_rejected(self, tmp_path: Path, records: list[dict[str, Any]], verdicts: dict[str, Any]) -> None:
         code, out = _run_score(tmp_path, records, verdicts)
@@ -1218,7 +1430,7 @@ class TestScoreFailsClosed:
 CLI_SCORE_BASELINE = {
     'strata': {DF: {RULING: {'population': 90, 'window_population': 20}},
                REIFY: {OTHER: {'population': 90, 'window_population': 4}}},
-    'sample': CLI_BASELINE['sample'] | {'window_days': 2.0},
+    'sample': CLI_BASELINE['sample'] | {'definition': DEFINITION_4716, 'window_days': 2.0},
     'adjudicated': {'population_weighted': {'overreach_rate_minted': BASELINE_OVERREACH}},
 }
 OVERREACHING_FACT = 'Beta overrides Alpha'
