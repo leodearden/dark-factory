@@ -44,7 +44,7 @@ router = APIRouter()
 
 @router.get('/api/v2/dashboard/merge-queue')
 async def api_merge_queue(request: Request) -> JSONResponse:
-    """MERGE_QUEUE — per-project depth/attempts/recent/in_queue/speculative/train_throughput."""
+    """MERGE_QUEUE — per-project depth/attempts/recent/in_queue/speculative/train_throughput/landing_rate."""
     config: DashboardConfig = request.app.state.config
     labels = config.project_labels
     pool: DbPool = request.app.state.db
