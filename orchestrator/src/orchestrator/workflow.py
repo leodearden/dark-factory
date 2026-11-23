@@ -92,6 +92,7 @@ from orchestrator.agents.write_set import (
     compute_write_set,
     ensure_claude_fleet_dir,
 )
+from orchestrator.architect_phase_verdict import confirmed_at, confirmed_since
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     ReviewAggregation,
@@ -5850,6 +5851,21 @@ class TaskWorkflow:
         )
         return WorkflowOutcome.PLANNED
 
+    async def _architect_prompt_unless_confirmed(
+        self, build_prompt: PromptBuilder, marker: str | None,
+    ) -> str | None:
+        """The architect's prompt, or None once its plan is confirmed with a stamp other than *marker*."""
+        assert self.artifacts is not None
+        plan = self.artifacts.peek_plan()
+        if confirmed_since(plan, marker):
+            logger.warning(
+                'Task %s: the architect confirmed its plan (_finalized_at %s, was %s) '
+                'before its run ended; declining the re-dispatch (task 6814)',
+                self.task_id, confirmed_at(plan), marker,
+            )
+            return None
+        return await build_prompt()
+
     async def _run_architect_for_plan(
         self, build_prompt: PromptBuilder,
     ) -> WorkflowOutcome | None:
@@ -5874,7 +5890,14 @@ class TaskWorkflow:
         rebase_retry_used = False
         for _outer_attempt in range(2):  # at most one rebase-retry round-trip
             for attempt in range(2):
-                result = await self._invoke(ARCHITECT, build_prompt, self.worktree)
+                result = await self._invoke(
+                    ARCHITECT,
+                    partial(
+                        self._architect_prompt_unless_confirmed, build_prompt,
+                        confirmed_at(self.artifacts.peek_plan()),
+                    ),
+                    self.worktree,
+                )
 
                 if not result.success:
                     cls = classify_agent_failure(result)
@@ -5883,15 +5906,13 @@ class TaskWorkflow:
                     # otherwise cut off).  A plan carrying ``_finalized_at`` was
                     # explicitly declared complete, so it is safe to use despite
                     # the run-level failure — the same validation gates below
-                    # still apply.  Without the marker the plan is an unfinished
-                    # partial; block and let the next session's completion pass
-                    # finish it.
+                    # still apply.  A re-dispatch declined by
+                    # _architect_prompt_unless_confirmed lands here too, on the
+                    # same confirmed_at predicate.  Without the marker the plan
+                    # is an unfinished partial; block and let the next
+                    # session's completion pass finish it.
                     salvaged = self.artifacts.read_plan()
-                    if (
-                        salvaged
-                        and salvaged.get('_finalized_at')
-                        and salvaged.get('steps')
-                    ):
+                    if confirmed_at(salvaged) is not None:
                         logger.warning(
                             'Task %s: architect run failed (%s) but a finalized '
                             'plan (%d steps) is on disk — salvaging instead of '
