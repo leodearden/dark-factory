@@ -8,6 +8,7 @@ pins ``ORCH_PROJECT_ROOT`` to ``tmp_path``, so the fixture tree IS ``tmp_path``.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,6 +61,17 @@ _ALPHA_RED = (
     'FAILED tests/test_a.py::test_one - AssertionError: one\n'
     "FAILED tests/test_a.py::test_two[x-y] - RuntimeError: worker crashed while running 'tests/t.py::x'\n"
     '== 2 failed, 1 passed in 1.0s ==\n'
+)
+_ALPHA_RED_WITH_SECTION = (
+    'F.. [100%]\n'
+    '=================================== FAILURES ===================================\n'
+    '___________________________________ test_one ___________________________________\n'
+    'tests/test_a.py:3: in test_one\n'
+    '    assert helper()\n'
+    'E   AssertionError: one\n'
+    '=========================== short test summary info ============================\n'
+    'FAILED tests/test_a.py::test_one - AssertionError: one\n'
+    '== 1 failed, 2 passed in 1.0s ==\n'
 )
 _BETA_COLLECTION_ERROR = (
     '=========================== short test summary info ============================\n'
@@ -152,8 +164,18 @@ def _run(module: str, rc: int, ended: audit_run.ModuleEnd, *failures: PytestFail
 _FAILED_ONE = PytestFailure('tests/test_a.py::test_one', FailureKind.FAILED, 'AssertionError: one')
 
 
+def _with_section(run: audit_run.ModuleRun, section: str) -> audit_run.ModuleRun:
+    return audit_run.ModuleRun(run.module, run.returncode, run.ended, run.failures, run.log_path, {_FAILED_ONE: section})
+
+
 def _has_summary(lines: list[str]) -> bool:
     return any(line.startswith('== ') and line.endswith(' ==') for line in lines)
+
+
+def _logged(report: str, module: str) -> Path:
+    """The log path *report*'s end line for *module* names."""
+    line = next(line for line in report.splitlines() if line.startswith(f'# {module}:'))
+    return Path(line.partition('log=')[2])
 
 
 class TestAuditNode:
@@ -236,7 +258,6 @@ class TestRunAudit:
 
     async def test_the_module_child_env_is_the_merge_gates_plus_cache_off(self, tree, capsys, monkeypatch):
         monkeypatch.setenv('ORCH_CONFIG_PATH', '/nonexistent/fake.yaml')
-        monkeypatch.setenv('PROJECT_ROOT', str(tree.root))
         monkeypatch.setenv('ORCH_AUDIT_PROBE', 'leak')
         tree.module('beta', output=_GREEN, rc=0, verify_env={'AUDIT_OVERRIDE': 'module'})
 
@@ -248,16 +269,52 @@ class TestRunAudit:
         assert (env['AUDIT_SHARED'], env['AUDIT_OVERRIDE']) == ('top', 'module')
         assert tree.env_of('alpha')['AUDIT_OVERRIDE'] == 'top'
         assert not [name for name in env if name.startswith('ORCH_')]
-        assert 'PROJECT_ROOT' not in env
 
-    async def test_a_verify_env_project_root_still_reaches_the_child(self, tree, capsys, monkeypatch):
-        monkeypatch.setenv('PROJECT_ROOT', str(tree.root))
-        tree.module('beta', output=_GREEN, rc=0, verify_env={'PROJECT_ROOT': '/from/verify_env'})
+    async def test_no_inherited_python_environment_bin_reaches_the_child(self, tree, capsys, monkeypatch, tmp_path):
+        main_venv, lane_venv = tmp_path / 'main-venv', tmp_path / 'lane-venv'
+        for venv in (main_venv, lane_venv):
+            (venv / 'bin').mkdir(parents=True)
+            (venv / 'pyvenv.cfg').write_text('home = /usr/bin\n')
+        tools = tmp_path / 'tools'
+        tools.mkdir()
+        monkeypatch.setenv('VIRTUAL_ENV', str(lane_venv))
+        monkeypatch.setenv('PATH', os.pathsep.join([
+            str(lane_venv / 'bin'), str(main_venv / 'bin'), str(tools), '/usr/bin', '/bin',
+        ]))
 
         await audit_run.run_audit(tree.root, tree.config(), tree.root / 'logs')
 
-        assert tree.env_of('beta')['PROJECT_ROOT'] == '/from/verify_env'
-        assert 'PROJECT_ROOT' not in tree.env_of('alpha')
+        assert tree.env_of('alpha')['PATH'].split(os.pathsep) == [str(tools), '/usr/bin', '/bin']
+
+    async def test_each_failures_pytest_section_is_quoted_into_the_report(self, tree, capsys, tmp_path):
+        tree.module('alpha', output=_ALPHA_RED_WITH_SECTION, rc=1)
+
+        _, report = await _audit(tree, capsys)
+
+        lines = report.splitlines()
+        header = lines.index(f'# failed {_ALPHA_ONE}:')
+        assert lines[header + 1:header + 4] == [
+            '#   | tests/test_a.py:3: in test_one', '#   |     assert helper()', '#   | E   AssertionError: one',
+        ], report
+        record = await _lane_record(tmp_path, report)
+        assert [failure.node for failure in record.failures] == [_ALPHA_ONE]
+        assert record.session_complete is True
+
+    async def test_no_module_with_a_test_command_is_a_failure_never_a_vacuous_green(self, tmp_path, capsys):
+        config_path = tmp_path / 'dark-factory-orchestrator.yaml'
+        config_path.write_text(yaml.safe_dump({'project_root': str(tmp_path)}))
+        (tmp_path / 'lint_only').mkdir()
+        (tmp_path / 'lint_only' / 'orchestrator.yaml').write_text(yaml.safe_dump({'lint_command': 'true'}))
+
+        rc = await audit_run.run_audit(tmp_path, load_config(config_path), tmp_path / 'logs')
+        report = capsys.readouterr().out
+
+        assert rc == 1
+        assert not _has_summary(report.splitlines()), report
+        assert any(line.startswith('# no module') for line in report.splitlines()), report
+        record = await _lane_record(tmp_path, report)
+        assert record.session_complete is False
+        assert record.failures == ()
 
     async def test_the_tree_is_provisioned_before_the_first_module_runs(self, tree, capsys):
         rc = await audit_run.run_audit(tree.root, tree.provisioning_config(0), tree.root / 'logs')
@@ -289,12 +346,21 @@ class TestRunAudit:
         _, report = await _audit(tree, capsys)
 
         logs = tree.root / 'logs'
-        alpha_line = next(line for line in report.splitlines() if line.startswith('# alpha:'))
-        alpha_log = Path(alpha_line.partition('log=')[2])
-        assert alpha_log.parent == logs
+        alpha_log = _logged(report, 'alpha')
+        assert alpha_log.parent.parent == logs
         assert alpha_log.read_text() == _ALPHA_RED
-        scripts_line = next(line for line in report.splitlines() if line.startswith('# tests/scripts:'))
-        assert Path(scripts_line.partition('log=')[2]).parent == logs
+        assert _logged(report, 'tests/scripts').parent == alpha_log.parent
+
+    async def test_a_second_run_never_overwrites_the_firsts_logs(self, tree, capsys):
+        tree.module('alpha', output=_ALPHA_RED, rc=1)
+        _, first = await _audit(tree, capsys)
+        tree.module('alpha', output=_GREEN, rc=0)
+
+        _, second = await _audit(tree, capsys)
+
+        assert _logged(first, 'alpha').read_text() == _ALPHA_RED
+        assert _logged(second, 'alpha').read_text() == _GREEN
+        assert _logged(first, 'alpha').parent != _logged(second, 'alpha').parent
 
     async def test_all_green_exits_zero_with_a_summary_and_no_failures(self, tree, capsys):
         rc, report = await _audit(tree, capsys)
@@ -331,6 +397,36 @@ class TestRenderReport:
 
         assert [f.node_id for f in parse_pytest_failures('\n'.join(lines))] == ['alpha::tests/test_a.py::t']
 
+    def test_a_quoted_section_carries_no_node_id_a_parser_could_lift(self):
+        section = (
+            "E   RuntimeError: worker crashed while running 'tests/t.py::x'\n"
+            'FAILED tests/t.py::y - echoed by the test\n'
+            'ERROR tests/t.py\n'
+        )
+        run = _run('alpha', 1, audit_run.ModuleEnd.EXIT, _FAILED_ONE)
+
+        lines = audit_run.render_report([_with_section(run, section)], 1.0)
+
+        assert [f.node_id for f in parse_pytest_failures('\n'.join(lines))] == [_ALPHA_ONE]
+        assert "#   | E   RuntimeError: worker crashed while running 'tests/t.py:x'" in lines, lines
+
+    @pytest.mark.asyncio
+    async def test_a_quoted_summary_line_never_completes_the_session(self, tmp_path):
+        run = _with_section(_run('alpha', -9, audit_run.ModuleEnd.TIMEOUT, _FAILED_ONE), '== 1 failed in 1.0s ==\n')
+
+        report = '\n'.join(audit_run.render_report([run], 1.0)) + '\n'
+
+        assert (await _lane_record(tmp_path, report)).session_complete is False
+
+    def test_a_long_section_is_cut_and_points_at_the_log(self):
+        section = ''.join(f'line {n}\n' for n in range(audit_run.SECTION_MAX_LINES + 5))
+
+        lines = audit_run.render_report([_with_section(_run('alpha', 1, audit_run.ModuleEnd.EXIT, _FAILED_ONE), section)], 1.0)
+
+        quoted = [line for line in lines if line.startswith('#   | ')]
+        assert len(quoted) == audit_run.SECTION_MAX_LINES + 1
+        assert quoted[-1] == '#   | ... 5 more lines in /logs/alpha.log', quoted[-1]
+
 
 class TestAuditRunCli:
     def _invoke(self, tree: _Tree):
@@ -349,8 +445,18 @@ class TestAuditRunCli:
 
         assert result.exit_code == 0, result.output
         assert 'FAILED' not in result.output, result.output
-        logs = tree.root / audit_run.DEFAULT_LOG_DIR
-        assert sorted(path.name for path in logs.iterdir()) == ['alpha.log', 'beta.log', 'tests--scripts.log']
+        [run_dir] = (tree.root / audit_run.DEFAULT_LOG_DIR).iterdir()
+        assert sorted(path.name for path in run_dir.iterdir()) == ['alpha.log', 'beta.log', 'tests--scripts.log']
+
+    def test_the_lane_commands_project_root_never_reaches_a_child(self, tree, monkeypatch):
+        monkeypatch.setenv('PROJECT_ROOT', str(tree.root))
+        tree.module('beta', output=_GREEN, rc=0, verify_env={'PROJECT_ROOT': '/from/verify_env'})
+
+        result = self._invoke(tree)
+
+        assert result.exit_code == 0, result.output
+        assert 'PROJECT_ROOT' not in tree.env_of('alpha')
+        assert tree.env_of('beta')['PROJECT_ROOT'] == '/from/verify_env'
 
 
 def _committed_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:

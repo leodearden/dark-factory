@@ -441,8 +441,9 @@ def verify_cache_audit_run_cmd(config: OrchestratorConfig, log_dir: Path | None)
 
     The offline lane's verify-cache-audit command (plans/verify-result-cache-prd.md § Audit).
     """
-    from orchestrator.verify_cache.audit_run import DEFAULT_LOG_DIR, run_audit
+    from orchestrator.verify_cache.audit_run import DEFAULT_LOG_DIR, drop_runner_only_env, run_audit
 
+    drop_runner_only_env(os.environ)
     tree = Path(config.project_root)
     sys.exit(asyncio.run(run_audit(tree, config, log_dir or tree / DEFAULT_LOG_DIR)))
 

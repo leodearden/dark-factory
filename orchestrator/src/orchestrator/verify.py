@@ -1352,6 +1352,20 @@ def parse_pytest_failures(test_output: str) -> tuple[PytestFailure, ...]:
     )
 
 
+def failure_sections(test_output: str, failures: Iterable[PytestFailure]) -> dict[PytestFailure, str]:
+    """Each of *failures*' own FAILURES/ERRORS section body in *test_output*, for those a section singles out.
+
+    A failure whose section is absent, or shares its title with another it cannot be told
+    apart from (see ``parse_pytest_failures``), has no entry.
+    """
+    sections = _section_bodies(test_output)
+    return {
+        failure: body
+        for failure in failures
+        if (body := _section_body_of(sections, failure.node_id, failure.kind)) is not None
+    }
+
+
 def node_ids_of(failures: Iterable[PytestFailure]) -> list[str]:
     """Node ids in order, de-duplicated on ``node_id`` alone."""
     return list(dict.fromkeys(failure.node_id for failure in failures))
