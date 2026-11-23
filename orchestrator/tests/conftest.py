@@ -713,6 +713,16 @@ def forbid_live_mcp(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_mcp_lifecycle_session(monkeypatch):
+    """Every test starts with no McpLifecycle session, and one its own start() makes is undone at teardown.
+
+    ``orchestrator/src/orchestrator/mcp_lifecycle.py::McpLifecycle.start`` assigns that
+    global, only stop() clears it, and ``mcp_call`` prefers it over its url (task 9528).
+    """
+    monkeypatch.setattr('orchestrator.mcp_lifecycle._session', None)
+
+
+@pytest.fixture(autouse=True)
 def _no_dry_run_unblock(monkeypatch, request):
     """Replace ``orchestrator.workflow.run_dry_run_unblock`` with an async no-op.
 
