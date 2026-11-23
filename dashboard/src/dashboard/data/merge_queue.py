@@ -30,7 +30,6 @@ from typing import Any, TypedDict, TypeVar
 
 import aiosqlite
 import httpx
-from shared.project_layout import runs_db
 from shared.quality_series.landings import UnrecognisedTrainEvent, recorded_landing_instants
 from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
@@ -334,21 +333,21 @@ def _landing_instants(path: Path, *, after: datetime, until: datetime) -> tuple[
 
 
 async def landing_rate(
-    root: Path | None, *, hours: int, now: datetime | None = None,
+    runs_db_path: Path | None, *, hours: int, now: datetime | None = None,
 ) -> Datum[LandingRateSeries]:
-    """*root*'s landing rate over the *hours* window, FRESH at *now* when its runs.db was read.
+    """The landing rate the runs.db at *runs_db_path* records over the *hours* window, FRESH at *now* when read.
 
     A readable runs.db with no landings is a series of measured zeros. With no
     runs.db open, or when the read fails, the Datum is UNKNOWN with a reason.
     """
     bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
-    if root is None:
+    if runs_db_path is None:
         return _no_runs_db()
     effective_now = resolve_now(now)
     trailing = _trailing_minutes_for_window(hours)
     try:
         instants = await asyncio.to_thread(
-            _landing_instants, runs_db(root),
+            _landing_instants, runs_db_path,
             after=effective_now - timedelta(hours=hours, minutes=trailing), until=effective_now,
         )
     except (TaskDbUnreadable, sqlite3.Error, UnrecognisedTrainEvent, ValueError) as exc:
@@ -901,6 +900,19 @@ def _leg_or_unread(result: _Leg | BaseException, unread: Callable[[str], _Leg], 
     return result
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectRunsDb:
+    """One project's runs.db: the pool's connection to it, None when unopened, and the file it is.
+
+    The connection and the path name one file, so the connection legs and
+    the landing read cannot read two different runs.dbs.
+    """
+
+    label: str
+    db: aiosqlite.Connection | None
+    path: Path
+
+
 def _unread_project(unread: Datum[Any], *, runs_db_present: bool) -> dict:
     """A project's per-project entry with every runs.db leg read as *unread*."""
     return {
@@ -917,7 +929,7 @@ def _unread_project(unread: Datum[Any], *, runs_db_present: bool) -> dict:
 
 
 async def build_per_project_merge_queue(
-    project_dbs: Sequence[tuple[str, aiosqlite.Connection | None]],
+    project_dbs: Sequence[ProjectRunsDb],
     *,
     hours: int,
     now: datetime,
@@ -925,7 +937,7 @@ async def build_per_project_merge_queue(
 ) -> dict[str, dict]:
     """Build per-project merge queue stats by querying each project's DB independently.
 
-    For each ``(pid, db)`` pair, gathers the per-DB stats concurrently. All
+    For each project's runs.db, gathers the per-DB stats concurrently. All
     per-project gathers also run concurrently across projects via a single
     top-level :func:`asyncio.gather`.
 
@@ -934,19 +946,18 @@ async def build_per_project_merge_queue(
     how many that window holds (see :func:`recent_merges`).
 
     ``depth_timeseries``, ``attempts``, ``recent_total``, ``speculative``,
-    ``train_throughput`` and ``landing_rate`` are Datums: a ``db=None`` pair, a
+    ``train_throughput`` and ``landing_rate`` are Datums: a ``db=None`` project, a
     leg that raises, or a project whose whole build fails serves them UNKNOWN
     with a reason rather than zeros that read as measured. ``landing_rate``
-    reads the runs.db of the root its *pid* names, not the connection.
+    reads the file at the project's ``path``, not through the connection.
 
     Args:
-        project_dbs: List of ``(project_root_str, connection_or_None)`` tuples
-            from :func:`_project_scoped_dbs_labeled`.
+        project_dbs: Each project's runs.db, labelled ``str(root)``.
         hours: Look-back window in hours (forwarded to each per-DB function).
         now: Shared reference timestamp captured once per request.
         runs_db_absent: The ``str(root)`` labels with no runs.db file, from
             ``dashboard/project_dbs.py::roots_without_file``. Honoured only
-            for a ``db=None`` pair; a label it omits is never assumed absent.
+            for a ``db=None`` project; a label it omits is never assumed absent.
 
     Returns:
         Dict ``{pid: {depth_timeseries, attempts, recent, recent_total, speculative, train_events, train_throughput, landing_rate, runs_db_present}}``,
@@ -961,7 +972,8 @@ async def build_per_project_merge_queue(
     """
     bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
 
-    async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
+    async def _one_project(project: ProjectRunsDb) -> tuple[str, dict]:
+        pid, db = project.label, project.db
         if db is None and pid in runs_db_absent:
             absent = unknown_datum('no runs.db file exists for this project', bound)
             return pid, _unread_project(absent, runs_db_present=False)
@@ -976,7 +988,7 @@ async def build_per_project_merge_queue(
                     train_throughput_stats(db, hours=hours, now=now),
                     return_exceptions=True,
                 ),
-                landing_rate(None if db is None else Path(pid), hours=hours, now=now),
+                landing_rate(None if db is None else project.path, hours=hours, now=now),
                 return_exceptions=True,
             )
             if isinstance(connection_legs, BaseException):
@@ -1018,7 +1030,7 @@ async def build_per_project_merge_queue(
             )
             return pid, _unread_project(unread, runs_db_present=True)
 
-    results = await asyncio.gather(*[_one_project(pid, db) for pid, db in project_dbs])
+    results = await asyncio.gather(*[_one_project(project) for project in project_dbs])
     return dict(results)
 
 

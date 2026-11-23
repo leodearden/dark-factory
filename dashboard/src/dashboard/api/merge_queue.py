@@ -28,6 +28,7 @@ from dashboard.data import redux_api
 from dashboard.data.db import DbPool
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
+    ProjectRunsDb,
     build_per_project_merge_queue,
     enrich_merges_with_titles,
     fetch_live_merge_queues,
@@ -37,9 +38,15 @@ from dashboard.data.merge_queue import (
 from dashboard.data.metrics import get_merge_active_series
 from dashboard.data.task_activity import RUNS_DB
 from dashboard.data.task_lookup import lookup_tasks
-from dashboard.project_dbs import _project_scoped_dbs_labeled, roots_without_file
+from dashboard.project_dbs import roots_without_file
 
 router = APIRouter()
+
+
+async def _project_runs_dbs(config: DashboardConfig, pool: DbPool) -> list[ProjectRunsDb]:
+    """Each known root's runs.db, its path derived once for the pool's connection and the landing read."""
+    stores = [(str(root), root / RUNS_DB) for root in config.all_project_roots]
+    return [ProjectRunsDb(label, await pool.get(path), path) for label, path in stores]
 
 
 @router.get('/api/v2/dashboard/merge-queue')
@@ -52,7 +59,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
     clock = app_clock(request.app)
     render_at = clock()
 
-    project_dbs = await _project_scoped_dbs_labeled(config, pool, RUNS_DB)
+    project_dbs = await _project_runs_dbs(config, pool)
     http_client: httpx.AsyncClient = request.app.state.http_client
     projects_raw, halt_status, live_map = await asyncio.gather(
         build_per_project_merge_queue(
