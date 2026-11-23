@@ -140,7 +140,14 @@ def neutralise_fixture(mod, *, note):
     The scratch directory is ONE per session, under pytest's base temp rather
     than the test's own `tmp_path`, which several suites census: a fresh
     numbered directory per test would rescan its parent on every call across
-    thousands of tests.
+    thousands of tests. Being session-wide, it is also mem0's home for anything
+    else in the session that inherits `MEM0_DIR`: a subprocess that imports
+    `mem0` writes mem0's `config.json` there at import time (mem0's
+    module-level `setup_config()`). Its contents therefore belong to the
+    session, and no test may assume it is empty. A test that must observe it
+    empty supplies its own base temp, as
+    `fused-memory/tests/test_store_mutation_preflight_contract.py::TestNeutraliseFixture::test_the_probe_leaves_the_redirected_directory_empty`
+    does.
 
     *note* is REQUIRED and keyword-only, carrying the two facts the shared
     rationale above cannot: this suite's seam (which entry point runs the

@@ -980,7 +980,7 @@ class TestBlockingHolders:
 class TestTryAcquireAdmittedParks:
     """``try_acquire(..., admitted_parks=...)`` bypasses the PARK gate only.
 
-    The held-lock ``_count_conflicts >= _limit_for`` gate is untouched and
+    The held-lock ``_holders_counted_against >= _limit_for`` gate is untouched and
     evaluated on live state at call time.  That is the whole safety property
     of C7 (INV-3): the scoring-time view is advisory, and ``try_acquire``
     under the lock remains the acting basis.

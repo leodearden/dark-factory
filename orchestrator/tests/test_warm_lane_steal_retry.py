@@ -23,16 +23,16 @@ Convention note: this module keeps its OWN local copies of the ``wl_git_repo``
 fixture and the warm-lane script/pool helpers rather than cross-importing from
 ``test_warm_lane_pool.py`` / ``test_git_ops.py`` — the same local-copy
 convention ``test_warm_lane_structural_exhaustion.py`` follows (see its
-``_init_repo`` / ``wl_git_repo`` at module scope).
+``wl_git_repo`` at module scope).
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 
 import pytest
+from _git_fixtures import seed_repo
 from _orch_helpers import assert_isolated_git_repo
 from _seed_script_stubs import seed_default_warm_base
 
@@ -44,36 +44,10 @@ from orchestrator.git_ops import GitOps, SeedLaneLock, WorktreeInfo, _run
 # ---------------------------------------------------------------------------
 
 
-async def _init_repo(repo: Path) -> None:
-    """Minimal git repo with one commit (mirrors test_warm_lane_pool.py).
-
-    esc-3072-3: the :func:`assert_isolated_git_repo` pre-flight cannot run
-    before ``git init`` — it refuses any directory that is not ALREADY a repo
-    root, which is precisely what that call creates.  So the guard runs
-    immediately AFTER the init and ahead of every other subprocess, which is
-    the earliest point at which it is evaluable and the point that matters:
-    ``git init`` only ever writes into its own ``cwd`` (it never adopts an
-    enclosing repo), whereas the ``git add -A`` + ``git commit`` below WOULD
-    retarget whatever encloses *repo* if *repo* were not a root.  Same
-    ordering rationale as ``test_branch_work_landed.py::_Repo.init``.
-    """
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    assert_isolated_git_repo(repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def wl_git_repo(tmp_path: Path) -> Path:
     """A git repo with the default warm-lane base and pool-storage sentinel."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    # esc-3072-3 guard lives inside _init_repo, immediately after `git init`
-    # (the earliest point the pre-flight is evaluable) — see its docstring.
-    asyncio.run(_init_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     seed_default_warm_base(repo)
     return repo
 
@@ -158,7 +132,6 @@ async def _setup_pool(
         git_ops.warm_lane_dispatched_predicate = lambda b: False
 
     return git_ops, lanes, start_ref
-
 
 
 # ---------------------------------------------------------------------------
@@ -697,7 +670,7 @@ class TestCreateWorktreeMapping:
         await _add_warm_lane_scripts(repo)
         git_ops = GitOps(_warm_config(), repo, warm_lane_pool_size=1)
 
-        async def _acquire(branch_name, start_ref, *, expected_title=None):
+        async def _acquire(branch_name, start_ref, *, expected_title=None, stack_on=None):
             return sentinel
 
         git_ops.acquire_warm_lane = _acquire  # type: ignore[method-assign]

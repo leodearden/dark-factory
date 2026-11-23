@@ -93,6 +93,9 @@ from _orch_helpers import (  # noqa: E402
     stamp_stock_routing_config,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
+from shared.pytest_fake_clock import (  # noqa: E402  # debt: ticket tkt_0RX7VH710F56TR7A4GHW9M6WNK
+    fake_clock as fake_clock,
+)
 
 from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402
@@ -1004,6 +1007,10 @@ def make_steward(tmp_path: Path):
       - ``steward_max_timeouts_per_escalation`` = 3,
         ``steward_max_empty_outputs_per_escalation`` = 2
       - ``suggestion_triage_threshold`` = 10
+      - ``steward_session_mode`` = the Field's own production default, read off
+        ``OrchestratorConfig.model_fields`` so mode-agnostic tests run the
+        shipped arm (an unassigned knob would be a MagicMock that silently
+        selects one)
       - triage + steward ``models`` / ``budgets`` / ``max_turns`` / ``effort`` / ``backends``
       - ``escalation.host`` / ``escalation.port``
       - ``timeouts.steward`` / ``steward_completion_timeout`` — the
@@ -1071,6 +1078,7 @@ def make_steward(tmp_path: Path):
         config.steward_max_timeouts_per_escalation = 3
         config.steward_max_empty_outputs_per_escalation = 2
         config.suggestion_triage_threshold = 10
+        config.steward_session_mode = OrchestratorConfig.model_fields['steward_session_mode'].default
         config.models.triage = 'sonnet'
         config.budgets.triage = 2.0
         config.max_turns.triage = 25

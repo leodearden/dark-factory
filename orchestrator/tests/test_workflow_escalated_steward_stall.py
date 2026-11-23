@@ -721,6 +721,7 @@ def _make_steward_config(project_root: Path) -> MagicMock:
     cfg.steward_completion_timeout = 300.0
     cfg.steward_max_timeouts_per_escalation = 3
     cfg.steward_max_empty_outputs_per_escalation = 2
+    cfg.steward_session_mode = OrchestratorConfig.model_fields['steward_session_mode'].default
     cfg.timeouts.steward = 1800.0
     return cfg
 

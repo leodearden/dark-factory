@@ -27,7 +27,7 @@ from typing import NamedTuple, cast
 import aiosqlite
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from shared.asyncio_tasks import abandon_task, track_task
 
@@ -43,6 +43,13 @@ from dashboard.api import task_prose as api_task_prose_routes
 from dashboard.api import tasks as api_tasks_routes
 from dashboard.api.clock import app_clock, install_clock, live_clock
 from dashboard.api.window import _parse_window, with_window
+from dashboard.asset_build import (
+    AssetBuild,
+    AssetBuildHeaders,
+    app_asset_build,
+    inject_page_build,
+    install_asset_build,
+)
 from dashboard.background_loops import PRODUCTION_LOOPS, BackgroundLoops
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
@@ -350,6 +357,7 @@ async def lifespan(app: FastAPI, *, loops: BackgroundLoops = PRODUCTION_LOOPS):
     config = DashboardConfig.from_env()
     app.state.config = config
     install_clock(app, live_clock)
+    install_asset_build(app, AssetBuild.at_start(_redux_dir))
     http_client = httpx.AsyncClient(
         follow_redirects=True,
         limits=_build_http_limits(config),
@@ -434,6 +442,7 @@ async def lifespan(app: FastAPI, *, loops: BackgroundLoops = PRODUCTION_LOOPS):
 
 
 app = FastAPI(title='Dark Factory Dashboard', lifespan=lifespan)
+app.add_middleware(AssetBuildHeaders)
 app.mount('/static', StaticFiles(directory=str(_pkg_dir / 'static')), name='static')
 
 # Route table for the handlers extracted out of this file (task 5586). Each
@@ -457,9 +466,11 @@ app.include_router(api_quality_routes.router)
 
 
 @app.get('/')
-async def index() -> FileResponse:
-    """Serve the React SPA entry point."""
-    return FileResponse(_redux_dir / 'index.html', media_type='text/html')
+async def index(request: Request) -> HTMLResponse:
+    """Serve the React SPA entry point, carrying the asset build it boots with."""
+    build = app_asset_build(request.app)
+    html = (_redux_dir / 'index.html').read_text(encoding='utf-8')
+    return HTMLResponse(inject_page_build(html, build.on_disk() if build else None))
 
 
 @app.get('/api/health')

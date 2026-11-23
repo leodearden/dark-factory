@@ -5,6 +5,11 @@
 # main bb1c659562 (2026-11-10): polarity holds; λ0 now sits second (lead sequencing ruling); σ is the OQ-5
 # follow-up (not a signal leaf). task_id is null for every block until the S5 decompose session runs
 # commit_planning.
+# 2026-11-22 (git-ops split decompose, gate 11190): six present-checks that pinned a symbol to git_ops.py were
+# widened to the package (from_seed_rc, adopt_lane, _classify_acquire_route, GitOpsCallbacks, GitOpsLimits) or to
+# git_ops.py + pool_storage.py with the PoolStorageGuard.ensure rename (_ensure_pool_storage), because
+# plans/git-ops-split-prd.md moves those symbols out of git_ops.py after S5 lands; polarity is unchanged (each
+# widened pattern is absent from the whole package at a4349b7f4b). The copied metadata.delivered_checks on 9259-9262 match.
 prd: plans/review-all-s5-gitops-ports-query-contract-and-the-git-runner-prd.md
 schema_version: 1
 signal_leaves: ["π"]
@@ -154,7 +159,7 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "^class GitOpsCallbacks"
-          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          paths: ["orchestrator/src/orchestrator/"]
           expect: present
       - name: "limits-dataclass"
         binding: "C2 producer — replaces the 7 monkeypatched module constants and _INDEX_LOCK_STALE_FLOOR_S"
@@ -162,7 +167,7 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "^class GitOpsLimits"
-          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          paths: ["orchestrator/src/orchestrator/"]
           expect: present
       - name: "env-override-retired"
         binding: "production test accommodation present today (_DF_WARM_LANE_SCRIPT_DIR_ENV); dir-anchored because γ moves the script helpers to warm_lane_scripts.py"
@@ -206,7 +211,7 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "def from_seed_rc\\("
-          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          paths: ["orchestrator/src/orchestrator/"]
           expect: present
       - name: "if-chain-deleted"
         binding: "9 `pool_info is WarmLaneUnavailable.` arms exist in create_worktree today"
@@ -266,7 +271,7 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "def adopt_lane\\("
-          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          paths: ["orchestrator/src/orchestrator/"]
           expect: present
       - name: "pool-slot-state-renamed"
         binding: "two enums named LaneState exist today"
@@ -293,8 +298,8 @@ tasks:
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "def _ensure_pool_storage\\("
-          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          pattern: "def (_ensure_pool_storage|ensure)\\("
+          paths: ["orchestrator/src/orchestrator/git_ops.py", "orchestrator/src/orchestrator/pool_storage.py"]
           expect: present
       - name: "route-classifier"
         binding: "D10 producer — the seven routes are labelled after the fact today, not separated"
@@ -302,7 +307,7 @@ tasks:
         delivered_check:
           kind: grep
           pattern: "def _classify_acquire_route\\("
-          paths: ["orchestrator/src/orchestrator/git_ops.py"]
+          paths: ["orchestrator/src/orchestrator/"]
           expect: present
       - name: "substrate-acquire-route-enum"
         binding: "substrate — lane_lifecycle.AcquireRoute exists today (task 7863); passes at ce0f71a384, d40ba048e9 and e634cfe658 by design"

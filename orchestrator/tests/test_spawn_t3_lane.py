@@ -1069,8 +1069,9 @@ class TestAwaitStarted:
         )
 
     def test_started_binds_the_transcript_and_folds_the_hand_launched_record(
-        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str]
+        self, env: Env, t3: FakeT3Server, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setattr(lane, 'STARTED_POLL_SECS', 0.05)
         t3.tool_replies['t3_thread_read'] = replies_in_turn(thread_read(status='preparing'), thread_read(status='running'))
         record_dir = spawn_record(env)
         write_transcript(env, SESSION_ID, trailer(record_dir))

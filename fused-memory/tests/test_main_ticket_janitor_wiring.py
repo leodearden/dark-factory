@@ -35,6 +35,7 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 PROJECT_ROOT = '/project'
 PROJECT_ID = 'project'
 DEADLINE_SECONDS = 5.0
+TINY_BACKOFF_SECONDS = 0.001
 
 
 class _DeferThenHoldCurator:
@@ -68,8 +69,8 @@ class _DeferThenHoldCurator:
 def config() -> FusedMemoryConfig:
     cfg = FusedMemoryConfig()
     cfg.curator = CuratorConfig(
-        deferral_backoff_base_seconds=0.001,
-        deferral_backoff_max_seconds=0.001,
+        deferral_backoff_base_seconds=TINY_BACKOFF_SECONDS,
+        deferral_backoff_max_seconds=TINY_BACKOFF_SECONDS,
         janitor=TicketJanitorConfig(curation_backlog_escalation_min_attempts=1),
     )
     return cfg
@@ -114,9 +115,14 @@ async def _park_through(interceptor: TaskInterceptor) -> str:
     return ticket_id
 
 
+async def _let_tiny_backoff_pass() -> None:
+    await asyncio.sleep(TINY_BACKOFF_SECONDS * 5)
+
+
 @pytest.mark.asyncio
 async def test_built_janitor_drains_through_the_interceptor(config, store, make_interceptor):
     ticket_id = await _park_through(make_interceptor(_DeferThenHoldCurator(defer_first=True)))
+    await _let_tiny_backoff_pass()
     curator = _DeferThenHoldCurator(defer_first=False)
     restarted = make_interceptor(curator)
     assert restarted.is_worker_alive(PROJECT_ID) is False

@@ -250,7 +250,9 @@ class TaskSnapshot:
             render's shaped rows belong to that render: they are joined to its
             runtime probe and its clock, and its external-dep tail overwrites
             them in place, so a cache shared across renders must never hold
-            them. Raw rows on the wire would ship the whole ``metadata`` blob
+            them. Only their unit-derived half may be shared
+            (``dashboard/src/dashboard/data/active_tasks.py::UnitRowMemo``).
+            Raw rows on the wire would ship the whole ``metadata`` blob
             and break the PRD's ``Datum[list[TaskRow]]`` contract, which is
             why neither wire-bound collector ever returns the cached unit
             as-is.
