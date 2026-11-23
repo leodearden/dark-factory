@@ -287,8 +287,8 @@ tasks:
     binding: producer:task-metadata-lookup L1 upstream for find_tasks_by_metadata
       (row shape task_id, status, priority, plus matched_value only with include_value=True;
       has_more paging with offset += returned under RESULT_BYTE_BUDGET; tasks_with_key
-      — lookup PRD amended 2026-10-05); transport scripts/legibility/census_trigger.py::post_mcp_tool_call
-      present on main
+      — lookup PRD amended 2026-10-05); transport shared/src/shared/mcp_session.py::SyncMcpSession
+      present on main (amended, task 8936 — task 6747 deleted census_trigger's post_mcp_tool_call)
     verdict: PASS
     delivered_check:
       kind: grep

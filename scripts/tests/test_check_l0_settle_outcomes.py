@@ -61,12 +61,16 @@ WORKFLOW_DISMISSAL = (
     'Auto-dismissed: steward interrupted (timeout) with WIP present — task blocked for review',
     None,
 )
+STEWARD_DISMISSAL = ('dismissed', 'steward', 'Duplicate of esc-{task_id}-1: the same red test', None)
+SETTLE_DISMISSAL = ('dismissed', 'orchestrator-workflow', 'Settled own L0: abandoned on timeout', None)
 CLOSE_DELAY = timedelta(hours=1)
 PERMISSIVE: dict[str, str] = {
     'window_days': '14',
     'baseline_stranded_per_100': '3.6',
     'ratio': '100',
     'min_stranded': '99',
+    'baseline_non_startup_wrong_per_100': '6.8',
+    'min_non_startup_wrong': '99',
     'max_reaper_wrong': '99',
     'max_pending_hours': '48',
 }
@@ -176,6 +180,7 @@ def build_settle_queue(queue_dir: Path) -> SettleQueue:
     dismissed_then_refiled = build.ago(days=5)
     dismissed_then_refiled_late = build.ago(days=8)
     dismissed_then_l2 = build.ago(days=12)
+    resolved_then_refiled = build.ago(days=1)
     post += [
         build.closed('11', build.ago(days=2), STEWARD),
         build.closed('12', build.ago(days=3), PROMOTION),
@@ -192,6 +197,10 @@ def build_settle_queue(queue_dir: Path) -> SettleQueue:
         build.pending('21', build.ago(hours=30)),
         build.closed('22', dismissed_then_l2, REAPER_DISMISSAL),
         build.closed('24', build.ago(days=13), ARCHITECT_PROMOTION),
+        build.closed('25', build.ago(days=1, hours=6), STEWARD_DISMISSAL, late=True),
+        build.closed('26', resolved_then_refiled, STEWARD),
+        build.closed('26', resolved_then_refiled + CLOSE_DELAY + timedelta(hours=2), STEWARD),
+        build.closed('27', build.ago(days=1, hours=12), SETTLE_DISMISSAL, late=True),
     ]
     excluded += [
         build.closed('30', build.ago(days=3), PROMOTION, severity='info'),
@@ -201,6 +210,8 @@ def build_settle_queue(queue_dir: Path) -> SettleQueue:
     ]
     pre += [build.closed(str(40 + n), build.ago(days=15 + n), STEWARD) for n in range(7)]
     pre += [build.closed('50', build.ago(days=25), PROMOTION)]
+    pre += [build.closed('51', build.ago(days=20), WORKFLOW_DISMISSAL, late=True)]
+    pre += [build.closed('52', build.ago(days=21), REAPER_DISMISSAL, late=True)]
     return SettleQueue(queue_dir, tuple(post), tuple(pre), tuple(excluded))
 
 
@@ -226,8 +237,8 @@ def trailing_json(lines: Sequence[str]) -> dict[str, Any]:
     return json.loads(lines[-1])
 
 
-def rate(stranded: int, filed: int) -> float:
-    return round(100 * stranded / filed, 2)
+def rate(count: int, filed: int) -> float:
+    return round(100 * count / filed, 2)
 
 
 def test_trailing_json_equals_fixture_counts(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
@@ -250,6 +261,9 @@ def test_trailing_json_equals_fixture_counts(settle_queue: SettleQueue, capsys: 
         'startup_wrong': 1,
         'workflow_auto_dismissals': 1,
         'workflow_auto_wrong': 1,
+        'non_startup_dismissals': 8,
+        'non_startup_wrong': 5,
+        'non_startup_wrong_per_100': rate(5, post_filed),
     }
     assert payload['pre'] == {
         'filed': pre_filed,
@@ -258,12 +272,15 @@ def test_trailing_json_equals_fixture_counts(settle_queue: SettleQueue, capsys: 
         'other_promotions': 0,
         'stranded': 1,
         'stranded_per_100': rate(1, pre_filed),
-        'reaper_dismissals': 0,
-        'reaper_wrong': 0,
+        'reaper_dismissals': 1,
+        'reaper_wrong': 1,
         'startup_dismissals': 0,
         'startup_wrong': 0,
-        'workflow_auto_dismissals': 0,
-        'workflow_auto_wrong': 0,
+        'workflow_auto_dismissals': 1,
+        'workflow_auto_wrong': 1,
+        'non_startup_dismissals': 2,
+        'non_startup_wrong': 2,
+        'non_startup_wrong_per_100': rate(2, pre_filed),
     }
     assert payload['pending_over_h'] == 0
 
@@ -290,6 +307,14 @@ STRANDED_BREACH = {'ratio': '1.0', 'min_stranded': '3'}
 STRANDED_BELOW_MIN_COUNT = {'ratio': '1.0', 'min_stranded': '4'}
 STRANDED_UNDER_FLOOR = {**STRANDED_BREACH, 'baseline_stranded_per_100': '50'}
 STRANDED_UNDER_PRE_BAR = {'ratio': '2.0', 'min_stranded': '3', 'baseline_stranded_per_100': '3.6'}
+NON_STARTUP_WRONG_BREACH = {'ratio': '1.0', 'min_non_startup_wrong': '5'}
+NON_STARTUP_WRONG_BELOW_MIN_COUNT = {'ratio': '1.0', 'min_non_startup_wrong': '6'}
+NON_STARTUP_WRONG_UNDER_FLOOR = {**NON_STARTUP_WRONG_BREACH, 'baseline_non_startup_wrong_per_100': '50'}
+NON_STARTUP_WRONG_UNDER_PRE_BAR = {
+    'ratio': '2.5',
+    'min_non_startup_wrong': '5',
+    'baseline_non_startup_wrong_per_100': '6.8',
+}
 REAPER_WRONG_BREACH = {'max_reaper_wrong': '2'}
 REAPER_WRONG_UNDER = {'max_reaper_wrong': '3'}
 PENDING_BREACH = {'max_pending_hours': '24'}
@@ -299,6 +324,10 @@ THRESHOLD_CASES = (
     STRANDED_BELOW_MIN_COUNT,
     STRANDED_UNDER_FLOOR,
     STRANDED_UNDER_PRE_BAR,
+    NON_STARTUP_WRONG_BREACH,
+    NON_STARTUP_WRONG_BELOW_MIN_COUNT,
+    NON_STARTUP_WRONG_UNDER_FLOOR,
+    NON_STARTUP_WRONG_UNDER_PRE_BAR,
     REAPER_WRONG_BREACH,
     REAPER_WRONG_UNDER,
     PENDING_BREACH,
@@ -361,6 +390,51 @@ def test_stranded_rate_bar_scales_the_pre_window_rate(
     assert trailing_json(lines)['stranded_bar_per_100'] == pytest.approx(ratio * pre_rate)
 
 
+def test_non_startup_wrong_rate_breach(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    code, lines = run_main(capsys, settle_queue.queue_dir, **NON_STARTUP_WRONG_BREACH)
+
+    assert_breached(code, lines, settle.Breach.NON_STARTUP_WRONG_RATE)
+    payload = trailing_json(lines)
+    breach = next(line for line in lines if line.startswith('breach: non_startup_wrong_rate'))
+    assert f'{payload["post"]["non_startup_wrong_per_100"]:.2f}/100' in breach
+    assert f'{payload["non_startup_wrong_bar_per_100"]:.2f}/100' in breach
+
+
+def test_non_startup_wrong_rate_needs_min_count(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    assert_clean(*run_main(capsys, settle_queue.queue_dir, **NON_STARTUP_WRONG_BELOW_MIN_COUNT))
+
+
+def test_non_startup_wrong_rate_uses_baseline_floor(
+    settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _, permissive = run_main(capsys, settle_queue.queue_dir)
+    post_rate = trailing_json(permissive)['post']['non_startup_wrong_per_100']
+    pre_rate = trailing_json(permissive)['pre']['non_startup_wrong_per_100']
+    assert pre_rate < post_rate < float(NON_STARTUP_WRONG_UNDER_FLOOR['baseline_non_startup_wrong_per_100'])
+
+    assert_clean(*run_main(capsys, settle_queue.queue_dir, **NON_STARTUP_WRONG_UNDER_FLOOR))
+
+
+def test_non_startup_wrong_rate_bar_scales_the_pre_window_rate(
+    settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _, permissive = run_main(capsys, settle_queue.queue_dir)
+    post_rate = trailing_json(permissive)['post']['non_startup_wrong_per_100']
+    pre = trailing_json(permissive)['pre']
+    unrounded_pre_rate = 100 * pre['non_startup_wrong'] / pre['filed']
+    ratio = float(NON_STARTUP_WRONG_UNDER_PRE_BAR['ratio'])
+    floor = float(NON_STARTUP_WRONG_UNDER_PRE_BAR['baseline_non_startup_wrong_per_100'])
+    assert ratio * max(floor, pre['stranded_per_100']) < post_rate < ratio * unrounded_pre_rate
+
+    code, lines = run_main(capsys, settle_queue.queue_dir, **NON_STARTUP_WRONG_UNDER_PRE_BAR)
+
+    assert_clean(code, lines)
+    shown_to_two_places = 0.005
+    assert trailing_json(lines)['non_startup_wrong_bar_per_100'] == pytest.approx(
+        ratio * unrounded_pre_rate, abs=shown_to_two_places,
+    )
+
+
 def test_reaper_wrong_breach(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
     assert_breached(*run_main(capsys, settle_queue.queue_dir, **REAPER_WRONG_BREACH), settle.Breach.REAPER_WRONG)
     assert_clean(*run_main(capsys, settle_queue.queue_dir, **REAPER_WRONG_UNDER))
@@ -370,20 +444,80 @@ def test_pending_breach(settle_queue: SettleQueue, capsys: pytest.CaptureFixture
     assert_breached(*run_main(capsys, settle_queue.queue_dir, **PENDING_BREACH), settle.Breach.PENDING_OVER_H)
 
 
-def test_startup_and_workflow_wrong_are_never_judged(
-    settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str],
-) -> None:
-    build = FixtureQueue(settle_queue.queue_dir, datetime.now(UTC))
-    for n in range(5):
-        build.closed(str(60 + n), build.ago(days=2, hours=n), RESTART_DISMISSAL, late=True)
-        build.closed(str(70 + n), build.ago(days=3, hours=n), WORKFLOW_DISMISSAL, late=True)
+Writer = Callable[[FixtureQueue, str, datetime], None]
 
-    code, lines = run_main(capsys, settle_queue.queue_dir, **REAPER_WRONG_UNDER)
+
+def closed_late(closure: tuple[str, str, str, str | None]) -> Writer:
+    def write(build: FixtureQueue, task_id: str, filed_at: datetime) -> None:
+        build.closed(task_id, filed_at, closure, late=True)
+
+    return write
+
+
+def resolved_then_refiled(build: FixtureQueue, task_id: str, filed_at: datetime) -> None:
+    build.closed(task_id, filed_at, STEWARD)
+    build.closed(task_id, filed_at + CLOSE_DELAY + timedelta(hours=2), STEWARD)
+
+
+def flood_post_window(queue_dir: Path, write: Writer) -> None:
+    """Five more wrong closes in the post window, on task ids the fixture does not use."""
+    build = FixtureQueue(queue_dir, datetime.now(UTC))
+    for n in range(5):
+        write(build, str(60 + n), build.ago(days=2, hours=n))
+
+
+@pytest.mark.parametrize(
+    ('write', 'startup_wrong'),
+    [
+        pytest.param(closed_late(RESTART_DISMISSAL), 6, id='restart-dismissal'),
+        pytest.param(closed_late(STALE_STRAND), 6, id='stale-strand'),
+        pytest.param(closed_late(PROMOTION), 1, id='reaper-promotion'),
+        pytest.param(resolved_then_refiled, 1, id='steward-resolution-then-refiled'),
+    ],
+)
+def test_unjudged_wrong_closes_never_breach(
+    settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str], write: Writer, startup_wrong: int,
+) -> None:
+    flood_post_window(settle_queue.queue_dir, write)
+
+    code, lines = run_main(capsys, settle_queue.queue_dir, **NON_STARTUP_WRONG_BELOW_MIN_COUNT)
 
     post = trailing_json(lines)['post']
-    assert post['startup_wrong'] == 6
-    assert post['workflow_auto_wrong'] == 6
     assert_clean(code, lines)
+    assert post['non_startup_wrong'] == 5
+    assert post['startup_wrong'] == startup_wrong
+
+
+@pytest.mark.parametrize(
+    'closure',
+    [
+        pytest.param(WORKFLOW_DISMISSAL, id='workflow-auto-dismissal'),
+        pytest.param(REAPER_DISMISSAL, id='reaper-dismissal'),
+        pytest.param(STEWARD_DISMISSAL, id='steward-dismissal'),
+        pytest.param(SETTLE_DISMISSAL, id='settle-dismissal'),
+    ],
+)
+def test_every_non_startup_dismissal_path_is_judged(
+    settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str], closure: tuple[str, str, str, str | None],
+) -> None:
+    flood_post_window(settle_queue.queue_dir, closed_late(closure))
+
+    code, lines = run_main(capsys, settle_queue.queue_dir, **NON_STARTUP_WRONG_BELOW_MIN_COUNT)
+
+    assert_breached(code, lines, settle.Breach.NON_STARTUP_WRONG_RATE)
+    assert trailing_json(lines)['post']['non_startup_wrong'] == 10
+
+
+def test_only_the_startup_sweep_is_reported_unjudged(
+    settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _, lines = run_main(capsys, settle_queue.queue_dir)
+
+    non_startup = [line for line in lines if line.startswith('  non-startup dismissals')]
+    startup = [line for line in lines if line.startswith('  startup dismissals')]
+    assert len(non_startup) == len(startup) == 2
+    assert all('not judged' not in line for line in non_startup)
+    assert all('not judged' in line for line in startup)
 
 
 def snapshot(root: Path) -> dict[str, tuple[bytes | None, int]]:
@@ -461,6 +595,13 @@ def test_record_missing_required_key_exits_2(settle_queue: SettleQueue, capsys: 
     keyless.write_text(json.dumps(record))
 
     assert_cannot_judge(*run_main(capsys, settle_queue.queue_dir), UNREADABLE, keyless)
+
+
+def test_record_with_unknown_status_exits_2(settle_queue: SettleQueue, capsys: pytest.CaptureFixture[str]) -> None:
+    build = FixtureQueue(settle_queue.queue_dir, datetime.now(UTC))
+    unknown = build.closed('62', build.ago(days=2), ('archived', 'steward', 'moved', None))
+
+    assert_cannot_judge(*run_main(capsys, settle_queue.queue_dir), UNREADABLE, unknown)
 
 
 def test_empty_post_window_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -630,6 +771,9 @@ def test_counts_records_written_by_the_real_queue(tmp_path: Path, capsys: pytest
     resolved_id = file_escalation(queue, '103', 'ordinary steward work', filed_at=now - timedelta(minutes=2))
     queue.resolve(resolved_id, 'steward fixed it', resolved_by='steward')
 
+    duplicate_id = file_escalation(queue, '106', 'a duplicate the steward dismisses', filed_at=now - timedelta(minutes=1))
+    queue.resolve(duplicate_id, 'Duplicate of an earlier L0', dismiss=True, resolved_by='steward')
+
     code, lines = run_main(capsys, queue_dir)
 
     post = trailing_json(lines)['post']
@@ -637,4 +781,5 @@ def test_counts_records_written_by_the_real_queue(tmp_path: Path, capsys: pytest
     assert (post['stale_strands'], post['stranded']) == (1, 1)
     assert (post['reaper_dismissals'], post['reaper_wrong']) == (1, 1)
     assert post['startup_dismissals'] == 1
-    assert post['filed'] == 3
+    assert (post['non_startup_dismissals'], post['non_startup_wrong']) == (2, 1)
+    assert post['filed'] == 4

@@ -87,22 +87,14 @@ function sampleLabels(count, stepMinutes = 60) {
 // it. It holds:
 //   - `sampleCount` labels;
 //   - a non-empty series per census member, so every band draws;
-//   - the rows' in-progress split;
 //   - the `latest` and `forecast` Datums;
 //   - the parity verdict's fields. Only the aggregate block names the
 //     breaching `projects`; leave them out for a per-project block.
 export function burndownBlock(vocab, sampleCount, { alarm, cap, peak, breachCount, projects }) {
   const labels = sampleLabels(sampleCount);
-  const series = Object.fromEntries(
+  const columns = Object.fromEntries(
     Object.values(vocab.SERIES_KEYS).map((key, i) => [key, labels.map(() => i + 1)]),
   );
-  const inProgress = series[vocab.SERIES_KEYS['in-progress']];
-  const split = {
-    in_progress_live: inProgress.map(n => n - 1),
-    in_progress_stranded: inProgress.map(() => 1),
-    in_progress_rows: inProgress,
-  };
-  const columns = { ...series, ...split };
   const counts = Object.fromEntries(Object.entries(columns).map(([key, values]) => [key, values.at(-1)]));
   return {
     labels,

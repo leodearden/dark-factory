@@ -943,6 +943,51 @@ class TestReapStaleSessionPointers:
             [_THREAD, fresh_temp.name]
         )
 
+    def _write_orphan_pointers(self, tmp_path: Path, *names: str) -> list[Path]:
+        for name in names:
+            session_records.write_claude_session_pointer(name, 'gone-record', root=tmp_path)
+        pointers = session_records.claude_session_pointers_dir(tmp_path)
+        return [pointers / name for name in names]
+
+    def test_entry_gone_before_unlink_is_skipped_silently(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raced, kept = self._write_orphan_pointers(tmp_path, 'raced-session', 'orphan-session')
+        original_unlink = Path.unlink
+
+        def unlink_after_rival(self: Path, missing_ok: bool = False) -> None:
+            if self == raced:
+                original_unlink(self)
+            original_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, 'unlink', unlink_after_rival)
+
+        with caplog.at_level(logging.WARNING, logger=session_reaper.__name__):
+            removed = session_reaper.reap_stale_session_pointers(root=tmp_path)
+
+        assert removed == [kept]
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_entry_that_cannot_be_removed_still_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stuck, other = self._write_orphan_pointers(tmp_path, 'stuck-session', 'orphan-session')
+        original_unlink = Path.unlink
+
+        def unlink_refusing_stuck(self: Path, missing_ok: bool = False) -> None:
+            if self == stuck:
+                raise PermissionError(13, 'Permission denied', str(self))
+            original_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, 'unlink', unlink_refusing_stuck)
+
+        with caplog.at_level(logging.WARNING, logger=session_reaper.__name__):
+            removed = session_reaper.reap_stale_session_pointers(root=tmp_path)
+
+        assert removed == [other]
+        [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert str(stuck) in warning
+
 
 _ENVIRONMENT = '3f9a1c2e-5b7d-4e8f-9a0b-1c2d3e4f5a6b'
 _GONE_THREAD = '2c4e6a8b-0d1f-4a3c-9e5b-7d9f1b3d5e70'

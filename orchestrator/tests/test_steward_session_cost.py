@@ -78,7 +78,12 @@ def install_fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def steward(make_steward):
     """A real steward under the production lifetime cap, whose queue resolves each record."""
     built = make_steward(
-        config_overrides={'steward_lifetime_budget': 20.0},
+        config_overrides={
+            'steward_lifetime_budget': 20.0,
+            # This module characterises the resume arm's session bookkeeping; the
+            # default arm is covered in test_steward_session_mode.py.
+            'steward_session_mode': 'resume',
+        },
         event_store=MagicMock(),
     )
     built.escalation_queue.get.side_effect = lambda escalation_id: dataclasses.replace(

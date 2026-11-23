@@ -39,12 +39,12 @@ scenarios #5 and #6, plus a control:
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.git_ops import _run
 from orchestrator.harness import Harness
@@ -59,25 +59,13 @@ pytestmark = pytest.mark.asyncio
 
 
 # ---------------------------------------------------------------------------
-# Real git repo fixture (mirrors test_git_ops.py's git_repo/_setup_repo).
+# Real git repo fixture (mirrors test_git_ops.py::git_repo, via _git_fixtures.seed_repo).
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit on main."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
-
-
-async def _setup_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+    return seed_repo(tmp_path / 'repo')
 
 
 # ---------------------------------------------------------------------------

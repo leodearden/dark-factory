@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from _orch_helpers import make_mock_gate as _make_gate  # centralized factory (task 1458)
+from _steward_helpers import _make_escalation, _make_result, _sole_invocation_end_data
 from escalation import archive
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -19,6 +20,7 @@ from shared.cli_invoke import AllAccountsCappedException
 from shared.testing_resume_rejection import measured_resume_rejection
 from shared.usage_gate import AccountLease, InvokeSlot
 
+from orchestrator.agents.steward_digest import EarlierAttempts
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.event_store import EventType
 from orchestrator.steward import (
@@ -34,24 +36,6 @@ from orchestrator.workflow_types import (
     StewardReescalatedL1,
     StewardResolved,
 )
-
-
-def _sole_invocation_end_data(emit_mock) -> dict:
-    """Return the ``data`` payload of the single ``invocation_end`` emit.
-
-    task η: ``_invoke_with_session`` now emits a ``routing_decision`` event
-    before the ``invocation_end`` event, so a bare ``emit.assert_called_once()``
-    no longer holds. Filter to the ``invocation_end`` call (asserting it fired
-    exactly once) rather than relaxing to the last-call heuristic.
-    """
-    calls = [
-        c for c in emit_mock.call_args_list
-        if c.args and c.args[0] == EventType.invocation_end
-    ]
-    assert len(calls) == 1, (
-        f'expected exactly one invocation_end emit; got {emit_mock.call_args_list!r}'
-    )
-    return calls[0].kwargs['data']
 
 
 def _attach_invoke_slot(gate: MagicMock) -> MagicMock:
@@ -112,7 +96,12 @@ def steward(make_steward):
     set it explicitly, and the rest either resolve successfully, start at
     ``retry_count=0`` (``0 >= 1`` is False), or hit the budget guard first.
     """
-    steward = make_steward(config_overrides={'steward_max_attempts': 1})
+    steward = make_steward(config_overrides={
+        'steward_max_attempts': 1,
+        # This module characterises the resume arm's session bookkeeping; the
+        # default arm is covered in test_steward_session_mode.py.
+        'steward_session_mode': 'resume',
+    })
     # Deliberately distinct from _make_escalation's default id 'esc-42-1' —
     # which is exactly conftest's make_id default.  A steward-minted escalation
     # must stay distinguishable from the escalation under test, or the two
@@ -150,26 +139,6 @@ def mock_briefing(steward):
     return steward.briefing
 
 
-def _make_result(
-    cost=1.0, turns=5, session_id='sess-abc', success=True,
-    duration_ms=5000, stderr='', timed_out=False, subtype='',
-    ended_awaiting_background=False,
-):
-    from shared.cli_invoke import AgentResult
-    return AgentResult(
-        success=success,
-        output='done',
-        stderr=stderr,
-        cost_usd=cost,
-        duration_ms=duration_ms,
-        turns=turns,
-        session_id=session_id,
-        timed_out=timed_out,
-        subtype=subtype,
-        ended_awaiting_background=ended_awaiting_background,
-    )
-
-
 def _make_capped_result(session_id='sess-capped', cost=1.0):
     from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
     from shared.cli_invoke import AgentResult
@@ -182,19 +151,6 @@ def _make_capped_result(session_id='sess-capped', cost=1.0):
         turns=1,
         session_id=session_id,
     )
-
-
-def _make_escalation(**overrides):  # type: ignore[no-untyped-def]
-    defaults: dict = dict(
-        id='esc-42-1',
-        task_id='42',
-        agent_role='orchestrator',
-        severity='blocking',
-        category='limit_exhausted',
-        summary='execute limit exhausted',
-    )
-    defaults.update(overrides)
-    return Escalation(**defaults)  # type: ignore[arg-type]
 
 
 def _assert_cap_fire_pops_counters(steward, esc_id, mock_invoke):  # type: ignore[no-untyped-def]
@@ -510,6 +466,8 @@ class TestStewardInvokeWithCapRetryWiring:
             escalation={**live.to_dict(), 'detail': esc.detail, 'summary': esc.summary},
             pending_escalations=[e.to_dict() for e in fresh_pending],
             worktree=steward.worktree,
+            handled=(),
+            earlier_attempts=EarlierAttempts(),
         )
         assert result == mock_briefing.build_steward_initial_prompt.return_value
 

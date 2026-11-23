@@ -17,6 +17,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### New `park_refused` event and `park_refused_emit_interval_secs` (task 6328)
+
+**Old behaviour.** Only the scored scan's top candidate earns skips and fairness
+parks. A candidate below it that was refused its locks by a same-tier (or
+lower-tier) park earned nothing and left no trace: no skip, no park, no event. It
+waited as long as the park's owner did. 6040 waited about 70 h behind 5221's
+critical park, while 5221 waited on 3096's hold of `harness.py`.
+
+**New behaviour.**
+
+- **New `park_refused` event** for a dispatch candidate refused by parks alone, none
+  of which outranks it. Higher-tier fairness parks (fairness working as designed),
+  pin reservations (they report through `pin_blocked`) and any held blocker are out
+  of the class. Payload `{task_id, priority, episode_secs, blockers: [{module, owner,
+  kind}], park_owners: [{owner, source, tier|pin_order, park_age_secs,
+  waiting_on}]}`; `waiting_on` is the owner's own blockers, or `null` when the owner
+  is not in the tick's task list. Dispatch decisions are unchanged.
+- **New config key `park_refused_emit_interval_secs`**, default `1800`, `gt=0`,
+  green tier. The first event comes once the refusal has lasted one interval, then at
+  most once per interval. A dispatch, a refusal by anything else, or the task leaving
+  the dispatch candidates ends the episode; a scoped tick (task 8480) does not.
+- **New read `ModuleLockTable.top_park_rank(owner)`**: the strongest rank among the
+  stack tops the owner holds.
+
+The operator lever is to pin the waiting task: OPERATIONS.md §5, "A task waiting on a
+peer's park". Why visibility rather than an automatic reservation:
+`plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7, "Annotation (task 6328)".
+
 #### Low follow-ups are held behind a per-project follow-up holder (task 8417)
 
 `submit_task` now files a low or polish agent follow-up or reviewer suggestion

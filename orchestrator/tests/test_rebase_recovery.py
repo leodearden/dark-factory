@@ -2288,3 +2288,238 @@ class TestPreflightCli:
         assert payload['merge_rr_backup'] is not None, 'MERGE_RR was still repaired'
         assert payload['verdict'] == rebase_recovery.VERDICT_BLOCKED
         assert str(os.getpid()) in ' '.join(payload['unrepaired'])
+
+
+# ---------------------------------------------------------------------------
+# A prior occupant's interrupted operation is moved aside (task 10991)
+# ---------------------------------------------------------------------------
+
+def _build_clean_linked_worktree(root: Path) -> tuple[Path, Path]:
+    """A linked worktree on ``feature`` with no interrupted operation at all."""
+    repo = _build_conflicting_branches(root, 'repo')
+    linked = root / 'linked'
+    _git_ok(repo, 'worktree', 'add', '-q', str(linked), 'feature')
+    return repo, linked
+
+
+def _operation_specimens_dir(repo: Path) -> Path:
+    return repo / '.git' / 'interrupted-operation-specimens'
+
+
+def _plant_merge_head(git_dir: Path, linked: Path, message: str) -> str:
+    head = _git_ok(linked, 'rev-parse', 'HEAD').strip()
+    (git_dir / 'MERGE_HEAD').write_text(f'{head}\n')
+    (git_dir / 'MERGE_MSG').write_text(f'{message}\n')
+    return head
+
+
+class _FrozenClock(datetime):
+    """Every quarantine in a case lands in the SAME second."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return _NOW
+
+
+class TestQuarantineInterruptedOperation:
+    """A lane's previous occupant can leave a rebase or merge half-done.
+
+    reify's _lane-20 handed task/10089 a lane whose rebase-merge/ still named
+    task/9844, and the next defensive abort reset task/9844 to its orig-head and
+    checked it out.  Moving the state aside changes no ref, HEAD, index or tree,
+    and the specimen keeps the evidence of whose operation it was.
+    """
+
+    def test_a_mid_rebase_linked_worktree_is_moved_aside_without_moving_a_ref(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        repo, linked, _ = build_linked_mid_rebase_worktree(tmp_path)
+        git_dir = repo / '.git' / 'worktrees' / 'linked'
+        feature_before = _git_ok(repo, 'rev-parse', 'refs/heads/feature')
+        head_file_before = (git_dir / 'HEAD').read_bytes()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_recovery'):
+            specimen = rebase_recovery.quarantine_interrupted_operation(linked)
+
+        assert specimen is not None
+        assert specimen.parent.resolve() == _operation_specimens_dir(repo).resolve()
+        assert specimen.name.startswith('linked')
+        assert not (git_dir / 'rebase-merge').exists()
+        assert (specimen / 'rebase-merge' / 'head-name').read_text().strip() == (
+            'refs/heads/feature'
+        )
+        assert _git_ok(repo, 'rev-parse', 'refs/heads/feature') == feature_before
+        assert (git_dir / 'HEAD').read_bytes() == head_file_before
+        assert (git_dir / 'MERGE_RR').exists(), 'rerere state stays with the preflight'
+        assert not (specimen / 'MERGE_RR').exists()
+        logged = '\n'.join(r.getMessage() for r in caplog.records)
+        assert str(specimen) in logged, logged
+        assert 'refs/heads/feature' in logged, logged
+
+    def test_a_merge_head_and_its_message_move_into_one_specimen(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, linked = _build_clean_linked_worktree(tmp_path)
+        git_dir = repo / '.git' / 'worktrees' / 'linked'
+        head = _plant_merge_head(git_dir, linked, 'prior occupant merge')
+
+        specimen = rebase_recovery.quarantine_interrupted_operation(linked)
+
+        assert specimen is not None
+        assert (specimen / 'MERGE_HEAD').read_text().strip() == head
+        assert (specimen / 'MERGE_MSG').read_text().strip() == 'prior occupant merge'
+        assert not (git_dir / 'MERGE_HEAD').exists()
+        assert not (git_dir / 'MERGE_MSG').exists()
+
+    def test_a_worktree_with_nothing_interrupted_is_left_alone(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, linked = _build_clean_linked_worktree(tmp_path)
+
+        assert rebase_recovery.quarantine_interrupted_operation(linked) is None
+        assert not _operation_specimens_dir(repo).exists()
+
+    def test_two_quarantines_in_the_same_second_keep_both_specimens(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        repo, linked = _build_clean_linked_worktree(tmp_path)
+        git_dir = repo / '.git' / 'worktrees' / 'linked'
+        monkeypatch.setattr(rebase_recovery, 'datetime', _FrozenClock)
+
+        _plant_merge_head(git_dir, linked, 'first')
+        first = rebase_recovery.quarantine_interrupted_operation(linked)
+        _plant_merge_head(git_dir, linked, 'second')
+        second = rebase_recovery.quarantine_interrupted_operation(linked)
+
+        assert first is not None and second is not None
+        assert first != second
+        assert (first / 'MERGE_MSG').read_text().strip() == 'first'
+        assert (second / 'MERGE_MSG').read_text().strip() == 'second'
+
+    @pytest.mark.parametrize(
+        'make_worktree',
+        (vanished_worktree, worktree_is_a_file, git_probe_times_out),
+        ids=lambda f: f.__name__,
+    )
+    def test_no_hostile_state_makes_it_raise(
+        self, make_worktree, tmp_path: Path, monkeypatch,
+    ) -> None:
+        worktree = make_worktree(tmp_path, monkeypatch)
+
+        assert rebase_recovery.quarantine_interrupted_operation(worktree) is None
+
+    @pytest.mark.parametrize(
+        'make_worktree',
+        (vanished_worktree, worktree_is_a_file, git_probe_times_out),
+        ids=lambda f: f.__name__,
+    )
+    def test_no_hostile_state_makes_a_specimen_claim_raise(
+        self, make_worktree, tmp_path: Path, monkeypatch,
+    ) -> None:
+        worktree = make_worktree(tmp_path, monkeypatch)
+
+        assert rebase_recovery.claim_specimen_dir(worktree) is None
+
+
+def _move_branch_to_a_new_commit(repo: Path, branch: str) -> str:
+    """Advance *branch* by one commit without touching any worktree."""
+    moved = _git_ok(
+        repo, 'commit-tree', f'{branch}^{{tree}}', '-p', branch, '-m', 'moved on',
+    ).strip()
+    _git_ok(repo, 'update-ref', f'refs/heads/{branch}', moved)
+    return moved
+
+
+@pytest.mark.asyncio
+class TestRebaseOntoMainNeverAbortsARebaseItDidNotStart:
+    """An abort resets the rebase's head-name to orig-head and checks it out.
+
+    That is the right undo for a rebase this call started, and the incident's
+    damage for one it did not: on reify's _lane-20, task/10089's resume aborted
+    task/9844's abandoned rebase, which reset task/9844 to its orig-head.
+    """
+
+    async def test_a_stale_rebase_under_an_attached_head_is_moved_aside(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, linked, _ = build_linked_mid_rebase_worktree(tmp_path)
+        moved = _move_branch_to_a_new_commit(repo, 'feature')
+        _git_ok(linked, 'checkout', '-f', '-b', 'victim', 'main')
+        (linked / 'victim.txt').write_text('victim work\n')
+        _git_ok(linked, 'add', 'victim.txt')
+        _git_ok(linked, 'commit', '-qm', 'victim work')
+        ops = _make_git_ops(repo)
+
+        with _guard_spy() as recorded:
+            landed = await ops.rebase_onto_main(linked)
+
+        assert landed is True
+        assert _git_ok(repo, 'rev-parse', 'refs/heads/feature').strip() == moved
+        assert _git_ok(linked, 'symbolic-ref', 'HEAD').strip() == 'refs/heads/victim'
+        assert _git(linked, 'merge-base', '--is-ancestor', 'main', 'victim').returncode == 0
+        rebase_state = Path(
+            _git_ok(linked, 'rev-parse', '--path-format=absolute',
+                    '--git-path', 'rebase-merge').strip(),
+        )
+        assert not rebase_state.exists()
+        assert list(_operation_specimens_dir(repo).iterdir())
+        assert recorded == []
+
+    async def test_a_rebase_still_owning_a_detached_head_is_refused_not_aborted(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, linked, _ = build_linked_mid_rebase_worktree(tmp_path)
+        feature_before = _git_ok(repo, 'rev-parse', 'refs/heads/feature')
+        ops = _make_git_ops(repo)
+
+        with _guard_spy() as recorded:
+            landed = await ops.rebase_onto_main(linked)
+
+        assert landed is False
+        assert recorded == []
+        assert (repo / '.git' / 'worktrees' / 'linked' / 'rebase-merge').is_dir()
+        assert _git_ok(repo, 'rev-parse', 'refs/heads/feature') == feature_before
+
+    async def test_a_clean_worktree_has_no_prior_rebase(
+        self, tmp_path: Path,
+    ) -> None:
+        _, linked = _build_clean_linked_worktree(tmp_path)
+
+        assert rebase_recovery.quarantine_stale_rebase(linked) is (
+            rebase_recovery.PriorRebase.NONE
+        )
+
+    async def test_a_stopped_git_am_under_an_attached_head_is_left_alone(
+        self, tmp_path: Path,
+    ) -> None:
+        """``git am`` keeps rebase-apply/ under an attached HEAD; it is not stale."""
+        repo, linked = _build_clean_linked_worktree(tmp_path)
+        mailbox = tmp_path / 'main-edit.patch'
+        mailbox.write_text(_git_ok(repo, 'format-patch', '-1', '--stdout', 'main'))
+        assert _git(linked, 'am', str(mailbox)).returncode != 0, 'fixture expected am to stop'
+        git_dir = repo / '.git' / 'worktrees' / 'linked'
+        assert (git_dir / 'rebase-apply' / 'applying').exists()
+        feature_before = _git_ok(repo, 'rev-parse', 'refs/heads/feature')
+        ops = _make_git_ops(repo)
+
+        with _guard_spy() as recorded:
+            landed = await ops.rebase_onto_main(linked)
+
+        assert landed is False
+        assert recorded == []
+        assert (git_dir / 'rebase-apply' / 'applying').exists()
+        assert _git_ok(linked, 'symbolic-ref', 'HEAD').strip() == 'refs/heads/feature'
+        assert _git_ok(repo, 'rev-parse', 'refs/heads/feature') == feature_before
+        assert not _operation_specimens_dir(repo).exists()
+
+    async def test_a_stale_rebase_that_cannot_be_moved_is_left_in_place(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, linked, _ = build_linked_mid_rebase_worktree(tmp_path)
+        _git_ok(linked, 'checkout', '-f', '-b', 'victim', 'main')
+        _operation_specimens_dir(repo).write_text('a file where the specimens go\n')
+
+        prior = rebase_recovery.quarantine_stale_rebase(linked)
+
+        assert prior is rebase_recovery.PriorRebase.IN_PROGRESS
+        assert (repo / '.git' / 'worktrees' / 'linked' / 'rebase-merge').is_dir()

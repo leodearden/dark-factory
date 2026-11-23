@@ -659,3 +659,68 @@ module (the overlay's same-file rule): **α → β → γ → δ → ε → ζ �
    `git_ops.lane_release`, `git_ops.merging`). Decide in each leaf, consistently with S5's
    `worktrees` / `landing` / `branches` / `queries`.
 3. **Whether `lane_paths` exists.** α decides it from where S5 put the facts (D7, R6).
+
+## Decompose record (2026-11-22, gate 11190)
+
+Decomposed by the `/team` session for human gate 11190 (esc-11190-1) at main `2f18cea0d1`; the capability manifest
+(`plans/git-ops-split-prd.capability-manifest.md`, sidecar beside it) was verified at `a4349b7f4b` and stamped by
+`commit_planning`. Every leaf is `task_kind='normal'`, carries `x_finding_key = ["fk-c00c5f01be4c"]`,
+`x_finding_run = "review-all-dark_factory-20261008"` and `source = "prd"`.
+
+| Label | Task |
+|---|---|
+| α | 11411 |
+| β | 11412 |
+| γ | 11413 |
+| δ0 | 11414 |
+| δ | 11415 |
+| ε | 11416 |
+| ζ0 | 11417 |
+| ζ | 11418 |
+| η | 11419 |
+| θ0 | 11420 |
+| θ | 11421 |
+| ι | 11422 |
+| ω | 11423 |
+
+**Codemod siblings (the §Decomposition plan's ~40-test-file rule, applied).** δ, ζ and θ named 80, 53 and 94 test files
+on main `a4349b7f4b`, so each is filed as a codemod sibling (δ0, ζ0, θ0: `complexity='simple'` with
+`force_full_path=true`, S5 ξ0's shape) plus the move leaf. The codemod creates the modules with the moved types and
+one-step surfaces that call the not-yet-moved bodies through a Protocol-typed reference, composes them, repoints callers
+and tests, and adds the modules to `CLUSTER_PATHS`; the move leaf moves the bodies and deletes the Protocol and the
+back-reference. These counts are pre-S5 predictions: α re-enumerates the three caller sets. ε and η named 35 each; with
+both D12 fallbacks η's union is about 56, so α's Correction says whether an η0 sibling is needed.
+
+**Edges.** One total order α → β → γ → δ0 → δ → ε → ζ0 → ζ → η → θ0 → θ → ι → ω. α → S5 π (9275). The S9 λ1 (9246) edge
+sits on δ0 and the 5042 edge on θ0, because the type and constant moves happen in the codemods. The trigger-chain gate
+6698 depends on every `high` leaf: β, δ0, δ, ζ0, ζ, ι, ω.
+
+**Decision-10 gating as executed.** 74 non-terminal tasks whose `metadata.files` (or `files_hint`) declares
+`git_ops.py` or an S5 git-engine module gained a dependency on α (11411), computed from the store at wiring time.
+Not gated: 26 tasks upstream of 9275 (gating them would close a cycle); 3105 (in progress with a live claimant); 10473
+and 10991 (blocked with work in flight); by Leo's rulings on 2026-11-22, the pinned tasks 3928 (starvation-watchdog
+pin), 6696, 8412, 10736 and 11050, and this batch's own prerequisites and composition site 5042, 9246 and 9218 (S8 β).
+`shared/src/shared/git_async.py` is not a gated path: no leaf edits it. As with merge-lane-quality's ζ2, tasks filed
+after this decompose are not gated automatically; until α lands, a new task declaring one of these files needs
+`add_dependency(<id>, 11411)` by hand. Gated: 3039, 3047, 3156, 3267, 3354, 3356, 3652, 3665, 3855, 3856, 3971, 4138, 4196, 4197, 4210, 4323, 4330, 4420, 4606, 4746, 4799, 5144, 5293, 5297, 5298, 5300, 5358, 5360, 5493, 5584, 5621, 6124, 6194, 6242, 6246, 6257, 6432, 6522, 6554, 6589, 6697, 6727, 6855, 6892, 7031, 7053, 7069, 7087, 7318, 7369, 7458, 7540, 7691, 7766, 7767, 7842, 7858, 7908, 8266, 8392, 8605, 8631, 8788, 8803, 9107, 9277, 10099, 10265, 10474, 10717, 10842, 11199, 11203, 11263.
+
+**Other decompose-time steps.** `Debt(TaskRef(7140))` in
+`scripts/tests/test_scripts_governed_lists.py::SIZE_CEILING_EXEMPT_LIST` now names ω (11423) (D11). Task 6432
+carries a dated note naming `git_queries.GitQueries` as its probes' home (D9). Six S5 delivered checks that pinned a
+symbol this batch moves to `git_ops.py` (`from_seed_rc`, `adopt_lane`, `_classify_acquire_route`, `_ensure_pool_storage`,
+`GitOpsCallbacks`, `GitOpsLimits`) were widened in the S5 sidecar and in the copied `metadata.delivered_checks` of
+9259–9262, polarity unchanged.
+
+**Corrections to this PRD's text found at decompose** (applied in the leaf briefs, not by editing the sections above):
+- D4's "each extraction leaf adds its own module ... without a raise" holds for file lines only. A moved function
+  arrives under a new baseline key, and any above `NEW_FUNCTION_COGNITIVE_CEILING` (15) is a
+  `new_function_over_ceiling` raise (`scripts/merge_lane_ratchet.py::_check_ceilings`). Each moving leaf records it
+  with `--authorize-raise` naming the function, its unchanged score and its owner.
+- γ does not edit inside `advance_main` (task 5042 owns it, D9), so γ's signal is `archaeology_blocks = 0` outside
+  `advance_main`.
+- δ's, ε's and ζ's signals cite B5, B9 and B10 as they hold at each leaf's chain point (merge-worktree cleanup and
+  rename/quarantine still live in S5's modules). ι owns the final-layout forms.
+- α measures every class a later leaf splits (GitOps, WorktreeOps, GitQueries, TaskBranchRefs, MainLanding), not
+  GitOps alone.
+- D12 names no fallback for `main_landing` itself. If it measures over 1,465 after θ's planned splits, θ records the
+  measurement and escalates rather than inventing a split.

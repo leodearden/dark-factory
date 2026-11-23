@@ -12557,6 +12557,68 @@ class TestRebindBranchToHead:
         # Clean up the second worktree
         await _run(['git', 'worktree', 'remove', '--force', str(second_wt)], cwd=git_repo)
 
+    async def _lane_with_one_commit_on_x(
+        self, git_repo: Path,
+    ) -> tuple[GitOps, Path, str]:
+        await _add_warm_lane_scripts(git_repo)
+        _, start_ref_raw, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=git_repo)
+        git_ops = GitOps(self._warm_config(), git_repo, warm_lane_pool_size=1)
+        info = await git_ops.acquire_warm_lane('X', start_ref_raw.strip())
+        assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
+        (info.path / 'wip.txt').write_text('work\n')
+        await _run(['git', 'add', '-A'], cwd=info.path)
+        await _run(['git', 'commit', '-m', 'wip'], cwd=info.path)
+        _, x_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/X'], cwd=git_repo,
+        )
+        return git_ops, info.path, x_sha_raw.strip()
+
+    async def test_rebind_refuses_a_lane_attached_to_a_foreign_branch(
+        self, git_repo: Path,
+    ):
+        """(e) task 10991: a lane on task/F must never become task/X's tip.
+
+        reify task/10089 lost its commit when its resume ran ``checkout -B``
+        over a lane a foreign checkout had left on another task's branch.
+        """
+        git_ops, lane, x_sha = await self._lane_with_one_commit_on_x(git_repo)
+        _, main_sha_raw, _ = await _run(['git', 'rev-parse', 'main'], cwd=git_repo)
+        await _run(['git', 'branch', 'task/F', 'main'], cwd=git_repo)
+        rc, _, err = await _run(['git', 'checkout', 'task/F'], cwd=lane)
+        assert rc == 0, err
+
+        result = await git_ops.rebind_branch_to_head(lane, 'task/X')
+
+        assert result is False
+        _, ref_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/X'], cwd=git_repo,
+        )
+        assert ref_sha_raw.strip() == x_sha
+        _, attached_raw, _ = await _run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=lane,
+        )
+        assert attached_raw.strip() == 'task/F'
+        _, f_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/F'], cwd=git_repo,
+        )
+        assert f_sha_raw.strip() == main_sha_raw.strip()
+
+    async def test_rebind_refuses_a_lane_detached_off_the_branch_lineage(
+        self, git_repo: Path,
+    ):
+        """(f) Detached at neither task/X's tip nor a descendant: refused."""
+        git_ops, lane, x_sha = await self._lane_with_one_commit_on_x(git_repo)
+        rc, _, err = await _run(['git', 'checkout', '--detach', 'main'], cwd=lane)
+        assert rc == 0, err
+
+        result = await git_ops.rebind_branch_to_head(lane, 'task/X')
+
+        assert result is False
+        _, ref_sha_raw, _ = await _run(
+            ['git', 'rev-parse', 'refs/heads/task/X'], cwd=git_repo,
+        )
+        assert ref_sha_raw.strip() == x_sha
+
 
 # ===========================================================================
 # Task-1923 step-5: RED — disk-backstop route end-to-end via acquire_warm_lane

@@ -1481,9 +1481,12 @@ class GraphitiBackend:
             )
 
     async def _provision_existing_registered_graphs(self) -> None:
-        existing = await self.graph_access.list_graphs()
-        for graph_name in sorted(set(existing) & self._registered_graph_ids):
+        for graph_name in await self._existing_registered_graphs():
             await self._ensure_indices(graph_name)
+
+    async def _existing_registered_graphs(self) -> list[str]:
+        """The graphs startup maintenance owns: registered ones the server has (D5)."""
+        return sorted(set(await self.graph_access.list_graphs()) & self._registered_graph_ids)
 
     async def initialize(
         self,
@@ -3952,9 +3955,10 @@ class GraphitiBackend:
     async def _run_startup_identity_scan(self) -> dict:
         """Startup identity-integrity sweep — per-graph orchestrator (W6-ε).
 
-        Enumerates every project graph via list_graphs() and, for each, runs
+        Enumerates every registered graph that exists and, for each, runs
         both the dup-NODE alarm (_scan_duplicate_entity_names) and the
-        dup-uuid-EDGE repair (_repair_duplicate_edge_uuids). Each graph is
+        dup-uuid-EDGE repair (_repair_duplicate_edge_uuids). The scope rule's
+        home is docs/prds/falkordb-index-provisioning.md D5. Each graph is
         processed best-effort: a failure on one graph is caught and logged,
         never aborting the sweep over the rest — mirrors the initialize()
         index-setup loop idiom (graphiti_client.py:378-385, try/except
@@ -3984,7 +3988,7 @@ class GraphitiBackend:
             - elapsed_ms: wall-clock duration of the full sweep (all graphs),
               in milliseconds.
         """
-        graphs = await self.list_graphs()
+        graphs = await self._existing_registered_graphs()
         stats: dict[str, int | float] = {
             'graphs_scanned': 0, 'dup_name_groups': 0, 'edges_repaired': 0,
         }
