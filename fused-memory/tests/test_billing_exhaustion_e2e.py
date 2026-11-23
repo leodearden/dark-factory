@@ -11,7 +11,6 @@ lands. A restart neither pages again nor strands the page it inherits.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -39,6 +38,8 @@ from fused_memory.services.memory_service import MemoryService
 
 pytest.importorskip('escalation.queue', reason='escalation package unavailable (minimal env)')
 from escalation.archive import ARCHIVE_SUBDIR  # noqa: E402
+from escalation.models import Escalation  # noqa: E402
+from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan  # noqa: E402
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -81,10 +82,13 @@ def _primary_root(svc: MemoryService) -> Path:
     return Path(root)
 
 
-def _records(root: Path, category: str) -> list[dict]:
-    """Every record of *category* on disk, the archive a resolve moves it to included."""
-    records = (json.loads(p.read_text()) for p in escalation_queue_dir(root).rglob('esc-*.json'))
-    return [r for r in records if r['category'] == category]
+def _records(root: Path, category: str) -> list[Escalation]:
+    """Every *category* record on disk, archive included; one moved mid-listing is skipped, not raised."""
+    scanned = (
+        read_escalation_for_scan(path, context='billing e2e')[0]
+        for path in iter_all_escalation_paths(escalation_queue_dir(root))
+    )
+    return [esc for esc in scanned if esc is not None and esc.category == category]
 
 
 async def _counts(svc: MemoryService) -> dict:
@@ -113,9 +117,9 @@ class TestExhaustedCreditsOnTheDurablePath:
             lambda: _records(root, _BILLING) or None, timeout=20.0,
             message='no provider_billing_exhausted page was filed',
         )
-        assert page['severity'] == 'critical'
-        assert page['level'] == 2
-        assert 'credits exhausted' in page['summary'].lower()
+        assert page.severity == 'critical'
+        assert page.level == 2
+        assert 'credits exhausted' in page.summary.lower()
         counts = await poll_until(
             lambda: _parked_counts(svc), timeout=20.0, message='nothing parked',
         )
@@ -153,7 +157,7 @@ class TestExhaustedCreditsOnTheDurablePath:
         await poll_until(_drained, timeout=20.0, message='the parked writes never drained')
         root = _primary_root(svc)
         await poll_until(
-            lambda: [r['status'] for r in _records(root, _BILLING)] == ['resolved'],
+            lambda: [r.status for r in _records(root, _BILLING)] == ['resolved'],
             timeout=20.0, message='the billing page was not resolved',
         )
 
@@ -198,10 +202,10 @@ class TestExhaustedCreditsOnTheMem0Path:
         assert first.stores_pending_retry == [SourceStore.mem0]
         assert second.stores_pending_retry == [SourceStore.mem0]
         [page] = _records(_primary_root(svc), _BILLING)
-        assert page['severity'] == 'critical'
-        assert page['level'] == 2
-        assert page['status'] == 'pending'
-        assert 'credits exhausted' in page['summary'].lower()
+        assert page.severity == 'critical'
+        assert page.level == 2
+        assert page.status == 'pending'
+        assert 'credits exhausted' in page.summary.lower()
 
     @pytest.mark.asyncio
     async def test_a_landed_write_resolves_the_page(self, billing_service):
@@ -213,7 +217,7 @@ class TestExhaustedCreditsOnTheMem0Path:
         landed = await _add_preference(svc, 'prefer frozen dataclasses for values')
 
         assert landed.memory_ids == ['mem0-back']
-        assert [r['status'] for r in _records(_primary_root(svc), _BILLING)] == ['resolved']
+        assert [r.status for r in _records(_primary_root(svc), _BILLING)] == ['resolved']
 
     @pytest.mark.asyncio
     async def test_a_write_that_lands_nothing_leaves_the_page_open(self, billing_service):
@@ -227,7 +231,7 @@ class TestExhaustedCreditsOnTheMem0Path:
         empty = await _add_preference(svc, 'prefer frozen dataclasses for values')
 
         assert empty.memory_ids == []
-        assert [r['status'] for r in _records(_primary_root(svc), _BILLING)] == ['pending']
+        assert [r.status for r in _records(_primary_root(svc), _BILLING)] == ['pending']
 
     @pytest.mark.asyncio
     async def test_a_transient_429_defers_without_a_billing_page(self, billing_service):
@@ -252,7 +256,7 @@ class TestARestartMidOutage:
         async with _running_service(mock_config, tmp_path) as after:
             await _add_preference(after, 'credits were restored during the restart')
 
-            statuses = [r['status'] for r in _records(_primary_root(after), _BILLING)]
+            statuses = [r.status for r in _records(_primary_root(after), _BILLING)]
         assert statuses == ['resolved']
 
     @pytest.mark.asyncio
@@ -271,11 +275,11 @@ class TestARestartMidOutage:
             )
             root = _primary_root(after)
             [page] = _records(root, _BILLING)
-            assert page['status'] == 'pending'
+            assert page.status == 'pending'
 
             after.graphiti.add_episode = AsyncMock(return_value=None)
             await poll_until(
-                lambda: [r['status'] for r in _records(root, _BILLING)] == ['resolved'],
+                lambda: [r.status for r in _records(root, _BILLING)] == ['resolved'],
                 timeout=20.0, message='the inherited page was not resolved',
             )
 
