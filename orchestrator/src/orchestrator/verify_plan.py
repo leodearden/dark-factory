@@ -1039,7 +1039,7 @@ def _task_3294_floor_run(
     )
 
 
-def _merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
+def merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
     """True iff *config*'s merge gate breadth is ``'full'``.
 
     A ``None`` *config* (every role='task' caller, and most existing tests)
@@ -1049,6 +1049,13 @@ def _merge_breadth_is_full(config: OrchestratorConfig | None) -> bool:
     way, because breadth is merge-role-gated.
     """
     return config is not None and config.merge_verify_breadth == 'full'
+
+
+# The name this module's own callers read, so that the patch of it in
+# orchestrator/tests/test_verify_plan.py reaches them;
+# tests/scripts/test_config_retune_gate_decision.py calls it too. Other
+# modules import merge_breadth_is_full.
+_merge_breadth_is_full = merge_breadth_is_full
 
 
 def effective_merge_module_configs(

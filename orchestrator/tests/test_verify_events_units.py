@@ -219,6 +219,12 @@ class TestUnitVocabulary:
         })
         assert set(UnitOutcome) - green == {UnitOutcome.RAN_RED}
 
+    def test_every_leg_names_a_module_config_command_field(self):
+        command_fields = {field.name for field in dataclasses.fields(ModuleConfig) if field.name.endswith('_command')}
+
+        assert set(verify_evidence.COMMAND_FIELD_BY_LEG) == set(verify_evidence.Leg)
+        assert set(verify_evidence.COMMAND_FIELD_BY_LEG.values()) == command_fields
+
     @pytest.mark.parametrize(('outcome', 'evidence', 'leaked'), [
         (UnitOutcome.RAN_RED, 7, True),
         (UnitOutcome.RAN_RED, None, False),

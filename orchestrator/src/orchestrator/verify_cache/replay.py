@@ -24,6 +24,7 @@ from orchestrator.verify_cache.policy import CacheDecision, Decision, LegResult,
 from orchestrator.verify_cache.recorder import CacheRecord, LegRun, RecordedUnit
 from orchestrator.verify_cache.registry import Entry, Registry, registry_db_path
 from orchestrator.verify_evidence import (
+    COMMAND_FIELD_BY_LEG,
     GREEN_OUTCOMES,
     Leg,
     UnitOutcome,
@@ -38,8 +39,6 @@ logger = logging.getLogger(__name__)
 
 #: The effective env a module's legs run under (``verify.py::_resolve_verify_env``).
 LegEnv = Callable[[ModuleConfig | None], Mapping[str, str]]
-
-_COMMAND_FIELD = {Leg.TEST: 'test_command', Leg.LINT: 'lint_command', Leg.TYPE: 'type_check_command'}
 
 
 def _utc_now() -> datetime:
@@ -108,7 +107,7 @@ class ExecutedModule:
     def unit_ids(self) -> tuple[str, ...]:
         """The unit of every leg this module runs."""
         return tuple(
-            module_leg_name(self.prefix, leg) for leg, attr in _COMMAND_FIELD.items() if getattr(self, attr)
+            module_leg_name(self.prefix, leg) for leg, attr in COMMAND_FIELD_BY_LEG.items() if getattr(self, attr)
         )
 
 
@@ -170,8 +169,8 @@ class ReplayPlan:
         replayed = self.replayed_legs(mc.prefix)
         if not replayed:
             return mc
-        remaining = dataclasses.replace(mc, **{_COMMAND_FIELD[leg]: None for leg in replayed})
-        if not any(getattr(remaining, attr) for attr in _COMMAND_FIELD.values()):
+        remaining = dataclasses.replace(mc, **{COMMAND_FIELD_BY_LEG[leg]: None for leg in replayed})
+        if not any(getattr(remaining, attr) for attr in COMMAND_FIELD_BY_LEG.values()):
             return None
         return remaining
 

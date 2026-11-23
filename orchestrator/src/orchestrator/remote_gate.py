@@ -109,10 +109,12 @@ class GateReplyError(ValueError):
 
 _WIRE_METADATA_KEY = 'df_wire'
 
+_FieldValue = typing.TypeVar('_FieldValue')
 
-def off_wire_field(**field_kwargs: typing.Any) -> typing.Any:
-    """A dataclass field that never crosses the dispatcher/remote boundary."""
-    return dataclasses.field(**field_kwargs, metadata={_WIRE_METADATA_KEY: False})
+
+def off_wire_field(*, default: _FieldValue, compare: bool = True) -> _FieldValue:
+    """A dataclass field, defaulting to *default*, that never crosses the dispatcher/remote boundary."""
+    return dataclasses.field(default=default, compare=compare, metadata={_WIRE_METADATA_KEY: False})
 
 
 def wire_fields(cls: type) -> tuple[dataclasses.Field[typing.Any], ...]:

@@ -51,7 +51,7 @@ from orchestrator.merge_lane.types import (
 from orchestrator.rebase_drops import DroppedCommit, RebaseDropLedger
 from orchestrator.verify import VerifyResult, run_verification
 from orchestrator.verify_evidence import GREEN_OUTCOMES, Leg, module_leg_name, units_from_wire
-from orchestrator.verify_plan import _merge_breadth_is_full, full_suite_type_check_modules
+from orchestrator.verify_plan import full_suite_type_check_modules, merge_breadth_is_full
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -177,7 +177,7 @@ def _type_covered_modules(executed: VerifyResult | None, config: OrchestratorCon
     plan holds a FULL_SUITE pyright run with a command and its type unit is
     green; a result without units (an older remote) is decided by its plan.
     """
-    if executed is None or not _merge_breadth_is_full(config):
+    if executed is None or not merge_breadth_is_full(config):
         return frozenset()
     planned = full_suite_type_check_modules(executed.plan)
     if executed.units is None:

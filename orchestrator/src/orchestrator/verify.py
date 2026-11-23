@@ -7748,7 +7748,7 @@ async def run_verification(
         worktree,
         module_prefix,
         role=role,
-        merge_breadth_full=verify_plan._merge_breadth_is_full(config),
+        merge_breadth_full=verify_plan.merge_breadth_is_full(config),
         attempt_id=attempt_id,
         task_id=task_id,
         archive_root=archive_root,
@@ -9036,7 +9036,8 @@ def _worktree_pkg_test_lister(worktree: Path) -> Callable[[str], list[str]]:
     return _list
 
 
-# Maps a PlannedRun's leg to the ModuleConfig attribute it renders into. Used
+# A PlannedRun renders into its leg's ModuleConfig attribute,
+# verify_evidence.py::COMMAND_FIELD_BY_LEG. Used
 # by _executed_module_configs_from_plan to recover which of
 # test_command/lint_command/type_check_command a PlannedRun belongs to. The
 # leg comes from verify_plan.py::planned_run_leg, which decodes the run's
@@ -9052,13 +9053,6 @@ def _worktree_pkg_test_lister(worktree: Path) -> Callable[[str], list[str]]:
 # commands to.) A SKIPPED run's cmd
 # is None and needs no attribution, since the corresponding ModuleConfig
 # field is simply left unset (None) there.
-_MC_ATTR_BY_LEG: dict[verify_evidence.Leg, str] = {
-    verify_evidence.Leg.LINT: 'lint_command',
-    verify_evidence.Leg.TYPE: 'type_check_command',
-    verify_evidence.Leg.TEST: 'test_command',
-}
-
-
 def _mc_attr_for_run_or_none(run: verify_plan.PlannedRun) -> str | None:
     """Resolve which ModuleConfig attribute *run* renders into, from its reason prefix.
 
@@ -9070,7 +9064,7 @@ def _mc_attr_for_run_or_none(run: verify_plan.PlannedRun) -> str | None:
     variant for callers that have already excluded that shape.
     """
     leg = verify_plan.planned_run_leg(run)
-    return None if leg is None else _MC_ATTR_BY_LEG[leg]
+    return None if leg is None else verify_evidence.COMMAND_FIELD_BY_LEG[leg]
 
 
 def _mc_attr_for_run(run: verify_plan.PlannedRun) -> str:
@@ -9720,7 +9714,7 @@ async def _run_scoped_verification_body(
             # _run_scoped_verification_with_infra_retry) never takes this
             # fork — breadth is merge-role-gated only, so that call stays on
             # the legacy path unconditionally regardless of the knob.
-            if role == 'merge' and verify_plan._merge_breadth_is_full(config):
+            if role == 'merge' and verify_plan.merge_breadth_is_full(config):
                 # The expansion itself lives in
                 # verify_plan.effective_merge_module_configs (flake-ledger PRD
                 # §8.2 / task 3787 γ) — ONE implementation of "the effective

@@ -8,6 +8,7 @@ import hashlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum, StrEnum
+from types import MappingProxyType
 from typing import Any, Protocol
 
 from orchestrator.verify_cache.modes import CacheMode
@@ -31,6 +32,14 @@ class Leg(StrEnum):
     TEST = 'test'
     LINT = 'lint'
     TYPE = 'type'
+
+
+#: The ``ModuleConfig`` field holding each leg's command.
+COMMAND_FIELD_BY_LEG: Mapping[Leg, str] = MappingProxyType({
+    Leg.TEST: 'test_command', Leg.LINT: 'lint_command', Leg.TYPE: 'type_check_command',
+})
+if set(COMMAND_FIELD_BY_LEG) != set(Leg):
+    raise AssertionError(f'a Leg has no command field: {sorted(set(Leg) - set(COMMAND_FIELD_BY_LEG))}')
 
 
 class UnitOutcome(StrEnum):
