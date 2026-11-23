@@ -103,6 +103,12 @@ from orchestrator.artifacts import (
 )
 from orchestrator.branch_base import own_work_base
 from orchestrator.branch_mergeability import Mergeability, read_branch_state
+from orchestrator.branch_stack import (
+    RestackConflict,
+    StackInspectionError,
+    StackRecordState,
+    StackTarget,
+)
 from orchestrator.completion_record import completion_record_metadata
 from orchestrator.config import EscalationConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
@@ -1417,6 +1423,7 @@ class TaskWorkflow:
         resume_outcome_sink: ResumeOutcomeSink | None = None,
         task_verify: TaskVerifyPort | None = None,
         task_priority: TaskPriorityLookup | None = None,
+        stack_target: StackTarget | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -1449,6 +1456,9 @@ class TaskWorkflow:
         # Task 9908: the scheduler's tier/pin lookup, recorded on merge_queued;
         # None leaves those keys null.
         self._task_priority = task_priority
+        # Task 10473: the predecessor commit this task's branch is stacked on
+        # (early start); None dispatches off main as before.
+        self._stack_target = stack_target
 
         self.machine = WorkflowStateMachine(WorkflowState.PLAN)
         self._phase_cost_at_entry: float = 0.0
@@ -2904,6 +2914,7 @@ class TaskWorkflow:
                 # Redundant second enforcement of the harness gate's ruling
                 # (orchestrator/recut_ruling.py), from the same dispatch snapshot.
                 recut_ruling=ruling_to_enforce(self.task),
+                stack_on=self._stack_target,
             )
             self.worktree = worktree_info.path
             self._reify_debug_port = worktree_info.reify_debug_port
@@ -3475,7 +3486,11 @@ class TaskWorkflow:
                 escalate_to_human=True,
             )
 
-        except WarmLaneRequeue as e:
+        except (WarmLaneRequeue, RestackConflict) as e:
+            # A RestackConflict (task 10473) is an uncounted requeue through
+            # the same table row lookup and re-pend; RestackBlocked and
+            # StackRecordUnconfirmed fall through to the broad except.
+            #
             # W9-ε: block_reason is now single-sourced from
             # classify_failure(e) -> BlockDisposition instead of this
             # clause's own inline isinstance(e, WarmLanePoolHardDown)/
@@ -3508,7 +3523,7 @@ class TaskWorkflow:
             disp = classify_failure(e)
             block_reason = disp.reason_prefix
             logger.info(
-                'Task %s: warm-lane requeue (%s, counts_against_requeue_cap=%s): %s',
+                'Task %s: requeue (%s, counts_against_requeue_cap=%s): %s',
                 self.task_id, block_reason, disp.counts_against_requeue_cap, e,
             )
             # γ3/D6: make the REQUEUED exit TRUTHFUL — re-pend the row BEFORE
@@ -11771,11 +11786,32 @@ class TaskWorkflow:
         return self.artifacts.aggregate_reviews()
 
     async def _own_work_base(self) -> str:
-        """The base whose ``...HEAD`` range in the worktree is this task's own work."""
+        """The base whose ``...HEAD`` range in the worktree is this task's own work.
+
+        A branch still stacked on an unlanded predecessor's commits measures
+        from the top of them (``GitOps.own_delta_cut``, the merge queue's
+        rule); any other branch from its fork point with main.
+        """
         assert self.worktree is not None and self.artifacts is not None
+        if not self._worktree_external:
+            stack_cut = await self._unlanded_stack_cut()
+            if stack_cut is not None:
+                return stack_cut
         return await own_work_base(
             self.worktree, self.config.git.main_branch, self.artifacts.read_base_commit(),
         )
+
+    async def _unlanded_stack_cut(self) -> str | None:
+        branch = f'{self.config.git.branch_prefix}{self.task_id}'
+        try:
+            return await self.git_ops.own_delta_cut(branch)
+        except StackInspectionError as exc:
+            logger.warning(
+                'Task %s: cannot tell whether %s still carries a stack base (%s); '
+                'its own work is measured from the fork point with main',
+                self.task_id, branch, exc,
+            )
+            return None
 
     async def _context_complete_review_subject(self) -> ReviewSubject:
         """The context-complete reviewer's inputs, from the worktree at its own-work base."""
@@ -13462,11 +13498,17 @@ class TaskWorkflow:
         return MergerDisposition(resolved=True, reason=verdict.get('reason') or '')
 
     async def _settle_conflicting_base(self) -> WorkflowOutcome | None:
-        """Merge main into a resumed branch that conflicts with it, or block: see dispatch_base.py."""
+        """Merge main into a resumed branch that conflicts with it, or block: see dispatch_base.py.
+
+        A branch that is, or may be, stacked on a predecessor is left alone.
+        """
         if self._worktree_external or self._train is not None:
             return None
         assert self.worktree is not None and self.artifacts is not None
+        branch = f'{self.git_ops.config.branch_prefix}{self.task_id}'
         try:
+            if await self._may_be_stacked(branch):
+                return None
             conflict = await find_base_conflict(self.git_ops, self.worktree)
         except Exception:
             logger.warning(
@@ -13485,7 +13527,7 @@ class TaskWorkflow:
             )
         settlement = await settle_base_conflict(
             self.git_ops, self.worktree, conflict,
-            branch=f'{self.git_ops.config.branch_prefix}{self.task_id}',
+            branch=branch,
             merger=self._merger_disposition,
         )
         if not settlement.settled:
@@ -13505,6 +13547,19 @@ class TaskWorkflow:
             ', '.join(conflict.conflicted_paths),
         )
         return None
+
+    async def _may_be_stacked(self, branch: str) -> bool:
+        """Whether the stack-base ledger records, or a failed read may hide, a
+        predecessor base under *branch*: main is never merged into such a branch."""
+        stack = await self.git_ops.stack_base_read(branch)
+        if stack.state is StackRecordState.ABSENT:
+            return False
+        logger.info(
+            'Task %s: not merging main into %s at dispatch start: its stack-base '
+            'record is %s (base %s)%s', self.task_id, branch, stack.state, stack.base,
+            f': {stack.detail}' if stack.detail else '',
+        )
+        return True
 
     def _submit_halt_owning_escalation(self, esc: Escalation) -> None:
         """See ``orchestrator/src/orchestrator/merge_halt_escalation.py::submit_halt_owning_escalation``."""
@@ -19766,6 +19821,7 @@ def build_workflow(
     resume_outcome_sink: ResumeOutcomeSink | None = None,
     task_verify: TaskVerifyPort | None = None,
     task_priority: TaskPriorityLookup | None = None,
+    stack_target: StackTarget | None = None,
 ) -> TaskWorkflow:
     """Single construction point for :class:`TaskWorkflow` (PRD C2 / Invariant P2).
 
@@ -19803,4 +19859,5 @@ def build_workflow(
         resume_outcome_sink=resume_outcome_sink,
         task_verify=task_verify,
         task_priority=task_priority,
+        stack_target=stack_target,
     )

@@ -61,7 +61,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -86,7 +86,14 @@ from orchestrator import branch_stack, rebase_recovery
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.branch_stack import (
     PreStackTip,
+    RestackOutcome,
+    RestackResult,
+    RestackTrial,
+    RestackTrialOutcome,
     StackBaseLedger,
+    StackBaseRead,
+    StackRecordState,
+    StackTarget,
     TipRestore,
     TipRestoreOutcome,
     UnstackOutcome,
@@ -379,6 +386,26 @@ def _is_train_successor(train: TrainMembership | None) -> TypeGuard[TrainMembers
     """Whether *train* places its task after the train's anchor (order > 0),
     so the task's branch stacks on its predecessor's tip rather than main."""
     return train is not None and train.get('order', 0) > 0
+
+
+def _log_reused_on_old_base(
+    worktree_path: Path, train: TrainMembership | None, base: str,
+) -> None:
+    """Say that a reused worktree continues on its old base *base*.  For a
+    train successor that breaks the stacking invariant, so it is an ERROR,
+    visible rather than silently shipped on a stale base."""
+    if _is_train_successor(train):
+        logger.error(
+            'Rebase conflict for stacked train member %s (train_id=%r, '
+            'order=%s) — continuing on stale base %s; stack integrity is '
+            'degraded.',
+            worktree_path, train.get('id'), train.get('order'), base[:8],
+        )
+    else:
+        logger.warning(
+            'Rebase failed for reused worktree %s — continuing on old base %s',
+            worktree_path, base[:8],
+        )
 
 
 @dataclass(frozen=True)
@@ -2139,6 +2166,22 @@ class BranchResetError(RuntimeError):
                 f'manually from git reflog before proceeding'
             )
         super().__init__(f'{lead} {step.value} in {worktree}: {loss}; {restore_note}')
+
+
+class StackRecordUnconfirmed(RuntimeError):
+    """A branch :meth:`GitOps.create_worktree` stacked on a commit is in place,
+    but the stack-base ledger does not answer that commit, so no later reader
+    could tell the branch's own commits from its base's."""
+
+    def __init__(self, full_branch: str, expected_base: str, read_back: StackBaseRead) -> None:
+        self.full_branch = full_branch
+        self.expected_base = expected_base
+        self.read_back = read_back
+        super().__init__(
+            f'{full_branch} is stacked on {expected_base}, but its stack-base record '
+            f'reads back {read_back.state} {read_back.base}'
+            f'{f" ({read_back.detail})" if read_back.detail else ""}'
+        )
 
 
 class _ParkedBranchStranded(RuntimeError):
@@ -4653,6 +4696,21 @@ class GitOps:
             )
         return predecessor_sha, predecessor.branch
 
+    async def _train_stack_target(
+        self, train: TrainMembership, branch_name: str,
+    ) -> StackTarget:
+        sha, predecessor_branch = await self._resolve_predecessor_tip(train, branch_name)
+        return StackTarget(predecessor_branch, sha)
+
+    async def _confirm_stack_base(
+        self, full_branch: str, stack: StackTarget, info: WorktreeInfo,
+    ) -> WorktreeInfo:
+        """*info* with the stacked commit as its base, once the ledger answers it."""
+        read = await self._stack_ledger().ensure_record(full_branch, stack.commit)
+        if not read.names(stack.commit):
+            raise StackRecordUnconfirmed(full_branch, stack.commit, read)
+        return replace(info, base_commit=stack.commit)
+
     async def disable_shared_repo_auto_maintenance(self) -> None:
         """Disable git auto-gc/maintenance on this orchestrator-managed shared repo.
 
@@ -4692,6 +4750,7 @@ class GitOps:
         expected_title: str | None = None,
         train: TrainMembership | None = None,
         recut_ruling: RecutRuling | None = None,
+        stack_on: StackTarget | None = None,
     ) -> WorktreeInfo:
         """Create a git worktree for a task branch, based off main.
 
@@ -4716,7 +4775,21 @@ class GitOps:
         ``recut_ruling`` — a pending re-cut ruling: raise
         :class:`RecutRulingViolation` before any git mutation while a prior
         incarnation of the branch survives.
+
+        ``stack_on`` (``orchestrator/src/orchestrator/branch_stack.py::StackTarget``)
+        — start the branch at that commit of a predecessor's branch instead
+        of main, from the warm pool where there is one.  A train successor
+        is stacked the same way on its predecessor's tip, so the two are
+        exclusive (ValueError).  A stacked branch is returned only once the
+        stack-base ledger answers the commit (else
+        :class:`StackRecordUnconfirmed`), and its ``base_commit`` is that
+        commit.
         """
+        if stack_on is not None and _is_train_successor(train):
+            raise ValueError(
+                f'create_worktree({branch_name!r}): stack_on={stack_on} and a train '
+                f'successor (train_id={train.get("id")!r}) both choose the base',
+            )
         worktree_path = self.worktree_base / branch_name
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
         full_branch = f'{self.config.branch_prefix}{branch_name}'
@@ -4764,16 +4837,21 @@ class GitOps:
         # duplicated key too.
         await self.disable_shared_repo_auto_maintenance()
 
-        # ── Resolve start-ref: train-predecessor tip or freshened main ──
-        # PRD § 9.4: when a train member has order > 0, branch from the prior
-        # member's branch tip so the chain is contiguous.  order=0 (degenerate
-        # train) and train=None both fall through to _freshen_main().
-        if _is_train_successor(train):
-            # ── Train path: branch from predecessor's tip ─────────────────
-            # PRD § 9.4: resolve the predecessor's branch and use its tip SHA
-            # as start_ref so the new worktree stacks directly on top.
-            # Guard (raise RuntimeError on None) is in _resolve_predecessor_tip.
-            start_ref, _ = await self._resolve_predecessor_tip(train, branch_name)
+        # ── Resolve start-ref: a stack commit or freshened main ─────────
+        # PRD § 9.4: a train member with order > 0 branches from the prior
+        # member's tip, *train_tip*, so the chain is contiguous (the guard
+        # raising RuntimeError on a missing predecessor is in
+        # _resolve_predecessor_tip).  *stack_on* names the commit for any
+        # other stacked branch.  The two are exclusive (checked above), and
+        # *stack* is whichever applies.  order=0 (degenerate train) and
+        # train=None without stack_on both fall through to _freshen_main().
+        train_tip = (
+            await self._train_stack_target(train, branch_name)
+            if _is_train_successor(train) else None
+        )
+        stack = stack_on or train_tip
+        if stack is not None:
+            start_ref = stack.commit
         else:
             # ── Freshen main from remote (best-effort) ────────────────────
             # If origin/main has advanced since session start, use the remote-
@@ -4786,20 +4864,20 @@ class GitOps:
 
         # Capture the freshened ref's SHA (used as stable base for diffs)
         rc, base_sha, _ = await _run(
-            ['git', 'rev-parse', start_ref],
+            ['git', 'rev-parse', start_ref] if stack is None
+            else ['git', 'rev-parse', '--verify', f'{start_ref}^{{commit}}'],
             cwd=self.project_root,
         )
         if rc != 0:
-            if _is_train_successor(train):
-                # start_ref was a SHA just verified by resolve_branch_sha; if
-                # rev-parse fails here it indicates git state corruption, not a
-                # missing remote ref.  Falling back to main would silently violate
-                # the train-stacking invariant, so raise instead.
+            if stack is not None:
+                # Falling back to main would silently violate the stacking
+                # invariant (a train's, or a dependent's started early on its
+                # predecessor), so raise instead.
                 raise RuntimeError(
-                    f'create_worktree: rev-parse of confirmed predecessor SHA '
-                    f'{start_ref!r} failed (rc={rc}); this is unexpected — '
-                    f'the SHA was just resolved by resolve_branch_sha and should '
-                    f'be stable'
+                    f'create_worktree: stack commit {start_ref!r} of '
+                    f'{stack.branch!r} does not resolve to a commit (rc={rc}); '
+                    f'{full_branch} is not created on {self.config.main_branch} '
+                    f'instead'
                 )
             logger.warning(
                 'create_worktree: rev-parse %s failed (rc=%d) — falling back to local %s',
@@ -4828,9 +4906,11 @@ class GitOps:
             and not await self._is_registered_worktree(worktree_path)
         ):
             pool_info = await self.acquire_warm_lane(
-                branch_name, start_ref, expected_title=expected_title,
+                branch_name, start_ref, expected_title=expected_title, stack_on=stack_on,
             )
             if isinstance(pool_info, WorktreeInfo):
+                if stack is not None:
+                    return await self._confirm_stack_base(full_branch, stack, pool_info)
                 return pool_info
             # β: pool is enabled — no cold-path fall-through.  Route discriminant
             # to the appropriate exception so callers get typed failure signals.
@@ -5007,67 +5087,19 @@ class GitOps:
                     'chore: save WIP before requeue rebase',
                 )
 
-                # ── Resolve rebase target: train-predecessor tip or main ──────
-                # Mirror the create-path start-ref logic (lines 777-791): a
-                # stacked train member (order > 0) must rebase onto its
-                # predecessor's tip so the stacking invariant is preserved
-                # across requeues.  Rebasing onto main (the old unconditional
-                # behaviour) corrupts the train by re-parenting the delta off
-                # main instead of the predecessor's commits.
-                if _is_train_successor(train):
-                    # Guard (raise RuntimeError on None) is in _resolve_predecessor_tip.
-                    rebase_target, base_ref = await self._resolve_predecessor_tip(
-                        train, branch_name
-                    )
-                else:
-                    rebase_target: str | None = None  # rebase_onto_main defaults to main
-                    base_ref: str = self.config.main_branch
-
-                # Rebase onto the resolved target (predecessor tip for stacked
-                # trains, main for non-train / order==0).  Critical for plan
-                # revalidation: the architect needs to see current file
-                # contents from the right base.
-                #
-                # rebase_preserving_task_commits (not the bare primitive):
-                # guards against a silent branch-reset wipe (task 2403) — see
-                # its docstring.  A BranchResetError raised here propagates
-                # out of create_worktree to _drive()'s exception handler.
-                if await self.rebase_preserving_task_commits(worktree_path, onto=rebase_target):
-                    # Re-capture base from worktree's own merge-base after the
-                    # rebase completes.  merge-base from inside the worktree
-                    # is race-immune to concurrent base-ref advances during
-                    # rev-parse / rebase.
-                    _, mb_out, _ = await _run(
-                        ['git', 'merge-base', base_ref, 'HEAD'],
-                        cwd=worktree_path,
-                    )
-                    actual_base = mb_out.strip() or base_sha.strip()
-                else:
-                    # Rebase failed (conflict) — continue on old base.
-                    # Compute the actual merge-base so WorktreeInfo is truthful.
-                    _, mb_out, _ = await _run(
-                        ['git', 'merge-base', base_ref, 'HEAD'],
-                        cwd=worktree_path,
-                    )
-                    actual_base = mb_out.strip() or base_sha.strip()
-                    if _is_train_successor(train):
-                        # For stacked train members a rebase conflict means the
-                        # stacking invariant is broken — log at ERROR so the
-                        # degradation is visible rather than silently shipped on
-                        # a stale base.
-                        logger.error(
-                            'Rebase conflict for stacked train member %s '
-                            '(train_id=%r, order=%s) — continuing on stale '
-                            'base %s; stack integrity is degraded.',
-                            worktree_path, train.get('id'),
-                            train.get('order'), actual_base[:8],
-                        )
-                    else:
-                        logger.warning(
-                            'Rebase failed for reused worktree %s — continuing '
-                            'on old base %s',
-                            worktree_path, actual_base[:8],
-                        )
+                rebased, base_ref = await self._move_reused_branch_onto_base(
+                    worktree_path, full_branch, stack_on=stack_on, train_tip=train_tip,
+                )
+                # The worktree's own merge-base: race-immune to concurrent
+                # base-ref advances during rev-parse / rebase, and truthful
+                # when the move failed and the branch stayed on its old base.
+                _, mb_out, _ = await _run(
+                    ['git', 'merge-base', base_ref, 'HEAD'],
+                    cwd=worktree_path,
+                )
+                actual_base = mb_out.strip() or base_sha.strip()
+                if not rebased:
+                    _log_reused_on_old_base(worktree_path, train, actual_base)
 
                 await arm_worktree_hooks(worktree_path)
                 # Re-run on reuse so the requeued agent re-acquires a free
@@ -5076,11 +5108,14 @@ class GitOps:
                 # to avoid leaking ports across requeues — see the docstring
                 # of _provision_reify_debug_port for the full contract.
                 port = await self._provision_reify_debug_port(worktree_path)
-                return WorktreeInfo(
+                reused = WorktreeInfo(
                     path=worktree_path,
                     base_commit=actual_base,
                     reify_debug_port=port,
                 )
+                if stack is not None and rebased:
+                    return await self._confirm_stack_base(full_branch, stack, reused)
+                return reused
             elif worktree_path.exists():
                 # The directory exists but git does not recognize it as a
                 # registered worktree.  Two very different cases share this
@@ -5177,8 +5212,10 @@ class GitOps:
                 reattached = await self._reattach_cold_worktree(
                     worktree_path, full_branch,
                     branch_name=branch_name, expected_title=expected_title,
-                    keep_stack=_is_train_successor(train),
+                    keep_stack=_is_train_successor(train), stack_on=stack_on,
                 )
+                if reattached is not None and stack_on is not None:
+                    return await self._confirm_stack_base(full_branch, stack_on, reattached)
                 if reattached is not None:
                     return reattached
                 # Mismatch quarantined full_branch — skip
@@ -5229,11 +5266,46 @@ class GitOps:
         post_create_base = mb_out.strip() or base_sha.strip()
         await arm_worktree_hooks(worktree_path)
         port = await self._provision_reify_debug_port(worktree_path)
-        return WorktreeInfo(
+        created = WorktreeInfo(
             path=worktree_path,
             base_commit=post_create_base,
             reify_debug_port=port,
         )
+        if stack is not None:
+            return await self._confirm_stack_base(full_branch, stack, created)
+        return created
+
+    async def _move_reused_branch_onto_base(
+        self, worktree_path: Path, full_branch: str, *,
+        stack_on: StackTarget | None, train_tip: StackTarget | None,
+    ) -> tuple[bool, str]:
+        """Move the reused *full_branch* in *worktree_path* onto the base it
+        is dispatched on; return whether it moved, and the ref its base is
+        measured against.
+
+        A stack target re-stacks the branch's own delta onto it (raising
+        RestackFailed when that stops).  A train successor rebases onto its
+        predecessor's tip, *train_tip*, so the stacking invariant holds across
+        requeues.  Any other branch is un-stacked from an unlanded base, then
+        rebased onto main.  Plan revalidation needs this: the architect must
+        see current file contents from the right base.
+
+        rebase_preserving_task_commits, not the bare primitive, guards against
+        a silent branch-reset wipe (task 2403); its BranchResetError
+        propagates to _drive()'s exception handler.
+        """
+        if stack_on is not None:
+            await self._restack_reused_branch(worktree_path, full_branch, stack_on)
+            return True, stack_on.commit
+        if train_tip is not None:
+            rebased = await self.rebase_preserving_task_commits(
+                worktree_path, onto=train_tip.commit,
+            )
+            return rebased, train_tip.branch
+        rebased = await self._rebase_requeued_onto_main(
+            worktree_path, full_branch, keep_stack=False,
+        )
+        return rebased, self.config.main_branch
 
     async def _reattach_cold_worktree(
         self,
@@ -5243,6 +5315,7 @@ class GitOps:
         branch_name: str,
         expected_title: str | None = None,
         keep_stack: bool = False,
+        stack_on: StackTarget | None = None,
     ) -> 'WorktreeInfo | None':
         """Re-attach ``worktree_path`` to a surviving orphan ``full_branch``.
 
@@ -5299,6 +5372,7 @@ class GitOps:
                 identity guard.
             keep_stack: Passed to :meth:`_reuse_warm_lane`; True for a train
                 successor, which keeps its predecessor's commits.
+            stack_on: Passed to :meth:`_reuse_warm_lane`: re-stack onto it.
 
         Raises:
             RuntimeError: ``git worktree add`` failed (e.g. *full_branch* is
@@ -5382,7 +5456,7 @@ class GitOps:
                 return None
 
         return await self._reuse_warm_lane(
-            worktree_path, full_branch, keep_stack=keep_stack,
+            worktree_path, full_branch, keep_stack=keep_stack, stack_on=stack_on,
         )
 
     async def create_interactive_worktree(
@@ -7280,6 +7354,7 @@ class GitOps:
         *,
         expected_title: str | None = None,
         recut_ruling: RecutRuling | None = None,
+        stack_on: StackTarget | None = None,
     ) -> 'WorktreeInfo | WarmLaneUnavailable':
         """Bounded steal-path retry driver over :meth:`_acquire_warm_lane_impl`.
 
@@ -7368,6 +7443,7 @@ class GitOps:
                 branch_name, start_ref, expected_title=expected_title,
                 steal_excluded=frozenset(excluded),
                 on_steal=stolen.append,
+                stack_on=stack_on,
             )
             if isinstance(result, WorktreeInfo):
                 return result
@@ -7683,6 +7759,7 @@ class GitOps:
         expected_title: str | None = None,
         steal_excluded: frozenset[Path] = frozenset(),
         on_steal: 'Callable[[Path], None] | None' = None,
+        stack_on: StackTarget | None = None,
     ) -> 'WorktreeInfo | WarmLaneUnavailable':
         """Allocate a FREE warm lane, seed/reset it, and return a WorktreeInfo.
 
@@ -8075,7 +8152,7 @@ class GitOps:
                         route = AcquireRoute.REUSE
                     # Dispatch-activity stamp for the GC record gate; see WarmLanePool.refresh_assignment.
                     self.warm_lane_pool.refresh_assignment(branch_name, lane)
-                    info = await self._reuse_warm_lane(lane, full_branch)
+                    info = await self._reuse_warm_lane(lane, full_branch, stack_on=stack_on)
                     self._note_assigned_via_route(
                         info.path, route, branch_name, expected_title, full_branch,
                     )
@@ -8276,7 +8353,7 @@ class GitOps:
                             lane, branch_name, remove_worktree=not _co_contended,
                         )
                         return _co_unavail
-                    info = await self._reuse_warm_lane(lane, full_branch)
+                    info = await self._reuse_warm_lane(lane, full_branch, stack_on=stack_on)
                     self._note_assigned_via_route(
                         info.path, route, branch_name, expected_title, full_branch,
                     )
@@ -8402,7 +8479,7 @@ class GitOps:
 
                 if disk_reuse:
                     route = AcquireRoute.DISK_BACKSTOP_REUSE
-                    info = await self._reuse_warm_lane(lane, full_branch)
+                    info = await self._reuse_warm_lane(lane, full_branch, stack_on=stack_on)
                     self._note_assigned_via_route(
                         info.path, route, branch_name, expected_title, full_branch,
                     )
@@ -8462,7 +8539,7 @@ class GitOps:
                     # above; reviewer_comprehensive robustness/data-integrity
                     # blocker at workflow.py:1736).
                     await self._clear_foreign_meta_root(lane)
-                    info = await self._reuse_warm_lane(lane, full_branch)
+                    info = await self._reuse_warm_lane(lane, full_branch, stack_on=stack_on)
                     self._note_assigned_via_route(
                         info.path, route, branch_name, expected_title, full_branch,
                     )
@@ -8533,7 +8610,11 @@ class GitOps:
             )
             return WorktreeInfo(path=lane, base_commit=base_commit, reify_debug_port=port)
 
-        except BranchResetError:
+        except (BranchResetError, branch_stack.RestackFailed):
+            # A RestackFailed keeps its type the same way, so a re-stack
+            # conflict requeues and a stopped re-stack blocks, on the
+            # retained lane (task 10473).
+            #
             # task 2403 (reviewer_comprehensive error_handling finding): a
             # BranchResetError raised by _reuse_warm_lane's guarded rebase
             # (rebase_preserving_task_commits, reached via the disk-backstop
@@ -8608,7 +8689,8 @@ class GitOps:
             )
 
     async def _reuse_warm_lane(
-        self, lane_dir: Path, full_branch: str, *, keep_stack: bool = False,
+        self, lane_dir: Path, full_branch: str, *,
+        keep_stack: bool = False, stack_on: StackTarget | None = None,
     ) -> 'WorktreeInfo':
         """Resume a requeued task's existing branch in the worktree *lane_dir*.
 
@@ -8632,7 +8714,9 @@ class GitOps:
 
         *keep_stack* skips step 3's un-stack, for a train successor.  Only
         the cold reattach can pass it: :meth:`acquire_warm_lane` never serves
-        a train successor.
+        a train successor.  *stack_on* replaces step 3 with the re-stack of
+        the branch's own delta onto it (:meth:`_restack_reused_branch`, which
+        raises when that stops), and step 4's base is then its commit.
 
         ``.task/plan.json`` is NOT committed by ``commit()`` (task metadata
         lives outside the worktree for the orchestrator hot path; any
@@ -8662,25 +8746,30 @@ class GitOps:
         await self.commit(lane_dir, 'chore: save WIP before requeue rebase')
 
         # 3. Un-stack, then rebase onto main (best-effort; failure leaves the
-        #    branch on its old base).  A BranchResetError (task 2403)
-        #    propagates to the caller's try/except-release wrapper and on to
-        #    _drive()'s exception handler.
-        rebased = await self._rebase_requeued_onto_main(
-            lane_dir, full_branch, keep_stack=keep_stack,
-        )
-        if not rebased:
-            logger.info(
-                '_reuse_warm_lane: %s not rebased onto main; continuing on old base',
-                lane_dir,
+        #    branch on its old base), or re-stack onto *stack_on*.  A
+        #    BranchResetError (task 2403) or RestackFailed propagates to the
+        #    caller's try/except-release wrapper and on to _drive()'s
+        #    exception handler.
+        if stack_on is not None:
+            await self._restack_reused_branch(lane_dir, full_branch, stack_on)
+            base_commit = stack_on.commit
+        else:
+            rebased = await self._rebase_requeued_onto_main(
+                lane_dir, full_branch, keep_stack=keep_stack,
             )
+            if not rebased:
+                logger.info(
+                    '_reuse_warm_lane: %s not rebased onto main; continuing on old base',
+                    lane_dir,
+                )
 
-        # 4. Recompute base: merge-base between main_branch and HEAD
-        _, mb_out, _ = await _run(
-            ['git', 'merge-base', self.config.main_branch, 'HEAD'],
-            cwd=lane_dir,
-        )
-        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane_dir)
-        base_commit = mb_out.strip() or head_sha.strip()
+            # 4. Recompute base: merge-base between main_branch and HEAD
+            _, mb_out, _ = await _run(
+                ['git', 'merge-base', self.config.main_branch, 'HEAD'],
+                cwd=lane_dir,
+            )
+            _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=lane_dir)
+            base_commit = mb_out.strip() or head_sha.strip()
 
         # 5. Arm the stash-guard hooks (no --fresh-checkout seed ran here)
         await arm_worktree_hooks(lane_dir)
@@ -8750,30 +8839,96 @@ class GitOps:
         is un-stacked first.  When the un-stack stops, the branch stays on its
         old base and keeps its record: a plain rebase would replay the base's
         commits under its own and hand them to the agent and the reviewer
-        (task 6219).  The un-stack rewrites the branch in whichever worktree
-        holds it, so the branch is left alone unless *worktree* is that
-        worktree.  *keep_stack* skips the un-stack, for a train successor
+        (task 6219).  *keep_stack* skips the un-stack, for a train successor
         stacked on its predecessor on purpose.  Returns whether the branch
         now sits on main.
         """
         if keep_stack:
             return await self.rebase_preserving_task_commits(worktree)
-        holder = await self._worktree_holding_branch(full_branch)
-        if holder is None or holder.resolve() != worktree.resolve():
-            logger.warning(
-                '_rebase_requeued_onto_main: %s stays on its old base: it is '
-                'held by %s, not %s',
-                full_branch, holder, worktree,
-            )
-            return False
-        unstack = await self.unstack_from_unlanded_base(full_branch)
-        if unstack.stops_merge:
+        held_back = await self._unstack_for_requeue(worktree, full_branch)
+        if held_back:
             logger.warning(
                 '_rebase_requeued_onto_main: %s stays on its old base: %s',
-                full_branch, unstack.merge_block_reason(),
+                full_branch, held_back,
             )
             return False
         return await self.rebase_preserving_task_commits(worktree)
+
+    async def _unstack_for_requeue(self, worktree: Path, full_branch: str) -> str:
+        """Un-stack the requeued *full_branch* from an unlanded base, in
+        *worktree*: rewrites the branch and drops its stack-base record.
+
+        Returns why the branch must stay on its old base, or '' once it
+        carries no unlanded stack base.  The un-stack works from the one
+        record :meth:`_reused_branch_record` read.
+        """
+        record = await self._reused_branch_record(worktree, full_branch)
+        if isinstance(record, str):
+            return record
+        unstack = await self._unstack_from(full_branch, record.base)
+        return unstack.merge_block_reason() if unstack.stops_merge else ''
+
+    async def _reused_branch_record(
+        self, worktree: Path, full_branch: str,
+    ) -> StackBaseRead | str:
+        """The readable stack-base record of the reused *full_branch*, or why
+        it must not be moved from *worktree*.  Reads only.
+
+        A reused branch is moved only from the worktree that holds it, and
+        only from a readable record: one that cannot be read may hide a stack.
+        """
+        holder = await self._worktree_holding_branch(full_branch)
+        if holder is None or holder.resolve() != worktree.resolve():
+            return f'{full_branch} is held by {holder}, not by {worktree}'
+        record = await self.stack_base_read(full_branch)
+        if record.state is StackRecordState.UNREADABLE:
+            return f'its stack-base record is unreadable: {record.detail}'
+        return record
+
+    async def _restack_reused_branch(
+        self, worktree: Path, full_branch: str, target: StackTarget,
+    ) -> None:
+        """Re-stack the reused *full_branch*'s own delta onto *target* in
+        *worktree*, in place of a rebase onto main.  Its own commits are cut
+        by the merge queue's rule (:meth:`own_delta_cut`'s foreign-commit
+        cut).  Raises ``branch_stack.restack_failure`` of any outcome but
+        RESTACKED."""
+        result = await self._restack_in(worktree, full_branch, target)
+        if result.outcome is not RestackOutcome.RESTACKED:
+            raise branch_stack.restack_failure(result)
+        logger.info(
+            '_restack_reused_branch: %s re-stacked onto %s of %s (tip %s -> %s)',
+            full_branch, target.commit, target.branch, result.old_tip, result.new_tip,
+        )
+
+    async def _restack_in(
+        self, worktree: Path, full_branch: str, target: StackTarget,
+    ) -> RestackResult:
+        """The re-stack's verdict, from ONE ledger read: the cut and the
+        replay both use it, so a read that fails in between cannot turn
+        "cannot read" into "no record" and replay main..HEAD instead."""
+        stopped = branch_stack.RestackVerdict(full_branch, worktree, target.commit)
+        old_tip = await self.resolve_branch_sha(full_branch)
+        record = await self._reused_branch_record(worktree, full_branch)
+        if isinstance(record, str):
+            return stopped.refused(old_tip, None, record)
+        main_sha = await self.get_main_sha()
+        if not main_sha:
+            return stopped.refused(
+                old_tip, record.base, f'{self.config.main_branch} does not resolve',
+            )
+        try:
+            cut = None if record.base is None else await self._foreign_cut(
+                full_branch, record.base, main_sha,
+            )
+        except branch_stack.StackInspectionError as exc:
+            return stopped.refused(
+                old_tip, record.base, f'its own commits cannot be told apart: {exc}',
+            )
+        return await branch_stack.restack_own_delta(
+            _run, worktree, ledger=self._stack_ledger(), branch=full_branch,
+            onto=target.commit, record=record, upstream=cut or main_sha,
+        )
 
     async def rebind_branch_to_head(
         self, worktree: Path, full_branch: str, *, relation: HeadRelation | None = None,
@@ -10774,6 +10929,26 @@ class GitOps:
     def _stack_ledger(self) -> StackBaseLedger:
         return StackBaseLedger(self.project_root, _run)
 
+    async def stack_base_read(self, full_branch: str) -> StackBaseRead:
+        """What the stack-base ledger says of *full_branch*: no record, its
+        recorded base, or a failed read, which may hide a record."""
+        return await self._stack_ledger().read(full_branch)
+
+    async def restack_trial(self, full_branch: str, target: StackTarget) -> RestackTrial:
+        """Would re-stacking *full_branch* from its recorded base onto
+        *target* conflict?  Moves nothing.  UNKNOWN without a readable record
+        or a resolvable tip."""
+        record = await self.stack_base_read(full_branch)
+        tip = await self.resolve_branch_sha(full_branch)
+        if record.base is None or tip is None:
+            return RestackTrial(
+                RestackTrialOutcome.UNKNOWN,
+                detail=f'{full_branch}: record {record.state} {record.detail}, tip {tip}',
+            )
+        return await branch_stack.restack_trial(
+            _run, self.project_root, base=record.base, onto=target.commit, tip=tip,
+        )
+
     async def forget_stack_bases(self, task_ids: Iterable[str]) -> None:
         """Drop the stack-base records of *task_ids*' branches, e.g. once
         their train has landed.  A failed delete is logged, not raised."""
@@ -10798,14 +10973,20 @@ class GitOps:
         keep the record, and their ``merge_block_reason()`` attributes the
         stop to the base.
         """
-        ledger = self._stack_ledger()
-        base = await ledger.base_of(full_branch)
+        return await self._unstack_from(
+            full_branch, await self._stack_ledger().base_of(full_branch),
+        )
+
+    async def _unstack_from(self, full_branch: str, base: str | None) -> UnstackResult:
+        """:meth:`unstack_from_unlanded_base` from a record already read:
+        *base* is the recorded base, None for no record."""
         if base is None:
             return UnstackResult(
                 outcome=UnstackOutcome.NOT_STACKED,
                 branch=full_branch,
                 main_branch=self.config.main_branch,
             )
+        ledger = self._stack_ledger()
         try:
             return await self._unstack_recorded(ledger, full_branch, base)
         except (branch_stack.StackInspectionError, WorktreeMissing) as exc:
@@ -10847,25 +11028,32 @@ class GitOps:
         prefix cannot be inspected; an unreadable record or tip answers main.
         """
         main = self.config.main_branch
-        base = await self._stack_ledger().base_of(full_branch)
-        if base is None:
-            return main
         try:
-            cut = await self._foreign_cut(full_branch, base, await self.get_main_sha())
+            cut = await self.own_delta_cut(full_branch)
         except branch_stack.StackInspectionError as exc:
             logger.warning(
-                'Cannot tell where %s\'s own delta starts above stack base %s: %s',
-                full_branch, base, exc,
+                'Cannot tell where %s\'s own delta starts above its stack base: %s',
+                full_branch, exc,
             )
             return None
         if cut is None:
             return main
         logger.warning(
-            '%s still carries commits of unlanded stack base %s; '
+            '%s still carries commits of an unlanded stack base; '
             'its own delta starts above %s',
-            full_branch, base, cut,
+            full_branch, cut,
         )
         return cut
+
+    async def own_delta_cut(self, full_branch: str) -> str | None:
+        """The newest commit of an unlanded stack base that *full_branch*
+        still carries below its own commits; None when it carries none (no
+        record, a landed base, or no foreign prefix).  Read-only.  Raises
+        ``branch_stack.StackInspectionError`` when that cannot be told."""
+        base = await self._stack_ledger().base_of(full_branch)
+        if base is None:
+            return None
+        return await self._foreign_cut(full_branch, base, await self.get_main_sha())
 
     async def restore_pre_stack_tip(self, tip: PreStackTip) -> TipRestore:
         """Put a stacked member's branch back on the tip it had before stacking.

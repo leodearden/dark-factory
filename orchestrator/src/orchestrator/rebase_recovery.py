@@ -1030,7 +1030,7 @@ async def guarded_abort(
     Only a WEDGED failure is logged, not every non-zero abort: git exits
     non-zero just as readily because there was nothing to abort, which is the
     ordinary outcome of a defensive abort and of a rebase that failed before
-    starting one.  :func:`_operation_still_in_progress` separates the two, and
+    starting one.  :func:`operation_still_in_progress` separates the two, and
     it runs only on the failure path.
     """
     result = await asyncio.to_thread(preflight_rebase_recovery, cwd)
@@ -1041,7 +1041,7 @@ async def guarded_abort(
             verb, cwd, '; '.join(result.unrepaired),
         )
     rc, out, err = await run([*RECOVERY_GIT, verb, '--abort'], cwd=cwd)
-    if rc != 0 and await asyncio.to_thread(_operation_still_in_progress, cwd):
+    if rc != 0 and await asyncio.to_thread(operation_still_in_progress, cwd):
         logger.warning(
             'git %s --abort FAILED in %s (rc %d) and the interrupted operation '
             'is STILL THERE: %s. The worktree is not clean, so any step that '
@@ -1087,7 +1087,7 @@ def _present(git_dir: Path, names: Iterable[str]) -> tuple[str, ...]:
     return tuple(name for name in names if os.path.lexists(git_dir / name))
 
 
-def _operation_still_in_progress(worktree: Path) -> bool:
+def operation_still_in_progress(worktree: Path) -> bool:
     """Does *worktree* still carry an interrupted git operation?
 
     Answers the question a failed abort cannot: ``git rebase --abort`` exits
