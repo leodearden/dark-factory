@@ -1336,6 +1336,28 @@ class TestRunsStartupOutcome:
                 'run-1', _sample_report(), startup_completed_at=datetime(2026, 11, 15),
             )
 
+    def test_mark_startup_completed_stores_utc_text_and_leaves_the_run_open(self, tmp_path):
+        store, db_path = self._started(tmp_path)
+        completed = datetime(2026, 11, 15, 1, 2, 3, tzinfo=timezone(timedelta(hours=2)))
+
+        store.mark_startup_completed('run-1', completed)
+
+        assert self._outcome(db_path, 'run-1') == ('2026-11-14T23:02:03+00:00', None)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            (completed_at,) = conn.execute(
+                'SELECT completed_at FROM runs WHERE run_id = ?', ('run-1',),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert completed_at is None
+
+    def test_mark_startup_completed_refuses_a_naive_instant(self, tmp_path):
+        store, _db_path = self._started(tmp_path)
+
+        with pytest.raises(ValueError, match='timezone-aware'):
+            store.mark_startup_completed('run-1', datetime(2026, 11, 15))
+
 
 class TestGetTaskOutcome:
     """Production's latest recorded outcome for a task, across runs (live-shadow PRD S1)."""
