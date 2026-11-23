@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 from _fm_helpers import load_script_module
+from _mem0_history_db import mem0_history_db
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.grouped_read import DEFAULT_AMENDMENT_TEXT_CHARS
@@ -255,23 +256,6 @@ def _item(**overrides: Any) -> dict[str, Any]:
         'supersedes_target': False, 'superseded_marks': [],
     }
     return {**row, **overrides}
-
-
-def _history_db(path: Path, rows: list[tuple[str, str | None, str, str, str]]) -> Path:
-    connection = sqlite3.connect(path)
-    connection.execute(
-        'CREATE TABLE history (id TEXT PRIMARY KEY, memory_id TEXT, old_memory TEXT,'
-        ' new_memory TEXT, event TEXT, created_at DATETIME, updated_at DATETIME,'
-        ' is_deleted INTEGER, actor_id TEXT, role TEXT)'
-    )
-    for index, (memory_id, old, new, event, updated_at) in enumerate(rows):
-        connection.execute(
-            'INSERT INTO history VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)',
-            (f'h{index}', memory_id, old, new, event, '2026-10-01T00:00:00+00:00', updated_at),
-        )
-    connection.commit()
-    connection.close()
-    return path
 
 
 def _without(row: dict[str, Any], field: str) -> dict[str, Any]:
@@ -608,7 +592,7 @@ class _Bundle:
         self.journal = self._journal(root / 'journal.db', [
             row for row in attaches if row['intent_id'] != self.missing
         ])
-        self.history = _history_db(root / 'history.db', [
+        self.history = mem0_history_db(root / 'history.db', [
             (f'p-{self.edited}', ATTACH_TIME_PARENT, f'parent text of {self.edited}', 'UPDATE',
              '2026-10-12T00:00:00+00:00'),
         ])
@@ -710,7 +694,9 @@ class TestTheShardsCommand:
             roles = sorted(key['shards'][name]['role'] for name in _shards_holding(key, keyed))
             assert roles == ['primary', 'second'], keyed
         for spec in key['shards'].values():
+            [basis] = {key['items'][item]['basis'] for item in spec['items']}
             assert spec == {'role': spec['role'], 'rater': f'opus-{spec["role"]}', 'round': 0,
+                            'kind': 'initial', 'basis': basis,
                             'items': spec['items'], 'brief_sha256': BRIEF_SHA256}
 
     def test_attach_time_pairs_sit_only_in_attach_shards(self, bundle: _Bundle) -> None:
@@ -860,15 +846,21 @@ def _primary_shard_of(key: dict[str, Any], keyed: tuple[str, str, str]) -> str:
 CORPUS_FILES = ('items.jsonl', 'verdicts.jsonl', 'strata.json', 'derivation.json')
 
 
-def _score(out: Path, *, verdicts: str = 'verdicts.jsonl', rubric: str = 'v2.1') -> int:
+def _score(out: Path, *, verdicts: str = 'verdicts.jsonl', corpus_record: str | None = None) -> int:
     """The scorer's exit code over the corpus ``assemble`` wrote into *out*, its verdicts
-    read from ``write_triage_v2_soak_<verdicts>``."""
+    read from ``write_triage_v2_soak_<verdicts>``.
+
+    The brief is the latest re-rate's of ``write_triage_v2_soak_<corpus_record>``
+    when given; else, for a corpus with no re-rate, v2.1 named explicitly.
+    """
     score = load_script_module(SCRIPTS / 'score_write_triage_reader.py',
                                mod_name='score_write_triage_reader')
     paths = {name: out / f'write_triage_v2_soak_{name}' for name in ('items.jsonl', verdicts, 'strata.json')}
+    brief = (['--rubric', 'v2.1', '--brief-sha256', BRIEF_SHA256] if corpus_record is None
+             else ['--corpus-record', str(out / f'write_triage_v2_soak_{corpus_record}')])
     return score.main([
         '--items', str(paths['items.jsonl']), '--verdicts', str(paths[verdicts]),
-        '--strata', str(paths['strata.json']), '--rubric', rubric,
+        '--strata', str(paths['strata.json']), *brief,
     ])
 
 
@@ -988,7 +980,7 @@ class TestTheRatingRounds:
             name = f'third_{index:02d}'
             assert {**key['shards'][name], 'items': len(key['shards'][name]['items'])} == {
                 'role': 'third', 'rater': f'opus-third-{index:02d}', 'round': 0, 'items': 1,
-                'brief_sha256': BRIEF_SHA256,
+                'kind': 'third', 'basis': 'current', 'brief_sha256': BRIEF_SHA256,
             }
             assert _shard_keyed(key, name) == {tied}
             _rate(bundle, overrides)
@@ -1016,7 +1008,7 @@ class TestTheRatingRounds:
         key = bundle.key()
         assert {**key['shards']['third_00'], 'items': len(key['shards']['third_00']['items'])} == {
             'role': 'third', 'rater': 'opus-third-00', 'round': 0, 'items': 1,
-            'brief_sha256': BRIEF_SHA256,
+            'kind': 'third', 'basis': 'current', 'brief_sha256': BRIEF_SHA256,
         }
         assert _shard_keyed(key, 'third_00') == {open_pair}
 
@@ -1214,7 +1206,7 @@ class TestTheRerate:
         assert {name: spec['brief_sha256'] for name, spec in derivation['shards'].items()} == {
             name: _sha(brief) if name in rerate['shards'] else BRIEF_SHA256 for name in key['shards']}
         assert derivation['check']['brief_sha256'] == BRIEF_SHA256
-        assert _score(out, verdicts='verdicts_v2_2.jsonl', rubric='v2.2') == 0
+        assert _score(out, verdicts='verdicts_v2_2.jsonl', corpus_record='derivation_v2_2.json') == 0
 
     def test_assemble_refuses_a_pair_reading_loss_outside_the_latest_rerate(
         self, rerated: _Bundle, brief: Path, tmp_path: Path,

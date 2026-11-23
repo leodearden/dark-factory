@@ -49,7 +49,7 @@ Every row of PRD §6 was re-checked by grep on 2026-10-05. All of them hold.
 | Escalation id minted before the record is built | `escalation/src/escalation/queue.py::EscalationQueue.make_id`, which the runner calls inside the `Escalation(...)` construction | PASS |
 | `resume` then `pending` | `escalation/src/escalation/action_effects.py::ACTION_EFFECTS`, `harness.py::Harness._on_escalation_resolved` | PASS |
 | Status surface for the capability report | `tools.py::get_status` already emits the top-level `reconciliation_halt` | PASS |
-| Script transport | `scripts/legibility/census_trigger.py::post_mcp_tool_call(url, tool_name, arguments)`. A tool `error` envelope rides `isError: false`, so δ must test for the `error` key | PASS |
+| Script transport | `scripts/legibility/census_trigger.py::post_mcp_tool_call(url, tool_name, arguments)`. A tool `error` envelope rides `isError: false`, so δ must test for the `error` key. *Amended, task 8936:* task 6747 deleted this function at `8afe2ec97e`; δ binds `shared/src/shared/mcp_session.py::SyncMcpSession` instead. | PASS |
 | Project-root discovery | `scripts/_task_db_scan.py::discover_project_roots` | PASS |
 | Active status set | `shared/src/shared/task_statuses.py::ACTIVE` (= every status minus TERMINAL, so it includes `deferred`) | PASS |
 
@@ -137,7 +137,7 @@ shape precedent.
 |---|---|---|
 | Script exists at the path the census L8b and snippet §2 name | Check: path `scripts/check_run_completion.py` present | PASS producer δ |
 | `weighted_completion` importable | Check: grep `def weighted_completion\(` | PASS producer δ |
-| Selection over `find_tasks_by_metadata` | producer: L1, upstream. The `x_finding_run` read needs only `status`/`priority` (default `include_value=False`), while `--pending` passes `include_value=True` and pages on `offset += returned` under the lookup's `RESULT_BYTE_BUDGET` (lookup PRD amended 2026-10-05). Transport: `post_mcp_tool_call` (main). Check: grep `find_tasks_by_metadata` in the script | PASS producer upstream |
+| Selection over `find_tasks_by_metadata` | producer: L1, upstream. The `x_finding_run` read needs only `status`/`priority` (default `include_value=False`), while `--pending` passes `include_value=True` and pages on `offset += returned` under the lookup's `RESULT_BYTE_BUDGET` (lookup PRD amended 2026-10-05). Transport: `shared/src/shared/mcp_session.py::SyncMcpSession` (main; amended, task 8936, since task 6747 deleted `post_mcp_tool_call`). Check: grep `find_tasks_by_metadata` in the script | PASS producer upstream |
 | Exit 75 from `os.EX_TEMPFAIL` | Check: grep `EX_TEMPFAIL` in the script | PASS producer δ |
 | `--pending` mode (ε) | Check: grep `['"]--pending['"]` in the script | PASS producer δ |
 | Verdict JSON ≤ 400 chars | floor: 400 > 343 (G6 note 2) | PASS floor |

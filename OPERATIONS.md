@@ -1393,6 +1393,60 @@ Each project has its own queue, so for the fleet:
 5. Ends with a mandatory `/reflect` — decisions and discoveries from the
    unblock session get written to memory before the session closes.
 
+### A task waiting on a peer's park (`park_refused`, task 6328)
+
+Only the scored scan's top candidate earns skips and fairness parks. A task
+below it that is refused its locks by a same-tier (or lower-tier) park earns
+nothing and waits as long as that park's owner does, which can be days when
+the owner itself waits on a holder. The scheduler reports that wait as
+`park_refused`: a dispatch candidate refused by parks alone, none of which
+outranks it. The first event comes once the refusal has lasted
+`park_refused_emit_interval_secs` (default 1800 s, green tier, hot-reloadable),
+then at most once per interval. A dispatch, a refusal by anything else, or the
+task leaving the dispatch candidates ends the episode.
+
+Read it with
+`mcp__fused-memory__get_scheduler_events(project_root=..., event_types=['park_refused'])`.
+The payload is `{task_id, priority, episode_secs, blockers, park_owners}`:
+
+- `blockers` — `[{module, owner, kind: 'parked'}]`, every park that refused
+  the acquire;
+- `park_owners` — one entry per blocking owner: `owner`, its park priority
+  (`source` plus `tier`, or `pin_order`), `park_age_secs`, and `waiting_on`,
+  the owner's own blockers (`null` when the owner is not in the tick's task
+  list).
+
+The lever is to pin the waiting task B:
+
+1. `set_task_priority_override(project_root, task_id=<B>, pinned=True, ttl_secs=<a few hours>)`.
+2. If other pins exist, `reorder_pin_queue` with B first. Only the first
+   `pin_reservation_max_active` (default 1) eligible lock-blocked pins
+   reserve; `get_pin_queue` shows the order.
+3. On the next tick B's pin reservation shadows the peer's park on the shared
+   keys and B dispatches.
+
+What the lever leaves alone: the peer's park comes back the moment B
+dispatches, its park on keys B does not need is never touched, and a held lock
+is never taken. So pinning does not help while any blocker reads
+`kind: 'held'`: B then waits on that holder, and `park_refused` stops naming
+it. Clear the pin afterwards with
+`clear_task_priority_override(project_root, task_id=<B>, field='pinned')` if
+you set no ttl.
+
+The heavier alternative is to defer the park owner. Since task 6518 a deferred
+owner drops its whole footprint, including keys B never needed.
+
+The automatic backstop is the starvation watchdog's `lock_refused` gate (knobs
+`starvation_watchdog.skip_threshold` and `starvation_watchdog.idle_only_secs`;
+`dark-factory-orchestrator.yaml` overrides them). It auto-pins the starving
+task, but only while an auto-pin slot (`starvation_watchdog.auto_pin_max_concurrent`)
+is free.
+
+While the `fairness.skip_threshold` TRIAL block in
+`dark-factory-orchestrator.yaml` is in force (review: gate task 10128),
+skip-earned fairness parks are effectively off, but `reserve_now` still
+installs tier-ranked parks, and those can produce this event.
+
 ### Merging: the submit → poll protocol
 
 **Never** `git merge --no-ff` directly into a project's main while its
@@ -4360,8 +4414,8 @@ check `applied`/`restart_required` on your reload call, per
 
 | Knob | Default | Scope |
 |---|---|---|
-| `watcher_daily_cost_ceiling_usd` | `50.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
-| `orch_daily_cost_ceiling_usd` | `200.0` | All orchestrator invocations (every role) for the day |
+| `watcher_daily_cost_ceiling_usd` | `150.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
+| `orch_daily_cost_ceiling_usd` | `10000.0` | All orchestrator invocations (every role) for the day |
 
 **Multi-account failover (`usage_cap.*`)** is on in every shipped config. A
 pool whose roster resolves no token is EMPTY, and every invocation then raises
@@ -4686,9 +4740,24 @@ check.
     `skipped_cap_7d` stays 0 while writes are off. The rate is 0.0 when nothing
     was asked, and `adjudications_asked_7d` shows the denominator. The run-report
     escalation names `summary.json`, and its summary line also names the failure
-    when the metrics could not be written (`metrics_unwritten`). Such a run
-    removes the previous `summary.json`, so gate θ fails closed on its absence
-    rather than reading a stale week.
+    when the metrics could not be written (`metrics_unwritten`). The summary
+    also carries `expires_at`, 28 h after its window ends
+    (`fused-memory/src/fused_memory/maintenance/link_heal_metrics.py::SUMMARY_TTL`).
+    That is the longest gap between two 02:15 runs (25 h, at the autumn clock
+    change) plus the 5-minute jitter, and leaves a run just under 3 h to write
+    its summary. `scripts/check_write_triage_readiness_gate.py` fails any gate
+    on a report past its `expires_at`, so θ's own predicate run fails closed on
+    a summary no run has replaced, whether the run was refused (exit 2),
+    crashed, or the timer stopped firing; one missed night is enough. θ's
+    delivered-checks re-run fails closed only once main next advances: the
+    scheduler caches a passing delivered check per main SHA
+    (`orchestrator/src/orchestrator/scheduler.py::Scheduler._compute_delivered_check_cache`).
+    A summary without `expires_at`, as written before task 11287, never
+    expires; the first run that writes its metrics replaces it. A run whose metrics could
+    not be written also removes the previous `summary.json`, because it no
+    longer counts tonight. If even that removal fails, the run-report
+    escalation's detail (not its summary line) and the sweep's JSON output
+    name the failure as `stale_summary_unremoved`.
 - **Exit codes.** 0 when the run is complete, or partial only by the write or
   adjudication cap or stale skips. 1 on a read, adjudication or write failure,
   a stopped run, or a report or metrics it could not write.

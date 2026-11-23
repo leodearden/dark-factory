@@ -56,7 +56,7 @@ Runs **inside** S2's lock, immediately after `add_episode`. Subsumes `_dedup_epi
 
 **S5 — post-ζ read invariant.** `get_valid_edges_for_node`/`get_all_valid_edges` dedup by `(endpoint uuid, edge uuid)` — valid because S4 makes `e.uuid` unique. Double-attribution (each directed edge under both endpoints) and self-loop collapse are preserved.
 
-**S6 — startup identity-integrity pass (ε).** On backend init, for each graph from `list_graphs()`: (a) exact-name duplicate `Entity` nodes → **loud WARN/alarm** naming `group_id`+name (safety net for S1/S2); (b) duplicate-uuid `RELATES_TO` edges → **one-shot idempotent repair** (re-mint fresh uuid + `superseded_edge_uuid`, preserving the edge set). No-op on a clean graph.
+**S6 — startup identity-integrity pass (ε).** On backend init, for each graph from `list_graphs()` (narrowed to registered graphs by task 11326; see docs/prds/falkordb-index-provisioning.md D5): (a) exact-name duplicate `Entity` nodes → **loud WARN/alarm** naming `group_id`+name (safety net for S1/S2); (b) duplicate-uuid `RELATES_TO` edges → **one-shot idempotent repair** (re-mint fresh uuid + `superseded_edge_uuid`, preserving the edge set). No-op on a clean graph.
 
 ### Boundary-test sketch (facing both sides of the seam)
 

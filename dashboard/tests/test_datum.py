@@ -503,6 +503,22 @@ def test_to_wire_still_passes_a_payload_with_no_wire_shape_through(payload):
     assert fresh_datum(value=payload).to_wire()['value'] == payload
 
 
+class _WireDict(dict):
+    """A dict subclass that declares its own wire shape."""
+
+    def to_wire(self):
+        return {'rendered': True}
+
+
+def test_to_wire_renders_a_dict_subclass_that_knows_its_wire_shape():
+    """Only an EXACT builtin skips the wire-shape check; a subclass still renders itself."""
+    assert fresh_datum(value=_WireDict(a=1)).to_wire()['value'] == {'rendered': True}
+    assert wire_value(fresh_datum(value=[_WireDict(a=1), {'plain': 1}]).to_wire()) == [
+        {'rendered': True},
+        {'plain': 1},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # A CONTAINER of wire-shaped payloads. The PRD's contract declares
 # `Datum[list[TaskRow]]` beside `Datum[TaskCensus]`, so beta wraps a list of

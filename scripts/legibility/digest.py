@@ -42,12 +42,11 @@ from legibility.detectors import (  # noqa: E402  # debt: task 6760
     RecordHits,
     SignalClass,
     classify_agent_class,
+    dialogue_turn_text,
     error_hits,
     is_client_rendered_turn,
-    is_non_dialogue_carrier,
     message_content,
     record_hits,
-    user_turn_text,
 )
 from legibility.inventory import (
     UNREADABLE_FILE_ERRORS,
@@ -494,52 +493,28 @@ def score_signals(counts: Mapping[str, int], n_user_turns: int) -> float:
 
 
 def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return genuine non-sidechain, non-meta human user turns.
-
-    Excludes: non-'user' records, isSidechain=True (subagent) turns,
-    isMeta=True (system-injected) turns, user records whose content is
-    entirely tool_result blocks, a record whose structured provenance alone
-    marks it as non-dialogue (:func:`reingestion.has_non_dialogue_provenance`), and
-    re-ingested machine content (:func:`reingestion.is_reingested_content`): a pasted
-    coder judgment, and every harness-injected briefing/prompt/report/
-    context-block turn -- the orchestrator briefing, the trickle-coder and
-    resume prompts, the reconciliation judge's run-review prompt and a lone
-    memory-context block alike (see :func:`reingestion.is_harness_injected_turn`). Every
-    one of those injected shapes lands in the transcript as ordinary
-    user-role text (isMeta unset), so isMeta alone cannot exclude any of
-    them. The gold bucket asks the SAME predicate every scalar detector asks
-    (:func:`detectors.is_non_dialogue_carrier`) rather than holding a private copy of
-    the rule: task 5685's ruling that the fix belongs at the
-    content-classification layer, not per bucket. Beyond that shared
-    predicate, the gold bucket alone excludes a turn the client composed
-    from a UI action (:func:`detectors.is_client_rendered_turn`): an
-    arg-less slash command, a local command's output echo, and the bare
-    interrupt marker, which stays an interrupt signal the Interrupts section
-    already lists.
+    """Return the human user turns, each with its record index: the records
+    :func:`detectors.dialogue_turn_text` keeps, the one rule the classifier's
+    INTERACTIVE also asks. Beyond that shared rule, the gold bucket alone
+    excludes a turn the client composed from a UI action
+    (:func:`detectors.is_client_rendered_turn`): an arg-less slash command, a
+    local command's output echo, and the bare interrupt marker, which stays
+    an interrupt signal the Interrupts section already lists.
 
     This function is the SINGLE source for both the gold user_corrections
-    section and render_digest's n_user_turns score component, so this one
-    filter excludes such a turn from the body AND the score together --
+    section and render_digest's n_user_turns score component, so a turn
+    this filter drops leaves the body AND the score together --
     which is exactly what confusion-census-2026-07-31 §3.1 asks for, its
     clusters 1.1(b) and 1.2 being one event observed from two surfaces.
     User corrections are gold (PRD Sec 5) -- this is the highest-priority
     digest section.
     """
-    turns = []
-    for index, record in enumerate(records):
-        if record.get('type') != 'user':
-            continue
-        if record.get('isSidechain'):
-            continue
-        if record.get('isMeta'):
-            continue
-        text = user_turn_text(record)
-        if text is None:
-            continue
-        if is_non_dialogue_carrier(record, text) or is_client_rendered_turn(text):
-            continue
-        turns.append({'index': index, 'text': text})
-    return turns
+    return [
+        {'index': index, 'text': text}
+        for index, record in enumerate(records)
+        if (text := dialogue_turn_text(record)) is not None
+        and not is_client_rendered_turn(text)
+    ]
 
 
 def _yaml_dquote(value: Any) -> str:

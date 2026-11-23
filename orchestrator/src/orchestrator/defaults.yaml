@@ -948,15 +948,17 @@ watcher_backend: claude
 # watcher_daily_cost_ceiling_usd: ceiling for escalation-watcher invocations
 #   only (role LIKE '%watcher%').  This is the early-warning trip — runaway
 #   watcher dispatch is the most likely cost source during AFK windows.
-#   Trip reason: cost_ceiling_watcher_exceeded (default 50.0).
+#   Trip reason: cost_ceiling_watcher_exceeded (default 150.0).
 #
 # orch_daily_cost_ceiling_usd: ceiling for ALL orchestrator invocations
 #   (entire invocations table, trailing 24h).  Final safety net.
-#   Trip reason: cost_ceiling_orch_exceeded (default 200.0).
+#   Trip reason: cost_ceiling_orch_exceeded (default 10000.0).
 #
-# Disable a ceiling by setting it to a very high value.
-watcher_daily_cost_ceiling_usd: 50.0
-orch_daily_cost_ceiling_usd: 200.0
+# Disable a ceiling by setting it to a very high value.  The orch-wide
+# default is effectively off: it stays as an opt-in tripwire (task 8262;
+# ruling in plans/cross-project-weights-study-2026-11-12/rulings.md).
+watcher_daily_cost_ceiling_usd: 150.0
+orch_daily_cost_ceiling_usd: 10000.0
 
 # Merge-queue train coalescing (tasks 1717-1722)
 #

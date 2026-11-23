@@ -1,7 +1,9 @@
 // render_failure.js — decides the text shown in place of whatever part of the
 // page threw while rendering: a tab, a chrome region, or the whole page. Each
 // notice says what failed, what is still live, how to retry, and what was
-// thrown. shell.jsx's RenderFailureBoundary only renders it.
+// thrown. A tab is retried by switching tabs, unless a reload would bring the
+// page onto the server's build (asset_skew.js), when only a reload can help.
+// shell.jsx's RenderFailureBoundary only renders it.
 //
 // IT MUST NEVER THROW, whatever was thrown. It runs while React recovers from
 // the throw, and a second throw there escapes its boundary and unmounts the
@@ -43,11 +45,12 @@ function describeThrownValue(thrown) {
 // Function declarations, not consts: app.jsx destructures these names, Babel
 // turns that destructure into a global `var`, and a `var` may share the classic
 // scripts' scope with a `function` but not with a `const`.
-function tabRenderFailureNotice(tabLabel, thrown) {
+function tabRenderFailureNotice(tabLabel, thrown, reloadReachesServerBuild) {
+  const retry = reloadReachesServerBuild === true
+    ? 'This page is running a different dashboard build from the server; reload the page to retry.'
+    : 'The rest of the dashboard is still live; switch tabs to retry this one.';
   return Object.freeze({
-    text:
-      'The ' + nameOfFailedPart(tabLabel, 'current') + ' tab failed to render. ' +
-      'The rest of the dashboard is still live; switch tabs to retry this one.',
+    text: 'The ' + nameOfFailedPart(tabLabel, 'current') + ' tab failed to render. ' + retry,
     detail: describeThrownValue(thrown),
   });
 }

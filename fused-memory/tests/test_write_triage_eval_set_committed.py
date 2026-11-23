@@ -45,6 +45,12 @@ def _rounds() -> types.ModuleType:
 
 
 @functools.cache
+def _backfill() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'backfill_rating_shard_kinds.py',
+                              mod_name='backfill_rating_shard_kinds')
+
+
+@functools.cache
 def _score() -> types.ModuleType:
     return load_script_module(SCRIPTS / 'score_write_triage_reader.py',
                               mod_name='score_write_triage_reader')
@@ -204,12 +210,18 @@ class TestTheCommittedEvalSet:
 class TestTheCommittedRerates:
     """Every re-rate the rounds key records is the one the summary reports and the verdicts rest on."""
 
+    def test_every_shard_records_the_kind_and_basis_its_fields_derive(self) -> None:
+        assert _backfill().backfilled(_key()) == _key()
+
     def test_the_summary_reports_each_keyed_rerate(self) -> None:
         assert _summary()['rerates'] == [
             {'version': rerate['version'], 'round': rerate['round'],
              'pairs': len(rerate['pairs']), 'brief_sha256': rerate['brief_sha256']}
             for rerate in _key().get('rerates', ())
         ]
+
+    def test_a_scorer_takes_from_the_summary_the_brief_of_the_keys_latest_rerate(self) -> None:
+        assert _rounds().latest_rerate_brief(_summary()) == _rounds().latest_rerate_brief(_key())
 
     def test_the_summary_names_the_brief_of_every_keyed_shard(self) -> None:
         assert {name: spec['brief_sha256'] for name, spec in _summary()['shards'].items()} == {

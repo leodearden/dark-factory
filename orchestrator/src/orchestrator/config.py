@@ -1067,6 +1067,20 @@ class DeliveredChecksConfig(BaseModel):
             'budget remain uncached and are retried next tick (fail-safe wait).'
         ),
     )
+    max_record_fetches_per_tick: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            'Maximum number of terminal dep records '
+            'Scheduler._phase_backfill_terminal_dep_records fetches per '
+            'scheduler tick; the delivered-check gate and the scheduled '
+            'self-deploy hold both read those records. Must be >= 1. A '
+            'never-cached dep it defers makes its dependents wait for a later '
+            'tick, so after a restart it sets how fast the cold record cache '
+            'warms; one slot per tick is kept for never-cached deps while any '
+            'wait.'
+        ),
+    )
     grace_cycles: int = Field(
         default=3,
         ge=1,
@@ -5363,6 +5377,17 @@ class OrchestratorConfig(BaseSettings):
             'or the task leaving the pin queue, resets it.'
         ),
     )
+    park_refused_emit_interval_secs: float = Field(
+        default=1800.0,
+        gt=0,
+        description=(
+            'park_refused is emitted once a dispatch candidate has been refused '
+            'its locks by parks alone, none of which outranks it, for this many '
+            'seconds, then at most once per this many seconds while that lasts. '
+            'A dispatch, a refusal by anything else, or the task leaving the '
+            'dispatch candidates ends the episode.'
+        ),
+    )
 
     # Escalation-watcher subprocess supervisor (AFK hardening, task 1326).
     # Keeps a fresh escalation-watcher-auto agent alive across multi-day AFK
@@ -5430,7 +5455,7 @@ class OrchestratorConfig(BaseSettings):
     # Disable either ceiling by setting to a very high value (no enable-flag
     # needed — mirrors auto_eval_redo_budget_usd pattern).
     watcher_daily_cost_ceiling_usd: float = Field(
-        default=50.0,
+        default=150.0,
         description=(
             'Daily USD ceiling for escalation-watcher invocations (trailing 24h '
             'sum of cost_usd WHERE role LIKE \'%watcher%\'). On breach, '
@@ -5439,7 +5464,7 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
     orch_daily_cost_ceiling_usd: float = Field(
-        default=200.0,
+        default=10000.0,
         description=(
             'Daily USD ceiling for ALL orchestrator invocations (trailing 24h '
             'sum of all cost_usd rows). On breach, pause_scheduler is called '
@@ -6983,6 +7008,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'pin_reservations_enabled',
         'pin_reservation_max_active',
         'pin_blocked_emit_interval_secs',
+        # park_refused cadence (task 6328): the same flat, tick-time read.
+        'park_refused_emit_interval_secs',
         # Digest + EWA breaker knobs (task 4559).  Explicit literals for the
         # same reason as the backfill_* group above: these are FLAT top-level
         # fields, not a submodel, so _submodel_leaf_paths does not apply.
@@ -7142,9 +7169,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # lowers the merge fan-out without a restart.
         'merge_verify_max_concurrent_modules',
         # Delivered-check dep-gate sweep budget (task 2580, capability-
-        # delivered-checks PRD delta) — scheduler tuning, same tier as
+        # delivered-checks PRD delta) and the terminal-dep record-fetch budget
+        # (task 9029, S16 D13) — scheduler tuning, same tier as
         # fairness.skip_threshold / starvation_watchdog.*.
         'delivered_checks.max_checks_per_tick',
+        'delivered_checks.max_record_fetches_per_tick',
         # Delivered-check grace-streak escalation knobs (task 2583, epsilon
         # of the same PRD) — same green tier: an operator may flip the kill
         # switch, retune the grace window, or adjust the per-check timeout
