@@ -17,6 +17,7 @@ from shared.declared_checks import DeclaredChecks, declared_checks
 from shared.followup_items import FOLLOWUP_ITEMS_METADATA_KEY, parse_item
 from shared.task_text_fingerprint import TaskTextDrift
 
+from orchestrator.agents.branch_history_guidance import BRANCH_HISTORY_HEADING
 from orchestrator.agents.harness_guidance import WAIT_PATTERN_REMINDER
 from orchestrator.agents.landed_sha_searches import LandedShaSearches, already_merged_step
 from orchestrator.agents.memory_recall import MemoryRecall
@@ -1293,6 +1294,10 @@ Before writing any new code, walk the pending steps in plan order:
         Rule 3 tells the agent not to file a scope request in this pass; one
         filed anyway is still applied at the pass boundary
         (``workflow.py::TaskWorkflow._amend``), so none is orphaned.
+
+        Rule 5 points at the IMPLEMENTER role section rendered by
+        ``agents/branch_history_guidance.py``, so a suggestion to rewrite
+        history cannot override it.
         """
         scope = _plan_scope(plan, task_id)
         if context is None:
@@ -1361,6 +1366,10 @@ This task holds locks for the following modules:
    guidance says.
 4. Prefix amendment commit messages with `amend:` so they're distinguishable
    from the main plan commits.
+5. Never rewrite a commit already on this branch, even when a suggestion
+   below asks you to amend, squash, reword or rebase one: answer it as your
+   role instructions' "{BRANCH_HISTORY_HEADING}" section says, with a new
+   `amend:` commit.
 
 ## Suggestions to Address
 
