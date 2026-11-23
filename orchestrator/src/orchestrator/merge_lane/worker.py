@@ -1222,12 +1222,10 @@ _COALESCE_RISKY_TERMINAL_STATES: frozenset[str] = frozenset({'blocked', 'error'}
 # nothing would park it merge-deferred, so a train holding it could never land.
 COALESCE_EXCLUDED_NO_AWAITING_WORKFLOW = 'no_awaiting_workflow'
 
-# How long a one-strike derail marker is remembered (task 5352).  An upper
-# bound on the subject, not a tuning dial: seven days is a generous outer
-# bound on a task's residency in the merge queue, and the marker must not
-# outlive the task it was recorded against.
-_COALESCE_DERAIL_TTL = timedelta(days=7)
-_NEXT_DISPATCH_UNCHAINED_TTL = timedelta(days=7)
+# How long a per-task marker (task 5352's one-strike derail, task 11047's
+# un-chained mark) is remembered: a generous outer bound on a task's merge-queue
+# residency, not a tuning dial, since no marker may outlive its task.
+_MERGE_QUEUE_RESIDENCY_BOUND = timedelta(days=7)
 
 
 class _TrainMergeHost(Protocol):
@@ -4829,7 +4827,7 @@ class SpeculativeMergeWorker:
         # that process was killed or gracefully stopped.
         self._next_dispatch_unchained: PersistentSet = PersistentSet(
             guard_path(_root, 'next_dispatch_unchained_task_ids.json'),
-            ttl=_NEXT_DISPATCH_UNCHAINED_TTL,
+            ttl=_MERGE_QUEUE_RESIDENCY_BOUND,
         )
         # task 2828 amend (reviewer_comprehensive, robustness): per-task
         # consecutive contended-lease requeue counter.  Incremented each time
@@ -5169,14 +5167,14 @@ class SpeculativeMergeWorker:
         # survives re-dispatch as a new MergeRequest with the same task_id —
         # and, since task 5352, a worker restart too: the marker is persisted
         # under project_root/data/orchestrator/guards/ and decays only via
-        # _COALESCE_DERAIL_TTL, which IS the decay policy this comment used to
-        # defer to a richer injectable predicate.  Unlike the sibling
+        # _MERGE_QUEUE_RESIDENCY_BOUND, which IS the decay policy this comment
+        # used to defer to a richer injectable predicate.  Unlike the sibling
         # _..._state_path attributes above there is no Path|None to thread and
         # no is-None branch at the call site: guard_path returns None for an
         # absent project_root and PersistentSet absorbs it as the in-memory mode.
         self._coalesce_derailed_task_ids: MutableSet[str] = PersistentSet(
             guard_path(_root, 'coalesce_derailed_task_ids.json'),
-            ttl=_COALESCE_DERAIL_TTL,
+            ttl=_MERGE_QUEUE_RESIDENCY_BOUND,
         )
         # α liveness ledger: ephemeral _merge-<uuid> worktrees owned by THIS
         # SpeculativeMergeWorker instance.  Touched every _heartbeat_loop tick
@@ -5393,9 +5391,10 @@ class SpeculativeMergeWorker:
             return
         # A request's gate attempts leave the lane with it, whichever exit it
         # took, so a resubmission starts its own count (task 8525). Its
-        # un-chained mark leaves too, so it may chain again (task 10723),
-        # unless the shutdown outcome retired it: that is no verdict, and the
-        # request comes back on the next start (intake_buffers.py::survives_restart).
+        # un-chained mark leaves too, so it may chain again (task 10723), and a
+        # drop (a cancelled Future) ends it although the journal keeps the entry
+        # (orchestrator/src/orchestrator/merge_lane/intake_buffers.py::survives_restart).
+        # Only the shutdown outcome keeps it: no verdict, and the request comes back.
         request = _request_of(retired)
         self._gate_retries.pop(request.task_id, None)
         if not resolved_with_shutdown(request.result):
