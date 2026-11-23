@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+import httpx
 from shared.mcp_envelope import write_failure_reason
 from shared.toolcall_markup import MARKUP_OVERRIDE_KEY
 
@@ -52,7 +53,14 @@ REPLACE_STRIPPED_KEYS = _RESERVED_METADATA_CONTROL_KEYS | _MACHINE_AUTHORED_META
 
 
 class ToolClient(Protocol):
-    async def call_tool(self, name: str, arguments: dict) -> Any: ...
+    async def call_tool(self, name: str, arguments: dict) -> Any:
+        """The tool's reply.
+
+        Raises ``RuntimeError`` when the server answered with an error, and
+        ``httpx.HTTPError`` when the call failed in transport, which leaves
+        open whether the server acted on it.
+        """
+        ...
 
 
 class MalformedRetryLedgerError(ValueError):
@@ -227,20 +235,22 @@ def write_backup(backup_path: Path, targets: Sequence[Target]) -> None:
 
 async def apply_target(client: ToolClient, target: Target, backup_path: Path) -> str | None:
     """Write *target*'s planned blob and read it back; the problem found, if any."""
+    recover = f'the pre-write blob is in {backup_path}'
     try:
         reply = await client.call_tool(
             'update_task', build_update_payload(target.task_id, target.project_root, target.plan.after),
         )
+    except httpx.HTTPError as exc:
+        return f'{target.label}: update_task did not complete ({exc!r}), so it may have landed; {recover}'
     except RuntimeError as exc:
         return f'{target.label}: update_task raised, nothing written: {exc}'
     reason = write_failure_reason(reply)
     if reason is not None:
         return f'{target.label}: update_task refused, nothing written: {reason}'
-    recover = f'the pre-write blob is in {backup_path}'
     try:
         stored = await _read_metadata(client, target.project_root, target.task_id)
-    except ToolReplyError as exc:
-        return f'{target.label}: read-back failed ({exc}); {recover}'
+    except (RuntimeError, httpx.HTTPError) as exc:
+        return f'{target.label}: read-back failed ({exc!r}); {recover}'
     if stored != target.plan.after:
         return f'{target.label}: read-back differs from the planned blob; {recover}'
     return None
