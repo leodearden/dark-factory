@@ -79,6 +79,14 @@ def _acquired(store: EventStore, task_id: str) -> int:
     return sum(1 for event in store.fetch_events_by_type(EventType.lock_acquired) if event['task_id'] == task_id)
 
 
+def _assert_not_passed_over(rig: _Rig, task_id: str) -> None:
+    """A task started elsewhere is no refused top: no skip bumped, no park, no park refusal."""
+    snapshot = rig.scheduler.get_state_snapshot()
+    assert task_id not in snapshot.skip_counts
+    assert task_id not in snapshot.parks
+    assert all(event['task_id'] != task_id for event in rig.store.fetch_events_by_type(EventType.park_refused))
+
+
 async def test_a_ranked_task_started_meanwhile_is_not_claimed_again(tmp_path):
     rig = _rig(tmp_path, D, E)
 
@@ -87,6 +95,7 @@ async def test_a_ranked_task_started_meanwhile_is_not_claimed_again(tmp_path):
     assert (b, a) == ('D', 'E')
     assert _acquired(rig.store, 'D') == 1
     assert _acquired(rig.store, 'E') == 1
+    _assert_not_passed_over(rig, 'D')
 
 
 async def test_a_pinned_task_started_meanwhile_is_not_claimed_again(tmp_path):
@@ -97,6 +106,7 @@ async def test_a_pinned_task_started_meanwhile_is_not_claimed_again(tmp_path):
     assert (b, a) == ('D', 'E')
     assert _acquired(rig.store, 'D') == 1
     assert _acquired(rig.store, 'E') == 1
+    _assert_not_passed_over(rig, 'D')
 
 
 async def test_the_only_candidate_started_meanwhile_leaves_nothing_to_claim(tmp_path):
@@ -106,3 +116,4 @@ async def test_the_only_candidate_started_meanwhile_leaves_nothing_to_claim(tmp_
 
     assert (b, a) == ('D', None)
     assert _acquired(rig.store, 'D') == 1
+    _assert_not_passed_over(rig, 'D')
