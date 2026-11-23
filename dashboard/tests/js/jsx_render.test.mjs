@@ -39,7 +39,9 @@ import {
   memoryEvalEscalation,
   memoryEvalRow,
   memoryEvalsPayload,
+  mergeActiveRow,
   mergeQueueBlock,
+  mergeRecentRow,
   openEscalationItem,
   orchestratorRow,
   projectRow,
@@ -644,6 +646,29 @@ for (const { arm, metrics, retries, drift, hints, texts, holeTitles } of LIVE_ME
       assert.equal(reading.firstChild.textContent, views[i].text, `"${label}" reading`);
       assert.equal(reading.title, views[i].title ?? '', `"${label}" reading's title`);
     });
+  });
+}
+
+for (const queued of [true, false]) {
+  test(`tabs.jsx::MergeTab gives Currently queued and Recent merges each a full row${queued ? ', queued first' : ', with nothing queued'}`, t => {
+    const block = mergeQueueBlock({ bucketMinutes: 60, active: queued ? [mergeActiveRow()] : [], recent: [mergeRecentRow({ taskId: '2' })] });
+    const { harness, container } = mountMergeTab(t, block);
+    const recent = panelTitled(container, 'Recent merges');
+    const grid = recent.parentElement;
+    assert.ok(grid.classList.contains('cols-12'), "Recent merges must sit in the project's 12-column grid");
+    assert.ok(recent.classList.contains('col-span-12'), 'Recent merges must span the whole row');
+    assert.equal(recent.querySelectorAll('tbody tr').length, 1, 'Recent merges must render its one fixture row');
+
+    if (queued) {
+      const queuedPanel = panelTitled(container, 'Currently queued');
+      assert.ok(queuedPanel.parentElement === grid, "Currently queued must sit in the project's 12-column grid");
+      assert.ok(queuedPanel.classList.contains('col-span-12'), 'Currently queued must span the whole row');
+      assert.ok(queuedPanel.compareDocumentPosition(recent) & harness.window.Node.DOCUMENT_POSITION_FOLLOWING, 'Currently queued must come before Recent merges');
+      assert.equal(queuedPanel.querySelectorAll('tbody tr').length, 1, 'Currently queued must render its one fixture row');
+    } else {
+      const titles = [...container.querySelectorAll('.panel-head > .title')].map(title => title.textContent);
+      assert.ok(!titles.some(text => text.startsWith('Currently queued')), `nothing is queued, yet: ${JSON.stringify(titles)}`);
+    }
   });
 }
 
