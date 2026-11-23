@@ -607,6 +607,9 @@ def _a_flock_waits_on(handle: typing.IO[str]) -> bool:
     return False
 
 
+_ENSURE_EXIT_CEILING_SECS = 60
+
+
 def test_an_ensure_whose_lock_file_is_replaced_while_it_waits_locks_the_new_file(remote: _Remote):
     """A holder may unlink the lock: winning a file no longer at the lock path is no lock."""
     remote.root.mkdir(parents=True)
@@ -628,14 +631,14 @@ def test_an_ensure_whose_lock_file_is_replaced_while_it_waits_locks_the_new_file
         assert remote.builds() == 0
 
         second.close()
-        _, stderr = proc.communicate(timeout=60)
+        _, stderr = proc.communicate(timeout=_ENSURE_EXIT_CEILING_SECS)
         assert proc.returncode == 0, stderr
         assert remote.builds() == 1
     finally:
         for handle in handles:
             handle.close()
         proc.kill()
-        proc.communicate(timeout=60)
+        proc.communicate(timeout=_ENSURE_EXIT_CEILING_SECS)
 
 
 def test_ensure_never_exits_with_the_ssh_transport_status(remote: _Remote):
