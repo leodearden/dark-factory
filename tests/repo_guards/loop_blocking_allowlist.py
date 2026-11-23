@@ -237,11 +237,12 @@ _COMBINE_AUDIT_APPEND_WHY = (
     'per follow-up item on the target, so roughly 40 bytes per item. It '
     'runs once per curator COMBINE decision, '
     'each of which follows an LLM call of seconds, so the append is never '
-    'on a hot or storm-coupled path. Since task 8416 '
-    'TaskInterceptor._resolve_batch_edge also reaches it: one refusal row '
-    'per within-batch combine whose sibling was not created, so at most '
-    'one append per batch edge, each after the same batch LLM call. The '
-    'one storm-coupled defect of this '
+    'on a hot or storm-coupled path. Since task 8416 two batch-edge sites '
+    'reach it too: TaskInterceptor._resolve_batch_edge (one refusal row per '
+    'within-batch combine whose sibling was not created) and '
+    'TaskInterceptor._audit_drop_onto_sibling (one row per within-batch drop '
+    'onto a sibling task), so at most one append per batch edge, each after '
+    'the same batch LLM call. The one storm-coupled defect of this '
     'shape, the EventQueue dead-letter append that fires during a drop '
     'storm, was moved onto a dedicated writer thread by task 6085.'
 )
@@ -413,7 +414,15 @@ AUDITED_SITES: list[tuple[str, str, str, str, TaskRef | TicketRef | None, str]] 
     (
         'fused-memory/src/fused_memory/middleware/task_interceptor.py',
         'TaskInterceptor._resolve_batch_edge',
-        'c7dacb0107b5',
+        '36be88f72819',
+        'accepted',
+        None,
+        _COMBINE_AUDIT_APPEND_WHY,
+    ),
+    (
+        'fused-memory/src/fused_memory/middleware/task_interceptor.py',
+        'TaskInterceptor._audit_drop_onto_sibling',
+        '1c4cefeb98fb',
         'accepted',
         None,
         _COMBINE_AUDIT_APPEND_WHY,

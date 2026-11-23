@@ -5442,33 +5442,37 @@ class TaskInterceptor:
         edge: CuratorDecision,
         sibling: _TicketLifecycle,
         *,
-        ticket_id: str,
+        ticket: _PreparedTicket,
         candidate: CandidateTask,
-        metadata: Any,
-        project_id: str,
     ) -> CuratorDecision:
-        """The decision a drop or combine onto *sibling*, already dispatched, dispatches as.
+        """The decision *ticket*'s drop or combine onto *sibling*, already dispatched, dispatches as.
 
         Either edge parks with a parked sibling. A drop lands on any task the
-        sibling resolved to. A combine rewrites only a task the sibling
-        created, through :meth:`_execute_combine` and so every combine guard;
-        ``batch_target_index`` stays set, so its audit row is batch-internal.
-        An edge with nothing to land on is created on its own, and a combine
-        that could not be made is audited as refused.
+        sibling resolved to, and is audited. A combine rewrites only a task the
+        sibling created, through :meth:`_execute_combine` and so every combine
+        guard; ``batch_target_index`` stays set, so its audit row is
+        batch-internal. An edge with nothing to land on is created on its own,
+        and a combine that could not be made is audited as refused.
+        *candidate* is *ticket*'s.
         """
         onto_sibling = f'batch_target_index (ticket={sibling.ticket.ticket_id}): {edge.justification}'
+        sibling_task = sibling.task_id
         match edge.action, _sibling_outcome(sibling):
             case _, DeferReason() as reason:
                 return CuratorDecision.deferred(reason)
-            case 'drop', _SiblingOutcome.CREATED | _SiblingOutcome.RESOLVED:
-                return CuratorDecision(
-                    action='drop', target_id=sibling.task_id, justification=onto_sibling,
+            case 'drop', _SiblingOutcome.CREATED | _SiblingOutcome.RESOLVED if sibling_task:
+                drop = CuratorDecision(
+                    action='drop', target_id=sibling_task, justification=onto_sibling,
                 )
+                await self._audit_drop_onto_sibling(
+                    drop, sibling_task, ticket=ticket, candidate=candidate,
+                )
+                return drop
             case 'drop', _:
                 logger.warning(
                     '_resolve_batch_edge: ticket %s drops onto ticket %s, which has no '
                     'task; degrading to create',
-                    ticket_id,
+                    ticket.ticket_id,
                     sibling.ticket.ticket_id,
                 )
                 return CuratorDecision(
@@ -5478,13 +5482,10 @@ class TaskInterceptor:
                 )
             case 'combine', _SiblingOutcome.CREATED:
                 return dataclasses.replace(
-                    edge, target_id=sibling.task_id, justification=onto_sibling,
+                    edge, target_id=sibling_task, justification=onto_sibling,
                 )
             case 'combine', _:
-                self._audit_unmade_batch_combine(
-                    edge, sibling, ticket_id=ticket_id, candidate=candidate,
-                    metadata=metadata, project_id=project_id,
-                )
+                self._audit_unmade_batch_combine(edge, sibling, ticket=ticket, candidate=candidate)
                 return CuratorDecision(
                     action='create',
                     justification=(
@@ -5497,17 +5498,64 @@ class TaskInterceptor:
             case _:
                 return edge
 
+    async def _audit_drop_onto_sibling(
+        self,
+        drop: CuratorDecision,
+        target_id: str,
+        *,
+        ticket: _PreparedTicket,
+        candidate: CandidateTask,
+    ) -> None:
+        """Audit *ticket*'s drop onto *target_id*, the task its batch sibling resolved to.
+
+        A drop rewrites nothing, so ``new`` repeats ``old``, read live from the
+        target, and its items are the target's before and after. Best-effort
+        like every audit row: a failed read or a malformed stored bundle logs
+        a WARNING, writes no row, and never changes the drop.
+        """
+        try:
+            tm = await self._ensure_taskmaster()
+            target = _extract_task_dict(await tm.get_task(target_id, ticket.project_root))
+        except Exception as exc:
+            logger.warning('combine-audit: drop target=%s could not be read: %s', target_id, exc)
+            return
+        if target is None:
+            logger.warning('combine-audit: drop target=%s returned no task dict', target_id)
+            return
+        title = str(target.get('title', '') or '')
+        description = str(target.get('description', '') or '')
+        context = _drop_fold(
+            ticket_id=ticket.ticket_id,
+            target_title=title,
+            target_meta=coerce_task_metadata(target.get('metadata')) or {},
+            candidate=candidate,
+            candidate_meta=extract_metadata_dict(
+                ticket.metadata, source='TaskInterceptor._audit_drop_onto_sibling',
+            ) or {},
+        )
+        if context is None:
+            return
+        _append_combine_audit(
+            project_id=ticket.project_id,
+            target_id=target_id,
+            old_title=title,
+            old_description=description,
+            old_status=str(target.get('status', '') or ''),
+            new_title=title,
+            new_description=description,
+            justification=drop.justification,
+            context=context,
+        )
+
     @staticmethod
     def _audit_unmade_batch_combine(
         edge: CuratorDecision,
         sibling: _TicketLifecycle,
         *,
-        ticket_id: str,
+        ticket: _PreparedTicket,
         candidate: CandidateTask,
-        metadata: Any,
-        project_id: str,
     ) -> None:
-        """Audit a combine into *sibling* refused because the sibling was not created.
+        """Audit *ticket*'s combine into *sibling*, refused because the sibling was not created.
 
         ``old`` is the sibling's candidate and terminal ticket status, and
         ``target_id`` the task it resolved to, if any. The candidate is created
@@ -5516,7 +5564,7 @@ class TaskInterceptor:
         logger.warning(
             '_resolve_batch_edge: ticket %s combines into ticket %s, which was %s and '
             'not created; creating it on its own',
-            ticket_id,
+            ticket.ticket_id,
             sibling.ticket.ticket_id,
             sibling.status,
         )
@@ -5526,16 +5574,16 @@ class TaskInterceptor:
         new_title, new_description = (rewrite.title, rewrite.description) if rewrite else ('', '')
         context, _ = _combine_fold(
             edge,
-            ticket_id=ticket_id,
+            ticket_id=ticket.ticket_id,
             target_title=old_title,
             target_meta={},
             candidate=candidate,
             candidate_meta=extract_metadata_dict(
-                metadata, source='TaskInterceptor._audit_unmade_batch_combine',
+                ticket.metadata, source='TaskInterceptor._audit_unmade_batch_combine',
             ) or {},
         )
         _append_combine_audit(
-            project_id=project_id,
+            project_id=ticket.project_id,
             target_id=sibling.task_id,
             old_title=old_title,
             old_description=old_description,
@@ -5762,12 +5810,7 @@ class TaskInterceptor:
                     effective_decision = dec
                     if dec is not None and target is not None and t.candidate is not None:
                         effective_decision = await self._resolve_batch_edge(
-                            dec,
-                            target,
-                            ticket_id=t.ticket_id,
-                            candidate=t.candidate,
-                            metadata=t.metadata,
-                            project_id=project_id,
+                            dec, target, ticket=t, candidate=t.candidate,
                         )
 
                     status = TicketStatus.FAILED
@@ -7122,8 +7165,14 @@ COMBINE_REFUSED_BATCH_TARGET_NOT_CREATE = 'batch-target-not-create'
 
 @dataclasses.dataclass(frozen=True)
 class _CombineAuditContext:
-    """What one combine folded and on whose behalf: the audit's candidate and item fields."""
+    """What one combine folded and on whose behalf: the audit's candidate and item fields.
 
+    ``action`` names the decision that wrote the row: a combine, or a
+    within-batch drop onto a sibling (task 8416), which folds nothing. A row
+    written before it existed has no ``action`` key and was a combine.
+    """
+
+    action: Literal['combine', 'drop']
     candidate_ticket_id: str
     candidate_source: str | None
     candidate_spawned_from: str | None
@@ -7133,6 +7182,7 @@ class _CombineAuditContext:
 
     def to_record(self) -> dict[str, Any]:
         return {
+            'action': self.action,
             'candidate_ticket_id': self.candidate_ticket_id,
             'candidate_source': self.candidate_source,
             'candidate_spawned_from': self.candidate_spawned_from,
@@ -7172,16 +7222,53 @@ def _combine_fold(
             exc,
         )
         items_before, items_after = (), None
-    candidate_source = candidate_meta.get('source')
     context = _CombineAuditContext(
+        action='combine',
         candidate_ticket_id=ticket_id,
-        candidate_source=candidate_source if isinstance(candidate_source, str) else None,
+        candidate_source=_candidate_source(candidate_meta),
         candidate_spawned_from=candidate.spawned_from,
         batch_internal=decision.batch_target_index is not None,
         items_before=tuple(item.key for item in items_before),
         items_after=tuple(item.key for item in items_after or ()),
     )
     return context, items_after
+
+
+def _drop_fold(
+    *,
+    ticket_id: str,
+    target_title: str,
+    target_meta: Mapping[str, Any],
+    candidate: CandidateTask,
+    candidate_meta: Mapping[str, Any],
+) -> _CombineAuditContext | None:
+    """The audit context of a within-batch drop onto a sibling's task, which folds nothing.
+
+    Its items are the target's, before and after. None, logged here, when the
+    target's stored bundle is malformed.
+    """
+    try:
+        items = task_items(
+            title=target_title, files=extract_files(dict(target_meta)), metadata=target_meta,
+        )
+    except FollowupBundleInvalid as exc:
+        logger.warning('combine-audit: the drop target %r has a malformed follow-up bundle (%s)', target_title, exc)
+        return None
+    keys = tuple(item.key for item in items)
+    return _CombineAuditContext(
+        action='drop',
+        candidate_ticket_id=ticket_id,
+        candidate_source=_candidate_source(candidate_meta),
+        candidate_spawned_from=candidate.spawned_from,
+        batch_internal=True,
+        items_before=keys,
+        items_after=keys,
+    )
+
+
+def _candidate_source(candidate_meta: Mapping[str, Any]) -> str | None:
+    source = candidate_meta.get('source')
+    return source if isinstance(source, str) else None
 
 
 def _append_combine_audit(
