@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import math
+from bisect import bisect_right
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -91,6 +92,12 @@ BUCKET_LADDER: tuple[tuple[int | None, int], ...] = (
     (None, 1440),  # > 30 d  →  1-d  buckets   (≤ 3 651 pts, covers all=87 600 h)
 )
 
+TRAILING_WINDOW_LADDER: tuple[tuple[int | None, int], ...] = (
+    (14 * 24, 24 * 60),    # ≤ 14 d → each point counts the trailing day
+    (None, 7 * 24 * 60),   # > 14 d → each point counts the trailing week
+)
+"""(max_window_hours | None, trailing_minutes): how far back each landing-rate point counts."""
+
 
 def _cutoff_iso(hours: int, *, now: datetime | None = None) -> str:
     """Return ISO-format cutoff datetime for the given look-back window (hours).
@@ -127,10 +134,20 @@ def _bucket_minutes_for_window(hours: int) -> int:
       <= 720 h → 360 min (≤ 121 buckets)
       >  720 h → 1440 min (≤ 3 651 buckets, covers window=all / 87 600 h)
     """
-    for max_hours, bucket_min in BUCKET_LADDER:
+    return _ladder_minutes(BUCKET_LADDER, hours)
+
+
+def _trailing_minutes_for_window(hours: int) -> int:
+    """The trailing window, in minutes, each landing-rate point of an *hours* window counts over."""
+    return _ladder_minutes(TRAILING_WINDOW_LADDER, hours)
+
+
+def _ladder_minutes(ladder: tuple[tuple[int | None, int], ...], hours: int) -> int:
+    """The minutes of *ladder*'s first tier whose max_hours bound *hours* does not exceed."""
+    for max_hours, minutes in ladder:
         if max_hours is None or hours <= max_hours:
-            return bucket_min
-    return 1440  # unreachable — BUCKET_LADDER always ends with (None, ...)
+            return minutes
+    raise ValueError(f'a window ladder ends in a catch-all tier (ladder={ladder!r}, hours={hours!r})')
 
 
 class DepthSeries(ChartData):
@@ -260,6 +277,44 @@ async def queue_depth_timeseries(
         db, _query,
         unknown_datum('the merge_attempt depth series could not be read from runs.db', bound),
     )
+
+
+# ---------------------------------------------------------------------------
+# 1b. Landing rate — landings/day over the trailing window ending at each point
+# ---------------------------------------------------------------------------
+
+class LandingRateSeries(ChartData):
+    """Landings per day at each instant, each counted over the trailing window that ends there."""
+
+    trailing_minutes: int
+
+
+def trailing_landing_rates(
+    landed: Sequence[datetime], *, now: datetime, hours: int,
+) -> LandingRateSeries:
+    """The landing rate at each bucket-width step from ``now - hours`` to ``now``.
+
+    *landed* is sorted ascending and reaches one trailing window before the
+    first point, so every point counts a whole window: landings in
+    ``(t - trailing, t]``, scaled to landings per day.
+    """
+    step = _bucket_minutes_for_window(hours)
+    trailing = _trailing_minutes_for_window(hours)
+    count = hours * 60 // step + 1
+    points = [now - timedelta(minutes=(count - 1 - k) * step) for k in range(count)]
+    values: list[int | float] = [
+        round(
+            (bisect_right(landed, t) - bisect_right(landed, t - timedelta(minutes=trailing)))
+            * 1440 / trailing,
+            2,
+        )
+        for t in points
+    ]
+    return {
+        'labels': [t.isoformat() for t in points],
+        'values': values,
+        'trailing_minutes': trailing,
+    }
 
 
 # ---------------------------------------------------------------------------

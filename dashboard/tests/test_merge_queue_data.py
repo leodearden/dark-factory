@@ -7,6 +7,7 @@ import json
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from typing import TypeVar
 from unittest.mock import AsyncMock, patch
 
@@ -677,7 +678,7 @@ class TestTrailingLandingRates:
         step = _bucket_minutes_for_window(hours)
         assert len(series['labels']) == hours * 60 // step + 1
         instants = [datetime.fromisoformat(label) for label in series['labels']]
-        assert {later - earlier for earlier, later in zip(instants, instants[1:])} == {
+        assert {later - earlier for earlier, later in pairwise(instants)} == {
             timedelta(minutes=step),
         }
         assert series['labels'][-1] == RATE_NOW.isoformat()
@@ -693,7 +694,7 @@ class TestTrailingLandingRates:
         assert series['values'][-1] == 2.0
         assert _rate_at(series, RATE_NOW - timedelta(hours=5)) == 1.0
         since_first = [
-            value for label, value in zip(series['labels'], series['values'])
+            value for label, value in zip(series['labels'], series['values'], strict=True)
             if datetime.fromisoformat(label) >= landed[0]
         ]
         assert since_first
