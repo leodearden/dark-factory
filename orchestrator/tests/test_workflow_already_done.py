@@ -26,6 +26,9 @@ from orchestrator.delivered_checks import DeliveredCheckResult, DeliveredChecksB
 from orchestrator.scheduler import SetTaskStatusRejected
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
+_AD_COMMIT = 'abcdef1234' + '0' * 30
+_UNLANDED_COMMIT = 'feedfacecafebeef' + '0' * 24
+
 
 @dataclass
 class _Fixture:
@@ -135,7 +138,7 @@ async def test_valid_commit_sets_done_with_provenance(tmp_path: Path):
         commit_on_main=True,
     )
     f.artifacts.write_already_done(
-        commit='abcdef1234567890',
+        commit=_AD_COMMIT,
         evidence='helpers.foo on main at task 42',
     )
 
@@ -151,13 +154,13 @@ async def test_valid_commit_sets_done_with_provenance(tmp_path: Path):
     # 2026-04-27 hardening: kind discriminator added; verified_by/evidence
     # folded into the structured note field so the schema accepts the call.
     assert provenance['kind'] == 'found_on_main'
-    assert provenance['commit'] == 'abcdef1234567890'
+    assert provenance['commit'] == _AD_COMMIT
     assert 'architect' in provenance['note']
     assert 'helpers.foo on main at task 42' in provenance['note']
     # Artifact cleared so a re-run doesn't see a stale report.
     assert f.artifacts.read_already_done() is None
     # is_ancestor called with (commit, main_sha) — strictly main-membership check.
-    f.is_ancestor.assert_awaited_once_with('abcdef1234567890', 'mainsha123')
+    f.is_ancestor.assert_awaited_once_with(_AD_COMMIT, 'mainsha123')
 
 
 @pytest.mark.asyncio
@@ -167,7 +170,7 @@ async def test_commit_not_on_main_blocks_without_l1(tmp_path: Path):
         project_root=tmp_path / 'proj',
         commit_on_main=False,
     )
-    f.artifacts.write_already_done('feedfacecafebeef', 'evidence text')
+    f.artifacts.write_already_done(_UNLANDED_COMMIT, 'evidence text')
 
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
     f.wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
@@ -178,7 +181,10 @@ async def test_commit_not_on_main_blocks_without_l1(tmp_path: Path):
     mark_blocked.assert_awaited_once()
     assert mark_blocked.await_args is not None
     args, kwargs = mark_blocked.await_args
-    assert 'not reachable from main' in args[0]
+    assert args[0] == (
+        f'Architect reported task already done at {_UNLANDED_COMMIT[:12]} '
+        f'but commit is not reachable from main'
+    )
     # Validation failure must NOT escalate to human — this is an architect bug.
     assert kwargs.get('escalate_to_human') is not True
     # Status NOT set to done.
@@ -223,6 +229,40 @@ async def test_empty_commit_string_blocks(tmp_path: Path):
     mark_blocked.assert_awaited_once()
     f.set_task_status.assert_not_called()
     f.is_ancestor.assert_not_called()
+
+
+_ESC_4331_SPECIMEN = 'fafc76cd5d9b4a3e50186d011c77351827693209d'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'commit', [_ESC_4331_SPECIMEN, 'fafc76cd5d9a', 'HEAD~1'],
+    ids=['41_chars', 'short_hash', 'not_hex'],
+)
+async def test_a_commit_that_is_not_a_full_sha_is_reported_as_malformed(
+    tmp_path: Path, commit: str,
+):
+    """A value that is not a full commit sha is the report's own fault, so it
+    is named as malformed; git never sees it, and nothing is said about main
+    (esc-4331's 41-character sha was misreported as "not reachable")."""
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f.artifacts.write_already_done(commit=commit, evidence='evidence text')
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    f.wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+
+    outcome = await f.wf._handle_already_done_report()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    mark_blocked.assert_awaited_once()
+    assert mark_blocked.await_args is not None
+    args, kwargs = mark_blocked.await_args
+    assert 'malformed' in args[0]
+    assert commit in args[0]
+    assert 'reachable' not in args[0]
+    f.is_ancestor.assert_not_called()
+    assert kwargs.get('escalate_to_human') is not True
+    f.set_task_status.assert_not_called()
+    assert f.artifacts.read_already_done() is None
 
 
 @pytest.mark.asyncio
@@ -362,7 +402,6 @@ async def test_run_short_circuits_on_plan_escalated(tmp_path: Path):
 
 _AD_GATE_TARGET = 'orchestrator.workflow.gate_mark_done_on_delivered_checks'
 _RUN_CHECK_TARGET = 'orchestrator.delivered_checks.run_delivered_check'
-_AD_COMMIT = 'abcdef1234567890'
 _AD_MAIN_SHA = 'mainsha123'
 _AD_DC_CHECK = {
     'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present',
@@ -833,7 +872,7 @@ async def test_rejected_mark_done_blocks_the_row_and_files_an_l1(tmp_path: Path)
     row behind one L1, never report DONE over the row it could not write."""
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
     f.artifacts.write_already_done(
-        commit='abcdef1234567890', evidence='helpers.foo on main at task 42',
+        commit=_AD_COMMIT, evidence='helpers.foo on main at task 42',
     )
     f.wf.scheduler.mark_done = AsyncMock(side_effect=SetTaskStatusRejected(
         task_id='50', error_code='pre_done_hook_rejected',
@@ -888,6 +927,12 @@ def _refusal_malformed_false_premise(
     return f
 
 
+def _refusal_malformed_sha(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f.artifacts.write_already_done(commit=_ESC_4331_SPECIMEN, evidence='e')
+    return f
+
+
 def _refusal_unreachable_commit(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
     f = _make(
         worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
@@ -929,6 +974,7 @@ def _refusal_rejected_mark_done(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fix
 
 _REFUSAL_ARMS = {
     'malformed_report': _Refusal(_refusal_malformed_report, 'malformed'),
+    'malformed_sha': _Refusal(_refusal_malformed_sha, 'malformed'),
     'unreachable_commit': _Refusal(_refusal_unreachable_commit, 'not reachable'),
     'unattributed_hold': _Refusal(_refusal_unattributed_hold, 'could not be attributed'),
     'delivered_checks_block': _Refusal(

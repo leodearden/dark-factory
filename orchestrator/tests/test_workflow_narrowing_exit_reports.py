@@ -40,7 +40,7 @@ from orchestrator.merge_lane import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
 from orchestrator.merge_lane.gates import PlanFilesTouchedResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
-_CLAIMED_COMMIT = '4e175c0732abc'
+_CLAIMED_COMMIT = '4e175c0732' + '0' * 30
 _TASK_ID = '2656'
 
 
