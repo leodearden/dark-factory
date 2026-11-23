@@ -493,6 +493,53 @@ class TestSweeps:
             store.clear_expired('proj', now=datetime(2026, 5, 14))
 
 
+class TestExpiredIds:
+    """``expired_ids`` names exactly the rows ``clear_expired`` would delete, and deletes none."""
+
+    NOW = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+
+    def _store_with_ttls(self, tmp_path: Path):
+        from orchestrator.overrides import OverrideStore
+
+        store = OverrideStore(tmp_path / 'scheduler_overrides.db')
+        store.set_override('proj', 'past', boost_tier='high', ttl_until=self.NOW - timedelta(hours=1))
+        store.set_override('proj', 'past-offset', boost_tier='high',
+                           ttl_until=datetime(2026, 5, 14, 16, 0, tzinfo=timezone(timedelta(hours=5))))
+        store.set_override('proj', 'equal', boost_tier='high', ttl_until=self.NOW)
+        store.set_override('proj', 'future', boost_tier='high', ttl_until=self.NOW + timedelta(hours=1))
+        store.set_override('proj', 'no-ttl', boost_tier='high')
+        store.set_override('other', 'other-past', boost_tier='high', ttl_until=self.NOW - timedelta(hours=1))
+        return store
+
+    def test_names_exactly_what_clear_expired_then_deletes(self, tmp_path: Path) -> None:
+        store = self._store_with_ttls(tmp_path)
+
+        named = store.expired_ids('proj', self.NOW)
+
+        assert named == ['past', 'past-offset']
+        assert store.clear_expired('proj', self.NOW) == named
+
+    def test_deletes_nothing(self, tmp_path: Path) -> None:
+        store = self._store_with_ttls(tmp_path)
+        before = (store.get_overrides('proj'), store.get_overrides('other'))
+
+        store.expired_ids('proj', self.NOW)
+
+        assert (store.get_overrides('proj'), store.get_overrides('other')) == before
+
+    def test_compares_in_utc_whatever_the_callers_offset(self, tmp_path: Path) -> None:
+        store = self._store_with_ttls(tmp_path)
+        same_instant = self.NOW.astimezone(timezone(timedelta(hours=-7)))
+
+        assert store.expired_ids('proj', same_instant) == store.expired_ids('proj', self.NOW)
+
+    def test_rejects_naive_now_as_clear_expired_does(self, tmp_path: Path) -> None:
+        store = self._store_with_ttls(tmp_path)
+
+        with pytest.raises(ValueError, match='timezone'):
+            store.expired_ids('proj', datetime(2026, 5, 14))
+
+
 class TestFromConfig:
     def test_from_config_returns_store_at_canonical_db_path(self, tmp_path: Path) -> None:
         from orchestrator.config import OrchestratorConfig
