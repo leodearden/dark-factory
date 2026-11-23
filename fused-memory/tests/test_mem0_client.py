@@ -2274,7 +2274,7 @@ _SCAN_LEAK_TEXT = _SCAN_BODY + _SCAN_LEAK_FRAGMENT
 _SCAN_DUP_TEXT = _SCAN_BODY + _SCAN_CLOSE_CONTENT + '\n' + _SCAN_OPEN_CONTENT + _SCAN_BODY
 
 
-def _scan_point(point_id: str, payload: dict):
+def _scan_point(point_id: str, payload: object):
     """Create a MagicMock that mimics a Qdrant Record."""
     point = MagicMock()
     point.id = point_id
