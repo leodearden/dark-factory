@@ -148,6 +148,7 @@ from orchestrator.starvation_watchdog import (
 )
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.strict_event_reads import task_ids_with_event
+from orchestrator.task_picture import TaskPicture
 from orchestrator.task_priority import TaskPriority
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 from orchestrator.time_sources import resolve_monotonic_time_source, resolve_wall_time_source
@@ -7825,6 +7826,68 @@ class Scheduler:
             self._emit_tick_telemetry(
                 ctx, tick_started, phase_ms, terminal_phase, assignment, scope,
             )
+
+    async def build_task_picture(self) -> TaskPicture | None:
+        """What the ordinary pass's read parts see now, built without writing anything.
+
+        The task fetch of :meth:`acquire_next`, then the read parts of its
+        writing steps in the pass's order, with the phases' fail-safe values;
+        ``None`` when the fetch fails. It touches no age anchor, streak,
+        cache, event, snapshot or store (PRD §5.4 "From what: the task
+        picture", invariant 12).
+        """
+        built_at = self._time_source()
+        tasks = await self.get_tasks(statuses=ACTIVE_TASK_STATUSES, distinguish_failure=True)
+        if tasks is None:
+            return None
+        index = _index_tasks(tasks)
+        dep_statuses = await self._read_dep_statuses(tasks, index.status_map)
+        status_map = {**index.status_map, **dep_statuses.resolved}
+        try:
+            records = await self._read_terminal_dep_records(tasks, status_map, index.tasks_by_id)
+        except Exception:
+            logger.warning('build_task_picture: terminal dep record read failed', exc_info=True)
+            records = _TerminalRecordRead()
+        terminal_dep_records = records.records
+        external = await self._read_external_statuses(tasks)
+        delivered = await self._read_picture_delivered_checks(
+            tasks, status_map, index.tasks_by_id, terminal_dep_records,
+        )
+        overrides = self._read_overrides(status_map, index.tasks_by_id).in_force
+        priorities = self._read_priorities(tasks, index.tasks_by_id, status_map, overrides)
+        return TaskPicture(
+            built_at=built_at,
+            tasks=tuple(tasks),
+            status_map=status_map,
+            tasks_by_id=index.tasks_by_id,
+            max_id=index.max_id,
+            terminal_dep_records=terminal_dep_records,
+            deferred_terminal_deps=records.deferred_new,
+            external_statuses=dict(external.statuses),
+            external_resolver_failed=external.error is not None,
+            delivered_check_cache=delivered,
+            overrides=overrides,
+            effective_priorities=priorities.effective_priorities,
+            transitive_counts=priorities.transitive_counts,
+        )
+
+    async def _read_picture_delivered_checks(
+        self,
+        tasks: list[dict],
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, dict],
+        terminal_dep_records: dict[str, dict],
+    ) -> dict[str, bool] | None:
+        """The delivered-check projection as :meth:`_phase_delivered_check_gate` would see it."""
+        if not self.config.delivered_checks.enabled:
+            return None
+        pending = [t for t in tasks if t.get('status') == 'pending']
+        try:
+            sweep = await self._read_delivered_checks(pending, status_map, tasks_by_id, terminal_dep_records)
+        except Exception:
+            logger.warning('build_task_picture: delivered-check read failed', exc_info=True)
+            return {}
+        return dict(sweep.projection)
 
     def _emit_tick_telemetry(
         self,
