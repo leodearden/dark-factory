@@ -25,8 +25,8 @@ lifting batch rule 2: `action='combine'` with `batch_target_index=<B>`,
 `rewritten_task`. B must itself be created. It is then rewritten through the
 ordinary combine path, under every combine guard.
 
-- A combine whose target sibling was not created (dropped, combined, parked
-  elsewhere, failed or refused) is created on its own with a reason starting
+- A combine whose target sibling was not created (dropped, combined, failed
+  or refused) is created on its own with a reason starting
   `batch-target-not-create`. It also writes a combine-audit refusal row with
   `refused_reason: batch-target-not-create`. A combine onto a parked sibling
   parks with it, as a drop does.

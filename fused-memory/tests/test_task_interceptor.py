@@ -14649,13 +14649,67 @@ async def test_batch_combine_pointing_at_refused_candidate_degrades_to_create_an
     [audit] = _combine_audit_lines(audit_dir)
     assert {
         key: audit.get(key)
-        for key in ('action', 'refused_reason', 'batch_internal', 'candidate_ticket_id', 'target_id')
+        for key in (
+            'action', 'refused_reason', 'batch_internal', 'candidate_ticket_id', 'target_id',
+            'sibling_ticket_id', 'sibling_ticket_status',
+        )
     } == {
         'action': 'combine',
         'refused_reason': 'batch-target-not-create',
         'batch_internal': True,
         'candidate_ticket_id': ticket_ids[1],
         'target_id': None,
+        'sibling_ticket_id': ticket_ids[0],
+        'sibling_ticket_status': 'refused',
+    }
+    assert audit['old'] == {
+        'title': 'Convert FIX C relay-flag deletion', 'description_truncated': 'x', 'status': '',
+    }
+
+
+@pytest.mark.asyncio
+async def test_batch_drop_onto_a_sibling_with_a_malformed_bundle_is_still_audited(
+    make_curator_interceptor, taskmaster, audit_dir,
+):
+    """A malformed stored bundle on the sibling's task leaves the drop's audit row without items,
+    as it leaves a combine's, rather than unwritten."""
+    create = CuratorDecision(action='create', justification='new')
+    mock_curator = curator_always(create)
+    mock_curator.curate_prepared = AsyncMock(return_value=[
+        create,
+        CuratorDecision(
+            action='drop', target_id=None, batch_target_index=0, justification='dup of batch 0',
+        ),
+    ])
+    interceptor = make_curator_interceptor(mock_curator)
+    taskmaster.add_task = AsyncMock(return_value={'id': '88', 'title': 'Task One'})
+    taskmaster.get_task = AsyncMock(return_value={
+        'id': '88', 'title': 'Task One', 'status': 'pending',
+        'metadata': {'followup_items': 'not a list'},
+    })
+
+    ticket_ids = await submit_as_one_batch(interceptor, mock_curator, [
+        {'title': 'Task One', 'description': 'x'},
+        {'title': 'Task One, filed again', 'description': 'x'},
+    ])
+    created, dropped = [
+        await interceptor.resolve_ticket(t, '/project', timeout_seconds=10.0)
+        for t in ticket_ids
+    ]
+
+    assert [(answer['status'], answer.get('task_id')) for answer in (created, dropped)] == [
+        ('created', '88'), ('combined', '88'),
+    ]
+    [audit] = _combine_audit_lines(audit_dir)
+    assert {
+        key: audit.get(key)
+        for key in ('action', 'target_id', 'candidate_ticket_id', 'items_before', 'items_after')
+    } == {
+        'action': 'drop',
+        'target_id': '88',
+        'candidate_ticket_id': ticket_ids[1],
+        'items_before': [],
+        'items_after': [],
     }
 
 

@@ -5458,7 +5458,7 @@ class TaskInterceptor:
         onto_sibling = f'batch_target_index (ticket={sibling.ticket.ticket_id}): {edge.justification}'
         sibling_task = sibling.task_id
         match edge.action, _sibling_outcome(sibling):
-            case _, DeferReason() as reason:
+            case 'drop' | 'combine', DeferReason() as reason:
                 return CuratorDecision.deferred(reason)
             case 'drop', _SiblingOutcome.CREATED | _SiblingOutcome.RESOLVED if sibling_task:
                 drop = CuratorDecision(
@@ -5509,10 +5509,10 @@ class TaskInterceptor:
         """Audit *ticket*'s drop onto *target_id*, the task its batch sibling resolved to.
 
         A drop rewrites nothing, so ``new`` repeats ``old``, read live from the
-        target, and its items are the target's before and after. Best-effort
-        like every audit row: a failed read or a malformed stored bundle logs
-        a WARNING, writes no row, and never changes the drop. The append runs
-        off the event loop.
+        target, and its items are the target's before and after, or none when
+        its stored bundle is malformed. Best-effort like every audit row: a
+        failed read logs a WARNING, writes no row, and never changes the drop.
+        The append runs off the event loop.
         """
         try:
             tm = await self._ensure_taskmaster()
@@ -5534,8 +5534,6 @@ class TaskInterceptor:
                 ticket.metadata, source='TaskInterceptor._audit_drop_onto_sibling',
             ) or {},
         )
-        if context is None:
-            return
         await asyncio.to_thread(
             _append_combine_audit,
             project_id=ticket.project_id,
@@ -5559,7 +5557,8 @@ class TaskInterceptor:
     ) -> None:
         """Audit *ticket*'s combine into *sibling*, refused because the sibling was not created.
 
-        ``old`` is the sibling's candidate and terminal ticket status, and
+        ``old`` is the sibling's candidate, which has no task status; the row
+        names the sibling's ticket and the status it ended in, and
         ``target_id`` the task it resolved to, if any. The candidate is created
         with its own items, so ``items_after`` is its keys and nothing is lost.
         The append runs off the event loop.
@@ -5585,17 +5584,18 @@ class TaskInterceptor:
                 ticket.metadata, source='TaskInterceptor._audit_unmade_batch_combine',
             ) or {},
         )
+        unmade = _UnmadeSibling(ticket_id=sibling.ticket.ticket_id, ticket_status=sibling.status or '')
         await asyncio.to_thread(
             _append_combine_audit,
             project_id=ticket.project_id,
             target_id=sibling.task_id,
             old_title=old_title,
             old_description=old_description,
-            old_status=sibling.status or '',
+            old_status='',
             new_title=new_title,
             new_description=new_description,
             justification=edge.justification,
-            context=context,
+            context=dataclasses.replace(context, unmade_sibling=unmade),
             refused_reason=COMBINE_REFUSED_BATCH_TARGET_NOT_CREATE,
         )
 
@@ -7163,8 +7163,18 @@ COMBINE_REFUSED_HAS_BRANCH = 'target_has_branch'
 COMBINE_REFUSED_HOLDER = 'target_is_holder'
 # A within-batch combine whose target sibling was not created (task 8416).
 # Hyphenated, unlike the tokens above, because it is also the justification
-# prefix of the create the combine degrades to.
+# prefix of the create the combine degrades to. Its target was a candidate,
+# not a task, so its old.status is empty and its breakdown is by
+# sibling_ticket_status instead.
 COMBINE_REFUSED_BATCH_TARGET_NOT_CREATE = 'batch-target-not-create'
+
+
+@dataclasses.dataclass(frozen=True)
+class _UnmadeSibling:
+    """The batch sibling a within-batch combine aimed at, and the status its ticket ended in."""
+
+    ticket_id: str
+    ticket_status: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7174,6 +7184,7 @@ class _CombineAuditContext:
     ``action`` names the decision that wrote the row: a combine, or a
     within-batch drop onto a sibling (task 8416), which folds nothing. A row
     written before it existed has no ``action`` key and was a combine.
+    ``unmade_sibling`` is set only on a ``batch-target-not-create`` refusal.
     """
 
     action: Literal['combine', 'drop']
@@ -7183,9 +7194,10 @@ class _CombineAuditContext:
     batch_internal: bool
     items_before: tuple[str, ...]
     items_after: tuple[str, ...]
+    unmade_sibling: _UnmadeSibling | None = None
 
     def to_record(self) -> dict[str, Any]:
-        return {
+        record: dict[str, Any] = {
             'action': self.action,
             'candidate_ticket_id': self.candidate_ticket_id,
             'candidate_source': self.candidate_source,
@@ -7194,6 +7206,10 @@ class _CombineAuditContext:
             'items_before': list(self.items_before),
             'items_after': list(self.items_after),
         }
+        if self.unmade_sibling is not None:
+            record['sibling_ticket_id'] = self.unmade_sibling.ticket_id
+            record['sibling_ticket_status'] = self.unmade_sibling.ticket_status
+        return record
 
 
 def _combine_fold(
@@ -7212,9 +7228,7 @@ def _combine_fold(
     """
     items_after: tuple[FollowupItem, ...] | None
     try:
-        items_before = task_items(
-            title=target_title, files=extract_files(dict(target_meta)), metadata=target_meta,
-        )
+        items_before = _stored_items(target_title, target_meta)
         extra = task_items(
             title=candidate.title, files=candidate.files_to_modify, metadata=candidate_meta,
         )
@@ -7245,20 +7259,18 @@ def _drop_fold(
     target_meta: Mapping[str, Any],
     candidate: CandidateTask,
     candidate_meta: Mapping[str, Any],
-) -> _CombineAuditContext | None:
+) -> _CombineAuditContext:
     """The audit context of a within-batch drop onto a sibling's task, which folds nothing.
 
-    Its items are the target's, before and after. None, logged here, when the
-    target's stored bundle is malformed.
+    Its items are the target's, before and after. When the target's stored
+    bundle is malformed, logged here, it records no items, as
+    :func:`_combine_fold` does, so the drop is still audited.
     """
     try:
-        items = task_items(
-            title=target_title, files=extract_files(dict(target_meta)), metadata=target_meta,
-        )
+        keys = tuple(item.key for item in _stored_items(target_title, target_meta))
     except FollowupBundleInvalid as exc:
         logger.warning('combine-audit: the drop target %r has a malformed follow-up bundle (%s)', target_title, exc)
-        return None
-    keys = tuple(item.key for item in items)
+        keys = ()
     return _CombineAuditContext(
         action='drop',
         candidate_ticket_id=ticket_id,
@@ -7268,6 +7280,11 @@ def _drop_fold(
         items_before=keys,
         items_after=keys,
     )
+
+
+def _stored_items(title: str, meta: Mapping[str, Any]) -> tuple[FollowupItem, ...]:
+    """The follow-up items a stored task stands for; raises FollowupBundleInvalid when malformed."""
+    return task_items(title=title, files=extract_files(dict(meta)), metadata=meta)
 
 
 def _candidate_source(candidate_meta: Mapping[str, Any]) -> str | None:
@@ -7288,13 +7305,24 @@ def _append_combine_audit(
     context: _CombineAuditContext,
     refused_reason: str | None = None,
 ) -> None:
-    """Append a one-line JSON record documenting a combine.
+    """Append a one-line JSON record documenting a combine, or a within-batch drop.
 
-    Records both about-to-happen combines (``refused_reason=None``) and
-    REFUSED ones (task 4035) — an operator cannot compute a refusal rate from
-    success records alone. The historical keys keep their shape, so existing
-    records stay parseable; *context* adds the candidate and item fields, and
-    ``rec.get('refused_reason')`` cleanly partitions refusal from success.
+    Rows partition first by ``action``: ``'combine'``, or ``'drop'`` for a
+    within-batch drop onto a sibling's task (task 8416); a row without the key
+    predates it and is a combine. Combines then partition by
+    ``refused_reason``: absent on an about-to-happen combine, a refusal token
+    on a REFUSED one (task 4035) — an operator cannot compute a refusal rate
+    from success records alone. A drop row carries no ``refused_reason`` and is
+    not an applied combine, so a count of combine rows filters on ``action``
+    first. The historical keys keep their shape, so existing records stay
+    parseable; *context* adds ``action`` and the candidate and item fields.
+
+    ``old`` describes the task ``target_id`` names, read live, except on a
+    ``batch-target-not-create`` refusal. That combine aimed at a sibling
+    candidate that never became its own task: ``old`` describes the candidate
+    and has no status, ``sibling_ticket_id`` and ``sibling_ticket_status`` name
+    its ticket and how it ended, and ``target_id`` is the task that sibling
+    resolved to, if any.
 
     The ``new`` block is populated on a refusal too: it records the title and
     description that would have overwritten the target, which is precisely the
