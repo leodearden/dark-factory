@@ -8,8 +8,9 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import install_identity_mocks
+from _fm_helpers import MockEdge, install_identity_mocks
 
+from fused_memory.models.enums import SourceStore
 from fused_memory.services.memory_service import MemoryService
 
 _PROJECT_ID = 'dark_factory'
@@ -101,3 +102,33 @@ class TestMem0HitAttribution:
         ))
 
         assert hit.task_id == expected
+
+
+async def _search_graph_hit(service, edge: MockEdge):
+    service.graphiti.search = AsyncMock(return_value=[edge])
+    results = await service.search(
+        query='Redis dependencies', project_id=_PROJECT_ID, stores=['graphiti'],
+    )
+    assert len(results) == 1
+    return results[0]
+
+
+class TestGraphitiHitAttribution:
+    @pytest.mark.asyncio
+    async def test_graph_hit_reports_its_partition_and_no_writer(self, service):
+        hit = await _search_graph_hit(service, MockEdge(
+            fact='Auth service depends on Redis', uuid='edge-1', group_id='dark_factory',
+        ))
+
+        assert hit.source_store is SourceStore.graphiti
+        assert hit.project_id == 'dark_factory'
+        assert hit.agent_id is None
+        assert hit.task_id is None
+
+    @pytest.mark.asyncio
+    async def test_unpartitioned_edge_does_not_borrow_the_queried_project(self, service):
+        hit = await _search_graph_hit(service, MockEdge(
+            fact='Auth service depends on Redis', uuid='edge-1',
+        ))
+
+        assert hit.project_id is None
