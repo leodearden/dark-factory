@@ -890,7 +890,7 @@ PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME: str = '_offline-deep'
 # GitOps.create_interactive_worktree below for the full contract.
 
 class WorktreeKind(Enum):
-    """Ephemeral main-tip probe/sweep worktree kinds minted by
+    """Ephemeral verify-worktree kinds minted by
     :meth:`GitOps.ephemeral_worktree` (task θ, verify-plan PRD).
 
     Each member's value IS both the directory-name prefix
@@ -903,6 +903,7 @@ class WorktreeKind(Enum):
 
     MAIN_PROBE = '_mainprobe-'
     MAIN_SWEEP = '_mainsweep-'
+    DRIFT_CHECK = '_driftcheck-'
 
 
 # Band-ownership registry for worktree_base's ephemeral-worktree namespace
@@ -930,6 +931,7 @@ PROTECTED_PREFIXES: dict[str, str] = {
     # CM's own naming (task θ).
     WorktreeKind.MAIN_PROBE.value: 'verify-main-probe',
     WorktreeKind.MAIN_SWEEP.value: 'verify-main-sweep',
+    WorktreeKind.DRIFT_CHECK.value: 'merge-drift-check',
 }
 
 
@@ -1835,6 +1837,10 @@ class EphemeralWorktreeError(Exception):
     fail-safe behavior (e.g. the main-tip probes in verify.py return their
     established sentinel and log a warning).
     """
+
+
+class WarmSeedUnavailable(EphemeralWorktreeError):
+    """A warm-required ephemeral worktree could not be CoW-seeded; raised before the body runs, with the worktree already removed."""
 
 
 class WarmLaneRequeue(Exception):
@@ -3579,35 +3585,59 @@ class GitOps:
             with contextlib.suppress(Exception):
                 os.close(lock_fd)
 
-    async def _warm_seed_ephemeral_worktree(self, path: Path, kind: WorktreeKind) -> None:
+    async def _warm_seed_ephemeral_worktree(self, path: Path, kind: WorktreeKind) -> str | None:
         """CoW-seed *path*'s ``target/`` from the warm-lane base, proceeding COLD on any fault.
 
+        Returns None when the seed ran with rc 0, else why the tree stays cold.
         ``HELD_BY_CALLER``: :meth:`ephemeral_worktree` holds ``<name>.lock`` for its lifetime.
         """
         try:
-            if self._warm_lane_base_resolvable() is WarmBaseHealth.OK:
-                seed_rc = await self._seed_warm_lane(
-                    path, '--fresh-checkout',
-                    lane_lock=SeedLaneLock.HELD_BY_CALLER,
-                )
-                if seed_rc != 0:
-                    logger.info(
-                        'ephemeral_worktree(%s): warm seed failed (rc=%d) '
-                        'for %s — proceeding COLD (fail-soft)',
-                        kind.name, seed_rc, path,
-                    )
-            else:
+            health = self._warm_lane_base_resolvable()
+            if health is not WarmBaseHealth.OK:
                 logger.log(
                     {WorktreeKind.MAIN_SWEEP: logging.INFO}.get(kind, logging.DEBUG),
                     'ephemeral_worktree(%s): warm base not resolvable — '
                     'skipping seed, proceeding COLD for %s', kind.name, path,
                 )
-        except Exception:
+                return f'warm base not resolvable ({health.name})'
+            seed_rc = await self._seed_warm_lane(
+                path, '--fresh-checkout',
+                lane_lock=SeedLaneLock.HELD_BY_CALLER,
+            )
+            if seed_rc != 0:
+                logger.info(
+                    'ephemeral_worktree(%s): warm seed failed (rc=%d) '
+                    'for %s — proceeding COLD (fail-soft)',
+                    kind.name, seed_rc, path,
+                )
+                return f'seed rc={seed_rc}'
+            return None
+        except Exception as e:
             logger.warning(
                 'ephemeral_worktree(%s): warm-seed gate raised '
                 'unexpectedly for %s — proceeding COLD (fail-soft)',
                 kind.name, path, exc_info=True,
             )
+            return f'warm-seed gate raised {e.__class__.__name__}: {e}'
+
+    @contextlib.asynccontextmanager
+    async def warm_ephemeral_worktree(self, kind: WorktreeKind, sha: str) -> AsyncIterator[Path]:
+        """:meth:`ephemeral_worktree`, but CoW-seeded or not at all: never silently cold.
+
+        The lifecycle (lock, naming, guaranteed teardown) is
+        :meth:`ephemeral_worktree`'s; the seed runs under its held ``<name>.lock``.
+
+        Raises:
+            WarmSeedUnavailable: the seed did not happen; the body never ran and
+                the minted tree is already removed.
+        """
+        async with self.ephemeral_worktree(kind, sha) as path:
+            reason = await self._warm_seed_ephemeral_worktree(path, kind)
+            if reason is not None:
+                raise WarmSeedUnavailable(
+                    f'warm_ephemeral_worktree({kind.name}): {reason} for {path} at {sha[:8]}'
+                )
+            yield path
 
     async def _remove_ephemeral_worktree(self, path: Path, kind: WorktreeKind) -> None:
         """Scoped ``git worktree remove --force``, never a prune (DD5), then ``remove_tree``; failures are WARNINGs."""

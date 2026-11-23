@@ -294,7 +294,7 @@ lane_state_class() {
 # `_merge-verify` is redundant against `_merge-*` and kept anyway: this string is
 # a verbatim render of the registry, so an operator can diff it against
 # `lane_protect_glob` output directly.
-LANE_PROTECT_GLOB_FALLBACK='_merge-*,_solo-*,_substrate-gate-*,_merge-verify,_offline-deep,.lane-state,.task-meta,_mainprobe-*,_mainsweep-*,_iact-*'
+LANE_PROTECT_GLOB_FALLBACK='_merge-*,_solo-*,_substrate-gate-*,_merge-verify,_offline-deep,.lane-state,.task-meta,_mainprobe-*,_mainsweep-*,_driftcheck-*,_iact-*'
 
 # _LANE_STATE_LIB_DIR / _LANE_STATE_REPO_ROOT — resolved ONCE, at source time,
 # by pure path arithmetic: no git invocation, no environment read. The lib ships
