@@ -1190,6 +1190,160 @@ class _PinCandidate:
     signal: str | None
 
 
+# The read parts of the ordinary pass's six writing steps (task 10476,
+# plans/early-start-on-predecessor-branch-prd.md §5.4) return these values.
+# A read part consults the pass's caches only by key, and writes nothing.
+
+
+@dataclass(frozen=True)
+class _TaskIndex:
+    """The status and id indices of one task fetch, and its highest numeric id."""
+
+    status_map: dict[str, str]
+    tasks_by_id: dict[str, dict]
+    max_id: int
+
+
+def _index_tasks(tasks: Iterable[dict]) -> _TaskIndex:
+    status_map: dict[str, str] = {}
+    tasks_by_id: dict[str, dict] = {}
+    max_id = 0
+    for t in tasks:
+        tid = str(t.get('id', ''))
+        if not tid:
+            continue
+        status_map[tid] = t.get('status', 'unknown')
+        tasks_by_id[tid] = t
+        if tid.isdecimal():
+            max_id = max(max_id, int(tid))
+    return _TaskIndex(status_map, tasks_by_id, max_id)
+
+
+@dataclass(frozen=True)
+class _DepStatusRead:
+    """The ``get_statuses`` answer for the dep ids a task fetch left out."""
+
+    requested: tuple[str, ...] = ()
+    answered: Mapping[str, str] = field(default_factory=dict)
+    error: Exception | None = None
+
+    @property
+    def degraded(self) -> bool:
+        return bool(self.requested) and resolver_failed(self.answered, self.error)
+
+    @property
+    def resolved(self) -> Mapping[str, str]:
+        """The statuses to merge into the status map: none from a degraded read."""
+        return {} if self.degraded else self.answered
+
+    @property
+    def still_missing(self) -> frozenset[str]:
+        """Requested ids a clean answer left out."""
+        return frozenset() if self.degraded else frozenset(self.requested).difference(self.answered)
+
+
+@dataclass(frozen=True)
+class _TerminalRecordRead:
+    """Terminal dep records: served from the cross-tick cache, or fetched within the budget.
+
+    ``held``, ``new`` and ``revalidate`` are the fetch candidates by group,
+    ``ordered`` the fetches the budget allowed, and ``fetched`` each of those
+    ids' fresh record (``None`` when unreadable).
+    """
+
+    served: Mapping[str, dict] = field(default_factory=dict)
+    held: frozenset[str] = frozenset()
+    new: frozenset[str] = frozenset()
+    revalidate: frozenset[str] = frozenset()
+    ordered: tuple[str, ...] = ()
+    fetched: Mapping[str, dict | None] = field(default_factory=dict)
+
+    @property
+    def records(self) -> dict[str, dict]:
+        records = dict(self.served)
+        records.update((dep_id, rec) for dep_id, rec in self.fetched.items() if rec is not None)
+        return records
+
+    @property
+    def deferred(self) -> frozenset[str]:
+        return (self.held | self.new | self.revalidate).difference(self.ordered)
+
+    @property
+    def deferred_new(self) -> frozenset[str]:
+        """Never-cached deps the budget deferred: their dependents wait."""
+        return self.deferred & self.new
+
+
+@dataclass(frozen=True)
+class _ExternalStatusRead:
+    """Pending tasks with cross-project deps, and the one batched status answer for them."""
+
+    pending_with_external: tuple[dict, ...] = ()
+    statuses: Mapping[str, str] = field(default_factory=dict)
+    error: Exception | None = None
+
+
+@dataclass(frozen=True)
+class _ErroredDep:
+    """A checked dep left unresolved because a check ERRORED and none FAILED."""
+
+    dep_id: str
+    check_names: tuple[str | None, ...]
+    unreadable: tuple[object, ...]
+
+
+@dataclass(frozen=True)
+class _DeliveredCheckSweep:
+    """One evaluation of the checked terminal deps at main.
+
+    ``main_sha`` is ``None`` when there was nothing to check or main did not
+    resolve; the projection is then empty.  ``digests`` names each checked
+    dep's current descriptor digest, ``delivered_keys`` the cache keys found
+    DELIVERED by a run this sweep, and ``resolved`` every dep whose verdict
+    was definitive (served, delivered or failed).
+    """
+
+    main_sha: str | None = None
+    checked_deps: Mapping[str, dict] = field(default_factory=dict)
+    deps_by_dependent: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    digests: Mapping[str, str] = field(default_factory=dict)
+    projection: Mapping[str, bool] = field(default_factory=dict)
+    fail_details: Mapping[str, dict] = field(default_factory=dict)
+    delivered_keys: tuple[tuple[str, str, str], ...] = ()
+    resolved: tuple[str, ...] = ()
+    errored: tuple[_ErroredDep, ...] = ()
+
+
+@dataclass(frozen=True)
+class _OverrideRead:
+    """The stored override rows and the ones the ordinary pass's clean-up would remove.
+
+    ``terminal_or_missing`` is the id set the clean-up hands ``clear_terminal``
+    (terminal statuses, and rows whose task the fetch lacks).
+    """
+
+    rows: Mapping[str, OverrideRow] = field(default_factory=dict)
+    terminal_or_missing: frozenset[str] = frozenset()
+    unpending_watchdog: frozenset[str] = frozenset()
+    expired: frozenset[str] = frozenset()
+
+    @property
+    def in_force(self) -> dict[str, OverrideRow]:
+        gone = self.terminal_or_missing | self.unpending_watchdog | self.expired
+        return {tid: row for tid, row in self.rows.items() if tid not in gone}
+
+
+@dataclass(frozen=True)
+class _PriorityRead:
+    effective_priorities: Mapping[str, str]
+    transitive_counts: Mapping[str, int]
+
+
+def _is_unpending_watchdog_pin(row: OverrideRow, status: str | None) -> bool:
+    """A starvation-watchdog pin whose task is no longer pending: its pin goes."""
+    return row.source is OverrideSource.STARVATION_WATCHDOG and status != 'pending'
+
+
 @dataclass(frozen=True)
 class _BackfillGrant:
     """The facts behind one EASY-backfill admission (task 3823 / PRD C7).
@@ -3354,12 +3508,30 @@ class Scheduler:
         which logs a bounded WARNING for it) is likewise skipped — a
         conscious fail-OPEN, not a silent gap; see the skip site below.
         """
+        sweep = await self._read_delivered_checks(
+            pending_tasks, status_map, tasks_by_id, terminal_dep_records,
+        )
+        return await self._apply_delivered_check_sweep(sweep, status_map)
+
+    async def _read_delivered_checks(
+        self,
+        pending_tasks: list[dict],
+        status_map: Mapping[str, str],
+        tasks_by_id: Mapping[str, dict] | None,
+        terminal_dep_records: Mapping[str, dict] | None,
+    ) -> _DeliveredCheckSweep:
+        """The read part of :meth:`_compute_delivered_check_cache`: evaluate, write nothing.
+
+        A DELIVERED verdict cached for main's sha and the dep's descriptor
+        digest is served by key; every other checked dep runs its checks
+        under the per-sweep budget, first-dep guarantee and per-check timeout.
+        """
         tasks_by_id = tasks_by_id or {}
 
-        # Collect the distinct terminal local deps carrying delivered_checks
-        # across all pending tasks, and which dependent(s) care about each.
+        # The distinct terminal local deps carrying delivered_checks across
+        # all pending tasks, and which dependent(s) care about each.
         checked_deps: dict[str, dict] = {}
-        deps_by_dependent: dict[str, set[str]] = {}
+        dep_sets: dict[str, set[str]] = {}
         for task in pending_tasks:
             task_id = str(task.get('id', '?'))
             for d in task.get('dependencies', []):
@@ -3370,119 +3542,59 @@ class Scheduler:
                 if dep_task is None and terminal_dep_records is not None:
                     dep_task = terminal_dep_records.get(dep_id)
                 if dep_task is None:
-                    # Conscious fail-OPEN (task 2692, reviewer_comprehensive
-                    # robustness amendment): a record still missing here
-                    # (absent from BOTH tasks_by_id and terminal_dep_records
-                    # — e.g. a get_task fetch failure in
-                    # _phase_backfill_terminal_dep_records) means this dep's
-                    # delivered_checks, if any, can't even be read, so it's
-                    # simply never added to checked_deps/the projection —
-                    # NOT gated. The alternative (fail-safe-WAIT on an
-                    # unreadable record) risks permanently deadlocking a
-                    # dependent whose dep record genuinely can never be
-                    # fetched, so this trades correctness for liveness.
-                    # _phase_backfill_terminal_dep_records logs a bounded
-                    # WARNING on every such fetch failure so the bypass is
-                    # operator-visible rather than silent.
+                    # Conscious fail-OPEN (task 2692): an unreadable record's
+                    # checks cannot be read, so the dep is not gated, rather
+                    # than risk deadlocking a dependent whose dep record can
+                    # never be fetched. _phase_backfill_terminal_dep_records
+                    # logs a bounded WARNING on every such fetch failure.
                     continue
                 if declared_checks(dep_task.get('metadata')).is_empty:
                     continue
                 checked_deps[dep_id] = dep_task
-                deps_by_dependent.setdefault(task_id, set()).add(dep_id)
+                dep_sets.setdefault(task_id, set()).add(dep_id)
+        deps_by_dependent = {task_id: tuple(dep_ids) for task_id, dep_ids in dep_sets.items()}
 
         if not checked_deps:
-            return {}
+            return _DeliveredCheckSweep()
 
         main_sha = await self._resolve_main_sha()
         if main_sha is None:
-            return {}
-
-        if main_sha != self._delivered_check_sha:
-            stale_keys = [k for k in self._delivered_check_cache if k[1] != main_sha]
-            for key in stale_keys:
-                del self._delivered_check_cache[key]
-            self._delivered_check_sha = main_sha
+            return _DeliveredCheckSweep()
 
         budget = self.config.delivered_checks.max_checks_per_tick
         used = 0
-        # Forward-progress guarantee (reviewer_comprehensive amendment):
-        # the first dep this sweep actually evaluates (below) is allowed to
-        # exceed the per-tick budget on its own checks — see the docstring
-        # above. Sticky for the rest of this sweep once consumed.
+        # Forward-progress guarantee: the first dep this sweep actually
+        # evaluates may exceed the budget on its own checks (see
+        # _compute_delivered_check_cache). Sticky once consumed.
         first_dep_this_sweep = True
+        digests: dict[str, str] = {}
         projection: dict[str, bool] = {}
-        # Value is `dict | None`: populated fresh in the FAILED branch below
-        # on every FAILED sweep (FAILED is never cached, so this is always
-        # rebuilt from this tick's actual results — see the FAILED branch).
-        # Stays `| None` defensively since the hold-visibility loop and
-        # _note_delivered_hold both already accept detail=None.
-        fail_detail_by_dep: dict[str, dict | None] = {}
-
-        # Per-dep index of existing cache keys, built ONCE per sweep in a
-        # single O(cache_size) pass (task 2975 amendment,
-        # reviewer_comprehensive perf note): the stale-digest-variant prune
-        # below previously re-scanned the WHOLE self._delivered_check_cache
-        # for every dep in checked_deps — with the cache bounded to
-        # roughly one entry per (dep, sha) (see the class docstring above),
-        # that per-dep full scan was effectively O(deps^2) per sweep.
-        # Looking up this index instead makes the prune O(1) amortized per
-        # dep. checked_deps is keyed by dep_id (each dep_id appears exactly
-        # once in the loop below), so a dep's slice of the index is never
-        # consulted again after its own iteration and does not need to be
-        # kept in sync with deletions made for OTHER deps.
-        keys_by_dep: dict[str, list[tuple[str, str, str]]] = {}
-        for k in self._delivered_check_cache:
-            keys_by_dep.setdefault(k[0], []).append(k)
+        fail_details: dict[str, dict] = {}
+        delivered_keys: list[tuple[str, str, str]] = []
+        resolved: list[str] = []
+        errored: list[_ErroredDep] = []
 
         for dep_id, dep_task in checked_deps.items():
-            # Read the descriptor and fold its digest into the cache key
-            # BEFORE the cache-hit check (task 2975): an operator editing
-            # metadata.delivered_checks at a fixed main SHA must land on a
-            # DIFFERENT key than the one a prior sweep cached against, so
-            # the edit is a cache MISS (re-evaluate) rather than continuing
-            # to serve a verdict computed against the old descriptor.
+            # The descriptor digest is part of the cache key (task 2975), so
+            # an operator's edit at a fixed main sha is a cache MISS.
             declared = declared_checks(dep_task.get('metadata'))
             checks = declared.checks
             descriptor_digest = _delivered_checks_descriptor_digest(list(checks))
+            digests[dep_id] = descriptor_digest
             cache_key = (dep_id, main_sha, descriptor_digest)
-            # Prune any stale digest variant(s) left behind by an earlier
-            # descriptor for this SAME (dep, sha) (task 2975): bounds cache
-            # growth to one variant per (dep, sha) rather than accumulating
-            # one entry per historical descriptor edit. Scoped to this
-            # dep's own keys via the keys_by_dep index built above instead
-            # of scanning self._delivered_check_cache in full. The
-            # comprehension materializes the matches into a list first —
-            # deleting from self._delivered_check_cache while iterating a
-            # view of it directly would raise.
-            stale_variant_keys = [
-                k
-                for k in keys_by_dep.get(dep_id, ())
-                if k[1] == main_sha and k[2] != descriptor_digest
-            ]
-            for stale_key in stale_variant_keys:
-                del self._delivered_check_cache[stale_key]
             if not declared.unreadable and cache_key in self._delivered_check_cache:
-                # Only the monotone-safe DELIVERED=True result is ever
-                # cached (see the FAILED branch below) — a cache hit is
-                # therefore always True, served straight from cache with no
-                # checks re-run this sweep. The digest covers ``checks``
-                # alone, so a declaration with unreadable entries is never
-                # served from it.
-                cached = self._delivered_check_cache[cache_key]
-                projection[dep_id] = cached
-                # A dep resolved definitively (cached True) on a prior sweep
-                # at this SHA — it can no longer be in the ERRORED-uncached
-                # state, so its diagnostic error streak (if any, e.g. from
-                # an earlier episode before a fix landed) is stale.
-                self._delivered_check_error_streak.pop(dep_id, None)
+                # Only DELIVERED is ever cached, so a hit is True, served with
+                # no check re-run. The digest covers ``checks`` alone, so a
+                # declaration with unreadable entries is never served from it.
+                projection[dep_id] = self._delivered_check_cache[cache_key]
+                resolved.append(dep_id)
                 continue
 
             results: list[tuple[dict, DeliveredCheckResult]] = []
             over_budget = False
             # Only the first dep this sweep that runs a check gets the
-            # forward-progress guarantee; every later dep still respects
-            # the budget exactly as before. A wholly unreadable declaration
-            # runs none, so it leaves the guarantee for the next dep.
+            # guarantee. A wholly unreadable declaration runs none, so it
+            # leaves the guarantee for the next dep.
             guaranteed_dep = first_dep_this_sweep and bool(checks)
             if guaranteed_dep:
                 first_dep_this_sweep = False
@@ -3499,12 +3611,8 @@ class Scheduler:
                         timeout=self.config.delivered_checks.check_timeout_secs,
                     )
                 except TimeoutError:
-                    # Fail-safe (task 2583, epsilon): a hung check (primarily
-                    # the timeout-less grep kind; defense-in-depth for
-                    # scripts, which also carry their own descriptor
-                    # timeout_secs) maps to ERRORED — same downstream
-                    # handling as a runner exception (row 7: left uncached,
-                    # no hold event, no streak bump, retried next sweep).
+                    # Fail-safe (task 2583): a hung check maps to ERRORED, the
+                    # same handling as a runner exception (row 7).
                     logger.warning(
                         'Delivered-check %r (dep %s) exceeded '
                         'check_timeout_secs=%s — treating as ERRORED (fail-safe)',
@@ -3535,54 +3643,89 @@ class Scheduler:
             if not declared.unreadable and all(
                 r is DeliveredCheckResult.DELIVERED for _c, r in results
             ):
-                self._delivered_check_cache[cache_key] = True
+                delivered_keys.append(cache_key)
                 projection[dep_id] = True
-                self._delivered_check_error_streak.pop(dep_id, None)
+                resolved.append(dep_id)
                 continue
 
             failed = next(
                 ((c, r) for c, r in results if r is DeliveredCheckResult.FAILED), None
             )
             if failed is not None:
+                # Deliberately never cached (REFILE of task 2782/2783): a git
+                # grep can transiently miss at the SAME sha, so FAILED re-runs
+                # every sweep, letting it flip to DELIVERED without main
+                # advancing. This sweep's projection still holds False.
                 failed_check, _r = failed
-                # Deliberately NOT cached (REFILE of task 2782/2783): unlike
-                # DELIVERED, FAILED is not monotone-safe against the
-                # OBSERVATION — a git grep can transiently miss (a race with
-                # a concurrent write during the merge that produced this
-                # SHA, or a read microseconds before the pattern becomes
-                # visible at that ref) even though the capability is
-                # actually present at this SAME main SHA. Caching FAILED
-                # sticky would wedge the dependent at this SHA until main
-                # ADVANCES. Instead, re-run every sweep — symmetric with the
-                # uncached ERRORED fail-safe path below — so a transient
-                # miss can flip to DELIVERED on a later sweep at the same
-                # SHA. This tick's projection still holds False (the
-                # dispatch gate still withholds, and the grace streak below
-                # still advances toward the born-at-L2 escalation on a
-                # genuinely-persistent failure).
                 projection[dep_id] = False
-                detail = {
+                fail_details[dep_id] = {
                     'name': failed_check.get('name'),
                     'dep_id': dep_id,
                     'main_sha': main_sha,
                     'kind': failed_check.get('kind'),
                 }
-                fail_detail_by_dep[dep_id] = detail
-                self._delivered_check_error_streak.pop(dep_id, None)
+                resolved.append(dep_id)
                 continue
 
-            # else: at least one ERRORED and none FAILED — leave uncached
-            # (fail-safe wait; every check for this dep retries next tick;
-            # no backoff — see the module docstring note above). NOT a
-            # _note_delivered_hold / _streak_delivered_hold event (row 7's
-            # dispatch-gate contract), but bump a separate diagnostic-only
-            # streak so a PERSISTENTLY errored check (as opposed to a
-            # transient git/script blip) still surfaces in the logs.
-            error_streak = self._delivered_check_error_streak.get(dep_id, 0) + 1
-            self._delivered_check_error_streak[dep_id] = error_streak
-            errored_names = [
-                c.get('name') for c, r in results if r is DeliveredCheckResult.ERRORED
-            ]
+            # At least one ERRORED and none FAILED: left unresolved (fail-safe
+            # wait, retried next sweep with no backoff).
+            errored.append(_ErroredDep(
+                dep_id,
+                tuple(c.get('name') for c, r in results if r is DeliveredCheckResult.ERRORED),
+                declared.unreadable,
+            ))
+
+        return _DeliveredCheckSweep(
+            main_sha=main_sha,
+            checked_deps=checked_deps,
+            deps_by_dependent=deps_by_dependent,
+            digests=digests,
+            projection=projection,
+            fail_details=fail_details,
+            delivered_keys=tuple(delivered_keys),
+            resolved=tuple(resolved),
+            errored=tuple(errored),
+        )
+
+    async def _apply_delivered_check_sweep(
+        self, sweep: _DeliveredCheckSweep, status_map: dict[str, str],
+    ) -> dict[str, bool]:
+        """The write part of :meth:`_compute_delivered_check_cache`; returns the projection.
+
+        Prunes the cache to main's sha and each dep's current descriptor
+        digest, caches what was DELIVERED, keeps the diagnostic error streak,
+        and drives the hold/fail streaks and the grace-streak escalation.
+        Pruning after evaluation changes no lookup: a pruned key never
+        matches the current sha or digest.
+        """
+        main_sha = sweep.main_sha
+        if main_sha is None:
+            return {}
+
+        if main_sha != self._delivered_check_sha:
+            stale_keys = [k for k in self._delivered_check_cache if k[1] != main_sha]
+            for key in stale_keys:
+                del self._delivered_check_cache[key]
+            self._delivered_check_sha = main_sha
+        # One digest variant per (dep, sha): an earlier descriptor's entry
+        # for the same sha goes (task 2975). Indexed per dep in one pass.
+        keys_by_dep: dict[str, list[tuple[str, str, str]]] = {}
+        for k in self._delivered_check_cache:
+            keys_by_dep.setdefault(k[0], []).append(k)
+        for dep_id, digest in sweep.digests.items():
+            for k in keys_by_dep.get(dep_id, ()):
+                if k[1] == main_sha and k[2] != digest:
+                    del self._delivered_check_cache[k]
+        for key in sweep.delivered_keys:
+            self._delivered_check_cache[key] = True
+
+        for dep_id in sweep.resolved:
+            self._delivered_check_error_streak.pop(dep_id, None)
+        for dep in sweep.errored:
+            # Diagnostic only, separate from the hold streak (row 7): a
+            # persistently errored check surfaces in the logs.
+            error_streak = self._delivered_check_error_streak.get(dep.dep_id, 0) + 1
+            self._delivered_check_error_streak[dep.dep_id] = error_streak
             error_log = (
                 logger.warning
                 if error_streak == _DELIVERED_CHECK_ERROR_LOG_THRESHOLD
@@ -3595,28 +3738,15 @@ class Scheduler:
                 'per row 7). This may indicate a misconfigured check (bad '
                 'regex/path, or a missing/non-executable script) or a '
                 'malformed metadata.delivered_checks.',
-                dep_id, error_streak, errored_names, declared.unreadable,
+                dep.dep_id, error_streak, list(dep.check_names), dep.unreadable,
             )
 
-        # Hold-visibility + grace-streak escalation: per dependent, decided
-        # from THIS tick's projection (task 2583, epsilon layers the
-        # grace-streak escalate branch onto delta's hold-only loop).
-        #
-        # Deliberate single-dep-at-a-time accounting (reviewed, not an
-        # oversight): `next(...)` below picks only the FIRST failing dep in
-        # `dep_ids` order. If a dependent carries delivered_checks on two+
-        # deps that ALL fail in the same tick, only that first dep's
-        # `_streak_delivered_fail` counter advances this tick; a second
-        # simultaneously-broken capability's grace clock only starts once
-        # the first is cleared — either by escalating (task goes `blocked`,
-        # so dispatch is moot) or by the first dep passing (leaving the
-        # second still-failing dep to become "the first failing dep" on a
-        # later tick). This mirrors `_apply_external_dep_policy`, which
-        # likewise tracks/escalates one blocking cause per dependent at a
-        # time. Acceptable because a single escalation already blocks the
-        # task; a second broken capability is still surfaced by name, just
-        # not concurrently with the first.
-        for task_id, dep_ids in deps_by_dependent.items():
+        # Hold-visibility + grace-streak escalation per dependent, from this
+        # sweep's projection. Deliberately one failing dep at a time (the
+        # first in order), mirroring _apply_external_dep_policy: a single
+        # escalation already blocks the task.
+        projection = sweep.projection
+        for task_id, dep_ids in sweep.deps_by_dependent.items():
             failed_dep_id = next(
                 (dep_id for dep_id in dep_ids if projection.get(dep_id) is False), None
             )
@@ -3624,44 +3754,39 @@ class Scheduler:
                 fail_count = self._streak_delivered_fail.bump((task_id, failed_dep_id))
                 grace_cycles = self.config.delivered_checks.grace_cycles
                 if fail_count >= grace_cycles:
-                    # Clear-then-fire: lets a persistent failure re-escalate
-                    # after grace_cycles more ticks if it's ever resolved and
-                    # then regresses again. Also clear the hold streak and
-                    # SKIP _note_delivered_hold this tick — a task being
-                    # escalated+blocked is not "still waiting" (mirrors
-                    # _apply_external_dep_policy's blocked_this_tick
-                    # suppression).
+                    # Clear-then-fire, and no hold event for a task being
+                    # escalated and blocked.
                     self._streak_delivered_fail.clear((task_id, failed_dep_id))
                     self._streak_delivered_hold.clear(task_id)
                     await self._fire_delivered_check_escalation(
                         task_id=task_id,
                         dep_id=failed_dep_id,
                         status_map=status_map,
-                        checked_deps=checked_deps,
-                        fail_detail_by_dep=fail_detail_by_dep,
+                        checked_deps=sweep.checked_deps,
+                        fail_detail_by_dep=sweep.fail_details,
                         main_sha=main_sha,
                     )
                 else:
                     self._note_delivered_hold(
-                        task_id, detail=fail_detail_by_dep.get(failed_dep_id)
+                        task_id, detail=sweep.fail_details.get(failed_dep_id)
                     )
             elif all(projection.get(dep_id) is True for dep_id in dep_ids):
                 self._streak_delivered_hold.clear(task_id)
                 for dep_id in dep_ids:
                     self._streak_delivered_fail.clear((task_id, dep_id))
-            # else: at least one dep absent this tick (errored/over-budget) —
-            # leave both streaks untouched, no visibility spam (row 7).
+            # else: a dep absent this sweep (errored/over-budget) — both
+            # streaks untouched, no visibility spam (row 7).
 
-        return projection
+        return dict(projection)
 
     async def _fire_delivered_check_escalation(
         self,
         *,
         task_id: str,
         dep_id: str,
-        status_map: dict[str, str],
-        checked_deps: dict[str, dict],
-        fail_detail_by_dep: dict[str, dict | None],
+        status_map: Mapping[str, str],
+        checked_deps: Mapping[str, dict],
+        fail_detail_by_dep: Mapping[str, dict],
         main_sha: str,
     ) -> None:
         """Fire the grace-streak born-at-L2 escalation for a delivered check
@@ -3957,9 +4082,7 @@ class Scheduler:
         """
         released: list[str] = []
         for tid, row in overrides.items():
-            if row.source is not OverrideSource.STARVATION_WATCHDOG:
-                continue
-            if status_map.get(tid) != 'pending' and self._release_watchdog_pin(tid):
+            if _is_unpending_watchdog_pin(row, status_map.get(tid)) and self._release_watchdog_pin(tid):
                 released.append(tid)
         return released
 
@@ -5554,87 +5677,87 @@ class Scheduler:
         (degraded-bump, recovered-clear, still-missing-bump) — CONSUMED
         here, not re-collapsed into a hand loop. Always continues.
         """
-        _all_dep_ids: set[str] = set()
-        for _t in ctx.tasks:
-            for _d in (_t.get('dependencies') or []):
-                _dep_id = str(
-                    _d.get('id', _d) if isinstance(_d, dict) else _d
-                )
-                if _dep_id:
-                    _all_dep_ids.add(_dep_id)
-        _missing_dep_ids = sorted(_all_dep_ids - set(ctx.status_map))
-        if _missing_dep_ids:
-            _backfilled, _backfill_err = await self.get_statuses(
-                ids=_missing_dep_ids
-            )
-            if resolver_failed(_backfilled, _backfill_err):
-                logger.warning(
-                    'acquire_next: dep-status backfill degraded '
-                    '(err=%r, missing_dep_ids=%r) — affected pending tasks '
-                    'held fail-safe-wait',
-                    _backfill_err,
-                    _missing_dep_ids,
-                )
-                for _tid, _dep_id in _iter_pending_deps_in(ctx.tasks, _missing_dep_ids):
-                    _cnt = self._streak_local_backfill.bump((_tid, _dep_id))
-                    # Reuse max_external_dep_unresolved_cycles as the
-                    # grace threshold — same "consecutive ticks before
-                    # loud escalation" semantics as the external-dep
-                    # resolver-degraded path being mirrored here.
-                    # A dedicated max_local_backfill_unresolved_cycles
-                    # field is deferred (config.py is out of scope).
-                    if _cnt >= self.config.max_external_dep_unresolved_cycles:
-                        logger.warning(
-                            'acquire_next: local dep backfill unresolved '
-                            'for %d consecutive ticks '
-                            '(task=%s, dep=%s) — possible scheduler '
-                            'degradation',
-                            _cnt,
-                            _tid,
-                            _dep_id,
-                        )
-            else:
-                ctx.status_map.update(_backfilled)
-                # Reset the consecutive-tick counters for deps that resolved
-                # successfully in this backfill — mirrors the
-                # _external_unresolved_counts.pop(...) on the 'done' branch in
-                # _apply_external_dep_policy.  Without this reset, a dep that
-                # degrades → recovers → degrades again accumulates across the
-                # gap, making the "consecutive" counters and warning messages
-                # misreport the streak length.
-                for _tid, _dep_id in _iter_pending_deps_in(ctx.tasks, _backfilled):
-                    self._streak_local_backfill.clear((_tid, _dep_id))
-                # Partial-response guard: get_statuses returned a valid
-                # (non-error) dict that is still missing some of the requested
-                # dep ids.  Treat those still-missing ids as degraded — warn +
-                # bump counter — mirroring the missing-key guard in
-                # get_external_statuses (~1545).  The absent ids stay out of
-                # status_map so _deps_satisfied returns False → fail-safe-wait,
-                # now VISIBLE rather than a silent idle.
-                _still_missing = set(_missing_dep_ids) - set(_backfilled)
-                if _still_missing:
-                    logger.warning(
-                        'acquire_next: dep-status backfill returned partial '
-                        'result (missing %d/%d dep ids: %r) — affected '
-                        'pending tasks held fail-safe-wait',
-                        len(_still_missing),
-                        len(_missing_dep_ids),
-                        sorted(_still_missing),
-                    )
-                    for _tid, _dep_id in _iter_pending_deps_in(ctx.tasks, _still_missing):
-                        _cnt = self._streak_local_backfill.bump((_tid, _dep_id))
-                        # Same threshold as the degraded path above.
-                        if _cnt >= self.config.max_external_dep_unresolved_cycles:
-                            logger.warning(
-                                'acquire_next: local dep absent from '
-                                'backfill for %d consecutive ticks '
-                                '(task=%s, dep=%s) — possible '
-                                'scheduler degradation',
-                                _cnt,
-                                _tid,
-                                _dep_id,
-                            )
+        read = await self._read_dep_statuses(ctx.tasks, ctx.status_map)
+        self._apply_dep_statuses(ctx.tasks, read, ctx.status_map)
         return _CONTINUE
+
+    async def _read_dep_statuses(
+        self, tasks: list[dict], status_map: Mapping[str, str],
+    ) -> _DepStatusRead:
+        """The read part of the dep-status backfill: ask for every dep id the fetch left out."""
+        all_dep_ids: set[str] = set()
+        for t in tasks:
+            for d in (t.get('dependencies') or []):
+                dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
+                if dep_id:
+                    all_dep_ids.add(dep_id)
+        missing = sorted(all_dep_ids - set(status_map))
+        if not missing:
+            return _DepStatusRead()
+        answered, err = await self.get_statuses(ids=missing)
+        return _DepStatusRead(tuple(missing), answered, err)
+
+    def _apply_dep_statuses(
+        self, tasks: list[dict], read: _DepStatusRead, status_map: dict[str, str],
+    ) -> None:
+        """The write part: merge a clean answer into *status_map* and keep the backfill streaks."""
+        if not read.requested:
+            return
+        # The grace threshold reuses max_external_dep_unresolved_cycles: the
+        # same "consecutive ticks before loud escalation" semantics as the
+        # external-dep resolver-degraded path this mirrors.
+        threshold = self.config.max_external_dep_unresolved_cycles
+        if read.degraded:
+            logger.warning(
+                'acquire_next: dep-status backfill degraded '
+                '(err=%r, missing_dep_ids=%r) — affected pending tasks '
+                'held fail-safe-wait',
+                read.error,
+                list(read.requested),
+            )
+            for tid, dep_id in _iter_pending_deps_in(tasks, read.requested):
+                cnt = self._streak_local_backfill.bump((tid, dep_id))
+                if cnt >= threshold:
+                    logger.warning(
+                        'acquire_next: local dep backfill unresolved '
+                        'for %d consecutive ticks '
+                        '(task=%s, dep=%s) — possible scheduler '
+                        'degradation',
+                        cnt,
+                        tid,
+                        dep_id,
+                    )
+            return
+        status_map.update(read.resolved)
+        # Reset the consecutive-tick counters of deps that resolved, so a dep
+        # that degrades, recovers and degrades again is not misreported as
+        # one streak (mirrors _apply_external_dep_policy's 'done' branch).
+        for tid, dep_id in _iter_pending_deps_in(tasks, read.resolved):
+            self._streak_local_backfill.clear((tid, dep_id))
+        # Partial answer: still-missing ids stay out of status_map, so
+        # _deps_satisfied fails safe and waits, now visibly.
+        still_missing = read.still_missing
+        if still_missing:
+            logger.warning(
+                'acquire_next: dep-status backfill returned partial '
+                'result (missing %d/%d dep ids: %r) — affected '
+                'pending tasks held fail-safe-wait',
+                len(still_missing),
+                len(read.requested),
+                sorted(still_missing),
+            )
+            for tid, dep_id in _iter_pending_deps_in(tasks, still_missing):
+                cnt = self._streak_local_backfill.bump((tid, dep_id))
+                if cnt >= threshold:
+                    logger.warning(
+                        'acquire_next: local dep absent from '
+                        'backfill for %d consecutive ticks '
+                        '(task=%s, dep=%s) — possible '
+                        'scheduler degradation',
+                        cnt,
+                        tid,
+                        dep_id,
+                    )
 
     async def _phase_backfill_terminal_dep_records(self, ctx: TickContext) -> object:
         """Backfill fetched TERMINAL dep records missing from tasks_by_id.
@@ -5746,107 +5869,125 @@ class Scheduler:
         ``_phase_delivered_check_gate``. Always continues.
         """
         try:
-            needed: set[str] = set()
-            for _t in ctx.tasks:
-                if _t.get('status') != 'pending':
-                    continue
-                for _d in (_t.get('dependencies') or []):
-                    _dep_id = str(
-                        _d.get('id', _d) if isinstance(_d, dict) else _d
-                    )
-                    if not _dep_id or _dep_id in ctx.tasks_by_id:
-                        continue
-                    if ctx.status_map.get(_dep_id) not in TERMINAL_STATUSES:
-                        continue
-                    needed.add(_dep_id)
-            if not needed:
-                return _CONTINUE
-
-            _held_to_fetch: set[str] = set()
-            _new_to_fetch: list[str] = []
-            _revalidate_to_fetch: list[str] = []
-            for _dep_id in needed:
-                _cached_record = self._terminal_dep_record_cache.get(_dep_id)
-                # A warmed record skips the re-fetch ONLY while immutable.
-                # The cache is never evicted, so a mutable record served from
-                # it alone would be stale forever: a corrected check
-                # descriptor (task 2977, freezing task 2975's digest
-                # self-heal) or a scheduled self-deploy's phase (task 7276,
-                # holding its dependents forever). A held record is served
-                # AND re-fetched: only an affirmative fresh read replaces it.
-                # Documented boundary: adding delivered_checks to a
-                # previously-checkless, already-warmed record is NOT
-                # observed until an orchestrator restart.
-                if _cached_record is None:
-                    _new_to_fetch.append(_dep_id)
-                elif _terminal_record_is_immutable(_cached_record):
-                    ctx.terminal_dep_records[_dep_id] = _cached_record
-                elif awaits_scheduled_restart(_cached_record.get('metadata')):
-                    ctx.terminal_dep_records[_dep_id] = _cached_record
-                    _held_to_fetch.add(_dep_id)
-                else:
-                    _revalidate_to_fetch.append(_dep_id)
-            if not (_held_to_fetch or _new_to_fetch or _revalidate_to_fetch):
-                return _CONTINUE
-
-            # See this method's "Budget priority" docstring paragraph. Each
-            # group is sorted independently for determinism.
-            _budget = self.config.delivered_checks.max_record_fetches_per_tick
-            _held_cap = _budget - 1 if _new_to_fetch else _budget
-            _ordered = (
-                sorted(_held_to_fetch)[:_held_cap]
-                + sorted(_new_to_fetch)
-                + sorted(_revalidate_to_fetch)
-            )[:_budget]
-            _candidates = _held_to_fetch.union(_new_to_fetch, _revalidate_to_fetch)
-            _deferred = _candidates.difference(_ordered)
-            if _deferred:
-                ctx.deferred_terminal_deps = frozenset(_deferred.intersection(_new_to_fetch))
-                logger.warning(
-                    'acquire_next: terminal dep record backfill has %d '
-                    'dep(s) to fetch this tick (%d held, %d new, %d '
-                    're-validation), exceeding '
-                    'delivered_checks.max_record_fetches_per_tick (%d) — fetching '
-                    '%d, deferring %d (%d held, %d new, %d re-validation) '
-                    'to a later tick.',
-                    len(_candidates), len(_held_to_fetch), len(_new_to_fetch),
-                    len(_revalidate_to_fetch), _budget, len(_ordered),
-                    len(_deferred),
-                    len(_deferred.intersection(_held_to_fetch)),
-                    len(_deferred.intersection(_new_to_fetch)),
-                    len(_deferred.intersection(_revalidate_to_fetch)),
-                )
-            _fetched = await asyncio.gather(
-                *(self.get_task(_dep_id) for _dep_id in _ordered)
-            )
-            for _dep_id, _record in zip(_ordered, _fetched, strict=True):
-                if _record is not None:
-                    ctx.terminal_dep_records[_dep_id] = _record
-                    self._terminal_dep_record_cache[_dep_id] = _record
-                elif _dep_id in _held_to_fetch:
-                    logger.warning(
-                        'acquire_next: terminal dep %s record fetch '
-                        'returned None (transient?) — hold retained: the '
-                        'cached scheduled-deploy record is served and its '
-                        'dependents stay held this tick; will retry next tick.',
-                        _dep_id,
-                    )
-                else:
-                    logger.warning(
-                        'acquire_next: terminal dep %s record fetch '
-                        'returned None (transient?) — any pending '
-                        "dependent's delivered-check gate on this dep, or "
-                        'scheduled-deploy hold on this not-yet-cached dep, '
-                        'is bypassed (fail-open, not affirmatively passed) '
-                        'this tick; will retry next tick.',
-                        _dep_id,
-                    )
+            read = await self._read_terminal_dep_records(ctx.tasks, ctx.status_map, ctx.tasks_by_id)
+            self._apply_terminal_dep_records(read, ctx)
         except Exception:
             logger.warning(
                 'acquire_next: terminal dep record backfill failed unexpectedly',
                 exc_info=True,
             )
         return _CONTINUE
+
+    async def _read_terminal_dep_records(
+        self,
+        tasks: list[dict],
+        status_map: Mapping[str, str],
+        tasks_by_id: Mapping[str, dict],
+    ) -> _TerminalRecordRead:
+        """The read part of the terminal-record backfill: serve from the cache, fetch the rest.
+
+        Reads ``self._terminal_dep_record_cache`` by key only and never adds
+        to it.  A fetch failure leaves the served records in place, so a held
+        record stays held.
+        """
+        needed: set[str] = set()
+        for t in tasks:
+            if t.get('status') != 'pending':
+                continue
+            for d in (t.get('dependencies') or []):
+                dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
+                if not dep_id or dep_id in tasks_by_id:
+                    continue
+                if status_map.get(dep_id) not in TERMINAL_STATUSES:
+                    continue
+                needed.add(dep_id)
+
+        served: dict[str, dict] = {}
+        held: set[str] = set()
+        new: list[str] = []
+        revalidate: list[str] = []
+        for dep_id in needed:
+            cached = self._terminal_dep_record_cache.get(dep_id)
+            # A warmed record skips the re-fetch ONLY while immutable; a held
+            # record is served AND re-fetched, since only an affirmative
+            # fresh read releases its hold (see the phase docstring).
+            if cached is None:
+                new.append(dep_id)
+            elif _terminal_record_is_immutable(cached):
+                served[dep_id] = cached
+            elif awaits_scheduled_restart(cached.get('metadata')):
+                served[dep_id] = cached
+                held.add(dep_id)
+            else:
+                revalidate.append(dep_id)
+        if not (held or new or revalidate):
+            return _TerminalRecordRead(served=served)
+
+        # "Budget priority" in the phase docstring; each group sorted.
+        budget = self.config.delivered_checks.max_record_fetches_per_tick
+        held_cap = budget - 1 if new else budget
+        ordered = (sorted(held)[:held_cap] + sorted(new) + sorted(revalidate))[:budget]
+        try:
+            fetched = await asyncio.gather(*(self.get_task(dep_id) for dep_id in ordered))
+        except Exception:
+            logger.warning(
+                'acquire_next: terminal dep record fetch failed unexpectedly',
+                exc_info=True,
+            )
+            fetched = [None] * len(ordered)
+        return _TerminalRecordRead(
+            served=served,
+            held=frozenset(held),
+            new=frozenset(new),
+            revalidate=frozenset(revalidate),
+            ordered=tuple(ordered),
+            fetched=dict(zip(ordered, fetched, strict=True)),
+        )
+
+    def _apply_terminal_dep_records(self, read: _TerminalRecordRead, ctx: TickContext) -> None:
+        """The write part: hand the records to the pass and cache the fresh ones."""
+        ctx.terminal_dep_records.update(read.records)
+        deferred = read.deferred
+        if deferred:
+            ctx.deferred_terminal_deps = read.deferred_new
+            candidates = read.held | read.new | read.revalidate
+            logger.warning(
+                'acquire_next: terminal dep record backfill has %d '
+                'dep(s) to fetch this tick (%d held, %d new, %d '
+                're-validation), exceeding '
+                'delivered_checks.max_record_fetches_per_tick (%d) — fetching '
+                '%d, deferring %d (%d held, %d new, %d re-validation) '
+                'to a later tick.',
+                len(candidates), len(read.held), len(read.new),
+                len(read.revalidate),
+                self.config.delivered_checks.max_record_fetches_per_tick,
+                len(read.ordered), len(deferred),
+                len(deferred & read.held),
+                len(deferred & read.new),
+                len(deferred & read.revalidate),
+            )
+        for dep_id in read.ordered:
+            record = read.fetched.get(dep_id)
+            if record is not None:
+                self._terminal_dep_record_cache[dep_id] = record
+            elif dep_id in read.held:
+                logger.warning(
+                    'acquire_next: terminal dep %s record fetch '
+                    'returned None (transient?) — hold retained: the '
+                    'cached scheduled-deploy record is served and its '
+                    'dependents stay held this tick; will retry next tick.',
+                    dep_id,
+                )
+            else:
+                logger.warning(
+                    'acquire_next: terminal dep %s record fetch '
+                    'returned None (transient?) — any pending '
+                    "dependent's delivered-check gate on this dep, or "
+                    'scheduled-deploy hold on this not-yet-cached dep, '
+                    'is bypassed (fail-open, not affirmatively passed) '
+                    'this tick; will retry next tick.',
+                    dep_id,
+                )
 
     async def _phase_drain_park_eviction(self, ctx: TickContext) -> object:
         """Hygiene: drain queued operator force-evict requests.
@@ -6494,25 +6635,11 @@ class Scheduler:
         failure degrades to fail-safe-wait instead of aborting the tick.
         Always continues.
         """
-        _pending_ext_deps: list[tuple[dict, list[str]]] = [
-            (t, deps)
-            for t in ctx.tasks
-            if t.get('status') == 'pending'
-            and (deps := task_external_deps(t))
-        ]
-        _pending_tasks_with_ext: list[dict] = [t for t, _ in _pending_ext_deps]
-        _ext_dep_union: list[str] = list({
-            dep
-            for _, deps in _pending_ext_deps
-            for dep in deps
-        })
-        if _ext_dep_union:
-            external_cache, external_err = await self.get_external_statuses(_ext_dep_union)
-        else:
-            external_cache, external_err = {}, None
+        read = await self._read_external_statuses(ctx.tasks)
+        external_cache = dict(read.statuses)
         try:
             await self._apply_external_dep_policy(
-                _pending_tasks_with_ext, external_cache, external_err
+                list(read.pending_with_external), external_cache, read.error
             )
         except Exception:
             # A failure in the policy pass (e.g. set_task_status raising inside
@@ -6524,8 +6651,22 @@ class Scheduler:
                 exc_info=True,
             )
         ctx.external_cache = external_cache
-        ctx.external_resolver_failed = external_err is not None
+        ctx.external_resolver_failed = read.error is not None
         return _CONTINUE
+
+    async def _read_external_statuses(self, tasks: list[dict]) -> _ExternalStatusRead:
+        """The read part of the external-dep gate: one batched status call, or none."""
+        pending_ext_deps: list[tuple[dict, list[str]]] = [
+            (t, deps)
+            for t in tasks
+            if t.get('status') == 'pending'
+            and (deps := task_external_deps(t))
+        ]
+        if not pending_ext_deps:
+            return _ExternalStatusRead()
+        dep_union: list[str] = list({dep for _, deps in pending_ext_deps for dep in deps})
+        statuses, err = await self.get_external_statuses(dep_union)
+        return _ExternalStatusRead(tuple(t for t, _ in pending_ext_deps), statuses, err)
 
     async def _phase_delivered_check_gate(self, ctx: TickContext) -> object:
         """Delivered-check dep-gate per-tick sweep (capability-delivered-
@@ -6614,33 +6755,54 @@ class Scheduler:
         pending. Runs alongside the park_gc sweep so the
         rest of the tick sees post-GC state. Always continues.
         """
-        current_overrides: dict[str, OverrideRow] = (
-            self._override_store.get_overrides(self._project_root)
-            if self._override_store
-            else {}
-        )
-        if self._override_store and current_overrides:
-            terminal_or_missing_ids: set[str] = (
-                {tid for tid, st in ctx.status_map.items() if st in TERMINAL_STATUSES}
-                | (set(current_overrides.keys()) - set(ctx.tasks_by_id.keys()))
-            )
-            if terminal_or_missing_ids:
-                cleared_overrides = self._override_store.clear_terminal(
-                    self._project_root, terminal_or_missing_ids
-                )
-                for tid in cleared_overrides:
-                    current_overrides.pop(tid, None)
-            for tid in self._release_unpending_watchdog_pins(current_overrides, ctx.status_map):
-                current_overrides.pop(tid)
-            # TTL sweep: clear any rows whose ttl_until has elapsed, on the
-            # same wall clock that stamps a watchdog pin's TTL.
-            expired_overrides = self._override_store.clear_expired(
-                self._project_root, self._wall_now()
-            )
-            for tid in expired_overrides:
-                current_overrides.pop(tid, None)
-        ctx.overrides = current_overrides
+        read = self._read_overrides(ctx.status_map, ctx.tasks_by_id)
+        ctx.overrides = self._apply_override_gc(read, ctx.status_map)
         return _CONTINUE
+
+    def _read_overrides(
+        self, status_map: Mapping[str, str], tasks_by_id: Mapping[str, dict],
+    ) -> _OverrideRead:
+        """The read part of the override GC: the stored rows, classified, none removed."""
+        store = self._override_store
+        rows = store.get_overrides(self._project_root) if store else {}
+        if store is None or not rows:
+            return _OverrideRead(rows=rows)
+        terminal_or_missing = frozenset(
+            {tid for tid, st in status_map.items() if st in TERMINAL_STATUSES}
+            | (set(rows) - set(tasks_by_id))
+        )
+        return _OverrideRead(
+            rows=rows,
+            terminal_or_missing=terminal_or_missing,
+            unpending_watchdog=frozenset(
+                tid for tid, row in rows.items()
+                if tid not in terminal_or_missing
+                and _is_unpending_watchdog_pin(row, status_map.get(tid))
+            ),
+            expired=frozenset(store.expired_ids(self._project_root, self._wall_now())),
+        )
+
+    def _apply_override_gc(
+        self, read: _OverrideRead, status_map: Mapping[str, str],
+    ) -> dict[str, OverrideRow]:
+        """The write part: remove what the read classified; the rows the store still holds.
+
+        The result follows what the store actually cleared or released, so a
+        failed delete leaves its row in force exactly as before the split.
+        """
+        current = dict(read.rows)
+        store = self._override_store
+        if store is None or not current:
+            return current
+        if read.terminal_or_missing:
+            for tid in store.clear_terminal(self._project_root, set(read.terminal_or_missing)):
+                current.pop(tid, None)
+        for tid in self._release_unpending_watchdog_pins(current, status_map):
+            current.pop(tid)
+        # TTL sweep on the same wall clock that stamps a watchdog pin's TTL.
+        for tid in store.clear_expired(self._project_root, self._wall_now()):
+            current.pop(tid, None)
+        return current
 
     async def _phase_reserve_now(self, ctx: TickContext) -> object:
         """Snapshot pre-short-circuit overrides, then reserve-now.
@@ -6760,24 +6922,30 @@ class Scheduler:
         ``ctx.transitive_counts``. Computed once per tick (O(N+E)).
         Always continues.
         """
-        reverse_index = self._build_reverse_index(ctx.tasks)
-        override_boosts = {
-            tid: row.boost_tier
-            for tid, row in ctx.overrides.items()
-            if row.boost_tier
-        }
-        effective_priorities = self._compute_effective_priorities(
-            ctx.tasks_by_id, reverse_index, ctx.status_map,
-            override_boosts=override_boosts or None,
-        )
-        self._last_effective_priorities = dict(effective_priorities)
+        read = self._read_priorities(ctx.tasks, ctx.tasks_by_id, ctx.status_map, ctx.overrides)
+        self._last_effective_priorities = dict(read.effective_priorities)
         self._lookup_pins.adopt(ctx.overrides)
-        transitive_counts = self._compute_transitive_counts(
-            ctx.tasks_by_id, reverse_index, ctx.status_map
-        )
-        ctx.effective_priorities = effective_priorities
-        ctx.transitive_counts = transitive_counts
+        ctx.effective_priorities = dict(read.effective_priorities)
+        ctx.transitive_counts = dict(read.transitive_counts)
         return _CONTINUE
+
+    def _read_priorities(
+        self,
+        tasks: list[dict],
+        tasks_by_id: dict[str, dict],
+        status_map: dict[str, str],
+        overrides: Mapping[str, OverrideRow],
+    ) -> _PriorityRead:
+        """The read part of the tier step: effective tiers (inheritance plus boosts) and CPM counts."""
+        reverse_index = self._build_reverse_index(tasks)
+        override_boosts = {tid: row.boost_tier for tid, row in overrides.items() if row.boost_tier}
+        return _PriorityRead(
+            effective_priorities=self._compute_effective_priorities(
+                tasks_by_id, reverse_index, status_map,
+                override_boosts=override_boosts or None,
+            ),
+            transitive_counts=self._compute_transitive_counts(tasks_by_id, reverse_index, status_map),
+        )
 
     async def _phase_build_candidates(self, ctx: TickContext) -> object:
         """Filter tasks to dispatch-eligible candidates.
@@ -7596,32 +7764,18 @@ class Scheduler:
             self._emit_tick_telemetry(None, tick_started, {}, 'no_active_tasks', None, scope)
             return None
 
-        # Status + id indices, built once per tick.
-        status_map: dict[str, str] = {}
-        tasks_by_id: dict[str, dict] = {}
-        max_id = 0
-        for t in tasks:
-            tid = str(t.get('id', ''))
-            if not tid:
-                continue
-            status_map[tid] = t.get('status', 'unknown')
-            tasks_by_id[tid] = t
-            if tid.isdecimal():
-                max_id = max(max_id, int(tid))
+        index = _index_tasks(tasks)
 
         # Maintain age anchors (resurrected tasks reset their anchor).
-        self._journal_age_resets(self.age_anchors.observe(tasks, max_id))
+        self._journal_age_resets(self.age_anchors.observe(tasks, index.max_id))
 
         # Per-tick mutable state threaded through the phase methods below
-        # (W10-β). Constructed once the status/id indices + age anchors are
-        # ready; `status_map`/`tasks_by_id`/`tasks` above are the SAME
-        # objects as ctx's fields (mutated in place by the phase methods
-        # that follow), so ctx stays consistent as they fill in.
+        # (W10-β); the phases fill the index's maps in place.
         ctx = TickContext(
             tasks=tasks,
-            status_map=status_map,
-            tasks_by_id=tasks_by_id,
-            max_id=max_id,
+            status_map=index.status_map,
+            tasks_by_id=index.tasks_by_id,
+            max_id=index.max_id,
             scope=scope,
         )
 
