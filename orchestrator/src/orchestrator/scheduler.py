@@ -163,6 +163,7 @@ from orchestrator.task_picture import TaskPicture
 from orchestrator.task_priority import TaskPriority
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 from orchestrator.time_sources import resolve_monotonic_time_source, resolve_wall_time_source
+from orchestrator.timed_gates import timed_gates
 from orchestrator.work_product import (
     BranchWork,
     WorkProductProbe,
@@ -1420,6 +1421,7 @@ class Scheduler:
         'empty_candidate_gate',
         'psi_gate',
         'select_pins',
+        'select_timed_gates',
         'select_scored',
     )
 
@@ -7105,7 +7107,9 @@ class Scheduler:
                 continue
             modules = self._get_modules(pin.task)
             if self._claim(pin.task_id, modules):
-                return await self._dispatch_pin(pin, modules)
+                return await self._book_dispatch(
+                    pin.task_id, pin.task, modules, tier=pin.tier, signal=pin.signal,
+                )
             if not self.config.pin_reservations_enabled:
                 continue
             is_head = (
@@ -7122,6 +7126,30 @@ class Scheduler:
                     skip_count=self._skip_count.get(pin.task_id, 0),
                 )
                 self._bound_pin_reservations(ctx, reservable)
+        return _CONTINUE
+
+    async def _phase_select_timed_gates(self, ctx: TickContext) -> object:
+        """Dispatch the oldest open timed gate (orchestrator/timed_gates.py) ahead of scoring.
+
+        Reads: ``ctx.candidates``, ``ctx.effective_priorities``,
+        ``ctx.candidate_signals``.  Every candidate already passed
+        :meth:`_eligible_for_dispatch`, so each one's milestone is open.  A
+        timed gate is deterministic, so the PSI hold exempts it (DA-D4) and it
+        holds no module lock.  Runs after the pins, so an operator pin still
+        goes first.  Ends the tick only when it dispatches; otherwise returns
+        ``_CONTINUE``.
+        """
+        for task in timed_gates(ctx.candidates):
+            tid = str(task.get('id', ''))
+            modules = self._get_modules(task)
+            if self._claim(tid, modules):
+                return await self._book_dispatch(
+                    tid,
+                    task,
+                    modules,
+                    tier=ctx.effective_priorities.get(tid, coerce_tier(task.get('priority'))),
+                    signal=ctx.candidate_signals.get(tid),
+                )
         return _CONTINUE
 
     def _note_pin_blocked(
@@ -7287,33 +7315,39 @@ class Scheduler:
             ))
         return sorted(queue, key=lambda pin: pin.pin_order)
 
-    async def _dispatch_pin(self, pin: _PinCandidate, modules: list[str]) -> TickOutcome:
-        """Book a pin whose :meth:`_claim` just succeeded, and end the tick."""
+    async def _book_dispatch(
+        self,
+        task_id: str,
+        task: dict,
+        modules: list[str],
+        *,
+        tier: str,
+        signal: str | None,
+    ) -> TickOutcome:
+        """Book a pin or timed gate whose :meth:`_claim` just succeeded, and end the tick."""
         # Starvation-watchdog settle (tasks 1880, 3821), wrapped so a
         # failure can NEVER abort a successful dispatch (PROPERTY 1).
         try:
-            await self._settle_starvation_on_dispatch(pin.task_id)
+            await self._settle_starvation_on_dispatch(task_id)
         except Exception:
             logger.warning(
-                'Starvation watchdog resolve for pin_tid=%s raised — '
+                'Starvation watchdog resolve for task_id=%s raised — '
                 'dispatch continues normally',
-                pin.task_id,
+                task_id,
                 exc_info=True,
             )
-        if pin.signal is not None:
-            self._last_dispatch_at[pin.task_id] = self._time_source()
-        self._dispatched_priority[pin.task_id] = pin.tier
-        self._settle_fairness_on_dispatch(pin.task_id, modules, pin.tier)
+        if signal is not None:
+            self._last_dispatch_at[task_id] = self._time_source()
+        self._dispatched_priority[task_id] = tier
+        self._settle_fairness_on_dispatch(task_id, modules, tier)
         self._emit_lock_event(
             EventType.lock_acquired,
-            task_id=pin.task_id,
+            task_id=task_id,
             modules=modules,
-            priority=pin.tier,
+            priority=tier,
         )
         await self._write_snapshot_best_effort()
-        return TickOutcome(TaskAssignment(
-            task_id=pin.task_id, task=pin.task, modules=modules
-        ))
+        return TickOutcome(TaskAssignment(task_id=task_id, task=task, modules=modules))
 
     def _note_anchor_coverage(self, task_ids: list[str], readings: list[AnchorReading]) -> bool:
         """Run the tick's arming gate and deliver its verdict: the event, then any L1."""
@@ -7601,9 +7635,10 @@ class Scheduler:
     async def acquire_next(self, scope: DispatchScope = DispatchScope.ANY) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.
 
-        Dispatch order is determined by ``_score_candidates()``: tier base is
-        dominant, age + CPM (+ continuity) bonuses order tasks within a tier,
-        and per-tier slot caps reserve headroom for higher-value work.
+        Pinned tasks dispatch first, then timed gates
+        (orchestrator/timed_gates.py), then candidates in
+        ``_score_candidates()`` order: tier base is dominant, and age + CPM
+        (+ continuity) bonuses order tasks within a tier.
 
         A *scope* other than ANY restricts this tick's dispatch to the tasks
         the scope admits (the harness passes MAIN_HEALTH_FIX when only the
