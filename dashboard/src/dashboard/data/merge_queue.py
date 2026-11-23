@@ -19,15 +19,20 @@ import asyncio
 import json
 import logging
 import math
+import sqlite3
 from bisect import bisect_right
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, TypedDict, TypeVar
 
 import aiosqlite
 import httpx
+from shared.project_layout import runs_db
+from shared.quality_series.landings import UnrecognisedTrainEvent, recorded_landing_instants
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.datum import Datum, DatumState, map_datum, unknown_datum
@@ -315,6 +320,39 @@ def trailing_landing_rates(
         'values': values,
         'trailing_minutes': trailing,
     }
+
+
+def _landing_instants(path: Path, *, after: datetime, until: datetime) -> tuple[datetime, ...]:
+    """When each landing *path*'s runs.db records in (after, until] landed, oldest first."""
+    conn = connect_ro(path)
+    try:
+        return recorded_landing_instants(conn, after=after, until=until)
+    finally:
+        conn.close()
+
+
+async def landing_rate(
+    root: Path | None, *, hours: int, now: datetime | None = None,
+) -> Datum[LandingRateSeries]:
+    """*root*'s landing rate over the *hours* window, FRESH at *now* when its runs.db was read.
+
+    A readable runs.db with no landings is a series of measured zeros. With no
+    runs.db open, or when the read fails, the Datum is UNKNOWN with a reason.
+    """
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+    if root is None:
+        return _no_runs_db()
+    effective_now = resolve_now(now)
+    trailing = _trailing_minutes_for_window(hours)
+    try:
+        instants = await asyncio.to_thread(
+            _landing_instants, runs_db(root),
+            after=effective_now - timedelta(hours=hours, minutes=trailing), until=effective_now,
+        )
+    except (TaskDbUnreadable, sqlite3.Error, UnrecognisedTrainEvent, ValueError) as exc:
+        return unknown_datum(f'the landings could not be read from runs.db: {describe_exc(exc)}', bound)
+    series = trailing_landing_rates(instants, now=effective_now, hours=hours)
+    return Datum(series, effective_now, DatumState.FRESH, None, bound)
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +909,7 @@ def _unread_project(unread: Datum[Any], *, runs_db_present: bool) -> dict:
         'speculative': unread,
         'train_events': [],
         'train_throughput': unread,
+        'landing_rate': unread,
         'runs_db_present': runs_db_present,
     }
 
@@ -892,10 +931,11 @@ async def build_per_project_merge_queue(
     the same ``hours`` window every other leg uses, and ``recent_total`` is
     how many that window holds (see :func:`recent_merges`).
 
-    ``depth_timeseries``, ``attempts``, ``recent_total``, ``speculative`` and
-    ``train_throughput`` are Datums: a ``db=None`` pair, a leg that raises, or
-    a project whose whole build fails serves them UNKNOWN with a reason rather
-    than zeros that read as measured.
+    ``depth_timeseries``, ``attempts``, ``recent_total``, ``speculative``,
+    ``train_throughput`` and ``landing_rate`` are Datums: a ``db=None`` pair, a
+    leg that raises, or a project whose whole build fails serves them UNKNOWN
+    with a reason rather than zeros that read as measured. ``landing_rate``
+    reads the runs.db of the root its *pid* names, not the connection.
 
     Args:
         project_dbs: List of ``(project_root_str, connection_or_None)`` tuples
@@ -907,12 +947,13 @@ async def build_per_project_merge_queue(
             for a ``db=None`` pair; a label it omits is never assumed absent.
 
     Returns:
-        Dict ``{pid: {depth_timeseries, attempts, recent, recent_total, speculative, train_events, train_throughput, runs_db_present}}``,
+        Dict ``{pid: {depth_timeseries, attempts, recent, recent_total, speculative, train_events, train_throughput, landing_rate, runs_db_present}}``,
         where ``depth_timeseries`` is a ``Datum[DepthSeries]`` whose series
         carries its ``bucket_minutes``, ``attempts`` a ``Datum[MergeAttempts]``
         (the shaper projects its outcome chart and latency), ``recent_total``
-        a ``Datum[int]``, ``speculative`` a ``Datum[dict]`` and
-        ``train_throughput`` a ``Datum[TrainThroughput]``. ``runs_db_present``
+        a ``Datum[int]``, ``speculative`` a ``Datum[dict]``,
+        ``train_throughput`` a ``Datum[TrainThroughput]`` and ``landing_rate``
+        a ``Datum[LandingRateSeries]``. ``runs_db_present``
         is False only for a project with no runs.db file, which keeps that
         project out of the client's runs.db totals.
     """
@@ -923,15 +964,22 @@ async def build_per_project_merge_queue(
             absent = unknown_datum('no runs.db file exists for this project', bound)
             return pid, _unread_project(absent, runs_db_present=False)
         try:
-            depth_r, attempts_r, recent_r, spec_r, train_r, throughput_r = await asyncio.gather(
-                queue_depth_timeseries(db, hours=hours, now=now),
-                merge_attempts(db, hours=hours, now=now),
-                recent_merges(db, limit=RECENT_MERGES_CAP, hours=hours, now=now),
-                speculative_stats(db, hours=hours, now=now),
-                recent_train_events(db, hours=hours, now=now),
-                train_throughput_stats(db, hours=hours, now=now),
+            connection_legs, rate_r = await asyncio.gather(
+                asyncio.gather(
+                    queue_depth_timeseries(db, hours=hours, now=now),
+                    merge_attempts(db, hours=hours, now=now),
+                    recent_merges(db, limit=RECENT_MERGES_CAP, hours=hours, now=now),
+                    speculative_stats(db, hours=hours, now=now),
+                    recent_train_events(db, hours=hours, now=now),
+                    train_throughput_stats(db, hours=hours, now=now),
+                    return_exceptions=True,
+                ),
+                landing_rate(None if db is None else Path(pid), hours=hours, now=now),
                 return_exceptions=True,
             )
+            if isinstance(connection_legs, BaseException):
+                raise connection_legs
+            depth_r, attempts_r, recent_r, spec_r, train_r, throughput_r = connection_legs
             depth = _leg_or_unread(depth_r, _unread_leg(pid, 'merge depth'), f'{pid}/depth')
             attempts = _leg_or_unread(attempts_r, _unread_leg(pid, 'merge attempts'), f'{pid}/attempts')
             unread_total = _unread_leg(pid, 'recent merges')
@@ -945,6 +993,7 @@ async def build_per_project_merge_queue(
             train_throughput = _leg_or_unread(
                 throughput_r, _unread_leg(pid, 'train throughput'), f'{pid}/train_throughput',
             )
+            rate = _leg_or_unread(rate_r, _unread_leg(pid, 'landing rate'), f'{pid}/landing_rate')
             return pid, {
                 'depth_timeseries': depth,
                 'attempts': attempts,
@@ -953,6 +1002,7 @@ async def build_per_project_merge_queue(
                 'speculative': spec,
                 'train_events': train_events_list,
                 'train_throughput': train_throughput,
+                'landing_rate': rate,
                 'runs_db_present': True,
             }
         except Exception as exc:
