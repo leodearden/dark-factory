@@ -10,7 +10,11 @@ the ``reads_git_history`` marker the leg selects.
 The detector, the accounting rule and its registry ``READS_ONLY_THROWAWAY_REPOS``
 live in ``tests/scripts/git_history_census.py``. This file runs that census over
 every gate test root at once, holds the registry to no stale or doubled entry,
-and checks the declared leg against the marked tests it must run.
+and checks the declared leg against the marked tests it must run. Each
+module's ``lint_command`` also runs the census over that module's own gate test
+roots, so task verify and the pre-commit hook catch an unaccounted reader before
+the merge gate does; this file checks that wiring through the production verify
+planner.
 
 The sweep reads the disk rather than a pytest collection, for the reason
 ``orchestrator/tests/test_marker_registration_drift.py`` records: a
@@ -25,10 +29,12 @@ from __future__ import annotations
 import dataclasses
 import functools
 import posixpath
+import shlex
 import tomllib
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 
+import git_history_census
 import pytest
 import verify_command_invariants as vci
 from _pytest.mark.expression import Expression
@@ -81,13 +87,16 @@ def _read_repo_file(rel_path: str) -> str | None:
     return path.read_text() if path.is_file() else None
 
 
+def module_gate_test_roots(config: ModuleConfig) -> list[GateTestRoot]:
+    """The test roots *config*'s pytest segment collects; none when its test_command runs no pytest."""
+    segment = vci.optional_token_segment(config.test_command or '', vci.PYTEST)
+    return [] if segment is None else pytest_segment_roots(segment, _read_repo_file)
+
+
 def gate_test_roots(module_configs: Mapping[str, ModuleConfig]) -> frozenset[GateTestRoot]:
-    roots: set[GateTestRoot] = set()
-    for config in module_configs.values():
-        segment = vci.optional_token_segment(config.test_command or '', vci.PYTEST)
-        if segment is not None:
-            roots.update(pytest_segment_roots(segment, _read_repo_file))
-    return frozenset(roots)
+    return frozenset(
+        root for config in module_configs.values() for root in module_gate_test_roots(config)
+    )
 
 
 @functools.cache
@@ -339,3 +348,66 @@ def test_each_leg_segment_carries_a_gate_pytest_timeout(declared_leg: list[LegSe
     for segment in declared_leg:
         timeout = segment.timeout_secs()
         assert timeout is not None and timeout > 60, (segment.command, timeout)
+
+
+# ─── Every module's task verify censuses its own gate test roots ────────────
+
+CENSUS = Path(git_history_census.__file__).resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+_CENSUS_HEAD = ['uv', 'run', '--project', 'shared', 'python', CENSUS]
+_KNOWN_MODULES = frozenset({'orchestrator', 'tests/scripts'})
+
+
+def _census_leg_failure(prefix: str, lint_command: str, roots: Sequence[str]) -> str | None:
+    """Why *lint_command* does not census exactly *roots* once, else None."""
+    legs = [shlex.split(segment) for segment in verify_cmd.split_top_level_and(lint_command)]
+    census_legs = [leg for leg in legs if CENSUS in leg]
+    if not roots:
+        if not census_legs:
+            return None
+        return f'{prefix}: collects no gate test root yet runs the census: {lint_command!r}'
+    if len(census_legs) == 1:
+        head, arguments = census_legs[0][:len(_CENSUS_HEAD)], census_legs[0][len(_CENSUS_HEAD):]
+        if head == _CENSUS_HEAD and sorted(arguments) == sorted(roots):
+            return None
+    return (
+        f'{prefix}: task verify executes {lint_command!r}; {prefix}/orchestrator.yaml '
+        f'lint_command must carry exactly one `&& {shlex.join([*_CENSUS_HEAD, *roots])}`'
+    )
+
+
+def test_every_module_task_verify_censuses_its_own_gate_test_roots(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
+    root_config: OrchestratorConfig,
+) -> None:
+    configs = discover_module_configs()
+    assert configs.keys() >= _KNOWN_MODULES, (
+        f'module discovery found {sorted(configs)}, missing {sorted(_KNOWN_MODULES - configs.keys())}; '
+        'a check over every registered module would pass vacuously'
+    )
+    failures = []
+    for prefix, config in sorted(configs.items()):
+        executed = executed_for_touched(prefix, [f'{prefix}/guard_wiring_probe.py'], root_config)
+        roots = [root.path for root in module_gate_test_roots(config)]
+        failure = _census_leg_failure(prefix, executed.lint_command or '', roots)
+        if failure is not None:
+            failures.append(failure)
+    assert not failures, (
+        "These modules' task verify does not run the git-history census exactly once over "
+        'their own gate test roots:\n' + '\n'.join(failures)
+    )
+
+
+def test_a_diff_adding_only_a_history_reading_test_still_runs_the_census(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
+    root_config: OrchestratorConfig,
+) -> None:
+    roots = [root.path for root in module_gate_test_roots(discover_module_configs()['orchestrator'])]
+    executed = executed_for_touched(
+        'orchestrator', ['orchestrator/tests/test_seeds_its_repo.py'], root_config,
+    )
+
+    assert roots == ['orchestrator/tests']
+    failure = _census_leg_failure('orchestrator', executed.lint_command or '', roots)
+    assert failure is None, failure
