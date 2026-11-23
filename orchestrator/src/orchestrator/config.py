@@ -3634,6 +3634,11 @@ class PriceEntry(BaseModel):
         ge=0,
         description='USD per 1M cached input tokens; None prices them at input_per_1m.',
     )
+    cache_write_per_1m: float | None = Field(
+        default=None,
+        ge=0,
+        description='USD per 1M cache-creation input tokens; None prices them at input_per_1m.',
+    )
 
 
 def default_price_table() -> dict[str, dict[str, float]]:
