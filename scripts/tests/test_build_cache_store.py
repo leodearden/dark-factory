@@ -156,15 +156,29 @@ def http_request(
         return err.code, b""
 
 
-def wait_for_http(url: str, deadline_secs: float = 15.0) -> None:
+def log_tail(log: Path, lines: int = 20) -> str:
+    return "\n".join(log.read_text(errors="replace").splitlines()[-lines:])
+
+
+def wait_until_serving(
+    server: subprocess.Popen[bytes], url: str, log: Path, deadline_secs: float = 15.0
+) -> None:
+    """Return once anything answers HTTP at url; fail at once if server exits first."""
     deadline = time.monotonic() + deadline_secs
     while time.monotonic() < deadline:
+        if server.poll() is not None:
+            raise AssertionError(
+                f"server exited with code {server.returncode} before answering at {url};"
+                f" {log} ends:\n{log_tail(log)}"
+            )
         try:
             http_request("GET", url)
             return
         except (urllib.error.URLError, ConnectionError, TimeoutError):
             time.sleep(0.1)
-    raise AssertionError(f"nothing answered at {url} within {deadline_secs}s")
+    raise AssertionError(
+        f"nothing answered at {url} within {deadline_secs}s; {log} ends:\n{log_tail(log)}"
+    )
 
 
 @pytest.fixture
@@ -183,8 +197,9 @@ def private_rclone(
         "RCLONE_USER": auth[0],
         "RCLONE_PASS": auth[1],
     }
+    log_path = tmp_path / "rclone.log"
     with (
-        (tmp_path / "rclone.log").open("wb") as log,
+        log_path.open("wb") as log,
         socket_activated(
             lambda port: ["rclone", "serve", "webdav", str(world.store), "--addr", f"127.0.0.1:{port}"],
             env=env,
@@ -192,7 +207,7 @@ def private_rclone(
         ) as (proc, port),
     ):
         base = f"http://127.0.0.1:{port}"
-        wait_for_http(base + "/")
+        wait_until_serving(proc, base + "/", log_path)
         yield proc, base, auth
 
 
