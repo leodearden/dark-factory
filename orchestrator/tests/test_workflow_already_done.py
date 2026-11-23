@@ -233,7 +233,7 @@ async def test_empty_commit_string_blocks(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_an_unanswerable_reachability_probe_is_not_reported_as_unreachable(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     """A git error on ``merge-base --is-ancestor`` answers nothing about the
     commit, so the block says reachability was never established instead of
@@ -244,7 +244,7 @@ async def test_an_unanswerable_reachability_probe_is_not_reported_as_unreachable
     )
     f.artifacts.write_already_done(commit=_AD_COMMIT, evidence='evidence text')
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-    f.wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+    monkeypatch.setattr(f.wf, '_mark_blocked', mark_blocked)
 
     outcome = await f.wf._handle_already_done_report()
 
@@ -272,7 +272,7 @@ _ESC_4331_SPECIMEN = 'fafc76cd5d9b4a3e50186d011c77351827693209d'
     ids=['41_chars', 'short_hash', 'not_hex'],
 )
 async def test_a_commit_that_is_not_a_full_sha_is_reported_as_malformed(
-    tmp_path: Path, commit: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, commit: str,
 ):
     """A value that is not a full commit sha is the report's own fault, so it
     is named as malformed; git never sees it, and nothing is said about main
@@ -280,7 +280,7 @@ async def test_a_commit_that_is_not_a_full_sha_is_reported_as_malformed(
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
     f.artifacts.write_already_done(commit=commit, evidence='evidence text')
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-    f.wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+    monkeypatch.setattr(f.wf, '_mark_blocked', mark_blocked)
 
     outcome = await f.wf._handle_already_done_report()
 
