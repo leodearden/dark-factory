@@ -517,3 +517,4 @@ directly, not just interactive agents.
 - **Memory skill**: `/memory` — detailed reference for memory operations, categories, search patterns
 - **Config**: `fused-memory/config/config.yaml`, `.mcp.json`
 - **Design invariants**: `docs/legibility/design-invariants.md` — checkable invariants gating `/prd` decompose (G7) and `/review` phase 2
+- **Verify-result cache**: `OPERATIONS.md` §11a "Verify-result cache" — per-role modes, unit outcomes, audit and kill switch, R-cache-1/2 pointers
