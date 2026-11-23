@@ -473,7 +473,7 @@ get_tasks(project_root="$TARGET_PROJECT", statuses=["pending", "in-progress", "b
 get_task(id="4", project_root="$TARGET_PROJECT")
 ```
 
-Never call `get_tasks` with only `project_root`: it returns every task in the store, far more than a session can read. For ids and statuses alone, use `get_statuses`.
+Never call `get_tasks` with only `project_root`: it returns every task in the store, far more than a session can read. For ids and statuses alone, use `get_statuses(project_root="$TARGET_PROJECT", page_size=500)`, advancing `offset` by `pagination.page_size` until `pagination.has_more` is false, or pass `ids=[...]` for known tasks. A bare `get_statuses` is unbounded too, and `page_size` must stay at or below 2000.
 
 If the returned tasks don't look like the project the user is in (e.g. you see dark-factory titles when the user is in reify), your `project_root` is wrong — re-run step 1 of "identify the target project" before continuing.
 
@@ -579,8 +579,10 @@ If tasks already exist from a prior session, first assess their state before re-
 ### 1. Audit the task tree
 
 ```
-get_tasks(project_root="$TARGET_PROJECT", statuses=["pending", "in-progress", "blocked"], fields=["title", "status"], page_size=20)
+get_tasks(project_root="$TARGET_PROJECT", statuses=["pending", "in-progress", "blocked"], fields=["title", "status", "dependencies"], page_size=200, offset=0)
 ```
+
+Page through the whole open set: advance `offset` by `pagination.page_size` until `pagination.has_more` is false. A task or dependency edge on a page you did not read is not missing.
 
 Review the task tree to understand the current state. **Do not change the status of existing tasks** — they may have been set by the user or another session. If a task's status looks wrong, ask the user before changing it.
 

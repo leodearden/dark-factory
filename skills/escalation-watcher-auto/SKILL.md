@@ -62,7 +62,7 @@ Understanding the system helps you form accurate root-cause hypotheses without p
 
 **Design** — PRD mis-decomposition / wrong architecture → sibling tasks of the same PRD all stalling:
 - Signature: `design_concern` / `scope_violation` / `risk_identified` escalations clustered around **one subsystem or one set of sibling tasks**
-- RCA tool: fused-memory `get_task` on each escalated task to compare their parents, `search_tasks` on the parent or PRD title for siblings that have not escalated, `search` for related design decisions
+- RCA tool: fused-memory `get_task` on each escalated task to compare its `metadata.prd_path` and its `dependencies` (a task record has no parent field), `search_tasks` on the PRD title for siblings that have not escalated, `search` for related design decisions
 
 **Monitor signal** — a synthetic sentinel `task_id` that reports ON a task rather than recording work done on one:
 - Signature: the `task_id` is not a task number but a sentinel — `__recovery_veto_streak__<real_task_id>` (the same recovery veto held a task for N consecutive sweeps) and, by the same shape, `__zero_progress_requeue__<real_task_id>`. The record pins nothing real: the sentinel exists precisely so that observing a hold cannot deepen it, which is why an open L2 in this class never blocks the task it names.
@@ -79,7 +79,7 @@ Deepen RCA when you observe **any** of the following signals:
 
 - **Repeated failures on the same module or merge** — two or more `task_failure` escalations referencing the same file path or recent commit
 - **Burst of infra symptoms** — three or more `infra_issue` or MCP-error escalations in one drain cycle, especially from unrelated tasks
-- **Sibling tasks of one PRD all stalling** — multiple escalations whose task IDs share the same parent task (check via `mcp__fused-memory__get_task` on each escalated task to compare their parents, then `mcp__fused-memory__search_tasks` on the parent or PRD title for siblings that have not escalated)
+- **Sibling tasks of one PRD all stalling** — multiple escalations whose tasks share one `metadata.prd_path` or depend on the same task (check via `mcp__fused-memory__get_task` on each escalated task, reading `metadata.prd_path` and `dependencies`, since a task record has no parent field; then `mcp__fused-memory__search_tasks` on the PRD title for siblings that have not escalated)
 - **Same category + overlapping summaries** from distinct tasks with no obvious individual root cause
 
 Without these signals, log the escalation category and summary, apply the routing table (step 5), and move on.
@@ -97,7 +97,7 @@ The auto-watcher's allowed tools strictly limit what you can access. Use these f
 | `Bash(git status ...)` | Working-tree state at the project root |
 | `python3 $DARK_FACTORY_ROOT/scripts/task_event_timeline.py` | List and count one task's `runs.db` events before a `root_cause`/`evidence` narrative joins them (read-only). Advisory entry: not in `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`; it runs because the rotation's `bypassPermissions` mode admits Bash, as `scripts/watcher-rearm.sh` does |
 | `mcp__fused-memory__get_task` | Full task record including metadata and recent history |
-| `mcp__fused-memory__get_tasks` | Filtered task list — pass `statuses`, `fields` and `page_size`, and page with `offset` until `pagination.has_more` is false before treating a miss as absence; never call it bare (it returns every task in the store) |
+| `mcp__fused-memory__get_tasks` | Filtered task list — pass `statuses`, `fields` and `page_size`, and page with `offset` until `pagination.has_more` is false before treating a miss as absence; never call it bare (it returns every task in the store). Use it only on a filter narrow enough to page through: whether a task for X already exists is a `search_tasks` question |
 | `mcp__fused-memory__search_tasks` | Semantic search over filed tasks, each hit carrying its current `status`: the existence check for "is there already a task for X". Its corpus excludes deferred and uncommitted tasks |
 | `mcp__fused-memory__search` | Semantic search for prior decisions, related tasks, conventions |
 | `mcp__escalation__get_escalation` | One full escalation record by id, archive included |
@@ -843,7 +843,20 @@ Agent found it depends on work that isn't done yet.
    ```
    Then `mcp__fused-memory__get_task` on each candidate whose `status` is not `done` or `cancelled`, to confirm it is the prerequisite. A `deferred` prerequisite is invisible here: the `search_tasks` corpus excludes deferred tasks.
 
-   If the existence check cannot run — `search_tasks` is missing from your toolset, the call is refused (an orchestrator not yet restarted onto the task-10426 grant can still list the tool but deny it), or it returns an `error` payload — that is not "no match", and step 3 does not apply. Do not fall back to paging `get_tasks`: the incomplete set is thousands of rows, far past the MCP response limit. Promote instead, with `root_cause="dependency-check-unavailable:" + <dep_description_slug>`, the refusal or error text verbatim in `evidence`, and a summary that says the existence check could not run, not that no task exists.
+   If the existence check cannot run — `search_tasks` is missing from your toolset, the call is refused (an orchestrator not yet restarted onto the task-10426 grant can still list the tool but deny it), or it returns an `error` payload — that is not "no match", and step 3 does not apply. Do not fall back to paging `get_tasks`: each page is bounded, but the incomplete set is thousands of rows, and reading them all would spend the rotation's context on one record. Promote instead, saying the existence check could not run, never that no task exists:
+   ```python
+   mcp__escalation__promote_to_l2(
+     task_id=<task_id>,
+     agent_role="escalation-watcher-auto",
+     member_ids=[<escalation_id>],
+     root_cause="dependency-check-unavailable:" + <dep_description_slug>,
+     evidence=<the refusal or error text, verbatim>,
+     options=["A: re-run the existence check after the orchestrator restarts onto the search_tasks grant", "B: link the prerequisite by hand (add_dependency), creating it first if it does not exist", "C: something else"],
+     summary="dependency_discovered — existence check unavailable for: " + <dep_description>,
+     category="dependency_discovered",
+   )
+   ```
+   Add to digest: `PROMOTED (L2): dependency_discovered — <task_id> — existence check unavailable: <error>`
 2. **If a matching incomplete task exists:**
    ```
    mcp__fused-memory__add_dependency(id=<task_id>, depends_on=<dep_id>, project_root=<project_root>)
