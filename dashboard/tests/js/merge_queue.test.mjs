@@ -38,7 +38,7 @@ const {
   projectInQueue, inQueueOver, inQueueHistory, latencyCaption, depthBucketCaption,
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
   projectDepth, projectAttempts, attemptCount, attemptsOver, attemptsHistory, worstP95Over,
-  totalHint,
+  totalHint, projectLandingRate, landingRateCaption, landingRateReading,
 } = mergeQueue;
 const { isDatum, datumView, EM_DASH, LOWER_BOUND_PREFIX, missingParts } = loadedWindow.DF_DATUM;
 const { recentMergesCaption } = loadedWindow.DF_WINDOW_CHIP;
@@ -119,6 +119,12 @@ function depthSeries(labels, values, bucketMinutes = 15) {
   return { labels, values, bucket_minutes: bucketMinutes };
 }
 
+// A served landing-rate value: landings per day at each point over the trailing
+// window the server names, its leading zero points trimmed by the shaper.
+function landingRate(labels, values, trailingMinutes = 1440) {
+  return { labels, values, trailing_minutes: trailingMinutes };
+}
+
 const UNTIMED = Object.freeze({ p50: null, p95: null, p99: null, mean_ms: null });
 
 // A served attempts value, as redux_api.py::_shape_attempts projects one window's
@@ -165,9 +171,11 @@ test('the module exposes its readers and assigns window.DF_MERGE_QUEUE', () => {
     Object.keys(mergeQueue).sort(),
     [
       'attemptCount', 'attemptsHistory', 'attemptsOver',
-      'depthBucketCaption', 'hitRateText', 'inQueueHistory', 'inQueueOver', 'latencyCaption',
+      'depthBucketCaption', 'hitRateText', 'inQueueHistory', 'inQueueOver',
+      'landingRateCaption', 'landingRateReading', 'latencyCaption',
       'projectAttempts', 'projectDepth',
-      'projectInQueue', 'projectSpeculative', 'queuedSince', 'recentTotal', 'speculativeOver',
+      'projectInQueue', 'projectLandingRate', 'projectSpeculative', 'queuedSince', 'recentTotal',
+      'speculativeOver',
       'totalHint', 'worstP95Over',
     ],
   );
@@ -382,6 +390,37 @@ test('depthBucketCaption: a depth naming no usable width states none', () => {
   }
 });
 
+// ── landingRateCaption / landingRateReading: the throughput panel's words ──
+
+test('landingRateCaption: names the trailing window the server counted each point over', () => {
+  assert.equal(landingRateCaption({ trailing_minutes: 1440 }), 'landings/day · 1-day trailing');
+  assert.equal(landingRateCaption({ trailing_minutes: 10080 }), 'landings/day · 7-day trailing');
+  assert.equal(landingRateCaption({ trailing_minutes: 60 }), 'landings/day · 1-h trailing');
+  assert.equal(landingRateCaption({ trailing_minutes: 90 }), 'landings/day · 90-min trailing');
+});
+
+test('landingRateCaption: a rate naming no usable trailing window states none', () => {
+  const holes = [
+    undefined, null, {}, { trailing_minutes: null }, { trailing_minutes: 0 },
+    { trailing_minutes: -15 }, { trailing_minutes: 7.5 }, { trailing_minutes: '15' },
+  ];
+  for (const series of holes) {
+    assert.equal(landingRateCaption(series), EM_DASH, JSON.stringify(series));
+  }
+});
+
+test('landingRateReading: a window with no landings reads a measured zero, saying so', () => {
+  assert.equal(landingRateReading(landingRate([], [])), '0/day · no landings in this window');
+});
+
+test('landingRateReading: the newest point and the mean over the served points', () => {
+  assert.equal(landingRateReading(landingRate([T1, T2], [2, 3])), 'now 3/day · mean 2.5/day');
+});
+
+test('landingRateReading: rates show at most one decimal, a trailing .0 dropped', () => {
+  assert.equal(landingRateReading(landingRate([T1, T2], [27.43, 31])), 'now 31/day · mean 29.2/day');
+});
+
 // ── queuedSince: when a queued row joined, from the probe instant and its age ─
 
 test('queuedSince: the probe instant minus the row\'s age', () => {
@@ -414,13 +453,14 @@ test('queuedSince: reads its inputs and alters neither', () => {
   assert.deepEqual([entry, row], pristine);
 });
 
-// ── projectSpeculative / recentTotal / projectDepth / projectAttempts: one
-// project's runs.db readings, stamped ─────────────────────────────────────
+// ── projectSpeculative / recentTotal / projectDepth / projectLandingRate /
+// projectAttempts: one project's runs.db readings, stamped ────────────────
 
 for (const [field, reader, value] of [
   ['speculative', projectSpeculative, counts(5, 3)],
   ['recent_total', recentTotal, 228],
   ['depth', projectDepth, depthSeries([T1, T2], [2, 0])],
+  ['landing_rate', projectLandingRate, landingRate([T1, T2], [2, 1.5])],
   ['attempts', projectAttempts, attemptsValue({ done: 3, conflict: 1 }, timedLatency(900, 4))],
 ]) {
   test(`${field}: the served Datum, stamped with the /merge-queue receipt as a copy`, () => {
