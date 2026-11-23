@@ -217,6 +217,7 @@ class TestAmenderPointer:
             "prompt's pointer to that section names nothing. Restore the splice."
         )
 
+    @pytest.mark.asyncio
     async def test_a_rewrite_suggestion_meets_the_pointer(
         self, briefing: BriefingAssembler,
     ) -> None:
