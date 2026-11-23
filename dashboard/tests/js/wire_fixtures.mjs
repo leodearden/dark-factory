@@ -327,7 +327,7 @@ export function projectRow(id) {
 // boundary_wire_fixtures.test.mjs: no boundary payload serves MEMORY_EVALS.
 
 // One open escalation, as data/memory_evals.py::_escalation_projection projects
-// it onto a metric row, the storm banner or unmatched_escalations.
+// it onto a verdict entry, the storm banner or unmatched_escalations.
 export function memoryEvalEscalation(id, overrides = {}) {
   return {
     id,
@@ -340,9 +340,9 @@ export function memoryEvalEscalation(id, overrides = {}) {
   };
 }
 
-// One metric row, as data/memory_evals.py::_build_eval emits it: unjudged and
-// unlinked unless overridden.
-export function memoryEvalRow(overrides = {}) {
+// One metric row, as data/memory_evals.py::_build_metric_row emits it: one
+// unjudged, unlinked verdict entry unless overridden.
+export function memoryEvalMetric(overrides = {}) {
   return {
     metric_id: 'canonical-in-top-5',
     kind: 'proportion',
@@ -352,13 +352,23 @@ export function memoryEvalRow(overrides = {}) {
     denominator: 30,
     direction: 'lower_is_worse',
     trend: { labels: ['20260704T031500Z', '20260705T031500Z'], values: [0.9, 0.9] },
+    value: null,
+    limit_ref: null,
+    run_stamp: null,
+    verdicts: [memoryEvalVerdict()],
+    ...overrides,
+  };
+}
+
+// One entry of a metric row's `verdicts`, as data/memory_evals.py::_verdict_fields
+// emits it: item-less, unjudged and unlinked unless overridden. A quiet item
+// entry omits verdict_detail and fingerprint; delete them to build one.
+export function memoryEvalVerdict(overrides = {}) {
+  return {
+    item: null,
     verdict: null,
     verdict_detail: null,
-    value: null,
-    item: null,
-    limit_ref: null,
     fingerprint: null,
-    run_stamp: null,
     escalation: null,
     parity: 'unjudged',
     ...overrides,

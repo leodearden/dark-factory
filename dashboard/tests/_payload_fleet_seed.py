@@ -3,7 +3,8 @@
 ``_payload_fleet.py`` answers every MCP read from its census; the routes this
 module feeds read files instead: escalation queues and their archives, and
 each root's run ledger (task results, events, invocations and account
-events). The sampled histories live in ``_payload_fleet_history.py``. Each
+events), and the memory-eval artifact tree. The sampled histories live in
+``_payload_fleet_history.py``. Each
 seeder writes one family through the production writer or schema wherever one
 is importable, at the sizes its ``*Shape`` names, and knows nothing of MCP.
 """
@@ -11,6 +12,7 @@ is importable, at the sizes its ``*Shape`` names, and knows nothing of MCP.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 from collections.abc import Sequence
@@ -19,6 +21,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from _dashboard_helpers import dump_artifact
 from _runs_db_fixture import EVENTS_DDL, TASK_RESULTS_DDL
 from escalation.archive import archive_dir_for_date
 from escalation.models import Escalation
@@ -303,3 +306,149 @@ def seed_account_events(ledger: Path, project_id: str, shape: CostShape, *, offs
             'VALUES (?, ?, ?, ?, ?, ?)',
             rows,
         )
+
+
+@dataclass(frozen=True)
+class MemoryEvalShape:
+    """One eval's artifacts: its window metrics, its tripwire's items (0: no tripwire), its run
+    depth, the lengths of an item key and of a window verdict's detail, and its corpus counters."""
+
+    eval_id: str
+    window_metrics: int
+    tripwire_items: int
+    runs: int
+    item_key_len: int
+    detail_len: int
+    corpus_counts: int
+
+
+_EVAL_STAMP_FORMAT = '%Y%m%dT%H%M%SZ'
+_EVAL_ALPHA = 0.002777777777777778
+_TRIPWIRE_METRIC = 'tripwire-items-present'
+# Two items in five are grandfathered, near the live share that
+# _payload_fleet.py::FleetCensus records.
+_GRANDFATHERED_PER_5 = 2
+
+
+def _eval_stamps(runs: int, now: datetime) -> list[str]:
+    """*runs* stamps a day apart, oldest first, the newest three hours before *now*."""
+    newest = now.replace(microsecond=0) - timedelta(hours=3)
+    return [(newest - timedelta(days=age)).strftime(_EVAL_STAMP_FORMAT) for age in reversed(range(runs))]
+
+
+def _window_ids(shape: MemoryEvalShape) -> list[str]:
+    return [f'window-metric-{index:02d}' for index in range(shape.window_metrics)]
+
+
+def _item_keys(shape: MemoryEvalShape) -> list[str]:
+    return [text(f't-{index:03d}', shape.item_key_len) for index in range(shape.tripwire_items)]
+
+
+def _grandfathered(index: int) -> bool:
+    return index % 5 < _GRANDFATHERED_PER_5
+
+
+def _fingerprint(*identity: str) -> str:
+    return hashlib.sha256('|'.join(identity).encode()).hexdigest()
+
+
+def _metrics_run(shape: MemoryEvalShape, stamp: str) -> dict:
+    """One M1 run: the window metrics as proportions, then the tripwire valued at its failing items."""
+    metrics: list[dict] = [
+        {
+            'metric_id': metric_id, 'kind': 'proportion', 'value': 0.9, 'n': 27, 'denominator': 30,
+            'direction': 'lower_is_worse',
+        }
+        for metric_id in _window_ids(shape)
+    ]
+    if shape.tripwire_items:
+        failing = sum(_grandfathered(index) for index in range(shape.tripwire_items))
+        metrics.append({
+            'metric_id': _TRIPWIRE_METRIC, 'kind': 'tripwire', 'value': float(failing),
+            'n': shape.tripwire_items,
+        })
+    return {
+        'schema_version': 1,
+        'eval_id': shape.eval_id,
+        'run_stamp': stamp,
+        'corpus': {
+            'project_id': 'dark_factory',
+            'counts': {text(f'counter-{index:02d}', 24): 1000 + index for index in range(shape.corpus_counts)},
+        },
+        'metrics': metrics,
+    }
+
+
+def _limits(shape: MemoryEvalShape, stamps: list[str], grandfather_hash: str) -> dict:
+    rule_kinds = [(metric_id, 'proportion') for metric_id in _window_ids(shape)]
+    if shape.tripwire_items:
+        rule_kinds.append((_TRIPWIRE_METRIC, 'tripwire'))
+    return {
+        'schema_version': 1,
+        'eval_id': shape.eval_id,
+        'run_stamp': stamps[-1],
+        'alpha': _EVAL_ALPHA,
+        'false_alarm_budget': 1.0,
+        'runs_per_quarter': 90,
+        'min_samples': 10,
+        'baseline_window': 3,
+        'baseline_run_stamps': stamps[:-1][-3:],
+        'grandfather_set_hash': grandfather_hash,
+        'generator': 'shared.memory_eval_limits',
+        'verdicts': [
+            {'metric_id': metric_id, 'rule_kind': rule_kind, 'status': 'ok', 'alarms': []}
+            for metric_id, rule_kind in rule_kinds
+        ],
+    }
+
+
+def _verdict_entries(shape: MemoryEvalShape, stamp: str, grandfather_hash: str) -> list[dict]:
+    """The eval's M2 entries: one per window metric, and one per tripwire item shaped like
+    shared/src/shared/memory_eval_verdicts.py::_tripwire_entries makes them."""
+    entries = [
+        {
+            'eval_id': shape.eval_id, 'metric_id': metric_id, 'window': 'trailing-3',
+            'verdict': 'no_alarm', 'fingerprint': _fingerprint(shape.eval_id, metric_id, 'trailing-3'),
+            'detail': text(f'{metric_id} against a pooled baseline', shape.detail_len),
+            'value': 0.9, 'limit_ref': f'alpha={_EVAL_ALPHA}', 'run_stamp': stamp,
+            'rule_kind': 'proportion', 'metric_status': 'ok',
+        }
+        for metric_id in _window_ids(shape)
+    ]
+    failing = float(sum(_grandfathered(index) for index in range(shape.tripwire_items)))
+    for index, item in enumerate(_item_keys(shape)):
+        grandfathered = _grandfathered(index)
+        entries.append({
+            'eval_id': shape.eval_id, 'metric_id': _TRIPWIRE_METRIC, 'item': item,
+            'verdict': 'grandfathered' if grandfathered else 'no_alarm',
+            'fingerprint': _fingerprint(shape.eval_id, _TRIPWIRE_METRIC, item),
+            'detail': f"Item '{item}' fails and is grandfathered (known-bad)." if grandfathered else f"Item '{item}' passes.",
+            'value': failing, 'limit_ref': f'grandfather_set_hash={grandfather_hash}', 'run_stamp': stamp,
+            'rule_kind': 'tripwire', 'metric_status': 'ok',
+        })
+    return entries
+
+
+def seed_memory_evals(
+    root: Path, shapes: Sequence[MemoryEvalShape], *, runless_evals: int, now: datetime,
+) -> None:
+    """Write each shape's eval dir under the memory-eval *root*, plus *runless_evals* dirs holding
+    no run, and APPEND every shape's verdict entries to the root verdicts artifact already there.
+
+    Appending keeps the escalation reach-path records an earlier
+    ``_dashboard_helpers.build_dual_escalation_tree`` wrote. Content depends on
+    *now* only through the stamps, which are fixed-width, so every build serves
+    the same number of bytes.
+    """
+    verdicts_path = root / 'verdicts-current.json'
+    verdicts = json.loads(verdicts_path.read_text())
+    for shape in shapes:
+        stamps = _eval_stamps(shape.runs, now)
+        grandfather_hash = _fingerprint(shape.eval_id, 'grandfather-set')
+        for stamp in stamps:
+            dump_artifact(root / shape.eval_id / f'metrics-{stamp}.json', _metrics_run(shape, stamp))
+        dump_artifact(root / shape.eval_id / 'limits-current.json', _limits(shape, stamps, grandfather_hash))
+        verdicts['entries'].extend(_verdict_entries(shape, stamps[-1], grandfather_hash))
+    for index in range(runless_evals):
+        dump_artifact(root / f'runless-eval-{index}' / 'notes.json', {'note': 'no metrics run here'})
+    dump_artifact(verdicts_path, verdicts)

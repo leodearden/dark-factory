@@ -50,6 +50,7 @@ const {
   chartForKind,
   trendGaps,
   verdictBadge,
+  splitVerdicts,
   PARITY_REFINEMENT,
   PARITY_PLAIN,
   VERDICT_BASES,
@@ -66,6 +67,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'ageText',
   'chartForKind',
   'dash',
+  'splitVerdicts',
   'trendGaps',
   'unmatchedReasonText',
   'verdictBadge',
@@ -775,4 +777,39 @@ test('verdictBadge: an inherited Object.prototype member is not a parity state',
     assert.equal(out.cls, 'badge bad', `parity '${parity}' produced cls ${out.cls}`);
     assert.ok(!out.label.endsWith('· undefined'), `parity '${parity}' leaked an inherited member`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// splitVerdicts — a metric row's verdicts, split into the metric's own and its items'
+// ---------------------------------------------------------------------------
+
+test('splitVerdicts: item-less entries judge the metric, item entries judge their items, in payload order', () => {
+  const whole = { item: null, verdict: 'no_alarm' };
+  const unset = { verdict: 'alarm' };
+  const beta = { item: 't-beta', verdict: 'grandfathered' };
+  const alpha = { item: 't-alpha', verdict: 'alarm' };
+  const verdicts = [beta, whole, alpha, unset];
+
+  const { own, items } = splitVerdicts(verdicts);
+
+  assert.deepEqual(own, [whole, unset]);
+  assert.deepEqual(items, [beta, alpha]);
+  assert.ok(own.every((entry, i) => entry === [whole, unset][i]), 'own must hold the payload objects themselves');
+  assert.ok(items.every((entry, i) => entry === [beta, alpha][i]), 'items must hold the payload objects themselves');
+});
+
+test('splitVerdicts: an absent or null list gives two empty lists', () => {
+  for (const verdicts of [undefined, null, []]) {
+    assert.deepEqual(splitVerdicts(verdicts), { own: [], items: [] }, `input ${verdicts}`);
+  }
+});
+
+test('splitVerdicts: the payload list is not mutated', () => {
+  const verdicts = [{ item: 't-a' }, { item: null }];
+  const snapshot = JSON.stringify(verdicts);
+
+  splitVerdicts(verdicts);
+
+  assert.equal(JSON.stringify(verdicts), snapshot);
+  assert.equal(verdicts.length, 2);
 });
