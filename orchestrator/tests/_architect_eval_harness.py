@@ -344,7 +344,12 @@ def only_record(metrics: dict) -> dict:
 
 
 def token_agent_result(
-    input_tokens, output_tokens, *, cost_usd: float = DEFAULT_ARCH_INVOKE.cost_usd,
+    input_tokens,
+    output_tokens,
+    *,
+    cost_usd: float = DEFAULT_ARCH_INVOKE.cost_usd,
+    cache_read_tokens: int | None = None,
+    cache_create_tokens: int | None = None,
 ):
     """A REAL ``AgentResult`` carrying explicit token counts.
 
@@ -360,6 +365,8 @@ def token_agent_result(
         turns=3,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_create_tokens=cache_create_tokens,
     )
 
 

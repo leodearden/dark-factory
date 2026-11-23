@@ -255,6 +255,28 @@ class TestArchitectCellResolvesCostProvenance:
         assert persisted['cost_usd'] != pytest.approx(99.0)
         assert result.metrics['cost_source'] == 'price_table'
 
+    async def test_priced_proxied_candidate_prices_its_cache_tokens(self):
+        """The architect's cache reads and writes are priced at their own
+        rates, not dropped from the figure."""
+        result, mocks = await run_architect_eval_hermetic(
+            self._cfg(model='qwen3-coder', env_overrides=dict(PROXY_ENV)),
+            produced_plan=well_formed_plan(),
+            arch_result=token_agent_result(
+                1_000_000, 500_000,
+                cache_read_tokens=2_000_000, cache_create_tokens=100_000, cost_usd=99.0,
+            ),
+            orch_prices={'qwen3-coder': {
+                'input_per_1m': 0.30, 'output_per_1m': 1.20,
+                'cached_input_per_1m': 0.03, 'cache_write_per_1m': 0.30,
+            }},
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_usd'] == pytest.approx(0.30 + 0.60 + 0.06 + 0.03)
+        assert persisted['cost_usd'] == pytest.approx(0.99)
+        assert persisted['cost_source'] == 'price_table'
+        assert result.metrics['cost_source'] == 'price_table'
+
     async def test_unpriced_proxied_candidate_warns_and_uses_defined_fallback(
         self, caplog,
     ):

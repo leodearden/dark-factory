@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from orchestrator.agents.token_pricing import FALLBACK_PRICE, TokenUsage, price_tokens
 from orchestrator.evals.metrics import (
     EvalMetrics,
     compute_composite,
@@ -190,8 +191,10 @@ class TestNullWorkGuard:
 class TestResolveCostUsd:
     """A PURE resolver of ``(cost_usd, cost_source)`` implementing Invariant P5.
 
-    Cost provenance ∈ {price_table, cli, unpriced_proxy}:
+    Cost provenance ∈ {price_table, price_table_no_cache_rate, cli, unpriced_proxy}:
       - price_table  → the run's model is listed in ``prices`` (trust the table)
+      - price_table_no_cache_rate → listed, but cache tokens met a missing
+                       cache rate and were priced at input_per_1m (WARNING)
       - cli          → NATIVE cloud endpoint, model unlisted (CLI cost is
                        trustworthy for the real Anthropic API)
       - unpriced_proxy → a PROXIED endpoint (is_local_model) whose model is
@@ -204,7 +207,7 @@ class TestResolveCostUsd:
 
         # 1_000_000 in @ $2/1M + 500_000 out @ $8/1M = 2.0 + 4.0 = 6.0
         cost, source = resolve_cost_usd(
-            1_000_000, 500_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=500_000),
             model='model-x',
             prices={'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
             cli_cost_usd=99.0,          # must be IGNORED when the model is priced
@@ -219,7 +222,7 @@ class TestResolveCostUsd:
         from orchestrator.evals.metrics import resolve_cost_usd
 
         cost, source = resolve_cost_usd(
-            1_000_000, 500_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=500_000),
             model='model-x',
             prices={'model-x': PriceEntry(input_per_1m=2.0, output_per_1m=8.0)},
             cli_cost_usd=99.0,
@@ -232,7 +235,7 @@ class TestResolveCostUsd:
         from orchestrator.evals.metrics import resolve_cost_usd
 
         cost, source = resolve_cost_usd(
-            1_000_000, 1_000_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=1_000_000),
             model='claude-sonnet-4',    # not in prices
             prices={},
             cli_cost_usd=3.5,
@@ -246,7 +249,7 @@ class TestResolveCostUsd:
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
             cost, source = resolve_cost_usd(
-                1_000_000, 1_000_000,
+                TokenUsage(input_tokens=1_000_000, output_tokens=1_000_000),
                 model='local-llama-70b',    # not in prices
                 prices={},
                 cli_cost_usd=0.0,           # raw CLI cost is WRONG for proxied
@@ -269,7 +272,7 @@ class TestResolveCostUsd:
         from orchestrator.evals.metrics import resolve_cost_usd
 
         cost, source = resolve_cost_usd(
-            1_000_000, 500_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=500_000),
             model='model-x',
             prices={'model-x': {'input_per_1m': 2.0, 'output_per_1m': 8.0}},
             cli_cost_usd=99.0,
@@ -277,6 +280,101 @@ class TestResolveCostUsd:
         )
         assert source == 'price_table'
         assert cost == pytest.approx(6.0)
+
+    # Measured counts of eval cell endpoint__46074e01, at GLM-5.3's published rates.
+    _MEASURED_USAGE = TokenUsage(
+        input_tokens=1_193,
+        output_tokens=12_537,
+        cache_read_tokens=1_370_402,
+        cache_create_tokens=13_702,
+    )
+    _GLM_RATES = {
+        'input_per_1m': 1.40,
+        'output_per_1m': 4.40,
+        'cached_input_per_1m': 0.26,
+        'cache_write_per_1m': 1.40,
+    }
+
+    def test_priced_model_prices_cache_tokens_at_their_own_rates(self):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        cost, source = resolve_cost_usd(
+            self._MEASURED_USAGE,
+            model='glm-5.3',
+            prices={'glm-5.3': self._GLM_RATES},
+            cli_cost_usd=99.0,
+            is_local_model=True,
+        )
+        assert (cost, source) == (pytest.approx(0.43232032), 'price_table')
+
+    def test_missing_cached_rate_labels_and_warns(self, caplog):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        usage = TokenUsage(input_tokens=100, output_tokens=10, cache_read_tokens=1_000)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            cost, source = resolve_cost_usd(
+                usage,
+                model='mimo-pro',
+                prices={'mimo-pro': {'input_per_1m': 1.0, 'output_per_1m': 4.0}},
+                cli_cost_usd=0.0,
+                is_local_model=True,
+            )
+
+        assert source == 'price_table_no_cache_rate'
+        assert cost == pytest.approx((100 * 1.0 + 1_000 * 1.0 + 10 * 4.0) / 1e6)
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.evals.metrics'
+        ]
+        assert any('mimo-pro' in w and 'cached_input_per_1m' in w for w in warnings), warnings
+
+    def test_missing_cache_rates_without_cache_tokens_stay_price_table(self, caplog):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            _, source = resolve_cost_usd(
+                TokenUsage(input_tokens=100, output_tokens=10),
+                model='mimo-pro',
+                prices={'mimo-pro': {'input_per_1m': 1.0, 'output_per_1m': 4.0}},
+                cli_cost_usd=0.0,
+                is_local_model=True,
+            )
+
+        assert source == 'price_table'
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_proxied_unlisted_prices_cache_tokens_at_the_fallback(self):
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        cost, source = resolve_cost_usd(
+            self._MEASURED_USAGE,
+            model='local-llama-70b',
+            prices={},
+            cli_cost_usd=0.0,
+            is_local_model=True,
+        )
+
+        assert source == 'unpriced_proxy'
+        assert cost == pytest.approx(price_tokens(FALLBACK_PRICE, self._MEASURED_USAGE).cost_usd)
+
+    def test_agrees_with_the_runtime_estimator(self):
+        from orchestrator.agents.invoke import _estimate_cost
+        from orchestrator.evals.metrics import resolve_cost_usd
+
+        entry = {'input_per_1m': 1.40, 'output_per_1m': 4.40, 'cached_input_per_1m': 0.26}
+        uncached, cached, out = 1_193, 1_370_402, 12_537
+
+        cost, _ = resolve_cost_usd(
+            TokenUsage(input_tokens=uncached, output_tokens=out, cache_read_tokens=cached),
+            model='m',
+            prices={'m': entry},
+            cli_cost_usd=0.0,
+            is_local_model=True,
+        )
+
+        assert cost == _estimate_cost(
+            'm', uncached + cached, out, {'m': entry}, cached_input_tokens=cached,
+        )
 
 
 class TestComposeCostSource:
