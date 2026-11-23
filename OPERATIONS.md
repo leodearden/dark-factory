@@ -4635,7 +4635,10 @@ claim the timer is armed; `scripts/user_timers.py check` answers that.
 - **Where findings go.** Each breach is one `escalate_info` (`risk_identified`,
   agent role `timeout-headroom-selfcheck`). Its opaque `task_id` slot is
   `timeout-headroom:<kind>:<subject>:<bound>-><required>`, where `<kind>` is
-  `per_test_headroom` or `leg_budget`. A run skips any slot that has escalation
+  `per_test_headroom` or `leg_budget`. `<subject>` is the anchor id or the
+  leg's archive infix (`tests/scripts` files as `tests_scripts`), because the
+  escalation server mints `esc-<slot>` files from the slot, so it must be one
+  file-name component. A run skips any slot that has escalation
   history (archive-inclusive), so the same measurement is never filed twice.
   A re-size changes `<bound>` and a materially worse measurement changes
   `<required>`; either re-arms the check. The info-L0 router turns each record

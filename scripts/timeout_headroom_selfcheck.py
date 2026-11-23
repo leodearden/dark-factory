@@ -202,7 +202,8 @@ class LegEvidence:
 
     @property
     def subject(self) -> str:
-        return self.prefix
+        """The leg's archive infix, the one file-name component its summaries carry (``tests_scripts``)."""
+        return sanitise_prefix(self.prefix)
 
     @property
     def bound(self) -> float:
@@ -221,11 +222,22 @@ def _slot_number(value: float) -> str:
     return str(int(value)) if float(value).is_integer() else repr(float(value))
 
 
+def _require_one_file_name_component(slot: str) -> None:
+    if '/' in slot or '\0' in slot:
+        raise ValueError(
+            'an escalation slot is one file-name component, because the escalation server '
+            f'mints esc-<slot> files from it; got slot {slot!r}'
+        )
+
+
 @dataclass(frozen=True)
 class Finding:
     """One breach.  Kind, subject, bound and required are read from its evidence, never stored twice."""
 
     evidence: AnchorEvidence | LegEvidence
+
+    def __post_init__(self) -> None:
+        _require_one_file_name_component(self.slot())
 
     @property
     def kind(self) -> FindingKind:
@@ -244,7 +256,10 @@ class Finding:
         return self.evidence.required
 
     def slot(self) -> str:
-        """The opaque escalation slot ``timeout-headroom:<kind>:<subject>:<bound>-><required>``; compared, never parsed."""
+        """The opaque escalation slot ``timeout-headroom:<kind>:<subject>:<bound>-><required>``; compared, never parsed.
+
+        ``<subject>`` is the anchor id or the leg's archive infix.
+        """
         return (
             f'{_SLOT_PREFIX}:{self.kind}:{self.subject}:'
             f'{_slot_number(self.bound)}->{_slot_number(self.required)}'
