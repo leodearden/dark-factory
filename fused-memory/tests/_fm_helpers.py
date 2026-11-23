@@ -984,6 +984,26 @@ def mock_memory_backends(svc: 'MemoryService') -> 'MemoryService':
     return svc
 
 
+def mock_search_backends(svc: 'MemoryService') -> 'MemoryService':
+    """Stub every backend read ``MemoryService.search`` awaits, each answering empty.
+
+    The shared definition of a MemoryService driven through its public
+    ``search`` seam: a read the search path grows is taught about here once.
+    Callers seed the hits under test (for example ``svc.mem0.search``) after
+    calling it.
+    """
+    svc.graphiti = MagicMock()
+    svc.graphiti.search = AsyncMock(return_value=[])
+    svc.graphiti.search_nodes = AsyncMock(return_value=[])
+    svc.graphiti.get_node_names_by_uuids = AsyncMock(return_value={})
+    install_identity_mocks(svc.graphiti)
+
+    svc.mem0 = MagicMock()
+    svc.mem0.search = AsyncMock(return_value={'results': []})
+    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+    return svc
+
+
 def wrap_like_graphiti(inner: BaseException) -> Exception:
     """Re-raise *inner* the way graphiti_core's OpenAI clients wrap a 429.
 

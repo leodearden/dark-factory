@@ -1,37 +1,29 @@
 """MemoryService.search hit attribution: every hit names its writer, task and stored scope.
 
 Driven through the public ``search`` seam; each store's double returns records shaped as the store really returns them.
+Stored scopes are written through Scope's own forward mappings, so a hit's project_id is checked against the
+scope the record was written under rather than against a literal that would survive a change to those mappings.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
-from _fm_helpers import MockEdge, install_identity_mocks
+from _fm_helpers import MockEdge, mock_search_backends
 
 from fused_memory.models.enums import SourceStore
+from fused_memory.models.scope import Scope
 from fused_memory.services.memory_service import MemoryService
 
-_PROJECT_ID = 'dark_factory'
+_WRITTEN_UNDER = Scope(project_id='dark_factory')
 _ATTRIBUTION_KEYS = ('agent_id', 'task_id', 'project_id')
 
 
 @pytest.fixture
 def service(mock_config):
     """A real MemoryService over mocked Graphiti and Mem0 backends."""
-    svc = MemoryService(mock_config)
-
-    svc.graphiti = MagicMock()
-    svc.graphiti.search = AsyncMock(return_value=[])
-    svc.graphiti.search_nodes = AsyncMock(return_value=[])
-    svc.graphiti.get_node_names_by_uuids = AsyncMock(return_value={})
-    install_identity_mocks(svc.graphiti)
-
-    svc.mem0 = MagicMock()
-    svc.mem0.search = AsyncMock(return_value={'results': []})
-    svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
-    return svc
+    return mock_search_backends(MemoryService(mock_config))
 
 
 def _mem0_item(**fields: object) -> dict:
@@ -49,7 +41,7 @@ def _mem0_item(**fields: object) -> dict:
 async def _search_mem0_hit(service, item: dict):
     service.mem0.search = AsyncMock(return_value={'results': [item]})
     results = await service.search(
-        query='who wrote this', project_id=_PROJECT_ID, stores=['mem0'],
+        query='who wrote this', project_id=_WRITTEN_UNDER.project_id, stores=['mem0'],
     )
     assert len(results) == 1
     return results[0]
@@ -61,14 +53,14 @@ class TestMem0HitAttribution:
         hit = await _search_mem0_hit(service, _mem0_item(
             created_at='2026-11-01T00:00:00+00:00',
             agent_id='claude-task-7',
-            user_id='dark_factory',
+            user_id=_WRITTEN_UNDER.mem0_user_id,
             metadata={'category': 'observations_and_summaries', 'task_id': '3137'},
         ))
 
         expected = {
             'agent_id': 'claude-task-7',
             'task_id': '3137',
-            'project_id': 'dark_factory',
+            'project_id': _WRITTEN_UNDER.project_id,
             'created_at': '2026-11-01T00:00:00+00:00',
         }
         assert {key: getattr(hit, key) for key in expected} == expected
@@ -85,6 +77,24 @@ class TestMem0HitAttribution:
         assert (hit.agent_id, hit.task_id, hit.project_id) == (None, None, None)
         dumped = hit.model_dump()
         assert {key: dumped[key] for key in _ATTRIBUTION_KEYS} == dict.fromkeys(_ATTRIBUTION_KEYS)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('stored_agent_id', 'stored_user_id'),
+        [
+            pytest.param('', '', id='empty-str'),
+            pytest.param(7, 123, id='int'),
+            pytest.param(['claude-task-7'], ['dark_factory'], id='list'),
+        ],
+    )
+    async def test_writer_and_scope_that_are_not_non_empty_strings_read_as_none(
+        self, service, stored_agent_id, stored_user_id,
+    ):
+        hit = await _search_mem0_hit(service, _mem0_item(
+            agent_id=stored_agent_id, user_id=stored_user_id,
+        ))
+
+        assert (hit.agent_id, hit.project_id) == (None, None)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -107,7 +117,7 @@ class TestMem0HitAttribution:
 async def _search_graph_hit(service, edge: MockEdge):
     service.graphiti.search = AsyncMock(return_value=[edge])
     results = await service.search(
-        query='Redis dependencies', project_id=_PROJECT_ID, stores=['graphiti'],
+        query='Redis dependencies', project_id=_WRITTEN_UNDER.project_id, stores=['graphiti'],
     )
     assert len(results) == 1
     return results[0]
@@ -117,11 +127,12 @@ class TestGraphitiHitAttribution:
     @pytest.mark.asyncio
     async def test_graph_hit_reports_its_partition_and_no_writer(self, service):
         hit = await _search_graph_hit(service, MockEdge(
-            fact='Auth service depends on Redis', uuid='edge-1', group_id='dark_factory',
+            fact='Auth service depends on Redis', uuid='edge-1',
+            group_id=_WRITTEN_UNDER.graphiti_group_id,
         ))
 
         assert hit.source_store is SourceStore.graphiti
-        assert hit.project_id == 'dark_factory'
+        assert hit.project_id == _WRITTEN_UNDER.project_id
         assert hit.agent_id is None
         assert hit.task_id is None
 
@@ -159,7 +170,7 @@ def _canonical_scroll_row() -> dict:
             'category': 'procedural_knowledge',
             'data': 'The consolidated canonical for the harness layout gate decision rule.',
             'agent_id': 'claude-task-4004',
-            'user_id': 'dark_factory',
+            'user_id': _WRITTEN_UNDER.mem0_user_id,
             'task_id': '4004',
         },
     }
@@ -175,7 +186,7 @@ class TestTopicPinnedCanonicalAttribution:
 
         results = await service.search(
             query='which harness layout does the gate decision rule accept',
-            project_id=_PROJECT_ID,
+            project_id=_WRITTEN_UNDER.project_id,
             categories=['procedural_knowledge'],
             stores=['mem0'],
             limit=5,
@@ -184,7 +195,7 @@ class TestTopicPinnedCanonicalAttribution:
         pinned = results[0]
         assert (pinned.id, pinned.topic_anchored) == (_CANONICAL_ID, True)
         assert (pinned.agent_id, pinned.task_id, pinned.project_id) == (
-            'claude-task-4004', '4004', 'dark_factory',
+            'claude-task-4004', '4004', _WRITTEN_UNDER.project_id,
         )
         assert 'agent_id' not in pinned.metadata
         assert 'user_id' not in pinned.metadata
