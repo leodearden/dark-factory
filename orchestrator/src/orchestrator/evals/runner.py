@@ -18,6 +18,7 @@ from shared.eval_lane import is_eval_fixture_task_id
 from shared.usage_gate import UsageGate
 
 from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.token_pricing import TokenUsage
 from orchestrator.config import (
     BackendsConfig,
     BudgetsConfig,
@@ -773,9 +774,11 @@ async def collect_metrics(
 
     # Cost provenance (Invariant P5): the CLI's own cost figure is wrong for a
     # proxied endpoint, so resolve cost from the config price table by the run's
-    # model, tracking which source was used. Every workflow cell's tokens come
-    # from the implementer, so cost resolves by config.models.implementer
-    # whatever *role* the cell is stamped with. ``run_architect_eval`` resolves through this SAME seam (task 3656) — with
+    # model, tracking which source was used. The workflow totals include every
+    # role's tokens (judge and reviewer too), cache reads and writes included,
+    # and all of them are priced at config.models.implementer whatever *role*
+    # the cell is stamped with; per-role pricing is task 9968.
+    # ``run_architect_eval`` resolves through this SAME seam (task 3656) — with
     # ``model=EvalConfig.model`` and ``prices`` from its own eval orch config,
     # the leaves that actually produced its tokens — and then composes its
     # two-component (architect + plan-judge) label via ``compose_cost_source``.
@@ -783,8 +786,12 @@ async def collect_metrics(
     # resolving and one copying the raw CLI number.
     run_model = workflow.config.models.implementer
     resolved_cost, cost_source = resolve_cost_usd(
-        wf_metrics.total_input_tokens,
-        wf_metrics.total_output_tokens,
+        TokenUsage(
+            input_tokens=wf_metrics.total_input_tokens,
+            output_tokens=wf_metrics.total_output_tokens,
+            cache_read_tokens=wf_metrics.total_cache_read_tokens,
+            cache_create_tokens=wf_metrics.total_cache_create_tokens,
+        ),
         model=run_model,
         prices=workflow.config.prices,
         cli_cost_usd=wf_metrics.total_cost_usd,

@@ -339,6 +339,7 @@ class TestClaudeEndpointPriceTable:
             assert entry['output_per_1m'] > 0
 
     def test_resolve_cost_usd_resolves_price_table_for_a_candidate_model(self):
+        from orchestrator.agents.token_pricing import TokenUsage
         from orchestrator.evals.configs import DEEPSEEK_MODEL, claude_endpoint_price_table
         from orchestrator.evals.metrics import resolve_cost_usd
 
@@ -350,7 +351,7 @@ class TestClaudeEndpointPriceTable:
         ) / 1_000_000
 
         cost, cost_source = resolve_cost_usd(
-            input_tokens, output_tokens,
+            TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens),
             model=DEEPSEEK_MODEL,
             prices=table,
             cli_cost_usd=99999.0,  # deliberately wrong — must NOT be used
