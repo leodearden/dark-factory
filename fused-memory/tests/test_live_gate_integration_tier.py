@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from _ast_guard import parse_python_module
+from shared.pytest_mark_grammar import marker_name, pytestmark_elements
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -21,28 +22,6 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 TESTS_DIR = Path(__file__).parent
 
 LIVE_GATE_FACTORIES = frozenset({'falkor_skipif', 'qdrant_skipif'})
-PYTESTMARK = 'pytestmark'
-
-
-def _pytestmark_value(stmt: ast.stmt) -> ast.expr | None:
-    if isinstance(stmt, ast.Assign) and any(
-        isinstance(target, ast.Name) and target.id == PYTESTMARK for target in stmt.targets
-    ):
-        return stmt.value
-    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-        return stmt.value if stmt.target.id == PYTESTMARK else None
-    return None
-
-
-def _pytestmark_marks(body: Sequence[ast.stmt]) -> list[ast.expr]:
-    marks: list[ast.expr] = []
-    for stmt in body:
-        value = _pytestmark_value(stmt)
-        if isinstance(value, (ast.List, ast.Tuple)):
-            marks.extend(value.elts)
-        elif value is not None:
-            marks.append(value)
-    return marks
 
 
 def _is_live_gate(mark: ast.expr) -> bool:
@@ -54,15 +33,6 @@ def _is_live_gate(mark: ast.expr) -> bool:
     )
 
 
-def _is_integration(mark: ast.expr) -> bool:
-    return (
-        isinstance(mark, ast.Attribute)
-        and mark.attr == 'integration'
-        and isinstance(mark.value, ast.Attribute)
-        and mark.value.attr == 'mark'
-    )
-
-
 def _test_items(
     body: Sequence[ast.stmt], applied: list[ast.expr], prefix: str,
 ) -> Iterator[tuple[str, list[ast.expr]]]:
@@ -70,7 +40,7 @@ def _test_items(
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name.startswith('test'):
             yield f'{prefix}{stmt.name}', [*applied, *stmt.decorator_list]
         elif isinstance(stmt, ast.ClassDef) and stmt.name.startswith('Test'):
-            class_marks = [*applied, *stmt.decorator_list, *_pytestmark_marks(stmt.body)]
+            class_marks = [*applied, *stmt.decorator_list, *pytestmark_elements(stmt.body)]
             yield from _test_items(stmt.body, class_marks, f'{prefix}{stmt.name}::')
 
 
@@ -78,10 +48,10 @@ def scan_live_gated_tests(tree: ast.Module) -> tuple[list[str], list[str]]:
     """Return (live-gated test suffixes, those not in the integration tier), as `Class::test`."""
     gated: list[str] = []
     not_integration: list[str] = []
-    for suffix, marks in _test_items(tree.body, _pytestmark_marks(tree.body), ''):
+    for suffix, marks in _test_items(tree.body, pytestmark_elements(tree.body), ''):
         if any(_is_live_gate(mark) for mark in marks):
             gated.append(suffix)
-            if not any(_is_integration(mark) for mark in marks):
+            if not any(marker_name(mark) == 'integration' for mark in marks):
                 not_integration.append(suffix)
     return gated, not_integration
 
