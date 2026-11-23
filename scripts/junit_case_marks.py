@@ -11,7 +11,10 @@ the class chain.  The test name loses a trailing ``@<xdist group>`` and then
 its ``[<params>]``.  The answer is
 ``shared.testing_timeout_markers.closest_timeout_site`` over that module's
 sites, so it sees what that function sees and no more.  A row whose tree or
-module cannot be read is an :class:`Unresolved` carrying the reason.
+module cannot be read is an :class:`Unresolved` carrying the reason.  A
+``git cat-file`` child that dies or answers outside its protocol is a
+:class:`CatFileError`, an ``OSError`` like the broken pipe a write to it can
+raise, so one handler covers both.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ from typing import IO, Protocol
 
 from shared.testing_timeout_markers import TimeoutSite, closest_timeout_site, timeout_marker_sites
 
-__all__ = ['CaseMarks', 'JunitRow', 'Unresolved']
+__all__ = ['CaseMarks', 'CatFileError', 'JunitRow', 'Unresolved']
 
 _XDIST_GROUP_SUFFIX = re.compile(r'@[^@\[\]]*$')
 
@@ -39,6 +42,10 @@ class JunitRow(Protocol):
 
     @property
     def name(self) -> str: ...
+
+
+class CatFileError(OSError):
+    """``git cat-file --batch`` gave no answer, or one outside its protocol."""
 
 
 @dataclass(frozen=True)
@@ -141,15 +148,29 @@ class CaseMarks:
         stdin, stdout = _pipe(self._process.stdin), _pipe(self._process.stdout)
         stdin.write(name.encode('utf-8') + b'\n')
         stdin.flush()
-        header = stdout.readline().decode('utf-8').rstrip('\n')
-        if header.endswith(_NOT_FOUND):
+        header = _found_header(stdout.readline(), name)
+        if header is None:
             return None
-        oid, kind, size = header.rsplit(' ', 2)
-        content = stdout.read(int(size))
-        stdout.read(1)
+        oid, kind, size = header
+        content = stdout.read(size)
+        if len(content) != size or stdout.read(1) != b'\n':
+            raise CatFileError(f'git cat-file --batch cut {oid} off after {len(content)} of {size} bytes')
         if kind == 'blob' and oid not in self._sites:
             self._sites[oid] = _parsed_sites(content)
         return _Object(kind, oid)
+
+
+def _found_header(raw: bytes, name: str) -> tuple[str, str, int] | None:
+    """The ``<oid> <kind> <size>`` answered for *name*, None when git found no such object."""
+    if not raw.endswith(b'\n'):
+        raise CatFileError(f'git cat-file --batch gave no answer for {name!r}')
+    header = raw.decode('utf-8', errors='replace').rstrip('\n')
+    if header.endswith(_NOT_FOUND):
+        return None
+    fields = header.split(' ')
+    if len(fields) != 3 or not fields[2].isdigit():
+        raise CatFileError(f'git cat-file --batch answered {header!r} for {name!r}')
+    return fields[0], fields[1], int(fields[2])
 
 
 def _parsed_sites(content: bytes) -> tuple[TimeoutSite, ...] | None:

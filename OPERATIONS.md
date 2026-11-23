@@ -4616,8 +4616,10 @@ claim the timer is armed; `scripts/user_timers.py check` answers that.
   `data/verify-logs/<task>/`: the archived junits, the attempt summaries and
   the dispatch records. Each junit row is judged at its own run's tree, which
   is the dispatch's `tip_sha`, else its `base_sha`, else `HEAD`. An xdist
-  worker-crash row carries no real duration, so it is listed as censored and
-  never judged. Nothing is kept between runs. The archive holds about seven
+  worker-crash row and a row pytest-timeout killed carry no duration of their
+  own, so each anchor lists them as `censored` and `timed_out` and never judges
+  them: a hung test's junit time says where the timeout fired, not how long the
+  test takes. A judged worst row names its outcome. Nothing is kept between runs. The archive holds about seven
   days, so the nightly scan sees every run about seven times before it ages
   out.
 - **Check 1, per-test headroom.** Each anchor in
@@ -4648,7 +4650,8 @@ claim the timer is armed; `scripts/user_timers.py check` answers that.
   in the main checkout. It holds `ok`, `measured_at`, `failure`, `findings`,
   `filed`, `skipped` and the full report of every anchor and leg. A run that
   could not measure or act records `ok` false with the stage that failed
-  (`config`, `tree`, `archive` or `escalation`) and exits 2. The wrapper still
+  (`config`, `tree`, `archive` or `escalation`, or `unexpected` for an
+  exception none of those anticipated) and exits 2. The wrapper still
   exits 0, for the reason every §12 job shares, and narrates `selfcheck=<rc>`
   in `journalctl --user -u timeout-headroom-selfcheck.service`. Nothing
   watches the stamp's age.

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 import timeout_headroom_selfcheck as selfcheck
 from escalation.queue import EscalationQueue
+from fake_git_cat_file import install_fake_cat_file
 from shared.testing_ceiling_anchors import (
     CeilingAnchor,
     Population,
@@ -116,6 +117,23 @@ def test_censored_members_are_excluded_from_the_worst_and_listed() -> None:
     assert [row.test_id for row in report.censored] == ['tests.test_m.TestScan::test_crashed']
 
 
+def test_timed_out_members_are_excluded_from_the_worst_and_listed() -> None:
+    """A hung test's junit time is where pytest-timeout killed it, not how long the test takes."""
+    report = _report(
+        _observation(452.169, name='test_hung', outcome=CaseOutcome.TIMED_OUT),
+        _observation(30.0, outcome=CaseOutcome.FAILED),
+    )
+
+    assert report.finding is None
+    assert report.members == 1
+    assert report.worst is not None
+    assert (report.worst.seconds, report.worst.outcome) == (30.0, CaseOutcome.FAILED)
+    assert [(row.test_id, row.outcome) for row in report.timed_out] == [
+        ('tests.test_m.TestScan::test_hung', CaseOutcome.TIMED_OUT)
+    ]
+    assert report.record()['timed_out'][0]['outcome'] == 'timed_out'
+
+
 def test_an_anchor_with_no_members_reports_no_worst() -> None:
     report = _report(_observation(500.0, _OTHER_SITE))
 
@@ -138,6 +156,7 @@ def test_a_per_test_finding_carries_the_anchor_and_the_worst_row() -> None:
         'required_ceiling_secs': 4440,
         'worst_row': {
             'seconds': 550.75,
+            'outcome': 'passed',
             'task_id': '7011',
             'attempt': 1,
             'leg': 'fused-memory',
@@ -576,8 +595,55 @@ def test_an_escalation_fault_fails_the_run_at_its_stage_and_stamps_it(tmp_path: 
     assert stamp['failure']['stage'] == 'escalation'
 
 
-def test_main_dry_run_prints_the_structured_report(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_a_cat_file_child_that_dies_fails_the_run_at_the_archive_stage_and_stamps_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = _project(tmp_path, scan_seconds=200.0)
+    install_fake_cat_file(monkeypatch, tmp_path / 'bin', answer='')
+
+    result = _selfcheck_run(root, _minting(tmp_path))
+
+    assert result.failure is not None
+    assert result.failure.stage is selfcheck.FailureStage.ARCHIVE
+    assert 'CatFileError' in result.failure.detail
+    stamp = json.loads(_config(root).stamp_path.read_text(encoding='utf-8'))
+    assert (stamp['ok'], stamp['failure']['stage']) == (False, 'archive')
+
+
+def test_an_unforeseen_exception_replaces_the_last_good_stamp_with_an_unexpected_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path, scan_seconds=20.0)
+    assert _selfcheck_run(root, _minting(tmp_path)).ok
+
+    def unreadable_registry() -> tuple[CeilingAnchor, ...]:
+        raise LookupError('anchor registry unreadable')
+
+    monkeypatch.setattr(selfcheck, 'registered_anchors', unreadable_registry)
+
+    result = _selfcheck_run(root, _minting(tmp_path))
+
+    assert result.failure is not None
+    assert result.failure.stage is selfcheck.FailureStage.UNEXPECTED
+    stamp = json.loads(_config(root).stamp_path.read_text(encoding='utf-8'))
+    assert stamp['ok'] is False
+    assert stamp['failure'] == {'stage': 'unexpected', 'detail': 'LookupError: anchor registry unreadable'}
+
+
+def _restore_orch_config_path_after_the_test(monkeypatch: pytest.MonkeyPatch, project_root: Path) -> None:
+    """``orchestrator.config.load_config`` sets ORCH_CONFIG_PATH process-wide and never unsets it.
+
+    Setting it here first, to the yaml about to be loaded, makes teardown put back
+    whatever this xdist worker had before.
+    """
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(project_root / selfcheck.ORCHESTRATOR_CONFIG))
+
+
+def test_main_dry_run_prints_the_structured_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path, scan_seconds=200.0)
+    _restore_orch_config_path_after_the_test(monkeypatch, root)
 
     code = selfcheck.main(['--project-root', str(root), '--dry-run', '--json'])
 
@@ -594,8 +660,9 @@ def _this_checkout() -> Path:
     return Path(_git(Path(__file__).resolve().parent, 'rev-parse', '--show-toplevel'))
 
 
-def test_the_legs_adapters_read_this_checkouts_registered_legs() -> None:
+def test_the_legs_adapters_read_this_checkouts_registered_legs(monkeypatch: pytest.MonkeyPatch) -> None:
     repo_root = _this_checkout()
+    _restore_orch_config_path_after_the_test(monkeypatch, repo_root)
 
     budgets = selfcheck.registered_leg_budgets(repo_root)
     family = selfcheck.family_legs(repo_root, budgets)
@@ -612,7 +679,10 @@ def _admitted_site(population: Population) -> TimeoutSite | None:
     return TimeoutSite('<module>', SiteKind.MODULE_PYTESTMARK, None, 3, constant or '', constant)
 
 
-def test_every_registered_leg_and_anchor_breach_has_a_slot_the_escalation_server_can_mint(tmp_path: Path) -> None:
+def test_every_registered_leg_and_anchor_breach_has_a_slot_the_escalation_server_can_mint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _restore_orch_config_path_after_the_test(monkeypatch, _this_checkout())
     leg_reports = [
         report
         for prefix in selfcheck.registered_leg_budgets(_this_checkout())

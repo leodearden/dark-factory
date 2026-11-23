@@ -6,8 +6,9 @@ Two checks, each judged from the durable verify archive alone:
   ``shared.testing_ceiling_anchors.registered_anchors``, the worst per-test
   total of any member row (its closest timeout mark, read at that run's own
   tree, admits it) must not exceed the ceiling divided by
-  ``UNDER_LOAD_HEADROOM_FACTOR``.  Censored rows (xdist worker crashes) carry
-  no duration: they are listed, never judged.
+  ``UNDER_LOAD_HEADROOM_FACTOR``.  Censored rows (xdist worker crashes) and
+  timed-out rows (pytest-timeout kills) carry no duration of their own: they
+  are listed, never judged.
 * LEG BUDGET.  Every registered verify leg whose tree holds a whole-tree guard
   family member must declare ``verify_command_timeout_secs >=
   min_leg_budget_for_family(W)``, W being the leg's longest green ``test``
@@ -115,9 +116,10 @@ class Observation:
 
 @dataclass(frozen=True)
 class WorstRow:
-    """The evidence a junit row contributes: its duration and where to find it."""
+    """The evidence a junit row contributes: its duration, its outcome and where to find it."""
 
     seconds: float
+    outcome: CaseOutcome
     task_id: str
     attempt: int
     leg: str | None
@@ -131,6 +133,7 @@ class WorstRow:
         run, case = observation.run, observation.case
         return cls(
             seconds=case.seconds,
+            outcome=case.outcome,
             task_id=run.task_id,
             attempt=run.attempt,
             leg=run.infix,
@@ -286,6 +289,7 @@ class AnchorReport:
     members: int
     worst: WorstRow | None
     censored: tuple[WorstRow, ...]
+    timed_out: tuple[WorstRow, ...]
     finding: Finding | None
 
     def record(self) -> dict[str, Any]:
@@ -297,6 +301,7 @@ class AnchorReport:
             'members': self.members,
             'worst': None if self.worst is None else asdict(self.worst, dict_factory=_plain),
             'censored': [asdict(row, dict_factory=_plain) for row in self.censored],
+            'timed_out': [asdict(row, dict_factory=_plain) for row in self.timed_out],
             'slot': None if self.finding is None else self.finding.slot(),
         }
 
@@ -336,8 +341,7 @@ def judge_anchors(
 
 def _judge_anchor(anchor: CeilingAnchor, observations: tuple[Observation, ...]) -> AnchorReport:
     members = [o for o in observations if anchor.population.admits(o.closest)]
-    censored = tuple(WorstRow.of(o) for o in members if o.case.outcome is CaseOutcome.CENSORED)
-    timed = [o for o in members if o.case.outcome is not CaseOutcome.CENSORED]
+    timed = [o for o in members if o.case.outcome.has_duration]
     worst = WorstRow.of(max(timed, key=lambda o: o.case.seconds)) if timed else None
     finding = None
     if worst is not None and worst.seconds > anchor.admissible_worst_secs:
@@ -359,9 +363,14 @@ def _judge_anchor(anchor: CeilingAnchor, observations: tuple[Observation, ...]) 
         admissible_worst_secs=anchor.admissible_worst_secs,
         members=len(timed),
         worst=worst,
-        censored=censored,
+        censored=_rows_of(members, CaseOutcome.CENSORED),
+        timed_out=_rows_of(members, CaseOutcome.TIMED_OUT),
         finding=finding,
     )
+
+
+def _rows_of(members: Iterable[Observation], outcome: CaseOutcome) -> tuple[WorstRow, ...]:
+    return tuple(WorstRow.of(o) for o in members if o.case.outcome is outcome)
 
 
 def _real_duration(value: object) -> bool:
@@ -463,6 +472,7 @@ class FailureStage(StrEnum):
     TREE = 'tree'
     ARCHIVE = 'archive'
     ESCALATION = 'escalation'
+    UNEXPECTED = 'unexpected'
 
 
 class SelfcheckFailure(Exception):
@@ -478,6 +488,13 @@ class SelfcheckFailure(Exception):
 class Failure:
     stage: FailureStage
     detail: str
+
+    @classmethod
+    def of(cls, exc: Exception) -> Failure:
+        """A :class:`SelfcheckFailure`'s own stage, else :attr:`FailureStage.UNEXPECTED`."""
+        if isinstance(exc, SelfcheckFailure):
+            return cls(exc.stage, exc.detail)
+        return cls(FailureStage.UNEXPECTED, f'{type(exc).__name__}: {exc}')
 
 
 @dataclass(frozen=True)
@@ -604,7 +621,8 @@ def _anchor_line(report: AnchorReport) -> str:
     verdict = 'ok' if report.finding is None else f'BREACH {report.finding.slot()}'
     return (
         f'anchor {report.anchor_id}: ceiling {report.ceiling_secs}s admits {report.admissible_worst_secs}s; '
-        f'{report.members} members, {worst}, {len(report.censored)} censored: {verdict}'
+        f'{report.members} members, {worst}, {len(report.censored)} censored, '
+        f'{len(report.timed_out)} timed out: {verdict}'
     )
 
 
@@ -614,11 +632,19 @@ def _leg_line(report: LegReport) -> str:
 
 
 def run(config: RunConfig, ports: Ports, now: datetime, *, legs: LegFacts) -> RunResult:
-    """Measure the archive, judge it, and file every finding whose slot has no escalation history."""
+    """Measure the archive, judge it, and file every finding whose slot has no escalation history.
+
+    Whatever stops a run, its result names the stage, and a real run stamps it.
+    """
     try:
-        report = measure(config, legs)
-    except SelfcheckFailure as exc:
-        return _stamped(config, RunResult(now, config.dry_run, None, failure=Failure(exc.stage, exc.detail)))
+        result = _measure_and_file(config, ports, now, legs)
+    except Exception as exc:
+        result = RunResult(now, config.dry_run, None, failure=Failure.of(exc))
+    return _stamped(config, result)
+
+
+def _measure_and_file(config: RunConfig, ports: Ports, now: datetime, legs: LegFacts) -> RunResult:
+    report = measure(config, legs)
     if config.dry_run:
         return RunResult(now, True, report)
     filed: list[str] = []
@@ -632,8 +658,8 @@ def run(config: RunConfig, ports: Ports, now: datetime, *, legs: LegFacts) -> Ru
                 _file(ports.escalation, finding, now)
                 filed.append(finding.slot())
     except SelfcheckFailure as exc:
-        failure = Failure(exc.stage, exc.detail)
-    return _stamped(config, RunResult(now, False, report, tuple(filed), tuple(skipped), failure))
+        failure = Failure.of(exc)
+    return RunResult(now, False, report, tuple(filed), tuple(skipped), failure)
 
 
 def measure(config: RunConfig, legs: LegFacts) -> Report:
@@ -742,7 +768,7 @@ def _body(finding: Finding) -> _Body:
                 'to plans/pytest-per-test-timeout-measurement-2026-09-17.md.'
             ),
             observation=(
-                f'{row.test_id} took {row.seconds}s in task {row.task_id} attempt {row.attempt} leg '
+                f'{row.test_id} took {row.seconds}s ({row.outcome}) in task {row.task_id} attempt {row.attempt} leg '
                 f'{row.leg} at {row.tree_sha} ({row.tree_source})'
             ),
             ref=row.junit_path,
@@ -886,7 +912,7 @@ def _selfcheck(args: argparse.Namespace, now: datetime) -> RunResult:
             else build_ports(config.project_root, escalation_mcp_url=args.escalation_url)
         )
     except SelfcheckFailure as exc:
-        return _stamped(config, RunResult(now, config.dry_run, None, failure=Failure(exc.stage, exc.detail)))
+        return _stamped(config, RunResult(now, config.dry_run, None, failure=Failure.of(exc)))
     return run(config, ports, now, legs=legs)
 
 

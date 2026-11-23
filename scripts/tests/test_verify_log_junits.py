@@ -10,6 +10,7 @@ from pathlib import Path
 from xml.sax.saxutils import quoteattr
 
 import pytest
+import pytest_timeout
 import verify_log_junits as vlj
 
 _TIP = 'a' * 40
@@ -106,6 +107,12 @@ _CRASH = (
     '<error message="failed on setup with &quot;worker \'gw1\' crashed while running '
     "'tests/test_worker_id_fixture.py::test_worker_id_survives_the_lanes_serial_confirm_rerun'&quot;\" />"
 )
+_TIMEOUT_MESSAGE = f'Failed: {pytest_timeout.PYTEST_FAILURE_MESSAGE % 300.0}'
+_TIMEOUT = f'<failure message={quoteattr(_TIMEOUT_MESSAGE)}>trace</failure>'
+_SETUP_TIMEOUT_MESSAGE = f'failed on setup with "{_TIMEOUT_MESSAGE}"'
+_SETUP_TIMEOUT = f'<error message={quoteattr(_SETUP_TIMEOUT_MESSAGE)}>trace</error>'
+_CHILDS_TIMEOUT_QUOTED = f'Failed: the probe child did not finish. Its output: E   {_TIMEOUT_MESSAGE}'
+_QUOTES_A_CHILDS_TIMEOUT = f'<failure message={quoteattr(_CHILDS_TIMEOUT_QUOTED)}>trace</failure>'
 
 
 def test_rows_at_or_above_the_floor_are_kept_and_the_rest_counted(tmp_path: Path) -> None:
@@ -136,6 +143,11 @@ def test_an_xdist_worker_crash_row_is_censored_and_other_outcomes_are_kept(tmp_p
         _testcase('tests.test_worker_id_fixture', 'test_worker_id_survives_the_lanes_serial_confirm_rerun', 0.026, _CRASH),
         _testcase('tests.test_a', 'test_failed', 3.0, '<failure message="assert 1 == 2">trace</failure>'),
         _testcase('tests.test_a', 'test_errored', 3.0, '<error message="fixture blew up">trace</error>'),
+        _testcase('tests.test_a', 'test_hung', 452.169, _TIMEOUT),
+        _testcase('tests.test_a', 'test_hung_in_setup', 300.5, _SETUP_TIMEOUT),
+        _testcase('tests.test_a', 'test_probes_a_child_that_hung', 240.3, _QUOTES_A_CHILDS_TIMEOUT),
+        _testcase('tests.test_a', 'test_xfailed', 3.0, '<skipped type="pytest.xfail" message="known bug" />'),
+        _testcase('tests.test_a', 'test_skipped', 3.0, '<skipped type="pytest.skip" message="no db">skip</skipped>'),
         _testcase('tests.test_a', 'test_passed', 3.0),
     )
 
@@ -145,20 +157,33 @@ def test_an_xdist_worker_crash_row_is_censored_and_other_outcomes_are_kept(tmp_p
         'test_worker_id_survives_the_lanes_serial_confirm_rerun': vlj.CaseOutcome.CENSORED,
         'test_failed': vlj.CaseOutcome.FAILED,
         'test_errored': vlj.CaseOutcome.FAILED,
+        'test_hung': vlj.CaseOutcome.TIMED_OUT,
+        'test_hung_in_setup': vlj.CaseOutcome.TIMED_OUT,
+        'test_probes_a_child_that_hung': vlj.CaseOutcome.FAILED,
+        'test_xfailed': vlj.CaseOutcome.SKIPPED,
+        'test_skipped': vlj.CaseOutcome.SKIPPED,
         'test_passed': vlj.CaseOutcome.PASSED,
     }
 
 
-def test_a_censored_row_is_kept_whatever_the_floor(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ('seconds', 'child', 'outcome'),
+    [(0.026, _CRASH, vlj.CaseOutcome.CENSORED), (12.0, _TIMEOUT, vlj.CaseOutcome.TIMED_OUT)],
+    ids=['censored', 'timed-out'],
+)
+def test_a_row_with_no_duration_of_its_own_is_kept_whatever_the_floor(
+    tmp_path: Path, seconds: float, child: str, outcome: vlj.CaseOutcome
+) -> None:
     """Its junit time is not a duration, so the floor cannot rule it out."""
     _write_junit(
         tmp_path / '4809' / 'attempt-1.fused-memory.junit-20261115T091851_734589Z.xml.gz',
-        _testcase('tests.test_worker_id_fixture', 'test_crashed', 0.026, _CRASH),
+        _testcase('tests.test_worker_id_fixture', 'test_stopped', seconds, child),
     )
 
     (run,) = _read(tmp_path, min_seconds=30.0).runs
 
-    assert [case.outcome for case in run.cases] == [vlj.CaseOutcome.CENSORED]
+    assert [case.outcome for case in run.cases] == [outcome]
+    assert not outcome.has_duration
 
 
 def _junit_and_dispatches(tmp_path: Path, *dispatch_stamps: str) -> None:

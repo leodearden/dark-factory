@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from junit_case_marks import CaseMarks, Unresolved
+from fake_git_cat_file import install_fake_cat_file
+from junit_case_marks import CaseMarks, CatFileError, Unresolved
 from shared.testing_timeout_markers import TimeoutSite
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from verify_log_junits import CaseOutcome, JunitCase
@@ -156,3 +157,20 @@ def test_commit_exists_answers_over_the_same_process(repo: _Repo, marks: CaseMar
     assert marks.commit_exists(repo.unmarked)
     assert not marks.commit_exists('0' * 40)
     assert not marks.commit_exists('not-a-sha')
+
+
+@pytest.mark.parametrize(
+    'answer',
+    ['', 'not a header\n', f'{"a" * 40} blob 100\nshort'],
+    ids=['died-silent', 'malformed-header', 'cut-off-content'],
+)
+def test_a_cat_file_answer_outside_its_protocol_is_a_cat_file_error(
+    repo: _Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str
+) -> None:
+    """An OSError, so a caller's handler for a broken pipe to the child covers it too."""
+    install_fake_cat_file(monkeypatch, tmp_path / 'bin', answer)
+
+    with CaseMarks(repo.root) as marks, pytest.raises(CatFileError) as raised:
+        marks.commit_exists(repo.marked)
+
+    assert isinstance(raised.value, OSError)

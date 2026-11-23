@@ -8,8 +8,13 @@ holding the rows at or above a duration floor.
 Two facts are decided once, here at the boundary, so no caller re-parses them:
 
 * a row whose ``<error>``/``<failure>`` message reports an xdist worker crash
-  is :attr:`CaseOutcome.CENSORED`.  Its junit ``time`` is not a duration, so it
-  is kept whatever the floor and must never be read as one;
+  is :attr:`CaseOutcome.CENSORED`, and one whose message IS pytest-timeout's
+  failure (``pytest_timeout.PYTEST_FAILURE_MESSAGE``, as junitxml words a
+  call failure or a setup or teardown error) is :attr:`CaseOutcome.TIMED_OUT`;
+  a message that merely quotes that text, say a child pytest's output, is not.
+  Neither a censored nor a timed-out row's junit ``time`` is the duration of a
+  test that ran to its own end, so such a row is kept whatever the floor and
+  must never be read as one;
 * each run's tree is the ``tip_sha`` of the attempt's first dispatch sidecar
   stamped at or after the junit, else that dispatch's ``base_sha``, else the
   caller's HEAD, recorded as a typed :class:`TreeSource`.
@@ -48,6 +53,9 @@ __all__ = [
 
 _UNREADABLE_JUNIT = (OSError, EOFError, zlib.error, ET.ParseError)
 _WORKER_CRASH = re.compile(r"worker '[^']+' crashed while running")
+_PYTEST_TIMEOUT = re.compile(
+    r'(?:failed on (?:setup|teardown) with ")?Failed: Timeout \(>[0-9.]+s\) from pytest-timeout\.'
+)
 
 
 class ArtefactKind(StrEnum):
@@ -113,12 +121,18 @@ class ArchiveName:
 
 
 class CaseOutcome(StrEnum):
-    """What a junit row says happened; CENSORED rows carry no real duration."""
+    """What a junit row says happened; TIMED_OUT and CENSORED rows carry no duration of their own."""
 
     PASSED = 'passed'
     FAILED = 'failed'
     SKIPPED = 'skipped'
+    TIMED_OUT = 'timed_out'
     CENSORED = 'censored'
+
+    @property
+    def has_duration(self) -> bool:
+        """Whether the row's junit ``time`` is the duration of a test that ran to its own end."""
+        return self not in (CaseOutcome.TIMED_OUT, CaseOutcome.CENSORED)
 
 
 class TreeSource(StrEnum):
@@ -272,7 +286,7 @@ def _read_cases(path: Path, min_seconds: float) -> tuple[tuple[JunitCase, ...], 
                 continue
             case = _case(element)
             element.clear()
-            if case.outcome is CaseOutcome.CENSORED or case.seconds >= min_seconds:
+            if not case.outcome.has_duration or case.seconds >= min_seconds:
                 kept.append(case)
             else:
                 below += 1
@@ -296,10 +310,12 @@ def _seconds(raw: str | None) -> float:
 
 
 def _outcome(element: ET.Element) -> CaseOutcome:
-    problems = [child for child in element if child.tag in ('error', 'failure')]
-    if any(_WORKER_CRASH.search(child.get('message', '')) for child in problems):
+    messages = [child.get('message', '') for child in element if child.tag in ('error', 'failure')]
+    if any(_WORKER_CRASH.search(message) for message in messages):
         return CaseOutcome.CENSORED
-    if problems:
+    if any(_PYTEST_TIMEOUT.match(message) for message in messages):
+        return CaseOutcome.TIMED_OUT
+    if messages:
         return CaseOutcome.FAILED
     if any(child.tag == 'skipped' for child in element):
         return CaseOutcome.SKIPPED
