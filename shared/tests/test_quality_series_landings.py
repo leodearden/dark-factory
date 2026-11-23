@@ -428,15 +428,15 @@ class TestRecordedLandingInstants:
         assert instants == (at_hour(1.0), at_hour(1.0), at_hour(2.0), at_hour(3.0))
         assert all(instant.tzinfo is not None for instant in instants)
 
-    @pytest.mark.parametrize(('after', 'until', 'named'), [
-        (at_hour(0.0).replace(tzinfo=None), at_hour(1.0), 'after='),
-        (at_hour(0.0), at_hour(1.0).replace(tzinfo=None), 'until='),
-        (at_hour(2.0), at_hour(1.0), 'after='),
+    @pytest.mark.parametrize(('after', 'until', 'invariant'), [
+        (at_hour(0.0).replace(tzinfo=None), at_hour(1.0), 'carries its offsets'),
+        (at_hour(0.0), at_hour(1.0).replace(tzinfo=None), 'carries its offsets'),
+        (at_hour(2.0), at_hour(1.0), 'ends no earlier than it starts'),
     ])
     def test_a_naive_or_inverted_window_is_refused_naming_its_bounds(
-        self, db: RunsDbBuilder, after, until, named: str
+        self, db: RunsDbBuilder, after, until, invariant: str
     ) -> None:
-        with pytest.raises(ValueError, match=named) as excinfo:
+        with pytest.raises(ValueError, match=invariant) as excinfo:
             recorded_landing_instants(db.conn, after=after, until=until)
         assert repr(after) in str(excinfo.value)
         assert repr(until) in str(excinfo.value)
