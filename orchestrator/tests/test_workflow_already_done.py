@@ -35,7 +35,7 @@ class _Fixture:
     wf: TaskWorkflow
     artifacts: TaskArtifacts
     set_task_status: AsyncMock
-    is_ancestor: AsyncMock
+    is_ancestor_checked: AsyncMock
     get_main_sha: AsyncMock
 
 
@@ -44,7 +44,7 @@ def _make(
     worktree: Path,
     project_root: Path,
     task_id: str = '50',
-    commit_on_main: bool = True,
+    commit_on_main: bool | None = True,
     main_sha: str = 'mainsha123',
     declared_files: tuple[str, ...] = ('helpers/foo.py',),
     commit_files: tuple[str, ...] = ('helpers/foo.py',),
@@ -97,10 +97,10 @@ def _make(
         await set_task_status(tid, 'done', done_provenance=provenance)
     scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)
 
-    is_ancestor = AsyncMock(return_value=commit_on_main)
+    is_ancestor_checked = AsyncMock(return_value=commit_on_main)
     get_main_sha = AsyncMock(return_value=main_sha)
     git_ops = MagicMock()
-    git_ops.is_ancestor = is_ancestor
+    git_ops.is_ancestor_checked = is_ancestor_checked
     git_ops.get_main_sha = get_main_sha
     git_ops.get_merge_commit_diff_files = AsyncMock(
         return_value=(list(commit_files), None),
@@ -125,7 +125,7 @@ def _make(
     return _Fixture(
         wf=wf, artifacts=artifacts,
         set_task_status=set_task_status,
-        is_ancestor=is_ancestor,
+        is_ancestor_checked=is_ancestor_checked,
         get_main_sha=get_main_sha,
     )
 
@@ -159,8 +159,8 @@ async def test_valid_commit_sets_done_with_provenance(tmp_path: Path):
     assert 'helpers.foo on main at task 42' in provenance['note']
     # Artifact cleared so a re-run doesn't see a stale report.
     assert f.artifacts.read_already_done() is None
-    # is_ancestor called with (commit, main_sha) — strictly main-membership check.
-    f.is_ancestor.assert_awaited_once_with(_AD_COMMIT, 'mainsha123')
+    # is_ancestor_checked called with (commit, main_sha) — strictly main-membership check.
+    f.is_ancestor_checked.assert_awaited_once_with(_AD_COMMIT, 'mainsha123')
 
 
 @pytest.mark.asyncio
@@ -212,7 +212,7 @@ async def test_missing_commit_blocks(tmp_path: Path):
     assert 'malformed' in args[0].lower()
     assert kwargs.get('escalate_to_human') is not True
     f.set_task_status.assert_not_called()
-    f.is_ancestor.assert_not_called()
+    f.is_ancestor_checked.assert_not_called()
     assert f.artifacts.read_already_done() is None
 
 
@@ -228,7 +228,39 @@ async def test_empty_commit_string_blocks(tmp_path: Path):
     assert outcome == WorkflowOutcome.BLOCKED
     mark_blocked.assert_awaited_once()
     f.set_task_status.assert_not_called()
-    f.is_ancestor.assert_not_called()
+    f.is_ancestor_checked.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_an_unanswerable_reachability_probe_is_not_reported_as_unreachable(
+    tmp_path: Path,
+):
+    """A git error on ``merge-base --is-ancestor`` answers nothing about the
+    commit, so the block says reachability was never established instead of
+    claiming the commit is not on main."""
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        commit_on_main=None,
+    )
+    f.artifacts.write_already_done(commit=_AD_COMMIT, evidence='evidence text')
+    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+    f.wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
+
+    outcome = await f.wf._handle_already_done_report()
+
+    assert outcome == WorkflowOutcome.BLOCKED
+    mark_blocked.assert_awaited_once()
+    assert mark_blocked.await_args is not None
+    args, kwargs = mark_blocked.await_args
+    assert 'not reachable' not in args[0]
+    assert 'could not answer' in args[0]
+    assert _AD_COMMIT[:12] in args[0]
+    assert _AD_COMMIT in kwargs['detail']
+    assert 'mainsha123' in kwargs['detail']
+    assert kwargs.get('escalate_to_human') is not True
+    f.set_task_status.assert_not_called()
+    cast(AsyncMock, f.wf.scheduler.mark_done).assert_not_called()
+    assert f.artifacts.read_already_done() is None
 
 
 _ESC_4331_SPECIMEN = 'fafc76cd5d9b4a3e50186d011c77351827693209d'
@@ -259,7 +291,7 @@ async def test_a_commit_that_is_not_a_full_sha_is_reported_as_malformed(
     assert 'malformed' in args[0]
     assert commit in args[0]
     assert 'reachable' not in args[0]
-    f.is_ancestor.assert_not_called()
+    f.is_ancestor_checked.assert_not_called()
     assert kwargs.get('escalate_to_human') is not True
     f.set_task_status.assert_not_called()
     assert f.artifacts.read_already_done() is None
@@ -410,7 +442,7 @@ _AD_DC_CHECK = {
 
 def _arm_already_done_fixture(
     tmp_path: Path, *, metadata: dict | None = None, enabled: bool = True,
-    commit_on_main: bool = True,
+    commit_on_main: bool | None = True,
 ) -> _Fixture:
     """`_make` plus a live ``delivered_checks`` config and a staged report.
 
@@ -439,7 +471,7 @@ def _arm_already_done_fixture(
 class TestHandleAlreadyDoneReportDeliveredChecksGuard:
     """The delivered-capability guard on the architect's already-done claim.
 
-    ``is_ancestor`` proves only that the cited commit EXISTS on main — never
+    ``is_ancestor_checked`` proves only that the cited commit EXISTS on main — never
     that THIS task's declared capability is present in it.
     ``metadata.delivered_checks``, when declared, is the second,
     capability-level half of that validation.
@@ -942,6 +974,17 @@ def _refusal_unreachable_commit(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fix
     return f
 
 
+def _refusal_reachability_unanswered(
+    tmp_path: Path, _mp: pytest.MonkeyPatch,
+) -> _Fixture:
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        commit_on_main=None,
+    )
+    f.artifacts.write_already_done(commit=_AD_COMMIT, evidence='e')
+    return f
+
+
 def _refusal_unattributed_hold(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
     f.wf.task['metadata'] = {'files': [], 'delivered_checks': []}
@@ -976,6 +1019,9 @@ _REFUSAL_ARMS = {
     'malformed_report': _Refusal(_refusal_malformed_report, 'malformed'),
     'malformed_sha': _Refusal(_refusal_malformed_sha, 'malformed'),
     'unreachable_commit': _Refusal(_refusal_unreachable_commit, 'not reachable'),
+    'reachability_unanswered': _Refusal(
+        _refusal_reachability_unanswered, 'could not answer',
+    ),
     'unattributed_hold': _Refusal(_refusal_unattributed_hold, 'could not be attributed'),
     'delivered_checks_block': _Refusal(
         _refusal_delivered_checks_block, 'delivered_checks are not present',

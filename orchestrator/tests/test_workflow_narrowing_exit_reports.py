@@ -112,7 +112,7 @@ def _arm_gate(
     mark_done = AsyncMock()
     wf.scheduler.mark_done = mark_done
     wf.git_ops.get_main_sha = AsyncMock(return_value='mainsha0001')
-    wf.git_ops.is_ancestor = AsyncMock(return_value=commit_on_main)
+    wf.git_ops.is_ancestor_checked = AsyncMock(return_value=commit_on_main)
     wf.git_ops.get_merge_commit_diff_files = AsyncMock(return_value=(['a.py'], None))
     wf.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
     monkeypatch.setattr(wf, '_reconcile_metadata_files_for_done', AsyncMock())
