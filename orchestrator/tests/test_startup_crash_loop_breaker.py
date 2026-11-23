@@ -15,7 +15,7 @@ import sqlite3
 from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _startup_harness import journal_merge_request, merge_lane_harness_factory
@@ -253,10 +253,12 @@ class TestHealthyStart:
 def _after_finish_startup(h: Harness, probe: Callable[[], None]) -> None:
     """Run ``probe`` once, inside ``h.run``, at the first task-tree read after startup finished."""
     probed = False
+    finish_startup = MagicMock()
+    h.scheduler.finish_startup = finish_startup
 
     def statuses() -> tuple[dict[str, str], None]:
         nonlocal probed
-        if h.scheduler.finish_startup.called and not probed:
+        if finish_startup.called and not probed:
             probed = True
             probe()
         return {'1': 'pending'}, None
