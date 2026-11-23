@@ -4,7 +4,9 @@ The parent lists every analysis's files once (``_tree_scan.py::list_files``),
 partitions the union by file size, and hands each worker the paths it is to
 extract, per analysis NAME.  Analyses hold closures that cannot cross a process
 boundary, so a worker imports the guard modules that declare them and looks
-each one up by name.  Workers are fresh interpreters, never forks: the parent
+each one up by name, importing each top-level module the parent holds from the
+parent's file and anything else through the parent's ``sys.path``.  Workers
+are fresh interpreters, never forks: the parent
 is a pytest-xdist worker, which runs threads.  A worker that fails, dies, or
 replies with anything but exactly its share fails the whole pass, and no worker
 outlives the parent's wait.
@@ -12,6 +14,8 @@ outlives the parent's wait.
 from __future__ import annotations
 
 import importlib
+import importlib.abc
+import importlib.util
 import os
 import pickle
 import subprocess
@@ -19,6 +23,7 @@ import sys
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from types import ModuleType
 
@@ -61,8 +66,40 @@ class TreePassWorkerError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class _WorkerRequest:
+class _ImportedFrom:
+    origin: str
+    search_locations: tuple[str, ...] | None
+
+
+@dataclass(frozen=True)
+class _ParentResolution:
+    """How the parent process resolves imports: its ``sys.path``, and where it imported each top-level module it holds."""
+
     sys_path: tuple[str, ...]
+    imports: dict[str, _ImportedFrom]
+
+    @classmethod
+    def captured(cls) -> _ParentResolution:
+        """This process's resolution, counting only the modules it holds from a file that still exists."""
+        imports = {
+            name: where
+            for name, module in list(sys.modules.items())
+            if '.' not in name
+            and (where := _imported_from(name, module)) is not None
+            and os.path.isfile(where.origin)
+        }
+        return cls(tuple(sys.path), imports)
+
+    def adopt(self) -> None:
+        """Makes this process resolve imports as the parent did; fails if it already holds another copy of a parent module."""
+        sys.path[:] = self.sys_path
+        _require_parent_files(self.imports)
+        sys.meta_path.insert(0, _ParentImportFinder(self.imports))
+
+
+@dataclass(frozen=True)
+class _WorkerRequest:
+    resolution: _ParentResolution
     guard_modules: tuple[str, ...]
     paths_by_analysis: dict[str, tuple[Path, ...]]
 
@@ -88,8 +125,9 @@ def run_across_workers(
     shares = partition_by_size(listing.union, min(workers, _usable_cpus()))
     if len(shares) < 2:
         return TreePass.assembled(listing, [extract_facts(listing.file_sets)])
+    resolution = _ParentResolution.captured()
     requests = [
-        _WorkerRequest(tuple(sys.path), module_names, _assignment(listing, share))
+        _WorkerRequest(resolution, module_names, _assignment(listing, share))
         for share in shares
     ]
     return TreePass.assembled(listing, _extract_in_workers(requests))
@@ -116,12 +154,66 @@ def partition_by_size(paths: Iterable[Path], count: int) -> tuple[frozenset[Path
 def serve(request_path: str, reply_path: str) -> None:
     """One worker's whole life: extract the share at *request_path*, write the reply to *reply_path*."""
     request: _WorkerRequest = pickle.loads(Path(request_path).read_bytes())
-    sys.path[:] = request.sys_path
+    request.resolution.adopt()
     analyses = _analyses_named(request.paths_by_analysis, request.guard_modules)
     reply = extract_facts({
         analyses[name]: frozenset(paths) for name, paths in request.paths_by_analysis.items()
     })
     Path(reply_path).write_bytes(pickle.dumps(reply))
+
+
+def _imported_from(name: str, module: object) -> _ImportedFrom | None:
+    """Where *module*, held as *name*, was imported from; None unless from a file under that very name.
+
+    ``sys.modules`` can hold None, mocks and stub modules, so the spec is
+    checked by type, never by truthiness.
+    """
+    spec = getattr(module, '__spec__', None)
+    if not (
+        isinstance(spec, ModuleSpec) and spec.name == name
+        and spec.has_location and isinstance(spec.origin, str)
+    ):
+        return None
+    locations = spec.submodule_search_locations
+    return _ImportedFrom(spec.origin, None if locations is None else tuple(locations))
+
+
+def _require_parent_files(imports: Mapping[str, _ImportedFrom]) -> None:
+    """Fails unless each module in *imports* this process already holds from a file is the parent's file."""
+    diverged = [
+        (name, held.origin, where.origin)
+        for name, where in sorted(imports.items())
+        if (held := _imported_from(name, sys.modules.get(name))) is not None
+        and os.path.realpath(held.origin) != os.path.realpath(where.origin)
+    ]
+    if diverged:
+        raise ImportError(
+            'a tree pass worker must import each module from the file the parent process '
+            'imported it from, but it already holds '
+            + '; '.join(
+                f'{name!r} from {worker_file} (the parent imported {parent_file})'
+                for name, worker_file, parent_file in diverged
+            )
+        )
+
+
+class _ParentImportFinder(importlib.abc.MetaPathFinder):
+    """Finds each top-level module in *imports* at the file the parent process imported it from."""
+
+    def __init__(self, imports: Mapping[str, _ImportedFrom]) -> None:
+        self._imports = imports
+
+    def find_spec(
+        self, fullname: str, path: Sequence[str] | None, target: ModuleType | None = None,
+    ) -> ModuleSpec | None:
+        where = self._imports.get(fullname)
+        if path is not None or where is None:
+            return None
+        locations = where.search_locations
+        return importlib.util.spec_from_file_location(
+            fullname, where.origin,
+            submodule_search_locations=None if locations is None else list(locations),
+        )
 
 
 def _importable_name(module: ModuleType) -> str:

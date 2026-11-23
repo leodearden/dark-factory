@@ -103,12 +103,17 @@ def _openai(word: str, *, named: int = 0, billed: object = _BILLED) -> MagicMock
     return client
 
 
+#: The plan-proxy endpoint and key `_judge_config` routes the judge through.
+_PLAN_URL = 'http://plan-proxy.test/v1'
+_PLAN_KEY = 'plan-proxy-test-key'
+
+
 def _judge_config() -> types.SimpleNamespace:
-    """Everything `judge_write` reads: the openai arm, enabled, five wide."""
+    """Everything `judge_write` reads: the openai arm on the plan proxy, enabled, five wide."""
     return types.SimpleNamespace(
         write_triage=types.SimpleNamespace(
             judge_enabled=True, judge_provider='openai', judge_model='test-model',
-            judge_candidate_count=5,
+            judge_candidate_count=5, judge_api_url=_PLAN_URL, judge_api_key=_PLAN_KEY,
         ),
         llm=types.SimpleNamespace(provider='openai', model='test-model', providers=None),
     )
@@ -290,11 +295,11 @@ class TestTheDefaultModelsSeededVerdictsAreUnchanged:
         clients['chat'].responses.create.assert_not_awaited()
 
 
-def _hit(memory_id: str, cosine: float) -> MemoryResult:
+def _hit(memory_id: str, cosine: float, *, content: str | None = None) -> MemoryResult:
     """A store row as `MemoryService.search` returns it, scored for one query."""
     return MemoryResult(
-        id=memory_id, content=f'content of {memory_id}', source_store=SourceStore.mem0,
-        metadata={'store_score': cosine},
+        id=memory_id, content=content or f'content of {memory_id}',
+        source_store=SourceStore.mem0, metadata={'store_score': cosine},
     )
 
 
@@ -324,33 +329,46 @@ def _shipped_plan(records: list[dict], rows_by_query: dict[str, list[MemoryResul
 
 
 class TestTheRetrievedLiveEdge:
-    """`build_retrieved_judge_fn`: only the middle band reaches the provider."""
+    """`build_retrieved_judge_fn`: only what `route_band` sends the judge reaches the provider."""
 
     @staticmethod
-    def _case(cosine: float) -> tuple[dict, list]:
+    def _case(cosine: float, *, canonical_content: str | None = None) -> tuple[dict, list]:
         """A duplicate retrieving its canonical at *cosine*, routed by the shipped bands."""
         plan = _shipped_plan(
             [_rec('canon', 'canon', 'canonical'), _rec('dup', 'canon', 'duplicate')],
-            {'content of dup': [_hit('canon', cosine)]},
+            {'content of dup': [_hit('canon', cosine, content=canonical_content)]},
         )
         [case] = plan.cases
         return case, _resolved(plan, 0)
 
-    @pytest.mark.parametrize(('cosine', 'band'), [
-        (0.95, OUTCOME_RESTATED),
-        (0.3, OUTCOME_STORED),
+    @pytest.mark.parametrize(('cosine', 'canonical_content', 'band'), [
+        (0.95, 'Content  of DUP', OUTCOME_RESTATED),
+        (0.3, None, OUTCOME_STORED),
     ])
     def test_a_band_that_decided_itself_makes_no_call(
-        self, cosine: float, band: str,
+        self, cosine: float, canonical_content: str | None, band: str,
     ) -> None:
-        case, candidates = self._case(cosine)
-        assert case['band'] == band, 'precondition: the shipped bands routed it'
+        case, candidates = self._case(cosine, canonical_content=canonical_content)
+        assert (case['band'], case['routed']) == (band, band), (
+            'precondition: the shipped bands and route kept it'
+        )
         client = _openai('amends')
         with patch('openai.AsyncOpenAI', return_value=client):
             answer = _live_judge().build_retrieved_judge_fn(_judge_config())(case, candidates)
         assert (answer.outcome, answer.verdict) == (band, None)
         assert answer.candidate_id is None
         client.responses.create.assert_not_awaited()
+
+    def test_a_restate_band_write_that_adds_to_its_canonical_is_one_completion(self) -> None:
+        case, candidates = self._case(0.95)
+        assert (case['band'], case['routed']) == (OUTCOME_RESTATED, OUTCOME_JUDGE), (
+            'precondition: route_band sent the high-cosine write to the judge'
+        )
+        client = _openai('amends')
+        with patch('openai.AsyncOpenAI', return_value=client):
+            answer = _live_judge().build_retrieved_judge_fn(_judge_config())(case, candidates)
+        assert client.responses.create.await_count == 1
+        assert (answer.outcome, answer.verdict) == (JUDGE_VERDICTS['amends'],) * 2
 
     def test_a_middle_band_case_is_one_completion(self) -> None:
         case, candidates = self._case(0.7)
@@ -379,6 +397,50 @@ class TestTheRetrievedLiveEdge:
         with patch('openai.AsyncOpenAI', return_value=_openai('distinct')):
             answer = _live_judge().build_retrieved_judge_fn(_judge_config())(case, candidates)
         assert (answer.outcome, answer.candidate_id) == (OUTCOME_STORED, None)
+
+
+class TestTheJudgeRunsOnlyOnThePlanProxy:
+    """Both live builders refuse a judge that would inherit the API-key route."""
+
+    @pytest.mark.parametrize('leaf', ['judge_api_url', 'judge_api_key'])
+    @pytest.mark.parametrize('unset', [None, '', '   '])
+    @pytest.mark.parametrize('builder', ['build_judge_fn', 'build_retrieved_judge_fn'])
+    def test_an_unset_leaf_is_refused_at_construction(
+        self, leaf: str, unset: str | None, builder: str,
+    ) -> None:
+        config = _judge_config()
+        setattr(config.write_triage, leaf, unset)
+        with (
+            patch('openai.AsyncOpenAI', return_value=_openai('amends')) as constructed,
+            pytest.raises(ValueError, match=leaf) as excinfo,
+        ):
+            getattr(_live_judge(), builder)(config)
+        other = ({'judge_api_url', 'judge_api_key'} - {leaf}).pop()
+        assert other not in str(excinfo.value), 'only the unset leaf is named'
+        constructed.assert_not_called()
+
+    def test_both_unset_leaves_are_named_in_one_refusal(self) -> None:
+        config = _judge_config()
+        config.write_triage.judge_api_url = None
+        config.write_triage.judge_api_key = None
+        with pytest.raises(ValueError) as excinfo:
+            _live_judge().build_judge_fn(config)
+        assert 'judge_api_url' in str(excinfo.value)
+        assert 'judge_api_key' in str(excinfo.value)
+
+    def test_a_seeded_case_is_judged_through_the_plan_proxy(self) -> None:
+        plan = _seeded_plan()
+        with patch('openai.AsyncOpenAI', return_value=_openai('amends')) as constructed:
+            _live_judge().build_judge_fn(_judge_config())(plan.cases[0], _resolved(plan, 0))
+        kwargs = constructed.call_args.kwargs
+        assert (kwargs['base_url'], kwargs['api_key']) == (_PLAN_URL, _PLAN_KEY)
+
+    def test_a_retrieved_case_is_judged_through_the_plan_proxy(self) -> None:
+        case, candidates = TestTheRetrievedLiveEdge._case(0.7)
+        with patch('openai.AsyncOpenAI', return_value=_openai('amends')) as constructed:
+            _live_judge().build_retrieved_judge_fn(_judge_config())(case, candidates)
+        kwargs = constructed.call_args.kwargs
+        assert (kwargs['base_url'], kwargs['api_key']) == (_PLAN_URL, _PLAN_KEY)
 
 
 class TestEachPromptRendersItsOwnRetrieval:
@@ -457,12 +519,14 @@ class TestTheRetrievedCli:
     """`main()` on a retrieved `--dry-run` over a stub store: what the plan is built from."""
 
     @staticmethod
-    def _main(tmp_path: Path, monkeypatch, *extra: str, rows=()) -> None:
-        """Every search answers *rows*."""
+    def _main(tmp_path: Path, monkeypatch, *extra: str, rows=(), searchable=True) -> None:
+        """Every search answers *rows*, or raises when not *searchable*."""
 
         class _LiveStore(FakeMemoryService):
             def __init__(self, config) -> None:
                 super().__init__(rows)
+                if not searchable:
+                    self.search.side_effect = AssertionError('the store was searched')
 
             async def initialize(self) -> None:
                 return None
@@ -488,12 +552,96 @@ class TestTheRetrievedCli:
         )
 
 
+    @staticmethod
+    def _report(tmp_path: Path, name: str) -> dict:
+        return json.loads((tmp_path / name).read_text())
+
+    @pytest.mark.parametrize('project', [(), ('--project-id', 'reify')])
+    def test_a_snapshot_written_by_one_run_is_judged_by_the_next_unchanged(
+        self, tmp_path: Path, monkeypatch, project: tuple[str, ...],
+    ) -> None:
+        snapshot = tmp_path / 'slates.json'
+        rows = [_hit('b-dup-1', 0.95), _hit('a-canon', 0.7), _hit('c-dup-1', 0.3)]
+        self._main(tmp_path, monkeypatch, '--slates-out', str(snapshot), rows=rows)
+        self._main(
+            tmp_path, monkeypatch, '--slates-in', str(snapshot), *project,
+            '--report-path', str(tmp_path / 'r2.json'),
+            '--cases-path', str(tmp_path / 'cases2.jsonl'), searchable=False,
+        )
+        assert (tmp_path / 'cases2.jsonl').read_bytes() == (tmp_path / 'cases.jsonl').read_bytes()
+        keys = ('project_id', 't_high', 't_low', 'candidate_k')
+        first, second = (
+            self._report(tmp_path, name)['provenance'] for name in ('r.json', 'r2.json')
+        )
+        assert first['project_id'] == 'reify'
+        assert {key: second[key] for key in keys} == {key: first[key] for key in keys}
+
+    def test_a_snapshot_of_another_population_is_refused(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        snapshot = tmp_path / 'slates.json'
+        self._main(
+            tmp_path, monkeypatch, '--limit', '1', '--slates-out', str(snapshot),
+            '--report-path', str(tmp_path / 'limited.json'), rows=[_hit('b-dup-1', 0.7)],
+        )
+        with pytest.raises(ValueError, match='memory_id') as refused:
+            self._main(
+                tmp_path, monkeypatch, '--slates-in', str(snapshot),
+                '--report-path', str(tmp_path / 'r2.json'), searchable=False,
+            )
+        assert 'record 1 (a-dup-2) has no slate' in str(refused.value)
+        assert not (tmp_path / 'r2.json').exists()
+
+    def test_a_project_id_other_than_the_snapshots_is_refused(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        snapshot = tmp_path / 'slates.json'
+        self._main(
+            tmp_path, monkeypatch, '--slates-out', str(snapshot), rows=[_hit('b-dup-1', 0.7)],
+        )
+        with pytest.raises(ValueError, match="'reify'.*'elsewhere'"):
+            self._main(
+                tmp_path, monkeypatch, '--slates-in', str(snapshot), '--project-id', 'elsewhere',
+                '--report-path', str(tmp_path / 'r2.json'), searchable=False,
+            )
+        assert not (tmp_path / 'r2.json').exists()
+
+    def test_a_snapshot_of_another_judge_width_is_refused(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        snapshot = tmp_path / 'slates.json'
+        self._main(
+            tmp_path, monkeypatch, '--slates-out', str(snapshot),
+            '--judge-candidate-count', '3', rows=[_hit('b-dup-1', 0.7)],
+        )
+        with pytest.raises(ValueError, match='judge_candidate_count'):
+            self._main(
+                tmp_path, monkeypatch, '--slates-in', str(snapshot),
+                '--judge-candidate-count', '4',
+                '--report-path', str(tmp_path / 'r2.json'), searchable=False,
+            )
+        assert not (tmp_path / 'r2.json').exists()
+
+    @pytest.mark.parametrize('flag', ['--slates-in', '--slates-out'])
+    def test_a_snapshot_flag_is_refused_on_a_seeded_run(
+        self, tmp_path: Path, monkeypatch, flag: str,
+    ) -> None:
+        monkeypatch.setattr(sys, 'argv', TestTheLimitedCli._argv(
+            tmp_path, '--slate-mode', 'seeded', flag, str(tmp_path / 'slates.json'),
+        ))
+        with pytest.raises(ValueError, match=flag):
+            _mod().main()
+        assert [path.name for path in tmp_path.iterdir()] == ['corpus.jsonl']
+
+
 class TestTheWordingCli:
     """`main()` on a live seeded `--limit` run: `--wording` reaches the shipped call."""
 
     @staticmethod
     def _instructions(tmp_path: Path, monkeypatch, *extra: str) -> list[str]:
         """The system prompt every Responses call carried, for one live seeded run."""
+        monkeypatch.setenv('OPENAI_PLAN_PROXY_URL', _PLAN_URL)
+        monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', _PLAN_KEY)
         fixture = tmp_path / 'corpus.jsonl'
         fixture.write_text(''.join(json.dumps(record) + '\n' for record in _CORPUS))
         monkeypatch.setattr(sys, 'argv', [
@@ -517,6 +665,33 @@ class TestTheWordingCli:
         assert set(sent) == {_wording().PRE_PSI_JUDGE_SYSTEM_PROMPT}
         assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _wording().system_prompt('shipped')
 
+    def test_a_psi_run_sends_the_psi_prompt_and_restores_the_shipped_one(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.server import write_triage_judge
+
+        sent = self._instructions(tmp_path, monkeypatch, '--wording', 'psi')
+        assert set(sent) == {_wording().PSI_JUDGE_SYSTEM_PROMPT}
+        assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _wording().system_prompt('shipped')
+
     def test_the_default_is_the_shipped_wording(self, tmp_path: Path, monkeypatch) -> None:
         sent = self._instructions(tmp_path, monkeypatch)
         assert set(sent) == {_wording().system_prompt('shipped')}
+
+
+    def test_a_live_run_off_the_plan_proxy_is_refused_before_the_fixture_is_read(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        monkeypatch.delenv('OPENAI_PLAN_PROXY_URL', raising=False)
+        monkeypatch.delenv('OPENAI_PLAN_PROXY_KEY', raising=False)
+        monkeypatch.setattr(sys, 'argv', [
+            'eval_write_triage_judge.py', '--fixture', str(tmp_path / 'absent.jsonl'),
+            '--report-path', str(tmp_path / 'r.json'),
+        ])
+        with (
+            patch('openai.AsyncOpenAI') as constructed,
+            pytest.raises(ValueError, match='judge_api_url'),
+        ):
+            _mod().main()
+        constructed.assert_not_called()
+        assert list(tmp_path.iterdir()) == []

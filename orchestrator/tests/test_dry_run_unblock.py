@@ -3586,6 +3586,31 @@ class TestSkillCommandsFitTheEnvelope:
         )
 
 
+_GRANTED_TOOLS_ENTRIES = re.compile(r'^\*\*Granted tools:\*\* (?P<entries>.+?)\. ', re.MULTILINE)
+
+
+def _granted_tools_listed(prompt: str) -> list[str] | None:
+    match = _GRANTED_TOOLS_ENTRIES.search(prompt)
+    return match['entries'].split(', ') if match else None
+
+
+class TestPromptNamesTheGrantedTools:
+    """Under dontAsk the investigator could not see its own allowlist, so it kept
+    retrying `cat`/`head`/`grep` Bash calls the CLI denies every time (task 8704)."""
+
+    @pytest.mark.asyncio
+    async def test_prompt_lists_exactly_the_tools_the_envelope_grants(self, tmp_path):
+        kwargs = await _capture_investigation_call(tmp_path, _TaskDocScheduler())
+        listed = _granted_tools_listed(kwargs['prompt'])
+        assert listed is not None, kwargs['prompt']
+
+        granted = set(kwargs['allowed_tools'])
+        assert set(listed) == granted, (
+            f'granted but not listed: {sorted(granted - set(listed))}; '
+            f'listed but not granted: {sorted(set(listed) - granted)}'
+        )
+
+
 # ---------------------------------------------------------------------------
 # task 3125 guard (2): a re-block the latest proposal already covers is not
 # re-investigated, and the coverage key survives a rebase onto a moved main.

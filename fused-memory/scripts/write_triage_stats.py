@@ -1,10 +1,11 @@
-"""Interval statistics for the write-triage reader scorer (rubric v2).
+"""The fused-memory scripts' shared home for interval statistics.
 
-A sample rate, Wilson 95% intervals for a sample proportion, nearest-rank
-percentiles, Cohen's kappa between two raters, and a stratum-weighted ratio
-with a seeded bootstrap interval that resamples within each stratum. Every
-figure is rounded to four places, so a report built from them is byte-stable
-across runs.
+A sample rate, Wilson score bounds for a sample proportion and their 95%
+interval, nearest-rank percentiles and their 95% interval, Cohen's kappa
+between two raters, and a stratum-weighted ratio with a seeded bootstrap
+interval that resamples within each stratum. Every reported figure is rounded
+to four places, so a report built from them is byte-stable across runs; only
+:func:`wilson_bounds` is unrounded, for callers with their own presentation.
 """
 from __future__ import annotations
 
@@ -32,15 +33,23 @@ def rate(hits: int, total: int) -> float | None:
     return round(hits / total, _PLACES) if total else None
 
 
+def wilson_bounds(share: float, n: float, z: float = _WILSON_Z) -> tuple[float, float]:
+    """Unrounded Wilson score bounds for an observed *share* over *n* trials, *n* possibly a non-integer effective n."""
+    if n <= 0 or not 0.0 <= share <= 1.0:
+        raise ValueError(f'wilson_bounds needs 0 <= share <= 1 and n > 0; got share={share}, n={n}')
+    z2 = z * z
+    denominator = 1 + z2 / n
+    centre = (share + z2 / (2 * n)) / denominator
+    half = z * math.sqrt(share * (1 - share) / n + z2 / (4 * n * n)) / denominator
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
 def wilson95(hits: int, total: int) -> list[float] | None:
     """Wilson score 95% interval for *hits*/*total*; None for an empty sample."""
     if not total:
         return None
-    share = hits / total
-    spread = _WILSON_Z * _WILSON_Z / total
-    centre = (share + spread / 2) / (1 + spread)
-    half = _WILSON_Z * math.sqrt(share * (1 - share) / total + spread / (4 * total)) / (1 + spread)
-    return [round(max(0.0, centre - half), _PLACES), round(min(1.0, centre + half), _PLACES)]
+    low, high = wilson_bounds(hits / total, total)
+    return [round(low, _PLACES), round(high, _PLACES)]
 
 
 def nearest_rank(sorted_values: Sequence[float], percent: float) -> float:
@@ -49,6 +58,11 @@ def nearest_rank(sorted_values: Sequence[float], percent: float) -> float:
         raise ValueError('nearest_rank needs at least one value')
     rank = max(1, math.ceil(percent * len(sorted_values) / 100))
     return sorted_values[rank - 1]
+
+
+def nearest_rank95(sorted_values: Sequence[float]) -> list[float]:
+    """The 2.5th and 97.5th nearest-rank percentiles of *sorted_values*, to four places."""
+    return [round(nearest_rank(sorted_values, 2.5), _PLACES), round(nearest_rank(sorted_values, 97.5), _PLACES)]
 
 
 def cohen_kappa(pairs: Iterable[tuple[Hashable, Hashable]]) -> float | None:
@@ -112,7 +126,7 @@ def stratified_bootstrap95(
     if not ratios:
         return None
     ratios.sort()
-    return [round(nearest_rank(ratios, 2.5), _PLACES), round(nearest_rank(ratios, 97.5), _PLACES)]
+    return nearest_rank95(ratios)
 
 
 def _resampled_sum(terms_by_stratum: Sequence[Sequence[float]], picks: Sequence[Sequence[int]]) -> float:

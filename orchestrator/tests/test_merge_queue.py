@@ -13123,27 +13123,23 @@ def _infra_category_verify_result(category: str = 'semaphore_timeout') -> Verify
     )
 
 
-class _ScriptedVerifier(FakeVerifier):
-    """A :class:`FakeVerifier` that answers per CALL instead of per task id.
+class _AnswerListVerifier(FakeVerifier):
+    """A :class:`FakeVerifier` whose every step answers from a call-ordered
+    list whose last entry repeats.
 
     The direct ``run_post_merge_verify`` tests each drive ONE task, and most
     of them are about what the SECOND answer does — an infra-transient
     failure that clears on the bounded retry, a narrowed retry budget running
-    out, a disk guard that relents after a prune. ``answers`` and
-    ``disk_reasons`` are consumed one entry per call and the last entry
-    repeats once exhausted, so a test scripts only the calls whose answer it
-    cares about.
+    out, a disk guard that relents after a prune — so a test scripts only the
+    calls whose answer it cares about. Unlike a mock's ``side_effect`` list,
+    an exhausted script repeats rather than raising, so an over-eager caller
+    is caught by the call-count assertion the test already makes.
 
-    Unlike a mock's ``side_effect`` list, an exhausted script repeats rather
-    than raising, so an over-eager caller is caught by the call-count
-    assertion the test already makes rather than by an opaque StopIteration.
-
-    ``scoped_calls`` and ``disk_guard_calls`` record what each step was asked,
-    the way the parent records ``verified`` and ``investigations``.
-
-    Per-CALL and the parent's per-TASK-ID scripting are mutually exclusive:
-    the parent resolves ``scripts[task_id]`` first, so a caller that supplied
-    both would silently never run its ``answers``.
+    Scoped ``answers`` ride the parent's ``sequence=``/``default=``, so the
+    scoped entry recording is the parent's own — see
+    ``orchestrator/tests/_merge_lane_fakes.py::FakeVerifier``. They are the
+    whole scoped script: do not also set the parent's ``scripts`` or call
+    ``then``, which would silently change which answer repeats.
     """
 
     def __init__(
@@ -13152,22 +13148,16 @@ class _ScriptedVerifier(FakeVerifier):
         answers: Sequence[VerifyScript] = (),
         gates: Sequence[Any] = (),
         disk_reasons: Sequence[str | None] = (None,),
-        **kwargs: Any,
     ) -> None:
-        if answers and 'scripts' in kwargs:
-            raise TypeError(
-                '_ScriptedVerifier answers per call: `answers` and the parent '
-                "FakeVerifier's per-task `scripts` cannot both be supplied, "
-                'because the task-id script wins and no answer would ever run.'
-            )
         if not disk_reasons:
             raise ValueError(
                 '`disk_reasons` must name at least one outcome — the last entry '
                 'is what repeats once the script is exhausted. Omit the argument '
                 'for the always-free default.'
             )
-        super().__init__(**kwargs)
-        self.answers = list(answers)
+        super().__init__(
+            default=answers[-1] if answers else None, sequence=answers[:-1],
+        )
         self.gates = list(gates)
         self.disk_reasons = list(disk_reasons)
         self.scoped_calls: list[dict[str, Any]] = []
@@ -13177,9 +13167,9 @@ class _ScriptedVerifier(FakeVerifier):
     def _consume(script: list[Any]) -> Any:
         """Take the next entry, or keep answering with the last one.
 
-        Every caller guarantees a non-empty script — ``answers`` and ``gates``
-        at their call sites, ``disk_reasons`` in ``__init__`` — so this says so
-        by name rather than letting an empty list surface as an IndexError from
+        Every caller guarantees a non-empty script — ``gates`` at its call
+        sites, ``disk_reasons`` in ``__init__`` — so this says so by name
+        rather than letting an empty list surface as an IndexError from
         somewhere inside the step it was scripting.
         """
         assert script, '_consume called with an empty script'
@@ -13187,15 +13177,7 @@ class _ScriptedVerifier(FakeVerifier):
 
     async def run_scoped(self, *args: Any, **options: Any) -> VerifyResult:
         self.scoped_calls.append(options)
-        if not self.answers:
-            return await super().run_scoped(*args, **options)
-        # This call's answer is played through a parent instance holding it as
-        # its only script: how a VerifyScript resolves (release / error /
-        # result) stays defined in exactly one place, and `self.default` is
-        # never rewritten to smuggle the answer down into the parent.
-        self.verified.append(options.get('task_id'))  # recorded as the parent would
-        answer = FakeVerifier(default=self._consume(self.answers))
-        return await answer.run_scoped(*args, **options)
+        return await super().run_scoped(*args, **options)
 
     async def run_unscoped_typechecks(self, *args: Any, **options: Any) -> Any:
         if not self.gates:
@@ -13243,6 +13225,45 @@ def _production_verifier_with(**steps: Any) -> VerifyPort:
 
 
 @pytest.mark.asyncio
+class TestAnswerListVerifier:
+    """The per-call verifier double keeps its parent's recording contract."""
+
+    async def test_answers_play_in_call_order_and_the_last_repeats(self) -> None:
+        verifier = _AnswerListVerifier(answers=[
+            fails(category='env_transient', summary='first'),
+            passes(summary='then'),
+        ])
+
+        results = [
+            await verifier.run_scoped(Path('wt'), None, [], task_id='t')
+            for _ in range(3)
+        ]
+
+        assert [r.summary for r in results] == ['first', 'then', 'then']
+
+    async def test_every_answered_call_is_a_recorded_entry(self) -> None:
+        verifier = _AnswerListVerifier(answers=[passes()])
+
+        await verifier.run_scoped(Path('wt'), None, [], task_id='a')
+        await verifier.run_scoped(Path('wt'), None, [], task_id='b')
+
+        assert verifier.verified == ['a', 'b']
+        assert verifier.entered_count == len(verifier.verified)
+        assert [c.task_id for c in verifier.verify_calls] == ['a', 'b']
+        await wait_responsive(
+            verifier.await_entry(2), label='second answered scoped verify entry',
+        )
+
+    async def test_no_answers_falls_back_to_a_passing_verify(self) -> None:
+        verifier = _AnswerListVerifier()
+
+        result = await verifier.run_scoped(Path('wt'), None, [], task_id='t')
+
+        assert result.passed is True
+        assert verifier.entered_count == 1
+
+
+@pytest.mark.asyncio
 class TestRunPostMergeVerify:
     """Direct unit tests for the run_post_merge_verify module-level helper.
 
@@ -13283,7 +13304,7 @@ class TestRunPostMergeVerify:
         enospc_retries: dict[str, int] = {}
 
         passed_result = fake_verify_result(passed=True, summary='', timed_out=False)
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=passed_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=passed_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries=enospc_retries,
@@ -13303,7 +13324,7 @@ class TestRunPostMergeVerify:
         merge_wt = MagicMock()
         disk_reason = f'{TRANSIENT_INFRA_REASON_PREFIX}: no space'
 
-        verifier = _ScriptedVerifier(disk_reasons=[disk_reason])
+        verifier = _AnswerListVerifier(disk_reasons=[disk_reason])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -13335,7 +13356,7 @@ class TestRunPostMergeVerify:
         failed_result.lint_output = ''
         failed_result.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=failed_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=failed_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -13367,7 +13388,7 @@ class TestRunPostMergeVerify:
         timed_out_result.lint_output = ''
         timed_out_result.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=timed_out_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=timed_out_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries={},
@@ -13392,7 +13413,7 @@ class TestRunPostMergeVerify:
 
         enospc_result = _enospc_verify_result()
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=enospc_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries,
@@ -13432,7 +13453,7 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result(category=category)), VerifyScript(result=passing)],
         )
         result = await run_post_merge_verify(
@@ -13469,7 +13490,7 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result(category=category)
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=infra_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries=enospc_retries,
@@ -13529,7 +13550,7 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result(category='env_transient')), VerifyScript(result=passing)],
         )
         result = await run_post_merge_verify(
@@ -13572,7 +13593,7 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result()
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=infra_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts=timeouts, enospc_retries=enospc_retries,
@@ -13623,7 +13644,7 @@ class TestRunPostMergeVerify:
             category='test_failure',
         )
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_failure_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=test_failure_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -13651,7 +13672,7 @@ class TestRunPostMergeVerify:
         req = self._make_req()
         merge_wt = MagicMock()
 
-        verifier = _ScriptedVerifier(answers=[raises(RuntimeError('boom'))])
+        verifier = _AnswerListVerifier(answers=[raises(RuntimeError('boom'))])
         with pytest.raises(RuntimeError, match='boom'):
             await run_post_merge_verify(
                 git_ops, req, merge_wt,
@@ -13682,7 +13703,7 @@ class TestRunPostMergeVerify:
         failing_verify.lint_output = ''
         failing_verify.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=failing_verify)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=failing_verify)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -13710,7 +13731,7 @@ class TestRunPostMergeVerify:
         l2 = Path('/fake/_merge-l2')
 
         passed_result = fake_verify_result(passed=True, summary='', timed_out=False)
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=passed_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=passed_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -13735,7 +13756,7 @@ class TestRunPostMergeVerify:
         enospc_retries: dict[str, int] = {}
 
         enospc_result = _enospc_verify_result()
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=enospc_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries,
@@ -13759,7 +13780,7 @@ class TestRunPostMergeVerify:
         enospc_retries: dict[str, int] = {}
 
         enospc_result = _enospc_verify_result()
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=enospc_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=enospc_retries,
@@ -13790,7 +13811,7 @@ class TestRunPostMergeVerify:
 
         expected_archive_root = tmp_path / 'data' / 'verify-logs'
 
-        verifier = _ScriptedVerifier(answers=[passes(summary='ok')])
+        verifier = _AnswerListVerifier(answers=[passes(summary='ok')])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},
@@ -13824,7 +13845,7 @@ class TestRunPostMergeVerify:
         timed_out_result.lint_output = ''
         timed_out_result.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=timed_out_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=timed_out_result)])
         with patch('orchestrator.merge_lane.verify_failure_outcome.classify_main_health_red', AsyncMock(return_value=None)):
             result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
@@ -13859,7 +13880,7 @@ class TestRunPostMergeVerify:
         test_fail_result.lint_output = ''
         test_fail_result.type_output = ''
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_fail_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=test_fail_result)])
         with patch('orchestrator.merge_lane.verify_failure_outcome.classify_main_health_red', AsyncMock(return_value=None)):
             result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
@@ -13901,7 +13922,7 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=passing)],
         )
         with (
@@ -13959,7 +13980,7 @@ class TestRunPostMergeVerify:
             category='test_failure',
         )
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=test_failure_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=test_failure_result)])
         with (
             patch(
                 'orchestrator.merge_lane.post_merge_verify.build_attempt0_payload',
@@ -14018,7 +14039,7 @@ class TestRunPostMergeVerify:
             category='test_failure',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=test_failure_result)],
         )
         with (
@@ -14079,7 +14100,7 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result('semaphore_timeout')
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=infra_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries=(er := {}),
@@ -14120,7 +14141,7 @@ class TestRunPostMergeVerify:
 
         infra_result = _infra_category_verify_result('semaphore_timeout')
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=infra_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=infra_result)])
         with (
             patch(
                 'orchestrator.merge_lane.post_merge_verify.build_attempt0_payload',
@@ -14175,7 +14196,7 @@ class TestRunPostMergeVerify:
             passed=True, test_output='', lint_output='', type_output='', summary='',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=_infra_category_verify_result('semaphore_timeout')), VerifyScript(result=passing)],
         )
         with (
@@ -21024,7 +21045,7 @@ class TestRunPostMergeVerifyRouting:
         )
         clean_gate = MagicMock(broken=False, timed_out=False, failing_subprojects=[], timed_out_subprojects=[])
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=passed_result)],
             gates=[clean_gate],
         )
@@ -21108,7 +21129,7 @@ class TestRunPostMergeVerifyRouting:
             summary='test-fail',
         )
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=failed_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=failed_result)])
         with patch('orchestrator.merge_lane.verify_failure_outcome.classify_main_health_red', AsyncMock(return_value=None)) as mock_mh:
             result = await run_post_merge_verify(
                 git_ops, req, merge_wt,
@@ -21143,7 +21164,7 @@ class TestRunPostMergeVerifyRouting:
             timed_out_subprojects=[], detail='type errors here',
         )
 
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=passed_scoped)],
             gates=[broken_gate],
         )
@@ -21183,7 +21204,7 @@ class TestRunPostMergeVerifyRouting:
         )
 
         timeouts: dict = {}
-        verifier = _ScriptedVerifier(
+        verifier = _AnswerListVerifier(
             answers=[VerifyScript(result=passed_scoped)],
             gates=[timeout_gate],
         )
@@ -21221,7 +21242,7 @@ class TestRunPostMergeVerifyRouting:
             lint_output='', type_output='', summary='disk full',
         )
 
-        verifier = _ScriptedVerifier(answers=[VerifyScript(result=enospc_result)])
+        verifier = _AnswerListVerifier(answers=[VerifyScript(result=enospc_result)])
         result = await run_post_merge_verify(
             git_ops, req, merge_wt,
             timeouts={}, enospc_retries={},

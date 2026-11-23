@@ -835,7 +835,9 @@ def run_session_start(
 
     With no record at the slug yet, this is the session's first sight: a rich
     record is built from the resolved identity with status RUNNING. An
-    existing record is refreshed to RUNNING in place, its other fields kept.
+    existing record is refreshed to RUNNING in place, its other fields kept
+    except exit_code, which RUNNING clears (see
+    ``session_records.py::set_status``).
     Both then get best-effort enrichment (``parent_session_id`` from
     ``CLAUDE_SPAWN_PARENT_ID``; a t3 display claiming ``claims_t3_thread``,
     else display from ``_resolve_display`` unless the record's is T3's), a
@@ -905,7 +907,9 @@ def run_session_start(
             transcript_path=session_records.transcript_path_for_cwd(cwd),
         )
 
-    record.status = session_records.Status.RUNNING
+    record = session_records.apply_refresh(
+        slug, record, status=session_records.Status.RUNNING
+    )
     if forked_from is not None:
         # The rejected env slug IS this nested claude's spawner.
         record.parent_session_id = forked_from

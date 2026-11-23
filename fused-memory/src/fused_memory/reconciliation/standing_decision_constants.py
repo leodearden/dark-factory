@@ -72,14 +72,14 @@ GROUNDS_ENUM: frozenset[str] = frozenset({GROUNDS_STRUCTURAL_SIZE_CONFLATION})
 # is a checkable property, not a slogan (reviewer finding correctness, amendment
 # pass).  The first cut also carried ``'count'``, ``'topic'``, ``'scope'`` and
 # ``'broad'``; each matches live flag_types that have nothing to do with entity
-# size — ``'count'`` hits ``recon_stale_task_count_snapshot`` and every other
-# ``*_count_*`` flag, ``'scope'`` hits ``scope_violation`` and
+# size — ``'count'`` hits any ``*_count_*`` flag about a count rather than a
+# size, ``'scope'`` hits ``scope_violation`` and
 # ``consolidated_scope_correction``.  A stem that fires there does not merely
 # add noise: it silently DROPS that finding for any entity under an active
 # standing decision, which is the exact failure the under-suppression bias
 # forbids.  They are dropped rather than made exact-token matches because
-# splitting on ``_`` would not save them (``scope_violation`` and
-# ``recon_stale_task_count_snapshot`` both contain the bare token) while it
+# splitting on ``_`` would not save them (``scope_violation`` carries the bare
+# token, as does any ``*_count_*`` flag) while it
 # WOULD break the stems that carry this family (``'conflat'`` inside
 # ``conflation``, ``'size'`` inside ``oversized``).  The surviving eight cover
 # the class; ``topic_conflation`` still matches via ``'conflat'``.  Add a stem

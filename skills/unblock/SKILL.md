@@ -599,7 +599,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
      - `poll["state"] in ("conflict", "blocked", "abandoned")` → see *Polled terminal failures* below. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) these are UNCONFIRMED** — per the staleness guard above they may be a prior round's record for this same reused branch/task_id rather than this submission's outcome. Before acting on one, re-check `mcp__escalation__get_merge_queue()` and who owns the worktree; if this branch is still in flight, keep polling to the 20-minute ceiling instead of resubmitting on a stale failure.
      - `poll["state"] == "superseded"` → **on the `request_id` arm** (always submission-scoped) follow the train/successor directly. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) this is UNCONFIRMED** per the staleness guard above — with a further wrinkle for a coalesce-absorbed member, where that arm's `superseded` can be permanent rather than merely stale. See *Polled terminal failures* below for the full follow-the-train procedure and why ancestry plus the two landing signals there, not re-polling this same handle, is the real resolution.
 
-   *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `failed`, orchestrator-down — plus the `superseded` absorption edge above, and cancellation, are covered below.)*
+   *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `error`, orchestrator-down — plus the `superseded` absorption edge above, and cancellation, are covered below.)*
 
 8. `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"kind": "merged", "commit": "<sha>"})`
    - **`kind` is required on every payload.** The server rejects a kind-less blob with `done_provenance.kind is required`, and there is no note-only payload — `found_on_main` requires **both** `commit` and `note`. So "no single commit applies" is never an escape; derive one.
@@ -616,7 +616,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
 - `status: "conflict"` or `status: "blocked"` → read `result["reason"]`, fix the conflict in the worktree, rebase on main, then **loop back to step 7** (resubmit). If backing out of that rebase is the right call, do it via [Recovering a wedged rebase or merge](#recovering-a-wedged-rebase-or-merge) — not a bare `git rebase --abort`.
 - `status: "unknown_branch"` → the branch was not found by the merge queue. Verify the branch exists in this repo (`git branch`) and you are targeting the correct escalation MCP endpoint. Push the branch if needed, then loop back to step 7.
-- `status: "failed"` → read `result["reason"]` and address accordingly, then loop back to step 7.
+- `status: "error"` → read `result["reason"]` and address accordingly, then loop back to step 7.
 - `{"error": "Merge queue not available — orchestrator not running"}` → orchestrator is down; fall back to a direct merge (**this is the ONLY situation where a direct merge is appropriate — NEVER use it in response to an epistemic `merge_status` answer**):
   ```
   git merge --no-ff task/<TASK_ID>   # run from the main branch checkout

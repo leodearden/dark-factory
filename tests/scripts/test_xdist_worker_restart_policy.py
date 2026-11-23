@@ -51,7 +51,6 @@ members do not, because no measured need was found (task 5408); that side is
 from __future__ import annotations
 
 import dataclasses
-import getpass
 import importlib.util
 import os
 import pathlib
@@ -62,6 +61,12 @@ import sys
 from collections.abc import Mapping
 
 import pytest
+from host_pytest_temp_root import (
+    listing,
+    recorded_temproot,
+    seed_dead_session_dirs,
+    temproot_recorder_source,
+)
 from pytest_config_discovery import discovered_pytest_configs
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -290,15 +295,7 @@ def test_three():
 
 _RECORDER_INI = '[pytest]\n'
 
-_TEMPROOT_RECORDER_MODULE = '''\
-import pathlib
-import tempfile
-
-
-def test_records_the_temproot(tmp_path):
-    record = pathlib.Path(__file__).resolve().with_name('seen-temproot')
-    record.write_text(tempfile.gettempdir())
-'''
+_TEMPROOT_RECORDER_MODULE = temproot_recorder_source()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -402,10 +399,6 @@ def _captured(result: subprocess.CompletedProcess[str]) -> str:
     return f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
 
 
-def _listing(root: pathlib.Path) -> list[str]:
-    return sorted(str(path.relative_to(root)) for path in root.rglob('*'))
-
-
 @pytest.mark.xdist_group(RESTART_REPRO_GROUP)
 @pytest.mark.timeout(300)
 def test_restarts_permitted_abort_the_session_unattributed(
@@ -488,8 +481,8 @@ def test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     host = tmp_path / 'host-temp'
-    (host / f'pytest-of-{getpass.getuser()}' / 'garbage-seeded' / 'leftover').mkdir(parents=True)
-    before = _listing(host)
+    seed_dead_session_dirs(host)
+    before = listing(host)
     monkeypatch.setenv('TMPDIR', str(host))
     suite = _write_suite(
         tmp_path,
@@ -504,13 +497,13 @@ def test_a_synthetic_suite_run_leaves_the_hosts_default_temp_root_untouched(
         f'{int(pytest.ExitCode.OK)} (OK).\n'
         f'{_captured(result)}'
     )
-    seen = pathlib.Path((suite.root / 'seen-temproot').read_text(encoding='utf-8'))
-    assert seen.resolve() == host.resolve(), (
+    seen = recorded_temproot(suite.root)
+    assert seen is not None and seen.resolve() == host.resolve(), (
         f'the child ran against temp root {seen}, not the stand-in {host}, so '
         'the listing check below would pass vacuously.\n'
         f'{_captured(result)}'
     )
-    after = _listing(host)
+    after = listing(host)
     assert after == before, (
         'a synthetic suite run must not create, lock or clean dirs in the host '
         "default temp root: its exit-time sweep of other sessions' dead dirs "
@@ -541,4 +534,4 @@ def test_an_argument_other_than_a_restart_flag_is_refused_before_any_session_sta
     assert smuggle in str(refused.value)
     assert not suite.basetemp.exists(), 'a session started anyway'
     assert not smuggled.exists(), 'a session started anyway'
-    assert not (suite.root / 'seen-temproot').exists(), 'a session started anyway'
+    assert recorded_temproot(suite.root) is None, 'a session started anyway'

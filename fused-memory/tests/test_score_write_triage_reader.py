@@ -886,7 +886,7 @@ class TestTheV2ScriptsImportOnlyDownward:
             'write_triage_reader_rubric', 'score_write_triage_reader', 'write_triage_stats',
             'run_write_triage_population_arms', 'freeze_write_triage_population',
             'calibrate_write_triage', 'eval_write_triage_retrieval', 'score_write_triage_pairs',
-            'write_triage_judge_wording',
+            'write_triage_judge_wording', 'eval_write_triage_scoring',
         }),
         ('rate_write_triage_cross_family', {
             'rate_write_triage_cross_family', 'build_write_triage_eval_set',
@@ -894,7 +894,7 @@ class TestTheV2ScriptsImportOnlyDownward:
             'write_triage_stats', 'run_write_triage_population_arms',
             'freeze_write_triage_population', 'calibrate_write_triage',
             'eval_write_triage_retrieval', 'score_write_triage_pairs',
-            'write_triage_judge_wording',
+            'write_triage_judge_wording', 'eval_write_triage_scoring',
         }),
     ])
     def test_a_module_loads_exactly_its_downward_closure(

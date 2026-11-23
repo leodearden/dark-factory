@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -30,7 +31,7 @@ from offline_lane_soak_fixtures import (
     episode,
     failure,
 )
-from offline_lane_soak_inputs import FusedMemoryTaskReader
+from offline_lane_soak_inputs import FusedMemoryTaskReader, MetadataMatches
 from orchestrator.flake_ledger import (
     UNKNOWN_TEST_ID,
     DebtTrigger,
@@ -202,6 +203,20 @@ def test_records_none_of_which_carries_an_effect_block_are_nothing_to_judge(tmp_
     _assert_nothing_to_judge(code, report, err, 'effect block')
 
 
+def test_records_none_of_which_records_its_debts_are_nothing_to_judge(tmp_path: Path, capsys):
+    project = SoakProject(tmp_path)
+    project.add_pass(
+        UNIT, at=T0, detect=(failure('tests/test_a.py::test_a'),), effect=effect(tests_counted=()), debt_fields=False,
+    )
+    project.provision(UNIT)
+
+    code, report, err = _report(project, capsys)
+
+    _assert_nothing_to_judge(code, report, err, 'debts')
+    assert 'effect block' in report['unjudgeable']
+    assert '--since' in report['unjudgeable']
+
+
 def test_no_pass_since_the_cut_is_nothing_to_judge(tmp_path: Path, capsys):
     project = SoakProject(tmp_path)
     _red_pass(project)
@@ -311,6 +326,21 @@ def test_a_pass_from_before_the_cut_over_is_outside_the_default_window(tmp_path:
     check = _check(report, 'records_well_formed')
     assert (check['examined'], check['notes']) == (4, [])
     assert report['since'] == T0.isoformat()
+
+
+def test_a_pass_from_before_the_ledger_cut_over_is_outside_the_default_window(tmp_path: Path, capsys):
+    project, _ = _green_project(tmp_path)
+    project.add_pass(
+        UNIT, at=T0 - timedelta(hours=1), detect=[failure(NODE_A)], confirm=[failure(NODE_A)],
+        outcome=_reproduced(NODE_A), effect=effect(tests_counted=(NODE_A,)), debt_fields=False,
+    )
+
+    code, report, _ = _report(project, capsys)
+
+    assert code == 0
+    assert report['since'] == T0.isoformat()
+    assert report['ledger_cut_over'] == T0.isoformat()
+    assert _check(report, 'records_well_formed')['examined'] == 4
 
 
 def test_command_restricts_the_examined_passes(tmp_path: Path, capsys):
@@ -477,12 +507,21 @@ def test_a_window_with_no_filing_and_no_crossing_has_no_data_to_bound(tmp_path: 
 # --- (d) ledger_rows_per_pass ----------------------------------------------------------
 
 
-def _reproduced_and_cleared(project: SoakProject, at: datetime, *, cleared_row: FlakeCallSite | None) -> LanePass:
-    """A confirmed pass reproducing NODE_A and clearing NODE_B, with NODE_A's row and, at *cleared_row*, NODE_B's."""
+def _reproduced_and_cleared(
+    project: SoakProject, at: datetime, *, cleared_row: FlakeCallSite | None, debt_fields: bool = True,
+    command: str = UNIT,
+) -> LanePass:
+    """A confirmed pass reproducing NODE_A and clearing NODE_B, with NODE_A's row and, at *cleared_row*, NODE_B's.
+
+    *debt_fields* False writes its effect block as the lane did before ε2, and, as the lane did then, no row.
+    """
     lane_pass = project.add_pass(
-        UNIT, at=at, detect=[failure(NODE_A), failure(NODE_B)], confirm=[failure(NODE_A)],
+        command, at=at, detect=[failure(NODE_A), failure(NODE_B)], confirm=[failure(NODE_A)],
         outcome=Confirmed(ConfirmMode.NARROWED, (NODE_A,), (NODE_B,), ()), effect=effect(tests_counted=(NODE_A,)),
+        debt_fields=debt_fields,
     )
+    if not debt_fields:
+        return lane_pass
     project.occurrence(lane_pass, [NODE_A], FlakeVerdict.fails_in_isolation)
     if cleared_row is not None:
         project.occurrence(lane_pass, [NODE_B], FlakeVerdict.passes_in_isolation, call_site=cleared_row)
@@ -564,6 +603,91 @@ def test_unconfirmable_outage_and_green_passes_examine_nothing(tmp_path: Path, c
     assert code == 0
     check = _check(report, 'ledger_rows_per_pass')
     assert (check['verdict'], check['examined']) == ('no_data', 0)
+
+
+def _before_epsilon2(project: SoakProject) -> list[LanePass]:
+    """Two confirmed passes written before ε2, at T0-2h and T0-1h: each owes rows the lane never wrote."""
+    return [
+        _reproduced_and_cleared(project, T0 - timedelta(hours=hours), cleared_row=None, debt_fields=False)
+        for hours in (2, 1)
+    ]
+
+
+def _spanning_window(project: SoakProject, capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, Any]]:
+    code, report, _ = _report(project, capsys, '--since', (T0 - timedelta(hours=3)).isoformat())
+    return code, report
+
+
+def test_a_window_spanning_the_ledger_cut_over_judges_only_passes_from_it(tmp_path: Path, capsys):
+    project = SoakProject(tmp_path)
+    project.provision(UNIT)
+    earlier = _before_epsilon2(project)
+    _reproduced_and_cleared(project, T0, cleared_row=FlakeCallSite.offline_lane)
+
+    code, report = _spanning_window(project, capsys)
+
+    assert code == 0
+    check = _check(report, 'ledger_rows_per_pass')
+    assert (check['verdict'], check['examined'], check['failures']) == ('pass', 2, [])
+    assert _check(report, 'records_well_formed')['examined'] == 3
+    assert len(check['notes']) == len(earlier)
+    for note, lane_pass in zip(check['notes'], earlier, strict=True):
+        assert f'{UNIT}/{lane_pass.pass_id}' in note
+        assert 'not judged' in note
+        assert T0.isoformat() in note
+
+
+def test_an_epsilon2_pass_missing_its_row_still_fails_in_a_window_spanning_the_cut_over(tmp_path: Path, capsys):
+    project = SoakProject(tmp_path)
+    project.provision(UNIT)
+    earlier = _before_epsilon2(project)
+    last = _reproduced_and_cleared(project, T0, cleared_row=None)
+
+    code, report = _spanning_window(project, capsys)
+
+    assert code == 1
+    (failure_line,) = _check(report, 'ledger_rows_per_pass')['failures']
+    assert last.pass_id in failure_line
+    assert NODE_B in failure_line
+    assert not any(lane_pass.pass_id in failure_line for lane_pass in earlier)
+
+
+def test_a_window_with_only_passes_before_the_ledger_cut_over_has_no_ledger_data(tmp_path: Path, capsys):
+    project = SoakProject(tmp_path)
+    project.provision(UNIT)
+    earlier = _before_epsilon2(project)
+
+    code, report = _spanning_window(project, capsys)
+
+    assert code == 0
+    assert report['ledger_cut_over'] is None
+    check = _check(report, 'ledger_rows_per_pass')
+    assert (check['verdict'], check['examined']) == ('no_data', 0)
+    assert len(check['notes']) == len(earlier)
+    for note, lane_pass in zip(check['notes'], earlier, strict=True):
+        assert f'{UNIT}/{lane_pass.pass_id}' in note
+        assert 'not judged' in note
+
+
+def test_the_ledger_cut_over_is_read_over_every_command_not_only_the_judged_ones(tmp_path: Path, capsys):
+    project = SoakProject(tmp_path)
+    project.provision(UNIT, LINT)
+    project.add_pass(UNIT, at=T0, effect=effect())
+    lint_pass = _reproduced_and_cleared(
+        project, T0 - timedelta(hours=1), cleared_row=None, debt_fields=False, command=LINT,
+    )
+
+    code, report, _ = _report(project, capsys, '--command', LINT, '--since', (T0 - timedelta(hours=2)).isoformat())
+
+    assert code == 0
+    assert report['commands'] == [LINT]
+    assert report['ledger_cut_over'] == T0.isoformat()
+    check = _check(report, 'ledger_rows_per_pass')
+    assert (check['verdict'], check['examined']) == ('no_data', 0)
+    (note,) = check['notes']
+    assert f'{LINT}/{lint_pass.pass_id}' in note
+    assert 'not judged' in note
+    assert T0.isoformat() in note
 
 
 # --- (e) deflake_tasks_carry_evidence and (g) offered_debts_owned_or_due ---------------
@@ -875,6 +999,7 @@ FIGURES = (
     'episodes_by_length',
     'filing_delay',
     'lane_debts',
+    'debt_cycle_owners',
     'due_list',
     'undecided_tests',
     'due_offers_per_pass',
@@ -1016,6 +1141,60 @@ def test_lane_debts_name_the_trigger_evidence_head_owner_and_its_status(tmp_path
             'owner': None, 'owner_status': None,
         },
     ]
+
+
+def test_debt_cycle_owners_list_every_cycles_owner_of_an_offered_test(tmp_path: Path, capsys):
+    project, offering, owners = _debt_project(tmp_path, owned=(NODE_A,))
+    first_owner = owners[NODE_A]
+    project.tasks.tasks[first_owner]['status'] = 'done'
+    again = project.add_pass(
+        UNIT, at=T0 + timedelta(hours=2), detect=[failure(NODE_A)], confirm=[],
+        outcome=Confirmed(ConfirmMode.NARROWED, (), (NODE_A,), ()),
+        effect=effect(debts_offered=(OfferedDebt(NODE_A, DebtTrigger.cleared, HEAD),)),
+    )
+    project.occurrence(again, [NODE_A], FlakeVerdict.passes_in_isolation)
+    row = project.open_lane_debt(NODE_A, DebtTrigger.cleared, again, earlier=[offering], now=T0 + timedelta(hours=2))
+    assert row.open_count == 2
+    second_owner = row.owner_task_id
+    assert second_owner is not None and second_owner != first_owner
+
+    _, report, _ = _report(project, capsys)
+
+    cycle_owners = _figure(report, 'debt_cycle_owners')
+    assert cycle_owners['owners'][NODE_A] == [
+        {'task_id': first_owner, 'cycle': 1, 'call_site': 'offline_lane', 'trigger': 'cleared', 'status': 'done'},
+        {
+            'task_id': second_owner, 'cycle': 2, 'call_site': 'offline_lane', 'trigger': 'cleared',
+            'status': project.tasks.tasks[second_owner]['status'],
+        },
+    ]
+    assert cycle_owners['unreadable_metadata'] == []
+    assert [debt['owner'] for debt in _figure(report, 'lane_debts') if debt['test'] == NODE_A] == [
+        second_owner, second_owner,
+    ]
+    rule = next(figure['rule'] for figure in report['figures'] if figure['name'] == 'debt_cycle_owners')
+    assert rule
+
+
+def test_debt_cycle_owners_name_the_tasks_whose_metadata_the_lookup_could_not_read(tmp_path: Path, capsys):
+    project, _, owners = _debt_project(tmp_path, owned=(NODE_A,))
+    project.tasks.tasks['8999'] = {'id': '8999', 'status': 'done', 'metadata': '{"flake_debt_test": truncated'}
+
+    _, report, _ = _report(project, capsys)
+
+    assert report['unjudgeable'] is None
+    cycle_owners = _figure(report, 'debt_cycle_owners')
+    assert [owner['task_id'] for owner in cycle_owners['owners'][NODE_A]] == [owners[NODE_A]]
+    assert cycle_owners['unreadable_metadata'] == ['8999']
+
+
+def test_a_failed_owner_lookup_is_nothing_to_judge(tmp_path: Path, capsys):
+    project, _, _ = _debt_project(tmp_path)
+    project.tasks.fail_lookups()
+
+    code, report, err = _report(project, capsys)
+
+    _assert_nothing_to_judge(code, report, err, 'task store unreadable')
 
 
 def test_the_due_list_shows_each_item_and_the_stale_count(tmp_path: Path, capsys):
@@ -1171,10 +1350,14 @@ def test_a_seeded_soak_passes_every_check_and_exits_zero(tmp_path: Path, capsys)
 
 
 class _ToolStub:
-    """A fused-memory client that answers every call with one reply, or raises one exception."""
+    """A fused-memory client that answers every call with one reply, or raises one exception.
 
-    def __init__(self, reply: Any = None, *, raises: Exception | None = None) -> None:
+    Given *replies*, it answers each call with the next of them instead.
+    """
+
+    def __init__(self, reply: Any = None, *, replies: Sequence[Any] = (), raises: Exception | None = None) -> None:
         self.reply = reply
+        self.replies = list(replies)
         self.raises = raises
         self.calls: list[tuple[str, dict]] = []
 
@@ -1182,7 +1365,7 @@ class _ToolStub:
         self.calls.append((name, arguments))
         if self.raises is not None:
             raise self.raises
-        return self.reply
+        return self.replies.pop(0) if self.replies else self.reply
 
 
 def _read(stub: _ToolStub, task_id: str = '42') -> tuple[dict | None, Exception | None]:
@@ -1222,6 +1405,69 @@ def test_the_task_reader_answers_a_transport_failure_with_that_exception():
     failure = httpx.ConnectError('connection refused')
 
     assert _read(_ToolStub(raises=failure)) == (None, failure)
+
+
+def _lookup_page(*task_ids: int, has_more: bool, malformed: Sequence[int] = ()) -> dict[str, Any]:
+    """One find_tasks_by_metadata page as the tool answers it, naming *malformed* only when there are any."""
+    page: dict[str, Any] = {
+        'results': [{'task_id': task_id, 'title': f'De-flake {NODE_A}', 'status': 'done'} for task_id in task_ids],
+        'tasks_with_key': 2,
+        'pagination': {'has_more': has_more, 'returned': len(task_ids)},
+    }
+    if malformed:
+        page['malformed_metadata_ids'] = list(malformed)
+    return page
+
+
+def _lookup(stub: _ToolStub) -> tuple[MetadataMatches | None, Exception | None]:
+    reader = FusedMemoryTaskReader(stub, '/srv/project')
+    return asyncio.run(reader.metadata_matches('flake_debt_test', NODE_A))
+
+
+def test_the_task_reader_lists_every_task_carrying_a_metadata_value_across_pages():
+    stub = _ToolStub(replies=[_lookup_page(8089, has_more=True), _lookup_page(8231, has_more=False)])
+
+    assert _lookup(stub) == (MetadataMatches(('8089', '8231'), ()), None)
+    assert [name for name, _ in stub.calls] == ['find_tasks_by_metadata', 'find_tasks_by_metadata']
+    for (_, arguments), offset in zip(stub.calls, (0, 1), strict=True):
+        assert {key: value for key, value in arguments.items() if key != 'limit'} == {
+            'project_root': '/srv/project', 'key': 'flake_debt_test', 'value': NODE_A, 'offset': offset,
+        }
+        assert isinstance(arguments['limit'], int) and arguments['limit'] > 0
+
+
+def test_the_task_reader_carries_the_tasks_whose_metadata_the_store_could_not_read():
+    stub = _ToolStub(replies=[
+        _lookup_page(8089, has_more=True, malformed=(7001, 7002)),
+        _lookup_page(8231, has_more=False, malformed=(7001, 7002)),
+    ])
+
+    assert _lookup(stub) == (MetadataMatches(('8089', '8231'), ('7001', '7002')), None)
+
+
+@pytest.mark.parametrize('reply', [
+    {'error': 'database is locked', 'error_type': 'OperationalError'},
+    {**_lookup_page(8089, has_more=False), MCP_IS_ERROR_KEY: True},
+    {},
+    {'tasks_with_key': 1, 'pagination': {'has_more': False}},
+    {'results': [8089], 'pagination': {'has_more': False}},
+    {'results': [{'task_id': 8089}], 'pagination': {}},
+    {**_lookup_page(8089, has_more=False), 'malformed_metadata_ids': 7001},
+    {**_lookup_page(8089, has_more=False), 'malformed_metadata_ids': [{'id': 7001}]},
+])
+def test_the_task_reader_answers_a_failed_lookup_as_an_error(reply: Any):
+    task_ids, error = _lookup(_ToolStub(reply))
+
+    assert task_ids is None
+    assert isinstance(error, Exception)
+    assert 'flake_debt_test' in str(error)
+    assert NODE_A in str(error)
+
+
+def test_the_task_reader_answers_a_lookup_transport_failure_with_that_exception():
+    failure = httpx.ConnectError('connection refused')
+
+    assert _lookup(_ToolStub(raises=failure)) == (None, failure)
 
 
 def _tools_call_answered(body: Any) -> httpx.MockTransport:

@@ -36,21 +36,13 @@ _NOT_YET_MIGRATED = frozenset({
     'test_agent_capability_wiring.py',
     'test_architect_all_committed_plan.py',
     'test_atomic_train_merge.py',
-    'test_convert_to_blocked.py',
     'test_create_merge_worktree_retry.py',
     'test_deterministic_provenance_wire_e2e.py',  # debt: task 11025
     'test_dry_run_unblock.py',  # debt: task 11026
     'test_git_repo_isolation_guard.py',
     'test_harness_infra_resume_truthful.py',
-    'test_harness_interactive_reaper.py',
     'test_harness_plan_step_rederive.py',
     'test_harness_wip_step_detection.py',
-    'test_inflight_verify_merge_lease.py',
-    'test_interactive_warm_worktree_integration_gate.py',
-    'test_interactive_worktree.py',
-    'test_interactive_worktree_reaper.py',
-    'test_lane_lifecycle_gitops.py',
-    'test_lane_lifecycle_integration.py',
     'test_merge_drift.py',
     'test_merge_gates_drop_guard_rename.py',
     'test_merge_gates_equivalence_rename.py',
@@ -94,26 +86,19 @@ _NOT_YET_MIGRATED = frozenset({
     'test_merge_verify_survivor_barrier.py',
     'test_merge_worktree_lifecycle_integration_gate.py',
     'test_multihost_verify_integration.py',
-    'test_pool_storage_guard.py',
-    'test_protected_prefixes.py',
-    'test_provenance_gate_integration.py',
-    'test_rebase_branch_reset_guard.py',
     'test_rebase_verify_cost.py',
     'test_reconcile_done_step_commits.py',
-    'test_remove_merge_worktree_guarded.py',
     'test_reopen_sticks_e2e.py',  # debt: task 11025
     'test_roles_ancestry_check.py',  # debt: task 11025
     'test_roles_staging_command.py',  # debt: task 11026
     'test_scheduler_park_owner_state.py',  # debt: task 11026
     'test_session_hooks_install.py',
     'test_session_resume_integration_gate.py',
-    'test_substrate_gate.py',
     'test_suffix_conflict_tracker.py',
     'test_task_runtime.py',
     'test_train_integration.py',
     'test_verify_events_units.py',  # debt: task 11025
     'test_verify_phase_rebase.py',
-    'test_verify_plan_integration.py',
     'test_verify_scope_inversion_boundary.py',
     'test_warm_base_coherence.py',
     'test_warm_lane_abort_teardown.py',

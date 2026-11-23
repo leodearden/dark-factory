@@ -2587,6 +2587,22 @@ class TestPinReservationConfig:
         assert live.pin_reservations_enabled is False
 
 
+class TestParkRefusedConfig:
+    """The ``park_refused`` cadence knob (task 6328), a flat leaf beside the pin_* block."""
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_default_is_half_an_hour(self):
+        assert OrchestratorConfig().park_refused_emit_interval_secs == 1800.0
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_emit_interval_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(park_refused_emit_interval_secs=bad)
+
+    def test_emit_interval_is_green_tier_reloadable(self):
+        assert 'park_refused_emit_interval_secs' in RELOADABLE_FIELDS
+
+
 class TestMainHealthFixReservedSlotsConfig:
     """Run slots outside max_concurrent_tasks that only a main-health fix may take (task 8480)."""
 

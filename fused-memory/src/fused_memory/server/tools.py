@@ -177,6 +177,7 @@ from fused_memory.server.grouped_read import (
     group_search_results,
 )
 from fused_memory.server.guard_excerpt import excerpt_fields
+from fused_memory.server.manifest_root import resolve_manifest_root
 from fused_memory.server.manifest_stamping import (
     stamp_capability_manifests,
     stamping_action_required,
@@ -10211,6 +10212,7 @@ def create_mcp_server(
         target_status: str = 'pending',
         deferral: dict | None = None,
         agent_id: str | None = None,
+        manifest_root: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Commit a batch of tasks created via ``submit_task(planning_mode=True)``.
@@ -10239,6 +10241,11 @@ def create_mcp_server(
                 is echoed per id as ``deferral``.
             agent_id: Which agent is committing (optional, auto-derived from
                 MCP context); a re-stamp records it as ``stamped_by``.
+            manifest_root: Absolute path of a git worktree of
+                *project_root*'s repository that holds the batch's PRD family
+                (a PRD not yet on main). Its capability-manifest sidecar is
+                the one stamped. Omitted, the sidecar is searched for in
+                *project_root*.
 
         RELEASE RULE (``pending``/``cancelled``): only a ``planning`` hold, or a
         row with no record, is released. Any other hold is refused per id with
@@ -10300,7 +10307,12 @@ def create_mcp_server(
         batch names and attaches the ``manifest_stamping`` report, plus
         ``manifest_stamping_action_required`` when it needs repair; it never
         blocks the flip. The contract is the
-        ``fused_memory.server.manifest_stamping`` module docstring.
+        ``fused_memory.server.manifest_stamping`` module docstring. A
+        ``manifest_root`` that is not an existing worktree of *project_root*'s
+        repository, or that is the main checkout itself, is refused with
+        ``error_type='ManifestRootRefused'`` and a ``reason_code`` before
+        anything is read or flipped; the rules live in
+        ``fused_memory.server.manifest_root``.
 
         Returns ``{success, results: [{task_id, result: ...}, ...]}`` matching
         the multi-id ``set_task_status`` response shape.
@@ -10341,6 +10353,13 @@ def create_mcp_server(
                     ),
                     'error_type': 'ValidationError',
                 }
+
+        accepted_manifest_root: Path | None = None
+        if manifest_root is not None:
+            accepted = await resolve_manifest_root(project_root, manifest_root)
+            if isinstance(accepted, dict):
+                return accepted
+            accepted_manifest_root = accepted
 
         # Lock-charter guard γ: batch-read all tasks concurrently, then
         # scan for directory entries before flipping status.  asyncio.gather
@@ -10451,16 +10470,18 @@ def create_mcp_server(
             # Best-effort/never-raising (PRD γ, task 2578) — stamps real
             # task_ids + copies MECHANICAL delivered_checks for any batch
             # task carrying prd_path/prd_task_label metadata. Reuses the
-            # already-fetched tasks_data (no extra reads). Only attaches the
-            # report key when a sidecar actually exists on disk, so a batch
-            # with no capability-manifest involvement gets a byte-identical
-            # legacy response.
+            # already-fetched tasks_data (no extra reads). Attaches the report
+            # key whenever a batch task carries prd_path (naming any derived
+            # sidecar absent from the root searched under sidecar_not_found),
+            # so a batch with no capability-manifest involvement gets a
+            # byte-identical legacy response.
             manifest_report = await stamp_capability_manifests(
                 project_root=project_root,
                 ids=ids,
                 tasks_data=list(tasks_data),
                 task_interceptor=task_interceptor,
                 agent_id=agent_id,
+                manifest_root=accepted_manifest_root,
             )
             if manifest_report is not None and isinstance(result, dict):
                 result['manifest_stamping'] = manifest_report
@@ -10623,7 +10644,10 @@ def create_mcp_server(
                 Passing it together with ``append=True`` is REJECTED — see
                 ``append`` above.
             status: New status (e.g. "pending"/"in-progress"/"done")
-            dependencies: Replacement list of dependency task ids (top-level only)
+            dependencies: Replacement list of dependency task ids (top-level only).
+                Each entry must exist (one already stored is exempt), must
+                not be the task itself, and must not close a local cycle (the
+                same ``DependencyCycle`` refusal as ``add_dependency``).
             agent_id: Which agent is writing (optional, auto-derived from MCP
                 context). Resolved here for uniform caller-identity attribution
                 across the task write path (task 2175/rho1b); status= writes
@@ -10800,6 +10824,13 @@ def create_mcp_server(
         Self-loops (same project + same task id) and malformed qualified strings
         raise ``TaskmasterError`` and surface as
         ``{'error': 'TASKMASTER_TOOL_ERROR: …', 'error_type': 'TaskmasterError'}``.
+
+        A bare-integer edge that would close a dependency cycle is refused, with
+        nothing written. The walk runs over the local ``dependencies`` table at
+        every status, and the reply carries ``{'error': 'dependency_cycle',
+        'error_type': 'DependencyCycle', 'cycle': [A, B, …, A], 'hint': …}``:
+        remove one of the named edges. Qualified ``project:id`` deps are not
+        walked.
 
         Args:
             id: Task ID that will depend on another

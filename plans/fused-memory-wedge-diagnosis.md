@@ -329,6 +329,12 @@ this same class of work, and as the `NOTE (blocking I/O)` in
 `reconciliation/harness.py` already prescribes for a sibling site. It must
 *not* touch `orchestrator/src/orchestrator/fm_retry.py`.
 
+Outcome: task 5550 merged 2026-09-25 (`efc1e0dcde`). Task 5739's post-merge
+syslog re-measure found 0 `wedged` threshold-crossings in 2026-10-18..11-15,
+against 57 in the 2026-08-23..09-21 baseline. The figures, and the decision
+to close the port-down fast lane, live in `OPERATIONS.md` §"fused-memory
+liveness revive".
+
 ## Related escalations
 
 - `esc-5544-2` — three plan steps stated stall magnitudes 1–2s off what the

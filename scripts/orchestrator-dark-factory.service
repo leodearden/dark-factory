@@ -67,7 +67,7 @@ Environment=ORCH_UNIT=orchestrator-dark-factory.service
 # overlays this value last. Measured 2026-09-07/08 (load-tuning session): the
 # offline lane ran 32 workers with 31 idle every ~40 min; one agent shell ran
 # 32 workers concurrently with three 8-wide task legs and a 16-wide merge leg.
-# Restart-tier: takes effect at the next unit restart (fleet redeploy cadence ~8h).
+# Restart-tier: takes effect at the next unit restart (fleet redeploy cadence ~72h).
 Environment=PYTEST_XDIST_AUTO_NUM_WORKERS=8
 
 # Auto-restart on crash; back off up to 60s.

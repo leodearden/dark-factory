@@ -89,13 +89,27 @@ def test_a_dependency_fan_out_skips_a_module_without_a_type_check(tmp_path: Path
 
 @pytest.mark.parametrize(
     'staged',
-    [['skills/x/run.py'], ['scripts/run.sh'], []],
-    ids=['py-under-no-module', 'non-py-non-screen', 'nothing-staged'],
+    [['skills/x/run.py'], ['scripts/run.sh'], [], ['skills/spawn/hooks/stop.sh']],
+    ids=[
+        'py-under-no-module',
+        'non-py-non-screen',
+        'nothing-staged',
+        'behavioural-artifact-consumed-by-registered-modules',
+    ],
 )
 def test_nothing_to_check_is_an_empty_listing(tmp_path: Path, staged: list[str]) -> None:
     run = run_helper(make_layout(tmp_path), staged)
 
     assert (run.rc, run.units) == (0, []), run.stderr
+
+
+def test_a_behavioural_artifact_beside_module_source_lists_only_that_modules_legs(
+    tmp_path: Path,
+) -> None:
+    run = run_helper(make_layout(tmp_path), ['orchestrator/src/x.py', 'skills/spawn/hooks/stop.sh'])
+
+    assert run.rc == 0, run.stderr
+    _assert_units(run.units, _legs(ORCHESTRATOR))
 
 
 def test_a_missing_top_level_config_cannot_list(tmp_path: Path) -> None:

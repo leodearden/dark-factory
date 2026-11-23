@@ -210,6 +210,75 @@ def test_main_refresh_sets_status(
     assert record.status == session_records.Status.RUNNING
 
 
+@pytest.mark.parametrize('live_status', ['running', 'idle', 'awaiting-input'])
+def test_main_refresh_clears_exit_code_when_record_leaves_terminal_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    live_status: str,
+) -> None:
+    """A live session falsely swept EXITED/ORPHAN_EXIT_CODE then flipped back
+    by a hook must not keep the sweep's terminal exit code."""
+    _set_env(monkeypatch, _launching_env(tmp_path))
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+    slug = session_records.build_session_slug('unblock', 'df', '2085', 4242)
+    session_records.update_status(
+        slug, root=tmp_path, status=session_records.Status.EXITED, exit_code=session_reaper.ORPHAN_EXIT_CODE
+    )
+
+    rc = sr.main(['refresh', '--record', record_dir, '--status', live_status])
+
+    assert rc == 0
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status(live_status)
+    assert record.exit_code is None
+
+
+def test_main_refresh_repairs_a_live_record_left_holding_an_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A record already on disk as running/ORPHAN_EXIT_CODE has a non-terminal
+    prior, yet its next refresh still drops the stale exit code."""
+    _set_env(monkeypatch, _launching_env(tmp_path))
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+    slug = session_records.build_session_slug('unblock', 'df', '2085', 4242)
+    launched = session_records.read_record(slug, root=tmp_path)
+    session_records.write_record(
+        dataclasses.replace(
+            launched, status=session_records.Status.RUNNING, exit_code=session_reaper.ORPHAN_EXIT_CODE
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['refresh', '--record', record_dir, '--status', 'idle'])
+
+    assert rc == 0
+    record = session_records.read_record(slug, root=tmp_path)
+    assert (record.status, record.exit_code) == (session_records.Status.IDLE, None)
+
+
+def test_main_refresh_keeps_exit_code_while_record_stays_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_env(monkeypatch, _launching_env(tmp_path))
+    sr.main(['launching'])
+    record_dir = capsys.readouterr().out.strip()
+    slug = session_records.build_session_slug('unblock', 'df', '2085', 4242)
+    session_records.update_status(slug, root=tmp_path, status=session_records.Status.EXITED, exit_code=3)
+
+    rc = sr.main(['refresh', '--record', record_dir, '--status', 'exited'])
+
+    assert rc == 0
+    record = session_records.read_record(slug, root=tmp_path)
+    assert (record.status, record.exit_code) == (session_records.Status.EXITED, 3)
+
+
 def test_main_set_display_stamps_and_is_preserved(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

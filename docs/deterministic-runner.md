@@ -166,10 +166,12 @@ Phase ε **self-restart** sub-path (`before_done.target_unit` == own unit):
   re-fetch fails or is deferred past the per-tick fetch budget
   (`orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_backfill_terminal_dep_records`).
   A dep never yet cached that the budget defers makes its dependents wait
-  (verdict `unknown`) until a later tick fetches it: after a restart the
-  cold cache takes ceil(terminal deps / `delivered_checks.max_checks_per_tick`)
-  ticks to warm.  Only a never-cached dep whose fetch fails outright fails
-  open, for that tick.  Accepted residual: an RP-4 submit that itself failed
+  (verdict `unknown`) until a later tick fetches it.  A held re-validation
+  never takes the last slot from a never-cached dep, so after a restart the
+  cold cache takes ceil(terminal deps / max(1, budget − held re-validations))
+  ticks to warm while fetches succeed, the budget being
+  `delivered_checks.max_record_fetches_per_tick`.  Only a never-cached dep
+  whose fetch fails outright fails open, for that tick.  Accepted residual: an RP-4 submit that itself failed
   reads as `verified`.
 - If scheduling succeeds (`rc == 0`) and `always_escalates=True`
   (act-then-ask): fall through directly to section 3 (the gate) WITHOUT

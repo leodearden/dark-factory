@@ -83,7 +83,6 @@ from fused_memory.reconciliation.overreach_flags import (
     acknowledge_overreach_flags,
     fetch_overreach_flags,
 )
-from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.predecessor_drain_recovery import recover_predecessor_drains
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
 from fused_memory.reconciliation.scope_freshness import (
@@ -106,15 +105,6 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     write_stage2_cycle_summary,
 )
 from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
-from fused_memory.reconciliation.task_count_snapshot_cadence import (
-    ESCALATION_CATEGORY as TASK_COUNT_SNAPSHOT_ESCALATION_CATEGORY,
-)
-from fused_memory.reconciliation.task_count_snapshot_cadence import (
-    TASK_COUNT_SNAPSHOT_MISS_THRESHOLD,
-    build_stale_snapshot_finding,
-    evaluate_snapshot_cadence,
-    extract_snapshot_written,
-)
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     TaskTreeUnavailableReason,
@@ -226,10 +216,6 @@ _RECON_DEDUP_CONFIG = (
             # _record_phantom_citation_finding_drop).  Same fold rationale as
             # the two storm categories above it.
             'recon_remediation_phantom_citation_storm',
-            # Task 2278: stable per-project finding identity (build_stale_snapshot_finding)
-            # so a sustained task_count_snapshot cadence gap folds into a single pending
-            # escalation per project instead of firing once per cycle.
-            TASK_COUNT_SNAPSHOT_ESCALATION_CATEGORY,
         ),
     )
     if HAS_ESCALATION else None
@@ -2670,7 +2656,7 @@ class ReconciliationHarness:
                 task_id=f'recon-{run_id[:8]}',
                 agent_role='reconciliation-harness',
                 severity='info' if category in (
-                    'recon_stale_run', _RECON_INTEGRITY_ISSUE_CATEGORY, TASK_COUNT_SNAPSHOT_ESCALATION_CATEGORY,
+                    'recon_stale_run', _RECON_INTEGRITY_ISSUE_CATEGORY,
                 ) else 'blocking',
                 category=category,
                 summary=summary,
@@ -3960,13 +3946,6 @@ class ReconciliationHarness:
             # so reports must be committed before firing the async task.
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
 
-            # Task 2278: structural cadence guard for the Stage-2 task_count_snapshot
-            # write — escalates once a confirmed miss has recurred for
-            # TASK_COUNT_SNAPSHOT_MISS_THRESHOLD consecutive full cycles.  Full-cycle
-            # path only (not evaluated from _maybe_remediate); reads the just-persisted
-            # stage report, so this runs after update_run_stage_reports above.
-            await self._maybe_escalate_stale_task_count_snapshot(project_id, run_id, run)
-
             # Async judge review. Fire-and-forget: it outlives this cycle and
             # is intentionally NOT tracked by _active_runs / recon_busy (whose
             # scope is defined at recon_busy_snapshot).
@@ -4673,106 +4652,6 @@ class ReconciliationHarness:
                 },
             )
             return max(lookback, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD)
-
-    async def _maybe_escalate_stale_task_count_snapshot(
-        self,
-        project_id: str,
-        run_id: str,
-        run: ReconciliationRun,
-    ) -> None:
-        """Escalate a sustained task_count_snapshot write-cadence gap.
-
-        Reads *run*'s Stage-2 freshness stat
-        (``task_count_snapshot_mem0_written``, already computed by
-        ``TaskKnowledgeSync.run()``'s post-flight check); only a CONFIRMED
-        current miss (``False`` — not a fresh write and not an
-        inconclusive/unknown check) is eligible to escalate.  A read-only
-        alias for the pre-task-3045 stat spelling was retired in task 3488,
-        once measurement confirmed no journal row inside the lookback window
-        below could still change the computed streak; a pre-rename row now
-        reads as unknown, which stops the streak rather than extending it.
-        The prior consecutive-miss streak is recomputed each call from
-        ``journal.get_recent_runs`` — mirroring ``_finding_persistence_count``'s
-        journal-recompute pattern — rather than a stored counter, so it
-        naturally resets on any successful write and survives a harness
-        restart with no new schema.
-
-        Prior runs are filtered to full-cycle COMPLETED runs only (mirrors the
-        completed filter in ``_get_prior_s3_findings``): a remediation/targeted
-        run neither counts toward nor resets the streak (the snapshot is a
-        full-cycle Stage-2 final action, so those runs' own stat reflects their
-        own window, not a genuine gap), and a failed full run is skipped so the
-        streak bridges across it to the next completed one.
-
-        Escalates category 'recon_stale_task_count_snapshot' (info severity,
-        deduped via ``_RECON_DEDUP_CONFIG.infra_dedupe_categories`` on the
-        stable per-project ``build_stale_snapshot_finding`` identity) once the
-        streak reaches ``TASK_COUNT_SNAPSHOT_MISS_THRESHOLD``.  Skipped
-        entirely for projects where ``is_snapshot_write_blocked`` — a missing
-        snapshot there is correct-by-design, not a gap. That check runs
-        FIRST, before the current-stat read or the ``journal.get_recent_runs``
-        call, so a blocked project incurs no per-cycle journal query or
-        streak recompute (amendment round: reviewer finding, efficiency).
-
-        Fails open — never raises — mirroring ``_get_prior_s3_findings`` /
-        ``_check_graphiti_queue_health``, so a journal hiccup never aborts a
-        reconciliation cycle.  Wired into ``run_full_cycle`` only, after the
-        Stage-2 report is persisted — NOT evaluated during remediation passes.
-
-        Task 2278.
-        """
-        if not HAS_ESCALATION:
-            return
-        try:
-            if is_snapshot_write_blocked(project_id):
-                return
-            current = extract_snapshot_written(run.stage_reports.get('task_knowledge_sync'))
-            if current is not False:
-                return
-            recent = await self.journal.get_recent_runs(
-                project_id, limit=max(20, TASK_COUNT_SNAPSHOT_MISS_THRESHOLD * 4),
-            )
-            prior_runs = [
-                r for r in recent
-                if getattr(r, 'id', None) != run_id
-                and str(getattr(r, 'run_type', '')) == RunType.full
-                and str(getattr(r, 'status', '')) == 'completed'
-            ]
-            # Defensive re-sort: get_recent_runs already orders by started_at DESC,
-            # but the filtered subset's ordering is re-asserted here rather than
-            # assumed, since compute_snapshot_miss_streak depends on most-recent-first.
-            prior_runs.sort(
-                key=lambda r: getattr(r, 'started_at', None) or datetime.min.replace(tzinfo=UTC),
-                reverse=True,
-            )
-            prior_flags = [
-                extract_snapshot_written(r.stage_reports.get('task_knowledge_sync'))
-                for r in prior_runs
-            ]
-            result = evaluate_snapshot_cadence(
-                current, prior_flags, blocked=is_snapshot_write_blocked(project_id),
-            )
-            if result['escalate']:
-                self._escalate(
-                    TASK_COUNT_SNAPSHOT_ESCALATION_CATEGORY,
-                    run_id,
-                    summary=(
-                        f'task_count_snapshot stale for {result["streak"]} consecutive '
-                        f'full cycles (project {project_id})'
-                    ),
-                    detail=(
-                        'Reconciliation Stage 2 has not confirmed a fresh '
-                        'task_count_snapshot Mem0 write within the run window for '
-                        f'{result["streak"]} consecutive completed full reconciliation '
-                        f'cycles for project {project_id!r}.'
-                    ),
-                    finding=build_stale_snapshot_finding(project_id),
-                )
-        except Exception as e:
-            logger.warning(
-                'reconciliation.stale_task_count_snapshot_check_failed',
-                extra={'project_id': project_id, 'run_id': run_id, 'error': str(e)},
-            )
 
     def _log_non_actionable_finding(
         self,

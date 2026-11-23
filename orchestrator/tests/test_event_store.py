@@ -1479,3 +1479,35 @@ class TestPinBlockedEventType:
         conn.close()
 
         assert rows == [('P', 'H')]
+
+
+class TestParkRefusedEventType:
+    """``park_refused`` names the parks a candidate waits on, none outranking it (task 6328)."""
+
+    def test_park_refused_round_trips(self, tmp_path: Path) -> None:
+        assert EventType.park_refused.value == EventType.park_refused.name == 'park_refused'
+
+        data = {
+            'task_id': 'B',
+            'priority': 'critical',
+            'episode_secs': 1800.0,
+            'blockers': [{'module': 'x.py', 'owner': 'A', 'kind': 'parked'}],
+            'park_owners': [{
+                'owner': 'A',
+                'source': 'fairness',
+                'tier': 'critical',
+                'park_age_secs': 7200.0,
+                'waiting_on': [{'module': 'z.py', 'owner': 'H', 'kind': 'held'}],
+            }],
+        }
+        db_path = tmp_path / 'e.db'
+        store = EventStore(db_path, 'run-1')
+        store.emit(EventType.park_refused, task_id='B', data=data)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT task_id, data FROM events WHERE event_type = 'park_refused'"
+        ).fetchall()
+        conn.close()
+
+        assert [(task_id, json.loads(raw)) for task_id, raw in rows] == [('B', data)]

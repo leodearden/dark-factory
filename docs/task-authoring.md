@@ -310,6 +310,18 @@ mechanism. A task dispatches only once every local dependency reaches a
 TERMINAL status (`done`/`cancelled`); an intra-atomic-train
 `merge-deferred` sibling is also accepted as satisfying.
 
+The store refuses an edge that would close a cycle.
+`add_dependency(A, B)` and `update_task(A, dependencies=[…B…])` walk from
+B over the local table at every status: a `done` or `cancelled` task's
+edges count, so reopening it cannot revive a cycle. A refusal carries
+`error_type` `DependencyCycle` and `cycle` `[A, B, …, A]`, and nothing is
+written: remove one of the named edges rather than retrying the call.
+Self-loops and missing ids are refused on both; `update_task` exempts a
+missing id already stored for the task, since writing it back adds no
+edge. The graph is local only:
+qualified external deps (§3.2) are not walked. The rule's home is
+`shared/src/shared/dependency_cycle.py`.
+
 ### 3.2 Cross-project external dependencies
 
 A task can declare a dependency on a task in **another** project using the
@@ -836,7 +848,8 @@ from it.
 | `enabled` | `true` | Kill switch — set `false` to disable the gate entirely |
 | `grace_cycles` | `3` | Consecutive FAILED ticks (per dependent, dep pair) before the born-at-L2 escalation fires |
 | `check_timeout_secs` | `120` | Per-check wall-clock timeout; a hung check maps to the same fail-safe outcome as a runner error |
-| `max_checks_per_tick` | `50` | Per-tick fan-out budget across all checked deps. It also bounds the scheduler's per-tick fetch of terminal dep records, which the scheduled self-deploy hold reads too (`docs/deterministic-runner.md` §2), so lowering it slows that hold's cold-cache warm-up |
+| `max_checks_per_tick` | `50` | Per-tick fan-out budget across all checked deps |
+| `max_record_fetches_per_tick` | `50` | Per-tick fetch budget for terminal dep records, which the delivered-check gate and the scheduled self-deploy hold read (`docs/deterministic-runner.md` §2). Lowering it slows the cold-cache warm-up after a restart; one slot per tick is kept for never-cached deps |
 
 **Manual re-pend recipe:** exactly like the external-dep gate, a dependent
 blocked by this escalation is **not auto-re-pended**. Once the underlying

@@ -3723,7 +3723,7 @@ class ConsolidationAutoConfig(BaseModel):
 
 class LinkHealConfig(BaseModel):
     """Caps, storm escapes, adjudicator knobs and the scheduled sweep for link
-    healing (tasks 6181, 6184, 7159).
+    healing (tasks 6181, 6184, 7159, 6188).
 
     Contract: ``plans/write-triage-link-healing-prd.md`` H1, "Caps and storm
     escapes", and H2, the link adjudicator. The consumers are
@@ -3838,6 +3838,18 @@ class LinkHealConfig(BaseModel):
             'How far back the first scheduled sweep looks for newly created '
             'children; later sweeps start where the last complete one ended. '
             'Read by maintenance/link_heal_sweep.py at each run start. Task 7159.'
+        ),
+    )
+    max_adjudications_per_run: int = Field(
+        default=200,
+        ge=1,
+        description=(
+            'The most pairs one scheduled sweep run asks the link adjudicator '
+            'about. Verdicts already ledgered at the current texts are reused '
+            'and do not count. The rest are recorded unexamined, the run is '
+            'partial and holds the sweep window, so a later sweep asks them. '
+            'Read by maintenance/link_heal_sweep.py at each run start. PRD ε, '
+            'task 6188.'
         ),
     )
     calibration_kappa_margin: float = Field(

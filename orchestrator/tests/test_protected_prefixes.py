@@ -9,18 +9,18 @@ integrations and the point-site wiring (self-heal rmtrees + harness
 substrate-gate pre-clean) that consult it.
 
 Fixtures mirror test_interactive_worktree_reaper.py's real-temp-git-repo
-pattern (``_init_repo`` via ``orchestrator.git_ops._run``,
+pattern (``seed_repo`` from ``_git_fixtures``,
 ``GitOps(GitConfig(), repo)``).
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
@@ -38,22 +38,10 @@ from orchestrator.git_ops import (
 # ---------------------------------------------------------------------------
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def pp_git_repo(tmp_path: Path) -> Path:
     """Temporary git repo with an initial commit for protected-prefixes tests."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 # ---------------------------------------------------------------------------

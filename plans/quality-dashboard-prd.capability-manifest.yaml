@@ -120,9 +120,8 @@ tasks:
         binding: "capability→producer — dashboard/tests/js/boundary_quality.test.mjs (new) on the boundary_*.test.mjs pattern"
         verdict: PASS
         delivered_check:
-          kind: grep
-          pattern: "boundary_quality"
-          paths: ["dashboard/tests/"]
+          kind: path
+          paths: ["dashboard/tests/js/boundary_quality.test.mjs"]
           expect: present
   - label: "ζ"
     task_id: 8462

@@ -38,7 +38,6 @@ verify.py's has_conftest full-suite fallback for merge-time verify.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import shutil
 from dataclasses import replace
@@ -47,6 +46,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _git_fixtures import seed_repo
 from _lane_test_helpers import (
     acquire_lane,
     add_warm_lane_scripts,
@@ -73,21 +73,10 @@ from orchestrator.warm_lane_pool import LaneState, WarmLanePool
 # ── Module-local fixtures + helpers ─────────────────────────────────────
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def ig_git_repo(tmp_path: Path) -> Path:
     """Temporary git repo with an initial commit + a resolvable warm base."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     seed_default_warm_base(repo)
     return repo
 
