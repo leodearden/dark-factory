@@ -32,7 +32,12 @@ from orchestrator.config import (
 from orchestrator.deployed_sha import DeployedSha
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
-from orchestrator.verify import VerifyResult, is_no_verdict_summary, run_scoped_verification
+from orchestrator.verify import (
+    MERGE_JUNIT_DIR,
+    VerifyResult,
+    is_no_verdict_summary,
+    run_scoped_verification,
+)
 from orchestrator.verify_cache.keys import TREE_UNIT_ID, UnitKey
 from orchestrator.verify_cache.modes import CacheMode, VerifyRole
 from orchestrator.verify_cache.policy import Decision
@@ -71,7 +76,7 @@ def _commit_edit(repo: Path, path: str, text: str) -> None:
     target = repo / path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text)
-    _git(repo, 'add', '-A')
+    _git(repo, 'add', path)
     _git(repo, 'commit', '-q', '-m', f'edit {path}')
 
 
@@ -248,6 +253,30 @@ class TestPlanReplay:
         for decided in (*replay.modules.values(), replay.tree):
             assert decided.decision.decision is Decision.UNAVAILABLE
             assert '1 path' in decided.decision.reason
+
+    @pytest.mark.parametrize(('stray', 'decisions'), [
+        pytest.param((), {Decision.MISS}, id='only-own-outputs'),
+        pytest.param(('stray.py',), {Decision.UNAVAILABLE}, id='own-outputs-and-a-stray'),
+    ])
+    @pytest.mark.asyncio
+    async def test_the_verify_s_own_outputs_are_not_a_working_copy_change(
+        self, repo, modules, access, stray, decisions,
+    ):
+        (repo / MERGE_JUNIT_DIR).mkdir()
+        (repo / MERGE_JUNIT_DIR / 'report.alpha.xml').write_text('<testsuites/>')
+        for path in stray:
+            (repo / path).write_text('x = 1\n')
+
+        replay = await plan_replay(
+            repo, _full_suite_plan(modules), modules, config=cache_config(repo), role='merge', access=access,
+            leg_env=_no_env, verify_outputs=(MERGE_JUNIT_DIR,),
+        )
+
+        assert replay is not None
+        decided = (*replay.modules.values(), replay.tree)
+        assert {unit.decision.decision for unit in decided} == decisions
+        if stray:
+            assert {'1 path' in unit.decision.reason for unit in decided} == {True}
 
     @pytest.mark.asyncio
     async def test_mode_off_decides_nothing_and_touches_no_registry(self, repo, modules, tmp_path):

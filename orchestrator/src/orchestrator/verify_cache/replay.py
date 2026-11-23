@@ -234,9 +234,13 @@ async def plan_replay(
     role: VerifyRole,
     access: CacheAccess,
     leg_env: LegEnv,
+    verify_outputs: Sequence[str] = (),
 ) -> ReplayPlan | None:
     """Decide every unit of a verify that runs *executed* under *plan* in *worktree*; None when
-    the cache is off for *role*, before any I/O. Never raises (I2): what cannot be read is UNAVAILABLE."""
+    the cache is off for *role*, before any I/O. Never raises (I2): what cannot be read is UNAVAILABLE.
+
+    *verify_outputs* are the root-relative directories the verify itself writes into *worktree*;
+    what is in them does not make the working copy differ from HEAD."""
     modes = config.verify_cache
     if modes.mode_for(role) is CacheMode.OFF:
         return None
@@ -248,6 +252,7 @@ async def plan_replay(
         return await _decide_all(
             worktree, plan, executed, modules,
             config=config, role=role, access=access, orchestrator_code=code, leg_env=leg_env,
+            verify_outputs=verify_outputs,
         )
     except Exception as exc:
         logger.warning('verify_cache.plan_replay unavailable: %s: %s', type(exc).__name__, exc)
@@ -265,9 +270,10 @@ async def _decide_all(
     access: CacheAccess,
     orchestrator_code: str,
     leg_env: LegEnv,
+    verify_outputs: Sequence[str],
 ) -> ReplayPlan:
     modes = config.verify_cache
-    changed = await _working_copy_changes(worktree)
+    changed = await _working_copy_changes(worktree, verify_outputs)
     if changed:
         noun = 'path' if changed == 1 else 'paths'
         return _unavailable(role, modes, modules, f'working copy differs from HEAD in {changed} {noun}')
@@ -290,9 +296,12 @@ async def _decide_all(
     )
 
 
-async def _working_copy_changes(worktree: Path) -> int:
-    """How many paths the working copy differs from HEAD in, untracked ones included."""
-    argv = ['git', '--no-optional-locks', 'status', '--porcelain=v1', '-z', '--untracked-files=normal']
+async def _working_copy_changes(worktree: Path, ignored_dirs: Sequence[str]) -> int:
+    """How many paths outside *ignored_dirs* the working copy differs from HEAD in, untracked ones included."""
+    argv = [
+        'git', '--no-optional-locks', 'status', '--porcelain=v1', '-z', '--untracked-files=normal',
+        '--', ':(top)', *(f':(top,exclude){directory}' for directory in ignored_dirs),
+    ]
     result = await run_git(argv, cwd=worktree, timeout=tree_objects.GIT_READ_TIMEOUT_SECS)
     if not result.ok:
         raise tree_objects.TreeReadError(

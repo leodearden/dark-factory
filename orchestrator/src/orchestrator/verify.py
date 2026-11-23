@@ -3218,6 +3218,10 @@ def _make_infix(module_prefix: 'str | None') -> str:
     return f'.{safe}'
 
 
+#: The root-relative directory a merge-role verify writes its junit reports into.
+MERGE_JUNIT_DIR = '.df-verify-junit'
+
+
 def _prepare_junit_report_path(
     worktree: Path, module_prefix: 'str | None', *, group: 'str | None' = None,
 ) -> 'Path | None':
@@ -3253,7 +3257,7 @@ def _prepare_junit_report_path(
     """
     if not worktree.is_dir():
         return None
-    junit_dir = worktree / '.df-verify-junit'
+    junit_dir = worktree / MERGE_JUNIT_DIR
     try:
         junit_dir.mkdir(exist_ok=True)
         report = junit_dir.resolve() / f'report{_make_infix(module_prefix)}{_make_infix(group)}.xml'
@@ -9519,6 +9523,7 @@ async def _replay_plan(
     return await plan_replay(
         worktree, plan, executed, config=config, role=role, access=access,
         leg_env=lambda mc: _resolve_verify_env(config, mc, role=role),
+        verify_outputs=(MERGE_JUNIT_DIR,),
     )
 
 

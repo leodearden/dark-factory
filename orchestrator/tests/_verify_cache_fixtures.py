@@ -34,7 +34,7 @@ def _marking_test(prefix: str) -> str:
 
 WORKSPACE_SEED = RepoSeed(
     files=(
-        ('.gitignore', '.df-verify-junit/\n.task/\n.pytest_cache/\n__pycache__/\n'),
+        ('.gitignore', '.task/\n.pytest_cache/\n__pycache__/\n'),
         ('pyproject.toml', '[tool.uv.workspace]\nmembers = ["alpha", "beta"]\n'),
         ('alpha/pyproject.toml', '[project]\nname = "alpha"\nversion = "0"\n'),
         ('alpha/src/alpha/__init__.py', 'A = 1\n'),
