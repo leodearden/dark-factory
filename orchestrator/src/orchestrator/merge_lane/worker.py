@@ -1226,6 +1226,7 @@ COALESCE_EXCLUDED_NO_AWAITING_WORKFLOW = 'no_awaiting_workflow'
 # bound on a task's residency in the merge queue, and the marker must not
 # outlive the task it was recorded against.
 _COALESCE_DERAIL_TTL = timedelta(days=7)
+_NEXT_DISPATCH_UNCHAINED_TTL = timedelta(days=7)
 
 
 class _TrainMergeHost(Protocol):
@@ -4820,7 +4821,13 @@ class SpeculativeMergeWorker:
         # mark lasts until a verdict for the task is applied, which is when its
         # request is retired (`_retire_item`): a verify the cascade cancels or
         # voids keeps it.
-        self._next_dispatch_unchained: set[str] = set()
+        # The set is restart-durable (task 11047, interim until BatchState
+        # replaces the mark): a worker built over the same project data
+        # directory starts with the marks the previous process held.
+        self._next_dispatch_unchained: MutableSet[str] = PersistentSet(
+            guard_path(_root, 'next_dispatch_unchained_task_ids.json'),
+            ttl=_NEXT_DISPATCH_UNCHAINED_TTL,
+        )
         # task 2828 amend (reviewer_comprehensive, robustness): per-task
         # consecutive contended-lease requeue counter.  Incremented each time
         # merge_verify_lease raises MergeVerifyLeaseContended and the item is
