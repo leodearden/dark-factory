@@ -17,7 +17,7 @@ from orchestrator.agents.roles import ROLES
 from orchestrator.artifacts import LANE_SYMLINKED_ARTIFACTS, TaskArtifacts
 
 _LANE_PATH = re.compile(r'\.task/[A-Za-z0-9_.-]*[A-Za-z0-9_]')
-_HISTORY_PATHS = ('.task/plan.json', '.task/iterations.jsonl')
+_LINKED_PATHS = tuple(f'.task/{name}' for name in LANE_SYMLINKED_ARTIFACTS)
 _LANE_LAYOUT_ROLES = ('implementer', 'debugger', 'merger', 'steward', 'simple_task')
 
 
@@ -55,15 +55,24 @@ def test_no_role_prompt_computes_a_meta_root_path(name):
 @pytest.mark.parametrize('name', ['implementer', 'debugger'])
 def test_history_reading_roles_name_both_lane_paths(name):
     prompt = ROLES[name].system_prompt
-    for path in _HISTORY_PATHS:
+    for path in _LINKED_PATHS:
         assert path in prompt, f'{name} does not name {path}'
 
 
+def test_lane_task_dir_exposes_only_the_linked_artifacts(tmp_path):
+    wt, arts = build_dual_root_lane(tmp_path)
+    assert sorted(p.name for p in (wt / '.task').iterdir()) == sorted(LANE_SYMLINKED_ARTIFACTS)
+    metadata = arts.artifact_path('metadata.json')
+    assert metadata.is_file() and not metadata.is_relative_to(wt), (
+        f'metadata.json was written to {metadata}, not outside the worktree {wt}'
+    )
+
+
 @pytest.mark.parametrize('name', _LANE_LAYOUT_ROLES)
-def test_lane_layout_roles_say_only_the_linked_artifacts_are_exposed(name):
+def test_lane_layout_roles_name_the_linked_artifacts_and_metadata_json(name):
     prompt = ROLES[name].system_prompt
-    for linked in LANE_SYMLINKED_ARTIFACTS:
-        assert f'.task/{linked}' in prompt, f'{name} does not name .task/{linked}'
+    for path in _LINKED_PATHS:
+        assert path in prompt, f'{name} does not name {path}'
     assert 'metadata.json' in prompt, (
         f'{name} describes the .task/ layout without saying metadata.json is not exposed there'
     )
@@ -127,7 +136,7 @@ async def test_no_briefing_computes_a_meta_root_path(briefing, name):
 @pytest.mark.parametrize('name', ['implementer', 'amender', 'resume'])
 async def test_history_reading_briefings_name_both_lane_paths(briefing, name):
     prompt = await _BRIEFINGS[name](briefing)
-    for path in _HISTORY_PATHS:
+    for path in _LINKED_PATHS:
         assert path in prompt, f'{name} does not name {path}'
 
 
