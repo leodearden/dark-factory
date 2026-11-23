@@ -13,11 +13,17 @@ from pathlib import Path
 
 import pytest
 import timeout_headroom_selfcheck as selfcheck
-from shared.testing_ceiling_anchors import CeilingAnchor, Population, PopulationKind
+from escalation.queue import EscalationQueue
+from shared.testing_ceiling_anchors import (
+    CeilingAnchor,
+    Population,
+    PopulationKind,
+    registered_anchors,
+)
 from shared.testing_timeout_headroom import UNDER_LOAD_HEADROOM_FACTOR
 from shared.testing_timeout_markers import SiteKind, TimeoutSite
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT, min_leg_budget_for_family
-from verify_budget_census import Corpus, Record, RecordPath
+from verify_budget_census import Corpus, Record, RecordPath, sanitise_prefix
 from verify_log_junits import CaseOutcome, JunitCase, JunitRun, TreeRef, TreeSource
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -316,6 +322,21 @@ def test_the_slot_changes_when_the_bound_changes() -> None:
     assert before.slot().startswith('timeout-headroom:per_test_headroom:big_family:')
 
 
+def test_a_finding_whose_slot_is_not_one_file_name_component_is_refused_at_construction() -> None:
+    spans_directories = CeilingAnchor(
+        anchor_id='a/b',
+        ceiling_secs=_ANCHOR.ceiling_secs,
+        measured_worst_secs=_ANCHOR.measured_worst_secs,
+        population=_SPELLED,
+        provenance=_ANCHOR.provenance,
+    )
+
+    with pytest.raises(ValueError, match='one file-name component') as refused:
+        selfcheck.judge_anchors((spans_directories,), (_observation(550.75),))
+
+    assert 'timeout-headroom:per_test_headroom:a/b:' in str(refused.value)
+
+
 # ---------------------------------------------------------------------------
 # run -- over a tmp project: a git repo holding its own verify archive.
 # ---------------------------------------------------------------------------
@@ -368,14 +389,29 @@ def _project(tmp_path: Path, *, scan_seconds: float) -> Path:
     return root
 
 
+def _leg_summary(root: Path, *, infix: str, seconds: float, cmd: str) -> None:
+    task_dir = root / 'data' / 'verify-logs' / '9000'
+    task_dir.mkdir(parents=True, exist_ok=True)
+    command = {'label': 'test', 'rc': 0, 'timed_out': False, 'duration_secs': seconds, 'cmd': cmd}
+    (task_dir / f'attempt-1.{infix}.summary-20261120T145849Z.json').write_text(
+        json.dumps({'commands': [command]}), encoding='utf-8'
+    )
+
+
 @dataclass
 class _Escalations:
-    """A plain recording escalation port: (tool, args) -> canned answer."""
+    """A plain recording escalation port: (tool, args) -> canned answer.
+
+    With a ``queue``, ``escalate_info`` mints its id through the real
+    ``EscalationQueue.make_id``, so a slot the server cannot mint fails here as it does there.
+    """
 
     history: Mapping[str, list[dict]] = field(default_factory=dict)
     fail_on: str | None = None
     answer_error: bool = False
+    queue: EscalationQueue | None = None
     calls: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+    minted: list[str] = field(default_factory=list)
 
     def __call__(self, tool: str, args: dict[str, object]) -> Mapping[str, object]:
         self.calls.append((tool, args))
@@ -385,10 +421,17 @@ class _Escalations:
             return {'error': 'boom'}
         if tool == 'get_task_escalations':
             return {'result': list(self.history.get(str(args['task_id']), []))}
+        if tool == 'escalate_info' and self.queue is not None:
+            self.minted.append(self.queue.make_id(str(args['task_id'])))
+            return {'id': self.minted[-1]}
         return {'id': 'esc-new-1'}
 
     def tools(self) -> list[str]:
         return [tool for tool, _ in self.calls]
+
+
+def _minting(tmp_path: Path) -> _Escalations:
+    return _Escalations(queue=EscalationQueue(tmp_path / 'escalations'))
 
 
 _NO_LEGS = selfcheck.LegFacts(budgets={}, family=frozenset())
@@ -403,13 +446,15 @@ def _config(root: Path, *, dry_run: bool = False) -> selfcheck.RunConfig:
     )
 
 
-def _selfcheck_run(root: Path, escalations: _Escalations, *, dry_run: bool = False) -> selfcheck.RunResult:
-    return selfcheck.run(_config(root, dry_run=dry_run), selfcheck.Ports(escalation=escalations), _NOW, legs=_NO_LEGS)
+def _selfcheck_run(
+    root: Path, escalations: _Escalations, *, dry_run: bool = False, legs: selfcheck.LegFacts = _NO_LEGS
+) -> selfcheck.RunResult:
+    return selfcheck.run(_config(root, dry_run=dry_run), selfcheck.Ports(escalation=escalations), _NOW, legs=legs)
 
 
 def test_a_breach_with_no_history_files_exactly_one_escalate_info_in_its_slot(tmp_path: Path) -> None:
     root = _project(tmp_path, scan_seconds=200.0)
-    escalations = _Escalations()
+    escalations = _minting(tmp_path)
 
     result = _selfcheck_run(root, escalations)
 
@@ -426,6 +471,23 @@ def test_a_breach_with_no_history_files_exactly_one_escalate_info_in_its_slot(tm
     assert isinstance(evidence, list) and evidence
     assert all(set(entry) == {'observation', 'measured_at', 'ref'} for entry in evidence)
     assert result.filed == (finding.slot(),)
+
+
+def test_a_breaching_leg_whose_prefix_spans_directories_is_filed(tmp_path: Path) -> None:
+    root = _project(tmp_path, scan_seconds=20.0)
+    _leg_summary(root, infix='tests_scripts', seconds=300.0, cmd='pytest tests/scripts')
+    escalations = _minting(tmp_path)
+    legs = selfcheck.LegFacts(budgets={'tests/scripts': 100}, family=frozenset({'tests/scripts'}))
+
+    result = _selfcheck_run(root, escalations, legs=legs)
+
+    assert result.ok, result.failure
+    (finding,) = result.findings
+    slot = finding.slot()
+    assert slot in result.filed
+    assert '/' not in slot
+    assert escalations.minted == [f'esc-{slot}-1']
+    assert finding.record()['evidence']['prefix'] == 'tests/scripts'
 
 
 def test_a_breach_whose_slot_has_history_is_skipped_and_reported(tmp_path: Path) -> None:
@@ -455,7 +517,7 @@ def test_a_dry_run_calls_no_write_tool_and_writes_no_stamp(tmp_path: Path) -> No
 def test_a_completed_run_writes_the_stamp(tmp_path: Path) -> None:
     root = _project(tmp_path, scan_seconds=200.0)
 
-    result = _selfcheck_run(root, _Escalations())
+    result = _selfcheck_run(root, _minting(tmp_path))
 
     stamp = json.loads(_config(root).stamp_path.read_text(encoding='utf-8'))
     assert stamp['ok'] is True
@@ -472,7 +534,7 @@ def test_a_completed_run_writes_the_stamp(tmp_path: Path) -> None:
 
 def test_a_quiet_night_files_nothing_and_still_stamps(tmp_path: Path) -> None:
     root = _project(tmp_path, scan_seconds=20.0)
-    escalations = _Escalations()
+    escalations = _minting(tmp_path)
 
     result = _selfcheck_run(root, escalations)
 
@@ -510,8 +572,12 @@ def test_main_dry_run_prints_the_structured_report(tmp_path: Path, capsys: pytes
     assert not _config(root).stamp_path.exists()
 
 
+def _this_checkout() -> Path:
+    return Path(_git(Path(__file__).resolve().parent, 'rev-parse', '--show-toplevel'))
+
+
 def test_the_legs_adapters_read_this_checkouts_registered_legs() -> None:
-    repo_root = Path(_git(Path(__file__).resolve().parent, 'rev-parse', '--show-toplevel'))
+    repo_root = _this_checkout()
 
     budgets = selfcheck.registered_leg_budgets(repo_root)
     family = selfcheck.family_legs(repo_root, budgets)
@@ -519,3 +585,34 @@ def test_the_legs_adapters_read_this_checkouts_registered_legs() -> None:
     assert isinstance(budgets['shared'], int)
     assert isinstance(budgets['orchestrator'], int)
     assert 'shared' in family
+
+
+def _admitted_site(population: Population) -> TimeoutSite | None:
+    if population.kind is PopulationKind.UNMARKED:
+        return None
+    constant = population.constant
+    return TimeoutSite('<module>', SiteKind.MODULE_PYTESTMARK, None, 3, constant or '', constant)
+
+
+def test_every_registered_leg_and_anchor_breach_has_a_slot_the_escalation_server_can_mint(tmp_path: Path) -> None:
+    leg_reports = [
+        report
+        for prefix in selfcheck.registered_leg_budgets(_this_checkout())
+        for report in selfcheck.judge_legs(
+            {prefix: 1}, frozenset({prefix}), {sanitise_prefix(prefix): _green(sanitise_prefix(prefix), 655.5)}
+        )
+    ]
+    anchor_reports = [
+        report
+        for anchor in registered_anchors()
+        for report in selfcheck.judge_anchors(
+            (anchor,), (_observation(anchor.admissible_worst_secs + 1.0, _admitted_site(anchor.population)),)
+        )
+    ]
+    findings = [report.finding for report in (*leg_reports, *anchor_reports)]
+    assert None not in findings
+    queue = EscalationQueue(tmp_path / 'q')
+
+    minted = {finding.slot(): queue.make_id(finding.slot()) for finding in findings if finding is not None}
+
+    assert {slot: esc_id for slot, esc_id in minted.items() if not esc_id.startswith(f'esc-{slot}-')} == {}
