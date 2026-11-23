@@ -110,6 +110,7 @@ from fused_memory.middleware.curator_types import (
     PoolWithheld,
     PreparedCandidate,
     RewrittenTask,
+    clip_for_embedding,
     clip_for_prompt,
     declared_scope_of,
     embedding_text,
@@ -1996,14 +1997,16 @@ class TaskCurator:
     ) -> list[dict[str, Any]]:
         """Semantic nearest-neighbour search over the curator corpus.
 
-        Read-only: embeds the raw ``query`` string and returns the most
+        Read-only: embeds the ``query`` string and returns the most
         similar filed tasks for ``project_id`` ranked by cosine similarity
         (higher score = more similar). Never creates the collection — a
         missing collection (no tasks ever filed) yields ``[]``.
 
         Args:
-            query: Free-text query, embedded as-is (NOT passed through
-                ``embedding_text``, which composes stored-task fields).
+            query: Free-text query, embedded as-is apart from the
+                ``clip_for_embedding`` bound every corpus vector shares (NOT
+                passed through ``embedding_text``, which composes stored-task
+                fields).
             project_id: Project identifier selecting the collection.
             limit: Max number of hits to return.
             score_threshold: Drop hits below this cosine score server-side.
@@ -2019,7 +2022,7 @@ class TaskCurator:
             name = self._collection_name(project_id)
             if not await client.collection_exists(name):
                 return []
-            embedding = await (await self._get_embedder()).create(query)
+            embedding = await (await self._get_embedder()).create(clip_for_embedding(query))
             results = await client.query_points(
                 collection_name=name,
                 query=embedding,
