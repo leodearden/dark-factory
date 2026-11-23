@@ -347,10 +347,14 @@ def ensure_holder(tm, project_root) -> int      # idempotent mint; refuses a sec
 def is_holder(task) -> bool
 def hold_at_create(kwargs, holder_id) -> None   # appends the edge + stamps followup_hold before tm.add_task
 def backfill(tm, project_root) -> int           # backend-direct under _write_lock; one event per project
-def promote(tm, project_root, held_id: int, *, by, ref=None) -> tuple[int, ...]
+HoldEmit = Callable[[EventType, Mapping[str, object]], Awaitable[None]]
+    # journals one hold event; a caller outside the interceptor (the packer, γ's rider_carry and
+    # sweep) passes TaskInterceptor.hold_emit(project_root). Every promotion function below
+    # requires the caller to hold the project's interceptor write lock.
+def promote(tm, project_root, held_id: int, *, by, ref=None, emit: HoldEmit) -> tuple[int, ...]
     # removes the holder edge, stamps, emits, then recurses into the held dependencies of held_id
     # (by='dependent', ref=held_id); returns every id promoted
-def promote_dependencies_of(tm, project_root, task_id: int) -> tuple[int, ...]
+def promote_dependencies_of(tm, project_root, task_id: int, *, emit: HoldEmit) -> tuple[int, ...]
     # the status-chokepoint and edge-insert entry: promotes held deps of a task that is pending
 class FollowupHolderProtectedError(TaskBackendError)
 ```
@@ -363,7 +367,10 @@ Invariants: exactly one live holder per project; a held task has exactly one hol
 `followup_hold` record, and the two agree; the holder never has dependencies, never dispatches, is
 never a curator pool entry or combine target, and leaves `pending` only through
 `release_holder=True`; promotion is the only writer that removes a holder edge except a human
-`remove_dependency`, which is recorded as `by=human`.
+`remove_dependency` or a human `update_task` replacement list that leaves out the holder id, each
+recorded as `by=human` (a machine-role replacement that leaves it out is refused,
+`followup_holder_edge_strip_refused`); a held task's `followup_hold` record is written only by
+`followup_hold.py`, so an `update_task` that would drop or rewrite it carries the stored record.
 
 ### 4.4 Boundary-test sketch (the integration gate ι's signal; every scenario drives the public
 interfaces `submit_task`, `resolve_ticket`, `get_task`, `add_dependency`, `remove_dependency`,
@@ -475,6 +482,8 @@ allowlist test greps real imports.
 2. **`update_task` replacement lists.** Decision 14 records a stripped holder edge as
    `by=human, ref='update_task'`; ζ decides whether the replacement list that strips it must also
    be rejected when the caller is an agent role (it is a release by side effect).
+   *Resolved in ζ (task 8418):* refused for every non-human actor class with
+   `followup_holder_edge_strip_refused`; a human replacement promotes `by=human, ref='update_task'`.
 3. **6000-character text term in `narrow`.** The data supports text length at the large end only
    (PRD1-G §2.3). Keep v1 as specified; θ's confusion table decides whether v2 drops it.
 4. **`undeclared` as its own band** (0 files lands median 40 non-test lines but 22% over 300). Kept in
@@ -483,6 +492,24 @@ allowlist test greps real imports.
    so a hit resolves before any batch edge exists. Confirm in δ's tests.
 6. **Human correction of a mis-called band.** Refused in v1 (immutable); if operators need it, add
    `basis='human'` in a later rule version rather than editing in place.
+7. **What counts as a waiting dependent.** Decision 14's edge-insert trigger promotes only when the
+   dependent is exactly `pending`, and the status chokepoint fires only on `deferred → pending`.
+   The backfill (decision 12) counts every active status except `deferred` as waiting. So an
+   `in-progress` or `blocked` task that gains an edge to a held task and later goes back to
+   `pending` leaves that task held. The dependent then waits silently, the jam class decision 14
+   exists to prevent. Either let `promote_dependencies_of` accept every active status except
+   `deferred`, or fire the chokepoint on every landing on `pending`. Either way, the edge-insert
+   rule and the backfill would share one definition of waiting. Raised by ζ's review (task 8418),
+   which kept the decided trigger set.
+8. **The release storm.** Row 15 journals one `followup_promoted` per held task, and
+   `storm-escape-required` binds only the backfill. Measured 2026-11-22: df's holder had 2,903
+   held follow-ups, and releasing that many on a test SQLite store took 22.6 s under the project
+   write lock. It also buffered 2,903 events, above the default backlog hard limit of 500, so the
+   project's writes escalate or are refused until reconciliation drains them. Two options: a
+   coalescing key or backlog exclusion for `followup_*` journal events
+   (`fused-memory/src/fused_memory/reconciliation/coalescing.py`, `event_buffer.py`), and one
+   batched backend write for the edge drops and stamps. Raised by ζ's review (task 8418); none of
+   these files is ζ's.
 
 ## Appendix A. G1 / G3 / G6 self-check
 

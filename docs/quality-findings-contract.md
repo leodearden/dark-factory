@@ -195,7 +195,11 @@ decided each finding:
    value=<key>)` (fused-memory MCP), which matches a list-valued
    `x_finding_key` by membership.
    a. A task in `pending`, `in-progress`, `blocked`, `deferred` or
-      `merge-deferred` → disposition `filed:<id>`; do not file.
+      `merge-deferred` → disposition `filed:<id>`; do not file. If that
+      task is held (it depends on its project's follow-up holder,
+      `docs/task-authoring.md` §3.4), append the finding key to its
+      `x_finding_key` with `update_task(metadata_mode='additive')`. That
+      promotes it with `by=citation` (`ref` = the key), so it dispatches.
    b. A `cancelled` task carrying `x_acceptance_reason` → `accepted:<id>`;
       do not file. A `cancelled` task without it was abandoned, not
       accepted: treat as absent and continue to step 2.
@@ -204,7 +208,8 @@ decided each finding:
 2. **Semantic lookup.** `search_tasks` with a paraphrase of the statement at
    `score_threshold ≥ 0.6`; its corpus excludes `deferred` tasks, which is
    why step 1 runs first. A plausible match is read with `get_task` before
-   deciding.
+   deciding. A plausible match on a held task gets the same append as in
+   step 1a and is recorded as `filed:<id>`.
 3. **Curator.** The ticket path's own `candidate_key` dedup is the last net,
    never the first.
 

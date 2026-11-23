@@ -23,6 +23,8 @@ class EventType(StrEnum):
     followup_held = 'followup_held'
     followup_hold_backfilled = 'followup_hold_backfilled'
     followup_holder_protected = 'followup_holder_protected'
+    followup_promoted = 'followup_promoted'
+    followup_promotion_deferred = 'followup_promotion_deferred'
 
 
 class EventSource(StrEnum):
