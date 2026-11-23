@@ -141,7 +141,6 @@ from dashboard.data.merge_queue import (  # noqa: E402
     _align_bucket,
     _bucket_minutes_for_window,
     _cutoff_iso,
-    _trailing_minutes_for_window,
     _ts_sort_key,
     enrich_merges_with_titles,
     landing_rate,
@@ -667,7 +666,7 @@ class TestTrailingLandingRates:
         (87600, 10080),
     ])
     def test_trailing_window_ladder_tiers(self, hours, expected):
-        assert _trailing_minutes_for_window(hours) == expected
+        assert trailing_landing_rates((), now=RATE_NOW, hours=hours)['trailing_minutes'] == expected
 
     def test_the_trailing_ladder_ends_in_a_catch_all(self):
         assert TRAILING_WINDOW_LADDER[-1][0] is None
@@ -684,7 +683,6 @@ class TestTrailingLandingRates:
         }
         assert series['labels'][-1] == RATE_NOW.isoformat()
         assert instants[0] == RATE_NOW - timedelta(hours=hours)
-        assert series['trailing_minutes'] == _trailing_minutes_for_window(hours)
         assert series['values'] == [0] * len(series['labels'])
 
     def test_the_rate_does_not_drop_to_zero_between_landings(self):
@@ -715,7 +713,7 @@ class TestTrailingLandingRates:
         assert trailing_landing_rates(week[-1:], now=RATE_NOW, hours=720)['values'][-1] == 0.14
 
     def test_each_point_counts_the_half_open_trailing_window_ending_there(self):
-        trailing = timedelta(minutes=_trailing_minutes_for_window(24))
+        trailing = timedelta(days=1)
         landed = [RATE_NOW - trailing, RATE_NOW]
 
         series = trailing_landing_rates(landed, now=RATE_NOW, hours=24)
@@ -756,6 +754,13 @@ class TestTrailingLandingRates:
     def test_a_window_with_no_landings_has_a_zero_mean(self):
         assert trailing_landing_rates((), now=RATE_NOW, hours=24)['window_mean_per_day'] == 0
 
+    def test_landings_in_any_order_count_as_they_would_sorted(self):
+        landed = [RATE_NOW - timedelta(hours=h) for h in (3, 30, 1, 12, 20)]
+
+        assert trailing_landing_rates(landed, now=RATE_NOW, hours=24) == trailing_landing_rates(
+            sorted(landed), now=RATE_NOW, hours=24,
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestLandingRate — the runs.db leg behind the throughput panel
@@ -791,7 +796,8 @@ class TestLandingRate:
 
     async def test_a_root_with_no_runs_db_is_unknown_not_zeros(self, tmp_path):
         assert_unread(
-            await landing_rate(tmp_path / 'proj', hours=24, now=RATE_NOW), RATE_NOW, 'runs.db',
+            await landing_rate(tmp_path / 'proj', hours=24, now=RATE_NOW),
+            RATE_NOW, 'TaskDbUnreadable', 'no such file',
         )
 
     async def test_a_runs_db_with_no_events_table_is_unknown_not_zeros(self, tmp_path):
@@ -801,7 +807,9 @@ class TestLandingRate:
             conn.execute('DROP TABLE events')
         conn.close()
 
-        assert_unread(await landing_rate(root, hours=24, now=RATE_NOW), RATE_NOW, 'runs.db')
+        assert_unread(
+            await landing_rate(root, hours=24, now=RATE_NOW), RATE_NOW, 'OperationalError', 'no such table: events',
+        )
 
     async def test_an_unrecognised_train_payload_is_unknown_naming_it(self, tmp_path):
         root = tmp_path / 'proj'

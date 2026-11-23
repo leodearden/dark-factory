@@ -290,18 +290,19 @@ class LandingRateSeries(ChartData):
 
 
 def trailing_landing_rates(
-    landed: Sequence[datetime], *, now: datetime, hours: int,
+    landed: Iterable[datetime], *, now: datetime, hours: int,
 ) -> LandingRateSeries:
     """The landing rate at each bucket-width step from ``now - hours`` to ``now``.
 
-    *landed* is sorted ascending and reaches one trailing window before the
-    first point, so every point counts a whole window: landings in
+    *landed*, in any order, reaches one trailing window before the first
+    point, so every point counts a whole window: landings in
     ``(t - trailing, t]``, scaled to landings per day.
 
     ``window_mean_per_day`` is the landings in ``(now - hours, now]`` per day
     of the window. No reading of the points recovers it, because each point
     counts only its own trailing window.
     """
+    landed = sorted(landed)
     step = _bucket_minutes_for_window(hours)
     trailing = _trailing_minutes_for_window(hours)
     count = hours * 60 // step + 1
