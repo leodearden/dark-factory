@@ -5,8 +5,15 @@ the record's native carriers count as this session's own dialogue, which
 pattern of which signal class each one holds, and what every structured
 error in it means. Both readers reduce these hits, and both take a
 session's agent class from :func:`classify_agent_class`, so neither can
-disagree with the other (plans/confusion-reduction-prd.md §7.2.4). Imports
-only :mod:`legibility.reingestion` and :mod:`legibility.inventory`.
+disagree with the other (plans/confusion-reduction-prd.md §7.2.4).
+
+It also holds the parses of what a user turn carries: its text
+(:func:`user_turn_text`), the one grammar for Claude Code's slash-command
+markup (:func:`parse_slash_command_expansion`, which
+check_transcript_persistence also uses), and the gold-only rule for a turn
+the client composed (:func:`is_client_rendered_turn`), which
+:func:`record_hits` never asks. Imports only :mod:`legibility.reingestion`
+and :mod:`legibility.inventory`.
 """
 from __future__ import annotations
 
@@ -80,6 +87,41 @@ def user_turn_text(record: Mapping[str, Any]) -> str | None:
         if texts:
             return '\n'.join(texts)
     return None
+
+
+@dataclass(frozen=True)
+class SlashCommandExpansion:
+    """A slash command as Claude Code stores the turn that typed it: *name*
+    as written in ``<command-name>``, *args* (None when no ``<command-args>``
+    tag follows), and the *trailing* text after the expansion."""
+
+    name: str
+    args: str | None
+    trailing: str
+
+
+_SLASH_COMMAND_EXPANSION_RE = re.compile(
+    r"""
+    \s*(?:<command-message>[^<]*</command-message>\s*)?
+    <command-name>(?P<name>[^<]*)</command-name>
+    (?:\s*<command-message>[^<]*</command-message>)?
+    (?:\s*<command-args>(?P<args>.*?)</command-args>)?
+    """,
+    re.DOTALL | re.VERBOSE,
+)
+
+
+def parse_slash_command_expansion(text: str) -> SlashCommandExpansion | None:
+    """The one parse of Claude Code's slash-command expansion, from the START of *text*.
+
+    Both on-disk orders parse: ``<command-message>`` written before
+    ``<command-name>``, or between it and ``<command-args>``. The start
+    anchor rejects a turn that merely QUOTES an expansion.
+    """
+    match = _SLASH_COMMAND_EXPANSION_RE.match(text)
+    if match is None:
+        return None
+    return SlashCommandExpansion(match['name'], match['args'], text[match.end():])
 
 
 def _flatten_content(content: Any) -> str:
@@ -207,6 +249,36 @@ prose/docstrings) and are deliberately NOT matched."""
 INTERRUPT_PATTERN = 'request interrupted by user'
 """The literal Claude-Code-injected marker for a user-interrupted tool call
 (e.g. "[Request interrupted by user for tool use]")."""
+
+_INTERRUPT_MARKER_TURN_RE = re.compile(
+    r'\[' + re.escape(INTERRUPT_PATTERN) + r'[^\]]*\]', re.IGNORECASE,
+)
+
+_LOCAL_COMMAND_OUTPUT_TURN_RE = re.compile(
+    r'<local-command-(?P<stream>stdout|stderr)>'
+    r'(?:(?!</local-command-).)*'
+    r'</local-command-(?P=stream)>',
+    re.DOTALL,
+)
+
+
+def is_client_rendered_turn(text: str) -> bool:
+    """Whether the WHOLE turn is one the client composed from a UI action: a
+    slash command with no typed args, one local command's output echo, or the
+    bare interrupt marker, so it holds no prose a human typed.
+
+    Asked by the gold-turn filter only, never by :func:`is_non_dialogue_carrier`:
+    the interrupt marker is this session's own INTERRUPT signal, which the
+    dialogue carriers must keep.
+    """
+    expansion = parse_slash_command_expansion(text)
+    if expansion is not None:
+        return not (expansion.args or '').strip() and not expansion.trailing.strip()
+    stripped = text.strip()
+    return any(
+        rule.fullmatch(stripped)
+        for rule in (_LOCAL_COMMAND_OUTPUT_TURN_RE, _INTERRUPT_MARKER_TURN_RE)
+    )
 
 
 @dataclass(frozen=True)
