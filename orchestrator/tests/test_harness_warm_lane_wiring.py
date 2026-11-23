@@ -39,6 +39,7 @@ from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.quarantine_provenance import NOT_RELOCATED
+from orchestrator.slot_lease import SlotLease
 from orchestrator.warm_lane_pool import WarmLanePool
 
 # ---------------------------------------------------------------------------
@@ -644,7 +645,7 @@ class TestHardCancelLaneRelease:
                 modules=[],
             )
             sem = asyncio.Semaphore(1)
-            report = await harness._run_slot(assignment, sem)
+            report = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
         # Must have returned the synthetic CANCELLED report from the except clause
         assert report is not None

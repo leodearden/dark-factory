@@ -3124,7 +3124,9 @@ class Harness:
                         'slot: every general run slot is held',
                         assignment.task_id,
                     )
-                self._launch_slot(assignment, sem, task_reports)
+                self._launch_slot(
+                    assignment, SlotLease(assignment.task_id, self.scheduler, sem), task_reports,
+                )
 
             self._compute_tallies(task_reports)
 
@@ -10118,9 +10120,9 @@ class Harness:
             )
 
     async def _run_slot(
-        self, assignment, sem: asyncio.Semaphore
+        self, assignment, lease: SlotLease
     ) -> TaskReport | None:
-        """Run a single workflow slot."""
+        """Run a single workflow slot on *lease*."""
         report = None
         # Hoisted (task 3172) so the `except asyncio.CancelledError` handler can
         # read the live phase defensively: a cancel landing during slot SETUP
@@ -10132,7 +10134,6 @@ class Harness:
         # preventing the rapid re-block loop where reconciliation immediately
         # re-dispatches the task before it can make progress.
         arm_requeue_cooldown = False
-        lease = SlotLease(assignment.task_id, self.scheduler, sem)
         self._slot_lease_registry()[assignment.task_id] = lease
         try:
             logger.info(
@@ -14775,9 +14776,9 @@ class Harness:
             await asyncio.sleep(self.config.idle_poll_secs)
 
     def _launch_slot(
-        self, assignment, sem: asyncio.Semaphore, task_reports: list[TaskReport],
+        self, assignment, lease: SlotLease, task_reports: list[TaskReport],
     ) -> asyncio.Task:
-        """Start the slot task for *assignment*, whose *sem* permit is already held."""
+        """Start the slot task for *assignment*, running on *lease*, which holds its permit or borrows one."""
         self._task_modules[assignment.task_id] = list(assignment.modules)
         # Register escalation wake-event BEFORE create_task so Fix #1a
         # (_on_escalation_resolved orphan-flip gate) sees task_id in
@@ -14789,7 +14790,7 @@ class Harness:
         # for, so a reject that brings the task back re-announces.
         self._landing_rejects.release(assignment.task_id)
         task = asyncio.create_task(
-            self._run_slot(assignment, sem),
+            self._run_slot(assignment, lease),
             name=f'workflow-{assignment.task_id}',
         )
         self._live_tasks.add(task)
@@ -14816,6 +14817,9 @@ class Harness:
                 if self._escalation_events.get(tid) is ev else None
             )
         )
+        # Backstop for a slot that never released its lease: cancelled before
+        # its first step, or its finally raised first.  Otherwise a no-op.
+        task.add_done_callback(lambda _t, lease=lease: lease.release(requeued=False))
         return task
 
     def _slot_lease_registry(self) -> dict[str, SlotLease]:

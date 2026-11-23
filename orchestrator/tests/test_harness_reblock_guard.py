@@ -28,6 +28,7 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.worker import InFlightMergeRegistry
 from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -122,7 +123,7 @@ class TestSlotSetupFailureReblockGuard:
         )
         sem = asyncio.Semaphore(1)
 
-        result = await harness._run_slot(assignment, sem)
+        result = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
         # _run_slot returns a synthetic BLOCKED report on unhandled slot exception.
         assert result is not None
@@ -168,7 +169,7 @@ class TestSlotSetupFailureReblockGuard:
         )
         sem = asyncio.Semaphore(1)
 
-        result = await harness._run_slot(assignment, sem)
+        result = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
 
         # _run_slot returns a synthetic CANCELLED report on hard-cancel.
         assert result is not None

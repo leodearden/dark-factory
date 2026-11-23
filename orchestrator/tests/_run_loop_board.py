@@ -26,6 +26,7 @@ from orchestrator.harness import Harness, TaskReport
 from orchestrator.main_health_fix_owner import SIGNATURE_KEY
 from orchestrator.run_slots import DispatchScope
 from orchestrator.scheduler import Scheduler, TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import WorkflowOutcome
 
 TICK = 0.01
@@ -72,6 +73,7 @@ class Board:
         self.live: set[str] = set()
         self.live_at_start: dict[str, int] = {}
         self.max_live = 0
+        self.leases: dict[str, SlotLease] = {}
         self._all_open = False
         self._inside_next_restricted_tick: Callable[[], Awaitable[None]] | None = None
         real_acquire = scheduler.acquire_next
@@ -117,9 +119,10 @@ class Board:
         for gate in self.gates.values():
             gate.set()
 
-    async def run_slot(self, assignment: TaskAssignment, sem: asyncio.Semaphore) -> TaskReport:
-        """Holds its run slot until the test opens its gate."""
+    async def run_slot(self, assignment: TaskAssignment, lease: SlotLease) -> TaskReport:
+        """Holds its run slot until the test opens its gate; records the lease it runs on."""
         tid = assignment.task_id
+        self.leases[tid] = lease
         self.live.add(tid)
         self.live_at_start[tid] = len(self.live)
         self.max_live = max(self.max_live, len(self.live))
@@ -133,8 +136,7 @@ class Board:
         finally:
             self.live.discard(tid)
             self.tasks = [t for t in self.tasks if t['id'] != tid]
-            self.scheduler.release(tid)
-            sem.release()
+            lease.release(requeued=False)
 
 
 async def until(predicate: Callable[[], bool], label: str) -> None:

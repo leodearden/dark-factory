@@ -32,6 +32,7 @@ from _recording_event_store import _RecordingEventStore
 
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness, TaskReport
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import TerminalReport, WorkflowOutcome, WorkflowState
 
 # ---------------------------------------------------------------------------
@@ -132,7 +133,7 @@ async def _drive_slot(
         # No steward => steward_cost / steward_invocations stay 0.
         mock_wf._steward = None
         MockWorkflow.return_value = mock_wf
-        report = await harness._run_slot(assignment, sem)
+        report = await harness._run_slot(assignment, SlotLease(assignment.task_id, harness.scheduler, sem))
     # ``_run_slot`` is typed ``TaskReport | None``; every path this driver
     # exercises returns a report (terminal or synthetic-CANCELLED), so this
     # states an existing precondition rather than weakening a check.

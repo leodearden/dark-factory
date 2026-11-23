@@ -25,6 +25,7 @@ from escalation.queue import EscalationQueue
 from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.harness import Harness
 from orchestrator.scheduler import ProvenanceValidationRejection, Scheduler, TaskAssignment
+from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import WorkflowOutcome
 
 # Repo root of this worktree: <root>/orchestrator/tests/<this file> -> <root>.
@@ -271,7 +272,7 @@ async def _dispatch(h: Harness, task_id: str):
     task = await h.scheduler.get_task(str(task_id))
     assert task is not None
     assignment = _make_assignment(task)
-    return await h._run_slot(assignment, asyncio.Semaphore(1))
+    return await h._run_slot(assignment, SlotLease(assignment.task_id, h.scheduler, asyncio.Semaphore(1)))
 
 
 # ---------------------------------------------------------------------------
