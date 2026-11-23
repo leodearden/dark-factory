@@ -32,6 +32,7 @@ from shared.async_sqlite_base import (
     connect_daemon,
 )
 from shared.sqlite_column_migration import add_column_if_missing
+from shared.write_queue_statuses import CLAIMABLE
 
 from fused_memory.services.queued_writes import (
     QueueCallback,
@@ -261,10 +262,7 @@ POST_EXECUTE_DEAD_PREFIX = (
     'post-execute failure (the backend write LANDED; do not blind-replay): '
 )
 
-#: The rows the queue still owes a write: a worker claims each once its
-#: ``next_retry_at`` is due.
-CLAIMABLE_STATUSES: tuple[str, ...] = ('pending', 'retry', 'parked')
-_CLAIMABLE_SQL = 'status IN ({})'.format(', '.join(f"'{s}'" for s in CLAIMABLE_STATUSES))
+_CLAIMABLE_SQL = 'status IN ({})'.format(', '.join(f"'{s}'" for s in CLAIMABLE))
 
 
 class DurableWriteQueue:
