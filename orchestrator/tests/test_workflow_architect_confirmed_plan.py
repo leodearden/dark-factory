@@ -5,10 +5,14 @@ REAL ``invoke_with_cap_retry`` against a real ``plan.json``; only the agent
 subprocess (``invoke_agent``) and the usage gate are doubles.
 ``TestConfirmedPlanAndExitReportConflict`` scripts ``_invoke`` itself, so what
 the architect left on disk is the only input.
+``TestExitRoutingCoversEveryExitReport`` ties the exits the architect runner
+routes to the ``ExitReport`` set that conflict detection reads.
 """
 
 from __future__ import annotations
 
+import ast
+import inspect
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,6 +23,7 @@ from _recording_event_store import _RecordingEventStore
 from shared.testing import make_gate_mock
 
 from orchestrator.agents.invoke import AgentResult
+from orchestrator.architect_phase_verdict import ExitReport
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
@@ -200,17 +205,25 @@ class TestReDispatchAfterConfirmIsDeclined:
         assert calls[1] == 'BRIEF'
 
 
+def _architect_finished() -> AgentResult:
+    return AgentResult(success=True, output='done', cost_usd=1.2, turns=14, duration_ms=60_000)
+
+
 def _make_scripted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architect_run: Callable[[TaskArtifacts], None],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    architect_run: Callable[[TaskArtifacts], None],
+    *,
+    run_result: Callable[[], AgentResult] = _architect_finished,
 ) -> tuple[TaskWorkflow, AsyncMock]:
-    """A workflow whose ``_invoke`` runs *architect_run* against the real artifacts and succeeds, and its ``_mark_blocked``."""
+    """A workflow whose ``_invoke`` runs *architect_run* against the real artifacts and returns *run_result*, and its ``_mark_blocked``."""
     wf = _make_workflow(tmp_path, monkeypatch)
     artifacts = wf.artifacts
     assert artifacts is not None
 
     async def invoke(role, build_prompt, cwd, output_schema=None):
         architect_run(artifacts)
-        return AgentResult(success=True, output='done', cost_usd=1.2, turns=14, duration_ms=60_000)
+        return run_result()
 
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
     monkeypatch.setattr(wf, '_invoke', AsyncMock(side_effect=invoke))
@@ -297,3 +310,64 @@ class TestConfirmedPlanAndExitReportConflict:
 
         assert outcome is None
         mark_blocked.assert_not_awaited()
+
+    async def test_a_failed_run_that_confirmed_and_reported_is_salvaged_into_the_conflict(self, tmp_path, monkeypatch):
+        wf, mark_blocked = _make_scripted(
+            tmp_path, monkeypatch, _confirm_and(_unactionable), run_result=_cap_hit_fresh,
+        )
+
+        outcome = await wf._run_architect_for_plan(AsyncMock(return_value='BRIEF'))
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        _reason, kwargs = _only_block(mark_blocked)
+        assert kwargs['category'] == 'design_concern'
+        assert 'unactionable_task' in kwargs['detail']
+
+    async def test_the_conflict_stops_the_steward(self, tmp_path, monkeypatch):
+        wf, _mark_blocked = _make_scripted(tmp_path, monkeypatch, _confirm_and(_unactionable))
+        steward = MagicMock(stop=AsyncMock())
+        monkeypatch.setattr(wf, '_steward', steward)
+
+        await wf._run_architect_for_plan(AsyncMock(return_value='BRIEF'))
+
+        steward.stop.assert_awaited_once()
+        assert wf._steward is None
+
+    async def test_reports_survive_a_block_that_raises(self, tmp_path, monkeypatch):
+        wf, _mark_blocked = _make_scripted(tmp_path, monkeypatch, _confirm_and(_unactionable))
+        monkeypatch.setattr(wf, '_mark_blocked', AsyncMock(side_effect=RuntimeError('escalation queue down')))
+
+        with pytest.raises(RuntimeError, match='escalation queue down'):
+            await wf._run_architect_for_plan(AsyncMock(return_value='BRIEF'))
+
+        assert wf.artifacts is not None
+        assert wf.artifacts.read_unactionable_task() is not None
+
+
+def _exit_readers_routed_by_the_architect_runner() -> set[str]:
+    """The ``self.artifacts.read_*`` exit readers ``_run_architect_for_plan`` routes on, itself or through a ``self._route_*`` method."""
+    methods = {
+        node.name: node
+        for node in ast.walk(ast.parse(inspect.getsource(TaskWorkflow)))
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    runner = methods['_run_architect_for_plan']
+    routers = {
+        node.attr for node in ast.walk(runner)
+        if isinstance(node, ast.Attribute) and node.attr.startswith('_route_')
+    }
+    return {
+        node.attr
+        for method in (runner, *(methods[name] for name in routers))
+        for node in ast.walk(method)
+        if isinstance(node, ast.Attribute)
+        and node.attr.startswith('read_')
+        and not node.attr.startswith('read_plan')
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == 'artifacts'
+    }
+
+
+class TestExitRoutingCoversEveryExitReport:
+    def test_every_routed_exit_is_an_exit_report(self):
+        assert _exit_readers_routed_by_the_architect_runner() == {f'read_{report.value}' for report in ExitReport}
