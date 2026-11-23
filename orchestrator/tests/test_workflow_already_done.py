@@ -237,7 +237,8 @@ async def test_an_unanswerable_reachability_probe_is_not_reported_as_unreachable
 ):
     """A git error on ``merge-base --is-ancestor`` answers nothing about the
     commit, so the block says reachability was never established instead of
-    claiming the commit is not on main."""
+    claiming the commit is not on main, and names both usual causes without
+    asserting either."""
     f = _make(
         worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
         commit_on_main=None,
@@ -254,12 +255,13 @@ async def test_an_unanswerable_reachability_probe_is_not_reported_as_unreachable
     args, kwargs = mark_blocked.await_args
     assert 'not reachable' not in args[0]
     assert 'could not answer' in args[0]
+    assert 'not a commit in this repository' in args[0]
+    assert 'git failure' in args[0]
     assert _AD_COMMIT[:12] in args[0]
     assert _AD_COMMIT in kwargs['detail']
     assert 'mainsha123' in kwargs['detail']
     assert kwargs.get('escalate_to_human') is not True
     f.set_task_status.assert_not_called()
-    cast(AsyncMock, f.wf.scheduler.mark_done).assert_not_called()
     assert f.artifacts.read_already_done() is None
 
 

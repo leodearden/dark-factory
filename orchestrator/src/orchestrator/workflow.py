@@ -7996,26 +7996,24 @@ class TaskWorkflow:
 
         main_sha = await self.git_ops.get_main_sha()
         on_main = await self.git_ops.is_ancestor_checked(commit, main_sha)
+        reachability_detail = (
+            f'commit: {commit}\nmain_sha: {main_sha}\nevidence: {evidence}'
+        )[:2000]
         if on_main is None:
             return await self._mark_blocked(
                 f'Architect reported task already done at {commit[:12]} '
                 f'but git could not answer whether that commit is reachable '
-                f'from main (merge-base --is-ancestor errored), so '
-                f'reachability was never established',
-                detail=(
-                    f'commit: {commit}\nmain_sha: {main_sha}\n'
-                    f'evidence: {evidence}'
-                )[:2000],
+                f'from main (merge-base --is-ancestor errored; usually the '
+                f'sha is not a commit in this repository, otherwise a git '
+                f'failure), so reachability was never established',
+                detail=reachability_detail,
                 merge_phase=merge_phase,
             )
         if not on_main:
             return await self._mark_blocked(
                 f'Architect reported task already done at {commit[:12]} '
                 f'but commit is not reachable from main',
-                detail=(
-                    f'commit: {commit}\nmain_sha: {main_sha}\n'
-                    f'evidence: {evidence}'
-                )[:2000],
+                detail=reachability_detail,
                 merge_phase=merge_phase,
             )
 
