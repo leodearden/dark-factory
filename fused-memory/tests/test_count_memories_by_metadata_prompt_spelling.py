@@ -7,38 +7,36 @@ the stage2_suppress gate fails open. Pins the call spelling an LLM would copy.
 
 from __future__ import annotations
 
-import re
-
 import pytest
+from _count_call_spelling import non_keyword_count_calls
+from _recon_prompt_write_scope import recon_system_prompts
 
-from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import (
     STAGE2_SYSTEM_PROMPT,
     build_stage2_system_prompt,
 )
-from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 
-_STAGE_PROMPTS = {
-    'STAGE1_SYSTEM_PROMPT': STAGE1_SYSTEM_PROMPT,
-    'STAGE2_SYSTEM_PROMPT': STAGE2_SYSTEM_PROMPT,
-    "build_stage2_system_prompt('dark_factory')": build_stage2_system_prompt('dark_factory'),
-    'STAGE3_SYSTEM_PROMPT': STAGE3_SYSTEM_PROMPT,
-}
+_PROMPTS = recon_system_prompts()
 
-_CALL_OPENING = re.compile(r'count_memories_by_metadata\(')
-_KEYWORD_CALL = re.compile(r'count_memories_by_metadata\(project_id=[^,()]*,\s*filters=')
+_KEYWORD_SUPPRESS_GATE = (
+    "count_memories_by_metadata(project_id=..., "
+    "filters={'task_id': str(task_id), 'stage2_suppress': True})"
+)
 
 
-@pytest.mark.parametrize('name', list(_STAGE_PROMPTS))
+@pytest.mark.parametrize('name', sorted(_PROMPTS))
 def test_every_count_call_uses_keyword_filters(name: str) -> None:
-    prompt = _STAGE_PROMPTS[name]
-    openings = len(_CALL_OPENING.findall(prompt))
-    keyword_calls = len(_KEYWORD_CALL.findall(prompt))
-    assert keyword_calls == openings, (
-        f'{name}: {openings - keyword_calls} count_memories_by_metadata call(s) '
-        'not spelled `project_id=..., filters=...`'
+    offending = non_keyword_count_calls(_PROMPTS[name])
+    assert offending == [], (
+        f'{name}: count_memories_by_metadata call(s) not spelled '
+        f'`project_id=..., filters=...`: {offending}'
     )
 
 
-def test_stage2_spells_the_gate_in_each_rule() -> None:
-    assert len(_KEYWORD_CALL.findall(STAGE2_SYSTEM_PROMPT)) == 3
+@pytest.mark.parametrize(
+    'prompt',
+    [STAGE2_SYSTEM_PROMPT, build_stage2_system_prompt('dark_factory')],
+    ids=['STAGE2_SYSTEM_PROMPT', "build_stage2_system_prompt('dark_factory')"],
+)
+def test_stage2_carries_the_keyword_suppress_gate(prompt: str) -> None:
+    assert _KEYWORD_SUPPRESS_GATE in prompt
