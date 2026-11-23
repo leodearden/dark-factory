@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Nest the legacy top-level infra-resume counters under ``metadata.retry_ledger``.
 
-One-shot for task 7135. Some stored task blobs still carry
+One-shot for task 7135. Some stored task blobs carried
 ``consecutive_infra_resume_failures`` and ``last_infra_resume_iteration_count``
-at the TOP level, and ``shared.task_metadata`` lifts them into ``retry_ledger``
-at parse time. This script moves them in storage with the lift's own semantics
-(a nested value wins and the shadowed top-level copy is dropped; a non-dict
-ledger is refused), so every migrated blob parses to the ``RetryLedger`` its
-readers already see and the lift can be deleted. A null counter carries no
-information and ``RetryLedger`` rejects it, so it is dropped, not nested
-(ruling esc-7135-5, reify #4880).
+at the TOP level, which ``shared.task_metadata`` lifted into ``retry_ledger`` at
+parse time until task 7135 retired the lift once this script had migrated every
+store. A top-level counter left behind now parses as an unknown key that no
+``RetryLedger`` reader sees. This script moves them in storage with the retired
+lift's semantics (a nested value wins and the shadowed top-level copy is
+dropped; a non-dict ledger is refused). A null counter carries no information
+and ``RetryLedger`` rejects it, so it is dropped, not nested (ruling
+esc-7135-5, reify #4880).
 
 It talks to the running fused-memory MCP server: targets come from
 ``find_tasks_by_metadata``, each raw blob from ``get_task``, and each write is
@@ -37,21 +38,17 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from shared.mcp_envelope import write_failure_reason
+from shared.toolcall_markup import MARKUP_OVERRIDE_KEY
 
+from fused_memory.backends.sqlite_task_backend import (
+    _MACHINE_AUTHORED_METADATA_KEYS,
+    _RESERVED_METADATA_CONTROL_KEYS,
+)
 from fused_memory.utils.script_loader import load_script
 
 DEFAULT_SERVER = 'http://127.0.0.1:8002'
 COUNTER_KEYS = ('consecutive_infra_resume_failures', 'last_infra_resume_iteration_count')
-# update_task strips these from every incoming payload, so a replace cannot
-# keep them: fused-memory/src/fused_memory/backends/sqlite_task_backend.py::
-# _RESERVED_METADATA_CONTROL_KEYS and ::_MACHINE_AUTHORED_METADATA_KEYS.
-REPLACE_STRIPPED_KEYS = frozenset(
-    {'append', 'metadata_mode', 'pending_since', 'pending_since_backfilled'},
-)
-# Some stored blobs already quote MCP markup; a replace echoes them back, so the
-# markup guard must be told it is deliberate. The server strips the flag before
-# the write (fused-memory/src/fused_memory/server/tools.py::update_task).
-MARKUP_OVERRIDE = 'allow_mcp_markup'
+REPLACE_STRIPPED_KEYS = _RESERVED_METADATA_CONTROL_KEYS | _MACHINE_AUTHORED_METADATA_KEYS
 
 
 class ToolClient(Protocol):
@@ -116,10 +113,11 @@ def nest_counters(meta: dict) -> NestingPlan | None:
 
 
 def build_update_payload(task_id: str, project_root: str, meta: dict) -> dict:
+    """A metadata-only replace that marks the echoed blob's quoted MCP markup as deliberate."""
     return {
         'id': task_id,
         'project_root': project_root,
-        'metadata': json.dumps({**meta, MARKUP_OVERRIDE: True}),
+        'metadata': json.dumps({**meta, MARKUP_OVERRIDE_KEY: True}),
         'metadata_mode': 'replace',
     }
 

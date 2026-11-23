@@ -1,8 +1,8 @@
 """Tests for ``scripts/nest_legacy_retry_ledger_counters.py`` (task 7135).
 
-The script moves the two legacy top-level infra-resume counters under
-``metadata.retry_ledger`` in the stored blobs, so the parse-time lift in
-``shared.task_metadata`` can be deleted. It is driven here only through its
+The script moved the two legacy top-level infra-resume counters under
+``metadata.retry_ledger`` in the stored blobs, so task 7135 could retire the
+parse-time lift in ``shared.task_metadata``. It is driven here only through its
 public seams: the pure transform, the payload builder, and ``run`` over an
 MCP-shaped adapter whose tools are a REAL started ``SqliteTaskBackend`` — the
 raw storage, the whole-blob replace and the metadata-lookup paging are the
