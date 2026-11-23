@@ -11,6 +11,14 @@ A second ``sem.release()`` would silently widen ``max_concurrent_tasks`` for the
 rest of the run; a second ``scheduler.release`` after a re-dispatch would drop
 the new dispatch's locks.
 
+A slot may also run on a borrowed permit: :meth:`SlotLease.lend` builds a lease
+that takes no permit and names its lender. When the lender is released while
+its borrower runs, the lender's permit passes to the borrower instead of going
+back to the pool; a borrower that ends first returns nothing. The rules are
+``plans/early-start-on-predecessor-branch-prd.md`` section 5.3 "Slot" and
+invariant 4. :meth:`SlotLease.wait_released` is the slot-ended signal, set once
+the locks are released and the permit is handed over or returned.
+
 :func:`suspended_slot_tasks`, :func:`culprit` and :func:`wedged_slot_escalation`
 build that force-release's loud signal: which await of which task holds the slot,
 and the L1 a human reads.
@@ -19,6 +27,7 @@ and the L1 a human reads.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from dataclasses import dataclass
 from typing import Protocol
@@ -28,6 +37,7 @@ from escalation.models import Escalation
 
 __all__ = [
     'SlotLease',
+    'SlotLendingError',
     'SuspendedTask',
     'await_chain',
     'culprit',
@@ -36,29 +46,94 @@ __all__ = [
 ]
 
 
+logger = logging.getLogger(__name__)
+
+
 class _LockReleaser(Protocol):
     def release(self, task_id: str, *, requeued: bool = ...) -> None: ...
 
 
+class SlotLendingError(RuntimeError):
+    """A lend the slot rules refuse: the lender is released, holds no permit, or already lends."""
+
+
 class SlotLease:
-    """The release obligations of one ``_run_slot`` invocation."""
+    """The release obligations of one slot: its module locks, and the permit it holds or borrows."""
 
     def __init__(self, task_id: str, scheduler: _LockReleaser, sem: asyncio.Semaphore) -> None:
+        self._bind(task_id, scheduler, permit=sem, lender=None)
+
+    def _bind(
+        self,
+        task_id: str,
+        scheduler: _LockReleaser,
+        *,
+        permit: asyncio.Semaphore | None,
+        lender: SlotLease | None,
+    ) -> None:
         self._task_id = task_id
         self._scheduler = scheduler
-        self._sem = sem
+        self._permit = permit
+        self._lender = lender
+        self._borrower: SlotLease | None = None
         self._released = False
+        self._released_event = asyncio.Event()
+
+    @property
+    def task_id(self) -> str:
+        return self._task_id
+
+    @property
+    def lender(self) -> SlotLease | None:
+        """The lease this one borrowed from; still set after it inherits the lender's permit."""
+        return self._lender
+
+    @property
+    def borrower(self) -> SlotLease | None:
+        """The live lease borrowing this one's permit, if any."""
+        return self._borrower
+
+    @property
+    def holds_permit(self) -> bool:
+        return self._permit is not None
 
     @property
     def released(self) -> bool:
         return self._released
 
+    def lend(self, task_id: str) -> SlotLease:
+        """A lease for *task_id* that takes no permit and inherits this one's when this one is released."""
+        rule = self._broken_lending_rule()
+        if rule is not None:
+            raise SlotLendingError(
+                f'slot lending refused: task {self._task_id} cannot lend to task {task_id}: {rule}',
+            )
+        borrower = SlotLease.__new__(SlotLease)
+        borrower._bind(task_id, self._scheduler, permit=None, lender=self)
+        self._borrower = borrower
+        return borrower
+
+    def _broken_lending_rule(self) -> str | None:
+        if self._released:
+            return 'the lender is already released'
+        if self._borrower is not None:
+            return f'the lender already lends to live borrower task {self._borrower._task_id}'
+        if self._permit is None:
+            return 'the lender holds no permit of its own; a borrower lends only after it inherits'
+        return None
+
+    async def wait_released(self) -> None:
+        """Return once this lease is released: its locks freed and its permit handed over or returned."""
+        await self._released_event.wait()
+
     def release(self, *, requeued: bool) -> bool:
-        """Release the slot's module locks, then its semaphore permit; False on a repeat.
+        """Release the slot's module locks, give back its permit, then signal; False on a repeat.
 
         *requeued* arms the scheduler's requeue cooldown, as
-        ``scheduler.py::Scheduler.release`` documents. The permit is returned
-        even if the lock release raises.
+        ``scheduler.py::Scheduler.release`` documents. A held permit passes to
+        a live borrower, otherwise back to its pool; a borrower that never
+        inherited gives nothing back. Each step runs even if the one before
+        raises.
         """
         if self._released:
             return False
@@ -66,8 +141,23 @@ class SlotLease:
         try:
             self._scheduler.release(self._task_id, requeued=requeued)
         finally:
-            self._sem.release()
+            try:
+                self._give_back_permit()
+            finally:
+                self._released_event.set()
         return True
+
+    def _give_back_permit(self) -> None:
+        permit, self._permit = self._permit, None
+        borrower, self._borrower = self._borrower, None
+        if permit is None:
+            if self._lender is not None and self._lender._borrower is self:
+                self._lender._borrower = None
+        elif borrower is not None:
+            borrower._permit = permit
+            logger.info("task %s's slot ended; its permit passes to borrower %s", self._task_id, borrower._task_id)
+        else:
+            permit.release()
 
 
 def await_chain(task: asyncio.Task) -> tuple[str, ...]:
