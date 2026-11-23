@@ -8777,8 +8777,9 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
                     parts.append(fragment)
         summary = 'All checks passed' if passed else f'Failures: {_SUMMARY_FRAGMENT_SEPARATOR.join(parts)}'
 
-    # Collect cause_hint from failing child results; join with ' | '.
-    cause_hint = ' | '.join(r.cause_hint for r in results if r.cause_hint)
+    # A failing verdict joins only its failing children's hints, so replay
+    # provenance on a passing child never enters a failure signature.
+    cause_hint = ' | '.join(r.cause_hint for r in (results if passed else failing) if r.cause_hint)
 
     # Pick the worst child category by priority.
     # Empty string is filtered out to avoid pulling the aggregate to '' when
@@ -9552,8 +9553,11 @@ async def _run_executed(executed: Sequence[ModuleConfig | None], run: ModuleRun)
 
 
 async def _run_unreplayed(replay: ReplayPlan, run: ModuleRun, mc: ModuleConfig | None) -> VerifyResult:
-    """*mc* run without its replayed legs, its cause_hint naming each replay after its own;
-    a cache-hit verdict when every leg replays."""
+    """*mc* run without its replayed legs; a cache-hit verdict when every leg replays.
+
+    A passing run's cause_hint names each replay after its own; a failing run's
+    stays what a cache-free run would give, since readers key failures on it.
+    """
     if mc is None:
         return await run(None)
     replayed = replay.replayed(mc.prefix)
@@ -9561,6 +9565,8 @@ async def _run_unreplayed(replay: ReplayPlan, run: ModuleRun, mc: ModuleConfig |
     if remaining is None:
         return _cache_hit_result(replay, replayed)
     result = await run(remaining)
+    if not result.passed:
+        return result
     hints = (result.cause_hint, _replay_hint(replayed))
     return replace(result, cause_hint=' | '.join(hint for hint in hints if hint))
 

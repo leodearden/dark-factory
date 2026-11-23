@@ -135,6 +135,31 @@ class TestFanOutSeam:
             assert _replay_hint(unit_id, recorded[unit_id]) in result.cause_hint
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('alpha_partly', [False, True], ids=['alpha-wholly-replayed', 'alpha-partly-replayed'])
+    async def test_a_red_verdict_keeps_the_cause_hint_a_cache_free_run_gives(
+        self, repo, access, registry, markers, alpha_partly,
+    ):
+        commit_edit(repo, 'lint/alpha.cfg', 'strict = true\n')
+        alpha = dataclasses.replace(
+            cache_module('alpha', markers), lint_command=f'echo alpha:lint >> {markers} && cat lint/alpha.cfg',
+        )
+        modules = [alpha, cache_module('beta', markers)]
+        config = cache_config(repo)
+        await record_run(registry, await merge_gate(repo, config, modules, access))
+        if alpha_partly:
+            commit_edit(repo, 'lint/alpha.cfg', 'strict = false\n')
+        commit_edit(repo, 'beta/tests/test_beta.py', 'def test_beta():\n    assert False\n')
+
+        result = await merge_gate(repo, config, modules, access)
+        cache_free = await merge_gate(repo, config, modules, None)
+
+        assert not result.passed and not cache_free.passed
+        assert UnitOutcome.CACHE_HIT in set(outcomes_of(result, module_units('alpha')))
+        assert result.category == cache_free.category
+        assert result.cause_hint == cache_free.cause_hint
+        assert 'replayed' not in result.cause_hint
+
+    @pytest.mark.asyncio
     async def test_a_wholly_replayed_module_reads_as_a_cache_hit_not_a_run(
         self, repo, modules, access, registry, markers,
     ):
