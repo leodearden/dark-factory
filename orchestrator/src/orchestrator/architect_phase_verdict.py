@@ -7,25 +7,25 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
+from typing import TypeGuard
 
 from orchestrator.artifacts import Plan, PlanState, TaskArtifacts
 
 _DETAIL_LIMIT = 2000
 _TRUNCATED = '…'
+_CONFIRMED_STATES = frozenset({PlanState.CONFIRMED, PlanState.STAMPED})
 
 
-def confirmed_at(plan: Mapping[str, object]) -> str | None:
-    """The confirm stamp of *plan*; None unless its typed lifecycle reads confirmed or stamped."""
-    parsed = Plan.from_json(plan)
-    if parsed.state in (PlanState.CONFIRMED, PlanState.STAMPED):
-        return parsed.lifecycle.confirmed_at
-    return None
+def is_confirmed(plan: Plan | None) -> TypeGuard[Plan]:
+    """Whether *plan* has steps and its typed lifecycle reads confirmed or stamped."""
+    return plan is not None and plan.state in _CONFIRMED_STATES
 
 
-def confirmed_since(plan: Mapping[str, object], marker: str | None) -> bool:
-    """Whether *plan* is confirmed with a stamp other than *marker*."""
-    stamp = confirmed_at(plan)
-    return stamp is not None and stamp != marker
+def newly_confirmed(plan: Plan | None, before: Plan | None) -> TypeGuard[Plan]:
+    """Whether *plan* is confirmed and carries a confirmation *before*, the plan as it was earlier (None if absent), did not."""
+    if not is_confirmed(plan):
+        return False
+    return before is None or plan.confirmed_since(before)
 
 
 class ExitReport(StrEnum):
@@ -68,30 +68,43 @@ def clear_exit_reports(artifacts: TaskArtifacts, reports: Iterable[ExitReport]) 
 class PlanExitConflict:
     """One architect phase both confirmed a plan and wrote exit reports: two verdicts that need a ruling."""
 
-    confirmed_at: str
-    step_count: int
+    plan: Plan
     reports: Mapping[ExitReport, Mapping]
 
     def summary(self) -> str:
         kinds = ', '.join(report.value for report in self.reports)
         return (
             f'Conflicting architect verdicts: exit report(s) {kinds} written, '
-            f'yet the same phase confirmed a {self.step_count}-step plan'
+            f'yet the same phase confirmed a {len(self.plan.steps)}-step plan'
         )
 
     def detail(self) -> str:
+        """Both verdicts within the detail budget: every report quoted, and the plan's steps, since plan.json may not outlive the ruling."""
         header = (
-            f'The architect phase confirmed a {self.step_count}-step plan (_finalized_at {self.confirmed_at}) '
-            f'and also wrote {len(self.reports)} exit report(s), quoted below.'
+            f'The architect phase confirmed a {len(self.plan.steps)}-step plan '
+            f'(_finalized_at {self.plan.lifecycle.confirmed_at}) and also wrote '
+            f'{len(self.reports)} exit report(s).'
         )
-        labels = [f'{report.value}: ' for report in self.reports]
-        room = _DETAIL_LIMIT - len(header) - sum(len(label) + 1 for label in labels)
-        per_report = max(room // max(len(labels), 1), 0)
-        lines = [
-            label + _truncated(json.dumps(dict(payload), ensure_ascii=False, default=str), per_report)
-            for label, payload in zip(labels, self.reports.values(), strict=True)
+        report_lines = [
+            f'{report.value}: {json.dumps(dict(payload), ensure_ascii=False, default=str)}'
+            for report, payload in self.reports.items()
         ]
-        return '\n'.join([header, *lines])[:_DETAIL_LIMIT]
+        step_lines = [
+            f"{step.get('id')}: {' '.join(str(step.get('description', '')).split())}" for step in self.plan.steps
+        ]
+        headings = ('Exit reports:', 'Confirmed plan steps:')
+        room = _DETAIL_LIMIT - len(header) - sum(len(heading) + 1 for heading in headings) - 1
+        reports = _fitted(report_lines, room - min(len('\n'.join(step_lines)), room // 2))
+        steps = _fitted(step_lines, room - len('\n'.join(reports)))
+        return '\n'.join([header, headings[0], *reports, headings[1], *steps])[:_DETAIL_LIMIT]
+
+
+def _fitted(lines: list[str], budget: int) -> list[str]:
+    """*lines*, each cut to an equal share of *budget* characters, the newlines joining them included."""
+    if not lines:
+        return []
+    share = max(budget // len(lines) - 1, 0)
+    return [_truncated(line, share) for line in lines]
 
 
 def _truncated(text: str, limit: int) -> str:
@@ -101,14 +114,9 @@ def _truncated(text: str, limit: int) -> str:
 
 
 def find_plan_exit_conflict(
-    plan: Mapping[str, object], phase_marker: str | None, reports: Mapping[ExitReport, Mapping],
+    plan: Plan | None, before: Plan | None, reports: Mapping[ExitReport, Mapping],
 ) -> PlanExitConflict | None:
-    """The conflict when *plan* was confirmed since *phase_marker* and *reports* is non-empty, else None."""
-    stamp = confirmed_at(plan)
-    if not reports or stamp is None or stamp == phase_marker:
+    """The conflict when *plan* is newly confirmed since *before* and *reports* is non-empty, else None."""
+    if not reports or not newly_confirmed(plan, before):
         return None
-    return PlanExitConflict(
-        confirmed_at=stamp,
-        step_count=len(Plan.from_json(plan).steps),
-        reports=MappingProxyType(dict(reports)),
-    )
+    return PlanExitConflict(plan=plan, reports=MappingProxyType(dict(reports)))

@@ -11,12 +11,12 @@ from orchestrator.architect_phase_verdict import (
     ExitReport,
     PlanExitConflict,
     clear_exit_reports,
-    confirmed_at,
-    confirmed_since,
     find_plan_exit_conflict,
+    is_confirmed,
+    newly_confirmed,
     read_exit_reports,
 )
-from orchestrator.artifacts import TaskArtifacts
+from orchestrator.artifacts import Plan, TaskArtifacts
 
 T0 = '2026-11-23T10:00:00+00:00'
 T1 = '2026-11-23T11:00:00+00:00'
@@ -25,6 +25,13 @@ STEPS = [{'id': 'step-1', 'type': 'impl', 'description': 'do it', 'status': 'pen
 
 def _confirmed_plan(stamp: str = T0) -> dict:
     return {'title': 't', 'files': ['a.py'], 'steps': list(STEPS), '_finalized_at': stamp}
+
+
+def _model(document: dict) -> Plan:
+    return Plan.from_json(document)
+
+
+UNCONFIRMED = _model({'title': 't', 'steps': list(STEPS)})
 
 
 @pytest.fixture
@@ -43,32 +50,37 @@ _WRITERS: dict[ExitReport, Callable[[TaskArtifacts], None]] = {
 }
 
 
-class TestConfirmedAt:
+class TestIsConfirmed:
     @pytest.mark.parametrize('plan', [
-        {},
-        {'title': 't', 'steps': [], '_finalized_at': T0},
-        {'title': 't', 'steps': list(STEPS)},
-    ], ids=['empty', 'no-steps', 'unconfirmed'])
-    def test_none_for_a_plan_not_confirmed(self, plan: dict) -> None:
-        assert confirmed_at(plan) is None
+        None,
+        _model({}),
+        _model({'title': 't', 'steps': [], '_finalized_at': T0}),
+        UNCONFIRMED,
+    ], ids=['absent', 'empty', 'no-steps', 'unconfirmed'])
+    def test_false_for_a_plan_not_confirmed(self, plan: Plan | None) -> None:
+        assert is_confirmed(plan) is False
 
-    def test_stamp_of_a_confirmed_plan(self) -> None:
-        assert confirmed_at(_confirmed_plan()) == T0
+    @pytest.mark.parametrize('document', [
+        _confirmed_plan(),
+        {**_confirmed_plan(), '_session_id': '6814-abc'},
+    ], ids=['confirmed', 'stamped'])
+    def test_true_for_a_confirmed_or_stamped_plan(self, document: dict) -> None:
+        assert is_confirmed(_model(document)) is True
 
-    def test_stamp_of_a_stamped_plan(self) -> None:
-        assert confirmed_at({**_confirmed_plan(), '_session_id': '6814-abc'}) == T0
 
+class TestNewlyConfirmed:
+    @pytest.mark.parametrize('plan', [None, UNCONFIRMED], ids=['absent', 'unconfirmed'])
+    def test_false_when_not_confirmed(self, plan: Plan | None) -> None:
+        assert newly_confirmed(plan, None) is False
 
-class TestConfirmedSince:
-    def test_false_when_unconfirmed(self) -> None:
-        assert confirmed_since({'steps': list(STEPS)}, None) is False
+    def test_false_when_the_earlier_plan_carried_the_same_stamp(self) -> None:
+        assert newly_confirmed(_model(_confirmed_plan(T0)), _model(_confirmed_plan(T0))) is False
 
-    def test_false_when_stamp_equals_marker(self) -> None:
-        assert confirmed_since(_confirmed_plan(T0), T0) is False
-
-    @pytest.mark.parametrize('marker', [None, T0], ids=['no-marker', 'other-stamp'])
-    def test_true_when_confirmed_with_a_new_stamp(self, marker: str | None) -> None:
-        assert confirmed_since(_confirmed_plan(T1), marker) is True
+    @pytest.mark.parametrize('before', [
+        None, UNCONFIRMED, _model(_confirmed_plan(T0)),
+    ], ids=['absent', 'unconfirmed', 'other-stamp'])
+    def test_true_when_confirmed_with_a_new_stamp(self, before: Plan | None) -> None:
+        assert newly_confirmed(_model(_confirmed_plan(T1)), before) is True
 
 
 class TestReadExitReports:
@@ -84,10 +96,8 @@ class TestReadExitReports:
         assert list(reports) == [report]
         assert reports[report] == getattr(artifacts, f'read_{report.value}')()
 
-    def test_member_values(self) -> None:
-        assert {r.value for r in ExitReport} == {
-            'unactionable_task', 'false_premise', 'already_done', 'ready_to_merge', 'blocking_dependency',
-        }
+    def test_every_member_has_a_writer(self) -> None:
+        assert set(_WRITERS) == set(ExitReport)
 
 
 class TestFindPlanExitConflict:
@@ -98,27 +108,27 @@ class TestFindPlanExitConflict:
         }
 
     def test_none_without_reports(self) -> None:
-        assert find_plan_exit_conflict(_confirmed_plan(T1), None, {}) is None
+        assert find_plan_exit_conflict(_model(_confirmed_plan(T1)), None, {}) is None
 
-    @pytest.mark.parametrize('plan,marker', [
-        ({'steps': list(STEPS)}, None),
-        (_confirmed_plan(T0), T0),
+    @pytest.mark.parametrize('plan,before', [
+        (UNCONFIRMED, None),
+        (_model(_confirmed_plan(T0)), _model(_confirmed_plan(T0))),
     ], ids=['unconfirmed', 'confirmed-before-phase'])
-    def test_none_when_not_confirmed_since_marker(self, plan: dict, marker: str | None) -> None:
-        assert find_plan_exit_conflict(plan, marker, self._reports()) is None
+    def test_none_when_not_newly_confirmed(self, plan: Plan, before: Plan | None) -> None:
+        assert find_plan_exit_conflict(plan, before, self._reports()) is None
 
     def test_conflict_carries_both_sides(self) -> None:
         reports = self._reports()
+        plan = _model(_confirmed_plan(T1))
 
-        conflict = find_plan_exit_conflict(_confirmed_plan(T1), T0, reports)
+        conflict = find_plan_exit_conflict(plan, _model(_confirmed_plan(T0)), reports)
 
         assert isinstance(conflict, PlanExitConflict)
-        assert conflict.confirmed_at == T1
-        assert conflict.step_count == len(STEPS)
+        assert conflict.plan == plan
         assert dict(conflict.reports) == reports
 
-    def test_summary_and_detail_name_every_report_and_the_stamp(self) -> None:
-        conflict = find_plan_exit_conflict(_confirmed_plan(T1), None, self._reports())
+    def test_summary_and_detail_name_every_report_and_the_plan(self) -> None:
+        conflict = find_plan_exit_conflict(_model(_confirmed_plan(T1)), None, self._reports())
         assert conflict is not None
 
         summary, detail = conflict.summary(), conflict.detail()
@@ -127,14 +137,16 @@ class TestFindPlanExitConflict:
             assert 'unactionable_task' in text
             assert 'blocking_dependency' in text
         assert T1 in detail
+        assert 'step-1: do it' in detail
         assert '\n' not in summary
         assert len(summary) < 200
         assert len(detail) <= 2000
 
-    def test_detail_stays_bounded_for_huge_payloads(self) -> None:
+    def test_detail_stays_bounded_for_huge_payloads_and_plans(self) -> None:
         reports = {r: {'evidence': 'x' * 5000} for r in ExitReport}
+        steps = [{'id': f'step-{n}', 'description': 'y' * 3000} for n in range(1, 21)]
 
-        conflict = find_plan_exit_conflict(_confirmed_plan(T1), None, reports)
+        conflict = find_plan_exit_conflict(_model({'steps': steps, '_finalized_at': T1}), None, reports)
         assert conflict is not None
 
         detail = conflict.detail()
@@ -142,6 +154,8 @@ class TestFindPlanExitConflict:
         assert T1 in detail
         for report in ExitReport:
             assert report.value in detail
+        for step in steps:
+            assert f"{step['id']}: " in detail
 
 
 class TestClearExitReports:
