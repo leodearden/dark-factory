@@ -364,8 +364,8 @@ class TestIsProxiedEndpoint:
 
     def test_runner_uses_the_metrics_singleton(self):
         """Identity, not mere equality — a re-declared local copy in runner.py
-        (the price-table seeding site) would fail this, mirroring
-        ``TestCostPrimitivesSingleHome``'s pin on the cost primitives."""
+        (the price-table seeding site) would fail this. It is the same single-home
+        rule ``TestCostFormulaSingleHome`` holds for the cost formula."""
         from orchestrator.evals import metrics, runner
 
         assert runner.is_proxied_endpoint is metrics.is_proxied_endpoint
@@ -551,26 +551,23 @@ class TestBlendComposite:
         ) == pytest.approx(0.94, abs=1e-4)
 
 
-# ---------------------------------------------------------------------------
-# Amendment (reviewer: code-reuse) — the cost primitives (_FALLBACK_PRICE / _rate)
-# have a SINGLE home in agents.invoke; metrics re-exports rather than
-# re-declares them, so the copy cannot drift. These guards fail loudly if a
-# future edit reintroduces a local copy in metrics.py.
-# ---------------------------------------------------------------------------
+class TestCostFormulaSingleHome:
+    """The runtime estimator and the eval resolver price through ONE formula,
+    agents.token_pricing.price_tokens, so the two cannot drift apart again."""
 
-class TestCostPrimitivesSingleHome:
-    """metrics._FALLBACK_PRICE / metrics._rate must BE the invoke singletons
-    (identity, not mere equality) — a re-declared local copy would fail these.
-    """
+    @pytest.mark.parametrize('entry', [
+        {'input_per_1m': 1.40, 'output_per_1m': 4.40, 'cached_input_per_1m': 0.26},
+        {'input_per_1m': 1.40, 'output_per_1m': 4.40},
+    ], ids=['with_cached_rate', 'without_cached_rate'])
+    def test_estimate_cost_agrees_with_price_tokens(self, entry):
+        from orchestrator.agents.invoke import _estimate_cost
+        from orchestrator.agents.token_pricing import TokenUsage, price_tokens
 
-    def test_fallback_price_is_the_invoke_singleton(self):
-        from orchestrator.agents import invoke
-        from orchestrator.evals import metrics
+        uncached, cached, out = 1_193, 1_370_402, 12_537
 
-        assert metrics._FALLBACK_PRICE is invoke._FALLBACK_PRICE
+        estimated = _estimate_cost(
+            'm', uncached + cached, out, {'m': entry}, cached_input_tokens=cached,
+        )
 
-    def test_rate_accessor_is_the_invoke_singleton(self):
-        from orchestrator.agents import invoke
-        from orchestrator.evals import metrics
-
-        assert metrics._rate is invoke._rate
+        usage = TokenUsage(input_tokens=uncached, output_tokens=out, cache_read_tokens=cached)
+        assert estimated == price_tokens(entry, usage).cost_usd
