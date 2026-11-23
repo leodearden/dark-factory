@@ -36,6 +36,7 @@ import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 from laptop_battery_guard_fixtures import write_shims
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from socket_activation import socket_activated
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -170,8 +171,11 @@ def wait_for_http(url: str, deadline_secs: float = 15.0) -> None:
 def private_rclone(
     world: PrunerWorld, tmp_path: Path
 ) -> Iterator[tuple[subprocess.Popen[bytes], str, tuple[str, str]]]:
-    """A real rclone serving the pruner world's store on a private loopback port."""
-    port = free_port()
+    """A real rclone serving the pruner world's store on a private loopback port.
+
+    The test binds the port and hands it to rclone as a socket-activated
+    listener, so no other process can take it before rclone serves on it.
+    """
     auth = ("tester", "secret-for-tests")
     env = {
         **os.environ,
@@ -179,21 +183,17 @@ def private_rclone(
         "RCLONE_USER": auth[0],
         "RCLONE_PASS": auth[1],
     }
-    with (tmp_path / "rclone.log").open("wb") as log:
-        proc = subprocess.Popen(
-            ["rclone", "serve", "webdav", str(world.store), "--addr", f"127.0.0.1:{port}"],
+    with (
+        (tmp_path / "rclone.log").open("wb") as log,
+        socket_activated(
+            lambda port: ["rclone", "serve", "webdav", str(world.store), "--addr", f"127.0.0.1:{port}"],
             env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    try:
+            output=log,
+        ) as (proc, port),
+    ):
         base = f"http://127.0.0.1:{port}"
         wait_for_http(base + "/")
         yield proc, base, auth
-    finally:
-        proc.kill()
-        proc.wait(timeout=10)
 
 
 class TestPrune:
