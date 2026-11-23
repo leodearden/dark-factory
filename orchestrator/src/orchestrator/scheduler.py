@@ -102,6 +102,7 @@ from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.park_refusal import ParkRefusalEpisodes, is_park_refusal
 from orchestrator.pause_policy import PauseClass, PausePolicy, policy_for
 from orchestrator.pending_age import AnchorReading, read_pending_age
 from orchestrator.pin_reservation import (
@@ -113,6 +114,7 @@ from orchestrator.pin_reservation import (
     park_rank,
     pin_release_reason,
     priority_payload,
+    rank_payload,
 )
 from orchestrator.recovery_emission import (
     LeaveReason,
@@ -1658,6 +1660,9 @@ class Scheduler:
         # Per-pin pin_blocked cadence (task 6040): a pin's blocked episode
         # ends when it dispatches or leaves the pin queue.
         self._pin_blocked = PinBlockedLimiter()
+        # Per-candidate park_refused cadence (task 6328): an episode ends on a
+        # dispatch, a refusal by anything else, or leaving candidacy.
+        self._park_refusals = ParkRefusalEpisodes()
         # Per-tier cap bookkeeping: remember the effective priority of every
         # currently-dispatched task so acquire_next can count slots at-or-below
         # a candidate's tier without re-walking the full task graph.
@@ -4823,8 +4828,8 @@ class Scheduler:
 
         THE single place a dispatch settles fairness state, called for EVERY
         dispatch — pin loop and scored loop, top or not: the skip count,
-        blocked-install streak and ``pin_blocked`` episode (task 6040) are
-        dropped, and the task's own parks are
+        blocked-install streak, ``pin_blocked`` episode (task 6040) and
+        ``park_refused`` episode (task 6328) are dropped, and the task's own parks are
         consumed (``reservation_used``, plus ``reservation_restored`` for each
         shadow the clear exposes).  A running task's park would otherwise
         block the installs of every owner it outranks (INV-3) until release,
@@ -4835,6 +4840,7 @@ class Scheduler:
         self._skip_count.pop(task_id, None)
         self._streak_park_install_blocked.clear(task_id)
         self._pin_blocked.forget(task_id)
+        self._park_refusals.end(task_id)
         if not self.lock_table.has_parks(task_id):
             return
         source = self.lock_table.reservation_source(task_id)
@@ -5684,47 +5690,36 @@ class Scheduler:
         restart resets the cache.
 
         Those still-uncached fetches are further bounded by
-        ``config.delivered_checks.max_checks_per_tick`` — reusing the same
-        knob ``_compute_delivered_check_cache`` applies to check RUNS (a
-        *dedicated* cap would need a new ``config.py`` field, outside this
-        task's scheduler.py-only scope). A tick with more newly-missing
-        dep_ids than the budget fetches a deterministic (sorted) prefix and
-        logs one bounded WARNING naming how many were deferred — the
-        deferred ids are simply "needed" again next tick (they're never
-        negatively cached, and any id fetched this tick is cached and so
-        never recompetes for a future tick's budget), so this is fail-safe
-        deferral, not silent dropping. A deferred dep with no cached record
-        is named in ``ctx.deferred_terminal_deps``, and its dependents wait
-        (UNKNOWN on the scheduled-deploy arm) rather than fail open: after a
-        restart the cold cache needs ceil(terminal deps / budget) ticks to
-        warm, and a held self-deploy sorting late would otherwise release
-        its dependents on every one of them.
+        ``config.delivered_checks.max_record_fetches_per_tick``. A tick with
+        more candidates than the budget fetches a deterministic prefix (see
+        "Budget priority") and logs one bounded WARNING counting the
+        deferred ids by group. A deferred id is ``needed`` again next tick
+        (never negatively cached). Deferring a held record or a never-cached
+        dep is fail-safe: the held record is still served, and the
+        never-cached dep is named in ``ctx.deferred_terminal_deps`` so its
+        dependents wait (UNKNOWN on the scheduled-deploy arm). A deferred
+        checks-carrying re-validation is not served and fails open that
+        tick, like a failed fetch. Bound:
+        never-cached ids get max(1, budget - H) slots per tick, H being
+        that tick's held re-validations, so after a restart N of them are
+        all fetched within ceil(N / max(1, budget - H)) ticks (H the largest
+        over those ticks) while their fetches succeed. A fetched id is
+        cached and leaves the queue; one whose fetch fails competes again
+        every tick and, sorting early, keeps its slot.
 
-        Budget priority: a held scheduled-deploy re-validation goes first
-        of all, since only a fresh read can release its hold (a deferred
-        one is served from cache, see below). Then (task 2977,
-        reviewer_comprehensive performance amendment): genuinely-NEW
-        dep_ids (absent from
-        ``_terminal_dep_record_cache`` entirely — typically a dependent's
-        first-ever evaluation of that dep) are always ordered ahead of
-        already-warmed checks-carrying dep_ids up for re-validation, so a
-        busy tick's steady-state re-validation churn can never chronically
-        starve a brand-new dep out of the shared per-tick budget; each
-        group is independently sorted for determinism, and the deferral
-        WARNING breaks the count down by group. Re-validation demand is
-        also self-limiting: it is driven entirely by the ``needed`` set
-        above, which only includes deps of still-PENDING dependents, so
-        once every dependent gating on a given checks-carrying dep has
-        dispatched, that dep drops out of ``needed`` and re-validation of
-        it stops. A cheaper gate keyed on the observed ``main_sha``
-        (mirroring task 2975's cache key) was considered and rejected:
-        this task's target scenario is an operator correcting a DONE dep's
-        check descriptor IN PLACE AT A FIXED main SHA (task 2977
-        analysis), so a SHA-advancement gate would never observe that edit
-        — reintroducing the exact staleness bug (esc-2911) this task
-        closes — and ``main_sha`` is not even part of this phase's
-        ``TickContext`` today (it is resolved separately, and only, inside
-        ``_compute_delivered_check_cache``).
+        Budget priority: held scheduled-deploy re-validations first, since
+        only a fresh read releases a hold, but while any never-cached id
+        waits they take at most budget - 1 slots; the rest stay served from
+        cache, holds in place. Held ids recur every tick until the settler
+        releases them, so without that cap they would starve never-cached
+        ids forever once H >= budget. At budget 1 held re-validations wait
+        while any never-cached id waits, even one that never fetches (their
+        holds stay). Then never-cached ids, then checks-carrying
+        re-validations (task 2977), so re-validation churn never starves a
+        brand-new dep; each group is sorted independently. Re-validation is
+        self-limiting: only deps of still-PENDING dependents are ``needed``.
+        A ``main_sha``-keyed gate would never see an operator correcting a
+        DONE dep's check descriptor in place at a fixed SHA (esc-2911).
 
         Fetches are issued concurrently via ``asyncio.gather`` over
         ``self.get_task`` (the lean per-id fetch primitive), which already
@@ -5796,23 +5791,25 @@ class Scheduler:
 
             # See this method's "Budget priority" docstring paragraph. Each
             # group is sorted independently for determinism.
+            _budget = self.config.delivered_checks.max_record_fetches_per_tick
+            _held_cap = _budget - 1 if _new_to_fetch else _budget
             _ordered = (
-                sorted(_held_to_fetch) + sorted(_new_to_fetch) + sorted(_revalidate_to_fetch)
-            )
-            _budget = self.config.delivered_checks.max_checks_per_tick
-            if len(_ordered) > _budget:
-                _total = len(_ordered)
-                _deferred = set(_ordered[_budget:])
-                _ordered = _ordered[:_budget]
+                sorted(_held_to_fetch)[:_held_cap]
+                + sorted(_new_to_fetch)
+                + sorted(_revalidate_to_fetch)
+            )[:_budget]
+            _candidates = _held_to_fetch.union(_new_to_fetch, _revalidate_to_fetch)
+            _deferred = _candidates.difference(_ordered)
+            if _deferred:
                 ctx.deferred_terminal_deps = frozenset(_deferred.intersection(_new_to_fetch))
                 logger.warning(
                     'acquire_next: terminal dep record backfill has %d '
                     'dep(s) to fetch this tick (%d held, %d new, %d '
                     're-validation), exceeding '
-                    'delivered_checks.max_checks_per_tick (%d) — fetching '
+                    'delivered_checks.max_record_fetches_per_tick (%d) — fetching '
                     '%d, deferring %d (%d held, %d new, %d re-validation) '
                     'to a later tick.',
-                    _total, len(_held_to_fetch), len(_new_to_fetch),
+                    len(_candidates), len(_held_to_fetch), len(_new_to_fetch),
                     len(_revalidate_to_fetch), _budget, len(_ordered),
                     len(_deferred),
                     len(_deferred.intersection(_held_to_fetch)),
@@ -7343,6 +7340,10 @@ class Scheduler:
         numeric one, in string order.
         """
         self._poll_work_product()
+        # A scoped tick's candidates are filtered (task 8480), so only an ANY
+        # tick can tell that a task has left candidacy.
+        if ctx.scope is DispatchScope.ANY:
+            self._park_refusals.retain(str(t.get('id', '')) for t in ctx.candidates)
         scored = self._score_candidates(ctx)
 
         # DEBUG: log the top 3 so α/β tuning is post-hoc diagnosable.
@@ -7409,6 +7410,7 @@ class Scheduler:
                             grant = None
                 if not acquired:
                     refused.append(task_id)
+                    self._note_park_refusal(ctx, task_id, modules, pri)
                 if acquired:
                     self._dispatched.add(task_id)
                     self._watchdog_state.note_scan(refused)
@@ -7455,6 +7457,67 @@ class Scheduler:
         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
         await self._write_snapshot_best_effort()
         return TickOutcome(None)
+
+    def _note_park_refusal(
+        self, ctx: TickContext, task_id: str, modules: list[str], tier: str
+    ) -> None:
+        """Track *task_id*'s refusal by parks alone, and emit ``park_refused`` when due (task 6328).
+
+        Called at refusal time, before a winner changes the lock table, so the
+        blockers are exactly what refused this acquire (INV-5).  A refusal
+        outside the class (:func:`orchestrator.park_refusal.is_park_refusal`)
+        ends the episode.
+        """
+        blockers = self.lock_table.blockers(task_id, modules)
+        if not is_park_refusal(tier, blockers, self.lock_table.top_park_rank):
+            self._park_refusals.end(task_id)
+            return
+        episode_secs = self._park_refusals.observe(
+            task_id,
+            now=self._time_source(),
+            interval=self.config.park_refused_emit_interval_secs,
+        )
+        if episode_secs is None or not self.event_store:
+            return
+        ranks = {
+            blocker.owner: self.lock_table.top_park_rank(blocker.owner)
+            for blocker in blockers
+        }
+        self.event_store.emit(
+            EventType.park_refused,
+            task_id=task_id,
+            data={
+                'task_id': task_id,
+                'priority': tier,
+                'episode_secs': episode_secs,
+                'blockers': [blocker.as_payload() for blocker in blockers],
+                'park_owners': [
+                    self._park_owner_entry(ctx, owner, rank)
+                    for owner, rank in sorted(ranks.items())
+                    if rank is not None
+                ],
+            },
+        )
+
+    def _park_owner_entry(self, ctx: TickContext, owner: str, rank: int) -> dict:
+        """One ``park_refused`` park owner: the priority behind its *rank*, its park age, and its own wait.
+
+        ``waiting_on`` is None, meaning unknown, when *owner* is not in this
+        tick's task list.  That is a fail-safe, not an expected case:
+        ``_phase_park_gc`` runs earlier in the tick and expires the parks of
+        every owner missing from it.
+        """
+        owner_task = ctx.tasks_by_id.get(owner)
+        waiting_on = None if owner_task is None else [
+            blocker.as_payload()
+            for blocker in self.lock_table.blockers(owner, self._get_modules(owner_task))
+        ]
+        return {
+            'owner': owner,
+            **rank_payload(rank),
+            'park_age_secs': self.lock_table.park_age_secs(owner, now=self._wall_now()),
+            'waiting_on': waiting_on,
+        }
 
     async def acquire_next(self, scope: DispatchScope = DispatchScope.ANY) -> TaskAssignment | None:
         """Find next eligible task under the value/h scoring model.

@@ -63,6 +63,7 @@ from shared.task_statuses import TaskStatus
 
 import dashboard.data.task_snapshot as snapshot_mod
 from dashboard.app import app
+from dashboard.asset_build import app_asset_build
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
@@ -1151,6 +1152,22 @@ def ragged_store_rows(workdir: Path) -> list[dict[str, Any]]:
     return [{**dict(row), 'project': Path(row['project_id']).name} for row in rows]
 
 
+def _asset_build_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """The build identities a real route stamps on its response, beside the ones the app holds."""
+    resp = client.get(MEMORY_GRAPHS)
+    assert resp.status_code == 200, resp.text
+    build = app_asset_build(app)
+    assert build is not None
+    return {
+        'asset_build_served': {
+            'path': MEMORY_GRAPHS,
+            'headers': dict(resp.headers),
+            'body': resp.json(),
+            'expected': {'started': build.started, 'onDisk': build.on_disk()},
+        },
+    }
+
+
 def build_all(workdir: Path) -> dict[str, Any]:
     """Every scenario's served body, keyed by the name the node half reads it under.
 
@@ -1167,4 +1184,5 @@ def build_all(workdir: Path) -> dict[str, Any]:
             **prd_lanes_family(client, workdir),
             **_quality_family(client, workdir),
             **_quality_snapshot_family(client, workdir),
+            **_asset_build_family(client, workdir),
         }

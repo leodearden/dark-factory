@@ -505,13 +505,16 @@ def record_hits(record: Mapping[str, Any]) -> RecordHits:
 class AgentClass(StrEnum):
     """The sampler's strata, plus UNKNOWN for an empty transcript.
     LEGIBILITY_INSTRUMENT is a session the legibility pipeline ran for
-    itself, not a factory agent."""
+    itself, not a factory agent. UNATTENDED is a session no marker names and
+    no human addressed (no :func:`dialogue_turn_text` turn), such as a
+    headless ``claude --print`` run or a sub-agent."""
 
     RECON = 'recon'
     CURATOR_CLASSIFIER = 'curator-classifier'
     WATCHER = 'watcher'
     ORCHESTRATED_TASK = 'orchestrated-task'
     INTERACTIVE = 'interactive'
+    UNATTENDED = 'unattended'
     LEGIBILITY_INSTRUMENT = 'legibility-instrument'
     UNKNOWN = 'unknown'
 
@@ -587,6 +590,21 @@ def is_primary_user_turn(record: Mapping[str, Any], *, subagent_transcript: bool
     )
 
 
+def dialogue_turn_text(record: Mapping[str, Any]) -> str | None:
+    """The text of a turn a human addressed to this session, None for any
+    other record: the single rule behind the digest's gold user turns and
+    n_user_turns, and the classifier's INTERACTIVE.
+
+    Main chain only, since no human types on a sub-agent's chain.
+    """
+    if not is_primary_user_turn(record):
+        return None
+    text = user_turn_text(record)
+    if text is None or is_non_dialogue_carrier(record, text):
+        return None
+    return text
+
+
 def _sighted(text: str, literals: AbstractSet[str]) -> frozenset[str]:
     lowered = text.lower()
     return frozenset(literal for literal in literals if literal in lowered)
@@ -615,6 +633,8 @@ class AgentClassEvidence:
     until the first identity-bearing record says which chain is the
     transcript's own. *first_turn_text* is None until the first primary user
     turn on that chain arrives, and '' when that turn holds no text.
+    *has_dialogue_turn* is whether any record so far is a turn a human
+    addressed to the session (:func:`dialogue_turn_text`).
     """
 
     in_worktree: bool
@@ -622,6 +642,7 @@ class AgentClassEvidence:
     subagent_transcript: bool | None = None
     first_turn_text: str | None = None
     first_turn_class: AgentClass | None = None
+    has_dialogue_turn: bool = False
     carrier_literals: frozenset[str] = frozenset()
 
     @classmethod
@@ -653,6 +674,8 @@ class AgentClassEvidence:
                 first_turn_text=text,
                 first_turn_class=_first_turn_class(text),
             )
+        if not evidence.has_dialogue_turn and dialogue_turn_text(record) is not None:
+            evidence = replace(evidence, has_dialogue_turn=True)
         unsighted = _MARKER_LITERALS - evidence.carrier_literals
         if evidence.in_worktree or evidence.first_turn_class is not None or not unsighted:
             return evidence
@@ -671,7 +694,8 @@ class AgentClassEvidence:
         marker table over the raw first user turn, then over every raw
         carrier. The carriers are read unfiltered
         on purpose: the class is decided BY injected markers, which the
-        dialogue filter exists to drop. No marker is INTERACTIVE.
+        dialogue filter exists to drop. No marker is INTERACTIVE when a
+        dialogue turn was seen and UNATTENDED otherwise.
         """
         if not self.has_records:
             return AgentClass.UNKNOWN
@@ -680,7 +704,9 @@ class AgentClassEvidence:
         if self.first_turn_class is not None:
             return self.first_turn_class
         marked = _marked_class(self.carrier_literals)
-        return AgentClass.INTERACTIVE if marked is None else marked
+        if marked is not None:
+            return marked
+        return AgentClass.INTERACTIVE if self.has_dialogue_turn else AgentClass.UNATTENDED
 
 
 def classify_agent_class(path: Path, records: Iterable[Mapping[str, Any]]) -> AgentClass:

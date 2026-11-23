@@ -141,6 +141,14 @@ fulltext actually returns rows — because an index can be present in `db.indexe
   (0 nodes, a near-duplicate of `know_live`) are **not** registered and will **not** be provisioned.
   If `my_solar_challenge` is live it should be *registered*, not special-cased here — that is the
   principled fix and it belongs to whoever owns that project, not to this PRD.
+  **Shared with the identity scan (task 11326).** The W6-ε startup identity scan
+  (`fused-memory/src/fused_memory/backends/graphiti_client.py::GraphitiBackend._run_startup_identity_scan`:
+  the dup-name alarm and the dup-uuid-edge *repair*) now uses this same scope. Both sweeps iterate
+  `GraphitiBackend._existing_registered_graphs`. The reason: the scan used to walk every graph on the
+  server, so a backend built by an integration test swept the whole shared FalkorDB. It re-minted the
+  deliberately duplicated uuids in other concurrent tests' private graphs, which caused the flake
+  behind task 11326. The consequence is the same as above, and deliberate: an unregistered graph gets
+  no startup dup-uuid repair, and the remedy is to register it.
 - **D6 — Provision at startup *and* at first write, under a per-group lock.** `_ensure_indices` is
   today reachable only from the startup enumeration, so a graph created later gets nothing until the
   next restart; `autotrade` and `mission_control` are registered projects with no graph yet, so this

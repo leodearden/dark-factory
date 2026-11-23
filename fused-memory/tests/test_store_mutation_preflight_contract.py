@@ -158,25 +158,22 @@ class TestNeutraliseFixture:
         assert result is None
         assert caplog.records == []
 
-    def test_the_probe_leaves_the_redirected_directory_as_it_found_it(
-        self, tmp_path_factory: pytest.TempPathFactory
+    def test_the_probe_leaves_the_redirected_directory_empty(
+        self, tmp_path: pathlib.Path
     ) -> None:
-        """Compared against a snapshot, not against empty: the scratch directory
-        is shared by the whole session, so a subprocess an earlier test spawned
-        under the fixture may already have left mem0's import-time
-        ``config.json`` there
-        (``fused-memory/tests/test_normalize_topic_slugs.py::TestNoLiveCorpusCountIsPinned``
-        does)."""
+        """Private base temp: the fixture's real directory is session state; see
+        `fused-memory/tests/_store_mutation_preflight_contract.py::neutralise_fixture`."""
         mod = _stub_script_module()
         fx = neutralise_fixture(mod, note='a note')
+        private_base = types.SimpleNamespace(getbasetemp=lambda: tmp_path)
 
         mp = pytest.MonkeyPatch()
         try:
-            _underlying(fx)(mp, tmp_path_factory)
+            _underlying(fx)(mp, private_base)
             redirected = pathlib.Path(os.environ['MEM0_DIR'])
-            before = sorted(redirected.iterdir())
+            assert redirected.is_relative_to(tmp_path)
             mod.assert_store_mutation_allowed(operation='sweep --apply')
-            assert sorted(redirected.iterdir()) == before
+            assert list(redirected.iterdir()) == []
         finally:
             mp.undo()
 
