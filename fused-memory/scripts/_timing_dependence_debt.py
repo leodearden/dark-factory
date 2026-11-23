@@ -133,7 +133,6 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_escalation_scan_off_loop.py': 2,
     'orchestrator/tests/test_flake_debt_drain.py': 2,
     'orchestrator/tests/test_flake_ledger.py': 2,
-    'orchestrator/tests/test_harness_main_health_fix_reserve.py': 2,
     'orchestrator/tests/test_live_refs_lib.py': 2,
     'orchestrator/tests/test_liveness_boundary_gate.py': 2,
     'orchestrator/tests/test_merge_lane_intake.py': 2,

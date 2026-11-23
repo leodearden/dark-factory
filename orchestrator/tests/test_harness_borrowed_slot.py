@@ -26,7 +26,7 @@ from _run_loop_board import (
     fleet_dir_env,
     plain,
     run_driven,
-    settle,
+    run_ready_callbacks,
     until,
 )
 from _workflow_helpers import _build_harness
@@ -219,7 +219,7 @@ class _Rig:
         assert not self.harness.is_workflow_active(tid)
 
     async def assert_never_launched(self, tid: str) -> None:
-        await settle()
+        await run_ready_callbacks()
         assert tid not in self.built
         assert tid not in self.slot_of
         assert not self.harness.is_workflow_active(tid)
@@ -314,13 +314,13 @@ async def test_a_borrower_in_the_run_loop_takes_no_permit_and_the_waiting_task_s
             TaskAssignment(task_id='D', task=plain('D'), modules=[]), board.leases[lender].lend('D'), [],
         )
         await until(lambda: board.started('D'), 'the borrower starts')
-        await settle()
+        await board.settle()
         assert not board.started(waiting), 'the borrower took a permit'
 
         first, second = (lender, 'D') if first_to_end == 'lender' else ('D', lender)
         board.gates[first].set()
         await until(lambda: first not in board.live, f'{first} ends')
-        await settle()
+        await board.settle()
         assert not board.started(waiting), f'{first} ending returned a permit while {second} still runs'
 
         board.gates[second].set()
@@ -442,7 +442,7 @@ class TestSlotEndedSignal:
 
         waiting = asyncio.create_task(waiter())
         try:
-            await settle()
+            await run_ready_callbacks()
             assert not waiting.done(), 'the signal fired while P still runs'
 
             await rig.end('P')

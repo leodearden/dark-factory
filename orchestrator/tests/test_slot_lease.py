@@ -7,6 +7,7 @@ from collections.abc import Coroutine
 from typing import Any
 
 import pytest
+from _orch_helpers import wait_responsive
 
 from orchestrator.slot_lease import SlotLease, SlotLendingError
 
@@ -250,7 +251,7 @@ class TestSlotEndedSignal:
         assert not waiting.done()
 
         lease.release(requeued=False)
-        await asyncio.wait_for(waiting, timeout=5)
+        await wait_responsive(waiting, label='the slot-ended waiter wakes')
 
         assert seen == [(False, [(LENDER, False)])]
 
@@ -272,7 +273,7 @@ class TestSlotEndedSignal:
         assert not waiting.done()
 
         lender.release(requeued=False)
-        await asyncio.wait_for(waiting, timeout=5)
+        await wait_responsive(waiting, label='the slot-ended waiter wakes')
 
         assert seen == [(True, True)]
         assert pool.locked()

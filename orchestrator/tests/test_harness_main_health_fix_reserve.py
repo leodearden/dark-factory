@@ -23,7 +23,7 @@ from _run_loop_board import (
     fleet_dir_env,
     plain,
     run_driven,
-    settle,
+    run_ready_callbacks,
     task,
     until,
 )
@@ -82,7 +82,7 @@ class TestMainHealthFixReserve:
             first = board.ticks_since(filed)[0]
             assert (first.scope, first.picked) == (DispatchScope.MAIN_HEALTH_FIX, '60')
 
-            await settle()
+            await board.settle()
             assert not board.started('50')
             assert not board.holds_locks('50')
 
@@ -108,7 +108,7 @@ class TestMainHealthFixReserve:
             first = board.ticks_since(filed)[0]
             assert (first.scope, first.picked) == (DispatchScope.MAIN_HEALTH_FIX, '60')
 
-            await settle()
+            await board.settle()
             assert not board.started('50')
             assert not board.holds_locks('50')
 
@@ -126,7 +126,7 @@ class TestMainHealthFixReserve:
 
             ticks_when_full = len(board.ticks)
             board.file(plain('70'))
-            await settle()
+            await board.settle()
             assert len(board.ticks) == ticks_when_full, 'no tick while every slot is held'
             assert not board.holds_locks('70')
 
@@ -146,7 +146,7 @@ class TestMainHealthFixReserve:
         async def drive() -> None:
             await _saturate(board)
             board.file(_fix('60'))
-            await settle()
+            await board.settle()
 
             assert not board.started('60')
             assert not board.holds_locks('60')
@@ -163,7 +163,7 @@ class TestMainHealthFixReserve:
             await _saturate(board)
             board.file(_fix('60'), _fix('61'))
             await until(lambda: board.started('60') or board.started('61'), 'one fix starts')
-            await settle()
+            await board.settle()
 
             [first_fix] = [tid for tid in ('60', '61') if board.started(tid)]
             second_fix = '61' if first_fix == '60' else '60'
@@ -191,7 +191,7 @@ class TestMainHealthFixReserve:
             filed.append(board.file(plain('70')))
             board.gates['1'].set()
             await until(lambda: board.started('1') and '1' not in board.live, 'merge-waiter 1 ends mid-tick')
-            await settle()
+            await run_ready_callbacks()
 
         board.inside_next_restricted_tick(end_a_merge_waiter_and_file_plain_work)
 

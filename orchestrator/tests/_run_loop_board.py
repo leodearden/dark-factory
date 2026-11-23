@@ -5,8 +5,10 @@ body is stubbed at its one seam, ``_run_slot``: each slot holds its run slot
 until the test opens its gate.  Startup collaborators are stubbed the way
 ``test_harness_parked_loop.py`` stubs them.
 
-``Board`` records every dispatch tick; ``build_board_harness`` wires it into a
-harness; ``run_driven`` runs ``h.run()`` while a test coroutine steers it.
+``Board`` records every dispatch tick and every wait for a slot to turn over;
+``build_board_harness`` wires it into a harness; ``run_driven`` runs ``h.run()``
+while a test coroutine steers it.  Nothing here sleeps in real time: ``until``
+polls by yielding, and ``Board.settle`` counts the loop's own polls.
 """
 
 from __future__ import annotations
@@ -30,7 +32,8 @@ from orchestrator.slot_lease import SlotLease
 from orchestrator.workflow import WorkflowOutcome
 
 TICK = 0.01
-SETTLE_TICKS = 10
+SETTLE_POLLS = 10
+READY_CALLBACK_ROUNDS = 10
 _GATE_OFF = PsiAdmissionConfig(enabled=False)
 
 
@@ -74,6 +77,7 @@ class Board:
         self.live_at_start: dict[str, int] = {}
         self.max_live = 0
         self.leases: dict[str, SlotLease] = {}
+        self.turnover_waits = 0
         self._all_open = False
         self._inside_next_restricted_tick: Callable[[], Awaitable[None]] | None = None
         real_acquire = scheduler.acquire_next
@@ -108,6 +112,15 @@ class Board:
     def ticks_since(self, epoch: int) -> list[Tick]:
         return [tick for tick in self.ticks if tick.epoch >= epoch]
 
+    def polls(self) -> int:
+        """The run loop's polls so far: every dispatch tick and every wait for a slot to turn over."""
+        return len(self.ticks) + self.turnover_waits
+
+    async def settle(self) -> None:
+        """Let the run loop make ``SETTLE_POLLS`` more polls."""
+        target = self.polls() + SETTLE_POLLS
+        await until(lambda: self.polls() >= target, f'the run loop makes {SETTLE_POLLS} more polls')
+
     def holds_locks(self, tid: str) -> bool:
         return self.scheduler.lock_table.is_held(tid)
 
@@ -140,16 +153,18 @@ class Board:
 
 
 async def until(predicate: Callable[[], bool], label: str) -> None:
+    """Yield to the loop until *predicate* holds, failing by *label* on the responsive-time deadline."""
     async def poll() -> None:
         while not predicate():
-            await asyncio.sleep(TICK)
+            await asyncio.sleep(0)
 
     await wait_responsive(poll(), label=label)
 
 
-async def settle() -> None:
-    """Let the loop run several idle polls."""
-    await asyncio.sleep(TICK * SETTLE_TICKS)
+async def run_ready_callbacks() -> None:
+    """Yield ``READY_CALLBACK_ROUNDS`` times, so every callback already scheduled, and those it schedules, runs."""
+    for _ in range(READY_CALLBACK_ROUNDS):
+        await asyncio.sleep(0)
 
 
 def build_board_harness(
@@ -189,6 +204,11 @@ def build_board_harness(
     h.git_ops.worktree_base = tmp_path / '.worktrees'
     h.usage_gate = None
     h.review_checkpoint = None
+    wait_for_slot_turnover = h._wait_for_slot_turnover
+
+    async def counted_wait_for_slot_turnover() -> None:
+        await wait_for_slot_turnover()
+        board.turnover_waits += 1
 
     stubs: tuple[tuple[str, object], ...] = (
         ('_start_escalation_server', AsyncMock()),
@@ -198,6 +218,7 @@ def build_board_harness(
         ('_reconcile_lane_checkouts', AsyncMock()),
         ('_reconcile_stranded_in_progress', AsyncMock(return_value=0)),
         ('_run_slot', board.run_slot),
+        ('_wait_for_slot_turnover', counted_wait_for_slot_turnover),
     )
     for name, stub in stubs:
         monkeypatch.setattr(h, name, stub)
