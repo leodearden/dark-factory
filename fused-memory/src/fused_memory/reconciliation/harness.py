@@ -757,12 +757,9 @@ def _run_failure_record(
     failed_stage: str | None,
     error_message: str | None = None,
 ) -> dict[str, object]:
-    """The ``_error`` record both S1→S2→S3 drivers' ``except Exception``
-    handlers, and the remediation pass's cancellation handler, write for a
-    run ended by an exception, so the failure can be classified from the row
-    alone. The other ``_error`` records (run_full_cycle's cancellation, both
-    drivers' AllAccountsCapped, the stale-run reaper) are built by hand and
-    carry neither the traceback nor the sqlite keys.
+    """The ``_error`` record for a run ended by ``exc``: its type, message,
+    failed stage, traceback and SQLite classification, so the failure can be
+    classified from the row alone.
     """
     return {
         'error_type': type(exc).__name__,
@@ -771,6 +768,14 @@ def _run_failure_record(
         'traceback': ''.join(traceback.format_exception(exc)),
         **sqlite_classification(exc),
     }
+
+
+def _run_deferral_record(
+    exc: AllAccountsCappedException, *, failed_stage: str | None,
+) -> dict[str, object]:
+    """The ``_error`` record for a run deferred because every account is
+    capped: the failure record, marked ``deferred``."""
+    return {**_run_failure_record(exc, failed_stage=failed_stage), 'deferred': True}
 
 
 def _log_dropped_escalation(category: str, run_id: str, summary: str, *, reason: str) -> None:
@@ -3701,8 +3706,8 @@ class ReconciliationHarness:
                 run.completed_at = datetime.now(UTC)
                 run.status = RunStatus.completed
                 await self.journal.complete_run(run_id, 'completed')
-            except asyncio.CancelledError:
-                await self._record_cancelled_run(run, project_id, current_stage_name)
+            except asyncio.CancelledError as e:
+                await self._record_cancelled_run(run, project_id, current_stage_name, e)
                 raise
             except AllAccountsCappedException as e:
                 await self._record_deferred_run(run, project_id, current_stage_name, e)
@@ -3751,7 +3756,11 @@ class ReconciliationHarness:
                 await self._persist_stage_reports_then_gc_config_dir(run)
 
     async def _record_cancelled_run(
-        self, run: ReconciliationRun, project_id: str, current_stage_name: str | None,
+        self,
+        run: ReconciliationRun,
+        project_id: str,
+        current_stage_name: str | None,
+        exc: asyncio.CancelledError,
     ) -> None:
         """Journal a ``run_full_cycle`` cancelled before durable completion:
         failed, with its drained events restored for a later cycle. The caller
@@ -3771,12 +3780,10 @@ class ReconciliationHarness:
         """
         run_id = run.id
         run.status = RunStatus.failed
-        run.stage_reports['_error'] = {
-            'error_type': 'CancelledError',
-            'error_message': 'Run cancelled (timeout or external cancellation)',
-            'failed_stage': current_stage_name,
-            'traceback': '',
-        }
+        run.stage_reports['_error'] = _run_failure_record(
+            exc, failed_stage=current_stage_name,
+            error_message='Run cancelled (timeout or external cancellation)',
+        )
         if await self._end_run_unless_completed(
             run, project_id, current_stage_name,
             lambda: self._journal_failed_and_restore_drained(run_id, project_id),
@@ -3853,12 +3860,7 @@ class ReconciliationHarness:
         failed, with its drained events restored for a later cycle. The caller
         returns the run rather than raising."""
         run.status = RunStatus.failed
-        run.stage_reports['_error'] = {
-            'error_type': 'AllAccountsCappedException',
-            'error_message': str(exc),
-            'failed_stage': current_stage_name,
-            'deferred': True,
-        }
+        run.stage_reports['_error'] = _run_deferral_record(exc, failed_stage=current_stage_name)
         run_id = run.id
         if await self._end_run_unless_completed(
             run, project_id, current_stage_name,
@@ -5982,12 +5984,7 @@ class ReconciliationHarness:
             raise
         except AllAccountsCappedException as e:
             run.status = RunStatus.failed
-            run.stage_reports['_error'] = {
-                'error_type': 'AllAccountsCappedException',
-                'error_message': str(e),
-                'failed_stage': current_stage_name,
-                'deferred': True,
-            }
+            run.stage_reports['_error'] = _run_deferral_record(e, failed_stage=current_stage_name)
             await self.journal.complete_run(run_id, 'failed')
             # Do NOT re-raise — parent run already completed
             # Do NOT restore events — there are none (remediation has no drained events)
