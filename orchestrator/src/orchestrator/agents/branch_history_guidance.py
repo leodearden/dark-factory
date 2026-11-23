@@ -1,13 +1,16 @@
 """Role-prompt guidance: a task branch's history is append-only for every agent.
 
 `orchestrator/src/orchestrator/agents/roles.py` splices `BRANCH_HISTORY_GUIDANCE`
-into the roles whose commits the harness attributes to plan steps. It is a leaf
-module, imported downward by roles.py, only so that already oversized file does
-not grow further.
+into the roles whose commits the harness attributes to plan steps, and appends
+`REVIEWER_BRANCH_HISTORY_RULE` to the reviewer contract. It is a leaf module,
+imported downward by roles.py, only so that already oversized file does not grow
+further.
 
 `orchestrator/tests/test_roles_branch_history_guidance.py` checks the splices,
 never the wording.
 """
+
+from orchestrator.git_ops import WIP_SAFETY_COMMIT_PREFIXES
 
 BRANCH_HISTORY_HEADING = "This branch's history is append-only"
 
@@ -35,5 +38,35 @@ rebases this branch between iterations, before verify and on requeue, which
 gives every commit above the base a new sha, so after the merge the cited sha
 names a commit main does not contain. Cite the plan step id or the commit's
 subject instead.
+"""
+)
+
+
+# Sorted, so the prompt bytes do not depend on the tuple's declaration order.
+_WIP_SUBJECTS = ' or '.join(
+    '`' + prefix.rstrip() + '`…' for prefix in sorted(WIP_SAFETY_COMMIT_PREFIXES)
+)
+
+REVIEWER_BRANCH_HISTORY_RULE = (
+    """
+## """
+    + BRANCH_HISTORY_HEADING
+    + """
+
+Agents may only add commits to this branch. The harness records each plan
+step's commit sha, scopes a re-review to the tree diff since an amendment pass
+began, and rebases the branch itself, so a commit an agent rewrites leaves those
+records pointing at nothing. Never suggest amending, squashing, rewording,
+splitting or rebasing a commit: a `suggested_fix` asks for a new commit instead.
+
+A commit whose subject starts with """
+    + _WIP_SUBJECTS
+    + """ is the harness's own safety
+commit of uncommitted work. Its message carries no rationale by construction,
+so do not report that.
+
+When a change needs rationale that no commit message and no tracked file gives,
+ask for it in the message of a new commit that names the commit it explains by
+its subject or plan step id.
 """
 )

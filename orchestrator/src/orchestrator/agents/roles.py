@@ -12,7 +12,10 @@ from shared.followup_items import (
 )
 from shared.prompt_artifact import PromptSpec
 
-from orchestrator.agents.branch_history_guidance import BRANCH_HISTORY_GUIDANCE
+from orchestrator.agents.branch_history_guidance import (
+    BRANCH_HISTORY_GUIDANCE,
+    REVIEWER_BRANCH_HISTORY_RULE,
+)
 from orchestrator.agents.briefing import OPEN_INFO_NOTES_HEADING
 from orchestrator.agents.code_quality import guidance
 from orchestrator.agents.detector_guidance import (
@@ -1298,6 +1301,7 @@ def build_reviewer_prompt_spec(
                 name=name, specialization=specialization, notes_heading=OPEN_INFO_NOTES_HEADING,
             )
             + REVIEWER_INV12_BLOCKERS
+            + REVIEWER_BRANCH_HISTORY_RULE
         ),
         baseline_heuristics=_REVIEWER_HEURISTICS_TEMPLATES[briefing].format(
             specialization=specialization,
