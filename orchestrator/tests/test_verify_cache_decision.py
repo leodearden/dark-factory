@@ -595,6 +595,28 @@ class TestFanOutSeam:
         assert {unit.outcome for unit in units.values()} == {UnitOutcome.CACHE_HIT}
 
 
+    @pytest.mark.asyncio
+    async def test_a_plan_less_gate_whose_test_leg_is_not_pytest_never_records_its_tree(
+        self, repo, access, registry, markers,
+    ):
+        config = cache_config(
+            repo, test_command=f'echo global:test >> {markers}',
+            lint_command=f'echo global:lint >> {markers}', type_check_command=f'echo global:type >> {markers}',
+        )
+        result = await _gate(repo, config, [], access)
+        assert result.passed, result.summary
+        assert result.cache_record is not None
+
+        outcome = await record_greens(
+            registry, result.cache_record, flake_suppressed=False,
+            evidence=VerifyEvidenceRef(41, 'r', 'sha-first', True),
+        )
+
+        test_unit = module_leg_name(None, Leg.TEST)
+        assert outcome.recorded == ()
+        assert f'refused [{test_unit}: test counts unknown: junit_tests=None collected=None]' in outcome.reason
+        assert f'tree: units neither admitted nor replayed: {test_unit}' in outcome.reason
+
 # ---------------------------------------------------------------------------
 # The merge gate as the lane dispatches it: the pool consumes what a verify
 # replayed before the merge_verify row, then records its greens citing that row.
