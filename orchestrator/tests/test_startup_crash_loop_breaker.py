@@ -48,7 +48,7 @@ class _RunRow(NamedTuple):
 def _run_rows(db: Path) -> list[_RunRow]:
     with closing(sqlite3.connect(db)) as conn:
         return [
-            _RunRow._make(row)
+            _RunRow(*row)
             for row in conn.execute(
                 'SELECT run_id, startup_completed_at, exit_reason, completed_at '
                 'FROM runs ORDER BY rowid',
