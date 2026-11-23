@@ -1989,8 +1989,10 @@ def _server_with_every_tool(artifacts: TaskArtifacts) -> tuple[FastMCP, frozense
         provenance pointing at ``commit``.
 
         Args:
-            commit: The git SHA on main that contains this task's work.
-                Must be reachable from main; the orchestrator verifies this.
+            commit: The full 40-character lowercase hex SHA (e.g. from
+                ``git log --format=%H``) of the commit on main that contains
+                this task's work; a short hash is refused. Must be reachable
+                from main; the orchestrator verifies this.
             evidence: Brief description of what you found — file/symbol
                 names that match this task's expected output, or why the
                 commit appears to subsume this task's scope.

@@ -172,6 +172,7 @@ from orchestrator.merge_lane.landing_evidence import (
     LandingReason,
     LandingVerdict,
     file_unattributed_landing_escalation,
+    is_valid_sha_40,
     validate_landing_evidence,
     validate_reported_landing,
 )
@@ -7979,6 +7980,14 @@ class TaskWorkflow:
             return await self._mark_blocked(
                 'Architect wrote malformed already_done.json '
                 '(missing commit)',
+                detail=json.dumps(report, indent=2)[:2000],
+                merge_phase=merge_phase,
+            )
+        if not is_valid_sha_40(commit):
+            return await self._mark_blocked(
+                f'Architect wrote malformed already_done.json (commit '
+                f'{commit[:60]!r} is not a full 40-character lowercase hex '
+                f'commit sha)',
                 detail=json.dumps(report, indent=2)[:2000],
                 merge_phase=merge_phase,
             )
