@@ -4824,7 +4824,7 @@ class SpeculativeMergeWorker:
         # The set is restart-durable (task 11047, interim until BatchState
         # replaces the mark): a worker built over the same project data
         # directory starts with the marks the previous process held.
-        self._next_dispatch_unchained: MutableSet[str] = PersistentSet(
+        self._next_dispatch_unchained: PersistentSet = PersistentSet(
             guard_path(_root, 'next_dispatch_unchained_task_ids.json'),
             ttl=_NEXT_DISPATCH_UNCHAINED_TTL,
         )
