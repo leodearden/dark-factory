@@ -46,12 +46,22 @@ def is_merge_worker_shutdown(outcome: MergeOutcome) -> bool:
     return outcome.status == 'blocked' and outcome.reason == MERGE_WORKER_SHUTDOWN_REASON
 
 
+def resolved_with_shutdown(result: asyncio.Future[MergeOutcome]) -> bool:
+    """Whether *result* was resolved with :func:`is_merge_worker_shutdown`'s outcome.
+
+    A pending, cancelled or exception-set Future was not.
+    """
+    if not result.done() or result.cancelled() or result.exception() is not None:
+        return False
+    return is_merge_worker_shutdown(result.result())
+
+
 def survives_restart(result: asyncio.Future[MergeOutcome]) -> bool:
     """Whether the request settled through *result* comes back on the next start.
 
-    It does when *result* was cancelled or resolved with the merge worker's
-    shutdown outcome (:func:`is_merge_worker_shutdown`): its branch is still
-    live, so the durable journal keeps it and the next start restores it.
+    It does when *result* was cancelled or :func:`resolved_with_shutdown`: its
+    branch is still live, so the durable journal keeps it and the next start
+    restores it.
 
     Every other terminal does not: a ``done``, ``superseded`` or other
     ``blocked`` outcome (drop-guard, ENOSPC, merge conflict, merger error,
@@ -61,11 +71,8 @@ def survives_restart(result: asyncio.Future[MergeOutcome]) -> bool:
     pending has settled nothing and does not count. A true process crash
     never asks: the journal entry recorded at intake simply stays.
     """
-    if result.cancelled():
-        return True
-    if not result.done() or result.exception() is not None:
-        return False
-    return is_merge_worker_shutdown(result.result())
+    return result.cancelled() or resolved_with_shutdown(result)
+
 
 _COALESCE_LIVE_ORIGINAL_SENTINEL_PREFIX = '__merge_coalesce_live_original__'
 

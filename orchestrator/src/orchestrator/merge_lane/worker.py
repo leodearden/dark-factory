@@ -129,6 +129,7 @@ from orchestrator.merge_lane.intake_buffers import (
     IntakeLifecycle,
     MergeIntake,
     answers_to,
+    resolved_with_shutdown,
 )
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import patch_content_contained
@@ -4820,10 +4821,12 @@ class SpeculativeMergeWorker:
         # so its own subset tree gets a verdict that IS attributable to it.  The
         # mark lasts until a verdict for the task is applied, which is when its
         # request is retired (`_retire_item`): a verify the cascade cancels or
-        # voids keeps it.
+        # voids keeps it, and so does a retire with the shutdown outcome,
+        # which is no verdict.
         # The set is restart-durable (task 11047, interim until BatchState
         # replaces the mark): a worker built over the same project data
-        # directory starts with the marks the previous process held.
+        # directory starts with the marks the previous process held, whether
+        # that process was killed or gracefully stopped.
         self._next_dispatch_unchained: PersistentSet = PersistentSet(
             guard_path(_root, 'next_dispatch_unchained_task_ids.json'),
             ttl=_NEXT_DISPATCH_UNCHAINED_TTL,
@@ -5386,13 +5389,17 @@ class SpeculativeMergeWorker:
         if current is not None and current != ItemLifecycleState.TERMINAL:
             self._note_transition(request_id, current, ItemLifecycleState.TERMINAL)
         retired = self._live_items.pop(request_id, None)
-        if retired is not None:
-            # A request's gate attempts and its un-chained mark leave the lane
-            # with it, whichever exit it took, so a resubmission starts its own
-            # count (task 8525) and may chain again (task 10723).
-            task_id = _request_of(retired).task_id
-            self._gate_retries.pop(task_id, None)
-            self._next_dispatch_unchained.discard(task_id)
+        if retired is None:
+            return
+        # A request's gate attempts leave the lane with it, whichever exit it
+        # took, so a resubmission starts its own count (task 8525). Its
+        # un-chained mark leaves too, so it may chain again (task 10723),
+        # unless the shutdown outcome retired it: that is no verdict, and the
+        # request comes back on the next start (intake_buffers.py::survives_restart).
+        request = _request_of(retired)
+        self._gate_retries.pop(request.task_id, None)
+        if not resolved_with_shutdown(request.result):
+            self._next_dispatch_unchained.discard(request.task_id)
 
     def _note_requeue(
         self,
