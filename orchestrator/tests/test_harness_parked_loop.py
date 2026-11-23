@@ -397,7 +397,7 @@ class TestParkedLoop:
             guard.cancel()
             release.set()
             if bystanders:
-                await asyncio.wait(bystanders, timeout=5.0)
+                await asyncio.wait(bystanders)
 
     async def test_cancel_immune_slot_is_detached_and_its_sibling_still_collected(
         self, tmp_path: Path, fleet_dir: Path,
@@ -432,7 +432,7 @@ class TestParkedLoop:
             guard.cancel()
             slots.immune_release.set()
             if immune_slots:
-                await asyncio.wait(immune_slots, timeout=5.0)
+                await asyncio.wait(immune_slots)
 
     async def test_polite_restart_waits_for_the_dispatch_loop(
         self, tmp_path: Path, fleet_dir: Path,
