@@ -296,17 +296,22 @@ function landingRateCaption(series) {
   return span === null ? QUEUE_EM_DASH : `landings/day · ${span} trailing`;
 }
 
+// A rate below 1 keeps two significant figures, so a window that landed
+// something never reads 0/day; any other rate shows at most one decimal.
 function rateText(perDay) {
+  if (perDay !== 0 && Math.abs(perDay) < 1) return String(Number(perDay.toPrecision(2)));
   return String(Math.round(perDay * 10) / 10);
 }
 
-// The newest point and the mean over the served points: a reading of the served
-// series, never a re-bucketing of it (the depth panel's peak was the precedent).
+// The newest point, and the window mean the server counted over the whole window
+// (data/merge_queue.py::trailing_landing_rates). An average of the points would lag
+// the trailing window and miss the leading zeros the server trims.
 function landingRateReading(series) {
   const values = series.values;
   if (values.length === 0) return '0/day · no landings in this window';
-  const mean = values.reduce((sum, v) => sum + v, 0) / values.length;
-  return `now ${rateText(values[values.length - 1])}/day · mean ${rateText(mean)}/day`;
+  const mean = series.window_mean_per_day;
+  const meanText = Number.isFinite(mean) ? `${rateText(mean)}/day` : QUEUE_EM_DASH;
+  return `now ${rateText(values[values.length - 1])}/day · mean ${meanText}`;
 }
 
 // Module-unique export const, never a bare `API` — the CANONICAL note in

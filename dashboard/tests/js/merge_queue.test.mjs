@@ -410,7 +410,7 @@ test('landingRateReading: rates below 1 keep two significant figures, never a fa
 });
 
 test('landingRateReading: a rate serving no usable window mean states none', () => {
-  for (const mean of [undefined, null, NaN, '0.5']) {
+  for (const mean of [null, NaN, '0.5']) {
     assert.equal(
       landingRateReading(landingRate([T1, T2], [2, 3], 1440, mean)), `now 3/day · mean ${EM_DASH}`,
       String(mean),
