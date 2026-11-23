@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+from shared.cli_boundary import LoudArgumentParser, run_cli
 from shared.mcp_envelope import write_failure_reason
 from shared.toolcall_markup import MARKUP_OVERRIDE_KEY
 
@@ -326,8 +327,8 @@ async def main_async(args: argparse.Namespace) -> int:
         )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser() -> LoudArgumentParser:
+    parser = LoudArgumentParser(description=__doc__)
     parser.add_argument(
         '--project-root', dest='project_roots', action='append', required=True,
         help='A project root whose task store to migrate. Repeat for each store; no default.',
@@ -347,9 +348,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    sys.exit(asyncio.run(main_async(build_parser().parse_args())))
+def main(argv: list[str] | None = None) -> int:
+    return asyncio.run(main_async(build_parser().parse_args(argv)))
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(run_cli(main))
