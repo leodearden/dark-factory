@@ -191,13 +191,13 @@ tasks:
       - orchestrator/src/orchestrator/
       expect: present
   - name: plugin-directory-on-pythonpath
-    binding: producer:β1 — only the _pytest_inject directory goes on PYTHONPATH; identifier absent from orchestrator/src on main
+    binding: producer:β1 — verify.py merges shared/src/shared/defect_plugin_location.py::DEFECT_PLUGIN_DIR (only the _pytest_inject directory) into PYTHONPATH; identifier absent from verify.py on main
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: _pytest_inject
+      pattern: DEFECT_PLUGIN_DIR
       paths:
-      - orchestrator/src/orchestrator/
+      - orchestrator/src/orchestrator/verify.py
       expect: present
   - name: no-shadowing-and-non-workspace-verification
     binding: rejection-mechanism — B21 and B18 fixtures (project with its own top-level testing module, filterwarnings=error) built by β and observed
