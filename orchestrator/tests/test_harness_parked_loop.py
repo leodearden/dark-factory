@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -35,6 +36,10 @@ from orchestrator.workflow import WorkflowOutcome
 _TICK = 0.01
 _FORCE_FIRE_AFTER_SECS = 900.0
 _UNIT = 'orchestrator-parked-test.service'
+_SHUTDOWN_DRAIN_SECS = 0.2
+# Frees a cancel-immune task if shutdown would otherwise wait on it forever.
+# A timer handle, not a Task, so run()'s straggler sweep cannot cancel it.
+_HANG_GUARD_SECS = 10.0
 
 
 class _Slots:
@@ -66,6 +71,14 @@ class _Slots:
         finally:
             self.finished.add(tid)
             sem.release()
+
+
+async def _ignore_cancels_until(release: asyncio.Event) -> None:
+    while not release.is_set():
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            continue
 
 
 class _Dispatch:
@@ -194,6 +207,18 @@ def _heartbeat_ts(fleet_dir: Path) -> float | None:
     if not path.exists():
         return None
     return json.loads(path.read_text())['ts_epoch']
+
+
+def _shrink_shutdown_drains(h: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(h, '_SHUTDOWN_WORKFLOW_DRAIN_SECS', _SHUTDOWN_DRAIN_SECS)
+    monkeypatch.setattr(h, '_SHUTDOWN_STRAGGLER_DRAIN_SECS', _SHUTDOWN_DRAIN_SECS)
+
+
+def _harness_errors_naming(caplog: pytest.LogCaptureFixture, name: str) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == 'orchestrator.harness' and r.levelno == logging.ERROR and name in r.getMessage()
+    ]
 
 
 @pytest.fixture
@@ -328,6 +353,41 @@ class TestParkedLoop:
 
         outcomes = {r.task_id: r.outcome for r in h.report.task_reports}
         assert outcomes == {'1': WorkflowOutcome.CANCELLED}
+
+    async def test_cancel_immune_bystander_does_not_hang_the_straggler_sweep(
+        self, tmp_path: Path, fleet_dir: Path,
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.ERROR, logger='orchestrator.harness')
+        dispatch, slots = _Dispatch(['1', '2']), _Slots()
+        h = _harness(tmp_path, dispatch, slots)
+        _shrink_shutdown_drains(h, monkeypatch)
+        release = asyncio.Event()
+        guard = asyncio.get_running_loop().call_later(_HANG_GUARD_SECS, release.set)
+        main = asyncio.current_task()
+        assert main is not None
+        bystanders: list[asyncio.Task] = []
+
+        async def sigterm_beside_an_immune_bystander() -> None:
+            await _until(lambda: dispatch.calls >= 1, 'loop parked on slot 1')
+            bystanders.append(asyncio.create_task(_ignore_cancels_until(release), name='immune-bystander'))
+            await asyncio.sleep(0)
+            main.cancel()
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await _run_driven(h, slots, sigterm_beside_an_immune_bystander)
+
+            [bystander] = bystanders
+            assert not bystander.done(), 'shutdown must not wait for a task that ignores its cancel'
+            assert _harness_errors_naming(caplog, 'immune-bystander')
+            outcomes = {r.task_id: r.outcome for r in h.report.task_reports}
+            assert outcomes == {'1': WorkflowOutcome.CANCELLED}
+        finally:
+            guard.cancel()
+            release.set()
+            if bystanders:
+                await asyncio.wait(bystanders, timeout=5.0)
 
     async def test_polite_restart_waits_for_the_dispatch_loop(
         self, tmp_path: Path, fleet_dir: Path,
