@@ -132,3 +132,59 @@ class TestGraphitiHitAttribution:
         ))
 
         assert hit.project_id is None
+
+
+_TOPIC = 'harness-layout-gate-decision-rule'
+_CANONICAL_ID = 'canonical-0001'
+
+
+def _topic_sibling(n: int) -> dict:
+    """A narrow sibling in the canonical's topic, carrying no canonical flag."""
+    return _mem0_item(
+        id=f'sibling-{n}',
+        memory=f'narrow sibling {n} on the harness layout gate',
+        score=round(0.89 - 0.01 * n, 4),
+        metadata={'category': 'procedural_knowledge', 'topic': _TOPIC},
+    )
+
+
+def _canonical_scroll_row() -> dict:
+    """The raw scroll dict the pin reads: managed and custom keys mixed in one payload."""
+    return {
+        'id': _CANONICAL_ID,
+        'created_at': '2026-08-09T00:00:00+00:00',
+        'metadata': {
+            'canonical': True,
+            'topic': _TOPIC,
+            'category': 'procedural_knowledge',
+            'data': 'The consolidated canonical for the harness layout gate decision rule.',
+            'agent_id': 'claude-task-4004',
+            'user_id': 'dark_factory',
+            'task_id': '4004',
+        },
+    }
+
+
+class TestTopicPinnedCanonicalAttribution:
+    @pytest.mark.asyncio
+    async def test_pinned_canonical_carries_writer_task_and_scope(self, service):
+        service.mem0.search = AsyncMock(
+            return_value={'results': [_topic_sibling(n) for n in range(1, 10)]}
+        )
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[_canonical_scroll_row()])
+
+        results = await service.search(
+            query='which harness layout does the gate decision rule accept',
+            project_id=_PROJECT_ID,
+            categories=['procedural_knowledge'],
+            stores=['mem0'],
+            limit=5,
+        )
+
+        pinned = results[0]
+        assert (pinned.id, pinned.topic_anchored) == (_CANONICAL_ID, True)
+        assert (pinned.agent_id, pinned.task_id, pinned.project_id) == (
+            'claude-task-4004', '4004', 'dark_factory',
+        )
+        assert 'agent_id' not in pinned.metadata
+        assert 'user_id' not in pinned.metadata
