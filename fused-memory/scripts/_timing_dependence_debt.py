@@ -24,11 +24,13 @@
 # new test files carrying 29 sites, cut the two session-lease test files from 7
 # to 1 while adding 3 in orchestrator/tests/_shared_host_fixtures.py, and grown
 # two shared/tests files by 3, so 1,877 in 442.  Again newly SEEN, not new debt.
+# Re-measured 2026-11-23 over main dfae8ef060: main grew test_steward_outcome.py
+# by 2 and test_info_l2_never_gates.py by 1, so 1,880 in 442.
 TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     # orchestrator/tests
     'orchestrator/tests/test_merge_queue_request_liveness.py': 46,
     'orchestrator/tests/test_merge_queue.py': 40,
-    'orchestrator/tests/test_steward_outcome.py': 33,
+    'orchestrator/tests/test_steward_outcome.py': 35,
     'orchestrator/tests/test_verify_boundary_harness.py': 30,
     'orchestrator/tests/test_deterministic_runner.py': 29,
     'orchestrator/tests/test_usage_gate.py': 25,
@@ -77,7 +79,7 @@ TIMING_DEPENDENCE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_before_done_script.py': 5,
     'orchestrator/tests/test_cli_verify_task.py': 5,
     'orchestrator/tests/test_decision_registry.py': 5,
-    'orchestrator/tests/test_info_l2_never_gates.py': 5,
+    'orchestrator/tests/test_info_l2_never_gates.py': 6,
     'orchestrator/tests/test_merge_lane_verify_dispatch.py': 5,
     'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 5,
     'orchestrator/tests/test_merge_skew_tripwire.py': 5,
