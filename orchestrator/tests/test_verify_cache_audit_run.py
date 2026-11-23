@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 import yaml
+from _poll_responsive import poll_responsive
 from click.testing import CliRunner
 from shared.proc_group import pid_running
 
@@ -221,10 +221,7 @@ class TestRunAudit:
         assert '# alpha: rc=' in report and 'ended=timeout' in report, report
         assert not _has_summary(report.splitlines()), report
         grandchild = int((alpha / 'grandchild.pid').read_text())
-        deadline = time.monotonic() + 10
-        while pid_running(grandchild) and time.monotonic() < deadline:
-            time.sleep(0.1)
-        assert not pid_running(grandchild)
+        await poll_responsive(lambda: not pid_running(grandchild), label=f'grandchild {grandchild} to be reaped')
 
     async def test_a_module_killed_by_a_signal_leaves_the_session_incomplete(self, tree, capsys, tmp_path):
         tree.module('alpha', output=_ALPHA_RED, rc=1)
