@@ -578,6 +578,52 @@ def test_the_build_lock_file_is_left_in_place(remote: _Remote):
     assert (remote.root / f'.build-{remote.sha}.lock').is_file()
 
 
+def _a_flock_waits_on(handle: typing.IO[str]) -> bool:
+    """Whether some process is blocked in flock on the file *handle* has open.
+
+    /proc/locks marks a blocked waiter with ``->``.  Its ``maj:min:inode`` field
+    names the superblock device, which can differ from st_dev, so only the
+    inode is matched.
+    """
+    inode = f':{os.fstat(handle.fileno()).st_ino}'
+    for line in Path('/proc/locks').read_text().splitlines():
+        fields = line.split()
+        if '->' in fields and any(f.count(':') == 2 and f.endswith(inode) for f in fields):
+            return True
+    return False
+
+
+def test_an_ensure_whose_lock_file_is_replaced_while_it_waits_locks_the_new_file(remote: _Remote):
+    """A holder may unlink the lock: winning a file no longer at the lock path is no lock."""
+    remote.root.mkdir(parents=True)
+    lock = remote.root / f'.build-{remote.sha}.lock'
+    handles = [lock.open('w')]
+    fcntl.flock(handles[0], fcntl.LOCK_EX)
+    proc = remote.popen()
+    try:
+        first = handles[0]
+        assert _holds_within(lambda: _a_flock_waits_on(first), 30)
+
+        lock.unlink()
+        second = lock.open('w')
+        handles.append(second)
+        fcntl.flock(second, fcntl.LOCK_EX)
+        first.close()
+
+        assert _holds_within(lambda: _a_flock_waits_on(second), 10)
+        assert remote.builds() == 0
+
+        second.close()
+        _, stderr = proc.communicate(timeout=60)
+        assert proc.returncode == 0, stderr
+        assert remote.builds() == 1
+    finally:
+        for handle in handles:
+            handle.close()
+        proc.kill()
+        proc.communicate(timeout=60)
+
+
 def test_ensure_never_exits_with_the_ssh_transport_status(remote: _Remote):
     """rc 255 means 'the ssh client failed'; a gate failure must not look like one.
 
