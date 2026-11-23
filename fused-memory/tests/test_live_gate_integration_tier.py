@@ -74,6 +74,27 @@ def test_every_live_gated_test_is_in_the_integration_tier() -> None:
     )
 
 
+def test_the_tree_scan_reads_every_test_module_and_names_items_by_relpath(tmp_path: Path) -> None:
+    (tmp_path / 'nested').mkdir()
+    (tmp_path / 'test_flat.py').write_text(
+        '@falkor_skipif()\ndef test_live(): ...\n', encoding='utf-8',
+    )
+    (tmp_path / 'nested' / 'test_deep.py').write_text(
+        'pytestmark = [qdrant_skipif(), pytest.mark.integration]\ndef test_live(): ...\n',
+        encoding='utf-8',
+    )
+    (tmp_path / 'test_ungated.py').write_text('def test_unit(): ...\n', encoding='utf-8')
+    (tmp_path / 'helpers.py').write_text(
+        '@falkor_skipif()\ndef test_live(): ...\n', encoding='utf-8',
+    )
+
+    assert scan_live_gated_tree(tmp_path) == LiveGateScan(
+        examined=3,
+        gated=('nested/test_deep.py::test_live', 'test_flat.py::test_live'),
+        not_integration=('test_flat.py::test_live',),
+    )
+
+
 @pytest.mark.parametrize(('source', 'expected_gated', 'expected_not_integration'), [
     pytest.param(
         """
