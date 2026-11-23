@@ -1748,6 +1748,7 @@ class TestBuildEvalOrchConfigAutoSeedsProxiedPrices:
         # feeds the REAL resolve_cost_usd (evals/metrics.py) with no manual
         # price seed on `base` — the auto-seed alone must be enough to land on
         # cost_source='price_table'.
+        from orchestrator.agents.token_pricing import TokenUsage
         from orchestrator.evals.configs import MINIMAX_BASE_URL, MINIMAX_MODEL
         from orchestrator.evals.metrics import resolve_cost_usd
         from orchestrator.evals.runner import build_eval_orch_config
@@ -1764,7 +1765,7 @@ class TestBuildEvalOrchConfigAutoSeedsProxiedPrices:
         cfg = build_eval_orch_config(proxied, {}, base)
 
         cost, source = resolve_cost_usd(
-            1_000_000, 1_000_000,
+            TokenUsage(input_tokens=1_000_000, output_tokens=1_000_000),
             model=cfg.models.implementer,
             prices=cfg.prices,
             cli_cost_usd=999.0,           # deliberately wrong CLI figure —

@@ -304,6 +304,11 @@
           "budget_bytes": 21000,
           "task": "5824",
           "reason": "Measured 2026-10-15 against the live dashboard (127.0.0.1:8080): 4,081 bytes with no query. Three evals. Small; the 16 KiB headroom floor sets this budget."
+        },
+        {
+          "budget_bytes": 100000,
+          "task": "10137",
+          "reason": "Measured 2026-11-23: 65,320 bytes, by building this route with task 10137's code (build_memory_evals plus shape_memory_evals, serialized as Starlette's JSONResponse does) over the live artifact tree fused-memory/data/memory-evals and the live reconciliation queue, since the live dashboard still served main's code. In the old per-item-row shape the live dashboard served 79,622 bytes on 2026-11-14 and 116,964 on 2026-11-17. Census: 7 eval dirs, 5 with runs: e1-retrieval-health 6 metric rows over 12 runs (a tripwire's 34 items nested under it), 11,146 B; e4-staleness-sweep 5 rows over 11 runs (78 items nested), 13,436 B; e6-corpus-health 44 rows over 8 runs, 34,114 B; link-heal 7 rows over 2 runs, 3,364 B; e7-write-after-miss 1 row over 11 runs, 2,147 B; 2 run-less dirs. Item rows no longer copy the metric fields or the trend, so the payload is O(items) plus one trend per metric. That trend term still grows by about 1.9 KB per daily run, two thirds of it trend.labels, which repeats the eval's run_stamps in every metric row (follow-up ticket tkt_0RXAFRYTP5CSB76AZ8G8PKCKNM removes it). The headroom convention would give 82,000, about 9 days of that growth. This budget is sized for the growth instead, about 18 days, so the daily live check holds until the follow-up lands and lowers it. It stays within the sweep's slack rule over the fleet's 52,354 bytes."
         }
       ]
     },

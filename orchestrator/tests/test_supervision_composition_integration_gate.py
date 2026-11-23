@@ -596,7 +596,12 @@ class TestG1JournalFirstRecovery:
     async def test_journal_row_recovers_on_main_without_git_archaeology(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.task_ground_truth import BranchState, BranchStateKind, RecoveryAction
+        from orchestrator.task_ground_truth import (
+            BranchShaSource,
+            BranchState,
+            BranchStateKind,
+            RecoveryAction,
+        )
 
         task_id = 'task-2244-g1'
         advanced_sha = 'a1' * 20  # sentinel: no git fake could ever produce this
@@ -605,7 +610,9 @@ class TestG1JournalFirstRecovery:
             tmp_path, task_id, advanced_sha,
         )
 
-        assert report.branch_state == BranchState(BranchStateKind.ON_MAIN, advanced_sha)
+        assert report.branch_state == BranchState(
+            BranchStateKind.ON_MAIN, advanced_sha, BranchShaSource.JOURNAL,
+        )
         assert action == RecoveryAction.MARK_DONE_WITH_PROVENANCE
         git_ops.find_merge_marker.assert_not_awaited()
         git_ops.is_ancestor.assert_not_awaited()

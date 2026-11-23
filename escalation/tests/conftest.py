@@ -48,6 +48,7 @@ if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
 from df_pytest_isolation import (
     arm_leaked_drain_process_guard,
     arm_test_root_isolation,
+    arm_usage_gate_sweep_confinement,
     reject_unsafe_basetemp,
 )
 
@@ -155,10 +156,13 @@ from shared.pytest_fake_clock import (  # noqa: E402  # debt: ticket tkt_0RX7VH7
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the suite-wide defences."""
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the suite-wide defences and UsageGate sweep confinement."""
     reject_unsafe_basetemp(config)
     arm_test_root_isolation(config)
     arm_leaked_drain_process_guard(config)
+    from shared import usage_gate
+
+    arm_usage_gate_sweep_confinement(config, usage_gate)
 
 
 # ---------------------------------------------------------------------------

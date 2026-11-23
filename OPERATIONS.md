@@ -4496,6 +4496,196 @@ How to read the columns:
 
 ---
 
+## 11a. Verify-result cache
+
+The verify-result cache replays a unit's recorded green instead of re-running
+it, when the unit's spec hash and every keyed input are identical. It never
+narrows a plan: the plan is computed exactly as without the cache, and the
+cache only decides whether a planned unit executes or replays. Design, keys,
+registry and amendments A1–A6 are in
+[`plans/verify-result-cache-prd.md`](plans/verify-result-cache-prd.md); this
+section is the operator surface only.
+
+**Rulings.** R-cache-1 (Leo, 2026-09-19): a per-unit green replay is evidence,
+not a skipped gate. R-cache-2 (Leo, 2026-11-14): greens serve across hosts. The
+ruling text has one home, the PRD's § "Pre-conditions for activating"; read the
+conditions there.
+
+### Modes
+
+`verify_cache` in `dark-factory-orchestrator.yaml`
+(`orchestrator/src/orchestrator/config.py::VerifyCacheConfig`) holds one mode
+per verify role. Each is its own green-tier reload leaf, so
+`mcp__escalation__reload_config` applies a change without a restart.
+
+| Key | Values | Default |
+|---|---|---|
+| `verify_cache.task_mode` | `off` \| `log` \| `on` | `off` |
+| `verify_cache.merge_mode` | `off` \| `log` \| `on` | `off` |
+| `verify_cache.remote_task_mode`, `verify_cache.remote_merge_mode` | `off` \| `log` \| `on` | `off` (arrive with task 9123, γ2) |
+| `verify_cache.remote_candidates_per_unit` | int cap on shipped candidates per unit | arrives with task 9123 |
+
+- `off`: no decision, no recording.
+- `log`: every unit still runs and its green is recorded; a unit whose key
+  matched a recorded green is stamped `would_hit`. A matched unit that then
+  runs red is stamped `ran_red` with the matched green's `evidence_event_id`:
+  a red the cache would have landed
+  (`orchestrator/src/orchestrator/verify_evidence.py::VerifyUnit.would_have_leaked`).
+  Nothing is replayed.
+- `on`: a matching unit is replayed and not run.
+
+Each mode rolls out `off` → `log` for three days → `on`, per role and (once
+γ2 lands) per remote mode, each with its own three-day `log` window.
+
+**Task and merge are independent values.** The task role may go `on` before the
+audit (task 5655) lands while the project's merge gate runs
+`merge_verify_breadth: "full"` (the default): that gate still runs every unit a
+task-role replay skipped, so a task-role false hit cannot land a red on main. A
+project set to `scoped` keeps `task_mode` behind the audit too. The merge role (and `remote_merge_mode`) stays
+behind the audit: `merge_mode: on` waits for task 5655. Before flipping a role
+to `on`, check its `log` window for a `ran_red` unit carrying an
+`evidence_event_id` for a cause the branch's own diff explains; spurious reds (infra kill, worker crash,
+deploy clock, known load flake) do not block the flip.
+
+A remote dispatch (verify on a `verify_runners` host) runs under the more
+conservative of the role's mode and the remote mode, so a runner never replays
+while the role is still in `log`. A runner's own config cannot turn replay on:
+the mode and the kill-switch state ride the dispatch. The runner decides against
+a view of recorded greens the dispatcher ships; the dispatcher re-reads the
+registry before it uses a returned hit. These keys arrive with task 9123; until
+it lands, a remote dispatch carries no view and every cacheable remote unit
+reports `unavailable` (see "Reading a verify event" for the units that do not).
+
+Current state: `orchestrator verify-cache status --config <path>` prints each
+role's mode, the registry's recorded greens by tier, and the kill switch. It is
+read-only and never creates a registry.
+
+### Reading a verify event
+
+`merge_verify` and `workflow_verify` events carry `plan_hash`, `cache_mode` and
+`units: [{unit, tier, key, outcome, evidence_event_id, reason}]` (shape:
+`orchestrator/src/orchestrator/verify_evidence.py::VerifyUnit.to_dict`). A unit's
+`key`, `evidence_event_id` and `reason` can be null. `plan_hash`, `cache_mode`
+and `units` are all null on a verify with no verdict
+(`orchestrator/src/orchestrator/verify_evidence.py::verify_event_fields`);
+`plan_hash` is also null when no plan ran, and `units` when the result recorded
+none (an older remote's). The pre-merge re-verify emits its own
+`workflow_verify` row, distinguished by its site.
+
+| Unit outcome | Meaning |
+|---|---|
+| `ran_green` / `ran_red` | The unit executed; nothing was replayed. Without an `evidence_event_id` there was no cache involvement (`off` mode, a miss, or a never-cache class), or the red ran under an `unavailable` or `disabled` decision, which the unit's `reason` names. In `log` mode a `ran_red` may carry `evidence_event_id`, naming the green a replay would have served: that unit is a leak the cache would have landed (`VerifyUnit.would_have_leaked`) |
+| `cache_hit` | Replayed, not run. `evidence_event_id` names the verify event whose green it replays; that event names the host that ran it, so a cross-host replay is traceable through it |
+| `would_hit` | `log` mode: the key matched a recorded green, and the unit ran anyway and passed. A matched unit that ran red is a `ran_red` with `evidence_event_id` (row above) |
+| `unavailable` | The cache could not decide, and the unit ran and passed. Causes include no registry on this host, an unreadable registry, a code identity its keys need was missing, a working copy that differed from HEAD, a toolchain (venv, lockfile) that could not be read, and a decision that itself failed (`orchestrator/src/orchestrator/verify_cache/replay.py::plan_replay`, `orchestrator/src/orchestrator/verify_cache/policy.py::decide`). The unit's `reason` names the actual cause and is the authority. A red is `ran_red`, with no `evidence_event_id`. It is never an error |
+| `disabled` | A decision, never an event value. Under the kill switch every unit runs, and a cacheable unit shows as `unavailable` if green or `ran_red` if red, the unit's `reason` naming the disable deadline (`orchestrator/src/orchestrator/verify_cache/policy.py::_decide`) |
+
+Some units are settled before the registry or the kill switch is read, so they
+show plain `ran_green`/`ran_red` under the kill switch and on a host with no
+registry alike:
+
+- every unit of a role in `off`, which decides nothing
+  (`orchestrator/src/orchestrator/verify_cache/replay.py::plan_replay`);
+- a never-cache module's units, settled as misses
+  (`orchestrator/src/orchestrator/verify_cache/policy.py::_decide`);
+- a unit with no planned run, whose `reason` begins `not keyed:`
+  (`orchestrator/src/orchestrator/verify_cache/replay.py::ReplayPlan.settle`).
+
+The last two show `unavailable` only when the whole verify could not be keyed
+(a dirty working copy, an unreadable toolchain, a missing code identity).
+Elsewhere in this section a "cacheable unit" is any other unit.
+
+A **no-verdict naming an unbacked cache hit** (γ2) means a remote runner
+returned a `cache_hit` for a `(unit_id, key)` the dispatcher's registry does
+not hold. The dispatcher refuses the whole result as a no-verdict
+(`orchestrator/src/orchestrator/verify_runner.py::RunnerUnavailable`) and the
+existing re-dispatch path runs it again with a fresh view, so the same unbacked
+hit cannot recur. It needs no action; repeated no-verdicts on one runner are the
+signal to look at that runner's toolchain or registry sync. Arrives with task
+9123 (γ2); until then no green crosses hosts.
+
+### Cross-host replay
+
+A green recorded on any host serves any host whose own computed key is equal
+(R-cache-2, Leo 2026-11-14; PRD § Amendment — 2026-11-14, A6). The runner's name
+is not a keyed input. Each runner computes its keys from its own worktree and
+toolchain, so a host whose interpreter, lockfile, pyright, ruff or `verify_env`
+overlay differs has a different toolchain fingerprint and misses. Whether the
+two hosts' fingerprints are equal today has not been measured; the remote `log`
+window shows it, as a remote `would_hit` unit whose evidence event ran on another
+host. Arrives with task 9123 (γ2); until then no green crosses hosts: a runner
+reaches no registry, so its cacheable units report `unavailable` and nothing it
+runs is recorded.
+
+### Audit and recording lanes
+
+Both are `LaneCommand` entries on `git.offline_lane_commands`, run by the
+offline lane at idle nice against the latest landed head. The lane coalesces:
+heads that land while a pass runs collapse into one re-run at the then-current
+head, so an intermediate head gets no pass of its own
+(`orchestrator/src/orchestrator/offline_lane.py::OfflineLaneWorker`). Both
+commands arrive with the tasks named.
+
+| Lane command | Task | What it does |
+|---|---|---|
+| `verify-cache-audit` | 5655 (ε) | Runs the merge-role command set uncached (`DF_VERIFY_CACHE=off`) at the head each lane pass runs from (above). A red attributable to a `cache_hit` unit evicts that unit's entries, bumps the streak and returns the leak record as an evidence note; the lane renders it into the fix task it files once the red persists. A repeated pass of the same leak is counted once |
+| the separate recording lane command | 5656 (ζ1) | Records per-test input sets from green runs for the per-test tier. It consumes green runs' coverage only, so it does not wait for the audit |
+
+The audit plugs into the offline lane's red path through the `on_pass_outcome`
+hook ([`plans/offline-lane-red-path-prd.md`](plans/offline-lane-red-path-prd.md)
+§5.7). When the lane files a fix task and when it escalates are decided in that
+PRD (D5, D11); the runbook is "The offline lane's red path" above. A red not
+attributable to a replay (main was red anyway) returns no notes and takes that
+path untouched. The blocker the audit files itself when it trips the kill switch
+is under "Kill switch and re-enabling".
+
+### Kill switch and re-enabling
+
+Two attributable leaks within seven days set `policy_state.disabled_until` (14
+days from the second leak, with a reason and the leak evidence) and file an L2
+blocker naming both. While it is in the future **both roles run every unit**,
+whatever the modes say, and remote dispatches carry it. A cacheable unit shows
+as `unavailable` (or `ran_red`; see the `disabled` row above). The units settled
+before the switch is read (listed under "Reading a verify event") show plain
+`ran_green`/`ran_red`; seeing them does not mean the switch failed to take
+effect. The switch lives in the
+registry, not in config, so a reload does not clear it.
+
+To re-enable once the leaks are fixed, an operator runs `orchestrator
+verify-cache enable --config <path>`, or calls `resolve_issue` on the blocker;
+either records the re-enable. Waiting out `disabled_until` also re-enables. Both
+arrive with task 5655; `orchestrator verify-cache status` shows the switch
+meanwhile (`policy: DISABLED until …` with the reason and leaks).
+
+### Never cached
+
+- Flake-suppressed greens, truncated sessions and TRIVIAL runs: refused at
+  recording, so they can never serve.
+- Units of a module flagged `verify_cache: never` in the module table: the
+  repo-wide guard module, which runs at every gate.
+- A red: the registry stores and serves greens only.
+- A remote dispatch that carries no view decides nothing; its cacheable units
+  report `unavailable`.
+- An entry recorded under a different spec hash never serves another spec's unit.
+- Per-test tier (arrives with tasks 5656 and 5657, ζ1/ζ2; neither the tier nor
+  the `repo_state` marker exists yet):
+  - Tests marked `repo_state`.
+  - A test whose file or conftest chain differs in object id from the one it
+    was recorded against has no recording and runs.
+
+The registry is derived state in its own sqlite file; deleting it is a cold
+start, not a data loss.
+
+### Pointer table
+
+| Item | Disposition |
+|---|---|
+| R-cache-1 (2026-09-19), R-cache-2 (2026-11-14) | Rulings; text in the PRD § "Pre-conditions for activating" |
+| Task 5294 (duplicate pyright leg) | Superseded by γ (task 5653): γ's unscoped-typecheck consult, `orchestrator/src/orchestrator/merge_lane/gates.py::_type_covered_modules`, is its dedupe. Closing 5294 as superseded is an operator action; its status lives in the task store |
+| Task 5410 (task-leg disjoint-rebase skip) | Cancelled 2026-10-09 (Leo) as superseded: task 6580 removed the merge-phase verify it targeted, and its predicate never fired (0/40 DF, 0/20 reify). The per-test tier (task 5657, ζ2) remains the long-run owner of green reuse. No retirement action remains; the reasoning is in task 5410's `details` |
+
+---
+
 ## 12. Nightly maintenance timers
 
 Recurring maintenance runs as systemd **user** timers, not as orchestrator

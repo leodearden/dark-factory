@@ -123,6 +123,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_rebase_recovery.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebased_solo_landing_ladder.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_reconcile_done_step_commits.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_reconcile_landed_uncited_tip.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_recut_ruling_gitops.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_review_inputs.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_roles_already_done_commit_search.py': _SEEDS_ITS_OWN_REPO,

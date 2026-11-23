@@ -10,7 +10,7 @@ from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import ClassificationFallback, MemoryCategory
 from fused_memory.models.memory import ClassificationResult
 from fused_memory.routing.json_extract import extract_json
-from fused_memory.routing.openai_client import LazyOpenAIClient
+from fused_memory.routing.openai_client import LazyOpenAIClient, routing_chat_params
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,14 @@ Respond as JSON:
   "confidence": <0.0-1.0>,
   "reasoning": "<brief>"
 }"""
+
+
+def _optional_category(value: object) -> MemoryCategory | None:
+    """The secondary category, or None for any answer that names none ("null", "none", 42, ...)."""
+    try:
+        return MemoryCategory(value)
+    except ValueError:
+        return None
 
 
 class WriteClassifier:
@@ -129,16 +137,14 @@ class WriteClassifier:
 
     async def _llm_classify(self, content: str) -> ClassificationResult:
         """Use LLM for classification."""
-        client = self._openai.get()
         try:
+            client = self._openai.get()
             response = await client.chat.completions.create(
-                model=self.config.llm.model,
                 messages=[
                     {'role': 'system', 'content': CLASSIFICATION_SYSTEM_PROMPT},
                     {'role': 'user', 'content': content[:2000]},
                 ],
-                temperature=0.0,
-                max_tokens=256,
+                **routing_chat_params(self.config),
             )
             raw = response.choices[0].message.content or ''
 
@@ -155,7 +161,7 @@ class WriteClassifier:
 
             data = json.loads(json_str)
             primary = MemoryCategory(data['primary'])
-            secondary = MemoryCategory(data['secondary']) if data.get('secondary') else None
+            secondary = _optional_category(data.get('secondary'))
             confidence = float(data.get('confidence', 0.7))
             reasoning = data.get('reasoning', '')
 
