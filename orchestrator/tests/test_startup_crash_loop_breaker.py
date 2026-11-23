@@ -10,10 +10,12 @@ event store.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from _startup_harness import journal_merge_request, merge_lane_harness_factory
@@ -24,6 +26,7 @@ from shared.project_layout import runs_db, startup_failures_json
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.liveness import MergeLivenessConfigError
+from orchestrator.run_store import RunStore
 from orchestrator.startup_steps import CRASH_LOOP_THRESHOLD, StartupFailureStreak
 
 SENTINEL = 'orchestrator-startup-crash-loop'
@@ -245,3 +248,89 @@ class TestHealthyStart:
         [(startup_completed_at, exit_reason)] = _runs(h)
         assert startup_completed_at is not None
         assert exit_reason is None
+
+
+def _after_finish_startup(h: Harness, probe: Callable[[], None]) -> None:
+    """Run ``probe`` once, inside ``h.run``, at the first task-tree read after startup finished."""
+    probed = False
+
+    def statuses() -> tuple[dict[str, str], None]:
+        nonlocal probed
+        if h.scheduler.finish_startup.called and not probed:
+            probed = True
+            probe()
+        return {'1': 'pending'}, None
+
+    h.scheduler.get_statuses = AsyncMock(side_effect=statuses)
+
+
+def _run_row(db: Path) -> tuple[str | None, str | None, str | None]:
+    with closing(sqlite3.connect(db)) as conn:
+        return conn.execute(
+            'SELECT startup_completed_at, exit_reason, completed_at FROM runs '
+            'ORDER BY rowid DESC LIMIT 1',
+        ).fetchone()
+
+
+@pytest.mark.asyncio
+class TestStartupCompletionIsDurableBeforeExit:
+    async def test_a_live_run_reads_startup_completed_before_run_returns(
+        self, make_harness,
+    ) -> None:
+        h = make_harness()
+        live_rows: list[tuple[str | None, str | None, str | None]] = []
+        _after_finish_startup(h, lambda: live_rows.append(_run_row(runs_db(h.config.project_root))))
+
+        await h.run(prd_path=None, dry_run=True)
+
+        [(startup_completed_at, exit_reason, completed_at)] = live_rows
+        assert startup_completed_at is not None
+        assert exit_reason is None
+        assert completed_at is None
+        assert _run_row(runs_db(h.config.project_root))[0] == startup_completed_at
+
+    async def test_a_run_sigkilled_after_startup_keeps_startup_completed_at(
+        self, make_harness, tmp_path,
+    ) -> None:
+        h = make_harness()
+        snapshot = tmp_path / 'sigkilled-runs.db'
+
+        def copy_live_db() -> None:
+            with (
+                closing(sqlite3.connect(runs_db(h.config.project_root))) as live,
+                closing(sqlite3.connect(snapshot)) as copy,
+            ):
+                live.backup(copy)
+
+        _after_finish_startup(h, copy_live_db)
+
+        await h.run(prd_path=None, dry_run=True)
+
+        startup_completed_at, exit_reason, completed_at = _run_row(snapshot)
+        assert startup_completed_at is not None
+        assert exit_reason is None
+        assert completed_at is None
+
+    async def test_a_failing_stamp_logs_a_warning_and_startup_still_completes(
+        self, make_harness, caplog,
+    ) -> None:
+        h = make_harness()
+
+        with (
+            patch.object(
+                RunStore, 'mark_startup_completed',
+                side_effect=sqlite3.OperationalError('database is locked'),
+            ),
+            caplog.at_level(logging.WARNING, logger='orchestrator.harness'),
+        ):
+            await h.run(prd_path=None, dry_run=True)
+
+        h.scheduler.finish_startup.assert_called_once()
+        db = runs_db(h.config.project_root)
+        assert _run_row(db)[1] is None
+        with closing(sqlite3.connect(db)) as conn:
+            [(run_id,)] = conn.execute('SELECT run_id FROM runs').fetchall()
+        assert any(
+            record.levelno == logging.WARNING and run_id in record.getMessage()
+            for record in caplog.records
+        )
