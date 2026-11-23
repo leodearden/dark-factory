@@ -92,7 +92,13 @@ from orchestrator.agents.write_set import (
     compute_write_set,
     ensure_claude_fleet_dir,
 )
-from orchestrator.architect_phase_verdict import confirmed_at, confirmed_since
+from orchestrator.architect_phase_verdict import (
+    clear_exit_reports,
+    confirmed_at,
+    confirmed_since,
+    find_plan_exit_conflict,
+    read_exit_reports,
+)
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     ReviewAggregation,
@@ -5866,6 +5872,33 @@ class TaskWorkflow:
             return None
         return await build_prompt()
 
+    async def _hold_on_plan_exit_conflict(self, phase_marker: str | None) -> WorkflowOutcome | None:
+        """Block behind one L1 when this phase both confirmed a plan and wrote exit reports; None when it did not."""
+        assert self.artifacts is not None
+        conflict = find_plan_exit_conflict(
+            self.artifacts.peek_plan(), phase_marker, read_exit_reports(self.artifacts),
+        )
+        if conflict is None:
+            return None
+        logger.error(
+            'Task %s: the architect phase confirmed a plan and also wrote exit report(s) %s',
+            self.task_id, [report.value for report in conflict.reports],
+        )
+        if self._steward:
+            await self._steward.stop()
+            self._steward = None
+        outcome = await self._mark_blocked(
+            conflict.summary(),
+            detail=conflict.detail(),
+            escalate_to_human=True,
+            category='design_concern',
+            dry_run_spawn=DryRunSpawn.NEVER,
+        )
+        # Cleared only once the escalation is filed, so a raising
+        # _mark_blocked leaves the evidence for the next attempt.
+        clear_exit_reports(self.artifacts, conflict.reports)
+        return outcome
+
     async def _run_architect_for_plan(
         self, build_prompt: PromptBuilder,
     ) -> WorkflowOutcome | None:
@@ -5885,6 +5918,7 @@ class TaskWorkflow:
                     self.task_id, status='pending', level=0,
                 )
             }
+        phase_marker = confirmed_at(self.artifacts.peek_plan())
 
         result: AgentResult | None = None
         rebase_retry_used = False
@@ -6008,7 +6042,10 @@ class TaskWorkflow:
             # merge submit (less decisive than already_done's clean DONE — the
             # work is on the BRANCH, not main — but more decisive than a
             # re-looping blocking_dependency); blocking_dependency may re-loop
-            # the architect.
+            # the architect.  A plan confirmed in this same phase turns any of
+            # them into a conflict, held for a ruling before routing (task 6814).
+            if outcome := await self._hold_on_plan_exit_conflict(phase_marker):
+                return outcome
             verdict = await self._route_task_verdict_report()
             if verdict is not None:
                 return verdict
