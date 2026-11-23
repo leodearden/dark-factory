@@ -74,11 +74,13 @@ _SCRIPTS = Path(__file__).resolve().parent
 
 
 if TYPE_CHECKING:
+    import mem0_history_at as _history
     import write_triage_rating_rounds as _rounds
     import write_triage_reader_rubric as _rubric
 else:
     _rubric = load_script(_SCRIPTS / 'write_triage_reader_rubric.py', 'write_triage_reader_rubric')
     _rounds = load_script(_SCRIPTS / 'write_triage_rating_rounds.py', 'write_triage_rating_rounds')
+    _history = load_script(_SCRIPTS / 'mem0_history_at.py', 'mem0_history_at')
 
 Binary = _rubric.Binary
 Answer = _rubric.Answer
@@ -581,7 +583,7 @@ def _draw_extension(
     """
     extension: dict[str, dict[str, Any]] = {}
     unrecoverable: list[dict[str, str]] = []
-    with _rounds.read_only(journal_db) as journal:
+    with _history.read_only(journal_db) as journal:
         for outcome, total in totals.items():
             drawn = extend_sample(bundle.population(outcome), bundle.adjudications, total,
                                   seed=f'{seed}:{outcome}')
@@ -606,8 +608,8 @@ def _rating_entries(
     for soaked in soak:
         if not soaked.item['parent_edited_after_attach']:
             continue
-        text = _rounds.text_at(history_db, soaked.item['target_id'],
-                               datetime.fromisoformat(soaked.child_created_at), soaked.parent_text)
+        text = _history.text_at(history_db, soaked.item['target_id'],
+                                datetime.fromisoformat(soaked.child_created_at), soaked.parent_text)
         if text is None:
             unrecoverable.append(soaked.item['entry_id'])
         else:

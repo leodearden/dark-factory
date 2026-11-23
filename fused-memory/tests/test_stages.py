@@ -117,6 +117,7 @@ from fused_memory.reconciliation.task_filter import (
     MAX_CANCELLED_TASKS_RETAINED,
     MAX_DONE_TASKS_RETAINED,
     FilteredTaskTree,
+    TaskTreeUnavailableReason,
     filter_task_tree,
     format_task_list,
     id_key,
@@ -5640,6 +5641,58 @@ class TestBriefingKnownGapsRefresh:
             )
 
         # Second invocation must not call add_task again
+        mock_deps['taskmaster'].add_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unavailable_injected_tree_does_not_suppress_the_dedup_fetch(
+        self, mock_deps, tmp_path, caplog,
+    ):
+        """An unknown injected tree is not 'no pending tasks': the hook fetches its own tree to dedup."""
+        scripts_dir = tmp_path / 'scripts'
+        scripts_dir.mkdir()
+        (scripts_dir / 'refresh_briefing_known_gaps.py').write_text(
+            'import json, sys\n'
+            "print(json.dumps([{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]))\n"
+            'sys.exit(1)\n'
+        )
+        (tmp_path / 'review').mkdir()
+        (tmp_path / 'review' / 'briefing.yaml').write_text('')
+
+        stage = TaskKnowledgeSync(StageId.task_knowledge_sync, **mock_deps)
+        stage.scope = _scope('reify', str(tmp_path))
+        stage.filtered_task_tree = FilteredTaskTree(
+            unavailable_reason=TaskTreeUnavailableReason.fetch_error,
+        )
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                {
+                    'id': '9001',
+                    'status': 'pending',
+                    'title': 'Refresh briefing: remove task 1751 from known_gaps',
+                },
+            ],
+        }
+
+        with (
+            patch.object(stage, 'assemble_payload', new=AsyncMock(return_value='payload')),
+            patch(
+                'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+                new=AsyncMock(return_value=StageResult(success=True, report={'summary': 'ok'})),
+            ),
+            caplog.at_level(logging.INFO, logger=_TKS_LOGGER),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='reify'),
+                prior_reports=[],
+                run_id='test-run-unavailable-tree',
+            )
+
+        queued_records = [
+            r for r in caplog.records
+            if r.name == _TKS_LOGGER and r.getMessage() == 'briefing_refresh_tasks_queued'
+        ]
+        assert [getattr(r, 'skipped_ids', None) for r in queued_records] == [['1751']]
         mock_deps['taskmaster'].add_task.assert_not_called()
 
     @pytest.mark.asyncio
@@ -12791,10 +12844,6 @@ def stage2_guard_mock_deps():
     write_journal_mock.get_ops_by_causation = AsyncMock(return_value=[])
     journal_mock = MagicMock()
     journal_mock.write_journal = write_journal_mock
-    # Task 2744: BaseStage.run now records/clears a per-stage CLI session on the
-    # run row around the stage subprocess; these must be awaitable on the mock.
-    journal_mock.record_run_session = AsyncMock()
-    journal_mock.clear_run_session = AsyncMock()
     return {
         'memory_service': AsyncMock(),
         'taskmaster': AsyncMock(),
@@ -15164,108 +15213,48 @@ class TestMemoryConsolidatorMem0ResultsKeyWarns:
         )
 
 
-class TestIntegrityCheckBlockedSnapshotWiring:
-    """IntegrityCheck.run() must apply filter_blocked_snapshot_findings and
-    surface report.stats['blocked_snapshot_findings_dropped'].
-
-    Mirrors TestIntegrityCheckRecordTaskDumpSpotCheck's mock_deps fixture and
-    the test_stage1.py TestStaleCountSnapshotCorrectionWiring pattern.
-
-    RED until step-6 wires filter_blocked_snapshot_findings into run() and
-    sets the stat.
-    """
+class TestIntegrityCheckTaskCountSnapshotWiring:
+    """IntegrityCheck.run() drops task-count snapshot findings for every
+    project and surfaces report.stats['task_count_snapshot_findings_dropped'].
+    'reify' is used because it once kept a snapshot (task 10081)."""
 
     @pytest.fixture
-    def config(self):
-        return ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-
-    @pytest.fixture
-    def mock_deps(self, config):
+    def mock_deps(self):
         return {
             'memory_service': AsyncMock(),
             'taskmaster': AsyncMock(),
             'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
+            'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+            'scope': _scope('reify', '/tmp/test'),
         }
 
-    @pytest.mark.asyncio
-    async def test_snapshot_finding_dropped_and_benign_survives_for_blocked_project(
-        self, mock_deps
-    ):
-        """Snapshot missing_knowledge finding is DROPPED and benign finding SURVIVES
-        for project_id='autopilot_video'; stat is set to 1.
-
-        RED: run() does not yet apply the filter or set the stat.
-        """
+    @staticmethod
+    async def _run(mock_deps, items_flagged: list[dict]) -> StageReport:
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.scope = _scope('autopilot_video', stage.scope.project_root)
         stage.filtered_task_tree = None
-
-        snapshot_flag = {
-            'task_id': None,
-            'flag_type': 'missing_knowledge',
-            'category': 'missing_knowledge',
-            'description': 'autopilot_video has no task-count snapshot temporal_fact edge',
-            'suggested_action': 'Add a count snapshot temporal_fact for autopilot_video',
-            'actionable': False,
-        }
-        benign_flag = {
-            'task_id': '42',
-            'flag_type': 'missing_deliverable',
-            'category': 'missing_deliverable',
-            'description': 'task 42 has no design doc',
-            'suggested_action': 'Add a design doc',
-            'actionable': True,
-        }
-
         base_report = StageReport(
             stage=StageId.integrity_check,
             started_at=datetime.now(UTC),
             completed_at=datetime.now(UTC),
-            items_flagged=[snapshot_flag, benign_flag],
+            items_flagged=items_flagged,
             stats={},
         )
-
         with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
-            report = await stage.run(
+            return await stage.run(
                 events=[],
-                watermark=Watermark(project_id='autopilot_video'),
+                watermark=Watermark(project_id='reify'),
                 prior_reports=[],
-                run_id='run-1840',
+                run_id='run-task-count-snapshot',
             )
 
-        categories = [f.get('category') for f in report.items_flagged]
-        assert 'missing_knowledge' not in categories, (
-            "Snapshot missing_knowledge finding must be DROPPED for autopilot_video; "
-            f"got items_flagged={report.items_flagged!r}"
-        )
-        assert 'missing_deliverable' in categories, (
-            "Benign missing_deliverable finding must SURVIVE the snapshot filter; "
-            f"got items_flagged={report.items_flagged!r}"
-        )
-        assert report.stats.get('blocked_snapshot_findings_dropped') == 1, (
-            "run() must set report.stats['blocked_snapshot_findings_dropped'] = 1; "
-            f"got stats={report.stats!r}. RED: stat not yet surfaced."
-        )
-
     @pytest.mark.asyncio
-    async def test_both_findings_survive_for_non_blocked_project(self, mock_deps):
-        """For project_id='reify' (not in blocked set), BOTH findings survive;
-        blocked_snapshot_findings_dropped == 0.
-
-        RED: run() does not yet apply the filter or set the stat.
-        """
-        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.scope = _scope('reify', stage.scope.project_root)
-        stage.filtered_task_tree = None
-
+    async def test_snapshot_finding_is_dropped_and_counted(self, mock_deps):
         snapshot_flag = {
             'task_id': None,
             'flag_type': 'missing_knowledge',
             'category': 'missing_knowledge',
             'description': 'reify has no task-count snapshot temporal_fact edge',
-            'suggested_action': 'Add a count snapshot',
+            'suggested_action': 'Add a count snapshot temporal_fact for reify',
             'actionable': False,
         }
         benign_flag = {
@@ -15277,38 +15266,33 @@ class TestIntegrityCheckBlockedSnapshotWiring:
             'actionable': True,
         }
 
-        base_report = StageReport(
-            stage=StageId.integrity_check,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[snapshot_flag, benign_flag],
-            stats={},
-        )
+        report = await self._run(mock_deps, [snapshot_flag, benign_flag])
 
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
-            report = await stage.run(
-                events=[],
-                watermark=Watermark(project_id='reify'),
-                prior_reports=[],
-                run_id='run-1840',
-            )
+        assert [f['category'] for f in report.items_flagged] == ['missing_deliverable']
+        assert report.stats['task_count_snapshot_findings_dropped'] == 1
 
-        assert len(report.items_flagged) == 2, (
-            "Both findings must survive for non-blocked project 'reify'; "
-            f"got items_flagged={report.items_flagged!r}"
-        )
-        assert report.stats.get('blocked_snapshot_findings_dropped') == 0, (
-            "run() must set report.stats['blocked_snapshot_findings_dropped'] = 0 "
-            "when no flags are dropped; "
-            f"got stats={report.stats!r}"
-        )
+    @pytest.mark.asyncio
+    async def test_stat_is_zero_with_no_snapshot_finding(self, mock_deps):
+        benign_flag = {
+            'task_id': '42',
+            'flag_type': 'missing_deliverable',
+            'category': 'missing_deliverable',
+            'description': 'task 42 has no design doc',
+            'suggested_action': 'Add a design doc',
+            'actionable': True,
+        }
+
+        report = await self._run(mock_deps, [benign_flag])
+
+        assert report.items_flagged == [benign_flag]
+        assert report.stats['task_count_snapshot_findings_dropped'] == 0
 
 
 class TestIntegrityCheckContaminationCeilingWiring:
     """IntegrityCheck.run() must apply filter_contamination_ceiling_findings and
     surface report.stats['contamination_ceiling_findings_dropped'] (task 2826).
 
-    Mirrors TestIntegrityCheckBlockedSnapshotWiring's mock_deps fixture and the
+    Mirrors TestIntegrityCheckTaskCountSnapshotWiring's mock_deps fixture and the
     patch.object(BaseStage, 'run', ...) pattern — the new gate is wired into the
     same IntegrityCheck.run() override.
 
@@ -15445,84 +15429,15 @@ class TestIntegrityCheckContaminationCeilingWiring:
         )
 
 
-class TestIntegrityCheckSnapshotStatEdgeWiring:
-    """IntegrityCheck.run() applies filter_snapshot_stat_edge_findings for every
-    project and surfaces report.stats['snapshot_stat_edge_findings_dropped']
-    (task 3487). Mirrors TestIntegrityCheckContaminationCeilingWiring."""
-
-    @pytest.fixture
-    def config(self):
-        return ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-
-    @pytest.fixture
-    def mock_deps(self, config):
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('dark_factory', '/tmp/test'),
-        }
-
-    async def _run(self, mock_deps, flags):
-        stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
-        stage.filtered_task_tree = None
-        base_report = StageReport(
-            stage=StageId.integrity_check,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=flags,
-            stats={},
-        )
-        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
-            return await stage.run(
-                events=[],
-                watermark=Watermark(project_id='dark_factory'),
-                prior_reports=[],
-                run_id='run-3487',
-            )
-
-    @pytest.mark.asyncio
-    async def test_stat_edge_finding_dropped_for_a_non_blocked_project(self, mock_deps):
-        stat_edge_flag = {
-            'task_id': None,
-            'flag_type': 'stats_mismatch',
-            'category': 'memory_stale',
-            'description': 'Stage 2 reported task_count_snapshot_mem0_written=1 but no '
-                           'Graphiti temporal_facts edge exists',
-            'suggested_action': 'Investigate the rejected write',
-            'actionable': False,
-        }
-        benign_flag = {
-            'task_id': '42',
-            'flag_type': 'missing_deliverable',
-            'category': 'missing_deliverable',
-            'description': 'task 42 has no design doc',
-            'suggested_action': 'Add a design doc',
-            'actionable': True,
-        }
-
-        report = await self._run(mock_deps, [stat_edge_flag, benign_flag])
-
-        assert report.items_flagged == [benign_flag]
-        assert report.stats['snapshot_stat_edge_findings_dropped'] == 1
-
-    @pytest.mark.asyncio
-    async def test_stat_is_zero_with_no_flags(self, mock_deps):
-        report = await self._run(mock_deps, [])
-
-        assert report.stats['snapshot_stat_edge_findings_dropped'] == 0
-
-
 class TestIntegrityCheckPhantomTaskCreationWiring:
     """IntegrityCheck.run() must apply filter_false_phantom_task_creation_flags
     and surface report.stats['phantom_task_creation_findings_dropped'] (task-2525
     step-5).
 
-    Mirrors TestIntegrityCheckBlockedSnapshotWiring's mock_deps fixture and
+    Mirrors TestIntegrityCheckTaskCountSnapshotWiring's mock_deps fixture and
     patch.object(BaseStage, 'run', ...) pattern — the new gate is wired into
     the same IntegrityCheck.run() override, immediately after the existing
-    filter_blocked_snapshot_findings block.
+    filter_task_count_snapshot_findings block.
 
     RED until step-6 wires filter_false_phantom_task_creation_flags into
     run() and sets the stat.

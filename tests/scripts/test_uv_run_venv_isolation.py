@@ -1,14 +1,25 @@
-"""Starting a unit must not mutate the shared root .venv.
+"""Neither starting a unit nor running a checked-in shell script may mutate the shared root .venv.
 
 SCOPE, stated precisely because the honest boundary is narrower than the
 invariant one would want.  This module sweeps every committed unit whose start
 runs ``uv run``: in its ExecStart, or one level down, in the checkout's shell
 wrapper its ExecStart executes (read as text by shell_uv_run_sites, never run).
+A second arm sweeps every non-test ``*.sh`` the checkout lists, by content,
+whether or not a unit runs it.
 It does NOT follow a wrapper's own callees, a wrapper not named ``*.sh``, a uv
 the wrapper reaches through a variable whose name never mentions uv, or a
 ``*_CMD`` seam a unit overrides through ``Environment=`` (no committed unit
 does today).  Inside that boundary "cannot answer" raises rather than skips: a
 ``.sh`` the checkout does not hold, and a uv-then-``run`` the scan cannot read.
+Python code that BUILDS a ``uv run`` argv or command string is invisible to a
+text scan of shell and is NOT swept.  Three such sites are pinned at their own
+seams:
+tests/scripts/test_dashboard_watchdog.py::test_b4_ceiling_escalation_runs_uv_without_syncing_the_shared_venv,
+tests/scripts/test_watchdog_crash_loop.py::test_submit_argv_is_the_born_at_l2_shape
+and scripts/tests/test_sitting_nightly_prepare.py::test_the_prepare_command_never_syncs_the_shared_root_venv.
+Any other Python-built ``uv run`` is checked by nothing, whatever it passes.
+Command examples in markdown are not swept, apart from the one unit copy-source
+FACTORY_INIT_REFERENCE names.
 Recording the boundary here is the point: a guard reporting green over what it
 never read is worse than one that says what it does not cover.
 
@@ -34,8 +45,10 @@ import dataclasses
 import pathlib
 import re
 import subprocess
+from collections.abc import Callable
 
 import pytest
+from git_listing import git, listed_files
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shell_logical_lines import logical_lines
 from systemd_unit_invariants import (
@@ -82,7 +95,39 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "scripts/orchestrator-solar-challenge-platform.service",
         "scripts/orchestrator-stream-touch.service",
         "scripts/return-brief.service",
+        "scripts/timeout-headroom-selfcheck.service",
+        "scripts/transcript-secret-sweep.laptop.conf",
         "scripts/transcript-secret-sweep.service",
+    }
+)
+
+# Every non-test shell script in the checkout that runs `uv run`, whether or not
+# a unit runs it; asserted by EQUALITY for the reason _EXPECTED_UV_RUN_UNITS states.
+_EXPECTED_UV_RUN_SCRIPTS = frozenset(
+    {
+        "fused-memory/scripts/cgl_eta_auto_apply.sh",
+        "scripts/check_dashboard_payload_budgets.sh",
+        "scripts/check_sandbox_soak.sh",
+        "scripts/check_write_triage_flip_preconditions.sh",
+        "scripts/deploy/install_laptop_transcript_secret_sweep.sh",
+        "scripts/eval_bootstrap_smoke.sh",
+        "scripts/exception-owner-sweep.sh",
+        "scripts/fused-memory-duplicate-audit.sh",
+        "scripts/fused-memory-flag-marker-check.sh",
+        "scripts/fused-memory-flag-marker-sweep.sh",
+        "scripts/fused-memory-link-heal.sh",
+        "scripts/fused-memory-memory-eval.sh",
+        "scripts/install-exception-owner-sweep-timer.sh",
+        "scripts/install-timeout-headroom-selfcheck-timer.sh",
+        "scripts/legibility/install-transcript-check-timer.sh",
+        "scripts/legibility/install-trickle-health-timer.sh",
+        "scripts/legibility/install-trickle-timer.sh",
+        "scripts/local-model-serving/install-lms-units.sh",
+        "scripts/memory-metadata-coverage-census.sh",
+        "scripts/rerun_cap_tainted.sh",
+        "scripts/return-brief.sh",
+        "scripts/timeout-headroom-selfcheck.sh",
+        "scripts/transcript-secret-sweep.sh",
     }
 )
 
@@ -131,7 +176,7 @@ _BOOLEAN_RUN_FLAGS = frozenset(
     }
 )
 
-# The uv executable as a wrapper's shell spells it, followed by `run`: a bare
+# The uv executable as a shell script spells it, followed by `run`: a bare
 # `uv` (also a `${X:-uv run ...}` seam default, or a path ending /uv), or a
 # parameter expansion naming a variable containing UV, e.g. "$UV_RESOLVED".
 _SHELL_UV_RUN_RE = re.compile(r'(?:\buv|\$\{?\w*UV\w*\}?)["\']?\s+run(?=\s|$)')
@@ -144,6 +189,10 @@ _SHELL_UV_MENTION_RUN_RE = re.compile(r'(?i:\buv|\$\{?\w*uv)\S*(?:\s+-\S+)*\s+ru
 
 # The prefixes systemd allows before an ExecStart executable (systemd.service(5)).
 _SYSTEMD_EXEC_PREFIXES = "-@:+!"
+
+# Git pathspecs naming every shell script outside a test tree; a plain `*.sh`
+# matches at every depth.
+_NON_TEST_SHELL_SCRIPTS = ("*.sh", ":(exclude,glob)**/tests/**")
 
 
 def discover_exec_start_files() -> list[str]:
@@ -269,13 +318,13 @@ def run_level_flags(args: list[str], command: str) -> list[str]:
     return flags
 
 
-class UnreadableWrapper(ValueError):
-    """A followed wrapper holds a `uv run` this scan cannot read; the unit FAILS, never skips."""
+class UnreadableShellUvRun(ValueError):
+    """A shell script holds a `uv run` this scan cannot read; its case FAILS, never skips."""
 
 
 @dataclasses.dataclass(frozen=True)
 class UvRunSite:
-    """One `uv run` a unit's start executes: where it is written, its text, its run-level flags."""
+    """One `uv run` a unit's start or a shell script executes: where it is written, its text, its run-level flags."""
 
     source: str
     command: str
@@ -285,16 +334,16 @@ class UvRunSite:
 def shell_uv_run_sites(script: str, source: str) -> list[UvRunSite]:
     """Every `uv run` in shell *script*, read from the TEXT and never by running it.
 
-    Running a wrapper is not safe from a test: the census wrapper creates git
+    Running a script is not safe from a test: the census wrapper creates git
     worktrees and lands through the merge queue.  Every non-comment occurrence
     counts, one inside a string included, since the flag walk stops at the
     first token that is not a flag anyway.
 
-    Raises UnreadableWrapper, naming *source*, for a uv-then-`run` that
+    Raises UnreadableShellUvRun, naming *source*, for a uv-then-`run` that
     _SHELL_UV_RUN_RE does not recognise or whose run-level flags the walk does
-    not know.  Answering [] there would class the unit "runs no uv run" and
-    skip it, or drop one of a two-site wrapper's sites while the other kept the
-    unit green.
+    not know.  Answering [] there would class the unit or script "runs no uv
+    run" and skip it, or drop one of a two-site script's sites while the other
+    kept it green.
     """
     sites: list[UvRunSite] = []
     for line in logical_lines(script):
@@ -304,26 +353,26 @@ def shell_uv_run_sites(script: str, source: str) -> list[UvRunSite]:
         for match in _SHELL_UV_RUN_RE.finditer(line):
             read_ends.add(match.end())
             args = [t.rstrip(")}\"';") for t in line[match.end() :].split()]
-            sites.append(UvRunSite(source, line, _wrapper_run_level_flags(args, line, source)))
+            sites.append(UvRunSite(source, line, _shell_run_level_flags(args, line, source)))
         if any(m.end() not in read_ends for m in _SHELL_UV_MENTION_RUN_RE.finditer(line)):
-            raise UnreadableWrapper(
+            raise UnreadableShellUvRun(
                 f"{source}: {line!r} mentions uv and then `run`, in a spelling "
                 "this scan does not read as a `uv run`, so it cannot check that "
-                "command's run-level flags. Spell it as the committed wrappers "
+                "command's run-level flags. Spell it as the committed scripts "
                 'do (`uv run ...`, `"$UV_RESOLVED" run ...`, or a '
                 "`${X_CMD:-uv run ...}` seam default), or teach "
                 "_SHELL_UV_RUN_RE the new spelling and pin it in "
-                "test_shell_uv_run_sites_reads_every_wrapper_spelling."
+                "test_shell_uv_run_sites_reads_every_committed_spelling."
             )
     return sites
 
 
-def _wrapper_run_level_flags(args: list[str], line: str, source: str) -> tuple[str, ...]:
-    """run_level_flags for a wrapper line, its raise naming the wrapper file."""
+def _shell_run_level_flags(args: list[str], line: str, source: str) -> tuple[str, ...]:
+    """run_level_flags for a shell line, its raise naming the script file."""
     try:
         return tuple(run_level_flags(args, line))
     except MalformedExecStart as exc:
-        raise UnreadableWrapper(f"{source}: {exc}") from exc
+        raise UnreadableShellUvRun(f"{source}: {exc}") from exc
 
 
 def wrapper_script_of(exec_start: str, root: pathlib.Path = REPO_ROOT) -> str | None:
@@ -358,7 +407,7 @@ def uv_run_sites(rel_path: str, root: pathlib.Path = REPO_ROOT) -> list[UvRunSit
     """Every `uv run` starting the unit at *rel_path* under *root* runs, directly or via its wrapper.
 
     An empty list means the unit's start runs no `uv run` and callers SKIP it.
-    MalformedExecStart (the unit) and UnreadableWrapper (its wrapper) propagate.
+    MalformedExecStart (the unit) and UnreadableShellUvRun (its wrapper) propagate.
     """
     text = (root / rel_path).read_text(encoding="utf-8")
     exec_start = logical_exec_start(text, rel_path)
@@ -368,13 +417,18 @@ def uv_run_sites(rel_path: str, root: pathlib.Path = REPO_ROOT) -> list[UvRunSit
     wrapper = wrapper_script_of(exec_start, root)
     if wrapper is None:
         return []
-    return shell_uv_run_sites((root / wrapper).read_text(encoding="utf-8"), wrapper)
+    return script_uv_run_sites(wrapper, root)
+
+
+def script_uv_run_sites(rel_path: str, root: pathlib.Path = REPO_ROOT) -> list[UvRunSite]:
+    """Every `uv run` in the shell script at *rel_path* under *root*."""
+    return shell_uv_run_sites((root / rel_path).read_text(encoding="utf-8"), rel_path)
 
 
 def discover_uv_run_units() -> list[str]:
     """Repo-relative paths of every discovered file whose start runs `uv run`.
 
-    A MalformedExecStart or UnreadableWrapper from any parser INCLUDES the
+    A MalformedExecStart or UnreadableShellUvRun from any parser INCLUDES the
     path rather than propagating, for two reasons, the second sharper.  A raise here happens
     inside the ``@pytest.mark.parametrize`` argument, i.e. at COLLECTION time,
     so it takes down the whole module — including the coverage guard that exists
@@ -388,10 +442,29 @@ def discover_uv_run_units() -> list[str]:
         try:
             if not uv_run_sites(rel_path):
                 continue
-        except (MalformedExecStart, UnreadableWrapper):
+        except (MalformedExecStart, UnreadableShellUvRun):
             pass
         units.append(rel_path)
     return units
+
+
+def discover_uv_run_scripts(root: pathlib.Path = REPO_ROOT) -> list[str]:
+    """*root*-relative paths of every non-test shell script git lists that runs `uv run`.
+
+    An UnreadableShellUvRun INCLUDES the path rather than skipping it, for the
+    reasons discover_uv_run_units gives.  listed_files raises on a git failure,
+    so discovery never silently answers [].
+    """
+    scripts = []
+    for path in listed_files(root, *_NON_TEST_SHELL_SCRIPTS):
+        rel_path = path.relative_to(root).as_posix()
+        try:
+            if not script_uv_run_sites(rel_path, root):
+                continue
+        except UnreadableShellUvRun:
+            pass
+        scripts.append(rel_path)
+    return sorted(scripts)
 
 
 def swept_paths() -> list[str]:
@@ -399,18 +472,26 @@ def swept_paths() -> list[str]:
     return sorted([*discover_uv_run_units(), FACTORY_INIT_REFERENCE])
 
 
-def _uv_run_sites_of(rel_path: str) -> list[UvRunSite]:
-    """The `uv run` sites of *rel_path*, failing rather than returning none.
+def swept_cases() -> list:
+    """Every swept source paired with the reader that yields its `uv run` sites."""
+    return [pytest.param(p, uv_run_sites, id=p) for p in swept_paths()] + [
+        pytest.param(p, script_uv_run_sites, id=p) for p in discover_uv_run_scripts()
+    ]
 
-    swept_paths only yields paths whose start ran a `uv run`, so an empty list
-    here means a file changed shape between collection and the test body.
+
+def _uv_run_sites_of(
+    rel_path: str, read_sites: Callable[[str], list[UvRunSite]]
+) -> list[UvRunSite]:
+    """The `uv run` sites *read_sites* finds in *rel_path*, failing rather than returning none.
+
+    swept_cases only yields paths that ran a `uv run`, so an empty list here
+    means a file changed shape between collection and the test body.
     """
-    sites = uv_run_sites(rel_path)
+    sites = read_sites(rel_path)
     assert sites, (
-        f"{rel_path} was swept as a `uv run` unit but no longer runs `uv run` "
-        "directly or through its wrapper. It was discovered by its ExecStart= "
-        "and must not leave the sweep silently — check whether the command "
-        "shape changed."
+        f"{rel_path} was swept as running `uv run` but no longer runs `uv run`. "
+        "It was discovered by its ExecStart= or as a shell script and must not "
+        "leave the sweep silently — check whether the command shape changed."
     )
     return sites
 
@@ -495,13 +576,47 @@ def test_discovery_covers_every_known_uv_run_unit() -> None:
     )
 
 
-@pytest.mark.parametrize("rel_path", swept_paths(), ids=lambda p: p)
-def test_uv_run_unit_passes_no_sync(rel_path: str) -> None:
-    """Every `uv run` a unit's start runs must carry `--no-sync` among its RUN-LEVEL flags."""
-    sites = _uv_run_sites_of(rel_path)
+def test_script_discovery_covers_every_known_uv_run_script() -> None:
+    """Coverage guard for the script arm: non-empty and exactly the known scripts.
+
+    Equality for the reason test_discovery_covers_every_known_uv_run_unit
+    gives: discovery ends in a parser, so a script re-spelled past it would
+    otherwise leave the sweep quietly.
+    """
+    discovered = set(discover_uv_run_scripts())
+    assert discovered, (
+        "discovery found no shell script running `uv run` at all, so the "
+        "parametrized sweeps below would check no script and report green. "
+        f"Check that git lists the checkout's *.sh files (REPO_ROOT={REPO_ROOT})."
+    )
+    missing = _EXPECTED_UV_RUN_SCRIPTS - discovered
+    extra = discovered - _EXPECTED_UV_RUN_SCRIPTS
+    assert not missing, (
+        f"these known `uv run` shell scripts dropped out of the sweep: {sorted(missing)}. "
+        "Either the script stopped running `uv run` (then remove it from "
+        "_EXPECTED_UV_RUN_SCRIPTS deliberately), or it moved, or shell_uv_run_sites "
+        "stopped recognising its `uv run`. A script that leaves this sweep "
+        "silently is the failure mode the sweep exists to prevent."
+    )
+    assert not extra, (
+        f"the sweep picked up shell scripts not in _EXPECTED_UV_RUN_SCRIPTS: {sorted(extra)}. "
+        "A shell script that newly runs `uv run` shares the one root .venv and "
+        "carries the same obligation, so add it to the constant. A script whose "
+        "`uv run` this scan cannot read also lands here, deliberately (see "
+        "discover_uv_run_scripts); its own case below names the defect. A test "
+        "fixture belongs under a tests/ directory, which discovery excludes."
+    )
+
+
+@pytest.mark.parametrize(("rel_path", "read_sites"), swept_cases())
+def test_uv_run_site_passes_no_sync(
+    rel_path: str, read_sites: Callable[[str], list[UvRunSite]]
+) -> None:
+    """Every `uv run` a unit's start or a shell script runs must carry `--no-sync` among its RUN-LEVEL flags."""
+    sites = _uv_run_sites_of(rel_path, read_sites)
     missing = [s for s in sites if "--no-sync" not in s.flags]
     assert not missing, (
-        f"{rel_path} starts `uv run` without a run-level `--no-sync` at: "
+        f"{rel_path} runs `uv run` without a run-level `--no-sync` at: "
         f"{'; '.join(_describe(s) for s in missing)}. Without it, process "
         "start INSTALLS the named member's missing dependency closure into the "
         "ONE shared root .venv "
@@ -511,24 +626,26 @@ def test_uv_run_unit_passes_no_sync(rel_path: str) -> None:
         "measurement is in scripts/orchestrator-autopilot-video.service, above "
         "its ExecStart). The flag must sit BEFORE the command token, or uv "
         "never sees it. The accepted cost is that an unsynced venv now fails "
-        "the unit with ModuleNotFoundError instead of repairing itself; the "
+        "the command with ModuleNotFoundError instead of repairing itself; the "
         "repair path is scripts/sync-orchestrator-env.sh (`uv sync "
         "--all-packages`)."
     )
 
 
-@pytest.mark.parametrize("rel_path", swept_paths(), ids=lambda p: p)
-def test_uv_run_unit_carries_no_lockfile_flag(rel_path: str) -> None:
+@pytest.mark.parametrize(("rel_path", "read_sites"), swept_cases())
+def test_uv_run_site_carries_no_lockfile_flag(
+    rel_path: str, read_sites: Callable[[str], list[UvRunSite]]
+) -> None:
     """Beside `--no-sync`, a run-level `--frozen`/`--locked` is a no-op — so forbid it.
 
     Its own test rather than a second assert in the arm above: the two fail for
     different reasons, a reader of a failure should see which one fired, and the
     presence arm must stay green independently of this one.
     """
-    sites = _uv_run_sites_of(rel_path)
+    sites = _uv_run_sites_of(rel_path, read_sites)
     offending = [s for s in sites if {"--frozen", "--locked"} & set(s.flags)]
     assert not offending, (
-        f"{rel_path} starts `uv run` with a run-level `--frozen`/`--locked` at: "
+        f"{rel_path} runs `uv run` with a run-level `--frozen`/`--locked` at: "
         f"{'; '.join(_describe(s) for s in offending)}. `--no-sync` skips the LOCK step "
         "along with the sync, so both lockfile flags buy literally nothing next "
         "to it — measured, with the exit codes and the unchanged lockfile "
@@ -579,10 +696,10 @@ def test_uv_run_unit_carries_no_lockfile_flag(rel_path: str) -> None:
         ),
     ],
 )
-def test_shell_uv_run_sites_reads_every_wrapper_spelling(
+def test_shell_uv_run_sites_reads_every_committed_spelling(
     script: str, expected_flags: list[tuple[str, ...]]
 ) -> None:
-    """Guard the guard: every way a committed wrapper spells `uv run` yields its site."""
+    """Guard the guard: every way a committed script spells `uv run` yields its site."""
     sites = shell_uv_run_sites(script, "planted.sh")
     assert [s.flags for s in sites] == expected_flags
 
@@ -636,14 +753,14 @@ def test_shell_uv_run_sites_ignores_what_is_not_a_uv_run(
     ],
 )
 def test_shell_uv_run_sites_raises_on_a_uv_run_it_cannot_read(script: str) -> None:
-    """Guard the guard: an unread uv run fails naming its wrapper, never answers "none"."""
-    with pytest.raises(UnreadableWrapper, match=r"^scripts/planted\.sh: "):
+    """Guard the guard: an unread uv run fails naming its script, never answers "none"."""
+    with pytest.raises(UnreadableShellUvRun, match=r"^scripts/planted\.sh: "):
         shell_uv_run_sites(script, "scripts/planted.sh")
 
 
-def test_shell_uv_run_sites_names_the_wrapper_holding_an_unknown_run_level_flag() -> None:
-    """The flag walk's raise names the wrapper file, not only the command text."""
-    with pytest.raises(UnreadableWrapper, match=r"^scripts/planted\.sh: .*'--reinstall'"):
+def test_shell_uv_run_sites_names_the_script_holding_an_unknown_run_level_flag() -> None:
+    """The flag walk's raise names the script file, not only the command text."""
+    with pytest.raises(UnreadableShellUvRun, match=r"^scripts/planted\.sh: .*'--reinstall'"):
         shell_uv_run_sites('echo "try uv run --reinstall"\n', "scripts/planted.sh")
 
 
@@ -734,3 +851,32 @@ def test_uv_run_sites_raises_for_a_wrapper_the_checkout_lacks(tmp_path: pathlib.
     _plant(tmp_path, {"u.service": _WRAPPER_UNIT})
     with pytest.raises(MalformedExecStart, match=r"scripts/u\.sh"):
         uv_run_sites("u.service", tmp_path)
+
+
+def test_discover_uv_run_scripts_reads_every_shell_script_outside_test_trees(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Guard the guard: every *.sh with a site, an unreadable one included; test trees and non-.sh excluded."""
+    git(tmp_path, "init", "-q")
+    _plant(
+        tmp_path,
+        {
+            "top.sh": "uv run --no-sync --project shared python x.py\n",
+            "scripts/a.sh": "uv run --no-sync --project shared python x.py\n",
+            "scripts/odd.sh": '"${UV:-uv}" run --frozen --project shared python\n',
+            "scripts/plain.sh": "python3 x.py\n",
+            "scripts/tests/t.sh": "uv run --frozen --project shared python x.py\n",
+            "pkg/tests/u.sh": "uv run --frozen --project shared python x.py\n",
+            "tests/root.sh": "uv run --frozen --project shared python x.py\n",
+            "scripts/notes.txt": "uv run --frozen --project shared python x.py\n",
+        },
+    )
+    assert discover_uv_run_scripts(tmp_path) == ["scripts/a.sh", "scripts/odd.sh", "top.sh"]
+
+
+def test_script_uv_run_sites_names_the_script_it_read(tmp_path: pathlib.Path) -> None:
+    """A script's sites carry its *root*-relative path as their source."""
+    _plant(tmp_path, {"scripts/w.sh": "exec uv run --frozen --project shared python x.py\n"})
+    assert [(s.source, s.flags) for s in script_uv_run_sites("scripts/w.sh", tmp_path)] == [
+        ("scripts/w.sh", ("--frozen", "--project"))
+    ]

@@ -70,6 +70,9 @@ _LIST_RATES: Mapping[str, _ModelRates] = MappingProxyType({
     'claude-sonnet-5': _ModelRates(2, 10, 0.2, 2.5, 4),
     'claude-haiku-4-5': _ModelRates(1, 5, 0.1, 1.25, 2),
     'claude-fable-5-1': _ModelRates(10, 50, 0.25, 12.5, 20),
+    # Published list price, NOT yet fitted from CLI output like the rows above;
+    # compare the first real Fable 5.2 CLI result against it.
+    'claude-fable-5-2': _ModelRates(8, 40, 0.20, 10, 16),
 })
 
 _TOKENS_PER_RATE_UNIT = 1_000_000

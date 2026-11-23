@@ -32,8 +32,12 @@ from legibility import (
     census_trigger,
     check_trickle_health,
     codebook,
+    coder,
+    detectors,
     digest,
     invariants,
+    inventory,
+    layout,
     nightly,
     plan_deviation_census,
     session_ledger,
@@ -136,7 +140,7 @@ def _encode_cwd(cwd: str) -> str:
 
     '/', '.' and '_' all map to '-'. "Independent" means SEPARATELY WRITTEN,
     not unchecked: test_legibility_inventory.py's TestEncoderLockstep pins
-    this copy to the canonical (orchestrator.session_registry.encode_cwd) and
+    this copy to the canonical (orchestrator.session_records.encode_cwd) and
     to real on-disk dir names (task 3272, which found this fixture and three
     production copies all missing the '_' rule at once). Deliberately does
     NOT import the canonical -- a fixture that calls the code under test
@@ -1914,26 +1918,15 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         assert result.exit_code == 0
         assert len(seen) == 1
 
-    @pytest.mark.parametrize('spelling', ['coder', 'legibility.coder'])
-    def test_the_capped_arm_catches_no_headroom_however_coder_was_imported(
-        self, spelling,
-    ):
-        """scripts/legibility/ is on sys.path as well as scripts/, so census's
-        bare `import coder` and nightly's `from legibility import coder` build
-        two distinct coder module objects. The invocation-boundary exceptions
-        live in session_runner, reached by the package spelling only, so both
-        coders catch the ONE NoHeadroom class the invoker raises. A mismatch
-        would let a capped digest escape run_nightly instead of reaching task
-        4736's exit-0 DEFERRED path.
+    def test_the_capped_arm_catches_the_invokers_no_headroom(self):
+        """The coder's capped arm catches the ONE session_runner.NoHeadroom
+        class the invoker raises. A mismatch would let a capped digest escape
+        run_nightly instead of reaching task 4736's exit-0 DEFERRED path.
         """
-        import importlib
-
-        coder_module = importlib.import_module(spelling)
-
         def capped_invoke(prompt, model):
             raise session_runner.NoHeadroom('no headroom')
 
-        result = coder_module.code_digest(
+        result = coder.code_digest(
             _HAND_DIGEST_FOR_IDENTITY, {'entries': []}, project='dark_factory',
             invoke=capped_invoke, invariant_slugs=(),
         )
@@ -4802,12 +4795,13 @@ class _NightRunner:
             pass_kind=nightly.PassKind.MANUAL, recorder=self.recorder,
         )
 
-    def scheduled_night(self, day, kind, *, retry_recorder=None):
+    def scheduled_night(self, day, kind, *, invoke=None, retry_recorder=None):
         """Run night *day* as main() does for an undated run: through
-        run_scheduled_night, so any retry the backlog owes runs too."""
+        run_scheduled_night, so any retry the backlog owes runs too.
+        *invoke* replaces the kind's coder."""
         self._prepare(day, kind)
         return nightly.run_scheduled_night(
-            **self._pass_kwargs(day, on_night=day, invoke=self._coder(kind)),
+            **self._pass_kwargs(day, on_night=day, invoke=invoke or self._coder(kind)),
             recorder=self.recorder, retry_recorder=retry_recorder,
         )
 
@@ -5386,6 +5380,32 @@ def _counting_invoke(calls: list[str]):
     return _invoke
 
 
+def _ledger_census_coding(session: str) -> None:
+    session_ledger.record_codings(session_ledger.ledger_path('testproj'), [
+        session_ledger.LedgerRow(
+            session=session, instrument_version=1,
+            coded_by=session_ledger.CodedBy.CENSUS, run_ref='census-run',
+            outcome=session_ledger.Outcome.MATCHED,
+            coded_at=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+        ),
+    ])
+
+
+def _garble_testproj_ledger() -> Path:
+    path = session_ledger.ledger_path('testproj')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'this is not an sqlite database, just bytes\n' * 8)
+    return path
+
+
+def _already_coded_warnings(caplog) -> list[str]:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == 'legibility.nightly' and record.levelno == logging.WARNING
+        and 'already-coded' in record.getMessage()
+    ]
+
+
 def _seed_state(*, day: int, exit_code: int) -> None:
     trickle_state.record_run(
         'testproj',
@@ -5536,14 +5556,7 @@ class TestRetryPass:
 
     def test_a_retry_skips_sessions_the_ledger_already_holds(self, tmp_path):
         runner, _before = _owed_after_storm_then_productive(tmp_path)
-        session_ledger.record_codings(session_ledger.ledger_path('testproj'), [
-            session_ledger.LedgerRow(
-                session='session-13', instrument_version=1,
-                coded_by=session_ledger.CodedBy.CENSUS, run_ref='census-run',
-                outcome=session_ledger.Outcome.MATCHED,
-                coded_at=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
-            ),
-        ])
+        _ledger_census_coding('session-13')
         retry_prompts: list[str] = []
 
         result = runner.retry(13, on_night=14, invoke=_counting_invoke(retry_prompts))
@@ -5554,7 +5567,21 @@ class TestRetryPass:
 
         scheduled_prompts: list[str] = []
         runner.night(13, 'productive', invoke=_counting_invoke(scheduled_prompts))
-        assert len(scheduled_prompts) == 1, 'a scheduled pass does not skip ledgered sessions'
+        assert len(scheduled_prompts) == 1, 'a manual pass does not skip ledgered sessions'
+
+    def test_a_retry_over_an_unreadable_ledger_skips_nothing_and_warns_once(
+        self, tmp_path, caplog,
+    ):
+        runner, _before = _owed_after_storm_then_productive(tmp_path)
+        path = _garble_testproj_ledger()
+        prompts: list[str] = []
+
+        with caplog.at_level(logging.WARNING, logger='legibility.nightly'):
+            runner.retry(13, on_night=14, invoke=_counting_invoke(prompts))
+
+        assert len(prompts) == 1
+        (warning,) = _already_coded_warnings(caplog)
+        assert str(path) in warning
 
     def test_a_retry_never_refires_the_barren_streak_escalation(self, tmp_path):
         runner = _NightRunner(tmp_path)
@@ -5856,6 +5883,130 @@ class TestNeverRunDates:
 
 
 # ---------------------------------------------------------------------------
+# task 7025: a scheduled pass over a date the schedule already reached
+# ---------------------------------------------------------------------------
+
+class TestScheduledPassOverAReachedDate:
+    """The 03:00 pass after a post-midnight catch-up re-targets the date the
+    catch-up already ran, so it codes only the selected sessions the ledger
+    does not hold."""
+
+    def test_a_scheduled_pass_re_targeting_a_reached_date_skips_ledgered_sessions(
+        self, tmp_path, caplog,
+    ):
+        runner = _NightRunner(tmp_path)
+        first: list[str] = []
+        runner.scheduled_night(13, 'productive', invoke=_counting_invoke(first))
+        assert len(first) == 1
+        again: list[str] = []
+
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            results = runner.scheduled_night(13, 'productive', invoke=_counting_invoke(again))
+
+        assert again == []
+        assert [result.exit_code for result in results] == [0] * len(results)
+        assert runner.recorded()['last_scheduled_target_date'] == '2026-07-13'
+        skipped_lines = [
+            record.getMessage() for record in caplog.records
+            if record.levelno == logging.INFO and 'already-coded' in record.getMessage()
+        ]
+        assert len(skipped_lines) == 1
+        assert ' 1 of 1 selected ' in skipped_lines[0]
+
+    def test_a_re_targeting_pass_over_an_unreadable_ledger_re_codes_and_warns_once(
+        self, tmp_path, caplog,
+    ):
+        runner = _NightRunner(tmp_path)
+        runner.scheduled_night(13, 'productive')
+        path = _garble_testproj_ledger()
+        again: list[str] = []
+
+        with caplog.at_level(logging.WARNING, logger='legibility.nightly'):
+            runner.scheduled_night(13, 'productive', invoke=_counting_invoke(again))
+
+        assert len(again) == 1
+        (warning,) = _already_coded_warnings(caplog)
+        assert str(path) in warning
+
+    def test_a_re_targeting_pass_codes_the_selected_sessions_the_catch_up_did_not_land(
+        self, tmp_path,
+    ):
+        runner = _NightRunner(tmp_path)
+        _write_transcript(
+            runner.projects_root / _encode_cwd(runner.work_cwd) / 'unlanded-13.jsonl',
+            cwd=runner.work_cwd, timestamp='2026-07-13T11:00:00Z',
+            session_id='unlanded-13',
+            user_text='why does the merge lane keep parking my task',
+        )
+        runner.scheduled_night(13, 'capped')
+        _ledger_census_coding('session-13')
+        prompts: list[str] = []
+
+        runner.scheduled_night(13, 'productive', invoke=_counting_invoke(prompts))
+
+        [prompt] = prompts
+        assert 'unlanded-13' in prompt
+        assert 'session-13' not in prompt
+        assert runner.recorded()['counters']['selected_count'] == 2
+
+    def test_a_scheduled_pass_past_the_cursor_still_codes_ledgered_sessions(
+        self, tmp_path,
+    ):
+        runner = _NightRunner(tmp_path)
+        runner.scheduled_night(13, 'productive')
+        _ledger_census_coding('session-14')
+        prompts: list[str] = []
+
+        runner.scheduled_night(14, 'productive', invoke=_counting_invoke(prompts))
+
+        assert len(prompts) == 1
+
+    def test_a_manual_pass_over_a_reached_date_still_re_codes(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.scheduled_night(13, 'productive')
+        prompts: list[str] = []
+
+        runner.night(13, 'productive', invoke=_counting_invoke(prompts))
+
+        assert len(prompts) == 1
+
+    def test_a_re_targeting_pass_codes_no_clone_of_a_session_the_catch_up_coded(
+        self, tmp_path,
+    ):
+        runner = _NightRunner(tmp_path)
+        _write_transcript(
+            runner.projects_root / _encode_cwd(runner.work_cwd) / 'session-13-clone.jsonl',
+            cwd=runner.work_cwd, timestamp='2026-07-13T11:00:00Z',
+            session_id='session-13-clone',
+        )
+        first: list[str] = []
+        runner.scheduled_night(13, 'productive', invoke=_counting_invoke(first))
+        assert len(first) == 1
+        cb_before = layout.codebook_path(runner.repo).read_text()
+        subjects_before = _commit_subjects(runner.repo)
+        again: list[str] = []
+
+        runner.scheduled_night(13, 'productive', invoke=_counting_invoke(again))
+
+        assert again == []
+        assert layout.codebook_path(runner.repo).read_text() == cb_before
+        assert _commit_subjects(runner.repo) == subjects_before
+        assert runner.recorded()['outcome'] == 'productive'
+        assert runner.recorded()['counters']['selected_count'] == 1
+
+    def test_a_re_targeting_pass_after_a_deferred_catch_up_codes_the_night(
+        self, tmp_path,
+    ):
+        runner = _NightRunner(tmp_path)
+        runner.scheduled_night(13, 'capped')
+        prompts: list[str] = []
+
+        runner.scheduled_night(13, 'productive', invoke=_counting_invoke(prompts))
+
+        assert len(prompts) == 1
+
+
+# ---------------------------------------------------------------------------
 # task 3340 step-11/12: the sibling barren door gets journal visibility
 # ---------------------------------------------------------------------------
 
@@ -5879,6 +6030,20 @@ def _sample(*, selected=(), zero_signal_dropped=0, dedupe_collapsed=0,
             zero_signal_dropped + dedupe_collapsed + below_sampling_cut
             + budget_skipped + len(selected)
         ),
+    )
+
+
+def _scored_record(session_id: str) -> nightly.sampling.ScoredRecord:
+    """A minimal signal-bearing record of the 2026-07-13 night, named
+    *session_id*."""
+    return nightly.sampling.ScoredRecord(
+        session=inventory.SessionRecord(
+            path=Path(f'/projects/-work/{session_id}.jsonl'), encoded_dir='-work',
+            cwd='/work', date=date(2026, 7, 13), size_bytes=1000,
+        ),
+        stratum=detectors.AgentClass.INTERACTIVE,
+        counts=nightly.sampling.SignalCounts.of(tool_error=1),
+        session_id=session_id,
     )
 
 
@@ -6013,7 +6178,7 @@ def test_report_sample_outcome_partial_truncation_stays_at_info(tmp_path, caplog
     designed, never an absence."""
     with caplog.at_level('INFO', logger='legibility.nightly'):
         result, posted = _run_sampled_night(
-            tmp_path, _sample(selected=['digest'], budget_skipped=2),
+            tmp_path, _sample(selected=[_scored_record('session-13')], budget_skipped=2),
         )
 
     assert result.alarms == ()

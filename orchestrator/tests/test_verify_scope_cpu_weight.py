@@ -23,9 +23,11 @@ from pathlib import Path
 
 import pytest
 from _fake_systemd_run import scope_payload_command
+from _real_project_slice import RealProjectSlice
+from _real_project_slice import real_project_slice as real_project_slice
 from shared.verify_admission import nice_prefix
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig, apply_reload
+from orchestrator.config import FusedMemoryConfig, ModuleConfig, OrchestratorConfig, apply_reload
 from orchestrator.verify import run_verification
 
 _TEST_CMD = 'true test-leg'
@@ -190,10 +192,15 @@ def _cpu_weight_settable() -> bool:
 class TestRealScopeCpuWeight:
 
     @pytest.mark.asyncio
-    async def test_task_scope_reads_back_weight_33(self, worktree):
+    async def test_task_scope_reads_back_weight_33(
+        self, worktree, real_project_slice: RealProjectSlice,
+    ):
         if not _cpu_weight_settable():
             pytest.skip('systemd user scopes with CPUWeight unavailable on this host')
-        config = OrchestratorConfig(verify_use_cgroup_scope=True)
+        config = OrchestratorConfig(
+            verify_use_cgroup_scope=True,
+            fused_memory=FusedMemoryConfig(project_id=real_project_slice.project_id),
+        )
         module_config = ModuleConfig(
             prefix='pkg',
             test_command=_READ_OWN_CPU_WEIGHT,

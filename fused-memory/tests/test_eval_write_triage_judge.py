@@ -112,6 +112,16 @@ class TestRunJudgeEval:
         _run(tmp_path)
         assert (tmp_path / 'report.md').exists()
 
+    def test_the_routing_block_is_the_score_of_the_cases_dump(self, tmp_path: Path) -> None:
+        cases_path = tmp_path / 'cases.jsonl'
+        report = _mod().run_judge_eval(
+            plan=_cases_mod().seeded_plan(_corpus(), distractors=2),
+            judge_fn=_fake_judge(), report_path=tmp_path / 'report.json',
+            provenance=dict(_PROVENANCE), cases_path=cases_path,
+        )
+        rows = [json.loads(line) for line in cases_path.read_text().splitlines()]
+        assert report['routing'] == _scoring().score_routing(rows)
+
     # --- the markdown sibling's composition (gate item 4) --------------------
     #
     # `run_judge_eval` writes the JSON and then a markdown sibling. Deriving
@@ -449,6 +459,9 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
             'cases_path': None,
             'canonical_aliases': None,
             'wording': 'shipped',
+            'judge_model': None,
+            'slates_in': None,
+            'slates_out': None,
             **overrides,
         })
         assert _mod()._run(args) == 0
@@ -581,6 +594,22 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
         assert recorded == hashlib.sha256(JUDGE_SYSTEM_PROMPT.encode('utf-8')).hexdigest()
         assert len(recorded) == 64 and set(recorded) <= set('0123456789abcdef')
 
+    def test_a_judge_model_override_is_recorded_and_applied_in_memory_only(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.config.schema import FusedMemoryConfig
+
+        monkeypatch.setenv('OPENAI_PLAN_PROXY_URL', 'http://plan-proxy.test/v1')
+        monkeypatch.setenv('OPENAI_PLAN_PROXY_KEY', 'plan-proxy-test-key')
+        config_yaml = SCRIPT_PATH.parent.parent / 'config' / 'config.yaml'
+        before = config_yaml.read_bytes()
+        captured = self._captured(
+            tmp_path, monkeypatch, judge_model='some-model', dry_run=False,
+        )
+        assert captured['judge_model'] == 'some-model'
+        assert config_yaml.read_bytes() == before
+        assert FusedMemoryConfig().write_triage.judge_model != 'some-model'
+
     def test_a_pre_psi_run_records_the_pre_psi_prompt_it_measured(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
@@ -619,6 +648,9 @@ class TestADotMdReportPathIsRejectedAtArgumentTime:
             cases_path=None,
             canonical_aliases=None,
             wording='shipped',
+            judge_model=None,
+            slates_in=None,
+            slates_out=None,
         )
 
     def test_run_refuses_it_before_it_even_reads_the_fixture(
@@ -760,6 +792,24 @@ class TestGuardCommittedReport:
         assert _mod().guard_committed_report(
             committed, dry_run=False, limit=None,
             slate_mode=_scoring().SLATE_RETRIEVED, wording='shipped') == committed
+
+    def test_a_judge_model_override_cannot_overwrite_the_arbiter(self) -> None:
+        with pytest.raises(ValueError, match='--report-path'):
+            _mod().guard_committed_report(
+                _mod()._DEFAULT_REPORT_PATH, dry_run=False, limit=None,
+                slate_mode=_scoring().SLATE_RETRIEVED, judge_model='gpt-6.2-sol')
+
+    def test_a_judge_model_override_elsewhere_is_untouched(self, tmp_path: Path) -> None:
+        target = str(tmp_path / 'arm.json')
+        assert _mod().guard_committed_report(
+            target, dry_run=False, limit=None,
+            slate_mode=_scoring().SLATE_RETRIEVED, judge_model='gpt-6.2-sol') == target
+
+    def test_no_judge_model_override_may_write_the_arbiter(self) -> None:
+        committed = _mod()._DEFAULT_REPORT_PATH
+        assert _mod().guard_committed_report(
+            committed, dry_run=False, limit=None,
+            slate_mode=_scoring().SLATE_RETRIEVED, judge_model=None) == committed
 
     def test_a_pre_psi_run_elsewhere_is_untouched(self, tmp_path: Path) -> None:
         target = str(tmp_path / 'fixture-pre-psi.json')
@@ -1010,6 +1060,7 @@ class TestTheCasesDump:
             'canonical_in_slate': True,
             'canonical_present': True,
             'band': OUTCOME_JUDGE,
+            'routed': OUTCOME_JUDGE,
             'similarity': 0.7,
             'verdict': OUTCOME_AMENDED,
             'outcome': OUTCOME_AMENDED,
@@ -1298,15 +1349,8 @@ class TestApplyFieldChars:
 
 
 # ---------------------------------------------------------------------------
-# The split: one contract path, and imports that point downward only
+# The split: imports that point downward only
 # ---------------------------------------------------------------------------
-
-class TestScoreAttachmentsKeepsItsContractPath:
-    """PRD C2' and task 5807 call it at eval_write_triage_judge.py::score_attachments."""
-
-    def test_the_cli_binds_the_scoring_modules_function(self) -> None:
-        assert _mod().score_attachments is _scoring().score_attachments
-
 
 #: Loads ONE ``scripts/`` module by path under its stem and prints the
 #: ``scripts/`` stems then in ``sys.modules``, as one JSON list.

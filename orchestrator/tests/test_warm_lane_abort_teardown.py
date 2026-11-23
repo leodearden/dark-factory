@@ -7,13 +7,14 @@ scripts rather than depending on test_git_ops.py's module-level helpers.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
+from _seed_script_stubs import seed_default_warm_base
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
@@ -30,32 +31,11 @@ from orchestrator.warm_lane_pool import LaneState
 # ---------------------------------------------------------------------------
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    """Temporary git repo with an initial commit + a resolvable warm base.
-
-    Task 2061: pre-creates the DEFAULT derived warm-lane base
-    (<repo>/.worktrees/_merge-verify/target, non-empty) so the
-    acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK.
-    Task 2099: also marks `.worktrees/.pool-root` present so the
-    create-once mount-presence guard does not false-trip.
-    """
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
-    default_base = repo / '.worktrees' / '_merge-verify' / 'target'
-    default_base.mkdir(parents=True, exist_ok=True)
-    (default_base / '.keep').write_text('warm base sentinel\n')
-    (repo / '.worktrees' / '.pool-root').touch()
+    """Temporary git repo with an initial commit + a resolvable warm base."""
+    repo = seed_repo(tmp_path / 'repo')
+    seed_default_warm_base(repo)
     return repo
 
 

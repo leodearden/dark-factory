@@ -1,0 +1,34 @@
+import json
+from collections import Counter
+E = json.load(open('/tmp/gate-10069/measure/events.json'))
+V = [e for e in E if e['type'] == 'merge_verify' and e['ts'] >= '2026-11-05']
+keys = Counter()
+for e in V:
+    keys[tuple(sorted(e['d'].keys()))] += 1
+for k, n in keys.most_common():
+    print(n, k)
+print('---- chain_depth_reason basis by day')
+c = Counter()
+for e in V:
+    r = e['d'].get('chain_depth_reason')
+    b = r.get('basis') if isinstance(r, dict) else repr(r)
+    c[(e['ts'][:10], b)] += 1
+for k in sorted(c):
+    print(k, c[k])
+print('---- distinct reason shapes')
+shapes = Counter()
+for e in V:
+    r = e['d'].get('chain_depth_reason')
+    if isinstance(r, dict):
+        shapes[(r.get('basis'), tuple(sorted(r.keys())))] += 1
+for k, n in shapes.items():
+    print(n, k)
+print('---- other fields')
+for f in ['runner', 'runner_reason', 'base_relation', 'speculative', 'depth', 'attempt', 'retry_scope', 'cache_mode']:
+    print(f, Counter(str(e['d'].get(f)) for e in V).most_common(12))
+print('chain_items', Counter(e['d'].get('chain_items') for e in V))
+# first rows with unchained-ish fields
+for e in V:
+    for k in e['d']:
+        if 'unchain' in k or 'solo' in k or 'isolat' in k or 'mark' in k:
+            print('FIELD', k, e['ts'], e['d'][k]); break

@@ -46,18 +46,17 @@ deliberately outside the marker and unpinned, and this guard must not be extende
 to them. Parser BEHAVIOUR is pinned by ``shared/tests/test_task_metadata.py``;
 neither implies the other.
 
-Marker plumbing lives in ``task_authoring_marker_span.marked_span`` (task 4999),
-shared with the task-4303 guard next door; read that module for why the markers
-are explicit and why every failure is loud.
+The marked span comes from ``tests/scripts/verify_command_invariants.py::marked_body``,
+whose ``marked_span`` docstring says why every marker failure is loud.
 """
 from __future__ import annotations
 
 import pathlib
 
 import pytest
+import verify_command_invariants as vci
 from shared.task_metadata import _BLESSED_METADATA_KEYS
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
-from task_authoring_marker_span import marked_span
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -65,10 +64,7 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 TASK_AUTHORING_PATH = REPO_ROOT / "docs" / "task-authoring.md"
 
-# The full HTML-comment forms, not the bare slug: `marked_span` requires the two
-# literals not to overlap as substrings, and the bare slug sits inside both.
-MIRROR_BEGIN = "<!-- tier-a-blessed-keys-mirror -->"
-MIRROR_END = "<!-- /tier-a-blessed-keys-mirror -->"
+MIRROR_SLUG = "tier-a-blessed-keys-mirror"
 
 _FENCE = "```"
 
@@ -76,23 +72,22 @@ _FENCE = "```"
 def _documented_blessed_keys(markdown_text):
     """The comma-separated key names in the fence delimited by the mirror markers.
 
-    Everything below the ``marked_span`` call is this guard's OWN fence-content
-    extraction; it raises loudly rather than returning ``[]`` for the same
-    reason ``marked_span`` does.
+    Everything below the ``vci.marked_body`` call is this guard's OWN
+    fence-content extraction; it raises loudly rather than returning ``[]`` for
+    the same reason ``vci.marked_body`` does.
 
     Returns the names in DOCUMENT ORDER (a list, not a set) so the caller can
     also detect an accidental double-entry, which set equality alone cannot see.
     """
-    marked = marked_span(
+    marked = vci.marked_body(
         markdown_text,
-        MIRROR_BEGIN,
-        MIRROR_END,
-        doc_path="docs/task-authoring.md",
-        task="task 3780",
-        delimits=(
+        slug=MIRROR_SLUG,
+        source="docs/task-authoring.md",
+        label=(
             "the fenced Tier-A listing that mirrors _BLESSED_METADATA_KEYS in "
             "shared/src/shared/task_metadata.py"
         ),
+        task="3780",
     )
 
     # Strip the fence delimiter lines; everything between them is the listing.
@@ -108,7 +103,7 @@ def _documented_blessed_keys(markdown_text):
     names = [name for name in names if name]
 
     assert names, (
-        f"the fenced listing between {MIRROR_BEGIN!r} and {MIRROR_END!r} in "
+        f"the fenced listing inside the {MIRROR_SLUG!r} marker in "
         f"docs/task-authoring.md is empty (task 3780) — this mirror invariant "
         f"would pass vacuously against an empty allowlist"
     )
@@ -118,12 +113,12 @@ def _documented_blessed_keys(markdown_text):
 _HAPPY_DOC = """\
 This is `_BLESSED_METADATA_KEYS` in `shared/src/shared/task_metadata.py`:
 
-<!-- tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:begin -->
 ```
 alpha, beta, gamma_delta,
 epsilon
 ```
-<!-- /tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:end -->
 
 Some qualifying prose mentioning `zeta` and `eta`, deliberately outside the
 marker and therefore unpinned.
@@ -135,45 +130,14 @@ _NO_BEGIN_MARKER_DOC = """\
 ```
 alpha, beta
 ```
-<!-- /tier-a-blessed-keys-mirror -->
-"""
-
-_NO_END_MARKER_DOC = """\
-<!-- tier-a-blessed-keys-mirror -->
-```
-alpha, beta
-```
-"""
-
-_DUPLICATE_MARKER_DOC = """\
-<!-- tier-a-blessed-keys-mirror -->
-```
-alpha, beta
-```
-<!-- /tier-a-blessed-keys-mirror -->
-
-## A later section
-
-<!-- tier-a-blessed-keys-mirror -->
-```
-gamma, delta
-```
-<!-- /tier-a-blessed-keys-mirror -->
-"""
-
-_INVERTED_MARKER_DOC = """\
-<!-- /tier-a-blessed-keys-mirror -->
-```
-alpha, beta
-```
-<!-- tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:end -->
 """
 
 _EMPTY_FENCE_DOC = """\
-<!-- tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:begin -->
 ```
 ```
-<!-- /tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:end -->
 """
 
 _DECOY_DOC = """\
@@ -181,12 +145,12 @@ _DECOY_DOC = """\
 decoy_before, another_decoy
 ```
 
-<!-- tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:begin -->
 ```
 alpha, beta, gamma_delta,
 epsilon
 ```
-<!-- /tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:end -->
 
 ```
 decoy_after
@@ -211,36 +175,32 @@ def test_documented_blessed_keys_ignores_unmarked_fences():
     assert _documented_blessed_keys(_DECOY_DOC) == _HAPPY_KEYS
 
 
-@pytest.mark.parametrize(
-    "markdown_text,case",
-    [
-        (_NO_BEGIN_MARKER_DOC, "opening marker deleted"),
-        (_NO_END_MARKER_DOC, "closing marker deleted"),
-        (_DUPLICATE_MARKER_DOC, "marker pair duplicated"),
-        (_INVERTED_MARKER_DOC, "markers inverted"),
-        (_EMPTY_FENCE_DOC, "marked fence emptied"),
-    ],
-)
-def test_documented_blessed_keys_fails_loudly_on_a_broken_marker(markdown_text, case):
-    """(c) A missing, duplicated, inverted or emptied marker RAISES — never [].
+def _assert_names_this_guard(excinfo):
+    message = str(excinfo.value)
+    assert "tier-a-blessed-keys-mirror" in message
+    assert "task-authoring.md" in message
+    assert "3780" in message
 
-    All five are the same failure at different depths: each would otherwise
-    silently reduce this guard to a tautology while the suite kept reporting
-    green. The message must tell a human what to restore and where, so the
-    assertions check the marker literal, the doc path and this guard's task are
-    all named. ``doc_path`` and ``task`` are ARGUMENTS threaded into
-    ``marked_span``, so without these a copy-paste from the task-4303 caller
-    next door would leave this file green while sending every broken-marker
-    reader to the wrong guard and the wrong document. Identifiers only, so any
-    rewording of the shared message templates stays green.
+
+def test_documented_blessed_keys_names_its_marker_document_and_task_on_a_missing_marker():
+    """A missing opening marker raises, naming this guard's slug, document and task.
+
+    The malformed-marker shapes are the shared helper's contract, pinned once in
+    `test_verify_command_invariants.py`; this pins only that the wrapper passes
+    this guard's slug, source and task to it.
     """
     with pytest.raises(AssertionError) as excinfo:
-        _documented_blessed_keys(markdown_text)
+        _documented_blessed_keys(_NO_BEGIN_MARKER_DOC)
 
-    message = str(excinfo.value)
-    assert "tier-a-blessed-keys-mirror" in message, case
-    assert "task-authoring.md" in message, case
-    assert "3780" in message, case
+    _assert_names_this_guard(excinfo)
+
+
+def test_documented_blessed_keys_refuses_an_empty_fence():
+    """The fence lines make the span non-blank, so this guard's own names check must refuse it."""
+    with pytest.raises(AssertionError) as excinfo:
+        _documented_blessed_keys(_EMPTY_FENCE_DOC)
+
+    _assert_names_this_guard(excinfo)
 
 
 def test_task_authoring_marker_pair_is_present_and_non_empty():

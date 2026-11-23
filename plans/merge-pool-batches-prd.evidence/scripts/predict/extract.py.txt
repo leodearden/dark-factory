@@ -1,0 +1,32 @@
+"""Extract merge-lane event rows (bounded by timestamp) from runs.db (mode=ro) into a JSONL."""
+import sqlite3, json, sys
+DB='file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro'
+OUT='/tmp/gate-10069/predict/events.jsonl'
+LO='2026-10-12'
+TYPES=['merge_queued','merge_dequeued','merge_attempt','merge_verify','merge_finalized','speculative_merge',
+ 'speculative_discard','merge_verify_cancelled','merge_blocked','merge_reverify_gate','merge_flake_suppressed',
+ 'rebase_verify_cost','merge_coalesced','workflow_verify','train_started','train_coalesced','train_merged','train_derailed',
+ 'task_started','phase_enter','merge_heartbeat']
+c=sqlite3.connect(DB,uri=True)
+n=0
+with open(OUT,'w') as f:
+    for et in TYPES:
+        k=0
+        for r in c.execute("select id,timestamp,run_id,task_id,event_type,phase,role,data,duration_ms from events where event_type=? and timestamp>=? order by id",(et,LO)):
+            try: d=json.loads(r[7] or '{}')
+            except Exception: d={'_raw':r[7]}
+            if et in('merge_verify','workflow_verify'):
+                u=d.pop('units',None)
+                if u:
+                    d['red_units']=[x.get('unit') for x in u if x.get('outcome')!='ran_green']
+                    d['n_units']=len(u)
+            if et=='merge_dequeued':
+                w=d.pop('waiting',None)
+                if w is not None:
+                    d['n_waiting']=len(w)
+            if et=='merge_heartbeat':
+                d={k2:v for k2,v in d.items() if not isinstance(v,(list,dict)) or k2=='head_of_line'}
+            f.write(json.dumps({'id':r[0],'ts':r[1],'run':r[2],'task':r[3],'et':r[4],'phase':r[5],'role':r[6],'d':d,'dur':r[8]})+'\n')
+            k+=1
+        print(et,k,file=sys.stderr); n+=k
+print(n)

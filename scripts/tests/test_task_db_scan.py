@@ -75,6 +75,7 @@ from _task_db_scan import (
     add_db_discovery_args,
     decode_metadata,
     discover_db_paths,
+    discover_or_report_no_default_root,
     discover_project_roots,
     format_coverage_block,
     format_json,
@@ -90,6 +91,7 @@ from _task_db_scan import (
     truncate,
 )
 from shared.project_layout import (
+    CheckoutRootError,
     default_project_root,
     known_project_roots,
     runs_db,
@@ -290,6 +292,33 @@ def test_discover_db_paths_skips_project_root_without_tasks_db(tmp_path):
     root.mkdir()
 
     assert discover_db_paths(project_roots=[str(root)]) == []
+
+
+# ---------------------------------------------------------------------------
+# discover_or_report_no_default_root(discover) -> list[str]
+# ---------------------------------------------------------------------------
+
+def test_discover_or_report_no_default_root_passes_a_discovery_result_through(capsys):
+    assert discover_or_report_no_default_root(lambda: ["/a", "/b"]) == ["/a", "/b"]
+    assert capsys.readouterr().err == ""
+
+
+def test_discover_or_report_no_default_root_maps_an_underivable_default_to_empty(capsys):
+    def discover() -> list[str]:
+        raise CheckoutRootError("no git checkout encloses /x: no ancestor has .git")
+
+    assert discover_or_report_no_default_root(discover) == []
+    err = capsys.readouterr().err
+    assert "default project root could not be derived" in err
+    assert "no git checkout encloses /x" in err
+
+
+def test_discover_or_report_no_default_root_lets_any_other_error_surface():
+    def discover() -> list[str]:
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        discover_or_report_no_default_root(discover)
 
 
 # ---------------------------------------------------------------------------

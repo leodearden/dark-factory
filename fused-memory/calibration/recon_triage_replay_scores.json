@@ -1,0 +1,907 @@
+{
+  "action_accuracy_by_outcome": {
+    "amended": {
+      "hits": 23,
+      "n": 40,
+      "population_interval95": [
+        0.4253,
+        0.7131
+      ],
+      "population_rate": 0.5697,
+      "rate": 0.575,
+      "wilson95": [
+        0.4219,
+        0.7149
+      ]
+    },
+    "contested": {
+      "hits": 45,
+      "n": 80,
+      "population_interval95": [
+        0.4488,
+        0.665
+      ],
+      "population_rate": 0.557,
+      "rate": 0.5625,
+      "wilson95": [
+        0.4534,
+        0.6659
+      ]
+    },
+    "restated": {
+      "hits": 31,
+      "n": 40,
+      "population_interval95": [
+        0.615,
+        0.918
+      ],
+      "population_rate": 0.78,
+      "rate": 0.775,
+      "wilson95": [
+        0.625,
+        0.8768
+      ]
+    }
+  },
+  "bootstrap": {
+    "resamples": 10000,
+    "seed": 7161
+  },
+  "by_project": {
+    "dark_factory": {
+      "action_accuracy": {
+        "hits": 22,
+        "n": 40,
+        "population_interval95": [
+          0.2374,
+          0.6794
+        ],
+        "population_rate": 0.4507,
+        "rate": 0.55,
+        "wilson95": [
+          0.3983,
+          0.6929
+        ]
+      },
+      "contest_resolution_accuracy": {
+        "hits": 11,
+        "n": 20,
+        "population_interval95": [
+          0.35,
+          0.75
+        ],
+        "population_rate": 0.55,
+        "rate": 0.55,
+        "wilson95": [
+          0.3421,
+          0.7418
+        ]
+      },
+      "judge_wrong_home_all": {
+        "hits": 17,
+        "n": 40,
+        "population_interval95": [
+          0.3355,
+          0.7436
+        ],
+        "population_rate": 0.5546,
+        "rate": 0.425,
+        "wilson95": [
+          0.2851,
+          0.5781
+        ]
+      },
+      "judge_wrong_home_contested": {
+        "hits": 3,
+        "n": 20,
+        "population_interval95": [
+          0.0,
+          0.3
+        ],
+        "population_rate": 0.15,
+        "rate": 0.15,
+        "wilson95": [
+          0.0524,
+          0.3604
+        ]
+      },
+      "misfile_detection": {
+        "hits": 8,
+        "n": 17,
+        "population_interval95": [
+          0.0322,
+          0.4752
+        ],
+        "population_rate": 0.1898,
+        "rate": 0.4706,
+        "wilson95": [
+          0.2616,
+          0.6904
+        ]
+      },
+      "wrong_detach_rate": {
+        "correct_contests_detached": 4,
+        "hits": 4,
+        "n": 23,
+        "population_interval95": [
+          0.0253,
+          0.2725
+        ],
+        "population_rate": 0.1187,
+        "rate": 0.1739,
+        "wilson95": [
+          0.0698,
+          0.3714
+        ]
+      }
+    },
+    "reify": {
+      "action_accuracy": {
+        "hits": 29,
+        "n": 40,
+        "population_interval95": [
+          0.6639,
+          0.9371
+        ],
+        "population_rate": 0.83,
+        "rate": 0.725,
+        "wilson95": [
+          0.5716,
+          0.8389
+        ]
+      },
+      "contest_resolution_accuracy": {
+        "hits": 13,
+        "n": 20,
+        "population_interval95": [
+          0.45,
+          0.85
+        ],
+        "population_rate": 0.65,
+        "rate": 0.65,
+        "wilson95": [
+          0.4329,
+          0.8188
+        ]
+      },
+      "judge_wrong_home_all": {
+        "hits": 9,
+        "n": 40,
+        "population_interval95": [
+          0.082,
+          0.4912
+        ],
+        "population_rate": 0.271,
+        "rate": 0.225,
+        "wilson95": [
+          0.1232,
+          0.375
+        ]
+      },
+      "judge_wrong_home_contested": {
+        "hits": 4,
+        "n": 20,
+        "population_interval95": [
+          0.05,
+          0.4
+        ],
+        "population_rate": 0.2,
+        "rate": 0.2,
+        "wilson95": [
+          0.0807,
+          0.416
+        ]
+      },
+      "misfile_detection": {
+        "hits": 6,
+        "n": 9,
+        "population_interval95": [
+          0.1664,
+          1.0
+        ],
+        "population_rate": 0.6754,
+        "rate": 0.6667,
+        "wilson95": [
+          0.3542,
+          0.8794
+        ]
+      },
+      "wrong_detach_rate": {
+        "correct_contests_detached": 0,
+        "hits": 0,
+        "n": 31,
+        "population_interval95": [
+          0.0,
+          0.0
+        ],
+        "population_rate": 0.0,
+        "rate": 0.0,
+        "wilson95": [
+          0.0,
+          0.1103
+        ]
+      }
+    },
+    "solar_challenge": {
+      "action_accuracy": {
+        "hits": 21,
+        "n": 40,
+        "population_interval95": [
+          0.2535,
+          0.6707
+        ],
+        "population_rate": 0.4593,
+        "rate": 0.525,
+        "wilson95": [
+          0.375,
+          0.6706
+        ]
+      },
+      "contest_resolution_accuracy": {
+        "hits": 9,
+        "n": 20,
+        "population_interval95": [
+          0.25,
+          0.65
+        ],
+        "population_rate": 0.45,
+        "rate": 0.45,
+        "wilson95": [
+          0.2582,
+          0.6579
+        ]
+      },
+      "judge_wrong_home_all": {
+        "hits": 17,
+        "n": 40,
+        "population_interval95": [
+          0.3111,
+          0.7123
+        ],
+        "population_rate": 0.5179,
+        "rate": 0.425,
+        "wilson95": [
+          0.2851,
+          0.5781
+        ]
+      },
+      "judge_wrong_home_contested": {
+        "hits": 7,
+        "n": 20,
+        "population_interval95": [
+          0.15,
+          0.55
+        ],
+        "population_rate": 0.35,
+        "rate": 0.35,
+        "wilson95": [
+          0.1812,
+          0.5671
+        ]
+      },
+      "misfile_detection": {
+        "hits": 10,
+        "n": 17,
+        "population_interval95": [
+          0.1587,
+          0.7602
+        ],
+        "population_rate": 0.4321,
+        "rate": 0.5882,
+        "wilson95": [
+          0.3601,
+          0.7839
+        ]
+      },
+      "wrong_detach_rate": {
+        "correct_contests_detached": 5,
+        "hits": 5,
+        "n": 23,
+        "population_interval95": [
+          0.0347,
+          0.2514
+        ],
+        "population_rate": 0.1208,
+        "rate": 0.2174,
+        "wilson95": [
+          0.0966,
+          0.419
+        ]
+      }
+    },
+    "solar_challenge_platform": {
+      "action_accuracy": {
+        "hits": 27,
+        "n": 40,
+        "population_interval95": [
+          0.4171,
+          0.8028
+        ],
+        "population_rate": 0.6171,
+        "rate": 0.675,
+        "wilson95": [
+          0.5202,
+          0.7992
+        ]
+      },
+      "contest_resolution_accuracy": {
+        "hits": 12,
+        "n": 20,
+        "population_interval95": [
+          0.4,
+          0.8
+        ],
+        "population_rate": 0.6,
+        "rate": 0.6,
+        "wilson95": [
+          0.3866,
+          0.7812
+        ]
+      },
+      "judge_wrong_home_all": {
+        "hits": 20,
+        "n": 40,
+        "population_interval95": [
+          0.3142,
+          0.7142
+        ],
+        "population_rate": 0.5199,
+        "rate": 0.5,
+        "wilson95": [
+          0.352,
+          0.648
+        ]
+      },
+      "judge_wrong_home_contested": {
+        "hits": 7,
+        "n": 20,
+        "population_interval95": [
+          0.15,
+          0.55
+        ],
+        "population_rate": 0.35,
+        "rate": 0.35,
+        "wilson95": [
+          0.1812,
+          0.5671
+        ]
+      },
+      "misfile_detection": {
+        "hits": 16,
+        "n": 20,
+        "population_interval95": [
+          0.4119,
+          0.9632
+        ],
+        "population_rate": 0.7032,
+        "rate": 0.8,
+        "wilson95": [
+          0.584,
+          0.9193
+        ]
+      },
+      "wrong_detach_rate": {
+        "correct_contests_detached": 3,
+        "hits": 3,
+        "n": 20,
+        "population_interval95": [
+          0.0,
+          0.2537
+        ],
+        "population_rate": 0.1072,
+        "rate": 0.15,
+        "wilson95": [
+          0.0524,
+          0.3604
+        ]
+      }
+    }
+  },
+  "confusion": {
+    "contest_upheld": {
+      "contest_upheld": 28,
+      "detach": 12,
+      "not_a_contest": 13
+    },
+    "detach": {
+      "contest_upheld": 1,
+      "detach": 36,
+      "keep": 13,
+      "not_a_contest": 7,
+      "relabel->amended": 1
+    },
+    "keep": {
+      "keep": 27,
+      "relabel->amended": 1
+    },
+    "not_a_contest": {
+      "contest_upheld": 1,
+      "not_a_contest": 3
+    },
+    "relabel->amended": {
+      "keep": 1,
+      "relabel->amended": 1
+    },
+    "relabel->contested": {
+      "detach": 4,
+      "keep": 1,
+      "relabel->amended": 3,
+      "relabel->contested": 3
+    },
+    "superseded_parent": {
+      "contest_upheld": 1,
+      "relabel->amended": 1,
+      "relabel->contested": 1,
+      "superseded_parent": 1
+    }
+  },
+  "harm": {
+    "by_project": {
+      "dark_factory": {
+        "delta_interval95": [
+          -0.4875,
+          0.2
+        ],
+        "delta_per_write": -0.1375,
+        "n": 40,
+        "per_write": {
+          "judge": 0.775,
+          "recon": 0.6375,
+          "status_quo": 0.775
+        },
+        "population_delta_interval95": [
+          -0.2768,
+          0.1562
+        ],
+        "population_delta_per_write": -0.0485,
+        "population_per_write": {
+          "judge": 0.6826,
+          "recon": 0.6341,
+          "status_quo": 0.4235
+        }
+      },
+      "reify": {
+        "delta_interval95": [
+          -0.6923,
+          0.2821
+        ],
+        "delta_per_write": -0.2051,
+        "n": 39,
+        "per_write": {
+          "judge": 0.7179,
+          "recon": 0.5128,
+          "status_quo": 0.7051
+        },
+        "population_delta_interval95": [
+          -0.4408,
+          0.1106
+        ],
+        "population_delta_per_write": -0.1593,
+        "population_per_write": {
+          "judge": 0.4409,
+          "recon": 0.2815,
+          "status_quo": 0.3883
+        }
+      },
+      "solar_challenge": {
+        "delta_interval95": [
+          -0.8875,
+          0.0125
+        ],
+        "delta_per_write": -0.425,
+        "n": 40,
+        "per_write": {
+          "judge": 1.225,
+          "recon": 0.8,
+          "status_quo": 0.725
+        },
+        "population_delta_interval95": [
+          -0.6366,
+          -0.0564
+        ],
+        "population_delta_per_write": -0.334,
+        "population_per_write": {
+          "judge": 1.1064,
+          "recon": 0.7724,
+          "status_quo": 0.5256
+        }
+      },
+      "solar_challenge_platform": {
+        "delta_interval95": [
+          -1.0625,
+          -0.15
+        ],
+        "delta_per_write": -0.6125,
+        "n": 40,
+        "per_write": {
+          "judge": 1.15,
+          "recon": 0.5375,
+          "status_quo": 0.5875
+        },
+        "population_delta_interval95": [
+          -0.9244,
+          -0.1512
+        ],
+        "population_delta_per_write": -0.5428,
+        "population_per_write": {
+          "judge": 1.0915,
+          "recon": 0.5487,
+          "status_quo": 0.5459
+        }
+      }
+    },
+    "delta_interval95": [
+      -0.5692,
+      -0.1258
+    ],
+    "delta_per_write": -0.3459,
+    "n": 159,
+    "per_write": {
+      "judge": 0.9686,
+      "recon": 0.6226,
+      "status_quo": 0.6981
+    },
+    "population_delta_interval95": [
+      -0.3935,
+      -0.103
+    ],
+    "population_delta_per_write": -0.246,
+    "population_per_write": {
+      "judge": 0.8167,
+      "recon": 0.5708,
+      "status_quo": 0.4657
+    },
+    "unpriced": [
+      {
+        "action": "not_a_contest",
+        "derivation": "incomplete",
+        "entry_id": "9b472ee2-23ef-4ab7-8773-97784a958086"
+      }
+    ]
+  },
+  "harm_weights": {
+    "attached_supersession": 1,
+    "digest_conflict": 2,
+    "duplicate_clutter": 0.5,
+    "false_conflict": 2,
+    "hidden_conflict": 3,
+    "hidden_detail": 1,
+    "orphaned_conflict": 1.5,
+    "wrong_home": 1
+  },
+  "harm_weights_status": "provisional",
+  "headline": {
+    "action_accuracy": {
+      "hits": 99,
+      "n": 160,
+      "population_interval95": [
+        0.4828,
+        0.6788
+      ],
+      "population_rate": 0.5809,
+      "rate": 0.6188,
+      "wilson95": [
+        0.5415,
+        0.6904
+      ]
+    },
+    "contest_resolution_accuracy": {
+      "hits": 45,
+      "n": 80,
+      "population_interval95": [
+        0.4478,
+        0.6663
+      ],
+      "population_rate": 0.557,
+      "rate": 0.5625,
+      "wilson95": [
+        0.4534,
+        0.6659
+      ]
+    },
+    "judge_wrong_home_all": {
+      "hits": 63,
+      "n": 160,
+      "population_interval95": [
+        0.3583,
+        0.5675
+      ],
+      "population_rate": 0.462,
+      "rate": 0.3937,
+      "wilson95": [
+        0.3214,
+        0.4711
+      ]
+    },
+    "judge_wrong_home_contested": {
+      "hits": 21,
+      "n": 80,
+      "population_interval95": [
+        0.1668,
+        0.3576
+      ],
+      "population_rate": 0.26,
+      "rate": 0.2625,
+      "wilson95": [
+        0.1786,
+        0.3682
+      ]
+    },
+    "misfile_detection": {
+      "hits": 40,
+      "n": 63,
+      "population_interval95": [
+        0.2905,
+        0.6076
+      ],
+      "population_rate": 0.4423,
+      "rate": 0.6349,
+      "wilson95": [
+        0.5115,
+        0.7428
+      ]
+    },
+    "wrong_detach_rate": {
+      "correct_contests_detached": 12,
+      "hits": 12,
+      "n": 97,
+      "population_interval95": [
+        0.0392,
+        0.118
+      ],
+      "population_rate": 0.0747,
+      "rate": 0.1237,
+      "wilson95": [
+        0.0722,
+        0.2039
+      ]
+    }
+  },
+  "no_decision": {
+    "count": 0,
+    "entry_ids": []
+  },
+  "rubric": "v2.2",
+  "sample": {
+    "by_stratum": {
+      "amended|dark_factory": 10,
+      "amended|reify": 10,
+      "amended|solar_challenge": 10,
+      "amended|solar_challenge_platform": 10,
+      "contested|dark_factory": 20,
+      "contested|reify": 20,
+      "contested|solar_challenge": 20,
+      "contested|solar_challenge_platform": 20,
+      "restated|dark_factory": 10,
+      "restated|reify": 10,
+      "restated|solar_challenge": 10,
+      "restated|solar_challenge_platform": 10
+    },
+    "n_headline": 160,
+    "n_report_only": 12,
+    "n_touched": 14,
+    "stratum_weights": {
+      "amended|dark_factory": 33.048,
+      "amended|reify": 34.272,
+      "amended|solar_challenge": 36.72,
+      "amended|solar_challenge_platform": 17.136,
+      "contested|dark_factory": 6.25,
+      "contested|reify": 5.8,
+      "contested|solar_challenge": 6.6,
+      "contested|solar_challenge_platform": 4.9,
+      "restated|dark_factory": 1.75,
+      "restated|reify": 2.375,
+      "restated|solar_challenge": 6.75,
+      "restated|solar_challenge_platform": 1.625
+    }
+  },
+  "touched": [
+    {
+      "correct": false,
+      "entry_id": "024ca326-c8da-492f-b14e-3f8ddf7b95e0",
+      "expected": "contest_upheld",
+      "headline": false,
+      "judge_harm": 0,
+      "live_recon_state": "relinked",
+      "outcome": "contested",
+      "project": "solar_challenge",
+      "recon": "detach",
+      "recon_harm": 1.5,
+      "truth_cells": []
+    },
+    {
+      "correct": false,
+      "entry_id": "092c0560-ac75-40fe-a634-e35bacd973f3",
+      "expected": "contest_upheld",
+      "headline": true,
+      "judge_harm": 0,
+      "live_recon_state": "missing",
+      "outcome": "contested",
+      "project": "solar_challenge_platform",
+      "recon": "not_a_contest",
+      "recon_harm": 2,
+      "truth_cells": []
+    },
+    {
+      "correct": true,
+      "entry_id": "3df2714b-cedd-44c6-8e5d-fa5eb6a21cd7",
+      "expected": "detach",
+      "headline": false,
+      "judge_harm": 1,
+      "live_recon_state": "relinked",
+      "outcome": "restated",
+      "project": "solar_challenge",
+      "recon": "detach",
+      "recon_harm": 0,
+      "truth_cells": [
+        "wrong_home"
+      ]
+    },
+    {
+      "correct": true,
+      "entry_id": "58959f97-206c-4789-94e0-4477359745b8",
+      "expected": "detach",
+      "headline": false,
+      "judge_harm": 3,
+      "live_recon_state": "relinked",
+      "outcome": "contested",
+      "project": "solar_challenge",
+      "recon": "detach",
+      "recon_harm": 0,
+      "truth_cells": [
+        "false_conflict",
+        "wrong_home"
+      ]
+    },
+    {
+      "correct": true,
+      "entry_id": "5b5850ac-5732-4523-80a2-8304aeb3b594",
+      "expected": "detach",
+      "headline": false,
+      "judge_harm": 3,
+      "live_recon_state": "relinked",
+      "outcome": "contested",
+      "project": "solar_challenge",
+      "recon": "detach",
+      "recon_harm": 0,
+      "truth_cells": [
+        "false_conflict",
+        "wrong_home"
+      ]
+    },
+    {
+      "correct": false,
+      "entry_id": "61fe3b21-af0c-4358-b5b8-4711d9cb56d3",
+      "expected": "contest_upheld",
+      "headline": false,
+      "judge_harm": 0,
+      "live_recon_state": "missing",
+      "outcome": "contested",
+      "project": "solar_challenge",
+      "recon": "detach",
+      "recon_harm": 1.5,
+      "truth_cells": []
+    },
+    {
+      "correct": true,
+      "entry_id": "81711e8a-b5db-4683-a7bf-8a03d3efc41a",
+      "expected": "detach",
+      "headline": false,
+      "judge_harm": 3,
+      "live_recon_state": "relinked",
+      "outcome": "contested",
+      "project": "solar_challenge",
+      "recon": "detach",
+      "recon_harm": 0,
+      "truth_cells": [
+        "false_conflict",
+        "wrong_home"
+      ]
+    },
+    {
+      "correct": true,
+      "entry_id": "911ee809-bed1-4f90-93a1-3e1bbcbbff0d",
+      "expected": "detach",
+      "headline": true,
+      "judge_harm": 1,
+      "live_recon_state": "relinked",
+      "outcome": "restated",
+      "project": "solar_challenge",
+      "recon": "detach",
+      "recon_harm": 0,
+      "truth_cells": [
+        "wrong_home"
+      ]
+    },
+    {
+      "correct": false,
+      "entry_id": "95a00908-8611-4dc3-a67f-c1fc04a2a489",
+      "expected": "relabel->contested",
+      "headline": false,
+      "judge_harm": 4,
+      "live_recon_state": "missing",
+      "outcome": "restated",
+      "project": "solar_challenge",
+      "recon": "detach",
+      "recon_harm": 1.5,
+      "truth_cells": [
+        "hidden_conflict",
+        "wrong_home"
+      ]
+    },
+    {
+      "correct": true,
+      "entry_id": "b6b9d450-457b-4632-8fa6-de0ce1a8ea17",
+      "expected": "detach",
+      "headline": false,
+      "judge_harm": 3,
+      "live_recon_state": "missing",
+      "outcome": "contested",
+      "project": "dark_factory",
+      "recon": "detach",
+      "recon_harm": 0,
+      "truth_cells": [
+        "false_conflict",
+        "wrong_home"
+      ]
+    },
+    {
+      "correct": true,
+      "entry_id": "de109f51-4da2-4ba5-a24d-5bf3925e7128",
+      "expected": "detach",
+      "headline": false,
+      "judge_harm": 3,
+      "live_recon_state": "relinked",
+      "outcome": "contested",
+      "project": "solar_challenge",
+      "recon": "detach",
+      "recon_harm": 0,
+      "truth_cells": [
+        "false_conflict",
+        "wrong_home"
+      ]
+    },
+    {
+      "correct": true,
+      "entry_id": "e15ddb6f-0096-44d1-9e2e-69fafe6b786b",
+      "expected": "detach",
+      "headline": false,
+      "judge_harm": 3,
+      "live_recon_state": "relinked",
+      "outcome": "contested",
+      "project": "solar_challenge",
+      "recon": "detach",
+      "recon_harm": 0,
+      "truth_cells": [
+        "false_conflict",
+        "wrong_home"
+      ]
+    },
+    {
+      "correct": false,
+      "entry_id": "e511b7ae-c368-40b4-8f44-bbef521c46af",
+      "expected": "contest_upheld",
+      "headline": false,
+      "judge_harm": 0,
+      "live_recon_state": "relinked",
+      "outcome": "contested",
+      "project": "solar_challenge",
+      "recon": "not_a_contest",
+      "recon_harm": 3,
+      "truth_cells": []
+    },
+    {
+      "correct": true,
+      "entry_id": "f57607c7-243a-41e5-9461-3c51404d540c",
+      "expected": "contest_upheld",
+      "headline": false,
+      "judge_harm": 0,
+      "live_recon_state": "relinked",
+      "outcome": "contested",
+      "project": "solar_challenge",
+      "recon": "contest_upheld",
+      "recon_harm": 0,
+      "truth_cells": []
+    }
+  ]
+}

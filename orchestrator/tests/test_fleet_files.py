@@ -192,7 +192,7 @@ class TestAtomicWriteSemantics:
     # wrote bytes that the registries' own readers then reject —
     # ``session_registry.py::read_record`` raises ``CorruptSessionRecord``,
     # ``decision_registry.py::list_decisions`` and
-    # ``session_registry.py::reap_stale_leases`` log and skip the file — i.e.
+    # ``session_leases.py::reap_stale_leases`` log and skip the file — i.e.
     # silent data loss.  (NOT
     # ``shared.safe_io.load_json_or_warn``, which an earlier version of this
     # comment named: that helper never reads session, decision or lease

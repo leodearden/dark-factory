@@ -39,7 +39,8 @@ a bare participle after a temporal cue ('until merged') a claim about an earlier
 ref (task 7811). A marker predicated of a ref that a contingency, necessity or
 simulation head governs ('depends on task N having landed', 'needs task N merged
 first', 'a mock of task N's edits merged') is not a claim either; nor is one after
-the determiner 'no' or a catch-up 'merged up to' (task 6824). See
+the determiner 'no' or a catch-up 'merged up to' (task 6824), or a merge into a
+pronoun ('merged into it', task 8600). See
 tests/test_completion_claim_mood.py and
 docs/completion-claim-mood-filter-2026-10/measurement.md.
 
@@ -331,12 +332,21 @@ _CATCH_UP_MERGE_RE: re.Pattern[str] = re.compile(
     r'\bmerged\s+up\s+(?:to|with)\b', re.IGNORECASE,
 )
 
+# 'X was merged into it' makes the pronoun's antecedent the merge's destination, so the merge
+# does not land it (dark_factory esc-unverified-claim-6670-1). Blanking the verb also drops
+# whatever ref the marker would bind instead, a subject or a following commit: accepted
+# residuals, pinned with the rule by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
+_MERGE_INTO_ANTECEDENT_RE: re.Pattern[str] = re.compile(
+    r'\bmerged\s+into\s+(?:it|them)\b', re.IGNORECASE,
+)
+
 _EXEMPTION_STRIPPERS: tuple[re.Pattern[str], ...] = (
     NEGATED_TERMINAL_RE,
     _NEGATED_EXTENSION_RE,
     FUTURE_ASPIRATIONAL_RE,
     _GOVERNED_VERB_RE,
     _CATCH_UP_MERGE_RE,
+    _MERGE_INTO_ANTECEDENT_RE,
 )
 
 
@@ -1224,5 +1234,7 @@ def emit_unverified_claim_escalation(
         logger=logger,
         log_label='completion_claim_gate',
         context=f'unverified claim about {ref!r}',
+        # L0, not the house L1, for the reason pinned by
+        # fused-memory/tests/test_completion_claim_gate.py::TestEmitUnverifiedClaimEscalation::test_the_filed_record_is_one_the_info_l0_router_converts_into_a_curator_task
         level=0,
     )

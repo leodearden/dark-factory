@@ -24,7 +24,9 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, TypeVar, c
 
 # escalation.pins is pure and imports only escalation.models, so it is
 # cycle-safe at module top (harness.py imports it the same way);
-# escalation.classify is likewise pure over escalation.models.
+# escalation.classify is likewise pure over escalation.models, and
+# escalation.categories imports nothing from the package.
+from escalation.categories import EscalationCategory
 from escalation.classify import closed_by_non_sweep_resolver
 from escalation.dedupe import submit_or_dedupe
 from escalation.pins import is_queue_handoff, needs_human
@@ -46,6 +48,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import TaskConfigDir
 from shared.cost_store import CostStore
+from shared.declared_checks import declared_checks
 from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 from shared.prompt_artifact import PromptArtifactStore, default_artifacts_root
 from shared.task_claimant import compose_claimant_run_id
@@ -100,12 +103,23 @@ from orchestrator.artifacts import (
 )
 from orchestrator.branch_base import own_work_base
 from orchestrator.branch_mergeability import Mergeability, read_branch_state
+from orchestrator.branch_stack import (
+    RestackConflict,
+    StackInspectionError,
+    StackRecordState,
+    StackTarget,
+)
 from orchestrator.completion_record import completion_record_metadata
 from orchestrator.config import EscalationConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.curator_submit import SubmitBatchResult, submit_task_batch
 from orchestrator.delivered_checks import (
     DeliveredChecksBlock,
     gate_mark_done_on_delivered_checks,
+)
+from orchestrator.dispatch_base import (
+    MergerDisposition,
+    find_base_conflict,
+    settle_base_conflict,
 )
 from orchestrator.dry_run_unblock import (
     investigation_in_flight,
@@ -147,6 +161,11 @@ from orchestrator.main_health_fix_owner import (
     ensure_main_fix_owner,
 )
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
+from orchestrator.merge_halt_escalation import (
+    MergeHaltEscalationText,
+    build_merge_halt_escalation_text,
+    submit_halt_owning_escalation,
+)
 from orchestrator.merge_lane.gates import PlanFilesTouchedResult, declaration_coverage
 from orchestrator.merge_lane.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
@@ -220,7 +239,7 @@ from orchestrator.scope_drift import (
     build_scope_drift_report,
     pending_scope_paths,
 )
-from orchestrator.session_registry import build_session_slug
+from orchestrator.session_records import build_session_slug
 from orchestrator.stranded_verified_green import (
     DURABLE_MERGE_FAILURE_STATUSES,
     SUCCESS_TRANSIENT_MERGE_STATUSES,
@@ -311,12 +330,18 @@ VERDICT_TOOLS_MCP_SERVER = 'verdict-tools'
 PER_INVOCATION_MCP_SERVERS = frozenset({PLAN_TOOLS_MCP_SERVER, VERDICT_TOOLS_MCP_SERVER})
 
 
-def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Path) -> dict:
+def _inject_plan_tools_mcp(
+    mcp_config: dict | None, cwd: Path, role: AgentRole, *, task_root: Path,
+) -> dict:
     """Inject the plan-tools stdio MCP server entry into *mcp_config*.
 
     Creates a minimal ``{'mcpServers': {}}`` skeleton when *mcp_config* is
     ``None``; otherwise preserves all pre-existing server entries and adds
     (or replaces) the ``plan-tools`` key.
+
+    The server exposes only ``role.plan_tools_grants``: dispatches run under
+    ``bypassPermissions``, where ``allowed_tools`` neither hides nor denies a
+    tool, so the grant is enforced by the server registering only these names.
 
     The plan-tools server is launched via the direct-interpreter no-uv hot path
     (task 1776): ``sys.executable -m orchestrator.mcp.plan_tools --worktree <wt>``.
@@ -345,6 +370,7 @@ def _inject_plan_tools_mcp(mcp_config: dict | None, cwd: Path, *, task_root: Pat
     mcp_config.setdefault('mcpServers', {})[PLAN_TOOLS_MCP_SERVER] = plan_tools_mcp_server(
         _ORCH_PROJECT_DIR, cwd, python_executable=sys.executable,
         meta_root=_meta_root_for_worktree(cwd), task_root=task_root,
+        granted_tools=role.plan_tools_grants,
     )
     return mcp_config
 
@@ -429,7 +455,7 @@ def compose_invocation_mcp_config(
     if 'orchestrator' in role.mcp_families and mcp is not None:
         mcp_config = mcp.mcp_config_json(escalation_url=escalation_url)
     if 'plan_tools' in role.mcp_families and cwd:
-        mcp_config = _inject_plan_tools_mcp(mcp_config, cwd, task_root=task_root)
+        mcp_config = _inject_plan_tools_mcp(mcp_config, cwd, role, task_root=task_root)
     if 'verdict_tools' in role.mcp_families and cwd:
         mcp_config = _inject_verdict_tools_mcp(mcp_config, cwd, role, task_root=task_root)
     if strict_mcp_config and not mcp_config:
@@ -496,6 +522,14 @@ def _is_gating_escalation(e: Escalation) -> bool:
       for high-severity escalations (D4 accepted consequence).
     """
     return (e.severity == 'blocking' and e.level == 0) or needs_human(e)
+
+
+def _is_l1_handoff(e: Escalation) -> bool:
+    """An open L1 hands the task to a human unless
+    :func:`escalation.pins.is_queue_handoff` says otherwise: info never does,
+    an unknown severity fails safe (plans/info-l0-disposition-router-prd.md D3).
+    """
+    return e.level == 1 and is_queue_handoff(e)
 
 
 def _format_reescalation_detail(escalations: list[Escalation]) -> str:
@@ -828,14 +862,6 @@ def _scope_basis(
         'undeclared': list(coverage.undeclared),
         'undelivered': list(coverage.undelivered),
     }
-
-
-def _declared_checks(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """The task's declared ``metadata.delivered_checks``, mapping entries only."""
-    return [
-        c for c in _declared_entries(metadata, 'delivered_checks')
-        if isinstance(c, dict)
-    ]
 
 
 def _compute_merge_outcome_signature(
@@ -1397,6 +1423,7 @@ class TaskWorkflow:
         resume_outcome_sink: ResumeOutcomeSink | None = None,
         task_verify: TaskVerifyPort | None = None,
         task_priority: TaskPriorityLookup | None = None,
+        stack_target: StackTarget | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -1429,6 +1456,9 @@ class TaskWorkflow:
         # Task 9908: the scheduler's tier/pin lookup, recorded on merge_queued;
         # None leaves those keys null.
         self._task_priority = task_priority
+        # Task 10473: the predecessor commit this task's branch is stacked on
+        # (early start); None dispatches off main as before.
+        self._stack_target = stack_target
 
         self.machine = WorkflowStateMachine(WorkflowState.PLAN)
         self._phase_cost_at_entry: float = 0.0
@@ -2884,6 +2914,7 @@ class TaskWorkflow:
                 # Redundant second enforcement of the harness gate's ruling
                 # (orchestrator/recut_ruling.py), from the same dispatch snapshot.
                 recut_ruling=ruling_to_enforce(self.task),
+                stack_on=self._stack_target,
             )
             self.worktree = worktree_info.path
             self._reify_debug_port = worktree_info.reify_debug_port
@@ -3139,6 +3170,11 @@ class TaskWorkflow:
             _mrp = await self._resume_merge_retry_if_pending(branch_name)
             if _mrp is not None:
                 return _mrp
+
+            # Never plan on a resumed base known to conflict with main (task 7736).
+            _settled = await self._settle_conflicting_base()
+            if _settled is not None:
+                return _settled
 
             # ── Lever C: SIMPLE_TASK optimistic path ──────────────────
             # Dispatch a single Sonnet agent that explores, plans (via
@@ -3450,7 +3486,11 @@ class TaskWorkflow:
                 escalate_to_human=True,
             )
 
-        except WarmLaneRequeue as e:
+        except (WarmLaneRequeue, RestackConflict) as e:
+            # A RestackConflict (task 10473) is an uncounted requeue through
+            # the same table row lookup and re-pend; RestackBlocked and
+            # StackRecordUnconfirmed fall through to the broad except.
+            #
             # W9-ε: block_reason is now single-sourced from
             # classify_failure(e) -> BlockDisposition instead of this
             # clause's own inline isinstance(e, WarmLanePoolHardDown)/
@@ -3483,7 +3523,7 @@ class TaskWorkflow:
             disp = classify_failure(e)
             block_reason = disp.reason_prefix
             logger.info(
-                'Task %s: warm-lane requeue (%s, counts_against_requeue_cap=%s): %s',
+                'Task %s: requeue (%s, counts_against_requeue_cap=%s): %s',
                 self.task_id, block_reason, disp.counts_against_requeue_cap, e,
             )
             # γ3/D6: make the REQUEUED exit TRUTHFUL — re-pend the row BEFORE
@@ -4128,7 +4168,10 @@ class TaskWorkflow:
         for _attempt in range(self.config.max_pre_merge_retries):
             main_before = await self.git_ops.get_main_sha()
             if not await self.git_ops.rebase_onto_main(self.worktree):
-                return False  # true conflict — queue will detect it
+                # Not a conflict verdict: a branch carrying a dispatch-start
+                # merge of main always fails a rebase yet merges cleanly. The
+                # queue's merge-tree probe decides (task 7736).
+                return False
             await self._restamp_branch_base_if_no_own_commits()
             if (
                 self.config.pre_merge_reverify
@@ -7930,7 +7973,7 @@ class TaskWorkflow:
             self.git_ops, self.task_id, branch,
             reported_sha=commit,
             declared_files=_declared_files(metadata),
-            delivered_checks=_declared_checks(metadata),
+            delivered_checks=list(declared_checks(metadata).checks),
             delivered_checks_enabled=self.config.delivered_checks.enabled,
         )
         if not verdict.accepted or verdict.evidence_sha is None:
@@ -11743,11 +11786,32 @@ class TaskWorkflow:
         return self.artifacts.aggregate_reviews()
 
     async def _own_work_base(self) -> str:
-        """The base whose ``...HEAD`` range in the worktree is this task's own work."""
+        """The base whose ``...HEAD`` range in the worktree is this task's own work.
+
+        A branch still stacked on an unlanded predecessor's commits measures
+        from the top of them (``GitOps.own_delta_cut``, the merge queue's
+        rule); any other branch from its fork point with main.
+        """
         assert self.worktree is not None and self.artifacts is not None
+        if not self._worktree_external:
+            stack_cut = await self._unlanded_stack_cut()
+            if stack_cut is not None:
+                return stack_cut
         return await own_work_base(
             self.worktree, self.config.git.main_branch, self.artifacts.read_base_commit(),
         )
+
+    async def _unlanded_stack_cut(self) -> str | None:
+        branch = f'{self.config.git.branch_prefix}{self.task_id}'
+        try:
+            return await self.git_ops.own_delta_cut(branch)
+        except StackInspectionError as exc:
+            logger.warning(
+                'Task %s: cannot tell whether %s still carries a stack base (%s); '
+                'its own work is measured from the fork point with main',
+                self.task_id, branch, exc,
+            )
+            return None
 
     async def _context_complete_review_subject(self) -> ReviewSubject:
         """The context-complete reviewer's inputs, from the worktree at its own-work base."""
@@ -12931,12 +12995,14 @@ class TaskWorkflow:
         # case the gate exists for.  Steward mediation (e.g. mutating plan.json
         # to silence the gate) would undermine the safeguard, so skip the L0
         # steward path entirely and submit an L1 immediately.
-        from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane import (
+            MAIN_HEALTH_RED_REASON_PREFIX,
+            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
+            TRANSIENT_INFRA_REASON_PREFIX,
+        )
         from orchestrator.merge_lane.worker import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
-            MAIN_HEALTH_RED_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-            TRANSIENT_INFRA_REASON_PREFIX,
         )
         if result.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX):
             self._write_merge_failure_review('dropped_plan_targets', result.reason)
@@ -13330,17 +13396,48 @@ class TaskWorkflow:
             f'Task {self.task_id}: merge conflicts detected, '
             f'resolving outside queue'
         )
+        # Rebase onto current main so MERGER works on up-to-date state
+        if await self.git_ops.rebase_onto_main(self.worktree):
+            await self._restamp_branch_base_if_no_own_commits()
+        merger_result, verdict = await self._invoke_merger(conflict_details)
+
+        if not merger_result.success or verdict is None:
+            # Fail-safe (I-FAIL-SAFE): an invocation failure, an absent
+            # verdict, or a malformed one all block the merge — a merger
+            # that produces no trustworthy disposition must never proceed.
+            report = merger_failure_report(
+                merger_result, observed_at=datetime.now(UTC).isoformat(),
+            )
+            self._write_merge_failure_review('merger_blocked', report.detail)
+            return await self._mark_blocked(
+                report.reason, detail=report.detail, evidence=report.evidence,
+                suggested_action=report.suggested_action, merge_phase=merge_phase,
+            )
+
+        if verdict['blocked']:
+            reason = self._blocked_verdict_reason(verdict, merger_result)
+            self._write_merge_failure_review('merger_blocked', reason)
+            return await self._mark_blocked(reason, merge_phase=merge_phase)
+
+        # Re-submit to queue (now resolved, needs fresh merge)
+        return await self._submit_to_merge_queue(
+            branch_name, pre_rebased=False, merge_phase=merge_phase,
+        )
+
+    async def _invoke_merger(self, conflicts: str) -> tuple[AgentResult, dict | None]:
+        """Run MERGER on *conflicts*: its result, and its disposition when trustworthy.
+
+        The verdict is ``None`` when the merger wrote none or a malformed one;
+        callers treat that, like a failed invocation, as blocked.
+        """
+        assert self.worktree is not None and self.artifacts is not None
         task_intent = (
             f"Task: {self.task.get('title', '')}\n"
             f"{self.task.get('description', '')}"
         )
         build_prompt = partial(
-            self.briefing.build_merger_prompt, conflict_details, task_intent,
+            self.briefing.build_merger_prompt, conflicts, task_intent,
         )
-
-        # Rebase onto current main so MERGER works on up-to-date state
-        if await self.git_ops.rebase_onto_main(self.worktree):
-            await self._restamp_branch_base_if_no_own_commits()
         # I-FRESH: never consume a stale verdict from a prior invocation on
         # this same worktree (mirrors steward.py's pre-triage clear).
         self.artifacts.clear_verdict('merger')
@@ -13379,96 +13476,98 @@ class TaskWorkflow:
         verdict = envelope.get('verdict') if isinstance(envelope, dict) else None
         if not isinstance(verdict, dict) or not isinstance(verdict.get('blocked'), bool):
             verdict = None
+        return merger_result, verdict
 
+    @staticmethod
+    def _blocked_verdict_reason(verdict: dict, merger_result: AgentResult) -> str:
+        """A blocked verdict's reason, else the merger's output in its place."""
+        return verdict.get('reason') or f'Merger blocked: {merger_result.output[:200]}'
+
+    async def _merger_disposition(self, brief: str) -> MergerDisposition:
+        """The dispatch_base MergerCall: MERGER on *brief*, read fail-safe."""
+        merger_result, verdict = await self._invoke_merger(brief)
         if not merger_result.success or verdict is None:
-            # Fail-safe (I-FAIL-SAFE): an invocation failure, an absent
-            # verdict, or a malformed one all block the merge — a merger
-            # that produces no trustworthy disposition must never proceed.
             report = merger_failure_report(
                 merger_result, observed_at=datetime.now(UTC).isoformat(),
             )
-            self._write_merge_failure_review('merger_blocked', report.detail)
-            return await self._mark_blocked(
-                report.reason, detail=report.detail, evidence=report.evidence,
-                suggested_action=report.suggested_action, merge_phase=merge_phase,
-            )
-
+            return MergerDisposition(resolved=False, reason=report.reason, detail=report.detail)
         if verdict['blocked']:
-            reason = verdict.get('reason') or f'Merger blocked: {merger_result.output[:200]}'
-            self._write_merge_failure_review('merger_blocked', reason)
-            return await self._mark_blocked(reason, merge_phase=merge_phase)
+            return MergerDisposition(
+                resolved=False, reason=self._blocked_verdict_reason(verdict, merger_result),
+            )
+        return MergerDisposition(resolved=True, reason=verdict.get('reason') or '')
 
-        # Re-submit to queue (now resolved, needs fresh merge)
-        return await self._submit_to_merge_queue(
-            branch_name, pre_rebased=False, merge_phase=merge_phase,
+    async def _settle_conflicting_base(self) -> WorkflowOutcome | None:
+        """Merge main into a resumed branch that conflicts with it, or block: see dispatch_base.py.
+
+        A branch that is, or may be, stacked on a predecessor is left alone.
+        """
+        if self._worktree_external or self._train is not None:
+            return None
+        assert self.worktree is not None and self.artifacts is not None
+        branch = f'{self.git_ops.config.branch_prefix}{self.task_id}'
+        try:
+            if await self._may_be_stacked(branch):
+                return None
+            conflict = await find_base_conflict(self.git_ops, self.worktree)
+        except Exception:
+            logger.warning(
+                'Task %s: could not probe the resumed branch against main; '
+                'planning on it unchecked', self.task_id, exc_info=True,
+            )
+            return None
+        if conflict is None:
+            return None
+        if self.event_store:
+            self.event_store.emit(
+                EventType.dispatch_base_conflict,
+                task_id=self.task_id,
+                phase=self.state.value,
+                data=conflict.to_event_payload(),
+            )
+        settlement = await settle_base_conflict(
+            self.git_ops, self.worktree, conflict,
+            branch=branch,
+            merger=self._merger_disposition,
         )
+        if not settlement.settled:
+            return await self._mark_blocked(
+                settlement.block_reason(), detail=settlement.block_detail(),
+                category=EscalationCategory.MERGE_NEEDS_REBASE.value,
+                dry_run_spawn=(
+                    DryRunSpawn.NEVER if settlement.declined_by_merger
+                    else DryRunSpawn.OUTSIDE_MERGE_PHASE
+                ),
+            )
+        self.artifacts.update_base_commit(conflict.main_sha)
+        self._base_commit = conflict.main_sha
+        logger.info(
+            'Task %s: merged main %s into the resumed branch at dispatch start '
+            '(conflicts on %s)', self.task_id, conflict.main_sha[:8],
+            ', '.join(conflict.conflicted_paths),
+        )
+        return None
+
+    async def _may_be_stacked(self, branch: str) -> bool:
+        """Whether the stack-base ledger records, or a failed read may hide, a
+        predecessor base under *branch*: main is never merged into such a branch."""
+        stack = await self.git_ops.stack_base_read(branch)
+        if stack.state is StackRecordState.ABSENT:
+            return False
+        logger.info(
+            'Task %s: not merging main into %s at dispatch start: its stack-base '
+            'record is %s (base %s)%s', self.task_id, branch, stack.state, stack.base,
+            f': {stack.detail}' if stack.detail else '',
+        )
+        return True
 
     def _submit_halt_owning_escalation(self, esc: Escalation) -> None:
-        """Submit a halt-owning escalation and register halt ownership.  Non-waiting.
-
-        This is the load-bearing submit → set_halt_owner ordering shared by:
-          - ``_submit_halt_escalation_and_wait`` (single-task path; follows with an await)
-          - ``_escalate_train_halt`` (train path; does not await — tip stays BLOCKED and
-            re-dispatches when the L1 is resolved and the queue is unhalted)
-
-        Order is significant: set_halt_owner MUST follow a successful submit.
-        A registered owner with no pending escalation cannot be resolved by
-        _on_escalation_resolved, so the halt would be permanent.  If submit
-        raises, the exception propagates before set_halt_owner is reached and
-        no orphan halt (OWNER-WITHOUT-ESCALATION) is registered.
-
-        HALT-WITHOUT-OWNER guard (task 1765): when the merger has already engaged
-        a per-lane WIP halt before we get here (``is_wip_halted=True,
-        halt_owner_esc_id=None``), a submit failure leaves the lane halted with no
-        owner registered.  ``_on_escalation_resolved`` has nothing to match, no
-        escalation exists for a human, and the halt silently blocks ALL merges on
-        that lane until ``force_unhalt_merge_queue``.  If submit raises and the
-        halt is ownerless, we release it before re-raising — same rationale as the
-        sibling guards in ``_submit_halt_escalation_and_wait`` (task 1448) and
-        ``_map_advance_failure`` (task 1671).
-
-        Guard condition: ``merge_worker.is_wip_halted and halt_owner_esc_id is None``
-        — ensures we release ONLY genuine ownerless orphans, never a foreign owner's
-        halt.  ``except BaseException`` (not ``Exception``) mirrors the sibling
-        guards and also covers a CancelledError arriving between halt-engage and
-        owner-registration.
-
-        Callers must guard with ``if self.escalation_queue:`` before calling.
-        """
+        """See ``orchestrator/src/orchestrator/merge_halt_escalation.py::submit_halt_owning_escalation``."""
         assert self.escalation_queue is not None, (
             '_submit_halt_owning_escalation requires escalation_queue; '
             'callers must guard with `if self.escalation_queue:`'
         )
-        try:
-            self.escalation_queue.submit(esc)  # propagates on failure; set_halt_owner NOT reached
-        except BaseException:
-            # HALT-WITHOUT-OWNER guard (task 1765): the merger may have already
-            # engaged a per-lane WIP halt before we got here. If submit raises,
-            # set_halt_owner is unreachable, so an engaged-but-ownerless halt would
-            # silently block the whole lane until force_unhalt_merge_queue. Release
-            # the orphan halt before propagating — only when it is genuinely
-            # ownerless (never steal a foreign owner's halt). Mirrors the sibling
-            # guards in _submit_halt_escalation_and_wait and _map_advance_failure.
-            if (
-                self.merge_worker is not None
-                and self.merge_worker.is_wip_halted
-                and self.merge_worker.halt_owner_esc_id is None
-            ):
-                try:
-                    self.merge_worker.unhalt_wip(reason='halt_escalation_submit_failed')
-                except Exception:
-                    # Swallow unhalt_wip failures so the original submit exception
-                    # always propagates to the caller — masking a disk-full or
-                    # serialization error with a secondary unhalt failure would make
-                    # diagnosis much harder.
-                    logger.exception(
-                        'Task %s: unhalt_wip failed during submit-failure cleanup '
-                        '(original submit exception will still propagate)',
-                        self.task_id,
-                    )
-            raise
-        if self.merge_worker is not None:
-            self.merge_worker.set_halt_owner(esc.id)
+        submit_halt_owning_escalation(self.escalation_queue, self.merge_worker, esc)
 
     async def _submit_halt_escalation_and_wait(self, esc: Escalation) -> None:
         """Submit a halt-owning escalation, register ownership, and wait for resolution.
@@ -13520,208 +13619,11 @@ class TaskWorkflow:
         *,
         branch_name: str | None = None,
         train_id: str | None = None,
-    ) -> tuple[str, str, str]:
-        """Build ``(category, summary, detail)`` for a WIP-halt level-1 escalation.
-
-        Shared by both the single-task handlers (``branch_name=...``) and the
-        train consumer ``_escalate_train_halt`` (``train_id=...``), so that
-        human-readable recovery instructions live in one place and cannot drift.
-
-        The task-context label (``'Merge for task X (branch Y)'`` vs
-        ``'Train merge for task X (train Y)'``) and one train-specific
-        split-brain note for ``done_wip_recovery`` are the only per-path
-        variations.
-
-        Parameters
-        ----------
-        status:
-            The ``MergeOutcome.status`` string.  Handled: ``'unmerged_state'``,
-            ``'stash_failed'``, ``'done_wip_recovery'``,
-            ``'wip_recovery_no_advance'``, ``'wip_halted'`` (default branch).
-        result:
-            The ``MergeOutcome`` object (for ``overlap_files``,
-            ``recovery_branch``, ``dirty_files``).
-        branch_name:
-            Single-task context — the local branch being merged.
-            Mutually exclusive with ``train_id``.
-        train_id:
-            Train context — the train identifier string.
-            Mutually exclusive with ``branch_name``.
-
-        Returns
-        -------
-        ``(category, summary, detail)`` :
-            Ready for ``Escalation(category=..., summary=..., detail=...)``.
-        """
-        is_train = train_id is not None
-        task_id = self.task_id
-
-        # Context label used in the detail intro sentence.
-        if is_train:
-            merge_ctx = f'Train merge for task {task_id} (train {train_id!r})'
-        elif branch_name is not None:
-            merge_ctx = f'Merge for task {task_id} (branch {branch_name})'
-        else:
-            merge_ctx = f'Merge for task {task_id}'
-
-        if status == 'unmerged_state':
-            category = 'unmerged_state'
-            if is_train:
-                summary = (
-                    f'Train member {task_id} blocked: '
-                    f'project_root has unresolved (UU/AA/DD) markers'
-                )
-            else:
-                summary = (
-                    'project_root has unresolved (UU/AA/DD) markers — '
-                    'merge queue halted'
-                )
-            detail = (
-                f'{merge_ctx} was blocked because project_root already has unresolved '
-                f'merge conflicts (UU/AA/DD markers) from a prior, unrelated event — '
-                f'the merge queue refuses to stash/advance over a partially resolved tree.\n\n'
-                f'Action required: inspect ``git status`` in project_root, '
-                f'resolve the existing merge state (``git mergetool`` / edit '
-                f'the conflicted files / ``git reset`` to abandon the prior '
-                f'merge), then resolve this escalation to un-halt the merge queue.\n\n'
-                f'Manual intervention required — do NOT let automated tooling '
-                f'resolve this escalation.'
-            )
-
-        elif status == 'done_wip_recovery':
-            category = 'wip_conflict'
-            recovery_branch = result.recovery_branch or '(unknown)'
-            if is_train:
-                summary = (
-                    f'Train member {task_id}: stash pop conflict — '
-                    f'WIP preserved on {recovery_branch}'
-                )
-                wip_clause = (
-                    'uncommitted WIP produced conflicts '
-                    '(split-brain: merge landed, members NOT flipped to done).'
-                )
-                # Task 1599 / Suggestion 4: the merge is already on main.
-                # Instruct the human to flip all members done before resolving
-                # so the re-dispatch does not re-attempt the already-landed merge.
-                post_resolve = (
-                    'Note: the merge commit is already on main.  Before resolving this '
-                    'escalation, ensure all train members are marked done — the train '
-                    're-dispatches on unhalt and re-entering the merge queue with an '
-                    'already-merged tip may produce a confusing split result.\n\n'
-                    'Resolve this escalation to un-halt the merge queue.'
-                )
-            else:
-                summary = f'Stash pop conflict — WIP preserved on {recovery_branch}'
-                wip_clause = 'your uncommitted WIP produced conflicts.'
-                post_resolve = 'Resolve this escalation to un-halt the merge queue.'
-            detail = (
-                f'{merge_ctx} landed on main successfully, but the stash pop of '
-                f'{wip_clause}\n\n'
-                f'Your WIP has been preserved on branch: {recovery_branch}\n\n'
-                f'To recover:\n'
-                f'  git checkout {recovery_branch}\n'
-                f'  # Review and cherry-pick or reapply your changes\n\n'
-                f'{post_resolve}'
-            )
-
-        elif status == 'wip_recovery_no_advance':
-            category = 'wip_conflict'
-            recovery_branch = result.recovery_branch or '(unknown)'
-            if is_train:
-                summary = (
-                    f'Train member {task_id}: stash pop conflict (no advance) — '
-                    f'WIP on {recovery_branch}'
-                )
-                no_advance_intro = (
-                    f'{merge_ctx} did NOT advance main (CAS failure path). '
-                    f'A stash pop conflict occurred, leaving'
-                )
-            else:
-                summary = (
-                    f'Stash pop conflict (merge did not advance) — '
-                    f'WIP on {recovery_branch}'
-                )
-                no_advance_intro = (
-                    f'{merge_ctx} did NOT advance main. '
-                    f'A stash pop conflict occurred after a CAS failure, leaving'
-                )
-            detail = (
-                f'{no_advance_intro} the working tree in an unresolvable state.\n\n'
-                f'Your WIP has been preserved on branch: {recovery_branch}\n\n'
-                f'The merge queue has been halted. To recover:\n'
-                f'  git checkout {recovery_branch}\n'
-                f'  # Review and reapply your changes to a clean branch\n\n'
-                f'Manual intervention required — do NOT let automated tooling '
-                f'resolve this escalation. Resolve this escalation to un-halt '
-                f'the merge queue.'
-            )
-
-        elif status == 'stash_failed':
-            # SHARED main-checkout-hygiene fault (task 2758): advance_main could
-            # not park project_root's dirty tracked WIP before advancing. Unlike
-            # wip_halted (WIP overlapping the merge diff), these files need not
-            # overlap the diff at all — project_root's tree is persistently
-            # dirty, so EVERY task landing fails identically until a human
-            # cleans it. The queue is halted so exactly ONE escalation is filed.
-            category = 'stash_failed'
-            dirty = result.dirty_files or []
-            dirty_head = ', '.join(dirty[:5]) if dirty else '(unknown)'
-            if is_train:
-                summary = (
-                    f'Train member {task_id} blocked: project_root park failed '
-                    f'(dirty tracked tree) — {dirty_head}'
-                )
-            else:
-                summary = (
-                    f'project_root park failed (dirty tracked tree) — '
-                    f'merge queue halted: {dirty_head}'
-                )
-            dirty_block = (
-                '\n'.join(f'  - {f}' for f in dirty) if dirty
-                else '  (dirty tracked file list unavailable)'
-            )
-            detail = (
-                f'{merge_ctx} was blocked because advance_main could not park '
-                f'the uncommitted WIP in project_root before advancing: '
-                f'project_root has dirty TRACKED file(s) that could not be '
-                f'stashed. This is a shared main-checkout infrastructure/hygiene '
-                f'incident — it recurs identically for every task landing until '
-                f'project_root is cleaned, so the merge queue has been halted '
-                f'(one escalation, not one per stalled task).\n\n'
-                f'Dirty tracked file(s):\n'
-                f'{dirty_block}\n\n'
-                f'Action required: inspect ``git status`` in project_root, then '
-                f'commit or clean the persistently-dirty tracked file(s) '
-                f'(``git commit`` / ``git checkout -- <path>`` / ``git stash``), '
-                f'then resolve this escalation to un-halt the merge queue.\n\n'
-                f'Manual intervention required — do NOT let automated tooling '
-                f'resolve this escalation.'
-            )
-
-        else:
-            # wip_halted (and any future halt-inducing status the probe catches)
-            category = 'wip_conflict'
-            overlap = result.overlap_files or []
-            if is_train:
-                summary = (
-                    f'Train member {task_id}: WIP overlaps merge diff: '
-                    + ', '.join(overlap[:5])
-                )
-                subject_ctx = f'train member {task_id} (train {train_id!r})'
-            else:
-                summary = f'WIP overlaps merge diff: {", ".join(overlap[:5])}'
-                branch_str = f' (branch {branch_name})' if branch_name else ''
-                subject_ctx = f'task {task_id}{branch_str}'
-            detail = (
-                f'Merge for {subject_ctx} was blocked because uncommitted '
-                f'work in project_root overlaps the merge diff.\n\n'
-                f'Overlapping files:\n'
-                + '\n'.join(f'  - {f}' for f in overlap)
-                + '\n\nAction required: commit or stash the WIP, then resolve this '
-                'escalation to un-halt the merge queue and retry.'
-            )
-
-        return category, summary, detail
+    ) -> MergeHaltEscalationText:
+        """See ``orchestrator/src/orchestrator/merge_halt_escalation.py::build_merge_halt_escalation_text``."""
+        return build_merge_halt_escalation_text(
+            status, result, task_id=self.task_id, branch_name=branch_name, train_id=train_id,
+        )
 
     def _warn_orphan_halt_no_queue(
         self,
@@ -14998,12 +14900,20 @@ class TaskWorkflow:
         # without the gate) never arises. compute_write_set is allowed to raise
         # on a malformed worktree (fail-loud; the fail-closed
         # backend-unavailable posture is a separate concern, not folded in here).
+        # A docs-only declared scope also grants the main checkout's .git and
+        # those paths: write_set.py::compute_write_set owns that gate.
         sandbox_modules = scope.sandbox_modules
         sandbox_extras = None
         if sandbox_modules is not None:
             write_set = compute_write_set(
                 cwd, task_id=self.task_id, task_root=self._artifact_roots(cwd)[1],
+                declared_files=self._task_files or task_metadata.get('files'),
             )
+            if write_set.docs_main_paths:
+                logger.info(
+                    'Task %s: %s granted the main checkout for its docs-only scope: %s',
+                    self.task_id, role.name, [str(p) for p in write_set.docs_main_paths],
+                )
             # Pre-create the load-bearing claude_fleet carve-out OUTSIDE the
             # sandbox at this single INV-5/D11 write-set consumption point, so it
             # exists before sandbox_extras (below) is built (task 2996) — see
@@ -15728,6 +15638,7 @@ class TaskWorkflow:
             self.event_store.emit(
                 EventType.routing_decision,
                 task_id=self.task_id,
+                phase=self.state.value,
                 role=role.name,
                 data={**decision.model_dump(), 'inputs_digest': digest},
             )
@@ -16077,7 +15988,7 @@ class TaskWorkflow:
         open_at_tail = self.escalation_queue.get_by_task(self.task_id, status='pending')
         handoffs = [
             e for e in open_at_tail
-            if needs_human(e) or (e.level == 1 and is_queue_handoff(e))
+            if needs_human(e) or _is_l1_handoff(e)
         ]
         if handoffs:
             steward_filed_one = any(
@@ -16624,19 +16535,23 @@ class TaskWorkflow:
         A fallback arm's has-work heuristic says only that the branch reads as
         merged; main's tip, which those arms used to stamp, is whatever landed
         most recently from ANY task.  This runs ``validate_landing_evidence``
-        in DISCOVERY mode — the shape of the harness dispatch gate's ancestry
-        arm — and returns the task's own attributable, surviving citation.  A
+        in DISCOVERY mode — the legacy citation-plus-effect-present policy,
+        kept here deliberately
+        (``docs/prds/landed-not-done-recovery.effect-present-caller-enumeration.md``
+        §7) — and returns the task's own attributable, surviving citation.  A
         reject, or a validation that raises, is logged and answers None, so
         every guard proceeds with its phase rather than stamping.
         """
+        metadata = self.task.get('metadata') or {}
         try:
             verdict = await validate_landing_evidence(
                 self.git_ops, self.task_id,
                 f'{self.config.git.branch_prefix}{self.task_id}',
                 branch_tip_sha=branch_tip_sha,
                 pattern_template=self.git_ops.config.commit_citation_pattern,
-                delivered_checks=_declared_checks(self.task.get('metadata') or {}),
+                delivered_checks=list(declared_checks(metadata).checks),
                 checks_enabled=self.config.delivered_checks.enabled,
+                branch_base_sha=metadata.get('branch_base_sha'),
             )
         except Exception:
             logger.warning(
@@ -17223,12 +17138,15 @@ class TaskWorkflow:
         """
         if not self.event_store:
             return
+        data: dict[str, object] = {'backend': backend, 'digest': write_set.digest()}
+        if write_set.docs_main_paths:
+            data['docs_main_paths'] = [str(p) for p in write_set.docs_main_paths]
         self.event_store.emit(
             EventType.sandbox_applied,
             task_id=self.task_id,
             phase=self.state.value,
             role=role_name,
-            data={'backend': backend, 'digest': write_set.digest()},
+            data=data,
         )
 
     def _ensure_sandbox_dirs(self, write_set: WriteSet) -> None:
@@ -19254,8 +19172,9 @@ class TaskWorkflow:
         ranks only publications about its own escalation, and no current
         steward producer publishes twice for one escalation.  The task-2248
         case of a follow-on L0 the steward chained and gave up on is foreign
-        to a scoped wait; the ``has_open_l1`` override in
-        :meth:`_await_steward_completion` covers it, not this ranking.
+        to a scoped wait; the open-L1 hand-off override
+        (:meth:`_open_l1_handoffs`) in :meth:`_await_steward_completion`
+        covers it, not this ranking.
 
         Higher wins: an L1 hand-off outranks budget exhaustion,
         which outranks a no-wip interruption, which outranks a wip-present
@@ -19277,9 +19196,10 @@ class TaskWorkflow:
         """True for the ``StewardOutcome`` variants that lead ``_mark_blocked``
         to re-pend the task: a clean ``StewardResolved``, or a
         ``StewardInterrupted`` with WIP present (the task-2060 resume-plan
-        branch).  These are exactly the outcomes the ``has_open_l1``
-        source-of-truth override in :meth:`_await_steward_completion` must
-        gate — a requeue must never race past an L1 that is already open.
+        branch).  These are exactly the outcomes the open-L1 hand-off
+        override (:meth:`_open_l1_handoffs`) in
+        :meth:`_await_steward_completion` must gate — a requeue must never
+        race past an L1 hand-off that is already open.
         """
         if isinstance(outcome, StewardResolved):
             return True
@@ -19299,6 +19219,17 @@ class TaskWorkflow:
                 self.task_id, status='pending', level=0,
             )
             if not router_owns(esc, enabled=self.config.info_l0_router_enabled)
+        ]
+
+    def _open_l1_handoffs(self, task_id: str) -> list[Escalation]:
+        """*task_id*'s pending level-1 records that hand it to a human (:func:`_is_l1_handoff`)."""
+        if self.escalation_queue is None:
+            return []
+        return [
+            esc for esc in self.escalation_queue.get_by_task(
+                task_id, status='pending', level=1,
+            )
+            if _is_l1_handoff(esc)
         ]
 
     def _l0s_holding_the_wait(self) -> list[Escalation]:
@@ -19518,7 +19449,7 @@ class TaskWorkflow:
         value.**  Every actionable variant is already fully determined by the
         escalation-queue state ``_wait_for_resolution``'s tail reads:
         ``StewardReescalatedL1``/``StewardBudgetExhausted`` ⇒ the L0 is
-        dismissed and an L1 is open ⇒ ``has_open_l1``; ``StewardResolved`` ⇒
+        dismissed and an L1 is open ⇒ an open L1 hand-off; ``StewardResolved`` ⇒
         the L0 is resolved; ``StewardInterrupted`` ⇒ the L0 is dismissed by the
         producer-side give-up contract with no L1.  Routing here would add a
         SECOND parallel outcome contract on a path that has none — precisely
@@ -19594,7 +19525,8 @@ class TaskWorkflow:
         record is found closed by a non-sweep resolver, else ``None``.
 
         A dedupe fold can make the awaited record ANOTHER task's.  Its close
-        while that task has an open L1 may be its steward's hand-off to a
+        while that task has an open L1 hand-off (:meth:`_open_l1_handoffs`;
+        an info L1 is never one) may be its steward's hand-off to a
         human (``steward.py::TaskSteward._auto_escalate_to_human`` files the
         L1, then dismisses the L0), not a resolution, so it never settles the
         wait.  This task's own hand-off always arrives as an in-scope envelope,
@@ -19607,9 +19539,7 @@ class TaskWorkflow:
         record = self.escalation_queue.get(escalation_id)
         if record is None or not closed_by_non_sweep_resolver(record):
             return None
-        if record.task_id != self.task_id and self.escalation_queue.has_open_l1(
-            record.task_id,
-        ):
+        if record.task_id != self.task_id and self._open_l1_handoffs(record.task_id):
             return None
         logger.info(
             'Task %s: awaited escalation %s found %s by %s with no outcome '
@@ -19723,7 +19653,7 @@ class TaskWorkflow:
         this channel — the dismissal is the only thing that wakes it — so a new
         steward early return that publishes without dismissing would satisfy
         this waiter while stranding that one.  The dismissal loops on this path
-        (``_mark_blocked``'s, and the ``has_open_l1`` override's below) are
+        (``_mark_blocked``'s, and the open-L1 hand-off override's below) are
         idempotent backstops over an already-dismissed record, not the primary
         mechanism.
 
@@ -19772,15 +19702,16 @@ class TaskWorkflow:
         reduced to the most severe via :meth:`_outcome_severity`.
 
         The multi-outcome silent-requeue gap (task 2248 review fix) is closed
-        by the ``has_open_l1`` source-of-truth override.  That gap is the
+        by the open-L1 hand-off override (:meth:`_open_l1_handoffs`).  That gap is the
         steward resolving this L0, then chaining a follow-on L0 and handing
         THAT one to a human.  In a scoped wait the follow-on's outcome is
         foreign and discarded, so the override is the only layer that sees
         it.  Before a requeue-producing outcome (:meth:`_outcome_requeues`)
-        is returned, the escalation queue's ``has_open_l1`` is re-checked,
+        is returned, the escalation queue's open L1 hand-offs are re-read,
         which also catches the publish-timing race where the follow-on L1 was
         filed but its outcome has not yet landed on the channel.  When an L1
-        is open, ``StewardReescalatedL1`` is returned instead.  If the
+        hand-off is open, ``StewardReescalatedL1`` naming it is returned
+        instead; an info L1 is never one.  If the
         overridden outcome was a wip-present ``StewardInterrupted``, the
         still-pending L0 it never dismissed is dismissed here too: that
         publisher deliberately skips ``_auto_escalate_to_human``, so the
@@ -19811,7 +19742,7 @@ class TaskWorkflow:
         if status in TERMINAL_STATUSES or status == 'deferred':
             return StewardTerminalDecision(new_status=TaskStatus(status))
         if outcome is not None:
-            # has_open_l1 source-of-truth override (review fix): a
+            # Open-L1 hand-off override (_open_l1_handoffs, review fix): a
             # requeue-producing outcome must not race past an L1 that is
             # already open — one the steward filed for a follow-on L0, whose
             # outcome was discarded as foreign to this scoped wait or has not
@@ -19821,11 +19752,8 @@ class TaskWorkflow:
             if (
                 self._outcome_requeues(outcome)
                 and self.escalation_queue is not None
-                and self.escalation_queue.has_open_l1(self.task_id)
+                and (handoffs := self._open_l1_handoffs(self.task_id))
             ):
-                open_l1 = self.escalation_queue.get_by_task(
-                    self.task_id, status='pending', level=1,
-                )
                 if isinstance(outcome, StewardInterrupted) and outcome.wip_commits_present:
                     # Amendment (review fix — orphan_resource_leak): the
                     # wip-present StewardInterrupted publisher deliberately
@@ -19858,9 +19786,7 @@ class TaskWorkflow:
                             'ESCALATED by an already-open L1',
                             self.task_id, len(orphan_l0),
                         )
-                return StewardReescalatedL1(
-                    esc_id=open_l1[0].id if open_l1 else '',
-                )
+                return StewardReescalatedL1(esc_id=handoffs[0].id)
             return outcome
         return StewardInterrupted(
             'timeout',
@@ -19895,6 +19821,7 @@ def build_workflow(
     resume_outcome_sink: ResumeOutcomeSink | None = None,
     task_verify: TaskVerifyPort | None = None,
     task_priority: TaskPriorityLookup | None = None,
+    stack_target: StackTarget | None = None,
 ) -> TaskWorkflow:
     """Single construction point for :class:`TaskWorkflow` (PRD C2 / Invariant P2).
 
@@ -19932,4 +19859,5 @@ def build_workflow(
         resume_outcome_sink=resume_outcome_sink,
         task_verify=task_verify,
         task_priority=task_priority,
+        stack_target=stack_target,
     )

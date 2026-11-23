@@ -2,8 +2,10 @@
 
 The INV-4 storm escape for the ``ensure_entity_node`` MCP tool (task 4932).
 This is the FIRE half of the alarm; the counter half is
-``MemoryService._entity_mint_storm_counters``, a per-``agent_id``
-:class:`shared.storm_counter.StormCounter` recording one event per MINT.
+``MemoryService._entity_mint_storm_counters``, an
+:class:`fused_memory.services.agent_project_storm_counters.AgentProjectStormCounters`:
+one :class:`shared.storm_counter.StormCounter` per ``(agent_id, project_id)``,
+recording one event per MINT.
 
 WHY THE MINT BRANCH IS THE ONE THAT NEEDS AN ALARM. Of the tool's four
 outcomes, three create nothing: a resolve returns an existing uuid and makes no
@@ -121,9 +123,10 @@ def emit_entity_mint_storm_escalation(
             ``'<unattributed>'``. Carried in the dedupe fingerprint so two
             agents storming at once produce two escalations rather than one
             entry that names neither.
-        count: Mints inside the window at the moment of the breach. Carried
-            rather than recomputed, so the alarm reports the reading that
-            actually tripped it.
+        count: *agent_id*'s mints in *project_id* ALONE inside the window at
+            the moment of the breach, so the number filed is reproducible from
+            that project's own journal rows. Carried rather than recomputed,
+            so the alarm reports the reading that actually tripped it.
         threshold: The ``entity_mint.storm_threshold`` value that was breached,
             so the detail stays self-describing after an operator retunes it.
         window_seconds: The ``entity_mint.storm_window_seconds`` value in force,
@@ -165,8 +168,9 @@ def emit_entity_mint_storm_escalation(
         f'threshold={threshold}',
         f'window_seconds={window_seconds}',
         '',
-        f'Agent {agent_id!r} MINTED {count} Graphiti Entity node(s) via the '
-        f'ensure_entity_node MCP tool within {window_seconds}s, at or above '
+        f'Agent {agent_id!r} MINTED {count} Graphiti Entity node(s) in project '
+        f'{project_id!r} via the ensure_entity_node MCP tool within '
+        f'{window_seconds}s, at or above '
         f'the storm threshold of {threshold}.',
         '',
         'Only MINTS are counted here. A resolve (the name already existed) '
@@ -209,7 +213,7 @@ def emit_entity_mint_storm_escalation(
             category=_CATEGORY,
             summary=(
                 f'entity mint storm: agent {agent_id!r} minted {count} Entity '
-                f'node(s) in {project_id} within {window_seconds}s '
+                f'node(s) in project {project_id!r} within {window_seconds}s '
                 f'(threshold {threshold})'
             ),
             detail=detail,

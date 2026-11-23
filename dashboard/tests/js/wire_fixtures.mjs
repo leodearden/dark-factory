@@ -82,26 +82,19 @@ function sampleLabels(count, stepMinutes = 60) {
   return Array.from({ length: count }, (_, i) => new Date(newest - (count - 1 - i) * stepMinutes * 60_000).toISOString());
 }
 
-// One burndown block, as data/redux_api.py::shape_burndown serves BURNDOWN and
-// each BURNDOWN_BY_PROJECT entry. It holds:
+// The aggregate burndown block, as data/redux_api.py::shape_burndown serves
+// BURNDOWN; burndownProjectBlock below builds a BURNDOWN_BY_PROJECT entry from
+// it. It holds:
 //   - `sampleCount` labels;
 //   - a non-empty series per census member, so every band draws;
-//   - the rows' in-progress split;
 //   - the `latest` and `forecast` Datums;
 //   - the parity verdict's fields. Only the aggregate block names the
 //     breaching `projects`; leave them out for a per-project block.
 export function burndownBlock(vocab, sampleCount, { alarm, cap, peak, breachCount, projects }) {
   const labels = sampleLabels(sampleCount);
-  const series = Object.fromEntries(
+  const columns = Object.fromEntries(
     Object.values(vocab.SERIES_KEYS).map((key, i) => [key, labels.map(() => i + 1)]),
   );
-  const inProgress = series[vocab.SERIES_KEYS['in-progress']];
-  const split = {
-    in_progress_live: inProgress.map(n => n - 1),
-    in_progress_stranded: inProgress.map(() => 1),
-    in_progress_rows: inProgress,
-  };
-  const columns = { ...series, ...split };
   const counts = Object.fromEntries(Object.entries(columns).map(([key, values]) => [key, values.at(-1)]));
   return {
     labels,
@@ -114,6 +107,15 @@ export function burndownBlock(vocab, sampleCount, { alarm, cap, peak, breachCoun
     parity_breach_count: breachCount,
     ...(projects === undefined ? {} : { parity_projects: projects }),
   };
+}
+
+// One BURNDOWN_BY_PROJECT entry: burndownBlock's series, Datums and parity
+// fields, with its label row sent as label_spans over an aggregate block of
+// `unionSampleCount` labels. Both rows end at WIRE_AS_OF, so the project's
+// `sampleCount` labels are the union's newest ones: one span over its tail.
+export function burndownProjectBlock(vocab, sampleCount, unionSampleCount, verdict) {
+  const { labels, ...block } = burndownBlock(vocab, sampleCount, verdict);
+  return { ...block, label_spans: [[unionSampleCount - labels.length, unionSampleCount]] };
 }
 
 // One open escalation, as data/escalation_analytics.py::_lifespan_block lists
@@ -228,13 +230,21 @@ function unreadWireDatum(reason) {
 // A null `bucketMinutes` is a series that names no width; its labels are then
 // hourly. `outcomes` counts the window's untimed attempts by outcome. With
 // `unread`, the project's runs.db could not be read, so its depth and attempts
-// are unknown.
-export function mergeQueueBlock({ bucketMinutes = null, buckets = 3, outcomes = {}, unread = false } = {}) {
+// are unknown. With `noRunsDb`, the project has no runs.db file at all: it is
+// served runs_db_present false, its depth and attempts unknown saying so.
+// `active`, `recent` and `metrics` are served as given.
+export function mergeQueueBlock({
+  bucketMinutes = null, buckets = 3, outcomes = {}, unread = false, noRunsDb = false,
+  active = [], recent = [], metrics = {},
+} = {}) {
   const labels = sampleLabels(buckets, bucketMinutes ?? 60);
   const outcomeLabels = Object.keys(outcomes);
   const outcomeValues = outcomeLabels.map(label => outcomes[label]);
   const attempts = outcomeValues.reduce((sum, n) => sum + n, 0);
-  const unreadReason = 'the merge_attempt events could not be read from runs.db';
+  const unreadReason = noRunsDb
+    ? 'no runs.db file exists for this project'
+    : 'the merge_attempt events could not be read from runs.db';
+  unread = unread || noRunsDb;
   return {
     depth: unread
       ? unreadWireDatum(unreadReason)
@@ -245,18 +255,29 @@ export function mergeQueueBlock({ bucketMinutes = null, buckets = 3, outcomes = 
         outcomes: { labels: outcomeLabels, values: outcomeValues, colors: outcomeLabels.map(() => '#888888') },
         latency: { p50: null, p95: null, p99: null, mean_ms: null, with_duration: 0, without_duration: attempts },
       }),
-    recent: [],
-    active: [],
+    recent,
+    active,
     recent_total: wireDatum(0),
     speculative: wireDatum({ hit_count: 0, discard_count: 0, total: 0, hit_rate: null }),
     in_queue: wireDatum(0),
     live_probe_configured: true,
+    runs_db_present: !noRunsDb,
     active_spark: { labels: [], values: [] },
     halt: { offline: true },
     train_events: [],
     train_throughput: wireDatum({}),
-    metrics: {},
+    metrics,
   };
+}
+
+// One MERGE_QUEUE[project].active row: data/merge_queue.py::_normalize_entry plus redux_api.py::shape_merge_queue's title Datum.
+export function mergeActiveRow({ taskId = '1', state = 'queued' } = {}) {
+  return { task_id: taskId, branch: `task/${taskId}`, state, age_secs: 60, position: 1, waiter_alive: true, title: wireDatum(`task ${taskId}`) };
+}
+
+// One MERGE_QUEUE[project].recent row: data/merge_queue.py::recent_merges plus redux_api.py::shape_merge_queue's title Datum.
+export function mergeRecentRow({ taskId = '1', outcome = 'done' } = {}) {
+  return { task_id: taskId, run_id: `run-${taskId}`, outcome, duration_ms: 1200, timestamp: WIRE_AS_OF, title: wireDatum(`task ${taskId}`) };
 }
 
 // The SCHEDULER payload, as /scheduler serves it: the keys data.js seeds it

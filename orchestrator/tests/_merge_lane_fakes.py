@@ -3,12 +3,13 @@
 Injected in place of the production adapters through
 ``MergeLane(..., verifier=FakeVerifier(...), clock=FakeClock(...))``.
 ``FakeVerifier`` scripts the verify outcome per task id or in call order,
-and records each scoped verify as a ``ScopedVerifyCall``;
+or hands a call to a delegate that does real work at verify time, and
+records each scoped verify as a ``ScopedVerifyCall``;
 ``FakeRemoteRunner`` is a remote verify host handed to the lane through
 ``remote_runners=``; ``FakeClock`` is a
 hand-advanced clock whose ``sleep`` advances it and waits at most
 ``sleep_cap`` of real time, and ``healthy_verify_clock`` one on which an
-in-flight verify keeps writing;
+in-flight verify keeps writing, ``make_lane``'s default clock;
 ``VerifyTasks`` builds a verify-frontier entry's ``verify_task`` in each
 state it can be in (pending, finished, raised, cancelled), and its
 ``verifies`` fixture cancels the pending ones at teardown -- re-export it
@@ -41,7 +42,15 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
-from collections.abc import AsyncIterator, Collection, Coroutine, Iterable, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Iterable,
+    Mapping,
+)
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -64,7 +73,8 @@ from orchestrator.merge_lane.types import (
     RemergeReason,
     SpeculativeItem,
 )
-from orchestrator.merge_lane.worker import MAIN_HEALTH_PROBE_PENDING_NOTE, SpeculativeMergeWorker
+from orchestrator.merge_lane.verify_failure_outcome import MAIN_HEALTH_PROBE_PENDING_NOTE
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import RunnerUnavailable
 
@@ -76,6 +86,9 @@ async def remerge_on_main(
     onto main, holding no permit."""
     claim = RemergeClaim(RemergeBase(None, RemergeReason.NO_TIP), None)
     return await worker._remerge(req, started_monotonic, claim=claim)
+
+#: A scoped verify a script hands its call to, called with ``run_scoped``'s own arguments.
+ScopedVerify = Callable[..., Awaitable[VerifyResult]]
 
 
 def lane_entry(lane: MergeLane, request_id: str) -> dict[str, Any] | None:
@@ -120,7 +133,7 @@ def main_health_probe_spawned(outcome: MergeOutcome) -> bool:
     """Whether a red *outcome* left a detached main-health probe in flight.
 
     Reads ``merge_queue.py::MAIN_HEALTH_PROBE_PENDING_NOTE``, which
-    ``_run_post_merge_verify`` appends to a red outcome's reason whenever
+    ``run_post_merge_verify`` appends to a red outcome's reason whenever
     ``_spawn_main_health_probe`` put a probe in flight -- the only trace the
     probe leaves on the outcome.
 
@@ -172,16 +185,26 @@ async def branch_merge_request(
 class VerifyScript:
     """What one ``FakeVerifier.run_scoped`` call does.
 
-    Exactly one of the shapes below applies: return ``result``, raise
-    ``error``, or wait for ``release`` first and then return ``result``.
-    *entered*, when given, is set the moment a call reaches this script,
-    before any release wait; it is the arrival half of a release gate.
+    A call that reaches this script sets *entered*, when given (the arrival
+    half of a release gate), then waits for *release*, when given. It then
+    ends in exactly one way: it raises *error*, or returns what *delegate*
+    returns, or returns *result*. *error* and *delegate* each end the call,
+    so construction rejects a script carrying both. A call that raises or
+    delegates never returns *result*.
     """
 
     result: VerifyResult
     error: BaseException | None = None
     release: asyncio.Event | None = None
     entered: asyncio.Event | None = None
+    delegate: ScopedVerify | None = None
+
+    def __post_init__(self) -> None:
+        if self.error is not None and self.delegate is not None:
+            raise ValueError(
+                f'a VerifyScript cannot both raise {self.error!r} and '
+                f'delegate to {self.delegate!r}: each one ends the call',
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -210,6 +233,10 @@ def raises(error: BaseException) -> VerifyScript:
     return VerifyScript(result=passes().result, error=error)
 
 
+def delegates_to(delegate: ScopedVerify) -> VerifyScript:
+    return VerifyScript(result=passes().result, delegate=delegate)
+
+
 def hangs_until(
     release: asyncio.Event, *, entered: asyncio.Event | None = None,
 ) -> VerifyScript:
@@ -228,22 +255,52 @@ class FakeVerifier:
 
     Each ``run_scoped`` call follows the next of the ordered ``sequence``
     scripts while any remain, then ``scripts[task_id]``, then ``default``.
+    A call whose behaviour is more than a verdict (a side effect at verify
+    time, a span recorder, production's own ``run_scoped_verification``) is
+    scripted with ``delegates_to(fn)``, and is recorded like any other call.
     It records every task id it was asked about in ``verified`` and what each
     call was handed in ``verify_calls``, one ``ScopedVerifyCall`` per entry
-    into the BASE ``run_scoped`` (an override that does not delegate records
-    only ``verified``/``entered_count``, through ``_note_entry``).
+    into the BASE ``run_scoped`` (an override that does not call
+    ``super().run_scoped`` records only ``verified``/``entered_count``,
+    through ``_note_entry``).
     ``await_entry(n)`` waits for the *n*-th entry into ``run_scoped``, which
     is how a test waits for a scripted hang to be genuinely under way before
     it probes the lane -- per CALL, so a test that drives two verifies can
     wait for the SECOND one instead of being let through early by the first.
-    The gates a merge passes through after a green scoped verify all report
-    clean, the disk guard reports *disk_reason* (``None``, the default, being
-    "proceed"), and dry-run investigations are recorded in ``investigations``
-    rather than run.
+    Its post-verify methods report clean, the disk guard reports
+    *disk_reason* (``None``, the default, being "proceed"), and dry-run
+    investigations are recorded in ``investigations`` rather than run.
 
     Script a per-CALL sequence with ``sequence=``; a subclass that must vary
     the selection further overrides ``next_script``. A legacy subclass that
     overrides ``run_scoped`` itself must still call ``_note_entry``.
+
+    WHAT INJECTING IT DOES AND DOES NOT STUB of the post-merge gate chain.
+    Measured by counting ``verifier.<method>`` call sites under
+    ``orchestrator/src/orchestrator/``, because the answer is narrower than
+    the port's method list suggests:
+
+    * ``check_post_merge_pyright`` and ``check_post_merge_equivalence`` have
+      ZERO lane call sites.
+      ``orchestrator/src/orchestrator/merge_lane/gates.py::_run_pyright_gate``
+      and ``::_run_equivalence_gate`` call ``::_check_post_merge_pyright`` and
+      ``::_check_post_merge_equivalence`` directly, so both gates run
+      PRODUCTION code under an injected verifier.
+    * ``run_unscoped_typechecks`` IS injected
+      (``run_unscoped=verifier.run_unscoped_typechecks`` in the lane's
+      ``worker.py``, ``drift.py`` and ``shadow.py``). Production
+      ``orchestrator/src/orchestrator/merge_lane/gates.py::_run_unscoped_typechecks``
+      returns a clean ``PostMergePyrightResult()`` when no module config
+      carries a ``type_check_command``, which is what this fake returns for a
+      request built with ``module_configs=[]``.
+    * ``ensure_disk_space`` IS injected, and is the one real narrowing.
+      Production
+      ``orchestrator/src/orchestrator/merge_lane/worker.py::_ensure_verify_disk_space``
+      proceeds whenever free bytes are at or above the threshold; its other
+      branch prunes stale ``_merge-*`` worktrees and is unit-covered by
+      ``orchestrator/tests/test_merge_queue.py::TestEnsureVerifyDiskSpace``.
+      Injecting the port also makes a test independent of the host's free
+      disk.
     """
 
     def __init__(
@@ -283,6 +340,10 @@ class FakeVerifier:
             self._entry_bell.clear()
             await self._entry_bell.wait()
 
+    def then(self, *scripts: VerifyScript) -> None:
+        """Queue *scripts* to run next, in order, ahead of the per-task and default scripts."""
+        self._ordered.extend(scripts)
+
     def next_script(self, task_id: str | None) -> VerifyScript:
         """The script the current ``run_scoped`` call for *task_id* follows.
 
@@ -314,6 +375,10 @@ class FakeVerifier:
             await script.release.wait()
         if script.error is not None:
             raise script.error
+        if script.delegate is not None:
+            return await script.delegate(
+                worktree, config, module_configs, task_files, **options,
+            )
         return script.result
 
     async def run_unscoped_typechecks(
@@ -457,9 +522,10 @@ class FakeClock:
     interval per ``wait_cap``, so at the defaults a parked verify's
     no-progress budget runs out in under a second of real time. Load
     only lengthens that, but it is still no load-safe slack: a scene that must not call a verify dead shows the
-    content progress a healthy verify makes -- ``healthy_verify_clock`` --
-    and only a scene exercising the dead-verify abort leaves
-    ``content_mtime`` frozen.
+    content progress a healthy verify makes -- ``healthy_verify_clock``,
+    ``make_lane``'s default -- and a scene exercising the dead-verify abort
+    opts into a frozen ``content_mtime`` by passing ``FakeClock(...)``
+    explicitly.
 
     ``tick`` additionally advances ``mono`` on every ``monotonic()`` read,
     for a lane loop that measures elapsed time off this clock but waits on
@@ -668,7 +734,11 @@ def make_lane(
 
     The verifier and clock default to fresh fakes rather than to the
     production adapters, so a test that forgets to pass one still gets a
-    lane that neither shells out nor waits out a production-sized sleep.
+    lane that never shells out. The clock defaults to
+    ``healthy_verify_clock()``: it waits out no production-sized sleep, and
+    an in-flight verify on it keeps writing, so a slow but healthy verify
+    is never called dead however loaded the host. A scene exercising the
+    dead-verify abort passes a frozen ``FakeClock(...)`` itself.
     *queue* defaults to a fresh ``asyncio.Queue`` on the running loop.
     Anything else ``MergeLane`` accepts passes through in *kwargs*.
     """
@@ -677,7 +747,7 @@ def make_lane(
         asyncio.Queue() if queue is None else queue,
         escalation_queue=escalation_queue,
         verifier=FakeVerifier() if verifier is None else verifier,
-        clock=FakeClock() if clock is None else clock,
+        clock=healthy_verify_clock() if clock is None else clock,
         **kwargs,
     )
 

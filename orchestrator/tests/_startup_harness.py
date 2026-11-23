@@ -30,6 +30,7 @@ STUBBED_STEPS: tuple[tuple[str, str], ...] = (
     ('1c0b', '_file_restored_pause_escalation'),
     ('1c1g', '_run_interactive_worktree_reaper_pass'),
     ('1c1h', '_run_leftover_verify_scope_reaper_pass'),
+    ('1c1i', '_ensure_project_slice_weight'),
     ('2c', '_recover_crashed_tasks'),
     ('2c2', '_reconcile_lane_checkouts'),
     ('2c3-streak-alarms', '_inherit_pending_streak_alarms'),
@@ -39,8 +40,7 @@ STUBBED_STEPS: tuple[tuple[str, str], ...] = (
     ('2g', '_run_scheduled_deploy_settle_pass'),
 )
 SYNC_STEPS = frozenset({
-    '_rehydrate_merge_halt', '_file_restored_pause_escalation',
-    '_inherit_pending_streak_alarms',
+    '_file_restored_pause_escalation', '_inherit_pending_streak_alarms',
 })
 #: Table steps the fixtures run for real against their mocked services.
 UNSTUBBED_STEPS = frozenset({'1b', '1b-crash-loop', '2f'})
@@ -54,11 +54,18 @@ _SCENE_GIT = GitConfig(
 _REAL_STARTUP_STEPS = UNSTUBBED_STEPS | {'1c0a'}
 
 
-def merge_lane_harness_factory(tmp_path: Path) -> Callable[[], Harness]:
+def merge_lane_harness_factory(
+    tmp_path: Path, *, real_steps: frozenset[str] = frozenset(),
+) -> Callable[[], Harness]:
     """Build Harnesses over ONE seeded repo, each running the real 1b and 1c0a.
 
+    *real_steps* names further ``STUBBED_STEPS`` steps each Harness keeps real.
     A later Harness sees the journal and runs.db an earlier one left.
     """
+    unknown = real_steps - {step for step, _attr in STUBBED_STEPS}
+    if unknown:
+        raise ValueError(f'not stubbed startup steps: {sorted(unknown)}')
+    kept_real = _REAL_STARTUP_STEPS | real_steps
     repo = seed_repo(tmp_path / 'repo')
 
     def make() -> Harness:
@@ -75,7 +82,7 @@ def merge_lane_harness_factory(tmp_path: Path) -> Callable[[], Harness]:
         h._start_escalation_server = AsyncMock(side_effect=start_escalation_server)
         h._stop_escalation_server = AsyncMock()
         for step, attr in STUBBED_STEPS:
-            if step not in _REAL_STARTUP_STEPS:
+            if step not in kept_real:
                 setattr(h, attr, MagicMock() if attr in SYNC_STEPS else AsyncMock())
         h._tag_task_modules = AsyncMock()
         h._tag_prd_metadata = AsyncMock()
@@ -86,6 +93,17 @@ def merge_lane_harness_factory(tmp_path: Path) -> Callable[[], Harness]:
         return h
 
     return make
+
+
+async def harness_with_real_merge_worker(
+    make: Callable[[], Harness], scheduler: MagicMock,
+) -> Harness:
+    """A Harness over the factory's shared escalation dir, holding a real merge worker."""
+    h = make()
+    await h._start_escalation_server()
+    h.scheduler = scheduler
+    await h._start_merge_worker()
+    return h
 
 
 async def journal_merge_request(h: Harness, task_id: str) -> str:

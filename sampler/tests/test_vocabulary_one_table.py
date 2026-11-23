@@ -25,9 +25,10 @@ from sampler.metrics import (
     MetricGroup,
     MetricSpec,
     arm_metrics,
+    every_tick,
     exact_metric_names,
 )
-from sampler.sampler import run_tick
+from sampler.sampler import Skipped, run_tick
 from sampler.store import LoadSampleStore
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -97,10 +98,10 @@ def _table_with(spec: MetricSpec, into: GroupName = GroupName.PROCESS) -> tuple[
 
     return tuple(
         dataclasses.replace(
-            group, metrics=(*group.metrics, spec), collect=emits_only_the_new_spec
+            group, metrics=(*group.metrics, spec), collect=every_tick(emits_only_the_new_spec)
         )
         if group.name is into
-        else dataclasses.replace(group, collect=dict)
+        else dataclasses.replace(group, collect=every_tick(dict))
         for group in METRIC_GROUPS
     )
 
@@ -113,10 +114,12 @@ class TestASpecAddedToTheTableReachesEveryProjection:
         db_path = tmp_path / 'db.sqlite'
 
         written = run_tick(
-            LoadSampleStore(db_path), 1_000_000, {group: group.collect() for group in table}
+            LoadSampleStore(db_path),
+            1_000_000,
+            {group: group.collect(1_000_000, None) for group in table},
         )
 
-        assert len(written) == len(table), 'a group was dropped at admission'
+        assert Skipped.DROPPED not in written.values(), 'a group was dropped at admission'
         conn = sqlite3.connect(str(db_path))
         try:
             stored = conn.execute('SELECT metric, leaf FROM samples').fetchall()
@@ -146,7 +149,7 @@ class TestASpecAddedToTheTableReachesEveryProjection:
 _FIXTURE_TABLE = (
     MetricGroup(
         GroupName.LOAD,
-        collect=dict,
+        collect=every_tick(dict),
         metrics=(
             MetricSpec('fixture_alpha'),
             MetricSpec('fixture_beta', per_leaf=True),
@@ -214,6 +217,9 @@ def _scope() -> list[tuple[Path, bool]]:
     others = [
         REPO_ROOT / 'dashboard' / 'src' / 'dashboard' / 'data' / 'load.py',
         REPO_ROOT / 'scripts' / 'load-threshold-calibration.py',
+        REPO_ROOT / 'scripts' / 'resource_report.py',
+        REPO_ROOT / 'scripts' / 'resource_report_holds.py',
+        REPO_ROOT / 'scripts' / 'resource_report_holds_render.py',
     ]
     return [(path, path == _SPEC_HOME) for path in sampler_modules] + [
         (path, False) for path in others
@@ -242,3 +248,17 @@ class TestTheLiveTree:
             'metric names spelled outside sampler.metrics.METRIC_GROUPS; derive them '
             'from the table instead:\n' + '\n'.join(findings)
         )
+
+    def test_the_consumer_modules_are_scanned(self):
+        """They attribute and read the new figures, so a metric name spelled there is drift."""
+        scanned = {path.name for path, _declares_specs in _scope()}
+
+        assert {'consumers.py', 'host_memory.py'} <= scanned
+
+    def test_the_resource_report_is_scanned(self):
+        """It queries the consumer metrics, so it must take every name from the table."""
+        scanned = {path.name for path, _declares_specs in _scope()}
+
+        assert {
+            'resource_report.py', 'resource_report_holds.py', 'resource_report_holds_render.py'
+        } <= scanned

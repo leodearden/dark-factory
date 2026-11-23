@@ -127,10 +127,18 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 import types
 
 import pytest
+from host_pytest_temp_root import (
+    TEMPROOT_RECORDER_TEST,
+    listing,
+    recorded_temproot,
+    seed_dead_session_dirs,
+    temproot_recorder_source,
+)
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
@@ -237,15 +245,20 @@ def test_peer(peer):
     pass
 '''
 
+TEMPROOT_RECORDER_MODULE_NAME = 'test_temproot_recorder.py'
+
+_TEMPROOT_RECORDER_MODULE = temproot_recorder_source(timeout_secs=NON_BLOCKING_TIMEOUT_SECS)
+
 
 @dataclasses.dataclass(frozen=True)
 class _ProbeSuite:
     root: pathlib.Path
     ini: pathlib.Path
+    basetemp: pathlib.Path
 
 
 def _write_probe_suite(tmp_path: pathlib.Path, method: str) -> _ProbeSuite:
-    """The synthetic suite under *tmp_path*, its cap enforced by *method*."""
+    """The synthetic suite under *tmp_path*, its cap enforced by *method*; basetemp is a not-yet-created sibling of its root."""
     root = tmp_path / 'suite'
     root.mkdir()
     ini = root / 'pytest.ini'
@@ -254,7 +267,7 @@ def _write_probe_suite(tmp_path: pathlib.Path, method: str) -> _ProbeSuite:
         encoding='utf-8',
     )
     (root / PROBE_MODULE_NAME).write_text(_PROBE_MODULE, encoding='utf-8')
-    return _ProbeSuite(root=root, ini=ini)
+    return _ProbeSuite(root=root, ini=ini, basetemp=tmp_path / 'basetemp')
 
 
 def _run_probe_suite(
@@ -263,6 +276,8 @@ def _run_probe_suite(
     budget_secs: float = PROBE_SUBPROCESS_TIMEOUT_SECS,
 ) -> subprocess.CompletedProcess[str]:
     """Run *suite* at ``-n PROBE_WORKERS --dist loadgroup -rA`` plus *extra*.
+
+    *extra* may not set --basetemp; one that does is refused before any session starts.
 
     A child still running after *budget_secs* fails the calling test with
     whatever it had printed and the live members of its process group. The
@@ -275,7 +290,21 @@ def _run_probe_suite(
     change what the child runs or suppress the literals asserted on. Only
     ``PYTEST_DISABLE_PLUGIN_AUTOLOAD`` is then set, so the child loads exactly
     ``PROBE_PLUGINS`` and nothing else installed in the venv.
+
+    The child runs under the suite's private basetemp, never in the host's
+    default pytest temp root; why:
+    ``test_timeout_method_policy.py::test_a_probe_suite_run_leaves_the_hosts_default_temp_root_untouched``.
     """
+    smuggled = [
+        extra[i:i + 2] if arg == '--basetemp' else (arg,)
+        for i, arg in enumerate(extra)
+        if arg == '--basetemp' or arg.startswith('--basetemp=')
+    ]
+    if smuggled:
+        raise ValueError(
+            'a probe suite runs under its own basetemp (suite.basetemp); extra may '
+            f'not set --basetemp: {smuggled!r}'
+        )
     missing = [
         plugin for plugin in ('xdist', 'pytest_timeout')
         if importlib.util.find_spec(plugin) is None
@@ -297,6 +326,7 @@ def _run_probe_suite(
                 '--dist', 'loadgroup',
                 '-rA',
                 *extra,
+                f'--basetemp={suite.basetemp}',
             ],
             cwd=suite.root,
             env=env,
@@ -489,6 +519,69 @@ def test_a_descendant_still_holding_the_probe_childs_output_does_not_hold_up_the
         f'the lingering descendant {lingerer} is still running: the probe\'s '
         'process group must not outlive the run.'
     )
+
+
+@pytest.mark.xdist_group(TIMEOUT_METHOD_PROBE_GROUP)
+def test_a_probe_suite_run_leaves_the_hosts_default_temp_root_untouched(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = tmp_path / 'host-temp'
+    seed_dead_session_dirs(host)
+    before = listing(host)
+    # The child's PYTEST_* is scrubbed, so TMPDIR is the only channel to its
+    # temp root. Pin this process's cached tempdir first: run_process_group
+    # opens temp files here, and they must not land in the stand-in.
+    monkeypatch.setattr(tempfile, 'tempdir', tempfile.gettempdir())
+    monkeypatch.setenv('TMPDIR', str(host))
+    suite = _write_probe_suite(tmp_path, SIGNAL_METHOD)
+    (suite.root / TEMPROOT_RECORDER_MODULE_NAME).write_text(
+        _TEMPROOT_RECORDER_MODULE, encoding='utf-8',
+    )
+
+    result = _run_probe_suite(suite, '-k', TEMPROOT_RECORDER_TEST)
+
+    assert result.returncode == pytest.ExitCode.OK, (
+        f'the recorder probe exited {result.returncode}, not '
+        f'{int(pytest.ExitCode.OK)} (OK).\n{_captured(result)}'
+    )
+    seen = recorded_temproot(suite.root)
+    assert seen is not None and seen.resolve() == host.resolve(), (
+        f'the child ran against temp root {seen}, not the stand-in {host}, so '
+        'the listing check below would pass vacuously.\n'
+        f'{_captured(result)}'
+    )
+    after = listing(host)
+    assert after == before, (
+        "a probe session must not create, lock or clean dirs in the host's "
+        "default pytest temp root: its exit-time sweep of other sessions' dead "
+        'dirs runs outside pytest-timeout and counts against the probe budget.\n'
+        f'before: {before}\nafter:  {after}\n'
+        f'{_captured(result)}'
+    )
+    assert suite.basetemp.is_dir(), (
+        f'the session did not create its private basetemp {suite.basetemp}.\n'
+        f'{_captured(result)}'
+    )
+
+
+@pytest.mark.parametrize(
+    'spelling', [('--basetemp={}',), ('--basetemp', '{}')], ids=['joined', 'separate'],
+)
+def test_a_basetemp_smuggled_through_extra_is_refused_before_any_session_starts(
+    tmp_path: pathlib.Path, spelling: tuple[str, ...],
+) -> None:
+    smuggled = tmp_path / 'elsewhere'
+    suite = _write_probe_suite(tmp_path, SIGNAL_METHOD)
+    (suite.root / TEMPROOT_RECORDER_MODULE_NAME).write_text(
+        _TEMPROOT_RECORDER_MODULE, encoding='utf-8',
+    )
+    smuggle = tuple(arg.format(smuggled) for arg in spelling)
+
+    with pytest.raises(ValueError, match='--basetemp') as refused:
+        _run_probe_suite(suite, '-k', TEMPROOT_RECORDER_TEST, '-n', '0', *smuggle)
+
+    assert str(smuggled) in str(refused.value)
+    assert recorded_temproot(suite.root) is None, 'a session started anyway'
 
 
 @pytest.mark.parametrize(

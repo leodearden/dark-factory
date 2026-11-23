@@ -5,7 +5,7 @@ This is the normative home of the decision to brief an eval architect with an
 `orchestrator/src/orchestrator/evals/replay_frame.py`,
 `orchestrator/src/orchestrator/evals/metrics.py::EvalMetrics.replay_frame`,
 `orchestrator/src/orchestrator/evals/runner.py` and
-`orchestrator/src/orchestrator/cli.py::_run_plan_only`.
+`orchestrator/src/orchestrator/evals/cli.py::_run_plan_only`.
 
 ## 1. Problem
 
@@ -79,8 +79,9 @@ One mechanism frames every eval architect:
 plus the block, and it overrides nothing else.
 
 - `runner.py::run_architect_eval` builds one per cell.
-- `orchestrator eval --plan-only` (`cli.py::_run_plan_only`) builds one per
-  fixture, since each fixture has its own base.
+- `orchestrator eval --plan-only`
+  (`orchestrator/src/orchestrator/evals/cli.py::_run_plan_only`) builds one
+  per fixture, since each fixture has its own base.
 - `runner.py::run_end_to_end` (the both-live matrix/confirm path) passes one
   through `build_workflow`'s `briefing` parameter, so TaskWorkflow's PLAN phase
   briefs its live architect with it.

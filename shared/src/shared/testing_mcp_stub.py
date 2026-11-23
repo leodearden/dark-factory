@@ -10,11 +10,14 @@ in each way a client must not mistake for success (:class:`StubAnswer`), and
 its first *unavailable_tool_calls* requests can be answered 503, as a gateway
 answers while the server behind it restarts. A *tools* handler can answer each
 OK ``tools/call`` by tool name and arguments, so a fake backend is served over
-the socket.
+the socket. :func:`tool_reply_body` is that OK answer's JSON-RPC body, for a
+client-side fault injector whose one good reply cannot come from a socket.
 
 Real sockets rather than patching a client's modules: the session header, path
 and Accept a client sends are wire facts the server observes in
-:attr:`StubMcpServer.requests`, so no client internals are pinned. Pure stdlib,
+:attr:`StubMcpServer.requests`, and :meth:`StubMcpServer.tool_call_arguments`
+names the calls its tool layer answered, past the stub's own refusals, so no
+client internals are pinned. Pure stdlib,
 registered in ``shared/tests/test_pure_stdlib_leaves.py``.
 """
 
@@ -31,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import MappingProxyType, TracebackType
 from typing import Any
 
-__all__ = ['RecordedRequest', 'StubAnswer', 'StubMcpServer', 'ToolHandler']
+__all__ = ['RecordedRequest', 'StubAnswer', 'StubMcpServer', 'ToolHandler', 'tool_reply_body']
 
 _ENDPOINT = '/mcp'
 _INVALID_REQUEST = -32600
@@ -71,8 +74,14 @@ class _Reply:
     session_id: str | None = None
 
 
+def _rpc_body(request_id: Any, *, result: dict | None = None, error: dict | None = None) -> dict:
+    if error is not None:
+        return {'jsonrpc': '2.0', 'id': request_id, 'error': error}
+    return {'jsonrpc': '2.0', 'id': request_id, 'result': result}
+
+
 def _rpc_error(status: int, message: str, code: int = _INVALID_REQUEST) -> _Reply:
-    body = {'jsonrpc': '2.0', 'id': 'server-error', 'error': {'code': code, 'message': message}}
+    body = _rpc_body('server-error', error={'code': code, 'message': message})
     return _Reply(status, json.dumps(body).encode(), 'application/json')
 
 
@@ -86,6 +95,11 @@ def _tool_ok(payload_text: str) -> dict:
 
 def _tool_error(text: str) -> dict:
     return {'content': [{'type': 'text', 'text': text}], 'isError': True}
+
+
+def tool_reply_body(payload: Mapping[str, Any], *, request_id: Any = 1) -> dict:
+    """The JSON-RPC body an MCP server answers an OK ``tools/call`` with when the tool replies *payload*."""
+    return _rpc_body(request_id, result=_tool_ok(json.dumps(dict(payload))))
 
 
 ToolHandler = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
@@ -116,6 +130,7 @@ class StubMcpServer:
         self._tools = tools
         self._lock = threading.Lock()
         self._requests: list[RecordedRequest] = []
+        self._tool_calls: list[tuple[str, str]] = []
         self._minted: list[str] = []
         self._open: set[str] = set()
         self._httpd: ThreadingHTTPServer | None = None
@@ -158,6 +173,22 @@ class StubMcpServer:
     def requests(self) -> tuple[RecordedRequest, ...]:
         with self._lock:
             return tuple(self._requests)
+
+    @property
+    def off_endpoint_paths(self) -> tuple[str, ...]:
+        """Paths of the arrived requests not addressed to ``/mcp``, such as the redirecting ``/mcp/``."""
+        with self._lock:
+            return tuple(r.path for r in self._requests if r.path != _ENDPOINT)
+
+    def tool_call_arguments(self, tool_name: str) -> tuple[Mapping[str, Any], ...]:
+        """Arguments of each *tool_name* call the tool layer answered, in arrival order.
+
+        Transport refusals, a scripted ``REDIRECT_307`` among them, and
+        notifications are not tool calls; a scripted failure answer is. Each
+        read is a fresh copy.
+        """
+        with self._lock:
+            return tuple(json.loads(text) for name, text in self._tool_calls if name == tool_name)
 
     @property
     def minted_session_ids(self) -> tuple[str, ...]:
@@ -251,16 +282,28 @@ class StubMcpServer:
         if 'id' not in message:
             return _Reply(202, session_id=session_id)
         method = message['method']
-        if method == 'tools/call' and self._answer is not StubAnswer.OK:
-            return self._scripted(message, session_id)
+        if method == 'tools/call':
+            return self._answer_tool_call(message, session_id)
         if method == 'initialize':
             return self._frame(message, self._initialize_result(message), session_id)
-        if method == 'tools/call':
-            return self._frame(message, self._tool_result(message.get('params', {})), session_id)
         if method == 'tools/list':
             return self._frame(message, {'tools': []}, session_id)
         error = {'code': _METHOD_NOT_FOUND, 'message': 'Method not found'}
         return self._frame(message, None, session_id, error=error)
+
+    def _answer_tool_call(self, message: dict, session_id: str | None) -> _Reply:
+        if self._answer is StubAnswer.REDIRECT_307:
+            return _Reply(307, location=_ENDPOINT, session_id=session_id)
+        params = message.get('params', {})
+        self._record_tool_call(params)
+        if self._answer is not StubAnswer.OK:
+            return self._scripted(message, session_id)
+        return self._frame(message, self._tool_result(params), session_id)
+
+    def _record_tool_call(self, params: Mapping[str, Any]) -> None:
+        arguments_text = json.dumps(params.get('arguments', {}))
+        with self._lock:
+            self._tool_calls.append((params.get('name', ''), arguments_text))
 
     def _scripted(self, message: dict, session_id: str | None) -> _Reply:
         match self._answer:
@@ -275,12 +318,10 @@ class StubMcpServer:
                 return _Reply(200, b'Internal Server Error', 'text/plain', session_id=session_id)
             case StubAnswer.EMPTY_202:
                 return _Reply(202, session_id=session_id)
-            case StubAnswer.REDIRECT_307:
-                return _Reply(307, location=_ENDPOINT, session_id=session_id)
             case StubAnswer.JSON_RPC_ERROR:
                 error = {'code': _INVALID_PARAMS, 'message': 'Invalid params: scripted stub failure'}
                 return self._frame(message, None, session_id, error=error)
-        raise AssertionError(f'{self._answer} is not a scripted failure')
+        raise AssertionError(f'{self._answer} is not a scripted tool-layer failure')
 
     def _initialize_result(self, message: dict) -> dict:
         requested = message.get('params', {}).get('protocolVersion', '2025-03-26')
@@ -308,12 +349,7 @@ class StubMcpServer:
         *,
         error: dict | None = None,
     ) -> _Reply:
-        rpc: dict[str, Any] = {'jsonrpc': '2.0', 'id': message['id']}
-        if error is not None:
-            rpc['error'] = error
-        else:
-            rpc['result'] = result
-        text = json.dumps(rpc)
+        text = json.dumps(_rpc_body(message['id'], result=result, error=error))
         if self._stateful:
             frame = f'event: message\ndata: {text}\n\n'
             return _Reply(200, frame.encode(), 'text/event-stream', session_id=session_id)

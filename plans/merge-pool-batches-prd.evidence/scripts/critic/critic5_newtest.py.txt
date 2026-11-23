@@ -1,0 +1,45 @@
+import sqlite3, json, collections, subprocess, re
+REPO='/home/leo/src/dark-factory'
+db=sqlite3.connect(f'file:{REPO}/data/orchestrator/runs.db?mode=ro', uri=True)
+tips={}
+for id_,ts,task,data in db.execute("""select id,timestamp,task_id,data from events where event_type='merge_verify'
+  and timestamp>='2026-10-21' and json_extract(data,'$.chain_items')>1 and json_extract(data,'$.passed')=0"""):
+    d=json.loads(data); tips[d['merge_sha']]=d
+ids=collections.defaultdict(set)
+for test_id,verdict,sha in db.execute("select test_id,verdict,merge_sha from flake_occurrence where call_site='merge_gate' and observed_at>='2026-10-21'"):
+    if sha in tips and test_id!='<unknown>': ids[sha].add(test_id)
+MODS=['client-feed','cockpit','dashboard','escalation','fused-memory','orchestrator','sampler','scripts','shared','tests/repo_guards','tests/scripts']
+def git(*a):
+    r=subprocess.run(['git','-C',REPO,*a],capture_output=True,text=True,errors='replace')
+    return r.stdout if r.returncode==0 else None
+def locate(sha,fp):
+    out=[]
+    for m in MODS:
+        if git('cat-file','-e',f'{sha}:{m}/{fp}') is not None: out.append(f'{m}/{fp}')
+        elif fp.startswith(m+'/') and git('cat-file','-e',f'{sha}:{fp}') is not None: out.append(fp)
+    return out
+per=collections.Counter(); tipclass=collections.Counter(); ex=[]
+nosha=0
+for sha,d in tips.items():
+    n=d.get('chain_items') or 1
+    base=(git('rev-parse',f'{sha}~{n}') or '').strip()
+    if not base: nosha+=1; continue
+    classes=set()
+    for tid in ids.get(sha,()):
+        if '::' not in tid: classes.add('module-level'); per['module-level']+=1; continue
+        fp=tid.split('::')[0]; fn=tid.split('::')[-1].split('[')[0]
+        paths=locate(sha,fp)
+        if not paths: classes.add('unmapped-on-tip'); per['unmapped-on-tip']+=1; continue
+        if len(paths)>1: per['ambiguous-module']+=1
+        p=paths[0]
+        src=git('show',f'{base}:{p}')
+        if src is None: k='file-absent-on-base'
+        elif re.search(r'def\s+'+re.escape(fn)+r'\b',src): k='present-on-base'
+        else: k='file-on-base-but-test-absent'; ex.append((sha[:8],tid[:90]))
+        classes.add(k); per[k]+=1
+    key=tuple(sorted(classes)) or ('no-ids',)
+    tipclass[key]+=1
+print('tips',len(tips),'no-commit',nosha)
+print('ids by class',per.most_common())
+for k,v in tipclass.most_common(): print(v,k)
+print(ex[:12])

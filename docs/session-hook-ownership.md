@@ -22,9 +22,9 @@ running, then to idle or awaiting-input, then to exited. This was introduced
 by task 2511.
 
 A hand-launched session has no `CLAUDE_SPAWN_SESSION_ID`. It keys on the
-Claude Code `session_id` from the hook's stdin JSON, through
-`session_registry.build_session_slug`, with the `session_id` in the
-`launcher_pid` slot as the uniqueness token. That `session_id` is the same
+Claude Code `session_id` from the hook's stdin JSON, which reaches
+`session_records.build_session_slug` as its uniqueness token. That
+`session_id` is the same
 for SessionStart, Notification and Stop within one session, so all three
 resolve to the same `record.json`. Both kinds keep their record across a
 re-mint (see §Session-id re-mints).
@@ -43,8 +43,9 @@ through to the hand-launched keying, unless it is a re-mint reached through
 the pid pointer, or a SessionStart in a thread whose recorded owner is dead.
 Every bind, and every dead-owner reclaim (see §Session-id re-mints), writes
 the session-id pointer, and every write of a record whose `claude_owner_pid`
-is the event's claude writes the pid pointer, so spawned, T3-hosted and
-hand-launched records carry the same pointers.
+is the event's claude writes the pid pointer, unless that claude is a shared
+`claude agents` host (see §Shared claude agents hosts), so spawned, T3-hosted
+and hand-launched records carry the same pointers.
 
 The thread pointer is how a T3-hosted session reaches its spawn record, since
 it has no `CLAUDE_SPAWN_*` environment at all. The T3 lane writes the pointer
@@ -115,16 +116,19 @@ by task 4193.
    flipped to `running` by the time a hook runs.
 3. **For a SessionStart re-mint, `claude_owner_pid` equality.** The owning
    pid stamped at bind time must equal the pid of this event's owning claude
-   (see §Session-id re-mints).
+   (see §Session-id re-mints), unless that claude is a shared `claude agents`
+   host, whose pid never proves a re-mint (see §Shared claude agents hosts).
 
 A record reached through a T3 thread pointer has no
 `CLAUDE_SPAWN_OWNER_PPID` to test, so the claude pids decide before binding:
 `EventProbes.owning_claude_pid` against the record's `claude_owner_pid`. An
-absent owner means this is the thread's first claude, which binds; an equal
-pid, or a recorded owner judged dead, binds too; an unresolvable event pid
-adopts without binding; any other pid forks. After binding, discriminator 1
-applies, with the exceptions in §Session-id re-mints. A nested claude in the
-thread has a live owner, its parent claude, so it forks.
+absent owner means this is the thread's first claude, which binds. An equal
+pid binds too, unless that claude is a shared `claude agents` host (see
+§Shared claude agents hosts), and so does a recorded owner judged dead. An
+unresolvable event pid adopts without binding; any other pid forks. After
+binding, discriminator 1 applies, with the exceptions in §Session-id re-mints.
+A nested claude in the thread has a live owner, its parent claude, so it
+forks.
 
 Lineage against `CLAUDE_SPAWN_LAUNCHER_PID` cannot replace any of these. The
 variable is never exported into the spawned session, since `sanitize_env`
@@ -149,8 +153,9 @@ when both of these hold:
   enough: it proves the emitter holds a session, not this one. Automatic
   compaction fires `compact` in any long-running nested `claude -p`.
 - The event's owning claude pid equals the `claude_owner_pid` bound on the
-  record. `/clear` and compaction run inside the owning process and keep its
-  pid. A nested claude is a different process.
+  record, and that claude is not a shared `claude agents` host. `/clear` and
+  compaction run inside the owning process and keep its pid. A nested claude
+  is a different process.
 
 When both hold, SessionStart re-binds the record to the new id.
 
@@ -221,6 +226,39 @@ already re-bound the record.
 
 Code: `orchestrator/src/orchestrator/session_hooks.py::_OWNER_ONLY_SESSION_START_SOURCES`,
 `::_is_owner_only_session_start`, `::_env_slug_ownership`.
+
+## Shared claude agents hosts
+
+A `claude agents` process runs the sessions it hosts in-process. Every hosted
+session's owning claude (`EventProbes.owning_claude_pid`) and its
+`$CLAUDE_PID` are therefore the host's pid, and the host outlives each
+session it runs. A pid shared that way cannot tell one hosted session from
+another (task 6945).
+
+So no `sessions-by-pid` pointer is ever keyed on a host pid. Writers refuse
+one, the resolver ignores a legacy host-keyed one still on disk, and the
+pointer sweep removes it. A hosted session reaches its record through its session-id
+pointer or through the hand-launched keying.
+
+Owner-pid equality is never evidence of the same session under a host. A
+hosted `/clear` or compaction therefore forks onto the hand-launched record of
+its new session id instead of re-binding. That is the safe direction, as for
+a `/resume`d spawned session: re-binding could capture a sibling hosted
+session's record. The cost is that a hosted session splits its record at
+each re-mint.
+
+`claude_owner_pid` still records the host, the process that bound the record.
+Self-exit refuses to signal it (`session_self_exit.py::_owner_refusal`,
+`SHARED_SESSION_HOST`), and a live host owner is never reclaimed.
+
+A hosted record's `launcher_pid` is the host's session leader, as for any
+hand-launched record, so its stale-pid reap waits on that process. A forked
+inheritor's `launcher_pid` is the host itself.
+
+Code: `orchestrator/src/orchestrator/session_identity.py::is_shared_session_host`,
+`orchestrator/src/orchestrator/session_ownership_probes.py::EventProbes.owner_is_shared_host`,
+`orchestrator/src/orchestrator/session_hooks.py::_owner_pid_verdict`,
+`orchestrator/src/orchestrator/session_records.py::is_session_pointer_pid`.
 
 ## Fail-soft direction
 
@@ -368,6 +406,13 @@ made from one observation cannot disagree because the tree changed between
 two walks. The memo lives for one event and is never shared across events,
 because the process tree is live state.
 
+Whether the walked claude is a shared `claude agents` host is read through the
+same tree, by its `is_shared_session_host` reader, and memoized with the walk.
+By default that reader is `session_identity.is_shared_session_host`, which
+reads `/proc/<pid>/cmdline` for the walked pid. The store's
+`session_records.is_session_pointer_pid` reads that cmdline again on its own,
+outside the event's memo.
+
 A new record's `launcher_pid` is its liveness signal for the stale-pid
 reaper:
 
@@ -383,5 +428,10 @@ reaper:
   an hour of heartbeat silence, so a fallback pid cannot reap a record that is
   still being written.
 
+Like the process tree, SessionStart's display resolution reads windows
+through an injected `session_windows.WindowProbe`
+(`run_session_start(..., windows=)`); None reads wmctrl.
+
 Code: `orchestrator/src/orchestrator/session_ownership_probes.py::ProcessTree`,
-`::EventProbes`, `::_owning_claude_pid`.
+`::EventProbes`, `::_owning_claude_pid`,
+`orchestrator/src/orchestrator/session_windows.py::WindowProbe`.

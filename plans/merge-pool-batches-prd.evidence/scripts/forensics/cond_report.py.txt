@@ -1,0 +1,71 @@
+import json,collections,math,statistics,datetime as dt
+C=json.load(open('/tmp/gate-10069/forensics/cond.json'))
+W=[x for x in C['verifies'] if x['in_window']]
+CT=C['contents']
+def tr(r): return CT[r['cid']]['truth'] if r['cid'] else 'U'
+def wilson(k,n,z=1.96):
+    if n==0: return (None,None)
+    p=k/n; d=1+z*z/n; c=p+z*z/(2*n); h=z*math.sqrt(p*(1-p)/n+z*z/(4*n*n)); return ((c-h)/d,(c+h)/d)
+def fmt(k,n):
+    if n==0: return '%d/%d'%(k,n)
+    lo,hi=wilson(k,n); return '%d/%d = %.2f [%.2f, %.2f]'%(k,n,k/n,lo,hi)
+def member_stats(batches,ext=False):
+    D=('D','Di') if ext else ('D',); S=('S','Sm') if ext else ('S',)
+    nd=ns=nu=0; cy=cn=cu=0; dc=set(); sc=set()
+    for x in batches:
+        ts=[tr(r) for r in x['own']]
+        d=sum(t in D for t in ts); s=sum(t in S for t in ts); nd+=d; ns+=s; nu+=len(ts)-d-s
+        for r in x['own']:
+            if tr(r) in D: dc.add(r['cid'])
+            elif tr(r) in S: sc.add(r['cid'])
+        if d: cy+=1
+        elif s==len(ts): cn+=1
+        else: cu+=1
+    return dict(n=len(batches),batch_yes=cy,batch_no=cn,batch_unk=cu,mem_D=nd,mem_S=ns,mem_U=nu,distinct_D=len(dc),distinct_S=len(sc))
+def show(label,batches):
+    for ext in (False,True):
+        m=member_stats(batches,ext)
+        print('  %-44s %s n=%d | batch has>=1 defective own: yes %d / no %d / unknown %d -> %s of determinable | per-member D/(D+S): %s (unknown-truth members %d) | distinct contents D %d S %d'%(
+            label,'ext ' if ext else 'strict',m['n'],m['batch_yes'],m['batch_no'],m['batch_unk'],fmt(m['batch_yes'],m['batch_yes']+m['batch_no']),fmt(m['mem_D'],m['mem_D']+m['mem_S']),m['mem_U'],m['distinct_D'],m['distinct_S']))
+def lst(batches):
+    for x in batches:
+        print('      ',x['vid'],x['ts'][5:16],'own',x['task'],'k%d'%x['k'],x['runner'][:3],'units',x['n_units'],'fails',','.join(x['fails'] or []),'mr',x['main_red'],'| own:',' '.join('%s:%s'%(r['task'],tr(r)) for r in x['own']),'| base:',' '.join('%s:%s'%(r['task'],tr(r)) for r in x['base_reqs']) or '-','| entries:',' '.join('%s/%s%s'%(e['owner'],e['st'],'' if e['delay'] is None else '+%dm'%(e['delay']/60)) for e in x['entries']))
+RED=[x for x in W if not x['passed']]; GRN=[x for x in W if x['passed']]
+print('window',len(W),'red',len(RED),'green',len(GRN))
+print('\n=== 1. RED on UNVERIFIED base')
+U=[x for x in RED if x['state']=='UNVERIFIED']
+print(' n =',len(U),'(chains %d, solos %d)'%(sum(x['k']>1 for x in U),sum(x['k']==1 for x in U)))
+for fate in ('landed_as_built','red','never_landed_no_red_row'):
+    for mrflag in (False,True):
+        b=[x for x in U if x['fate']==fate and bool(x['main_red'])==mrflag]
+        if not b: continue
+        print(' fate=%s main_red=%s'%(fate,mrflag)); show('',b); lst(b)
+print('\n=== 2. RED on GREEN base (main not red)')
+G=[x for x in RED if x['state'] in('MAIN','GREEN_SPEC') and not x['main_red']]
+print(' n =',len(G),'MAIN %d GREEN_SPEC %d'%(sum(x['state']=='MAIN' for x in G),sum(x['state']=='GREEN_SPEC' for x in G)))
+show('all',G)
+for nm,pred in (('MAIN',lambda x:x['state']=='MAIN'),('GREEN_SPEC',lambda x:x['state']=='GREEN_SPEC')): show(nm,[x for x in G if pred(x)])
+for k in sorted(set(x['k'] for x in G)): show('k=%d'%k,[x for x in G if x['k']==k])
+print(' undeterminable or no-defect batches:')
+lst([x for x in G if not any(tr(r) in('D','Di') for r in x['own'])])
+print('\n=== 2b. RED on red MAIN (state MAIN/GREEN_SPEC, main red)')
+M=[x for x in RED if x['state'] in('MAIN','GREEN_SPEC') and x['main_red']]
+print(' n =',len(M),'fails only main-red tests:',sum(1 for x in M if set(x['fails'] or [])<=set(x['main_red'])))
+show('all',M); show('k=1',[x for x in M if x['k']==1]); show('k>1',[x for x in M if x['k']>1])
+print('\n=== 3. RED on RED base')
+R0=[x for x in W if x['state']=='RED_BEFORE']
+print(' already red at verdict time: n =',len(R0),'(red %d, green %d)'%(sum(not x['passed'] for x in R0),sum(x['passed'] for x in R0)))
+R1=[x for x in RED if x['state']=='UNVERIFIED' and x['fate']=='red']
+show('later red (all)',R1); show('later red, main not red',[x for x in R1 if not x['main_red']])
+show('later red + never landed',[x for x in RED if x['state']=='UNVERIFIED' and x['fate']!='landed_as_built'])
+# priors
+own_seen=collections.OrderedDict()
+for x in sorted(W,key=lambda x:x['end']):
+    for r in x['own']:
+        if r['cid'] and r['cid'] not in own_seen: own_seen[r['cid']]=x['vid']
+c=collections.Counter(CT[k]['truth'] for k in own_seen)
+print(' PRIOR A (distinct contents that were an own member of any window verify; truth D vs S):',dict(c))
+print('   strict D/(D+S):',fmt(c['D'],c['D']+c['S']),' ext (D+Di)/(D+Di+S+Sm):',fmt(c['D']+c['Di'],c['D']+c['Di']+c['S']+c['Sm']),' unknown',c['U'])
+show('PRIOR B per appearance, all window verifies',W)
+show('PRIOR B per appearance, all red verifies',RED)
+json.dump({'U':[x['vid'] for x in U]},open('/tmp/gate-10069/forensics/cond_sets.json','w'))

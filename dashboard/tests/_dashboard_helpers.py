@@ -14,6 +14,7 @@ the same process.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import shutil
@@ -31,6 +32,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from dashboard.app import lifespan
+from dashboard.background_loops import BackgroundLoops
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
 from dashboard.loops import _metrics_loop, _MetricsStore
@@ -157,6 +160,13 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     ``wait_shutdown`` until pytest-timeout fires, blaming whichever test
     happened to be holding the fixture.
 
+    SETS ``DASHBOARD_SAMPLERS`` off, for the same reason the URLs are set:
+    unset means the product default, on.  The samplers' root discovery
+    (dashboard/src/dashboard/data/orchestrator.py::find_running_orchestrators,
+    reached from data/burndown.py::collect_snapshot and
+    data/metrics.py::_sample_orchestrators) ps-scans the real host, and no env
+    var can isolate that.  ``enable_samplers`` below is the opt-in.
+
     A DEFAULT, not a lock, exactly like the paths above: a function-scoped
     ``monkeypatch.setenv`` is created after — and torn down before — the
     session-scoped context, so ``two_url_client`` and any test that overrides
@@ -168,9 +178,24 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     """
     mp.setenv('DASHBOARD_PROJECT_ROOT', str(root))
     mp.setenv('DASHBOARD_FUSED_MEMORY_URLS', ','.join(HERMETIC_FUSED_MEMORY_URLS))
+    mp.setenv('DASHBOARD_SAMPLERS', 'off')
     mp.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
     mp.delenv('RECONCILIATION_DATA_DIR', raising=False)
     mp.delenv('QUEUE_DATA_DIR', raising=False)
+
+
+def enable_samplers(mp: pytest.MonkeyPatch) -> None:
+    """Opt one test whose SUBJECT is a sampler under a lifespan back in.
+
+    It starts all three samplers: burndown, metrics and quality.  Call it after
+    any ``apply_isolated_env`` call in the same test, which would otherwise
+    reset the switch to off.  Only burndown and metrics discover roots by
+    ps-scanning the host, so the caller must stub what those two reach (the
+    loops on ``dashboard.app``, or ``dashboard.loops.collect_snapshot`` /
+    ``collect_metrics_snapshot``).  Quality reads ``config.all_project_roots``,
+    which ``apply_isolated_env`` already isolates.
+    """
+    mp.setenv('DASHBOARD_SAMPLERS', 'on')
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +278,11 @@ async def drain(*tasks: asyncio.Task[Any]) -> None:
 # ONE definition of "run a real dashboard loop until the caller has seen
 # enough, then cancel it": drive_loop_until for any loop, drive_metrics_loop
 # for _metrics_loop against a recorded collect_metrics_snapshot.  Their
-# contract is pinned by test_metrics_loop_harness.py.
+# contract is pinned by test_metrics_loop_harness.py.  IDLE_BACKGROUND_LOOPS
+# and app_with_loops are the other direction: a whole lifespan, with the loops
+# it starts chosen by the test.  Tests choose a lifespan's background loops
+# through ``lifespan``'s ``loops`` argument, never by patching names on
+# ``dashboard.app``.
 # ---------------------------------------------------------------------------
 
 
@@ -332,6 +361,24 @@ async def drive_metrics_loop(
             timeout=timeout,
         )
     return calls
+
+
+async def _idle_loop(*_args: object, **_kwargs: object) -> None:
+    return None
+
+
+IDLE_BACKGROUND_LOOPS = BackgroundLoops(
+    burndown=_idle_loop, metrics=_idle_loop, quality=_idle_loop, reaper=_idle_loop,
+)
+"""Background loops that return at once, for a lifespan whose loops are not under test.
+
+Derive a variant with ``dataclasses.replace(IDLE_BACKGROUND_LOOPS, metrics=...)``.
+"""
+
+
+def app_with_loops(loops: BackgroundLoops) -> FastAPI:
+    """A fresh app whose every lifespan starts *loops* instead of the production ones."""
+    return FastAPI(lifespan=functools.partial(lifespan, loops=loops))
 
 
 # ---------------------------------------------------------------------------

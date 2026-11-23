@@ -212,7 +212,7 @@ def reports_disk_full(text: str) -> bool:
 
     The one disk-full text predicate, shared by ``_classify_environmental``,
     ``git_ops.py::_worktree_add_failure_is_retryable`` and
-    ``merge_lane/worker.py::_verify_hit_enospc``. Known residual: a failing
+    ``merge_lane/verify_failure_outcome.py::verify_hit_enospc``. Known residual: a failing
     test whose own message quotes the full phrase still reads as disk-full.
     """
     folded = text.casefold()

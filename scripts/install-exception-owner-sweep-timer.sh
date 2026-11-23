@@ -15,7 +15,7 @@
 # deployment that activates this timer, not to an install. An operator who
 # wants a look right now runs the read-only
 #
-#   uv run --project shared python scripts/exception_owner_sweep.py --dry-run
+#   uv run --no-sync --project shared python scripts/exception_owner_sweep.py --dry-run
 #
 # and, for a real run, `systemctl --user start exception-owner-sweep.service`.
 set -euo pipefail
@@ -50,6 +50,6 @@ fi
 
 echo "install-exception-owner-sweep-timer.sh: ${TIMER_NAME} installed and enabled (nightly 06:00)."
 echo "install-exception-owner-sweep-timer.sh: NO immediate run was kicked. For a read-only look:"
-echo "  uv run --project shared python scripts/exception_owner_sweep.py --dry-run"
+echo "  uv run --no-sync --project shared python scripts/exception_owner_sweep.py --dry-run"
 echo "install-exception-owner-sweep-timer.sh: for a real run now:"
 echo "  systemctl --user start ${SERVICE_NAME}"

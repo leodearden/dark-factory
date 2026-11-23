@@ -23,7 +23,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, assert_never
 
 import click
 from shared import project_layout
@@ -533,19 +533,18 @@ class _MineTally:
     attempted: int
     completed: int = 0
     added: int = 0
+    unmeasured: int = 0
     cost: float = 0.0
 
 
 @cli.command('mine')
 @click.option('--runs-db', default=None, type=click.Path(path_type=Path),
-              help='Path to the offline orchestrator runs.db (env: REVIEWER_TRIAL_RUNS_DB; '
-                   "default: the main checkout's runs.db)")
+              help="Path to the offline orchestrator runs.db (default: the main checkout's runs.db)")
 @click.option('--escalations-dir', default=None, type=click.Path(path_type=Path),
-              help='Path to the offline escalations directory (env: REVIEWER_TRIAL_ESCALATIONS_DIR; '
-                   "default: the main checkout's escalation queue)")
+              help='Path to the offline escalations directory '
+                   "(default: the main checkout's escalation queue)")
 @click.option('--repo-path', default=None, type=click.Path(path_type=Path),
-              help='Git repo to recover mined diffs from (env: REVIEWER_TRIAL_REPO_ROOT; '
-                   'default: the main checkout)')
+              help='Git repo to recover mined diffs from (default: the main checkout)')
 @click.option('--target-total', default=100, type=int, help='Aim for this many total diffs (existing + mined)')
 @click.option('--max-parallel', default=8, type=int, help='Max concurrent frontier-labeling calls')
 @click.option('--model', default='opus', help='Frontier model for propose_labels_frontier')
@@ -569,22 +568,28 @@ def mine(
     after every successfully-labeled diff, so an interrupted run only loses
     whatever was still in flight.
     """
-    runs_db = runs_db or cli_default(
-        '--runs-db', project_layout.runs_db, env_var='REVIEWER_TRIAL_RUNS_DB',
-    )
+    runs_db = runs_db or cli_default('--runs-db', project_layout.runs_db)
     escalations_dir = escalations_dir or cli_default(
         '--escalations-dir', project_layout.escalation_queue_dir,
-        env_var='REVIEWER_TRIAL_ESCALATIONS_DIR',
     )
-    repo_path = repo_path or cli_default('--repo-path', Path, env_var='REVIEWER_TRIAL_REPO_ROOT')
+    repo_path = repo_path or cli_default('--repo-path', Path)
+    click.echo(f'Mine sources: runs_db={runs_db}  escalations_dir={escalations_dir}  repo_path={repo_path}')
 
     async def _run() -> int:
         from orchestrator.config import GitConfig
+        from orchestrator.evals.measurement import (
+            MeasurementStage,
+            Unmeasured,
+            UnmeasuredCause,
+            exception_reason,
+        )
 
         from .adjudication import AdjudicationLog
+        from .corpus import CorpusDiff
         from .mining import (
+            NoIssuesProposed,
             RecoveredCandidate,
-            admit_mined_diff,
+            admit_proposal,
             audit_corpus,
             backfill_hand_authored,
             candidate_pool,
@@ -592,7 +597,6 @@ def mine(
             frontier_description,
             mine_escalation_refs,
             mine_fn_candidates,
-            mined_corpus_diff,
             propose_labels_frontier,
             recover_candidates,
             save_corpus,
@@ -603,8 +607,8 @@ def mine(
                 f'runs.db not found at {runs_db}\n'
                 '  This is an offline generation tool that reads the gitignored '
                 'orchestrator run history, which lives in the MAIN repo checkout, not '
-                "a task worktree (see corpus/README.md). Pass --runs-db, "
-                'or set REVIEWER_TRIAL_RUNS_DB, to point at a real runs.db -- otherwise '
+                'a task worktree (see corpus/README.md). Pass --runs-db '
+                'to point at a real runs.db -- otherwise '
                 "sqlite3 silently creates an empty one and this fails later with "
                 "'no such table: task_results'.",
                 err=True,
@@ -657,7 +661,7 @@ def mine(
             description = frontier_description(candidate, titles.get(candidate.task_id, ''))
             async with semaphore:
                 try:
-                    issues, cost = await propose_labels_frontier(
+                    proposal = await propose_labels_frontier(
                         item.diff_text, model=model, description=description,
                         oauth_token=oauth_token, max_turns=max_turns,
                     )
@@ -665,25 +669,39 @@ def mine(
                     logging.getLogger(__name__).warning(
                         'propose_labels_frontier failed for task %s: %s', candidate.task_id, exc,
                     )
-                    issues, cost = [], 0.0
+                    proposal = Unmeasured(
+                        MeasurementStage.LABEL_PROPOSER, UnmeasuredCause.RAISED, exception_reason(exc),
+                        cost_usd=0.0,
+                    )
 
+            cost = proposal.cost_usd
             tally.completed += 1
             tally.cost += cost
             progress = f'  [{tally.completed}/{tally.attempted}] {candidate.diff_id}:'
-            if not issues:
-                click.echo(f'{progress} no issues proposed -- skipping (cost=${cost:.3f})')
-                return
-
-            diff = mined_corpus_diff(
-                item, issues=issues, description=description,
-                escalation_refs=esc_refs.get(candidate.task_id, []), runs_db=runs_db,
+            outcome = admit_proposal(
+                manifest, log, item, proposal, description=description,
+                escalation_refs=esc_refs.get(candidate.task_id, []), runs_db=runs_db, frontier_model=model,
             )
-            admit_mined_diff(manifest, log, diff, frontier_model=model)
-            save_corpus(manifest, log, seed=seed, manifest_path=_CORPUS_PATH, log_path=_ADJUDICATION_LOG_PATH)
-            tally.added += 1
-            click.echo(
-                f'{progress} {len(issues)} issues added (cost=${cost:.3f}, corpus now {len(manifest.diffs)})'
-            )
+            match outcome:
+                case CorpusDiff():
+                    save_corpus(
+                        manifest, log, seed=seed, manifest_path=_CORPUS_PATH, log_path=_ADJUDICATION_LOG_PATH,
+                    )
+                    tally.added += 1
+                    click.echo(
+                        f'{progress} {len(outcome.ground_truth)} issues added '
+                        f'(cost=${cost:.3f}, corpus now {len(manifest.diffs)})'
+                    )
+                case Unmeasured():
+                    tally.unmeasured += 1
+                    click.echo(
+                        f'{progress} proposer did not measure ({outcome.cause}: {outcome.reason}) '
+                        f'-- skipping; the next run retries it (cost=${cost:.3f})'
+                    )
+                case NoIssuesProposed():
+                    click.echo(f'{progress} no issues proposed -- skipping (cost=${cost:.3f})')
+                case _:
+                    assert_never(outcome)
 
         await asyncio.gather(*(_label(item) for item in pool))
 
@@ -691,6 +709,7 @@ def mine(
         click.echo(
             f'Mined {tally.added}/{tally.attempted} new diffs this run (frontier cost: ${tally.cost:.2f}).'
         )
+        click.echo(f'Unmeasured proposals: {tally.unmeasured} (not admitted; the next mine run retries them).')
         click.echo(f'Corpus: {len(manifest.diffs)} diffs total.')
 
         report = audit_corpus(manifest, log, min_diffs=min_diffs)

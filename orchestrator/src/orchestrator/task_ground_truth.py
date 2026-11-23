@@ -29,7 +29,7 @@ half of the same classification is exposed to the sweep-side appliers as
 eta rewired the KEY ELEMENT, never the table.
 
 Task 3563 normalised the OTHER side of that comparison: :class:`Claimant`'s
-``run_id`` is now homogeneous across all three liveness sources — a full
+``run_id`` is now homogeneous across every liveness source — a full
 ``shared.task_claimant.compose_claimant_run_id`` identity or ``None``
 (unknown), never a bare ``session_id``. See the :class:`Claimant` docstring
 for the normative contract. This is disposition-neutral by construction: no
@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
     from orchestrator.git_ops import GitOps
+    from orchestrator.merge_deferred_recovery import LiveMergeRequests
     from orchestrator.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,7 @@ class ClaimantSource(enum.StrEnum):
     DB = 'db'
     PLAN_LOCK = 'plan_lock'
     IN_MEMORY = 'in_memory'
+    MERGE_REQUEST = 'merge_request'
 
 
 class RecoveryAction(enum.StrEnum):
@@ -201,9 +203,9 @@ class BranchState:
 
 @dataclass(frozen=True)
 class Claimant:
-    """A live claimant identity, folded from one of three liveness signals.
+    """A live claimant identity, folded from one of four liveness signals.
 
-    ``run_id`` CONTRACT (task 3563) — normative, all three sources:
+    ``run_id`` CONTRACT (task 3563) — normative, every source:
     it is either a FULL ``shared.task_claimant.compose_claimant_run_id``
     identity (``'{run_id}/{session_id}/pid={owner_pid}'``) or ``None``,
     meaning UNKNOWN.  It is never a bare ``session_id`` and never partially
@@ -219,7 +221,7 @@ class Claimant:
       through whole.  The plan.lock leg's fail-safe is deliberately NOT mirrored
       here — normalising that PRODUCER is a 3563 follow-up (ticket
       ``tkt_0RSGFS860E6VY37A7XH6S9FYCP``), and the "never partially composed"
-      rule holds for all three sources only once it lands.
+      rule holds for every source only once it lands.
     * PLAN_LOCK — composed here from the lock's ``run_id``/``session_id``/
       ``owner_pid``, which ``TaskArtifacts.lock_plan`` records in the same
       process that stamps the DB claimant, making the two byte-identical for
@@ -228,6 +230,8 @@ class Claimant:
       workflows have none to record.
     * IN_MEMORY — always ``None``; the scheduler's held-set carries no
       identity.
+    * MERGE_REQUEST — always ``None``; the in-flight registry carries no
+      claimant identity.
 
     Composing PARTIALLY would be worse than the bare session id this replaced:
     ``'/{session_id}/pid={pid}'`` carries the ``/pid=`` marker, so it PASSES
@@ -418,6 +422,7 @@ class TaskGroundTruth:
         *,
         now_fn: Callable[[], datetime] = _utc_now,
         heartbeat_ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+        merge_requests: LiveMergeRequests | None = None,
     ) -> None:
         self.git_ops = git_ops
         self.scheduler = scheduler
@@ -425,6 +430,7 @@ class TaskGroundTruth:
         self.worktree_resolver = worktree_resolver
         self.now_fn = now_fn
         self.heartbeat_ttl = heartbeat_ttl
+        self.merge_requests = merge_requests
 
     async def derive_truth(self, tid: str) -> TruthReport:
         """Compose a fresh :class:`TruthReport` for *tid* (PRD §5.4).
@@ -570,11 +576,13 @@ class TaskGroundTruth:
         return BranchState(BranchStateKind.GONE_NO_MARKER)
 
     def _resolve_live_claimant(self, tid: str, task: dict, worktree_path: Path) -> Claimant | None:
-        """Resolve *tid*'s live claimant (TG-3), folding three signals in
+        """Resolve *tid*'s live claimant (TG-3), folding four signals in
         priority order:
 
         1. ``scheduler.is_actively_held(tid)`` — the in-memory public
            accessor (task 2235).
+        1a. A merge request in flight for *tid* (``merge_requests``), which
+           outlives a dead submitter's stale db claimant (task 7277).
         2. A fresh W2 db claimant: ``claimant_run_id`` present AND NOT
            ``shared.task_claimant.is_stranded_any_status`` against the
            injected ``now_fn``/``heartbeat_ttl``.
@@ -616,6 +624,9 @@ class TaskGroundTruth:
         """
         if self.scheduler.is_actively_held(tid):
             return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.IN_MEMORY)
+
+        if self.merge_requests is not None and tid in self.merge_requests.task_ids_in_flight():
+            return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.MERGE_REQUEST)
 
         claimant_run_id = task.get('claimant_run_id')
         if claimant_run_id and str(claimant_run_id).strip():

@@ -402,6 +402,28 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)  # type: ignore[arg-type]
 
 
+def _deploy_done_kind(target_unit: str | None) -> str:
+    """A deploy's done kind: with no target_unit there was no unit to verify."""
+    return 'deterministic-deploy' if target_unit else 'deterministic-deploy-unverified'
+
+
+def _crash_resume_deploy_evidence(
+    target_unit: str | None, verified_pid: object,
+) -> dict[str, object]:
+    """Evidence for a deploy whose writeback stamp landed but whose done write did not.
+
+    A targetless deploy's stamp records only that its script exited 0, so its
+    record claims neither a verified deploy nor a pid.
+    """
+    if not target_unit:
+        return {'note': 'resumed after deploy (crash before done write)'}
+    return {
+        'pid': verified_pid,
+        'note': 'resumed after verified deploy (crash before done write)',
+        'unit': target_unit,
+    }
+
+
 def _cite_gate_escalation_id(own_records: list, gate_category: str) -> str | None:
     """Pick the escalation a `deterministic-gate` close should CITE.
 
@@ -1022,11 +1044,12 @@ class DeterministicRunner:
         #     PYTHONPATH still dies at `shared.async_sqlite_base` ->
         #     `import aiosqlite`, a site-packages-only wheel.  So PYTHONPATH
         #     alone is NOT sufficient.
-        #  2. Workspace src roots — supplied explicitly by the
-        #     `--setenv=PYTHONPATH=` token `RestartPlan`'s detached argv now
-        #     carries (proc_supervision._submit_child_pythonpath).  This is the
-        #     only leg systemd-run can break: it propagates NONE of the caller's
-        #     environment to a transient unit.
+        #  2. Workspace src roots — supplied explicitly by the `PYTHONPATH=`
+        #     assignment prefix RestartPlan's RP-4 wrapper puts on the submit
+        #     command
+        #     (orchestrator/src/orchestrator/proc_supervision.py::_submit_child_shell_command).
+        #     This is the only leg systemd-run can break: it propagates NONE of
+        #     the caller's environment to a transient unit.
         #
         # NOT via "a PYTHONPATH side-channel from the orchestrator service
         # unit", as this comment previously claimed — MEASURED FALSE:
@@ -1864,7 +1887,7 @@ class DeterministicRunner:
                     task_id,
                     'done',
                     done_provenance=_build_done_provenance(
-                        'deterministic-deploy',
+                        _deploy_done_kind(target_unit),
                         pid=pid,
                         active_enter_timestamp=active_enter_timestamp,
                         unit=target_unit,
@@ -3114,7 +3137,7 @@ class DeterministicRunner:
                         task_id,
                         'done',
                         done_provenance=_build_done_provenance(
-                            'deterministic-deploy',
+                            _deploy_done_kind(_ata_unit),
                             unit=_ata_unit,
                             note='resumed after gate resolution',
                         ),
@@ -3287,10 +3310,10 @@ class DeterministicRunner:
                         task_id,
                         'done',
                         done_provenance=_build_done_provenance(
-                            'deterministic-deploy',
-                            pid=metadata.get('before_done_verified_pid'),
-                            note='resumed after verified deploy (crash before done write)',
-                            unit=target_unit,
+                            _deploy_done_kind(target_unit),
+                            **_crash_resume_deploy_evidence(
+                                target_unit, metadata.get('before_done_verified_pid'),
+                            ),
                         ),
                     )
                     return WorkflowOutcome.DONE
@@ -3399,7 +3422,7 @@ class DeterministicRunner:
                         task_id,
                         'done',
                         done_provenance=_build_done_provenance(
-                            'deterministic-deploy',
+                            _deploy_done_kind(target_unit),
                             note='resumed after human resolution',
                             unit=target_unit,
                         ),
@@ -3775,7 +3798,8 @@ class DeterministicRunner:
                     # a byte-for-byte copy of that helper's run + timeout-
                     # translate + escalate ladder, which could silently drift
                     # from the helper over time — routing through the helper
-                    # makes that impossible).
+                    # makes that impossible). Its done kind comes from
+                    # _deploy_done_kind.
                     no_target_note = (
                         'No target_unit is set — the deploy is driven on the '
                         'script exit code alone (task 2632 / esc-2585-1).'

@@ -55,6 +55,13 @@ the sweep's bare list items, prose scans), and an optional keyword would make
 each site's blindness ungreppable. The predicates split by NAME so a reader can
 see at a glance which gates are parameter-aware.
 
+:func:`only_inert_html_closers` refines the REFUSAL path and narrows no gate
+(task **10396**). Three closer names, :data:`HTML_COLLIDING_CLOSER_NAMES`, are
+also ordinary markup element names, so a value quoting an HTML block carries
+their closers. The predicate says whether every needle :func:`detect_for` sees
+is such a closer and terminates no envelope boundary of the call. Callers ask
+it only after :func:`repair` declines, so every value it can fix is still fixed.
+
 ## What ``repair`` guarantees about its OWN output — and what it does not
 
 Two outputs, two different contracts. Confusing them is how this module's one
@@ -121,6 +128,7 @@ from typing import Any, NamedTuple
 __all__ = [
     'CANONICAL_OPENER_PREFIX',
     'ENVELOPE_LITERALS',
+    'HTML_COLLIDING_CLOSER_NAMES',
     'INVOKE_CLOSER',
     'MARKUP_OVERRIDE_KEY',
     'MCP_MARKUP_PATTERNS',
@@ -132,7 +140,9 @@ __all__ = [
     'detect_for',
     'escape_envelope_literals',
     'markup_override_requested',
+    'only_inert_html_closers',
     'repair',
+    'scan_parameter_values',
     'strip_markup_override',
 ]
 
@@ -201,6 +211,17 @@ PREFILTER_NEEDLES: tuple[str, ...] = tuple(
 ENVELOPE_LITERALS: tuple[str, ...] = tuple(
     dict.fromkeys((*PREFILTER_NEEDLES, *MCP_MARKUP_PATTERNS))
 )
+
+#: The closer names that are also ordinary markup element names, so prose
+#: quoting an HTML block spells their closers. Read only by
+#: :func:`only_inert_html_closers`.
+HTML_COLLIDING_CLOSER_NAMES: frozenset[str] = frozenset(
+    (_NAME_DESCRIPTION, _NAME_DETAILS, _NAME_CONTENT)
+)
+
+_HTML_COLLIDING_CLOSERS: dict[str, str] = {
+    closer_for(name): name for name in HTML_COLLIDING_CLOSER_NAMES
+}
 
 
 #: ONE pass over the whole literal set, as an alternation in tuple order.
@@ -323,7 +344,7 @@ def _extra_names(param: str, schema_params: frozenset[str]) -> frozenset[str]:
       widening vocabulary is held exactly equal to the repairer's candidate
       grammar, so a needle can never be spelled for a name :func:`repair` would
       refuse to qualify. It also bounds what a caller-controlled *param* can
-      turn into a cache key: ``_first_markup_argument`` passes each key of the
+      turn into a cache key: ``_markup_arguments`` passes each key of the
       caller's argument mapping straight through.
     """
     names = set(schema_params)
@@ -387,6 +408,49 @@ def detect_for(
     return match.group(0) if match is not None else None
 
 
+def only_inert_html_closers(
+    value: object,
+    param: object,
+    schema_params: object,
+) -> bool:
+    """Is every needle :func:`detect_for` sees in *value* a quoted HTML closer?
+
+    True iff *value* carries at least one needle of the alternation
+    ``detect_for(value, param, schema_params)`` scans, every occurrence is the
+    closer of a :data:`HTML_COLLIDING_CLOSER_NAMES` name, and every such closer
+    whose name could close a parameter of this call (*param* or a
+    *schema_params* member) leaves the parser short of an item boundary, per
+    :func:`_at_item_boundary`. A closer meeting that terminates no envelope
+    boundary and has no swallowed parameter behind it.
+
+    Any canonical opener, invoke closer, ``parameter`` closer, or closer of a
+    non-colliding *param* or schema name answers False: those are unambiguous
+    harness markup. An empty or unusable schema answers False too (fail-closed,
+    the direction :func:`repair` takes): with no schema nothing can be judged.
+
+    Callers ask this only AFTER :func:`repair` returned ``None``; it widens no
+    gate and replaces no refusal :func:`repair` can turn into a fix.
+
+    Pure, total and one scan of *value*. Each boundary test passes a position,
+    never a slice; see :func:`_at_item_boundary`'s *pos*.
+    """
+    if not value or not isinstance(value, str):
+        return False
+    schema = _as_name_set(schema_params)
+    if not schema:
+        return False
+    own_name = param if isinstance(param, str) else ''
+    seen = False
+    for match in _widened_re(_extra_names(own_name, schema)).finditer(value):
+        name = _HTML_COLLIDING_CLOSERS.get(match.group(0))
+        if name is None:
+            return False
+        if (name == own_name or name in schema) and _at_item_boundary(value, match.end()):
+            return False
+        seen = True
+    return seen
+
+
 # ---------------------------------------------------------------------------
 # Repair — recovering the parameters the harness parser silently dropped.
 # ---------------------------------------------------------------------------
@@ -409,6 +473,18 @@ _CANONICAL_OPENER_RE = re.compile(r'\x3cparameter\s+name="([^"]+)"\s*"?>')
 # collide with a canonical opener (``parameter`` is followed by whitespace, not
 # by the closing bracket) nor with any closing tag (``/`` is not a name char).
 _ECHO_OPENER_RE = re.compile(r'\x3c(' + _TAG_NAME + r')"?>')
+
+# "An opener in EITHER dialect", for the one caller that does not care which:
+# scan_parameter_values, which routes a refused payload's preservation record
+# by the pseudo-parameters leaked into it. An ALTERNATION rather than two
+# searches, so the common no-opener case scans the value ONCE. Exactly
+# equivalent to searching each part in turn: neither part can match a prefix of
+# a match of the other (verified over 4054 generated fragments, 0 divergences).
+# The group numbering of the parts is deliberately not relied on; each hit is
+# re-read through _item_opener_at and the names are never read off this pattern.
+_ANY_OPENER_RE = re.compile(
+    _CANONICAL_OPENER_RE.pattern + '|' + _ECHO_OPENER_RE.pattern
+)
 
 # Structural bounds. repair() must be total for adversarial input WITHOUT a
 # blanket try/except (that is signature (b) of tests/repo_guards/silent_fallthrough_scan.py
@@ -970,6 +1046,47 @@ def repair(
         )
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# The non-validating residue scan — ROUTING a refused payload, never a write.
+# ---------------------------------------------------------------------------
+
+#: A residue carrying more openers than this is refused whole: an uninspected
+#: remainder could contradict whatever the inspected part found. Far above the
+#: 15 openers the largest committed residue-loss specimen carries.
+_MAX_SCAN_OPENERS = 256
+
+
+def scan_parameter_values(value: object, names: Iterable[str]) -> dict[str, str]:
+    """Best-effort ``name -> value`` for pseudo-parameters leaked into *value*.
+
+    Every opener in either dialect whose name is in *names* contributes the
+    verbatim slice up to its own closer, or to end of string when none follows.
+    A name seen with two different values is dropped: ambiguity refuses. A
+    non-``str`` *value* yields ``{}``.
+
+    NON-VALIDATING, and for ROUTING a preservation record only: never believe
+    it for a write. It is independent of :func:`repair`, whose accept-time
+    validation and NO SILENT PARTIAL REPAIR contract it neither shares nor
+    loosens.
+    """
+    if not isinstance(value, str):
+        return {}
+    wanted = _as_name_set(names)
+    found: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for inspected, match in enumerate(_ANY_OPENER_RE.finditer(value)):
+        if inspected >= _MAX_SCAN_OPENERS:
+            return {}
+        opener = _item_opener_at(value, match.start())
+        if opener is None or opener.name not in wanted:
+            continue
+        closer = _closer_re(opener.closer_name).search(value, opener.end)
+        item_value = value[opener.end: closer.start() if closer else len(value)]
+        if found.setdefault(opener.name, item_value) != item_value:
+            ambiguous.add(opener.name)
+    return {name: item for name, item in found.items() if name not in ambiguous}
 
 
 # ---------------------------------------------------------------------------

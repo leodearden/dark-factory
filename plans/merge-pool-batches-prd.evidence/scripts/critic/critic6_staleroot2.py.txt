@@ -1,0 +1,34 @@
+import sqlite3, json, subprocess, collections
+REPO='/home/leo/src/dark-factory'
+db=sqlite3.connect(f'file:{REPO}/data/orchestrator/runs.db?mode=ro', uri=True)
+def git(*a):
+    r=subprocess.run(['git','-C',REPO,*a],capture_output=True,text=True)
+    return r.returncode, r.stdout.strip()
+main=git('rev-parse','main')[1]
+c=collections.Counter(); ex=[]; kinds=collections.Counter()
+for ts,data in db.execute("select timestamp,data from events where event_type='merge_verify' and timestamp>='2026-11-06' order by id"):
+    d=json.loads(data)
+    if d.get('attempt') not in (None,0): continue
+    n=d.get('chain_items') or 1
+    if n<2 or d.get('base_relation')!='main': continue
+    tip=d['merge_sha']
+    rc,root=git('rev-parse',f'{tip}~{n}')
+    if rc: c['no-commit']+=1; continue
+    rc,fp=git('rev-list','--first-parent',f'{root}..{main}')
+    F=set(fp.split())
+    c['batches']+=1; anyn=False
+    for i in range(n):
+        rc,mt=git('rev-parse',f'{tip}~{i}^2')
+        if rc: c['member-no-2nd-parent']+=1; continue
+        c['members']+=1
+        rc,anc=git('rev-list',f'{root}..{mt}')
+        newer=[x for x in anc.split() if x in F]
+        if newer:
+            c['members carrying main commits newer than root']+=1; anyn=True
+            # are those commits queue landings (merge commits 'Merge task/..') or direct commits?
+            for x in newer:
+                rc,subj=git('log','-1','--format=%s',x)
+                kinds['queue merge' if subj.startswith('Merge task/') or subj.startswith('Merge ') else 'direct/other']+=1
+            if len(ex)<5: ex.append((ts[:16],tip[:8],n,i,len(newer)))
+    if anyn: c['batches with such a member']+=1
+print(dict(c)); print(dict(kinds)); print(ex)

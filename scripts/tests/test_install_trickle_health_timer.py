@@ -11,12 +11,13 @@ the probes bound.
 
 Template-content invariants live here rather than in a separate file, per
 `test_install_trickle_timer.py::test_service_template_pins_claude_bin`'s
-precedent; the installer-behaviour half is driven via subprocess with a FAKE
-`systemctl` shimmed onto PATH. Real systemd is never touched.
+precedent; the installer-behaviour half is driven via subprocess with
+`scripts/tests/conftest.py::fake_timer_systemctl` first on PATH, and unit directives
+are read through `scripts/tests/conftest.py::unit_values` and
+`scripts/tests/conftest.py::unit_environment`. Real systemd is never touched.
 """
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import subprocess
@@ -51,83 +52,6 @@ TRICKLE_SERVICE_NAME = 'legibility-trickle@.service'
 TRICKLE_TIMER_NAME = 'legibility-trickle@.timer'
 
 
-def _directives(name) -> dict[str, list[tuple[str, str]]]:
-    """Parse a systemd unit into `{section: [(key, value), ...]}`.
-
-    Copied from
-    `test_install_memory_metadata_coverage_census_timer.py::_directives` per
-    this directory's deliberate copy-not-share convention for unit/fake-systemctl
-    helpers.
-
-    WHY A PARSER AND NOT A SUBSTRING SCAN. These units comment heavily by
-    design, and a raw-substring check cannot tell a live DIRECTIVE from the
-    COMMENT that explains it. Both units here carry prose naming
-    `Persistent=true`, `check_trickle_health.py` and the state-root variable,
-    so every substring pin over the raw text would stay green through an
-    outright deletion of the directive it thought it was checking.
-
-    Duplicate keys are preserved as separate pairs, never collapsed:
-    `configparser` would collapse or reject them, and a repeated `OnCalendar=`
-    is an ADDITIONAL firing to systemd, not an override.
-
-    Accepts a unit filename (resolved under TEMPLATES_DIR) or a Path, so
-    sibling `*.timer` units can be parsed for the collision check.
-    """
-    path = name if isinstance(name, Path) else TEMPLATES_DIR / name
-    sections: dict[str, list[tuple[str, str]]] = {}
-    current = ''
-    for raw in path.read_text().splitlines():
-        line = raw.strip()
-        # FULL-LINE comments only: systemd treats `#`/`;` as a comment lead-in
-        # at the start of a line, and a directive's value may legitimately
-        # contain either character (a Documentation= URL fragment, say).
-        if not line or line[0] in '#;':
-            continue
-        if line.startswith('[') and line.endswith(']'):
-            current = line[1:-1].strip()
-            sections.setdefault(current, [])
-            continue
-        if '=' not in line:
-            continue
-        key, value = line.split('=', 1)
-        sections.setdefault(current, []).append((key.strip(), value.strip()))
-    return sections
-
-
-def _values(directives, section, key) -> list[str]:
-    """Every value declared for `key` under `[section]`, in file order.
-
-    A list, not a scalar: asserting `== ['x']` pins both the value AND that it
-    is declared exactly once.
-    """
-    return [v for k, v in directives.get(section, []) if k == key]
-
-
-def _service_environment(service_text):
-    """Parse the [Service] section's `Environment=` assignments into a dict.
-
-    Copied from `test_install_trickle_timer.py::_service_environment`, same
-    copy-not-share convention. shlex.split()s each directive's right-hand side
-    before splitting every token on its FIRST `=`, so a future reflow of the
-    unit onto systemd's legal space-separated multi-assignment form does not
-    silently stop being checked.
-    """
-    env = {}
-    in_service = False
-    for raw_line in service_text.splitlines():
-        line = raw_line.strip()
-        if line.startswith('['):
-            in_service = line == '[Service]'
-            continue
-        if not in_service or not line.startswith('Environment='):
-            continue
-        for token in shlex.split(line[len('Environment='):]):
-            name, sep, value = token.partition('=')
-            if sep:
-                env[name] = value
-    return env
-
-
 def _live_directive_text(name) -> str:
     """Every non-comment line of a unit, joined.
 
@@ -145,9 +69,9 @@ def _live_directive_text(name) -> str:
     )
 
 
-def _on_calendar_time(timer_name) -> str:
+def _on_calendar_time(unit_values, timer_name) -> str:
     """The `HH:MM:SS` of a timer declaring exactly one `*-*-* HH:MM:SS` slot."""
-    slots = _values(_directives(timer_name), 'Timer', 'OnCalendar')
+    slots = unit_values(TEMPLATES_DIR / timer_name, 'Timer', 'OnCalendar')
     assert len(slots) == 1, f'{timer_name} declares OnCalendar={slots!r}'
     return slots[0].split()[-1]
 
@@ -165,14 +89,14 @@ def test_both_unit_templates_exist():
     assert TIMER.is_file(), f'Expected the health probe timer at {TIMER}'
 
 
-def test_service_execstart_runs_the_health_probe_for_the_instance():
+def test_service_execstart_runs_the_health_probe_for_the_instance(unit_values):
     """`ExecStart` must name THIS probe and take its project from `%i`.
 
     systemd expands `%i` at instantiation, so the template is copied verbatim
     and never per-project customised — one committed file serves dark_factory,
     reify and every project after them.
     """
-    exec_starts = _values(_directives(SERVICE_NAME), 'Service', 'ExecStart')
+    exec_starts = unit_values(TEMPLATES_DIR / SERVICE_NAME, 'Service', 'ExecStart')
     assert len(exec_starts) == 1, f'ExecStart={exec_starts!r}'
     command = exec_starts[0]
 
@@ -197,7 +121,7 @@ def test_service_execstart_runs_the_health_probe_for_the_instance():
     )
 
 
-def test_service_execstart_interpreter_is_an_absolute_path():
+def test_service_execstart_interpreter_is_an_absolute_path(unit_values):
     """Asserted independently of the literal interpreter, because the property
     that matters is absoluteness, not which binary.
 
@@ -209,7 +133,7 @@ def test_service_execstart_interpreter_is_an_absolute_path():
     Recorded in `scripts/legibility-trickle@.service`'s own comments; both
     sibling units pin an absolute `uv` for this reason.
     """
-    command = _values(_directives(SERVICE_NAME), 'Service', 'ExecStart')[0]
+    command = unit_values(TEMPLATES_DIR / SERVICE_NAME, 'Service', 'ExecStart')[0]
     interpreter = shlex.split(command)[0]
     assert os.path.isabs(interpreter), (
         f'ExecStart must begin with an ABSOLUTE interpreter path: a bare name '
@@ -218,26 +142,27 @@ def test_service_execstart_interpreter_is_an_absolute_path():
     )
 
 
-def test_service_is_a_journal_logging_oneshot_in_the_dark_factory_checkout():
+def test_service_is_a_journal_logging_oneshot_in_the_dark_factory_checkout(
+        unit_values, unit_environment):
     """All generic legibility CODE lives in the dark-factory checkout (PRD §5);
     only the target project varies, via `%i`. `Type=oneshot` is what makes the
     unit's `Result` meaningful to `check_trickle_liveness.sh`, and journal
     routing is what makes a failed probe readable at all."""
-    service = _directives(SERVICE_NAME)
-    assert _values(service, 'Service', 'Type') == ['oneshot']
-    assert _values(service, 'Service', 'WorkingDirectory') == [PRODUCTION_ROOT]
-    assert _values(service, 'Service', 'StandardOutput') == ['journal']
-    assert _values(service, 'Service', 'StandardError') == ['journal']
-    assert _values(service, 'Install', 'WantedBy') == ['timers.target']
+    service = TEMPLATES_DIR / SERVICE_NAME
+    assert unit_values(service, 'Service', 'Type') == ['oneshot']
+    assert unit_values(service, 'Service', 'WorkingDirectory') == [PRODUCTION_ROOT]
+    assert unit_values(service, 'Service', 'StandardOutput') == ['journal']
+    assert unit_values(service, 'Service', 'StandardError') == ['journal']
+    assert unit_values(service, 'Install', 'WantedBy') == ['timers.target']
 
-    env = _service_environment(SERVICE.read_text())
+    env = unit_environment(SERVICE, 'Service')
     assert env.get('PYTHONPATH') == f'{PRODUCTION_ROOT}/scripts', (
         f'`from legibility import ...` must resolve under a bare ExecStart; '
         f'parsed [Service] Environment={env!r}'
     )
 
 
-def test_service_pins_no_claude_bin():
+def test_service_pins_no_claude_bin(unit_environment):
     """This probe never invokes the coder, so a `LEGIBILITY_CLAUDE_BIN` pin
     would be a needless copy of the nightly unit's — and a copy that rots.
 
@@ -245,7 +170,7 @@ def test_service_pins_no_claude_bin():
     way this unit gets written is by copying `legibility-trickle@.service`,
     which carries that pin for a load-bearing reason that does not apply here.
     """
-    env = _service_environment(SERVICE.read_text())
+    env = unit_environment(SERVICE, 'Service')
     assert 'LEGIBILITY_CLAUDE_BIN' not in env, (
         f'The health probe launches no CLI; parsed [Service] '
         f'Environment={env!r}'
@@ -285,7 +210,7 @@ def test_neither_unit_pins_a_legibility_state_root():
             )
 
 
-def test_timer_fires_at_the_free_0430_slot():
+def test_timer_fires_at_the_free_0430_slot(unit_values):
     """04:30 is the slot `OPERATIONS.md` §12 explicitly declared free.
 
     The rest of the nightly ladder is taken: 03:00 legibility-trickle, 03:30
@@ -294,11 +219,11 @@ def test_timer_fires_at_the_free_0430_slot():
     stagger is deliberate — these jobs share one machine and, in several cases,
     the same backing stores.
     """
-    assert _values(_directives(TIMER_NAME), 'Timer', 'OnCalendar') == [
+    assert unit_values(TEMPLATES_DIR / TIMER_NAME, 'Timer', 'OnCalendar') == [
         '*-*-* 04:30:00']
 
 
-def test_timer_does_not_collide_with_an_occupied_slot():
+def test_timer_does_not_collide_with_an_occupied_slot(unit_values):
     """Guards the LADDER, not just this unit's own literal, so a future
     re-cadence onto a taken slot fails here instead of silently double-booking
     a third job.
@@ -312,12 +237,12 @@ def test_timer_does_not_collide_with_an_occupied_slot():
     double-booked between two existing units, so a global all-pairs-distinct
     assertion would fail on pre-existing state that is nobody's bug.
     """
-    ours = set(_values(_directives(TIMER_NAME), 'Timer', 'OnCalendar'))
+    ours = set(unit_values(TEMPLATES_DIR / TIMER_NAME, 'Timer', 'OnCalendar'))
     assert ours, 'the timer declares no OnCalendar at all'
     for other in sorted(TEMPLATES_DIR.glob('*.timer')):
         if other.name == TIMER_NAME:
             continue
-        clash = ours & set(_values(_directives(other), 'Timer', 'OnCalendar'))
+        clash = ours & set(unit_values(other, 'Timer', 'OnCalendar'))
         if clash:
             raise AssertionError(
                 f'{TIMER_NAME} shares {sorted(clash)!r} with {other.name} — '
@@ -325,7 +250,7 @@ def test_timer_does_not_collide_with_an_occupied_slot():
                 f'table')
 
 
-def test_health_probe_runs_strictly_after_the_nightly_trickle():
+def test_health_probe_runs_strictly_after_the_nightly_trickle(unit_values):
     """Asserted as a RELATION between the two parsed timers, not as a literal.
 
     The probe reads the state file the night's run WRITES. Ordering it before
@@ -333,28 +258,28 @@ def test_health_probe_runs_strictly_after_the_nightly_trickle():
     exactly one day, and never wrong in a way that looks wrong. A literal pin
     on 04:30 cannot catch a future re-cadence of the TRICKLE past it; this can.
     """
-    assert _on_calendar_time(TIMER_NAME) > _on_calendar_time(TRICKLE_TIMER_NAME), (
-        f'the health probe ({_on_calendar_time(TIMER_NAME)}) must fire after '
-        f'the nightly trickle ({_on_calendar_time(TRICKLE_TIMER_NAME)}) whose '
+    assert _on_calendar_time(unit_values, TIMER_NAME) > _on_calendar_time(unit_values, TRICKLE_TIMER_NAME), (
+        f'the health probe ({_on_calendar_time(unit_values, TIMER_NAME)}) must fire after '
+        f'the nightly trickle ({_on_calendar_time(unit_values, TRICKLE_TIMER_NAME)}) whose '
         f'state file it reads'
     )
 
 
-def test_timer_catches_up_a_missed_night_and_avoids_a_thundering_herd():
+def test_timer_catches_up_a_missed_night_and_avoids_a_thundering_herd(unit_values):
     """`Persistent=true` catches up a probe missed to a sleeping laptop instead
     of silently skipping it — and `max_age_hours=72` gives the freshness check
     enough slack that a catch-up firing BEFORE the nightly's own catch-up
     cannot false-alarm. `RandomizedDelaySec` keeps every project's timer from
     firing at the same instant."""
-    timer = _directives(TIMER_NAME)
-    assert _values(timer, 'Timer', 'Persistent') == ['true']
-    assert _values(timer, 'Timer', 'RandomizedDelaySec'), (
+    timer = TEMPLATES_DIR / TIMER_NAME
+    assert unit_values(timer, 'Timer', 'Persistent') == ['true']
+    assert unit_values(timer, 'Timer', 'RandomizedDelaySec'), (
         'a randomized delay is what stops every project firing at once'
     )
 
 
-def test_timer_is_installed_into_timers_target():
-    assert _values(_directives(TIMER_NAME), 'Install', 'WantedBy') == [
+def test_timer_is_installed_into_timers_target(unit_values):
+    assert unit_values(TEMPLATES_DIR / TIMER_NAME, 'Install', 'WantedBy') == [
         'timers.target']
 
 
@@ -362,111 +287,16 @@ def test_timer_is_installed_into_timers_target():
 # Installer behaviour
 # ---------------------------------------------------------------------------
 #
-# Driven via subprocess with a FAKE `systemctl` shimmed onto PATH (records
-# every invocation, minus `--user`, into a shared JSON state file) plus a REAL
-# invocation of `nightly.py resolve-config` -- no mock, because the whole point
-# of the installer delegating to it is that this script never re-implements the
-# project_id -> repo mapping. Real systemd is never touched.
-#
-# Ported from `test_install_trickle_timer.py`, keeping this directory's
-# deliberate copy-not-share convention for the fake-`systemctl` source string:
-# it is copy-pasted across ~11 files by design, so a change to one job's
-# install contract cannot silently re-point another's test. Do NOT extract a
-# shared helper here.
+# Driven via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl` first
+# on PATH plus a REAL invocation of `nightly.py resolve-config` -- no mock,
+# because the whole point of the installer delegating to it is that this script
+# never re-implements the project_id -> repo mapping. Real systemd is never
+# touched.
 #
 # `XDG_CONFIG_HOME` is still the right lever for the unit DIRECTORY and is
 # untouched by task 4514's state-path change -- that change scoped only the
 # legibility STATE root, and every sibling installer test honours
 # `XDG_CONFIG_HOME` the same way.
-
-_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
-"""Fake `systemctl` for testing install-trickle-health-timer.sh.
-
-Records every invocation (minus `--user`) into a JSON state file at
-$FAKE_SYSTEMCTL_STATE. `enable --now <unit>` marks each non-flag arg as an
-enabled unit; `list-timers` echoes back one line per *.timer unit enabled so
-far THIS RUN, unless FAKE_SYSTEMCTL_OMIT_LIST_TIMERS=1 -- simulating a
-self-verify failure where `enable` nominally succeeded but the unit is
-absent from `list-timers`.
-"""
-import json
-import os
-import sys
-
-STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
-
-
-def _load():
-    with open(STATE_PATH) as f:
-        return json.load(f)
-
-
-def _save(state):
-    with open(STATE_PATH, "w") as f:
-        json.dump(state, f)
-
-
-def main(argv):
-    args = [a for a in argv[1:] if a != "--user"]
-    if not args:
-        return 1
-    verb, rest = args[0], args[1:]
-
-    state = _load()
-    state.setdefault("calls", []).append(args)
-
-    if verb == "daemon-reload":
-        _save(state)
-        return 0
-
-    if verb == "enable":
-        units = [a for a in rest if not a.startswith("-")]
-        enabled = state.setdefault("enabled_timers", [])
-        for u in units:
-            if u not in enabled:
-                enabled.append(u)
-        _save(state)
-        return 0
-
-    if verb == "list-timers":
-        _save(state)
-        if os.environ.get("FAKE_SYSTEMCTL_OMIT_LIST_TIMERS") == "1":
-            print("0 timers listed.")
-            return 0
-        enabled = state.get("enabled_timers", [])
-        for unit in enabled:
-            service = unit.replace(".timer", ".service")
-            print(f"Mon 2026-07-14 04:30:00 UTC 8h left n/a n/a {unit} {service}")
-        print(f"{len(enabled)} timers listed.")
-        return 0
-
-    return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv))
-'''
-
-
-def _fake_systemctl(tmp_path):
-    """Write an executable fake `systemctl` into <tmp_path>/bin/systemctl and
-    its backing JSON state file. Returns (bin_dir, state_path)."""
-    bin_dir = tmp_path / 'bin'
-    bin_dir.mkdir(exist_ok=True)
-    fake = bin_dir / 'systemctl'
-    fake.write_text(_FAKE_SYSTEMCTL_SRC)
-    fake.chmod(0o755)
-
-    state_path = tmp_path / 'systemctl_state.json'
-    state_path.write_text(json.dumps({'calls': [], 'enabled_timers': []}))
-    return bin_dir, state_path
-
-
-def _systemctl_calls(tmp_path):
-    state_path = tmp_path / 'systemctl_state.json'
-    if not state_path.is_file():
-        return []
-    return json.loads(state_path.read_text())['calls']
 
 
 def _write_project_config(tmp_path, *, project_id, escalation_port=8199):
@@ -489,21 +319,20 @@ def _write_project_config(tmp_path, *, project_id, escalation_port=8199):
     return search_root
 
 
-def _run_script(tmp_path, project_id, *, env=None):
+def _run_script(fake_timer_systemctl, project_id, *, env=None):
     """Run install-trickle-health-timer.sh <project_id> via subprocess.
 
-    Puts a fresh fake `systemctl` on PATH (state reset each call) and defaults
+    Puts *fake_timer_systemctl* first on PATH, reset on every call, and defaults
     INSTALL_TRICKLE_HEALTH_TIMER_PYTHON=sys.executable so the script's
     `nightly.py resolve-config` delegation runs the REAL resolver directly --
-    no `uv run`/`--frozen` needed in-test. Callers supply XDG_CONFIG_HOME and
+    no `uv run` needed in-test. Callers supply XDG_CONFIG_HOME and
     LEGIBILITY_SEARCH_ROOTS via *env*; any ambient LEGIBILITY_SEARCH_ROOTS is
     popped so a developer's shell cannot make this resolve the real projects.
     """
-    bin_dir, state_path = _fake_systemctl(tmp_path)
+    fake_timer_systemctl.reset()
 
     full_env = dict(os.environ)
-    full_env['PATH'] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
-    full_env['FAKE_SYSTEMCTL_STATE'] = str(state_path)
+    full_env['PATH'] = f"{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env['INSTALL_TRICKLE_HEALTH_TIMER_PYTHON'] = sys.executable
     full_env.pop('LEGIBILITY_SEARCH_ROOTS', None)
     if env:
@@ -521,12 +350,12 @@ def test_script_is_executable():
     )
 
 
-def test_install_copies_templates_and_enables_timer(tmp_path):
+def test_install_copies_templates_and_enables_timer(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id='proj_a')
     xdg_config = tmp_path / 'xdg-config'
 
     result = _run_script(
-        tmp_path, 'proj_a',
+        fake_timer_systemctl, 'proj_a',
         env={'XDG_CONFIG_HOME': str(xdg_config),
              'LEGIBILITY_SEARCH_ROOTS': str(search_root)},
     )
@@ -546,7 +375,7 @@ def test_install_copies_templates_and_enables_timer(tmp_path):
     assert service_path.read_bytes() == SERVICE.read_bytes()
     assert timer_path.read_bytes() == TIMER.read_bytes()
 
-    calls = _systemctl_calls(tmp_path)
+    calls = fake_timer_systemctl.calls()
     assert ['daemon-reload'] in calls, f'calls={calls!r}'
     assert ['enable', '--now', 'legibility-trickle-health@proj_a.timer'] in calls, (
         f'calls={calls!r}'
@@ -554,25 +383,46 @@ def test_install_copies_templates_and_enables_timer(tmp_path):
     assert any(c[0] == 'list-timers' for c in calls), f'calls={calls!r}'
 
 
-def test_install_is_idempotent(tmp_path):
+def test_install_does_not_kick_an_immediate_run(fake_timer_systemctl, tmp_path):
+    """No surprise run at install time.
+
+    The probe judges the state the night's trickle wrote, and escalates what
+    it finds. Kicked at install, on a host whose first 03:00 trickle has not
+    run yet, it would judge a night that has not happened. The installer arms
+    the timer and leaves the run to it.
+    """
+    search_root = _write_project_config(tmp_path, project_id='proj_a')
+
+    result = _run_script(
+        fake_timer_systemctl, 'proj_a',
+        env={'XDG_CONFIG_HOME': str(tmp_path / 'xdg-config'),
+             'LEGIBILITY_SEARCH_ROOTS': str(search_root)},
+    )
+
+    assert result.returncode == 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    for call in fake_timer_systemctl.calls():
+        assert call[:1] != ['start'], f'unexpected immediate run: {call!r}'
+
+
+def test_install_is_idempotent(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id='proj_a')
     xdg_config = tmp_path / 'xdg-config'
     env = {'XDG_CONFIG_HOME': str(xdg_config),
            'LEGIBILITY_SEARCH_ROOTS': str(search_root)}
 
-    result_1 = _run_script(tmp_path, 'proj_a', env=env)
+    result_1 = _run_script(fake_timer_systemctl, 'proj_a', env=env)
     assert result_1.returncode == 0, (
         f'stdout={result_1.stdout!r} stderr={result_1.stderr!r}'
     )
 
-    result_2 = _run_script(tmp_path, 'proj_a', env=env)
+    result_2 = _run_script(fake_timer_systemctl, 'proj_a', env=env)
     assert result_2.returncode == 0, (
         f'Expected re-running the install to still exit 0; '
         f'stdout={result_2.stdout!r} stderr={result_2.stderr!r}'
     )
 
 
-def test_install_fails_when_self_verify_omits_timer(tmp_path):
+def test_install_fails_when_self_verify_omits_timer(fake_timer_systemctl, tmp_path):
     """The guard that stops `enable --now` nominally succeeding while nothing
     observable is installed.
 
@@ -585,7 +435,7 @@ def test_install_fails_when_self_verify_omits_timer(tmp_path):
     xdg_config = tmp_path / 'xdg-config'
 
     result = _run_script(
-        tmp_path, 'proj_a',
+        fake_timer_systemctl, 'proj_a',
         env={
             'XDG_CONFIG_HOME': str(xdg_config),
             'LEGIBILITY_SEARCH_ROOTS': str(search_root),
@@ -600,7 +450,7 @@ def test_install_fails_when_self_verify_omits_timer(tmp_path):
     )
 
 
-def test_install_fails_when_project_config_unresolvable(tmp_path):
+def test_install_fails_when_project_config_unresolvable(fake_timer_systemctl, tmp_path):
     """Config resolution happens FIRST, so an unresolvable project_id costs
     nothing: no systemctl invocation and no unit file left behind to be
     enabled by a later unrelated `daemon-reload`."""
@@ -609,7 +459,7 @@ def test_install_fails_when_project_config_unresolvable(tmp_path):
     empty_search_root.mkdir()
 
     result = _run_script(
-        tmp_path, 'no_such_project',
+        fake_timer_systemctl, 'no_such_project',
         env={'XDG_CONFIG_HOME': str(xdg_config),
              'LEGIBILITY_SEARCH_ROOTS': str(empty_search_root)},
     )
@@ -618,16 +468,16 @@ def test_install_fails_when_project_config_unresolvable(tmp_path):
         f'Expected a non-zero exit for an unresolvable project_id; '
         f'stdout={result.stdout!r} stderr={result.stderr!r}'
     )
-    assert _systemctl_calls(tmp_path) == [], (
+    assert fake_timer_systemctl.calls() == [], (
         f'Expected NO systemctl invocation when config resolution fails '
-        f'first; calls={_systemctl_calls(tmp_path)!r}'
+        f'first; calls={fake_timer_systemctl.calls()!r}'
     )
     assert not (xdg_config / 'systemd' / 'user' / SERVICE_NAME).exists(), (
         'Expected no unit file to be installed when config resolution fails'
     )
 
 
-def test_installer_does_not_touch_the_trickle_units(tmp_path):
+def test_installer_does_not_touch_the_trickle_units(fake_timer_systemctl, tmp_path):
     """This installer must never disturb the LIVE nightly timer.
 
     The two jobs are siblings by design and their unit names differ by one
@@ -640,7 +490,7 @@ def test_installer_does_not_touch_the_trickle_units(tmp_path):
     xdg_config = tmp_path / 'xdg-config'
 
     result = _run_script(
-        tmp_path, 'proj_a',
+        fake_timer_systemctl, 'proj_a',
         env={'XDG_CONFIG_HOME': str(xdg_config),
              'LEGIBILITY_SEARCH_ROOTS': str(search_root)},
     )
@@ -654,7 +504,7 @@ def test_installer_does_not_touch_the_trickle_units(tmp_path):
         f'the health installer wrote the nightly trickle\'s units: {strays!r}'
     )
     touched = [
-        c for c in _systemctl_calls(tmp_path)
+        c for c in fake_timer_systemctl.calls()
         if any(TRICKLE_TIMER_NAME.replace('@.', '@') in a for a in c)
     ]
     assert touched == [], (

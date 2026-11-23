@@ -26,6 +26,7 @@ import pytest
 from fused_memory.server.entities_gate import entities_gate
 from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY
 from fused_memory.utils.referent_resolution import _DECLARED_REFERENT_HINT
+from server.entities_declaration_shapes import FALSY_NON_LIST_SHAPES, MALFORMED_SHAPES
 
 GROUP = 'dark_factory'
 
@@ -37,33 +38,6 @@ _CITES_NOTHING = 'the merge-lane hardening work'
 #: ``_CITES_3127`` padded past the 200-char excerpt with prose naming nothing
 #: else, so the scan still sees exactly Task 3127.
 _LONG_CITES_3127 = _CITES_3127 + ', and the merge lane settled the cycle afterwards' * 6
-
-#: The falsy NON-list shapes, as ``(id, value)`` pairs.  Their own arm below
-#: pins the property that singles them out — that the gate short-circuits on
-#: ``entities is None`` and never on ``not entities`` — and they are spliced
-#: into ``_MALFORMED_SHAPES`` so the shared coverage sees them too, from ONE
-#: spelling of the triple.
-_FALSY_NON_LIST_SHAPES = (('empty-str', ''), ('empty-dict', {}), ('zero', 0))
-
-#: Every shape gamma's TOTAL ``InputValidationError`` contract must reject,
-#: hoisted to one list because THREE tests consume it: the two arms below, and
-#: the tool-boundary arm in ``tests/server/test_entities_gate_ingestion.py``,
-#: which imports it from here.  Kept as one list on purpose — a shape added to
-#: a second copy and not the first would be silently unchecked for the property
-#: the first pins, which is the lockstep duplication this batch keeps guarding
-#: against.  The boundary import is what stops the pure-function claim and the
-#: agent-visible behaviour from drifting apart: every shape here is reachable
-#: through FastMCP only because both tools annotate ``entities`` as ``Any``.
-_MALFORMED_SHAPES = [
-    pytest.param('task 3127', id='a-str-not-a-list'),
-    pytest.param([{'id': 'abc'}], id='non-digit-id'),
-    pytest.param([{'id': 3127, 'projectId': 'reify'}], id='unrecognized-key'),
-    pytest.param([{'id': True}], id='bool-id'),
-    pytest.param([{'id': 3127, 'project_id': 'task'}], id='task-vocabulary-qualifier'),
-    pytest.param([[1]], id='a-list-of-non-dicts'),
-    pytest.param({'kind': 'task', 'id': 3127}, id='an-unwrapped-single-dict'),
-    *(pytest.param(value, id=f'falsy-{label}') for label, value in _FALSY_NON_LIST_SHAPES),
-]
 
 
 class TestAbsenceIsNeverRejected:
@@ -122,7 +96,7 @@ class TestMalformedDeclarationsAreRejected:
     ``server/tools.py`` already return.
     """
 
-    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
+    @pytest.mark.parametrize('declared', MALFORMED_SHAPES)
     def test_each_malformed_shape_blocks_the_write(self, declared):
         block = entities_gate(
             declared, content=_CITES_3127, group_id=GROUP, agent_id='claude-interactive',
@@ -134,7 +108,7 @@ class TestMalformedDeclarationsAreRejected:
         assert block['agent_id'] == 'claude-interactive', f'{block!r}'
         assert block['content_excerpt'] == _CITES_3127[:200], f'{block!r}'
 
-    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
+    @pytest.mark.parametrize('declared', MALFORMED_SHAPES)
     def test_the_remediation_reaches_the_agent_inside_the_message(self, declared):
         """Gamma single-sources the accepted shape into the exception message.
 
@@ -164,14 +138,14 @@ class TestMalformedDeclarationsAreRejected:
         lose the caller's intent invisibly — the silent degradation this
         repo's loud-over-silent norm forbids.
 
-        These three are also spliced into ``_MALFORMED_SHAPES``, so the arms
+        These three are also spliced into ``MALFORMED_SHAPES``, so the arms
         above and the tool boundary check them too.  This arm is kept separate
         anyway because it pins a DIFFERENT property — not "the gate rejects
         this shape" but "the gate did not read this shape as an absence" — and
         that is the claim whose failure message a reader needs when a future
         ``not entities`` shortcut appears.
         """
-        for _label, falsy in _FALSY_NON_LIST_SHAPES:
+        for _label, falsy in FALSY_NON_LIST_SHAPES:
             block = entities_gate(falsy, content=_CITES_3127, group_id=GROUP)
             assert isinstance(block, dict), f'{falsy!r} was read as absence: {block!r}'
             assert block['error_type'] == 'ValidationError', f'{falsy!r}: {block!r}'
@@ -407,6 +381,34 @@ class TestHonestMixedDeclarationsAreAccepted:
         assert block['conflicts'] == ['Task 3129'], f'{block!r}'
 
 
+class TestProseColonNumberIsNotAForeignRef:
+    """Prose 'word: N' names no project, so declaring N beside it is honest
+    (task 6826); a tight 'project:N' still contests the declared number."""
+
+    @pytest.mark.parametrize(
+        'content,declared',
+        [
+            pytest.param('Follow-ups: 6035', 6035, id='sighting-follow-ups'),
+            pytest.param('Related owners: 5308', 5308, id='sighting-owners'),
+            pytest.param('Task 6183 at the time: 394 linked records', 394, id='sighting-time'),
+            pytest.param('matched the live plan exactly: 15+4 detaches', 15, id='sighting-exactly'),
+        ],
+    )
+    def test_the_live_sighting_is_accepted(self, content, declared):
+        assert entities_gate(
+            [{'kind': 'task', 'id': declared}], content=content, group_id=GROUP,
+        ) is None
+
+    def test_a_tight_foreign_ref_still_conflicts(self):
+        block = entities_gate(
+            [{'kind': 'task', 'id': 2500}], content='blocked on reify:2500', group_id=GROUP,
+        )
+
+        assert isinstance(block, dict), f'the tight foreign ref was not caught: {block!r}'
+        assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
+        assert block['conflicts'] == ['Task 2500'], f'{block!r}'
+
+
 class TestADiscardedDeclarationIsShapeCheckedOnly:
     """A declaration the write will not record can buy no attribution, so it
     is never conflict-rejected; a malformed one is still a wiring bug."""
@@ -416,7 +418,7 @@ class TestADiscardedDeclarationIsShapeCheckedOnly:
             [{'id': 3129}], content=_CITES_3127, group_id=GROUP, declaration_recorded=False,
         ) is None
 
-    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
+    @pytest.mark.parametrize('declared', MALFORMED_SHAPES)
     def test_a_malformed_declaration_still_blocks(self, declared):
         block = entities_gate(
             declared, content=_CITES_3127, group_id=GROUP, declaration_recorded=False,

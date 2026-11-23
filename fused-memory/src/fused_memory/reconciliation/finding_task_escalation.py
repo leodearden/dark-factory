@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
@@ -51,10 +52,12 @@ from shared.timestamps import parse_timestamp_or_warn
 __all__ = [
     'FINDING_TASK_ESCALATION_CATEGORY',
     'FINDING_TASK_ESCALATION_LEVEL',
+    'LIVENESS_UNKNOWN_DETAIL_KEY',
     'RoutedRecordView',
     'TerminalRoutedRecordView',
     'build_finding_task_escalation_kwargs',
     'is_routable_task_id',
+    'liveness_unknown_detail',
     'recent_conversion_suppresses_refile',
     'resolve_finding_task_target',
     'routed_record_carries_finding',
@@ -85,35 +88,36 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 #
 # `level=0`, and the argument for it is STRUCTURAL, not a matter of degree.
 #
-# Every orchestrator guard that a recon-authored record could hijack reaches
-# the escalation queue through ONE helper — `EscalationQueue.has_open_l1`
-# (`escalation/src/escalation/queue.py`), which filters on `level` + `status`
-# and an OPTIONAL `category`, and is documented as answering "a human is
-# already on this task, so the workflow must not auto-requeue it".  Crucially
-# it never reads `.severity` at all, so a severity choice cannot mitigate the
-# collision — only the level can.  It is level-1-ONLY, so a level-0 record is
+# Every orchestrator guard that a recon-authored record could hijack reads the
+# escalation queue through a level-1-ONLY test: `EscalationQueue.has_open_l1`
+# (`escalation/src/escalation/queue.py`), or in the workflow
+# `orchestrator/workflow.py::_is_l1_handoff` (level == 1 AND
+# `escalation.pins.is_queue_handoff`).  `has_open_l1` filters on `level` +
+# `status` and an OPTIONAL `category`, and is documented as answering "a human
+# is already on this task, so the workflow must not auto-requeue it".
+# Crucially it never reads `.severity` at all, so for any `has_open_l1` reader
+# a severity choice cannot mitigate the collision — only the level can.  The
+# workflow's test, by contrast, is severity-aware, so an info L1 never hands
+# off there (`plans/info-l0-disposition-router-prd.md` D3); for it, level 0 is
+# defence in depth that also keeps the record clear of any future uncategorized
+# `has_open_l1` reader.  Both are level-1-ONLY, so a level-0 record is
 # invisible to every one of them by construction:
 #
-#   - `orchestrator/workflow.py::TaskWorkflow._wait_for_resolution`, which
-#     raises `_StewardReescalated` and diverts the workflow on the strength of
-#     an open L1;
-#   - `orchestrator/workflow.py::TaskWorkflow._await_steward_completion`, the
-#     requeue-diversion override, which holds a requeue-producing steward
-#     outcome back when an L1 is already open.
+#   - `orchestrator/workflow.py::_is_l1_handoff`, the workflow's single rule
+#     for an open L1 that hands the task to a human.
+#     `TaskWorkflow._open_l1_handoffs` applies it for
+#     `_await_steward_completion`'s requeue-diversion override and
+#     `_awaited_record_outcome`'s cross-task check;
+#     `TaskWorkflow._wait_for_resolution`'s tail applies it, next to
+#     `escalation.pins.needs_human`, over the full pending set.
 #
 # The orphan-L0 reaper (`orchestrator/harness.py::Harness._reap_orphan_l0_escalations`)
 # is not a reader: since task 5223 its coverage rule is
 # `escalation/queue.py::EscalationQueue.dismiss_if_covered`, scoped to the L0's
 # own category, so an L1 of another category cannot hijack it.
 #
-# BOTH workflow.py sites are uncategorized, and an earlier revision of this
-# block listed only the first. That was a measurement error, corrected here
-# (esc-4821-5): `_await_steward_completion` was mistakenly reported as NOT
-# holding an uncategorized read, when it holds exactly the requeue-diversion
-# one. Grep `has_open_l1(` and subtract the `category=` call sites before
-# editing this list -- there are two uncategorized readers in workflow.py, not
-# one. The omission never changed the DESIGN (level-0 is invisible to every
-# level-1-only reader alike), only this list's claim to be complete.
+# workflow.py holds no uncategorized `has_open_l1` read.  Grep `has_open_l1(`
+# and `_is_l1_handoff` before editing this list.
 #
 # That is the population this closes.  Two classes of `has_open_l1` reader are
 # deliberately NOT in it, and were re-measured rather than assumed: the
@@ -187,6 +191,21 @@ _ESCALATION_SEVERITY = 'info'
 _AGENT_ROLE = 'reconciliation-harness'
 
 _FINDING_FINGERPRINT_KEY = 'finding_fingerprint'
+
+#: Detail key, on both a persistent-finding recon escalation and a routed
+#: finding-task record, listing the task ids whose liveness probe failed: the
+#: record was filed because no id was confirmed live, not because each was
+#: confirmed not live (task 5370).
+LIVENESS_UNKNOWN_DETAIL_KEY = 'liveness_unknown_task_ids'
+
+
+def liveness_unknown_detail(task_ids: AbstractSet[str]) -> dict[str, list[str]]:
+    """The detail entries recording *task_ids* as liveness-unknown.
+
+    *task_ids* sorted under ``LIVENESS_UNKNOWN_DETAIL_KEY``, or no entry at all
+    when it is empty, so a record whose probes all ran carries no such key.
+    """
+    return {LIVENESS_UNKNOWN_DETAIL_KEY: sorted(task_ids)} if task_ids else {}
 
 _ROUTABLE_TASK_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
 
@@ -335,6 +354,7 @@ def build_finding_task_escalation_kwargs(
     run_id: str,
     persistence: int,
     finding_fingerprint: str,
+    target_liveness_unknown: bool = False,
 ) -> dict[str, Any]:
     """Build the ``Escalation(...)`` keyword arguments for *finding*.
 
@@ -370,6 +390,10 @@ def build_finding_task_escalation_kwargs(
       exists to decide.  The finding's OWN ``suggested_action`` text is carried
       in ``detail``.
 
+    *target_liveness_unknown* records that *task_id*'s liveness probe failed:
+    ``detail`` then lists it per :func:`liveness_unknown_detail`.  A routed
+    record is about its one target, so no other id can be marked.
+
     Pure: no I/O, and *finding* is not mutated.
     """
     finding_category = str(finding.get('category') or '') or 'unknown'
@@ -379,24 +403,22 @@ def build_finding_task_escalation_kwargs(
         f'{persistence} cycles): {" ".join(description.split())}'
     )
 
-    detail = json.dumps(
-        {
-            'finding_id': finding.get('finding_id'),
-            'category': finding.get('category'),
-            'severity': finding.get('severity'),
-            'description': finding.get('description'),
-            'suggested_action': finding.get('suggested_action'),
-            'actionable': finding.get('actionable'),
-            'affected_ids': finding.get('affected_ids'),
-            'cited_tasks': finding.get('cited_tasks'),
-            'run_id': run_id,
-            'project_id': project_id,
-            'persistence': persistence,
-            _FINDING_FINGERPRINT_KEY: finding_fingerprint,
-        },
-        default=str,
-        indent=2,
-    )
+    detail_dict: dict[str, Any] = {
+        'finding_id': finding.get('finding_id'),
+        'category': finding.get('category'),
+        'severity': finding.get('severity'),
+        'description': finding.get('description'),
+        'suggested_action': finding.get('suggested_action'),
+        'actionable': finding.get('actionable'),
+        'affected_ids': finding.get('affected_ids'),
+        'cited_tasks': finding.get('cited_tasks'),
+        'run_id': run_id,
+        'project_id': project_id,
+        'persistence': persistence,
+        _FINDING_FINGERPRINT_KEY: finding_fingerprint,
+        **liveness_unknown_detail({task_id} if target_liveness_unknown else frozenset()),
+    }
+    detail = json.dumps(detail_dict, default=str, indent=2)
 
     return {
         'task_id': task_id,

@@ -17,7 +17,7 @@ cockpit.ui_config) -- and even that write is DEBOUNCED for the app's whole
 life: the session table's two selection seams (CockpitApp._sync_detail_pane
 on a cursor move, CockpitApp._resync_session_detail on a rebuild) only
 RECORD the live selection in _selected_slug, and CockpitApp._flush_ui_config
-writes from the poll timer (CockpitApp._poll_registry) only when that
+writes from the poll timer (CockpitApp.start_poll_tick) only when that
 differs from what was last persisted, leaving CockpitApp.on_unmount as the
 single unconditional final write. So neither a keypress nor a table rebuild
 ever WRITES cockpit-ui.json -- a narrower claim than it may look: the
@@ -66,7 +66,7 @@ from orchestrator.decision_registry import (
 from orchestrator.fleet_files import (
     fleet_root as resolve_fleet_root,
 )
-from orchestrator.session_registry import SessionRecord, Status
+from orchestrator.session_records import SessionRecord, Status
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -290,7 +290,7 @@ class CockpitApp(App):
         self._has_scanned = False
         # Monotonic scan-sequence guard (esc-2517-1, task 2606): _scan_seq is
         # the next-to-issue sequence number (see _next_scan_seq), bumped once
-        # per scan INITIATED -- by refresh_registry, _poll_registry or
+        # per scan INITIATED -- by refresh_registry, start_poll_tick or
         # _reread_decisions, all always on the main thread. Each of the two
         # registries has its own high-water mark of the newest sequence
         # actually applied: _applied_scan_seq for sessions, which only a full
@@ -304,11 +304,11 @@ class CockpitApp(App):
         self._applied_scan_seq = 0
         self._applied_decisions_seq = 0
         # Drop-tick backpressure for the threaded poll path (see
-        # _poll_registry/_scan_registry_worker): True while a scan launched
-        # by _poll_registry is still running. Only ever read/written on the
-        # main thread (set in _poll_registry, cleared by
+        # start_poll_tick/_scan_registry_worker): True while a scan launched
+        # by start_poll_tick is still running. Only ever read/written on the
+        # main thread (set in start_poll_tick, cleared by
         # _clear_scan_in_flight via call_from_thread), so the check-then-set
-        # in _poll_registry is race-free without needing a lock.
+        # in start_poll_tick is race-free without needing a lock.
         self._scan_in_flight = False
         self._selected_slug: str | None = None
         # The pane starts on the session-flavoured placeholder (and, when
@@ -381,7 +381,7 @@ class CockpitApp(App):
         self.refresh_registry()
         if ui_config.selected_slug is not None:
             self.query_one('#session-table', SessionTable).select_slug(ui_config.selected_slug)
-        self.set_interval(self.poll_interval, self._poll_registry)
+        self.set_interval(self.poll_interval, self.start_poll_tick)
 
     def on_unmount(self) -> None:
         # Unconditional, not _flush_ui_config: an app mounted over an empty
@@ -393,7 +393,7 @@ class CockpitApp(App):
         """Issue the next monotonic scan sequence number. MAIN-THREAD-ONLY.
 
         self._scan_seq += 1 is a non-atomic read-modify-write; only
-        refresh_registry, _poll_registry and _reread_decisions call this,
+        refresh_registry, start_poll_tick and _reread_decisions call this,
         and all three always run on the main thread (mirrors the
         _scan_in_flight discipline -- see __init__), so no lock is needed.
         The returned value must travel WITH its scan as an explicit value --
@@ -411,7 +411,7 @@ class CockpitApp(App):
         A thin synchronous wrapper around _scan_registry (the I/O half) and
         _apply_scan (the UI half) -- used for on_mount's initial paint and
         by every test that calls it directly, so a same-tick rebuild stays
-        deterministic. The recurring poll timer goes through _poll_registry
+        deterministic. The recurring poll timer goes through start_poll_tick
         instead, which runs the scan on a background thread (see
         _scan_registry_worker) so a slow scan never blocks the event loop
         (C10 tour F1, esc-2303-1).
@@ -468,7 +468,7 @@ class CockpitApp(App):
         Also guards against a stale threaded-poll result landing after a
         fresher read already applied (esc-2517-1, task 2606): *seq* is the
         monotonic sequence number the caller obtained from _next_scan_seq()
-        at scan-initiation time (see refresh_registry/_poll_registry). Each
+        at scan-initiation time (see refresh_registry/start_poll_tick). Each
         half of the result is checked against its own high-water mark. A
         seq strictly older than self._applied_scan_seq (the newest scan
         already applied) is dropped whole before the snapshot diff even
@@ -484,7 +484,7 @@ class CockpitApp(App):
         Note: seq order tracks scan-*initiation* order, not measured
         read-completion order -- it is a proxy for freshness, not a direct
         stamp of it. Scans never race each other: _scan_in_flight (see
-        _poll_registry) admits only one in-flight poll worker at a time,
+        start_poll_tick) admits only one in-flight poll worker at a time,
         and refresh_registry only ever runs synchronously at on_mount,
         before the poll timer is registered. A keypress's _reread_decisions
         can take a seq while a poll scan is in flight, though, so that
@@ -579,37 +579,35 @@ class CockpitApp(App):
         if self._detail_owner is DetailOwner.SESSION_TABLE:
             self._show_session_detail(slug)
 
-    def _poll_registry(self) -> None:
-        """on_mount's set_interval callback: launch the threaded scan worker.
+    def start_poll_tick(self) -> None:
+        """Run one tick of the background poll: the same call the poll timer makes.
 
-        Never scans synchronously itself -- see _scan_registry_worker, which
-        runs the actual I/O off the UI thread so a slow scan (10k+ sessions,
-        ~4.5s) never freezes input (C10 tour F1, esc-2303-1).
+        Returns BEFORE the scan lands: the scan runs on a Textual worker
+        thread (_scan_registry_worker) so a slow one (10k+ sessions, ~4.5s)
+        never freezes input (C10 tour F1, esc-2303-1), and a caller that
+        needs its result awaits ``app.workers.wait_for_complete()``. A tick
+        that arrives while a scan is still in flight is dropped, but the
+        cockpit-ui.json flush runs even on a dropped tick. refresh_registry,
+        by contrast, scans and applies synchronously on the calling (main)
+        thread, with no flush and no backpressure. Main-thread-only, like
+        the _scan_in_flight flag it checks.
 
-        Drops an overlapping tick instead of piling up worker threads: in
-        production poll_interval (1.5s) is routinely shorter than a full
-        scan over 10k+ sessions (~4.5s), so an unguarded launch here would
-        start one thread per tick for the scan's entire duration. Checking
-        and setting _scan_in_flight here (both on the main thread, same as
-        the timer callback that invokes this method) makes the
-        check-then-set race-free without needing a lock or introspecting
-        Textual's worker registry. _scan_registry_worker's own try/finally
-        clears the flag -- via call_from_thread, also on the main thread --
-        even when the scan raises, so one bad tick never wedges every
-        later poll.
+        Why the drop: in production poll_interval (1.5s) is routinely
+        shorter than a full scan over 10k+ sessions (~4.5s), so an
+        unguarded launch here would start one thread per tick for the
+        scan's entire duration. Checking and setting _scan_in_flight here,
+        on the main thread, makes the check-then-set race-free without
+        needing a lock or introspecting Textual's worker registry.
+        _scan_registry_worker's own try/finally clears the flag -- via
+        call_from_thread, also on the main thread -- even when the scan
+        raises, so one bad tick never wedges every later poll.
 
-        Also issues this poll's scan sequence number via _next_scan_seq()
-        (main-thread-only, like the flag check above) and hands it to the
-        worker, so a stale hand-off can be dropped once it lands -- see
-        _apply_scan's stale-scan guard (esc-2517-1).
+        Also issues this tick's scan sequence number via _next_scan_seq()
+        and hands it to the worker, so a stale hand-off can be dropped once
+        it lands -- see _apply_scan's stale-scan guard (esc-2517-1).
 
-        Doubles as the flush point for the cockpit-ui.json write debounce
-        (see _flush_ui_config), reusing this timer rather than adding a
-        second recurring wake-up. The flush must run BEFORE the
-        _scan_in_flight early return: a 10k+-session scan routinely outlasts
-        the poll interval, so a flush placed after it would be starved for
-        as long as scans keep overlapping -- the busy-fleet case where the
-        operator is most likely to be moving the cursor.
+        A flush (see _flush_ui_config) placed after the _scan_in_flight
+        early return would be starved for as long as scans keep overlapping.
         test_app.py::TestUIConfigWriteDebounce::
         test_flush_is_not_starved_by_the_scan_backpressure_drop pins the
         placement.
@@ -633,7 +631,7 @@ class CockpitApp(App):
         fully shut down by the time this (possibly slow) scan finishes --
         see its docstring.
 
-        *seq* is the scan sequence number _poll_registry obtained from
+        *seq* is the scan sequence number start_poll_tick obtained from
         _next_scan_seq() (main-thread-only) before launching this worker --
         carried through unchanged on the background thread and forwarded to
         _apply_scan via the call_from_thread hand-off, so _apply_scan can
@@ -644,7 +642,7 @@ class CockpitApp(App):
         error) must only fail this one tick, never take down the whole app
         -- Textual's default would treat an unhandled worker exception as
         fatal and close the app. The finally clause below still clears
-        _scan_in_flight when the scan raises, so _poll_registry's very next
+        _scan_in_flight when the scan raises, so start_poll_tick's very next
         tick starts a fresh scan instead of being dropped forever.
         """
         try:
@@ -683,8 +681,8 @@ class CockpitApp(App):
         """Main-thread-only: clear the drop-tick backpressure flag.
 
         Only ever invoked via call_from_thread from _scan_registry_worker
-        (see _poll_registry's docstring), so this always runs on the main
-        thread, same as the _poll_registry read/set.
+        (see start_poll_tick's docstring), so this always runs on the main
+        thread, same as the start_poll_tick read/set.
         """
         self._scan_in_flight = False
 
@@ -1549,7 +1547,7 @@ class CockpitApp(App):
                 self._focus_slug(slug, self._records)
 
     def _flush_ui_config(self) -> None:
-        """Debounced half of the cockpit-ui.json write path; called from _poll_registry.
+        """Debounced half of the cockpit-ui.json write path; called from start_poll_tick.
 
         Writes only when the live selection differs from what was last
         persisted, so an idle cockpit does ZERO writes per tick rather than

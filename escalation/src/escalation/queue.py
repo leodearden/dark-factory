@@ -605,12 +605,16 @@ def read_escalation_for_scan(
     file in this package was audited when this helper was introduced; the
     asymmetry below is deliberate, not an oversight.
 
-    FIXED -- the unlocked scans, all seven reads routed through this helper:
+    FIXED -- the unlocked scans, all eight reads routed through this helper:
     ``shadow_ruling.py::agreement_report`` (task 5374; the weekly shadow-ruling
     count, which the watcher skill points at the LIVE ``data/escalations``
     tree and which passes a WIDER ``parse_errors`` tuple than the default --
     it adds ``ValueError`` so a truncated file's ``UnicodeDecodeError`` costs
     one record rather than the whole measurement),
+    ``refile_absorption.py::absorbing_resolutions`` (task 4915; the operator
+    listing of resolutions absorbing refiles, also run over the live tree and
+    passing its own wider tuple with ``ValueError`` for the same reason, plus
+    ``AttributeError`` for a file holding valid JSON that is not an object),
     ``queue.py::EscalationQueue.get_by_task``,
     ``queue.py::EscalationQueue.get_pending`` (which also backs
     ``dismiss_all_pending``, so the startup L0 sweep inherits the fix),
@@ -1210,6 +1214,10 @@ class EscalationQueue:
 
         Level-1 is the handed-to-human tier: the presence of one signals that
         the workflow must not auto-requeue the task — a human will unblock.
+        This method counts EVERY pending L1 whatever its severity; the
+        workflow's hand-off gates instead admit an open L1 only when
+        ``escalation.pins.is_queue_handoff`` calls it a hand-off, so an info
+        L1 never holds a task there.
 
         ``category``, when given, restricts the check to open L1s whose
         ``.category`` matches — a signature filter (task 2757).  This lets a NEW
@@ -2356,9 +2364,10 @@ class EscalationQueue:
         "changed since I triaged it" re-assess rule — are, exhaustively:
         ``add_members_to_l2`` (a real member append, severity promotion or
         recorded amendment; guarded, since a true no-op must not bump),
-        ``amend`` (a recorded explicit amendment; guarded the same way) and
+        ``amend`` (a recorded explicit amendment; guarded the same way),
         ``attach_dedupe_child`` (a dedupe fold; unconditional, since every
-        successful call appends a child and increments ``dedupe_count``).
+        successful call appends a child and increments ``dedupe_count``) and
+        ``release_merge_halt`` (a first release stamp; a repeat is a no-op).
 
         Returns the updated ``Escalation``, or ``None`` when *escalation_id*
         is not found in the queue root, fails to parse, or is not pending
@@ -2446,6 +2455,34 @@ class EscalationQueue:
                 'claim_policy_class: %s claimed %s as %s', claimed_by, escalation_id, policy_class,
             )
             return ClaimResult(record=esc, refusal=None)
+
+    def release_merge_halt(self, escalation_id: str, *, note: str) -> Escalation | None:
+        """Record that a pending merge-halt record stopped owning the queue halt (task 3876).
+
+        The sole writer of ``halt_released_at`` / ``halt_release_note``. It bumps
+        ``updated_at``: the record no longer halts the merge queue, a substantive
+        change the watcher's "changed since I triaged it" rule must see.
+
+        It has :meth:`stamp_triage`'s write shape: serialized per id by
+        ``escalation_id_lock``, queue root only, pending only, so a closed
+        record is refused rather than resurrected. Idempotent: a released record
+        is returned unchanged, keeping its first stamp. ``None`` when there is no
+        pending record to release.
+        """
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            esc = self._load_root_pending(escalation_id)
+            if esc is None:
+                return None
+            if esc.halt_released_at is not None:
+                return esc
+
+            now = datetime.now(UTC).isoformat()
+            esc.halt_released_at = now
+            esc.updated_at = now
+            esc.halt_release_note = note
+            self._rewrite(escalation_id, esc)
+            logger.info('release_merge_halt: released the merge halt owned by %s', escalation_id)
+            return esc
 
     def amend(
         self, escalation_id: str, *, root_cause: str = '', summary: str = '',
@@ -2836,13 +2873,14 @@ class EscalationQueue:
         non-zero only on already-adjudicated records has no business inflating
         every pending row.
 
-        The residual gap is DISCOVERY, not access: the counter accrues only on
-        RESOLVED/DISMISSED records, which no triage surface lists, so reading it
-        means knowing the id to ask about.  The suppression WARNING in
-        ``file_unattributed_landing_escalation`` names that id on every
-        suppression, which is the intended entry point; a listing surface or a
-        named operator query for "resolutions absorbing refiles" is genuine
-        follow-up work and is filed as such rather than being silently assumed.
+        DISCOVERY is a separate surface from access: the counter accrues only
+        on RESOLVED/DISMISSED records, which no triage surface lists.  The
+        suppression WARNING in ``file_unattributed_landing_escalation`` names
+        the id on every suppression; the listing of every record with a
+        non-zero counter is
+        ``escalation/src/escalation/refile_absorption.py::absorbing_resolutions``,
+        run as the named operator query in OPERATIONS.md §"Which resolutions
+        are absorbing refiles?".
 
         Locking: the whole read-modify-write runs under ``escalation_id_lock``
         — a concurrent same-id bump from another harness/worker process must not

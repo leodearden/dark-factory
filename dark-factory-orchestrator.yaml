@@ -90,21 +90,29 @@ max_concurrent_tasks: 36
 # orchestrator/tests/test_operational_config_binding.py.
 lock_depth: 12
 
-# HUB-FILE LOCK WIDTH (limit 2 on exactly two files; Leo 2026-10-19). A BOUNDED
-# EXPERIMENT, not a standing setting; max_per_module stays 1 everywhere else.
-# Why: workflow.py and harness.py are the two most contended lock keys, and this
-# is the only lever that lets two orchestrator tasks hold one hub file at once.
+# HUB-FILE LOCK WIDTH (limit 2 on each hub file listed below; Leo 2026-10-19). A
+# BOUNDED EXPERIMENT, not a standing setting; max_per_module stays 1 everywhere else.
+# Why: each hub file is a heavily contended lock key (workflow.py and harness.py
+# were the two most contended; config.py's case is below), and this is the only
+# lever that lets two orchestrator tasks hold one hub file at once.
 # Correctness rests on BRE (acquire-before-edit) + full-workspace merge-verify,
 # as for lock_depth above; the price is paid at rebase/merge time.
 # The experiment, its 14d baseline and the REVERT CLAUSE live in task
 # 7202: a deterministic always_escalates human gate that fires 7 days
 # after the deploy task closes and re-measures. Read it there before changing or
 # keeping this key.
+# config.py joined the two-holder experiment on Leo's ruling of 2026-11-14 (lock
+# hand-off study): the scheduling fixes that were ruled waited on each other for
+# this one file; of its last 70 consecutive pairs of landed changes 1.4% touched
+# overlapping lines and 4.3% came within 10 lines (measured 2026-11-12). The review
+# gate is task 7202, whose amendment of 2026-11-14 covers this file and counts a
+# collision with a co-holder that has already landed.
 # Keys are depth-lock_depth paths (4 components, inside lock_depth 12), so they
 # match exactly what ModuleLockTable._limit_for looks up; a deeper key never would.
 # RED TIER: module_overrides is not in RELOADABLE_FIELDS and _limit_for memoises
-# per process, so this takes effect at the next orchestrator restart (the
-# explicit deploy task filed with this carrier), not on reload_config.
+# per process, so each entry takes effect at the next orchestrator restart, not on
+# reload_config: workflow.py and harness.py at the explicit deploy task filed with
+# their carrier, config.py at the next fleet redeploy (it has no deploy task).
 #
 # THE TWO RATCHET JSON PATHS (Leo's ruling 3 of 2026-10-21, task 7298) are
 # UNBOUNDED, not widened: 99 is above any max_concurrent_tasks this repo has run.
@@ -120,6 +128,7 @@ lock_depth: 12
 module_overrides:
   orchestrator/src/orchestrator/workflow.py: 2
   orchestrator/src/orchestrator/harness.py: 2
+  orchestrator/src/orchestrator/config.py: 2
   orchestrator/tests/merge_lane_ratchet_baseline.json: 99
   orchestrator/tests/merge_lane_ratchet_authorized_raises.json: 99
   orchestrator/tests/merge_lane_ratchet_raises/_README.json: 99
@@ -564,11 +573,15 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #     lint coverage above. Filed as [tkt_0RS401FD4JNB5SW8F8JB1DQ38K].
 #   * skills/**/*.sh and SKILL.md bodies are BEHAVIOURAL artifacts —
 #     spawn-claude.sh, spawn/hooks/*.sh, and the SKILL.md text
-#     load_skill_system_prompt injects into agent system prompts — whose
-#     consumer tests exist (enumerated in CORRECTION 1) but never run on the
-#     diff that CHANGES them, for the _has_source_files reason in CORRECTION 2.
-#     Fixing that is a verify/verify_plan production change, a different class
-#     from a yaml edit. Filed as [tkt_0RS401ZAKSC9EJFQDX8KCXCSD3].
+#     load_skill_system_prompt injects into agent system prompts. Filed as
+#     [tkt_0RS401ZAKSC9EJFQDX8KCXCSD3]; task 5296 closed it for the artifacts
+#     named in
+#     orchestrator/src/orchestrator/verify_artifact_consumers.py::BEHAVIOURAL_ARTIFACTS:
+#     at role='task' a diff touching one of them runs its consumer tests
+#     (orchestrator/src/orchestrator/verify_plan.py::with_artifact_consumer_modules
+#     and ::derive_verify_plan). A skills/ artifact absent from that table is
+#     still TRIVIAL at the task leg (verify_plan.py::is_trivial_diff) and is
+#     caught at the merge gate.
 # Both are curator TICKET ids, not task ids: the curator runs asynchronously
 # and decides create/combine/drop, so the resulting task number is not knowable
 # at this commit. 3485's own follow-up for this question was
@@ -1520,7 +1533,9 @@ recovery_emission:
 #
 # merge_verify_breadth: "full" makes merge-role verify run every REGISTERED
 # module's full suite instead of only the touched modules (Resolved decision
-# 5 in the PRD) — the λ knob, defaulting to "scoped" in defaults.yaml.
+# 5 in the PRD). "full" is also the shipped default since task 7008
+# (defaults.yaml); the key is declared here so this repo's whole-tree gate
+# does not depend on the shipped default.
 #
 # merge_train_former_enabled / merge_train_coalesce_enabled /
 # merge_train_max_members: turn on the train former + retroactive
@@ -1690,11 +1705,14 @@ git:
     - "dark-factory-orchestrator.yaml"
 
   offline_lane_commands:
+    # `uv run` binds pytest and python to THIS worktree's own venv. A bare
+    # name resolved through the daemon's PATH, i.e. main's .venv, which
+    # imports main's editable source rather than the commit under test.
     - name: qdrant-integration
-      command: "pytest -m integration"
+      command: "uv run pytest -m integration"
       cwd: "fused-memory"
       fix_task_priority: "medium"
-      outage_probe: "python scripts/lane_dependency_probe.py"
+      outage_probe: "uv run python scripts/lane_dependency_probe.py"
     # PRD §11 q4 RE-DECIDED (task 3349, 2026-08-01): the ported warm-lane bash
     # bucket moves OFF the verify hot path and onto this lane — the escape
     # plans/warm-lane-infra-repatriation-prd.md documented for exactly this
@@ -1736,7 +1754,7 @@ git:
     # originals on this suite's green, so a red here must not sit in a
     # low-priority queue.
     - name: warm-lane-bash
-      command: "pytest -m warm_lane_bash"
+      command: "uv run pytest -m warm_lane_bash"
       cwd: "orchestrator"
       fix_task_priority: "high"
 
@@ -1803,11 +1821,14 @@ psi_admission:           # PRD plans/load-throttle-harmonisation-prd.md §6.2 (2
 # 2026-10-20: carry the flip (carrier 7619) one week after reify's canary 3189.
 # Reify's week was neutral: 122 merge verifies, 95 landings (66 the week before),
 # 2 deep verifies, 1 chain landing, 0 chain-attributed red.
-# STOP RULE: back to 0 if gates per landed item exceed 1.0, or on any
+# Since task 8528 chain_cap is the kill switch only: any positive value turns
+# chains on, and 6 is not a bound. merge_deep.depth_table sets the depth from
+# the rolling per-item pass estimate (plans/merge-lane-policy-prd.md D6/D7); it
+# is left at the code default (depth 3 at 0.75 up to depth 12 at 0.992), so no key here.
+# STOP RULE: chain_cap: 0 if gates per landed item exceed 1.0, or on any
 # chain-attributed red main or rebase-conflict cluster. Green tier: reload_config
-# applies a change without a restart; this carry issues none, so 6 goes live at
-# the next restart. The coalesce test this flip once redded pins chain_cap=0
-# since task 7279 (merge 58a69de6a5).
+# applies a change without a restart. The coalesce test this flip once redded
+# pins chain_cap=0 since task 7279 (merge 58a69de6a5).
 merge_deep:
   chain_cap: 6
   # No warm spec pool here, so builds are git-only (8 builds, max 31 s).
@@ -1832,3 +1853,37 @@ fairness:
     medium: 1000000
     low: 1000000
     polish: 9999
+
+# SHADOW EVAL CONCURRENCY (Leo, 2026-11-01, task 8120; PRD plans/live-shadow-eval-prd.md
+# decision 7). Two cells at once. Only max_concurrent is set here: `enabled` stays at its
+# default (off) because enabling is gate 5393's ruling.
+# Why 2: a cell's verify waits on the same admission semaphore as production task
+# verifies. A cell's config is production's, derived by model_copy, under three override
+# layers: evals/profile.py::EVAL_PROFILE (pinned by
+# orchestrator/tests/test_eval_profile.py::test_apply_eval_profile_parity);
+# evals/runner.py::build_eval_orch_config's per-run update (project_root, models,
+# budgets, routing, verify commands, verify_env and more; NO test pins this layer); and
+# evals/shadow_invocation.py::build_shadow_orch_config's sandbox.enabled (pinned by
+# orchestrator/tests/test_eval_shadow_invocation.py::test_shadow_diverges_from_the_corpus_eval_profile_only_in_sandbox_enabled).
+# As of 2026-11-19 none of the three names an admission key, so verify_admission_enabled
+# and verify_admission_slots_dir are inherited unchanged and
+# verify_admission_gate.py::gate_for, keyed by the resolved slots dir, hands cells
+# production's gate. Cells therefore verify with role='task' on the same
+# AdmissionGate and flock as production (verify_admission_task_slots, above). With remote
+# task legs (6673) moving production's legs to leo-laptop, the workstation semaphore
+# frees more often, so it can absorb more verifies per completed task.
+# FINDING (read from code, 2026-11-19): shadow cell verifies are LOCAL-ONLY.
+# evals/shadow_invocation.py::SHADOW_PROFILE gives a shadow cell
+# verify.py::run_scoped_verification (role='task') as its task_verify. That is the
+# in-process local verify. task_verify_dispatch.py::TaskVerifyDispatcher (6670) is
+# constructed only in harness.py, so no cell reaches it and every cell verifies on the
+# workstation. Each extra cell lands entirely on the workstation's task slots, which
+# bears on how far to raise this. Do not raise above 2 without remote cell verifies.
+# No shadow runner is wired in production yet (shadow_eval.py::ShadowCoordinator is never
+# constructed in orchestrator/src), so this value has no runtime effect until one is.
+# verify_admission_task_slots is deliberately untouched by this task (value and history:
+# plans/verify-admission-task-slots-gate.md).
+# Rollback: one reload_config with max_concurrent back at 1 (or delete this block).
+# Green tier; apply with reload_config and read the shadow_eval.max_concurrent disposition.
+shadow_eval:
+  max_concurrent: 2

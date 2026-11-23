@@ -1,0 +1,41 @@
+import json,collections
+V=json.load(open('/tmp/gate-10069/forensics/verifies.json'))
+F=json.load(open('/tmp/gate-10069/forensics/fails.json'))
+AB=json.load(open('/tmp/gate-10069/forensics/test_abbrev.json'))
+ALIAS={'T12':'T0','T13':'T1'}
+def fset(v):
+    o=F.get(str(v['vid']))
+    if o is None: return None
+    if not o['files']: return None
+    return set(ALIAS.get(AB[t],AB[t]) for t in o['failed'])
+E=[json.loads(l) for l in open('/tmp/gate-10069/forensics/ev.jsonl')]
+print('main_health_red attempts:')
+for e in E:
+    if e['et']=='merge_attempt' and e['d'].get('outcome')=='main_health_red': print('  ',e['id'],e['ts'][5:19],e['task'])
+VV=[v for v in V if v['ts']>='2026-11-15T11:00']
+for T in ['T0','T2','T4','T6','T8','T9','T10','T11']:
+    inv=[v for v in VV if (not v['passed']) and fset(v) and T in fset(v)]
+    if not inv: continue
+    lo=min(v['ts'] for v in inv); hi=max(v['ts'] for v in inv)
+    win=[v for v in VV if lo<=v['ts']<=hi]
+    print('\n==',T,'window',lo[5:16],hi[5:16],'verifies in window',len(win),'failing T',len(inv),'passed',sum(v['passed'] for v in win),'red-other',sum((not v['passed']) and fset(v) is not None and T not in fset(v) for v in win),'red-nolog',sum((not v['passed']) and fset(v) is None for v in win))
+    # per task contingency
+    c=collections.defaultdict(lambda:[0,0,0])  # with&fail, with&notfail(known), 
+    for v in win:
+        fs=fset(v)
+        if v['passed']: st='nf'
+        elif fs is None: continue
+        else: st='f' if T in fs else 'nf'
+        for l in v['layers']:
+            if l.get('task') is None: continue
+            c[l['task']][0 if st=='f' else 1]+=1
+    nfail=len(inv)
+    rows=sorted(c.items(),key=lambda x:(-x[1][0],x[1][1]))
+    print('   task: with&failT / with&notfailT   (of %d failing trees)'%nfail)
+    for t,(a,b,_) in rows[:8]: print('    ',t,a,b)
+    # failing trees lacking the top candidate
+    top=rows[0][0]
+    lack=[v for v in inv if top not in [l.get('task') for l in v['layers']]]
+    print('   failing trees lacking',top,':',[(v['vid'],v['ts'][5:16],v['task'],'k%d'%v['k']) for v in lack][:12])
+    withnot=[v for v in win if top in [l.get('task') for l in v['layers']] and (v['passed'] or (fset(v) is not None and T not in fset(v)))]
+    print('   trees WITH',top,'not failing T:',[(v['vid'],v['ts'][5:16],v['task'],'k%d'%v['k'],'P' if v['passed'] else 'F') for v in withnot][:12])

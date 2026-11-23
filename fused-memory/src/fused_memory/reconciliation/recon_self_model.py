@@ -621,7 +621,7 @@ def render_cycle_summary_section() -> str:
         'reasons: (1) several Mem0 delete paths write no tombstone at all — '
         'most notably the MCP `delete_memory` tool itself (the path the '
         "recon stages' own flag-reaping instructions call), plus cascade "
-        'child deletes, the task_count_snapshot prune, the targeted-recon '
+        'child deletes, the targeted-recon '
         'completion-echo delete, the harness status-correction delete, and '
         'the scope-freshness snapshot pool cap; and (2) even a written '
         'tombstone expires after `mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS` '

@@ -37,6 +37,11 @@ from fused_memory.utils.validation import InputValidationError
 #: The group every derived-path test scans in, unless it needs a foreign one.
 GROUP = 'dark_factory'
 
+#: Spelled as escapes, mirroring tests/test_canonical_labels.py: U+212A renders
+#: as an ordinary 'K', so a literal-character fixture would be unreviewable.
+LATIN_SMALL_LETTER_LONG_S = '\u017f'
+KELVIN_SIGN = '\u212a'
+
 
 class TestReferentSourcesVocabulary:
     """``REFERENT_SOURCES`` is the CLOSED vocabulary of resolution sources.
@@ -1073,6 +1078,30 @@ class TestMalformedDeclarationIsRejectedLoudly:
                 declared=[{'kind': 'task', 'id': 3127}, {'id': 'oops'}],
                 metadata={'task_id': 3668},
                 content='Fixed the bug in Task 3127.',
+                group_id=GROUP,
+            )
+
+    @pytest.mark.parametrize(
+        'lookalike_project_id',
+        ['ta' + LATIN_SMALL_LETTER_LONG_S + 'k', 'tas' + KELVIN_SIGN],
+        ids=['long-s-spelling', 'kelvin-sign-spelling'],
+    )
+    def test_a_unicode_lookalike_of_the_task_vocabulary_is_rejected_loudly(
+        self, lookalike_project_id
+    ):
+        """The declared path never mints a foreign node for a Unicode
+        lookalike of task vocabulary. ``str.lower()`` does not fold the long
+        s, so the vocabulary guard would not recognise the long-s spelling,
+        and only ``validate_project_id``'s ASCII allowlist stops it.
+        ``str.lower()`` does fold the Kelvin sign, so the Kelvin spelling
+        passes the allowlist as ``'task'``, and the vocabulary guard stops
+        it. Pins the loud rejection, not which guard fires, so dropping
+        either guard fails here."""
+        with pytest.raises(InputValidationError):
+            resolve_referents(
+                declared=[{'kind': 'task', 'id': 2500, 'project_id': lookalike_project_id}],
+                metadata={},
+                content='',
                 group_id=GROUP,
             )
 

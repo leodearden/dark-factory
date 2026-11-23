@@ -1,0 +1,430 @@
+section	era	start	end	source
+era	48	2026-06-01T00:00:00+00:00	2026-09-14T09:57:12+00:00	start: before the first record; end: reify 3999a1a5f9 max_concurrent_tasks 48->24
+era	24_pre5205	2026-09-14T09:57:12+00:00	2026-10-04T17:26:07+00:00	end: DF #5205 per-role CPUWeight, 1624fdc7c7/eede4a0353 on DF main
+era	24_5205_gov_on	2026-10-04T17:26:07+00:00	2026-10-13T21:22:54+00:00	end: reify 5d76303d36 cpu_governance OFF
+era	24_5205_gov_off	2026-10-13T21:22:54+00:00	2026-11-02T18:24:47+00:00	end: reify f8cdbf46ff max_concurrent_tasks 16
+era	16_prepause	2026-11-02T18:24:47+00:00	2026-11-08T16:00:00+00:00	end: pause start, plans/cross-project-weights-study-2026-11-12/REPORT.md terms
+era	16_resumed	2026-11-14T13:55:09+00:00	2026-11-16T06:43:40+00:00	start: first reify merge_verify after the pause (derived); end: reify d2b6e4bc05 16->24
+era	24_flat_nov	2026-11-16T06:43:40+00:00	2026-11-19T00:23:57+00:00	end: DF 3a8f8019ea Merge task/3394 (verify scopes move to df.slice)
+era	24_slice	2026-11-19T00:23:57+00:00	2026-11-19T07:30:20+00:00	start: 3394 merge; scopes move at each orchestrator restart after it
+section	era	outcome	p50_min	p90_min	n
+latency	48	passed	37.0	65.3	1519
+latency	48	failed	11.7	43.1	449
+latency	48	all	32.1	62.4	1968
+latency	24_pre5205	passed	67.0	115.4	232
+latency	24_pre5205	failed	23.3	53.9	41
+latency	24_pre5205	all	62.7	111.9	273
+latency	24_5205_gov_on	passed	80.7	135.3	56
+latency	24_5205_gov_on	failed	0.4	20.0	2
+latency	24_5205_gov_on	all	80.1	131.0	58
+latency	24_5205_gov_off	passed	87.1	127.9	63
+latency	24_5205_gov_off	failed	39.9	48.1	22
+latency	24_5205_gov_off	all	81.5	124.2	85
+latency	16_prepause	passed	69.2	84.5	34
+latency	16_prepause	failed	46.9	64.6	5
+latency	16_prepause	all	66.8	83.2	39
+latency	16_resumed	passed	64.1	98.3	17
+latency	16_resumed	failed	-	-	0
+latency	16_resumed	all	64.1	98.3	17
+latency	24_flat_nov	passed	53.3	69.5	44
+latency	24_flat_nov	failed	48.7	62.9	5
+latency	24_flat_nov	all	50.8	67.3	49
+latency	24_slice	passed	54.1	88.2	2
+latency	24_slice	failed	71.0	71.0	1
+latency	24_slice	all	71.0	88.2	3
+window	48_last14d	passed	51.5	73.0	197
+window	48_last14d	failed	19.3	50.1	21
+window	48_last14d	all	50.5	71.0	218
+window	24_last14d_pre5205	passed	72.2	127.4	143
+window	24_last14d_pre5205	failed	26.0	54.9	23
+window	24_last14d_pre5205	all	69.8	121.7	166
+window	5205_to_1017_measurement	passed	80.7	131.0	59
+window	5205_to_1017_measurement	failed	20.0	41.9	4
+window	5205_to_1017_measurement	all	80.1	131.0	63
+window	last_7d	passed	54.7	79.5	63
+window	last_7d	failed	48.7	62.9	6
+window	last_7d	all	54.4	76.0	69
+section	era_or_window	p50_min	p90_min	n
+admission	48	-	-	0
+admission	24_pre5205	-	-	0
+admission	24_5205_gov_on	0.0	0.0	1
+admission	24_5205_gov_off	325.8	784.5	671
+admission	16_prepause	371.4	805.4	199
+admission	16_resumed	328.3	489.9	61
+admission	24_flat_nov	273.0	429.1	120
+admission	24_slice	198.0	363.3	12
+admission	48_last14d	-	-	0
+admission	24_last14d_pre5205	-	-	0
+admission	5205_to_1017_measurement	125.2	294.2	157
+admission	last_7d	286.4	447.8	198
+section	scope	era	start	wall_min	cpu_min	cores_while_running
+scope	df-verify-reify-4ae45bbd-d4b4f29e491d.scope	24_5205_gov_off	2026-10-28T05:07:38+00:00	80.0	373.4	4.67
+scope	df-verify-reify-4ae45bbd-d0be21e1044c.scope	24_5205_gov_off	2026-10-28T06:46:43+00:00	34.3	44.6	1.30
+scope	df-verify-reify-4ae45bbd-2a4b33c1dcc4.scope	24_5205_gov_off	2026-10-28T08:11:06+00:00	69.1	351.5	5.09
+scope	df-verify-reify-4ae45bbd-c7b440af43e5.scope	24_5205_gov_off	2026-10-28T10:44:24+00:00	112.5	364.1	3.24
+scope	df-verify-reify-4ae45bbd-25e58e997ec9.scope	24_5205_gov_off	2026-10-28T12:44:35+00:00	78.8	367.2	4.66
+scope	df-verify-reify-4ae45bbd-72694741221b.scope	24_5205_gov_off	2026-10-28T14:27:16+00:00	114.5	367.1	3.21
+scope	df-verify-reify-4ae45bbd-212cbd31dd08.scope	24_5205_gov_off	2026-10-28T16:32:07+00:00	75.3	358.3	4.75
+scope	df-verify-reify-4ae45bbd-784c5c195439.scope	24_5205_gov_off	2026-10-28T18:51:05+00:00	65.2	246.6	3.78
+scope	df-verify-reify-4ae45bbd-8ee07b5f80e4.scope	24_5205_gov_off	2026-10-28T20:29:24+00:00	95.0	373.5	3.93
+scope	df-verify-reify-4ae45bbd-c7e652984382.scope	24_5205_gov_off	2026-10-28T22:25:38+00:00	111.3	371.7	3.34
+scope	df-verify-reify-4ae45bbd-a4195c335482.scope	24_5205_gov_off	2026-10-29T01:55:22+00:00	78.8	353.2	4.48
+scope	df-verify-reify-4ae45bbd-0fb2b95af3fe.scope	24_5205_gov_off	2026-10-29T03:18:00+00:00	78.0	357.2	4.58
+scope	df-verify-reify-4ae45bbd-efb782fdd423.scope	24_5205_gov_off	2026-10-29T04:52:44+00:00	94.1	341.1	3.62
+scope	df-verify-reify-4ae45bbd-f9259acd0abb.scope	24_5205_gov_off	2026-10-29T06:39:47+00:00	72.4	361.3	4.99
+scope	df-verify-reify-4ae45bbd-f047803c20b9.scope	24_5205_gov_off	2026-10-29T09:46:12+00:00	140.6	395.8	2.81
+scope	df-verify-reify-4ae45bbd-f51a29762cc9.scope	24_5205_gov_off	2026-10-30T01:09:29+00:00	99.6	373.0	3.75
+scope	df-verify-reify-4ae45bbd-d83a83942a6c.scope	24_5205_gov_off	2026-10-30T06:45:44+00:00	66.7	360.1	5.39
+scope	df-verify-reify-4ae45bbd-dde8f9f4dd75.scope	24_5205_gov_off	2026-10-30T08:22:50+00:00	73.3	372.2	5.08
+scope	df-verify-reify-4ae45bbd-1690fe032ea1.scope	24_5205_gov_off	2026-10-30T09:39:23+00:00	72.7	364.9	5.02
+scope	df-verify-reify-4ae45bbd-336e5a95927f.scope	24_5205_gov_off	2026-10-30T11:36:04+00:00	89.4	373.1	4.17
+scope	df-verify-reify-4ae45bbd-242836308ee9.scope	24_5205_gov_off	2026-10-30T15:39:00+00:00	71.3	364.4	5.11
+scope	df-verify-reify-4ae45bbd-e06bbb5cfe9f.scope	24_5205_gov_off	2026-10-30T17:38:39+00:00	91.6	377.9	4.12
+scope	df-verify-reify-4ae45bbd-92fdc9c8fb77.scope	24_5205_gov_off	2026-10-31T00:46:51+00:00	67.2	365.4	5.44
+scope	df-verify-reify-4ae45bbd-ba6e2d675ee4.scope	24_5205_gov_off	2026-10-31T04:06:14+00:00	64.9	259.2	4.00
+scope	df-verify-reify-4ae45bbd-e7a1c7eb887d.scope	24_5205_gov_off	2026-10-31T12:05:53+00:00	85.7	376.4	4.39
+scope	df-verify-reify-4ae45bbd-4266b4e6894d.scope	24_5205_gov_off	2026-10-31T13:34:20+00:00	61.9	369.3	5.97
+scope	df-verify-reify-4ae45bbd-d48b74a9a2d6.scope	24_5205_gov_off	2026-10-31T15:00:11+00:00	84.9	380.4	4.48
+scope	df-verify-reify-4ae45bbd-3acb0450b679.scope	24_5205_gov_off	2026-10-31T16:31:47+00:00	57.7	367.6	6.37
+scope	df-verify-reify-4ae45bbd-14b383fdb7c8.scope	24_5205_gov_off	2026-10-31T17:40:59+00:00	42.4	255.8	6.04
+scope	df-verify-reify-4ae45bbd-357098882bed.scope	24_5205_gov_off	2026-10-31T19:00:16+00:00	71.8	271.7	3.79
+scope	df-verify-reify-4ae45bbd-766329463b52.scope	24_5205_gov_off	2026-10-31T23:23:09+00:00	76.5	367.9	4.81
+scope	df-verify-reify-4ae45bbd-568a39c603a1.scope	24_5205_gov_off	2026-11-01T01:04:49+00:00	33.6	59.1	1.76
+scope	df-verify-reify-4ae45bbd-e12382f7cb8d.scope	24_5205_gov_off	2026-11-01T03:05:50+00:00	82.2	370.1	4.50
+scope	df-verify-reify-4ae45bbd-c6fabf303adc.scope	24_5205_gov_off	2026-11-01T04:31:23+00:00	61.5	367.3	5.97
+scope	df-verify-reify-4ae45bbd-0296b2ea1af0.scope	24_5205_gov_off	2026-11-01T05:42:18+00:00	72.6	233.9	3.22
+scope	df-verify-reify-4ae45bbd-1a62d08d788d.scope	24_5205_gov_off	2026-11-01T07:24:08+00:00	10.6	5.3	0.50
+scope	df-verify-reify-4ae45bbd-dcbe018fffb0.scope	24_5205_gov_off	2026-11-01T19:13:33+00:00	113.1	378.3	3.35
+scope	df-verify-reify-4ae45bbd-a330f4ec40f8.scope	24_5205_gov_off	2026-11-02T04:19:45+00:00	110.5	391.3	3.54
+scope	df-verify-reify-4ae45bbd-f3b203091a56.scope	24_5205_gov_off	2026-11-02T07:21:23+00:00	37.2	112.1	3.01
+scope	df-verify-reify-4ae45bbd-748d22b7f519.scope	24_5205_gov_off	2026-11-02T08:52:44+00:00	35.4	112.7	3.18
+scope	df-verify-reify-4ae45bbd-f7eb7095f9e9.scope	24_5205_gov_off	2026-11-02T12:06:33+00:00	34.5	116.0	3.36
+scope	df-verify-reify-4ae45bbd-c002641f9a26.scope	24_5205_gov_off	2026-11-02T12:59:51+00:00	54.7	262.1	4.79
+scope	df-verify-reify-4ae45bbd-43bc1f708643.scope	16_prepause	2026-11-02T16:38:39+00:00	112.4	394.1	3.50
+scope	df-verify-reify-4ae45bbd-1d74414c1867.scope	16_prepause	2026-11-02T20:46:33+00:00	56.8	250.8	4.42
+scope	df-verify-reify-4ae45bbd-57c64af26558.scope	16_prepause	2026-11-02T22:04:05+00:00	61.2	288.4	4.71
+scope	df-verify-reify-4ae45bbd-673e73b53ce8.scope	16_prepause	2026-11-02T23:23:39+00:00	0.3	0.3	0.84
+scope	df-verify-reify-4ae45bbd-a85349b8bc65.scope	16_prepause	2026-11-02T23:27:31+00:00	73.2	378.8	5.18
+scope	df-verify-reify-4ae45bbd-737ce3b07158.scope	16_prepause	2026-11-03T00:49:32+00:00	76.6	375.7	4.90
+scope	df-verify-reify-4ae45bbd-39e2b6be942b.scope	16_prepause	2026-11-03T03:13:02+00:00	98.2	380.1	3.87
+scope	df-verify-reify-4ae45bbd-3aad6178b4e0.scope	16_prepause	2026-11-03T05:01:47+00:00	78.5	382.9	4.88
+scope	df-verify-reify-4ae45bbd-a3ea10868967.scope	16_prepause	2026-11-03T16:15:20+00:00	68.0	353.1	5.19
+scope	df-verify-reify-4ae45bbd-f47391f97bba.scope	16_prepause	2026-11-03T17:37:19+00:00	16.4	51.2	3.11
+scope	df-verify-reify-4ae45bbd-4f18a4a0c699.scope	16_prepause	2026-11-03T17:58:45+00:00	74.1	352.4	4.76
+scope	df-verify-reify-4ae45bbd-6e2b2395bcdd.scope	16_prepause	2026-11-03T19:29:42+00:00	52.7	242.8	4.61
+scope	df-verify-reify-4ae45bbd-f2fb71d581db.scope	16_prepause	2026-11-03T20:58:41+00:00	79.6	366.9	4.61
+scope	df-verify-reify-4ae45bbd-be7e421b3290.scope	16_prepause	2026-11-04T13:28:45+00:00	60.8	354.9	5.84
+scope	df-verify-reify-4ae45bbd-e69cb607d79a.scope	16_prepause	2026-11-04T14:41:21+00:00	72.7	366.4	5.04
+scope	df-verify-reify-4ae45bbd-548483138b90.scope	16_prepause	2026-11-04T16:34:11+00:00	66.5	360.8	5.42
+scope	df-verify-reify-4ae45bbd-6f4680d32827.scope	16_prepause	2026-11-04T17:54:07+00:00	65.2	368.6	5.65
+scope	df-verify-reify-4ae45bbd-996597f63cd5.scope	16_prepause	2026-11-04T19:20:59+00:00	90.6	370.3	4.09
+scope	df-verify-reify-4ae45bbd-bafcad68f3d6.scope	16_prepause	2026-11-04T22:14:03+00:00	33.4	106.0	3.18
+scope	df-verify-reify-4ae45bbd-f927c51f54fb.scope	16_prepause	2026-11-04T23:07:25+00:00	48.5	255.8	5.28
+scope	df-verify-reify-4ae45bbd-b9884f94e5e1.scope	16_prepause	2026-11-05T03:31:34+00:00	66.7	359.3	5.39
+scope	df-verify-reify-4ae45bbd-3ffe7faa420e.scope	16_prepause	2026-11-05T05:02:54+00:00	86.8	368.6	4.25
+scope	df-verify-reify-4ae45bbd-f6abb5cea3f8.scope	16_prepause	2026-11-05T06:33:35+00:00	56.8	356.9	6.28
+scope	df-verify-reify-4ae45bbd-9ec0c7c52b5d.scope	16_prepause	2026-11-05T10:48:30+00:00	43.1	137.6	3.19
+scope	df-verify-reify-4ae45bbd-9784e776e13a.scope	16_prepause	2026-11-05T13:50:35+00:00	75.1	360.2	4.80
+scope	df-verify-reify-4ae45bbd-807bec7c4d7c.scope	16_prepause	2026-11-05T15:27:52+00:00	85.3	373.0	4.37
+scope	df-verify-reify-4ae45bbd-35da69e82932.scope	16_prepause	2026-11-05T23:19:46+00:00	33.3	99.1	2.97
+scope	df-verify-reify-4ae45bbd-50a1f36b1ebe.scope	16_prepause	2026-11-06T00:02:33+00:00	8.5	50.0	5.85
+scope	df-verify-reify-4ae45bbd-3569822b1b5d.scope	16_prepause	2026-11-06T00:28:11+00:00	55.1	359.1	6.52
+scope	df-verify-reify-4ae45bbd-50a4f74139e1.scope	16_prepause	2026-11-06T02:52:40+00:00	28.8	61.9	2.15
+scope	df-verify-reify-4ae45bbd-0eff1c8e1572.scope	16_prepause	2026-11-06T03:26:25+00:00	54.8	358.0	6.53
+scope	df-verify-reify-4ae45bbd-3889c1213f68.scope	16_prepause	2026-11-06T05:11:41+00:00	17.0	51.2	3.01
+scope	df-verify-reify-4ae45bbd-5848a76c098c.scope	16_prepause	2026-11-06T05:32:56+00:00	20.2	51.4	2.55
+scope	df-verify-reify-4ae45bbd-4540bc08f3aa.scope	16_prepause	2026-11-06T05:56:22+00:00	49.1	254.2	5.18
+scope	df-verify-reify-4ae45bbd-241a9b959d0a.scope	16_prepause	2026-11-06T06:54:38+00:00	58.7	362.9	6.19
+scope	df-verify-reify-4ae45bbd-8c4a922983b1.scope	16_prepause	2026-11-06T08:27:25+00:00	63.6	360.8	5.67
+scope	df-verify-reify-4ae45bbd-e6e8b1abb39b.scope	16_prepause	2026-11-06T09:49:21+00:00	95.2	377.3	3.97
+scope	df-verify-reify-4ae45bbd-c914b6439c02.scope	16_prepause	2026-11-06T17:24:30+00:00	89.2	374.2	4.20
+scope	df-verify-reify-4ae45bbd-cd7eb7ee21a6.scope	16_prepause	2026-11-06T21:18:12+00:00	88.4	368.7	4.17
+scope	df-verify-reify-4ae45bbd-17448524dc93.scope	16_prepause	2026-11-07T02:37:13+00:00	98.9	370.8	3.75
+scope	df-verify-reify-4ae45bbd-713c194966ec.scope	16_prepause	2026-11-07T17:15:08+00:00	63.0	363.6	5.77
+scope	df-verify-reify-4ae45bbd-3acc64bed839.scope	16_prepause	2026-11-07T18:27:45+00:00	25.9	63.0	2.43
+scope	df-verify-reify-4ae45bbd-f462c49ed84d.scope	16_prepause	2026-11-07T19:01:15+00:00	86.7	382.9	4.42
+scope	df-verify-reify-4ae45bbd-4ec761292d05.scope	16_prepause	2026-11-07T20:35:10+00:00	32.2	65.9	2.04
+scope	df-verify-reify-4ae45bbd-55a9fcdf7488.scope	16_prepause	2026-11-07T22:04:28+00:00	84.9	269.0	3.17
+scope	df-verify-reify-4ae45bbd-9588902153fc.scope	16_prepause	2026-11-07T23:41:04+00:00	63.8	268.6	4.21
+scope	df-verify-reify-4ae45bbd-36017dbac7bb.scope	16_prepause	2026-11-08T01:48:21+00:00	71.3	378.9	5.31
+scope	df-verify-reify-4ae45bbd-424e0392df73.scope	16_prepause	2026-11-08T03:04:46+00:00	70.5	262.0	3.72
+scope	df-verify-reify-4ae45bbd-2758ce9a9af8.scope	16_prepause	2026-11-08T04:19:50+00:00	80.0	372.6	4.66
+scope	df-verify-reify-4ae45bbd-b509fd33fd39.scope	16_prepause	2026-11-08T05:53:34+00:00	72.3	377.6	5.22
+scope	df-verify-reify-4ae45bbd-aab84a8eae9d.scope	16_prepause	2026-11-08T07:14:13+00:00	60.7	266.1	4.38
+scope	df-verify-reify-4ae45bbd-c2cca609f369.scope	16_prepause	2026-11-08T08:37:46+00:00	76.3	374.8	4.91
+scope	df-verify-reify-4ae45bbd-5a343dafec62.scope	16_prepause	2026-11-08T10:06:17+00:00	66.1	371.9	5.62
+scope	df-verify-reify-4ae45bbd-a93b5543713b.scope	16_prepause	2026-11-08T11:33:03+00:00	72.0	373.5	5.18
+scope	df-verify-reify-4ae45bbd-8377d34b9612.scope	16_prepause	2026-11-08T14:03:00+00:00	87.4	375.9	4.30
+scope	df-verify-reify-4ae45bbd-a154db8d806b.scope	paused	2026-11-08T15:47:49+00:00	71.4	375.0	5.25
+scope	df-verify-reify-4ae45bbd-ff0156faa1c1.scope	paused	2026-11-08T17:21:09+00:00	85.2	271.7	3.19
+scope	df-verify-reify-4ae45bbd-e124c9c57d00.scope	paused	2026-11-08T19:01:33+00:00	84.9	364.4	4.29
+scope	df-verify-reify-4ae45bbd-56c282d830ae.scope	paused	2026-11-08T20:36:41+00:00	79.7	367.5	4.61
+scope	df-verify-reify-4ae45bbd-834141103bcd.scope	paused	2026-11-08T20:44:22+00:00	98.4	372.9	3.79
+scope	df-verify-reify-4ae45bbd-f82ed4c003b3.scope	paused	2026-11-08T22:14:07+00:00	43.3	261.8	6.05
+scope	df-verify-reify-4ae45bbd-42ca726e8dc5.scope	paused	2026-11-08T23:13:10+00:00	55.8	358.8	6.43
+scope	df-verify-reify-4ae45bbd-07f17d35ced7.scope	paused	2026-11-09T00:15:15+00:00	48.0	258.8	5.40
+scope	df-verify-reify-4ae45bbd-52d20c317ba4.scope	paused	2026-11-09T01:31:10+00:00	59.6	362.5	6.08
+scope	df-verify-reify-4ae45bbd-f647004eaa52.scope	paused	2026-11-09T03:19:30+00:00	52.7	363.6	6.90
+scope	df-verify-reify-4ae45bbd-3b9fd4efd5fa.scope	paused	2026-11-09T04:22:59+00:00	66.7	375.1	5.62
+scope	df-verify-reify-4ae45bbd-f4de09ca1bbb.scope	paused	2026-11-09T06:16:36+00:00	56.8	373.6	6.57
+scope	df-verify-reify-4ae45bbd-a4299793d702.scope	paused	2026-11-09T09:34:18+00:00	46.1	366.7	7.96
+scope	df-verify-reify-4ae45bbd-c08255091a73.scope	paused	2026-11-14T12:42:38+00:00	5.5	12.0	2.17
+scope	df-verify-reify-4ae45bbd-dd58a1428d9f.scope	paused	2026-11-14T12:58:17+00:00	56.9	378.5	6.66
+scope	df-verify-reify-4ae45bbd-cf5d4da9d52f.scope	16_resumed	2026-11-14T14:19:12+00:00	53.8	257.8	4.79
+scope	df-verify-reify-4ae45bbd-deb82aa57ccd.scope	16_resumed	2026-11-14T15:38:07+00:00	72.6	252.0	3.47
+scope	df-verify-reify-4ae45bbd-b578646ed5b8.scope	16_resumed	2026-11-14T19:30:35+00:00	64.1	252.5	3.94
+scope	df-verify-reify-4ae45bbd-52b448c4fc18.scope	16_resumed	2026-11-14T20:50:26+00:00	71.0	248.5	3.50
+scope	df-verify-reify-4ae45bbd-383af4d92f1b.scope	16_resumed	2026-11-14T23:11:43+00:00	67.3	251.0	3.73
+scope	df-verify-reify-4ae45bbd-5d7f11275859.scope	16_resumed	2026-11-15T00:55:33+00:00	97.5	355.3	3.64
+scope	df-verify-reify-4ae45bbd-70f9f9ef9cee.scope	16_resumed	2026-11-15T03:02:19+00:00	13.2	7.9	0.60
+scope	df-verify-reify-4ae45bbd-66b24734bc3f.scope	16_resumed	2026-11-15T03:20:38+00:00	72.6	349.3	4.81
+scope	df-verify-reify-4ae45bbd-d629c685b94b.scope	16_resumed	2026-11-15T05:26:43+00:00	142.0	339.2	2.39
+scope	df-verify-reify-4ae45bbd-78df558a0874.scope	16_resumed	2026-11-15T08:42:12+00:00	112.7	241.7	2.15
+scope	df-verify-reify-4ae45bbd-81655fafb953.scope	16_resumed	2026-11-15T13:28:45+00:00	48.0	247.1	5.15
+scope	df-verify-reify-4ae45bbd-ac5e8f0d2e58.scope	16_resumed	2026-11-15T14:50:50+00:00	60.4	250.0	4.14
+scope	df-verify-reify-4ae45bbd-ca24b7d1182a.scope	16_resumed	2026-11-15T16:06:30+00:00	71.0	255.5	3.60
+scope	df-verify-reify-4ae45bbd-4335b6192d25.scope	16_resumed	2026-11-15T18:47:54+00:00	44.5	353.6	7.94
+scope	df-verify-reify-4ae45bbd-43506f2a4d93.scope	16_resumed	2026-11-15T20:02:48+00:00	53.7	363.5	6.77
+scope	df-verify-reify-4ae45bbd-16c192ba32f3.scope	16_resumed	2026-11-15T21:03:30+00:00	59.8	359.4	6.01
+scope	df-verify-reify-4ae45bbd-5225f39fc62f.scope	16_resumed	2026-11-15T21:10:26+00:00	84.5	364.6	4.32
+scope	df-verify-reify-4ae45bbd-f47e683d6dad.scope	16_resumed	2026-11-15T22:19:17+00:00	84.3	364.8	4.33
+scope	df-verify-reify-4ae45bbd-a2c5537ae0ed.scope	16_resumed	2026-11-16T00:28:36+00:00	57.9	257.5	4.45
+scope	df-verify-reify-4ae45bbd-3ef3e83a63db.scope	16_resumed	2026-11-16T01:36:20+00:00	61.4	368.1	5.99
+scope	df-verify-reify-4ae45bbd-f5a916a68518.scope	16_resumed	2026-11-16T02:49:24+00:00	59.4	252.0	4.24
+scope	df-verify-reify-4ae45bbd-aab38e772b23.scope	16_resumed	2026-11-16T04:58:42+00:00	87.9	366.6	4.17
+scope	df-verify-reify-4ae45bbd-9ae40ef5d588.scope	24_flat_nov	2026-11-16T08:19:46+00:00	34.6	242.2	7.00
+scope	df-verify-reify-4ae45bbd-ed0049e408ed.scope	24_flat_nov	2026-11-16T09:20:21+00:00	51.7	346.4	6.70
+scope	df-verify-reify-4ae45bbd-b64e142ae277.scope	24_flat_nov	2026-11-16T10:15:45+00:00	55.4	339.3	6.12
+scope	df-verify-reify-4ae45bbd-35f84ba30d67.scope	24_flat_nov	2026-11-16T11:17:17+00:00	56.9	350.4	6.16
+scope	df-verify-reify-4ae45bbd-cf871346324a.scope	24_flat_nov	2026-11-16T12:20:08+00:00	47.2	338.8	7.19
+scope	df-verify-reify-4ae45bbd-4aaca1893f3b.scope	24_flat_nov	2026-11-16T13:14:33+00:00	45.9	337.8	7.35
+scope	df-verify-reify-4ae45bbd-cb1f007aaaa3.scope	24_flat_nov	2026-11-16T15:01:23+00:00	48.2	340.5	7.06
+scope	df-verify-reify-4ae45bbd-c98c233a1433.scope	24_flat_nov	2026-11-16T16:04:10+00:00	63.2	338.6	5.36
+scope	df-verify-reify-4ae45bbd-8f5926260e3f.scope	24_flat_nov	2026-11-16T17:14:59+00:00	50.5	340.0	6.73
+scope	df-verify-reify-4ae45bbd-6f82c0888c75.scope	24_flat_nov	2026-11-16T18:14:34+00:00	41.0	342.3	8.35
+scope	df-verify-reify-4ae45bbd-328091c61bd8.scope	24_flat_nov	2026-11-16T19:08:02+00:00	57.3	343.6	6.00
+scope	df-verify-reify-4ae45bbd-c8a41a326b02.scope	24_flat_nov	2026-11-16T20:13:33+00:00	40.5	239.2	5.91
+scope	df-verify-reify-4ae45bbd-68c41a1246e0.scope	24_flat_nov	2026-11-16T20:56:44+00:00	38.3	246.4	6.43
+scope	df-verify-reify-4ae45bbd-4beb8b5532c4.scope	24_flat_nov	2026-11-16T22:22:09+00:00	26.6	66.1	2.48
+scope	df-verify-reify-4ae45bbd-4ad27d54bc82.scope	24_flat_nov	2026-11-16T22:51:46+00:00	46.7	317.5	6.80
+scope	df-verify-reify-4ae45bbd-986b544f66f4.scope	24_flat_nov	2026-11-17T00:08:55+00:00	38.3	215.5	5.62
+scope	df-verify-reify-4ae45bbd-432068036fd4.scope	24_flat_nov	2026-11-17T00:50:50+00:00	35.9	224.9	6.27
+scope	df-verify-reify-4ae45bbd-70980bee2e19.scope	24_flat_nov	2026-11-17T02:15:36+00:00	18.8	44.1	2.34
+scope	df-verify-reify-4ae45bbd-37c5ff713282.scope	24_flat_nov	2026-11-17T02:38:01+00:00	37.9	220.1	5.81
+scope	df-verify-reify-4ae45bbd-dade5188ea30.scope	24_flat_nov	2026-11-17T03:37:33+00:00	30.3	215.4	7.11
+scope	df-verify-reify-4ae45bbd-693af233b22c.scope	24_flat_nov	2026-11-17T04:52:52+00:00	42.9	106.1	2.48
+scope	df-verify-reify-4ae45bbd-985421b06b25.scope	24_flat_nov	2026-11-17T05:40:08+00:00	66.8	324.2	4.85
+scope	df-verify-reify-4ae45bbd-b7d36e1a16ba.scope	24_flat_nov	2026-11-17T07:18:07+00:00	68.5	231.5	3.38
+scope	df-verify-reify-4ae45bbd-974e65cf5cf2.scope	24_flat_nov	2026-11-17T08:55:54+00:00	35.7	64.7	1.81
+scope	df-verify-reify-4ae45bbd-4ec3b7544f9f.scope	24_flat_nov	2026-11-17T09:46:47+00:00	52.6	227.5	4.32
+scope	df-verify-reify-4ae45bbd-7cfc9b6c9f80.scope	24_flat_nov	2026-11-17T10:43:56+00:00	47.1	230.1	4.89
+scope	df-verify-reify-4ae45bbd-a9acf22edcaa.scope	24_flat_nov	2026-11-17T13:59:08+00:00	49.8	274.8	5.52
+scope	df-verify-reify-4ae45bbd-c8b8f971f308.scope	24_flat_nov	2026-11-17T15:15:42+00:00	46.2	278.9	6.04
+scope	df-verify-reify-4ae45bbd-68651cc3bfe1.scope	24_flat_nov	2026-11-17T16:09:40+00:00	38.0	251.2	6.60
+scope	df-verify-reify-4ae45bbd-2a62b5572215.scope	24_flat_nov	2026-11-17T16:52:35+00:00	38.1	272.4	7.16
+scope	df-verify-reify-4ae45bbd-bceedaeccef9.scope	24_flat_nov	2026-11-17T17:34:25+00:00	21.9	124.6	5.68
+scope	df-verify-reify-4ae45bbd-c0a0752d4b2d.scope	24_flat_nov	2026-11-17T17:59:51+00:00	44.3	325.3	7.35
+scope	df-verify-reify-4ae45bbd-56e25dbfbe05.scope	24_flat_nov	2026-11-17T19:10:59+00:00	39.2	315.7	8.06
+scope	df-verify-reify-4ae45bbd-e1b4ab27694b.scope	24_flat_nov	2026-11-17T20:38:13+00:00	78.2	333.0	4.26
+scope	df-verify-reify-4ae45bbd-961c385b330f.scope	24_flat_nov	2026-11-17T22:01:19+00:00	59.3	228.8	3.86
+scope	df-verify-reify-4ae45bbd-7724698d4b56.scope	24_flat_nov	2026-11-17T23:06:32+00:00	53.3	230.5	4.32
+scope	df-verify-reify-4ae45bbd-0f4e2bdf6d49.scope	24_flat_nov	2026-11-18T00:06:34+00:00	65.4	322.7	4.93
+scope	df-verify-reify-4ae45bbd-198d836a28af.scope	24_flat_nov	2026-11-18T01:41:59+00:00	45.5	221.6	4.87
+scope	df-verify-reify-4ae45bbd-f6eee7a0904f.scope	24_flat_nov	2026-11-18T02:31:21+00:00	43.9	226.4	5.16
+scope	df-verify-reify-4ae45bbd-1fa523927dfe.scope	24_flat_nov	2026-11-18T03:18:17+00:00	41.3	227.4	5.51
+scope	df-verify-reify-4ae45bbd-089f9708ad96.scope	24_flat_nov	2026-11-18T04:04:37+00:00	37.5	314.5	8.38
+scope	df-verify-reify-4ae45bbd-26c39f1bbe34.scope	24_flat_nov	2026-11-18T04:46:12+00:00	37.6	216.6	5.75
+scope	df-verify-reify-4ae45bbd-3d71ad6da70d.scope	24_flat_nov	2026-11-18T05:35:09+00:00	63.7	314.8	4.94
+scope	df-verify-reify-4ae45bbd-57184f9d4bd5.scope	24_flat_nov	2026-11-18T06:41:10+00:00	42.3	314.3	7.43
+scope	df-verify-reify-4ae45bbd-d4b9d9882b6e.scope	24_flat_nov	2026-11-18T07:38:07+00:00	53.5	330.0	6.17
+scope	df-verify-reify-4ae45bbd-29e65f3e26cf.scope	24_flat_nov	2026-11-18T09:18:38+00:00	38.4	221.0	5.75
+scope	df-verify-reify-4ae45bbd-489db875d7e4.scope	24_flat_nov	2026-11-18T10:00:29+00:00	58.1	325.3	5.60
+scope	df-verify-reify-4ae45bbd-6b17bace4bb9.scope	24_flat_nov	2026-11-18T11:53:24+00:00	76.8	329.0	4.28
+scope	df-verify-reify-4ae45bbd-4afcda5af3b1.scope	24_flat_nov	2026-11-18T13:14:55+00:00	45.5	319.7	7.02
+scope	df-verify-reify-4ae45bbd-936396c52a3a.scope	24_flat_nov	2026-11-18T14:03:29+00:00	20.8	65.6	3.15
+scope	df-verify-reify-4ae45bbd-5d69bb58f133.scope	24_flat_nov	2026-11-18T14:29:04+00:00	50.4	323.7	6.42
+scope	df-verify-reify-4ae45bbd-4994abb62ac1.scope	24_flat_nov	2026-11-18T15:24:07+00:00	44.3	233.9	5.28
+scope	df-verify-reify-4ae45bbd-275268e201ee.scope	24_flat_nov	2026-11-18T16:15:23+00:00	50.6	323.5	6.40
+scope	df-verify-reify-4ae45bbd-3bf5b96a15a8.scope	24_flat_nov	2026-11-18T17:10:32+00:00	53.9	322.6	5.98
+scope	df-verify-reify-4ae45bbd-5a97336bddef.scope	24_flat_nov	2026-11-18T19:10:50+00:00	54.4	64.5	1.19
+scope	df-verify-reify-4ae45bbd-71bbeca7b107.scope	24_flat_nov	2026-11-18T20:09:09+00:00	64.7	228.1	3.52
+scope	df-verify-reify-4ae45bbd-938685929371.scope	24_flat_nov	2026-11-18T21:40:00+00:00	70.7	324.7	4.59
+scope	df-verify-reify-4ae45bbd-0e5524f9690b.scope	24_flat_nov	2026-11-18T23:01:33+00:00	58.8	230.3	3.92
+scope	df-verify-reify-4ae45bbd-22d6f86ac055.scope	24_slice	2026-11-19T01:05:12+00:00	82.4	344.6	4.18
+scope	df-verify-reify-4ae45bbd-1c1f7ba9ada0.scope	24_slice	2026-11-19T02:33:04+00:00	50.8	237.0	4.67
+scope	df-verify-reify-4ae45bbd-77ba3d03bf0d.scope	24_slice	2026-11-19T04:01:11+00:00	81.6	340.2	4.17
+scope	df-verify-reify-4ae45bbd-7174fb584fb7.scope	24_slice	2026-11-19T05:40:12+00:00	6.9	4.3	0.62
+scope	df-verify-reify-4ae45bbd-4b7a78268fac.scope	24_slice	2026-11-19T05:53:21+00:00	67.9	65.6	0.97
+section	era	n	wall_min_p50	cores_while_running_p50	cores_while_running_p90
+scope_era	24_5205_gov_off	42	73.0	4.28	5.44
+scope_era	16_prepause	55	66.5	4.61	5.84
+scope_era	paused	15	56.9	5.62	6.90
+scope_era	16_resumed	22	65.7	4.21	6.01
+scope_era	24_flat_nov	58	46.5	5.75	7.19
+scope_era	24_slice	5	67.9	4.17	4.67
+section	merge_end	era	passed	wall_min	merge_scopes	paired_lint	ambiguous_lint	merge_cpu_min	mean_cores	overlaps_other_local_merge	runqueue_median	runqueue_samples
+merge	2026-10-28T06:27:42+00:00	24_5205_gov_off	True	87.1	1	1	2	390.7	4.49	False	3.66	1021
+merge	2026-10-28T12:36:53+00:00	24_5205_gov_off	True	124.2	1	1	2	381.6	3.07	False	3.41	1451
+merge	2026-10-28T14:04:02+00:00	24_5205_gov_off	True	82.7	1	1	3	376.7	4.55	False	3.84	974
+merge	2026-10-28T17:47:31+00:00	24_5205_gov_off	True	84.3	1	0	2	358.3	4.25	False	3.09	997
+merge	2026-10-28T19:56:20+00:00	24_5205_gov_off	True	68.7	1	1	1	254.9	3.71	False	3.25	803
+merge	2026-10-28T22:04:30+00:00	24_5205_gov_off	True	119.7	1	1	1	397.0	3.32	False	2.75	1402
+merge	2026-10-29T00:16:57+00:00	24_5205_gov_off	True	129.2	1	1	2	394.8	3.05	False	3.56	1499
+merge	2026-10-29T03:14:28+00:00	24_5205_gov_off	True	81.9	1	1	2	362.2	4.42	False	2.97	961
+merge	2026-10-29T04:36:04+00:00	24_5205_gov_off	True	81.5	1	1	1	366.0	4.49	False	3.62	960
+merge	2026-10-29T06:26:53+00:00	24_5205_gov_off	True	99.4	1	1	2	350.6	3.53	False	3.94	1156
+merge	2026-10-29T07:52:14+00:00	24_5205_gov_off	True	77.2	1	1	1	371.1	4.81	False	3.08	902
+merge	2026-10-30T02:49:14+00:00	24_5205_gov_off	True	105.0	1	0	4	373.0	3.55	False	3.28	1230
+merge	2026-10-30T07:52:29+00:00	24_5205_gov_off	True	70.9	1	1	2	370.2	5.22	False	3.16	835
+merge	2026-10-30T09:36:07+00:00	24_5205_gov_off	True	76.5	1	1	1	381.1	4.98	False	2.84	894
+merge	2026-10-30T10:52:05+00:00	24_5205_gov_off	True	75.9	1	1	1	373.1	4.92	False	3.56	892
+merge	2026-10-30T16:50:20+00:00	24_5205_gov_off	True	74.8	1	1	2	373.2	4.99	False	3.62	879
+merge	2026-10-31T01:54:03+00:00	24_5205_gov_off	True	71.1	1	1	1	374.4	5.26	False	3.20	838
+merge	2026-10-31T13:31:39+00:00	24_5205_gov_off	True	89.1	1	0	2	376.4	4.22	False	3.50	1051
+merge	2026-10-31T14:36:15+00:00	24_5205_gov_off	True	64.5	1	1	2	378.1	5.86	False	2.97	763
+merge	2026-10-31T16:25:17+00:00	24_5205_gov_off	False	92.5	1	0	4	380.4	4.11	False	2.56	1079
+merge	2026-10-31T17:29:29+00:00	24_5205_gov_off	True	61.4	1	1	2	377.9	6.15	False	3.22	723
+merge	2026-10-31T18:23:43+00:00	24_5205_gov_off	True	45.9	1	1	3	265.0	5.77	False	3.16	537
+merge	2026-11-01T00:39:40+00:00	24_5205_gov_off	True	79.6	1	1	3	376.9	4.73	False	3.02	934
+merge	2026-11-01T01:38:27+00:00	24_5205_gov_off	False	36.9	1	1	1	67.5	1.83	False	1.62	431
+merge	2026-11-01T04:28:03+00:00	24_5205_gov_off	True	84.7	1	1	1	378.6	4.47	False	3.00	998
+merge	2026-11-01T05:32:55+00:00	24_5205_gov_off	True	64.7	1	1	1	375.2	5.80	False	2.92	762
+merge	2026-11-01T06:54:54+00:00	24_5205_gov_off	True	80.3	1	1	1	243.9	3.04	False	4.03	936
+merge	2026-11-01T21:06:38+00:00	24_5205_gov_off	True	135.5	1	1	2	400.6	2.96	False	2.56	1536
+merge	2026-11-02T07:58:36+00:00	24_5205_gov_off	False	41.0	1	1	1	121.0	2.95	False	3.89	472
+merge	2026-11-02T09:28:11+00:00	24_5205_gov_off	False	39.0	1	1	1	121.3	3.11	False	4.11	452
+merge	2026-11-02T12:41:04+00:00	24_5205_gov_off	False	38.2	1	1	1	125.7	3.29	False	3.72	450
+merge	2026-11-02T13:54:34+00:00	24_5205_gov_off	True	57.7	1	1	1	271.3	4.70	False	3.00	661
+merge	2026-11-02T21:43:21+00:00	16_prepause	False	64.0	1	1	1	260.0	4.07	False	3.75	727
+merge	2026-11-02T23:05:20+00:00	16_prepause	False	64.6	1	1	1	297.0	4.60	False	5.05	738
+merge	2026-11-03T00:40:46+00:00	16_prepause	True	76.2	2	1	1	387.9	5.09	False	3.78	865
+merge	2026-11-03T02:06:11+00:00	16_prepause	True	81.8	1	1	1	384.6	4.70	False	3.75	935
+merge	2026-11-03T06:20:19+00:00	16_prepause	True	82.4	1	1	0	391.8	4.75	False	2.94	946
+merge	2026-11-03T17:23:21+00:00	16_prepause	True	70.8	1	1	2	360.4	5.09	False	3.91	809
+merge	2026-11-03T19:12:49+00:00	16_prepause	True	78.1	1	1	1	361.0	4.62	False	3.94	907
+merge	2026-11-03T20:22:24+00:00	16_prepause	True	55.9	1	1	1	251.4	4.49	False	3.81	650
+merge	2026-11-04T14:29:31+00:00	16_prepause	True	63.0	1	1	2	363.2	5.76	False	3.08	736
+merge	2026-11-04T15:54:06+00:00	16_prepause	True	75.2	1	1	2	375.6	4.99	False	3.66	850
+merge	2026-11-04T17:40:43+00:00	16_prepause	True	69.9	1	1	2	369.2	5.28	False	3.53	803
+merge	2026-11-04T18:59:19+00:00	16_prepause	True	69.0	1	1	1	378.2	5.48	False	3.22	797
+merge	2026-11-04T22:47:26+00:00	16_prepause	False	36.9	1	1	1	114.3	3.10	False	3.41	425
+merge	2026-11-04T23:55:55+00:00	16_prepause	True	51.6	1	1	2	264.6	5.12	False	3.19	607
+merge	2026-11-05T04:38:14+00:00	16_prepause	True	69.6	1	1	1	368.0	5.29	False	2.94	801
+merge	2026-11-05T07:30:22+00:00	16_prepause	True	59.5	1	1	1	365.0	6.13	False	3.28	687
+merge	2026-11-05T11:31:40+00:00	16_prepause	False	46.9	1	1	2	145.6	3.10	False	2.88	547
+merge	2026-11-05T15:05:41+00:00	16_prepause	True	83.2	1	1	2	370.9	4.46	False	3.19	965
+merge	2026-11-05T23:53:07+00:00	16_prepause	False	36.1	1	1	2	107.0	2.96	False	2.31	413
+merge	2026-11-06T01:23:18+00:00	16_prepause	True	58.4	1	1	1	367.6	6.30	False	2.88	670
+merge	2026-11-06T04:21:18+00:00	16_prepause	True	57.4	1	1	0	366.3	6.38	False	3.34	655
+merge	2026-11-06T06:45:27+00:00	16_prepause	True	51.4	1	1	1	262.2	5.10	False	3.09	591
+merge	2026-11-06T07:53:19+00:00	16_prepause	True	61.1	1	1	2	370.4	6.06	False	3.50	700
+merge	2026-11-06T09:31:02+00:00	16_prepause	True	66.7	1	1	2	369.5	5.54	False	3.72	750
+merge	2026-11-06T19:29:53+00:00	16_prepause	True	16.0	0	0	1	0.0	0.00	False	2.28	182
+merge	2026-11-06T22:46:35+00:00	16_prepause	True	103.5	1	1	3	384.5	3.72	False	2.88	1201
+merge	2026-11-07T06:43:02+00:00	16_prepause	True	26.7	0	0	1	0.0	0.00	False	1.84	305
+merge	2026-11-07T18:18:20+00:00	16_prepause	True	65.6	1	1	0	371.4	5.67	False	3.28	762
+merge	2026-11-07T20:28:00+00:00	16_prepause	True	90.3	1	1	3	392.1	4.34	False	4.09	1049
+merge	2026-11-08T00:44:54+00:00	16_prepause	True	66.8	1	1	1	277.3	4.15	False	3.78	749
+merge	2026-11-08T02:59:40+00:00	16_prepause	True	75.5	1	1	2	387.4	5.13	False	4.06	863
+merge	2026-11-08T04:15:19+00:00	16_prepause	True	73.9	1	1	1	270.7	3.66	False	3.72	847
+merge	2026-11-08T05:39:53+00:00	16_prepause	True	84.5	1	1	2	382.1	4.52	False	3.62	979
+merge	2026-11-08T07:05:53+00:00	16_prepause	True	74.3	1	1	1	385.8	5.19	False	3.72	865
+merge	2026-11-08T08:14:57+00:00	16_prepause	True	63.0	1	1	3	274.5	4.36	False	3.53	737
+merge	2026-11-08T08:29:27+00:00	16_prepause	True	2.3	0	0	1	0.0	0.00	False	2.03	27
+merge	2026-11-08T09:54:06+00:00	16_prepause	True	80.3	1	1	1	384.3	4.78	False	3.78	929
+merge	2026-11-08T11:12:26+00:00	16_prepause	True	69.2	1	1	2	380.7	5.50	False	3.72	803
+merge	2026-11-08T15:30:23+00:00	16_prepause	True	90.4	1	1	3	384.5	4.25	False	4.41	1047
+merge	2026-11-08T16:59:17+00:00	paused	True	74.5	1	1	3	383.6	5.15	False	3.09	867
+merge	2026-11-08T20:26:30+00:00	paused	True	98.2	1	1	3	381.9	3.89	False	3.00	1144
+merge	2026-11-08T21:56:24+00:00	paused	True	82.6	1	1	2	375.8	4.55	True	4.16	956
+merge	2026-11-08T22:22:48+00:00	paused	True	116.2	2	3	3	772.9	6.65	True	3.91	1348
+merge	2026-11-08T22:57:26+00:00	paused	True	46.2	1	1	1	270.3	5.85	True	2.86	536
+merge	2026-11-09T00:08:57+00:00	paused	True	59.2	1	1	0	367.9	6.21	False	2.72	688
+merge	2026-11-09T01:03:15+00:00	paused	True	49.9	1	1	1	267.3	5.36	False	2.88	573
+merge	2026-11-09T02:30:48+00:00	paused	True	61.7	1	1	1	371.0	6.02	False	2.83	716
+merge	2026-11-09T04:12:10+00:00	paused	True	55.4	1	1	1	372.2	6.72	False	3.16	646
+merge	2026-11-09T05:29:44+00:00	paused	True	70.9	1	1	1	384.9	5.43	False	3.25	828
+merge	2026-11-09T07:13:27+00:00	paused	True	59.3	1	1	1	382.5	6.45	False	2.84	699
+merge	2026-11-09T10:20:22+00:00	paused	True	47.6	1	1	0	374.6	7.87	False	1.88	546
+merge	2026-11-14T13:55:09+00:00	16_resumed	True	59.2	1	1	0	387.3	6.54	False	3.12	698
+merge	2026-11-14T15:13:01+00:00	16_resumed	True	57.4	1	1	1	265.2	4.62	False	2.50	673
+merge	2026-11-14T20:34:42+00:00	16_resumed	True	79.5	1	1	1	268.9	3.38	False	3.12	932
+merge	2026-11-15T00:19:03+00:00	16_resumed	True	85.8	1	1	2	267.2	3.12	False	3.02	994
+merge	2026-11-15T02:33:04+00:00	16_resumed	True	118.3	1	1	3	371.9	3.14	False	3.11	1382
+merge	2026-11-15T04:33:17+00:00	16_resumed	True	76.0	1	1	1	358.8	4.72	False	2.72	896
+merge	2026-11-15T10:34:52+00:00	16_resumed	True	166.0	1	1	3	257.0	1.55	False	1.75	1939
+merge	2026-11-15T14:16:47+00:00	16_resumed	True	51.2	1	1	1	256.2	5.00	False	2.12	601
+merge	2026-11-15T15:51:14+00:00	16_resumed	True	64.3	1	1	1	258.3	4.01	False	2.84	749
+merge	2026-11-15T19:32:26+00:00	16_resumed	True	47.3	1	1	3	362.4	7.65	False	1.91	558
+merge	2026-11-15T20:56:29+00:00	16_resumed	True	55.7	1	1	3	371.8	6.67	False	2.62	658
+merge	2026-11-15T22:03:16+00:00	16_resumed	True	64.1	1	1	0	367.7	5.74	True	3.22	736
+merge	2026-11-15T22:34:55+00:00	16_resumed	True	98.3	2	3	1	766.1	7.80	True	3.25	1133
+merge	2026-11-16T01:26:31+00:00	16_resumed	True	60.9	1	1	2	266.9	4.38	False	3.09	703
+merge	2026-11-16T02:37:47+00:00	16_resumed	True	63.8	1	1	2	377.6	5.92	False	3.00	744
+merge	2026-11-16T03:48:48+00:00	16_resumed	True	69.2	1	1	2	260.9	3.77	False	3.09	807
+merge	2026-11-16T03:55:02+00:00	16_resumed	True	4.0	0	0	1	0.0	0.00	False	4.30	48
+merge	2026-11-16T08:54:24+00:00	24_flat_nov	True	37.4	1	1	1	250.6	6.70	False	2.72	427
+merge	2026-11-16T10:12:05+00:00	24_flat_nov	True	54.7	1	1	2	354.4	6.48	False	2.75	624
+merge	2026-11-16T11:11:11+00:00	24_flat_nov	True	57.9	1	1	2	347.3	6.00	False	2.78	657
+merge	2026-11-16T12:14:10+00:00	24_flat_nov	True	59.5	1	1	1	359.5	6.04	False	3.03	675
+merge	2026-11-16T13:07:17+00:00	24_flat_nov	True	50.0	1	1	2	347.8	6.95	False	3.09	571
+merge	2026-11-16T14:00:30+00:00	24_flat_nov	True	50.8	1	1	1	346.3	6.82	False	2.38	581
+merge	2026-11-16T15:49:38+00:00	24_flat_nov	True	53.3	1	1	2	349.6	6.56	False	2.69	604
+merge	2026-11-16T18:05:32+00:00	24_flat_nov	True	54.0	1	1	3	349.8	6.48	False	2.39	616
+merge	2026-11-16T18:55:34+00:00	24_flat_nov	True	43.7	1	1	4	350.7	8.02	False	2.06	496
+merge	2026-11-16T19:01:59+00:00	24_flat_nov	True	5.0	0	0	1	0.0	0.00	False	1.70	58
+merge	2026-11-16T20:05:19+00:00	24_flat_nov	True	60.4	1	1	2	353.1	5.85	False	3.06	689
+merge	2026-11-16T20:54:04+00:00	24_flat_nov	True	43.9	1	1	5	248.2	5.65	False	2.38	500
+merge	2026-11-16T21:35:05+00:00	24_flat_nov	True	40.0	1	1	1	254.3	6.36	False	2.59	457
+merge	2026-11-16T23:38:29+00:00	24_flat_nov	True	48.9	1	1	1	326.2	6.67	False	2.44	535
+merge	2026-11-17T01:26:42+00:00	24_flat_nov	True	38.6	1	1	1	234.1	6.06	False	2.19	429
+merge	2026-11-17T03:15:54+00:00	24_flat_nov	True	40.1	1	1	1	228.5	5.70	False	2.56	455
+merge	2026-11-17T04:07:50+00:00	24_flat_nov	True	32.4	1	1	0	223.8	6.91	False	2.12	369
+merge	2026-11-17T06:46:56+00:00	24_flat_nov	True	69.5	1	1	3	333.2	4.80	False	3.44	789
+merge	2026-11-17T08:26:37+00:00	24_flat_nov	True	71.9	1	1	3	240.3	3.34	False	3.19	822
+merge	2026-11-17T09:31:39+00:00	24_flat_nov	False	38.3	1	1	1	73.4	1.91	False	2.97	439
+merge	2026-11-17T10:39:26+00:00	24_flat_nov	True	56.4	1	1	3	236.6	4.19	False	2.91	643
+merge	2026-11-17T11:31:03+00:00	24_flat_nov	True	50.3	1	1	2	238.7	4.74	False	2.84	576
+merge	2026-11-17T14:48:56+00:00	24_flat_nov	False	52.9	1	1	2	283.0	5.35	False	2.62	605
+merge	2026-11-17T16:01:57+00:00	24_flat_nov	False	48.7	1	1	2	286.7	5.89	False	2.56	557
+merge	2026-11-17T17:30:41+00:00	24_flat_nov	False	41.3	1	1	2	279.9	6.78	False	2.00	473
+merge	2026-11-17T18:44:06+00:00	24_flat_nov	True	46.4	1	1	1	332.9	7.18	False	2.12	528
+merge	2026-11-17T19:50:11+00:00	24_flat_nov	True	40.8	1	1	1	323.6	7.93	False	2.44	462
+merge	2026-11-17T21:56:23+00:00	24_flat_nov	True	84.6	1	1	2	340.9	4.03	False	2.94	961
+merge	2026-11-17T23:00:40+00:00	24_flat_nov	True	63.1	1	1	2	239.1	3.79	False	2.59	721
+merge	2026-11-17T23:59:53+00:00	24_flat_nov	True	56.3	1	1	3	239.2	4.25	False	2.25	649
+merge	2026-11-18T01:12:00+00:00	24_flat_nov	True	71.1	1	1	3	330.9	4.65	False	2.28	801
+merge	2026-11-18T02:27:30+00:00	24_flat_nov	True	54.4	1	1	1	230.1	4.23	False	2.25	621
+merge	2026-11-18T03:15:12+00:00	24_flat_nov	True	46.1	1	1	1	233.9	5.07	False	2.66	523
+merge	2026-11-18T03:59:34+00:00	24_flat_nov	True	43.8	1	1	2	235.8	5.39	False	2.47	499
+merge	2026-11-18T04:42:08+00:00	24_flat_nov	True	40.2	1	1	2	323.4	8.04	False	2.16	455
+merge	2026-11-18T05:23:51+00:00	24_flat_nov	True	40.6	1	1	1	225.4	5.56	False	1.78	463
+merge	2026-11-18T07:23:28+00:00	24_flat_nov	True	43.8	1	1	1	321.1	7.32	False	2.31	496
+merge	2026-11-18T08:31:36+00:00	24_flat_nov	True	56.3	1	1	1	339.4	6.03	False	2.91	644
+merge	2026-11-18T09:57:04+00:00	24_flat_nov	True	40.7	1	1	2	229.0	5.62	False	1.97	465
+merge	2026-11-18T10:58:33+00:00	24_flat_nov	True	60.7	1	1	0	333.6	5.49	False	2.36	696
+merge	2026-11-18T14:00:26+00:00	24_flat_nov	True	48.2	1	1	2	328.9	6.82	False	2.12	552
+merge	2026-11-18T15:19:31+00:00	24_flat_nov	True	54.3	1	1	3	332.8	6.13	False	2.25	616
+merge	2026-11-18T16:08:24+00:00	24_flat_nov	True	47.2	1	1	2	242.1	5.13	False	2.78	539
+merge	2026-11-18T17:05:57+00:00	24_flat_nov	True	54.1	1	1	2	333.6	6.17	False	2.78	614
+merge	2026-11-18T18:04:27+00:00	24_flat_nov	True	56.7	1	1	2	331.0	5.83	False	2.75	650
+merge	2026-11-18T20:05:13+00:00	24_flat_nov	False	62.9	1	1	2	73.1	1.16	False	2.88	720
+merge	2026-11-18T21:13:55+00:00	24_flat_nov	True	67.3	1	1	2	236.7	3.52	False	2.47	766
+merge	2026-11-18T22:50:41+00:00	24_flat_nov	True	73.9	1	1	2	333.3	4.51	False	2.56	849
+merge	2026-11-19T00:00:23+00:00	24_flat_nov	True	62.1	1	1	2	239.7	3.86	False	2.73	712
+merge	2026-11-19T03:23:49+00:00	24_slice	True	54.1	1	1	3	247.1	4.57	False	3.09	615
+merge	2026-11-19T05:22:50+00:00	24_slice	True	88.2	1	1	2	349.3	3.96	False	3.34	985
+merge	2026-11-19T07:00:41+00:00	24_slice	False	71.0	1	1	2	75.0	1.06	False	2.19	816
+section	era	merges_with_a_merge_scope	mean_cores_mean	mean_cores_p50	runqueue_median_p50	merge_cpu_min_p50	wall_min_p50
+merge_era	24_5205_gov_off	32	4.24	4.45	3.21	373.2	78.4
+merge_era	16_prepause	36	4.83	4.89	3.58	368.6	69.1
+merge_era	paused	12	5.85	5.93	2.94	375.2	60.5
+merge_era	16_resumed	16	4.88	4.67	3.01	313.8	64.2
+merge_era	24_flat_nov	48	5.58	5.84	2.56	303.9	51.8
+merge_era	24_slice	3	3.20	3.96	3.09	247.1	71.0
+section	runqueue_bucket	merges	mean_cores_p50	mean_cores_mean
+merge_rq	[0,2)	6	5.59	5.01
+merge_rq	[2,3)	65	5.49	5.28
+merge_rq	[3,4)	69	4.78	4.82
+merge_rq	[4,inf)	7	4.34	4.15
+note	journal retention starts 2026-10-28T03:07:29+00:00; TOL_S=120.0; PAIR_S=2.0; load-samples.db read immutable (WAL frames not yet checkpointed are unseen); era boundaries are commit times, i.e. the earliest a change could take effect, not the restart that applied it

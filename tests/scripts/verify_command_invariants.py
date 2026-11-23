@@ -10,7 +10,8 @@ in a second hand-written copy for exactly the reason the five command-parsing
 copies below did, and the same rule applies to both. Everything in the WHY IT
 EXISTS and IMPORT ME sections is written about the command helpers, but is meant
 about this module. Since task 5769 it also holds :func:`marked_body`, the
-slug-keyed form of that extraction.
+slug-keyed form of that extraction, and since task 6883
+:func:`marked_bullet_command`, its labelled-bullet command form.
 
 WHY IT EXISTS. A trio of command-parsing helpers — pick the ``&&`` segment that
 invokes the checker, extract that checker's positional targets, decide whether a
@@ -619,6 +620,10 @@ def marked_span(
 _AFTER_THE_OPENING_COMMENT = re.compile(r"\A.*?-->(.*)\Z", re.DOTALL)
 
 
+def _slug_markers(slug: str) -> tuple[str, str]:
+    return f"<!-- {slug}:begin", f"<!-- {slug}:end -->"
+
+
 def marked_body(text: str, *, slug: str, source: str, label: str, task: str) -> str:
     """The body of the ``<!-- {slug}:begin ... -->`` / ``<!-- {slug}:end -->`` span.
 
@@ -629,13 +634,37 @@ def marked_body(text: str, *, slug: str, source: str, label: str, task: str) -> 
     non-blank assertion. The body is returned verbatim: comment and whitespace
     policy belong to the caller.
     """
+    begin, end = _slug_markers(slug)
     return marked_span(
         text,
-        begin=f"<!-- {slug}:begin",
-        end=f"<!-- {slug}:end -->",
+        begin=begin,
+        end=end,
         pattern=_AFTER_THE_OPENING_COMMENT,
         what="body after the closed opening-marker comment",
         source=source,
         label=label,
         task=task,
     )
+
+
+def marked_bullet_command(
+    text: str, *, slug: str, bullet_label: str, source: str, task: str
+) -> str:
+    """The inline-code command on the ``- **{bullet_label}**:`` bullet in *slug*'s span.
+
+    Keyed on the label, not on backticks, so inline code in the opener comment
+    is never extracted. Every malformed span raises through :func:`marked_span`.
+    Unlike it, the command is returned stripped: every caller executes or
+    tokenises it.
+    """
+    begin, end = _slug_markers(slug)
+    return marked_span(
+        text,
+        begin=begin,
+        end=end,
+        pattern=re.compile(r"- \*\*" + re.escape(bullet_label) + r"\*\*: `([^`]+)`"),
+        what=f"`- **{bullet_label}**: <command>` bullet",
+        source=source,
+        label=f"the {bullet_label!r} command",
+        task=task,
+    ).strip()

@@ -81,7 +81,13 @@ from shared.mcp_markup_middleware import (
 from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY, detect, repair
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp, plan_tools
+from orchestrator.mcp import (
+    markup_journal,
+    markup_sink,
+    plan_markup_repair,
+    plan_markup_stamp,
+    plan_tools,
+)
 from orchestrator.workflow import _is_gating_escalation
 
 # ---------------------------------------------------------------------------
@@ -138,14 +144,14 @@ QUOTED_DECISION = (
 
 @pytest.fixture(autouse=True)
 def _clear_reported_refusals():
-    """Clear ``_REPORTED_REFUSALS`` around every test in this module.
+    """Forget every reported refusal around each test in this module.
 
     It is PROCESS-global memo state owned by the read-time path, so a refusal
     reported by one test would otherwise be suppressed in the next.
     """
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair.forget_reported_refusals()
     yield
-    plan_tools._REPORTED_REFUSALS.clear()
+    plan_markup_repair.forget_reported_refusals()
 
 
 @pytest.fixture(autouse=True)
@@ -1143,7 +1149,7 @@ class TestUnrepairableResidueIsPreserved:
         ``detect_for(value, param, schema_params)`` triple the scan asks, so
         the three sites agree BY CONSTRUCTION rather than coinciding. Here
         ``repair`` returned ``None``, so there is no ``Repair`` to read one off
-        at all and the guard publishes what ``_first_markup_argument``
+        at all and the guard publishes what ``_markup_arguments``
         actually matched on. Asserting
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
@@ -1152,7 +1158,7 @@ class TestUnrepairableResidueIsPreserved:
         The expectation is SPELLED, not computed by calling ``detect_for``
         here. An expectation derived from the predicate under test moves with
         it, so it can only ever catch a disagreement between
-        ``_first_markup_argument`` and ``detect_for`` — never a change to what
+        ``_markup_arguments`` and ``detect_for`` — never a change to what
         ``detect_for`` MEANS. Measured on this corpus specimen: the self-name
         closer sits at offset 459 and the blanket ``detect``'s answer at 471,
         so the widened value is the HEAD of the leak and the blanket one
@@ -1350,7 +1356,7 @@ class TestUnrepairableResidueIsPreserved:
         ``detect_for(value, param, schema_params)`` triple the scan asks, so
         the three sites agree BY CONSTRUCTION rather than coinciding. Here
         ``repair`` returned ``None``, so there is no ``Repair`` to read one off
-        at all and the guard publishes what ``_first_markup_argument``
+        at all and the guard publishes what ``_markup_arguments``
         actually matched on. Asserting
         the blanket ``detect`` here would name a literal that merely TRAILS
         the leak (PRD 2.2) and would disagree with the fact for the same
@@ -1359,7 +1365,7 @@ class TestUnrepairableResidueIsPreserved:
         The expectation is SPELLED, not computed by calling ``detect_for``
         here. An expectation derived from the predicate under test moves with
         it, so it can only ever catch a disagreement between
-        ``_first_markup_argument`` and ``detect_for`` — never a change to what
+        ``_markup_arguments`` and ``detect_for`` — never a change to what
         ``detect_for`` MEANS. Measured on this corpus specimen: the self-name
         closer sits at offset 459 and the blanket ``detect``'s answer at 471,
         so the widened value is the HEAD of the leak and the blanket one
@@ -1932,7 +1938,7 @@ class TestWhereTheRecordLands:
         this branch would silently file every record under the CWD.
         """
         monkeypatch.setattr(
-            plan_tools.subprocess, 'run',
+            subprocess, 'run',
             lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout='  \n', stderr=''),
         )
 

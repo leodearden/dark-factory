@@ -27,7 +27,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import census as mod
 import pytest
 from legibility import (
     account_pool,
@@ -38,9 +37,9 @@ from legibility import (
     session_runner,
     synthesis,
 )
+from legibility import census as mod
+from legibility import config as config_mod
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
-
-import config as config_mod
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 

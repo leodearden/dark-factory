@@ -65,8 +65,10 @@ from _lock_chip_matrix import (
 )
 from shared.task_statuses import TaskStatus
 
+from dashboard.asset_build import ASSET_BUILD_ON_DISK_HEADER, ASSET_BUILD_STARTED_HEADER
 from dashboard.data.burndown import aggregate_forecast_confidence
 from dashboard.data.census import SERIES_KEYS
+from dashboard.data.label_spans import labels_from_spans
 from dashboard.data.prd_view import LANE_DISPLAY_ORDER, Lane
 
 _JS_DIR = Path(__file__).parent / 'js'
@@ -220,8 +222,11 @@ def test_sketch_6_the_sampler_persists_the_census_the_route_serves(served_bodies
     burndown = served_bodies['burndown_at_t']
     assert census['state'] == 'fresh', census
 
-    for block in (burndown['BURNDOWN'], burndown['BURNDOWN_BY_PROJECT']['dark-factory']):
-        assert datetime.fromisoformat(block['labels'][-1]) == datetime.fromisoformat(census['as_of'])
+    aggregate = burndown['BURNDOWN']
+    project = burndown['BURNDOWN_BY_PROJECT']['dark-factory']
+    project_labels = labels_from_spans(project['label_spans'], aggregate['labels'])
+    for block, labels in ((aggregate, aggregate['labels']), (project, project_labels)):
+        assert datetime.fromisoformat(labels[-1]) == datetime.fromisoformat(census['as_of'])
         for member, column in SERIES_KEYS.items():
             assert block[column][-1] == census['value']['counts'][member.value], (
                 f'{column}: one datum, two homes, at one instant'
@@ -590,3 +595,13 @@ def test_quality_a_root_holding_neither_snapshot_home_serves_no_snapshot_yet(ser
 
     assert (snapshots['state'], snapshots['value']) == ('unknown', None), snapshots
     assert snapshots['reason'].startswith('no snapshot yet'), snapshots['reason']
+
+
+def test_asset_build_the_served_headers_are_the_identities_the_app_holds(served_bodies):
+    served = served_bodies['asset_build_served']
+    headers = {name.lower(): value for name, value in served['headers'].items()}
+    expected = served['expected']
+
+    assert expected['started'] and expected['onDisk'], expected
+    assert headers[ASSET_BUILD_STARTED_HEADER.lower()] == expected['started']
+    assert headers[ASSET_BUILD_ON_DISK_HEADER.lower()] == expected['onDisk']

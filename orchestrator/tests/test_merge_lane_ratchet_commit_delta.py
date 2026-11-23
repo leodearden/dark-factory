@@ -39,7 +39,7 @@ def _violation_fields(violation: ratchet.Violation) -> tuple[str, str, int, int]
 
     Asserting on the tuple rather than on ``message`` is what keeps these
     tests about the COMPARISON: the wording lives in ``Violation.rose`` and is
-    pinned by ``test_merge_lane_ratchet.py::TestViolationShape``, so
+    pinned by ``test_merge_lane_ratchet_write_gate.py::TestCheckAgainstBaseline``, so
     re-deriving it here would be a second copy that drifts.
     """
     return (

@@ -42,13 +42,14 @@ if TYPE_CHECKING:
     from orchestrator.git_ops import GitOps, WorktreeKind
 
 from shared.asyncio_tasks import gather_unwound
+from shared.cgroup_slice import project_slice_name
 from shared.proc_group import terminate_process_group
 from shared.psi import cpu_some10_or_none, read_psi_sample
 from shared.python_env import without_python_env_selection
 from shared.secret_env import without_account_pool
 from shared.verify_admission import acquire_task_slot, is_gated_role, nice_prefix
 
-from orchestrator import verify_evidence, verify_plan
+from orchestrator import verify_evidence, verify_fallback_floor, verify_plan
 from orchestrator.cargo_scope import discover_workspace_crates, files_to_crates
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 
@@ -1973,8 +1974,7 @@ def seed_main_baseline(
     *ids* is the whole tree's failing set at *main_sha*; ``frozenset()``
     means every module is green there. Called from the PASS path of a
     merge+full gate run (merge_sha IS the merged tree that is about to
-    CAS-advance to become the next main tip — see merge_queue.py's
-    ``_run_post_merge_verify``), so in steady state
+    CAS-advance to become the next main tip — see merge_lane/post_merge_verify.py::run_post_merge_verify), so in steady state
     ``main_baseline_failing_ids`` below is a cache hit for as long as that
     SHA is main's tip and never pays for a probe (B2); and from that
     function's own whole-tree cold-start probe.
@@ -4020,21 +4020,6 @@ def _apply_cargo_scope(
     )
 
 
-# Source-file extensions that warrant running verify at all. Markdown / YAML /
-# TOML / JSON diffs are inert: every existing scoping branch
-# (scope_module_config filters .py, _build_fallback_config filters .py,
-# _apply_cargo_scope filters .rs) would no-op on them anyway, so the
-# previous global-pytest fall-through was the only path that actually fired
-# — and it was unsafe (see plans/fix-all-root-causes-humble-dream.md R1/R2).
-_SOURCE_EXTENSIONS: frozenset[str] = frozenset({'.py', '.rs'})
-
-
-def _has_source_files(task_files: list[str]) -> bool:
-    """Return True when *task_files* contains at least one .py or .rs path."""
-    exts = tuple(_SOURCE_EXTENSIONS)
-    return any(f.endswith(exts) for f in task_files)
-
-
 def _trivial_pass(reason: str) -> 'VerifyResult':
     """Build a VerifyResult that represents 'verify trivially passed'.
 
@@ -4102,6 +4087,49 @@ def _merge_no_evidence_fail(reason: str) -> 'VerifyResult':
         trivial=False,
         units=(),
     )
+
+
+def _no_tests_ran_fail(passed_result: 'VerifyResult', py_files: list[str]) -> 'VerifyResult':
+    category = verify_fallback_floor.NO_TESTS_RAN_CATEGORY
+    declared = ', '.join(py_files) or '(none)'
+    return replace(
+        passed_result,
+        passed=False,
+        trivial=False,
+        failing_leg_categories=None,
+        category=category,
+        summary=f"No tests ran for the task's declared .py files ({declared}).",
+        cause_hint=(
+            f"{category}: the fallback verify derived no test from the task's declared "
+            f'files ({declared}). Add or modify a test covering the change and declare '
+            "it in the task's files (report_missing_plan_file)."
+        ),
+    )
+
+
+def _no_tests_ran_verdict(
+    result: 'VerifyResult',
+    executed_fallback: ModuleConfig,
+    config: OrchestratorConfig,
+    files: list[str],
+) -> 'VerifyResult':
+    if not (result.passed and verify_fallback_floor.fallback_ran_no_tests(
+        executed_fallback.test_command, config.test_command,
+    )):
+        return result
+    py_files = [f for f in files if f.endswith('.py')]
+    if config.verify_allow_no_tests_ran:
+        logger.warning(
+            'Fallback verify ran no tests for %s; passing because '
+            'verify_allow_no_tests_ran is set',
+            py_files,
+        )
+        return result
+    logger.warning(
+        'Fallback verify ran no tests for %s; failing as %s',
+        py_files, verify_fallback_floor.NO_TESTS_RAN_CATEGORY,
+    )
+    return _no_tests_ran_fail(result, py_files)
 
 
 async def _verify_pipeline_guard_requires_full_gate(
@@ -4391,6 +4419,10 @@ def _build_fallback_config(
     used as-is when it differs from the bare ``pytest`` default so that
     complex flag sequences like ``-m 'not slow' --ignore=tests/e2e`` are not
     mangled by :func:`_scope_to_keyword`'s prefix-then-parse approach.
+    Where no test target is derivable here, the caller's fallback test floor
+    (``orchestrator/src/orchestrator/verify_fallback_floor.py::apply_fallback_test_floor``)
+    may replace the returned ``test_command`` with the configured one whole;
+    see docs/fallback-test-floor.md.
 
     *content_cache*, when given, is threaded into the structural-file content
     read (see :func:`_worktree_reader`) so a file already read through the
@@ -6000,6 +6032,7 @@ class _ScopeKw(TypedDict, total=False):
 
     use_cgroup_scope: bool
     scope_tag: str
+    slice_name: str
     cpu_weight: int
     memory_properties: tuple[str, ...]
 
@@ -6155,16 +6188,21 @@ def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: fl
 
 def _scope_launch_argv(
     scope_unit: str,
+    slice_name: str | None,
     cpu_weight: int | None,
     memory_properties: tuple[str, ...] = (),
 ) -> list[str]:
-    """The systemd-run prefix for a verify scope; CPUWeight is the between-cgroup
+    """The systemd-run prefix for a verify scope. *slice_name* is the project's
+    parent cgroup (contract: docs/cgroup-slice-topology.md; None leaves the
+    scope in the user manager's default slice); CPUWeight is the between-cgroup
     share (nice only orders threads inside the scope), and *memory_properties*
     are the scope's memory limits (an empty tuple adds none)."""
     argv = [
         'systemd-run', '--user', '--scope', '--quiet', '--collect',
         f'--unit={scope_unit}',
     ]
+    if slice_name is not None:
+        argv.append(f'--slice={slice_name}')
     if cpu_weight is not None:
         argv += ['-p', f'CPUWeight={cpu_weight}']
     for prop in memory_properties:
@@ -6249,6 +6287,7 @@ async def _run_cmd(
     *,
     use_cgroup_scope: bool = False,
     scope_tag: str = '',
+    slice_name: str | None = None,
     cpu_weight: int | None = None,
     memory_properties: tuple[str, ...] = (),
     clock_stop: ClockStopConfig | None = None,
@@ -6276,7 +6315,8 @@ async def _run_cmd(
     flag is off or ``systemd-run`` is missing, so the default behaviour and the
     existing test suite are unchanged. When *cpu_weight* is not None the scope
     is created with ``-p CPUWeight=<cpu_weight>``; None omits the property
-    (systemd default). Each *memory_properties* entry is added as
+    (systemd default). ``--slice=<slice_name>`` places the scope under the
+    project slice, and None omits it. Each *memory_properties* entry is added as
     ``-p <entry>``; the default ``()`` adds none.
 
     When *log_path* is provided, subprocess output is streamed (read in 4 KiB
@@ -6376,7 +6416,7 @@ async def _run_cmd(
             handshake = ScopeLaunchHandshake()
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    *_scope_launch_argv(scope_unit, cpu_weight, memory_properties),
+                    *_scope_launch_argv(scope_unit, slice_name, cpu_weight, memory_properties),
                     '/bin/bash', '-c', handshake.payload(cmd),
                     cwd=str(cwd),
                     stdout=asyncio.subprocess.PIPE,
@@ -7837,6 +7877,7 @@ async def run_verification(
                 {
                     'use_cgroup_scope': True,
                     'scope_tag': _scope_tag_for(config.project_root),
+                    'slice_name': project_slice_name(config.fused_memory.project_id),
                     'cpu_weight': _resolve_scope_cpu_weight(config, role),
                     'memory_properties': config.verify_cgroup_memory.systemd_properties(),
                 }
@@ -9038,8 +9079,9 @@ def _executed_fallback_plan(
     over from the decision unchanged: they answer WHY a tool slot was scoped
     a given way, not WHERE/HOW it actually ran.
 
-    *pytest_reason* is the ONE exception, and it exists because the fallback
-    branch's WHY genuinely changed at the execution layer (task 3513). When
+    *pytest_reason* is the ONE exception: it carries an execution-layer
+    rewrite of the pytest slot (marker widening, task 3513; fallback test
+    floor, task 8714), where the fallback branch's WHY genuinely changed. When
     ``verify_plan.widen_fallback_for_marker_deselection`` proves the decision's
     file-scoped pytest run would collect zero items, the call site drops the
     file targets from the ModuleConfig that is about to EXECUTE; passing that
@@ -9120,9 +9162,12 @@ def _safe_derive_executed_fallback_plan(
     the idealized flat ``'__fallback__'`` decision alone.
     *fallback_pytest_reason* rides along on that same path (and only that
     path — it is meaningless without an *executed_fallback* to reconcile
-    against): it is ``widen_fallback_for_marker_deselection``'s reason, which
-    :func:`_executed_fallback_plan` needs in order to record a marker-deselection
-    widening the executed config already applied. A bug in the
+    against): it is ``widen_fallback_for_marker_deselection``'s or the fallback
+    test floor's reason, which :func:`_executed_fallback_plan` needs in order to
+    record a pytest-slot rewrite the executed config already applied. With an
+    *executed_fallback* the decision is derived before its test floor, so the
+    executed record takes its floor from the execution layer alone; without one
+    the floored decision is returned. A bug in the
     decision layer or this reconciliation — an unforeseen ``VerifyCmd``/
     dataclass edge — must never fail an otherwise-passing verify attempt
     just because its plan couldn't be built. Catches broadly and logs a
@@ -9132,6 +9177,7 @@ def _safe_derive_executed_fallback_plan(
     try:
         plan = verify_plan.derive_verify_plan(
             existing_files, module_configs, config, worktree_reader, role=role,
+            fallback_test_floor=executed_fallback is None,
         )
         if executed_fallback is not None:
             plan = _executed_fallback_plan(
@@ -9437,7 +9483,7 @@ async def _run_scoped_verification_body(
             # _executed_module_configs_from_plan bridge the module_configs-
             # branch merge+full expansion above uses (PRD Resolved decision
             # 2: the broad gate must be per-module parseable commands, never
-            # the opaque chain). breadth=='scoped' (the shipped default)
+            # the opaque chain). breadth=='scoped' (the explicit per-project opt-down)
             # falls through to the legacy single global call below,
             # byte-identical (R4 rollback golden). This is the
             # merge_verify_workspace=True routing
@@ -9528,6 +9574,26 @@ async def _run_scoped_verification_body(
                 role=role,
                 admission_request=plan_request(admission_plan, None),
             )
+        # Filter to files that still exist — tasks may delete files as part of
+        # their work. The artifact widening and both planner sites below read
+        # this one on-disk set.
+        existing_files = [f for f in task_files or () if (worktree / f).exists()]
+        if task_files:
+            # Task 5296: a touched behavioural artifact (a skills/ script, an
+            # agent-prompt SKILL.md, the root yaml) runs the registered
+            # modules whose tests consume it, even when the task owns none.
+            # Idempotent: the remote task leg already receives the widened
+            # set from task_verify_dispatch.py::TaskVerifyDispatcher._scope_of.
+            widened_modules = verify_plan.with_artifact_consumer_modules(
+                config, module_configs, existing_files, role,
+            )
+            added = [mc.prefix for mc in widened_modules[len(module_configs):]]
+            if added:
+                logger.info(
+                    'Verification scope: adding %d behavioural-artifact consumer module(s): %s',
+                    len(added), ', '.join(added),
+                )
+            module_configs = widened_modules
         if module_configs:
             # λ (task 2589, R1): the broad merge gate. role=='merge' +
             # merge_verify_breadth=='full' expands module_configs from the
@@ -9569,8 +9635,6 @@ async def _run_scoped_verification_body(
                 )
             # Apply file-level scoping within each subproject when task_files given
             if task_files:
-                # Filter to files that still exist — tasks may delete files as part of their work
-                existing_files = [f for f in task_files if (worktree / f).exists()]
                 # Shared structural-content cache (task γ amendment): threaded
                 # into derive_verify_plan's worktree_reader below, so a
                 # touched file is read from disk at most once per attempt
@@ -9601,7 +9665,8 @@ async def _run_scoped_verification_body(
                     )
                 if not scoped:
                     # No subproject has matching files. Two sub-cases:
-                    #   (a) Diff has no .py/.rs at all (docs, YAML, JSON …) —
+                    #   (a) nothing in the diff needs verifying
+                    #       (verify_plan.is_trivial_diff) —
                     #       every existing scope branch would no-op anyway; the
                     #       previous global-pytest fall-through was unsafe in
                     #       this layout. Trivially pass — UNLESS the merge-role
@@ -9612,7 +9677,7 @@ async def _run_scoped_verification_body(
                     #       (e.g. root-level conftest.py + skills/*.md). Fan
                     #       out per-subproject so each runs in its own venv
                     #       with its own pyproject options.
-                    if not _has_source_files(existing_files):
+                    if verify_plan.is_trivial_diff(existing_files, module_configs, role):
                         if role == 'merge' and is_merge_verify:
                             # INV-1 (task 2883): the ADOPTABLE merge verdict must
                             # never trivially pass a no-evidence resolution. Any
@@ -9790,12 +9855,10 @@ async def _run_scoped_verification_body(
 
         # No module_configs — try fallback or global
         if task_files:
-            # Filter to files that still exist — tasks may delete files as part of their work
-            existing_files = [f for f in task_files if (worktree / f).exists()]
             # Mirror the same docs-only short-circuit as the module_configs
             # branch: with no .py/.rs files _build_fallback_config would
             # return None and we'd fall through to the unsafe global pytest.
-            if not _has_source_files(existing_files):
+            if verify_plan.is_trivial_diff(existing_files, module_configs, role):
                 if role == 'merge' and is_merge_verify:
                     # INV-1 (task 2883): the ADOPTABLE merge verdict must never
                     # trivially pass a no-evidence resolution. Escalate to the
@@ -9877,6 +9940,14 @@ async def _run_scoped_verification_body(
             # is left unwired pending a follow-up that updates the test double.
             fallback = _build_fallback_config(existing_files, config, worktree=worktree)
             if fallback is not None:
+                fallback, floor_reason = verify_fallback_floor.apply_fallback_test_floor(
+                    fallback, existing_files, config.test_command, role,
+                )
+                if floor_reason is not None:
+                    logger.info(
+                        'Fallback test floor: %s — running %r',
+                        floor_reason, fallback.test_command,
+                    )
                 fallback = _apply_cargo_scope(
                     fallback, existing_files, worktree, scope_cargo_enabled,
                 )
@@ -9889,19 +9960,20 @@ async def _run_scoped_verification_body(
                 # rescoped result — so the command's own shape decides. One
                 # reader serves both this probe and the plan derivation below.
                 fallback_reader = _worktree_reader(worktree)
-                fallback, fallback_pytest_reason = (
+                fallback, widen_reason = (
                     verify_plan.widen_fallback_for_marker_deselection(
                         fallback, fallback_reader,
                     )
                 )
-                if fallback_pytest_reason is not None:
+                if widen_reason is not None:
                     # Loud over silent: this is DEGRADATION (the widened run
                     # applies the same addopts, so the trigger files stay
                     # deselected and unrun), not a free coverage upgrade.
                     logger.warning(
                         'Fallback pytest widened to %r — %s',
-                        fallback.test_command, fallback_pytest_reason,
+                        fallback.test_command, widen_reason,
                     )
+                fallback_pytest_reason = widen_reason if widen_reason is not None else floor_reason
                 logger.info('Verification mode: fallback-scoped (%d files)', len(existing_files))
                 # Plan-authoritative execution (task κ,
                 # verify-scope-inversion-prd.md): derive_verify_plan's
@@ -9968,7 +10040,7 @@ async def _run_scoped_verification_body(
                     ),
                 )
                 fallback_result.plan = plan_dict
-                return fallback_result
+                return _no_tests_ran_verdict(fallback_result, fallback, config, existing_files)
 
             # For Rust projects with no module_configs and no Python fallback
             # (Reify's layout), try to scope the global commands.
@@ -10171,6 +10243,8 @@ async def verify_failure_is_preexisting_on_main(
         ``(False, '')`` (fail-safe) for any of:
           - Main probe passes (break is task-own).
           - Different signature (break is task-own or different inherited break).
+          - A ``no_tests_ran`` failure: a property of the diff's fallback
+            scoping, never of main, so it is never probed (task 7041).
           - ``git_ops.get_main_sha()`` fails or returns empty.
           - ``git worktree add --detach`` fails after retries.
           - Any unexpected exception during probing.
@@ -10238,6 +10312,8 @@ async def verify_failure_is_preexisting_on_main(
             return (hint or '').strip().lower()
 
     try:
+        if failing_result.category == verify_fallback_floor.NO_TESTS_RAN_CATEGORY:
+            return False, ''
         # Resolve the current main SHA.
         try:
             main_sha: str = await git_ops.get_main_sha()  # type: ignore[union-attr]

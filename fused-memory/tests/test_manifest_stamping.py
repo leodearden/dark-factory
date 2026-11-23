@@ -487,7 +487,7 @@ async def test_external_producer_label_is_reported_and_its_siblings_still_stamp(
 
 
 @pytest.mark.asyncio
-async def test_sidecar_missing_on_disk_returns_none(tmp_path):
+async def test_sidecar_missing_on_disk_is_reported_not_found(tmp_path):
     """prd_path/prd_task_label are present but the derived sidecar file doesn't exist."""
     task_interceptor = AsyncMock()
     ids = ['1']
@@ -508,7 +508,16 @@ async def test_sidecar_missing_on_disk_returns_none(tmp_path):
         task_interceptor=task_interceptor,
     )
 
-    assert result is None
+    assert result == {
+        'path': None,
+        'stamped': [],
+        'missing_labels': [],
+        'errors': [],
+        'sidecar_not_found': {
+            'root': str(tmp_path.resolve()),
+            'paths': ['plans/foo-prd.capability-manifest.yaml'],
+        },
+    }
     task_interceptor.update_task.assert_not_called()
 
 
@@ -732,7 +741,7 @@ async def test_concurrent_stamps_of_one_sidecar_both_land(tmp_path, monkeypatch)
 @pytest.mark.asyncio
 @pytest.mark.parametrize('traversal_style', ['relative_dotdot', 'absolute'])
 async def test_containment_refuses_traversal_prd_path(tmp_path, caplog, traversal_style):
-    """A derived sidecar path that resolves outside project_root must be
+    """A derived sidecar path that resolves outside the sidecar root must be
     refused by the containment guard — both a relative '../' escape and an
     absolute prd_path reach the guard (via different pathlib routes) and
     must both be blocked. With no safe candidate surviving, the call
@@ -786,7 +795,7 @@ async def test_containment_refuses_traversal_prd_path(tmp_path, caplog, traversa
         f'{[r.getMessage() for r in warning_records]}'
     )
     message = warning_records[0].getMessage()
-    assert 'resolve outside project_root' in message
+    assert f'resolve outside the sidecar root {project_root.resolve()}' in message
     assert 'evil-prd.capability-manifest.yaml' in message
 
 
@@ -838,7 +847,7 @@ async def test_containment_refusal_is_reported_when_a_safe_sidecar_also_exists(t
 
     assert len(report['errors']) == 1
     error_entry = report['errors'][0]
-    assert 'resolved outside project_root, refused' in error_entry
+    assert f'resolved outside the sidecar root {project_root.resolve()}, refused' in error_entry
     assert '../outside/evil-prd.capability-manifest.yaml' in error_entry
 
     # The escaping file was never read or written back...

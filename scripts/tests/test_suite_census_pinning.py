@@ -165,12 +165,12 @@ LEDGER = "_x = 1\nNOTE = 'a ledger line records one sighting per confusion'\n"
 BARE_TEST = '''\
 from unittest.mock import patch
 
-import ledger
 import lms_ctl
+import lms_ledger
 
 
 def test_bare_string_patch():
-    with patch('ledger._x'):
+    with patch('lms_ledger._x'):
         pass
 
 
@@ -280,9 +280,10 @@ class TestCensus:
 
 
 class TestFirstPartyIsTheDomain:
-    def test_a_legibility_attribute_patched_through_both_names_is_one_target(self, scripts):
+    def test_a_legibility_attribute_is_first_party_only_through_its_package_name(self, scripts):
         assert scripts.distinct_private_targets == frozenset({'legibility.ledger._x', 'tool._y'})
-        assert scripts.tests_with_private_patch == 4
+        # The bare 'ledger._x' patch names no first-party module.
+        assert scripts.tests_with_private_patch == 3
 
     def test_a_member_namespace_package_without_init_is_first_party(self, pkgb):
         assert pkgb.distinct_private_targets == frozenset({'nsb.state._s'})
@@ -309,7 +310,7 @@ def bare_scripts(tmp_path_factory: pytest.TempPathFactory) -> pinning.PackageRow
     root = git_tree(tmp_path_factory.mktemp('bare'), {
         'pyproject.toml': '[tool.uv.workspace]\nmembers = ["pkga"]\n',
         'pkga/src/pkga/__init__.py': '',
-        'scripts/legibility/ledger.py': LEDGER,
+        'scripts/local-model-serving/lms_ledger.py': LEDGER,
         'scripts/local-model-serving/lms_ctl.py': '_c = 1\n',
         'scripts/tests/test_bare.py': BARE_TEST,
     })
@@ -323,7 +324,7 @@ class TestExtraImportRoots:
         assert bare_scripts.tests_with_private_patch == 2
         # Each is spelled through its file's first importable name.
         assert bare_scripts.distinct_private_targets == frozenset(
-            {'legibility.ledger._x', 'lms_ctl._c'}
+            {'lms_ledger._x', 'lms_ctl._c'}
         )
 
     def test_a_prose_constant_counts_through_a_bare_import(self, bare_scripts):
@@ -336,15 +337,15 @@ class TestExtraImportRoots:
         tree = git_tree(tmp_path, {
             'pyproject.toml': '[tool.uv.workspace]\nmembers = ["pkga"]\n',
             'pkga/src/pkga/__init__.py': '',
-            'scripts/ledger.py': '_x = 1\n',
-            'scripts/legibility/ledger.py': '_x = 2\n',
+            'scripts/lms_ledger.py': '_x = 1\n',
+            'scripts/local-model-serving/lms_ledger.py': '_x = 2\n',
         })
         with pytest.raises(MetricsError) as refused:
             pinning.measure_python_tree(tree)
         message = str(refused.value)
-        assert "'ledger' names" in message
-        assert 'scripts/ledger.py' in message
-        assert 'scripts/legibility/ledger.py' in message
+        assert "'lms_ledger' names" in message
+        assert 'scripts/lms_ledger.py' in message
+        assert 'scripts/local-model-serving/lms_ledger.py' in message
 
 
 def test_render_has_one_row_per_package_plus_totals_and_names_the_unreadable(census):

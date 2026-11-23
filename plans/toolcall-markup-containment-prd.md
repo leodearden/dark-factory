@@ -367,6 +367,16 @@ what would let specimens land permanently in fleet `plan.json` files."* The mech
 model/harness-side over-consumption past a mis-closed tag, where parameter N's value swallows parameter N+1's entire
 serialization and N+1 is silently dropped — and is not fixable at the fleet layer.
 
+**Recurrence log continued (2026-11-21) — one unrepairable specimen at the gated fused-memory boundary, `reify`.**
+`esc-markup-residue-11` (reify queue, 2026-11-21T23:16:01Z): an `update_task.metadata` call whose payload was a
+verbatim copy of reify task 3787's own metadata (`dry_run_proposals`, `done_provenance`, `retry_ledger`, …) carried
+envelope markup inside a dry-run proposal's text; the residue was not parseable, so the guard refused the call and
+preserved the raw payload on the record. Same blindness as above: the owner reads `l2-escalation-watcher` but
+`agent_id` was None. **Nothing was lost** — 3787 reached `done` (`found_on_main` `3fd685c47f`) by another write at
+23:19Z, and the refused value duplicated content already on the task; `markup_residue.spooled_files` and
+`preservation_failures` were both 0. Closed by the reify L2 watcher on Leo's ruling of 2026-11-22. The gate held;
+this is a floor-count datum for the gated boundary, not landed damage.
+
 ### 2.6 The corruption is deterministically repairable
 
 Replaying all 334 specimens through a schema-validated repairer: **308 repair cleanly (92.2%), recovering 194 dropped parameters**; 26 (7.8%) are ambiguous (doubly-corrupted calls) and must escalate. Recovered parameters are exactly the silently-lost ones: `add_memory.category` ×70, `add_memory.project_id` ×32, `add_design_decision.rationale` ×25, `add_memory.agent_id` ×18, `escalate_info.suggested_action` ×13, `submit_review_verdict.issues` ×10, `submit_task.priority` ×5.
@@ -555,6 +565,7 @@ Every rewrite is **atomic**: repair into a temp file in the same directory, veri
 | `docs/prds/memory-write-path-convergence.md` §8 row "XML-leak cure" | re-point | row currently reads "DF 3083 (pending)"; 3083 is `done` | **this PRD** | ι files the paired edit |
 | DF 3083 (done, `7899eef17b`) | consumes | `toolcall_xml_leak` detector, `scan_memory_content` | 3083 (terminal) — this PRD re-exports its literals from `shared` | C1 |
 | DF 3141 (done, `da94baf14a`) | consumes | `markup_tripwire`, `MarkupStormCounter` | 3141 (terminal) — generalised here | C2 |
+| `plans/uuid-prefix-resolution-prd.md` leaf γ (DF 4643) | generalises | the fused-memory shim (`install_markup_guard`, retired by `8ccffde1b3`) became one guard chain, `fused-memory/src/fused_memory/server/boundary_guards.py::boundary_guard_chain`, able to consume `RepairPolicy.FORWARD_REPAIR`. The markup member is now `fused-memory/src/fused_memory/server/markup_guard.py::build_markup_guard`. Its tier (REJECT_WITH_REPAIR) and its outermost place in the chain are unchanged. Whether that tier should change is that PRD's open question 3, deliberately out of scope | **`plans/uuid-prefix-resolution-prd.md`** (leaf γ, DF 4643) | DF 4643 (done, `28787ba3bc`) |
 | `docs/legibility/design-invariants.md` | consumes | INV-1/2/3/4/5/7 gate this batch | that doc (normative) | G7 walk in §9 |
 
 No reciprocal-ownership ambiguity: 3083 and 3141 are both terminal, so this PRD takes the territory uncontested. ι makes that explicit in the owning PRD rather than leaving it inferred.

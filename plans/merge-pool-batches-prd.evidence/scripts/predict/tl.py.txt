@@ -1,0 +1,10 @@
+import json,sys
+E=[json.loads(l) for l in open('/tmp/gate-10069/predict/events.jsonl')]
+tasks=sys.argv[1].split(','); lo=sys.argv[2] if len(sys.argv)>2 else '2026-11-15'; hi=sys.argv[3] if len(sys.argv)>3 else '9'
+skip={'phase_enter','merge_heartbeat','task_started'}
+for e in E:
+    if e['task'] in tasks and lo<=e['ts']<hi and e['et'] not in skip:
+        d=dict(e['d'])
+        for k in ('plan_hash','cache_mode','n_units','chain_build_ms','retry_scope','retry_subset_sizes','snapshot_tip','tip_sha_unresolved','tip_sha_unresolved_reason','slot_wait_secs'): d.pop(k,None)
+        s=json.dumps(d)
+        print(e['id'],e['ts'][5:19],e['task'],e['et'],s[:420])

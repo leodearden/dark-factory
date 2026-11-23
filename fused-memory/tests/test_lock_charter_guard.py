@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 import shared.reify_checkout as reify_checkout
+from _census_helpers import census_lines
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware.gitignored_deliverable_guard import (
@@ -80,13 +81,7 @@ def _resolve_reify_checkout(start: Path | None = None) -> reify_checkout.ReifyCh
     )
 
 
-_SCHEMA_WARNING = 'task_metadata.schema_warning'
-_SOURCE = 'source=lock_charter_guard.extract_files'
-
-
-def _discard_lines(caplog) -> list[str]:
-    messages = (r.getMessage() for r in caplog.records)
-    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+_SOURCE = 'lock_charter_guard.extract_files'
 
 
 # ---------------------------------------------------------------------------
@@ -1111,14 +1106,14 @@ class TestExtractFiles:
         with caplog.at_level(logging.WARNING):
             result = extract_files('not valid json {{{')
         assert result == []
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
     @pytest.mark.parametrize('metadata', [42, ['a/b.rs']], ids=repr)
     def test_non_str_unreadable_metadata_warns_and_returns_empty(self, metadata, caplog):
         with caplog.at_level(logging.WARNING):
             result = extract_files(metadata)
         assert result == []
-        assert len(_discard_lines(caplog)) == 1
+        assert len(census_lines(caplog, _SOURCE)) == 1
 
     def test_json_non_dict_returns_empty(self):
         # JSON string that parses to a list, not a dict

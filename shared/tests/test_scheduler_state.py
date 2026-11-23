@@ -35,6 +35,7 @@ _SNAPSHOT_KEYS = {
     'current_holders',
     'held_by_task',
     'holder_limits',
+    'successor_of',
     'lock_depth',
     'is_paused',
     'pause_reason',
@@ -82,6 +83,7 @@ def _populated() -> SchedulerStateSnapshot:
         current_holders={'mod/a': 'T7'},
         held_by_task={'T6': ('mod/a',), 'T7': ('mod/a',)},
         holder_limits={'mod/a': sys.maxsize},
+        successor_of={'T7': 'T6'},
         lock_depth=3,
         is_paused=True,
         pause_reason='operator halt',
@@ -119,6 +121,7 @@ class TestEmpty:
             'current_holders': {},
             'held_by_task': {},
             'holder_limits': {},
+            'successor_of': {},
             'lock_depth': None,
             'is_paused': False,
             'pause_reason': None,
@@ -195,6 +198,7 @@ class TestWireShape:
         assert wire['current_holders'] == {'mod/a': 'T7'}
         assert wire['held_by_task'] == {'T6': ['mod/a'], 'T7': ['mod/a']}
         assert wire['holder_limits'] == {'mod/a': sys.maxsize}
+        assert wire['successor_of'] == {'T7': 'T6'}
         assert wire['lock_depth'] == 3
         assert wire['is_paused'] is True
         assert wire['pause_reason'] == 'operator halt'

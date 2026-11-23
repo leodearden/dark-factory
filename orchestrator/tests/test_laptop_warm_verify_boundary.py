@@ -15,8 +15,8 @@ so the sleeper faithfully reproduces the exact cargo/rustc session-escape the
 watchdog/cancel tree-kill machinery must handle, with zero reify toolchain
 dependency.
 
-Fakes/helpers are reused from the sibling test_cli.py harness (established
-cross-test-module import pattern -- see test_concurrent_verify_boundary.py) and
+Fakes/helpers are reused from orchestrator/tests/_verify_merge_cli_fixtures.py
+(the shared verify-merge CLI scaffolding) and
 from orchestrator.verify_cancel (the SAME /proc walkers the production
 watchdog/cancel kill paths use) -- single source of truth, zero divergent
 ad-hoc process-tree parsing.
@@ -97,17 +97,16 @@ from _verify_host_drive import (
     merge_request_for_verify,
     probe_free_orch_config,
 )
+from _verify_merge_cli_fixtures import _setup_verify_repo
 from click.testing import CliRunner
 from escalation.queue import EscalationQueue
-from test_cli import _setup_verify_repo
 
-import orchestrator.cli as cli_module
+import orchestrator.cli_config as cli_config
 from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_lane.worker import (
-    _run_post_merge_verify,
-    _verify_worktree_contention_sentinel,
-)
+from orchestrator.merge_lane.post_merge_verify import run_post_merge_verify
+from orchestrator.merge_lane.verify_failure_outcome import _verify_worktree_contention_sentinel
+from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
 from orchestrator.verify_cancel import (
     WatchdogTrigger,
     lane_lock_path,
@@ -968,7 +967,7 @@ def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, mo
       failure sentinels like FLOCK_CONTENTION_CATEGORY), contention is None --
       structurally unchanged by the live heartbeat;
     * is_flock_contention_failure(result) is False for both -- the REAL beta
-      discriminant predicate that gates _run_post_merge_verify's escalation
+      discriminant predicate that gates run_post_merge_verify's escalation
       branch (task 2307 beta) never fires on this happy path, so nothing
       downstream would file a born-at-L2 escalation.  (A CLI-only harness
       has no merge_queue in the loop to observe an EscalationQueue directly
@@ -1035,13 +1034,14 @@ def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, mo
         )
         assert is_flock_contention_failure(result) is False, (
             f'run {n}: real beta discriminant fired on a happy-path result -- '
-            f'_run_post_merge_verify would wrongly escalate: {result!r}'
+            f'run_post_merge_verify would wrongly escalate: {result!r}'
         )
 
 
 # ---------------------------------------------------------------------------
 # Task 2309 step-5/6 -- SS9 Row 4: cancel-verify under a LIVE watchdog (B2
-# coexistence).  Extends test_cli.py:1656's real e2e cancel pattern with a
+# coexistence).  Extends the real e2e cancel pattern of
+# test_cli_verify_merge.py::test_verify_merge_cancel_end_to_end with a
 # live HeartbeatWriter so the stdin watchdog stays armed throughout but never
 # self-fires, proving an explicit cancel-verify tree-kills cleanly anyway.
 # ---------------------------------------------------------------------------
@@ -1057,7 +1057,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
     for the whole test but never times out or self-fires.  Waits for the
     build to publish its session pgid (:func:`sleeper_spec`'s
     *build_pgid_file*), then cancels via ``cancel-verify --request-id``
-    through :class:`CliRunner` (the same in-process pattern as test_cli.py's
+    through :class:`CliRunner` (the same in-process pattern as test_cli_verify_merge.py's
     ``test_verify_merge_cancel_end_to_end``).
 
     Asserts:
@@ -1091,7 +1091,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
         build = wait_for_pgid_file(build_pgf, proc=child, timeout=row_discovery_ceiling_secs())
         tree = snapshot_pre_kill_tree(leader, build)
 
-        monkeypatch.setattr(cli_module, 'load_config', lambda _path: config_obj)
+        monkeypatch.setattr(cli_config, 'load_config', lambda _path: config_obj)
         result = CliRunner().invoke(main, [
             'cancel-verify', '--request-id', REQUEST_ID, '--config', str(cfg_file),
         ])
@@ -1419,6 +1419,13 @@ LOOPBACK_SSH_HOST: str = 'loopback-verify-host'
 STARVED_HEARTBEAT_INTERVAL_SECS: float = 3600.0
 
 
+#: CLI startup, then one watchdog window plus load headroom: a wedge detector
+#: that costs nothing on the success path.
+STARVATION_DISPATCH_CEILING_SECS: float = (
+    ROW_DISCOVERY_CEILING_MAX_SECS + ROW_TREE_KILL_CEILING_SECS
+)
+
+
 @pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)
 def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_warning(
     tmp_path, monkeypatch, caplog
@@ -1439,9 +1446,6 @@ def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_wa
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = write_verify_config(tmp_path / 'config.yaml', repo, persistent_merge_worktree=False)
     tag = uuid.uuid4().hex
-    # CLI startup, then one watchdog window plus load headroom: a wedge
-    # detector that costs nothing on the success path.
-    dispatch_ceiling = row_discovery_ceiling_secs() + ROW_TREE_KILL_CEILING_SECS
 
     with monkeypatch.context() as env:
         apply_dispatcher_env(env)
@@ -1461,11 +1465,12 @@ def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_wa
         try:
             with pytest.raises(RunnerUnavailable) as excinfo:
                 asyncio.run(asyncio.wait_for(
-                    runner.run_merge_verify(head_sha, sleeper_spec(300.0)), dispatch_ceiling,
+                    runner.run_merge_verify(head_sha, sleeper_spec(300.0)),
+                    STARVATION_DISPATCH_CEILING_SECS,
                 ))
         except TimeoutError:
             pytest.fail(
-                f'the remote dispatch did not end within {dispatch_ceiling}s: the starved '
+                f'the remote dispatch did not end within {STARVATION_DISPATCH_CEILING_SECS}s: the starved '
                 f'leader\'s watchdog never fired, so its self-kill could not be attributed'
             )
         finally:
@@ -1498,7 +1503,7 @@ def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_wa
 # verify-merge #1 holds .merge_verify.lock mid-build; a real verify-merge #2
 # on the SAME worktree_base reports the FLOCK_CONTENTION_CATEGORY
 # discriminant on stdout WITHOUT ever touching the tree; #2's parsed stdout
-# is then fed through the REAL merge_queue consumer (_run_post_merge_verify +
+# is then fed through the REAL merge_queue consumer (run_post_merge_verify +
 # a real EscalationQueue), asserting a born-at-L2 escalation is filed and the
 # MergeOutcome is 'blocked'.
 # ---------------------------------------------------------------------------
@@ -1528,7 +1533,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     ``acquire_host_verify_worktree`` is ever called on contention).
 
     Consumer side: parses #2's stdout via ``result_from_json`` and feeds it
-    through the REAL ``_run_post_merge_verify`` (a stub runner returning that
+    through the REAL ``run_post_merge_verify`` (a stub runner returning that
     exact parsed result -- the established pattern from
     ``TestRunPostMergeVerifyFlockContention`` in
     ``test_merge_queue_multihost_wiring.py``) with a REAL
@@ -1642,7 +1647,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
     # --- Consumer side: feed #2's real discriminant through the real beta
-    # consumer (_run_post_merge_verify) with a real EscalationQueue. ---
+    # consumer (run_post_merge_verify) with a real EscalationQueue. ---
 
     stub_runner = MagicMock()
     stub_runner.is_local = False
@@ -1654,13 +1659,14 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         config = probe_free_orch_config()
         req = merge_request_for_verify(config, task_files=['src/foo.py'], worktree=tmp_path)
         git_ops = git_ops_mock_for_verify()
-        return await _run_post_merge_verify(
+        return await run_post_merge_verify(
             git_ops, req, tmp_path,
             timeouts={}, enospc_retries={},
             max_timeouts=2, max_enospc=1,
             merge_sha=head_sha,
             runner=stub_runner,
             escalation_queue=eq,
+            verifier=PRODUCTION_VERIFIER,
         )
 
     outcome = asyncio.run(_drive_consumer())
@@ -1685,7 +1691,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
 # Task 2830 step-4 -- the SS9 Signal at the real subprocess seam: a live
 # knob-ON verify-merge HOLDS the shared <lane_dir>.lock mid-build, so a
 # non-blocking flock probe on it from this process is DENIED.  Stronger
-# evidence than the mock-based step-1 pin (test_cli.py
+# evidence than the mock-based step-1 pin (test_cli_verify_merge.py
 # test_verify_merge_holds_lane_lock_during_warm_run): drives the real CLI
 # span end-to-end and pins the lock PATH the split lane-lock lifetime
 # (esc-2830-1) re-acquires for the build's duration.

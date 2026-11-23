@@ -291,7 +291,7 @@ def _file_storm_escalation(
     """File the storm escalation naming the window's *sites*, unless one is open.
 
     Modeled on
-    ``orchestrator/src/orchestrator/merge_lane/worker.py::_alarm_verify_worktree_contention``:
+    ``orchestrator/src/orchestrator/merge_lane/verify_failure_outcome.py::_alarm_verify_worktree_contention``:
     a born-at-L2 escalation (``severity='critical'``, ``level=2``,
     ``agent_role='orchestrator-merge-flake-monitor'`` — the ``orchestrator-``
     prefix marks it a harness sentinel so the escalation server never downgrades

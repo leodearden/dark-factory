@@ -8,10 +8,11 @@
 // the two halves findable from each other.
 //
 // THE CLIENT NEVER CONSTRUCTS OR MUTATES A SERVER DATUM — datum.py's dataclass
-// is frozen for the same reason. Four client-built envelopes are sanctioned
-// and no more: unknownDatum, plainDatum, derivedDatum and combinedDatum, each
-// below with the gap it covers. combinedDatum is the only one built FROM served
-// Datums: a cross-project total the server serves per project only.
+// is frozen for the same reason. Five client-built envelopes are sanctioned
+// and no more: unknownDatum, plainDatum, derivedDatum, combinedDatum and its
+// lower-bound sibling lowerBoundCombinedDatum, each below with the gap it
+// covers. The two totals are the only ones built FROM served Datums: a
+// cross-project total the server serves per project only.
 //
 // A PLAIN-JS CLASSIC SCRIPT, NOT A .jsx MODULE, so the render decision is
 // EXECUTABLE: the .jsx files are `type="text/babel"` behind CDN Babel with no
@@ -386,6 +387,7 @@ function servedDatum(served, endpointKey, absentReason, receipts) {
 // A HOLE ANYWHERE IS A HOLE IN THE TOTAL. A partial sum is an under-count passed
 // off as a total, so `combine` never runs over a scope with a gap in it, and the
 // reason names every missing part so the operator reads which one and why.
+// lowerBoundCombinedDatum below is the sibling that serves it as a floor instead.
 //
 // OTHERWISE THE WORST PART DECIDES THE STATE: lower_bound > stale > fresh,
 // lower_bound first so both the '≥' and the age badge survive.
@@ -400,14 +402,55 @@ function servedDatum(served, endpointKey, absentReason, receipts) {
 const COMBINED_STATE_PRECEDENCE = ['lower_bound', 'stale', 'fresh'];
 
 function combinedDatum(partsByLabel, combine, emptyReason) {
-  const parts = partsByLabel.map(([label, part]) => [label, assertDatum(part, 'combinedDatum')]);
+  const parts = labelledDatums(partsByLabel, 'combinedDatum');
   if (parts.length === 0) return unknownDatum(emptyReason);
 
-  const holes = parts.filter(([, part]) => part.state === 'unknown');
+  const holes = parts.filter(isHolePart);
   if (holes.length > 0) return unknownDatum(labelledReasons(holes));
 
-  const measured = parts.map(([, part]) => part);
-  const ages = displayedAgesOf(measured);
+  return measuredTotal(parts, parts.map(([, part]) => part), combine, 'combinedDatum');
+}
+
+// ── A FLOOR over several served Datums, for a MONOTONE combine ──
+// PRECONDITION: adding a part never lowers `combine`'s result — a sum or a max,
+// never a ratio. That is what makes the measured parts' total a true '≥' of
+// the whole when some parts are holes: it is served lower_bound, its reason
+// names every non-fresh part (holes included, in part order), and the hole
+// labels travel as `_missing_parts`, a client annotation underscored like
+// withReceipt's, which missingParts reads. Every part a hole is no floor at
+// all, so it is unknown; no hole at all is exactly combinedDatum.
+function lowerBoundCombinedDatum(partsByLabel, combine, emptyReason) {
+  const parts = labelledDatums(partsByLabel, 'lowerBoundCombinedDatum');
+  if (parts.length === 0) return unknownDatum(emptyReason);
+
+  const holes = parts.filter(isHolePart);
+  if (holes.length === parts.length) return unknownDatum(labelledReasons(holes));
+
+  const measured = parts.filter(labelled => !isHolePart(labelled)).map(([, datum]) => datum);
+  const total = measuredTotal(parts, measured, combine, 'lowerBoundCombinedDatum');
+  if (holes.length === 0) return total;
+  return { ...total, state: 'lower_bound', _missing_parts: holes.map(([label]) => label) };
+}
+
+// The labels of the parts a lower-bound total could not read, in part order;
+// [] for every other Datum.
+function missingParts(datum) {
+  const missing = datum ? datum._missing_parts : undefined;
+  return Array.isArray(missing) ? [...missing] : [];
+}
+
+function labelledDatums(partsByLabel, who) {
+  return partsByLabel.map(([label, part]) => [label, assertDatum(part, who)]);
+}
+
+function isHolePart([, part]) {
+  return part.state === 'unknown';
+}
+
+// The total over the `measured` Datums among the labelled `parts`, by the
+// state, age, bound and receipt rules stated above combinedDatum.
+function measuredTotal(parts, measured, combine, who) {
+  const ages = displayedAgesOf(measured, who);
   const oldestAge = Math.max(...ages);
   const oldest = measured[ages.indexOf(oldestAge)];
   const unfresh = parts.filter(([, part]) => part.state !== 'fresh');
@@ -428,17 +471,17 @@ function combinedDatum(partsByLabel, combine, emptyReason) {
 }
 
 // Every part's displayed age at ONE instant. Displayed ages all grow at the
-// same rate, so their order and their differences — all combinedDatum reads —
+// same rate, so their order and their differences — all measuredTotal reads —
 // hold at every later render. A part with no receipt has no displayed age to
 // compare, and a total over it could not say how old it looks: a caller's
 // error, thrown like assertDatum's.
-function displayedAgesOf(parts) {
+function displayedAgesOf(parts, who) {
   const now = Date.now();
   return parts.map(part => {
     const age = displayedAgeMs(part, now);
     if (age === null) {
       throw new TypeError(
-        'combinedDatum was given a part with no displayed age — stamp every served part ' +
+        who + ' was given a part with no displayed age — stamp every served part ' +
           'with its receipt (withReceipt) before combining.',
       );
     }
@@ -481,6 +524,8 @@ const DATUM_API = {
   servedDatum,
   undeliveredDatum,
   combinedDatum,
+  lowerBoundCombinedDatum,
+  missingParts,
   PLAIN_DATUM_BOUND_SECONDS,
 };
 

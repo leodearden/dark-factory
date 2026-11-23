@@ -37,11 +37,12 @@ from orchestrator.main_health_fix_owner import (
     MainFixTaskFiler,
     build_main_fix_task_arguments,
     ensure_main_fix_owner,
+    is_main_health_fix,
 )
+from orchestrator.merge_lane.main_health_probe import _build_main_health_outcome
 from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_AUTO_HEAL_MAX_ATTEMPTS,
     SpeculativeMergeWorker,
-    _build_main_health_outcome,
 )
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
@@ -189,6 +190,44 @@ class TestFixMainTaskArguments:
 
     def test_an_empty_reason_files_no_details(self) -> None:
         assert 'details' not in _fix_arguments(MainBreak('compile_error', 'hint', ''))
+
+
+STEWARD_TRIAGE_HEAL_METADATA = {
+    'spawn_context': 'steward-triage',
+    'source': 'steward-triage',
+    'escalation_id': 'esc-6484-3',
+    'files': ['orchestrator/src/orchestrator/harness.py'],
+}
+
+
+class TestIsMainHealthFix:
+    """The fix owner of a confirmed main break is recognised by the signature its filer writes."""
+
+    @pytest.mark.parametrize('spawn_context', list(FixSpawnContext))
+    def test_the_filers_own_metadata_marks_a_fix(self, spawn_context: FixSpawnContext) -> None:
+        arguments = build_main_fix_task_arguments(
+            TEST_BREAK, project_root='/p', spawn_context=spawn_context,
+        )
+
+        assert is_main_health_fix({'id': 1, 'metadata': arguments['metadata']})
+
+    def test_metadata_arriving_as_a_json_string_still_marks_a_fix(self) -> None:
+        metadata = _fix_arguments(TEST_BREAK)['metadata']
+
+        assert is_main_health_fix({'id': 1, 'metadata': json.dumps(metadata)})
+
+    def test_a_steward_triage_heal_carries_no_signature(self) -> None:
+        assert not is_main_health_fix({'id': 8468, 'metadata': STEWARD_TRIAGE_HEAL_METADATA})
+
+    @pytest.mark.parametrize('task', [
+        {'id': 1},
+        {'id': 1, 'metadata': None},
+        {'id': 1, 'metadata': {SIGNATURE_KEY: ''}},
+        {'id': 1, 'metadata': {SIGNATURE_KEY: '   '}},
+        {'id': 1, 'metadata': {SIGNATURE_KEY: 123}},
+    ], ids=['no-metadata', 'null-metadata', 'empty', 'whitespace', 'non-string'])
+    def test_no_usable_signature_is_not_a_fix(self, task: dict) -> None:
+        assert not is_main_health_fix(task)
 
 
 class TestMainFixTaskFiler:

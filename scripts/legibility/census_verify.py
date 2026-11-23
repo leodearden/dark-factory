@@ -35,7 +35,7 @@ a cap announces itself."""
 QUALITY_DEFINITION_MARKER = "=== QUALITY DEFINITION ===\n"
 
 
-def _verify_prompt(cluster: dict, *, project_root: str, quality_block: str) -> str:
+def verify_prompt(cluster: dict, *, project_root: str, quality_block: str) -> str:
     """Prompt for the real Sonnet verify_fn: confirm-or-refute one novel
     cluster against *project_root*'s current main via targeted file reads,
     judged against *quality_block* (``code_quality.guidance``).
@@ -50,7 +50,10 @@ def _verify_prompt(cluster: dict, *, project_root: str, quality_block: str) -> s
     of that scoping, not as a substitute for it.
 
     Asks for an OBSERVATION, never a diagnosis (codebook lesson
-    guards-assert-unverified-diagnoses)."""
+    guards-assert-unverified-diagnoses).
+
+    The opening sentence is restated, lowercased, as
+    ``reingestion.CENSUS_VERIFIER_PROMPT_OPENER``; tests hold the two in step."""
     return (
         "You are the periodic-census verifier for the dark-factory "
         "agent-confusion codebook (plans/confusion-reduction-prd.md "
@@ -168,7 +171,7 @@ def build_verify_fn(
             # reason -- together with `verified` the three always sum to the
             # clusters offered (census_headroom.CensusHeadroomExhausted's INVARIANT).
             remaining = len(clusters) - index
-            prompt = _verify_prompt(
+            prompt = verify_prompt(
                 cluster, project_root=project_root, quality_block=quality_block,
             )
             try:

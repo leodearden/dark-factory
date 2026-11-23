@@ -601,14 +601,15 @@ class EventBuffer:
     # ── Drain ──────────────────────────────────────────────────────────
 
     async def drain(
-        self, project_id: str, run_id: str | None = None,
+        self, project_id: str, run_id: str,
     ) -> list[ReconciliationEvent]:
-        """Atomically drain buffered events for a project.
+        """Atomically drain a project's buffered events as run *run_id*.
 
-        When ``run_id`` is provided, the drained rows are stamped with
-        ``drained_by_run_id = run_id`` so a later run-scoped ``restore_drained``
-        can restore exactly this run's events without touching a concurrent
-        run's drained rows (task 2711 / E7).
+        Each drained row is stamped ``drained_by_run_id = run_id`` and with this
+        instance's ``drained_by_instance_id``, so a later run-scoped
+        ``restore_drained`` can restore exactly this run's events without
+        touching a concurrent run's drained rows (task 2711 / E7). *run_id* is
+        required so this path can never leave an unattributed row (task 6784).
         """
         rows = await self._require_access().read_all(
             """SELECT * FROM event_buffer
@@ -643,14 +644,14 @@ class EventBuffer:
         return events
 
     async def drain_oldest_chunk(
-        self, project_id: str, limit: int,
+        self, project_id: str, limit: int, run_id: str,
         before: datetime | None = None,
-        run_id: str | None = None,
     ) -> list[ReconciliationEvent]:
-        """Drain the oldest `limit` buffered events for a project.
+        """Drain the oldest `limit` buffered events for a project as run *run_id*.
 
         Stamps the drained rows like ``drain`` does: ``drained_by_run_id`` and
-        ``drained_by_instance_id``.
+        ``drained_by_instance_id``. *run_id* is required so this path can never
+        leave an unattributed row (task 6784).
 
         Args:
             before: If set, only drain events with timestamp < this value.
@@ -812,10 +813,9 @@ class EventBuffer:
         ``include_unattributed`` additionally restores rows with
         ``drained_by_run_id IS NULL``. This closes the upgrade-boundary gap
         where events drained by a pre-task-2711 process carry no run
-        attribution: since every production drain path stamps
-        ``drained_by_run_id`` as it drains (``drain_by_ids`` requires a
-        ``run_id``, and ``run_full_cycle``, ``drain``'s only production
-        caller, always passes one; task 6453), a NULL row can only be left
+        attribution: since every drain path (``drain``,
+        ``drain_oldest_chunk``, ``drain_by_ids``) requires a ``run_id`` and
+        stamps it as it drains (tasks 6453, 6784), a NULL row can only be left
         over from a process that no longer exists by the time a recovery pass
         runs, so it is provably safe to fold into a *specific* run's recovery
         without reintroducing the concurrent-run clobber the run scoping was

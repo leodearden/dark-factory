@@ -633,7 +633,7 @@ def _invoke_probe_models_cli(monkeypatch, tmp_path, report: ProbeReport,
     the assertion for a parse-time rejection.
     """
     fake_config = _fake_probe_cli_config(tmp_path)
-    monkeypatch.setattr('orchestrator.cli.load_config', lambda _path: fake_config)
+    monkeypatch.setattr('orchestrator.cli_config.load_config', lambda _path: fake_config)
 
     calls: list[dict] = []
 

@@ -228,7 +228,8 @@ def test_imports_under_a_bare_isolated_python3(tmp_path):
             '-I',
             '-S',
             '-c',
-            f'import sys; sys.path.insert(0, {str(_LEGIBILITY_DIR)!r}); import state_docs',
+            f'import sys; sys.path.insert(0, {str(_LEGIBILITY_DIR.parent)!r}); '
+            'from legibility import state_docs',
         ],
         capture_output=True,
         text=True,

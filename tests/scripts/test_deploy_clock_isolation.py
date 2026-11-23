@@ -36,20 +36,11 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from nested_pytest_session import arming_conftest, run_nested_pytest
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
-# docstring exists to prevent.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E402
-
-import df_pytest_isolation  # noqa: E402
-from df_pytest_isolation import (  # noqa: E402
+import df_pytest_isolation
+from df_pytest_isolation import (
     CLOCK_PROVENANCE_SESSION_KEY,
     CLOCK_PROVENANCE_SOURCE_KEY,
     FLEET_LEASE_RELPATH,
@@ -67,6 +58,7 @@ from df_pytest_isolation import (  # noqa: E402
     run_session_token,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # NOT `from df_pytest_isolation import _df_deploy_clocks_unwritten`. Importing a
@@ -1226,21 +1218,21 @@ class TestGuardIsLiveInThisRun:
         assert marker.autouse is True, 'the guard must be autouse — nothing requests it'
 
     def test_the_guard_fixture_is_registered_in_this_run(self, request) -> None:
-        """The conftest binding is real WIRING, not a dormant definition.
+        """The conftest's arm call is real WIRING, not a dormant definition.
 
-        pytest only collects fixtures bound into a conftest's namespace, which
-        is why df_pytest_isolation's fixtures are imported there under
-        ``# noqa: F401 — the binding IS the wiring``. Deleting that import
-        breaks nothing visible except this assertion.
+        pytest only collects fixtures a plugin or conftest registers, which is
+        why each test-root conftest calls ``arm_test_root_isolation(config)`` from its
+        ``pytest_configure``. Deleting that call breaks nothing visible except
+        this assertion.
         """
         try:
             request.getfixturevalue(_GUARD_NAME)
         except pytest.FixtureLookupError:
             pytest.fail(
-                f'{_GUARD_NAME} is not registered for this rootdir. Wire the '
-                'test-root conftest to import it from df_pytest_isolation '
-                '(`# noqa: F401 — the binding IS the wiring`); without that, '
-                'this whole suite runs with no deploy-clock guard.',
+                f'{_GUARD_NAME} is not registered for this rootdir. Call '
+                'arm_test_root_isolation(config) from the test-root conftest\'s '
+                'pytest_configure; without that, this whole suite runs with no '
+                'deploy-clock guard.',
                 pytrace=False,
             )
 
@@ -1435,7 +1427,7 @@ def _nested_run(tmp_path: Path, *, scenario: str) -> subprocess.CompletedProcess
     """
     assert scenario in _NESTED_SCENARIOS, scenario
     return run_nested_pytest(tmp_path / scenario, {
-        'conftest.py': binding_conftest(_GUARD_NAME),
+        'conftest.py': arming_conftest(_GUARD_NAME),
         'test_forgetful.py': _nested_test_source(scenario=scenario),
     })
 
@@ -1605,7 +1597,7 @@ class TestTheGuardAttributesTheStampEndToEnd:
         """
         monkeypatch.setenv('PYTEST_ADDOPTS', '-n 2 --dist each')
         result = run_nested_pytest(tmp_path / 'xdist', {
-            'conftest.py': binding_conftest(_GUARD_NAME),
+            'conftest.py': arming_conftest(_GUARD_NAME),
             'test_xdist_stamp.py': _xdist_test_source(),
         })
         combined = result.stdout + result.stderr

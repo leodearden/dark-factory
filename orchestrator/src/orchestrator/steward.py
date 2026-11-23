@@ -1,13 +1,19 @@
-"""Per-task persistent steward — autonomous escalation handler.
+"""Per-task steward — autonomous escalation handler.
 
-The steward maintains a single Claude session across all escalations for a task,
-accumulating context via ``--resume``.  It handles both blocking escalations
-(code fixes) and review suggestion triage (create tasks / write conventions /
-dismiss).
+``steward_session_mode`` decides what one escalation's session inherits from the
+last.  Under the default ``fresh_per_l0`` every handling starts a new Claude
+session with the full briefing plus a digest of the L0s this steward already
+concluded and a count of the sessions that already ran on this L0 without
+concluding it (both rendered by ``orchestrator/agents/steward_digest.py``);
+under ``resume`` one session is carried across escalations via ``--resume``.
+Both share the cap-hit resume within one L0.  The steward handles both blocking
+escalations (code fixes) and review suggestion triage (create tasks / write
+conventions / dismiss).
 
 Lifecycle:
 - Started lazily on first escalation (not at workflow start).
-- Each escalation either resumes the existing session or creates a fresh one.
+- Each handling starts a fresh session (``fresh_per_l0``) or resumes the carried
+  one (``resume``).
 - Budget-capped at $12 lifetime; auto-re-escalates to level-1 on exhaustion.
 - Each escalation gets up to steward_max_attempts total attempts (default 1) before re-escalating to level-1.
 - **Every give-up path dismisses its own L0 before publishing an outcome**
@@ -61,6 +67,7 @@ from shared.process_cost import next_resume_prior
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
+from orchestrator.agents.steward_digest import EarlierAttempts, HandledL0
 from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
 from orchestrator.routing import RoleDefaults
@@ -71,6 +78,7 @@ from orchestrator.workflow_types import (
     StewardInterrupted,
     StewardReescalatedL1,
     StewardResolved,
+    WorkflowState,
     classify_failure,
 )
 
@@ -134,7 +142,7 @@ class StewardMetrics:
 
 
 class TaskSteward:
-    """Per-task persistent steward — handles escalations via a resumable session."""
+    """Per-task steward — handles each escalation in the session ``steward_session_mode`` selects."""
 
     def __init__(
         self,
@@ -235,6 +243,8 @@ class TaskSteward:
         # and the wip-gated guards below default to wip=False in that case.
         self._outcome_channel: asyncio.Queue[PublishedStewardOutcome] | None = None
         self._wip_probe: Callable[[], Awaitable[bool]] | None = None
+        # The L0s this instance concluded, oldest first.
+        self._handled: tuple[HandledL0, ...] = ()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -270,10 +280,13 @@ class TaskSteward:
         """
         self._wip_probe = probe
 
-    def _publish_outcome(self, escalation_id: str, outcome: StewardOutcome) -> None:
-        """Put *outcome*, tagged with *escalation_id*, on the registered channel.
+    def _publish_outcome(self, escalation: Escalation, outcome: StewardOutcome) -> None:
+        """Record *escalation*'s conclusion and put *outcome*, tagged with its id, on the channel.
 
-        No-op when no channel is set.
+        Publication reaches the instance's handled-L0 record (``_handled``, the
+        digest a fresh session is briefed with) and the workflow channel.  The
+        record is kept whether or not a channel is set; the channel put is a
+        no-op when none is.
 
         Synchronous (``put_nowait``, not ``await queue.put``) so it is safe
         to call from both async call sites (``_handle_escalation``) and sync
@@ -281,10 +294,47 @@ class TaskSteward:
         unbounded by construction here, so ``put_nowait`` never raises
         ``QueueFull``.
         """
+        self._handled = (
+            *self._handled, HandledL0(escalation.id, escalation.category, outcome),
+        )
         if self._outcome_channel is not None:
             self._outcome_channel.put_nowait(
-                PublishedStewardOutcome(escalation_id, outcome),
+                PublishedStewardOutcome(escalation.id, outcome),
             )
+
+    def _carries_session_across_l0s(self) -> bool:
+        """The one membership rule of the ``steward_session_mode`` axis.
+
+        Read at use time, so a hot reload applies from the next handling.
+        """
+        return self.config.steward_session_mode == 'resume'
+
+    def _briefing_digest(self) -> tuple[HandledL0, ...]:
+        """The concluded L0s a full briefing carries: ``self._handled`` under ``fresh_per_l0``.
+
+        Under ``resume`` it is ``()`` on every full briefing, including the ones
+        built for a session that holds no history (the first L0, the L0 after an
+        empty-output drop, a fresh retry after a rejected resume). That keeps the
+        resume arm byte-identical to the pre-5819 steward, which is what makes it
+        the shadow-eval comparison arm (task 5820).
+        """
+        return () if self._carries_session_across_l0s() else self._handled
+
+    def _earlier_attempts(self, escalation_id: str) -> EarlierAttempts:
+        """The sessions that already ran on *escalation_id* without concluding it, for a full briefing.
+
+        Read off the per-escalation guard counters under ``fresh_per_l0``, so a
+        re-handle after a timeout kill, a left-pending attempt or an empty
+        output knows it is not the first.  Under ``resume`` it is always empty,
+        for the same byte parity as :meth:`_briefing_digest`.
+        """
+        if self._carries_session_across_l0s():
+            return EarlierAttempts()
+        return EarlierAttempts(
+            timed_out=self._timeout_counts.get(escalation_id, 0),
+            left_pending=self._retry_counts.get(escalation_id, 0),
+            no_output=self._empty_output_counts.get(escalation_id, 0),
+        )
 
     async def stop(self) -> None:
         """Cancel the steward loop and cleanup."""
@@ -501,7 +551,7 @@ class TaskSteward:
     # ------------------------------------------------------------------
 
     async def _handle_escalation(self, escalation: Escalation) -> None:
-        """Handle a single escalation via the persistent session.
+        """Handle a single escalation: fresh session or carried one, per ``steward_session_mode``.
 
         **Every give-up path below dismisses its own L0 before publishing an
         outcome** (task 3170) — ``_auto_escalate_to_human`` does it as part of
@@ -633,6 +683,9 @@ class TaskSteward:
                 if self._give_up_if_lifetime_budget_spent(escalation):
                     return
 
+        if not self._carries_session_across_l0s():
+            self._drop_session()
+
         # Prompt: initial (full briefing) vs continuation (just the escalation)
         is_initial = self._session_id is None
         if is_initial:
@@ -647,6 +700,8 @@ class TaskSteward:
                 escalation=escalation.to_dict(),
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
+                handled=self._briefing_digest(),
+                earlier_attempts=self._earlier_attempts(escalation.id),
             )
         else:
             prompt = await self.briefing.build_steward_continuation_prompt(
@@ -688,7 +743,7 @@ class TaskSteward:
         if self.event_store:
             self.event_store.emit(
                 EventType.invocation_end,
-                task_id=self.task_id, phase='escalated', role='steward',
+                task_id=self.task_id, phase=WorkflowState.ESCALATED.value, role='steward',
                 cost_usd=result.cost_usd, duration_ms=result.duration_ms,
                 data={
                     'turns': result.turns, 'success': result.success,
@@ -780,7 +835,7 @@ class TaskSteward:
                 or escalation.summary
             )
             self._publish_outcome(
-                escalation.id, StewardResolved(resolution_text=resolution_text),
+                escalation, StewardResolved(resolution_text=resolution_text),
             )
 
     # ------------------------------------------------------------------
@@ -825,7 +880,7 @@ class TaskSteward:
         per_invocation_budget: float,
         escalation: Escalation,
     ):
-        """Invoke the steward agent, resuming the session if one exists.
+        """Invoke the steward agent, resuming the carried session if there is one.
 
         Delegates the account-failover cap-retry loop (usage-gate slot
         management, cap-hit detection, the zero-output wedge guard, 401/403
@@ -837,7 +892,12 @@ class TaskSteward:
         armed resume, and that replacement is reported
         (``_note_rejected_resume``).
 
-        The steward is always a LIVE continuation, never a crash-recovery
+        Under ``fresh_per_l0`` ``_handle_escalation`` has already dropped the
+        session, so nothing is carried in and the only resume left is the
+        shared loop's cap-hit resume within this L0; under ``resume`` the
+        session carried from the previous L0 is resumed.
+
+        A steward resume is always a LIVE continuation, never a crash-recovery
         resume: ``prompt`` (built by ``_handle_escalation``) carries the new
         escalation's content, which the resumed session has not seen yet.
         This passes ``resume_delivers_prompt=True`` so the shared loop
@@ -871,6 +931,8 @@ class TaskSteward:
                 ).to_dict(),
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
+                handled=self._briefing_digest(),
+                earlier_attempts=self._earlier_attempts(escalation.id),
             )
 
         # Route resolution (task η): resolve model/effort/max_turns through the
@@ -896,6 +958,7 @@ class TaskSteward:
             event_store=self.event_store,
             cost_store=self.cost_store,
             applied_budget_usd=per_invocation_budget,
+            phase=WorkflowState.ESCALATED,
         )
         kwargs: dict = dict(
             prompt=prompt,
@@ -1047,6 +1110,7 @@ class TaskSteward:
             in_memory_task=self.task,
             event_store=self.event_store,
             cost_store=self.cost_store,
+            phase=WorkflowState.ESCALATED,
         )
         remaining = self._remaining_lifetime_budget()
         if remaining <= decision.budget_usd:
@@ -1370,7 +1434,7 @@ class TaskSteward:
                 f'resume-plan interruption'
             )
             self._publish_outcome(
-                escalation.id,
+                escalation,
                 StewardResolved(
                     resolution_text=stored.resolution or escalation.summary,
                 ),
@@ -1382,7 +1446,7 @@ class TaskSteward:
             f'({outcome.reason}) with WIP present — dismissed the L0 and '
             f'published a resume-plan interruption (no L1 filed)'
         )
-        self._publish_outcome(escalation.id, outcome)
+        self._publish_outcome(escalation, outcome)
 
     # ------------------------------------------------------------------
     # Auto-escalation to level-1 (human)
@@ -1441,7 +1505,7 @@ class TaskSteward:
             f'to level 1: {reason}'
         )
         self._publish_outcome(
-            escalation.id,
+            escalation,
             outcome if outcome is not None else StewardReescalatedL1(esc_id=reesc.id),
         )
 

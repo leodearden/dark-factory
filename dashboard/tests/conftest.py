@@ -23,8 +23,7 @@ from pathlib import Path
 # silently resolve against the installed editable package instead of the
 # local worktree src/, causing hard-to-diagnose test failures.
 # ---------------------------------------------------------------------------
-_SRC = Path(__file__).parent.parent / 'src'
-if str(_SRC) not in sys.path:
+if str(_SRC := Path(__file__).parent.parent / 'src') not in sys.path:
     sys.path.insert(0, str(_SRC))
 # Also front-load this worktree's shared/src so `import shared` (e.g. the
 # shared.mcp_idempotency helper the McpSession twin imports, task 2766) loads
@@ -32,11 +31,9 @@ if str(_SRC) not in sys.path:
 # tree — otherwise a brand-new shared submodule that has not yet landed on
 # main is unimportable here, breaking collection of tests that touch it.
 # Mirrors orchestrator/tests/conftest.py's shared/src insertion.
-_SHARED_SRC = Path(__file__).parent.parent.parent / 'shared' / 'src'
-if str(_SHARED_SRC) not in sys.path:
+if str(_SHARED_SRC := Path(__file__).parent.parent.parent / 'shared' / 'src') not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
-_TESTS_DIR = Path(__file__).parent
-if str(_TESTS_DIR) not in sys.path:
+if str(_TESTS_DIR := Path(__file__).parent) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
 # Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
@@ -46,28 +43,26 @@ if str(_TESTS_DIR) not in sys.path:
 # at sys.path[0] it would make the subproject directories resolve as namespace
 # packages pointing at the project folder instead of src/<pkg>/, defeating the
 # guard block above.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
+if str(REPO_ROOT := Path(__file__).resolve().parents[2]) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-import aiosqlite  # noqa: E402
-import httpx  # noqa: E402
-import pytest  # noqa: E402
-from _dashboard_helpers import RECONCILIATION_SCHEMA, apply_isolated_env  # noqa: E402
-from df_pytest_isolation import (  # noqa: E402
-    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
-    _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
-    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
-    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+import aiosqlite
+import httpx
+import pytest
+from _dashboard_helpers import RECONCILIATION_SCHEMA, apply_isolated_env
+from df_pytest_isolation import (
     arm_leaked_drain_process_guard,
+    arm_test_root_isolation,
     reject_unsafe_basetemp,
 )
-from starlette.testclient import TestClient  # noqa: E402
+from shared.pytest_fake_clock import fake_clock as fake_clock
+from starlette.testclient import TestClient
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the drain-leak guard."""
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3); arm the suite-wide defences."""
     reject_unsafe_basetemp(config)
+    arm_test_root_isolation(config)
     arm_leaked_drain_process_guard(config)
 
 
@@ -162,17 +157,7 @@ def two_url_config(tmp_path):
 
 
 @pytest.fixture()
-def samplers_off(monkeypatch):
-    """Any app lifespan started later in this test runs without the two background samplers.
-
-    Request it from a test that builds its own ``TestClient(app)`` and asserts
-    on a patched MCP seam (task 5826).
-    """
-    monkeypatch.setenv('DASHBOARD_SAMPLERS', 'off')
-
-
-@pytest.fixture()
-def client(samplers_off):
+def client():
     """Create a TestClient for the dashboard FastAPI app.
 
     Its lifespan is isolated on BOTH axes by the session-scoped
@@ -183,8 +168,9 @@ def client(samplers_off):
     half is not cosmetic: without it every lifespan here makes two real MCP
     round trips, and one slow response wedges ``TestClient.__exit__``.
 
-    The samplers are off, because their discovery ``ps``-scans the real host
-    and their reads land on whatever MCP seam the test patched (task 5826).
+    The samplers are off suite-wide via the session ``_isolated_project_root``
+    (dashboard/tests/_dashboard_helpers.py::apply_isolated_env), because their
+    discovery ``ps``-scans the real host.
     """
     from dashboard.app import app
 
@@ -193,7 +179,7 @@ def client(samplers_off):
 
 
 @pytest.fixture()
-def two_url_client(monkeypatch, samplers_off):
+def two_url_client(monkeypatch):
     """TestClient running the lifespan with a two-URL fused-memory config.
 
     Uses monkeypatch.setenv so DashboardConfig.from_env() inside the lifespan
@@ -204,8 +190,9 @@ def two_url_client(monkeypatch, samplers_off):
     from the session-scoped ``_isolated_project_root`` temp dir, so this
     lifespan does not touch the operator's live checkout either (task 3503).
 
-    The samplers are off, because their discovery ``ps``-scans the real host
-    and their reads land on whatever MCP seam the test patched (task 5826).
+    The samplers are off suite-wide via the session ``_isolated_project_root``
+    (dashboard/tests/_dashboard_helpers.py::apply_isolated_env), because their
+    discovery ``ps``-scans the real host.
     """
     from dashboard.app import app
 

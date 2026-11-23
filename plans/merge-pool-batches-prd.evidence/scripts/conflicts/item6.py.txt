@@ -1,0 +1,22 @@
+import sqlite3,json,collections,statistics as st,numpy as np
+c=sqlite3.connect('file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro',uri=True)
+rs=c.execute("""select timestamp,json_extract(data,'$.chain_items'),json_extract(data,'$.duration_ms'),json_extract(data,'$.runner'),json_extract(data,'$.passed'),json_extract(data,'$.retry_scope'),json_extract(data,'$.cache_mode')
+ from events where event_type='merge_verify' and timestamp>='2026-11-11' and timestamp<'2026-11-21'""").fetchall()
+rs=[r for r in rs if r[2] is not None and r[5] is None]
+print('n verifies since 11-11 (full scope)',len(rs))
+def fit(x,y):
+    x=np.array(x,float);y=np.array(y,float);A=np.vstack([np.ones_like(x),x]).T;b=np.linalg.lstsq(A,y,rcond=None)[0];r=y-A@b
+    se=np.sqrt(np.diag(r@r/(len(y)-2)*np.linalg.inv(A.T@A)));return b,se
+for runner in (None,'laptop','local'):
+  for passed in (None,1):
+    R=[r for r in rs if (runner is None or r[3]==runner) and (passed is None or r[4]==passed)]
+    g=collections.defaultdict(list)
+    for r in R: g[r[1]].append(r[2]/60000)
+    tab={k:(len(v),round(st.median(v),1),round(sorted(v)[int(.9*(len(v)-1))],1)) for k,v in sorted(g.items())}
+    print('runner',runner,'passed',passed,tab)
+    for lo in (1,2):
+        S=[r for r in R if r[1]>=lo]
+        if len(set(r[1] for r in S))<2: continue
+        b,se=fit([r[1] for r in S],[r[2]/60000 for r in S])
+        print(f'   items>={lo}: n={len(S)} slope {b[1]:.2f} min/item 95% [{b[1]-1.96*se[1]:.2f},{b[1]+1.96*se[1]:.2f}] intercept {b[0]:.1f}')
+print(collections.Counter(r[3] for r in rs))

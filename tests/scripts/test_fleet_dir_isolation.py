@@ -39,7 +39,7 @@ forgets:
   / ``leaked_fleet_heartbeat_reason``), directly testable without a nested
   pytest run;
 * that BOTH fixtures are actually armed in the process running this file —
-  defined, shaped session/autouse, and registered by a conftest binding — since
+  defined, shaped session/autouse, and registered by a conftest's arm call — since
   every pure-helper test above stays green against a dead defence; and
 * what a violation DOES to a run, through a real nested pytest session: the
   process exits non-zero even though every one of its tests passed.
@@ -60,20 +60,11 @@ import sys
 from pathlib import Path
 
 import pytest
+from nested_pytest_session import arming_conftest, run_nested_pytest
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
-# docstring exists to prevent.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E402
-
-import df_pytest_isolation  # noqa: E402
-from df_pytest_isolation import (  # noqa: E402
+import df_pytest_isolation
+from df_pytest_isolation import (
     LIVE_FLEET_DIR,
     SYNTHETIC_UNIT_PREFIX,
     assert_synthetic_units,
@@ -86,6 +77,7 @@ from df_pytest_isolation import (  # noqa: E402
     synthetic_unit,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # NOT `from df_pytest_isolation import _df_...`. Importing a FIXTURE into a test
@@ -646,8 +638,8 @@ class TestBothFixturesAreLiveInThisRun:
 
     Everything above tests pure functions against ``tmp_path`` dirs; all of it
     would stay green if neither fixture were ever loaded by any conftest — the
-    ``# noqa: F401`` bindings in ``conftest.py`` and ``scripts/tests/conftest.py``
-    could be deleted and only this class would notice.  That is the difference
+    ``arm_fleet_dir_isolation(config)`` calls in ``conftest.py`` and
+    ``scripts/tests/conftest.py`` could be deleted and only this class would notice.  That is the difference
     between a wired defence and a dead one, and a silently-dead guard is the
     exact failure mode this whole task family exists to prevent.
 
@@ -682,21 +674,21 @@ class TestBothFixturesAreLiveInThisRun:
 
     @pytest.mark.parametrize('name', [_REDIRECT_NAME, _GUARD_NAME])
     def test_the_fixture_is_registered_in_this_run(self, name: str, request) -> None:
-        """The conftest binding is real WIRING, not a dormant definition.
+        """The conftest's arm call is real WIRING, not a dormant definition.
 
-        pytest only collects fixtures bound into a conftest's namespace, which is
-        why this module's fixtures are imported there under
-        ``# noqa: F401 — the binding IS the wiring``.  Deleting that import
-        breaks nothing visible except this assertion.
+        pytest only collects fixtures a plugin or conftest registers, which is
+        why each test-root conftest calls ``arm_fleet_dir_isolation(config)`` from its
+        ``pytest_configure``. Deleting that call breaks nothing visible except
+        this assertion.
         """
         try:
             request.getfixturevalue(name)
         except pytest.FixtureLookupError:
             pytest.fail(
-                f'{name} is not registered for this rootdir. Wire the test-root '
-                'conftest to import it from df_pytest_isolation '
-                '(`# noqa: F401 — the binding IS the wiring`); without that, this '
-                'whole suite runs with no live-fleet defence.',
+                f'{name} is not registered for this rootdir. Call '
+                'arm_fleet_dir_isolation(config) from the test-root conftest\'s '
+                'pytest_configure; without that, this whole suite runs with no '
+                'live-fleet defence.',
                 pytrace=False,
             )
 
@@ -745,10 +737,10 @@ def _nested_conftest_source(*, preexisting: bool) -> str:
         if preexisting
         else ''
     )
-    return binding_conftest(_GUARD_NAME, setup=f"""\
+    return arming_conftest(_GUARD_NAME, setup=f"""\
 import df_pytest_isolation
 
-# Repoint the guard at THIS tmp tree before binding it. The fixture reads the
+# Repoint the guard at THIS tmp tree before arming it. The fixture reads the
 # module global at call time, so this is what keeps the nested run away from the
 # real machine-global fleet directory.
 df_pytest_isolation.LIVE_FLEET_DIR = Path(__file__).resolve().parent / 'fleet'
@@ -814,14 +806,14 @@ def _nested_run(
 # a gating command is not a test: it says which RUN went red, not which branch.
 #
 # This reduces 4398 to its essentials in a nested pytest session -- two
-# sub-rootdirs, each with a conftest binding the fixture exactly as this repo's
-# three real roots do -- so the branch is pinned by something that names it.
+# sub-rootdirs, each with its own conftest -- so the branch is pinned by
+# something that names it.
 # ---------------------------------------------------------------------------
 
-# The binding IS the wiring, and it goes in a CONFTEST rather than a test
-# module: that is what the real roots do (conftest.py, scripts/tests/conftest.py,
-# orchestrator/tests/conftest.py) and it is what makes two independent instances
-# of one session-scoped fixture exist in a single session.
+# Importing the fixture into each sub-root's conftest gives every root its own
+# instance of one session-scoped fixture in a single session. The real roots no
+# longer do this -- they arm it once per session -- but it is the only wiring
+# that still reaches the adopt branch, so it is kept on purpose.
 _ADOPTION_CONFTEST = """\
 import sys
 from pathlib import Path
@@ -831,6 +823,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from df_pytest_isolation import _df_fleet_dir_redirect  # noqa: F401
+"""
+
+# The production wiring (conftest.py, scripts/tests/conftest.py,
+# orchestrator/tests/conftest.py): each root arms the pair from its
+# pytest_configure. Arming also arms the live-fleet heartbeat guard, so the copy
+# is repointed at the nested tree first, keeping the run off the real directory.
+_ARMING_CONFTEST = """\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import df_pytest_isolation
+
+df_pytest_isolation.LIVE_FLEET_DIR = Path(__file__).resolve().parent.parent / 'fleet'
+
+
+def pytest_configure(config):
+    df_pytest_isolation.arm_fleet_dir_isolation(config)
 """
 
 # Each nested test RECORDS what its own root's instance yielded, so the outer
@@ -864,8 +875,10 @@ def _adoption_test_source(record: str) -> str:
     return _ADOPTION_TEST_TEMPLATE.replace('__RECORD__', repr(record))
 
 
-def _nested_adoption_run(root: Path) -> subprocess.CompletedProcess[str]:
-    """Run one pytest session spanning TWO sub-rootdirs that each bind the fixture.
+def _nested_adoption_run(
+    root: Path, sub_root_conftest: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run one pytest session spanning TWO sub-rootdirs, each wired by *sub_root_conftest*.
 
     The module order on the command line is A, B, A -- the shape task 4398
     actually reported (``pytest scripts/tests/... tests/scripts/...
@@ -878,8 +891,8 @@ def _nested_adoption_run(root: Path) -> subprocess.CompletedProcess[str]:
     return run_nested_pytest(
         root,
         {
-            'root_a/conftest.py': _ADOPTION_CONFTEST,
-            'root_b/conftest.py': _ADOPTION_CONFTEST,
+            'root_a/conftest.py': sub_root_conftest,
+            'root_b/conftest.py': sub_root_conftest,
             'root_a/test_a_first.py': _adoption_test_source('a-first'),
             'root_b/test_b_only.py': _adoption_test_source('b-only'),
             'root_a/test_a_second.py': _adoption_test_source('a-second'),
@@ -891,64 +904,100 @@ def _nested_adoption_run(root: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _assert_both_roots_yield_the_one_redirect_the_env_var_holds(
+    root: Path, sub_root_conftest: str, *, suspect: str,
+) -> None:
+    """Run the two-root session wired by *sub_root_conftest* and assert ONE redirect.
+
+    Asserts the PROPERTY, not the mechanism: whatever the wiring does
+    internally, both roots must agree on ONE directory and that directory must
+    be what ``ORCH_FLEET_DIR`` holds while each root's tests run. Both halves
+    are load-bearing -- agreeing on a path neither root exported would satisfy
+    the first one alone. *suspect* names the mechanism the caller pins, so a
+    red run points at it.
+    """
+    result = _nested_adoption_run(root, sub_root_conftest)
+    combined = result.stdout + result.stderr
+
+    assert result.returncode == 0, (
+        f'the two-root nested session exited {result.returncode}: a per-root '
+        'identity assertion failed or the session never reached its tests -- '
+        f'{suspect}. stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert '3 passed' in combined, (
+        'the nested session did not run all three modules, so it proves '
+        f'nothing about two roots sharing one redirect. output={combined!r}'
+    )
+
+    records = {
+        p.name: p.read_text().splitlines()
+        for p in sorted((root / 'observed').iterdir())
+    }
+    assert set(records) == {'a-first', 'a-second', 'b-only'}, records
+
+    yielded = {name: rec[0] for name, rec in records.items()}
+    env_seen = {name: rec[1] for name, rec in records.items()}
+
+    assert len(set(yielded.values())) == 1, (
+        'the two roots yielded DIFFERENT redirects, so at least one is '
+        'handing its tests a directory the env var does not name -- '
+        f'{suspect}. yielded={yielded!r}'
+    )
+    assert set(env_seen.values()) == set(yielded.values()), (
+        'every root agreed on a directory that is not what ORCH_FLEET_DIR '
+        'actually held, so a spawned script would read somewhere else '
+        f'entirely. yielded={yielded!r} env={env_seen!r}'
+    )
+
+
 class TestTheAdoptBranchHoldsInARealSession:
-    """Two roots, one session, one redirect."""
+    """Two roots, two instances of the redirect, one session, one redirect."""
 
     def test_both_roots_yield_the_one_redirect_the_env_var_holds(
         self, tmp_path: Path,
     ) -> None:
         """The end-to-end proof of ``_df_fleet_dir_redirect``'s adopt branch.
 
-        Asserts the PROPERTY, not the mechanism: whatever the two instances do
-        internally, they must agree on ONE directory and that directory must be
-        what ``ORCH_FLEET_DIR`` holds while each root's tests run. Both halves
-        are load-bearing -- agreeing on a path neither root exported would
-        satisfy the first one alone.
-
-        Without adoption this fails on the recorded paths (``fleet-dir0`` vs
-        ``fleet-dir1`` under one basetemp, which is verbatim what 4398
-        reported) and, when the A-B-A order holds, on the nested run's own exit
-        code as well.
+        Each sub-root imports the fixture into its conftest, so the session
+        holds two instances of it. Without adoption this fails on the recorded
+        paths (``fleet-dir0`` vs ``fleet-dir1`` under one basetemp, which is
+        verbatim what 4398 reported) and, when the A-B-A order holds, on the
+        nested run's own exit code as well.
 
         Note the nested session INHERITS this session's ``ORCH_FLEET_DIR``,
         which points into the OUTER basetemp -- so the first instance correctly
         REFUSES it (a previous run's value is never adoptable) and mktemps, and
-        only the second adopts. That is the create path and the adopt path in
-        one run, in the order they occur in production.
+        only the second adopts: the create path and the adopt path in one run.
         """
-        root = tmp_path / 'two-roots'
-        result = _nested_adoption_run(root)
-        combined = result.stdout + result.stderr
-
-        assert result.returncode == 0, (
-            'a two-root nested session failed its own per-root identity '
-            'assertions -- the redirect fixture is clobbering across roots '
-            f'again (task 4398). stdout={result.stdout!r} '
-            f'stderr={result.stderr!r}'
-        )
-        assert '3 passed' in combined, (
-            'the nested session did not run all three modules, so it proves '
-            f'nothing about two live instances. output={combined!r}'
+        _assert_both_roots_yield_the_one_redirect_the_env_var_holds(
+            tmp_path / 'two-roots', _ADOPTION_CONFTEST,
+            suspect=(
+                "_df_fleet_dir_redirect's adopt branch is not running, so its "
+                'two instances clobber each other across roots (task 4398)'
+            ),
         )
 
-        records = {
-            p.name: p.read_text().splitlines()
-            for p in sorted((root / 'observed').iterdir())
-        }
-        assert set(records) == {'a-first', 'a-second', 'b-only'}, records
 
-        yielded = {name: rec[0] for name, rec in records.items()}
-        env_seen = {name: rec[1] for name, rec in records.items()}
+class TestArmingFromTwoRootsYieldsOneRedirect:
+    """The production wiring: two roots arm the redirect, one session, one redirect."""
 
-        assert len(set(yielded.values())) == 1, (
-            'the two roots yielded DIFFERENT redirects, so at least one is '
-            'handing its tests a directory the env var does not name -- the '
-            f'adopt branch is not running. yielded={yielded!r}'
-        )
-        assert set(env_seen.values()) == set(yielded.values()), (
-            'every root agreed on a directory that is not what ORCH_FLEET_DIR '
-            'actually held, so a spawned script would read somewhere else '
-            f'entirely. yielded={yielded!r} env={env_seen!r}'
+    def test_both_roots_yield_the_one_redirect_the_env_var_holds(
+        self, tmp_path: Path,
+    ) -> None:
+        """Each sub-root calls ``arm_fleet_dir_isolation`` as the real roots do.
+
+        ``arm_fixtures`` registers the redirect once per session by plugin
+        name, so the second root's arm call is a no-op and the session holds a
+        single instance. If that idempotency broke, the second call would
+        register a duplicate plugin and abort the session at configure time.
+        """
+        _assert_both_roots_yield_the_one_redirect_the_env_var_holds(
+            tmp_path / 'two-roots', _ARMING_CONFTEST,
+            suspect=(
+                'check that arm_fixtures still registers each fixture once per '
+                'session by plugin name, and that arm_fleet_dir_isolation still '
+                'arms _df_fleet_dir_redirect'
+            ),
         )
 
 

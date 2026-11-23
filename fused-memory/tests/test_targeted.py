@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from _census_helpers import census_lines
 from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import complete_paged_read, make_8df8_scenario, pydantic_spec
 from _git_root_helper import make_git_root
@@ -5615,18 +5616,12 @@ async def test_unblock_dependent_guards(
         mock_taskmaster.set_task_status.assert_not_awaited()
 
 
-_SCHEMA_WARNING = 'task_metadata.schema_warning'
-_VETO_READER_SOURCE = 'source=targeted._unblock_veto_reason'
-
-
-def _veto_reader_discard_lines(caplog) -> list[str]:
-    messages = (r.getMessage() for r in caplog.records)
-    return [m for m in messages if _SCHEMA_WARNING in m and _VETO_READER_SOURCE in m]
+_VETO_READER_SOURCE = 'targeted._unblock_veto_reason'
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    'metadata, expected_type, census_lines',
+    'metadata, expected_type, expected_census_count',
     [
         pytest.param('{not json', 'dependent_unblock_applied', 1, id='unparseable_string'),
         pytest.param(42, 'dependent_unblock_applied', 1, id='non_str_value'),
@@ -5638,7 +5633,7 @@ def _veto_reader_discard_lines(caplog) -> list[str]:
 )
 async def test_unblock_veto_reader_logs_unreadable_dependent_metadata_once(
     wired_reconciler, mock_taskmaster, tmp_path, caplog,
-    metadata, expected_type, census_lines,
+    metadata, expected_type, expected_census_count,
 ):
     """Unreadable dependent metadata still reads as empty, so it raises no
     veto (the ``blocked_unparseable_metadata_treated_as_empty`` pin above),
@@ -5658,7 +5653,7 @@ async def test_unblock_veto_reader_logs_unreadable_dependent_metadata_once(
         )
 
     assert [a['type'] for a in _dep_actions_for(result, '2')] == [expected_type]
-    assert len(_veto_reader_discard_lines(caplog)) == census_lines
+    assert len(census_lines(caplog, _VETO_READER_SOURCE)) == expected_census_count
 
 
 # ── task-4903: durability of the write + per-dependent isolation ───────────
@@ -5826,8 +5821,10 @@ async def test_unblock_dependent_failure_does_not_strand_siblings(
 # ── task-4903: escalation-pin veto ──────────────────────────────────────────
 
 
-def _seed_open_escalation_pinning_task_2(project_root: str) -> str:
-    """Submit a real pending escalation pinning task '2' into the layout queue."""
+def _seed_open_escalation_on_task_2(
+    project_root: str, *, severity: str = 'blocking', level: int = 1,
+) -> str:
+    """Submit a real pending escalation on task '2' into the layout queue."""
     from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
@@ -5836,12 +5833,12 @@ def _seed_open_escalation_pinning_task_2(project_root: str) -> str:
         id=queue.make_id('2'),
         task_id='2',
         agent_role='harness',
-        severity='blocking',
+        severity=severity,
         category='dependency_discovered',
         summary='Task 2 blocked pending external dependency',
         detail='blocked pending review',
         suggested_action='wait',
-        level=1,
+        level=level,
     ))
 
 
@@ -5879,7 +5876,7 @@ async def test_unblock_dependent_vetoed_by_open_escalation(
     than a hand-rolled JSON blob.
     """
     project_root = str(tmp_path)
-    esc_id = _seed_open_escalation_pinning_task_2(project_root)
+    esc_id = _seed_open_escalation_on_task_2(project_root)
 
     result = await _unblock_sweep_over_blocked_task_2(
         wired_reconciler, mock_taskmaster, project_root,
@@ -5903,7 +5900,7 @@ async def test_unblock_dependent_vetoed_by_open_escalation(
 async def test_unblock_dependent_vetoed_by_open_escalation_in_relocated_layout_queue(
     wired_reconciler, mock_taskmaster, tmp_path, escalation_queue_relocation,
 ):
-    esc_id = _seed_open_escalation_pinning_task_2(str(tmp_path))
+    esc_id = _seed_open_escalation_on_task_2(str(tmp_path))
 
     result = await _unblock_sweep_over_blocked_task_2(
         wired_reconciler, mock_taskmaster, str(tmp_path),
@@ -5913,6 +5910,45 @@ async def test_unblock_dependent_vetoed_by_open_escalation_in_relocated_layout_q
     assert action.get('reason') == 'escalation_pinned', action
     assert action.get('escalation_ids') == [esc_id], action
     assert not (tmp_path / escalation_queue_relocation.legacy_relpath).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('level', [0, 1, 2])
+async def test_unblock_dependent_not_vetoed_by_info_only_escalation(
+    wired_reconciler, mock_taskmaster, tmp_path, level,
+):
+    """An info record is an annotation, not a handoff: it pins nothing at any
+    level (escalation/src/escalation/pins.py::classify_pins, link 1)."""
+    _seed_open_escalation_on_task_2(str(tmp_path), severity='info', level=level)
+
+    result = await _unblock_sweep_over_blocked_task_2(
+        wired_reconciler, mock_taskmaster, str(tmp_path),
+    )
+
+    [action] = _dep_actions_for(result, '2')
+    assert action['type'] == 'dependent_unblock_applied', action
+    set_task_status = wired_reconciler.task_interceptor.set_task_status
+    set_task_status.assert_awaited_once()
+    assert set_task_status.await_args.kwargs.get('task_id') == '2'
+    assert set_task_status.await_args.kwargs.get('status') == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_veto_names_only_the_pinning_escalation(
+    wired_reconciler, mock_taskmaster, tmp_path,
+):
+    _seed_open_escalation_on_task_2(str(tmp_path), severity='info', level=2)
+    blocking_id = _seed_open_escalation_on_task_2(str(tmp_path))
+
+    result = await _unblock_sweep_over_blocked_task_2(
+        wired_reconciler, mock_taskmaster, str(tmp_path),
+    )
+
+    [action] = _dep_actions_for(result, '2')
+    assert action['type'] == 'dependent_unblock_vetoed', action
+    assert action.get('reason') == 'escalation_pinned', action
+    assert action.get('escalation_ids') == [blocking_id], action
+    wired_reconciler.task_interceptor.set_task_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio

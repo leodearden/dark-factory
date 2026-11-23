@@ -31,7 +31,7 @@ import types
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -45,7 +45,11 @@ from fused_memory.backends.graphiti_client import (
     PagedRead,
     ReadCompleteness,
 )
+from fused_memory.backends.llm_token_usage import measure_llm_tokens
 from fused_memory.services.durable_queue import DurableWriteQueue
+
+if TYPE_CHECKING:
+    from fused_memory.services.memory_service import MemoryService
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -916,6 +920,83 @@ def _make_rate_limit_error(
     return RateLimitError(message, response=response, body=body)
 
 
+def make_insufficient_quota_error(
+    message: str = (
+        'You have no credits remaining. Please add credits to your account to continue.'
+    ),
+    *,
+    with_code: bool = True,
+    code: str = 'insufficient_quota',
+    error_type: str | None = 'insufficient_quota',
+) -> RateLimitError:
+    """Build the 2026-11-19 incident's openai.RateLimitError: credits exhausted.
+
+    ``with_code=False`` drops ``code`` and keeps only ``type`` — the shape
+    syslog carried during the incident. ``code='credit_balance_exhausted'``
+    is the live deployment's shape: its 429 body carries that code with type
+    ``insufficient_quota``. ``error_type=None`` drops ``type`` so ``code``
+    alone carries the signal.
+    """
+    request = httpx.Request('POST', 'https://api.openai.com/v1/embeddings')
+    response = httpx.Response(429, request=request)
+    body: dict[str, Any] = {'message': message, 'param': None}
+    if error_type is not None:
+        body['type'] = error_type
+    if with_code:
+        body['code'] = code
+    return RateLimitError(message, response=response, body=body)
+
+
+def make_transient_rate_limit_error() -> RateLimitError:
+    """Build a real openai.RateLimitError for a transient too-many-requests 429."""
+    message = 'Rate limit reached for requests'
+    request = httpx.Request('POST', 'https://api.openai.com/v1/embeddings')
+    response = httpx.Response(429, request=request)
+    body = {'message': message, 'type': 'requests', 'param': None, 'code': 'rate_limit_exceeded'}
+    return RateLimitError(message, response=response, body=body)
+
+
+def mock_memory_backends(svc: 'MemoryService') -> 'MemoryService':
+    """Stub Graphiti/Mem0 on *svc* so tests never hit real FalkorDB/Qdrant.
+
+    The shared definition of a mocked MemoryService for suites that run a
+    real DurableWriteQueue against it: a backend that grows a new method is
+    taught about here once. Callers override individual stubs (for example
+    ``svc.mem0.add.side_effect``) after calling it.
+    """
+    svc.graphiti = MagicMock()
+    svc.graphiti.initialize = AsyncMock()
+    svc.graphiti.add_episode = AsyncMock(return_value=None)
+    svc.graphiti.close = AsyncMock()
+    svc.graphiti._require_client = MagicMock()
+    # A bare MagicMock probe yields an AsyncMock usage that the real WriteJournal
+    # rejects, dropping the graphiti backend_ops row; this one measures nothing.
+    svc.graphiti.token_probe = lambda: measure_llm_tokens(None)
+
+    svc.mem0 = MagicMock()
+    svc.mem0.search = AsyncMock(return_value={'results': []})
+    svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
+    svc.mem0.get_all = AsyncMock(return_value={'results': []})
+    svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    svc.mem0.close = AsyncMock()
+    return svc
+
+
+def wrap_like_graphiti(inner: BaseException) -> Exception:
+    """Re-raise *inner* the way graphiti_core's OpenAI clients wrap a 429.
+
+    graphiti_core/llm_client/openai_base_client.py does
+    ``raise RateLimitError from e``, so the returned exception carries the
+    structured provider fields only on ``__cause__``.
+    """
+    from graphiti_core.llm_client.errors import RateLimitError as GraphitiRateLimitError
+
+    try:
+        raise GraphitiRateLimitError from inner
+    except GraphitiRateLimitError as wrapped:
+        return wrapped
+
+
 # ---------------------------------------------------------------------------
 # Leaked TaskInterceptor curator-worker reaper (task 2737)
 # ---------------------------------------------------------------------------
@@ -1169,7 +1250,7 @@ def lease_dir_fixture(tmp_path, monkeypatch):
     case is one of the behaviours under test.
 
     Activation is by import, per module
-    (``from _fm_helpers import lease_dir_fixture  # noqa: F401``), and NEVER
+    (``from _fm_helpers import lease_dir_fixture as lease_dir_fixture``), and NEVER
     from conftest.py: an autouse fixture there would apply to every test in
     the package, redirecting the ``-m integration`` lane away from the
     directory the live cron reads and silently disabling the guard task 4775

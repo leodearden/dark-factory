@@ -35,7 +35,7 @@ from brief_sections import Section
 
 sys.path.insert(0, str(state.CHECKOUT_ROOT / 'orchestrator' / 'src'))
 
-from orchestrator import session_registry
+from orchestrator import session_records
 
 
 class Exit(enum.IntEnum):
@@ -494,23 +494,23 @@ _BUILDERS: Mapping[state.Pass, Callable[[_Seat], _Built]] = types.MappingProxyTy
 })
 
 
-def _code_spans(outcomes: Sequence[session_registry.ResultOutcome]) -> str:
+def _code_spans(outcomes: Sequence[session_records.ResultOutcome]) -> str:
     return ', '.join(f'`{outcome}`' for outcome in outcomes)
 
 
 def _spawn_section(seat: _Seat) -> tuple[Section, list[str]]:
-    """What a spawned session owes its record, in session_registry's outcome vocabulary."""
-    result = session_registry.RESULT_FILENAME
-    terminal = [o for o in session_registry.RESULT_OUTCOMES if o in session_registry.TERMINAL_RESULT_OUTCOMES]
+    """What a spawned session owes its record, in session_records's outcome vocabulary."""
+    result = session_records.RESULT_FILENAME
+    terminal = [o for o in session_records.RESULT_OUTCOMES if o in session_records.TERMINAL_RESULT_OUTCOMES]
     inbox = seat.run.home.inbox_file(seat.stream, seat.pass_, seat.item)
     return Section.SPAWN, [
         f'- The inbox file `{inbox}` is your return. `{result}` names that path and carries no '
         'copy of it.',
         f'- After each pass, checkpoint `{result}` with outcome '
-        f'`{session_registry.ResultOutcome.IN_PROGRESS}`; its final write carries a terminal '
+        f'`{session_records.ResultOutcome.IN_PROGRESS}`; its final write carries a terminal '
         f'outcome: {_code_spans(terminal)}.',
         f'- On a context or usage limit, write HANDOFF.md beside `{result}` and end with outcome '
-        f'`{session_registry.ResultOutcome.HANDED_OFF}`.',
+        f'`{session_records.ResultOutcome.HANDED_OFF}`.',
         '- Run /reflect before you end.',
         '- End as the launch trailer says.',
     ]

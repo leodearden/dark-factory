@@ -85,9 +85,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 for _path in (_REPO_ROOT / 'orchestrator' / 'src', _REPO_ROOT / 'shared' / 'src', _REPO_ROOT / 'scripts'):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
-# legibility/coder.py imports its sibling as a bare `codebook`; appended last so no flat legibility module shadows anything.
-if str(_REPO_ROOT / 'scripts' / 'legibility') not in sys.path:
-    sys.path.append(str(_REPO_ROOT / 'scripts' / 'legibility'))
 
 from legibility import account_pool  # noqa: E402
 from orchestrator.agents.sandbox_dispatch import (  # noqa: E402  # debt: task 6760
@@ -120,7 +117,7 @@ TAIL_CHARS = 2000
 DEFAULT_MCP_JSON = _REPO_ROOT / '.mcp.json'
 NIGHTLY_MCP_SERVERS: tuple[str, ...] = ('escalation', 'fused-memory')
 
-PREPARE_COMMAND = 'uv run --frozen --project shared python scripts/sitting/prepare_sitting.py'
+PREPARE_COMMAND = 'uv run --no-sync --project shared python scripts/sitting/prepare_sitting.py'
 """The one shell spelling the run may execute; repo-relative, so the child runs in the run's root."""
 
 _GIT_READS = git_read_rules('show', 'log')

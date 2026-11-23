@@ -15,7 +15,6 @@ import contextlib
 import functools
 import os
 import random
-import shlex
 import signal
 import stat
 import subprocess
@@ -25,11 +24,20 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from _fake_systemctl import fake_systemctl as fake_systemctl
+from _fake_systemctl import recorded_calls
 from _fake_systemd_run import fake_systemd_run as fake_systemd_run
 from _fake_systemd_run import recorded_scope_spawns
+from _real_project_slice import RealProjectSlice
+from _real_project_slice import real_project_slice as real_project_slice
 from shared.proc_group import read_stat_fields
 
-from orchestrator.config import CpuGovernConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.config import (
+    CpuGovernConfig,
+    FusedMemoryConfig,
+    ModuleConfig,
+    OrchestratorConfig,
+)
 from orchestrator.verify import run_verification
 
 _PROC = Path('/proc')
@@ -42,31 +50,11 @@ def worktree(tmp_path) -> Path:
     return wt
 
 
-@pytest.fixture
-def fake_systemctl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Put a recording ``systemctl`` first on PATH; return its argv-record dir."""
-    argv_dir = tmp_path / 'systemctl-argv'
-    argv_dir.mkdir()
-    fakebin = tmp_path / 'fakectl'
-    fakebin.mkdir()
-    script = fakebin / 'systemctl'
-    script.write_text(
-        '#!/bin/sh\n'
-        f'rec=$(mktemp {shlex.quote(str(argv_dir))}/argv.XXXXXX)\n'
-        'for a in "$@"; do printf \'%s\\0\' "$a" >> "$rec"; done\n'
-        'exit 0\n'
-    )
-    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    monkeypatch.setenv('PATH', f'{fakebin}{os.pathsep}' + os.environ['PATH'])
-    return argv_dir
-
-
 def _killed_units(argv_dir: Path) -> set[str]:
     """The unit of every recorded ``systemctl --user kill|stop ... <unit>`` call."""
-    records = [p.read_bytes().decode().split('\0')[:-1] for p in argv_dir.iterdir()]
     return {
         record[-1]
-        for record in records
+        for record in recorded_calls(argv_dir)
         if record[:1] == ['--user'] and len(record) > 2 and record[1] in ('kill', 'stop')
     }
 
@@ -229,6 +217,7 @@ class TestRealGovernedMergeLeg:
     @pytest.mark.asyncio
     async def test_timed_out_governed_merge_leg_leaves_no_survivors(
         self, worktree, governed_slice, marker, tmp_path,
+        real_project_slice: RealProjectSlice,
     ):
         try:
             relocates = _nested_scope_relocates()
@@ -240,6 +229,7 @@ class TestRealGovernedMergeLeg:
         config = OrchestratorConfig(
             verify_use_cgroup_scope=True,
             cpu_governance=CpuGovernConfig(enabled=True, exec_path=str(governed)),
+            fused_memory=FusedMemoryConfig(project_id=real_project_slice.project_id),
         )
         # `& wait` keeps bash as the session leader, so GNU timeout's setpgid
         # really leaves the spawn process group.

@@ -13,11 +13,6 @@ The briefing captures durable truths — purpose, intent, priorities, decisions,
 project: dark-factory
 last_updated: 2026-10-04   # required; set on every write by /review-briefing
 
-# Optional /audit integration knobs. /review Phase 2 reads these when the
-# project ships an /audit slash command (e.g. Reify's reify-audit).
-audit:
-  window_days: 14   # How far back a full review's /audit sweep looks. Default 14.
-
 # Conventions and rules with teeth — violations are always bugs.
 # Include rationale so reviewers understand WHY, not just WHAT.
 conventions:
@@ -124,14 +119,6 @@ ISO-8601 date of the last write by `/review-briefing`, as a real key (a header c
 ### `subprojects` keys
 
 One key per workspace member, plus any non-member directory worth reviewing. These keys are the area vocabulary every quality instrument uses (`docs/quality-findings-contract.md` §3), so a member without a key is a defect `--validate` reports.
-
-### `audit` (optional)
-
-Knobs for `/review` Phase 2's invocation of the project's `/audit` slash command (if any). Only consumed when `.claude/skills/audit/SKILL.md` exists at project root.
-
-- `window_days` — how many days back a `mode: full` review's sweep looks. Default `14`. An incremental review ignores it and sweeps from its `since` commit's date instead.
-
-If the project has no `/audit` skill, this block is inert — leave it absent or empty. Adding `window_days` does not on its own change `/review`'s behaviour; the `/audit` skill must exist for the knob to matter.
 
 ### `conventions[]`
 

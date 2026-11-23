@@ -17,10 +17,10 @@ from _merge_worker_drive import (
 from _orch_helpers import (
     PYPROJECT_DEFAULT_TIMEOUT,
     STOP_WORKER_JOIN_TIMEOUT,
-    UNDER_LOAD_HEADROOM_FACTOR,
 )
 from _wait_budget_audit import item_wait_budgets
 from _wait_hygiene_scan import unguarded_worker_teardown_items
+from shared.testing_timeout_headroom import UNDER_LOAD_HEADROOM_FACTOR
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps

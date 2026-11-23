@@ -1,0 +1,17 @@
+import re,numpy as np,collections,statistics as st
+DF={'2507122','2382379','234358','1188485','3122652','2245511','2531748','1538594','1218128'}
+pts=collections.defaultdict(list)
+for l in open('/tmp/gate-10069/conflicts/bc_all.txt'):
+    m=re.search(r'uv\[(\d+)\].*built=(\d+).*reason=(\S+).*elapsed_ms=(\d+)',l)
+    pid,b,r,el=m.groups(); att=int(b)+(r!='None')
+    pts['df' if pid in DF else 'reify'].append((att,int(el)/1000))
+for p,v in pts.items():
+    x=np.array([a for a,_ in v],float); y=np.array([e for _,e in v])
+    A=np.vstack([np.ones_like(x),x]).T; b=np.linalg.lstsq(A,y,rcond=None)[0]; r=y-A@b
+    se=np.sqrt(np.diag(r@r/(len(y)-2)*np.linalg.inv(A.T@A)))
+    g=collections.defaultdict(list)
+    for a,e in v: g[a].append(e)
+    med={k:round(st.median(w),1) for k,w in sorted(g.items())}
+    mb=np.polyfit(list(med),list(med.values()),1)
+    print(p,'n',len(y),'medians by merges',med,{k:len(w) for k,w in sorted(g.items())})
+    print(f'  OLS slope {b[1]:.2f}s/merge 95% [{b[1]-1.96*se[1]:.2f},{b[1]+1.96*se[1]:.2f}] int {b[0]:.1f}; median-fit slope {mb[0]:.2f} int {mb[1]:.2f} -> 12: {mb[1]+12*mb[0]:.1f}s 24: {mb[1]+24*mb[0]:.1f}s')

@@ -70,6 +70,16 @@ class TestWordings:
         assert _mod().WORDING_PRE_PSI == 'pre-psi'
         assert _mod().WORDINGS == ('shipped', 'pre-psi')
 
+    def test_psi_is_selectable_but_not_on_the_d16_axis(self) -> None:
+        assert _mod().WORDING_PSI == 'psi'
+        assert _mod().SELECTABLE_WORDINGS == ('shipped', 'pre-psi', 'psi')
+        assert _mod().WORDING_PSI not in _mod().WORDINGS
+
+    def test_the_psi_wording_names_the_frozen_psi_prompt(self) -> None:
+        prompt = _mod().system_prompt(_mod().WORDING_PSI)
+        assert prompt is _mod().PSI_JUDGE_SYSTEM_PROMPT
+        assert _sha(prompt) == PSI_SHA256
+
     def test_the_pre_psi_prompt_is_the_historical_one_byte_for_byte(self) -> None:
         assert _sha(_mod().PRE_PSI_JUDGE_SYSTEM_PROMPT) == PRE_PSI_SHA256
 
@@ -94,6 +104,15 @@ class TestWordings:
         with pytest.raises(ValueError, match='shipped') as excinfo:
             _mod().system_prompt('post-psi')
         assert 'pre-psi' in str(excinfo.value)
+        assert "'psi'" in str(excinfo.value)
+
+    def test_each_frozen_wording_hashes_to_its_pinned_sha(self) -> None:
+        assert _mod().prompt_sha256(_mod().WORDING_PSI) == PSI_SHA256
+        assert _mod().prompt_sha256(_mod().WORDING_PRE_PSI) == PRE_PSI_SHA256
+
+    def test_an_unknown_wording_has_no_sha(self) -> None:
+        with pytest.raises(ValueError, match='post-psi'):
+            _mod().prompt_sha256('post-psi')
 
 
 class TestJudgeWordingOverride:
@@ -113,9 +132,28 @@ class TestJudgeWordingOverride:
         assert sha == _sha(_mod().PRE_PSI_JUDGE_SYSTEM_PROMPT)
         assert after == _mod().system_prompt(_mod().WORDING_SHIPPED)
 
+    @pytest.mark.asyncio
+    async def test_the_psi_wording_sends_the_psi_prompt_then_the_shipped_one(self) -> None:
+        client = _openai_client()
+        with patch('openai.AsyncOpenAI', return_value=client):
+            with _mod().judge_wording(_mod().WORDING_PSI) as sha:
+                await _call_shipped_llm()
+            inside = client.responses.create.call_args.kwargs['instructions']
+            await _call_shipped_llm()
+            after = client.responses.create.call_args.kwargs['instructions']
+
+        assert inside == _mod().PSI_JUDGE_SYSTEM_PROMPT
+        assert sha == PSI_SHA256
+        assert after == _mod().system_prompt(_mod().WORDING_SHIPPED)
+
     def test_the_shipped_wording_yields_the_shipped_sha(self) -> None:
         with _mod().judge_wording(_mod().WORDING_SHIPPED) as sha:
             assert sha == _sha(_mod().system_prompt(_mod().WORDING_SHIPPED))
+
+    @pytest.mark.parametrize('wording', ['shipped', 'pre-psi', 'psi'])
+    def test_the_yielded_sha_is_the_wordings_prompt_sha256(self, wording: str) -> None:
+        with _mod().judge_wording(wording) as sha:
+            assert sha == _mod().prompt_sha256(wording)
 
     def test_the_shipped_prompt_is_restored_when_the_body_raises(self) -> None:
         shipped = _mod().system_prompt(_mod().WORDING_SHIPPED)
@@ -136,7 +174,7 @@ class TestJudgeWordingOverride:
             _mod().WORDING_SHIPPED,
         )
 
-    @pytest.mark.parametrize('wording', ['shipped', 'pre-psi'])
+    @pytest.mark.parametrize('wording', ['shipped', 'pre-psi', 'psi'])
     def test_re_entering_the_same_wording_is_refused(self, wording: str) -> None:
         with (
             _mod().judge_wording(wording),

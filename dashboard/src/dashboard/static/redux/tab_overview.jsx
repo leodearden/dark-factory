@@ -35,14 +35,14 @@ const METRICS = [
   { key: 'psi_io_some_avg10',   label: 'IO pressure · some',   type: 'psi' },
   { key: 'psi_io_full_avg10',   label: 'IO pressure · full',   type: 'psi' },
   { key: 'occt_queue_depth',    label: 'OCCT queue depth',     type: 'int' },
-  { key: 'verify_concurrency',  label: 'Verify concurrency',   type: 'int' },
-  { key: 'verify_rss_total_bytes', label: 'Verify RSS total',  type: 'bytes' },
+  { key: 'verify_scopes_live',  label: 'Verify scopes live',   type: 'int' },
+  { key: 'verify_scope_memory_bytes', label: 'Verify scope memory', type: 'bytes' },
 ];
 
 /* Format a host-load metric value for display.
  *  type 'psi'   → "X.XX%"  (avg10 stall %; some = tasks stalling, full = all stalling)
- *  type 'bytes' → "X.X GiB" (verify_rss_total_bytes via 1024**3 = 1073741824)
- *  type 'int'   → integer (occt_queue_depth, verify_concurrency)
+ *  type 'bytes' → "X.X GiB" (verify_scope_memory_bytes via 1024**3 = 1073741824)
+ *  type 'int'   → integer (occt_queue_depth, verify_scopes_live)
  */
 function formatLoadValue(type, v) {
   if (type === 'psi')   return `${v.toFixed(2)}%`;

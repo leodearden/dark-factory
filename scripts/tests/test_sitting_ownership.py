@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from orchestrator.session_registry import SessionRecord, Status
+from orchestrator.session_records import SessionRecord, Status
 from shared.task_deferral import CarriedByDeferral, UntilConditionDeferral, record_to_json
 from shared.task_statuses import ACTIVE, TERMINAL
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT

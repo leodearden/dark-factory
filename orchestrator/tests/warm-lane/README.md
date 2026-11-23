@@ -9,9 +9,10 @@ leaf α2 (Phase 1).
 
 `.sh` files are not collected by pytest, so each of these is driven as one
 parametrized pytest item by `orchestrator/tests/test_warm_lane_bash_suite.py`.
-That driver also carries the two non-vacuity guards — the `PORTED_TESTS`
-manifest and the `SCRIPT_COVERAGE` map, each asserted set-equal to what is
-actually on disk — which keep a dropped, renamed or mis-globbed port from
+That driver also carries the two non-vacuity guards — the `BASH_SUITES`
+manifest (`PORTED_TESTS` plus `NATIVE_TESTS`, the suites with no reify
+source) and the `SCRIPT_COVERAGE` map, each asserted set-equal to what is
+actually on disk — which keep a dropped, renamed or mis-globbed suite from
 reporting a vacuous green. It fails (never skips) when a required host tool is
 absent, for the same reason.
 
@@ -55,11 +56,12 @@ the file since the `62c0f188c5` port anchor. The copy therefore differs from
 reify@`a90327f927` only by Deltas 1 and 8, the edits every port carries; the
 re-sync introduced no delta of its own.
 
-`test_warm_lane_gc.sh` has since grown DARK-FACTORY-NATIVE coverage that has no
-reify counterpart, added by **task 3075** (PRD leaf γ) — the line count and SHA
-above still describe the ported baseline, not the current file:
+`warm-lane-gc.sh` has since gained DARK-FACTORY-NATIVE coverage that has no
+reify counterpart, first added by **task 3075** (PRD leaf γ). It now lives in
+`test_warm_lane_gc_native.sh` (Delta 10); the line count and SHA above describe
+only `test_warm_lane_gc.sh`'s ported baseline:
 
-- **Block S** (23 asserts) — the durable lane record is Pass 1's reclaimability
+- **Block S** (25 asserts) — the durable lane record is Pass 1's reclaimability
   gate. `S-basic` pins that an `assigned` lane survives with a FREE flock and no
   `--extra-protect-glob` (the dark-factory ε shape); `S-reasons` pins the reason
   vocabulary, the gate ORDER by attribution, and the appended
@@ -70,7 +72,7 @@ above still describe the ported baseline, not the current file:
   up-front snapshot without going red.
 - **A10** (3 asserts) — the fail-loud guard for the new sibling
   `lib_lane_state.sh`, with `lib_live_refs.sh` deliberately PRESENT in the
-  fixture so A9's guard cannot account for the result.
+  fixture so `test_warm_lane_gc.sh`'s A9 guard cannot account for the result.
 
 **Task 7862** added two more blocks to `test_warm_lane_gc.sh`. They are the
 test half of
@@ -79,7 +81,8 @@ test half of
 `e8ae8f9246` (2026-10-17), a later revision than the anchor above:
 
 - **Block S-discard** (43 asserts). reify's S1-S4 are renamed S-discard1-4,
-  because this file's Block S is the record gate. It adds two
+  because Block S, now in `test_warm_lane_gc_native.sh`, is the record gate.
+  It adds two
   dark-factory-native pieces with no reify counterpart:
   - S-discard1's full-line summary assert, which pins that `reset_cold` is
     appended after `downgraded_assigned`;
@@ -91,15 +94,17 @@ test half of
 
 Test-side divergences from that reify revision:
 
-- T2-setup's `holder_wait_for_marker` becomes this file's
-  `_wait_for_reader_lock "$T2_READY" 30`.
+- T2-setup's `holder_wait_for_marker` becomes
+  `_wait_for_reader_lock "$T2_READY" 30`, now defined in
+  `lib_warm_lane_gc_harness.sh` (Delta 10).
 - The reaper's `holder_wait_until_waiter_queued` becomes a local
   `_wait_until_waiter_queued <slot> 120`. It has reify's `/proc/locks` body in
   `_wait_for_reader_lock`'s tick shape. reify's `slot_holder_handshake_lib.sh`,
   and the `load_tolerance_lib.sh` it needs, are not vendored. The deadline is
   longer than reify's because dark-factory's Pass 1 runs the lane-record read
   and the `live_ref_present` walk before the reseed.
-- `make_gc_fixture` is imported from that revision. So are the four seed-stub
+- `make_gc_fixture` is imported from that revision, and now defined in
+  `lib_warm_lane_gc_harness.sh` (Delta 10). So are the four seed-stub
   emitters (`_post_clone_abort_seed_stub_body`, `_empty_refusal_seed_stub_body`,
   `_discard_fail_seed_stub_body`, `_gen_probe_seed_stub_body`) and
   `_restore_discard_fail_lane`. The older blocks still build their fixtures
@@ -116,7 +121,7 @@ are the test half of
 [`orchestrator/scripts/warm-lane/README.md`](../../scripts/warm-lane/README.md)
 "Delta 14":
 
-- **Block V** in `test_warm_lane_gc.sh` (102 asserts) pins the Pass-1
+- **Block V** in `test_warm_lane_gc_native.sh` (102 asserts) pins the Pass-1
   skip-unchanged gate (V1-V9), with **A12** (3 asserts) for its sibling lib
   `lib_lane_seed.sh`. It builds an "unchanged" lane deterministically, with no
   sleep: every dir under `target/` is aged 100s back and the stamp's
@@ -127,10 +132,10 @@ are the test half of
 
 Neither block has a skip guard.
 
-Six ported suites carry further dark-factory-native asserts:
+Six suites carry further dark-factory-native asserts:
 
 - **Task 5940:** `test_provision_warm_lane_fs.sh` N4, `test_warm_lane_disk_guard.sh` A10,
-  `test_warm_lane_gc_sweep.sh` G6g, `test_warm_lane_gc.sh` A11m/A11n,
+  `test_warm_lane_gc_sweep.sh` G6g, `test_warm_lane_gc_native.sh` A11m/A11n,
   `test_warm_lane_audit.sh` A3/A4 and `test_warm_lane_degenerate_ref.sh` U8.
   They pin the script-side change recorded in
   [`orchestrator/scripts/warm-lane/README.md`](../../scripts/warm-lane/README.md)
@@ -184,6 +189,10 @@ not just until leaf κ. Leaf κ's deletion set must NOT include them:
 
 Porting either would mean relocating scripts PRD §5 deliberately leaves in
 reify. The seed/refresh/warm-base test family is excluded for the same reason.
+
+The ninth file, `test_warm_lane_gc_native.sh`, is not a port: it holds
+`warm-lane-gc.sh`'s dark-factory-native coverage (Delta 10), and the driver
+lists it in `NATIVE_TESTS`, never in `PORTED_TESTS`.
 
 ## Documented deltas from the reify sources
 
@@ -256,7 +265,8 @@ repo-relative name.
 
 The file is otherwise ported whole, including the lane-isolation facility
 (`init_isolated_lane_root`, `make_isolated_lane`), which
-`test_thin_warm_lane.sh` and `test_warm_lane_gc.sh` both call. Its deliberate
+`test_thin_warm_lane.sh`, `test_warm_lane_gc.sh` and
+`test_warm_lane_gc_native.sh` all call. Its deliberate
 omission of an EXIT trap is preserved: bash EXIT traps do not stack, so a
 library-level trap would clobber each suite's own `trap cleanup EXIT`.
 `test_summary`'s exit-0/exit-1 convention is the entire pass/fail protocol the
@@ -425,6 +435,101 @@ Against the lib before it refused an empty pair, it reports
 asserts fail. The block needs `python3`, which `REQUIRED_HOST_TOOLS` already
 lists, so it is not a deduction.
 
+### Delta 10 — `test_warm_lane_gc.sh`: shared harness in `lib_warm_lane_gc_harness.sh`; dark-factory-native blocks in `test_warm_lane_gc_native.sh` (task 6931)
+
+Added by **task 6931**. Every dark-factory-native block for `warm-lane-gc.sh`
+had landed in `test_warm_lane_gc.sh`, which grew to 4245 lines against its
+1939-line reify anchor. It is now split on its provenance seam:
+
+- `test_warm_lane_gc.sh` keeps the reify-ported blocks: A1-A9, B-H, K, M-R,
+  S-discard, T and TRASH.
+- `test_warm_lane_gc_native.sh` takes the dark-factory-native ones: A10, A12
+  and A11a-n/l, A11-boundary, the S family (S, S-pressure, S-age,
+  S-age-degrade), V and X. These pin the gates dark-factory alone owns: the
+  durable-record gate, skip-unchanged and the rendered protect glob. The driver
+  lists this file in `NATIVE_TESTS`, so nothing invites a diff against reify.
+
+**Why this seam.** Provenance decides how each half changes. The ported half
+changes by re-sync from reify, which still lands changes to this file (its
+Block U, reify `9f01c9c0ae`, is not yet ported), and its drift check is one
+`diff` against the anchor. Before the split (base `2c2f34db14`) that diff was
+almost purely additive: 24 hunks, 21 reify lines removed and 2327 added. At the
+split itself (`c922a744f4`, task/6931, "carve the dark-factory-native gc blocks
+into test_warm_lane_gc_native.sh") it was 21 hunks, 63 removed and 746 added;
+later edits move these figures, so re-measure rather than quote them. The
+removed side grew because the helpers lifted into `lib_warm_lane_gc_harness.sh`
+now show as anchor-side deletions: a re-sync should expect them there, not read
+them as lost reify text. The native half changes only when dark-factory changes
+its own gates. A behavioural split (CLI and reclaim, protect set, live-reference and
+record gates, seed outcome) would mix provenances in every file and turn each
+re-sync into a reassembly.
+
+**The one new departure from reify text.** The helpers both suites call are
+defined in the sourced `lib_warm_lane_gc_harness.sh` rather than inline:
+`run_helper` (the anchor's, now carrying task 3292's bridge-cost pin, with its
+`run_helper_live_default` sibling), `make_repo`, `_seed_stub_body`,
+`_wait_for_reader_lock` and `make_gc_fixture`. The reason is Delta 1's: one
+definition instead of two that drift. The lib sources only its own siblings
+(`lib_warm_lane_paths.sh`, then the shipped `lib_lane_state.sh` for
+`$LANE_PROTECT_GLOB_FALLBACK`), never a suite, and installs no EXIT trap. Each
+suite keeps its own `_TMPDIRS`/`_BGPIDS`/`cleanup`/`trap`,
+`init_isolated_lane_root` and `ERR_FILE`. Helpers with one user stay with it:
+`make_task_lane`, the S-discard/T stub emitters, `_restore_discard_fail_lane`,
+`_wait_until_waiter_queued` and `_wait_for_exec_map` remain in
+`test_warm_lane_gc.sh`.
+
+**What moved with what.** A10, A12, A11a-n/l and A11-boundary moved with the
+features they guard and keep their labels. A11 now builds its own empty-pool
+fixture with `make_gc_fixture` instead of reusing A7's. S-discard1's summary
+assert and S-discard5, the two dark-factory-native pieces inside the ported
+S-discard block, stay in it. No assert label changed: the two halves' sorted
+PASS labels equal the pre-split suite's 449 plus the native suite's own
+TRASH1/TRASH2 pair.
+
+**The litter-guard stem.** The native suite arms the shared-trash guard with
+stem `test-native-gc`. It must not start with `test-gc`:
+`assert_no_shared_trash_litter` attributes litter by a prefix test on the stem,
+so the ported suite's `test-gc` would claim a `test-gc-native` suite's litter.
+
+**Why the ported file is not split further.** It is still past the 2000-line
+alarm. It is the one-to-one mirror of reify's single
+`tests/infra/test_warm_lane_gc.sh`, and both this README's one-diff drift check
+and the pending Block U port rely on that mapping. The partition tried and the
+measurement are in the commit that created `test_warm_lane_gc_native.sh`.
+
+### Delta 11 — `test_warm_lane_audit.sh`: JSON checkers run under `python3 -I` via `_py_json_check`; Block R (3 asserts) (task 10896)
+
+Added by **task 10896**. All eight JSON checkers in the audit suite (H4, H6,
+H7, K6b, L8b, M7, N6b and O8b) now go through one helper,
+`_py_json_check <json> <python3-arg>...`, which pipes `<json>` into
+`python3 -I`. Reify's source runs bare `python3`, so this is a divergence from
+it.
+
+**Why.** Python puts a script's own directory, or for `-c` the cwd, at
+`sys.path[0]`. The checkers are created in the host-shared `/tmp`. importlib's
+`FileFinder` re-lists a `sys.path` directory whenever that directory's mtime
+has changed since its last look, and `/tmp`'s mtime changes whenever any
+process on the host creates or deletes a file there. On 2026-11-19 `/tmp` held
+about 279k entries. `printf '{"a": 1}' | python3 /tmp/probe.py` measured
+17.94s, against 0.03s with `-I`. That cost drove the 900s overruns on
+offline-lane passes `20261119T043112-51e371` and `20261119T072552-5a1f91`,
+whose captured output stopped at H6, H7 and M7. `-I` keeps both the script
+directory and the cwd off `sys.path`, so a checker imports only from the
+stdlib. It also stops a stray `/tmp/json.py` from shadowing the stdlib. The fix
+removes the cause, and `SUBPROC_TIMEOUT` is not widened.
+
+**Block R** pins the mechanism structurally rather than by timing. A private
+`mktemp -d` holds a `json.py` that writes `poisoned json.py imported` to
+stderr and exits 97, beside a checker that imports json. The stderr line
+names the cause in a failing assert's captured-output dump. **R0** is the non-vacuity control: run
+with bare `python3` and `PYTHONSAFEPATH` unset, the checker exits 97, so the
+poison really does shadow json. **R1** runs the checker script through the
+helper, and **R2** runs a `-c` checker through it from the poisoned cwd. Both
+exit 0. The block is NON-VACUOUS by construction: with the helper still
+running bare `python3`, R1 and R2 fail. Its asserts are counted in the floor's
+one home, `test_warm_lane_bash_suite.py::ASSERT_FLOORS`. The block needs only
+`python3`, which `REQUIRED_HOST_TOOLS` already lists.
+
 ### Not a delta — α's provision Deltas 1–2 needed no test-side change
 
 α's relocation of `provision-warm-lane-fs.sh` changed its `REPO_ROOT` to a
@@ -442,19 +547,22 @@ sole pin on that behaviour.
 The driver's `test_bash_suite_passes` applies the same predicate reify's own
 runner (`tests/infra/run_all_ambient_isolation_lib.sh`) does: **exit 0 AND a
 `Results: N passed, 0 failed` line AND `N` at or above a per-suite floor**
-(`ASSERT_FLOORS`). Exit status alone cannot tell "all 865 asserts ran and
+(`ASSERT_FLOORS`). Exit status alone cannot tell "every assert ran and
 passed" from "a block skipped and the rest passed", and leaf **κ** deletes
 reify's originals on the strength of these items being green — so the weaker
 predicate would have been the single weak link in that chain.
 
-Only two shortfalls against the measured counts below are legitimate, both from
-skip guards this leaf was required to preserve verbatim, so both are subtracted
-in the floor rather than left to pass silently:
+Only three shortfalls against a suite's measured count are legitimate, each
+from a skip guard ported verbatim from reify, so each is subtracted in the floor
+rather than left to pass silently. The current measured counts and floors have
+one home, `test_warm_lane_bash_suite.py::ASSERT_FLOORS`, whose comments record
+each deduction. This table records only which blocks are conditional, and why:
 
-| Suite | measured | floor | conditional block |
-|---|---|---|---|
-| `test_provision_warm_lane_fs.sh` | 111 | 106 | Block I (5 asserts) — real-geometry `xfs_info`/`xfs_db` proof, guarded on `mkfs.xfs`/`xfs_info`/`xfs_db`. Measured both ways: 111 with xfsprogs, 106 without. |
-| `test_warm_lane_audit.sh` | 228 | 225 | L9 (3 asserts) — unreadable-record degradation, guarded on `id -u != 0` because mode 000 is not a barrier for root. |
+| Suite | conditional block | guard |
+|---|---|---|
+| `test_provision_warm_lane_fs.sh` | Block I (5 asserts) — real-geometry `xfs_info`/`xfs_db` proof | `mkfs.xfs`, `xfs_info` and `xfs_db` present |
+| `test_warm_lane_audit.sh` | L9 (3 asserts) — unreadable-record degradation | `id -u != 0`: mode 000 is not a barrier for root |
+| `test_warm_lane_gc.sh` | S-discard3 (8 asserts) — a seed whose discard of `<lane>/target` itself fails | `id -u != 0`: the fixture's `chmod a-w` is not a barrier for root |
 
 xfsprogs is deliberately **not** promoted into the driver's
 `REQUIRED_HOST_TOOLS`: Block I's guard exists so the bash file stays runnable by
@@ -462,11 +570,11 @@ a developer on any host, and hard-requiring an optional package would red the
 whole orchestrator suite on a host that lacks only that. Every other suite's
 floor equals its measured count. `test_thin_warm_lane.sh`'s Block C df-delta
 assert is not a deduction — it is gated on `REIFY_WARM_LANE_MOUNT`, which the
-driver always strips, so 45 is both its floor and its measured count there.
+driver always strips, so its floor is its measured count there.
 
 `test_warm_lane_degenerate_ref.sh`'s floor moved **70 → 81** when task 5566
 ported reify's K1–K6 conventional-commit block (esc-7244-16). It is **not** one
-of the two legitimate deductions: the block carries no skip guard and needs only
+of the three legitimate deductions: the block carries no skip guard and needs only
 `git`, so 81 is both floor and measured count on any host satisfying
 `REQUIRED_HOST_TOOLS`. Both sides were RE-MEASURED on this branch —
 `Results: 70 passed, 0 failed` before the port, `Results: 81 passed, 0 failed`
@@ -891,6 +999,37 @@ That is a live signal on the lane's red path, unexamined here and not part of
 this table's scope; it is flagged because a reader trending these durations
 will meet it.
 
+### The gc split (task 6931): one-sitting A/B, 2026-11-17
+
+Arm A is the pre-split `test_warm_lane_gc.sh` at `2c2f34db14`, written into
+this directory as `.presplit_gc.sh` so it sources the same siblings and scripts
+(the `test_*.sh` manifest glob cannot match that name), and deleted afterwards.
+Arm B is the post-split `test_warm_lane_gc.sh` followed by
+`test_warm_lane_gc_native.sh`. Runs alternate A,B ×3, each run directly
+(`env -u GIT_DIR -u GIT_WORK_TREE`, no `REIFY_*`) under `/usr/bin/time`, with
+the 1-min loadavg sampled immediately before and after it, on 32 cores.
+
+| arm, 2026-11-17 11:43–11:57 UTC | median | runs |
+|---|---|---|
+| A = pre-split | **115.11s** (115.11, 109.32, 170.44) | `449 passed, 0 failed` ×3 |
+| B, `test_warm_lane_gc.sh` | 52.74s (50.16, 52.74, 76.69) | `234 passed, 0 failed` ×3 |
+| B, `test_warm_lane_gc_native.sh` | 88.38s (57.23, 88.38, 104.14) | `217 passed, 0 failed` ×3 |
+| B, both halves | **141.12s** (107.39, 141.12, 180.83) | |
+| **ratio B/A** | **1.23x** | per pair 0.93x, 1.29x, 1.06x |
+
+Loadavg band across the sitting 73.35–110.69 (1.51x spread): VALID under
+this section's ~1.5x rule, at its edge. **Three earlier sittings the same morning were
+discarded, not salvaged**: their bands were 72.49–266.87 (3.68x), 92.11–171.73
+(1.86x) and 108.76–301.01 (2.77x). Every run in all four sittings passed, with
+the counts above.
+
+Against `SUBPROC_TIMEOUT` (900s), each half's median is 52.74s (6%) and 88.38s
+(10%). The slowest single half-run in any of the four sittings, discarded ones
+included, was 147.66s, at loadavg up to 279. `SUBPROC_TIMEOUT` and
+`PYTEST_TIMEOUT` are unchanged. The driver runs the two halves as two items in
+one `xdist_group`, so the bucket pays their sum. The per-pair ratios straddle
+1.0x, so this sitting does not separate a fixed per-suite cost from load noise.
+
 ## PRD §11 q4 — re-decided: the offline lane (the escape is taken)
 
 **The ported tests run POST-MERGE on `git.offline_lane_commands`, off the verify
@@ -900,7 +1039,7 @@ move independently:
 | | edit point | value |
 |---|---|---|
 | (a) | `orchestrator/pyproject.toml` → `[tool.pytest.ini_options] addopts` | `-m 'not warm_lane_bash'` |
-| (b) | `dark-factory-orchestrator.yaml` → `git.offline_lane_commands` | `name: warm-lane-bash`, `command: "pytest -m warm_lane_bash"`, `cwd: "orchestrator"`, `fix_task_priority: "high"` |
+| (b) | `dark-factory-orchestrator.yaml` → `git.offline_lane_commands` | `name: warm-lane-bash`, `command: "uv run pytest -m warm_lane_bash"`, `cwd: "orchestrator"`, `fix_task_priority: "high"` |
 
 `fix_task_priority` is `high` (the `qdrant-integration` entry alongside it is
 `medium`) because leaf **κ** deletes reify's originals on this suite's green: a

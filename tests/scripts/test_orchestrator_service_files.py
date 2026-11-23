@@ -53,6 +53,9 @@ import pathlib
 import re
 
 import pytest
+from orchestrator_projects import scan_units
+from shared.cgroup_slice import DAEMON_SUBGROUP, project_slice_name
+from shared.project_id import project_id_for_root
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Shared with tests/scripts/test_know_live_installed_unit_parity.py, which had
@@ -324,6 +327,9 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     # After=/Requires= referencing the unit), masking real structural drift.
     expected_df_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-dark-factory.service"
     expected_reify_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-reify.service"
+    # Each unit also runs under its OWN project slice, matched exactly the same way.
+    expected_df_slice_line = f"Slice={project_slice_name('dark_factory')}"
+    expected_reify_slice_line = f"Slice={project_slice_name('reify')}"
 
     # Each unit also Wants=/After= and (in [Install]) Also= its OWN
     # `orchestrator-<project>.socket` (escalation socket activation), so every
@@ -344,6 +350,8 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
             and rl.strip() == expected_reify_orch_unit_line
         ):
             continue
+        if dl.strip() == expected_df_slice_line and rl.strip() == expected_reify_slice_line:
+            continue
         if df_socket in dl and dl.replace(df_socket, reify_socket) == rl:
             continue
         df_ok = any(frag in dl for frag in allowed_df_fragments)
@@ -353,7 +361,7 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
 
     assert not unexpected, (
         "Unexpected differences between df and reify service files "
-        "(only Description, --config path, and ORCH_UNIT should differ):\n"
+        "(only Description, --config path, ORCH_UNIT and Slice should differ):\n"
         + "\n".join(f"  line {n}:\n    df:    {d!r}\n    reify: {r!r}" for n, d, r in unexpected)
     )
 
@@ -540,6 +548,16 @@ def _directives(section_lines: list[str]) -> list[str]:
     ]
 
 
+def _unit_fixture(*service_lines: str) -> str:
+    """A minimal [Service]-shaped unit carrying *service_lines*.
+
+    Shared by the ExecStart parser tests and the cgroup-placement predicate
+    tests below; each asserts only on the lines it passes in.
+    """
+    body = "\n".join(service_lines)
+    return f"[Unit]\nDescription=Fixture\n\n[Service]\nType=simple\n{body}\n"
+
+
 @pytest.mark.parametrize("unit_path", _START_LIMITED_UNITS, ids=lambda p: p.name)
 def test_start_limit_directives_under_unit_section(unit_path: pathlib.Path) -> None:
     """EXPECTED_START_LIMIT must be declared in [Unit], and no StartLimit key in [Service].
@@ -632,6 +650,138 @@ def test_orchestrator_service_sets_own_orch_unit(
 
 
 # ---------------------------------------------------------------------------
+# Per-project cgroup slice (task 3394; contract docs/cgroup-slice-topology.md)
+#
+# Each project unit runs under the slice the shared name rule gives the project
+# its --config names. The project roots come from scan_units, the same
+# ExecStart --config reader the restart tooling uses.
+# ---------------------------------------------------------------------------
+
+_PROJECT_UNIT_SCAN = scan_units(REPO_ROOT / "scripts")
+_PROJECT_UNIT_ROOTS = {
+    unit: root for root, units in _PROJECT_UNIT_SCAN.roots.items() for unit in units
+}
+
+
+def test_slice_scan_covers_every_project_unit() -> None:
+    """Every non-watchdog unit has a scanned project root, so none passes vacuously."""
+    assert _PROJECT_UNIT_SCAN.problems == ()
+    project_units = {
+        p.name for p in ALL_ORCHESTRATOR_SERVICE_FILES if p != WATCHDOG_SERVICE
+    }
+    assert set(_PROJECT_UNIT_ROOTS) == project_units
+
+
+@pytest.mark.parametrize("unit_name", sorted(_PROJECT_UNIT_ROOTS))
+def test_project_unit_runs_under_its_project_slice(unit_name: str) -> None:
+    service = parse_sections(
+        (REPO_ROOT / "scripts" / unit_name).read_text(encoding="utf-8")
+    )["Service"]
+    slices = [line.removeprefix("Slice=") for line in service if line.startswith("Slice=")]
+    expected = project_slice_name(project_id_for_root(_PROJECT_UNIT_ROOTS[unit_name]))
+    assert slices == [expected]
+
+
+# ---------------------------------------------------------------------------
+# Memory-only delegation, started in the daemon subgroup (task 10460; contract
+# docs/cgroup-slice-topology.md, plans/per-consumer-resource-recording-prd.md
+# D9/D10)
+#
+# A unit under its project slice also delegates the memory controller and
+# starts its process tree in the daemon subgroup; a unit outside any slice
+# carries none of the three. No unit delegates cpu.
+# ---------------------------------------------------------------------------
+
+_DELEGATE_MEMORY = "Delegate=memory"
+_DELEGATE_SUBGROUP = f"DelegateSubgroup={DAEMON_SUBGROUP}"
+_SYSTEMD_BOOLEAN_TRUE = frozenset({"1", "yes", "y", "true", "t", "on"})
+
+
+def _delegates_cpu(value: str) -> bool:
+    """Whether a Delegate= value hands the cpu controller over; boolean true hands over all."""
+    return value.strip().lower() in _SYSTEMD_BOOLEAN_TRUE or "cpu" in value.split()
+
+
+def _cgroup_placement_problems(service_directives: list[str]) -> list[str]:
+    found = {
+        "Slice=": any(d.startswith("Slice=") for d in service_directives),
+        _DELEGATE_MEMORY: _DELEGATE_MEMORY in service_directives,
+        _DELEGATE_SUBGROUP: _DELEGATE_SUBGROUP in service_directives,
+    }
+    problems = []
+    if len(set(found.values())) > 1:
+        present = ", ".join(name for name, is_present in found.items() if is_present)
+        problems.append(
+            f"Slice=, {_DELEGATE_MEMORY} and {_DELEGATE_SUBGROUP} must appear all three "
+            f"or none; present: {present}"
+        )
+    problems.extend(
+        f"{d} delegates the cpu controller, which no orchestrator unit may"
+        for d in service_directives
+        if d.startswith("Delegate=") and _delegates_cpu(d.removeprefix("Delegate="))
+    )
+    return problems
+
+
+_ALL_THREE = ("Slice=df-x.slice", _DELEGATE_MEMORY, _DELEGATE_SUBGROUP)
+
+
+@pytest.mark.parametrize(
+    "service_lines",
+    [pytest.param((), id="none-of-the-three"), pytest.param(_ALL_THREE, id="all-three")],
+)
+def test_cgroup_placement_accepts_all_three_or_none(service_lines: tuple[str, ...]) -> None:
+    service = _directives(parse_sections(_unit_fixture(*service_lines))["Service"])
+    assert _cgroup_placement_problems(service) == []
+
+
+@pytest.mark.parametrize(
+    ("service_lines", "named"),
+    [
+        pytest.param(("Slice=df-x.slice",), "present: Slice=", id="slice-alone"),
+        pytest.param(
+            ("Slice=df-x.slice", _DELEGATE_MEMORY),
+            f"present: Slice=, {_DELEGATE_MEMORY}",
+            id="slice-and-delegation-without-subgroup",
+        ),
+        pytest.param(
+            (_DELEGATE_MEMORY, _DELEGATE_SUBGROUP),
+            f"present: {_DELEGATE_MEMORY}, {_DELEGATE_SUBGROUP}",
+            id="delegation-without-slice",
+        ),
+        pytest.param(
+            ("Slice=df-x.slice", "Delegate=yes", _DELEGATE_SUBGROUP),
+            "Delegate=yes delegates the cpu controller",
+            id="boolean-true-delegates-cpu",
+        ),
+        pytest.param(
+            ("Slice=df-x.slice", "Delegate=memory cpu", _DELEGATE_SUBGROUP),
+            "Delegate=memory cpu delegates the cpu controller",
+            id="controller-list-names-cpu",
+        ),
+    ],
+)
+def test_cgroup_placement_problems_name_what_is_wrong(
+    service_lines: tuple[str, ...], named: str
+) -> None:
+    service = _directives(parse_sections(_unit_fixture(*service_lines))["Service"])
+    problems = _cgroup_placement_problems(service)
+    assert any(named in problem for problem in problems), problems
+
+
+@pytest.mark.parametrize(
+    "unit_path",
+    [*ALL_ORCHESTRATOR_SERVICE_FILES, REPO_ROOT / FACTORY_INIT_REFERENCE],
+    ids=lambda p: p.name,
+)
+def test_unit_carries_slice_and_memory_delegation_together_or_not_at_all(
+    unit_path: pathlib.Path,
+) -> None:
+    service = _directives(parse_sections(_service_unit_text(unit_path))["Service"])
+    assert _cgroup_placement_problems(service) == []
+
+
+# ---------------------------------------------------------------------------
 # Canonical orchestrator-config filename (task 3641; completes task 3512's sweep)
 #
 # CANONICAL_CONFIG_BASENAME, MalformedExecStart, the token scan and the
@@ -680,12 +830,6 @@ def _exec_start_config_arg(content: str, unit_name: str = "<unit>") -> str | Non
 # _SAMPLE_UNIT): both helpers take a string, so a file would add I/O without
 # adding coverage.
 # ---------------------------------------------------------------------------
-
-
-def _unit_fixture(*service_lines: str) -> str:
-    """A minimal [Service]-shaped unit carrying *service_lines*, for the parsers."""
-    body = "\n".join(service_lines)
-    return f"[Unit]\nDescription=Fixture\n\n[Service]\nType=simple\n{body}\n"
 
 
 @pytest.mark.parametrize(
@@ -909,8 +1053,8 @@ def test_orchestrator_service_points_at_canonical_config_filename(
     canonical, required filename — the dashboard's escalation-URL discovery
     (``_discover_escalation_urls``) keys on it, and legacy spellings
     (``orchestrator.yaml``, ``orchestrator-config.yaml``,
-    ``orchestrator/config.yaml``) are honoured only as a discovery fallback for
-    not-yet-migrated projects, never as a supported choice.  Task 2698
+    ``orchestrator/config.yaml``) are not read by discovery at all (retired,
+    task 7138).  Task 2698
     canonicalized the filename; task 2719 then RETIRED dark-factory's own
     transitional symlinks (guarded by test_legacy_config_symlinks_retired.py),
     which is the precedent that makes the legacy spelling a defect here rather

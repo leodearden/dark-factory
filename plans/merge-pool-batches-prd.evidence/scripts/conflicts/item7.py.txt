@@ -1,0 +1,36 @@
+import sqlite3,json,collections,statistics as st
+from datetime import datetime
+c=sqlite3.connect('file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro',uri=True)
+P=lambda s: datetime.fromisoformat(s).timestamp()
+mv=c.execute("select timestamp,data from events where event_type='merge_verify' and json_extract(data,'$.chain_items')>=2 and json_extract(data,'$.passed')=1 and json_extract(data,'$.chain_request_ids') is not null order by id").fetchall()
+mf=c.execute("select timestamp,json_extract(data,'$.request_id'),json_extract(data,'$.landed_via_chain'),json_extract(data,'$.state') from events where event_type='merge_finalized' and timestamp>='2026-11-15' ").fetchall()
+fin=collections.defaultdict(list)
+for ts,rid,lvc,stt in mf: fin[rid].append((P(ts),lvc,stt))
+out=collections.defaultdict(list); stops=collections.Counter(); rows=[]
+for ts,d in mv:
+    d=json.loads(d); t0=P(ts); rids=d['chain_request_ids']; k=len(rids)
+    lands=[]; 
+    for rid in rids:
+        hit=[f for f in fin.get(rid,[]) if f[0]>=t0-5 and f[0]<=t0+6*3600 and f[1]==1]
+        lands.append(min(hit)[0] if hit else None)
+    # landed prefix length
+    n=0
+    for x in lands:
+        if x is None: break
+        n+=1
+    full = n==k
+    stops['full' if full else f'stopped_after_{n}']+=1
+    if n>=1:
+        span=max(lands[:n])-t0; first=lands[0]-t0
+        rows.append((k,n,first,span))
+        if n>=2: out[k].append((span-first)/(n-1))
+print('green chain verifies with request ids:',len(mv)); print(stops)
+q=lambda v,f: sorted(v)[int(round(f*(len(v)-1)))]
+byk=collections.defaultdict(list)
+for k,n,first,span in rows: byk[k].append((n,first,span))
+print('k n_verifies median_first_s median_span_s p90_span_s median_landed')
+for k in sorted(byk):
+    v=byk[k]; print(k,len(v),round(st.median(x[1] for x in v)),round(st.median(x[2] for x in v)),round(q([x[2] for x in v],.9)),st.median(x[0] for x in v))
+allper=[x for v in out.values() for x in v]
+print('per-member seconds after the head (span-first)/(n-1): n',len(allper),'p50',round(q(allper,.5),1),'p90',round(q(allper,.9),1))
+for k in sorted(out): print(' k',k,len(out[k]),round(st.median(out[k]),1))

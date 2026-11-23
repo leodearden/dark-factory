@@ -31,6 +31,7 @@ import {
 import { seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
+  burndownProjectBlock,
   escalationAnalytics,
   escalationRow,
   escalationsPayload,
@@ -39,7 +40,9 @@ import {
   memoryEvalMetric,
   memoryEvalVerdict,
   memoryEvalsPayload,
+  mergeActiveRow,
   mergeQueueBlock,
+  mergeRecentRow,
   openEscalationItem,
   orchestratorRow,
   projectRow,
@@ -47,6 +50,7 @@ import {
   schedulerLockRow,
   schedulerModule,
   schedulerSnapshot,
+  servingEndpoint,
   taskCensus,
   taskRow,
   tasksSnapshotEntry,
@@ -180,7 +184,7 @@ function seedBurndown(window, { alarm }) {
   seedDashboardData(window, {
     PROJECTS: [projectRow(PROJECT)],
     BURNDOWN: burndownBlock(vocab, AGGREGATE_SAMPLES, { ...verdict, projects: [PROJECT] }),
-    BURNDOWN_BY_PROJECT: { [PROJECT]: burndownBlock(vocab, PROJECT_SAMPLES, verdict) },
+    BURNDOWN_BY_PROJECT: { [PROJECT]: burndownProjectBlock(vocab, PROJECT_SAMPLES, AGGREGATE_SAMPLES, verdict) },
     __receipt: receiptsFor(window.DF_DATA_LOADER, ['BURNDOWN', 'PROJECTS']),
   });
 }
@@ -193,13 +197,16 @@ function statusMixPanel(container) {
   return panels[0];
 }
 
-// Each view: how to reach it, which block it draws, and the projects its call
-// site hands parityBannerState.
+// Each view: how to reach it, which block it draws, the sample labels its chart
+// lays that block over, and the projects its call site hands parityBannerState.
+// The project's labels are the union's newest PROJECT_SAMPLES, stated here from
+// the seed rather than through the label_spans decoder under test.
 const BURN_VIEWS = [
   {
     view: 'aggregate',
     show() {},
     block: window => window.DF_DATA.BURNDOWN,
+    sampleLabels: window => window.DF_DATA.BURNDOWN.labels,
     bannerProjects: window => window.DF_DATA.BURNDOWN.parity_projects,
   },
   {
@@ -210,6 +217,7 @@ const BURN_VIEWS = [
       click(window, button);
     },
     block: window => window.DF_DATA.BURNDOWN_BY_PROJECT[PROJECT],
+    sampleLabels: window => window.DF_DATA.BURNDOWN.labels.slice(AGGREGATE_SAMPLES - PROJECT_SAMPLES),
     bannerProjects: () => null,
   },
 ];
@@ -232,7 +240,7 @@ function filledPathColors(panel) {
   return [...panel.querySelectorAll('svg path')].map(path => path.getAttribute('fill')).filter(Boolean);
 }
 
-for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
+for (const { view, show, block, sampleLabels, bannerProjects } of BURN_VIEWS) {
   test(`tabs.jsx::BurnTab ${view} view renders one legend entry per burndownLegend item`, t => {
     const harness = openWindow(t);
     seedBurndown(harness.window, { alarm: false });
@@ -262,9 +270,8 @@ for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
     );
 
     const { fmtDateTime } = harness.window.DF_SHELL;
-    const { BURNDOWN, BURNDOWN_BY_PROJECT } = harness.window.DF_DATA;
-    const anySampleLabel = new Set([...BURNDOWN.labels, ...BURNDOWN_BY_PROJECT[PROJECT].labels].map(fmtDateTime));
-    const ownLabels = Array.from(block(harness.window).labels, fmtDateTime);
+    const anySampleLabel = new Set(Array.from(harness.window.DF_DATA.BURNDOWN.labels, fmtDateTime));
+    const ownLabels = Array.from(sampleLabels(harness.window), fmtDateTime);
     assert.deepEqual(
       [...panel.querySelectorAll('svg text')].map(text => text.textContent).filter(text => anySampleLabel.has(text)),
       ownLabels,
@@ -298,6 +305,42 @@ for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
     assert.deepEqual([...panel.querySelectorAll('.badge.bad')], [], `the ${view} view rendered a parity banner with the alarm down`);
   });
 }
+
+function summaryTrendCell(container, projectId) {
+  const table = panelTitled(container, 'Per project · summary').querySelector('table');
+  const trendColumn = [...table.querySelectorAll('thead th')].findIndex(th => th.textContent === 'Trend');
+  assert.ok(trendColumn >= 0, 'the Per project summary table has no Trend column');
+  const row = [...table.querySelectorAll('tbody tr')].find(tr => tr.querySelector('td')?.textContent === projectId);
+  assert.ok(row, `the Per project summary table has no row for ${projectId}`);
+  return row.querySelectorAll('td')[trendColumn];
+}
+
+function pathData(root) {
+  return [...root.querySelectorAll('svg path')].map(path => path.getAttribute('d'));
+}
+
+// The Trend sparkline derives velocity from the project's done series over its
+// labels, and deriveVelocitySeries draws nothing for a missing or mismatched
+// label row, so only a call site that decoded label_spans draws this spark.
+test('tabs.jsx::BurnTab aggregate summary table draws each project Trend sparkline over its own labels', t => {
+  const harness = openWindow(t);
+  seedBurndown(harness.window, { alarm: false });
+  const { container } = harness.mount(harness.window.DF_TABS.BurnTab, BURN_PROPS);
+
+  const { Sparkline, PALETTE, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds } = harness.window.DF_CHARTS;
+  const ownLabels = harness.window.DF_DATA.BURNDOWN.labels.slice(AGGREGATE_SAMPLES - PROJECT_SAMPLES);
+  const smoothSecs = smoothingLabelToSeconds(defaultSmoothingForWindow(BURN_PROPS.displayWindow));
+  const velocity = deriveVelocitySeries(harness.window.DF_DATA.BURNDOWN_BY_PROJECT[PROJECT].done, ownLabels, smoothSecs);
+  assert.equal(velocity.length, PROJECT_SAMPLES, 'the seeded project must have a velocity sample per own label');
+  const expected = pathData(harness.mount(Sparkline, { values: velocity, color: PALETTE.accent }).container);
+  assert.ok(expected.length > 0, 'a Sparkline of the project velocity drew nothing, so a match proves nothing');
+
+  assert.deepEqual(
+    pathData(summaryTrendCell(container, PROJECT)),
+    expected,
+    `the ${PROJECT} Trend cell must draw the velocity of its ${PROJECT_SAMPLES} own samples`,
+  );
+});
 
 // ── Decision 3: the PINNING chip (pins_recovery.js::pinningBadgeState) ──
 // pins_recovery is three-state on the wire: true, false, or ABSENT (unknown).
@@ -465,6 +508,49 @@ test('tabs.jsx::MergeTab counts a measured window\'s attempts with attemptCount'
   }
 });
 
+// ── The headline totals over several projects (merge_queue.js::totalHint) ──
+// A present-but-unread project makes a total a '≥' over the readable ones,
+// and the tile's hint names it; a project with no runs.db file is outside the
+// runs.db totals, so it is named nowhere. Its own pips still read unknown.
+
+test('tabs.jsx::MergeTab serves a lower-bound total naming the unreadable project, and leaves a project with no runs.db out', t => {
+  const harness = openWindow(t);
+  const stoppedProbe = wireDatum(null, { as_of: null, state: 'unknown', reason: 'connect refused; no sample in the history window' });
+  seedDashboardData(harness.window, {
+    MERGE_QUEUE: {
+      [PROJECT]: mergeQueueBlock({ bucketMinutes: 60, outcomes: { done: 3 } }),
+      hive: { ...mergeQueueBlock({ bucketMinutes: 60, unread: true }), in_queue: stoppedProbe, active_spark: { labels: [], values: [] } },
+      ghost: mergeQueueBlock({ bucketMinutes: 60, noRunsDb: true }),
+    },
+    __receipt: receiptsFor(harness.window.DF_DATA_LOADER, ['MERGE_QUEUE']),
+  });
+  const { container } = harness.mount(harness.window.DF_TABS.MergeTab, { projectFilter: [] });
+  const DF = harness.window.DF_DATA;
+  const { attemptsOver, inQueueOver, projectAttempts, totalHint } = harness.window.DF_MERGE_QUEUE;
+  const { datumView, LOWER_BOUND_PREFIX, EM_DASH } = harness.window.DF_DATUM;
+  const hintOf = tile => tile.querySelector('.lbl > span')?.textContent ?? '';
+
+  const mergesTile = statTile(container, 'Merges (window)');
+  const merges = attemptsOver(DF, null);
+  assert.equal(mergesTile.querySelector('.val').textContent, datumView(merges).text);
+  assert.ok(datumView(merges).text.startsWith(LOWER_BOUND_PREFIX), datumView(merges).text);
+  const mergesHint = hintOf(mergesTile);
+  assert.ok(mergesHint.endsWith(totalHint(merges)), `"${mergesHint}" must end with totalHint()`);
+  assert.ok(mergesHint.includes('hive'), mergesHint);
+  assert.ok(!mergesHint.includes('ghost'), `a project with no runs.db is named: ${mergesHint}`);
+
+  const queueTile = statTile(container, 'In queue now');
+  const inQueue = inQueueOver(DF, null);
+  assert.equal(queueTile.querySelector('.val').textContent, datumView(inQueue).text);
+  assert.ok(datumView(inQueue).text.startsWith(LOWER_BOUND_PREFIX), datumView(inQueue).text);
+  assert.equal(hintOf(queueTile), ` · ${totalHint(inQueue)}`);
+
+  const pips = [...container.querySelectorAll('.pip')].map(pip => pip.textContent);
+  const hivePip = `${datumView(projectAttempts(DF, 'hive')).text} attempts`;
+  assert.equal(hivePip, `${EM_DASH} attempts`);
+  assert.ok(pips.includes(hivePip), JSON.stringify(pips));
+});
+
 function withDepthValues(block, values) {
   return { ...block, depth: { ...block.depth, value: { ...block.depth.value, values } } };
 }
@@ -498,6 +584,100 @@ test('tabs.jsx::MergeTab gives a window one attempt count, whatever the depth se
   assert.doesNotMatch(depth, /\battempts\b/);
   assert.doesNotMatch(depth, /\bmerges\b/);
 });
+
+// ── A project's Merge-tab layout: one row of number cards, then each table on its own row ──
+// jsdom lays nothing out, so the layout is read from what the browser lays it
+// out by: the cards' shared row, each card's inline flex weight, and the
+// tables' column spans in the project's 12-column grid.
+
+const panelTitleOf = panel => panel.querySelector('.panel-head > .title')?.textContent;
+
+function numberCell(card, label) {
+  const cells = [...card.querySelector('.panel-body').children].filter(cell => [...cell.children].some(line => line.textContent === label));
+  assert.equal(cells.length, 1, `expected exactly one number labelled "${label}"`);
+  return cells[0];
+}
+
+test('tabs.jsx::MergeTab sets Latency centiles, Speculative merge and Live merge metrics in one row, each card weighted by its count of numbers', t => {
+  const { container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60 }));
+  const titles = ['Latency centiles', 'Speculative merge', 'Live merge metrics'];
+  const cards = titles.map(title => panelTitled(container, title));
+
+  const row = cards[0].parentElement;
+  assert.ok(cards.every(card => card.parentElement === row), 'the number cards must share one row');
+  assert.ok(row.classList.contains('number-cards'), 'the shared row must be a .number-cards flex row');
+  assert.ok(row.classList.contains('col-span-12'), 'the number-card row must span the whole project row');
+  assert.ok(row.parentElement.classList.contains('cols-12'), "the number-card row must sit in the project's 12-column grid");
+  assert.deepEqual([...row.children].map(panelTitleOf), titles, 'the row must hold exactly the three number cards, in order');
+  const counts = cards.map(card => card.querySelector('.panel-body').children.length);
+  assert.deepEqual(counts, [4, 3, 2]);
+  assert.deepEqual(cards.map(card => Number(card.style.flexGrow)), counts, 'each card must be weighted by its count of numbers');
+  const basisPerNumber = cards.map((card, i) => parseFloat(card.style.flexBasis) / counts[i]);
+  assert.ok(basisPerNumber[0] > 0, `each card must carry a positive flex basis: ${cards.map(card => card.style.flexBasis)}`);
+  assert.ok(basisPerNumber.every(basis => basis === basisPerNumber[0]), `each card's flex basis must be proportional to its count of numbers: ${cards.map(card => card.style.flexBasis)}`);
+});
+
+const LIVE_METRIC_ARMS = [
+  {
+    arm: 'measured',
+    metrics: { retries_per_landing: 1.5, landings_total: 4, drift_at_detection: { count: 2, last: 3 } },
+    retries: 1.5, drift: 3, hints: ['4 landings', '2 detections'], texts: ['1.50', '3'],
+  },
+  {
+    arm: 'empty',
+    metrics: {},
+    retries: undefined, drift: null, hints: ['offline', 'no conflicts'], holeTitles: ['no value in the payload', 'no drift detections'],
+  },
+];
+
+for (const { arm, metrics, retries, drift, hints, texts, holeTitles } of LIVE_METRIC_ARMS) {
+  test(`tabs.jsx::MergeTab renders Live merge metrics as compact readings with their hints, ${arm}`, t => {
+    const { harness, container } = mountMergeTab(t, mergeQueueBlock({ bucketMinutes: 60, metrics }));
+    const { plainDatum, derivedDatum, datumView, EM_DASH } = harness.window.DF_DATUM;
+    const { stateKey } = servingEndpoint(harness.window.DF_DATA_LOADER, 'MERGE_QUEUE');
+    const panel = panelTitled(container, 'Live merge metrics');
+    assert.ok(panel.querySelector('.kpi') === null, 'Live merge metrics must render compact readings, not StatTiles');
+    assert.ok(panel.querySelector('.spark') === null, 'Live merge metrics must draw no empty spark slot');
+
+    const views = [
+      datumView(plainDatum(retries, stateKey), { format: n => Number(n).toFixed(2) }),
+      datumView(derivedDatum(drift, stateKey, 'no drift detections')),
+    ];
+    if (texts) assert.deepEqual(views.map(view => view.text), texts);
+    else assert.deepEqual(views.map(view => [view.text, view.title]), holeTitles.map(title => [EM_DASH, title]));
+
+    ['Retries / landing', 'Drift @ detect'].forEach((label, i) => {
+      const cell = numberCell(panel, label);
+      assert.ok(cell.textContent.includes(hints[i]), `"${label}" must show its hint "${hints[i]}": ${cell.textContent}`);
+      const reading = cell.querySelector('.mono > span');
+      assert.equal(reading.firstChild.textContent, views[i].text, `"${label}" reading`);
+      assert.equal(reading.title, views[i].title ?? '', `"${label}" reading's title`);
+    });
+  });
+}
+
+for (const queued of [true, false]) {
+  test(`tabs.jsx::MergeTab gives Currently queued and Recent merges each a full row${queued ? ', queued first' : ', with nothing queued'}`, t => {
+    const block = mergeQueueBlock({ bucketMinutes: 60, active: queued ? [mergeActiveRow()] : [], recent: [mergeRecentRow({ taskId: '2' })] });
+    const { harness, container } = mountMergeTab(t, block);
+    const recent = panelTitled(container, 'Recent merges');
+    const grid = recent.parentElement;
+    assert.ok(grid.classList.contains('cols-12'), "Recent merges must sit in the project's 12-column grid");
+    assert.ok(recent.classList.contains('col-span-12'), 'Recent merges must span the whole row');
+    assert.equal(recent.querySelectorAll('tbody tr').length, 1, 'Recent merges must render its one fixture row');
+
+    if (queued) {
+      const queuedPanel = panelTitled(container, 'Currently queued');
+      assert.ok(queuedPanel.parentElement === grid, "Currently queued must sit in the project's 12-column grid");
+      assert.ok(queuedPanel.classList.contains('col-span-12'), 'Currently queued must span the whole row');
+      assert.ok(queuedPanel.compareDocumentPosition(recent) & harness.window.Node.DOCUMENT_POSITION_FOLLOWING, 'Currently queued must come before Recent merges');
+      assert.equal(queuedPanel.querySelectorAll('tbody tr').length, 1, 'Currently queued must render its one fixture row');
+    } else {
+      const titles = [...container.querySelectorAll('.panel-head > .title')].map(title => title.textContent);
+      assert.ok(!titles.some(text => text.startsWith('Currently queued')), `nothing is queued, yet: ${JSON.stringify(titles)}`);
+    }
+  });
+}
 
 // ── The Completion-paths legend (charts.jsx::PALETTE.paths) ──
 // Every slice performance.py::get_completion_paths serves draws in a colour of

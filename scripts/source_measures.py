@@ -182,8 +182,15 @@ def file_size_measures_in_tree(
     source: str, tree: ast.Module, *, path: str
 ) -> FileSizeMeasures:
     """``file_size_measures`` over a tree the caller already parsed from *source*."""
-    prose = _docstring_lines(tree) | _comment_lines(source, path=path)
+    prose = prose_line_numbers_in_tree(source, tree, path=path)
     return FileSizeMeasures(lines=len(source.splitlines()), prose_lines=len(prose))
+
+
+def prose_line_numbers_in_tree(
+    source: str, tree: ast.Module, *, path: str
+) -> frozenset[int]:
+    """The line numbers behind ``FileSizeMeasures.prose_lines``: docstring spans unioned with COMMENT-token lines."""
+    return frozenset(_docstring_lines(tree) | _comment_lines(source, path=path))
 
 
 # ---------------------------------------------------------------------------
@@ -327,15 +334,18 @@ def reexport_names_in_tree(tree: ast.Module) -> list[str]:
 # committed baseline number was measured with.
 #
 # CEILING (<7) is PERFORMANCE, and it is not hygiene -- it is what keeps this
-# instrument from becoming a suite-truncating landmine. 7.0.1's cost grows
-# roughly cubically in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so
-# the whole 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0. The
-# ratchet carries pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT), and
-# exceeding it does not merely fail the test: pytest-timeout's thread method
-# os._exit()s the xdist worker and --max-worker-restart=0 then truncates the
-# ENTIRE orchestrator suite, reporting against an innocent test (the esc-3980-1
-# / esc-3787-1 mode documented at
-# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT).
+# instrument from becoming a timeout landmine. 7.0.1's cost grows roughly
+# cubically in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so the
+# whole 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0, unloaded.
+# Under verify load multiply that by the tree-scan family's measured ~4.8x
+# inflation (the MEASURED history at
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT),
+# which puts 7.x past the ceiling. The ratchet carries
+# pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT); exceeding it fails the
+# ratchet test, and only once complexipy's Rust call returns, because signal
+# cannot interrupt it sooner (see
+# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT,
+# whose MECHANISM block owns this fact and the thread-era history).
 #
 # The tuples are the source of truth; the human-readable specifier is derived
 # from them, so the message and the check can never disagree. The same string
@@ -353,9 +363,11 @@ _COMPLEXIPY_RANGE_REASON = (
     '(merge_queue.py totals 2031 at 3.0.0, 2092 at 5.0.0, 2133 at 6.x/7.x), so '
     'an unpinned engine would silently rewrite every baseline figure; and 7.x '
     'is ~48x slower on the monolith (247.0s vs 4.75s at 6.2.0, ~330s+ vs 9.52s '
-    'cluster-wide) against the ratchet test\'s 300s timeout, which pytest-'
-    'timeout enforces by os._exit()ing the xdist worker and truncating the '
-    'whole suite. Install the pinned version: `uv sync --all-packages`.'
+    'cluster-wide, before the ~4.8x load inflation measured for whole-tree '
+    'scans) against the ratchet test\'s WHOLE_TREE_SCAN_TEST_TIMEOUT; a '
+    'breach fails the ratchet test, and only '
+    'once complexipy\'s Rust call returns. Install the pinned version: '
+    '`uv sync --all-packages`.'
 )
 
 
@@ -1037,11 +1049,11 @@ _SCRIPTS_PSEUDO_MEMBER = MemberRoots(
     pseudo=True,
     src_root='scripts',
     tests_root='scripts/tests',
-    # scripts/tests/conftest.py puts these on sys.path, mirrored by the root
+    # scripts/tests/conftest.py puts each root on sys.path, mirrored by the root
     # pyproject.toml [tool.pyright].extraPaths. Pinned equal to the first by
     # scripts/tests/test_source_measures_import_roots.py and to the second by
     # tests/scripts/test_source_measures.py::TestExtraImportNames.
-    extra_import_roots=('scripts/legibility', 'scripts/local-model-serving'),
+    extra_import_roots=('scripts/local-model-serving',),
 )
 _TESTS_PSEUDO_MEMBER = MemberRoots(name='tests', pseudo=True, src_root=None, tests_root='tests')
 

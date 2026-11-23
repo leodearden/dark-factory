@@ -1,0 +1,26 @@
+import sys
+sys.path.insert(0,'/tmp/gate-10069/critic6')
+from rule7 import fallback_cost, batch_cost, going_costs, plan_batch
+R,U=0.01,0.15
+def gc_variant(q,r,u,mf=12,mt=24):
+    # cleared members are never sent alone by a fallback: a cleared-only red batch is treated as scannable (s=1)
+    a_new,a_cl=1.0,1.0
+    for i in range(500):
+        nc=min(batch_cost(0,c,q,r,0.0,True,a_new,a_cl)/c for c in range(1,mt+1))
+        nf=min(batch_cost(f,0,q,r,u,True,a_new,nc)/f for f in range(1,mf+1))
+        if abs(nc-a_cl)<1e-9 and abs(nf-a_new)<1e-9: return nf,nc
+        a_new,a_cl=nf,nc
+print('D13 (cleared members of a fallback verify alone) vs cleared kept cleared; starting rates, scanning on')
+for q in (0.05,0.08,0.14,0.20):
+    a,c,_=going_costs(q,R,U,True); a2,c2=gc_variant(q,R,U)
+    print(f'q={q}: A_cleared {c:.4f} vs {c2:.4f} (+{100*(c/c2-1):.0f}%); A_new {a:.4f} vs {a2:.4f} (+{100*(a/a2-1):.1f}%)')
+print('at r=0.02, u=0.3:')
+for q in (0.08,0.14):
+    a,c,_=going_costs(q,0.02,0.3,True); a2,c2=gc_variant(q,0.02,0.3)
+    print(f'q={q}: A_cleared {c:.4f} vs {c2:.4f} (+{100*(c/c2-1):.0f}%); A_new {a:.4f} vs {a2:.4f} (+{100*(a/a2-1):.1f}%)')
+print()
+print('effect of r_hat drifting up (landed rows always written as NEW): plans at q=0.14, u=0.15, scanning on')
+for r in (0.01,0.05,0.1,0.2,0.3,0.5):
+    a,c,_=going_costs(0.14,r,U,True)
+    best_c=min(range(1,25),key=lambda x:(batch_cost(0,x,0.14,r,U,True,a,c)/x,-x))
+    print(f'r={r}: A_new {a:.3f} A_cleared {c:.3f} cleared-only batch size {best_c}; cleared front 24 cleared+20 new -> {plan_batch("cleared",["cleared"]*23+["new"]*20,0.14,r,U,True)}; new front -> {plan_batch("new",["new"]*20+["cleared"]*10,0.14,r,U,True)}')

@@ -1,0 +1,59 @@
+"""Tighten the false-failure estimate: compare the failed request's branch content with what later LANDED
+(merge commit vs its first parent), by a context-free hash of added/removed lines."""
+import json,collections,subprocess,bisect,hashlib,datetime as dt
+P='/tmp/gate-10069/predict/'; REPO='/home/leo/src/dark-factory'
+def T(s): return dt.datetime.fromisoformat(s).timestamp()
+E=[json.loads(l) for l in open(P+'events.jsonl')]
+wv=collections.defaultdict(list); landed=[]; fin={}
+for e in E:
+    e['t']=T(e['ts'])
+    if e['et']=='workflow_verify': wv[e['task']].append(e)
+    elif e['et']=='merge_finalized' and e['d']['state']=='done' and e['d'].get('merge_sha'):
+        landed.append((e['t'],e['d']['merge_sha'])); fin[e['d']['request_id']]=e['d']['merge_sha']
+for v in wv.values(): v.sort(key=lambda e:e['t'])
+landed.sort(); lt=[x[0] for x in landed]
+def main_at(t):
+    i=bisect.bisect_right(lt,t)-1; return landed[i][1] if i>=0 else None
+def git(*a):
+    p=subprocess.run(['git','-C',REPO,*a],capture_output=True,text=True,errors='replace'); return p.returncode,p.stdout
+def chash(a,b):
+    rc,out=git('diff','-U0','--no-color',a,b)
+    if rc!=0: return None
+    keep=[]; f=None
+    for l in out.splitlines():
+        if l.startswith('+++ ') or l.startswith('--- '): 
+            if l.startswith('+++ '): f=l[4:]
+            continue
+        if l.startswith('+') or l.startswith('-'): keep.append((f or '')+'|'+l)
+    return hashlib.sha1('\n'.join(sorted(keep)).encode()).hexdigest() if keep else 'EMPTY'
+def tip_at(task,t):
+    w=[e for e in wv.get(task,()) if e['t']<=t+5]
+    return w[-1]['d'].get('tip_sha') if w else None
+rows={r['rid']:r for r in json.load(open(P+'rows_all.json'))}
+detail=json.load(open(P+'falsefail_detail.json'))
+inv=collections.defaultdict(list)
+for l in open(P+'inv.jsonl'):
+    x=json.loads(l); x['t']=T(x['ts']); inv[x['task']].append(x)
+out=collections.Counter(); ex=[]
+for task,rid,nrid,ny,content,n_agent,n_wv,disp,reason in detail:
+    if ny!='next PASS': continue
+    r=rows[rid]; n=rows[nrid]
+    tipA=tip_at(task,r['enq_t']); M=fin.get(nrid)
+    if not tipA or not M: out[('undetermined (no tip or next not landed)', 'agent' if n_agent else 'no_agent')]+=1; continue
+    rc,mb=git('merge-base',tipA,M+'^1')
+    mb=mb.strip()
+    if rc!=0 or not mb: out[('undetermined (git)', 'agent' if n_agent else 'no_agent')]+=1; continue
+    hA=chash(mb,tipA); hB=chash(M+'^1',M)
+    if hA is None or hB is None: out[('undetermined (git)', 'agent' if n_agent else 'no_agent')]+=1; continue
+    same=(hA==hB)
+    roles=collections.Counter(x['role'] for x in inv.get(task,()) if r['verdict_t']<x['t']<n['enq_t'])
+    out[('LANDED CONTENT IDENTICAL to failed content' if same else 'content differs','agent' if n_agent else 'no_agent')]+=1
+    ex.append((task,rid,nrid,same,dict(roles),round((n['enq_t']-r['verdict_t'])/3600,1),disp,reason[:70]))
+for k,v in sorted(out.items()): print(v,k)
+print('identical cases:')
+import sys
+for x in ex:
+    if not x[3] and not any(k in x[4] for k in('steward','implementer','debugger','merger','simple_task','architect')): print('   DIFF/no-agent',x)
+for x in ex:
+    if x[3]: print('  ',x)
+json.dump(ex,open(P+'falsefail2.json','w'))

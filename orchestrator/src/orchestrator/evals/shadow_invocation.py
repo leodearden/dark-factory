@@ -38,9 +38,9 @@ def build_shadow_orch_config(
     architect_config: EvalConfig | None = None,
     judge_config: EvalConfig | None = None,
 ) -> OrchestratorConfig:
-    """The corpus eval config with sandboxed roles run under the operator's backend.
+    """The corpus eval config for a shadow fixture; it refuses a memory endpoint and a non-shadow fixture id.
 
-    Strict MCP and the null memory sentinel are ``EVAL_PROFILE``'s, inherited
+    Strict MCP, the null memory sentinel and the base's sandbox are inherited
     through ``build_eval_orch_config``.
     """
     if memory_endpoint is not None:
@@ -56,13 +56,9 @@ def build_shadow_orch_config(
             f'minted by evals/live_fixture.py::build_live_fixture is contained by '
             f'escalation Gate 0'
         )
-    evaled = build_eval_orch_config(
+    return build_eval_orch_config(
         config, task, base_config,
         architect_config=architect_config, judge_config=judge_config,
-    )
-    assert base_config is not None, 'build_eval_orch_config refuses a None base_config'
-    return evaled.model_copy(
-        update={'sandbox': base_config.sandbox.model_copy(update={'enabled': True})},
     )
 
 

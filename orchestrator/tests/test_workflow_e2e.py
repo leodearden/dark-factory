@@ -36,7 +36,7 @@ from shared.task_statuses import TaskStatus
 from shared.task_transitions import outcome_allows_status
 from shared.usage_gate import SessionBudgetExhausted
 
-from orchestrator import session_registry
+from orchestrator import session_records
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, DEBUGGER, IMPLEMENTER, JUDGE, MERGER
 from orchestrator.artifacts import TaskArtifacts
@@ -1570,7 +1570,7 @@ def _make_resolve_then_dismiss_chained_steward(
     Neither waiter reaches ESCALATED through that trailing publication.
     ``_mark_blocked``'s wait is scoped to its own L0 (task 5563), so the
     chained outcome is foreign and discarded; ESCALATED comes from the
-    ``has_open_l1`` source-of-truth override in
+    open-L1 hand-off override in
     ``TaskWorkflow._await_steward_completion``, which replaces the in-scope
     ``StewardResolved``.  ``run()``'s ESCALATED wait never routes on the
     channel at all: its tail reads the open L1 from the escalation queue.
@@ -3006,8 +3006,8 @@ class TestMarkBlockedFalseDoneGuard:
 
         The steward's ``StewardReescalatedL1`` is about the chained L0, so
         ``_mark_blocked``'s scoped wait discards it (task 5563) and receives
-        only its own L0's ``StewardResolved``.  The ``has_open_l1``
-        source-of-truth override in ``_await_steward_completion`` turns that
+        only its own L0's ``StewardResolved``.  The open-L1 hand-off
+        override in ``_await_steward_completion`` turns that
         would-be requeue into ``StewardReescalatedL1``, which
         ``_mark_blocked``'s single isinstance dispatch (SO-1) routes to
         ESCALATED — no re-pend, no duplicate L1.  This still exercises the
@@ -3295,10 +3295,8 @@ class TestMarkBlockedFalseDoneGuard:
         """
         from unittest.mock import AsyncMock, patch
 
-        from orchestrator.merge_lane.worker import (
-            TRANSIENT_INFRA_REASON_PREFIX,
-            MergeOutcome,
-        )
+        from orchestrator.merge_lane.verify_failure_outcome import TRANSIENT_INFRA_REASON_PREFIX
+        from orchestrator.merge_lane.worker import MergeOutcome
 
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path
@@ -8767,7 +8765,7 @@ class TestBuildSpawnEnv:
         (_architect_spawn_session_id stashed), a post-architect role's
         CLAUDE_SPAWN_PARENT_ID is the architect's reconstructed
         SessionStart-hook registry slug -- built via the exact same
-        session_registry.build_session_slug the architect's own hook uses,
+        session_records.build_session_slug the architect's own hook uses,
         so it matches that real record precisely."""
         workflow = self._make_workflow(config, git_ops, task_assignment)
         workflow._architect_spawn_session_id = 'arch-uuid-xyz'
@@ -8775,11 +8773,11 @@ class TestBuildSpawnEnv:
         env = workflow._build_spawn_env(IMPLEMENTER)
 
         assert env['CLAUDE_SPAWN_ROLE'] == 'implementer'
-        assert env['CLAUDE_SPAWN_PARENT_ID'] == session_registry.build_session_slug(
+        assert env['CLAUDE_SPAWN_PARENT_ID'] == session_records.build_session_slug(
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            'arch-uuid-xyz',  # type: ignore[arg-type]  # deliberate str in launcher_pid slot; see session_hooks.hook_session_slug
+            'arch-uuid-xyz',
         )
 
     async def test_architect_still_receives_workflow_root_when_stashed(
@@ -8830,11 +8828,13 @@ class TestBuildSpawnEnv:
         implementer_kwargs = captured_calls[1]
         implementer_spawn_env = implementer_kwargs['spawn_env']
         assert implementer_spawn_env['CLAUDE_SPAWN_ROLE'] == 'implementer'
-        assert implementer_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == session_registry.build_session_slug(
+        architect_session_id = workflow._architect_spawn_session_id
+        assert architect_session_id is not None
+        assert implementer_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == session_records.build_session_slug(
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            workflow._architect_spawn_session_id,  # type: ignore[arg-type]  # deliberate str in launcher_pid slot; see session_hooks.hook_session_slug
+            architect_session_id,
         )
 
 

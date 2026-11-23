@@ -6,9 +6,11 @@ Cross-checks fleet session-registry records
 (``~/.claude/fleet/sessions/<slug>/record.json``) against
 ``~/.claude/projects`` transcripts and alarms loudly when a COMPLETED
 spawn-launched interactive session — a record WITH a substantive prompt, a
-terminal status, and a ``start_ts`` inside a lookback window — produced no
-plausibly-matching transcript. This is the detector for the transcript-loss
-regression (a suppressed session-persistence path), NOT the preventer: that
+terminal status and a ``start_ts`` inside a lookback window, and not an
+unbound orphan — produced no plausibly-matching transcript. Unbound orphans
+are counted in the one-line result instead. This is the detector for the
+transcript-loss regression (a suppressed session-persistence path), NOT the
+preventer: that
 is ``skills/spawn/spawn-claude.sh``'s unconditional
 ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`` export. Shipping
 the detector means any future silent transcript-loss regression is caught in
@@ -19,7 +21,7 @@ Natural home: ``scripts/legibility/`` alongside ``check_trickle_liveness.sh``
 a ``__main__`` sys.path self-bootstrap, dependency-injection seams, and a
 ``main() -> exit-code`` CLI a systemd/watcher probe can surface.
 
-Registry enumeration composes existing public ``session_registry`` helpers
+Registry enumeration composes existing public ``session_records`` helpers
 (``sessions_dir`` + ``read_record``, skipping missing/corrupt like the
 reapers) rather than adding an iterator to that heavily-tested orchestrator
 contract file — see the plan's design decisions.
@@ -51,7 +53,7 @@ if __name__ == '__main__':
 
 from legibility import alarm, config, detectors, inventory  # noqa: E402  # debt: task 6760
 
-from orchestrator import session_registry
+from orchestrator import session_reaper, session_records
 
 logger = logging.getLogger('legibility.check_transcript_persistence')
 
@@ -88,10 +90,10 @@ matching falls back to the WEAK file-mtime time window instead."""
 
 def iter_registry_records(
     fleet_root: Path | str | None = None,
-) -> Iterator[session_registry.SessionRecord]:
+) -> Iterator[session_records.SessionRecord]:
     """Yield every readable ``SessionRecord`` under the fleet registry.
 
-    Composes ``session_registry.sessions_dir(fleet_root).iterdir()`` +
+    Composes ``session_records.sessions_dir(fleet_root).iterdir()`` +
     ``read_record`` in sorted (directory-name) order, skipping a slug dir
     whose ``record.json`` is missing (``FileNotFoundError``) or unparseable
     (``CorruptSessionRecord``) — the same tolerate-missing/corrupt idiom
@@ -99,15 +101,15 @@ def iter_registry_records(
     (default ``None`` -> real ``~/.claude/fleet``), so tests never touch the
     real tree. Yields nothing when the sessions dir does not exist.
     """
-    base = session_registry.sessions_dir(fleet_root)
+    base = session_records.sessions_dir(fleet_root)
     if not base.is_dir():
         return
     for slug_dir in sorted(base.iterdir()):
         if not slug_dir.is_dir():
             continue
         try:
-            record = session_registry.read_record(slug_dir.name, root=fleet_root)
-        except (FileNotFoundError, session_registry.CorruptSessionRecord):
+            record = session_records.read_record(slug_dir.name, root=fleet_root)
+        except (FileNotFoundError, session_records.CorruptSessionRecord):
             continue
         yield record
 
@@ -130,12 +132,19 @@ def _parse_start_ts(value: str | None) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _is_unbound_orphan(record: session_records.SessionRecord) -> bool:
+    """Whether *record* is the unbound-orphan shape: the reaper stamped ORPHAN_EXIT_CODE and no session hook ever bound a session id."""
+    return record.exit_code == session_reaper.ORPHAN_EXIT_CODE and not (
+        record.claude_session_id or record.claude_launch_session_id
+    )
+
+
 def find_completed_spawn_records(
-    records: Iterable[session_registry.SessionRecord],
+    records: Iterable[session_records.SessionRecord],
     *,
     now: datetime,
     lookback: timedelta,
-) -> list[session_registry.SessionRecord]:
+) -> list[session_records.SessionRecord]:
     """Filter *records* to COMPLETED spawn sessions worth checking.
 
     Keeps a record iff ALL hold:
@@ -145,25 +154,62 @@ def find_completed_spawn_records(
       (b) its status is terminal (``EXITED``/``FAILED_TO_START``) — an
           in-flight session's transcript may still be flushing, so alarming
           on it would false-positive;
-      (c) its ``start_ts`` parses and lies within ``[now - lookback, now]``.
+      (c) its ``start_ts`` parses and lies within ``[now - lookback, now]``;
+      (d) it is not an unbound orphan (:func:`_is_unbound_orphan`) — the
+          reaper stamped ``session_reaper.ORPHAN_EXIT_CODE`` and no session
+          id was ever bound, so nothing shows its session started (the
+          launcher died before claude ran, e.g. a caller's ``timeout``
+          killing a t3-lane launcher inside its started-grace), and such a
+          record cannot be a lost transcript.
 
     Records failing any condition (in-flight, promptless, out-of-window,
-    unparseable ``start_ts``) are skipped defensively.
+    unparseable ``start_ts``, unbound orphan) are skipped defensively.
     """
+    return [
+        record
+        for record in _terminal_spawns_in_window(records, now=now, lookback=lookback)
+        if not _is_unbound_orphan(record)
+    ]
+
+
+def _terminal_spawns_in_window(
+    records: Iterable[session_records.SessionRecord],
+    *,
+    now: datetime,
+    lookback: timedelta,
+) -> Iterator[session_records.SessionRecord]:
+    """Yield the *records* meeting conditions (a)-(c) of :func:`find_completed_spawn_records`."""
     window_start = now - lookback
-    kept: list[session_registry.SessionRecord] = []
     for record in records:
         if not record.prompt or not record.prompt.strip():
             continue
-        if record.status not in session_registry.TERMINAL_STATUSES:
+        if record.status not in session_records.TERMINAL_STATUSES:
             continue
         start = _parse_start_ts(record.start_ts)
         if start is None:
             continue
         if not (window_start <= start <= now):
             continue
-        kept.append(record)
-    return kept
+        yield record
+
+
+def count_skipped_unbound_orphans(
+    records: Iterable[session_records.SessionRecord],
+    cwd_prefixes: Sequence[str],
+    *,
+    now: datetime,
+    lookback: timedelta,
+) -> int:
+    """Count this project's records that condition (d) alone kept out of the check.
+
+    A sudden rise means hooks stopped binding session ids, which would also
+    hide a transcript-loss regression in sibling-mode spawns.
+    """
+    return sum(
+        1
+        for record in _terminal_spawns_in_window(records, now=now, lookback=lookback)
+        if _is_unbound_orphan(record) and inventory.is_member(record.cwd, cwd_prefixes)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +294,7 @@ def _typed_slash_command(text: str) -> str | None:
 
 
 def find_matching_transcript(
-    record: session_registry.SessionRecord,
+    record: session_records.SessionRecord,
     projects_root: Path | str,
     *,
     now: datetime,
@@ -302,7 +348,7 @@ def find_matching_transcript(
     return _match_mtime_window(record.start_ts, candidates, now=now, skew=skew)
 
 
-def _bound_session_ids(record: session_registry.SessionRecord) -> tuple[str, ...]:
+def _bound_session_ids(record: session_records.SessionRecord) -> tuple[str, ...]:
     """Return *record*'s usable bound Claude Code session ids, current then launch; empty means unbound.
 
     Each id becomes a filename inside the expected dir, so one that is not a
@@ -417,7 +463,7 @@ class MissingTranscript:
 
 
 def find_missing_transcripts(
-    records: Iterable[session_registry.SessionRecord],
+    records: Iterable[session_records.SessionRecord],
     projects_root: Path | str,
     cwd_prefixes: Sequence[str],
     *,
@@ -603,13 +649,15 @@ class CheckResult:
     ``exit_code`` is the authoritative loud signal (0 healthy, 1 = at least
     one lost session OR — under ``--check-preventer`` — a failed preventer
     guard) a systemd/watcher probe surfaces. ``missing`` is the finding list,
-    ``escalated`` whether the best-effort POST succeeded,
-    ``force_persistence_ok`` the preventer verdict (``None`` when not checked),
-    and ``reason`` a human-readable one-line summary.
+    ``skipped_unbound_orphans`` the :func:`count_skipped_unbound_orphans`
+    count (reported, never alarmed on), ``escalated`` whether the best-effort
+    POST succeeded, ``force_persistence_ok`` the preventer verdict (``None``
+    when not checked), and ``reason`` a human-readable one-line summary.
     """
 
     exit_code: int
     missing: list[MissingTranscript]
+    skipped_unbound_orphans: int
     escalated: bool
     force_persistence_ok: bool | None
     reason: str
@@ -649,6 +697,7 @@ def _read_spawn_script(spawn_script_path: Path | str | None) -> str:
 
 def _build_reason(
     missing: Sequence[MissingTranscript],
+    skipped_unbound_orphans: int,
     force_persistence_ok: bool | None,
     check_preventer: bool,
 ) -> str:
@@ -660,6 +709,8 @@ def _build_reason(
         )
     else:
         parts.append('no lost transcripts detected')
+    if skipped_unbound_orphans:
+        parts.append(f'{skipped_unbound_orphans} unbound orphan record(s) not checked')
     if check_preventer:
         if force_persistence_ok:
             parts.append('preventer guard present')
@@ -697,16 +748,20 @@ def run_check(
 
     ``exit_code`` is 1 iff there is at least one lost session OR (under
     *check_preventer*) the guard fails; else 0. Escalation failure never
-    changes the exit code (the non-zero code is the authoritative signal).
+    changes the exit code (the non-zero code is the authoritative signal),
+    and neither does the skipped-unbound-orphan count, which is only reported.
     """
     if now is None:
         now = datetime.now(UTC)
     cfg = _load_config(config_path=config_path, project_id=project_id)
     root = Path(projects_root) if projects_root is not None else DEFAULT_PROJECTS_ROOT
 
-    records = iter_registry_records(fleet_root=fleet_root)
+    records = list(iter_registry_records(fleet_root=fleet_root))
     missing = find_missing_transcripts(
         records, root, cfg.cwd_prefixes, now=now, lookback=lookback,
+    )
+    skipped_unbound_orphans = count_skipped_unbound_orphans(
+        records, cfg.cwd_prefixes, now=now, lookback=lookback,
     )
 
     force_persistence_ok: bool | None = None
@@ -723,10 +778,13 @@ def run_check(
         )
 
     exit_code = 1 if (missing or preventer_failed) else 0
-    reason = _build_reason(missing, force_persistence_ok, check_preventer)
+    reason = _build_reason(
+        missing, skipped_unbound_orphans, force_persistence_ok, check_preventer,
+    )
     return CheckResult(
         exit_code=exit_code,
         missing=missing,
+        skipped_unbound_orphans=skipped_unbound_orphans,
         escalated=escalated,
         force_persistence_ok=force_persistence_ok,
         reason=reason,

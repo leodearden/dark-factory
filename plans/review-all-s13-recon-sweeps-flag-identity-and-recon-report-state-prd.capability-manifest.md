@@ -113,16 +113,15 @@ Closes fk-0791e9817b84. High. Dep α.
 
 Closes fk-917fdf32a542, fk-cdb8c20a3d0f. OQ-1 (b) and OQ-8 (b′) ruled by Leo: the sweep invalidates and writes nothing; the Stage-1 prompt's two status sections tell the agent to invalidate and write nothing for a task's status (D19); the detector stays as a backstop. Deps κ2, δ2; out of batch 9203 (S26 μ, C7 read surface), 6721 (S14 μ), 6718 (S14 θ, same sweep module and test), 7941, 5272 (6598 done).
 
+**Amended 2026-11-14/18 (fused-recall plan 1, program ruling R93).** Task 9739 now depends on task 10087 (κ of `plans/live-task-facts-at-recall-prd.md`), which deletes the stale-status sweep, the status detector and the Stage-1 prompt's status sections. η shrinks to the priority-override sweep: the sweep-only and prompt rows above no longer describe its work. Its check `sweep-writes-no-replacement-guidance` is dropped; `stage1-status-flip-two-step-gone` and `stage1-task-count-example-gone` moved to 10087. The dependency on 7941 was removed (7941 cancelled as superseded by 10087). The detector no longer stays as a backstop (R93 supersedes R66 on that point).
+
 | Capability | Binding | Verdict | Delivered check |
 |---|---|---|---|
 | edge-sweep-primitive | built here — reconciliation/graph_edge_sweep.py::invalidate_edges (C6) | PASS | grep present `^async def invalidate_edges\(` in `fused-memory/src/fused_memory/reconciliation/graph_edge_sweep.py` |
 | private-agent-id-gone | anti-inversion — the agent id comes from recon_stage_agent_id(StageId) | PASS | grep absent `_SWEEP_AGENT_ID` in `fused-memory/src/` |
 | agent-id-literal-gone | anti-inversion — no hand-written stage agent id assignment in reconciliation | PASS | grep absent `= 'recon-stage-memory_consolidator'` in `fused-memory/src/fused_memory/reconciliation/` |
 | replacement-status-prose-gone | anti-inversion (OQ-1 b) — the sweep invalidates and writes no status sentence | PASS | grep absent `_SUPERSEDE_FACT_TEMPLATE` in `fused-memory/src/` |
-| sweep-writes-no-replacement-guidance | built here — prompts/stage1.py tells the agent the sweep writes no replacement status fact | PASS | grep present `do not write a replacement status fact` in `fused-memory/src/fused_memory/reconciliation/prompts/stage1.py` |
-| stage1-status-flip-two-step-gone | anti-inversion (OQ-8 b′) — the Stage-1 prompt no longer scopes the invalidate-and-write two-step to status flips | PASS | grep absent `status flips` in `fused-memory/src/fused_memory/reconciliation/prompts/stage1.py` |
 | supersede-stats-gone | anti-inversion (OQ-1 b) — the consolidator reports no superseding-write stats | PASS | grep absent `stale_blocked_edges_supersede` in `fused-memory/src/` |
-| stage1-task-count-example-gone | anti-inversion (OQ-8 b′) — the Stage-1 prompt's effective-date example is no longer a task-status count (the recon-stage count-snapshot gate refuses that write anyway) | PASS | grep absent `3 blocked, 18 done` in `fused-memory/src/fused_memory/reconciliation/prompts/stage1.py` |
 | checked-read-surface-upstream | producer:task-9203 upstream (S26 μ, C7 MemoryService.enumerate_valid_edges); its own delivered checks gate it | PASS | — |
 | recon-stage-agent-id-upstream | producer:task-6721 upstream (S14 μ, shared/agent_identity.py::recon_stage_agent_id) | PASS | — |
 | stage-id-substrate | `grep:fused-memory/src/fused_memory/models/reconciliation.py::StageId` substrate — on main | PASS | — |
