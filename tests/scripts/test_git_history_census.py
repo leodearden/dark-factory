@@ -5,6 +5,7 @@ Every source here is text parsed in memory or written to disk; no git process ru
 from __future__ import annotations
 
 import ast
+import posixpath
 import subprocess
 import sys
 from pathlib import Path
@@ -13,16 +14,19 @@ import git_history_census
 import pytest
 from git_history_census import (
     MARKER,
+    READS_ONLY_THROWAWAY_REPOS,
     GateTestRoot,
     HistoryCall,
     Sweep,
     SweepSource,
     UnreadableGateFile,
     applied_marker_names,
+    doubly_accounted_failure,
     history_calls,
     imported_module_stems,
     main,
     may_hold_a_history_call_or_marker,
+    stale_throwaway_entry_failure,
     sweep,
     sweep_sources,
     text_source,
@@ -342,6 +346,9 @@ _SEEDS_ITS_REPO_SOURCE = (
     "    subprocess.run(['git', '-C', str(tmp_path), 'rev-list', '--count', 'HEAD'], check=True)\n"
 )
 _SEEDS_ITS_REPO_CALL_LINE = 5
+_MARKED_SEEDS_ITS_REPO_SOURCE = (
+    f'import pytest\npytestmark = pytest.mark.{MARKER}\n{_SEEDS_ITS_REPO_SOURCE}'
+)
 
 
 def _plant(checkout: Path, rel_path: str, text: str) -> None:
@@ -358,7 +365,91 @@ def test_a_file_listed_in_the_throwaway_mapping_is_accounted_for(tmp_path: Path)
     unlisted = sweep(roots, repo_root=tmp_path, throwaway={})
 
     assert unaccounted_reader_failure(listed) is None
+    assert stale_throwaway_entry_failure(listed) is None
+    assert doubly_accounted_failure(listed) is None
     assert unaccounted_reader_failure(unlisted) is not None
+
+
+def test_a_sweep_keeps_its_own_copy_of_the_throwaway_mapping(tmp_path: Path) -> None:
+    _plant(tmp_path, _SEEDS_ITS_REPO, _SEEDS_ITS_REPO_SOURCE)
+    throwaway = {_SEEDS_ITS_REPO: 'reason'}
+
+    census = sweep(frozenset({_SYNTHETIC_ROOT}), repo_root=tmp_path, throwaway=throwaway)
+    throwaway.clear()
+
+    assert unaccounted_reader_failure(census) is None
+    assert isinstance(hash(census), int)
+
+
+# ─── The registry's own verdicts ────────────────────────────────────────────
+
+
+def test_a_listed_path_under_the_swept_roots_that_reaches_no_history_call_is_stale(
+    tmp_path: Path,
+) -> None:
+    _plant(tmp_path, _SEEDS_ITS_REPO, _SEEDS_ITS_REPO_SOURCE)
+    _plant(tmp_path, 'pkg/tests/test_no_longer_reads.py', 'def test_it():\n    pass\n')
+    census = sweep(frozenset({_SYNTHETIC_ROOT}), repo_root=tmp_path, throwaway={
+        _SEEDS_ITS_REPO: 'reason',
+        'pkg/tests/test_no_longer_reads.py': 'reason',
+        'pkg/tests/test_deleted.py': 'reason',
+        'other/tests/test_another_sweeps.py': 'reason',
+    })
+
+    failure = stale_throwaway_entry_failure(census)
+
+    assert failure is not None
+    assert 'pkg/tests/test_no_longer_reads.py' in failure
+    assert 'pkg/tests/test_deleted.py' in failure
+    assert _SEEDS_ITS_REPO not in failure
+    assert 'other/tests/test_another_sweeps.py' not in failure
+
+
+def test_a_listed_importer_of_a_history_helper_is_not_stale(tmp_path: Path) -> None:
+    _plant(tmp_path, 'pkg/tests/_history.py', _HISTORY_HELPER_SOURCE)
+    _plant(tmp_path, 'pkg/tests/test_uses.py', 'from _history import base\n')
+
+    census = sweep(
+        frozenset({_SYNTHETIC_ROOT}), repo_root=tmp_path,
+        throwaway={'pkg/tests/test_uses.py': 'reason'},
+    )
+
+    assert stale_throwaway_entry_failure(census) is None
+
+
+def test_a_listed_file_that_is_also_marked_is_accounted_for_twice(tmp_path: Path) -> None:
+    _plant(tmp_path, _SEEDS_ITS_REPO, _MARKED_SEEDS_ITS_REPO_SOURCE)
+    _plant(
+        tmp_path, 'pkg/tests/test_marked_no_call.py',
+        f'import pytest\npytestmark = pytest.mark.{MARKER}\n',
+    )
+    census = sweep(frozenset({_SYNTHETIC_ROOT}), repo_root=tmp_path, throwaway={
+        _SEEDS_ITS_REPO: 'reason', 'pkg/tests/test_marked_no_call.py': 'reason',
+    })
+
+    failure = doubly_accounted_failure(census)
+
+    assert failure is not None
+    assert _SEEDS_ITS_REPO in failure
+    assert 'pkg/tests/test_marked_no_call.py' in failure
+
+
+def test_a_listed_helper_with_a_marked_importer_is_accounted_for_twice(tmp_path: Path) -> None:
+    _plant(tmp_path, 'pkg/tests/_history.py', _HISTORY_HELPER_SOURCE)
+    _plant(
+        tmp_path, 'pkg/tests/test_reads.py',
+        f'import pytest\nfrom _history import base\npytestmark = pytest.mark.{MARKER}\n',
+    )
+    census = sweep(
+        frozenset({_SYNTHETIC_ROOT}), repo_root=tmp_path,
+        throwaway={'pkg/tests/_history.py': 'reason'},
+    )
+
+    failure = doubly_accounted_failure(census)
+
+    assert failure is not None
+    assert 'pkg/tests/_history.py' in failure
+    assert 'pkg/tests/test_reads.py' not in failure
 
 
 # ─── The command line ───────────────────────────────────────────────────────
@@ -384,10 +475,7 @@ def test_an_unaccounted_reader_of_a_tmp_repo_fails_the_census_naming_its_call(
 def test_a_marked_reader_passes_the_census_silently(
     tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _plant(
-        tmp_path, _SEEDS_ITS_REPO,
-        f'import pytest\npytestmark = pytest.mark.{MARKER}\n{_SEEDS_ITS_REPO_SOURCE}',
-    )
+    _plant(tmp_path, _SEEDS_ITS_REPO, _MARKED_SEEDS_ITS_REPO_SOURCE)
 
     code = _census(tmp_path, 'pkg/tests')
     captured = capsys.readouterr()
@@ -413,6 +501,43 @@ def test_an_unmarked_importer_of_a_marked_files_helper_fails_the_census_naming_b
     assert 'pkg/tests/_history.py' in out
 
 
+def _a_listed_path_and_its_directory() -> tuple[str, str]:
+    listed = min(READS_ONLY_THROWAWAY_REPOS)
+    return listed, posixpath.dirname(listed)
+
+
+def test_the_census_reports_a_stale_entry_only_under_the_roots_it_sweeps(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    listed, root = _a_listed_path_and_its_directory()
+    elsewhere = next(
+        rel_path for rel_path in sorted(READS_ONLY_THROWAWAY_REPOS)
+        if not rel_path.startswith(f'{root}/')
+    )
+    (tmp_path / root).mkdir(parents=True)
+
+    code = _census(tmp_path, root)
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert listed in out
+    assert elsewhere not in out
+
+
+def test_the_census_reports_a_listed_file_that_is_also_marked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    listed, root = _a_listed_path_and_its_directory()
+    _plant(tmp_path, listed, _MARKED_SEEDS_ITS_REPO_SOURCE)
+
+    code = _census(tmp_path, root)
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert 'more than one way' in out
+    assert listed in out
+
+
 @pytest.mark.parametrize(
     'root',
     [
@@ -434,10 +559,19 @@ def test_a_root_that_is_not_a_directory_under_the_checkout_is_a_usage_error(
     assert captured.out == ''
 
 
-def test_an_admitted_file_the_parser_rejects_is_an_incomplete_census_not_a_pass(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+@pytest.mark.parametrize(
+    'content',
+    [
+        pytest.param(b"def broken(:\n    _git(root, 'log')\n", id='a-syntax-error'),
+        pytest.param(b"_git(root, 'log')" + bytes([0]), id='a-nul-byte'),
+        pytest.param(b"_git(root, 'log')  # " + bytes([0xFF]), id='invalid-utf-8'),
+    ],
+)
+def test_a_file_the_census_cannot_decode_or_parse_is_an_incomplete_census_not_a_pass(
+    content: bytes, tmp_path: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _plant(tmp_path, 'pkg/tests/_reads.py', "def broken(:\n    _git(root, 'log')\n")
+    (tmp_path / 'pkg/tests').mkdir(parents=True)
+    (tmp_path / 'pkg/tests/_reads.py').write_bytes(content)
 
     code = _census(tmp_path, 'pkg/tests')
     captured = capsys.readouterr()

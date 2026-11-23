@@ -15,15 +15,21 @@ with the reason none of its calls into the helper reads the checkout. A test
 that reaches the checkout's history only through production code, or through a
 helper's own helper, makes no call this census can see; mark it by hand.
 
+The registry is held to the same rule from the other side: an entry under the
+swept roots must still name a file that reaches a history call, and no file may
+be accounted for in more than one way. An entry outside every swept root is left
+to the sweep whose roots hold it.
+
 RUN AS A SCRIPT, ``python tests/scripts/git_history_census.py ROOT...`` sweeps
 the ``.py`` files under each root of the checkout holding this file: exit 0
-silently when every reader is accounted for, 1 with a report when one is not,
-and 2 when a root is not a directory under the checkout or an admitted file
-cannot be read or parsed, since then the census is incomplete. Each module's
+silently when every verdict holds, 1 with a report when one does not, and 2
+when a root is not a directory under the checkout or a file cannot be read or
+an admitted one parsed, since then the census is incomplete. Each module's
 ``lint_command`` runs it over that module's gate test roots through
 ``uv run --project shared python``, because it reads markers through
-``shared.pytest_mark_grammar``. The whole-tree checks over the live gate, and
-the registry's staleness checks, are in ``tests/scripts/test_merge_gate_history_leg.py``.
+``shared.pytest_mark_grammar``. ``tests/scripts/test_merge_gate_history_leg.py``
+runs the same verdicts over every gate root at once, and holds every registry
+entry to lie under one.
 """
 from __future__ import annotations
 
@@ -34,9 +40,10 @@ import functools
 import posixpath
 import re
 import sys
+import types
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
 
@@ -154,8 +161,8 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     ),
 }
 
-_CENSUS_FILE = Path(__file__).resolve().relative_to(CHECKOUT_ROOT).as_posix()
-_REGISTRY_HOME = f'READS_ONLY_THROWAWAY_REPOS in {_CENSUS_FILE}'
+CENSUS_FILE = Path(__file__).resolve().relative_to(CHECKOUT_ROOT).as_posix()
+_REGISTRY_HOME = f'READS_ONLY_THROWAWAY_REPOS in {CENSUS_FILE}'
 _GIT_OPTIONS_TAKING_A_VALUE = frozenset({'-C', '-c'})
 _SHELLED_HISTORY_CALL = re.compile(r'git (-C \S+ )?(log|merge-base|rev-list|describe)\b')
 
@@ -346,11 +353,17 @@ class SweptFile:
 
 @dataclasses.dataclass(frozen=True)
 class Sweep:
-    """The swept files, and the throwaway-repo listing they are accounted against."""
+    """The swept files, and a read-only copy of the throwaway-repo listing they are accounted against."""
 
     roots: frozenset[GateTestRoot]
     files: tuple[SweptFile, ...]
-    throwaway: Mapping[str, str]
+    throwaway: Mapping[str, str] = dataclasses.field(hash=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'throwaway', types.MappingProxyType(dict(self.throwaway)))
+
+    def lies_under_a_root(self, rel_path: str) -> bool:
+        return any(PurePosixPath(rel_path).is_relative_to(root.path) for root in self.roots)
 
     @functools.cached_property
     def marked(self) -> tuple[SweptFile, ...]:
@@ -502,7 +515,10 @@ def sweep(
     throwaway: Mapping[str, str] = READS_ONLY_THROWAWAY_REPOS,
 ) -> Sweep:
     return sweep_sources(roots, [
-        SweepSource(rel_path=path.relative_to(repo_root).as_posix(), root=root, read=path.read_text)
+        SweepSource(
+            rel_path=path.relative_to(repo_root).as_posix(), root=root,
+            read=functools.partial(path.read_text, encoding='utf-8'),
+        )
         for root in sorted(roots, key=lambda root: root.path)
         for path in sorted((repo_root / root.path).rglob('*.py'))
     ], throwaway)
@@ -510,10 +526,14 @@ def sweep(
 
 # ─── The verdicts ───────────────────────────────────────────────────────────
 
+_REQUEST_THE_REGISTRY = (
+    f'If {CENSUS_FILE} is outside your task\'s declared files, request it with '
+    f"escalate_blocker(category='scope_violation')"
+)
+_REGISTRY_SCOPE_ROUTE = f'{_REQUEST_THE_REGISTRY}.'
 _SCOPE_ROUTE = (
-    f'If {_CENSUS_FILE} is outside your task\'s declared files, request it with '
-    f"escalate_blocker(category='scope_violation'); do not mark a throwaway-repo reader to "
-    f'stay in scope, since the mark puts the file on the merge gate\'s history leg.'
+    f'{_REQUEST_THE_REGISTRY}; do not mark a throwaway-repo reader to stay in scope, '
+    f'since the mark puts the file on the merge gate\'s history leg.'
 )
 
 
@@ -560,6 +580,52 @@ def unaccounted_importer_failure(census: Sweep) -> str | None:
     )
 
 
+def stale_throwaway_entry_failure(census: Sweep) -> str | None:
+    """The report on each listed path under the swept roots that reaches no history call, else None."""
+    files = census.by_path()
+    stale = [
+        f'  {rel_path}'
+        for rel_path in sorted(census.throwaway)
+        if census.lies_under_a_root(rel_path)
+        and (rel_path not in files or not census.reaches_a_history_call(files[rel_path]))
+    ]
+    if not stale:
+        return None
+    return (
+        f'{len(stale)} {_REGISTRY_HOME} entry(ies) no longer name a gate test file that makes '
+        f'a history call or imports a history helper:\n' + '\n'.join(stale) + '\n'
+        f'Remove each. A deleted, renamed or split file takes its entry with it; any file '
+        f'that still shells a history call is accounted for on its own. {_REGISTRY_SCOPE_ROUTE}'
+    )
+
+
+def doubly_accounted_failure(census: Sweep) -> str | None:
+    """The report on each swept file accounted for in more than one way, else None."""
+    doubled = [
+        f'  {swept.rel_path}: {"; ".join(ways)}'
+        for swept in census.files
+        if len(ways := census.ways_accounted_for(swept)) > 1
+    ]
+    if not doubled:
+        return None
+    return (
+        f'{len(doubled)} merge-gate file(s) are accounted for in more than one way:\n'
+        + '\n'.join(doubled) + '\n'
+        f'Keep exactly one. If every history call the file reaches targets a tmp or fixture '
+        f'repo, keep its entry in {_REGISTRY_HOME} and drop the mark (for a helper, the mark on '
+        f'an importer that carries it only for the helper); otherwise drop the entry, since '
+        f'the mark already accounts for the file. {_REGISTRY_SCOPE_ROUTE}'
+    )
+
+
+_VERDICTS: tuple[Callable[[Sweep], str | None], ...] = (
+    unaccounted_reader_failure,
+    unaccounted_importer_failure,
+    stale_throwaway_entry_failure,
+    doubly_accounted_failure,
+)
+
+
 # ─── The command line ───────────────────────────────────────────────────────
 
 
@@ -571,7 +637,10 @@ def _is_directory_under(checkout: Path, directory: str) -> bool:
 def main(argv: Sequence[str]) -> int:
     """Census the gate test roots *argv* names; return the exit code."""
     parser = argparse.ArgumentParser(
-        description='Report gate test files that shell a git history subcommand unaccounted for.',
+        description=(
+            'Report gate test files that shell a git history subcommand unaccounted for, '
+            'and stale or doubled accounting.'
+        ),
     )
     parser.add_argument('roots', nargs='+', metavar='ROOT', help='relative to the checkout')
     parser.add_argument(
@@ -592,11 +661,7 @@ def main(argv: Sequence[str]) -> int:
     except UnreadableGateFile as exc:
         print(f'the census is incomplete: {exc}', file=sys.stderr)
         return 2
-    failures = [
-        failure
-        for failure in (unaccounted_reader_failure(census), unaccounted_importer_failure(census))
-        if failure is not None
-    ]
+    failures = [failure for verdict in _VERDICTS if (failure := verdict(census)) is not None]
     for failure in failures:
         print(failure)
     return 1 if failures else 0

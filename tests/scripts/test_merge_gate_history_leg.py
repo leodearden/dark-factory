@@ -34,15 +34,17 @@ import tomllib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 
-import git_history_census
 import pytest
 import verify_command_invariants as vci
 from _pytest.mark.expression import Expression
 from git_history_census import (
+    CENSUS_FILE,
     MARKER,
     READS_ONLY_THROWAWAY_REPOS,
     GateTestRoot,
     Sweep,
+    doubly_accounted_failure,
+    stale_throwaway_entry_failure,
     sweep,
     unaccounted_importer_failure,
     unaccounted_reader_failure,
@@ -101,7 +103,7 @@ def gate_test_roots(module_configs: Mapping[str, ModuleConfig]) -> frozenset[Gat
 
 @functools.cache
 def _live_sweep() -> Sweep:
-    return sweep(gate_test_roots(_discover_module_configs(REPO_ROOT)))
+    return sweep(gate_test_roots(_discover_module_configs(REPO_ROOT)), repo_root=REPO_ROOT)
 
 
 def _registered_markers(pyproject_text: str) -> frozenset[str]:
@@ -231,38 +233,27 @@ def test_every_test_file_importing_a_history_helper_is_accounted_for() -> None:
 
 
 @_SWEEP_GROUP
-def test_every_history_reader_is_accounted_for_exactly_once() -> None:
-    live = _live_sweep()
-    doubled = {
-        swept.rel_path: ways
-        for swept in live.files
-        if swept.calls and len(ways := live.ways_accounted_for(swept)) > 1
-    }
-    assert not doubled, doubled
+def test_no_gate_file_is_accounted_for_in_more_than_one_way() -> None:
+    failure = doubly_accounted_failure(_live_sweep())
+    assert failure is None, failure
 
 
 @_SWEEP_GROUP
 def test_every_throwaway_repo_entry_still_reaches_a_history_call() -> None:
-    live = _live_sweep()
-    files = live.by_path()
-    stale = [
-        rel_path for rel_path in READS_ONLY_THROWAWAY_REPOS
-        if rel_path not in files or not live.reaches_a_history_call(files[rel_path])
-    ]
-    assert not stale, (
-        f'READS_ONLY_THROWAWAY_REPOS entries that no longer name a gate test file making a '
-        f'history call or importing a history helper: {stale}. Remove them.'
-    )
+    failure = stale_throwaway_entry_failure(_live_sweep())
+    assert failure is None, failure
 
 
 @_SWEEP_GROUP
-def test_no_file_is_both_marked_and_allowlisted() -> None:
-    files = _live_sweep().by_path()
-    both = [
-        rel_path for rel_path in READS_ONLY_THROWAWAY_REPOS
-        if rel_path in files and files[rel_path].carries_marker
-    ]
-    assert not both, both
+def test_every_throwaway_repo_entry_lies_under_a_gate_test_root() -> None:
+    live = _live_sweep()
+    outside = sorted(
+        rel_path for rel_path in READS_ONLY_THROWAWAY_REPOS if not live.lies_under_a_root(rel_path)
+    )
+    assert not outside, (
+        f'READS_ONLY_THROWAWAY_REPOS entries under no gate test root, which no census sweeps '
+        f'and so none can find stale: {outside}. Remove them.'
+    )
 
 
 @_SWEEP_GROUP
@@ -352,15 +343,14 @@ def test_each_leg_segment_carries_a_gate_pytest_timeout(declared_leg: list[LegSe
 
 # ─── Every module's task verify censuses its own gate test roots ────────────
 
-CENSUS = Path(git_history_census.__file__).resolve().relative_to(REPO_ROOT.resolve()).as_posix()
-_CENSUS_HEAD = ['uv', 'run', '--project', 'shared', 'python', CENSUS]
+_CENSUS_HEAD = ['uv', 'run', '--project', 'shared', 'python', CENSUS_FILE]
 _KNOWN_MODULES = frozenset({'orchestrator', 'tests/scripts'})
 
 
 def _census_leg_failure(prefix: str, lint_command: str, roots: Sequence[str]) -> str | None:
     """Why *lint_command* does not census exactly *roots* once, else None."""
     legs = [shlex.split(segment) for segment in verify_cmd.split_top_level_and(lint_command)]
-    census_legs = [leg for leg in legs if CENSUS in leg]
+    census_legs = [leg for leg in legs if CENSUS_FILE in leg]
     if not roots:
         if not census_legs:
             return None
