@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _sdk_client_stubs import sdk_client_double
+from shared.testing_virtual_clock import virtual_clock_test
 
 from fused_memory.llm.list_prices import list_price
 from fused_memory.llm.openai_responses import (
@@ -188,7 +189,7 @@ class TestFailuresPropagate:
         with pytest.raises(Boom):
             await _call(client)
 
-    @pytest.mark.asyncio
+    @virtual_clock_test
     async def test_a_call_past_its_timeout_raises_timeout_error(self) -> None:
         async def _hang(*_args, **_kwargs):
             await asyncio.sleep(5)

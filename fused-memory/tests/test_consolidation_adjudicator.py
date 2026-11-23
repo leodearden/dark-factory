@@ -31,6 +31,8 @@ from _adjudicator_doubles import (
     unauthorized,
 )
 from _sdk_client_stubs import sdk_client_double
+from shared.testing_own_time import run_on_own_time
+from shared.testing_virtual_clock import virtual_clock_test
 
 from fused_memory.config.schema import (
     ConsolidationAutoConfig,
@@ -453,10 +455,11 @@ class TestInstructions:
         assert _snake_case_words(INSTRUCTIONS) - known == set()
 
 
+_IMPORT_PROBE_BUDGET_S = 120.0
+
+
 def _probe(body: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, '-c', body], capture_output=True, text=True, timeout=300,
-    )
+    return run_on_own_time([sys.executable, '-c', body], budget=_IMPORT_PROBE_BUDGET_S)
 
 
 _EXECUTOR = 'fused_memory.reconciliation.consolidation_auto_executor'
@@ -667,7 +670,7 @@ def _sdk_response() -> types.SimpleNamespace:
 
 
 class TestOpenAIModelCall:
-    @pytest.mark.asyncio
+    @virtual_clock_test
     async def test_the_client_uses_the_provider_section_and_one_attempt(
         self, monkeypatch, tmp_path,
     ) -> None:
@@ -689,7 +692,7 @@ class TestOpenAIModelCall:
         assert reply.text == '{}'
         assert client.responses.create.call_args.kwargs['text'] == {'format': text_format()}
 
-    @pytest.mark.asyncio
+    @virtual_clock_test
     async def test_a_blank_key_is_not_forwarded(self, monkeypatch, tmp_path) -> None:
         config = _config(
             monkeypatch, tmp_path,
