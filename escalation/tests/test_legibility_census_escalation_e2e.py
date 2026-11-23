@@ -214,9 +214,10 @@ def test_census_hard_failure_lands_a_retrievable_escalation(
     )
     assert _RAISED_MESSAGE in fetched.detail
     assert not ghost.exists(), (
-        f'{ghost.name} survived in the private tempdir; the dead-PID sweep of the '
-        f'census session runner must run over the private tempdir of this test, '
-        f'never the host /tmp, and still reclaim there'
+        f'{ghost.name} survived in the private tempdir: either the dead-PID sweep '
+        f'of the census session runner ran outside it (over the host /tmp), or '
+        f'_SESSION_SWEEP_PREFIX no longer matches the prefix that '
+        f'scripts/legibility/session_runner.py sweeps'
     )
 
 
