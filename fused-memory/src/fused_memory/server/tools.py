@@ -4594,6 +4594,13 @@ def create_mcp_server(
             a top-level hit.  A record that is neither a child nor has children
             carries no 'grouped' key at all.
 
+            ATTRIBUTION (task 3137).  Every top-level result carries 'agent_id' (the writer),
+            'task_id' (the writer's metadata task_id, as a string) and 'project_id' (the
+            project scope the record is STORED under) beside 'created_at', each null when the
+            store recorded none.  Graphiti results never carry agent_id or task_id.  project_id
+            is the storage scope, not the origin: a rehomed record's origin is still read from
+            metadata.src_project.  Nested 'grouped' entries do not carry these keys.
+
             TOPIC-PINNED RESULTS (task 3111).  Every result carries a
             'topic_anchored' bool.  When True, that result was PROMOTED into
             the window BY RULE rather than earned its place by rank: when a
