@@ -1,0 +1,18 @@
+{
+  "task_id": "5429",
+  "reason": "review finding: the autouse MergeProvenance reset is spelled as the two counted attribute writes the other 39 resets use, instead of patch.object's string name that the private_reads sweep cannot see; the coupling to MergeProvenance._outbox is unchanged, only now measured (2 reads). The public unbind seam that removes it is a follow-up outside this task's scope",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_reconcile_landed_uncited_tip.py",
+      "baseline": 1,
+      "current": 3
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6439,
+      "current": 6441
+    }
+  ]
+}

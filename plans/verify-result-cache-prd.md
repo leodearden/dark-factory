@@ -460,7 +460,7 @@ the full-breadth gate itself.
 | `plans/merge-lane-quality-prd.md` (5036 ζ2 relocation) | consumes | `_run_unscoped_typechecks` consult (γ); cite by symbol, land on the package if 5036 has landed | this PRD (γ) | queued |
 | `plans/integration-test-lane-prd.md` (offline lane) | consumes | `LaneCommand` entry + red-handler hook into `audit.py` | this PRD (ε); lane engine untouched | queued |
 | Task 4226 | consumes | confirmed-red set parse | 4226 | pending (blocks ε) |
-| Task 5410 (task-leg disjoint-rebase skip) | parallel | both read `rebase_verify_cost`; per-test tier subsumes 5410's predicate | 5410 stays; retirement note in θ | wired |
+| Task 5410 (task-leg disjoint-rebase skip) | parallel | both read `rebase_verify_cost`; per-test tier subsumes 5410's predicate | 5410 cancelled as superseded (task 6580 removed its site; predicate never fired); ζ2 owns green reuse | cancelled 2026-10-09 |
 | Task 5294 (duplicate pyright leg) | absorbed | executed-or-replayed plan consult | this PRD (γ) | close as superseded at γ landing |
 | Task 5409 (NULL tip_sha) / 2752 checkpoint | parallel | tip checkpoint remains for task-leg redispatch; registry is a superset | 5409 stays | wired |
 | `plans/flake-ledger-prd.md` / 5492 | consumes | `flake_suppression` on `VerifyResult` read by admission | flake ledger owns; this PRD reads | wired |
