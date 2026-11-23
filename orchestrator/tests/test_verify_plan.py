@@ -1442,18 +1442,20 @@ class TestScoperTrailingClausePreservation:
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
             ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
             ' && python3 tests/scripts/raw_envelope_literal_guard.py fused-memory'
+            ' && uv run --project shared python tests/scripts/git_history_census.py fused-memory/tests'
         )
         assert 'src/ tests/' not in scoped
         for checker in (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests',
             '&& python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests',
             '&& python3 tests/scripts/raw_envelope_literal_guard.py fused-memory',
+            '&& uv run --project shared python tests/scripts/git_history_census.py fused-memory/tests',
         ):
             assert checker in scoped, f'{checker!r} must survive verbatim'
             assert checker in FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
 
     def test_dashboard_lint_chain_scopes_ruff_and_keeps_every_checker(self):
-        """The second 4-segment chain (tasks 4485 and 6230), as a full literal golden.
+        """The second 5-segment chain (tasks 4485, 6230 and 11476), as a full literal golden.
 
         Same shape as the fused-memory case above: the ruff clause narrows
         to the touched file while every sibling checker survives verbatim,
@@ -1466,12 +1468,14 @@ class TestScoperTrailingClausePreservation:
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests'
             ' && python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests'
             ' && python3 tests/scripts/raw_envelope_literal_guard.py dashboard'
+            ' && uv run --project shared python tests/scripts/git_history_census.py dashboard/tests'
         )
         assert 'src/ tests/' not in scoped
         for checker in (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests',
             '&& python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests',
             '&& python3 tests/scripts/raw_envelope_literal_guard.py dashboard',
+            '&& uv run --project shared python tests/scripts/git_history_census.py dashboard/tests',
         ):
             assert checker in scoped, f'{checker!r} must survive verbatim'
             assert checker in DASHBOARD_LINT_COMMAND, 'the slice asserted above must be verbatim'
